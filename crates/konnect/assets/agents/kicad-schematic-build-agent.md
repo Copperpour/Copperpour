@@ -59,7 +59,7 @@ load_toolset("templates")
 - Wire power first, then signals, then low-priority connections
 
 **Step 5: Annotate and save**
-- Run `annotate_schematic`; an `outcome` of `partial` means `unresolved` names duplicated or unprovable designators — resolve them (`resolve_duplicates: true` for separate parts, or edit the designators; units of one multi-unit package are never renumbered for you) before saving
+- Run `annotate_schematic` (on a hierarchical design, on its root with `schematic_scope: "hierarchy"`); an `outcome` of `partial` means `unresolved` names duplicated or unprovable designators — resolve them (`resolve_duplicates: true` for separate parts, or edit the designators; units of one multi-unit package are never renumbered for you) before saving
 - Run `save_project` so formal checks inspect the current saved design
 
 **Step 6: Collect direct evidence**

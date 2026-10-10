@@ -611,3 +611,138 @@ fn a_written_default_netclass_still_plots_wires() {
         "a sparse named class changed the junction dot: {radius} -> {after}"
     );
 }
+
+/// Every `(reference …)` and `Reference` property of `prefix` followed by a
+/// number, set back to `prefix?`.
+fn reset_references(content: &str, prefix: &str) -> String {
+    let mut out = content.to_string();
+    for needle in ["(reference \"", "(property \"Reference\" \""] {
+        let mut next = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(at) = rest.find(needle) {
+            let value = at + needle.len();
+            let len = rest[value..].find('"').unwrap();
+            let reference = &rest[value..value + len];
+            next.push_str(&rest[..value]);
+            match reference.strip_prefix(prefix) {
+                Some(number)
+                    if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    next.push_str(prefix);
+                    next.push('?');
+                }
+                _ => next.push_str(reference),
+            }
+            rest = &rest[value + len..];
+        }
+        next.push_str(rest);
+        out = next;
+    }
+    out
+}
+
+/// KiCad's netlist of `root`: the component references, and whatever
+/// kicad-cli said while exporting it.
+fn netlisted(kicad_cli: &str, root: &std::path::Path, label: &str) -> (Vec<String>, String) {
+    let netlist = root.with_file_name(format!("{label}.net"));
+    let export = Command::new(kicad_cli)
+        .args(["sch", "export", "netlist", "--output"])
+        .arg(&netlist)
+        .arg(root)
+        .output()
+        .expect("failed to run KiCad netlist export");
+    assert!(export.status.success(), "netlist export failed: {export:?}");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&export.stdout),
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let text = std::fs::read_to_string(netlist).expect("KiCad wrote no netlist");
+    let references = konnect_sexp::parse_sexp(&text)
+        .expect("KiCad netlist must parse")
+        .find("components")
+        .expect("KiCad netlist has no components")
+        .find_all("comp")
+        .into_iter()
+        .map(|comp| {
+            comp.find_str("ref")
+                .expect("a comp without a ref")
+                .to_string()
+        })
+        .collect();
+    (references, said)
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
+fn a_nested_hierarchy_annotated_from_its_root_netlists_cleanly() {
+    let Some(kicad_cli) = find_kicad_cli() else {
+        panic!("kicad-cli not found — set KICAD_CLI or install KiCAD (this test is e2e-only)");
+    };
+    // The nested fixture (#42): cell is placed four times, two of them under
+    // each of bank's two placements. Both cases leave one Y?; the second also
+    // sets every R back to R?.
+    let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../konnect-core/tests/fixtures/annotate_nested_hierarchy");
+    for reset in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        for name in [
+            "nested_pages.kicad_pro",
+            "nested_pages.kicad_sch",
+            "bank.kicad_sch",
+            "cell.kicad_sch",
+        ] {
+            let content = std::fs::read_to_string(fixtures.join(name)).unwrap();
+            // The fixture is fully annotated. cell's one "Y3" is the crystal's
+            // record on north/west, page 11; its Reference property shows
+            // south/east's Y1, the first of its instances in page order.
+            let content = if name == "cell.kicad_sch" {
+                assert_eq!(content.matches("\"Y3\"").count(), 1);
+                assert_eq!(content.matches("(reference \"Y3\")").count(), 1);
+                content.replace("(reference \"Y3\")", "(reference \"Y?\")")
+            } else {
+                content
+            };
+            let content = if reset {
+                reset_references(&content, "R")
+            } else {
+                content
+            };
+            std::fs::write(directory.path().join(name), content).unwrap();
+        }
+        let root = directory.path().join("nested_pages.kicad_sch");
+        let (_, said) = netlisted(&kicad_cli, &root, "before");
+        assert!(said.contains("annotation errors"), "{said}");
+
+        let mut p = Mcp::spawn(&kicad_cli);
+        p.load("sch_components");
+        let result = p.tool(
+            "annotate_schematic",
+            json!({"schematic": root.to_string_lossy(), "schematic_scope": "hierarchy"}),
+        );
+        let body = body(&result);
+        assert_eq!(body["outcome"]["status"], "complete", "{body}");
+
+        let (after, said) = netlisted(&kicad_cli, &root, "after");
+        assert!(!said.contains("annotation errors"), "{said}");
+        let distinct: std::collections::BTreeSet<&String> = after.iter().collect();
+        assert_eq!(
+            after.len(),
+            37,
+            "five parts on the root, six on each of two bank instances and five on each of four \
+             cell instances, power symbols aside: {after:?}"
+        );
+        assert_eq!(
+            distinct.len(),
+            after.len(),
+            "every component its own: {after:?}"
+        );
+        assert!(after.iter().any(|r| r == "Y3"), "{after:?}");
+        if reset {
+            assert!(
+                (1..=16).all(|n| after.contains(&format!("R{n}"))),
+                "{after:?}"
+            );
+        }
+    }
+}

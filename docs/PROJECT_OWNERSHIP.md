@@ -60,6 +60,22 @@ separate entries, and the instance lists are always given in full — those are
 what a repair has to write back. Read it as prose, not as a parsed list: to
 enumerate every affected symbol, inspect the file.
 
+## Hierarchy annotation
+
+`annotate_schematic` with `schematic_scope: "hierarchy"` (#42) walks the saved
+sheet tree of the proven root and checks every file's instance records before
+it plans anything. A record is the project's when its path starts at the root,
+as eeschema saves it, and carries the project's name or none.
+
+| Observed saved state | Annotation result |
+| --- | --- |
+| The target is the proven root, and the project lists no other top-level sheet | Annotate every sheet instance; commit every changed file in one transaction. |
+| The target is a child sheet, or no project owns it | Return `invalid_argument` naming the root or asking for `schematic_scope: "file"`; never annotate the file alone. |
+| Unproven or ambiguous project ownership | Preserve #189's `conflict` refusal before writing. |
+| The project lists another top-level sheet, or gives the root another uuid | Return `invalid_argument`: eeschema annotates every top-level sheet as one hierarchy, and keys the root by the uuid listed. |
+| A placed symbol lacks a record for a sheet instance of its file, records one twice, records a project path that is not one, records one under another project's name, or records a path under another root under this project's name (eeschema prunes those on load); or two symbols of one file share a uuid | Return `stale_target` before writing; nothing is pruned or created. |
+| Records under another root, under another project's name or none | Leave them untouched. |
+
 ## Unreleased notes (next minor release)
 
 Schematics that previously inherited an unrelated ancestor project's libraries,
