@@ -8,22 +8,39 @@ use std::{path::Path, time::Duration};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Publish by sibling-file replacement, never by truncating a destination inode.
-/// This also preserves the source board if an output path is a distinct hard link.
+/// [`write_report_blocking`] off the async runtime.
 pub(crate) async fn write_report(output: &str, contents: &str) -> anyhow::Result<()> {
-    use anyhow::Context;
     let path = std::path::PathBuf::from(output);
     let contents = contents.to_string();
-    tokio::task::spawn_blocking(move || {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("could not create report directory {}", parent.display())
-            })?;
-        }
-        konnect_sexp::writer::write_atomic(&path, &contents)
-            .with_context(|| format!("could not write report to {}", path.display()))
-    })
-    .await?
+    tokio::task::spawn_blocking(move || write_report_blocking(&path, &contents)).await?
+}
+
+/// Publish by sibling-file replacement, never by truncating a destination inode.
+/// This also preserves the source board if an output path is a distinct hard link.
+///
+/// Called directly by a caller already off the async runtime, as an IPC
+/// closure is.
+pub(crate) fn write_report_blocking(path: &Path, contents: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create report directory {}", parent.display()))?;
+    }
+    konnect_sexp::writer::write_atomic(path, contents)
+        .with_context(|| format!("could not write report to {}", path.display()))
+}
+
+/// Whether `output` plainly cannot take a report: it is one of `sources`, a
+/// directory, or under something that is not a directory. Checked before any
+/// work starts; a write that fails later still has to report the work done.
+pub(crate) fn output_is_unusable(output: &Path, sources: &[&Path]) -> bool {
+    let aliases = |source: &Path| match (output.canonicalize(), source.canonicalize()) {
+        (Ok(output), Ok(source)) => output == source,
+        _ => output == source,
+    };
+    sources.iter().any(|source| aliases(source))
+        || output.is_dir()
+        || output.ancestors().skip(1).any(Path::is_file)
 }
 
 #[derive(serde::Serialize)]
@@ -124,18 +141,7 @@ pub(crate) async fn run(
     // Refuse obvious publication errors before any live save/refill. Later
     // permission changes or filesystem races still need applied-state recovery.
     if let Some(output) = args["output"].as_str() {
-        let output_path = Path::new(output);
-        let same_board = match (output_path.canonicalize(), board.canonicalize()) {
-            (Ok(output), Ok(board)) => output == board,
-            _ => output_path == board,
-        };
-        let invalid = same_board
-            || output_path.is_dir()
-            || output_path
-                .ancestors()
-                .skip(1)
-                .any(|parent| parent.is_file());
-        if invalid {
+        if output_is_unusable(Path::new(output), &[board]) {
             return Ok(Err(CallToolResult::error_kind(
                 ToolErrorKind::InvalidArgument {
                     field: "output".into(),
