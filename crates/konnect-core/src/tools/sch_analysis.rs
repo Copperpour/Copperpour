@@ -1514,6 +1514,13 @@ mod power_symbol_net_tests {
         let stale = SCH.replace("(lib_id \"Device:R\")", "(lib_id \"Device:Missing\")");
         let result = call_result(&stale, "get_net_connections", json!({ "net": "GND" })).await;
         assert!(result.is_error, "a short pin list was answered as complete");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        assert_eq!(
+            text,
+            &format!("Cannot list the pins on net 'GND': {UNRESOLVED_PIN_GEOMETRY}")
+        );
     }
 
     #[tokio::test]
