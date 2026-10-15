@@ -492,6 +492,24 @@ pub struct IpcPadNetChange {
     pub net: String,
 }
 
+/// A custom (user) field on a placed footprint, after `set_footprint_field`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcFootprintFieldChange {
+    pub reference: String,
+    pub kiid: String,
+    pub name: String,
+    /// The field's text before the edit; `None` when the field did not exist.
+    pub previous_value: Option<String>,
+    /// The field's text read back after the edit.
+    pub value: String,
+    pub visible: bool,
+    /// True when the field was added rather than updated.
+    pub created: bool,
+    /// False when the footprint already held exactly this field, so nothing
+    /// was sent to KiCad.
+    pub changed: bool,
+}
+
 /// What a pad-net assignment did.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IpcPadNetOutcome {
@@ -540,6 +558,17 @@ pub enum IpcViaMove {
         before: IpcVia,
         moved: IpcVia,
         restored: bool,
+    },
+}
+
+/// What `set_footprint_field` did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcFootprintFieldOutcome {
+    Applied(IpcFootprintFieldChange),
+    /// The update was sent but a fresh read-back did not confirm it. The
+    /// board may or may not have changed.
+    Uncertain {
+        reason: String,
     },
 }
 

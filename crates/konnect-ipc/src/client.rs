@@ -4663,6 +4663,17 @@ impl KiCadIpcClient {
 
 // ─── Pad nets, vias and custom footprint fields ─────────────────────────────
 
+/// The fields every KiCad footprint carries. A custom field may not take one
+/// of these names: the footprint would then hold two fields called, say,
+/// "Value", and each reader would see whichever it found first.
+pub const MANDATORY_FOOTPRINT_FIELDS: &[&str] = &[
+    "Reference",
+    "Value",
+    "Footprint",
+    "Datasheet",
+    "Description",
+];
+
 impl KiCadIpcClient {
     /// Every via on one exact open board, as KiCad holds it.
     pub fn get_vias_in(
@@ -5005,6 +5016,196 @@ impl KiCadIpcClient {
             changes,
             changed: true,
         })
+    }
+
+    /// Add or update one custom field — `LCSC`, `MPN`, anything that is not
+    /// a mandatory field — on a placed footprint.
+    ///
+    /// KiCad's `CreateItems` cannot do the add: a field created with the
+    /// footprint as its container is handed to `BOARD::Add`, which files a
+    /// `PCB_FIELD` as a board-level drawing rather than a footprint child.
+    /// `FOOTPRINT::Deserialize` does read user fields from
+    /// `definition.items`, so the footprint is sent back whole with the field
+    /// in it, in one undo step. A new field is hidden unless `visible` says
+    /// otherwise, sits on the footprint's own Fab layer at its anchor, and is
+    /// mirrored on the back like every other back-side text.
+    pub fn set_footprint_field_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+        name: &str,
+        value: &str,
+        visible: Option<bool>,
+    ) -> Result<IpcFootprintFieldOutcome> {
+        if name.trim().is_empty() {
+            anyhow::bail!("a footprint field needs a non-empty name");
+        }
+        if let Some(mandatory) = MANDATORY_FOOTPRINT_FIELDS
+            .iter()
+            .find(|mandatory| mandatory.eq_ignore_ascii_case(name))
+        {
+            anyhow::bail!(
+                "'{mandatory}' is a mandatory footprint field, not a custom one; edit it with \
+                 the tool that owns it"
+            );
+        }
+        let mut footprint = self.find_footprint_instance_in(document.clone(), reference)?;
+        let kiid = footprint
+            .id
+            .as_ref()
+            .map(|id| id.value.clone())
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("footprint '{reference}' has no KIID"))?;
+        let anchor = footprint.position.unwrap_or_default();
+        let on_back = footprint.layer == kiapi::board::types::BoardLayer::BlBCu as i32;
+        let definition = footprint
+            .definition
+            .as_mut()
+            .with_context(|| format!("footprint '{reference}' carries no definition"))?;
+        let item_count = definition.items.len();
+
+        let mut previous: Option<(String, bool)> = None;
+        for item in definition.items.iter_mut() {
+            if !crate::builders::any_is(item, "kiapi.board.types.Field") {
+                continue;
+            }
+            let mut field = kiapi::board::types::Field::decode(item.value.as_slice())
+                .with_context(|| format!("footprint '{reference}' has an unreadable field"))?;
+            if field.name != name {
+                continue;
+            }
+            if previous.is_some() {
+                anyhow::bail!("footprint '{reference}' carries more than one field named '{name}'");
+            }
+            let text = field
+                .text
+                .as_mut()
+                .and_then(|board_text| board_text.text.as_mut())
+                .with_context(|| format!("field '{name}' of '{reference}' carries no text"))?;
+            previous = Some((text.text.clone(), field.visible));
+            text.text = value.to_string();
+            if let Some(visible) = visible {
+                field.visible = visible;
+            }
+            *item = crate::builders::pack_any(&field, "kiapi.board.types.Field");
+        }
+        let created = previous.is_none();
+        if let Some((old_value, old_visible)) = &previous {
+            if old_value == value && visible.is_none_or(|visible| visible == *old_visible) {
+                return Ok(IpcFootprintFieldOutcome::Applied(IpcFootprintFieldChange {
+                    reference: reference.to_string(),
+                    kiid,
+                    name: name.to_string(),
+                    previous_value: Some(old_value.clone()),
+                    value: old_value.clone(),
+                    visible: *old_visible,
+                    created: false,
+                    changed: false,
+                }));
+            }
+        } else {
+            let layer = if on_back { "B.Fab" } else { "F.Fab" };
+            let field = kiapi::board::types::Field {
+                id: None,
+                name: name.to_string(),
+                text: Some(kiapi::board::types::BoardText {
+                    id: None,
+                    text: Some(kiapi::common::types::Text {
+                        position: Some(anchor),
+                        attributes: Some(kiapi::common::types::TextAttributes {
+                            size: Some(crate::builders::vec2(1.0, 1.0)),
+                            stroke_width: Some(crate::builders::distance(0.15)),
+                            angle: Some(kiapi::common::types::Angle { value_degrees: 0.0 }),
+                            mirrored: on_back,
+                            ..Default::default()
+                        }),
+                        text: value.to_string(),
+                        hyperlink: String::new(),
+                    }),
+                    layer: crate::builders::layer_from_name(layer) as i32,
+                    knockout: false,
+                    locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+                    parent: None,
+                }),
+                visible: visible.unwrap_or(false),
+            };
+            definition
+                .items
+                .push(crate::builders::pack_any(&field, "kiapi.board.types.Field"));
+        }
+
+        let packed = crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+        let update_document = document.clone();
+        self.run_commit("Set footprint field", move |client| {
+            client.update_items_in(update_document, vec![packed])
+        })?;
+
+        let after = match self.find_footprint_instance_in(document, reference) {
+            Ok(after) => after,
+            Err(error) => {
+                return Ok(IpcFootprintFieldOutcome::Uncertain {
+                    reason: format!(
+                        "post-update read-back could not resolve '{reference}': {error:#}"
+                    ),
+                })
+            }
+        };
+        if after.id.as_ref().map(|id| id.value.as_str()) != Some(kiid.as_str()) {
+            return Ok(IpcFootprintFieldOutcome::Uncertain {
+                reason: format!("post-update read-back of '{reference}' carries a different KIID"),
+            });
+        }
+        let Some(definition) = after.definition.as_ref() else {
+            return Ok(IpcFootprintFieldOutcome::Uncertain {
+                reason: format!("post-update read-back of '{reference}' has no definition"),
+            });
+        };
+        let expected_count = item_count + usize::from(created);
+        if definition.items.len() != expected_count {
+            return Ok(IpcFootprintFieldOutcome::Uncertain {
+                reason: format!(
+                    "'{reference}' should hold {expected_count} items after the update but read \
+                     back {}",
+                    definition.items.len()
+                ),
+            });
+        }
+        let held = definition
+            .items
+            .iter()
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Field"))
+            .filter_map(|item| kiapi::board::types::Field::decode(item.value.as_slice()).ok())
+            .find(|field| field.name == name);
+        let Some(held) = held else {
+            return Ok(IpcFootprintFieldOutcome::Uncertain {
+                reason: format!(
+                    "KiCad accepted the update but '{reference}' reads back with no field '{name}'"
+                ),
+            });
+        };
+        let held_value = held
+            .text
+            .as_ref()
+            .and_then(|board_text| board_text.text.as_ref())
+            .map(|text| text.text.clone())
+            .unwrap_or_default();
+        if held_value != value {
+            return Ok(IpcFootprintFieldOutcome::Uncertain {
+                reason: format!(
+                    "field '{name}' of '{reference}' reads back as '{held_value}', not '{value}'"
+                ),
+            });
+        }
+        Ok(IpcFootprintFieldOutcome::Applied(IpcFootprintFieldChange {
+            reference: reference.to_string(),
+            kiid,
+            name: name.to_string(),
+            previous_value: previous.map(|(value, _)| value),
+            value: held_value,
+            visible: held.visible,
+            created,
+            changed: true,
+        }))
     }
 }
 
