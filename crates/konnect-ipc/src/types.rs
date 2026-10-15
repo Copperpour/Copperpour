@@ -481,6 +481,35 @@ pub struct IpcVia {
     pub locked: bool,
 }
 
+/// One pad's net before and after a pad-net assignment, read back from KiCad.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcPadNetChange {
+    pub uuid: Option<String>,
+    pub number: String,
+    /// Net before the edit; empty for an unconnected pad.
+    pub previous_net: String,
+    /// Net KiCad holds after the edit; empty for an unconnected pad.
+    pub net: String,
+}
+
+/// What a pad-net assignment did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcPadNetOutcome {
+    /// A fresh read-back shows every pad with the requested number on the
+    /// requested net. `changed` is false when they already were, in which
+    /// case nothing was sent.
+    Applied {
+        kiid: String,
+        changes: Vec<IpcPadNetChange>,
+        changed: bool,
+    },
+    /// The footprint has no pad with that number. Nothing was sent.
+    NoSuchPad { available: Vec<String> },
+    /// The update was sent but a fresh read-back did not confirm it. The
+    /// board may or may not have changed.
+    Uncertain { reason: String },
+}
+
 /// What `add_via` stored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IpcViaPlacement {

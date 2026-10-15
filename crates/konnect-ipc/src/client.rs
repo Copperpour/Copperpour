@@ -4858,6 +4858,154 @@ impl KiCadIpcClient {
             restored,
         })
     }
+
+    /// Assign `net_name` to every pad numbered `pad_number` on one placed
+    /// footprint; an empty name leaves the pads unconnected.
+    ///
+    /// On a KiCad 10 board without a schematic this is how the netlist is
+    /// edited. KiCad resolves the net by name and creates it when the board
+    /// has none of that name, which is the same rule copper items follow.
+    /// Pads sharing a number are one pin to KiCad, so all of them move
+    /// together. The whole footprint is sent back in one undo step and a
+    /// fresh read-back is the only evidence of the result.
+    pub fn set_pad_net_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+        pad_number: &str,
+        net_name: &str,
+    ) -> Result<IpcPadNetOutcome> {
+        let mut footprint = self.find_footprint_instance_in(document.clone(), reference)?;
+        let kiid = footprint
+            .id
+            .as_ref()
+            .map(|id| id.value.clone())
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("footprint '{reference}' has no KIID"))?;
+        let definition = footprint
+            .definition
+            .as_mut()
+            .with_context(|| format!("footprint '{reference}' carries no definition"))?;
+        let item_count = definition.items.len();
+        let mut available = BTreeSet::new();
+        let mut changes = Vec::new();
+        for item in definition.items.iter_mut() {
+            if !crate::builders::any_is(item, "kiapi.board.types.Pad") {
+                continue;
+            }
+            let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())
+                .with_context(|| format!("footprint '{reference}' has an unreadable pad"))?;
+            available.insert(pad.number.clone());
+            if pad.number != pad_number {
+                continue;
+            }
+            let uuid = kiid_value(pad.id.clone());
+            changes.push(IpcPadNetChange {
+                uuid: (!uuid.is_empty()).then_some(uuid),
+                number: pad.number.clone(),
+                previous_net: pad
+                    .net
+                    .as_ref()
+                    .map(|net| net.name.clone())
+                    .unwrap_or_default(),
+                net: net_name.to_string(),
+            });
+            // Net codes are deprecated in KiCad 10's API: the name is what
+            // `BOARD_CONNECTED_ITEM::UnpackNet` reads.
+            pad.net = Some(kiapi::board::types::Net {
+                code: None,
+                name: net_name.to_string(),
+            });
+            *item = crate::builders::pack_any(&pad, "kiapi.board.types.Pad");
+        }
+        if changes.is_empty() {
+            return Ok(IpcPadNetOutcome::NoSuchPad {
+                available: available.into_iter().collect(),
+            });
+        }
+        if changes.iter().all(|change| change.previous_net == net_name) {
+            return Ok(IpcPadNetOutcome::Applied {
+                kiid,
+                changes,
+                changed: false,
+            });
+        }
+
+        let packed = crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+        let update_document = document.clone();
+        self.run_commit("Set pad net", move |client| {
+            client.update_items_in(update_document, vec![packed])
+        })?;
+
+        let after = match self.find_footprint_instance_in(document, reference) {
+            Ok(after) => after,
+            Err(error) => {
+                return Ok(IpcPadNetOutcome::Uncertain {
+                    reason: format!(
+                        "post-update read-back could not resolve '{reference}': {error:#}"
+                    ),
+                })
+            }
+        };
+        if after.id.as_ref().map(|id| id.value.as_str()) != Some(kiid.as_str()) {
+            return Ok(IpcPadNetOutcome::Uncertain {
+                reason: format!("post-update read-back of '{reference}' carries a different KIID"),
+            });
+        }
+        let Some(definition) = after.definition.as_ref() else {
+            return Ok(IpcPadNetOutcome::Uncertain {
+                reason: format!("post-update read-back of '{reference}' has no definition"),
+            });
+        };
+        // The update replaces the whole footprint. A child that did not come
+        // back would be a silent loss, so the count is part of the evidence.
+        if definition.items.len() != item_count {
+            return Ok(IpcPadNetOutcome::Uncertain {
+                reason: format!(
+                    "'{reference}' held {item_count} items before the update and {} after",
+                    definition.items.len()
+                ),
+            });
+        }
+        let pads = definition
+            .items
+            .iter()
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Pad"))
+            .filter_map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).ok())
+            .collect::<Vec<_>>();
+        for change in &mut changes {
+            let held = pads.iter().find(|pad| match &change.uuid {
+                Some(uuid) => kiid_value(pad.id.clone()) == *uuid,
+                None => pad.number == change.number,
+            });
+            let Some(held) = held else {
+                return Ok(IpcPadNetOutcome::Uncertain {
+                    reason: format!(
+                        "pad '{}' of '{reference}' is missing from the post-update read-back",
+                        change.number
+                    ),
+                });
+            };
+            change.net = held
+                .net
+                .as_ref()
+                .map(|net| net.name.clone())
+                .unwrap_or_default();
+            if change.net != net_name {
+                return Ok(IpcPadNetOutcome::Uncertain {
+                    reason: format!(
+                        "pad '{}' of '{reference}' reads back on net '{}', not '{net_name}'",
+                        change.number, change.net
+                    ),
+                });
+            }
+        }
+        Ok(IpcPadNetOutcome::Applied {
+            kiid,
+            changes,
+            changed: true,
+        })
+    }
 }
 
 /// A via message as the read-back type, with every field taken from KiCad.

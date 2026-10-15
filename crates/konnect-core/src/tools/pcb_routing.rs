@@ -385,6 +385,7 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_route_diff_pair(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        super::pad_nets::tool(),
     ]
 }
 
