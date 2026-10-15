@@ -4661,6 +4661,239 @@ impl KiCadIpcClient {
     }
 }
 
+// ─── Pad nets, vias and custom footprint fields ─────────────────────────────
+
+impl KiCadIpcClient {
+    /// Every via on one exact open board, as KiCad holds it.
+    pub fn get_vias_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<Vec<IpcVia>> {
+        let items =
+            self.get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbVia)?;
+        items
+            .iter()
+            // Type-check before decoding, as `get_tracks_in` does: protobuf
+            // decoding accepts compatible bytes under the wrong declared type.
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Via"))
+            .map(|item| {
+                kiapi::board::types::Via::decode(item.value.as_slice())
+                    .map(|via| ipc_via(&via))
+                    .context("KiCad returned an unreadable via")
+            })
+            .collect()
+    }
+
+    /// The via carrying `uuid` on one exact open board, as KiCad's message.
+    fn find_via_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        uuid: &str,
+    ) -> Result<Option<kiapi::board::types::Via>> {
+        let items =
+            self.get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbVia)?;
+        for item in &items {
+            if !crate::builders::any_is(item, "kiapi.board.types.Via") {
+                continue;
+            }
+            let via = kiapi::board::types::Via::decode(item.value.as_slice())
+                .context("KiCad returned an unreadable via")?;
+            if via.id.as_ref().map(|id| id.value.as_str()) == Some(uuid) {
+                return Ok(Some(via));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Add a through via on `net_name` to an exact open board, then report
+    /// the net KiCad actually stored.
+    ///
+    /// KiCad resolves the net by name on creation, but a via that lands on
+    /// copper already carrying another net can be stored on that net instead.
+    /// The create response is serialized before KiCad recomputes
+    /// connectivity, so only a fresh read-back shows it. A via on the wrong
+    /// net is a short the caller never asked for; it is deleted again and
+    /// reported rather than left on the board.
+    pub fn add_via_verified_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        net_name: &str,
+        x: f64,
+        y: f64,
+        drill: f64,
+        pad_size: f64,
+    ) -> Result<IpcViaPlacement> {
+        let net_code = self.resolve_net_code_in(document.clone(), net_name)?;
+        let via = crate::builders::build_via(net_name, net_code, x, y, drill, pad_size);
+        let created = self.create_items_in_returning(
+            document.clone(),
+            vec![crate::builders::pack_any(&via, "kiapi.board.types.Via")],
+        )?;
+        let kiid = created
+            .iter()
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Via"))
+            .find_map(|item| kiapi::board::types::Via::decode(item.value.as_slice()).ok())
+            .and_then(|via| via.id)
+            .map(|id| id.value)
+            .filter(|id| !id.is_empty())
+            .context(
+                "KiCad created the via but did not report its KIID, so the net it stored \
+                 cannot be read back",
+            )?;
+        let stored = self
+            .find_via_in(document.clone(), &kiid)?
+            .map(|via| ipc_via(&via))
+            .with_context(|| {
+                format!("KiCad created via '{kiid}' but read-back does not list it")
+            })?;
+        if stored.net_name == net_name {
+            return Ok(IpcViaPlacement::Placed(stored));
+        }
+        let removed = self
+            .delete_items_in(document.clone(), vec![kiid.clone()])
+            .is_ok()
+            && matches!(self.find_via_in(document, &kiid), Ok(None));
+        Ok(IpcViaPlacement::NetMismatch {
+            requested_net: net_name.to_string(),
+            stored,
+            removed,
+        })
+    }
+
+    /// Delete one observed via from the requested board.
+    ///
+    /// As [`Self::delete_trace_segment_verified`]: `DeleteItems` accepts any
+    /// KIID, so the item is first proven to be a via on this board, and a
+    /// second read proves it is gone. `None` means no via carries `uuid`, and
+    /// nothing was sent.
+    pub fn delete_via_verified(&self, requested: &Path, uuid: &str) -> Result<Option<IpcVia>> {
+        let document = self.find_open_board(requested)?;
+        let Some(via) = self.find_via_in(document.clone(), uuid)? else {
+            return Ok(None);
+        };
+        self.delete_items_in(document.clone(), vec![uuid.to_string()])?;
+        let remains = self
+            .find_via_in(document, uuid)
+            .with_context(|| {
+                format!(
+                    "KiCad accepted deletion of via '{uuid}' but post-delete read-back failed; \
+                     the deletion may have committed"
+                )
+            })?
+            .is_some();
+        if remains {
+            anyhow::bail!("KiCad accepted deletion of via '{uuid}' but read-back still lists it");
+        }
+        Ok(Some(ipc_via(&via)))
+    }
+
+    /// Move one observed via to `(x, y)` on the requested board.
+    ///
+    /// Only the position changes; drill, size, layers and net are carried
+    /// over from KiCad's own message. Moving a via onto copper of another net
+    /// can make KiCad store it on that net, so the net is read back too, and
+    /// a via that changed net is moved back rather than left shorting.
+    pub fn move_via_verified(
+        &self,
+        requested: &Path,
+        uuid: &str,
+        x: f64,
+        y: f64,
+    ) -> Result<IpcViaMove> {
+        let document = self.find_open_board(requested)?;
+        let Some(original) = self.find_via_in(document.clone(), uuid)? else {
+            return Ok(IpcViaMove::NotFound);
+        };
+        let before = ipc_via(&original);
+        let mut moved = original.clone();
+        moved.position = Some(crate::builders::vec2(x, y));
+        self.update_items_in(
+            document.clone(),
+            vec![crate::builders::pack_any(&moved, "kiapi.board.types.Via")],
+        )?;
+        let after = self
+            .find_via_in(document.clone(), uuid)
+            .with_context(|| {
+                format!(
+                    "KiCad accepted the move of via '{uuid}' but read-back failed; the move \
+                     may have committed"
+                )
+            })?
+            .map(|via| ipc_via(&via))
+            .with_context(|| {
+                format!("KiCad accepted the move of via '{uuid}' but read-back no longer lists it")
+            })?;
+        let target = crate::builders::vec2(x, y);
+        let held = &after.position;
+        if crate::builders::vec2(held.x, held.y) != target {
+            anyhow::bail!(
+                "KiCad accepted the move of via '{uuid}' but read-back places it at ({}, {}), \
+                 not ({x}, {y})",
+                held.x,
+                held.y
+            );
+        }
+        if after.net_name == before.net_name {
+            return Ok(IpcViaMove::Moved { before, after });
+        }
+        let restored = self
+            .update_items_in(
+                document.clone(),
+                vec![crate::builders::pack_any(
+                    &original,
+                    "kiapi.board.types.Via",
+                )],
+            )
+            .is_ok()
+            && self
+                .find_via_in(document, uuid)
+                .ok()
+                .flatten()
+                .map(|via| ipc_via(&via))
+                .as_ref()
+                == Some(&before);
+        Ok(IpcViaMove::NetChanged {
+            before,
+            moved: after,
+            restored,
+        })
+    }
+}
+
+/// A via message as the read-back type, with every field taken from KiCad.
+fn ipc_via(via: &kiapi::board::types::Via) -> IpcVia {
+    use kiapi::board::types::ViaType;
+    let stack = via.pad_stack.as_ref();
+    let drill = stack.and_then(|stack| stack.drill.as_ref());
+    IpcVia {
+        uuid: kiid_value(via.id.clone()),
+        net_name: via
+            .net
+            .as_ref()
+            .map(|net| net.name.clone())
+            .unwrap_or_default(),
+        position: point_in_mm(via.position.unwrap_or_default()),
+        drill_mm: drill
+            .and_then(|drill| drill.diameter)
+            .map(|diameter| nm_to_mm(diameter.x_nm)),
+        pad_size_mm: stack
+            .and_then(|stack| stack.copper_layers.first())
+            .and_then(|layer| layer.size)
+            .map(|size| nm_to_mm(size.x_nm)),
+        via_type: match ViaType::try_from(via.r#type).ok() {
+            Some(ViaType::VtThrough) => Some("through".to_string()),
+            Some(ViaType::VtBlindBuried) => Some("blind_buried".to_string()),
+            Some(ViaType::VtMicro) => Some("micro".to_string()),
+            Some(ViaType::VtBlind) => Some("blind".to_string()),
+            Some(ViaType::VtBuried) => Some("buried".to_string()),
+            Some(ViaType::VtUnknown) | None => None,
+        },
+        start_layer: drill.map(|drill| layer_enum_to_name(drill.start_layer).to_string()),
+        end_layer: drill.map(|drill| layer_enum_to_name(drill.end_layer).to_string()),
+        locked: via.locked == kiapi::common::types::LockedState::LsLocked as i32,
+    }
+}
+
 /// True when `rotation` keeps axis-aligned shapes axis-aligned.
 fn is_cardinal_rotation(rotation_deg: f64) -> bool {
     let r = rotation_deg.rem_euclid(90.0);
