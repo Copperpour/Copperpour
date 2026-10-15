@@ -4221,6 +4221,39 @@ impl KiCadIpcClient {
         let item = Self::build_footprint_item(
             lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
         )?;
+        self.create_placed_footprint_in(document, reference, item)
+    }
+
+    /// Place an already-built `FootprintInstance` on the open `board` and
+    /// verify it by reference.
+    ///
+    /// For a caller that adds library data [`Self::build_footprint_item`]
+    /// does not carry — 3D models, attributes, description — to the item
+    /// before it is sent, so that the part arrives complete in one creation
+    /// rather than being patched afterwards.
+    pub fn place_footprint_item(
+        &self,
+        board: &Path,
+        reference: &str,
+        item: prost_types::Any,
+    ) -> Result<IpcFootprint> {
+        let document = self.find_open_board(board)?;
+        if self
+            .list_footprints_in(document.clone())?
+            .iter()
+            .any(|footprint| footprint.reference == reference)
+        {
+            anyhow::bail!("footprint reference '{reference}' already exists on the board");
+        }
+        self.create_placed_footprint_in(document, reference, item)
+    }
+
+    fn create_placed_footprint_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+        item: prost_types::Any,
+    ) -> Result<IpcFootprint> {
         self.create_items_in(document.clone(), vec![item])?;
         let footprints = self.list_footprints_in(document)?;
         footprints

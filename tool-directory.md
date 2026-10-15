@@ -259,7 +259,7 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `place_component` | Place a footprint through live KiCAD IPC when reachable, or use a revision-aware file fallback when no KiCAD process can hold the board open. The fallback preserves complete footprint content and rejects duplicate references. |
+| `place_component` | Place a footprint on F.Cu or B.Cu through live KiCAD IPC when reachable, or use a revision-aware file fallback when no KiCAD process can hold the board open. The live path carries the library's 3D models, attributes and description, and reaches B.Cu through KiCad's native flip (10.0.6+). A pre-6.0 `(module …)` footprint is upgraded in a private copy with `kicad-cli fp upgrade`. The fallback preserves complete footprint content and rejects duplicate references. |
 | `move_component` | Move a placed footprint through live KiCAD IPC when reachable, or use a revision-aware closed-board file fallback. |
 | `rotate_component` | Set a placed footprint's absolute rotation through live KiCAD IPC when reachable, or use a revision-aware closed-board file fallback that updates child angles. |
 | `set_component_placements` | Set X/Y positions and absolute rotations for multiple existing footprints atomically, using one live KiCAD update and one undo step or one revision-aware closed-board write. |
