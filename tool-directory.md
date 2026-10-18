@@ -95,7 +95,7 @@ and Windows servers do not.
 |------|-------------|
 | `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid, copies the library Value and Footprint unless explicitly overridden, preserves every saved hierarchy instance, and reports committed-file readback. Refuses stale instance metadata before writing. |
 | `delete_schematic_component` | Remove a component and all of its placed units by reference designator. |
-| `edit_schematic_component` | Update shared fields and KiCad's native `dnp` attribute consistently across every placed unit of a component, and move or hide any field's text. |
+| `edit_schematic_component` | Update or remove shared fields, and set KiCad's native `dnp` attribute, consistently across every placed unit of a component, and move or hide any field's text. |
 | `get_schematic_component` | Get shared properties, the `dnp` state and every placed unit's position for a component. |
 | `list_schematic_components` | List all symbol instances with positions, values, footprints, `dnp` state, and properties. |
 | `move_schematic_component` | Move the lowest-numbered unit to a new position and translate every other unit by the same delta. Does NOT adjust connected wires. Junction dots are re-judged, and a no-connect flag travels with the pin it protects. |

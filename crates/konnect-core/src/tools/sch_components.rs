@@ -30,7 +30,8 @@ use konnect_sexp::{
         pin_outward_direction, read_schematic,
     },
     writer::{
-        apply_edits, find_direct_child_blocks, read_consistent, write_atomic_if_unchanged, SexpEdit,
+        apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, read_consistent,
+        write_atomic_if_unchanged, SexpEdit,
     },
     ItemAnchor, ItemId, SchematicCommand, SexpError,
 };
@@ -81,7 +82,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_schematic_component",
-            "Update fields (Reference, Value, Footprint, custom properties) and KiCad's native do-not-populate (DNP) attribute consistently across every placed unit of a component, and move or hide the text of any field.",
+            "Update fields (Reference, Value, Footprint, custom properties) and KiCad's native do-not-populate (DNP) attribute consistently across every placed unit of a component, remove custom properties, and move or hide the text of any field.",
             json!({
                 "type": "object",
                 "properties": {
@@ -99,6 +100,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "object",
                         "additionalProperties": true,
                         "description": "Additional property fields to set as key:value pairs"
+                    },
+                    "remove_fields": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Custom property names to delete from every placed unit. KiCad's mandatory fields (Reference, Value, Footprint, Datasheet, Description) cannot be removed. A name no unit carries is reported in absent_fields."
                     },
                     "field_placements": {
                         "type": "object",
@@ -1028,6 +1034,9 @@ pub(crate) struct ComponentTargetUnit {
     uuid: String,
     unit: u32,
     fields: BTreeMap<String, String>,
+    /// Properties the unit must no longer carry, so a removal that fails to
+    /// reach the file cannot pass the readback.
+    absent_fields: BTreeSet<String>,
     lib_id: String,
     x: f64,
     y: f64,
@@ -1077,6 +1086,7 @@ impl ComponentTargetUnit {
                 ("Value".to_owned(), fields.value.clone()),
                 ("Footprint".to_owned(), fields.footprint.clone()),
             ]),
+            absent_fields: BTreeSet::new(),
             instances,
         }
     }
@@ -1208,6 +1218,18 @@ fn verify_component_expectations(
                 .into_result());
             }
         }
+        for field in &target.absent_fields {
+            if unit["fields"].get(field).is_some() {
+                return Err(ComponentDeleteTargetError::stale(
+                    path,
+                    format!(
+                        "observed property {field} is still present after its removal for UUID {}",
+                        target.uuid
+                    ),
+                )
+                .into_result());
+            }
+        }
     }
     Ok(())
 }
@@ -1237,6 +1259,17 @@ impl ComponentTarget {
             }
         }
         self
+    }
+
+    fn without_fields(&self, names: &[String]) -> Self {
+        let mut expected = self.clone();
+        for unit in &mut expected.units {
+            for name in names {
+                unit.fields.remove(name);
+                unit.absent_fields.insert(name.clone());
+            }
+        }
+        expected
     }
 
     fn uuids(&self) -> Vec<String> {
@@ -1352,6 +1385,7 @@ fn component_target_from_source(
             uuid,
             unit: instance.unit,
             fields,
+            absent_fields: BTreeSet::new(),
             lib_id: instance.lib_id,
             x: instance.x,
             y: instance.y,
@@ -2589,6 +2623,70 @@ fn symbol_blocks_by_uuid(content: &str, uuids: &[String]) -> Vec<(usize, usize)>
         .collect()
 }
 
+/// KiCad's mandatory symbol fields. Every placed symbol carries them, and
+/// eeschema reads a property as one of them whatever its case, so a lowercase
+/// `value` is still the Value field.
+fn is_mandatory_field(name: &str) -> bool {
+    [
+        "Reference",
+        "Value",
+        "Footprint",
+        "Datasheet",
+        "Description",
+    ]
+    .iter()
+    .any(|mandatory| mandatory.eq_ignore_ascii_case(name))
+}
+
+/// The `remove_fields` names, checked in full before anything is edited so a
+/// refusal leaves the file untouched. A repeated name is removed once.
+///
+/// Omission alone is read as no argument. An explicit `null` is refused like
+/// any other value that is not an array, as the advertised schema refuses it,
+/// so a direct call and a served one get the same answer.
+fn remove_field_names(args: &serde_json::Value) -> Result<Vec<String>, CallToolResult> {
+    let entries = match args.get("remove_fields") {
+        None => return Ok(Vec::new()),
+        Some(serde_json::Value::Array(entries)) => entries,
+        Some(_) => {
+            return Err(crate::tools::invalid_arg(
+                "remove_fields",
+                "expected an array of field names",
+            ))
+        }
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries {
+        let Some(name) = entry.as_str().filter(|name| !name.is_empty()) else {
+            return Err(crate::tools::invalid_arg(
+                "remove_fields",
+                "every entry must be a non-empty field name",
+            ));
+        };
+        if is_mandatory_field(name) {
+            return Err(crate::tools::invalid_arg(
+                "remove_fields",
+                &format!(
+                    "'{name}' is one of KiCad's mandatory symbol fields (Reference, Value, \
+                     Footprint, Datasheet, Description), which cannot be removed"
+                ),
+            ));
+        }
+        for argument in ["fields", "field_placements"] {
+            if args[argument].get(name).is_some() {
+                return Err(crate::tools::invalid_arg(
+                    "remove_fields",
+                    &format!("'{name}' is also named in {argument}; a call cannot both change and remove a field"),
+                ));
+            }
+        }
+        if !names.iter().any(|seen| seen == name) {
+            names.push(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PropertyWriteCounts {
     pub(crate) updated: usize,
@@ -2737,6 +2835,75 @@ pub(crate) fn set_property_value(
         apply_edits(content.to_string(), edits),
         PropertyWriteCounts { updated, added },
     ))
+}
+
+/// Plan the deletion of one property from every placed unit: the edits, and
+/// how many units carried it. A unit without it is left alone, so removing a
+/// field that is already gone plans nothing.
+///
+/// The name is matched whole, closing quote included, so removing `MP` leaves
+/// `MPN` alone.
+///
+/// KiCad writes a private field as `(property private "NAME" …)`. This
+/// module's reader takes that field's name to be `private`, so it could not
+/// confirm the removal; such a field is refused by name rather than reported
+/// absent. The handler plans every name before its first edit, so this
+/// refusal, like a block that cannot be deleted, refuses the whole call and
+/// nothing is written.
+fn plan_property_removal(
+    content: &str,
+    reference: &str,
+    field: &str,
+) -> Result<(Vec<SexpEdit>, usize), CallToolResult> {
+    let unchanged = |why: String| {
+        CallToolResult::error(format!(
+            "No fields were updated on '{reference}': {field}: {why}"
+        ))
+    };
+    let blocks = find_all_symbol_instance_blocks(content, reference);
+    if blocks.is_empty() {
+        return Err(unchanged(format!(
+            "symbol '{reference}' not found in this schematic"
+        )));
+    }
+
+    let escaped = escape_property_text(field);
+    let opening = format!(r#"(property "{escaped}""#);
+    let private = format!(r#"(property private "{escaped}""#);
+    let mut edits = Vec::new();
+    let mut units = 0;
+
+    for (start, end) in blocks {
+        let block = &content[start..end];
+        let mut carried = false;
+        for (child, _) in find_direct_child_blocks(block, "symbol") {
+            if block[child..].starts_with(&private) {
+                return Err(crate::tools::invalid_arg(
+                    "remove_fields",
+                    &format!(
+                        "'{field}' is a private field on '{reference}', which this tool does \
+                         not remove; nothing was changed"
+                    ),
+                ));
+            }
+            if !block[child..].starts_with(&opening) {
+                continue;
+            }
+            // With its own line's indentation and newline, so the block closes
+            // up as eeschema would have written it without the field.
+            let (from, to) = find_block_with_leading_whitespace(content, start + child)
+                .ok_or_else(|| {
+                    unchanged(format!("'{field}' property on '{reference}' is malformed"))
+                })?;
+            edits.push(SexpEdit::delete(from, to));
+            carried = true;
+        }
+        if carried {
+            units += 1;
+        }
+    }
+
+    Ok((edits, units))
 }
 
 /// What `edit_schematic_component` may change about where a field's text sits.
@@ -3080,6 +3247,10 @@ async fn handle_edit_schematic_component(
             &dnp_property_refusal(name),
         ));
     }
+    let remove_names = match remove_field_names(args) {
+        Ok(names) => names,
+        Err(error) => return Ok(error),
+    };
 
     let mut content = read_consistent(&sch_path)?;
     let expected = content.clone();
@@ -3111,6 +3282,28 @@ async fn handle_edit_schematic_component(
             }
         };
     }
+
+    // Every removal is planned on the file as read, before the call's first
+    // edit, so a field that cannot be removed refuses the whole call instead of
+    // leaving its other edits to be written. And before any rename: the blocks
+    // that carry `reference` now are the units bound above, where after a
+    // rename onto a designator already in use they would include another
+    // part's.
+    let mut removal_edits = Vec::new();
+    let mut removed_fields = Vec::new();
+    let mut absent_fields = Vec::new();
+    for name in &remove_names {
+        match plan_property_removal(&content, &reference, name) {
+            Ok((_, 0)) => absent_fields.push(name.clone()),
+            Ok((edits, units)) => {
+                removal_edits.extend(edits);
+                removed_fields.push(name.clone());
+                changed.push(format!("{name} removed ({units} unit(s))"));
+            }
+            Err(refusal) => return Ok(refusal),
+        }
+    }
+    content = apply_edits(content, removal_edits);
 
     if let Some(new_ref) = opt_str(args, "new_reference") {
         let before_rename = content.clone();
@@ -3324,9 +3517,13 @@ async fn handle_edit_schematic_component(
         )));
     }
 
-    let intent =
-        ComponentMutationIntent::new(target.with_fields(&expected_fields).with_dnp(applied_dnp))
-            .with_field_placements(applied_placements, placement_unit);
+    let intent = ComponentMutationIntent::new(
+        target
+            .with_fields(&expected_fields)
+            .without_fields(&remove_names)
+            .with_dnp(applied_dnp),
+    )
+    .with_field_placements(applied_placements, placement_unit);
     let observed = if !changed.is_empty() {
         let item_ids = match target.item_ids() {
             Ok(item_ids) => item_ids,
@@ -3363,6 +3560,10 @@ async fn handle_edit_schematic_component(
         result["requested_reference"] = json!(reference);
     }
     copy_component_observation(&mut result, &observed);
+    if !remove_names.is_empty() {
+        result["removed_fields"] = json!(removed_fields);
+        result["absent_fields"] = json!(absent_fields);
+    }
     if !errors.is_empty() {
         result["errors"] = json!(errors);
     }
@@ -8900,6 +9101,441 @@ mod multi_unit_component_tests {
         );
     }
 
+    /// #679's fixture, as eeschema 10.0.6 saved it: R1 and all three units of
+    /// U1 carry `LCSC` and `MPN`.
+    fn fields_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("component_fields.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/component_fields_kicad10.kicad_sch"),
+        )
+        .unwrap();
+        (directory, path)
+    }
+
+    #[tokio::test]
+    async fn remove_fields_deletes_a_field_from_every_unit() {
+        let (_directory, path) = fields_fixture();
+        let result = body(
+            handle_edit_schematic_component(
+                &json!({ "schematic": path, "reference": "U1", "remove_fields": ["MPN"] }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["removed_fields"], json!(["MPN"]));
+        assert_eq!(result["absent_fields"], json!([]));
+        let units = result["units"].as_array().unwrap();
+        assert_eq!(units.len(), 3);
+        assert!(
+            units
+                .iter()
+                .all(|unit| unit["fields"].get("MPN").is_none()
+                    && unit["fields"]["LCSC"] == "C679002")
+        );
+
+        // KiCad 10.0.6 resaves this output byte for byte (provenance in
+        // component_fields_kicad10.removed.README.md): U1's three MPN blocks
+        // go, R1's stays, and every other line is as eeschema wrote it.
+        let resaved =
+            include_str!("../../tests/fixtures/component_fields_kicad10.removed.kicad_sch");
+        assert_eq!(resaved.matches("(property \"MPN\"").count(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), resaved);
+    }
+
+    #[tokio::test]
+    async fn remove_fields_takes_a_field_from_the_units_that_carry_it() {
+        // Only unit 1 of U1 carries Note.
+        let (_directory, path) = fixture();
+        let result = body(
+            handle_edit_schematic_component(
+                &json!({ "schematic": path, "reference": "U1", "remove_fields": ["Note"] }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["removed_fields"], json!(["Note"]));
+        assert_eq!(result["changes"], json!(["Note removed (1 unit(s))"]));
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert!(!source.contains("(property \"Note\""), "{source}");
+        assert_eq!(source.matches("(property \"Datasheet\"").count(), 2);
+    }
+
+    /// Two names are planned on the same file and deleted in one pass: both
+    /// go from every unit of U1, adjacent as they are, and R1 keeps its own.
+    #[tokio::test]
+    async fn two_fields_are_removed_in_one_call() {
+        let (_directory, path) = fields_fixture();
+        let result = body(
+            handle_edit_schematic_component(
+                &json!({ "schematic": path, "reference": "U1", "remove_fields": ["LCSC", "MPN"] }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["removed_fields"], json!(["LCSC", "MPN"]));
+        assert_eq!(result["absent_fields"], json!([]));
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(source.matches("(property \"LCSC\"").count(), 1);
+        assert_eq!(source.matches("(property \"MPN\"").count(), 1);
+        assert!(
+            source.contains("(property \"LCSC\" \"C679001\""),
+            "{source}"
+        );
+        assert!(
+            source.contains("(property \"MPN\" \"MPN-679-R1\""),
+            "{source}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_field_is_carried_to_a_new_name_in_one_call() {
+        let (_directory, path) = fields_fixture();
+        let result = body(
+            handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "U1",
+                    "fields": { "Part Number": "MPN-679-U1" },
+                    "remove_fields": ["MPN"]
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["removed_fields"], json!(["MPN"]));
+        assert!(result["units"].as_array().unwrap().iter().all(|unit| {
+            unit["fields"]["Part Number"] == "MPN-679-U1" && unit["fields"].get("MPN").is_none()
+        }));
+    }
+
+    /// A rename onto a designator another part carries: the removal counts
+    /// only the bound part's units, and the other part keeps its field.
+    #[tokio::test]
+    async fn removals_ahead_of_a_rename_onto_a_designator_in_use_touch_only_the_bound_part() {
+        let (_directory, path) = fields_fixture();
+        let result = body(
+            handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "R1",
+                    "new_reference": "U1",
+                    "remove_fields": ["MPN"]
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["removed_fields"], json!(["MPN"]));
+        assert!(
+            result["changes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("MPN removed (1 unit(s))")),
+            "{result}"
+        );
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert!(!source.contains("MPN-679-R1"), "{source}");
+        assert_eq!(
+            source.matches("(property \"MPN\" \"MPN-679-U1\"").count(),
+            3
+        );
+    }
+
+    /// The fields fixture with R1's `MPN` written as KiCad writes a private
+    /// field.
+    fn private_mpn_fixture() -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let (directory, path) = fields_fixture();
+        let private = std::fs::read_to_string(&path).unwrap().replacen(
+            "(property \"MPN\" \"MPN-679-R1\"",
+            "(property private \"MPN\" \"MPN-679-R1\"",
+            1,
+        );
+        std::fs::write(&path, &private).unwrap();
+        (directory, path, private)
+    }
+
+    /// The structured refusal a private field draws, by field, name and part.
+    fn assert_private_refusal(result: &CallToolResult) {
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(result).as_deref(),
+            Some("invalid_argument")
+        );
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["field"], "remove_fields", "{body}");
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("'MPN' is a private field on 'R1'"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_private_field_is_refused_by_name() {
+        let (_directory, path, private) = private_mpn_fixture();
+        let result = handle_edit_schematic_component(
+            &json!({ "schematic": path, "reference": "R1", "remove_fields": ["MPN"] }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert_private_refusal(&result);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), private);
+    }
+
+    /// A private name refuses the whole call before its first edit: neither
+    /// the other removal nor the `fields` edit beside it is written.
+    #[tokio::test]
+    async fn a_private_field_refuses_the_whole_call_before_any_edit() {
+        let (_directory, path, private) = private_mpn_fixture();
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path,
+                "reference": "R1",
+                "fields": { "Tolerance": "1%" },
+                "remove_fields": ["LCSC", "MPN"]
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert_private_refusal(&result);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), private);
+    }
+
+    #[tokio::test]
+    async fn a_name_is_matched_whole_not_as_a_prefix() {
+        let (_directory, path) = fields_fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = body(
+            handle_edit_schematic_component(
+                &json!({ "schematic": path, "reference": "U1", "remove_fields": ["MP"] }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["absent_fields"], json!(["MP"]));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn removing_an_absent_field_reports_it_and_writes_nothing() {
+        let (_directory, path) = fields_fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = body(
+            handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "U1",
+                    "remove_fields": ["Tolerance", "Tolerance"]
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["removed_fields"], json!([]));
+        assert_eq!(result["absent_fields"], json!(["Tolerance"]));
+        assert_eq!(result["changes"], json!([]));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn remove_fields_refusals_leave_the_file_unchanged() {
+        for (extra, reason) in [
+            (json!({ "remove_fields": ["Value"] }), "mandatory"),
+            (json!({ "remove_fields": ["description"] }), "mandatory"),
+            (
+                json!({ "remove_fields": ["LCSC", "MPN"], "fields": { "MPN": "X" } }),
+                "also named in fields",
+            ),
+            (
+                json!({ "remove_fields": ["MPN"], "field_placements": { "MPN": { "hide": false } } }),
+                "also named in field_placements",
+            ),
+            (json!({ "remove_fields": "MPN" }), "array"),
+            (json!({ "remove_fields": null }), "array"),
+            (json!({ "remove_fields": [""] }), "non-empty"),
+            (json!({ "remove_fields": [7] }), "non-empty"),
+        ] {
+            let (_directory, path) = fields_fixture();
+            let before = std::fs::read_to_string(&path).unwrap();
+            let mut args = extra.clone();
+            args["schematic"] = json!(path);
+            args["reference"] = json!("U1");
+            let result = handle_edit_schematic_component(&args, &context())
+                .await
+                .unwrap();
+            assert!(result.is_error, "{extra} must be refused");
+            assert_eq!(
+                extract_error_kind(&result).as_deref(),
+                Some("invalid_argument"),
+                "{extra}"
+            );
+            let ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text result");
+            };
+            assert!(text.contains(reason), "{extra}: {text}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{extra}");
+        }
+    }
+
+    /// `remove_fields` through served `tools/call`, as a client sends it. The
+    /// advertised schema refuses `null`, a string and a non-string entry before
+    /// the handler runs, so those refusals are dispatch's, each naming the
+    /// field the schema failed on. A mandatory name passes the schema, and its
+    /// refusal is the handler's.
+    #[tokio::test]
+    async fn served_remove_fields_removes_refuses_and_stays_out_of_other_replies() {
+        let (_directory, path) = fields_fixture();
+        let schematic = path.display().to_string();
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+        let call = |arguments: serde_json::Value| {
+            let message = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "edit_schematic_component", "arguments": arguments}});
+            let handler = &handler;
+            async move {
+                let result = handler
+                    .handle_message(message)
+                    .await
+                    .unwrap()
+                    .result
+                    .unwrap();
+                let body = serde_json::from_str::<serde_json::Value>(
+                    result["content"][0]["text"].as_str().unwrap(),
+                )
+                .unwrap();
+                (result["isError"] == true, body)
+            }
+        };
+
+        let before = std::fs::read_to_string(&path).unwrap();
+        for (remove_fields, field) in [
+            (json!(null), "remove_fields"),
+            (json!("MPN"), "remove_fields"),
+            (json!([7]), "remove_fields[0]"),
+            (json!(["Description"]), "remove_fields"),
+        ] {
+            let (refused, body) = call(json!({
+                "schematic": schematic,
+                "reference": "U1",
+                "remove_fields": remove_fields
+            }))
+            .await;
+            assert!(refused, "{remove_fields} must be refused: {body}");
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], field, "{body}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                before,
+                "{remove_fields}"
+            );
+        }
+
+        let (refused, removed) = call(json!({
+            "schematic": schematic,
+            "reference": "U1",
+            "remove_fields": ["MPN"]
+        }))
+        .await;
+        assert!(!refused, "{removed}");
+        assert_eq!(removed["removed_fields"], json!(["MPN"]));
+        assert_eq!(removed["absent_fields"], json!([]));
+        let units = removed["units"].as_array().unwrap();
+        assert_eq!(units.len(), 3);
+        assert!(
+            units
+                .iter()
+                .all(|unit| unit["fields"].get("MPN").is_none()
+                    && unit["fields"]["LCSC"] == "C679002"),
+            "{removed}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            include_str!("../../tests/fixtures/component_fields_kicad10.removed.kicad_sch")
+        );
+
+        let (refused, edited) = call(json!({
+            "schematic": schematic,
+            "reference": "U1",
+            "fields": { "LCSC": "C679003" }
+        }))
+        .await;
+        assert!(!refused, "{edited}");
+        assert!(
+            edited.get("removed_fields").is_none() && edited.get("absent_fields").is_none(),
+            "{edited}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_field_added_then_removed_leaves_the_eeschema_file_as_it_was() {
+        let (_directory, path) = eeschema_fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        for args in [
+            json!({ "fields": { "Tolerance": "1%" } }),
+            json!({ "remove_fields": ["Tolerance"] }),
+        ] {
+            let mut args = args;
+            args["schematic"] = json!(path);
+            args["reference"] = json!("U1");
+            body(
+                handle_edit_schematic_component(&args, &context())
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_removal_missing_from_the_prospective_file_is_refused_without_writing() {
+        let (_directory, path) = fields_fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        // The writer's result keeps one unit's MPN.
+        COMPONENT_PROSPECTIVE_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some((
+                "(property \"LCSC\" \"C679002\"".to_owned(),
+                "(property \"MPN\" \"MPN-679-U1\")\n\t\t(property \"LCSC\" \"C679002\"".to_owned(),
+            ));
+        });
+        let result = handle_edit_schematic_component(
+            &json!({ "schematic": path, "reference": "U1", "remove_fields": ["MPN"] }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        assert!(text.contains("MPN is still present"), "{text}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
     #[tokio::test]
     async fn rename_updates_rendered_and_netlist_references_on_every_unit() {
         let (_directory, path) = fixture();
@@ -10858,6 +11494,43 @@ mod native_dnp_tests {
         assert_eq!(saved, kicad_with(SHEET, "R1", "no", "yes"));
         assert_eq!(result["fields"]["DNP"], "yes", "{result}");
         assert_eq!(result["dnp"], true, "{result}");
+    }
+
+    /// `remove_fields` can clear the stray `DNP` property #415 describes, in
+    /// the same write that sets the native attribute. It does not touch the
+    /// attribute, and `fields` still refuses a property named DNP, whether or
+    /// not the same call removes one.
+    #[tokio::test]
+    async fn remove_fields_clears_a_dnp_property_beside_the_native_attribute() {
+        let (_dir, path) = fixture(SHEET);
+        let result = body(
+            &call(
+                "edit_schematic_component",
+                &path,
+                json!({ "reference": "R1", "dnp": true, "remove_fields": ["DNP"] }),
+            )
+            .await,
+        );
+        assert_eq!(result["removed_fields"], json!(["DNP"]), "{result}");
+        assert_eq!(result["dnp"], true, "{result}");
+        assert!(result["fields"].get("DNP").is_none(), "{result}");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("(property \"DNP\""));
+
+        let (_dir, path) = fixture(SHEET);
+        let refused = call(
+            "edit_schematic_component",
+            &path,
+            json!({ "reference": "R1", "fields": { "DNP": "yes" }, "remove_fields": ["DNP"] }),
+        )
+        .await;
+        assert!(refused.is_error, "{}", text(&refused));
+        assert!(
+            text(&refused).contains("'dnp' argument"),
+            "{}",
+            text(&refused)
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
     }
 
     /// `"DNP": true` is refused as DNP, not as a non-string value, so the
