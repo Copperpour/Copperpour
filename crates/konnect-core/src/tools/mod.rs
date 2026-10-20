@@ -49,8 +49,11 @@ pub mod sch_wiring;
 pub mod schematic_builder;
 #[cfg(test)]
 mod schematic_placement_tests;
+#[cfg(test)]
+mod schematic_title_block_tests;
 pub mod svg_import;
 pub mod templates;
+pub(crate) mod title_block_args;
 pub mod verification;
 
 use crate::mcp::protocol::{CallToolResult, McpToolDescription};

@@ -204,7 +204,12 @@ async fn refusals_leave_the_board_untouched() {
     std::fs::write(&board, &repeated).unwrap();
     let result = call(&handler, &board, json!({ "title": "x" })).await;
     assert!(result.is_error);
-    assert!(body(&result)["message"]
+    let refusal = body(&result);
+    assert_eq!(
+        refusal["error"]["capability"], "unrepresentable_title_block",
+        "{refusal}"
+    );
+    assert!(refusal["message"]
         .as_str()
         .unwrap()
         .contains("repeats revision"));
