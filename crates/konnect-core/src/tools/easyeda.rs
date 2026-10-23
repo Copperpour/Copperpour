@@ -130,12 +130,23 @@ fn easyeda_pin_type(code: &str) -> &'static str {
     }
 }
 
+/// Convert an EasyEDA pin rotation angle to a KiCad pin angle in degrees.
+/// EasyEDA pin rotation convention is offset by 180° from KiCad's pin orientation convention:
+/// - 180° (pin on left edge entering body going East) -> KiCad 0° (angle 0, pointing right towards body)
+/// - 0° (pin on right edge entering body going West) -> KiCad 180° (angle 180, pointing left towards body)
+/// - 270° (pin on bottom edge entering body going North) -> KiCad 90° (angle 90, pointing up towards body)
+/// - 90° (pin on top edge entering body going South) -> KiCad 270° (angle 270, pointing down towards body)
+pub(crate) fn easyeda_pin_angle(rot: &str) -> f64 {
+    let rot_deg: f64 = rot.parse().unwrap_or(0.0);
+    (180.0 + rot_deg).rem_euclid(360.0)
+}
+
 /// Convert an EasyEDA pin rotation angle to a KiCad pin orientation name.
 fn easyeda_pin_orientation(rot: &str) -> &'static str {
     match rot {
-        "0" => "right",
+        "0" => "left",
         "90" => "down",
-        "180" => "left",
+        "180" => "right",
         "270" => "up",
         _ => "right",
     }
@@ -203,6 +214,8 @@ pub(crate) fn parse_easyeda_symbol_pins(
             fallback_num
         };
 
+        let angle = easyeda_pin_angle(rot);
+
         pins.push(json!({
             "number": pin_num,
             "name": pin_name,
@@ -210,12 +223,88 @@ pub(crate) fn parse_easyeda_symbol_pins(
             "electrical_type": elec_type,
             "x": snap_x,
             "y": snap_y,
+            "angle": angle,
             "orientation": easyeda_pin_orientation(rot),
             "length": 2.54
         }));
     }
 
     pins
+}
+
+/// Parse symbol body graphics (rectangles, circles/ellipses) from EasyEDA shape array.
+pub(crate) fn parse_easyeda_symbol_graphics(
+    shapes: &[serde_json::Value],
+    head_x: f64,
+    head_y: f64,
+) -> Vec<serde_json::Value> {
+    let mut graphics = Vec::new();
+    let snap = |val: f64| (val / 1.27).round() * 1.27;
+
+    for shape_val in shapes {
+        let Some(s) = shape_val.as_str() else { continue };
+
+        if s.starts_with("R~") {
+            let parts: Vec<&str> = s.split('~').collect();
+            if parts.len() < 7 {
+                continue;
+            }
+            let raw_x: f64 = parts[1].parse().unwrap_or(0.0);
+            let raw_y: f64 = parts[2].parse().unwrap_or(0.0);
+            let raw_w: f64 = parts[5].parse().unwrap_or(0.0);
+            let raw_h: f64 = parts[6].parse().unwrap_or(0.0);
+
+            let sx = snap((raw_x - head_x) * 0.254);
+            let sy = snap((head_y - raw_y) * 0.254);
+            let ex = snap((raw_x + raw_w - head_x) * 0.254);
+            let ey = snap((head_y - (raw_y + raw_h)) * 0.254);
+
+            graphics.push(json!({
+                "type": "rect",
+                "start": { "x": sx, "y": sy },
+                "end": { "x": ex, "y": ey },
+                "stroke_width_mm": 0.254,
+                "fill": "background"
+            }));
+        } else if s.starts_with("E~") || s.starts_with("C~") {
+            let parts: Vec<&str> = s.split('~').collect();
+            if parts.len() < 4 {
+                continue;
+            }
+            let raw_x: f64 = parts[1].parse().unwrap_or(0.0);
+            let raw_y: f64 = parts[2].parse().unwrap_or(0.0);
+            let raw_r: f64 = parts[3].parse().unwrap_or(1.0);
+
+            let cx = (raw_x - head_x) * 0.254;
+            let cy = (head_y - raw_y) * 0.254;
+            let r = (raw_r * 0.254).max(0.1);
+
+            let fill = if parts.len() > 8 && parts[8] != "none" && !parts[8].is_empty() {
+                "outline"
+            } else {
+                "none"
+            };
+
+            // Deduplicate if identical circle already added
+            let already_exists = graphics.iter().any(|g| {
+                g["type"] == "circle"
+                    && (g["center"]["x"].as_f64().unwrap_or(0.0) - cx).abs() < 1e-4
+                    && (g["center"]["y"].as_f64().unwrap_or(0.0) - cy).abs() < 1e-4
+            });
+
+            if !already_exists {
+                graphics.push(json!({
+                    "type": "circle",
+                    "center": { "x": cx, "y": cy },
+                    "radius_mm": r,
+                    "stroke_width_mm": 0.254,
+                    "fill": fill
+                }));
+            }
+        }
+    }
+
+    graphics
 }
 
 /// Parse footprint pads from EasyEDA shape array.
@@ -502,7 +591,9 @@ pub(crate) async fn handle_import_jlcpcb_part(
         .await;
     }
 
-    let sym_args = json!({
+    let sym_graphics = parse_easyeda_symbol_graphics(&sym_shapes, sym_head_x, sym_head_y);
+
+    let mut sym_args = json!({
         "library_path": sym_lib_path.display().to_string(),
         "name": symbol_name,
         "reference_prefix": ref_prefix,
@@ -518,6 +609,10 @@ pub(crate) async fn handle_import_jlcpcb_part(
             "JLCPCB_Class": jlc_class
         }
     });
+
+    if !sym_graphics.is_empty() {
+        sym_args["graphics"] = json!(sym_graphics);
+    }
 
     let sym_res = crate::tools::library::handle_create_symbol(&sym_args, ctx).await?;
     if sym_res.is_error {
@@ -717,22 +812,42 @@ mod tests {
         let pins = parse_easyeda_symbol_pins(&shapes, head_x, head_y);
 
         assert_eq!(pins.len(), 2);
-        // Pin 1: type 0 -> passive, rot 180 -> left, name PIN1, num 1
+        // Pin 1: type 0 -> passive, rot 180 -> KiCad angle 0.0 (points East into body), name PIN1, num 1
         assert_eq!(pins[0]["number"], "1");
         assert_eq!(pins[0]["name"], "PIN1");
         assert_eq!(pins[0]["electrical_type"], "passive");
-        assert_eq!(pins[0]["orientation"], "left");
-        // Pin 2: type 1 -> input, rot 0 -> right, name IN, num 2
+        assert_eq!(pins[0]["angle"], 0.0);
+        // Pin 2: type 1 -> input, rot 0 -> KiCad angle 180.0 (points West into body), name IN, num 2
         assert_eq!(pins[1]["number"], "2");
         assert_eq!(pins[1]["name"], "IN");
         assert_eq!(pins[1]["electrical_type"], "input");
-        assert_eq!(pins[1]["orientation"], "right");
+        assert_eq!(pins[1]["angle"], 180.0);
 
         // Coordinates must be multiples of 1.27 mm
         let x1 = pins[0]["x"].as_f64().unwrap();
         let y1 = pins[0]["y"].as_f64().unwrap();
         assert!(((x1 / 1.27).round() * 1.27 - x1).abs() < 1e-6);
         assert!(((y1 / 1.27).round() * 1.27 - y1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_easyeda_symbol_graphics_converts_rect_and_circle() {
+        let shapes = vec![
+            json!("R~360~278~2~2~80~44~#880000~1~0~none~gge1~0~"),
+            json!("E~365~283~1.5~1.5~#880000~1~0~#880000~gge2~0"),
+            json!("E~365~283~1.5~1.5~#880000~1~0~#880000~gge3~0"), // duplicate circle
+        ];
+        let graphics = parse_easyeda_symbol_graphics(&shapes, 400.0, 300.0);
+        assert_eq!(graphics.len(), 2);
+        assert_eq!(graphics[0]["type"], "rect");
+        assert_eq!(graphics[0]["start"]["x"], -10.16);
+        assert_eq!(graphics[0]["start"]["y"], 5.08);
+        assert_eq!(graphics[0]["end"]["x"], 10.16);
+        assert_eq!(graphics[0]["end"]["y"], -5.08);
+        assert_eq!(graphics[0]["fill"], "background");
+
+        assert_eq!(graphics[1]["type"], "circle");
+        assert_eq!(graphics[1]["fill"], "outline");
     }
 
     #[test]
