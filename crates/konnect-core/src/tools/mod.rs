@@ -27,6 +27,7 @@ pub mod integration;
 mod jlcpcb_midpoints;
 #[cfg(test)]
 mod kicad10_schematic_identity_tests;
+pub(crate) mod launch;
 mod lcsc_packages;
 pub mod library;
 mod library_footprint;
