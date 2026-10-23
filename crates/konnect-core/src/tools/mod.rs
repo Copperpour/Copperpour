@@ -9,6 +9,8 @@ mod board_source;
 #[cfg(test)]
 mod board_source_contract_tests;
 mod board_stackup;
+#[cfg(test)]
+mod board_title_block_tests;
 pub mod cli;
 pub mod config;
 #[cfg(test)]
@@ -941,7 +943,7 @@ pub(crate) fn mutation_outcome_uncertain(
             reason: reason.clone(),
         },
         format!(
-            "{operation} committed a file mutation, but immediate readback did not prove the requested result. The file at '{path}' may have changed; reload and inspect it before retrying. {reason}"
+            "{operation} committed a mutation, but immediate readback did not prove the requested result. The file at '{path}' may have changed; reload and inspect it before retrying. {reason}"
         ),
     )
 }
@@ -2905,7 +2907,7 @@ pub(crate) mod schematic_target_tests {
 		(size 40 20)
 		(uuid "{sheet_uuid}")
 		(property "Sheetname" "Child" (at 20 19.365 0))
-		(property "Sheetfile" "{child}" (at 20 40.635 0))
+		(property "Sheetfile" "{child}"(at 20 40.635 0))
 	)
 	(sheet_instances (path "/" (page "1")))
 )
