@@ -3,6 +3,19 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `check_schematic_overlaps` passes symbols that meet at a pin tip (patch release)
+
+`check_schematic_overlaps` used to compare one envelope per symbol, covering
+both its drawings and its pins. A power symbol on a pin tip therefore shared
+area with the symbol it connects to, and was reported as a
+`component_overlap`. The tool now compares the drawings and the pins
+separately. A pair is reported when the drawings share area, when a pin runs
+into the other symbol's drawing, or when two pins meet anywhere but tip to tip,
+as KiCad connects pins only there. Pins meeting tip to tip and drawings that only
+touch are not reported. Response fields are unchanged: `bounds_a`, `bounds_b`,
+`overlap_x_mm` and `overlap_y_mm` still describe the envelopes, so a pair
+reported only for its pins can show a depth of 0 on one axis (#745).
+
 ## Unreleased: `move_labels_by_offset` moves the label it names, with its fields (patch release)
 
 `move_labels_by_offset` used to edit the first `(at ` in each label's text. For
