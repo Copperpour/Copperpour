@@ -1,12 +1,12 @@
 # Upstream (`mixelpixx/Konnect`) Backlog — Open PRs & Issues
 
 Fetched from [`mixelpixx/Konnect`](https://github.com/mixelpixx/Konnect) on **2026-10-23**.
-- **60 Open Pull Requests** (all fetched locally into `refs/remotes/upstream-prs/<PR_NUMBER>`)
-- **185 Open Issues** (83 with an open PR, 102 without an open PR)
+- **62 Open Pull Requests** (all fetched locally into `refs/remotes/upstream-prs/<PR_NUMBER>`)
+- **190 Open Issues** (85 with an open PR, 105 without an open PR)
 
 ## How to Merge Upstream PRs While Preserving Original Authorship
 
-All 60 open PR branches are fetched into your local git repository under `upstream-prs/<NUMBER>`. Because git commits store the original `Author:` metadata inside the commit object, merging or cherry-picking from `upstream-prs/<NUMBER>` **automatically preserves the original contributor's name and email**.
+All 62 open PR branches are fetched into your local git repository under `upstream-prs/<NUMBER>`. Because git commits store the original `Author:` metadata inside the commit object, merging or cherry-picking from `upstream-prs/<NUMBER>` **automatically preserves the original contributor's name and email**.
 
 ```bash
 # 1. Inspect the PR commits, author, and diff against main:
@@ -26,9 +26,19 @@ git cherry-pick main..upstream-prs/<PR_NUMBER>
 
 ---
 
-## Part 1: Open Pull Requests (60)
+## Part 1: Open Pull Requests (62)
 
 Tick the checkbox (`- [x]`) once you have reviewed and merged (or intentionally skipped) a PR.
+
+- [x] **PR [#956](https://github.com/mixelpixx/Konnect/pull/956): fix(pcb): keep parts excluded from the BOM on the board in sync**
+  - **GitHub Author:** [@janisgs](https://github.com/janisgs) | **Git Commit Author(s):** `janisgs <janisgs@gmail.com>` (1 commit, 2026-10-23)
+  - **Local Ref:** `upstream-prs/956` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#875](https://github.com/mixelpixx/Konnect/issues/875)
+  - **Summary:** `update_pcb_from_schematic` drops every symbol marked *Exclude from bill of materials*. Test points, wire/solder pads and mounting holes therefore never reach the board, and a part with both flags off is dropped without...
+
+- [x] **PR [#955](https://github.com/mixelpixx/Konnect/pull/955): fix(sch_batch): say where batch_delete takes reference designators**
+  - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-23)
+  - **Local Ref:** `upstream-prs/955` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#954](https://github.com/mixelpixx/Konnect/issues/954)
+  - **Summary:** "By UUID or component reference designator" led callers to put J3 or #PWR05 in `uuids`, which fails as an unknown UUID. Name both arguments in the description, and when a `uuids` entry is a reference, say to pass it in...
 
 - [x] **PR [#949](https://github.com/mixelpixx/Konnect/pull/949): fix(library): find symbols to delete in KiCad-saved libraries**
   - **GitHub Author:** [@vanjoe](https://github.com/vanjoe) | **Git Commit Author(s):** `Joel Vandergriendt <joelvandergriendt@microridge.ca>` (1 commit, 2026-10-22)
@@ -332,10 +342,12 @@ Tick the checkbox (`- [x]`) once you have reviewed and merged (or intentionally 
 
 ---
 
-## Part 2: Open Issues With an Open PR (83)
+## Part 2: Open Issues With an Open PR (85)
 
 These open issues already have one or more open PRs above addressing them. Tick them off when the linked PR is merged.
 
+- [x] **Issue [#954](https://github.com/mixelpixx/Konnect/issues/954): batch_delete description invites reference designators in uuids** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-23) → Addressed by **PR #955**
+  - `batch_delete`'s description says it deletes items "by UUID or component reference designator". Read with the schema, that invites putting references in `uuids`, which fails with...
 - [ ] **Issue [#945](https://github.com/mixelpixx/Konnect/issues/945): create_project reports any transaction conflict as "would replace existing path(s)", including a stuck older journal** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-20) → Addressed by **PR #944**
   - `create_project` maps every `SexpError::TransactionConflict` from `commit_file_transaction` to `project_conflict`, whose message says the project "would replace existing...
 - [x] **Issue [#936](https://github.com/mixelpixx/Konnect/issues/936): connect_passthrough writes its stub with no junction detection** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-19) → Addressed by **PR #937**
@@ -378,6 +390,8 @@ These open issues already have one or more open PRs above addressing them. Tick 
   - No tool changes one pin of an existing library symbol. Renaming one CH347F pin (8: `SRST` → `~ACT/SRST`) meant `delete_symbol`, re-entering all 29 pins in `create_symbol`, then...
 - [x] **Issue [#887](https://github.com/mixelpixx/Konnect/issues/887): connect_pins / batch_connect_pins join any pin their L-route passes over, shorting nets with no warning** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-12) → Addressed by **PR #901**
   - `connect_pins` and `batch_connect_pins` route a blind H-then-V L-bend between the two pins. When a leg passes over a third pin's tip, the router *adds a junction there*, so...
+- [x] **Issue [#875](https://github.com/mixelpixx/Konnect/issues/875): Schematic → PCB sync drops symbols marked Exclude from BOM** (by [@vvzvlad](https://github.com/vvzvlad), 2026-10-12) → Addressed by **PR #956**
+  - From reading the code; not reproduced live. `pcb_sync.rs:1660-1662` returns `false` for any symbol with `in_bom = no`, so the part never reaches the board. In KiCad 10.0.6 only...
 - [x] **Issue [#870](https://github.com/mixelpixx/Konnect/issues/870): Codex MCP cannot connect to KiCad when plugin IPC Socket is blank** (by [@Louber1](https://github.com/Louber1), 2026-10-11) → Addressed by **PR #872**
   - Konnect responds to MCP calls in Codex, but cannot access the open KiCad PCB Editor. `open_project({})` reports that its IPC socket path is not configured. 1. Open a board in...
 - [x] **Issue [#869](https://github.com/mixelpixx/Konnect/issues/869): macOS: Start/Stop Server brings the KiCad project manager to the front** (by [@Louber1](https://github.com/Louber1), 2026-10-11) → Addressed by **PR #873**
@@ -505,10 +519,18 @@ These open issues already have one or more open PRs above addressing them. Tick 
 
 ---
 
-## Part 3: Remaining Open Issues (102)
+## Part 3: Remaining Open Issues (105)
 
 Open upstream issues that do not currently have an open PR linked.
 
+- [ ] **Issue [#953](https://github.com/mixelpixx/Konnect/issues/953): No tool renames a placed net label in place** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-23)
+  - No tool changes the text of a placed net label (local, global or hierarchical). Renaming a net means deleting each label and adding it again at the same position, rotation and...
+- [ ] **Issue [#952](https://github.com/mixelpixx/Konnect/issues/952): run_drc: no per-rule count in the summary** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-23)
+  - `run_drc` reports totals by category and severity, but no count per rule. On a board where most violations share one rule, the `limit` is spent on copies of it and the caller...
+- [ ] **Issue [#951](https://github.com/mixelpixx/Konnect/issues/951): score_placement hard-fails edge-mounted parts (castellated, flush USB-C), and connector_edges measures from the bbox centre** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-23)
+  - `score_placement` reports `hard_fail` for any part whose courtyard box crosses the board outline. Edge-mounted parts do that by design: castellated half-holes centred on...
+- [ ] **Issue [#950](https://github.com/mixelpixx/Konnect/issues/950): connect_to_net with stub_length 0 writes a zero-length wire** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-23)
+  - `connect_to_net` with `stub_length: 0` writes a wire whose two endpoints are the same point, then the label. `batch_connect_to_net` handles 0 on purpose: it writes no wire and...
 - [ ] **Issue [#947](https://github.com/mixelpixx/Konnect/issues/947): Contributor sign-off, and Konnect's move to Konnect-EDA** (by [@mixelpixx](https://github.com/mixelpixx), 2026-10-22)
   - Thank you to everyone who has contributed to Konnect. Konnect is moving to Orchis.ai LLC. Soon this AGPL edition will be frozen: its releases stay available under the AGPL, and...
 - [ ] **Issue [#941](https://github.com/mixelpixx/Konnect/issues/941): Footprint writes over IPC drop the footprint's (units ...) block — root cause in KiCad, worth a user warning** (by [@majdab88](https://github.com/majdab88), 2026-10-20)
@@ -563,8 +585,6 @@ Open upstream issues that do not currently have an open PR linked.
   - No tool writes a rule area (`(zone … (keepout …))`) into a `.kicad_mod`. `set_footprint_graphics` handles line / arc / rect / circle / poly only. Our use case is the antenna...
 - [ ] **Issue [#876](https://github.com/mixelpixx/Konnect/issues/876): No way to create custom-named power nets (power symbols)** (by [@vvzvlad](https://github.com/vvzvlad), 2026-10-12)
   - We needed global power nets with our own names (isolated rails, a CAN bus). `add_power_symbol` only places `power:<net>` from the stock library. `power_net` is both the library...
-- [ ] **Issue [#875](https://github.com/mixelpixx/Konnect/issues/875): Schematic → PCB sync drops symbols marked Exclude from BOM** (by [@vvzvlad](https://github.com/vvzvlad), 2026-10-12)
-  - From reading the code; not reproduced live. `pcb_sync.rs:1660-1662` returns `false` for any symbol with `in_bom = no`, so the part never reaches the board. In KiCad 10.0.6 only...
 - [ ] **Issue [#860](https://github.com/mixelpixx/Konnect/issues/860): Net-query tools answer an unknown net name as an empty net** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-09)
   - `get_net_connections`, `get_net_connectivity` and `get_net_components` answer a name that matches no net as a net with nothing on it. A typo, KiCad's own spelling of a net...
 - [ ] **Issue [#829](https://github.com/mixelpixx/Konnect/issues/829): No tool moves a placed footprint's Reference/Value text — move_footprint_text from KiCAD-MCP-Server was not ported** `[enhancement, P2, area:pcb, status:design-needed]` (by [@dmanresa-saes](https://github.com/dmanresa-saes), 2026-10-05)
