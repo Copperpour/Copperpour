@@ -118,7 +118,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         includes.push(dir);
     }
 
-    prost_build::Config::new().compile_protos(protos, &includes)?;
+    prost_build::Config::new()
+        .protoc_arg("--experimental_allow_proto3_optional")
+        .compile_protos(protos, &includes)?;
 
     Ok(())
 }

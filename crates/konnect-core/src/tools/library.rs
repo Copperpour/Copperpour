@@ -1720,6 +1720,8 @@ fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
         "symbols"
     } else if var.ends_with("_3DMODEL_DIR") {
         "3dmodels"
+    } else if var.ends_with("_TEMPLATE_DIR") {
+        "template"
     } else {
         return None;
     };
@@ -5745,6 +5747,45 @@ mod tests {
             expand_lib_uri("/plain/path", None),
             Some(PathBuf::from("/plain/path")),
             "a non-variable URI must pass through untouched"
+        );
+    }
+
+    static TEMPLATE_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct TemplateDirEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for TemplateDirEnv {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var("KICAD10_TEMPLATE_DIR", v),
+                None => std::env::remove_var("KICAD10_TEMPLATE_DIR"),
+            }
+        }
+    }
+
+    fn template_dir_env(dir: &Path) -> TemplateDirEnv {
+        let guard = TEMPLATE_DIR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("KICAD10_TEMPLATE_DIR");
+        std::env::set_var("KICAD10_TEMPLATE_DIR", dir);
+        TemplateDirEnv {
+            _guard: guard,
+            previous,
+        }
+    }
+
+    #[test]
+    fn expand_lib_uri_expands_template_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sym_table = tmp.path().join("sym-lib-table");
+        std::fs::write(&sym_table, "(sym_lib_table)\n").unwrap();
+        let _env = template_dir_env(tmp.path());
+
+        assert_eq!(
+            expand_lib_uri("${KICAD10_TEMPLATE_DIR}/sym-lib-table", None),
+            Some(sym_table)
         );
     }
 
