@@ -1171,7 +1171,7 @@ fn entry_indent(content: &str, open_pos: usize) -> Option<String> {
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "set_board_size",
             "Add a rectangular board outline of the given dimensions on the Edge.Cuts layer. \
@@ -1423,7 +1423,9 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         super::board_stackup::tool(),
-    ]
+    ];
+    tools.extend(super::pcb_board_zones::tools());
+    tools
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────

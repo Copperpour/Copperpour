@@ -502,7 +502,7 @@ callable tools, the fix is to make the *first* listing complete:
 ```
 
 in `konnect.toml` in the working directory, or a `settings.json` beside the binary. Every toolset is then loaded at
-startup, so `tools/list` carries all 238 tools from the first call.
+startup, so `tools/list` carries all 240 tools from the first call.
 
 It is off by default because it costs what the router exists to save: roughly
 25K tokens per listing instead of ~2K. Turn it on only if your client needs it.
@@ -564,8 +564,8 @@ persistently across restarts.
 
 Unlike VS Code Copilot ([#325](https://github.com/mixelpixx/Konnect/issues/325)),
 no client-side tool cap has been observed, so `eager_toolsets = true` fully
-resolves it: the first listing carries the whole catalog (223 tools measured
-on Konnect v0.11.0) and every tool resolves with no further loading. Prefer
+resolves it: the first listing carries the whole catalog (all 240 tools) and
+every tool resolves with no further loading. Prefer
 `settings.json` beside the binary — a harness-spawned server may run with a
 redirected environment that never sees a user-profile config file. Then
 restart the Muse session: Muse does not respawn a running MCP server, so the
