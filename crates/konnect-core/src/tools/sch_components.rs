@@ -58,7 +58,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "reference": { "type": "string", "description": "Optional reference designator. Default: the library prefix plus '?' (e.g. 'R?', '#FLG?'), which annotate_schematic numbers" },
                     "value": { "type": "string", "description": "Optional override for the library symbol's Value" },
                     "footprint": { "type": "string", "description": "Optional override for the library symbol's Footprint" },
-                    "unit": { "type": "integer", "minimum": 1, "description": "Unit number for multi-unit symbols (gate/part selection). Default 1.", "default": 1 }
+                    "unit": { "type": "integer", "minimum": 1, "description": "Unit number for multi-unit symbols (gate/part selection). Default 1.", "default": 1 },
+                    "lcsc_id": { "type": "string", "description": "Optional LCSC part number (e.g. 'C2856837'). Automatically enriches LCSC, MPN, Manufacturer, and Datasheet from ~/.konnect/jlcpcb.db at placement time." },
+                    "fields": { "type": "object", "additionalProperties": true, "description": "Additional custom properties to set on the placed component instance (e.g. {\"LCSC\": \"C123\", \"MPN\": \"...\"})" }
                 },
                 "required": ["schematic", "lib_id", "x", "y"]
             }),
@@ -532,6 +534,15 @@ async fn handle_add_schematic_component(
         }
     };
 
+    let lcsc_id = opt_str(args, "lcsc_id");
+    let fields = args["fields"].as_object();
+    let db_path = crate::tools::integration::resolve_db_path(args, _ctx);
+    let extras = ComponentPlacementExtras {
+        lcsc_id,
+        fields,
+        db_path: Some(&db_path),
+    };
+
     let placed = match place_one_component(
         &mut sch,
         &context.instance_paths,
@@ -546,6 +557,7 @@ async fn handle_add_schematic_component(
         footprint,
         unit,
         &source,
+        extras,
     ) {
         Ok(placed) => placed,
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
@@ -727,6 +739,13 @@ pub(crate) fn mirror_arg<'a>(
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ComponentPlacementExtras<'a> {
+    pub lcsc_id: Option<&'a str>,
+    pub fields: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    pub db_path: Option<&'a std::path::Path>,
+}
+
 /// Place one symbol into `sch`: embeds the lib_symbols definition, validates
 /// the unit, and adds the positioned instance. Does not write the file --
 /// callers own the read/write cycle (single-add and batch-add alike).
@@ -745,6 +764,7 @@ pub(crate) fn place_one_component(
     footprint: Option<&str>,
     unit: u32,
     src: &dyn cse::library::SymbolLibrarySource,
+    extras: ComponentPlacementExtras<'_>,
 ) -> Result<PlacedComponent, CallToolResult> {
     // Snap to 1.27mm grid
     let (x, y) = snap_point(x, y, 1.27);
@@ -852,6 +872,104 @@ pub(crate) fn place_one_component(
         true,
         centred,
     ));
+
+    // Carry all custom properties from the library symbol (excluding standard 5 and ki_*)
+    let lib_custom_props = cse::library::symbol_custom_properties(sch, lib_id);
+    for (prop_name, prop_val) in lib_custom_props {
+        sym.properties.push(positioned(
+            &prop_name,
+            &prop_val,
+            x,
+            y,
+            0.0,
+            true,
+            centred,
+        ));
+    }
+
+    // Determine if an LCSC ID is specified or present in library properties
+    let effective_lcsc = extras
+        .lcsc_id
+        .or_else(|| {
+            extras
+                .fields
+                .and_then(|f| f.get("LCSC").and_then(|v| v.as_str()))
+        })
+        .or_else(|| sym.property("LCSC"))
+        .map(String::from);
+
+    if let Some(lcsc) = effective_lcsc {
+        if let Some(p) = sym.properties.iter_mut().find(|p| p.name == "LCSC") {
+            p.value = lcsc.clone();
+        } else {
+            sym.properties
+                .push(positioned("LCSC", &lcsc, x, y, 0.0, true, centred));
+        }
+
+        if let Some(path) = extras.db_path {
+            if let Some(info) = crate::tools::integration::query_jlcpcb_db_part(path, &lcsc) {
+                if !info.mfr_part.is_empty()
+                    && (sym.property("MPN").is_none() || sym.property("MPN") == Some(""))
+                {
+                    if let Some(p) = sym.properties.iter_mut().find(|p| p.name == "MPN") {
+                        p.value = info.mfr_part;
+                    } else {
+                        sym.properties
+                            .push(positioned("MPN", &info.mfr_part, x, y, 0.0, true, centred));
+                    }
+                }
+                if !info.manufacturer.is_empty()
+                    && (sym.property("Manufacturer").is_none()
+                        || sym.property("Manufacturer") == Some(""))
+                {
+                    if let Some(p) = sym.properties.iter_mut().find(|p| p.name == "Manufacturer") {
+                        p.value = info.manufacturer;
+                    } else {
+                        sym.properties.push(positioned(
+                            "Manufacturer",
+                            &info.manufacturer,
+                            x,
+                            y,
+                            0.0,
+                            true,
+                            centred,
+                        ));
+                    }
+                }
+                if !info.datasheet.is_empty()
+                    && (sym.property("Datasheet").is_none()
+                        || sym.property("Datasheet") == Some("")
+                        || sym.property("Datasheet") == Some("~"))
+                {
+                    if let Some(p) = sym.properties.iter_mut().find(|p| p.name == "Datasheet") {
+                        p.value = info.datasheet;
+                    }
+                }
+                if !info.description.is_empty()
+                    && (sym.property("Description").is_none()
+                        || sym.property("Description") == Some(""))
+                {
+                    if let Some(p) = sym.properties.iter_mut().find(|p| p.name == "Description") {
+                        p.value = info.description;
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply explicit fields override if supplied
+    if let Some(custom_fields) = extras.fields {
+        for (key, val) in custom_fields {
+            if let Some(val_str) = val.as_str() {
+                if let Some(p) = sym.properties.iter_mut().find(|p| p.name == *key) {
+                    p.value = val_str.to_string();
+                } else {
+                    sym.properties
+                        .push(positioned(key, val_str, x, y, 0.0, true, centred));
+                }
+            }
+        }
+    }
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
@@ -4814,6 +4932,13 @@ mod tests {
             ),
         )
         .unwrap();
+        std::fs::write(
+            symdir.join("WITH_CUSTOM_FIELDS.kicad_sym"),
+            format!(
+                "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"eeschema\")\n\t(symbol \"WITH_CUSTOM_FIELDS\"\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"Custom Part\" (at 0 0 0))\n\t\t(property \"Footprint\" \"Package_SO:SOIC-8\" (at 0 0 0) hide)\n\t\t(property \"Datasheet\" \"{STUB_MARKER}\" (at 0 0 0) hide)\n\t\t(property \"Description\" \"Custom part description\" (at 0 0 0) hide)\n\t\t(property \"LCSC\" \"C9999\" (at 0 0 0) hide)\n\t\t(property \"MPN\" \"MY-MPN-100\" (at 0 0 0) hide)\n\t\t(property \"Manufacturer\" \"MyMfr\" (at 0 0 0) hide)\n\t\t(symbol \"WITH_CUSTOM_FIELDS_0_1\"\n\t\t\t(pin passive line (at 0 3.81 270) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n"
+            ),
+        )
+        .unwrap();
         // LM2904-style multi-unit part: unit 1 = pins 1-3, unit 2 = pins 5-7,
         // unit 3 = power pins 4/8 (#35 repro shape).
         let pin = |num: &str, x: f64, y: f64, angle: u32| {
@@ -5960,6 +6085,138 @@ mod tests {
             Some(""),
             "KiCad writes the mandatory Description field even when empty"
         );
+    }
+
+    #[tokio::test]
+    async fn placement_carries_library_custom_fields_automatically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom_fields.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Custom:IC\"\n      (property \"Reference\" \"U\" (at 0 0 0))\n      (property \"Value\" \"IC\" (at 0 0 0))\n      (property \"Datasheet\" \"~\" (at 0 0 0))\n      (property \"Description\" \"Custom IC\" (at 0 0 0))\n      (property \"LCSC\" \"C9999\" (at 0 0 0))\n      (property \"MPN\" \"MY-PART-100\" (at 0 0 0))\n      (property \"Manufacturer\" \"Acme Corp\" (at 0 0 0))\n      (property \"ki_keywords\" \"ic internal\" (at 0 0 0))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Custom:IC",
+                "reference": "U1",
+                "x": 100.0,
+                "y": 50.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let field = |name: &str| {
+            sch.symbols
+                .iter()
+                .find(|s| s.reference() == Some("U1"))
+                .and_then(|s| s.properties.iter().find(|p| p.name == name))
+                .map(|p| p.value.as_str())
+        };
+        assert_eq!(field("LCSC"), Some("C9999"));
+        assert_eq!(field("MPN"), Some("MY-PART-100"));
+        assert_eq!(field("Manufacturer"), Some("Acme Corp"));
+        assert_eq!(field("ki_keywords"), None, "ki_* properties must not be copied");
+    }
+
+    #[tokio::test]
+    async fn placement_enriches_from_jlcpcb_db_using_lcsc_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("jlcpcb.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE components (LCSC TEXT, MFR_Part TEXT, Package TEXT, Manufacturer TEXT, Library_Type TEXT, Description TEXT, Datasheet TEXT, Price REAL, Stock INTEGER, Category TEXT)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO components VALUES ('C2856837', 'FPC-05FB-40PH20', '0.5mm', 'XUNPU', 'Extended', '0.5mm Pitch 40 Pin FPC Connector', 'https://example.com/fpc.pdf', 0.5, 100, 'Connectors')",
+            [],
+        ).unwrap();
+
+        let path = dir.path().join("enrich.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:CONN\"\n      (property \"Reference\" \"J\" (at 0 0 0))\n      (property \"Value\" \"CONN\" (at 0 0 0))\n      (property \"Datasheet\" \"~\" (at 0 0 0))\n      (property \"Description\" \"\" (at 0 0 0))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:CONN",
+                "reference": "J1",
+                "x": 100.0,
+                "y": 50.0,
+                "lcsc_id": "C2856837",
+                "output_path": db_path.display().to_string()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let field = |name: &str| {
+            sch.symbols
+                .iter()
+                .find(|s| s.reference() == Some("J1"))
+                .and_then(|s| s.properties.iter().find(|p| p.name == name))
+                .map(|p| p.value.as_str())
+        };
+        assert_eq!(field("LCSC"), Some("C2856837"));
+        assert_eq!(field("MPN"), Some("FPC-05FB-40PH20"));
+        assert_eq!(field("Manufacturer"), Some("XUNPU"));
+        assert_eq!(field("Datasheet"), Some("https://example.com/fpc.pdf"));
+        assert_eq!(field("Description"), Some("0.5mm Pitch 40 Pin FPC Connector"));
+    }
+
+    #[tokio::test]
+    async fn placement_explicit_fields_override_and_add() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fields_override.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 0 0 0))\n      (property \"Value\" \"10k\" (at 0 0 0))\n      (property \"Datasheet\" \"~\" (at 0 0 0))\n      (property \"Description\" \"Resistor\" (at 0 0 0))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:R",
+                "reference": "R1",
+                "x": 100.0,
+                "y": 50.0,
+                "fields": {
+                    "LCSC": "C12345",
+                    "Tolerance": "1%",
+                    "Power": "0.1W"
+                }
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let field = |name: &str| {
+            sch.symbols
+                .iter()
+                .find(|s| s.reference() == Some("R1"))
+                .and_then(|s| s.properties.iter().find(|p| p.name == name))
+                .map(|p| p.value.as_str())
+        };
+        assert_eq!(field("LCSC"), Some("C12345"));
+        assert_eq!(field("Tolerance"), Some("1%"));
+        assert_eq!(field("Power"), Some("0.1W"));
     }
 
     #[tokio::test]

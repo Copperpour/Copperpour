@@ -156,7 +156,9 @@ pub fn tools() -> Vec<ToolDef> {
                                 "reference": { "type": "string" },
                                 "value": { "type": "string" },
                                 "footprint": { "type": "string" },
-                                "unit": { "type": "integer", "minimum": 1, "default": 1 }
+                                "unit": { "type": "integer", "minimum": 1, "default": 1 },
+                                "lcsc_id": { "type": "string", "description": "Optional LCSC part number (e.g. 'C2856837'). Automatically enriches LCSC, MPN, Manufacturer, and Datasheet from ~/.konnect/jlcpcb.db at placement time." },
+                                "fields": { "type": "object", "additionalProperties": true, "description": "Additional custom properties to set on the placed component instance (e.g. {\"LCSC\": \"C123\", \"MPN\": \"...\"})" }
                             },
                             "required": ["lib_id", "x", "y"]
                         }
@@ -717,6 +719,15 @@ async fn handle_batch_place_components(
             }
         };
 
+        let lcsc_id = comp["lcsc_id"].as_str();
+        let fields = comp["fields"].as_object();
+        let db_path = crate::tools::integration::resolve_db_path(args, _ctx);
+        let extras = super::sch_components::ComponentPlacementExtras {
+            lcsc_id,
+            fields,
+            db_path: Some(&db_path),
+        };
+
         match place_one_component(
             &mut sch,
             &context.instance_paths,
@@ -731,6 +742,7 @@ async fn handle_batch_place_components(
             footprint,
             unit,
             &src,
+            extras,
         ) {
             Ok(placed) => {
                 let (expected_x, expected_y) = snap_point(x, y, 1.27);
@@ -2642,6 +2654,36 @@ mod batch_place_and_connect_tests {
                 .any(|line| line.ends_with(' ') || line.ends_with('\t')),
             "batch placement must not leave trailing whitespace: {after:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn batch_place_components_carries_custom_fields_and_enriches_lcsc() {
+        let (_d, path) = seeded_schematic();
+        let result = handle_batch_place_components(
+            &json!({
+                "schematic": path.display().to_string(),
+                "components": [
+                    {
+                        "lib_id": "Device:R",
+                        "x": 100.0,
+                        "y": 100.0,
+                        "reference": "R1",
+                        "lcsc_id": "C12345",
+                        "fields": { "Manufacturer": "Yageo", "Tolerance": "1%" }
+                    }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let r1 = sch.symbols.by_reference("R1").unwrap();
+        assert_eq!(r1.property("LCSC"), Some("C12345"));
+        assert_eq!(r1.property("Manufacturer"), Some("Yageo"));
+        assert_eq!(r1.property("Tolerance"), Some("1%"));
     }
 
     /// An entry without `reference` keeps the stock library prefix (#669).

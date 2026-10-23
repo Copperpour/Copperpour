@@ -520,6 +520,7 @@ async fn handle_apply_template(
                 None,
                 1,
                 &source,
+                crate::tools::sch_components::ComponentPlacementExtras::default(),
             ) {
                 Ok(placement) => placement,
                 Err(error) => return Ok(error),

@@ -431,6 +431,35 @@ pub struct SymbolMetadata {
     pub description: String,
 }
 
+/// Read all custom properties (excluding standard KiCad fields and internal `ki_*` fields)
+/// defined on `lib_id`'s embedded library symbol.
+pub fn symbol_custom_properties(schematic: &Schematic, lib_id: &str) -> Vec<(String, String)> {
+    let Some(symbol) = embedded_lib_symbol(schematic, lib_id) else {
+        return Vec::new();
+    };
+    let mut customs = Vec::new();
+    for property in symbol.find_all("property") {
+        let Some(name) = property.value() else { continue };
+        if matches!(
+            name,
+            "Reference" | "Value" | "Footprint" | "Datasheet" | "Description"
+        ) {
+            continue;
+        }
+        if name.starts_with("ki_") {
+            continue;
+        }
+        let value = property
+            .args()
+            .get(1)
+            .and_then(SexpNode::text)
+            .unwrap_or_default()
+            .to_string();
+        customs.push((name.to_string(), value));
+    }
+    customs
+}
+
 /// Read the metadata fields of `lib_id` from the schematic's embedded symbol.
 /// Missing fields and an unknown symbol both produce empty values, matching
 /// KiCad's mandatory placed-field representation.
@@ -987,6 +1016,22 @@ mod field_anchor_tests {
     /// The anchor alone is not enough: `Regulator_Linear:AP2112K-3.3` puts
     /// Reference and Value on the same `y` and keeps them apart with
     /// `justify left`.
+    #[test]
+    fn reads_custom_properties_from_direct_library_properties() {
+        let (sch, _dir) = schematic_with(
+            "(symbol \"Custom:Part\" (property \"Reference\" \"U\" (at 0 0 0)) (property \"Value\" \"Part\" (at 0 0 0)) (property \"Footprint\" \"Package:SOIC\" (at 0 0 0)) (property \"Datasheet\" \"~\" (at 0 0 0)) (property \"Description\" \"Part\" (at 0 0 0)) (property \"ki_keywords\" \"ic\" (at 0 0 0)) (property \"LCSC\" \"C12345\" (at 0 0 0)) (property \"MPN\" \"PART-1\" (at 0 0 0)) (property \"Manufacturer\" \"Acme\" (at 0 0 0)))",
+        );
+        assert_eq!(
+            symbol_custom_properties(&sch, "Custom:Part"),
+            vec![
+                ("LCSC".to_string(), "C12345".to_string()),
+                ("MPN".to_string(), "PART-1".to_string()),
+                ("Manufacturer".to_string(), "Acme".to_string()),
+            ]
+        );
+        assert!(symbol_custom_properties(&sch, "Custom:Unknown").is_empty());
+    }
+
     #[test]
     fn reads_the_justify_that_keeps_fields_on_a_shared_row_apart() {
         let (sch, _dir) = schematic_with(

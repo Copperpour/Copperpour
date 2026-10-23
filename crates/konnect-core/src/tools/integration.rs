@@ -170,7 +170,7 @@ pub fn tools() -> Vec<ToolDef> {
 
 // ─── JLCPCB database path helper ─────────────────────────────────────────────
 
-fn default_jlcpcb_db_path() -> PathBuf {
+pub(crate) fn default_jlcpcb_db_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         let appdata = std::env::var("APPDATA").unwrap_or_default();
@@ -183,7 +183,7 @@ fn default_jlcpcb_db_path() -> PathBuf {
     }
 }
 
-fn resolve_db_path(args: &serde_json::Value, ctx: &ToolContext) -> PathBuf {
+pub(crate) fn resolve_db_path(args: &serde_json::Value, ctx: &ToolContext) -> PathBuf {
     if let Some(p) = args["output_path"].as_str() {
         return PathBuf::from(p);
     }
@@ -191,6 +191,38 @@ fn resolve_db_path(args: &serde_json::Value, ctx: &ToolContext) -> PathBuf {
         return p.clone();
     }
     default_jlcpcb_db_path()
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct JlcpchPartInfo {
+    #[allow(dead_code)]
+    pub lcsc: String,
+    pub mfr_part: String,
+    pub manufacturer: String,
+    pub datasheet: String,
+    pub description: String,
+}
+
+pub(crate) fn query_jlcpcb_db_part(db_path: &Path, lcsc_id: &str) -> Option<JlcpchPartInfo> {
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open(db_path).ok()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT LCSC, MFR_Part, Manufacturer, Datasheet, Description FROM components WHERE LCSC = ?1 LIMIT 1",
+        )
+        .ok()?;
+    stmt.query_row(rusqlite::params![lcsc_id], |row| {
+        Ok(JlcpchPartInfo {
+            lcsc: row.get::<_, String>(0).unwrap_or_default(),
+            mfr_part: row.get::<_, String>(1).unwrap_or_default(),
+            manufacturer: row.get::<_, String>(2).unwrap_or_default(),
+            datasheet: row.get::<_, String>(3).unwrap_or_default(),
+            description: row.get::<_, String>(4).unwrap_or_default(),
+        })
+    })
+    .ok()
 }
 
 #[cfg(test)]
