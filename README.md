@@ -22,6 +22,11 @@ that teach Claude KiCAD conventions out of the box.
 > release and it wants real-world mileage and review. Issues and PRs are welcome —
 > see [CONTRIBUTING.md](CONTRIBUTING.md) and the
 > [naming conventions](docs/NAMING_CONVENTIONS.md).
+>
+> **LibreKonnect (`v0.14.0`):** Community-maintained AGPL-3.0 continuation fork of
+> [`mixelpixx/Konnect`](https://github.com/mixelpixx/Konnect), integrating 60 open
+> community pull requests and fixes on top of upstream `v0.13.0` — see
+> [docs/UPSTREAM_BACKLOG.md](docs/UPSTREAM_BACKLOG.md).
 
 > ## Add realtime research to KiCAD MCP and Konnect. Introducing Nimrod
 >
@@ -119,7 +124,7 @@ Konnect.
 
 ### From the KiCAD Plugin Manager (recommended)
 
-1. Download the package for your OS from [Releases](https://github.com/mixelpixx/Konnect/releases):
+1. Download the package for your OS from [Releases](https://github.com/mn89h/LibreKonnect/releases):
    `konnect-pcm-v<version>-windows.zip`, `-macos.zip`, or `-linux.zip`. Each
    bundles that platform's server binary — the macOS package is a universal
    build, so one download covers Apple Silicon and Intel. (The `konnect-pcm-*`
@@ -216,7 +221,7 @@ it is not silently guessed from a directory name.
 
 ### macOS
 
-The [Releases](https://github.com/mixelpixx/Konnect/releases) page ships
+The [Releases](https://github.com/mn89h/LibreKonnect/releases) page ships
 standalone server binaries for both Apple Silicon (`aarch64-apple-darwin`) and
 Intel (`x86_64-apple-darwin`). They are not yet code-signed, so if you download
 one through a browser, clear the quarantine flag before first launch:
@@ -374,6 +379,7 @@ works only when passed with `--config`.)
 - Community Discord: [join the Konnect community](https://discord.gg/NVp9RGMmDu)
   for installation help, AI-client setup, design-workflow discussion,
   contributor coordination, and live project-status updates
-- Issues & feature requests: [GitHub Issues](https://github.com/mixelpixx/Konnect/issues)
+- Issues & feature requests: [GitHub Issues](https://github.com/mn89h/LibreKonnect/issues)
+- Upstream backlog & merged PRs: [docs/UPSTREAM_BACKLOG.md](docs/UPSTREAM_BACKLOG.md)
 - Roadmap: [ROADMAP.md](ROADMAP.md)
 - Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)

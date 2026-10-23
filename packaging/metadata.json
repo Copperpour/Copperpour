@@ -13,11 +13,11 @@
   },
   "license": "open-source",
   "resources": {
-    "homepage": "https://github.com/mixelpixx/Konnect"
+    "homepage": "https://github.com/mn89h/LibreKonnect"
   },
   "versions": [
     {
-      "version": "0.13.0",
+      "version": "0.14.0",
       "status": "stable",
       "kicad_version": "10.0",
       "kicad_version_max": "10.99"
