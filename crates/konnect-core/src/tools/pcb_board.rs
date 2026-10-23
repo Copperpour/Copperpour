@@ -12,6 +12,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::board_source::{self, BoardSource};
 use crate::tools::live_board::{self, LiveBoard};
+use crate::tools::title_block_args::{self, TitleBlockUpdate};
 use crate::tools::{
     get_path, invalid_arg, opt_str_list, require_f64, require_str, with_board_ipc_classified,
     ToolContext, ToolDef,
@@ -1217,7 +1218,7 @@ pub fn tools() -> Vec<ToolDef> {
              older answers unsupported_capability), where the change is unsaved and has \
              no undo step, else the saved file. Returns the title block read back after \
              the write, the fields that changed, and 'source'.",
-            title_block_schema(),
+            title_block_args::schema("board", "Path to .kicad_pcb file", serde_json::Map::new()),
             |args, ctx| async move { handle_set_board_title_block(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
@@ -1747,86 +1748,6 @@ async fn handle_get_board_info(
     })))
 }
 
-/// The tool's argument for each title-block field, in `title_block::FIELDS`
-/// order. Spelled out because these names are this tool's public API.
-fn title_block_arguments() -> &'static [&'static str] {
-    &[
-        "title",
-        "date",
-        "revision",
-        "company",
-        "comment_1",
-        "comment_2",
-        "comment_3",
-        "comment_4",
-        "comment_5",
-        "comment_6",
-        "comment_7",
-        "comment_8",
-        "comment_9",
-    ]
-}
-
-fn title_block_schema() -> serde_json::Value {
-    let mut properties = serde_json::Map::new();
-    properties.insert(
-        "board".into(),
-        json!({ "type": "string", "description": "Path to .kicad_pcb file" }),
-    );
-    for &field in title_block_arguments() {
-        let description = match field.strip_prefix("comment_") {
-            Some(number) => format!("Comment {number}, which ${{COMMENT{number}}} resolves to"),
-            None => format!("The title block's {field}"),
-        };
-        properties.insert(
-            field.into(),
-            json!({ "type": "string", "description": description }),
-        );
-    }
-    json!({ "type": "object", "properties": properties, "required": ["board"] })
-}
-
-/// The title-block fields a call supplies, each replacing the stored value.
-#[derive(Clone)]
-struct TitleBlockUpdate(Vec<(&'static str, String)>);
-
-impl TitleBlockUpdate {
-    fn parse(args: &serde_json::Value) -> Result<Self, CallToolResult> {
-        let mut fields = Vec::new();
-        for &field in title_block_arguments() {
-            match &args[field] {
-                serde_json::Value::Null => {}
-                serde_json::Value::String(value) => fields.push((field, value.clone())),
-                _ => return Err(invalid_arg(field, "must be a string when supplied")),
-            }
-        }
-        if fields.is_empty() {
-            return Err(invalid_arg(
-                "title_block",
-                "supply at least one of title, date, revision, company, comment_1 .. comment_9",
-            ));
-        }
-        Ok(Self(fields))
-    }
-
-    fn applied_to(&self, block: &TitleBlock) -> TitleBlock {
-        let mut block = block.clone();
-        for (field, value) in &self.0 {
-            *block.field_mut(field).expect("a title_block::FIELDS entry") = value.clone();
-        }
-        block
-    }
-}
-
-fn title_block_json(block: &TitleBlock) -> serde_json::Value {
-    block
-        .fields()
-        .into_iter()
-        .map(|(field, value)| (field.to_string(), json!(value)))
-        .collect::<serde_json::Map<_, _>>()
-        .into()
-}
-
 /// What KiCad did with a title-block write.
 enum TitleBlockIpcOutcome {
     /// A fresh read returned the intended block, `changed` from the one read
@@ -1884,31 +1805,13 @@ fn set_title_block_over_ipc(
     })
 }
 
-/// The board file's title block, which must equal `intended`; `Err` gives why
-/// it does not.
-fn saved_title_block_matches(
-    board_path: &Path,
-    intended: &TitleBlock,
-) -> Result<TitleBlock, String> {
-    let source = std::fs::read_to_string(board_path).map_err(|error| error.to_string())?;
-    let tree = parse_sexp(&source).map_err(|error| error.to_string())?;
-    let saved = title_block::read(&tree).map_err(|error| error.to_string())?;
-    if saved != *intended {
-        return Err(format!(
-            "the saved title block differs from the request in {}",
-            saved.changed_from(intended).join(", ")
-        ));
-    }
-    Ok(saved)
-}
-
 async fn handle_set_board_title_block(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     const OPERATION: &str = "set_board_title_block";
     let board_path = get_path(args, "board")?;
-    let update = match TitleBlockUpdate::parse(args) {
+    let update = match TitleBlockUpdate::from_arguments(args) {
         Ok(update) => update,
         Err(error) => return Ok(error),
     };
@@ -1923,7 +1826,7 @@ async fn handle_set_board_title_block(
             BoardWrite::Ipc(TitleBlockIpcOutcome::Applied { after, changed }) => {
                 return Ok(CallToolResult::json(&json!({
                     "file": board_path.display().to_string(),
-                    "title_block": title_block_json(&after),
+                    "title_block": title_block_args::to_json(&after),
                     "changed": changed,
                     "source": "ipc",
                     "saved": false,
@@ -1984,18 +1887,15 @@ async fn handle_set_board_title_block(
                 "the board file did not read back as written",
             ))
         }
-        Err(SexpError::InvalidValue(reason)) => {
-            return Ok(CallToolResult::error(format!(
-                "The board's title block cannot be edited safely: {reason}. The board file \
-                 was not modified."
-            )))
+        Err(error @ SexpError::InvalidValue(_)) => {
+            return Ok(title_block_args::unrepresentable(&board_path, &error))
         }
         Err(error) => return Err(error.into()),
     };
     if intended == before {
         return Ok(CallToolResult::json(&json!({
             "file": board_path.display().to_string(),
-            "title_block": title_block_json(&before),
+            "title_block": title_block_args::to_json(&before),
             "changed": [],
             "source": "file",
             "saved": true,
@@ -2003,7 +1903,7 @@ async fn handle_set_board_title_block(
             "warning": fallback_reason.warning()
         })));
     }
-    let after = match saved_title_block_matches(&board_path, &intended) {
+    let after = match title_block_args::read_back(&board_path, &intended) {
         Ok(after) => after,
         Err(reason) => {
             return Ok(crate::tools::mutation_outcome_uncertain(
@@ -2016,7 +1916,7 @@ async fn handle_set_board_title_block(
 
     Ok(CallToolResult::json(&json!({
         "file": board_path.display().to_string(),
-        "title_block": title_block_json(&after),
+        "title_block": title_block_args::to_json(&after),
         "changed": after.changed_from(&before),
         "source": "file",
         "saved": true,
@@ -6566,42 +6466,5 @@ mod board_revision_tests {
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_conflict("add_board_text", &text["error"], &board);
         assert_eq!(std::fs::read_to_string(&board).unwrap(), newer());
-    }
-}
-
-#[cfg(test)]
-mod title_block_readback_tests {
-    use super::*;
-
-    #[test]
-    fn the_arguments_are_the_models_field_names() {
-        assert_eq!(title_block_arguments(), title_block::FIELDS.as_slice());
-    }
-
-    /// The post-write check, against a file holding something other than
-    /// the request: the case a correct write never produces.
-    #[test]
-    fn a_saved_block_other_than_the_request_names_the_field() {
-        let dir = tempfile::tempdir().unwrap();
-        let board = dir.path().join("board.kicad_pcb");
-        std::fs::write(
-            &board,
-            "(kicad_pcb\n\t(paper \"A4\")\n\t(title_block\n\t\t(rev \"B\")\n\t)\n)\n",
-        )
-        .unwrap();
-        let mut intended = TitleBlock {
-            revision: "B".into(),
-            ..TitleBlock::default()
-        };
-        assert_eq!(
-            saved_title_block_matches(&board, &intended),
-            Ok(intended.clone())
-        );
-
-        intended.comments[8] = "ninth".into();
-        let reason = saved_title_block_matches(&board, &intended).unwrap_err();
-        assert!(reason.contains("comment_9"), "{reason}");
-        std::fs::remove_file(&board).unwrap();
-        assert!(saved_title_block_matches(&board, &intended).is_err());
     }
 }

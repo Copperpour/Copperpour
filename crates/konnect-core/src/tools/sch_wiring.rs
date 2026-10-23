@@ -555,10 +555,13 @@ pub(crate) fn insert_wire_with_junctions(
         .as_ref()
         .map(crate::tools::junction_exit_points)
         .unwrap_or_default();
-    let junctions: Vec<(f64, f64)> = new_wire_junctions(&existing_wires, &exits, (x1, y1), (x2, y2))
-        .into_iter()
-        .filter(|&(jx, jy)| konnect_sexp::geometry::point_on_segment(jx, jy, x1, y1, x2, y2, 0.01))
-        .collect();
+    let junctions: Vec<(f64, f64)> =
+        new_wire_junctions(&existing_wires, &exits, (x1, y1), (x2, y2))
+            .into_iter()
+            .filter(|&(jx, jy)| {
+                konnect_sexp::geometry::point_on_segment(jx, jy, x1, y1, x2, y2, 0.01)
+            })
+            .collect();
 
     let mut c = content;
     c = insert_before_close(&c, &format_wire(x1, y1, x2, y2));
