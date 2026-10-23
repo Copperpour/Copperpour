@@ -45,12 +45,12 @@ Tick the checkbox (`- [x]`) once you have reviewed and merged (or intentionally 
   - **Local Ref:** `upstream-prs/946` | **Status vs `main`:** Clean merge | **Relates to Issues:** None
   - **Summary:** Adds a notice at the top of the README: - Konnect is moving to the Orchis.ai LLC GitHub organization soon. - This AGPL edition will then be frozen. Its releases stay available under the AGPL, and new development...
 
-- [ ] **PR [#944](https://github.com/mixelpixx/Konnect/pull/944): feat(sch_hierarchy): set a schematic sheet's title block (closes #714, stacked on #943)**
+- [x] **PR [#944](https://github.com/mixelpixx/Konnect/pull/944): feat(sch_hierarchy): set a schematic sheet's title block (closes #714, stacked on #943)**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (2 commits, 2026-10-20)
   - **Local Ref:** `upstream-prs/944` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#714](https://github.com/mixelpixx/Konnect/issues/714), [#945](https://github.com/mixelpixx/Konnect/issues/945)
   - **Summary:** Adds `set_schematic_title_block` (`sch_hierarchy`), the schematic half of #714. It sets any of `title`, `date`, `revision`, `company` and `comment_1`..`comment_9` on one sheet file, or with `scope: "hierarchy"` on...
 
-- [ ] **PR [#943](https://github.com/mixelpixx/Konnect/pull/943): feat(pcb_board): set the board's title block (part of #714)**
+- [x] **PR [#943](https://github.com/mixelpixx/Konnect/pull/943): feat(pcb_board): set the board's title block (part of #714)**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-20)
   - **Local Ref:** `upstream-prs/943` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#714](https://github.com/mixelpixx/Konnect/issues/714)
   - **Summary:** Adds `set_board_title_block` (`pcb_board`), the board half of #714 as the maintainer's two-PR plan lays it out. It sets any of `title`, `date`, `revision`, `company` and `comment_1`..`comment_9`, the fields...
@@ -60,12 +60,12 @@ Tick the checkbox (`- [x]`) once you have reviewed and merged (or intentionally 
   - **Local Ref:** `upstream-prs/942` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#786](https://github.com/mixelpixx/Konnect/issues/786)
   - **Summary:** `search_jlcpcb_parts` matched every query word as a bare substring, so `20pF` also returned `220pF`/`120pF` and `1k` returned `1.1k`/`10k`. Value words now match as whole values. Issue: Part of #786 (part 1, "words...
 
-- [ ] **PR [#937](https://github.com/mixelpixx/Konnect/pull/937): fix(schematic): dot a wire end where three or more exits meet**
+- [x] **PR [#937](https://github.com/mixelpixx/Konnect/pull/937): fix(schematic): dot a wire end where three or more exits meet**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-19)
   - **Local Ref:** `upstream-prs/937` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#897](https://github.com/mixelpixx/Konnect/issues/897), [#935](https://github.com/mixelpixx/Konnect/issues/935), [#936](https://github.com/mixelpixx/Konnect/issues/936)
   - **Summary:** The wire tools added a junction dot only where a wire end landed mid-span on another wire. When three or more wire ends met at one point, they wrote none. KiCad still connected the ends, but the T looked like a...
 
-- [ ] **PR [#934](https://github.com/mixelpixx/Konnect/pull/934): feat(schematic): move a whole block rigidly with move_region include "all"**
+- [x] **PR [#934](https://github.com/mixelpixx/Konnect/pull/934): feat(schematic): move a whole block rigidly with move_region include "all"**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-19)
   - **Local Ref:** `upstream-prs/934` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#104](https://github.com/mixelpixx/Konnect/issues/104), [#896](https://github.com/mixelpixx/Konnect/issues/896)
   - **Summary:** `move_region` moved only symbols, so a finished block could not be shifted without leaving its wires, labels and junctions behind. It now takes `include: "all"`, which moves everything inside the box as one rigid...
@@ -105,17 +105,17 @@ Tick the checkbox (`- [x]`) once you have reviewed and merged (or intentionally 
   - **Local Ref:** `upstream-prs/921` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#304](https://github.com/mixelpixx/Konnect/issues/304), [#789](https://github.com/mixelpixx/Konnect/issues/789)
   - **Summary:** **The problem.** A KiCad 10 board with no schematic keeps its netlist on its pads, and here every part was on the back. Driving one such board live through Konnect v0.13.0 (4-layer, 1229 footprints) hit seven gaps,...
 
-- [ ] **PR [#919](https://github.com/mixelpixx/Konnect/pull/919): fix(pcb_export): plot the front view when export_pdf/export_svg get no layers**
+- [x] **PR [#919](https://github.com/mixelpixx/Konnect/pull/919): fix(pcb_export): plot the front view when export_pdf/export_svg get no layers**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-15)
   - **Local Ref:** `upstream-prs/919` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#465](https://github.com/mixelpixx/Konnect/issues/465)
   - **Summary:** `export_pdf` and `export_svg` both declared `layers` optional and documented an empty list as "all visible layers". When `layers` was omitted they sent `kicad-cli` no `--layers` at all, and `kicad-cli` refused the...
 
-- [ ] **PR [#917](https://github.com/mixelpixx/Konnect/pull/917): fix(schematic): key sheet symbols to the sheets that place them**
+- [x] **PR [#917](https://github.com/mixelpixx/Konnect/pull/917): fix(schematic): key sheet symbols to the sheets that place them**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-15)
   - **Local Ref:** `upstream-prs/917` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#389](https://github.com/mixelpixx/Konnect/issues/389), [#478](https://github.com/mixelpixx/Konnect/issues/478), [#515](https://github.com/mixelpixx/Konnect/issues/515), [#913](https://github.com/mixelpixx/Konnect/issues/913), [#914](https://github.com/mixelpixx/Konnect/issues/914), [#915](https://github.com/mixelpixx/Konnect/issues/915), [#916](https://github.com/mixelpixx/Konnect/issues/916)
   - **Summary:** After `delete_sheet` and a re-add, a reused child sheet kept a path naming the deleted sheet beside the new one. The issue rated that as file growth, but since the strict instance check...
 
-- [ ] **PR [#911](https://github.com/mixelpixx/Konnect/pull/911): fix(ipc): report a raw ENOTCONN dial error as a failed handshake**
+- [x] **PR [#911](https://github.com/mixelpixx/Konnect/pull/911): fix(ipc): report a raw ENOTCONN dial error as a failed handshake**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-14)
   - **Local Ref:** `upstream-prs/911` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#711](https://github.com/mixelpixx/Konnect/issues/711)
   - **Summary:** On macOS, a listener that accepts and closes before NNG's negotiation was sometimes reported as `transport_error` ("Socket is not connected (os error 57)") instead of `handshake_failed`, depending on which syscall...
@@ -125,17 +125,17 @@ Tick the checkbox (`- [x]`) once you have reviewed and merged (or intentionally 
   - **Local Ref:** `upstream-prs/910` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#431](https://github.com/mixelpixx/Konnect/issues/431)
   - **Summary:** Add list_zones and delete_zone for copper zones and rule areas. Bind deletion to an observed UUID, source, and board revision. Reuse exact-board IPC targeting and atomic saved-file transactions. Verify deletion...
 
-- [ ] **PR [#909](https://github.com/mixelpixx/Konnect/pull/909): fix(library): let library symbols carry Footprint, Description and custom fields**
+- [x] **PR [#909](https://github.com/mixelpixx/Konnect/pull/909): fix(library): let library symbols carry Footprint, Description and custom fields**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-13)
   - **Local Ref:** `upstream-prs/909` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#892](https://github.com/mixelpixx/Konnect/issues/892), [#907](https://github.com/mixelpixx/Konnect/issues/907), [#908](https://github.com/mixelpixx/Konnect/issues/908)
   - **Summary:** `create_symbol` always wrote an empty Footprint and Description, and it could not write `ki_keywords`, `ki_fp_filters` or custom fields such as MPN or LCSC. No tool could set them on an existing library symbol...
 
-- [ ] **PR [#906](https://github.com/mixelpixx/Konnect/pull/906): fix(library): report what set_footprint_metadata replaced**
+- [x] **PR [#906](https://github.com/mixelpixx/Konnect/pull/906): fix(library): report what set_footprint_metadata replaced**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-13)
   - **Local Ref:** `upstream-prs/906` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#845](https://github.com/mixelpixx/Konnect/issues/845), [#895](https://github.com/mixelpixx/Konnect/issues/895), [#902](https://github.com/mixelpixx/Konnect/issues/902), [#905](https://github.com/mixelpixx/Konnect/issues/905)
   - **Summary:** `set_footprint_metadata`'s `attributes` replaces the whole `(attr …)` block, as documented. The response said only `"changed_fields": ["attributes"]`. So a caller who added `exclude_from_bom` without repeating `smd`...
 
-- [ ] **PR [#901](https://github.com/mixelpixx/Konnect/pull/901): fix(schematic): refuse a routed wire that joins another net**
+- [x] **PR [#901](https://github.com/mixelpixx/Konnect/pull/901): fix(schematic): refuse a routed wire that joins another net**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-13)
   - **Local Ref:** `upstream-prs/901` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#887](https://github.com/mixelpixx/Konnect/issues/887), [#899](https://github.com/mixelpixx/Konnect/issues/899), [#900](https://github.com/mixelpixx/Konnect/issues/900)
   - **Summary:** `connect_pins`, `batch_connect_pins` and `add_schematic_connection` route an L-bend, horizontal leg first. On `main` @ 9488e5f the route silently joined other nets in three ways, and the call still reported success:...
@@ -150,12 +150,12 @@ Tick the checkbox (`- [x]`) once you have reviewed and merged (or intentionally 
   - **Local Ref:** `upstream-prs/872` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#870](https://github.com/mixelpixx/Konnect/issues/870)
   - **Summary:** 1. **Whitespace & Blank IPC Normalization in Configuration Resolution:** - In `resolve_ipc_address_with` (`crates/konnect/src/config.rs`), `self.ipc_address` is now trimmed. - If the configured value in a discovered...
 
-- [ ] **PR [#871](https://github.com/mixelpixx/Konnect/pull/871): fix(schematic): report each placement's mirror from pin-location tools**
+- [x] **PR [#871](https://github.com/mixelpixx/Konnect/pull/871): fix(schematic): report each placement's mirror from pin-location tools**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-11)
   - **Local Ref:** `upstream-prs/871` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#855](https://github.com/mixelpixx/Konnect/issues/855)
   - **Summary:** `get_schematic_pin_locations` and `batch_get_schematic_pin_locations` reported each placement's `rotation` but not its mirror. A mirrored unit and a plain one at the same rotation could be told apart only by which...
 
-- [ ] **PR [#868](https://github.com/mixelpixx/Konnect/pull/868): fix(project): refuse a file that changed mid-rename in rename_project**
+- [x] **PR [#868](https://github.com/mixelpixx/Konnect/pull/868): fix(project): refuse a file that changed mid-rename in rename_project**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-10)
   - **Local Ref:** `upstream-prs/868` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#851](https://github.com/mixelpixx/Konnect/issues/851)
   - **Summary:** `rename_project` read each file it rewrites with `read_to_string` and wrote it back with the unconditional `write_atomic`. If KiCad or another writer saved one of them in between, the rename replaced that save with...
@@ -175,17 +175,17 @@ Tick the checkbox (`- [x]`) once you have reviewed and merged (or intentionally 
   - **Local Ref:** `upstream-prs/865` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#788](https://github.com/mixelpixx/Konnect/issues/788), [#836](https://github.com/mixelpixx/Konnect/issues/836)
   - **Summary:** `update_pcb_from_schematic` updates a footprint by sending it whole through `UpdateItems`, and KiCad replaces the footprint with one built from that message. The message carries none of the groups, points or variants...
 
-- [ ] **PR [#864](https://github.com/mixelpixx/Konnect/pull/864): fix(pcb): mirror inner copper layers when a footprint changes sides**
+- [x] **PR [#864](https://github.com/mixelpixx/Konnect/pull/864): fix(pcb): mirror inner copper layers when a footprint changes sides**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-09)
   - **Local Ref:** `upstream-prs/864` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#775](https://github.com/mixelpixx/Konnect/issues/775), [#831](https://github.com/mixelpixx/Konnect/issues/831), [#863](https://github.com/mixelpixx/Konnect/issues/863)
   - **Summary:** A footprint that changed sides kept its inner copper where it was. KiCad mirrors inner layers through the copper stack, so on 8 layers an `In2.Cu` pad belongs on `In5.Cu` after a flip. Konnect's closed-board...
 
-- [ ] **PR [#862](https://github.com/mixelpixx/Konnect/pull/862): fix(pcb): count a copper zone only on its own net in sync**
+- [x] **PR [#862](https://github.com/mixelpixx/Konnect/pull/862): fix(pcb): count a copper zone only on its own net in sync**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-09)
   - **Local Ref:** `upstream-prs/862` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#451](https://github.com/mixelpixx/Konnect/issues/451), [#474](https://github.com/mixelpixx/Konnect/issues/474), [#779](https://github.com/mixelpixx/Konnect/issues/779), [#780](https://github.com/mixelpixx/Konnect/issues/780), [#861](https://github.com/mixelpixx/Konnect/issues/861)
   - **Summary:** On a board with any zone, `update_pcb_from_schematic` counted every board net as routed. So it refused every pad-net change as `routed_pad_net_change`, even on a net with no track, arc, via or pour. Nearly every real...
 
-- [ ] **PR [#859](https://github.com/mixelpixx/Konnect/pull/859): fix(ipc): name resolved Windows paths without the \\?\ prefix**
+- [x] **PR [#859](https://github.com/mixelpixx/Konnect/pull/859): fix(ipc): name resolved Windows paths without the \\?\ prefix**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-08)
   - **Local Ref:** `upstream-prs/859` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#407](https://github.com/mixelpixx/Konnect/issues/407), [#673](https://github.com/mixelpixx/Konnect/issues/673), [#858](https://github.com/mixelpixx/Konnect/issues/858)
   - **Summary:** On Windows, `canonicalize` returns an extended-length path (`\\?\C:\…`, `\\?\UNC\server\share\…`). Board-identity errors and sibling-lock messages printed that form beside the caller's own spelling of the same...
@@ -200,37 +200,37 @@ Tick the checkbox (`- [x]`) once you have reviewed and merged (or intentionally 
   - **Local Ref:** `upstream-prs/854` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#853](https://github.com/mixelpixx/Konnect/issues/853)
   - **Summary:** `get_net_connections` is documented as returning a net's pins and labels, but it built only the labels (picked by name) and a `connected_points` count. It now answers for the whole net, the way `kicad-cli sch export...
 
-- [ ] **PR [#852](https://github.com/mixelpixx/Konnect/pull/852): fix(pcb): refuse a board file that changed between read and write**
+- [x] **PR [#852](https://github.com/mixelpixx/Konnect/pull/852): fix(pcb): refuse a board file that changed between read and write**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-07)
   - **Local Ref:** `upstream-prs/852` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#845](https://github.com/mixelpixx/Konnect/issues/845), [#851](https://github.com/mixelpixx/Konnect/issues/851)
   - **Summary:** Seven board file fallbacks in `pcb_board.rs` read the board with `std::fs::read_to_string`, spliced in their edit and replaced the file with the unconditional `write_atomic`: `set_board_size`, `add_layer`,...
 
-- [ ] **PR [#850](https://github.com/mixelpixx/Konnect/pull/850): fix(pcb): refuse an unknown layer in board text, logo and zone writers**
+- [x] **PR [#850](https://github.com/mixelpixx/Konnect/pull/850): fix(pcb): refuse an unknown layer in board text, logo and zone writers**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-07)
   - **Local Ref:** `upstream-prs/850` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#237](https://github.com/mixelpixx/Konnect/issues/237), [#844](https://github.com/mixelpixx/Konnect/issues/844), [#849](https://github.com/mixelpixx/Konnect/issues/849)
   - **Summary:** `add_board_text`, `import_svg_logo` and `add_zone`/`add_copper_pour` now refuse a `layer` that has no KiCad board layer as `invalid_argument` with `field: "layer"`. The refusal comes before the IPC attempt and before...
 
-- [ ] **PR [#848](https://github.com/mixelpixx/Konnect/pull/848): fix(routing): refuse per-layer padstacks in Specctra export**
+- [x] **PR [#848](https://github.com/mixelpixx/Konnect/pull/848): fix(routing): refuse per-layer padstacks in Specctra export**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-06)
   - **Local Ref:** `upstream-prs/848` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#842](https://github.com/mixelpixx/Konnect/issues/842)
   - **Summary:** `export_specctra_dsn` wrote a pad's front shape and size on every copper layer, ignoring KiCad 10's per-layer padstack. A through-hole pad in `front_inner_back` or `custom` mode can be a different shape or size on...
 
-- [ ] **PR [#847](https://github.com/mixelpixx/Konnect/pull/847): fix(routing): turn rotated footprints' Specctra pins once**
+- [x] **PR [#847](https://github.com/mixelpixx/Konnect/pull/847): fix(routing): turn rotated footprints' Specctra pins once**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-06)
   - **Local Ref:** `upstream-prs/847` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#670](https://github.com/mixelpixx/Konnect/issues/670), [#840](https://github.com/mixelpixx/Konnect/issues/840), [#841](https://github.com/mixelpixx/Konnect/issues/841), [#842](https://github.com/mixelpixx/Konnect/issues/842)
   - **Summary:** `export_specctra_dsn`'s Rust exporter, the default `disable` path, turned the pads of every rotated footprint twice. In a `.kicad_pcb`, a pad's `(at x y angle)` angle already includes its footprint's rotation. The...
 
-- [ ] **PR [#846](https://github.com/mixelpixx/Konnect/pull/846): fix(pcb): write add_board_text coordinates as KiCad writes them**
+- [x] **PR [#846](https://github.com/mixelpixx/Konnect/pull/846): fix(pcb): write add_board_text coordinates as KiCad writes them**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-06)
   - **Local Ref:** `upstream-prs/846` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#237](https://github.com/mixelpixx/Konnect/issues/237), [#747](https://github.com/mixelpixx/Konnect/issues/747), [#774](https://github.com/mixelpixx/Konnect/issues/774), [#828](https://github.com/mixelpixx/Konnect/issues/828), [#838](https://github.com/mixelpixx/Konnect/issues/838), [#844](https://github.com/mixelpixx/Konnect/issues/844), [#845](https://github.com/mixelpixx/Konnect/issues/845)
   - **Summary:** `add_board_text`'s file fallback wrote the caller's `x`, `y` and `rotation` into the board verbatim, so float noise from an older response (#747) reached the file as `(at 54.60999999999999 27.939999999999998...
 
-- [ ] **PR [#843](https://github.com/mixelpixx/Konnect/pull/843): fix(routing): export rounded-rectangle pads to Specctra**
+- [x] **PR [#843](https://github.com/mixelpixx/Konnect/pull/843): fix(routing): export rounded-rectangle pads to Specctra**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-06)
   - **Local Ref:** `upstream-prs/843` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#1](https://github.com/mixelpixx/Konnect/issues/1), [#670](https://github.com/mixelpixx/Konnect/issues/670), [#790](https://github.com/mixelpixx/Konnect/issues/790), [#840](https://github.com/mixelpixx/Konnect/issues/840), [#841](https://github.com/mixelpixx/Konnect/issues/841), [#842](https://github.com/mixelpixx/Konnect/issues/842)
   - **Summary:** `export_specctra_dsn` refused any board with a `roundrect` pad: `unsupported first routing profile: pad R4-1 has shape 'roundrect'`. Most stock SMD footprints have roundrect pads, so `route_specctra_dsn`,...
 
-- [ ] **PR [#839](https://github.com/mixelpixx/Konnect/pull/839): fix(schematic): write add_schematic_text coordinates as KiCad writes them**
+- [x] **PR [#839](https://github.com/mixelpixx/Konnect/pull/839): fix(schematic): write add_schematic_text coordinates as KiCad writes them**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-06)
   - **Local Ref:** `upstream-prs/839` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#747](https://github.com/mixelpixx/Konnect/issues/747), [#828](https://github.com/mixelpixx/Konnect/issues/828), [#838](https://github.com/mixelpixx/Konnect/issues/838)
   - **Summary:** `add_schematic_text` wrote the caller's `x`, `y` and `rotation` into the file as given. A coordinate an older response reported, such as `54.60999999999999` (#747), reached the file as `(at 54.60999999999999...
@@ -285,7 +285,7 @@ Tick the checkbox (`- [x]`) once you have reviewed and merged (or intentionally 
   - **Local Ref:** `upstream-prs/814` | **Status vs `main`:** Needs rebase/conflict resolution | **Relates to Issues:** [#766](https://github.com/mixelpixx/Konnect/issues/766), [#803](https://github.com/mixelpixx/Konnect/issues/803), [#813](https://github.com/mixelpixx/Konnect/issues/813)
   - **Summary:** `move_labels_by_offset` edited the first `(at ` in each label's raw text. In a label named `(at 1 2)`, that match is inside the quoted name. The tool rewrote the name, left the label where it was, and still reported...
 
-- [ ] **PR [#809](https://github.com/mixelpixx/Konnect/pull/809): fix(routing): copy routing from boards KiCad saved**
+- [x] **PR [#809](https://github.com/mixelpixx/Konnect/pull/809): fix(routing): copy routing from boards KiCad saved**
   - **GitHub Author:** [@pauliuszaleckas](https://github.com/pauliuszaleckas) | **Git Commit Author(s):** `Paulius Zaleckas <paulius.zaleckas@gmail.com>` (1 commit, 2026-10-04)
   - **Local Ref:** `upstream-prs/809` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#766](https://github.com/mixelpixx/Konnect/issues/766), [#767](https://github.com/mixelpixx/Konnect/issues/767), [#802](https://github.com/mixelpixx/Konnect/issues/802)
   - **Summary:** `copy_routing_pattern` copied nothing from a board KiCad had saved. It searched for `"\n (segment "` and `"\n (via "` as text, but KiCad 10 indents with a tab and breaks the line after the head. So every call...
@@ -338,21 +338,21 @@ These open issues already have one or more open PRs above addressing them. Tick 
 
 - [ ] **Issue [#945](https://github.com/mixelpixx/Konnect/issues/945): create_project reports any transaction conflict as "would replace existing path(s)", including a stuck older journal** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-20) → Addressed by **PR #944**
   - `create_project` maps every `SexpError::TransactionConflict` from `commit_file_transaction` to `project_conflict`, whose message says the project "would replace existing...
-- [ ] **Issue [#936](https://github.com/mixelpixx/Konnect/issues/936): connect_passthrough writes its stub with no junction detection** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-19) → Addressed by **PR #937**
+- [x] **Issue [#936](https://github.com/mixelpixx/Konnect/issues/936): connect_passthrough writes its stub with no junction detection** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-19) → Addressed by **PR #937**
   - `connect_passthrough` writes its stub with a raw `format_wire` and never checks for junctions. A stub drawn from a point where wires already meet gets no dot, unlike the same...
-- [ ] **Issue [#935](https://github.com/mixelpixx/Konnect/issues/935): move_schematic_component adds no junction where a pin lands on a wire corner** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-19) → Addressed by **PR #937**
+- [x] **Issue [#935](https://github.com/mixelpixx/Konnect/issues/935): move_schematic_component adds no junction where a pin lands on a wire corner** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-19) → Addressed by **PR #937**
   - Moving a symbol so a pin lands on a corner (two wire ends meeting) adds no junction dot. KiCad counts the pin as a third exit there and draws one. `reconcile_junctions_at`...
 - [ ] **Issue [#924](https://github.com/mixelpixx/Konnect/issues/924): A field KiCad marks private is read as a field named "private", and a whole-file write drops its value** (by [@davidtdab](https://github.com/davidtdab), 2026-10-18) → Addressed by **PR #931**
   - KiCad writes a field it marks private with a bare `private` token before the name: `(property private "NAME" "VALUE" …)`...
 - [ ] **Issue [#922](https://github.com/mixelpixx/Konnect/issues/922): Docs: Muse (Meta) needs eager_toolsets, recommend in troubleshooting** (by [@idorurez](https://github.com/idorurez), 2026-10-18) → Addressed by **PR #923**
   - Muse (Meta) with Konnect over MCP stdio (verified with Konnect v0.11.0, Windows, KiCad 10.0). `load_toolset` reports success, but the newly loaded tools are never callable: the...
-- [ ] **Issue [#916](https://github.com/mixelpixx/Konnect/issues/916): Instance entries under a project that no .kicad_pro defines make a sheet permanently stale** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-15) → Addressed by **PR #917**
+- [x] **Issue [#916](https://github.com/mixelpixx/Konnect/issues/916): Instance entries under a project that no .kicad_pro defines make a sheet permanently stale** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-15) → Addressed by **PR #917**
   - `validate_sheet_instance_state` treats every `(project, path)` instance a symbol records as part of its identity. An entry under any project name other than the owning...
-- [ ] **Issue [#915](https://github.com/mixelpixx/Konnect/issues/915): edit_sheet new_file repoints a sheet without relinking either file's symbol instances (stale_target)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-15) → Addressed by **PR #917**
+- [x] **Issue [#915](https://github.com/mixelpixx/Konnect/issues/915): edit_sheet new_file repoints a sheet without relinking either file's symbol instances (stale_target)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-15) → Addressed by **PR #917**
   - `edit_sheet` with `new_file` repoints a sheet's `Sheetfile`, but leaves the symbol instance paths in both files as they were. The old file keeps a path for a sheet that no...
-- [ ] **Issue [#914](https://github.com/mixelpixx/Konnect/issues/914): Re-adding a sheet that contains sheets leaves the nested files keyed to the old sheet (stale_target)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-15) → Addressed by **PR #917**
+- [x] **Issue [#914](https://github.com/mixelpixx/Konnect/issues/914): Re-adding a sheet that contains sheets leaves the nested files keyed to the old sheet (stale_target)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-15) → Addressed by **PR #917**
   - When a sheet that contains sheets is deleted and added back, only the files placed directly under the parent are relinked. Every file further down keeps paths under the old...
-- [ ] **Issue [#913](https://github.com/mixelpixx/Konnect/issues/913): Placement refuses KiCad 10 projects whose .kicad_pro top_level_sheets UUID differs from the root schematic's (uuid): stale_target on paths KiCad wrote** (by [@triglav-modular](https://github.com/triglav-modular), 2026-10-15) → Addressed by **PR #917**
+- [x] **Issue [#913](https://github.com/mixelpixx/Konnect/issues/913): Placement refuses KiCad 10 projects whose .kicad_pro top_level_sheets UUID differs from the root schematic's (uuid): stale_target on paths KiCad wrote** (by [@triglav-modular](https://github.com/triglav-modular), 2026-10-15) → Addressed by **PR #917**
   - KiCad 10 can keep the root sheet's UUID in the project file, at `schematic.top_level_sheets[].uuid`. When that value is not nil, KiCad keys every symbol instance path to it...
 - [ ] **Issue [#908](https://github.com/mixelpixx/Konnect/issues/908): create_symbol appends a duplicate symbol name and overwrites intervening saves** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-13) → Addressed by **PR #909**
   - `create_symbol` appends a symbol whose name the library already defines, and reports success. The library then holds two top-level `(symbol "NAME" ...)` entries. KiCad's resave...
@@ -362,61 +362,61 @@ These open issues already have one or more open PRs above addressing them. Tick 
   - `set_footprint_metadata`, `set_footprint_graphics` and `set_footprint_models` map every `SexpError::Conflict` from `write_atomic_if_unchanged` to a `conflict` refusal that says...
 - [ ] **Issue [#902](https://github.com/mixelpixx/Konnect/issues/902): set_footprint_metadata cannot write allow_soldermask_bridges, so any attributes edit strips it from stock footprints** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-13) → Addressed by **PR #906**
   - `set_footprint_metadata`'s `attributes` enum has no `allow_soldermask_bridges`, which KiCad writes into `(attr …)` and which 220 stock KiCad 10.0.6 footprints carry (189 with...
-- [ ] **Issue [#900](https://github.com/mixelpixx/Konnect/issues/900): add_wire, batch_add_wire and connect_to_net stubs dot every junction-less T on the sheet, joining nets far from the new wire** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-13) → Addressed by **PR #901**
+- [x] **Issue [#900](https://github.com/mixelpixx/Konnect/issues/900): add_wire, batch_add_wire and connect_to_net stubs dot every junction-less T on the sheet, joining nets far from the new wire** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-13) → Addressed by **PR #901**
   - `add_wire`, `batch_add_wire` and the `connect_to_net` stub dot **every** junction-less T on the sheet, not only the T's the new wire forms. KiCad does not join a wire end that...
-- [ ] **Issue [#899](https://github.com/mixelpixx/Konnect/issues/899): connect_to_net / batch_connect_to_net stubs join any pin they reach, with no warning** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-13) → Addressed by **PR #901**
+- [x] **Issue [#899](https://github.com/mixelpixx/Konnect/issues/899): connect_to_net / batch_connect_to_net stubs join any pin they reach, with no warning** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-13) → Addressed by **PR #901**
   - `connect_to_net` and `batch_connect_to_net` (with `stub_length` > 0) draw a stub wire from the pin and put the net label at its far end. When that end, or the stub's span,...
-- [ ] **Issue [#897](https://github.com/mixelpixx/Konnect/issues/897): Wire tools write no junction where three or more wire ends meet** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-13) → Addressed by **PR #937**
+- [x] **Issue [#897](https://github.com/mixelpixx/Konnect/issues/897): Wire tools write no junction where three or more wire ends meet** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-13) → Addressed by **PR #937**
   - The wire tools add a junction dot only where a wire end lands **mid-span** on another wire. When three or more wire ends meet at one point (a T built from separate segments),...
-- [ ] **Issue [#896](https://github.com/mixelpixx/Konnect/issues/896): move_region: rigid block move of wires, labels and power symbols with the symbols** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-12) → Addressed by **PR #934**
+- [x] **Issue [#896](https://github.com/mixelpixx/Konnect/issues/896): move_region: rigid block move of wires, labels and power symbols with the symbols** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-12) → Addressed by **PR #934**
   - Request: a **rigid** block move. Translate everything inside a box together: symbols, wires and buses, junctions, labels, no-connects and power symbols. Refuse the move when...
-- [ ] **Issue [#895](https://github.com/mixelpixx/Konnect/issues/895): set_footprint_metadata replaces attributes without reporting what was dropped** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-12) → Addressed by **PR #906**
+- [x] **Issue [#895](https://github.com/mixelpixx/Konnect/issues/895): set_footprint_metadata replaces attributes without reporting what was dropped** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-12) → Addressed by **PR #906**
   - `set_footprint_metadata` replaces the whole `(attr …)` block, as documented. The response only says `"changed_fields": ["attributes"]`, so a caller who adds `exclude_from_bom`...
-- [ ] **Issue [#892](https://github.com/mixelpixx/Konnect/issues/892): create_symbol cannot set Footprint, Description, keywords, fp_filters or custom fields, and no tool sets them later** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-12) → Addressed by **PR #909**
+- [x] **Issue [#892](https://github.com/mixelpixx/Konnect/issues/892): create_symbol cannot set Footprint, Description, keywords, fp_filters or custom fields, and no tool sets them later** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-12) → Addressed by **PR #909**
   - `create_symbol` accepts `value`, `datasheet` and `reference_prefix`, but always writes an empty `Footprint` and `Description`. It cannot write `ki_keywords`, `ki_fp_filters` or...
 - [ ] **Issue [#891](https://github.com/mixelpixx/Konnect/issues/891): No way to edit a library symbol's pins in place (edit_symbol_pin)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-12) → Addressed by **PR #948**
   - No tool changes one pin of an existing library symbol. Renaming one CH347F pin (8: `SRST` → `~ACT/SRST`) meant `delete_symbol`, re-entering all 29 pins in `create_symbol`, then...
-- [ ] **Issue [#887](https://github.com/mixelpixx/Konnect/issues/887): connect_pins / batch_connect_pins join any pin their L-route passes over, shorting nets with no warning** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-12) → Addressed by **PR #901**
+- [x] **Issue [#887](https://github.com/mixelpixx/Konnect/issues/887): connect_pins / batch_connect_pins join any pin their L-route passes over, shorting nets with no warning** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-12) → Addressed by **PR #901**
   - `connect_pins` and `batch_connect_pins` route a blind H-then-V L-bend between the two pins. When a leg passes over a third pin's tip, the router *adds a junction there*, so...
 - [ ] **Issue [#870](https://github.com/mixelpixx/Konnect/issues/870): Codex MCP cannot connect to KiCad when plugin IPC Socket is blank** (by [@Louber1](https://github.com/Louber1), 2026-10-11) → Addressed by **PR #872**
   - Konnect responds to MCP calls in Codex, but cannot access the open KiCad PCB Editor. `open_project({})` reports that its IPC socket path is not configured. 1. Open a board in...
 - [ ] **Issue [#869](https://github.com/mixelpixx/Konnect/issues/869): macOS: Start/Stop Server brings the KiCad project manager to the front** (by [@Louber1](https://github.com/Louber1), 2026-10-11) → Addressed by **PR #873**
   - With a board open in KiCad’s PCB Editor, clicking **Start Server** or **Stop Server** in Konnect’s settings brings the KiCad project manager to the front. The window moves away...
-- [ ] **Issue [#863](https://github.com/mixelpixx/Konnect/issues/863): update_footprints_from_library sends front-side pads on an inner layer the board lacks** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-09) → Addressed by **PR #864**
+- [x] **Issue [#863](https://github.com/mixelpixx/Konnect/issues/863): update_footprints_from_library sends front-side pads on an inner layer the board lacks** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-09) → Addressed by **PR #864**
   - `update_footprints_from_library` checks inner copper against the board's stack only when it mirrors a back-side footprint. A front-side refresh copies the library's pad and...
-- [ ] **Issue [#861](https://github.com/mixelpixx/Konnect/issues/861): update_footprints_from_library: any zone marks every board net as routed (same rule as #779)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-09) → Addressed by **PR #862**
+- [x] **Issue [#861](https://github.com/mixelpixx/Konnect/issues/861): update_footprints_from_library: any zone marks every board net as routed (same rule as #779)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-09) → Addressed by **PR #862**
   - `update_footprints_from_library` builds its set of routed nets with `snapshot_routed_nets` (`crates/konnect-core/src/tools/pcb_footprint_update.rs:332`, `main` @ 9488e5f). If...
-- [ ] **Issue [#858](https://github.com/mixelpixx/Konnect/issues/858): Windows: transaction journal and update_pcb_from_schematic errors print \\?\ verbatim paths** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-08) → Addressed by **PR #859**
+- [x] **Issue [#858](https://github.com/mixelpixx/Konnect/issues/858): Windows: transaction journal and update_pcb_from_schematic errors print \\?\ verbatim paths** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-08) → Addressed by **PR #859**
   - **Not reproduced.** I'm on Fedora Linux, where `canonicalize` returns a plain path. This comes from reading the code, with the same cause #673 confirmed on Windows 11. Print...
 - [ ] **Issue [#856](https://github.com/mixelpixx/Konnect/issues/856): Join nearby pins on one rail and place a single power symbol (batch_add_power_symbol)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-07) → Addressed by **PR #857**
   - Konnect gives every pin its own power symbol, so a sheet ends up with a row of separate GND arrows where a person would join the pins and draw one. There is no tool that ties a...
-- [ ] **Issue [#855](https://github.com/mixelpixx/Konnect/issues/855): Pin-location tools don't report whether a symbol is mirrored** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-07) → Addressed by **PR #871**
+- [x] **Issue [#855](https://github.com/mixelpixx/Konnect/issues/855): Pin-location tools don't report whether a symbol is mirrored** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-07) → Addressed by **PR #871**
   - `get_schematic_pin_locations` and `batch_get_schematic_pin_locations` report a placement's `rotation`, but not whether it is mirrored. A mirrored symbol and an unmirrored one...
 - [ ] **Issue [#853](https://github.com/mixelpixx/Konnect/issues/853): get_net_connections says it returns a net's pins, but reports only labels** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-07) → Addressed by **PR #854**
   - `get_net_connections` is described as "Get all pins and labels connected to a named net", but its response has no pins. It returns the net's labels and a `connected_points`...
-- [ ] **Issue [#851](https://github.com/mixelpixx/Konnect/issues/851): rename_project rewrites schematic and board files without a revision check (write_atomic, not write_atomic_if_unchanged)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-07) → Addressed by **PR #868**, **PR #852**
+- [x] **Issue [#851](https://github.com/mixelpixx/Konnect/issues/851): rename_project rewrites schematic and board files without a revision check (write_atomic, not write_atomic_if_unchanged)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-07) → Addressed by **PR #868**, **PR #852**
   - `rename_project` rewrites `(project "NAME"` in the renamed `.kicad_sch` and `.kicad_pcb` files and in every child sheet. For each one it reads with `std::fs::read_to_string`...
-- [ ] **Issue [#849](https://github.com/mixelpixx/Konnect/issues/849): Board file fallbacks write a layer alias (F.Silkscreen) that KiCad 10 refuses to load** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-07) → Addressed by **PR #850**
+- [x] **Issue [#849](https://github.com/mixelpixx/Konnect/issues/849): Board file fallbacks write a layer alias (F.Silkscreen) that KiCad 10 refuses to load** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-07) → Addressed by **PR #850**
   - `builders::layer_from_name` accepts KiCad's long display names as aliases (`F.Silkscreen`, `F.Courtyard`, `F.Adhesive`, `User.Drawings`, `User.Comments`, `User.Eco1`, …). Over...
-- [ ] **Issue [#845](https://github.com/mixelpixx/Konnect/issues/845): Board file fallbacks overwrite a board that changed between their read and write (write_atomic, not write_atomic_if_unchanged)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-06) → Addressed by **PR #906**, **PR #852**, **PR #846**
+- [x] **Issue [#845](https://github.com/mixelpixx/Konnect/issues/845): Board file fallbacks overwrite a board that changed between their read and write (write_atomic, not write_atomic_if_unchanged)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-06) → Addressed by **PR #906**, **PR #852**, **PR #846**
   - The file fallbacks of seven board writers in `crates/konnect-core/src/tools/pcb_board.rs` read the board with `std::fs::read_to_string`, splice in their edit, and write it back...
-- [ ] **Issue [#844](https://github.com/mixelpixx/Konnect/issues/844): add_board_text, import_svg_logo and add_zone send an unknown layer to KiCad as BL_UNDEFINED** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-06) → Addressed by **PR #850**, **PR #846**
+- [x] **Issue [#844](https://github.com/mixelpixx/Konnect/issues/844): add_board_text, import_svg_logo and add_zone send an unknown layer to KiCad as BL_UNDEFINED** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-06) → Addressed by **PR #850**, **PR #846**
   - Three live-board writers put a caller-supplied `layer` into an IPC message through the infallible `builders::layer_from_name`, so an unknown name (a typo such as `F.Silk`) is...
-- [ ] **Issue [#842](https://github.com/mixelpixx/Konnect/issues/842): export_specctra_dsn writes a pad's front shape on every layer, ignoring KiCad 10 per-layer padstacks (front_inner_back / custom)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-06) → Addressed by **PR #848**, **PR #847**, **PR #843**
+- [x] **Issue [#842](https://github.com/mixelpixx/Konnect/issues/842): export_specctra_dsn writes a pad's front shape on every layer, ignoring KiCad 10 per-layer padstacks (front_inner_back / custom)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-06) → Addressed by **PR #848**, **PR #847**, **PR #843**
   - `export_specctra_dsn`'s Rust exporter ignores a pad's KiCad 10 per-layer padstack. A through-hole pad in `front_inner_back` or `custom` mode can have a different shape, size,...
 - [ ] **Issue [#841](https://github.com/mixelpixx/Konnect/issues/841): Native Specctra adoption refuses KiCad's DSN for stock footprints: courtyard (outline (polygon)) and half-um pad positions** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-06) → Addressed by **PR #847**, **PR #843**
   - `adopt_native_dsn`, which `native_bridge_mode: "prefer"` / `"require"` uses, refuses KiCad's own DSN for a board built from ordinary stock footprints, for two reasons unrelated...
-- [ ] **Issue [#840](https://github.com/mixelpixx/Konnect/issues/840): export_specctra_dsn turns rotated footprints' pads twice: the pad's absolute angle is written as the pin's relative (rotate)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-06) → Addressed by **PR #847**, **PR #843**
+- [x] **Issue [#840](https://github.com/mixelpixx/Konnect/issues/840): export_specctra_dsn turns rotated footprints' pads twice: the pad's absolute angle is written as the pin's relative (rotate)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-06) → Addressed by **PR #847**, **PR #843**
   - `export_specctra_dsn`'s Rust exporter writes the pads of every rotated footprint turned twice. In a `.kicad_pcb`, a pad's `(at x y angle)` angle is absolute: it already...
-- [ ] **Issue [#838](https://github.com/mixelpixx/Konnect/issues/838): add_board_text writes a caller's float noise into the board file (54.60999999999999)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-06) → Addressed by **PR #846**, **PR #839**
+- [x] **Issue [#838](https://github.com/mixelpixx/Konnect/issues/838): add_board_text writes a caller's float noise into the board file (54.60999999999999)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-06) → Addressed by **PR #846**, **PR #839**
   - `add_board_text`'s file fallback writes the caller's `x`/`y` into the board with plain `{}` Display, so float noise reaches the file: KiCad 10.0.6 resaves the same file as `(at...
 - [ ] **Issue [#836](https://github.com/mixelpixx/Konnect/issues/836): update_pcb_from_schematic: updating a footprint drops its groups, points and variants** (by [@mixelpixx](https://github.com/mixelpixx), 2026-10-05) → Addressed by **PR #865**
   - Found by @davidtdab while building #824 for #788, from KiCad 10.0.6's source. Not yet reproduced live. `update_pcb_from_schematic` updates an existing footprint by sending it...
 - [ ] **Issue [#834](https://github.com/mixelpixx/Konnect/issues/834): Freerouting launches show Dock icons on macOS: java started without -Djava.awt.headless=true** (by [@triglav-modular](https://github.com/triglav-modular), 2026-10-05) → Addressed by **PR #927**
   - On macOS, every Java process Konnect starts for Freerouting registers with the window server as a foreground app and shows a "Freerouting" icon in the Dock while it runs,...
-- [ ] **Issue [#831](https://github.com/mixelpixx/Konnect/issues/831): fix(pcb): flip_component and back-side library refresh don't mirror inner copper layers (In2↔In5 on 8 layers)** (by [@Reid-n0rc](https://github.com/Reid-n0rc), 2026-10-05) → Addressed by **PR #864**
+- [x] **Issue [#831](https://github.com/mixelpixx/Konnect/issues/831): fix(pcb): flip_component and back-side library refresh don't mirror inner copper layers (In2↔In5 on 8 layers)** (by [@Reid-n0rc](https://github.com/Reid-n0rc), 2026-10-05) → Addressed by **PR #864**
   - When a footprint changes sides, Konnect leaves inner copper layers unchanged. KiCad mirrors them through the copper stack: on an N-copper-layer board, `In(k).Cu` ↔...
-- [ ] **Issue [#828](https://github.com/mixelpixx/Konnect/issues/828): add_schematic_text writes a caller's float noise into the file (54.60999999999999)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-05) → Addressed by **PR #846**, **PR #839**, **PR #830**
+- [x] **Issue [#828](https://github.com/mixelpixx/Konnect/issues/828): add_schematic_text writes a caller's float noise into the file (54.60999999999999)** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-05) → Addressed by **PR #846**, **PR #839**, **PR #830**
   - `add_schematic_text` writes the caller's `x`/`y` into the file with plain `{}` Display. A coordinate carrying float noise is written as is: KiCad writes `54.61 27.94`. The...
 - [ ] **Issue [#813](https://github.com/mixelpixx/Konnect/issues/813): rotate_schematic_label and bulk_move_schematic_components rewrite a name or field value containing (at** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-04) → Addressed by **PR #814**
   - Two more tools find an `(at …)` by searching the item's raw text, the way `move_labels_by_offset` did in #803. When a name or field value contains `(at `, the search matches...
@@ -424,11 +424,11 @@ These open issues already have one or more open PRs above addressing them. Tick 
   - I found this while doing the measurement I promised on #791 (KiCad 10.0.5, Windows 11, a scratch copy of the KiCad-written placement fixture project). The fix for #791 makes...
 - [ ] **Issue [#803](https://github.com/mixelpixx/Konnect/issues/803): move_labels_by_offset rewrites a label name containing (at and leaves a global label's Intersheetrefs behind** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-03) → Addressed by **PR #814**, **PR #807**
   - `move_labels_by_offset` edits each label by searching its text for `(at `. Two things go wrong: - When a label's own name contains `(at `, the search matches inside the name....
-- [ ] **Issue [#802](https://github.com/mixelpixx/Konnect/issues/802): copy_routing_pattern finds no tracks on a KiCad-saved board** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-03) → Addressed by **PR #809**, **PR #807**
+- [x] **Issue [#802](https://github.com/mixelpixx/Konnect/issues/802): copy_routing_pattern finds no tracks on a KiCad-saved board** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-03) → Addressed by **PR #809**, **PR #807**
   - `copy_routing_pattern` finds no tracks on a board KiCad saved. It reports `{"copied": 0, "note": "No routing elements found in the specified source region"}` whether or not the...
 - [ ] **Issue [#800](https://github.com/mixelpixx/Konnect/issues/800): Net-query tools report labels (and get_net_connectivity's wires) with no uuid** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-10-03) → Addressed by **PR #801**
   - `get_net_connections`, `get_net_connectivity`, `get_connected_items` and `trace_from_point` report labels with no `uuid`, and `get_net_connectivity` also reports its wires with...
-- [ ] **Issue [#790](https://github.com/mixelpixx/Konnect/issues/790): export_specctra_dsn refuses roundrect pads (51% of stock footprints) in every native_bridge_mode** (by [@mixelpixx](https://github.com/mixelpixx), 2026-10-03) → Addressed by **PR #843**
+- [x] **Issue [#790](https://github.com/mixelpixx/Konnect/issues/790): export_specctra_dsn refuses roundrect pads (51% of stock footprints) in every native_bridge_mode** (by [@mixelpixx](https://github.com/mixelpixx), 2026-10-03) → Addressed by **PR #843**
   - Found during an end-to-end build of an STM32F411 minimal system (Konnect v0.13.0 `dfecfa8`, KiCad 10.0.6, Windows 11). Re-verified against `main` @ `bf7bfd6`....
 - [ ] **Issue [#789](https://github.com/mixelpixx/Konnect/issues/789): update_pcb_from_schematic places footprints without library attributes, 3D models, description/tags, or Value on Fab** (by [@mixelpixx](https://github.com/mixelpixx), 2026-10-03) → Addressed by **PR #921**, **PR #820**
   - Found during an end-to-end build of an STM32F411 minimal system (Konnect v0.13.0 `dfecfa8`, KiCad 10.0.6, Windows 11). Re-verified against `main` @ `bf7bfd6`....
@@ -444,7 +444,7 @@ These open issues already have one or more open PRs above addressing them. Tick 
   - `connect_to_net`, `connect_pins` and their batch forms resolve `reference` + `pin_number` by taking the first placed symbol that has the pin. When two placed symbols share a...
 - [ ] **Issue [#780](https://github.com/mixelpixx/Konnect/issues/780): update_pcb_from_schematic preflight fails over live IPC: GetOpenDocuments is AS_UNHANDLED (KiCad 10.0.6, macOS, Konnect 0.12.1)** (by [@QiKe-007](https://github.com/QiKe-007), 2026-10-03) → Addressed by **PR #862**
   - Calling `update_pcb_from_schematic` (dry run) on a saved project whose board is open in the PCB Editor fails in the live-board preflight with `KiCad IPC error: no handler...
-- [ ] **Issue [#779](https://github.com/mixelpixx/Konnect/issues/779): update_pcb_from_schematic: any copper zone marks every board net as routed, so no pad-net change can be applied** (by [@saspol](https://github.com/saspol), 2026-10-03) → Addressed by **PR #862**
+- [x] **Issue [#779](https://github.com/mixelpixx/Konnect/issues/779): update_pcb_from_schematic: any copper zone marks every board net as routed, so no pad-net change can be applied** (by [@saspol](https://github.com/saspol), 2026-10-03) → Addressed by **PR #862**
   - On a board with at least one copper zone, `update_pcb_from_schematic` reports every pad-net change as `routed_pad_net_change` and refuses to apply it, even when neither the old...
 - [ ] **Issue [#777](https://github.com/mixelpixx/Konnect/issues/777): Expose differential-pair settings in netclass create and readback** (by [@neusse](https://github.com/neusse), 2026-10-03) → Addressed by **PR #866**
   - Let `create_netclass` set KiCad's native differential-pair width, trace gap, and via gap, and make `get_netclasses` report their resolved/inherited values under the same...
@@ -466,15 +466,15 @@ These open issues already have one or more open PRs above addressing them. Tick 
   - `check_schematic_overlaps` reports a power symbol attached at a pin tip as a `component_overlap`. Attaching a power symbol directly to a pin end is the normal way to connect a...
 - [ ] **Issue [#727](https://github.com/mixelpixx/Konnect/issues/727): add_power_symbol takes only coordinates; accept reference + pin_number like connect_to_net** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-09-29) → Addressed by **PR #782**
   - `add_power_symbol` accepts only coordinates. To put a GND or +3V3 symbol on a pin, the caller must first look up the pin's endpoint, copy it over, and pick a rotation by hand....
-- [ ] **Issue [#714](https://github.com/mixelpixx/Konnect/issues/714): Set the title block on schematic sheets and the board (title, date, revision, company, comments 1–9)** (by [@Reid-n0rc](https://github.com/Reid-n0rc), 2026-09-28) → Addressed by **PR #944**, **PR #943**
+- [x] **Issue [#714](https://github.com/mixelpixx/Konnect/issues/714): Set the title block on schematic sheets and the board (title, date, revision, company, comments 1–9)** (by [@Reid-n0rc](https://github.com/Reid-n0rc), 2026-09-28) → Addressed by **PR #944**, **PR #943**
   - Konnect can read a board's title block (`get_board_info` returns title, date, revision and company), but no tool can **write** a title block, on a schematic sheet or on the...
-- [ ] **Issue [#711](https://github.com/mixelpixx/Konnect/issues/711): macOS: a listener that closes mid-negotiation is reported as transport_error (ENOTCONN), flaking unreachable_reasons** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-09-28) → Addressed by **PR #911**
+- [x] **Issue [#711](https://github.com/mixelpixx/Konnect/issues/711): macOS: a listener that closes mid-negotiation is reported as transport_error (ENOTCONN), flaking unreachable_reasons** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-09-28) → Addressed by **PR #911**
   - `unix::a_listener_that_closes_without_negotiating_reports_a_failed_handshake` (`crates/konnect-ipc/tests/unreachable_reasons.rs`) failed on macOS CI for #677's head `7e8c354`,...
 - [ ] **Issue [#692](https://github.com/mixelpixx/Konnect/issues/692): Symbol serialization diverges from eeschema: bare (fields_autoplaced), and body_style/in_pos_files relocated to the end of the block** (by [@Finic8](https://github.com/Finic8), 2026-09-25) → Addressed by **PR #694**, **PR #693**
   - `Symbol::to_sexp` diverges from eeschema's own symbol serialization in two independent ways. Neither loses data; both rewrite every symbol instance in the file on any...
 - [ ] **Issue [#691](https://github.com/mixelpixx/Konnect/issues/691): Schematic writes drop (exclude_from_sim no) from every (text …) node — Text has no unmodelled-child preservation** (by [@Finic8](https://github.com/Finic8), 2026-09-25) → Addressed by **PR #693**
   - `Text` is the only schematic node type with **no unmodelled-child preservation**. `Text::from_sexp` parses exactly four things — the string, `at`, `uuid`, `effects` — and...
-- [ ] **Issue [#673](https://github.com/mixelpixx/Konnect/issues/673): Windows: board-identity errors print KiCad's open boards as \\?\ verbatim paths beside a raw requested path** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-09-20) → Addressed by **PR #859**, **PR #817**
+- [x] **Issue [#673](https://github.com/mixelpixx/Konnect/issues/673): Windows: board-identity errors print KiCad's open boards as \\?\ verbatim paths beside a raw requested path** (by [@pauliuszaleckas](https://github.com/pauliuszaleckas), 2026-09-20) → Addressed by **PR #859**, **PR #817**
   - On Windows, the board-identity errors print KiCad's open boards as extended-length ("verbatim") paths while printing the requested board as the caller typed it, so one message...
 - [ ] **Issue [#670](https://github.com/mixelpixx/Konnect/issues/670): bug(routing): export_specctra_dsn checks the Rust profile before the native bridge, so native_bridge_mode=require cannot reach KiCad's own exporter** (by [@ncolomer](https://github.com/ncolomer), 2026-09-20) → Addressed by **PR #847**, **PR #843**
   - `export_specctra_dsn` runs its "first supported routing profile" check before it ever reaches the KiCad-native export path, so `native_bridge_mode: "require"` returns the...
@@ -482,9 +482,9 @@ These open issues already have one or more open PRs above addressing them. Tick 
   - Konnect vendors a snapshot of KiCad's protobuf API, but the repository does not record enough machine-readable provenance or regularly compare that snapshot with the current...
 - [ ] **Issue [#515](https://github.com/mixelpixx/Konnect/issues/515): add_hierarchical_sheet gives a nested sheet the same page number as its parent** (by [@triglav-modular](https://github.com/triglav-modular), 2026-09-10) → Addressed by **PR #917**
   - `add_hierarchical_sheet` assigns the new sheet a page number without checking whether that number is already in use, so a sheet nested under another gets the same page as its...
-- [ ] **Issue [#478](https://github.com/mixelpixx/Konnect/issues/478): add_hierarchical_sheet appends an instance path on every re-add and never prunes paths naming deleted sheets** (by [@triglav-modular](https://github.com/triglav-modular), 2026-09-07) → Addressed by **PR #917**
+- [x] **Issue [#478](https://github.com/mixelpixx/Konnect/issues/478): add_hierarchical_sheet appends an instance path on every re-add and never prunes paths naming deleted sheets** (by [@triglav-modular](https://github.com/triglav-modular), 2026-09-07) → Addressed by **PR #917**
   - `add_hierarchical_sheet` **appends** an instance path to every symbol in a reused child file, and never removes the paths that name sheets which no longer exist. Delete a sheet...
-- [ ] **Issue [#465](https://github.com/mixelpixx/Konnect/issues/465): export_svg documents 'empty = all visible layers' but fails when layers is omitted** (by [@mixelpixx](https://github.com/mixelpixx), 2026-09-07) → Addressed by **PR #919**
+- [x] **Issue [#465](https://github.com/mixelpixx/Konnect/issues/465): export_svg documents 'empty = all visible layers' but fails when layers is omitted** (by [@mixelpixx](https://github.com/mixelpixx), 2026-09-07) → Addressed by **PR #919**
   - Found in Chris's end-to-end run on Konnect v0.11.0 / KiCad 10.0 / Windows 11 / Claude Desktop (QuadNode PCIe accelerator card). Verified against current main unless noted....
 - [ ] **Issue [#451](https://github.com/mixelpixx/Konnect/issues/451): update_pcb_from_schematic: routed_pad_net_change cannot be acknowledged, so a net split on a routed board can never be applied** (by [@triglav-modular](https://github.com/triglav-modular), 2026-09-07) → Addressed by **PR #862**
   - `update_pcb_from_schematic` returns `status: "conflict"` with `routed_pad_net_change` whenever a pad's net changes and either the old or the new net carries routed copper — and...
@@ -622,7 +622,7 @@ Open upstream issues that do not currently have an open PR linked.
 - [ ] **Issue [#611](https://github.com/mixelpixx/Konnect/issues/611): improve docs and quickstart** `[documentation, P2, status:ready-for-work]` (by [@ammmir](https://github.com/ammmir), 2026-09-17)
   - the README is a wall of text that could be improved significantly for human users. I installed, the plugin into KiCad, started the server, now what? I would suggest laying the...
 - [ ] **Issue [#598](https://github.com/mixelpixx/Konnect/issues/598): enhancement(discovery): no way to search the full tool catalogue by capability across unloaded toolsets** `[enhancement, P1, area:platform, status:design-needed]` (by [@Reid-n0rc](https://github.com/Reid-n0rc), 2026-09-16)
-  - Konnect has no way to search its full tool catalogue by capability/keyword. `list_toolboxes` returns one sentence per toolset (20 toolsets covering 226 tools), and a tool's...
+  - Konnect has no way to search its full tool catalogue by capability/keyword. `list_toolboxes` returns one sentence per toolset (20 tool-groups covering 226 MCP-tools), and a tool's...
 - [ ] **Issue [#590](https://github.com/mixelpixx/Konnect/issues/590): Architectural direction: native KiCad operations, complete design preservation, and compatibility retirement** `[status:design-needed, tracker]` (by [@neusse](https://github.com/neusse), 2026-09-15)
   - Use this public tracker to coordinate Konnect's architectural direction: prefer supported native KiCad operations, preserve complete design information, centralize shared...
 - [ ] **Issue [#589](https://github.com/mixelpixx/Konnect/issues/589): feat(platform): report actionable KiCad CLI and IPC prerequisite health at MCP startup** `[enhancement, P1, area:platform, status:design-needed]` (by [@neusse](https://github.com/neusse), 2026-09-15)
@@ -676,7 +676,7 @@ Open upstream issues that do not currently have an open PR linked.
 - [ ] **Issue [#456](https://github.com/mixelpixx/Konnect/issues/456): No tool sets a pad net on a board, and none renames a placed footprint in situ** `[enhancement, P2, area:pcb, status:design-needed, architecture:reviewed]` (by [@triglav-modular](https://github.com/triglav-modular), 2026-09-07)
   - Two board-editing primitives are missing, and they are the two that a caller reaches for the moment `update_pcb_from_schematic` refuses: 1. **Nothing sets a pad's net on a...
 - [ ] **Issue [#455](https://github.com/mixelpixx/Konnect/issues/455): No tool sets or clears a footprint lock, though both placement planners now honour it** `[enhancement, P2, area:pcb, status:ready-for-work]` (by [@triglav-modular](https://github.com/triglav-modular), 2026-09-07)
-  - Nothing in the server sets or clears a footprint's `(locked)` flag on a board. Checked against all 223 tools on v0.11.0: no tool is lock-shaped, and `edit_component` takes only...
+  - Nothing in the server sets or clears a footprint's `(locked)` flag on a board. Checked against all 223 MCP-tools on v0.11.0: no tool is lock-shaped, and `edit_component` takes only...
 - [ ] **Issue [#449](https://github.com/mixelpixx/Konnect/issues/449): Konnect Freerouting round trip is limited to two copper layers** `[enhancement, P1, area:routing, status:design-needed, architecture:reviewed]` (by [@mayjack0312](https://github.com/mayjack0312), 2026-09-07)
   - The current Konnect routing configuration does not support this 4-layer PCB. Both `native_bridge_mode="prefer"` and `"require"` return the same error: - unsupported first...
 - [ ] **Issue [#438](https://github.com/mixelpixx/Konnect/issues/438): List Konnect on a KiCad PCM-compatible repository (e.g. Bouni's community repo) instead of manual zip install** `[enhancement, P2, area:platform, needs:maintainer-decision, status:design-needed]` (by [@ncolomer](https://github.com/ncolomer), 2026-09-05)
