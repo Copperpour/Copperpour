@@ -44,6 +44,7 @@ mod route_obstacle_tests;
 pub mod sch_analysis;
 pub(crate) mod sch_annotate;
 pub mod sch_batch;
+mod sch_block_move;
 pub mod sch_bus;
 pub mod sch_components;
 pub(crate) mod sch_connectivity;
