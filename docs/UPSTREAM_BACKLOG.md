@@ -75,17 +75,17 @@ Tick the checkbox (`- [x]`) once you have reviewed and merged (or intentionally 
   - **Local Ref:** `upstream-prs/931` | **Status vs `main`:** Clean merge | **Relates to Issues:** [#924](https://github.com/mixelpixx/Konnect/issues/924)
   - **Summary:** Fixes #924. KiCad writes a private field as `(property private "NAME" "VALUE" ...)`, but Konnect read `private` as the name and dropped the value, so readers reported `"private": "NAME"` and writes emitted `(property...
 
-- [ ] **PR [#930](https://github.com/mixelpixx/Konnect/pull/930): build(deps): bump the minor-and-patch group across 1 directory with 7 updates**
+- [x] **PR [#930](https://github.com/mixelpixx/Konnect/pull/930): build(deps): bump the minor-and-patch group across 1 directory with 7 updates**
   - **GitHub Author:** [@dependabot[bot]](https://github.com/dependabot[bot]) | **Git Commit Author(s):** `dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>` (1 commit, 2026-10-19)
   - **Local Ref:** `upstream-prs/930` | **Status vs `main`:** Clean merge | **Relates to Issues:** None
   - **Summary:** Bumps the minor-and-patch group with 7 updates in the / directory: Updates `serde_json` from 1.0.151 to 1.0.154 <br /> Updates `jsonschema` from 0.58.2 to 0.58.6 <br /> Updates `tokio` from 1.53.1 to 1.53.3 <br />...
 
-- [ ] **PR [#929](https://github.com/mixelpixx/Konnect/pull/929): build(deps): bump the minor-and-patch group across 1 directory with 5 updates**
+- [x] **PR [#929](https://github.com/mixelpixx/Konnect/pull/929): build(deps): bump the minor-and-patch group across 1 directory with 5 updates**
   - **GitHub Author:** [@dependabot[bot]](https://github.com/dependabot[bot]) | **Git Commit Author(s):** `dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>` (1 commit, 2026-10-19)
   - **Local Ref:** `upstream-prs/929` | **Status vs `main`:** Clean merge | **Relates to Issues:** None
   - **Summary:** Bumps the minor-and-patch group with 5 updates in the /crates/schematic-viewer directory: Updates `tauri` from 2.12.0 to 2.12.4 <br /> Updates `tokio` from 1.53.1 to 1.53.3 <br /> Updates `serde_json` from 1.0.151 to...
 
-- [ ] **PR [#928](https://github.com/mixelpixx/Konnect/pull/928): build(deps): bump taiki-e/install-action from 2.87.22 to 2.87.29**
+- [x] **PR [#928](https://github.com/mixelpixx/Konnect/pull/928): build(deps): bump taiki-e/install-action from 2.87.22 to 2.87.29**
   - **GitHub Author:** [@dependabot[bot]](https://github.com/dependabot[bot]) | **Git Commit Author(s):** `dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>` (1 commit, 2026-10-19)
   - **Local Ref:** `upstream-prs/928` | **Status vs `main`:** Clean merge | **Relates to Issues:** None
   - **Summary:** Bumps [taiki-e/install-action](https://github.com/taiki-e/install-action) from 2.87.22 to 2.87.29. <br /> [![Dependabot compatibility...
@@ -255,7 +255,7 @@ Tick the checkbox (`- [x]`) once you have reviewed and merged (or intentionally 
   - **Local Ref:** `upstream-prs/824` | **Status vs `main`:** Needs rebase/conflict resolution | **Relates to Issues:** [#725](https://github.com/mixelpixx/Konnect/issues/725), [#788](https://github.com/mixelpixx/Konnect/issues/788)
   - **Summary:** `update_pcb_from_schematic` carried no symbol field beyond Reference, Value and the footprint. `LCSC`, `MPN`, Datasheet, Description and every custom field stayed off the board, and a field changed in the schematic...
 
-- [ ] **PR [#823](https://github.com/mixelpixx/Konnect/pull/823): build(deps): bump gix from 0.87.1 to 0.88.0**
+- [x] **PR [#823](https://github.com/mixelpixx/Konnect/pull/823): build(deps): bump gix from 0.87.1 to 0.88.0**
   - **GitHub Author:** [@dependabot[bot]](https://github.com/dependabot[bot]) | **Git Commit Author(s):** `dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>` (1 commit, 2026-10-05)
   - **Local Ref:** `upstream-prs/823` | **Status vs `main`:** Clean merge | **Relates to Issues:** None
   - **Summary:** Bumps [gix](https://github.com/GitoxideLabs/gitoxide) from 0.87.1 to 0.88.0. <br /> [![Dependabot compatibility...
