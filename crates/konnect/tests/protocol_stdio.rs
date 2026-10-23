@@ -15,11 +15,15 @@ struct McpProcess {
     next_id: i64,
     /// The handshake's `initialize` response.
     initialized: Value,
+    _tempdir: Option<tempfile::TempDir>,
 }
 
 impl McpProcess {
     fn spawn() -> Self {
-        Self::spawn_in_dir(None)
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = Self::spawn_with_env(Some(tmp.path()), true, &[]);
+        p._tempdir = Some(tmp);
+        p
     }
 
     /// Spawn with the process working directory set to `dir`, so
@@ -75,6 +79,7 @@ impl McpProcess {
             reader,
             next_id: 1,
             initialized: Value::Null,
+            _tempdir: None,
         };
         // MCP handshake
         let init = p.request(

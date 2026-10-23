@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **240 registered tools** + **7 always-visible meta-tools** = **247 total**
+- **241 registered tools** + **7 always-visible meta-tools** = **248 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -380,7 +380,7 @@ and Windows servers do not.
 
 ## Integration
 
-### `integration` · 9 tools
+### `integration` · 10 tools
 **Purpose:** JLCPCB parts database, local Freerouting MCP routing, datasheet URLs.
 **Source:** [`crates/konnect-core/src/tools/integration.rs`](crates/konnect-core/src/tools/integration.rs)
 
@@ -389,6 +389,7 @@ and Windows servers do not.
 | `download_jlcpcb_database` | Download or update the local JLCPCB parts database cache (SQLite). |
 | `search_jlcpcb_parts` | Search the local JLCPCB database by keyword, value, or category. The query is split on whitespace; a part matches only if every word appears, in any order, in its LCSC number, MPN, package, manufacturer or description (case-insensitive, `%` and `_` literal). A word that is a value (`20pF`, `4.7uF`, `1k`, `0402`) matches only as a whole value, so `20pF` does not find `220pF`. |
 | `get_jlcpcb_part` | Retrieve full details for a single JLCPCB part by LCSC part number. |
+| `import_jlcpcb_part` | Import a symbol and footprint directly from JLCPCB / EasyEDA by LCSC part number (e.g. `C2856837`). Converts pins, pads, graphics, and custom properties (LCSC, MPN, Manufacturer, JLCPCB_Class, verified datasheet URL), saves to the project's KiCad symbol and footprint libraries, idempotently registers both in sym-lib-table and fp-lib-table, and optionally places the component onto the schematic. |
 | `suggest_jlcpcb_alternatives` | Suggest JLCPCB-stocked parts with the same value in the package a KiCad footprint maps to. Excludes parts below a stock floor and ranks Basic, then Preferred, then Extended parts, then known price and stock; the response states the LCSC package names matched, the ranking and what was excluded. |
 | `get_jlcpcb_database_stats` | Statistics about the local JLCPCB cache: part count, last updated, file size. |
 | `enrich_datasheets` | Fetch and cache datasheet URLs for all components in a schematic (LCSC API). |

@@ -783,7 +783,7 @@ fn build_footprint_graphics(args: &serde_json::Value, name: &str, pads: &[PadGeo
     s
 }
 
-async fn handle_create_footprint(
+pub(crate) async fn handle_create_footprint(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
@@ -1982,7 +1982,7 @@ pub(crate) fn resolve_footprint_path(
     ))
 }
 
-async fn handle_register_footprint_library(
+pub(crate) async fn handle_register_footprint_library(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
@@ -2255,7 +2255,7 @@ fn lib_table_target(
     Ok((table_dir.join(table_filename), uri))
 }
 
-async fn handle_register_symbol_library(
+pub(crate) async fn handle_register_symbol_library(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
@@ -4296,7 +4296,7 @@ impl BuiltUnit {
     }
 }
 
-async fn handle_create_symbol(
+pub(crate) async fn handle_create_symbol(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
@@ -4666,7 +4666,7 @@ async fn handle_create_symbol(
     ))
 }
 
-async fn handle_delete_symbol(
+pub(crate) async fn handle_delete_symbol(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {

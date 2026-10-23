@@ -83,6 +83,26 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_get_jlcpcb_part(args, ctx).await }
         ),
         tool!(
+            "import_jlcpcb_part",
+            "Import a symbol and footprint directly from JLCPCB / EasyEDA by LCSC part number (e.g. 'C2856837'). Converts pins, pads, graphics, and custom properties (LCSC, MPN, Manufacturer, JLCPCB_Class, verified datasheet URL), saves to the project's KiCad symbol and footprint libraries, idempotently registers both in sym-lib-table and fp-lib-table, and optionally places the component onto the schematic.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Path to KiCad project directory (where .kicad_pro, sym-lib-table, and fp-lib-table live). Uses server config default if omitted" },
+                    "lcsc_id": { "type": "string", "description": "LCSC part number (e.g. 'C2856837')" },
+                    "library_name": { "type": "string", "description": "Library nickname and filename to store symbol and footprint (default: 'jlcpcb')", "default": "jlcpcb" },
+                    "include_3d": { "type": "boolean", "description": "Whether to attempt downloading 3D STEP/OBJ model if available", "default": false },
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch to place component immediately after importing (optional)" },
+                    "x": { "type": "number", "description": "X coordinate in mm on schematic if placing" },
+                    "y": { "type": "number", "description": "Y coordinate in mm on schematic if placing" },
+                    "reference": { "type": "string", "description": "Optional reference designator override if placing" },
+                    "value": { "type": "string", "description": "Optional value override if placing" }
+                },
+                "required": ["lcsc_id"]
+            }),
+            |args, ctx| async move { super::easyeda::handle_import_jlcpcb_part(args, ctx).await }
+        ),
+        tool!(
             "suggest_jlcpcb_alternatives",
             "Suggest JLCPCB-stocked parts with the same value in the package a KiCad footprint uses. The footprint is mapped to LCSC's package names, the value must match as a whole value, and parts below a stock floor are excluded. Results rank Basic, then Preferred, then Extended parts, then known price and stock; the response states the package names matched, the ranking, and what was excluded.",
             json!({

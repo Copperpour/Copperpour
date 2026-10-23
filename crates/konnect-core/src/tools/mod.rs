@@ -18,6 +18,7 @@ mod copy_routing_pattern_tests;
 pub(crate) mod cross_probe;
 pub mod design_review;
 pub(crate) mod drc;
+pub mod easyeda;
 pub mod editor_navigation;
 mod footprint_fields;
 mod footprint_graphics;

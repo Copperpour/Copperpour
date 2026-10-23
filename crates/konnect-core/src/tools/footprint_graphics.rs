@@ -174,7 +174,7 @@ pub(super) fn tool() -> ToolDef {
     )
 }
 
-async fn handle_set_footprint_graphics(
+pub(crate) async fn handle_set_footprint_graphics(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {

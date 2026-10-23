@@ -197,6 +197,8 @@ mod tests {
                 if policy != false {
                     assert!(
                         matches!(path,
+                        "add_schematic_component/properties/fields" |
+                        "batch_place_components/properties/components/items/properties/fields" |
                         "edit_schematic_component/properties/fields" |
                         "edit_schematic_component/properties/field_placements" |
                         "batch_edit_schematic_components/properties/edits/items/properties/fields" |
