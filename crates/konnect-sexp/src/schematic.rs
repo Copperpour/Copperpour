@@ -380,12 +380,14 @@ impl SymbolBounds {
         self.max_y = self.max_y.max(y);
     }
 
+    // Differences are rounded: 69.342 - 68.58 is `0.7620000000000005` in
+    // `f64`, and callers report them (#747).
     pub fn width(self) -> f64 {
-        self.max_x - self.min_x
+        round6(self.max_x - self.min_x)
     }
 
     pub fn height(self) -> f64 {
-        self.max_y - self.min_y
+        round6(self.max_y - self.min_y)
     }
 
     /// Whether the relative interiors meet. A box flat on an axis is a line
@@ -419,8 +421,8 @@ impl SymbolBounds {
     /// boxes return a negative value on at least one axis.
     pub fn overlap_depth(self, other: Self) -> (f64, f64) {
         (
-            self.max_x.min(other.max_x) - self.min_x.max(other.min_x),
-            self.max_y.min(other.max_y) - self.min_y.max(other.min_y),
+            round6(self.max_x.min(other.max_x) - self.min_x.max(other.min_x)),
+            round6(self.max_y.min(other.max_y) - self.min_y.max(other.min_y)),
         )
     }
 }

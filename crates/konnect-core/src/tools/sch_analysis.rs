@@ -1245,6 +1245,36 @@ mod placement_overlap_tests {
         assert_eq!(body["overlap_count"], 3);
     }
 
+    /// #747 on KiCad's own `multichannel` demo sheet, where C12 shifted over
+    /// IC2's second unit overlaps its power pin. The extents are the file's
+    /// placements plus their library geometry, and the overlap is their
+    /// intersection; the old response said `0.7620000000000005` and
+    /// `228.60000000000002`.
+    #[tokio::test]
+    async fn kicad_demo_overlap_reports_file_precision() {
+        let sheet = include_str!("../../tests/fixtures/multichannel_channel_strip.kicad_sch")
+            .replace("(at 208.28 67.31 0)", "(at 214.63 67.31 0)");
+        let result = overlaps(&sheet).await;
+        let noisy = crate::tools::noisy_numbers(&result);
+        assert!(noisy.is_empty(), "reported {noisy:?}");
+
+        let overlap = &result["overlaps"][0];
+        assert_eq!(
+            (&overlap["a"], &overlap["b"]),
+            (&json!("C12"), &json!("IC2"))
+        );
+        assert_eq!(overlap["overlap_x_mm"], json!(7.62));
+        assert_eq!(overlap["overlap_y_mm"], json!(0.762));
+        assert_eq!(
+            overlap["bounds_a"],
+            json!({ "x_min": 214.63, "y_min": 65.278, "x_max": 222.25, "y_max": 69.342 })
+        );
+        assert_eq!(
+            overlap["bounds_b"],
+            json!({ "x_min": 208.28, "y_min": 68.58, "x_max": 228.6, "y_max": 88.9 })
+        );
+    }
+
     #[tokio::test]
     async fn invalid_overlap_tolerance_is_a_named_argument_error() {
         let tmp = tempfile::tempdir().unwrap();

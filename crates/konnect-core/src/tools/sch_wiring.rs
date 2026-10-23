@@ -1624,8 +1624,9 @@ pub(crate) fn reconcile_junctions_at(
     );
     let mut to_add: Vec<(f64, f64)> = to_add
         .into_iter()
-        // Pin endpoints come out of arithmetic (136.19 + 3.81 = 139.70000000000002).
-        // Round before deduplicating, so two noisy copies of one point add one dot.
+        // `format_junction` interpolates the f64 verbatim. Pin endpoints arrive
+        // rounded (#747), but other callers' points may not, so round to the
+        // 6 decimals KiCAD writes rather than leaking float noise into the file.
         .map(|(x, y)| (round6(x), round6(y)))
         .collect();
     to_add.sort_by(|a, b| a.partial_cmp(b).expect("rounded coordinates are finite"));
