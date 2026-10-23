@@ -722,6 +722,7 @@ async fn handle_search_jlcpcb_parts(
 
     let tokens = jlcpcb_search_tokens(&query);
     let sql_tokens = tokens.clone();
+    let query_for_fallback = query.clone();
     let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = rusqlite::Connection::open(&db_path)?;
 
@@ -785,7 +786,99 @@ async fn handle_search_jlcpcb_parts(
             })
             .take(limit)
             .collect();
-        Ok(rows)
+
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
+
+        // Fallback: If exact token search yielded 0 results, retry with punctuation-normalized
+        // MPN and token matching. This resolves part numbers where hyphens or underscores
+        // were omitted, altered, or where a URL slug combines manufacturer and part number
+        // (e.g. "XUNPU-FPC_05FB40PH20" or "STM32F103C8T6").
+        let fallback_tokens: Vec<String> = query_for_fallback
+            .split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '/')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+
+        if fallback_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut fallback_sql = String::from(
+            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
+             FROM components WHERE 1=1",
+        );
+        let mut fallback_params: Vec<String> = Vec::new();
+        for token in &fallback_tokens {
+            let escaped = token
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            fallback_params.push(format!("%{}%", escaped));
+            let n1 = fallback_params.len();
+
+            let clean: String = token.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+            if clean.len() >= 2 {
+                let clean_escaped = clean
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
+                fallback_params.push(format!("%{}%", clean_escaped));
+                let n2 = fallback_params.len();
+                fallback_sql.push_str(&format!(
+                    " AND (Description LIKE ?{n1} ESCAPE '\\' OR MFR_Part LIKE ?{n1} ESCAPE '\\' \
+                     OR LCSC LIKE ?{n1} ESCAPE '\\' OR Package LIKE ?{n1} ESCAPE '\\' \
+                     OR Manufacturer LIKE ?{n1} ESCAPE '\\' \
+                     OR REPLACE(REPLACE(REPLACE(REPLACE(MFR_Part, '-', ''), '_', ''), '/', ''), ' ', '') LIKE ?{n2} ESCAPE '\\' \
+                     OR REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(Manufacturer, '') || MFR_Part, '-', ''), '_', ''), '/', ''), ' ', '') LIKE ?{n2} ESCAPE '\\')"
+                ));
+            } else {
+                fallback_sql.push_str(&format!(
+                    " AND (Description LIKE ?{n1} ESCAPE '\\' OR MFR_Part LIKE ?{n1} ESCAPE '\\' \
+                     OR LCSC LIKE ?{n1} ESCAPE '\\' OR Package LIKE ?{n1} ESCAPE '\\' \
+                     OR Manufacturer LIKE ?{n1} ESCAPE '\\')"
+                ));
+            }
+        }
+        if basic_only {
+            fallback_sql.push_str(" AND Library_Type = 'Basic'");
+        }
+        if in_stock {
+            fallback_sql.push_str(" AND Stock > 0");
+        }
+        if let Some(ref cat) = category {
+            fallback_params.push(format!("%{}%", cat));
+            fallback_sql.push_str(&format!(" AND Category LIKE ?{}", fallback_params.len()));
+        }
+        fallback_sql.push_str(" ORDER BY LCSC");
+
+        let fallback_value_tokens: Vec<&String> = fallback_tokens
+            .iter()
+            .filter(|token| is_jlcpcb_value_token(token))
+            .collect();
+        let mut fallback_stmt = conn.prepare(&fallback_sql)?;
+        let fallback_rows: Vec<serde_json::Value> = fallback_stmt
+            .query_map(
+                rusqlite::params_from_iter(fallback_params.iter()),
+                row_to_part_json,
+            )?
+            .filter_map(|r| r.ok())
+            .filter(|part| {
+                fallback_value_tokens.iter().all(|token| {
+                    ["description", "mpn", "lcsc", "package", "manufacturer"]
+                        .iter()
+                        .any(|field| {
+                            part[*field].as_str().is_some_and(|text| {
+                                lcsc_packages::contains_whole_value(text, token)
+                            })
+                        })
+                })
+            })
+            .take(limit)
+            .collect();
+
+        Ok(fallback_rows)
     })
     .await??;
 
@@ -3400,6 +3493,33 @@ mod jlcpcb_cache_tests {
             search_lcsc_ids(&db_path, "40P Pin Header Through Hole").await,
             vec!["C1002"]
         );
+    }
+
+    #[tokio::test]
+    async fn search_jlcpcb_parts_punctuation_normalized_mpn_fallback() {
+        let (_dir, db_path) = seed_test_db();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        // Insert parts with hyphens, underscores, etc.
+        conn.execute(
+            "INSERT INTO components VALUES ('C2856837', 'FPC-05FB-40PH20', '0.5mm', 'XUNPU', 'Extended', '0.5mm Pitch 40 Pin FPC Connector', '', 0.5, 100, 'Connectors')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO components VALUES ('C8734', 'STM32F103-C8T6', 'LQFP-48', 'STMicroelectronics', 'Extended', '32-bit ARM Cortex-M3 MCU', '', 1.5, 50, 'Microcontrollers')",
+            [],
+        ).unwrap();
+
+        // 1. Unhyphenated MPN query finds hyphenated part
+        assert_eq!(search_lcsc_ids(&db_path, "STM32F103C8T6").await, vec!["C8734"]);
+        assert_eq!(search_lcsc_ids(&db_path, "05FB40PH20").await, vec!["C2856837"]);
+        assert_eq!(search_lcsc_ids(&db_path, "FPC05FB40PH20").await, vec!["C2856837"]);
+
+        // 2. URL slug combining manufacturer and MPN with separators
+        assert_eq!(search_lcsc_ids(&db_path, "XUNPU-FPC_05FB40PH20").await, vec!["C2856837"]);
+
+        // 3. Exact query still works directly
+        assert_eq!(search_lcsc_ids(&db_path, "FPC-05FB-40PH20").await, vec!["C2856837"]);
+        assert_eq!(search_lcsc_ids(&db_path, "STM32F103-C8T6").await, vec!["C8734"]);
     }
 
     #[tokio::test]
