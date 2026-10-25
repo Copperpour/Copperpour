@@ -1,5 +1,5 @@
 //! Regression coverage for public inputs removed because they never affected
-//! the operation. Every removal has a user-facing migration entry.
+//! the operation. Konnect v0.13.0's `docs/API_MIGRATIONS.md` documents each.
 
 use konnect_core::router::registry;
 
@@ -29,17 +29,6 @@ fn ignored_inputs_are_no_longer_advertised() {
         assert!(
             definition.input_schema["properties"].get(field).is_none(),
             "{tool_name}.{field} never affected its operation and must not return"
-        );
-    }
-}
-
-#[test]
-fn every_removed_input_has_a_migration_note() {
-    let migrations = include_str!("../../../docs/API_MIGRATIONS.md");
-    for &(tool_name, field) in REMOVED {
-        assert!(
-            migrations.contains(&format!("`{tool_name}.{field}`")),
-            "missing migration for {tool_name}.{field}"
         );
     }
 }

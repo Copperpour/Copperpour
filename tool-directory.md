@@ -8,7 +8,8 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 - Per-tool names + descriptions: `crates/konnect-core/src/tools/<toolset>.rs` (each `tool!(…)` in the `tools()` vec)
 
 Compatibility notes for removed or narrowed arguments are recorded in
-[`docs/API_MIGRATIONS.md`](docs/API_MIGRATIONS.md).
+[`docs/API_MIGRATIONS.md`](docs/API_MIGRATIONS.md), and in
+[`docs/api-migrations/`](docs/api-migrations/) until they are released.
 
 ## Overview
 

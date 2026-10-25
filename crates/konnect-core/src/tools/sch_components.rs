@@ -229,7 +229,7 @@ pub fn tools() -> Vec<ToolDef> {
             // No parameters: the handler refuses unconditionally, and the
             // schema-parameter guard (rightly) refuses a schema that advertises
             // arguments nothing reads. The old parameters are documented in
-            // docs/API_MIGRATIONS.md alongside #285's removals.
+            // Konnect v0.13.0's docs/API_MIGRATIONS.md alongside #285's removals.
             json!({
                 "type": "object",
                 "properties": {},

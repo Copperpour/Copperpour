@@ -98,7 +98,9 @@ workflow remains separate because it installs KiCad and is not an ordinary
 per-PR gate. Apply the `run:e2e-kicad` label to run that same workflow for a
 pull request when KiCad-facing behavior needs hosted acceptance evidence.
 
-Before creating a release tag, dispatch `.github/workflows/release.yml` against
+Before creating a release tag, run `cargo xtask collect-api-migrations
+<version>` and commit the result, which moves the notes in
+`docs/api-migrations/` into `docs/API_MIGRATIONS.md`. Then dispatch `.github/workflows/release.yml` against
 the exact candidate ref. The manual entry point runs the release-profile target
 matrix, all three PCM package builds, and the reusable real-KiCad acceptance
 workflow with a synthetic `0.0.0` package version. Its publication job is

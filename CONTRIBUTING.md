@@ -216,6 +216,10 @@ These are exactly the commands CI runs — if they pass locally, CI should be gr
   used to conflict by construction, and a release that moved the counts conflicted
   with the whole open queue at once. The guard (`doc_tool_counts`) still fails if
   anything is stale; the command is how you satisfy it.
+- If a tool's caller can see the change, add a migration note as its own file in
+  `docs/api-migrations/` (see its README), not to `docs/API_MIGRATIONS.md`. Every
+  PR used to add its note at the top of that one file, so any two open PRs
+  conflicted there.
 
 First PR from a fork? CI workflows may sit at "waiting for approval" until a
 maintainer approves the run — that's a GitHub setting for first-time contributors,

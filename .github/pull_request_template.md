@@ -40,7 +40,8 @@ against main that repeats unmerged prerequisite commits.
 ## Compatibility and safety
 
 <!--
-List public API/config/schema changes and their migration path.
+List public API/config/schema changes and their migration path, and add a
+note in docs/api-migrations/ for each.
 For file or IPC mutations, explain target validation, atomicity/rollback, and failure behavior.
 Write "No public compatibility impact" when applicable.
 -->
