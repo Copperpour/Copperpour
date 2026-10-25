@@ -439,7 +439,9 @@ pub fn symbol_custom_properties(schematic: &Schematic, lib_id: &str) -> Vec<(Str
     };
     let mut customs = Vec::new();
     for property in symbol.find_all("property") {
-        let Some(name) = property.value() else { continue };
+        let Some(name) = property.value() else {
+            continue;
+        };
         if matches!(
             name,
             "Reference" | "Value" | "Footprint" | "Datasheet" | "Description"

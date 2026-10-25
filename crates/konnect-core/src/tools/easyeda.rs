@@ -37,9 +37,7 @@ pub(crate) fn easyeda_cache_dir() -> PathBuf {
 
 /// Fetch an EasyEDA component bundle by LCSC ID, using local disk cache first
 /// and falling back across easyeda.com and lceda.cn with standard browser headers.
-pub(crate) async fn fetch_easyeda_bundle(
-    lcsc_id: &str,
-) -> anyhow::Result<serde_json::Value> {
+pub(crate) async fn fetch_easyeda_bundle(lcsc_id: &str) -> anyhow::Result<serde_json::Value> {
     let clean_id = lcsc_id.trim();
     if clean_id.is_empty() {
         anyhow::bail!("LCSC part number cannot be empty");
@@ -62,12 +60,10 @@ pub(crate) async fn fetch_easyeda_bundle(
         .timeout(std::time::Duration::from_secs(20))
         .build()?;
 
-    let primary_url = format!(
-        "https://easyeda.com/api/products/{clean_id}/components?version=6.4.19.5"
-    );
-    let fallback_url = format!(
-        "https://lceda.cn/api/products/{clean_id}/components?version=6.4.19.5"
-    );
+    let primary_url =
+        format!("https://easyeda.com/api/products/{clean_id}/components?version=6.4.19.5");
+    let fallback_url =
+        format!("https://lceda.cn/api/products/{clean_id}/components?version=6.4.19.5");
 
     let mut body = None;
     for url in [&primary_url, &fallback_url] {
@@ -161,7 +157,9 @@ pub(crate) fn parse_easyeda_symbol_pins(
     let mut pins = Vec::new();
 
     for shape_val in shapes {
-        let Some(s) = shape_val.as_str() else { continue };
+        let Some(s) = shape_val.as_str() else {
+            continue;
+        };
         if !s.starts_with("P~") {
             continue;
         }
@@ -242,7 +240,9 @@ pub(crate) fn parse_easyeda_symbol_graphics(
     let snap = |val: f64| (val / 1.27).round() * 1.27;
 
     for shape_val in shapes {
-        let Some(s) = shape_val.as_str() else { continue };
+        let Some(s) = shape_val.as_str() else {
+            continue;
+        };
 
         if s.starts_with("R~") {
             let parts: Vec<&str> = s.split('~').collect();
@@ -316,7 +316,9 @@ pub(crate) fn parse_easyeda_footprint_pads(
     let mut pads = Vec::new();
 
     for shape_val in shapes {
-        let Some(s) = shape_val.as_str() else { continue };
+        let Some(s) = shape_val.as_str() else {
+            continue;
+        };
         if !s.starts_with("PAD~") {
             continue;
         }
@@ -392,7 +394,9 @@ pub(crate) fn parse_easyeda_graphics(
     let mut fab_graphics = Vec::new();
 
     for shape_val in shapes {
-        let Some(s) = shape_val.as_str() else { continue };
+        let Some(s) = shape_val.as_str() else {
+            continue;
+        };
         let parts: Vec<&str> = s.split('~').collect();
         if parts.is_empty() {
             continue;
@@ -498,7 +502,11 @@ pub(crate) async fn handle_import_jlcpcb_part(
     let library_name = opt_str(args, "library_name").unwrap_or("jlcpcb");
     let bundle = match fetch_easyeda_bundle(lcsc_id).await {
         Ok(b) => b,
-        Err(e) => return Ok(CallToolResult::error(format!("Failed to fetch part '{lcsc_id}': {e}"))),
+        Err(e) => {
+            return Ok(CallToolResult::error(format!(
+                "Failed to fetch part '{lcsc_id}': {e}"
+            )))
+        }
     };
 
     // Extract symbol metadata
@@ -515,7 +523,11 @@ pub(crate) async fn handle_import_jlcpcb_part(
     let jlc_class = sym_c_para["JLCPCB Part Class"].as_str().unwrap_or("");
     let raw_pre = sym_c_para["pre"].as_str().unwrap_or("U?");
     let ref_prefix = raw_pre.trim_end_matches('?');
-    let ref_prefix = if ref_prefix.is_empty() { "U" } else { ref_prefix };
+    let ref_prefix = if ref_prefix.is_empty() {
+        "U"
+    } else {
+        ref_prefix
+    };
 
     let description = bundle["description"]
         .as_str()
@@ -544,7 +556,10 @@ pub(crate) async fn handle_import_jlcpcb_part(
     let sym_head_x = sym_head["x"].as_f64().unwrap_or(0.0);
     let sym_head_y = sym_head["y"].as_f64().unwrap_or(0.0);
 
-    let sym_shapes = bundle["dataStr"]["shape"].as_array().cloned().unwrap_or_default();
+    let sym_shapes = bundle["dataStr"]["shape"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let pins = parse_easyeda_symbol_pins(&sym_shapes, sym_head_x, sym_head_y);
 
     if pins.is_empty() {
@@ -568,15 +583,11 @@ pub(crate) async fn handle_import_jlcpcb_part(
         )));
     }
 
-    let (silk_graphics, fab_graphics) =
-        parse_easyeda_graphics(&pkg_shapes, pkg_head_x, pkg_head_y);
+    let (silk_graphics, fab_graphics) = parse_easyeda_graphics(&pkg_shapes, pkg_head_x, pkg_head_y);
 
     // 1. Create Symbol Library and Symbol
     let sym_lib_path = project_dir.join(format!("{library_name}.kicad_sym"));
-    let symbol_desc = format!(
-        "{} [Source: {}]",
-        description, EASYEDA_ATTRIBUTION
-    );
+    let symbol_desc = format!("{} [Source: {}]", description, EASYEDA_ATTRIBUTION);
     let footprint_id = format!("{library_name}:{footprint_name}");
 
     // If symbol already exists in library, delete it cleanly first
@@ -624,10 +635,7 @@ pub(crate) async fn handle_import_jlcpcb_part(
     let _ = tokio::fs::create_dir_all(&fp_lib_dir).await;
     let fp_path = fp_lib_dir.join(format!("{footprint_name}.kicad_mod"));
 
-    let fp_desc = format!(
-        "{} [Source: {}]",
-        raw_pkg_name, EASYEDA_ATTRIBUTION
-    );
+    let fp_desc = format!("{} [Source: {}]", raw_pkg_name, EASYEDA_ATTRIBUTION);
 
     let fp_args = json!({
         "output": fp_path.display().to_string(),
@@ -740,11 +748,9 @@ pub(crate) async fn handle_import_jlcpcb_part(
             crate::tools::sch_components::handle_add_schematic_component(&place_args, ctx).await
         {
             if !placed.is_error {
-                if let Some(content) = placed.content.first() {
-                    if let ToolContent::Text { text } = content {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
-                            placement_readback = Some(parsed);
-                        }
+                if let Some(ToolContent::Text { text }) = placed.content.first() {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+                        placement_readback = Some(parsed);
                     }
                 }
             }
@@ -894,7 +900,7 @@ mod tests {
 
         let (silk, fab) = parse_easyeda_graphics(&shapes, 100.0, 100.0);
         assert_eq!(silk.len(), 2); // 1 track + 1 circle
-        assert_eq!(fab.len(), 1);  // 1 track
+        assert_eq!(fab.len(), 1); // 1 track
         assert_eq!(silk[0]["layer"], "F.SilkS");
         assert_eq!(silk[1]["layer"], "F.SilkS");
         assert_eq!(fab[0]["layer"], "F.Fab");
@@ -988,7 +994,9 @@ mod tests {
         assert!(sym_content.contains(EASYEDA_ATTRIBUTION));
 
         // Verify .kicad_mod was created
-        let fp_file = project_dir.join("test_jlc.pretty").join("MOCK-PKG-40P.kicad_mod");
+        let fp_file = project_dir
+            .join("test_jlc.pretty")
+            .join("MOCK-PKG-40P.kicad_mod");
         assert!(fp_file.is_file());
         let fp_content = std::fs::read_to_string(&fp_file).unwrap();
         assert!(fp_content.contains(EASYEDA_ATTRIBUTION));

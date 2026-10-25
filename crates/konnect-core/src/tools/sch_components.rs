@@ -876,15 +876,8 @@ pub(crate) fn place_one_component(
     // Carry all custom properties from the library symbol (excluding standard 5 and ki_*)
     let lib_custom_props = cse::library::symbol_custom_properties(sch, lib_id);
     for (prop_name, prop_val) in lib_custom_props {
-        sym.properties.push(positioned(
-            &prop_name,
-            &prop_val,
-            x,
-            y,
-            0.0,
-            true,
-            centred,
-        ));
+        sym.properties
+            .push(positioned(&prop_name, &prop_val, x, y, 0.0, true, centred));
     }
 
     // Determine if an LCSC ID is specified or present in library properties
@@ -914,8 +907,15 @@ pub(crate) fn place_one_component(
                     if let Some(p) = sym.properties.iter_mut().find(|p| p.name == "MPN") {
                         p.value = info.mfr_part;
                     } else {
-                        sym.properties
-                            .push(positioned("MPN", &info.mfr_part, x, y, 0.0, true, centred));
+                        sym.properties.push(positioned(
+                            "MPN",
+                            &info.mfr_part,
+                            x,
+                            y,
+                            0.0,
+                            true,
+                            centred,
+                        ));
                     }
                 }
                 if !info.manufacturer.is_empty()
@@ -6122,7 +6122,11 @@ mod tests {
         assert_eq!(field("LCSC"), Some("C9999"));
         assert_eq!(field("MPN"), Some("MY-PART-100"));
         assert_eq!(field("Manufacturer"), Some("Acme Corp"));
-        assert_eq!(field("ki_keywords"), None, "ki_* properties must not be copied");
+        assert_eq!(
+            field("ki_keywords"),
+            None,
+            "ki_* properties must not be copied"
+        );
     }
 
     #[tokio::test]
@@ -6174,7 +6178,10 @@ mod tests {
         assert_eq!(field("MPN"), Some("FPC-05FB-40PH20"));
         assert_eq!(field("Manufacturer"), Some("XUNPU"));
         assert_eq!(field("Datasheet"), Some("https://example.com/fpc.pdf"));
-        assert_eq!(field("Description"), Some("0.5mm Pitch 40 Pin FPC Connector"));
+        assert_eq!(
+            field("Description"),
+            Some("0.5mm Pitch 40 Pin FPC Connector")
+        );
     }
 
     #[tokio::test]
