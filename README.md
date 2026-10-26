@@ -331,10 +331,9 @@ Konnect is licensed under the **[GNU AGPL-3.0](LICENSE)**.
 If you're a hobbyist, student, freelancer, or open-source project: **use it freely,
 no strings attached.** Design boards, ship them, sell them.
 
-If you're a business: the AGPL requires that anything you build on or around Konnect —
-including software provided over a network — be open-sourced under the same license.
-If that doesn't work for you, **commercial licenses are available**: see
-[COMMERCIAL.md](COMMERCIAL.md).
+If you're a business: using it in-house is free too. The AGPL's conditions apply when
+you distribute Konnect, or let outside users interact with a modified copy over a
+network. Then they get its source under the same license.
 
 ## Relationship to KiCAD-MCP-Server
 
@@ -350,7 +349,7 @@ the architecture it proved, rebuilt for production:
 | Schematic backend | kicad-skip + custom loaders | Native S-expression engine, atomic writes |
 | Context cost | Router pattern | Load/unload toolsets + observability |
 | Skills / agents | — | 6 skills + 2 agents bundled |
-| License | MIT | AGPL-3.0 + commercial |
+| License | MIT | AGPL-3.0 |
 
 ## Troubleshooting
 

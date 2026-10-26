@@ -324,7 +324,6 @@ The workflow enforces timing only. It never chooses the disposition.
 
 ## Licensing
 
-Konnect is AGPL-3.0 with commercial licences available, so contributions must
-be relicensable. Submitting a contribution accepts the CLA in
-[CONTRIBUTING.md](CONTRIBUTING.md). If you cannot agree to it, open an issue
-describing the change instead — a reimplementation from a description is fine.
+LibreKonnect is AGPL-3.0 only, and contributions are accepted under that same
+license; see [CONTRIBUTING.md](CONTRIBUTING.md). There is no CLA and no
+commercial license.
