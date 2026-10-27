@@ -20,56 +20,25 @@ that teach Claude KiCAD conventions out of the box.
 > see [CONTRIBUTING.md](CONTRIBUTING.md) and the
 > [naming conventions](docs/NAMING_CONVENTIONS.md).
 >
-> **Formerly Konnect.** Copperpour is the community-maintained AGPL-3.0
-> continuation of [`mixelpixx/Konnect`](https://github.com/mixelpixx/Konnect), which
-> went closed source in October 2026. Its `v0.14.0` integrated 60 open community pull
-> requests and fixes on top of Konnect `v0.13.0`. Upgrading? See
-> [Migrating from Konnect](#migrating-from-konnect).
+> **Formerly Konnect.** See [Why Copperpour exists](#why-copperpour-exists).
 
 ## Why Copperpour exists
 
-Copperpour continues Konnect, the successor to [KiCAD-MCP-Server](https://github.com/mixelpixx/KiCAD-MCP-Server),
-a Python/TypeScript project that proved AI-driven PCB design works — and, in the
-process, showed exactly where that architecture runs out of road. Konnect was built
-to fix those specific problems:
+Copperpour keeps AI-assisted KiCAD design open. It is the community-maintained
+AGPL-3.0 fork of [Konnect](https://github.com/mixelpixx/Konnect), which went closed
+source in October 2026, and Konnect was the successor to
+[KiCAD-MCP-Server](https://github.com/mixelpixx/KiCAD-MCP-Server). Copperpour's
+first release, `v0.14.0`, added 60 open community pull requests and fixes on top of
+Konnect `v0.13.0`. Upgrading? See [Migrating from Konnect](#migrating-from-konnect).
 
-**The call path was too long.** In the original server, a single tool call travels
-through TypeScript, schema validation, a spawned Python subprocess, JSON over
-stdin/stdout, a command router, and finally SWIG-generated C++ proxy objects before
-anything touches your board. That's four language and serialization boundaries, each
-with its own failure modes — subprocess lifecycle management, stdout parsing that
-filters out warnings KiCAD leaks into the stream, chunked-JSON reassembly. In
-Copperpour, a tool call is a function call. One process, one language, no plumbing.
-
-**The dependency surface was enormous.** Running the original means carrying Node.js
-and its npm tree, Python and its pip packages, wxPython, kicad-skip, and KiCAD's
-SWIG bindings — two package ecosystems plus a binding layer, every one of them a
-moving target that can break an install. Copperpour is a single static binary —
-20–25 MB depending on platform, a ~9 MB download. There is nothing to install
-alongside it and nothing to version-match.
-
-**SWIG is a dead end.** The original's PCB backend depends on KiCAD's SWIG Python
-bindings, which KiCAD is deprecating in favor of its IPC API. SWIG also carried
-real operational scars: a zone-fill call that can segfault the backend, proxy-object
-comparison bugs, and a fallback path that can silently swap backends mid-session.
-Copperpour talks to KiCAD 10 through the official IPC API (protobuf over NNG) — the
-interface KiCAD is investing in — with real-time board edits that integrate with
-KiCAD's own undo/redo.
-
-**Schematic edits should not corrupt files.** Copperpour edits `.kicad_sch` files
-through its own S-expression engine with atomic writes (write, fsync, rename), UUID
-preservation, and round-trip tests — no third-party schematic library with known
-gaps, no text-manipulation workarounds.
-
-**Context economy is a feature.** Exposing all 241 tools to an LLM costs roughly 23K
-tokens of context on every listing. Copperpour's router loads a starter kit (~2K
-tokens) and lets the model pull in toolsets on demand — plus built-in observability
-(`get_recent_calls`, `server_stats`, JSONL call logs) so the model can diagnose its
-own tool failures.
-
-The result is smaller, faster to install, aligned with where KiCAD is going, and
-built for production use rather than experimentation. The original project remains
-open, maintained, and useful — see [the comparison below](#relationship-to-kicad-mcp-server).
+- **One binary.** A single static Rust binary, a ~9 MB download, with no Node.js,
+  Python or bindings to install. A tool call is a function call.
+- **KiCAD's IPC API.** Board edits go through KiCAD 10's official IPC API in real
+  time, with KiCAD's own undo/redo, not the SWIG bindings KiCAD is deprecating.
+- **Safe schematic writes.** Its own S-expression engine edits `.kicad_sch` files
+  with revision-checked atomic writes.
+- **Small context.** A ~2K-token starter kit, with toolsets loaded on demand, instead
+  of a ~23K-token catalogue on every listing.
 
 ## What it does
 
@@ -348,22 +317,6 @@ no strings attached.** Design boards, ship them, sell them.
 If you're a business: using it in-house is free too. The AGPL's conditions apply when
 you distribute Copperpour, or let outside users interact with a modified copy over a
 network. Then they get its source under the same license.
-
-## Relationship to KiCAD-MCP-Server
-
-The original [Python/TypeScript project](https://github.com/mixelpixx/KiCAD-MCP-Server)
-remains fully open (MIT) and maintained. Konnect, now continued as Copperpour, is
-the architecture it proved, rebuilt for production:
-
-| | KiCAD-MCP-Server | Copperpour |
-|---|---|---|
-| Runtime | Node.js + Python + SWIG bindings | Single static binary (20–25 MB) |
-| Tool call path | TS → subprocess → Python → SWIG C++ | Direct function call |
-| PCB backend | SWIG (deprecated by KiCAD) + experimental IPC | KiCAD 10 IPC API |
-| Schematic backend | kicad-skip + custom loaders | Native S-expression engine, atomic writes |
-| Context cost | Router pattern | Load/unload toolsets + observability |
-| Skills / agents | — | 6 skills + 2 agents bundled |
-| License | MIT | AGPL-3.0 |
 
 ## Troubleshooting
 
