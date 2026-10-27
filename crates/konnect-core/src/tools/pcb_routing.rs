@@ -131,13 +131,13 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "plan_specctra_ses_import",
-            "Validate a Freerouting Specctra SES against its revision-bound Konnect manifest and the exact live KiCad board. Returns every track and via that would be created; never mutates or saves the board.",
+            "Validate a Freerouting Specctra SES against its revision-bound Copperpour manifest and the exact live KiCad board. Returns every track and via that would be created; never mutates or saves the board.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Open source .kicad_pcb used for the DSN export" },
                     "ses_path": { "type": "string", "description": "Freerouting .ses result" },
-                    "manifest_path": { "type": "string", "description": "Konnect reverse manifest written with the DSN" }
+                    "manifest_path": { "type": "string", "description": "Copperpour reverse manifest written with the DSN" }
                 },
                 "required": ["board", "ses_path", "manifest_path"]
             }),
@@ -152,7 +152,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "board": { "type": "string", "description": "Open source .kicad_pcb used for the DSN export" },
                     "ses_path": { "type": "string", "description": "Freerouting .ses result" },
-                    "manifest_path": { "type": "string", "description": "Konnect reverse manifest written with the DSN" },
+                    "manifest_path": { "type": "string", "description": "Copperpour reverse manifest written with the DSN" },
                     "candidate_output_path": { "type": "string", "description": "New .kicad_pcb path. Existing files are never replaced." }
                 },
                 "required": ["board", "ses_path", "manifest_path", "candidate_output_path"]
@@ -4144,7 +4144,7 @@ mod zone_net_format_tests {
         assert_eq!(body["source"], json!("file"));
         assert!(body["warning"]
             .as_str()
-            .is_some_and(|w| w.contains("current Konnect server session")));
+            .is_some_and(|w| w.contains("current Copperpour server session")));
     }
 
     /// The new arguments reach the alias too — it is the same handler, and a

@@ -834,7 +834,7 @@ fn classify_erc_coordinates(kicad_version: Option<&str>) -> ErcCoordinates {
             scale_applied: Some(ERC_JSON_SCALE_CORRECTION),
             reason: format!(
                 "KiCad {version} writes every ERC JSON coordinate at 1/{ERC_JSON_SCALE_CORRECTION} \
-                 of its true value (kicad#25582, fixed in {fixed_in}); Konnect multiplied it \
+                 of its true value (kicad#25582, fixed in {fixed_in}); Copperpour multiplied it \
                  back. A length quoted inside KiCad's own violation text is scaled the same way \
                  and is left as KiCad wrote it."
             ),

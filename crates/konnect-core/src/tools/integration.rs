@@ -2064,7 +2064,7 @@ fn freerouting_jar_path_description() -> String {
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "Path to a Freerouting JAR (optional). When omitted, Konnect searches, in order: \
+        "Path to a Freerouting JAR (optional). When omitted, Copperpour searches, in order: \
          {locations}. Relative paths are taken from the server's working directory. \
          There is no configuration setting for it."
     )

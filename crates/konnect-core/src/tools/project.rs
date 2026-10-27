@@ -394,7 +394,7 @@ fn unanswered_message(ping: &konnect_ipc::PingOutcome) -> &'static str {
             ..
         } => {
             "The KiCad IPC endpoint refused this account, likely a different account or a \
-             restrictive ACL; run Konnect as the same operating-system user as KiCad. See \
+             restrictive ACL; run Copperpour as the same operating-system user as KiCad. See \
              ipc_failure."
         }
         PingOutcome::Unreachable {

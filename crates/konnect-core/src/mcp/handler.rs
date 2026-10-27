@@ -425,7 +425,7 @@ impl McpHandler {
                                     reason: reason.clone(),
                                 },
                                 format!(
-                                    "Board '{path}' cannot be replaced safely ({reason}): a KiCad editor lock appeared before the committed write, so saved-file authority cannot be proven. Konnect did not modify it. Close or recover Pcbnew, reconcile any unsaved work, and save the authoritative state. Retry only after confirming that no KiCad process owns the board and the lock is gone."
+                                    "Board '{path}' cannot be replaced safely ({reason}): a KiCad editor lock appeared before the committed write, so saved-file authority cannot be proven. Copperpour did not modify it. Close or recover Pcbnew, reconcile any unsaved work, and save the authoritative state. Retry only after confirming that no KiCad process owns the board and the lock is gone."
                                 ),
                             ),
                             CallStatus::Error,

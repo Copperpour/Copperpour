@@ -159,7 +159,7 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "export_gerber",
-            "Export Gerber production files using kicad-cli. By default Konnect selects all \
+            "Export Gerber production files using kicad-cli. By default Copperpour selects all \
              enabled copper layers, masks, silkscreens, and Edge.Cuts while excluding \
              documentation-only layers.",
             json!({
@@ -304,7 +304,7 @@ pub fn tools() -> Vec<ToolDef> {
              through-hole footprints, circle, rectangle and unchamfered rounded-rectangle pads \
              with one shape on every copper layer (written as polygons that enclose the copper), \
              one straight-line closed outline, \
-             and no existing tracks, vias, or zones. Konnect refuses unsupported geometry or \
+             and no existing tracks, vias, or zones. Copperpour refuses unsupported geometry or \
              custom DRC rules, or incomplete effective routing rules instead of approximating \
              them, and writes a \
              revision-bound reverse manifest beside the DSN for later SES import.",

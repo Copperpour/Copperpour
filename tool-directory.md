@@ -16,7 +16,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 - **21 toolsets** organized into 10 categories
 - **241 registered tools** + **7 always-visible meta-tools** = **248 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
-- **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
+- **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<copperpour dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
 ## Meta-tools (always visible)
 
@@ -51,7 +51,7 @@ and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `reload_server` | After explicit confirmation, open and validate the on-disk Konnect binary, preserve the original argv (including `--config`), flush the reply, stop accepting requests, release process bookkeeping, recheck the candidate identity at the final handoff, and replace the current standalone Unix stdio process image. Linux executes the open file directly. Same-version development rebuilds require `allow_same_version=true`; downgrades are refused. |
+| `reload_server` | After explicit confirmation, open and validate the on-disk Copperpour binary, preserve the original argv (including `--config`), flush the reply, stop accepting requests, release process bookkeeping, recheck the candidate identity at the final handoff, and replace the current standalone Unix stdio process image. Linux executes the open file directly. Same-version development rebuilds require `allow_same_version=true`; downgrades are refused. |
 
 ---
 
@@ -103,7 +103,7 @@ and Windows servers do not.
 | `mirror_schematic_component` | Set or clear a placed component's mirror (`x`, `y` or `none`), on every placed unit or, with `unit`, on one unit alone. Field text reflects with the body. The orientation is stored in the rotation and mirror pair eeschema writes, so the stored rotation can change (180° with `x` is stored as 0° with `y`), and a later `rotate_schematic_component` works from that stored angle; `mirrored_units` reports each selected unit as written, and a call that changes nothing does not rewrite the file. Does NOT adjust connected wires; junction dots are re-judged where the pins moved, and a no-connect flag travels with the pin it protects. |
 | `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
 | `move_region` | Move all symbols within a bounding box by a given offset. With `include: "all"`, move everything in the box as one rigid block (wires, buses, junctions, labels, no-connects, sheets), refusing when a wire, bus, symbol or sheet crosses the edge or a pin's net would change. |
-| `annotate_schematic` | Number `?` designators the way eeschema's Tools → Annotate does (first free number in the project, ascending X per sheet instance, numbers reserved across every instance in the file, both places written). The units of one multi-unit part share one designator. Separate parts sharing a designator are reported as `unresolved` with a `partial` outcome, or renumbered with `resolve_duplicates`; a shared designator that could be a package is never renumbered. Annotates one project's instance records (`project`, default the schematic's owner). Konnect's own implementation; kicad-cli has no annotate command. |
+| `annotate_schematic` | Number `?` designators the way eeschema's Tools → Annotate does (first free number in the project, ascending X per sheet instance, numbers reserved across every instance in the file, both places written). The units of one multi-unit part share one designator. Separate parts sharing a designator are reported as `unresolved` with a `partial` outcome, or renumbered with `resolve_duplicates`; a shared designator that could be a package is never renumbered. Annotates one project's instance records (`project`, default the schematic's owner). Copperpour's own implementation; kicad-cli has no annotate command. |
 | `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on every placed unit, accounting for rotation/mirroring, plus each pin's `orientation_degrees` and `length_mm` and each placement's `mirror_x`/`mirror_y`. |
 | `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read, with the same fields. |
 | `add_component_annotation` | Add or update a custom property across every placed unit of a component. A key named `DNP` is refused: set the native attribute with `edit_schematic_component`'s `dnp`. |
@@ -434,7 +434,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 | Tool | Description |
 |------|-------------|
-| `load_user_config` | Load the user's global Konnect preferences (manufacturers, fab constraints, default passives, design rules). Call at session start. `source` says file or defaults; a file that exists but cannot be parsed or read is refused (`invalid_configuration`), never replaced by defaults. |
+| `load_user_config` | Load the user's global Copperpour preferences (manufacturers, fab constraints, default passives, design rules). Call at session start. `source` says file or defaults; a file that exists but cannot be parsed or read is refused (`invalid_configuration`), never replaced by defaults. |
 | `save_user_config` | Update a user preference using dot-notation, e.g. `fab_constraints.fab_house`. Keeps every other key, reports the file as read back, and refuses to write over a file it could not read. |
 | `load_project_config` | Load project-specific config from `<project_dir>/.copperpour/project.json`. Project overrides user. `source` says file or defaults; an unusable file is refused. |
 | `save_project_config` | Save a project-specific rule or override (same dot-notation and the same refusals as `save_user_config`). |

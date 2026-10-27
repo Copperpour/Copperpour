@@ -631,8 +631,8 @@ impl UnreachableReason {
             Self::AccessDenied => {
                 "The operating system refused this account access to the endpoint. Likely \
                  causes: the endpoint was created by a different account, as when a sandboxed \
-                 AI client (for example Codex on Windows) runs Konnect as a separate user, or \
-                 a restrictive ACL. Known workaround: run Konnect as the same operating-system \
+                 AI client (for example Codex on Windows) runs Copperpour as a separate user, or \
+                 a restrictive ACL. Known workaround: run Copperpour as the same operating-system \
                  user as KiCad, outside the sandbox."
             }
             Self::HandshakeFailed => {

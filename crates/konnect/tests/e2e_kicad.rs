@@ -437,7 +437,7 @@ fn full_design_loop_with_real_kicad() {
     assert_eq!(
         review["design_review"]["coverage"]["schematic"]["symbol_instances"],
         json!(kicad_component_count),
-        "Konnect and KiCad disagree on schematic component coverage: {review}"
+        "Copperpour and KiCad disagree on schematic component coverage: {review}"
     );
 
     // ── PCB: export Gerbers + DRC through real kicad-cli ─────────────────

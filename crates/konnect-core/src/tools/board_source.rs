@@ -185,7 +185,7 @@ where
                 reason: message.clone(),
             },
             format!(
-                "KiCad did not complete the {what} for this board: {message}. Konnect did not \
+                "KiCad did not complete the {what} for this board: {message}. Copperpour did not \
                  substitute the saved board file, which may be older than the editor's state. \
                  Retry, or ask for board_source='saved' to inspect the last saved snapshot."
             ),
@@ -234,7 +234,7 @@ where
         } if observed_live => BoardRead::Refused(lost_live_board(
             board_path,
             &format!(
-                "Konnect previously reached KiCad with this board open, and KiCad now {}.",
+                "Copperpour previously reached KiCad with this board open, and KiCad now {}.",
                 absence.observed()
             ),
         )),
@@ -275,7 +275,7 @@ fn explicitly_requested(ctx: &ToolContext, board_path: &Path) -> SavedBoard {
     if ctx.board_session.was_observed_live(board_path) {
         SavedBoard {
             reason: "explicitly_requested_after_live_observation",
-            detail: "board_source='saved' was requested. Konnect observed this board live in \
+            detail: "board_source='saved' was requested. Copperpour observed this board live in \
                      KiCad during this server session, so the saved file may be older than that \
                      editor's state."
                 .to_string(),
@@ -305,7 +305,7 @@ fn no_live_board(lock: live_board::EditorLock, base: &'static str, observed: &st
         live_board::EditorLock::Absent => SavedBoard {
             reason: base,
             detail: format!(
-                "{observed}, and no exact-board sibling lock was present, so Konnect read the \
+                "{observed}, and no exact-board sibling lock was present, so Copperpour read the \
                  saved board file."
             ),
         },
@@ -360,7 +360,7 @@ fn lost_live_board(board_path: &Path, situation: &str) -> CallToolResult {
         },
         format!(
             "{situation} The saved board file may be older than the editor state that was lost, \
-             so Konnect did not report it as current and did not read it as this board's live \
+             so Copperpour did not report it as current and did not read it as this board's live \
              state. Reopen the board in KiCad, or ask for board_source='saved' to inspect the \
              last saved snapshot with its freshness limitation stated."
         ),

@@ -121,7 +121,8 @@ where
         konnect_ipc::IpcFailure::Target { error, message } if error.proves_not_open() => {
             if !ctx.board_session.authorize_file_fallback(board_path) {
                 LiveBoard::LostAfterObservation {
-                    situation: "Konnect previously reached KiCad with this board open, and KiCad \
+                    situation:
+                        "Copperpour previously reached KiCad with this board open, and KiCad \
                                 no longer has it open.",
                     ipc_unreachable: false,
                 }
@@ -133,7 +134,8 @@ where
         konnect_ipc::IpcFailure::Unreachable(message) => {
             if !ctx.board_session.authorize_file_fallback(board_path) {
                 LiveBoard::LostAfterObservation {
-                    situation: "Konnect previously reached KiCad with this board open, but IPC is \
+                    situation:
+                        "Copperpour previously reached KiCad with this board open, but IPC is \
                                 now unreachable.",
                     ipc_unreachable: true,
                 }
