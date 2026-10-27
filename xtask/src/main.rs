@@ -10,6 +10,11 @@
 //! moves the counts conflicts with the whole open queue at once. v0.10.0 did
 //! exactly that to eleven open pull requests. The guard stays; the
 //! hand-editing does not.
+//!
+//! `cargo xtask collect-api-migrations <version>` folds the unreleased notes in
+//! `docs/api-migrations/` into `docs/API_MIGRATIONS.md`; see `api_migrations`.
+
+mod api_migrations;
 
 use konnect_core::router::{meta_tools, registry};
 use std::path::{Path, PathBuf};
@@ -18,11 +23,14 @@ const SKIP: &[&str] = &["target", "node_modules", ".git", ".claude", "dist", "bu
 const NL: char = '\n';
 
 fn main() {
-    match std::env::args().nth(1).as_deref() {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
         Some("fix-doc-counts") => fix_doc_counts(),
+        Some("collect-api-migrations") => api_migrations::collect(args.get(2).map(String::as_str)),
         other => {
             eprintln!("unknown task: {other:?}");
             eprintln!("usage: cargo xtask fix-doc-counts");
+            eprintln!("       cargo xtask collect-api-migrations vMAJOR.MINOR.PATCH");
             std::process::exit(2);
         }
     }

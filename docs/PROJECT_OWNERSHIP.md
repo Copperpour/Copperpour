@@ -72,7 +72,7 @@ to select its library context. Ownership uses the existing `conflict` kind.
 Placement adds `stale_target` and observed hierarchy/readback fields without
 removing existing tools, inputs, or response fields. These response changes are
 also part of the next minor release (#383/#389); see
-[API migrations](API_MIGRATIONS.md#unreleased-complete-schematic-placement-instances-minor-release).
+[Konnect's API migrations](https://github.com/mixelpixx/Konnect/blob/v0.13.0/docs/API_MIGRATIONS.md#unreleased-complete-schematic-placement-instances-minor-release).
 
 This behavior change belongs in the next minor release, as agreed in #189.
 Existing `conflict` clients should inspect `error.paths` and the message before
