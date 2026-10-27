@@ -538,7 +538,8 @@ fn property_effects(
         underlined: false,
         visible: true,
         mirrored,
-        multiline: false,
+        // As KiCad loads a footprint property.
+        multiline: true,
         // The caller sets this from the property's `(unlocked …)` clause.
         keep_upright: true,
         size: Some(konnect_ipc::builders::vec2(width, height)),
