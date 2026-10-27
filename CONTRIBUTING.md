@@ -6,8 +6,6 @@ Thanks for your interest! Bug reports, feature requests, and pull requests are w
 
 - Read [GOVERNANCE.md](GOVERNANCE.md) — who maintains what, how work is claimed,
   and what has to be true before a change lands.
-- Check [ROADMAP.md](ROADMAP.md) — your idea may already be planned (or intentionally
-  out of scope).
 - For anything non-trivial, open an issue first so we can agree on the approach before
   you invest time.
 - Keep each pull request focused on one reviewable outcome. Split unrelated platform,
@@ -75,12 +73,7 @@ Include a short architectural-fit answer:
 > If it introduces a workaround or duplicates behavior, explain why and when it
 > can be retired.
 
-Use the [architectural coordination tracker](https://github.com/mixelpixx/Konnect/issues/590)
-to find related investigations, shared-policy work, and compatibility retirement
-plans. Its horizon is proposed direction pending maintainer agreement, not a
-replacement for the roadmap or governance. Entries may exist without child
-issues or PRs until implementation is scoped. Short answers are sufficient;
-documentation-only changes may say not applicable. This is a design review
+Short answers are sufficient; documentation-only changes may say not applicable. This is a design review
 signal, not a new requirement to redesign a subsystem or migrate unrelated
 legacy behavior before landing a focused fix.
 

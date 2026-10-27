@@ -1,24 +1,14 @@
-# Konnect code owners.
+# Copperpour code owners.
 #
 # Listing an owner here auto-requests their review when a PR touches the path.
-# It is a routing hint and a statement of who decides in that area — not a
-# merge gate. See GOVERNANCE.md.
+# It is a routing hint and a statement of who decides in that area, not a
+# merge gate.
 
 # Default: the maintainer.
-*                                           @mixelpixx
+*                                                  @pauliuszaleckas
 
-# Agent-facing guidance — the skills, agents and hook Konnect installs.
-# Owned by @neusse, who audits this layer from outside our own toolchain.
-# That independence is the point: every defect found here so far (#356, #357,
-# #358) was invisible from inside the stack that ships it.
-/crates/konnect/assets/                     @neusse @mixelpixx
-/crates/konnect/src/manifest.rs             @neusse @mixelpixx
-
-# Specctra / Freerouting routing bridge — @neusse's design and implementation.
-# This path does not exist yet: it arrives with the #338-#340 stack. Registered
-# ahead of time so ownership is in place the moment it lands.
-/crates/konnect-core/src/specctra.rs        @neusse @mixelpixx
-
-# Platform and KiCad-version compatibility, including the KiCad 11 SWIG
-# removal deadline (#257) and per-user install discovery (#254).
-/crates/konnect-core/src/kicad_install.rs   @neusse @mixelpixx
+# JLCPCB and EasyEDA parts, decided by @mn89h.
+/crates/konnect-core/src/tools/easyeda.rs          @mn89h @pauliuszaleckas
+/crates/konnect-core/src/tools/jlcpcb_*            @mn89h @pauliuszaleckas
+/crates/konnect-core/src/tools/lcsc_packages.rs    @mn89h @pauliuszaleckas
+/docs/JLCPCB_CPL_CORRECTIONS.md                    @mn89h @pauliuszaleckas

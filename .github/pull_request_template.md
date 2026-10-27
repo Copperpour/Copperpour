@@ -18,8 +18,7 @@ Issue: #
 Does this change extend an existing KiCad capability or shared Konnect module?
 If it introduces a workaround or duplicates behavior, explain why and when it
 can be retired. Keep the answer short; documentation-only changes may say N/A.
-See architectural coordination tracker #590. This is a design review signal,
-not a requirement to migrate unrelated legacy behavior.
+This is a design review signal, not a requirement to migrate unrelated legacy behavior.
 For scope expansion, identify the smallest fix and explicit exclusions under
 GOVERNANCE.md#proportionate-scope-review; a short answer is sufficient.
 -->

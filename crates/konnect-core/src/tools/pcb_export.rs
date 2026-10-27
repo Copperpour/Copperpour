@@ -1166,8 +1166,7 @@ mod new_export_format_tests {
     //! Tests for `export_dxf`/`export_gencad`/`export_ipc2581`/`export_odb`.
     //!
     //! These handlers shell out to `kicad-cli`, which isn't available in CI
-    //! (see ROADMAP.md's "mocked IPC endpoint" item — no kicad-cli mock exists
-    //! yet either), so we can only test what's reachable without it:
+    //! (no kicad-cli mock exists yet), so we can only test what's reachable without it:
     //! argument validation (missing required args fail before ever touching
     //! `kicad-cli`) and that a missing/unconfigured `kicad-cli` binary produces
     //! a clean error instead of a panic.

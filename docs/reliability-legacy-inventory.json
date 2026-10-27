@@ -19,8 +19,8 @@
       ],
       "rationale": "Explicit synchronization and provenance are shared through tools::drc after #408, but general source authority and the outcome-envelope migration remain incomplete.",
       "tracking_issues": [
-        "https://github.com/mixelpixx/Konnect/issues/119",
-        "https://github.com/mixelpixx/Konnect/issues/574"
+        "https://github.com/Copperpour/Copperpour/issues/16",
+        "https://github.com/Copperpour/Copperpour/issues/58"
       ],
       "removal_criteria": "One owned DRC execution/result contract identifies source state and reports unavailable or partial evidence without ambiguity."
     },
