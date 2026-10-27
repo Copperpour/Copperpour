@@ -198,14 +198,18 @@ pub fn tools() -> Vec<ToolDef> {
              KiCad's API would drop. \
              Added footprints are staged beside the board as KiCad measured it; `staging` \
              names the item classes KiCad would not list, so a partial or unmeasured board \
-             is never reported as complete or empty.",
+             is never reported as complete or empty. `changes` lists the first `limit` \
+             planned changes, `changes_count` all of them; `output` writes the whole \
+             response to a file.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Saved root .kicad_sch path" },
                     "board": { "type": "string", "description": "Matching .kicad_pcb path currently open in KiCad" },
                     "dry_run": { "type": "boolean", "description": "Plan without changing the board", "default": true },
-                    "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" }
+                    "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" },
+                    "limit": { "type": "integer", "minimum": 0, "description": "Maximum planned changes to list; the plan and its revision stay whole", "default": 50 },
+                    "output": { "type": "string", "minLength": 1, "description": "Optional path to write the whole response JSON, every change listed" }
                 },
                 "required": ["schematic", "board"]
             }),

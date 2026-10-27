@@ -4,13 +4,14 @@
 //! This module owns the deep planning interface: turn a KiCad-exported
 //! flattened netlist plus a board snapshot into a complete, immutable plan.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::mcp::protocol::{CallToolResult, ToolContent};
 use crate::tools::{
     pcb_board::{attempt_ipc_write, BoardWrite},
-    ToolContext,
+    BoundedList, ToolContext,
 };
 use anyhow::{bail, Context, Result};
 use konnect_sexp::SexpNode;
@@ -328,6 +329,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     let board = crate::tools::get_path(args, "board")?;
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
     let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
+    let options = ResponseOptions::from_args(args);
     if !dry_run && expected_revision.is_none() {
         return Ok(CallToolResult::error_kind(
             crate::mcp::error::ToolErrorKind::InvalidArgument {
@@ -359,6 +361,26 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             )))
         }
     };
+    // Refused before the board is read, as `run_drc` refuses its report path.
+    // The hierarchy holds the root schematic and every sheet below it.
+    if let Some(output) = &options.output {
+        let sources = hierarchy
+            .iter()
+            .map(PathBuf::as_path)
+            .chain([board.as_path()])
+            .collect::<Vec<_>>();
+        if super::drc::output_is_unusable(output, &sources) {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "output".to_string(),
+                    reason: "destination aliases the board or a schematic file, is a directory \
+                             or has a non-directory ancestor"
+                        .to_string(),
+                },
+                "Choose a writable file path for the response. Nothing was planned or applied.",
+            ));
+        }
+    }
     let temp = tempfile::Builder::new().suffix(".net").tempfile()?;
     if let Err(error) =
         super::cli::export_netlist(&ctx.config.kicad_cli, &schematic, temp.path(), "kicadsexpr")
@@ -430,7 +452,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             }
             if !preflight.is_empty() {
                 refuse_plan(&mut plan, preflight);
-                return Ok(sync_response(&plan, "conflict", hierarchy.len(), false));
+                return Ok(sync_response(&plan, "conflict", hierarchy.len(), false, &options));
             }
             restage_additions(&mut plan, &prepared, snapshot.state.bounds);
             refresh_revision_with_staging(&mut plan);
@@ -443,7 +465,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                     PlanStatus::Noop => "noop",
                     PlanStatus::Conflict => "conflict",
                 };
-                return Ok(sync_response(&plan, status, hierarchy.len(), false));
+                return Ok(sync_response(&plan, status, hierarchy.len(), false, &options));
             }
             if expected_revision.as_deref() != Some(plan.plan_revision.as_str()) {
                 plan.status = PlanStatus::Conflict;
@@ -455,10 +477,10 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                     None,
                 ));
                 plan.changes.clear();
-                return Ok(sync_response(&plan, "conflict", hierarchy.len(), false));
+                return Ok(sync_response(&plan, "conflict", hierarchy.len(), false, &options));
             }
             if plan.status == PlanStatus::Noop {
-                return Ok(sync_response(&plan, "noop", hierarchy.len(), false));
+                return Ok(sync_response(&plan, "noop", hierarchy.len(), false, &options));
             }
 
             let (creates, updates) = build_mutation_items(&plan, &prepared, &snapshot)?;
@@ -488,7 +510,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 plan.counts.board_only_preserved.planned;
             plan.counts.skipped_by_flag.applied = plan.counts.skipped_by_flag.planned;
             plan.counts.unassigned_footprint.applied = plan.counts.unassigned_footprint.planned;
-            Ok(sync_response(&plan, "applied", hierarchy.len(), true))
+            Ok(sync_response(&plan, "applied", hierarchy.len(), true, &options))
         },
     )
     .await?;
@@ -522,42 +544,144 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     })
 }
 
+/// How many planned changes a response lists, and where the whole response
+/// goes (#69).
+struct ResponseOptions {
+    limit: usize,
+    output: Option<PathBuf>,
+}
+
+impl Default for ResponseOptions {
+    fn default() -> Self {
+        Self {
+            limit: Self::DEFAULT_LIMIT,
+            output: None,
+        }
+    }
+}
+
+impl ResponseOptions {
+    /// As many as `run_drc` lists violations when no `limit` is named.
+    const DEFAULT_LIMIT: usize = 50;
+
+    fn from_args(args: &serde_json::Value) -> Self {
+        Self {
+            // The schema holds `limit` to a non-negative integer, which JSON
+            // may also write as `2.0`. A float casts to `usize` saturating.
+            limit: args["limit"]
+                .as_f64()
+                .map_or(Self::DEFAULT_LIMIT, |limit| limit as usize),
+            output: args["output"].as_str().map(PathBuf::from),
+        }
+    }
+}
+
+/// The sync's response, in the order a caller reads it: the verdict, the
+/// plan revision and the counts first, the planned changes last (#69).
+/// `json!` sorts its keys, which put `status` and `plan_revision` after every
+/// change.
+#[derive(Serialize)]
+struct SyncResponse<'a> {
+    status: &'a str,
+    plan_revision: &'a str,
+    coverage: serde_json::Value,
+    /// `changes` holds the first `changes_shown` of `changes_count` planned
+    /// changes, as `run_drc` reports `shown` and `truncated` beside its list.
+    changes_count: usize,
+    changes_shown: usize,
+    changes_truncated: bool,
+    /// What added footprints were staged beside: the live board as KiCad
+    /// measured it, with the classes it would not list (#688). Null only when
+    /// the plan never reached the board.
+    staging: Option<serde_json::Value>,
+    undo: Option<&'static str>,
+    diagnostics: Cow<'a, [SyncDiagnostic]>,
+    /// Schematic components with no footprint: reported per part with what
+    /// the board holds for them, never planned and never fatal (#507). A
+    /// collection takes a plural noun (docs/NAMING_CONVENTIONS.md); the
+    /// `coverage` entry beside it is a count category and stays singular.
+    unassigned_footprints: &'a [UnassignedFootprint],
+    /// Bounded as rendered only: `plan.changes` stays whole, since the plan
+    /// revision hashes it and the apply sends it.
+    changes: &'a [PlannedChange],
+}
+
+impl<'a> SyncResponse<'a> {
+    fn new(
+        plan: &'a SyncPlan,
+        status: &'a str,
+        hierarchy_files: usize,
+        applied: bool,
+        limit: usize,
+    ) -> Self {
+        let changes = BoundedList::new(&plan.changes, limit);
+        Self {
+            status,
+            plan_revision: &plan.plan_revision,
+            changes_count: changes.count,
+            changes_shown: changes.shown,
+            changes_truncated: changes.truncated,
+            changes: changes.items,
+            coverage: serde_json::json!({
+                "source": "saved_schematic_hierarchy",
+                "hierarchy_files": hierarchy_files,
+                "transport": "live_kicad_ipc",
+                "atomicity": "single_kicad_undo_commit",
+                "footprints_added": plan.counts.added,
+                "footprints_updated": plan.counts.updated,
+                "pads_reassigned": plan.counts.pads_reassigned,
+                "board_only_preserved": plan.counts.board_only_preserved,
+                "skipped_by_flag": plan.counts.skipped_by_flag,
+                "unassigned_footprint": plan.counts.unassigned_footprint,
+                "conflicts": plan.counts.conflicts
+            }),
+            staging: plan.staging.as_ref().map(StagingEvidence::json),
+            undo: applied.then_some("Ctrl-Z reverses the whole schematic-to-PCB update."),
+            diagnostics: Cow::Borrowed(&plan.diagnostics),
+            unassigned_footprints: &plan.unassigned,
+        }
+    }
+}
+
 fn sync_response(
     plan: &SyncPlan,
     status: &str,
     hierarchy_files: usize,
     applied: bool,
+    options: &ResponseOptions,
 ) -> CallToolResult {
-    let value = serde_json::json!({
-        "status": status,
-        "plan_revision": plan.plan_revision,
-        "coverage": {
-            "source": "saved_schematic_hierarchy",
-            "hierarchy_files": hierarchy_files,
-            "transport": "live_kicad_ipc",
-            "atomicity": "single_kicad_undo_commit",
-            "footprints_added": plan.counts.added,
-            "footprints_updated": plan.counts.updated,
-            "pads_reassigned": plan.counts.pads_reassigned,
-            "board_only_preserved": plan.counts.board_only_preserved,
-            "skipped_by_flag": plan.counts.skipped_by_flag,
-            "unassigned_footprint": plan.counts.unassigned_footprint,
-            "conflicts": plan.counts.conflicts
-        },
-        "changes": plan.changes,
-        "diagnostics": plan.diagnostics,
-        // Schematic components with no footprint: reported per part with what
-        // the board holds for them, never planned and never fatal (#507). A
-        // collection takes a plural noun (docs/NAMING_CONVENTIONS.md); the
-        // `coverage` entry beside it is a count category and stays singular.
-        "unassigned_footprints": plan.unassigned,
-        // What added footprints were staged beside: the live board as KiCad
-        // measured it, with the classes it would not list (#688). Null only
-        // when the plan never reached the board.
-        "staging": plan.staging.as_ref().map(StagingEvidence::json),
-        "undo": if applied { Some("Ctrl-Z reverses the whole schematic-to-PCB update.") } else { None }
-    });
-    CallToolResult::json(&value)
+    let mut response = SyncResponse::new(plan, status, hierarchy_files, applied, options.limit);
+    let Some(output) = &options.output else {
+        return CallToolResult::json(&response);
+    };
+    let whole = SyncResponse::new(plan, status, hierarchy_files, applied, usize::MAX);
+    let written = serde_json::to_string_pretty(&whole)
+        .map_err(anyhow::Error::from)
+        .and_then(|text| super::drc::write_report_blocking(output, &text));
+    let Err(error) = written else {
+        return CallToolResult::json(&response);
+    };
+    let reason = format!(
+        "the full response was not written to {}: {error:#}",
+        output.display()
+    );
+    // As `run_drc` answers a report it could not write: with nothing applied
+    // the call fails and can be repeated; after an apply it fails carrying the
+    // applied response, so the commit is not repeated blindly.
+    if !applied {
+        return CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::HandlerError { reason },
+            "Nothing was applied. Choose a writable output path and run the sync again.",
+        );
+    }
+    response.diagnostics.to_mut().push(conflict(
+        "output_not_written",
+        format!("{reason}. The commit was applied; do not apply this plan again."),
+        None,
+    ));
+    let mut result = CallToolResult::json(&response);
+    result.is_error = true;
+    result
 }
 
 /// A refusal before any plan exists: the saved hierarchy, the netlist export
@@ -3514,7 +3638,7 @@ mod tests {
     fn the_response_names_the_collection_in_the_plural_and_the_count_in_the_singular() {
         let design = unassigned_design();
         let plan = plan_sync(UNASSIGNED, &design, &board_with(vec![]));
-        let result = sync_response(&plan, "ready", 1, false);
+        let result = sync_response(&plan, "ready", 1, false, &ResponseOptions::default());
         let text = match result.content.first() {
             Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
             other => panic!("expected text content, got {other:?}"),
@@ -6246,6 +6370,12 @@ mod tests {
 
         /// One `tools/call`, with the result's `isError` beside the body.
         async fn call(&self, arguments: serde_json::Value) -> (bool, serde_json::Value) {
+            let (is_error, text) = self.call_text(arguments).await;
+            (is_error, serde_json::from_str(&text).unwrap())
+        }
+
+        /// As [`Self::call`], with the body as the text the client receives.
+        async fn call_text(&self, arguments: serde_json::Value) -> (bool, String) {
             let response = self
                 .handler
                 .handle_message(serde_json::json!({
@@ -6259,8 +6389,29 @@ mod tests {
             let result = response.result.expect("successful JSON-RPC response");
             (
                 result["isError"] == serde_json::json!(true),
-                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+                result["content"][0]["text"].as_str().unwrap().to_string(),
             )
+        }
+
+        /// A sync of `netlist` through `tools/call` with `extra` beside the
+        /// paths, as the text the client receives.
+        async fn sync_text(&self, netlist: &str, extra: serde_json::Value) -> (bool, String) {
+            std::fs::write(&self.exported, netlist).unwrap();
+            let mut arguments = serde_json::json!({
+                "schematic": self.schematic.to_string_lossy(),
+                "board": self.board.to_string_lossy(),
+            });
+            let serde_json::Value::Object(extra) = extra else {
+                panic!("extra arguments are an object")
+            };
+            arguments.as_object_mut().unwrap().extend(extra);
+            self.call_text(arguments).await
+        }
+
+        /// As [`Self::sync_text`], parsed.
+        async fn sync(&self, netlist: &str, extra: serde_json::Value) -> (bool, serde_json::Value) {
+            let (is_error, text) = self.sync_text(netlist, extra).await;
+            (is_error, serde_json::from_str(&text).unwrap())
         }
 
         /// A dry run and then the apply of its plan, both through
@@ -6659,7 +6810,9 @@ mod tests {
     #[test]
     fn a_plan_that_never_reached_the_board_reports_no_staging() {
         let plan = plan_adding(Vec::new());
-        let body = match &sync_response(&plan, "conflict", 1, false).content[0] {
+        let body = match &sync_response(&plan, "conflict", 1, false, &ResponseOptions::default())
+            .content[0]
+        {
             ToolContent::Text { text } => serde_json::from_str::<serde_json::Value>(text).unwrap(),
             _ => panic!("sync response was not JSON text"),
         };
@@ -7484,5 +7637,292 @@ mod tests {
 
         assert_refused(&plan, "what an update of R1 would drop is unknown");
         assert_eq!(served.sent("UpdateItems"), 0);
+    }
+
+    // ─── #69: a bounded response, verdict first ────────────────────────────
+
+    /// `count` parts the board lacks, each a stock 0603.
+    fn additions(count: usize) -> String {
+        let references = (1..=count).map(|n| format!("C{n}")).collect::<Vec<_>>();
+        let parts = references
+            .iter()
+            .map(|reference| (reference.as_str(), STOCK_0603, &["1", "2"][..]))
+            .collect::<Vec<_>>();
+        exported_netlist(&parts)
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_lists_the_first_limit_changes_and_counts_them_all() {
+        let served = ServedSync::new().await;
+
+        let (is_error, plan) = served
+            .sync(&additions(3), serde_json::json!({ "limit": 1 }))
+            .await;
+
+        assert!(!is_error, "{plan:#}");
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["changes_count"], 3, "{plan:#}");
+        assert_eq!(plan["changes_shown"], 1);
+        assert_eq!(plan["changes_truncated"], true);
+        let changes = plan["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["reference"], "C1");
+        assert_eq!(plan["coverage"]["footprints_added"]["planned"], 3);
+    }
+
+    /// The input schema takes an integral `1.0` as an integer, so the limit
+    /// does too.
+    #[tokio::test]
+    async fn an_integral_float_limit_is_the_limit() {
+        let served = ServedSync::new().await;
+
+        let (is_error, plan) = served
+            .sync(&additions(3), serde_json::json!({ "limit": 1.0 }))
+            .await;
+
+        assert!(!is_error, "{plan:#}");
+        assert_eq!(plan["changes_shown"], 1, "{plan:#}");
+        assert_eq!(plan["changes"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fifty_changes_are_listed_when_no_limit_is_named() {
+        let served = ServedSync::new().await;
+
+        let plan = served.dry_run(&additions(51)).await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["changes_count"], 51);
+        assert_eq!(plan["changes_shown"], 50);
+        assert_eq!(plan["changes_truncated"], true);
+        assert_eq!(plan["changes"].as_array().unwrap().len(), 50);
+    }
+
+    /// `json!` sorted the keys, so `status` and `plan_revision` came after
+    /// every change, past where a client cuts a long response.
+    #[tokio::test]
+    async fn the_verdict_and_plan_revision_come_before_the_changes() {
+        let served = ServedSync::new().await;
+
+        let (_, text) = served.sync_text(&additions(3), serde_json::json!({})).await;
+
+        assert!(
+            text.starts_with(r#"{"status":"ready","plan_revision":""#),
+            "{text}"
+        );
+        let changes = text.find(r#""changes":["#).expect("changes");
+        for key in [
+            "coverage",
+            "changes_count",
+            "changes_shown",
+            "changes_truncated",
+            "staging",
+            "undo",
+            "diagnostics",
+            "unassigned_footprints",
+        ] {
+            let at = text
+                .find(&format!("\"{key}\":"))
+                .unwrap_or_else(|| panic!("no {key}: {text}"));
+            assert!(at < changes, "{key} comes after the changes: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_output_file_holds_the_whole_response() {
+        let served = ServedSync::new().await;
+        let out = tempfile::tempdir().unwrap();
+        // A directory that does not exist yet, as `run_drc` creates.
+        let output = out.path().join("plans").join("sync.json");
+
+        let (is_error, plan) = served
+            .sync(
+                &additions(3),
+                serde_json::json!({ "limit": 1, "output": output.to_string_lossy() }),
+            )
+            .await;
+
+        assert!(!is_error, "{plan:#}");
+        assert_eq!(plan["changes_shown"], 1, "{plan:#}");
+        let whole: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&output).unwrap()).unwrap();
+        assert_eq!(whole["status"], plan["status"]);
+        assert_eq!(whole["plan_revision"], plan["plan_revision"]);
+        assert_eq!(whole["coverage"], plan["coverage"]);
+        assert_eq!(
+            (
+                &whole["changes_count"],
+                &whole["changes_shown"],
+                &whole["changes_truncated"]
+            ),
+            (
+                &serde_json::json!(3),
+                &serde_json::json!(3),
+                &serde_json::json!(false)
+            )
+        );
+        let references = whole["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|change| change["reference"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(references, ["C1", "C2", "C3"]);
+    }
+
+    /// The bound is the response's only: the revision hashes the whole plan
+    /// and the apply sends all of it, and its file lists all of it.
+    #[tokio::test]
+    async fn a_bounded_dry_run_applies_its_whole_plan() {
+        let served = ServedSync::new().await;
+        let netlist = additions(3);
+        let out = tempfile::tempdir().unwrap();
+        let output = out.path().join("applied.json");
+
+        let unbounded = served.dry_run(&netlist).await;
+        let (_, bounded) = served
+            .sync(&netlist, serde_json::json!({ "limit": 0 }))
+            .await;
+        assert_eq!(bounded["changes"], serde_json::json!([]), "{bounded:#}");
+        assert_eq!(bounded["changes_count"], 3);
+        assert_eq!(bounded["plan_revision"], unbounded["plan_revision"]);
+
+        let (is_error, applied) = served
+            .sync(
+                &netlist,
+                serde_json::json!({
+                    "dry_run": false,
+                    "expected_plan_revision": bounded["plan_revision"],
+                    "limit": 0,
+                    "output": output.to_string_lossy(),
+                }),
+            )
+            .await;
+
+        assert!(!is_error, "{applied:#}");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["coverage"]["footprints_added"]["applied"], 3);
+        assert_eq!(applied["changes"], serde_json::json!([]));
+        assert_eq!(applied["changes_count"], 3);
+        assert_eq!(served.sent_footprints().len(), 3);
+        let whole: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&output).unwrap()).unwrap();
+        assert_eq!(whole["status"], "applied", "{whole:#}");
+        assert_eq!(whole["changes"].as_array().unwrap().len(), 3);
+    }
+
+    /// An output that would replace the board or a schematic of the saved
+    /// hierarchy, or that cannot be a file, is refused before the board is
+    /// read, as `run_drc` refuses its report path.
+    #[tokio::test]
+    async fn an_output_over_the_board_a_schematic_or_a_file_is_refused_first() {
+        let served = ServedSync::new().await;
+        // A root with one sheet, so a sheet below the root is a source too.
+        std::fs::write(
+            &served.schematic,
+            include_bytes!("../../tests/fixtures/single_pin_nets.kicad_sch"),
+        )
+        .unwrap();
+        let sheet = served
+            .schematic
+            .with_file_name("single_pin_nets_child.kicad_sch");
+        std::fs::write(
+            &sheet,
+            include_bytes!("../../tests/fixtures/single_pin_nets_child.kicad_sch"),
+        )
+        .unwrap();
+        let sources = [served.board.clone(), served.schematic.clone(), sheet];
+        let before = sources.clone().map(|path| std::fs::read(path).unwrap());
+        let out = tempfile::tempdir().unwrap();
+        let blocker = out.path().join("blocker");
+        std::fs::write(&blocker, "a file, not a directory").unwrap();
+        let netlist = additions(1);
+
+        for output in sources
+            .iter()
+            .cloned()
+            .chain([out.path().to_path_buf(), blocker.join("sync.json")])
+        {
+            for mut extra in [
+                serde_json::json!({}),
+                serde_json::json!({ "dry_run": false, "expected_plan_revision": "any" }),
+            ] {
+                extra["output"] = serde_json::json!(output.to_string_lossy());
+                let (is_error, refused) = served.sync(&netlist, extra).await;
+
+                assert!(is_error, "{}: {refused:#}", output.display());
+                assert_eq!(refused["error"]["kind"], "invalid_argument", "{refused:#}");
+                assert_eq!(refused["error"]["field"], "output", "{refused:#}");
+            }
+        }
+        assert!(served.sent_footprints().is_empty());
+        assert_eq!(sources.map(|path| std::fs::read(path).unwrap()), before);
+    }
+
+    /// A write that fails after the check, as on a full disk or a permission
+    /// change, is answered as `run_drc` answers a report it could not write:
+    /// with nothing applied the call fails and can be repeated; after an
+    /// apply it fails carrying the applied response.
+    #[test]
+    fn an_output_that_cannot_be_written_fails_the_call_and_keeps_an_applied_response() {
+        let plan = plan_adding(vec![planned_add("C1", STOCK_0603, &["1", "2"])]);
+        let out = tempfile::tempdir().unwrap();
+        let blocker = out.path().join("blocker");
+        std::fs::write(&blocker, "a file, not a directory").unwrap();
+        let output = blocker.join("sync.json");
+        let options = ResponseOptions {
+            output: Some(output.clone()),
+            ..ResponseOptions::default()
+        };
+        let body = |result: &CallToolResult| -> serde_json::Value {
+            match &result.content[0] {
+                ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+                _ => panic!("sync response was not JSON text"),
+            }
+        };
+        let path = output.display().to_string();
+
+        let dry_run = sync_response(&plan, "ready", 1, false, &options);
+        assert!(dry_run.is_error);
+        let refused = body(&dry_run);
+        assert_eq!(refused["error"]["kind"], "handler_error", "{refused:#}");
+        let reason = refused["error"]["reason"].as_str().unwrap();
+        assert!(reason.contains(&path), "{reason}");
+
+        let applied = sync_response(&plan, "applied", 1, true, &options);
+        assert!(applied.is_error);
+        let applied = body(&applied);
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["changes_count"], 1);
+        assert_eq!(applied["coverage"]["conflicts"]["planned"], 0);
+        let diagnostics = applied["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1, "{applied:#}");
+        assert_eq!(diagnostics[0]["code"], "output_not_written");
+        let message = diagnostics[0]["message"].as_str().unwrap();
+        assert!(message.contains(&path), "{message}");
+        assert!(
+            message.contains("do not apply this plan again"),
+            "{message}"
+        );
+        assert!(!output.exists());
+    }
+
+    /// Refused by the input schema, before the handler runs: an empty
+    /// `output` would otherwise reach the writer and fail there instead.
+    #[tokio::test]
+    async fn a_negative_limit_or_an_empty_output_is_refused_by_the_schema() {
+        let served = ServedSync::new().await;
+
+        for (field, extra) in [
+            ("limit", serde_json::json!({ "limit": -1 })),
+            ("output", serde_json::json!({ "output": "" })),
+        ] {
+            let (is_error, refused) = served.sync(&additions(1), extra).await;
+
+            assert!(is_error, "{refused:#}");
+            assert_eq!(refused["error"]["kind"], "invalid_argument", "{refused:#}");
+            assert_eq!(refused["error"]["field"], field, "{refused:#}");
+        }
+        assert!(served.sent_footprints().is_empty());
     }
 }

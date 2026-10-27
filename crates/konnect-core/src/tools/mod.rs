@@ -1609,6 +1609,82 @@ pub(crate) fn field_at(
 pub(crate) const FALLBACK_REFERENCE_AT: (f64, f64, f64) = (0.0, 3.81, 0.0);
 pub(crate) const FALLBACK_VALUE_AT: (f64, f64, f64) = (0.0, -3.81, 0.0);
 
+// ─── Response helpers ────────────────────────────────────────────────────────
+
+/// The first `limit` entries of a list a response renders, with how many it
+/// holds (#69), for the `shown` and `truncated` that `run_drc` reports
+/// beside its list.
+///
+/// Bound only what is rendered: a list that is hashed or applied stays whole
+/// beside its response.
+#[derive(Debug, PartialEq)]
+pub(crate) struct BoundedList<'a, T> {
+    pub(crate) count: usize,
+    pub(crate) shown: usize,
+    pub(crate) truncated: bool,
+    pub(crate) items: &'a [T],
+}
+
+impl<'a, T> BoundedList<'a, T> {
+    pub(crate) fn new(items: &'a [T], limit: usize) -> Self {
+        let shown = items.len().min(limit);
+        Self {
+            count: items.len(),
+            shown,
+            truncated: shown < items.len(),
+            items: &items[..shown],
+        }
+    }
+}
+
+#[cfg(test)]
+mod bounded_list_tests {
+    use super::BoundedList;
+
+    #[test]
+    fn a_list_over_its_limit_shows_the_first_entries_and_counts_them_all() {
+        assert_eq!(
+            BoundedList::new(&[1, 2, 3], 2),
+            BoundedList {
+                count: 3,
+                shown: 2,
+                truncated: true,
+                items: &[1, 2],
+            }
+        );
+    }
+
+    #[test]
+    fn a_list_within_its_limit_is_shown_whole() {
+        for limit in [3, 4, usize::MAX] {
+            assert_eq!(
+                BoundedList::new(&[1, 2, 3], limit),
+                BoundedList {
+                    count: 3,
+                    shown: 3,
+                    truncated: false,
+                    items: &[1, 2, 3],
+                },
+                "limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_limit_of_zero_shows_only_the_count() {
+        assert_eq!(
+            BoundedList::new(&[1, 2, 3], 0),
+            BoundedList {
+                count: 3,
+                shown: 0,
+                truncated: true,
+                items: &[],
+            }
+        );
+        assert!(!BoundedList::<i32>::new(&[], 0).truncated);
+    }
+}
+
 // ─── Schematic text helpers ──────────────────────────────────────────────────
 
 /// Byte range of the placed `(symbol …)` block whose Reference property is
