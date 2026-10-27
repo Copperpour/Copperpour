@@ -3,11 +3,11 @@
 `batch_connect_kicad10.kicad_sch` has pins facing all four ways, one of them on
 a mirrored symbol, and a stub that ends mid-span on a wire. It checks
 `batch_connect_to_net`'s placement options against what `main` wrote before
-the change (#701).
+the change.
 
 ## Provenance
 
-Built through Konnect against KiCad's stock `MCU_Microchip_ATtiny` and `Device`
+Built through Copperpour against KiCad's stock `MCU_Microchip_ATtiny` and `Device`
 libraries with `create_schematic`, `add_schematic_component` and `add_wire`,
 then force-resaved by KiCad 10.0.6:
 
@@ -83,7 +83,7 @@ The fixture itself reports 18 `pin_not_connected`, 4 `power_pin_not_driven`,
 `kicad-cli sch erc --severity-all`. No pin is wired and the wire touches
 nothing, so this is expected.
 
-## `add_schematic_text` coordinates (#828)
+## `add_schematic_text` coordinates
 
 `sch_batch.rs`'s `the_served_dispatch_writes_the_coordinates_kicad_writes` adds
 text `"hi"` to a copy of this sheet. The oracle is KiCad 10.0.6 resaving the
@@ -98,7 +98,7 @@ kicad-cli sch upgrade --force <copy>.kicad_sch
 | `(at 54.60999999999999 27.939999999999998 0)` | `(at 54.61 27.94 0)` |
 | `(at 54.61 27.94 90.00000000000001)` | `(at 54.61 27.94 90)` |
 
-## Coordinates in the response (#747)
+## Coordinates in the response
 
 `kicad-cli sch erc --format json --severity-all --units mm` (KiCad 10.0.6)
 reports each unconnected pin's position, in units of 100 mm. Scaled to mm, it

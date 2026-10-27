@@ -1,7 +1,7 @@
 # Structural schematic scan fixture
 
 `structural_scans_kicad10.kicad_sch` is Eeschema-authored evidence for the
-three saved-schematic paths repaired by issue #84:
+three saved-schematic paths repaired by mixelpixx/Konnect#84:
 
 - wire endpoint repair sees a loose wire at `(190.54, 193.04)` and one
   geometric destination at `(190.5, 193.04)`, represented by both R3 pin 1
@@ -12,7 +12,7 @@ three saved-schematic paths repaired by issue #84:
   full library/symbol records.
 
 The seed was the existing `junction_reconcile.kicad_sch` fixture, which was
-built through Konnect against KiCad's stock `Device:R` library. The deliberate
+built through Copperpour against KiCad's stock `Device:R` library. The deliberate
 wire, label, and custom-property cases were added, then the whole document was
 parsed and force-resaved by KiCad 10.0.5:
 

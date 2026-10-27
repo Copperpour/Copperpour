@@ -14,5 +14,5 @@ The `_locked_arc` pair was produced the same way with one additional locked
 `PCB_ARC`. These native files are parity oracles, not runtime dependencies. The
 exports prove that KiCad represents locked straight tracks and vias as
 Specctra `type fix`, while lowering the locked arc to its straight start/end
-chord. Konnect's fail-closed Rust profile therefore rejects locked arcs rather
+chord. Copperpour's fail-closed Rust profile therefore rejects locked arcs rather
 than silently approximating their geometry.

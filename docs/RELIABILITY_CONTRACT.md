@@ -83,7 +83,7 @@ table below is its human-readable explanation.
 
 | Area | Current gap | Tracking | Removal condition |
 |---|---|---|---|
-| DRC entry points | #408 introduces shared explicit save/refill ordering and source evidence. Default calls still read saved files; general source authority and the outcome-envelope migration remain incomplete. | [#16](https://github.com/Copperpour/Copperpour/issues/16), [#58](https://github.com/Copperpour/Copperpour/issues/58) | One owned DRC execution/result contract identifies source state and unavailable or partial evidence, including the remaining migration. |
+| DRC entry points | `tools::drc` shares explicit save/refill ordering and source evidence. Default calls still read saved files; general source authority and the outcome-envelope migration remain incomplete. | [#16](https://github.com/Copperpour/Copperpour/issues/16), [#58](https://github.com/Copperpour/Copperpour/issues/58) | One owned DRC execution/result contract identifies source state and unavailable or partial evidence, including the remaining migration. |
 | Explicit config loading | A failed explicit plugin config can fall through to defaults and report success. | [#545](https://github.com/mixelpixx/Konnect/issues/545) | Explicit-config refusal is structured, does not start with substituted defaults, and has regression coverage. |
 | Live/file board readers | `get_layer_list` and `get_netclasses` read the saved file while sibling writers can operate on the live board. | [#542](https://github.com/mixelpixx/Konnect/issues/542) | Readers disclose and consistently select the live or saved source, with stale-file coverage. |
 
@@ -117,16 +117,6 @@ remain visible in issues; fixing one tool does not require migrating every other
 handler first. Keep fixes focused and expose one review-ready step per overlapping
 dependency chain under the existing branch workflow.
 
-Implementation tracked by [#549](https://github.com/mixelpixx/Konnect/issues/549)
-is separate from this policy:
-
-| Follow-up | Planned automation or implementation |
-|---|---|
-| [#551](https://github.com/mixelpixx/Konnect/pull/551) | Compiled/cached Draft 2020-12 validation for domain and meta-tools, catalogue conformance, checked unit handling, and positive sheet dimensions; coordinated with #546/#547/#543 |
-| [#552](https://github.com/mixelpixx/Konnect/pull/552) | Shared, lifecycle-owned `inproc://` IPC test fixture; migrates the five racy mocks from #544 and covers readiness, concurrency, repeated use, and cleanup after success or responder failure |
-| [#553](https://github.com/mixelpixx/Konnect/pull/553) | Shared outcomes and initial handler/observer migration |
-| [#554](https://github.com/mixelpixx/Konnect/pull/554) | Named CI gate for the adopted outcome catalogue, served-dispatch outcome preservation, and a reviewed three-entry legacy-debt ratchet |
-
 The dispatch compiles, caches, and enforces every advertised tool schema before
 the handler runs. Handlers still own domain rules and checked direct-call paths.
 The CI gate checks that the outcome pilot remains served through the catalogue,
@@ -143,7 +133,7 @@ not model selection.
 ## Maintainer references
 
 - [Governance](../GOVERNANCE.md)
-- [Contributing](https://github.com/mixelpixx/Konnect/blob/main/CONTRIBUTING.md)
+- [Contributing](../CONTRIBUTING.md)
 - [Branch workflow](BRANCH_AND_PULL_REQUEST_WORKFLOW.md)
 
 The canonical source is `docs/RELIABILITY_CONTRACT.md`. The installer embeds these

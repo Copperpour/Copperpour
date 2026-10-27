@@ -11,7 +11,8 @@ the library's `(stroke (type …))`. A stroke without a type, or a KiCad 6 bare
 upright unless the library marks it `(unlocked yes)` or, in a KiCad 7 or older
 file, `(at … unlocked)`. The refresh still refuses unlocked user text and
 properties, so its text always keeps upright. `place_component`'s Reference
-and Value fields are unchanged (#971).
+and Value fields are unchanged
+([#157](https://github.com/Copperpour/Copperpour/issues/157)).
 
 Footprint text and refreshed properties are now sent at their angle as placed,
 which KiCad turns upright itself, where they used to be turned by 180° past
@@ -25,10 +26,10 @@ drill, chamfer and anchor settings a pad's shape does not use, and a pad angle
 of 270° against −90°. A footprint that matches its library now plans `noop`,
 and so does a dry run right after an apply. Before, every stock footprint
 planned `pads`, `graphics` and `metadata` on every run. A footprint an earlier
-Konnect refreshed plans `graphics` and `metadata` once more, because its text
+Copperpour refreshed plans `graphics` and `metadata` once more, because its text
 was saved `(unlocked yes)` and turned; applying that plan settles it.
 
 KiCad 10.0.6 reports a `(type default)` stroke as solid over IPC, so the
 planner cannot see strokes that an earlier refresh turned into `default`, and
 does not offer to restore them. Use KiCad's own Update Footprints from Library
-for those. Arguments and response shapes are unchanged (#970).
+for those. Arguments and response shapes are unchanged.

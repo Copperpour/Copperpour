@@ -5,7 +5,7 @@ KiCad's own `complex_hierarchy` demo
 resaved by KiCad 10.0.6. Nothing is hand-written. The root places
 `ampli_ht.kicad_sch` twice (`/ampli_ht_vertical/`, `/ampli_ht_horizontal/`),
 so a hierarchy walk meets the same sheet file twice. It backs
-`set_schematic_title_block` (#714).
+`set_schematic_title_block`.
 
 ## Provenance
 

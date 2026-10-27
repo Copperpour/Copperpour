@@ -2,11 +2,11 @@
 
 `rotate_junctions_kicad10.kicad_sch` carries the two directions a turn can
 change junction state, so `rotate_schematic_component` can be asked to
-reconcile them and checked against an answer that is not its own (#615).
+reconcile them and checked against an answer that is not its own.
 
 ## Provenance
 
-Built through Konnect against KiCad's stock `Device` library —
+Built through Copperpour against KiCad's stock `Device` library —
 `create_schematic`, `add_wire`, `add_schematic_component`,
 `move_schematic_component`, `add_schematic_net_label` — then parsed and
 force-resaved by KiCad 10.0.6:
@@ -66,7 +66,8 @@ kicad-cli sch export netlist --output rotate.net rotate_junctions_kicad10.kicad_
 The load-bearing row is the last pair. KiCad puts the turned pin on `/NETB`
 only when the dot is there; without it the same pin, at the same coordinate on
 the same wire, is reported as `unconnected-(R2-Pad1)`. That is the half of
-#615 that changes the design rather than the picture: a wrong implementation
+mixelpixx/Konnect#615 that changes the design rather than the picture: a wrong
+implementation
 cannot produce both rows.
 
 The `R1` rows are the converse and agree with each other — a stranded dot costs

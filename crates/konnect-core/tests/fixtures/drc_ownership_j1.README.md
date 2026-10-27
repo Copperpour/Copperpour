@@ -1,4 +1,4 @@
-# DRC ownership fixture (issue #413)
+# DRC ownership fixture
 
 `drc_ownership_j1.kicad_pcb` and `drc_ownership_j1.drc.json` are the board and
 report pair used to prove that a DRC report item names what owns it.
@@ -77,7 +77,7 @@ path.
 
 ## What the pair covers
 
-| acceptance case (#413)                | fixture item                                              |
+| acceptance case                | fixture item                                              |
 | ------------------------------------- | --------------------------------------------------------- |
 | board's top-level `Edge.Cuts` outline | `gr_line` `e0000000-…-000000000004`, `owner.kind: board`   |
 | `Edge.Cuts` circle nested in J1       | `fp_circle` `7b970478-…`, `owner.kind: footprint`, ref J1  |

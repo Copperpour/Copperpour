@@ -84,7 +84,6 @@ expansion is deferred.
 - **Announce intent before bumping**, and **land count-changing PRs first.**
   Every PR that adds a tool touches the same handful of documented counts, so a
   release that moves those counts conflicts with the entire open queue at once.
-  This is not hypothetical: Konnect's v0.10.0 did it to eleven open PRs.
 - Version choice: a new tool, a renamed tool, or a changed response shape is a
   **minor**. Fixes — even ones that narrow behaviour nobody could have relied
   on — are a **patch**.

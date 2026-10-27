@@ -1,7 +1,7 @@
 # Schematic project ownership
 
 Copperpour resolves saved schematic ownership by parsing candidate projects' sheet
-trees. Directory ancestry alone does not establish ownership (#189). The shared
+trees. Directory ancestry alone does not establish ownership. The shared
 resolver serves symbol placement, library resolution, and ERC root detection.
 Relative target paths are anchored at the process working directory before
 walking ancestors, so the same saved hierarchy remains discoverable.
@@ -42,7 +42,7 @@ the successful response from that symbol.
 | Reused child with matching metadata | Write every hierarchy path; preserve existing symbols and other documents. |
 | Loose schematic with no candidate project and matching local instance metadata | Use its own project name and root UUID. |
 | Missing, foreign, duplicate, malformed, or obsolete symbol paths, references, or units | Return `stale_target` before writing; never silently repair or pick one entry. References must retain the symbol's designator identity, at least one hierarchy entry must match the symbol Reference, and every saved unit must match the placed unit. |
-| Unproven or ambiguous project ownership | Preserve #189's `conflict` refusal before writing. |
+| Unproven or ambiguous project ownership | Preserve the ownership `conflict` refusal before writing. |
 | Readback has the wrong document, missing symbol/fields, or inconsistent instance metadata | Return `stale_target` instead of success; the placement may already have been written. |
 
 The saved root sheet tree supplies expected paths. Existing symbol instance
@@ -62,7 +62,8 @@ enumerate every affected symbol, inspect the file.
 
 ## Hierarchy annotation
 
-`annotate_schematic` with `schematic_scope: "hierarchy"` (#42) walks the saved
+`annotate_schematic` with `schematic_scope: "hierarchy"`
+([#42](https://github.com/Copperpour/Copperpour/issues/42)) walks the saved
 sheet tree of the proven root and checks every file's instance records before
 it plans anything. A record is the project's when its path starts at the root,
 as eeschema saves it, and carries the project's name or none.
@@ -71,28 +72,20 @@ as eeschema saves it, and carries the project's name or none.
 | --- | --- |
 | The target is the proven root, and the project lists no other top-level sheet | Annotate every sheet instance; commit every changed file in one transaction. |
 | The target is a child sheet, or no project owns it | Return `invalid_argument` naming the root or asking for `schematic_scope: "file"`; never annotate the file alone. |
-| Unproven or ambiguous project ownership | Preserve #189's `conflict` refusal before writing. |
+| Unproven or ambiguous project ownership | Preserve the ownership `conflict` refusal before writing. |
 | The project lists another top-level sheet, or gives the root another uuid | Return `invalid_argument`: eeschema annotates every top-level sheet as one hierarchy, and keys the root by the uuid listed. |
 | A placed symbol lacks a record for a sheet instance of its file, records one twice, records a project path that is not one, records one under another project's name, or records a path under another root under this project's name (eeschema prunes those on load); or two symbols of one file share a uuid | Return `stale_target` before writing; nothing is pruned or created. |
 | Records under another root, under another project's name or none | Leave them untouched. |
 
-## Unreleased notes (next minor release)
+## Repairing an ownership conflict
 
-Schematics that previously inherited an unrelated ancestor project's libraries,
-or silently fell back to projectless operation despite an unproven candidate,
-now return `conflict`. Repair the saved root-to-child sheet references, restore
-unreadable project schematics, or place a genuinely independent document outside
-the unrelated project. An explicit library table beside a schematic continues
-to select its library context. Ownership uses the existing `conflict` kind.
-
-Placement adds `stale_target` and observed hierarchy/readback fields without
-removing existing tools, inputs, or response fields. These response changes are
-also part of the next minor release (#383/#389); see
-[Konnect's API migrations](https://github.com/mixelpixx/Konnect/blob/v0.13.0/docs/API_MIGRATIONS.md#unreleased-complete-schematic-placement-instances-minor-release).
-
-This behavior change belongs in the next minor release, as agreed in #189.
-Existing `conflict` clients should inspect `error.paths` and the message before
-retrying: reloading alone does not repair an ownership conflict.
+A schematic that once inherited an unrelated ancestor project's libraries, or
+fell back to projectless operation despite an unproven candidate, now returns
+`conflict`. Reloading alone does not repair it: inspect `error.paths` and the
+message, then repair the saved root-to-child sheet references, restore
+unreadable project schematics, or move a genuinely independent document out of
+the unrelated project. An explicit library table beside a schematic still
+selects its library context.
 
 ## Evidence and limits
 

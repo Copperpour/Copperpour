@@ -6,4 +6,4 @@ now writes only the label, on the pin or point itself, as
 object with equal ends. A negative `stub_length` used to flip the stub to the
 opposite side; it is now refused with `invalid_argument` naming
 `stub_length`, before anything is written. Pass `direction` to choose the
-side (#143).
+side ([#143](https://github.com/Copperpour/Copperpour/issues/143)).

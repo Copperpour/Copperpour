@@ -1,4 +1,4 @@
-# Board whose saved state cannot be mistaken for a live one (issue #542)
+# Board whose saved state cannot be mistaken for a live one
 
 `board_source_divergence_kicad10.kicad_pcb` is the saved half of the
 `board_source` tests for `get_layer_list` and `get_netclasses`. Its stackup and
@@ -31,7 +31,7 @@ edited after the resave. Measured against **KiCad 10.0.6** on Fedora Linux.
 ## Oracles
 
 All three were produced by `kicad-cli` from the committed file, and none of
-them reads any Konnect code.
+them reads any Copperpour code.
 
 ### Enabled layers and their displayed names — `pcb export gerbers`
 

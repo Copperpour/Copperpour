@@ -3,16 +3,16 @@
 `route_obstacles_kicad10.kicad_sch` and its child sheet
 `route_obstacles_sub_kicad10.kicad_sch` put another net's pin or sheet pin on the
 L-bend that `connect_pins`, `batch_connect_pins` and `add_schematic_connection`
-draw between two pins (#887). They also hold a T with no junction, which every
+draw between two pins. They also hold a T with no junction, which every
 route used to dot wherever it was on the sheet.
 
 ## Provenance
 
-Built through Konnect (`main` @ `9488e5f`) against KiCad's stock `Device`
+Built through Copperpour (`main` @ `9488e5f`) against KiCad's stock `Device`
 library with `create_schematic`, `add_schematic_component`,
 `add_schematic_net_label`, `add_hierarchical_sheet` and `add_sheet_pin`. The
 three wires of the `tee` group were then appended as text, because every
-Konnect wire tool dots a T. Then both files were force-resaved by KiCad 10.0.6:
+Copperpour wire tool dots a T. Then both files were force-resaved by KiCad 10.0.6:
 
 ```text
 kicad-cli sch upgrade --force route_obstacles_kicad10.kicad_sch

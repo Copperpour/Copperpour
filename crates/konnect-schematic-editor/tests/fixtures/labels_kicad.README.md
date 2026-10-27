@@ -1,4 +1,4 @@
-# Label fixtures (#695)
+# Label fixtures
 
 Two minimal sheets whose label blocks are copied byte for byte, CRLF line endings
 included, from schematics that KiCad itself wrote. They pin how KiCad serializes

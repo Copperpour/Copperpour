@@ -143,12 +143,12 @@ These are exactly the commands CI runs — if they pass locally, CI should be gr
   structured `invalid_argument` naming the field), or `get_path` for paths.
   A handler that substitutes a default for a schema-required argument runs on a
   value the caller never supplied and reports success — that was 25 sites across
-  18 tools in #218. The dispatch refuses a *missing* required argument before
+  18 tools. The dispatch refuses a *missing* required argument before
   your handler runs, but only the helpers catch a wrong *type*.
 - **Map layers for a KiCAD write with `try_layer_from_name`**, not
   `layer_from_name`. The infallible one returns `BL_UNDEFINED` for a name it
   does not know, and KiCAD 10.0.5 does not validate that field — it faults and
-  the editor dies, taking the user's unsaved board (#237). The fallible one
+  the editor dies, taking the user's unsaved board. The fallible one
   refuses at Copperpour's boundary, where a refusal is still possible.
 - **Fixtures for anything that parses a board or footprint should come from
   real KiCAD output.** A synthetic one passed 67 tests while `flip_component`

@@ -7,7 +7,7 @@ pitch BGA fanout target (U2, board-only), two through-hole test points
 (TP1, TP2, board-only), a 60x45mm outline, and a three-segment routed
 VCC track run.
 
-Provenance: the schematic was authored through Konnect's own schematic
+Provenance: the schematic was authored through Copperpour's own schematic
 tools; the BOARD file's serialization is KiCad's — every footprint was
 added by `update_pcb_from_schematic` / `place_component` over live IPC
 into a running pcbnew 10.0.5, tracks by `route_trace`, and the file was
@@ -17,5 +17,5 @@ KiCad emits.
 
 Regenerating: scripts build_t07b.py (schematic phase, KiCad closed) and
 build_t07_board.py (board phase, pcbnew open) in the session scratchpad
-that produced this; the flow is ordinary Konnect tool calls and can be
+that produced this; the flow is ordinary Copperpour tool calls and can be
 re-derived from this README's description.

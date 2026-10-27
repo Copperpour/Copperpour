@@ -2,7 +2,7 @@
 
 `rotate_fields_kicad10.kicad_sch` carries the cases a turn has to get right
 for a symbol's Reference and Value text, so `rotate_schematic_component` can
-be checked against an answer that is not its own (#612).
+be checked against an answer that is not its own.
 
 A field's `(at …)` is an absolute sheet coordinate, not an offset from the
 body. The sheet is therefore built in **twins**: a symbol placed unrotated,
@@ -11,7 +11,7 @@ must land its fields exactly on the second's, less that 25.4mm.
 
 ## Provenance
 
-Built through Konnect against KiCad's stock `Device`, `Regulator_Linear`
+Built through Copperpour against KiCad's stock `Device`, `Regulator_Linear`
 libraries — `create_schematic`, `add_schematic_component`,
 `edit_schematic_component`, `add_wire`, `add_schematic_net_label`,
 `add_no_connect` — then parsed and force-resaved by KiCad 10.0.6:
@@ -23,7 +23,7 @@ kicad-cli sch upgrade --force rotate_fields_kicad10.kicad_sch
 What is committed is that Eeschema serialization: `(generator "eeschema")`,
 `(version 20260306)`, `(generator_version "10.0")`, KiCad's own library
 records, field positions and UUIDs. KiCad left every field position exactly
-where Konnect had written it, so the resave changed the file's shape and not
+where Copperpour had written it, so the resave changed the file's shape and not
 its geometry.
 
 ## Cases

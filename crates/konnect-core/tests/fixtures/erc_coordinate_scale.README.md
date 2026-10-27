@@ -1,4 +1,4 @@
-# ERC coordinate scale fixtures (issue #541, kicad#25582)
+# ERC coordinate scale fixtures (mixelpixx/Konnect#541, kicad#25582)
 
 Five files, for the two sides of one upstream defect and the one build the
 version boundary cannot see:
@@ -46,7 +46,7 @@ two-item violation.
 ## Oracle table
 
 Every item, in report order. The text report is the oracle; the JSON report is
-what Konnect is handed.
+what Copperpour is handed.
 
 | # | Sheet | Item | JSON `pos` | Text report | Ratio |
 |---|---|---|---|---|---|
@@ -71,7 +71,7 @@ Item 12 is on the child sheet.
 The same units provider formats the item *text*, so on an affected version a
 description carrying a dimension is wrong by the same factor: rows 3, 9 and 11
 read `Horizontal Wire, length 0.1270 mm` in the JSON against
-`Horizontal Wire, length 12.70 mm` in the text report. Konnect corrects
+`Horizontal Wire, length 12.70 mm` in the text report. Copperpour corrects
 coordinates and leaves KiCad's prose alone, so this divergence survives in the
 response — the `coordinates.reason` string says so.
 
@@ -126,12 +126,12 @@ release commit does) changed the stamp and nothing else.
 
 That is also a fact about the wild, not only about this fixture: anyone running
 a self-built 10.0-branch KiCad between 10.0.6 and 10.0.7 gets *correct*
-coordinates reported as `10.0.6`, and Konnect will scale them by 100. The
+coordinates reported as `10.0.6`, and Copperpour will scale them by 100. The
 report carries nothing that separates such a build from the affected release,
 so this is a limit of the version boundary rather than something the
 implementation can detect. Released builds are unaffected.
 
-Such builds are outside the supported contract: #541 covers released KiCad
+Such builds are outside the supported contract: mixelpixx/Konnect#541 covers released KiCad
 builds only, by maintainer decision on that issue. The unmodified capture is
 committed so that `an_unreleased_branch_build_stamped_as_the_affected_release_is_scaled`
 pins the resulting behaviour: `corrected`, and every coordinate 100× the true

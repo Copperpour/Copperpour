@@ -1,4 +1,4 @@
-# reference_prefix_kicad10 fixtures (#669)
+# reference_prefix_kicad10 fixtures
 
 Two stock KiCad 10.0.6 library symbols, for tests of the reference a placement
 writes when the caller passes none. `stock_reference_prefix_libraries()` in
@@ -27,7 +27,7 @@ gives byte-identical output, so the bytes are KiCad's.
 | `power:PWR_FLAG` | `#FLG` | `#FLG?` | `#FLG01` |
 
 The prefix column is the library itself. `kicad-cli sch export netlist` on a
-sheet built through Konnect this way (`create_project`,
+sheet built through Copperpour this way (`create_project`,
 `add_schematic_component` twice, `annotate_schematic`) lists one component,
 `R1`: the `#FLG01` flag stays off the netlist, as KiCad treats `#` references.
 

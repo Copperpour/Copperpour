@@ -6,7 +6,7 @@ to tell apart, including the two that cross the hierarchy boundary.
 
 ## Provenance
 
-The pair was built through Konnect against KiCad's stock `Device:R` and
+The pair was built through Copperpour against KiCad's stock `Device:R` and
 `power:` libraries — `batch_place_components`, `batch_add_wire`,
 `add_schematic_net_label`, `add_power_symbol`, `add_hierarchical_sheet`,
 `import_sheet_pins` — and then parsed and force-resaved by KiCad 10.0.5:
@@ -76,10 +76,10 @@ errors and eight warnings, none of them structural:
 
 ## Coordinate text after a move
 
-`bulk_move_writes_kicad_coordinate_text` (#744) moves `#PWR002` and `R8` by
+`bulk_move_writes_kicad_coordinate_text` moves `#PWR002` and `R8` by
 `dx = -5.08, dy = 0`. The snapped y of `#PWR002`, 132 × 1.27, is
 `167.64000000000001` in `f64`. `R8`'s, 110 × 1.27, is exactly `139.7`, which
-makes it the control. The expected text is KiCad's: a Konnect-moved copy of
+makes it the control. The expected text is KiCad's: a Copperpour-moved copy of
 this sheet, resaved by KiCad 10.0.6 with `kicad-cli sch upgrade --force`,
 carries the same symbol `(at …)` lines. (The fixture itself came from 10.0.5,
 as above.)

@@ -13,7 +13,7 @@ output over it.
    (`kicommon.dll` serializes it; `GetDefaultVariantName()` backs the
    implicit default). **`kicad-cli` does not consult it**: exports honor a
    schematic's variant clauses even when this key is absent (verified).
-   Konnect must still maintain it, for GUI interoperability.
+   Copperpour must still maintain it, for GUI interoperability.
 
 2. **`.kicad_sch`, per symbol placement** — inside each symbol's
    `(instances (project "…" (path "/uuid" (reference …) (unit …) …)))`
@@ -42,7 +42,7 @@ output over it.
 ## Behavioral notes for implementers
 
 - **`kicad-cli --variant` never validates the name.** An undefined variant
-  name silently exports the default (verified on a stock demo). Konnect's
+  name silently exports the default (verified on a stock demo). Copperpour's
   variant tools must do their own name validation against the project
   registry — the exporter will not catch a typo.
 - The default variant is implicit and protected: eeschema carries distinct

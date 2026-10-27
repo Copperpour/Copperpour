@@ -2,11 +2,11 @@
 
 `trace_point_kicad10.kicad_sch` carries one of each thing that can sit on a
 schematic point, so `trace_from_point` can be asked what is there and checked
-against an answer that is not its own (#539).
+against an answer that is not its own.
 
 ## Provenance
 
-Built through Konnect against KiCad's stock `Device` and
+Built through Copperpour against KiCad's stock `Device` and
 `Amplifier_Operational` libraries — `create_schematic`,
 `add_schematic_component`, `connect_to_net`, `add_wire`, `add_junction` — then
 parsed and force-resaved by KiCad 10.0.6:
@@ -32,7 +32,7 @@ one on top of it. The redundant call was dropped rather than documented.
 | `(100.33, 104.14)` | `R1` pin 2, one wire end | a pin must not imply a dot |
 | `(130.81, 121.92)` | a dot, two wires | a dot must not imply a pin |
 | `(160.02, 104.14)` | `R2` pin 2 and `R3` pin 1, no wire | two pins stacked on one point |
-| `(198.12, 130.81)` | `U1` pin 7, unit 2 only | unit 1 is placed 30mm away (#35) |
+| `(198.12, 130.81)` | `U1` pin 7, unit 2 only | unit 1 is placed 30mm away |
 | `(210, 50)` | nothing | every list present and empty |
 
 `R2` and `R3` touch pin-to-pin with no wire between them, which is why KiCad's

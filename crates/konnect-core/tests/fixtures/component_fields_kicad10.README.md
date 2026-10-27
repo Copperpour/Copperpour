@@ -2,11 +2,11 @@
 
 `component_fields_kicad10.kicad_sch` carries custom `LCSC` and `MPN` properties
 on a single-unit and a multi-unit component, so `get_schematic_component` and
-`list_schematic_components` can be checked for returning them (#679).
+`list_schematic_components` can be checked for returning them.
 
 ## Provenance
 
-Built through Konnect against KiCad's stock `Device` and
+Built through Copperpour against KiCad's stock `Device` and
 `Amplifier_Operational` libraries — `create_project`,
 `add_schematic_component`, `edit_schematic_component` — then parsed and
 force-resaved by KiCad 10.0.6:

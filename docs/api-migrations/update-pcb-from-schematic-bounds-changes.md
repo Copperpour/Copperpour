@@ -3,7 +3,8 @@
 The sync's response listed every planned change with every pad-to-net pair,
 and its keys were sorted, so `status` and `plan_revision` came after the whole
 list. For 340 footprints the dry run was 166 KB, more than a client would take,
-and the plan could not be applied from the chat session (#69).
+and the plan could not be applied from the chat session
+([#69](https://github.com/Copperpour/Copperpour/issues/69)).
 
 The top-level keys now come in this order: `status`, `plan_revision`,
 `coverage`, `changes_count`, `changes_shown`, `changes_truncated`, `staging`,

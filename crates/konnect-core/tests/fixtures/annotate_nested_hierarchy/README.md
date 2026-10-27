@@ -1,10 +1,11 @@
-# Nested reused-sheet fixture (#42)
+# Nested reused-sheet fixture ([#42](https://github.com/Copperpour/Copperpour/issues/42))
 
 A project made for these tests in KiCad 10.0.6. Copperpour created the project,
 the root's two sheets and every symbol (`create_project`,
 `add_hierarchical_sheet`, `edit_sheet`, `batch_place_components`); the two
 sheets inside `bank.kicad_sch` were drawn in eeschema, which records a nested
-sheet under the hierarchy's root (see #515). eeschema then set the pages,
+sheet under the hierarchy's root (see
+[#49](https://github.com/Copperpour/Copperpour/issues/49)). eeschema then set the pages,
 annotated and saved every file, so what is committed is its serialization:
 `(version 20260306)`, `(generator "eeschema")`, `(generator_version "10.0")`.
 

@@ -49,7 +49,7 @@ save("specctra_rotated_footprints_45")
 A pad's `(at x y angle)` angle in a `.kicad_pcb` includes its footprint's
 rotation. KiCad's DSN writes each pin's `(rotate ...)` as the pad's angle within
 the footprint, normalized to [0, 360) and printed with `%.6g`, and omits it
-when 0 (#840):
+when 0:
 
 | Ref | Footprint | Pad angles in the file | KiCad's pin `(rotate ...)` |
 |-----|-----------|------------------------|----------------------------|
@@ -60,5 +60,6 @@ when 0 (#840):
 
 KiCad stores R3's pads at ±0.499999 mm, and its DSN writes them at ±499.999 µm.
 `adopt_native_dsn` compares whole-micrometre pin positions, so it refuses that
-board (#841). The adoption tests therefore use the board without R3. The `_45`
+board ([#98](https://github.com/Copperpour/Copperpour/issues/98)). The adoption tests
+therefore use the board without R3. The `_45`
 board checks pin rotations only.

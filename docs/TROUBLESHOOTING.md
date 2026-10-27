@@ -125,7 +125,7 @@ and macOS the socket is a filesystem entry and its metadata is read. On Windows
 KiCad's `ipc://` endpoint is a **named pipe**, which has no filesystem presence
 at all, so the same path is looked up in the pipe namespace (`\\.\pipe\`)
 instead. Before that was true, Windows detected nothing and every setup had to
-be configured by hand (#529); if you are on a Konnect older than that fix, set
+be configured by hand; on a Konnect release from before that fix, set
 `ipc_address` or `KICAD_API_SOCKET` explicitly.
 
 If the address is unresolved, both of the following must be correct — neither
@@ -339,7 +339,7 @@ but cannot be used. `error.path` names the file and `error.reason` starts with
 truncated write or a hand edit) or `unreadable:` (permissions, a directory at
 that path, invalid UTF-8).
 
-Konnect used to answer with its defaults here, and the next save then replaced
+Older versions answered with their defaults here, and the next save then replaced
 the file with them. It now refuses and writes nothing, so your settings are
 still in the file. Open it, fix the JSON (or move it aside to start again from
 the defaults), and retry. The user file is `%APPDATA%\copperpour\config.json` on
@@ -352,7 +352,7 @@ disk. Read the file before retrying; do not assume nothing was written.
 
 ## An older schematic-to-PCB sync left extra unnamed pads
 
-Konnect versions v0.4.0 through v0.6.1 could rewrite each drawing shape inside
+Konnect v0.4.0 through v0.6.1 could rewrite each drawing shape inside
 a footprint as an anonymous pad while `update_pcb_from_schematic` reassigned
 pad nets ([#244](https://github.com/mixelpixx/Konnect/issues/244)). Current
 versions prevent and detect that corruption, but prevention does not repair a
@@ -360,7 +360,7 @@ board already saved by an affected release.
 
 Open the affected board in KiCAD, load `pcb_components`, and call
 `repair_corrupted_footprints` with the board path. Its default dry run scans
-for #244's exact signature: an anonymous pad with no net and an empty layer set,
+for that corruption's exact signature: an anonymous pad with no net and an empty layer set,
 paired one-for-one with a drawing shape missing from the registered footprint
 library. It refuses ambiguous pad layouts or an unavailable library rather
 than guessing. Optionally pass `references` to restrict the scan.
@@ -526,7 +526,8 @@ Two Copilot behaviors make the normal toolset settings ineffective:
   later therefore remain unavailable to the model.
 - With `eager_toolsets = true`, Copperpour advertises its full catalog at startup,
   but Copilot applies its own total callable-tool budget across all configured
-  MCP servers. The #325 reporter measured a 128-tool ceiling and saw only an
+  MCP servers. The mixelpixx/Konnect#325 reporter measured a 128-tool ceiling and saw
+  only an
   arbitrary, changing subset of Copperpour tools exposed. Tools outside that
   subset produced "currently disabled by the user."
 
@@ -585,7 +586,7 @@ active layer belongs to the editor session, not the `.kicad_pcb` document.
 
 Close the board in KiCad, make a backup copy, remove only the injected
 `(active_layer "...")` line from the board file, and reopen the board. Do not
-remove the surrounding `(setup ...)` block. Konnect versions containing the
-fix for #610 refuse `set_active_layer` with `unsupported_capability` and leave
-the file byte-identical until stable KiCad IPC exposes a native operation with
+remove the surrounding `(setup ...)` block. Later versions, including every
+Copperpour release, refuse `set_active_layer` with `unsupported_capability` and
+leave the file byte-identical until stable KiCad IPC exposes a native operation with
 readback.

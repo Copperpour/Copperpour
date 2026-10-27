@@ -1,4 +1,4 @@
-# Six-layer board with power and mixed planes (issue #461)
+# Six-layer board with power and mixed planes
 
 `six_layer_power_planes_kicad10.kicad_pcb` is the board `estimate_cost` and
 `validate_for_manufacturing` are tested against for their copper-layer count.
@@ -42,11 +42,11 @@ layer (10 declared, 9 by substring); this fixture makes the gap unmissable.
 `crates/konnect-core/src/tools/manufacturing.rs`, module
 `copper_layer_count_tests`.
 
-`crates/konnect-core/src/tools/board_layer_refusal_tests.rs` (#844) uses the board
+`crates/konnect-core/src/tools/board_layer_refusal_tests.rs` uses the board
 as KiCad's own serialization to write into, and as the oracle for which layer
 names KiCad accepts on a board item.
 
-## Layer names KiCad loads on an item (#844)
+## Layer names KiCad loads on an item
 
 One `(gr_text "LOGO" (at 10 10 0) (layer "<name>") …)` was inserted before the
 board's closing paren, then loaded with KiCad 10.0.6:

@@ -2,7 +2,7 @@
 
 `mirror_fields_kicad10.kicad_sch` carries the cases a reflection has to get
 right for a symbol's Reference and Value text, so `Symbol::set_mirror` can be
-checked against an answer that is not its own (#613).
+checked against an answer that is not its own.
 
 A field's `(at …)` is an absolute sheet coordinate, not an offset from the
 body. The sheet is therefore built in **twins**, like
@@ -12,9 +12,10 @@ exactly on the second's, less that 25.4mm.
 
 ## Provenance
 
-Built through Konnect against KiCad's stock `Device` and `Regulator_Linear`
+Built through Copperpour against KiCad's stock `Device` and `Regulator_Linear`
 libraries — `create_schematic`, `add_schematic_component` (with `mirror`,
-#485) and `edit_schematic_component` — then parsed and force-resaved by KiCad
+mixelpixx/Konnect#485) and `edit_schematic_component` — then parsed and force-resaved
+by KiCad
 10.0.6:
 
 ```text
@@ -24,7 +25,7 @@ kicad-cli sch upgrade --force mirror_fields_kicad10.kicad_sch
 What is committed is that Eeschema serialization: `(generator "eeschema")`,
 `(version 20260306)`, `(generator_version "10.0")`, KiCad's own library
 records, field positions and UUIDs. KiCad left every field position exactly
-where Konnect had written it.
+where Copperpour had written it.
 
 ## Cases
 
@@ -58,7 +59,7 @@ baseline. Those are identical between a symbol and its twin, because both
 carry the same reflection when they are drawn.
 
 The render proves only that KiCad draws each field where the file says. The
-twins are Konnect placements, so their field positions come from the same
+twins are Copperpour placements, so their field positions come from the same
 placement transform the fix assumes. `U3` against `U4` therefore shows that
 reflecting agrees with placing reflected. It cannot show that the transform
 rotates before it mirrors, since a transform with that order wrong would move

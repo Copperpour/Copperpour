@@ -7,7 +7,7 @@ symbol's own pin.
 
 ## Provenance
 
-Built through Konnect against KiCad's stock `Device:`, `Memory_EEPROM:`,
+Built through Copperpour against KiCad's stock `Device:`, `Memory_EEPROM:`,
 `Connector:` and `power:` libraries — `batch_place_components`,
 `batch_add_wire`, `add_schematic_net_label`, `add_power_symbol`,
 `batch_add_no_connect` — and then parsed and force-resaved by KiCad 10.0.5:
@@ -25,7 +25,7 @@ stacked at `(55.88, 119.38)`, KiCad left `TP2`'s pin unconnected and netted only
 `TP3`. Moving the second label 2.54 mm along the same wire nets both. The
 co-located case that KiCad *does* honour is a label on a power symbol's own pin,
 which is what `ALT` at `(59.69, 88.9)` is — and it is the one that matters here,
-because Konnect synthesises a power symbol's name as a pseudo-label at exactly
+because Copperpour synthesises a power symbol's name as a pseudo-label at exactly
 that point.
 
 ## KiCad's own answer
@@ -48,7 +48,7 @@ kicad-cli sch erc --severity-all --format json -o erc.json two_name_nets.kicad_s
 | `/MIX` | 1 — TP4.1 | a local label beside a hierarchical one |
 | `Net-(TP8-Pad1)` | 2 — TP8.1, TP9.1 | a net with no label at all, which KiCad names after a pin |
 
-ERC states the precedence outcomes directly, and they are the table Konnect's
+ERC states the precedence outcomes directly, and they are the table Copperpour's
 `driver_priority` encodes — global label > power symbol > local label >
 hierarchical label, ties on the name ascending:
 
@@ -95,7 +95,7 @@ five two-name nets, `power_pin_not_driven` where no `PWR_FLAG` is placed, and
 ## Label UUIDs
 
 `list_schematic_labels` must report the UUID Eeschema wrote for each of the 15
-labels. The table is read from the resaved file's text, not through Konnect:
+labels. The table is read from the resaved file's text, not through Copperpour:
 
 ```text
 awk '/^\t\((label|global_label|hierarchical_label) /{k=$1; match($0,/"[^"]*"/); n=substr($0,RSTART,RLENGTH); want=1}

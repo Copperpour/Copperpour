@@ -10,7 +10,8 @@ A real `kicad-cli sch export netlist --format kicadsexpr` export (Eeschema
 | `R2` | `Device:R` | `Resistor_SMD:R_0603_1608Metric` | present |
 
 `R1` pin 1 is wired to `C1` pin 1, so the unassigned component also appears
-in the `nets` section (`Net-(C1-Pad1)`), which is the case #507 is about: a
+in the `nets` section (`Net-(C1-Pad1)`), which is the case mixelpixx/Konnect#507 is
+about: a
 sync must keep the other components and report `R1`, not fail on it.
 
 Recipe: `create_project`, three `add_schematic_component` calls,
