@@ -1,4 +1,4 @@
-# Contributing to Konnect
+# Contributing to Copperpour
 
 Thanks for your interest! Bug reports, feature requests, and pull requests are welcome.
 
@@ -14,13 +14,9 @@ Thanks for your interest! Bug reports, feature requests, and pull requests are w
   Independent changes branch from current `upstream/main`; dependent work exposes one
   mergeable step at a time instead of opening cumulative PRs against the same old base.
 - For a pull request from a fork, leave **Allow edits by maintainers** enabled for the
-  PR branch. This lets a maintainer perform the one clean rebase needed when the PR
-  reaches the front of the queue and resolve mechanical conflicts caused by intervening
-  `main` changes. Ambiguous semantic conflicts and substantive changes still return to
+  PR branch. This lets a maintainer rebase a reviewed PR and resolve mechanical
+  conflicts caused by intervening `main` changes. Ambiguous semantic conflicts and substantive changes still return to
   the author. If maintainer edits cannot be enabled, the author owns that refresh.
-- Keep the PR's workflow state honest. A maintainer uses one `status:*` label to name
-  the next actor; `status:ready-to-merge` means the exact current head has completed
-  review, not merely that the author considers it finished.
 - Read [docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md) before adding public
   tools, schema fields, CLI options, environment variables, or user-facing terms.
 
@@ -69,7 +65,7 @@ new tool.
 
 Include a short architectural-fit answer:
 
-> Does this change extend an existing KiCad capability or shared Konnect module?
+> Does this change extend an existing KiCad capability or shared Copperpour module?
 > If it introduces a workaround or duplicates behavior, explain why and when it
 > can be retired.
 
@@ -80,8 +76,8 @@ legacy behavior before landing a focused fix.
 Keep the proposed solution proportionate to the demonstrated problem. Follow
 [proportionate scope review](GOVERNANCE.md#proportionate-scope-review) when a
 fix would grow into speculative edge-case handling or a broader subsystem.
-`status:needs-scope-review` asks a maintainer to settle that boundary, not a
-contributor to implement every variation. A narrow safe fix can remain separate
+A maintainer settles that boundary on the issue; you are not asked to implement
+every variation. A narrow safe fix can remain separate
 from deferred expansion.
 
 When changing a tool's behavior, follow the
@@ -104,49 +100,13 @@ The description should state:
 
 ## From review to merge
 
-Konnect currently runs in a personal GitHub repository. Collaborators have Write
-access rather than organization-style Maintain/Admin roles. Maintainers can triage,
-review, merge, and arm auto-merge, but only the owner can change repository settings.
-GitHub's native merge queue is not available in this ownership model, so the documented
-landing order and `status:*` labels are the queue.
-
-The repository requires a pull request, all ten hosted checks, resolved review
-conversations, an up-to-date branch, and the merge-commit method. GitHub enforces that
-the branch includes current `main`. When a reviewed PR reaches the front of the queue
-and is merely behind, a maintainer may update it with rebase and let hosted CI rerun;
-the maintainer may also resolve a mechanical conflict that preserves the unique change.
-The contributor is needed for ambiguous conflicts, copied prerequisite history, failed
-checks or substantive changes. Once a maintainer has reviewed the refreshed exact head and marked
-it `status:ready-to-merge`, they may enable auto-merge while checks are finishing.
-Auto-merge is the last execution step; it is not review and does not make a cumulative
-or poorly evidenced PR ready.
-
-PRs authored by `@mixelpixx` or `@neusse` have standing merge authorization after
-the exact current head satisfies the same review, CI, closure, and queue gates. The
-queue maintainer continues through consecutive ready PRs by either maintainer, but
-stops before the first next-to-land PR by another author for explicit authorization
-of that exact head. This changes waiting time, not the readiness standard or landing
-order.
-
-A substantive review finding stops the PR regardless of who authored it. The
-maintainer records the complete finding, applies `status:waiting-on-author`, and
-leaves auto-merge off. Standing authorization applies only after the author resolves
-the finding and the new exact head receives a no-findings review with all ten required
-checks green. Reviewers do not silently repair another maintainer's PR and merge it in
-the same pass unless they were explicitly asked to take over that specific finding.
-
-CODEOWNERS may automatically request Chris's review even when another maintainer
-handles the routine review. That request is a notification, not an extra approval
-gate. The [review-request workflow](docs/BRANCH_AND_PULL_REQUEST_WORKFLOW.md#review-requests-and-completion)
-explains how the maintainer records a completed review and clears only a stale
-automatic request; it never dismisses a specific owner decision or review finding.
-
-If you push after that review, assume the readiness decision is invalid. GitHub may
-disable auto-merge automatically for a new commit from a fork. Resolve new feedback
-and wait for review of the new head. If only `main` moved after review, wait until the
-PR reaches the front of the queue: a maintainer can perform a clean update then. After
-merge, GitHub deletes the topic branch automatically; retain any later dependent work
-on its own branch.
+[GOVERNANCE.md](GOVERNANCE.md#merging) has the rules. In short: a contributor's PR
+needs a maintainer's approving review of its exact head and green required checks,
+and a maintainer merges it with a merge commit. A push after the review needs a new
+review. A maintainer may rebase a reviewed PR that has fallen behind and resolve a
+mechanical conflict; ambiguous conflicts, copied prerequisite history, failed checks
+and substantive changes come back to you. CODEOWNERS routes JLCPCB, EasyEDA and LCSC
+changes to @mn89h, who decides them.
 
 You do not need personal access to every supported operating system, KiCad
 version, or hardware configuration. For an environment-dependent check you
@@ -170,12 +130,10 @@ These are exactly the commands CI runs — if they pass locally, CI should be gr
 - `cargo test --workspace --locked --doc` passes
 - `cargo clippy --workspace --locked --all-targets -- -D warnings` is clean
 - `cargo fmt --all -- --check` is clean
-- The branch includes current `upstream/main`, GitHub reports no conflicts, and the
-  required checks passed on the exact head being reviewed
+- GitHub reports no conflicts with current `main`, and the required checks passed on the exact head being reviewed
 - Every review conversation is resolved; a post-review commit or base refresh requires
-  review of the new exact head before auto-merge is armed again. An unchanged unique
-  diff may receive a focused refresh review; changed behavior requires substantive
-  re-review
+  review of the new exact head. An unchanged unique diff may receive a focused refresh
+  review; changed behavior requires substantive re-review
 - The commit list and diff contain only this PR's unique work; dependencies and stack
   position are explicit
 - New names follow [the naming conventions](docs/NAMING_CONVENTIONS.md); public name
