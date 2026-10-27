@@ -164,7 +164,7 @@ Step by step (based on the diagnostic guide contributed in
    ```
 
 Alternative: launching the server from within KiCAD sets `KICAD_API_SOCKET`
-automatically, and a `konnect-settings.json` passed via `--config` can carry
+automatically, and a `copperpour-settings.json` passed via `--config` can carry
 `ipc_socket_path` directly.
 
 ## PCB tools return "KiCAD must be running with the board loaded"
@@ -542,9 +542,9 @@ Current options are:
    full catalog.
 3. Use the community two-tool proxy pattern demonstrated in
    [the #325 follow-up](https://github.com/mixelpixx/Konnect/issues/325#issuecomment-5407317596):
-   expose only `konnect_help` and `konnect_call` to Copilot, let
-   `konnect_help()` list names or return one tool's description and schema,
-   and let `konnect_call(tool, arguments)` forward the actual call to a child
+   expose only `copperpour_help` and `copperpour_call` to Copilot, let
+   `copperpour_help()` list names or return one tool's description and schema,
+   and let `copperpour_call(tool, arguments)` forward the actual call to a child
    Copperpour process started with `eager_toolsets = true`.
 
 The proxy is a community workaround attached to the issue, not code shipped or

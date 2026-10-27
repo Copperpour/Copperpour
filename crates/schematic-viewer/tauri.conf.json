@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Konnect Schematic Viewer",
+  "productName": "Copperpour Schematic Viewer",
   "version": "0.14.0",
   "identifier": "com.github.mixelpixx.konnect.viewer",
   "build": {
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Schematic Viewer — Konnect",
+        "title": "Schematic Viewer — Copperpour",
         "width": 1280,
         "height": 900,
         "resizable": true,

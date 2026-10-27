@@ -663,7 +663,7 @@ fn blank_kicad_pcb() -> &'static str {
     concat!(
         "(kicad_pcb\n",
         "\t(version 20260206)\n",
-        "\t(generator \"konnect\")\n",
+        "\t(generator \"copperpour\")\n",
         "\t(generator_version \"10.0\")\n",
         "\t(general\n",
         "\t\t(thickness 1.6)\n",
@@ -741,6 +741,7 @@ mod tests {
         // wire-only net (symbol instance paths can't resolve).
         let content = blank_kicad_sch();
         assert!(content.contains("(uuid \""));
+        assert!(content.contains("(generator \"copperpour\")"), "{content}");
         let sch = {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("t.kicad_sch");
@@ -755,6 +756,7 @@ mod tests {
     fn blank_kicad_pcb_declares_core_layers() {
         let content = blank_kicad_pcb();
         assert!(content.contains("\"F.Cu\""));
+        assert!(content.contains("(generator \"copperpour\")"), "{content}");
         assert!(content.contains("\"B.Cu\""));
         assert!(content.contains("\"Edge.Cuts\""));
     }
