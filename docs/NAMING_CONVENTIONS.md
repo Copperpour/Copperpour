@@ -56,7 +56,7 @@ MCP tool names and toolset names are stable public API:
 - Never silently rename or reuse a tool. Add an alias/deprecation period and document
   the migration when a public rename is unavoidable.
 
-Tool arguments and Konnect-owned JSON keys use `snake_case`. Protocol-defined JSON-RPC
+Tool arguments and Copperpour-owned JSON keys use `snake_case`. Protocol-defined JSON-RPC
 and MCP fields retain the specification's spelling, such as `jsonrpc`, `tools/list`,
 and `serverInfo`. KiCad plugin manifests retain the KiCad schema's field names.
 

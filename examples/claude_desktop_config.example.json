@@ -2,7 +2,7 @@
   "_comment_1": "Copy the contents of this into %APPDATA%\\Claude\\claude_desktop_config.json.",
   "_comment_2": "If you already have mcpServers, merge the 'copperpour' entry into your existing object.",
   "_comment_3": "Substitute <YOU> with your Windows username.",
-  "_comment_4": "The --config arg is optional — Konnect works with defaults out of the box.",
+  "_comment_4": "The --config arg is optional — Copperpour works with defaults out of the box.",
 
   "mcpServers": {
     "copperpour": {

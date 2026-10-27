@@ -63,7 +63,7 @@ failure there as a real break rather than a Nix-user problem.
 ## Architecture
 
 ```
-Konnect/
+Copperpour/
 ├── crates/
 │   ├── konnect/              # Main binary + cdylib entry points
 │   │   └── src/
@@ -355,7 +355,7 @@ The infallible `layer_from_name` stays for read paths that already filter `BL_UN
 Every `tools/call` flows through `McpHandler::execute_tool`, which wraps the dispatch with:
 - A **ring buffer** of the last 100 `CallRecord`s (surfaced via `get_recent_calls` meta-tool).
 - **Per-tool counters** for totals, errors, cumulative duration, last-status, last-error (surfaced via `server_stats`).
-- **JSONL append** to `<konnect dir>/logs/calls.jsonl` (one line per call). Paths:
+- **JSONL append** to `<copperpour dir>/logs/calls.jsonl` (one line per call). Paths:
   - Windows: `%APPDATA%\copperpour\logs\calls.jsonl`
   - macOS: `~/Library/Application Support/copperpour/logs/calls.jsonl`
   - Linux: `~/.copperpour/logs/calls.jsonl`

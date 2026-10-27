@@ -123,6 +123,7 @@
     z-index: 5;
   }
   .overlay h2 { color: var(--overlay-h); margin-bottom: 8px; }
+  #viewer .overlay .logo { position: static; display: block; width: 64px; height: 64px; margin: 0 auto 12px; }
   .overlay p { color: var(--overlay-p); font-size: 14px; }
   .overlay .spinner {
     width: 40px;
@@ -186,7 +187,13 @@
 <div id="viewer">
   <div id="svg-container"></div>
   <div class="overlay" id="empty-state">
-    <h2>Konnect</h2>
+    <svg class="logo" viewBox="0 0 256 256" role="img" aria-label="Copperpour logo">
+      <rect x="4" y="4" width="248" height="248" rx="40" fill="#B87333"/>
+      <rect x="18" y="18" width="220" height="220" rx="28" fill="none" stroke="#E8A86E" stroke-width="10"/>
+      <text x="128" y="128" dy="0.355em" text-anchor="middle" fill="#FFFFFF"
+            font-family="Liberation Sans, Arial, Helvetica, sans-serif" font-weight="700" font-size="132">Cu</text>
+    </svg>
+    <h2>Copperpour</h2>
     <p>Schematic Viewer</p>
     <p style="margin-top:12px">Drag a .kicad_sch file here or use the MCP tool to open</p>
   </div>

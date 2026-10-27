@@ -935,7 +935,7 @@ pub(crate) async fn handle_create_footprint(
     };
 
     let content = format!(
-        "(footprint \"{}\"\n  (version 20240108)\n  (generator \"konnect\")\n  (layer \"F.Cu\")\n  (descr \"{}\")\n  (attr {}){}{}{}\n)",
+        "(footprint \"{}\"\n  (version 20240108)\n  (generator \"copperpour\")\n  (layer \"F.Cu\")\n  (descr \"{}\")\n  (attr {}){}{}{}\n)",
         name, description, attr, pad_sexp, graphics, model_sexp
     );
 
@@ -4875,7 +4875,7 @@ pub(crate) async fn handle_create_symbol(
         }
         content
     } else {
-        "(kicad_symbol_lib\n  (version 20251024)\n  (generator \"konnect\")\n  \
+        "(kicad_symbol_lib\n  (version 20251024)\n  (generator \"copperpour\")\n  \
          (generator_version \"10.0\")\n)\n"
             .to_string()
     };
@@ -7235,6 +7235,7 @@ mod tests {
         let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
         assert!(output.get("warnings").is_none(), "{output}");
         let content = std::fs::read_to_string(&out).unwrap();
+        assert!(content.contains("(generator \"copperpour\")"), "{content}");
         let pads: Vec<&str> = footprint_pad_ranges(&content)
             .into_iter()
             .map(|(start, end)| &content[start..end])
@@ -8269,7 +8270,7 @@ mod tests {
             "missing symbol body rectangle:\n{c}"
         );
         assert!(
-            c.contains("(generator \"konnect\")"),
+            c.contains("(generator \"copperpour\")"),
             "stale generator string"
         );
         assert!(

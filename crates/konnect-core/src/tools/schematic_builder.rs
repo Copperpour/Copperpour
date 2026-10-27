@@ -68,7 +68,7 @@ impl SchematicBuilder {
             preserved_before_symbols: Vec::new(),
             preserved_after_symbols: Vec::new(),
             header: format!(
-                "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"A4\")",
+                "(kicad_sch\n\t(version 20250610)\n\t(generator \"copperpour\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"A4\")",
                 uuid
             ),
             lib_symbols: Vec::new(),
@@ -463,6 +463,7 @@ mod tests {
         let output = builder.to_string();
         assert!(output.starts_with("(kicad_sch"));
         assert!(output.contains("(version 20250610)"));
+        assert!(output.contains("(generator \"copperpour\")"), "{output}");
         assert!(output.contains("(lib_symbols"));
         assert!(output.ends_with(")\n"));
     }
