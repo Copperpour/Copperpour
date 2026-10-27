@@ -362,8 +362,9 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["auto", "right", "left", "up", "down"],
                         "default": "auto"
                     },
-                    "stub_length": { "type": "number", "default": 2.54,
-                        "description": "Length of the wire stub in mm" },
+                    "stub_length": { "type": "number", "default": 2.54, "minimum": 0,
+                        "description": "Length of the wire stub in mm. 0 draws no wire and \
+                                        puts the label on the point itself." },
                     "label_type": {
                         "type": "string",
                         "enum": ["net_label", "global_label"],
@@ -3521,6 +3522,17 @@ async fn handle_connect_to_net(
     };
     let direction = opt_str(args, "direction").unwrap_or("auto");
     let stub_length = opt_f64(args, "stub_length").unwrap_or(2.54);
+    // A negative length would flip the stub's direction; 0 is a label on the
+    // point with no wire, as in batch_connect_to_net.
+    if stub_length < 0.0 || !stub_length.is_finite() {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "stub_length".to_string(),
+                reason: "must be a finite number >= 0".into(),
+            },
+            "'stub_length' must be a finite number >= 0 (0 places the label on the point with no wire)",
+        ));
+    }
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
 
     let (_, tree) = read_schematic(&sch_path)?;
@@ -3592,7 +3604,11 @@ async fn handle_connect_to_net(
     Ok(CallToolResult::json(&json!({
         "connected": net,
         "direction": dir.name,
-        "wire": { "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y },
+        "wire": if stub_length > 0.0 {
+            json!({ "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y })
+        } else {
+            serde_json::Value::Null
+        },
         "label": { "x": label_x, "y": label_y, "rotation": label_rot }
     })))
 }
@@ -3610,7 +3626,10 @@ pub(crate) fn add_net_stub(
     net: &str,
 ) -> (f64, f64, f64) {
     let end = dir.end(pin, stub_length);
-    add_stub_wire(sch, exits, pin, end);
+    // A zero-length stub is a label on the point: no degenerate wire.
+    if stub_length > 0.0 {
+        add_stub_wire(sch, exits, pin, end);
+    }
     add_stub_label(sch, label_type, net, end, dir.label_rotation);
     (end.0, end.1, dir.label_rotation)
 }
@@ -4432,6 +4451,77 @@ mod unit_aware_wiring_tests {
             after.contains("(justify right"),
             "a 180° label must be right-justified: {after}"
         );
+    }
+
+    fn written_coordinates_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("written_coordinates_kicad10.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/written_coordinates_kicad10.kicad_sch"),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    /// stub_length 0 puts the label on the pin and writes no wire (#143).
+    /// KiCad nets R1 pin 2 as `/RST` afterwards; see the fixture README.
+    #[tokio::test]
+    async fn a_zero_length_stub_writes_no_wire() {
+        let (_d, path) = written_coordinates_schematic();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let args = json!({ "schematic": path.display().to_string(), "reference": "R1",
+                           "pin_number": "2", "net": "RST", "stub_length": 0 });
+        let result = handle_connect_to_net(&args, &test_ctx()).await.unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        assert!(!result.is_error, "{text}");
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(response["wire"], serde_json::Value::Null, "{text}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after.matches("(wire").count(),
+            before.matches("(wire").count(),
+            "{after}"
+        );
+        assert!(
+            after.contains("(label \"RST\"\n\t\t(at 139.7 105.41 0)"),
+            "{after}"
+        );
+    }
+
+    /// A negative length would flip the stub; it is refused before any write.
+    #[tokio::test]
+    async fn a_negative_stub_length_is_refused() {
+        let (_d, path) = written_coordinates_schematic();
+        let before = std::fs::read(&path).unwrap();
+        let args = json!({ "schematic": path.display().to_string(), "reference": "R1",
+                           "pin_number": "2", "net": "RST", "stub_length": -2.54 });
+        let result = handle_connect_to_net(&args, &test_ctx()).await.unwrap();
+        assert!(result.is_error, "{:?}", result.content);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        assert!(text.contains("\"kind\":\"invalid_argument\""), "{text}");
+        assert!(text.contains("\"field\":\"stub_length\""), "{text}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn schema_refuses_a_negative_stub() {
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "connect_to_net")
+            .unwrap();
+        let args = |stub: f64| {
+            json!({ "schematic": "s.kicad_sch", "net": "N", "pin_x": 0.0, "pin_y": 0.0,
+                    "stub_length": stub })
+        };
+        assert!(def.input_validator.is_valid(&args(0.0)));
+        assert!(def.input_validator.is_valid(&args(2.54)));
+        assert!(!def.input_validator.is_valid(&args(-1.0)));
     }
 
     /// An explicit direction still wins over the derived one.
