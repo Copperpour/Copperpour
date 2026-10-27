@@ -53,7 +53,7 @@ nix develop           # shell with the pinned toolchain, protoc, kicad-small
 The flake pins its own toolchain from `rust-toolchain.toml` and reads the
 version from the workspace `Cargo.toml`, so those stay in step automatically.
 What it does *not* track automatically is the build itself: `cargoBuildFlags`
-names `-p konnect --bin konnect`, and `preCheck` exports `KONNECT_STATE_DIR`
+names `-p konnect --bin copperpour`, and `preCheck` exports `COPPERPOUR_STATE_DIR`
 for the tests that need a writable state dir. **Renaming the binary, adding a
 workspace member the server depends on, or introducing a test that needs
 another environment variable will break the Nix build without breaking any
@@ -201,7 +201,7 @@ Konnect/
 - Existing-file edits use revision-checked atomic replacement: read the exact
   source, acquire a cooperative lock, reject any intervening KiCad or Konnect
   change, write a unique sibling scratch file, fsync, and rename.
-- Cooperative lock files live under `KONNECT_STATE_DIR/locks` when that
+- Cooperative lock files live under `COPPERPOUR_STATE_DIR/locks` when that
   absolute override is set, otherwise under the platform local-data directory
   (`konnect/locks`). Reads never create files in the KiCad project.
 - Schematic writes also refuse while KiCad's sibling `~<name>.kicad_sch.lck`
@@ -271,7 +271,7 @@ broader per-tool inventory is tracked in #574.
 
 ### Plugin Installation
 - **PCM zip** is the correct install method
-- KiCad installs to: `C:\Users\<YOU>\Documents\KiCad\10.0\3rdparty\plugins\com_github_mixelpixx_konnect\`
+- KiCad installs to: `C:\Users\<YOU>\Documents\KiCad\10.0\3rdparty\plugins\com_github_copperpour_copperpour\`
 - Both `__init__.py` (SWIG ActionPlugin for PCB editor settings dialog) and `plugin.json` (IPC exec plugin) are included
 - `native_bridge.py` is a KiCad-10-only, opt-in compatibility bridge. It exposes
   only authenticated status and native Specctra export over an ephemeral
@@ -312,7 +312,7 @@ Tool-call failures are typed via the `ToolErrorKind` enum in `crates/konnect-cor
 | `stale_target` | A previously bound PCB document is no longer uniquely open, saved symbol instance metadata disagrees with the proven hierarchy, or prospective component state lacks the expected document, UUID/reference, unit, library, hierarchy, position, rotation, or property value — carries `target` and `reason`; the edit, annotation, and grouping preflight refuses before writing |
 | `mutation_outcome_uncertain` | An edit committed, but immediate readback could not prove its requested result — carries `operation`, `path`, and `reason`; reload and inspect the named file (or, for a live-board write, the board in KiCad) before retrying because it may have changed |
 | `ambiguous_open_board` | KiCad answered, and its open-document list could not be read as a complete set of comparable board identities — carries `path`; neither the live nor the file path may run |
-| `invalid_configuration` | A Konnect preferences file (`config.json`, `.konnect/project.json`) exists but cannot be used — carries `path` and a `reason` starting `malformed_json:` or `unreadable:`; defaults are never substituted, because the next save would persist them over the user's settings |
+| `invalid_configuration` | A Konnect preferences file (`config.json`, `.copperpour/project.json`) exists but cannot be used — carries `path` and a `reason` starting `malformed_json:` or `unreadable:`; defaults are never substituted, because the next save would persist them over the user's settings |
 | `handler_error` | Catch-all for unmigrated `anyhow::Error` returns |
 
 ### Producing structured errors in a handler
@@ -358,7 +358,7 @@ Every `tools/call` flows through `McpHandler::execute_tool`, which wraps the dis
 - **JSONL append** to `<konnect dir>/logs/calls.jsonl` (one line per call). Paths:
   - Windows: `%APPDATA%\konnect\logs\calls.jsonl`
   - macOS: `~/Library/Application Support/konnect/logs/calls.jsonl`
-  - Linux: `~/.konnect/logs/calls.jsonl`
+  - Linux: `~/.copperpour/logs/calls.jsonl`
 - **Structured `tracing` events** (`tool_call_start` + `tool_call_end`) carrying `call_id`, `tool`, `toolset`, `status`, `dur_ms` — greppable in the stderr log.
 
 Each `CallRecord` includes: `call_id`, `ts` (unix ms), `tool`, `toolset` (optional — `None` for meta-tools), `dur_ms`, `status` (`ok` / `error` / `not_found`), `error_kind`, `args_bytes`, `result_bytes`.

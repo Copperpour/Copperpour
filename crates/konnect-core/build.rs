@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=COPPERPOUR_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=KONNECT_BUILD_COMMIT");
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR");
@@ -11,17 +12,18 @@ fn main() {
         .canonicalize()
         .unwrap_or_else(|_| Path::new(&manifest_dir).join("../.."));
 
-    let (commit, source) = match env::var("KONNECT_BUILD_COMMIT")
-        .ok()
-        .filter(|value| is_commit_id(value))
+    // KONNECT_BUILD_COMMIT is the name before the rename to Copperpour.
+    let (commit, source) = match ["COPPERPOUR_BUILD_COMMIT", "KONNECT_BUILD_COMMIT"]
+        .into_iter()
+        .find_map(|key| env::var(key).ok().filter(|value| is_commit_id(value)))
     {
         Some(commit) => (Some(commit), "build_environment"),
         None => (commit_from_git_files(&repo_root), "git_head"),
     };
 
     if let Some(commit) = commit {
-        println!("cargo:rustc-env=KONNECT_BUILD_COMMIT={commit}");
-        println!("cargo:rustc-env=KONNECT_BUILD_COMMIT_SOURCE={source}");
+        println!("cargo:rustc-env=COPPERPOUR_BUILD_COMMIT={commit}");
+        println!("cargo:rustc-env=COPPERPOUR_BUILD_COMMIT_SOURCE={source}");
     }
 }
 

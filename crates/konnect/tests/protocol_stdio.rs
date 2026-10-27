@@ -54,7 +54,7 @@ impl McpProcess {
         isolate_home: bool,
         env: &[(&str, &str)],
     ) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_copperpour"));
         for (key, value) in env {
             command.env(key, value);
         }
@@ -90,7 +90,7 @@ impl McpProcess {
                 "clientInfo": {"name": "protocol-test", "version": "0"}
             }),
         );
-        assert_eq!(init["result"]["serverInfo"]["name"], "konnect");
+        assert_eq!(init["result"]["serverInfo"]["name"], "copperpour");
         p.initialized = init;
         p.notify("notifications/initialized");
         p
@@ -626,7 +626,7 @@ fn env_fallback_applies_without_disturbing_reported_provenance() {
 /// Used for the cases where startup must FAIL: the MCP harness above expects a
 /// handshake, and there deliberately is not one.
 fn run_expecting_startup_failure(dir: &std::path::Path, args: &[&str]) -> (bool, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_konnect"))
+    let output = Command::new(env!("CARGO_BIN_EXE_copperpour"))
         .args(args)
         .current_dir(dir)
         .env("HOME", dir)
@@ -727,13 +727,13 @@ fn ipc_failure_kind_and_message_reach_the_client_over_stdio() {
 /// `APPDATA` point at `home`.
 fn user_config_under(home: &std::path::Path) -> std::path::PathBuf {
     let dir = if cfg!(target_os = "windows") {
-        home.join("konnect")
+        home.join("copperpour")
     } else if cfg!(target_os = "macos") {
         home.join("Library")
             .join("Application Support")
-            .join("konnect")
+            .join("copperpour")
     } else {
-        home.join(".konnect")
+        home.join(".copperpour")
     };
     dir.join("config.json")
 }
@@ -793,8 +793,10 @@ fn an_absent_user_configuration_reports_defaults_over_stdio() {
 
 /// The served binary compares installed guidance with its own bundle once per
 /// installed version and tells both the model and `get_installation_info`
-/// (#728). It writes only its record under `.konnect`, and a second start with
-/// the same install neither rescans nor repeats the notice.
+/// (#728). It writes only its record under `.copperpour`, and a second start
+/// with the same install neither rescans nor repeats the notice. The marker is
+/// written where a build before the rename put it, `.konnect`, which the first
+/// start moves.
 /// Unix only: `dirs::home_dir` ignores `HOME` on Windows, so the child would
 /// read the real profile there.
 #[cfg(unix)]
@@ -806,10 +808,10 @@ fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
     let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
     let instructions = p.initialized["result"]["instructions"].as_str().unwrap();
     assert!(
-        instructions.starts_with("Konnect Claude guidance (installed by v0.2.2)"),
+        instructions.starts_with("Copperpour Claude guidance (installed by v0.2.2)"),
         "{instructions}"
     );
-    assert!(instructions.contains("`konnect init`"), "{instructions}");
+    assert!(instructions.contains("`copperpour init`"), "{instructions}");
     assert_eq!(instructions.lines().count(), 1, "Codex was never installed");
 
     let result = p.call_tool("get_installation_info", json!({}));
@@ -840,7 +842,11 @@ fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
     for dir in [".claude", ".agents"] {
         assert!(!tmp.path().join(dir).exists(), "detection wrote {dir}");
     }
-    let mut data = std::fs::read_dir(tmp.path().join(".konnect"))
+    assert!(
+        !tmp.path().join(".konnect").exists(),
+        "moved to .copperpour"
+    );
+    let mut data = std::fs::read_dir(tmp.path().join(".copperpour"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         // The call log and runtime directory every server start keeps.

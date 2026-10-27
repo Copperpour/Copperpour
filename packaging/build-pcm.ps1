@@ -1,4 +1,4 @@
-# Assemble the KiCAD PCM plugin package for Konnect.
+# Assemble the KiCAD PCM plugin package for Copperpour.
 #
 # Produces a zip laid out the way KiCAD's Plugin and Content Manager expects
 # for "Install from File" and for kicad-addons repository submission:
@@ -10,7 +10,7 @@
 #     settings_dialog.py     wxPython settings UI
 #     native_bridge.py       authenticated KiCad 10 native Specctra bridge
 #     resources/icon.png     toolbar icon (referenced by __init__.py)
-#     bin/konnect.exe        the MCP server binary
+#     bin/copperpour.exe        the MCP server binary
 #     bin/schematic-viewer.exe  (optional) live schematic viewer
 #   resources/
 #     icon.png               icon shown in the PCM dialog
@@ -20,7 +20,7 @@
 # it is never valid for "all platforms".
 #
 # Usage:
-#   ./packaging/build-pcm.ps1 -Version 0.1.0 -BinaryPath target/release/konnect.exe `
+#   ./packaging/build-pcm.ps1 -Version 0.1.0 -BinaryPath target/release/copperpour.exe `
 #       [-ViewerPath crates/schematic-viewer/target/release/schematic-viewer.exe] `
 #       [-Platform windows] [-OutDir dist]
 #
@@ -40,7 +40,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 
 if (-not (Test-Path $BinaryPath)) { throw "Binary not found: $BinaryPath" }
 
-$staging = Join-Path ([System.IO.Path]::GetTempPath()) "konnect-pcm-$Version"
+$staging = Join-Path ([System.IO.Path]::GetTempPath()) "copperpour-pcm-$Version"
 if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
 New-Item -ItemType Directory -Path "$staging/plugins/bin", "$staging/plugins/resources", "$staging/resources" -Force | Out-Null
 
@@ -49,7 +49,7 @@ Copy-Item "$repoRoot/plugin/__init__.py" "$staging/plugins/"
 Copy-Item "$repoRoot/plugin/plugin.json" "$staging/plugins/"
 Copy-Item "$repoRoot/plugin/settings_dialog.py" "$staging/plugins/"
 Copy-Item "$repoRoot/plugin/native_bridge.py" "$staging/plugins/"
-Copy-Item $BinaryPath "$staging/plugins/bin/konnect.exe"
+Copy-Item $BinaryPath "$staging/plugins/bin/copperpour.exe"
 if ($ViewerPath -and (Test-Path $ViewerPath)) {
     Copy-Item $ViewerPath "$staging/plugins/bin/schematic-viewer.exe"
     Write-Host "Included schematic viewer: $ViewerPath"
@@ -57,10 +57,10 @@ if ($ViewerPath -and (Test-Path $ViewerPath)) {
 
 # Stamp the IPC entrypoint to this platform's binary name. plugin.json ships the
 # Windows default; the packaging step is authoritative so a package points at the
-# binary it actually bundles (build-pcm.sh stamps bin/konnect for macOS/Linux).
+# binary it actually bundles (build-pcm.sh stamps bin/copperpour for macOS/Linux).
 $pluginManifest = Get-Content "$staging/plugins/plugin.json" -Raw | ConvertFrom-Json
 foreach ($action in $pluginManifest.actions) {
-    if ($action.entrypoint -like "bin/*") { $action.entrypoint = "bin/konnect.exe" }
+    if ($action.entrypoint -like "bin/*") { $action.entrypoint = "bin/copperpour.exe" }
 }
 $pluginManifest | ConvertTo-Json -Depth 10 | Set-Content "$staging/plugins/plugin.json"
 
@@ -91,7 +91,7 @@ $metadata | ConvertTo-Json -Depth 10 | Set-Content "$staging/metadata.json"
 
 # Zip it
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
-$zipPath = Join-Path (Resolve-Path $OutDir) "konnect-pcm-v$Version-$Platform.zip"
+$zipPath = Join-Path (Resolve-Path $OutDir) "copperpour-pcm-v$Version-$Platform.zip"
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 Compress-Archive -Path "$staging/*" -DestinationPath $zipPath
 
@@ -104,4 +104,4 @@ Write-Host "  download_size:   $size"
 Write-Host "  install_size:    $installSize"
 Write-Host "  download_sha256: $sha"
 Write-Host "  platforms:       [$Platform]"
-Write-Host "  download_url:    https://github.com/mixelpixx/Konnect/releases/download/v$Version/konnect-pcm-v$Version-$Platform.zip"
+Write-Host "  download_url:    https://github.com/Copperpour/Copperpour/releases/download/v$Version/copperpour-pcm-v$Version-$Platform.zip"

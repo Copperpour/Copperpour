@@ -1124,12 +1124,12 @@ impl KiCadIpcClient {
                 "KiCAD IPC socket path not configured. To fix: \
                  (1) in KiCAD, enable Preferences > Plugins > 'Enable KiCad API' \
                  (KiCad > Preferences on macOS) and copy the listed ipc:// address; \
-                 (2) paste it into the 'IPC Socket' field of the Konnect settings dialog \
-                 (Tools > External Plugins > Konnect) and save; \
+                 (2) paste it into the 'IPC Socket' field of the Copperpour settings dialog \
+                 (Tools > External Plugins > Copperpour) and save; \
                  (3) restart the AI client so the server rereads settings. \
-                 Alternatively set ipc_socket_path in konnect-settings.json or launch \
+                 Alternatively set ipc_socket_path in the plugin's settings.json or launch \
                  via KiCAD (which sets KICAD_API_SOCKET). \
-                 Full guide: https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md",
+                 Full guide: https://github.com/Copperpour/Copperpour/blob/main/docs/TROUBLESHOOTING.md",
             ));
         }
 
@@ -1210,7 +1210,7 @@ impl KiCadIpcClient {
                 reason,
                 format!(
                     "Cannot connect to KiCad IPC at {diagnostic_dial_url}: {error}. {} Guide: \
-                     https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md",
+                     https://github.com/Copperpour/Copperpour/blob/main/docs/TROUBLESHOOTING.md",
                     reason.explanation()
                 ),
             )

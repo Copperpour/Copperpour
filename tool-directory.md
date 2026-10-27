@@ -200,7 +200,7 @@ and Windows servers do not.
 |------|-------------|
 | `export_schematic_svg` | Export a schematic sheet to SVG using kicad-cli, with optional monochrome rendering and colour theme. |
 | `render_schematic_png` | Render a sheet to PNG: kicad-cli SVG rasterized in-process with deterministic stroke-font rendering. Returns the path and actual pixel dimensions; `inline` adds base64 content so the caller can inspect its own output. |
-| `set_visual_baseline` | Capture the current render of a sheet as its visual baseline under the project's `.konnect/baselines/`, recording the source hash and renderer identity. |
+| `set_visual_baseline` | Capture the current render of a sheet as its visual baseline under the project's `.copperpour/baselines/`, recording the source hash and renderer identity. |
 | `compare_visual_baseline` | Re-render at the baseline's width and report pixel drift vs a 2% threshold, with the changed region's bounding box; "no baseline stored" is an explicit result, and a stale-renderer baseline is flagged, never silently trusted. |
 | `export_schematic_pdf` | Export a schematic to PDF using kicad-cli, optionally monochrome or limited to the root sheet. |
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
@@ -435,7 +435,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 |------|-------------|
 | `load_user_config` | Load the user's global Konnect preferences (manufacturers, fab constraints, default passives, design rules). Call at session start. `source` says file or defaults; a file that exists but cannot be parsed or read is refused (`invalid_configuration`), never replaced by defaults. |
 | `save_user_config` | Update a user preference using dot-notation, e.g. `fab_constraints.fab_house`. Keeps every other key, reports the file as read back, and refuses to write over a file it could not read. |
-| `load_project_config` | Load project-specific config from `<project_dir>/.konnect/project.json`. Project overrides user. `source` says file or defaults; an unusable file is refused. |
+| `load_project_config` | Load project-specific config from `<project_dir>/.copperpour/project.json`. Project overrides user. `source` says file or defaults; an unusable file is refused. |
 | `save_project_config` | Save a project-specific rule or override (same dot-notation and the same refusals as `save_user_config`). |
 | `get_effective_config` | Return the merged config (user defaults + project overrides) with `sources` for each half. The config Claude should use for design decisions; refuses rather than merge defaults in place of a file that cannot be used. |
 | `add_design_rule` | Add a natural-language design rule Claude should follow. Examples: "Always use 100nF X7R for MCU decoupling within 3mm of power pin". |

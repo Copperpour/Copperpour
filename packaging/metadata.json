@@ -1,19 +1,19 @@
 {
   "$schema": "https://go.kicad.org/pcm/schemas/v1",
-  "name": "Konnect",
+  "name": "Copperpour",
   "description": "AI-assisted PCB design via the Model Context Protocol. Enables Claude and other AI assistants to design schematics and PCBs with 241 tools organized into on-demand toolsets.",
-  "description_full": "Konnect exposes a complete set of KiCAD design tools to AI assistants via the Model Context Protocol (MCP). It supports schematic editing, PCB layout, local Freerouting MCP routing, library management, JLCPCB part search, ERC/DRC, design review audits, and full export pipelines. Tools are organized into 21 toolsets loaded on demand so the AI only sees relevant tools at once.",
-  "identifier": "com.github.mixelpixx.konnect",
+  "description_full": "Copperpour exposes a complete set of KiCAD design tools to AI assistants via the Model Context Protocol (MCP). It supports schematic editing, PCB layout, local Freerouting MCP routing, library management, JLCPCB part search, ERC/DRC, design review audits, and full export pipelines. Tools are organized into 21 toolsets loaded on demand so the AI only sees relevant tools at once.",
+  "identifier": "com.github.copperpour.copperpour",
   "type": "plugin",
   "author": {
-    "name": "mixelpixx",
+    "name": "Copperpour",
     "contact": {
-      "web": "https://github.com/mixelpixx"
+      "web": "https://github.com/Copperpour"
     }
   },
   "license": "open-source",
   "resources": {
-    "homepage": "https://github.com/mn89h/LibreKonnect"
+    "homepage": "https://github.com/Copperpour/Copperpour"
   },
   "versions": [
     {

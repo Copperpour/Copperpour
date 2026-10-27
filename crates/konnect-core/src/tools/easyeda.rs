@@ -20,16 +20,14 @@ pub(crate) fn easyeda_cache_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         let appdata = std::env::var("APPDATA").unwrap_or_default();
-        PathBuf::from(appdata)
-            .join("konnect")
+        crate::app_dirs::user_dir(&PathBuf::from(appdata), false)
             .join("cache")
             .join("easyeda")
     }
     #[cfg(not(target_os = "windows"))]
     {
         let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home)
-            .join(".konnect")
+        crate::app_dirs::user_dir(&PathBuf::from(home), true)
             .join("cache")
             .join("easyeda")
     }

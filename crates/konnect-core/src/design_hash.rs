@@ -15,9 +15,10 @@
 //!
 //! The design set is every file matching the design suffixes, discovered
 //! recursively, excluding anything under `.git` and KiCad backup/autosave
-//! artifacts. `.konnect/` state is deliberately NOT part of the design hash:
-//! gate results must be able to reference the design they evaluated without
-//! the reference changing the referent.
+//! artifacts. `.copperpour/` state (`.konnect/` before the rename) is
+//! deliberately NOT part of the design hash: gate results must be able to
+//! reference the design they evaluated without the reference changing the
+//! referent.
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -58,9 +59,12 @@ fn collect_design_files(root: &Path) -> Result<Vec<String>> {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if path.is_dir() {
-                // .git is history, .konnect is derived state, *-backups is
-                // KiCad's own archive directory — none are the design.
-                if name != ".git" && name != ".konnect" && !name.ends_with("-backups") {
+                // .git is history, .copperpour (.konnect before the rename) is
+                // derived state, *-backups is KiCad's own archive directory —
+                // none are the design.
+                if ![".git", ".copperpour", ".konnect"].contains(&name.as_str())
+                    && !name.ends_with("-backups")
+                {
                     stack.push(path);
                 }
                 continue;
@@ -174,7 +178,10 @@ mod tests {
         let (baseline, files) = design_state_hash(dir.path()).unwrap();
         assert_eq!(files, vec!["amp.kicad_pcb"]);
 
-        write(dir.path(), ".konnect/gates/abc.json", b"{}");
+        write(dir.path(), ".copperpour/gates/abc.json", b"{}");
+        // A design file is the only kind the exclusion has to keep out.
+        write(dir.path(), ".copperpour/state/amp.kicad_pcb", b"copy");
+        write(dir.path(), ".konnect/state/amp.kicad_pcb", b"copy");
         write(dir.path(), ".git/config", b"x");
         write(dir.path(), "amp-backups/amp.kicad_pcb", b"old");
         write(dir.path(), "_autosave-amp.kicad_pcb", b"tmp");

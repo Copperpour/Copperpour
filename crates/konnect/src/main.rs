@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Cli::Version => {
-            println!("konnect {}", env!("CARGO_PKG_VERSION"));
+            println!("copperpour {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
         Cli::Subcommand("init") => {
@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
     }
 
     // Keep accepting the public `--client` option, but MCP startup is
-    // deliberately non-mutating: guidance installation requires `konnect init`.
+    // deliberately non-mutating: guidance installation requires `copperpour init`.
     let _client = install::client_from_server_args(&args[1..])?;
 
     // --config <path>: load config from specified file
@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
         .with_env_filter(filter)
         .init();
 
-    info!("Konnect v{} starting", env!("CARGO_PKG_VERSION"));
+    info!("Copperpour v{} starting", env!("CARGO_PKG_VERSION"));
     ipc_source.log(&config.ipc_address);
 
     // Name the configuration that actually started this process. A user whose
@@ -256,34 +256,34 @@ fn print_help_for(subcommand: Option<&str>) {
     };
     match subcommand {
         Some("init") => {
-            println!("konnect init [--client <claude|codex>]\n");
-            println!("Install Konnect's skills and agents for an AI client.");
+            println!("copperpour init [--client <claude|codex>]\n");
+            println!("Install Copperpour's skills and agents for an AI client.");
             println!("Writes to that client's configuration directory.");
             clients();
         }
         Some("uninstall") => {
-            println!("konnect uninstall [--client <claude|codex>]\n");
-            println!("Remove the skills and agents Konnect installed for a client.");
-            println!("Only Konnect's own named assets are removed.");
+            println!("copperpour uninstall [--client <claude|codex>]\n");
+            println!("Remove the skills and agents Copperpour installed for a client.");
+            println!("Only Copperpour's own named assets are removed.");
             clients();
         }
         Some("status") => {
-            println!("konnect status [--client <claude|codex>]\n");
+            println!("copperpour status [--client <claude|codex>]\n");
             println!("Report what is installed for a client. Writes nothing.");
             clients();
         }
         Some("skill") => {
-            println!("konnect skill <name>\n");
+            println!("copperpour skill <name>\n");
             println!("Print bundled guidance as human-readable text. Writes nothing.");
         }
         Some("hook") => {
-            println!("konnect hook <name>\n");
+            println!("copperpour hook <name>\n");
             println!("Print one structured Claude hook response as JSON. Writes nothing.");
         }
         Some("transaction") => {
-            println!("konnect transaction status <project-dir>");
-            println!("konnect transaction recover <project-dir>");
-            println!("konnect transaction abandon <project-dir> <transaction-id> --force\n");
+            println!("copperpour transaction status <project-dir>");
+            println!("copperpour transaction recover <project-dir>");
+            println!("copperpour transaction abandon <project-dir> <transaction-id> --force\n");
             println!("Inspect and resolve write-ahead journals left by multi-file");
             println!("schematic changes. 'status' writes nothing.");
         }
@@ -292,21 +292,21 @@ fn print_help_for(subcommand: Option<&str>) {
 }
 
 fn print_help() {
-    println!("Konnect v{}", env!("CARGO_PKG_VERSION"));
+    println!("Copperpour v{}", env!("CARGO_PKG_VERSION"));
     println!("MCP server for KiCad EDA with embedded guidance.\n");
     println!("USAGE:");
-    println!("  konnect                  Start MCP server (pipe) or install (TTY)");
-    println!("  konnect [--client <client>] [--config <path>]");
-    println!("  konnect init [--client <client>]");
-    println!("  konnect uninstall [--client <client>]");
-    println!("  konnect status [--client <client>]");
-    println!("  konnect skill <name>     Print skill content (for hooks)");
-    println!("  konnect hook <name>      Print structured Claude hook JSON");
-    println!("  konnect transaction status <project-dir>");
-    println!("  konnect transaction recover <project-dir>");
-    println!("  konnect transaction abandon <project-dir> <id> --force");
-    println!("  konnect --version        Print version");
-    println!("  konnect --help           This message");
+    println!("  copperpour               Start MCP server (pipe) or install (TTY)");
+    println!("  copperpour [--client <client>] [--config <path>]");
+    println!("  copperpour init [--client <client>]");
+    println!("  copperpour uninstall [--client <client>]");
+    println!("  copperpour status [--client <client>]");
+    println!("  copperpour skill <name>  Print skill content (for hooks)");
+    println!("  copperpour hook <name>   Print structured Claude hook JSON");
+    println!("  copperpour transaction status <project-dir>");
+    println!("  copperpour transaction recover <project-dir>");
+    println!("  copperpour transaction abandon <project-dir> <id> --force");
+    println!("  copperpour --version     Print version");
+    println!("  copperpour --help        This message");
     println!("\nCLIENTS:");
     println!("  claude (default)         Skills, agents, and hooks under ~/.claude");
     println!("  codex                    Skills under ~/.agents/skills");
@@ -317,7 +317,7 @@ mod cli_dispatch_tests {
     use super::*;
 
     fn cli(argv: &[&str]) -> Vec<String> {
-        std::iter::once("konnect")
+        std::iter::once("copperpour")
             .chain(argv.iter().copied())
             .map(String::from)
             .collect()

@@ -268,6 +268,8 @@ impl Default for Config {
 /// entry is loaded; the rest are shadowed, never merged.
 fn default_config_paths() -> Vec<PathBuf> {
     let mut config_paths = vec![
+        PathBuf::from("copperpour.toml"),
+        // The name before the rename to Copperpour.
         PathBuf::from("konnect.toml"),
         PathBuf::from("settings.json"),
     ];
@@ -301,7 +303,7 @@ fn select_config_candidate(candidates: &[PathBuf]) -> (Option<PathBuf>, Vec<Path
     (selected, skipped)
 }
 
-/// settings.json next to the binary, and one dir up (covers <plugin_dir>/bin/konnect).
+/// settings.json next to the binary, and one dir up (covers <plugin_dir>/bin/copperpour).
 fn exe_relative_settings_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
@@ -320,23 +322,23 @@ fn dirs_config_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         let appdata = std::env::var("APPDATA").unwrap_or_default();
-        PathBuf::from(appdata).join("konnect").join("config.toml")
+        konnect_core::app_dirs::user_dir(&PathBuf::from(appdata), false).join("config.toml")
     }
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("konnect")
-            .join("config.toml")
+        konnect_core::app_dirs::user_dir(
+            &PathBuf::from(home)
+                .join("Library")
+                .join("Application Support"),
+            false,
+        )
+        .join("config.toml")
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home)
-            .join(".config")
-            .join("konnect")
+        konnect_core::app_dirs::user_dir(&PathBuf::from(home).join(".config"), false)
             .join("config.toml")
     }
 }

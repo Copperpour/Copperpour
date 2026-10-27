@@ -324,6 +324,6 @@ The workflow enforces timing only. It never chooses the disposition.
 
 ## Licensing
 
-LibreKonnect is AGPL-3.0 only, and contributions are accepted under that same
+Copperpour is AGPL-3.0 only, and contributions are accepted under that same
 license; see [CONTRIBUTING.md](CONTRIBUTING.md). There is no CLA and no
 commercial license.

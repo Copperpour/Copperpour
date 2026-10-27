@@ -2473,10 +2473,10 @@ mod client_adaptation_tests {
             .is_none());
 
         let drifted = lazy_handler().await;
-        drifted.set_guidance_probe(Arc::new(FixedProbe(Some("run konnect init"))));
+        drifted.set_guidance_probe(Arc::new(FixedProbe(Some("run copperpour init"))));
         let result = initialize_result(&drifted).await;
-        assert_eq!(result["instructions"], "run konnect init");
-        assert_eq!(result["serverInfo"]["name"], "konnect");
+        assert_eq!(result["instructions"], "run copperpour init");
+        assert_eq!(result["serverInfo"]["name"], "copperpour");
     }
 
     /// Claude Code honours list_changed and must not be swept up by a loose
@@ -2538,7 +2538,7 @@ mod config_state_dispatch_tests {
     async fn a_malformed_project_configuration_is_refused_and_never_overwritten() {
         let handler = handler().await;
         let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join(".konnect").join("project.json");
+        let config = dir.path().join(".copperpour").join("project.json");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         let original = r#"{"design_rules": ["keep me"],"#;
         std::fs::write(&config, original).unwrap();
@@ -2590,7 +2590,7 @@ mod config_state_dispatch_tests {
         assert!(!is_error, "{loaded}");
         assert_eq!(loaded["source"], "defaults", "{loaded}");
         assert!(
-            !dir.path().join(".konnect").exists(),
+            !dir.path().join(".copperpour").exists(),
             "a load of an absent project file writes nothing"
         );
 
@@ -2611,6 +2611,33 @@ mod config_state_dispatch_tests {
         .await;
         assert_eq!(reloaded["source"], "file", "{reloaded}");
         assert_eq!(reloaded["config"]["fab"]["house"], "JLCPCB", "{reloaded}");
+    }
+
+    /// A project configured before the rename keeps its configuration: the
+    /// first read moves `.konnect` to `.copperpour`, with everything in it.
+    #[tokio::test]
+    async fn a_konnect_project_directory_is_moved_and_loaded() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join(".konnect");
+        std::fs::create_dir_all(old.join("baselines")).unwrap();
+        std::fs::write(old.join("project.json"), r#"{"fab": {"house": "JLCPCB"}}"#).unwrap();
+        std::fs::write(old.join("baselines").join("amp.json"), "{}").unwrap();
+
+        let (is_error, loaded) = call(
+            &handler,
+            "load_project_config",
+            json!({ "project_dir": dir.path().display().to_string() }),
+        )
+        .await;
+
+        assert!(!is_error, "{loaded}");
+        assert_eq!(loaded["source"], "file", "{loaded}");
+        assert_eq!(loaded["config"]["fab"]["house"], "JLCPCB", "{loaded}");
+        let new = dir.path().join(".copperpour");
+        assert!(new.join("project.json").is_file());
+        assert!(new.join("baselines").join("amp.json").is_file());
+        assert!(!old.exists());
     }
 }
 

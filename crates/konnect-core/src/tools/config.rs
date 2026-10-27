@@ -1,7 +1,7 @@
 //! `config` toolset — User preferences, project rules, and effective configuration.
 //!
-//! Persists user-level config to `~/.konnect/config.json` and project-level
-//! config to `<project_dir>/.konnect/project.json`. Claude should call
+//! Persists user-level config to `~/.copperpour/config.json` and project-level
+//! config to `<project_dir>/.copperpour/project.json`. Claude should call
 //! `load_user_config` at the start of every session.
 //!
 //! A configuration file has four states and they are never merged (#580):
@@ -81,20 +81,22 @@ fn user_config_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         let appdata = std::env::var("APPDATA").unwrap_or_default();
-        PathBuf::from(appdata).join("konnect")
+        crate::app_dirs::user_dir(&PathBuf::from(appdata), false)
     }
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("konnect")
+        crate::app_dirs::user_dir(
+            &PathBuf::from(home)
+                .join("Library")
+                .join("Application Support"),
+            false,
+        )
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".konnect")
+        crate::app_dirs::user_dir(&PathBuf::from(home), true)
     }
 }
 
@@ -103,7 +105,7 @@ fn user_config_path() -> PathBuf {
 }
 
 fn project_config_path(project_dir: &Path) -> PathBuf {
-    project_dir.join(".konnect").join("project.json")
+    crate::app_dirs::project_state_dir(project_dir).join("project.json")
 }
 
 // ─── Config I/O helpers ──────────────────────────────────────────────────────
@@ -453,7 +455,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "load_project_config",
-            "Load project-specific configuration from <project_dir>/.konnect/project.json. \
+            "Load project-specific configuration from <project_dir>/.copperpour/project.json. \
              Project config overrides user config where both exist. 'source' is 'file' or \
              'defaults' (no file; nothing is written). A file that cannot be parsed or read is \
              refused with invalid_configuration.",
@@ -472,7 +474,7 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "save_project_config",
             "Save a project-specific rule or override. Same dot-notation as save_user_config \
-             but writes to the project's .konnect/project.json, with the same refusals: an \
+             but writes to the project's .copperpour/project.json, with the same refusals: an \
              unusable existing file is never overwritten.",
             json!({
                 "type": "object",
@@ -933,7 +935,7 @@ mod config_state_tests {
     }
 
     fn config_in(dir: &Path) -> PathBuf {
-        dir.join("konnect").join("config.json")
+        dir.join("copperpour").join("config.json")
     }
 
     fn write(path: &Path, content: &str) {
@@ -1212,7 +1214,7 @@ mod config_state_tests {
         let project = dir
             .path()
             .join("proj")
-            .join(".konnect")
+            .join(".copperpour")
             .join("project.json");
 
         let clean = body(&effective_config_at(&user, Some(&project)));
@@ -1245,7 +1247,7 @@ mod config_state_tests {
     #[test]
     fn a_design_rule_is_appended_and_never_over_a_malformed_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".konnect").join("project.json");
+        let path = dir.path().join(".copperpour").join("project.json");
         let saved = update_config(
             &path,
             "project",

@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::process::Command;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-const PCM_IDENTIFIER: &str = "com.github.mixelpixx.konnect";
+const PCM_IDENTIFIER: &str = "com.github.copperpour.copperpour";
 
 pub(crate) async fn collect(
     config: &ServerConfig,
@@ -49,8 +49,8 @@ pub(crate) async fn collect(
     json!({
         "build": {
             "version": running_version,
-            "commit": option_env!("KONNECT_BUILD_COMMIT"),
-            "commit_source": option_env!("KONNECT_BUILD_COMMIT_SOURCE"),
+            "commit": option_env!("COPPERPOUR_BUILD_COMMIT"),
+            "commit_source": option_env!("COPPERPOUR_BUILD_COMMIT_SOURCE"),
             "working_tree_state": "not_recorded",
             "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
             "target_os": std::env::consts::OS,
@@ -111,7 +111,7 @@ fn guidance_block(guidance: Option<&dyn GuidanceProbe>) -> Value {
         Some(probe) => probe.detail(),
         None => json!({
             "probe_status": "not_available",
-            "reason": "This process does not carry the guidance bundle (embedded or library use); run `konnect status` from the standalone binary.",
+            "reason": "This process does not carry the guidance bundle (embedded or library use); run `copperpour status` from the standalone binary.",
         }),
     }
 }
@@ -144,7 +144,7 @@ fn classify_installation(executable_path: &Path) -> InstallSource {
         return InstallSource {
             name: "kicad_pcm",
             evidence:
-                "A sibling KiCad executable-plugin manifest has Konnect's exact public identifier.",
+                "A sibling KiCad executable-plugin manifest has Copperpour's exact public identifier.",
             manifest_path: Some(path),
         };
     }
@@ -280,8 +280,12 @@ pub(crate) fn compare_konnect_versions(candidate: &str, running: &str) -> Option
     stable_version_cmp(candidate, running)
 }
 
+/// `copperpour <version>`, or `konnect <version>` from a build before the rename.
 fn parse_konnect_version(line: &str) -> Option<&str> {
-    let version = line.strip_prefix("konnect ")?.trim();
+    let version = line
+        .strip_prefix("copperpour ")
+        .or_else(|| line.strip_prefix("konnect "))?
+        .trim();
     (!version.is_empty() && !version.chars().any(char::is_whitespace)).then_some(version)
 }
 
@@ -386,7 +390,7 @@ mod tests {
         assert!(absent["reason"]
             .as_str()
             .unwrap()
-            .contains("konnect status"));
+            .contains("copperpour status"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -414,9 +418,9 @@ mod tests {
         let bin_dir = plugin_dir.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let executable = bin_dir.join(if cfg!(windows) {
-            "konnect.exe"
+            "copperpour.exe"
         } else {
-            "konnect"
+            "copperpour"
         });
         std::fs::write(&executable, b"").unwrap();
 
@@ -427,9 +431,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(classify_installation(&executable).name, "unknown");
+        // Konnect's identifier is another project's package now.
         std::fs::write(
             plugin_dir.join("plugin.json"),
             r#"{"identifier":"com.github.mixelpixx.konnect","runtime":{"type":"exec"}}"#,
+        )
+        .unwrap();
+        assert_eq!(classify_installation(&executable).name, "unknown");
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"identifier":"com.github.copperpour.copperpour","runtime":{"type":"exec"}}"#,
         )
         .unwrap();
 
@@ -453,8 +464,16 @@ mod tests {
     }
 
     #[test]
+    fn a_version_line_under_either_name_is_read() {
+        assert_eq!(parse_konnect_version("copperpour 0.15.0"), Some("0.15.0"));
+        assert_eq!(parse_konnect_version("konnect 0.14.0"), Some("0.14.0"));
+        assert_eq!(parse_konnect_version("kicad-cli 10.0.1"), None);
+        assert_eq!(parse_konnect_version("copperpour "), None);
+    }
+
+    #[test]
     fn embedded_commit_is_hex_when_available() {
-        if let Some(commit) = option_env!("KONNECT_BUILD_COMMIT") {
+        if let Some(commit) = option_env!("COPPERPOUR_BUILD_COMMIT") {
             assert!((7..=64).contains(&commit.len()));
             assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
         }

@@ -181,11 +181,12 @@ which later files were shadowed.
 So a value present only in a lower-priority file has no effect while a
 higher-priority file exists.
 
-1. `konnect.toml` in the working directory;
-2. `settings.json` in the working directory;
-3. `settings.json` beside the executable;
-4. `settings.json` one directory above the executable;
-5. the platform configuration directory.
+1. `copperpour.toml` in the working directory;
+2. `konnect.toml` in the working directory, its name before the rename;
+3. `settings.json` in the working directory;
+4. `settings.json` beside the executable;
+5. `settings.json` one directory above the executable;
+6. the platform configuration directory.
 
 Two consequences worth stating outright, because both have been reported as
 missing functionality:
@@ -193,7 +194,7 @@ missing functionality:
 - In the standard plugin layout a `settings.json` exists beside the binary, so
   the platform configuration directory is never reached and any `config.toml`
   there is inert.
-- A stray `konnect.toml` or `settings.json` in a working directory takes over the
+- A stray `copperpour.toml`, `konnect.toml` or `settings.json` in a working directory takes over the
   entire configuration for that run.
 
 Call **`get_installation_info`** to see which file configured the running
@@ -216,8 +217,8 @@ list above is not consulted, and `get_installation_info` reports
 `ipc_socket_path` alias is accepted by the serde definition in `config.rs`.
 
 A blank or whitespace-only configured `jlcpcb_db_path` means unset for all
-JLCPCB database tools. They use the platform default (`%APPDATA%/konnect/jlcpcb.db`
-on Windows, `$HOME/.konnect/jlcpcb.db` elsewhere) unless a nonblank configured
+JLCPCB database tools. They use the platform default (`%APPDATA%/copperpour/jlcpcb.db`
+on Windows, `$HOME/.copperpour/jlcpcb.db` elsewhere) unless a nonblank configured
 path is supplied. Nonblank configured paths are preserved without trimming;
 the download tool's per-call `output_path` takes precedence. This normalization does not rewrite
 your settings file or download a database at startup.

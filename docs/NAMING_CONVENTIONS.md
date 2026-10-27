@@ -33,7 +33,7 @@ Follow the Rust API Guidelines and `rustfmt`, with these repository-specific cho
 - Types and traits use `UpperCamelCase`. Acronyms are words: `KiCadIpcClient`,
   `McpHandler`, `IpcFootprint`, `UuidCache`.
 - Constants and environment variables use `SCREAMING_SNAKE_CASE`: `HOOK_SKILLS`,
-  `KICAD_API_SOCKET`, `KONNECT_STATE_DIR`.
+  `KICAD_API_SOCKET`, `COPPERPOUR_STATE_DIR`.
 - Boolean names describe a true state with `is_`, `has_`, `can_`, or `should_` when
   the prefix adds clarity: `is_error`, `has_pull_up`.
 - Fallible `find_*` functions return `Option` when absence is normal. `get_*` functions

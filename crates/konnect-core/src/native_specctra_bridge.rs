@@ -113,10 +113,11 @@ pub(crate) async fn try_export(board: &Path) -> NativeExportAttempt {
 }
 
 fn registration_root() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("KONNECT_BRIDGE_DIR") {
+    if let Some(path) = crate::app_dirs::env_var("BRIDGE_DIR") {
         return Some(PathBuf::from(path));
     }
-    dirs::data_local_dir().map(|path| path.join("konnect").join("native-bridge"))
+    // The KiCad plugin writes here; it ships with this binary, so no move.
+    dirs::data_local_dir().map(|path| path.join(crate::app_dirs::APP_NAME).join("native-bridge"))
 }
 
 fn registrations(root: &Path) -> Result<Vec<PathBuf>> {

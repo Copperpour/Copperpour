@@ -8,8 +8,13 @@ license.workspace = true
 
 # Compile as both a binary (standalone MCP server) and a cdylib (KiCAD plugin)
 [[bin]]
-name = "konnect"
+name = "copperpour"
 path = "src/main.rs"
+
+# The name before the rename: runs `copperpour` beside it. Kept for one release.
+[[bin]]
+name = "konnect"
+path = "src/bin/konnect.rs"
 
 [lib]
 name = "konnect_plugin"

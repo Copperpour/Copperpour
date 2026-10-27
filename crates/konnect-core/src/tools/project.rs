@@ -592,7 +592,7 @@ async fn handle_open_viewer(
         }
         None => Ok(CallToolResult::error(
             "Schematic viewer binary (schematic-viewer.exe) not found. \
-             It should be in the same directory as konnect.exe.",
+             It should be in the same directory as copperpour.exe.",
         )),
     }
 }
@@ -1328,7 +1328,7 @@ fn rename_rewrite_failed(
             format!(
                 "The files were renamed, but rewriting their project references failed after \
                  this journal was written ({}), so some may already hold the new name. Run \
-                 `konnect transaction status` in the project directory.",
+                 `copperpour transaction status` in the project directory.",
                 failure.error
             ),
         ));

@@ -72,9 +72,9 @@ to verify the process that actually restarted. This diagnostic writes nothing.
 
 ## Installed guidance is out of date
 
-`konnect init` writes skills, agents, and Claude hooks once. Upgrading Konnect
+`copperpour init` writes skills, agents, and Claude hooks once. Upgrading Konnect
 does not touch them, so an older install keeps advising the old tools. Run
-`konnect status` (add `--client codex` for Codex) with the binary your MCP
+`copperpour status` (add `--client codex` for Codex) with the binary your MCP
 client uses. Each file and hook is compared with that binary's bundle:
 
 | Status | Meaning |
@@ -86,18 +86,18 @@ client uses. Each file and hook is compared with that binary's bundle:
 
 A `different` hook carries a reason: `legacy_handler` is the pre-hook-JSON
 `… skill <name>` form, which Claude ignores, and `other_executable` is a hook
-that runs another Konnect binary, written exactly as `konnect init` writes it.
+that runs another Konnect binary, written exactly as `copperpour init` writes it.
 
 The serving process makes the same comparison for both clients once per
 installed guidance version, meaning each install marker. The first start
 for that marker scans, records the resulting state in
-`~/.konnect/.guidance-checked-<client>`, and sets the MCP `initialize`
+`~/.copperpour/.guidance-checked-<client>`, and sets the MCP `initialize`
 `instructions` to a one-line notice when either client is `out_of_sync`. Later
 starts read the record instead of rescanning and give no notice. Running
-`konnect init` starts a new check. Upgrading the binary alone does not. `get_installation_info` reports the
+`copperpour init` starts a new check. Upgrading the binary alone does not. `get_installation_info` reports the
 result under `guidance`; its `checked` field is `now` for a scan in this
 process, with per-file detail, or `earlier` for a recorded state without it.
-`konnect status` always scans. Nothing rewrites guidance. Run `konnect init` to
+`copperpour status` always scans. Nothing rewrites guidance. Run `copperpour init` to
 update. It overwrites `different` files, so save any edits you made first.
 
 ## "KiCAD IPC socket path not configured"
@@ -218,7 +218,7 @@ The known workaround: run Konnect outside the sandbox, as the same user as
 KiCad, over HTTP:
 
 ```toml
-# konnect.toml in the directory Konnect is started from
+# copperpour.toml in the directory Copperpour is started from
 transport = "http"
 http_address = "127.0.0.1:3000"
 ipc_address = "ipc://C:/Users/<you>/AppData/Local/Temp/kicad/api.sock"
@@ -342,10 +342,10 @@ that path, invalid UTF-8).
 Konnect used to answer with its defaults here, and the next save then replaced
 the file with them. It now refuses and writes nothing, so your settings are
 still in the file. Open it, fix the JSON (or move it aside to start again from
-the defaults), and retry. The user file is `%APPDATA%\konnect\config.json` on
-Windows, `~/Library/Application Support/konnect/config.json` on macOS and
-`~/.konnect/config.json` elsewhere; a project's is
-`<project_dir>/.konnect/project.json`.
+the defaults), and retry. The user file is `%APPDATA%\copperpour\config.json` on
+Windows, `~/Library/Application Support/copperpour/config.json` on macOS and
+`~/.copperpour/config.json` elsewhere; a project's is
+`<project_dir>/.copperpour/project.json`.
 
 A save that ends in `mutation_outcome_uncertain` could not prove what is on
 disk. Read the file before retrying; do not assume nothing was written.
@@ -377,7 +377,7 @@ result is not what you expect.
 
 Common install paths are auto-detected (including the Windows registry). If
 your install is somewhere unusual, set the path in the plugin settings dialog
-in a `settings.json` beside the binary, or in a `konnect.toml` in the working directory (`kicad_cli`). Discovery order is `konnect.toml` and `settings.json` in the CWD, then `settings.json` next to the binary and one level up, then the platform config dir. **Only the first existing file is loaded — later ones are not merged in**, so a `kicad_cli` set in a lower-priority file is ignored while a higher-priority file exists. A file under any other name is only read when passed with `--config`.
+in a `settings.json` beside the binary, or in a `copperpour.toml` in the working directory (`kicad_cli`). Discovery order is `copperpour.toml`, `konnect.toml` (its name before the rename) and `settings.json` in the CWD, then `settings.json` next to the binary and one level up, then the platform config dir. **Only the first existing file is loaded — later ones are not merged in**, so a `kicad_cli` set in a lower-priority file is ignored while a higher-priority file exists. A file under any other name is only read when passed with `--config`.
 
 If a setting appears to be ignored, call `get_installation_info` and read its
 `configuration` block: `selected_path` is the file that configured the running
@@ -401,8 +401,8 @@ fallback. Use `disable` to force Rust output.
 
 The bridge listens only on an ephemeral IPv4 loopback port and requires a
 per-session bearer token. Registration and temporary DSN files live under the
-per-user local-data directory (`%LOCALAPPDATA%\konnect\native-bridge` on
-Windows); `KONNECT_BRIDGE_DIR` overrides it for diagnostics and tests. A clean
+per-user local-data directory (`%LOCALAPPDATA%\copperpour\native-bridge` on
+Windows); `COPPERPOUR_BRIDGE_DIR` overrides it for diagnostics and tests. A clean
 plugin shutdown removes its own registration and temporary files. Stale
 registrations left by a hard KiCad crash are ignored because Konnect probes and
 authenticates each candidate before use.
@@ -466,7 +466,7 @@ without reviewing their contents, and do not commit them. Both forms are
 ignored by the repository `.gitignore`.
 
 Cooperative document locks are stored outside the project under the platform
-local-data directory. Set `KONNECT_STATE_DIR` to an absolute directory to
+local-data directory. Set `COPPERPOUR_STATE_DIR` to an absolute directory to
 override that location. A relative override is rejected rather than falling
 back to project-local sidecars.
 
@@ -501,7 +501,7 @@ callable tools, the fix is to make the *first* listing complete:
 { "eager_toolsets": true }
 ```
 
-in `konnect.toml` in the working directory, or a `settings.json` beside the binary. Every toolset is then loaded at
+in `copperpour.toml` in the working directory, or a `settings.json` beside the binary. Every toolset is then loaded at
 startup, so `tools/list` carries all 248 tools from the first call.
 
 It is off by default because it costs what the router exists to save: roughly
@@ -575,7 +575,7 @@ per listing instead of ~2K.
 ## Plugin doesn't appear in KiCAD
 
 Install via **Plugin and Content Manager → Install from File** with the
-`konnect-pcm-*.zip` release asset (not the bare binary archives), then restart
+`copperpour-pcm-*.zip` release asset (not the bare binary archives), then restart
 KiCAD.
 
 ## A board no longer opens after `set_active_layer`

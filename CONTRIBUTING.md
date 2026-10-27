@@ -223,7 +223,7 @@ not a failure on your part.
 
 ## Licensing your contribution
 
-LibreKonnect is licensed under the [AGPL-3.0](LICENSE) only, and contributions
+Copperpour is licensed under the [AGPL-3.0](LICENSE) only, and contributions
 are accepted under that same license. You keep the copyright in your work, and
 nobody gets a right to relicense it.
 

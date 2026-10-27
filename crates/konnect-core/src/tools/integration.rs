@@ -194,12 +194,12 @@ pub(crate) fn default_jlcpcb_db_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         let appdata = std::env::var("APPDATA").unwrap_or_default();
-        PathBuf::from(appdata).join("konnect").join("jlcpcb.db")
+        crate::app_dirs::user_dir(&PathBuf::from(appdata), false).join("jlcpcb.db")
     }
     #[cfg(not(target_os = "windows"))]
     {
         let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".konnect").join("jlcpcb.db")
+        crate::app_dirs::user_dir(&PathBuf::from(home), true).join("jlcpcb.db")
     }
 }
 

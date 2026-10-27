@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Validate Konnect's PCM packaging against KiCAD's addon schema.
+"""Validate Copperpour's PCM packaging against KiCAD's addon schema.
 
 Two modes, combinable:
 
   python packaging/validate-pcm.py --metadata packaging/metadata.json
       Validate a metadata.json file against the vendored packages.v1 schema.
 
-  python packaging/validate-pcm.py --zip dist/konnect-pcm-v0.1.2.zip
+  python packaging/validate-pcm.py --zip dist/copperpour-pcm-v0.1.2.zip
       Assert the PCM zip structure (metadata at root, plugin launcher,
       per-OS entrypoint binary, icons) and validate the embedded metadata.
 
@@ -84,9 +84,9 @@ def validate_zip(zip_path: Path) -> list[str]:
 
     # Exactly one server binary must be present, and plugin.json's entrypoint
     # must point at it (PR #7's per-OS stamping contract).
-    binaries = [n for n in names if n.startswith("plugins/bin/konnect")]
+    binaries = [n for n in names if n.startswith("plugins/bin/copperpour")]
     if not binaries:
-        errors.append(f"{zip_path.name}: no plugins/bin/konnect* binary found")
+        errors.append(f"{zip_path.name}: no plugins/bin/copperpour* binary found")
 
     if "plugins/plugin.json" in names:
         plugin = json.loads(z.read("plugins/plugin.json"))

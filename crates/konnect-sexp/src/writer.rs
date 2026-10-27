@@ -328,21 +328,27 @@ fn reject_non_file_lock_path(path: &Path) -> Result<(), SexpError> {
 }
 
 fn document_lock_path(path: &Path) -> Result<PathBuf, SexpError> {
-    let state_root = match std::env::var_os("KONNECT_STATE_DIR") {
-        Some(value) if !value.is_empty() => {
+    // KONNECT_STATE_DIR is the name before the rename to Copperpour.
+    let configured = ["COPPERPOUR_STATE_DIR", "KONNECT_STATE_DIR"]
+        .into_iter()
+        .find_map(|key| std::env::var_os(key).filter(|value| !value.is_empty()));
+    let state_root = match configured {
+        Some(value) => {
             let root = PathBuf::from(value);
             if !root.is_absolute() {
                 return Err(SexpError::InvalidValue(
-                    "KONNECT_STATE_DIR must be an absolute path".to_owned(),
+                    "COPPERPOUR_STATE_DIR must be an absolute path".to_owned(),
                 ));
             }
             root
         }
-        _ => dirs::data_local_dir()
+        // Still named `konnect`, so a Konnect build editing the same file
+        // takes the same lock as this one.
+        None => dirs::data_local_dir()
             .map(|root| root.join("konnect"))
             .ok_or_else(|| {
                 SexpError::InvalidValue(
-                    "no platform local-data directory is available; set KONNECT_STATE_DIR to an absolute path"
+                    "no platform local-data directory is available; set COPPERPOUR_STATE_DIR to an absolute path"
                         .to_owned(),
                 )
             })?,
@@ -854,7 +860,7 @@ pub(crate) mod mode_probe {
             .env(PROBE_DIRECTORY, directory.path())
             // Keep any lock file a probe happens to need out of the
             // developer's own state directory.
-            .env("KONNECT_STATE_DIR", directory.path())
+            .env("COPPERPOUR_STATE_DIR", directory.path())
             .output()
             .expect("probe process runs");
 
