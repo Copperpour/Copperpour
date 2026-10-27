@@ -297,7 +297,7 @@ Crystal (Device:Crystal) between XI and XO pins. Two load capacitors from each c
 After placing components and wiring, always run these checks:
 
 ### annotate_schematic
-Numbers `?` designators the way eeschema's Tools → Annotate does (ascending X, first free number in the project, numbers reserved across every sheet instance in the file) and writes both places a designator lives. The units of one multi-unit part get one shared designator. Duplicated designators are **reported, not fixed**: read `unresolved` and the `outcome` — `partial` means the schematic still has a conflict — and pass `resolve_duplicates: true` to renumber all but the first of each group of separate parts; a shared designator that could be the units of one package is never renumbered, so fix those by hand. It annotates one project's instance records (the schematic's owner, or `project`) and never edits another project's; numbers used on the project's other sheets are reserved through its sheet tree (the response lists the sheets it consulted), but duplicates already spread across sheets are not detected, so annotate each sheet and then run `run_erc`. Run after all placement is complete; `dry_run: true` shows the plan first.
+Numbers `?` designators the way eeschema's Tools → Annotate does (ascending X, first free number in the project, numbers reserved across every sheet instance in the file) and writes both places a designator lives. The units of one multi-unit part get one shared designator. Duplicated designators are **reported, not fixed**: read `unresolved` and the `outcome` — `partial` means the schematic still has a conflict — and pass `resolve_duplicates: true` to renumber all but the first of each group of separate parts; a shared designator that could be the units of one package is never renumbered, so fix those by hand. It annotates one project's instance records (the schematic's owner, or `project`) and never edits another project's; called on one sheet it reserves the numbers the project's other sheets use (the response lists the sheets it consulted). For a hierarchical design, call it once on the project's root with `schematic_scope: "hierarchy"`: every sheet instance is numbered in eeschema's page order and duplicates across sheets are found. Run after all placement is complete; `dry_run: true` shows the plan first.
 
 ### validate_wire_connections
 Checks that all wires connect properly to pins. Reports:
@@ -316,7 +316,7 @@ Finds floating wires, labels, and symbols that are not connected to anything.
 ### Verification Workflow
 
 1. Place and wire complete functional blocks.
-2. Run `annotate_schematic`, then save with `save_project`.
+2. Run `annotate_schematic` (on a hierarchical design, on its root with `schematic_scope: "hierarchy"`), then save with `save_project`.
 3. Run `validate_wire_connections` and `validate_component_connections`.
 4. Run `find_shorted_nets`; reconcile each finding against the intended nets.
 5. Run `find_orphan_items` as a heuristic and corroborate its findings.

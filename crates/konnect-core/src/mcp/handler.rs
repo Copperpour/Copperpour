@@ -1456,6 +1456,97 @@ mod annotate_dispatch_tests {
         assert_eq!(body["assigned"][0]["project"], "adj", "{body}");
         assert_eq!(body["unresolved"][0]["project"], "adj", "{body}");
     }
+
+    /// `schematic_scope: "hierarchy"` (#42) through the served dispatch, on
+    /// the nested fixture: a crystal left unannotated on a cell instance is
+    /// numbered from the root, and the file read back shows it.
+    #[tokio::test]
+    async fn a_hierarchy_call_survives_the_served_dispatch() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        // The fixture is fully annotated. Its one "Y3" is the crystal's record
+        // on north/west, page 11; its `Reference` property shows south/east's
+        // Y1, the first of its instances in page order. The record is left `Y?`.
+        let cell = include_str!("../../tests/fixtures/annotate_nested_hierarchy/cell.kicad_sch");
+        assert_eq!(cell.matches("\"Y3\"").count(), 1);
+        assert_eq!(cell.matches("(reference \"Y3\")").count(), 1);
+        let cell = cell.replace("(reference \"Y3\")", "(reference \"Y?\")");
+        for (name, content) in [
+            (
+                "nested_pages.kicad_pro",
+                include_str!(
+                    "../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_pro"
+                ),
+            ),
+            (
+                "nested_pages.kicad_sch",
+                include_str!(
+                    "../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_sch"
+                ),
+            ),
+            (
+                "bank.kicad_sch",
+                include_str!("../../tests/fixtures/annotate_nested_hierarchy/bank.kicad_sch"),
+            ),
+            ("cell.kicad_sch", cell.as_str()),
+        ] {
+            std::fs::write(dir.path().join(name), content).unwrap();
+        }
+        let root = dir
+            .path()
+            .join("nested_pages.kicad_sch")
+            .display()
+            .to_string();
+        let call = |id: i64, arguments: Value| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": "annotate_schematic", "arguments": arguments}
+            })
+        };
+
+        let refused = handler
+            .handle_message(call(
+                1,
+                json!({"schematic": root, "schematic_scope": "sheets"}),
+            ))
+            .await
+            .expect("request returns a response")
+            .result
+            .expect("tool results carry refusals");
+        assert_eq!(refused["isError"], json!(true), "{refused}");
+
+        let result = handler
+            .handle_message(call(
+                2,
+                json!({"schematic": root, "schematic_scope": "hierarchy"}),
+            ))
+            .await
+            .expect("request returns a response")
+            .result
+            .expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        let body: Value = serde_json::from_str(text).expect("tool body is JSON");
+        assert_eq!(body["schematic_scope"], "hierarchy", "{body}");
+        assert_eq!(body["outcome"]["status"], "complete", "{body}");
+        assert_eq!(body["assigned"][0]["to"], "Y3", "{body}");
+        let cell = std::fs::read_to_string(dir.path().join("cell.kicad_sch")).unwrap();
+        assert!(cell.contains("(reference \"Y3\")") && !cell.contains("\"Y?\""));
+    }
 }
 
 #[cfg(test)]

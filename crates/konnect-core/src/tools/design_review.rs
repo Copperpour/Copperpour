@@ -862,7 +862,7 @@ fn args_for_schematic(args: &Value, path: &Path) -> Value {
     sheet_args
 }
 
-fn requested_schematic_scope(args: &Value) -> Result<&'static str, CallToolResult> {
+pub(crate) fn requested_schematic_scope(args: &Value) -> Result<&'static str, CallToolResult> {
     match args.get("schematic_scope") {
         None | Some(Value::Null) => Ok("file"),
         Some(Value::String(scope)) if scope == "file" => Ok("file"),
