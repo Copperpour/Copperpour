@@ -367,7 +367,7 @@ and Windows servers do not.
 | `list_footprint_libraries` | List all registered footprint libraries (global and/or project). |
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library, with optional footprint, description, keywords, footprint filters and custom fields. |
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
-| `set_symbol_properties` | Set the Footprint, Description, keywords, footprint filters or custom fields of an existing library symbol with a revision-checked write, reporting each field's previous and current value. Empty keywords or filters remove their property. |
+| `set_symbol_properties` | Set the Value, Footprint, Description, keywords, footprint filters or custom fields of an existing library symbol, or rename or remove its custom fields, with a revision-checked write, reporting each field's previous and current value. Empty keywords or filters remove their property. |
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |

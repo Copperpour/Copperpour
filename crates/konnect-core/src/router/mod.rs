@@ -204,6 +204,7 @@ mod tests {
                         "batch_edit_schematic_components/properties/edits/items/properties/fields" |
                         "create_symbol/properties/fields" |
                         "set_symbol_properties/properties/fields" |
+                        "set_symbol_properties/properties/rename_fields" |
                         "copy_routing_pattern/properties/net_map" |
                         "apply_template/properties/net_mappings"
                     ),

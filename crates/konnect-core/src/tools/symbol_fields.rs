@@ -12,7 +12,7 @@ use konnect_sexp::writer::{
     apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, read_consistent,
     transact_atomic, SexpEdit,
 };
-use konnect_sexp::SexpError;
+use konnect_sexp::{SexpError, SexpNode};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -28,6 +28,8 @@ const MANDATORY_FIELDS: &[&str] = &[
 const KEYWORDS: &str = "ki_keywords";
 const FP_FILTERS: &str = "ki_fp_filters";
 const LEGACY_DESCRIPTION: &str = "ki_description";
+const MANDATORY_LIST: &str = "Reference, Value, Footprint, Datasheet, Description";
+const KI_RESERVED: &str = "is a ki_* name, which KiCad keeps for its own symbol properties";
 
 /// `schema` with the field arguments both tools share added to its properties.
 pub(super) fn with_field_schema(mut schema: serde_json::Value) -> serde_json::Value {
@@ -68,7 +70,7 @@ pub(super) fn with_field_schema(mut schema: serde_json::Value) -> serde_json::Va
             "fields",
             json!({
                 "type": "object",
-                "description": "Custom fields such as MPN, LCSC or Manufacturer, as name: value. New ones are written hidden, in name order. The mandatory fields and ki_* names have their own arguments.",
+                "description": "Custom fields such as MPN, LCSC or Manufacturer, as name: value. New ones are written hidden, in name order. KiCad's mandatory field names and ki_* names, in any case, are refused.",
                 "additionalProperties": { "type": "string" }
             }),
         ),
@@ -82,11 +84,16 @@ pub(super) fn with_field_schema(mut schema: serde_json::Value) -> serde_json::Va
 /// keywords or filter value means "no such property", as KiCad itself writes it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct SymbolFields {
+    pub(super) value: Option<String>,
     pub(super) footprint: Option<String>,
     pub(super) description: Option<String>,
     pub(super) keywords: Option<String>,
     pub(super) fp_filters: Option<String>,
     pub(super) custom: Vec<(String, String)>,
+    /// Custom fields renamed, current name to new, and removed. Only
+    /// `set_symbol_properties` takes these, and `value`.
+    pub(super) renames: Vec<(String, String)>,
+    pub(super) removals: Vec<String>,
 }
 
 impl SymbolFields {
@@ -94,6 +101,9 @@ impl SymbolFields {
     /// the order KiCad writes them.
     fn requested(&self) -> Vec<(&str, &str)> {
         let mut out = Vec::new();
+        if let Some(value) = &self.value {
+            out.push(("Value", value.as_str()));
+        }
         if let Some(value) = &self.footprint {
             out.push(("Footprint", value.as_str()));
         }
@@ -179,21 +189,22 @@ pub(super) fn parse_symbol_fields(
         keywords,
         fp_filters: fp_filters.map(|filters| filters.join(" ")),
         custom,
+        ..SymbolFields::default()
     })
 }
 
 /// Why a custom field may not take `name`, or `None` when it may.
 fn reserved_owner(name: &str) -> Option<&'static str> {
-    if ["Footprint", "Description"]
+    if ["Value", "Footprint", "Description"]
         .iter()
         .any(|field| field.eq_ignore_ascii_case(name))
     {
-        Some("use the footprint or description argument")
+        Some("use the value, footprint or description argument")
     } else if MANDATORY_FIELDS
         .iter()
         .any(|field| field.eq_ignore_ascii_case(name))
     {
-        Some("Reference, Value and Datasheet are mandatory fields")
+        Some("Reference and Datasheet are mandatory fields")
     } else if name.to_ascii_lowercase().starts_with("ki_") {
         Some("ki_* names are reserved by KiCad; use keywords or fp_filters")
     } else {
@@ -201,18 +212,206 @@ fn reserved_owner(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The arguments only `set_symbol_properties` takes, checked in full before
+/// the library is read. A name has one part in a call: it is set, renamed,
+/// or removed.
+fn parse_symbol_edits(
+    args: &serde_json::Value,
+    fields: &mut SymbolFields,
+) -> Result<(), CallToolResult> {
+    fields.value = opt_string(args, "value")?;
+    fields.renames = parse_rename_fields(args, fields)?;
+    fields.removals = parse_remove_fields(args, fields)?;
+    Ok(())
+}
+
+fn parse_rename_fields(
+    args: &serde_json::Value,
+    fields: &SymbolFields,
+) -> Result<Vec<(String, String)>, CallToolResult> {
+    // An explicit null is refused like any other non-object, as the schema
+    // refuses it.
+    let map = match args.get("rename_fields") {
+        None => return Ok(Vec::new()),
+        Some(value) => value.as_object().ok_or_else(|| {
+            invalid_arg(
+                "rename_fields",
+                "must be an object of current name: new name",
+            )
+        })?,
+    };
+    let mut renames = Vec::new();
+    for (old, new) in map {
+        let field = format!("rename_fields.{old}");
+        let new = new
+            .as_str()
+            .ok_or_else(|| invalid_arg(&field, "must be a string"))?;
+        if new.is_empty() || new.trim() != new {
+            return Err(invalid_arg(
+                &field,
+                "a field name must be non-empty, without surrounding whitespace",
+            ));
+        }
+        let refusal = if is_mandatory(old) {
+            Some(format!(
+                "'{old}' is one of KiCad's mandatory symbol fields ({MANDATORY_LIST}), whose names \
+                 cannot change"
+            ))
+        } else if is_ki_name(old) {
+            Some(format!("'{old}' {KI_RESERVED}"))
+        } else if is_mandatory(new) {
+            Some(format!(
+                "'{new}' is one of KiCad's mandatory symbol fields ({MANDATORY_LIST}), so a custom \
+                 field cannot take that name"
+            ))
+        } else if is_ki_name(new) {
+            Some(format!("'{new}' {KI_RESERVED}"))
+        } else if is_generated_name(new) {
+            // SCH_FIELD::SetName marks such a field generated, and its text is
+            // then its name, so the value would be lost.
+            Some(format!(
+                "'{new}' has the form of a KiCad generated field, whose text KiCad replaces with \
+                 its name on load"
+            ))
+        } else {
+            fields
+                .custom
+                .iter()
+                .find(|(name, _)| name == old || name == new)
+                .map(|(name, _)| {
+                    format!("'{name}' is also named in fields; a call cannot both set and rename a field")
+                })
+        };
+        if let Some(reason) = refusal {
+            return Err(invalid_arg(&field, &reason));
+        }
+        renames.push((old.clone(), new.to_string()));
+    }
+    // Current-name order, whatever order the JSON map keeps its keys in.
+    renames.sort();
+    for (index, (old, new)) in renames.iter().enumerate() {
+        let field = format!("rename_fields.{old}");
+        if let Some((other, _)) = renames[..index].iter().find(|(_, earlier)| earlier == new) {
+            return Err(invalid_arg(
+                &field,
+                &format!("'{new}' is also the new name of '{other}'; a symbol carries one field per name"),
+            ));
+        }
+        if new != old && renames.iter().any(|(current, _)| current == new) {
+            return Err(invalid_arg(
+                &field,
+                &format!(
+                    "'{new}' is also a current name in rename_fields; a chain or swap of names \
+                     takes one call per step"
+                ),
+            ));
+        }
+    }
+    Ok(renames)
+}
+
+/// `remove_fields`, checked in full before the library is read. A repeated
+/// name is removed once.
+fn parse_remove_fields(
+    args: &serde_json::Value,
+    fields: &SymbolFields,
+) -> Result<Vec<String>, CallToolResult> {
+    // An explicit null is refused like any other non-array, as the schema
+    // refuses it.
+    let entries = match args.get("remove_fields") {
+        None => return Ok(Vec::new()),
+        Some(serde_json::Value::Array(entries)) => entries,
+        Some(_) => {
+            return Err(invalid_arg(
+                "remove_fields",
+                "expected an array of field names",
+            ))
+        }
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries {
+        let Some(name) = entry.as_str().filter(|name| !name.is_empty()) else {
+            return Err(invalid_arg(
+                "remove_fields",
+                "every entry must be a non-empty field name",
+            ));
+        };
+        let refusal = if is_mandatory(name) {
+            Some(format!(
+                "'{name}' is one of KiCad's mandatory symbol fields ({MANDATORY_LIST}), which \
+                 cannot be removed"
+            ))
+        } else if is_ki_name(name) {
+            Some(format!(
+                "'{name}' {KI_RESERVED}; an empty keywords or fp_filters removes ki_keywords or \
+                 ki_fp_filters"
+            ))
+        } else if fields.custom.iter().any(|(set, _)| set == name) {
+            Some(format!(
+                "'{name}' is also named in fields; a call cannot both change and remove a field"
+            ))
+        } else if fields
+            .renames
+            .iter()
+            .any(|(old, new)| old == name || new == name)
+        {
+            Some(format!(
+                "'{name}' is also named in rename_fields; a call cannot both change and remove a field"
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            return Err(invalid_arg("remove_fields", &reason));
+        }
+        if !names.iter().any(|seen| seen == name) {
+            names.push(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
+/// A mandatory field's name, which KiCad reads in any case.
+fn is_mandatory(name: &str) -> bool {
+    MANDATORY_FIELDS
+        .iter()
+        .any(|field| field.eq_ignore_ascii_case(name))
+}
+
+fn is_ki_name(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("ki_")
+}
+
+/// KiCad's generated-field pattern, `^\$\{\w*\}$`.
+fn is_generated_name(name: &str) -> bool {
+    name.strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .is_some_and(|word| word.chars().all(|c| c.is_alphanumeric() || c == '_'))
+}
+
 pub(super) fn tool() -> ToolDef {
     tool!(
         "set_symbol_properties",
-        "Set the Footprint, Description, keywords, footprint filters or custom fields \
-         (MPN, LCSC, ...) of an existing library symbol. Only the supplied fields change; an \
-         existing field keeps its position and visibility. Reports each changed field's \
-         previous and current value.",
+        "Set the Value, Footprint, Description, keywords, footprint filters or custom fields \
+         (MPN, LCSC, ...) of an existing library symbol, and rename or remove its custom \
+         fields. Only the supplied fields change; an existing or renamed field keeps its position \
+         and visibility. Reports each changed field's previous and current value.",
         with_field_schema(json!({
             "type": "object",
             "properties": {
                 "library_path": { "type": "string", "description": "Path to an existing .kicad_sym library file" },
-                "symbol_name": { "type": "string", "description": "Name of the symbol to change" }
+                "symbol_name": { "type": "string", "description": "Name of the symbol to change" },
+                "value": { "type": "string", "description": "Symbol value (the Value field)" },
+                "rename_fields": {
+                    "type": "object",
+                    "description": "Custom fields to rename, as current name: new name. A renamed field keeps its value, position, visibility and text effects. Names match whole and case-sensitively, as KiCad's custom field names do; a new name the symbol already carries is refused.",
+                    "additionalProperties": { "type": "string" }
+                },
+                "remove_fields": {
+                    "type": "array",
+                    "description": "Custom field names to delete from the symbol. KiCad's mandatory fields (Reference, Value, Footprint, Datasheet, Description) and ki_* names cannot be removed. A name the symbol does not carry is reported in absent_fields.",
+                    "items": { "type": "string" }
+                }
             },
             "required": ["library_path", "symbol_name"],
             "additionalProperties": false
@@ -233,14 +432,18 @@ async fn handle_set_symbol_properties(
     if path.extension().and_then(|extension| extension.to_str()) != Some("kicad_sym") {
         return Ok(unusable(&path, "it does not end in .kicad_sym"));
     }
-    let fields = match parse_symbol_fields(args) {
+    let mut fields = match parse_symbol_fields(args) {
         Ok(fields) => fields,
         Err(error) => return Ok(error),
     };
+    if let Err(error) = parse_symbol_edits(args, &mut fields) {
+        return Ok(error);
+    }
     if fields.is_empty() {
         return Ok(invalid_arg(
             "symbol_properties",
-            "supply at least one of footprint, description, keywords, fp_filters or fields",
+            "supply at least one of value, footprint, description, keywords, fp_filters, \
+             fields, rename_fields or remove_fields",
         ));
     }
     let source = match read_consistent(&path) {
@@ -265,7 +468,7 @@ async fn handle_set_symbol_properties(
 
     if replacement != source {
         // A planning mistake is refused here, with nothing written.
-        if let Some(reason) = readback_mismatch(&replacement, symbol, &fields) {
+        if let Some(reason) = readback_mismatch(&replacement, &source, symbol, &fields) {
             return Ok(handler_error(format!(
                 "set_symbol_properties wrote nothing: its planned edit failed its own check \
                  ({reason})"
@@ -303,7 +506,7 @@ async fn handle_set_symbol_properties(
             Err(error) => return Err(error.into()),
         }
         let reason = match read_consistent(&path) {
-            Ok(written) => readback_mismatch(&written, symbol, &fields),
+            Ok(written) => readback_mismatch(&written, &source, symbol, &fields),
             Err(error) => Some(format!("it could not be read back: {error}")),
         };
         if let Some(reason) = reason {
@@ -311,12 +514,23 @@ async fn handle_set_symbol_properties(
         }
     }
 
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "success": true,
         "library_path": path.display().to_string(),
         "symbol": symbol,
         "changes": changes
-    })))
+    });
+    if !fields.removals.is_empty() {
+        // Only a removal puts a remove_fields name into `changes`, since each
+        // name has one part in a call.
+        let (removed, absent): (Vec<&String>, Vec<&String>) = fields
+            .removals
+            .iter()
+            .partition(|name| changes.contains_key(name.as_str()));
+        body["removed_fields"] = json!(removed);
+        body["absent_fields"] = json!(absent);
+    }
+    Ok(CallToolResult::json(&body))
 }
 
 /// A library that was named but cannot be edited. Like a missing file, that is
@@ -366,6 +580,7 @@ struct Property {
     name: String,
     value: String,
     block: (usize, usize),
+    name_span: (usize, usize),
     value_span: (usize, usize),
 }
 
@@ -375,6 +590,13 @@ fn field<'a>(properties: &'a [Property], name: &str) -> Option<&'a Property> {
     properties.iter().rfind(|property| {
         property.name == name || (name == "Description" && property.name == LEGACY_DESCRIPTION)
     })
+}
+
+/// The property named exactly `name`, as KiCad compares custom field names.
+/// Renames and removals use this rather than [`field`], so the KiCad 6/7
+/// `ki_description` alias cannot reach them.
+fn exact<'a>(properties: &'a [Property], name: &str) -> Option<&'a Property> {
+    properties.iter().find(|property| property.name == name)
 }
 
 /// KiCad writes no keywords or filter property when it has none.
@@ -414,6 +636,20 @@ fn prepare_edit(
         .ok_or_else(|| unusable(path, &format!("symbol '{symbol}' has no fields")))?;
     let unit = if indent.contains('\t') { "\t" } else { "  " };
 
+    // Every symbol KiCad writes carries its Value; one that does not would get
+    // a second, hidden one from the insert path below.
+    if fields.value.is_some() && exact(&properties, "Value").is_none() {
+        let folded = properties
+            .iter()
+            .find(|property| property.name.eq_ignore_ascii_case("Value"))
+            .map(|property| format!("; it has '{}', which KiCad reads as Value", property.name))
+            .unwrap_or_default();
+        return Err(unusable(
+            path,
+            &format!("symbol '{symbol}' has no Value field{folded}"),
+        ));
+    }
+
     let mut deletions = Vec::new();
     let mut replacements = Vec::new();
     let mut insertions: Vec<(&str, &str)> = Vec::new();
@@ -444,6 +680,66 @@ fn prepare_edit(
         changes.insert(
             name.to_string(),
             json!({ "previous": existing.map(|p| p.value.as_str()), "current": current }),
+        );
+    }
+
+    // A rename replaces the name token alone, as KiCad's Symbol Properties
+    // dialog does, so the field keeps its value, its place and its look.
+    for (old, new) in &fields.renames {
+        let argument = format!("rename_fields.{old}");
+        let Some(property) = exact(&properties, old) else {
+            let mut reason = format!("symbol '{symbol}' has no field '{old}'");
+            if exact(&properties, new).is_some() {
+                reason.push_str(&format!("; it has a field '{new}'"));
+            }
+            for variant in properties.iter().filter(|property| {
+                property.name != *old
+                    && property.name != *new
+                    && property.name.eq_ignore_ascii_case(old)
+            }) {
+                reason.push_str(&format!(
+                    "; it has '{}', which KiCad treats as a different field",
+                    variant.name
+                ));
+            }
+            return Err(invalid_arg(&argument, &reason));
+        };
+        if old == new {
+            continue;
+        }
+        if exact(&properties, new).is_some() {
+            return Err(invalid_arg(
+                &argument,
+                &format!(
+                    "symbol '{symbol}' already has a field '{new}', and KiCad refuses a field \
+                     name already in use"
+                ),
+            ));
+        }
+        replacements.push(SexpEdit::replace(
+            property.name_span.0,
+            property.name_span.1,
+            quote_string(new),
+        ));
+        changes.insert(
+            old.clone(),
+            json!({ "previous": property.value, "current": null }),
+        );
+        changes.insert(
+            new.clone(),
+            json!({ "previous": null, "current": property.value }),
+        );
+    }
+    for name in &fields.removals {
+        let Some(property) = exact(&properties, name) else {
+            continue;
+        };
+        let range = find_block_with_leading_whitespace(source, property.block.0)
+            .ok_or_else(|| unusable(path, "it holds an unbalanced field"))?;
+        deletions.push(SexpEdit::delete(range.0, range.1));
+        changes.insert(
+            name.clone(),
+            json!({ "previous": property.value, "current": null }),
         );
     }
 
@@ -523,10 +819,13 @@ fn symbol_properties(source: &str, start: usize, end: usize) -> Result<Vec<Prope
         }
         let node = konnect_sexp::parse_sexp(&source[block.0..block.1])
             .map_err(|_| "it holds a field that does not parse".to_string())?;
-        let (Some(name), Some(value), Some(value_span)) = (
-            node.get(1).and_then(|n| n.as_str()),
-            node.get(2).and_then(|v| v.as_str()),
-            value_span(source, block.0),
+        // KiCad writes a private field as `(property private "NAME" "VALUE" …)`.
+        let private = matches!(node.get(1), Some(SexpNode::Atom(atom)) if atom == "private");
+        let first = 1 + usize::from(private);
+        let (Some(name), Some(value), Some((name_span, value_span))) = (
+            node.get(first).and_then(|n| n.as_str()),
+            node.get(first + 1).and_then(|v| v.as_str()),
+            name_and_value_spans(source, block.0, private),
         ) else {
             return Err("it holds a field without a quoted name and value".into());
         };
@@ -537,6 +836,7 @@ fn symbol_properties(source: &str, start: usize, end: usize) -> Result<Vec<Prope
             name: name.to_string(),
             value: value.to_string(),
             block,
+            name_span,
             value_span,
         });
     }
@@ -550,11 +850,19 @@ fn header(source: &str, start: usize) -> Option<(&str, &str)> {
     Some((&source[head_start..head_end], &source[name_start..name_end]))
 }
 
-/// The span of the value string in the `(property "NAME" "VALUE"` at `start`.
-fn value_span(source: &str, start: usize) -> Option<(usize, usize)> {
-    let (_, head_end) = skip_sexp_token(source, start + 1)?;
-    let (_, name_end) = skip_sexp_token(source, head_end)?;
-    skip_sexp_token(source, name_end)
+/// The spans of the name and value strings in the `(property "NAME" "VALUE"`
+/// at `start`, past a `private` atom when there is one.
+fn name_and_value_spans(
+    source: &str,
+    start: usize,
+    private: bool,
+) -> Option<((usize, usize), (usize, usize))> {
+    let (_, mut name_from) = skip_sexp_token(source, start + 1)?;
+    if private {
+        name_from = skip_sexp_token(source, name_from)?.1;
+    }
+    let name = skip_sexp_token(source, name_from)?;
+    Some((name, skip_sexp_token(source, name.1)?))
 }
 
 /// A hidden field in KiCad's own layout, so a resave leaves it as written.
@@ -569,20 +877,58 @@ fn hidden_property(name: &str, value: &str, indent: &str, unit: &str) -> String 
 }
 
 /// Why `written` does not hold every requested field of `symbol`, or `None`
-/// when it does.
-fn readback_mismatch(written: &str, symbol: &str, fields: &SymbolFields) -> Option<String> {
+/// when it does. A removed or renamed-away name must be gone, and a renamed
+/// field must be its block in `before` with only the name changed.
+fn readback_mismatch(
+    written: &str,
+    before: &str,
+    symbol: &str,
+    fields: &SymbolFields,
+) -> Option<String> {
     let Ok((start, end)) = symbol_block(written, symbol) else {
         return Some(format!("symbol '{symbol}' is no longer in the library"));
     };
     let Ok(properties) = symbol_properties(written, start, end) else {
         return Some(format!("symbol '{symbol}' no longer has readable fields"));
     };
-    fields.requested().into_iter().find_map(|(name, value)| {
+    let requested = fields.requested().into_iter().find_map(|(name, value)| {
         let found = field(&properties, name).map(|property| property.value.as_str());
         let expected = (!absent_when_empty(name, value)).then_some(value);
         (found != expected)
             .then(|| format!("field '{name}' reads {found:?} instead of {expected:?}"))
-    })
+    });
+    let removed = || {
+        fields
+            .removals
+            .iter()
+            .find(|name| exact(&properties, name).is_some())
+            .map(|name| format!("field '{name}' is still present after its removal"))
+    };
+    let renamed = || {
+        let original = symbol_block(before, symbol)
+            .ok()
+            .and_then(|(start, end)| symbol_properties(before, start, end).ok())?;
+        fields
+            .renames
+            .iter()
+            .filter(|(old, new)| old != new)
+            .find_map(|(old, new)| {
+                if exact(&properties, old).is_some() {
+                    return Some(format!("field '{old}' is still present after its rename"));
+                }
+                let was = exact(&original, old)?;
+                let expected = format!(
+                    "{}{}{}",
+                    &before[was.block.0..was.name_span.0],
+                    quote_string(new),
+                    &before[was.name_span.1..was.block.1]
+                );
+                let found = exact(&properties, new).map(|p| &written[p.block.0..p.block.1]);
+                (found != Some(expected.as_str()))
+                    .then(|| format!("field '{new}' is not '{old}' renamed"))
+            })
+    };
+    requested.or_else(removed).or_else(renamed)
 }
 
 /// A test-only seam between the read and the write: the next call writes
@@ -1033,9 +1379,786 @@ mod tests {
     fn readback_names_a_field_the_file_does_not_hold() {
         let fields = parse_symbol_fields(&bare_edit(Path::new("x.kicad_sym"))).unwrap();
 
-        let reason = readback_mismatch(FIXTURE, "FIELDS_BARE", &fields).unwrap();
+        let reason = readback_mismatch(FIXTURE, FIXTURE, "FIELDS_BARE", &fields).unwrap();
 
         assert!(reason.contains("'Footprint' reads Some(\"\")"), "{reason}");
-        assert_eq!(readback_mismatch(EDITED, "FIELDS_BARE", &fields), None);
+        assert_eq!(
+            readback_mismatch(EDITED, EDITED, "FIELDS_BARE", &fields),
+            None
+        );
+    }
+
+    /// Where KiCad's own symbol libraries are installed, if they are.
+    fn installed_symbol_dir() -> Option<std::path::PathBuf> {
+        ["KICAD10_SYMBOL_DIR", "KICAD_SYMBOL_DIR"]
+            .iter()
+            .filter_map(std::env::var_os)
+            .map(std::path::PathBuf::from)
+            .chain(
+                [
+                    r"C:\KiCad\10.0\share\kicad\symbols",
+                    r"C:\Program Files\KiCad\10.0\share\kicad\symbols",
+                    "/usr/share/kicad/symbols",
+                    "/usr/local/share/kicad/symbols",
+                    "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols",
+                ]
+                .iter()
+                .map(std::path::PathBuf::from),
+            )
+            .find(|dir| dir.is_dir())
+    }
+
+    /// The tool's output for one call on FIXTURE, which KiCad 10.0.6 resaves byte
+    /// for byte; see symbol_fields_kicad10.renamed.README.md.
+    const RENAMED: &str =
+        include_str!("../../tests/fixtures/symbol_fields_kicad10.renamed.kicad_sym");
+
+    /// One call on `symbol`, with `edit`'s arguments.
+    async fn edit_symbol(
+        handler: &McpHandler,
+        path: &Path,
+        symbol: &str,
+        edit: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut arguments = edit;
+        arguments["library_path"] = json!(path);
+        arguments["symbol_name"] = json!(symbol);
+        call(handler, "set_symbol_properties", arguments).await
+    }
+
+    /// `source` without the property block that opens with `opening`, line by
+    /// line as KiCad writes it.
+    fn without_block(source: &str, opening: &str) -> String {
+        let mut out = String::new();
+        let mut skipping = false;
+        for line in source.split_inclusive('\n') {
+            if line.trim_start().starts_with(opening) {
+                skipping = true;
+            }
+            if !skipping {
+                out.push_str(line);
+            } else if line.trim_end_matches(['\r', '\n']) == "\t\t)" {
+                skipping = false;
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_value_a_rename_and_a_removal_write_what_kicad_resaves() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"value": "TPS7A0230", "rename_fields": {"LCSC": "LCSC Part"}, "remove_fields": ["MPN"]}),
+        )
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), RENAMED);
+    }
+
+    /// A re-run after the rename landed names the field that is there now,
+    /// once, as the rename it was.
+    #[tokio::test]
+    async fn a_rename_run_twice_names_the_field_that_is_there() {
+        let handler = handler().await;
+        for (old, new) in [("LCSC", "LCSC Part"), ("MPN", "mpn")] {
+            let (_dir, path) = library_with(FIXTURE);
+            let edit = json!({"rename_fields": {old: new}});
+            let first = edit_symbol(&handler, &path, "FIELDS_FULL", edit.clone()).await;
+            assert_ne!(first["is_error"], true, "{first}");
+            let after = std::fs::read_to_string(&path).unwrap();
+            let again = edit_symbol(&handler, &path, "FIELDS_FULL", edit).await;
+            assert_eq!(
+                again["error"]["field"],
+                format!("rename_fields.{old}"),
+                "{again}"
+            );
+            let reason = again["error"]["reason"].as_str().unwrap_or_default();
+            assert_eq!(reason.matches(&format!("'{new}'")).count(), 1, "{reason}");
+            assert!(
+                reason.contains(&format!("has no field '{old}'; it has a field '{new}'")),
+                "{reason}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rename_changes_only_the_name_token() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        assert_eq!(FIXTURE.matches("(property \"LCSC\"").count(), 1);
+
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"rename_fields": {"LCSC": "LCSC Part"}}),
+        )
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(
+            body["changes"],
+            json!({
+                "LCSC": {"previous": "C2862740", "current": null},
+                "LCSC Part": {"previous": null, "current": "C2862740"}
+            })
+        );
+        assert!(body.get("removed_fields").is_none() && body.get("absent_fields").is_none());
+        let renamed = FIXTURE.replacen("(property \"LCSC\"", "(property \"LCSC Part\"", 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), renamed);
+
+        // KiCad keeps custom field names case-sensitively, so a case-only
+        // rename is a rename.
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"rename_fields": {"MPN": "mpn"}}),
+        )
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            renamed.replacen("(property \"MPN\"", "(property \"mpn\"", 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_edit_replaces_only_the_value_token() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        assert_eq!(FIXTURE.matches("\"CH347F\"").count(), 1);
+
+        let body = edit_symbol(&handler, &path, "FIELDS_BARE", json!({"value": "CH347T"})).await;
+        assert_eq!(
+            body["changes"],
+            json!({"Value": {"previous": "CH347F", "current": "CH347T"}}),
+            "{body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            FIXTURE.replacen("\"CH347F\"", "\"CH347T\"", 1)
+        );
+    }
+
+    /// KiCad's stock `Regulator_Current` library, in which `HV101K5-G` extends
+    /// `HV100K5-G` and carries its own Value. Read from the installed library
+    /// rather than committed, because the library is CC BY-SA, as the footprint
+    /// and demo tests do. Skips without an installed KiCad, or when the installed
+    /// library no longer gives `HV101K5-G` its own Value. With KiCad 10.0.6's
+    /// copy, `kicad-cli sym upgrade --force` resaves this call's output byte for
+    /// byte.
+    #[tokio::test]
+    async fn a_derived_symbols_value_changes_only_its_own_block() {
+        let Some(dir) = installed_symbol_dir() else {
+            eprintln!("SKIP: no installed KiCad symbol library");
+            return;
+        };
+        let library = dir.join("Regulator_Current.kicad_sym");
+        let Ok(derived) = std::fs::read_to_string(&library) else {
+            eprintln!("SKIP: {} is not installed", library.display());
+            return;
+        };
+        let own = "(property \"Value\" \"HV101K5-G\"";
+        if derived.matches(own).count() != 1 || !derived.contains("(extends \"HV100K5-G\")") {
+            eprintln!("SKIP: {} no longer derives HV101K5-G so", library.display());
+            return;
+        }
+        let handler = handler().await;
+        let (_dir, path) = library_with(&derived);
+
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "HV101K5-G",
+            json!({"value": "HV101K5-G/TR"}),
+        )
+        .await;
+        assert_eq!(
+            body["changes"],
+            json!({"Value": {"previous": "HV101K5-G", "current": "HV101K5-G/TR"}}),
+            "{body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            derived.replacen(own, "(property \"Value\" \"HV101K5-G/TR\"", 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removed_field_leaves_the_rest_as_written() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"remove_fields": ["MPN"]}),
+        )
+        .await;
+        assert_eq!(
+            body["changes"],
+            json!({"MPN": {"previous": "TPS7A0233PDBVR", "current": null}}),
+            "{body}"
+        );
+        assert_eq!(body["removed_fields"], json!(["MPN"]));
+        assert_eq!(body["absent_fields"], json!([]));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            without_block(FIXTURE, "(property \"MPN\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_listed_twice_is_removed_once() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"remove_fields": ["MPN", "MPN"]}),
+        )
+        .await;
+        assert_eq!(body["removed_fields"], json!(["MPN"]), "{body}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            without_block(FIXTURE, "(property \"MPN\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_case_variant_is_another_field() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"remove_fields": ["mpn"]}),
+        )
+        .await;
+        assert_eq!(body["absent_fields"], json!(["mpn"]), "{body}");
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"rename_fields": {"lcsc": "X"}}),
+        )
+        .await;
+        assert_eq!(body["error"]["field"], "rename_fields.lcsc", "{body}");
+        assert!(
+            body.to_string()
+                .contains("it has 'LCSC', which KiCad treats as a different field"),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE);
+
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"rename_fields": {"LCSC": "mpn"}}),
+        )
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        let names: Vec<String> = fields_of(&std::fs::read_to_string(&path).unwrap(), "FIELDS_FULL")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            names.contains(&"mpn".to_string()) && names.contains(&"MPN".to_string()),
+            "{names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removed_name_is_matched_whole() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"remove_fields": ["MP"]}),
+        )
+        .await;
+        assert_eq!(body["absent_fields"], json!(["MP"]), "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE);
+    }
+
+    #[tokio::test]
+    async fn removing_absent_fields_reports_them_and_writes_nothing() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"remove_fields": ["Tolerance", "Tolerance"]}),
+        )
+        .await;
+        assert_eq!(body["changes"], json!({}), "{body}");
+        assert_eq!(body["removed_fields"], json!([]));
+        assert_eq!(body["absent_fields"], json!(["Tolerance"]));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identity_rename_changes_nothing() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"rename_fields": {"LCSC": "LCSC"}}),
+        )
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(body["changes"], json!({}));
+        assert!(body.get("removed_fields").is_none() && body.get("absent_fields").is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn a_field_added_where_one_is_removed_survives() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        // MPN is the last custom field, so it is the new field's anchor.
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"remove_fields": ["MPN"], "fields": {"Manufacturer": "Texas Instruments"}}),
+        )
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        let names: Vec<String> = fields_of(&std::fs::read_to_string(&path).unwrap(), "FIELDS_FULL")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Reference",
+                "Value",
+                "Footprint",
+                "Datasheet",
+                "Description",
+                "LCSC",
+                "Manufacturer",
+                "ki_keywords",
+                "ki_fp_filters"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_field_added_then_removed_gives_back_the_kicad_file() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        for edit in [
+            json!({"fields": {"Note": "x"}}),
+            json!({"remove_fields": ["Note"]}),
+        ] {
+            let body = edit_symbol(&handler, &path, "FIELDS_BARE", edit).await;
+            assert_ne!(body["is_error"], true, "{body}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE);
+    }
+
+    #[tokio::test]
+    async fn a_crlf_library_stays_crlf() {
+        let handler = handler().await;
+        let edit = json!({"value": "TPS7A0230", "rename_fields": {"LCSC": "LCSC Part"}, "remove_fields": ["MPN"]});
+        let (_lf_dir, lf) = library_with(FIXTURE);
+        let (_crlf_dir, crlf) = library_with(&FIXTURE.replace('\n', "\r\n"));
+        for path in [&lf, &crlf] {
+            let body = edit_symbol(&handler, path, "FIELDS_FULL", edit.clone()).await;
+            assert_ne!(body["is_error"], true, "{body}");
+        }
+        let lf = std::fs::read_to_string(&lf).unwrap();
+        let crlf = std::fs::read_to_string(&crlf).unwrap();
+        assert_eq!(crlf, lf.replace('\n', "\r\n"));
+        assert!(!crlf.replace("\r\n", "").contains('\n'));
+    }
+
+    #[tokio::test]
+    async fn a_private_field_is_read_after_its_keyword() {
+        let handler = handler().await;
+        let private = FIXTURE.replacen("(property \"LCSC\"", "(property private \"LCSC\"", 1);
+        let (_dir, path) = library_with(&private);
+
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"rename_fields": {"private": "X"}}),
+        )
+        .await;
+        assert!(
+            body.to_string().contains("has no field 'private'"),
+            "{body}"
+        );
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"rename_fields": {"LCSC": "Supplier"}}),
+        )
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        let renamed = private.replacen(
+            "(property private \"LCSC\"",
+            "(property private \"Supplier\"",
+            1,
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), renamed);
+
+        let body = edit_symbol(
+            &handler,
+            &path,
+            "FIELDS_FULL",
+            json!({"remove_fields": ["Supplier"]}),
+        )
+        .await;
+        assert_eq!(body["removed_fields"], json!(["Supplier"]), "{body}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            without_block(&renamed, "(property private \"Supplier\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn value_on_a_symbol_without_a_value_field_is_refused() {
+        let handler = handler().await;
+        let folded = FIXTURE.replacen(
+            "(property \"Value\" \"CH347F\"",
+            "(property \"value\" \"CH347F\"",
+            1,
+        );
+        let (_dir, path) = library_with(&folded);
+        let body = edit_symbol(&handler, &path, "FIELDS_BARE", json!({"value": "X"})).await;
+        assert_eq!(body["error"]["kind"], "handler_error", "{body}");
+        assert!(
+            body.to_string()
+                .contains("it has 'value', which KiCad reads as Value"),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), folded);
+    }
+
+    #[tokio::test]
+    async fn rename_and_remove_refusals_leave_the_library_unchanged() {
+        let handler = handler().await;
+        for (arguments, field, reason) in [
+            (
+                json!({"rename_fields": {"Reference": "Ref"}}),
+                "rename_fields.Reference",
+                "whose names cannot change",
+            ),
+            (
+                json!({"rename_fields": {"value": "X"}}),
+                "rename_fields.value",
+                "whose names cannot change",
+            ),
+            (
+                json!({"rename_fields": {"ki_keywords": "Keywords"}}),
+                "rename_fields.ki_keywords",
+                "is a ki_* name",
+            ),
+            (
+                json!({"rename_fields": {"MPN": "datasheet"}}),
+                "rename_fields.MPN",
+                "cannot take that name",
+            ),
+            (
+                json!({"rename_fields": {"MPN": "KI_DESCRIPTION"}}),
+                "rename_fields.MPN",
+                "is a ki_* name",
+            ),
+            (
+                json!({"rename_fields": {"MPN": "${MPN}"}}),
+                "rename_fields.MPN",
+                "generated field",
+            ),
+            (
+                json!({"rename_fields": {"MPN": " Part"}}),
+                "rename_fields.MPN",
+                "without surrounding whitespace",
+            ),
+            (
+                json!({"rename_fields": {"MPN": ""}}),
+                "rename_fields.MPN",
+                "without surrounding whitespace",
+            ),
+            (
+                json!({"rename_fields": {"LCSC": "X", "MPN": "X"}}),
+                "rename_fields.MPN",
+                "is also the new name of 'LCSC'",
+            ),
+            (
+                json!({"rename_fields": {"LCSC": "MPN", "MPN": "Part"}}),
+                "rename_fields.LCSC",
+                "chain or swap",
+            ),
+            (
+                json!({"rename_fields": {"LCSC": "MPN", "MPN": "LCSC"}}),
+                "rename_fields.LCSC",
+                "chain or swap",
+            ),
+            (
+                json!({"rename_fields": {"LCSC": "X"}, "fields": {"X": "1"}}),
+                "rename_fields.LCSC",
+                "also named in fields",
+            ),
+            (
+                json!({"rename_fields": {"LCSC": "X"}, "fields": {"LCSC": "1"}}),
+                "rename_fields.LCSC",
+                "also named in fields",
+            ),
+            (
+                json!({"rename_fields": {"Missing": "X"}}),
+                "rename_fields.Missing",
+                "has no field 'Missing'",
+            ),
+            (
+                json!({"rename_fields": {"LCSC": "MPN"}}),
+                "rename_fields.LCSC",
+                "already has a field 'MPN'",
+            ),
+            (
+                json!({"remove_fields": ["Value"]}),
+                "remove_fields",
+                "cannot be removed",
+            ),
+            (
+                json!({"remove_fields": ["description"]}),
+                "remove_fields",
+                "cannot be removed",
+            ),
+            (
+                json!({"remove_fields": ["ki_fp_filters"]}),
+                "remove_fields",
+                "is a ki_* name",
+            ),
+            (
+                json!({"remove_fields": [""]}),
+                "remove_fields",
+                "non-empty field name",
+            ),
+            (
+                json!({"remove_fields": ["MPN"], "fields": {"MPN": "x"}}),
+                "remove_fields",
+                "also named in fields",
+            ),
+            (
+                json!({"remove_fields": ["LCSC"], "rename_fields": {"LCSC": "X"}}),
+                "remove_fields",
+                "also named in rename_fields",
+            ),
+            (
+                json!({"remove_fields": ["X"], "rename_fields": {"LCSC": "X"}}),
+                "remove_fields",
+                "also named in rename_fields",
+            ),
+            (
+                json!({"rename_fields": null}),
+                "rename_fields",
+                "null is not of type \\\"object\\\"",
+            ),
+            (
+                json!({"remove_fields": null}),
+                "remove_fields",
+                "null is not of type \\\"array\\\"",
+            ),
+            (
+                json!({"rename_fields": {}, "remove_fields": []}),
+                "symbol_properties",
+                "supply at least one of value, footprint, description, keywords, fp_filters, fields, rename_fields or remove_fields",
+            ),
+        ] {
+            let (_dir, path) = library_with(FIXTURE);
+            let body = edit_symbol(&handler, &path, "FIELDS_FULL", arguments.clone()).await;
+            assert_eq!(body["is_error"], true, "{arguments}: {body}");
+            assert_eq!(
+                body["error"]["kind"], "invalid_argument",
+                "{arguments}: {body}"
+            );
+            assert_eq!(body["error"]["field"], field, "{arguments}: {body}");
+            assert!(body.to_string().contains(reason), "{arguments}: {body}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                FIXTURE,
+                "{arguments}"
+            );
+        }
+    }
+
+    /// The handler's own shape checks, beneath the schema the dispatch
+    /// enforces first.
+    #[tokio::test]
+    async fn rename_and_remove_shape_refusals_without_dispatch() {
+        let context = ToolContext::new(
+            ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        for (arguments, field, reason) in [
+            (
+                json!({"rename_fields": "MPN"}),
+                "rename_fields",
+                "must be an object",
+            ),
+            (
+                json!({"rename_fields": null}),
+                "rename_fields",
+                "must be an object",
+            ),
+            (
+                json!({"rename_fields": {"MPN": 7}}),
+                "rename_fields.MPN",
+                "must be a string",
+            ),
+            (
+                json!({"remove_fields": "MPN"}),
+                "remove_fields",
+                "expected an array of field names",
+            ),
+            (
+                json!({"remove_fields": null}),
+                "remove_fields",
+                "expected an array of field names",
+            ),
+            (
+                json!({"remove_fields": [7]}),
+                "remove_fields",
+                "non-empty field name",
+            ),
+            (json!({"value": 7}), "value", "must be a string"),
+        ] {
+            let (_dir, path) = library_with(FIXTURE);
+            let mut call_arguments = arguments.clone();
+            call_arguments["library_path"] = json!(path);
+            call_arguments["symbol_name"] = json!("FIELDS_FULL");
+            let result = handle_set_symbol_properties(&call_arguments, &context)
+                .await
+                .unwrap();
+            assert!(result.is_error, "{arguments}");
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("invalid_argument"),
+                "{arguments}"
+            );
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text");
+            };
+            assert!(text.contains(reason), "{arguments}: {text}");
+            let body: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["error"]["field"], field, "{arguments}: {text}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                FIXTURE,
+                "{arguments}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fields_names_the_value_argument() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        for (name, reason) in [
+            ("Value", "use the value, footprint or description argument"),
+            ("Datasheet", "Reference and Datasheet are mandatory fields"),
+        ] {
+            let body = edit_symbol(
+                &handler,
+                &path,
+                "FIELDS_FULL",
+                json!({"fields": {name: "x"}}),
+            )
+            .await;
+            assert!(body.to_string().contains(reason), "{name}: {body}");
+            let dir = tempfile::tempdir().unwrap();
+            let body = call(
+                &handler,
+                "create_symbol",
+                json!({
+                    "library_path": dir.path().join("refused.kicad_sym"), "name": "R",
+                    "reference_prefix": "U", "fields": {name: "x"},
+                    "pins": [{"number": "1", "name": "A", "type": "input"}]
+                }),
+            )
+            .await;
+            assert!(
+                body.to_string().contains(reason),
+                "create_symbol {name}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn readback_names_a_removal_the_file_still_holds() {
+        let fields = SymbolFields {
+            removals: vec!["LCSC".into()],
+            ..SymbolFields::default()
+        };
+        let reason = readback_mismatch(FIXTURE, FIXTURE, "FIELDS_FULL", &fields).unwrap();
+        assert!(
+            reason.contains("still present after its removal"),
+            "{reason}"
+        );
+        let removed = without_block(FIXTURE, "(property \"LCSC\"");
+        assert_eq!(
+            readback_mismatch(&removed, FIXTURE, "FIELDS_FULL", &fields),
+            None
+        );
+    }
+
+    #[test]
+    fn readback_names_a_rename_that_did_not_keep_its_layout() {
+        let fields = SymbolFields {
+            renames: vec![("LCSC".into(), "LCSC Part".into())],
+            ..SymbolFields::default()
+        };
+        let reason = readback_mismatch(FIXTURE, FIXTURE, "FIELDS_FULL", &fields).unwrap();
+        assert!(
+            reason.contains("still present after its rename"),
+            "{reason}"
+        );
+
+        let renamed = FIXTURE.replacen("(property \"LCSC\"", "(property \"LCSC Part\"", 1);
+        assert_eq!(
+            readback_mismatch(&renamed, FIXTURE, "FIELDS_FULL", &fields),
+            None
+        );
+
+        // The renamed block without its (hide yes): the name is right, the
+        // field is not the one renamed.
+        let at = renamed.find("(property \"LCSC Part\"").unwrap();
+        let hide = at + renamed[at..].find("\t\t\t(hide yes)\n").unwrap();
+        let unhidden = format!(
+            "{}{}",
+            &renamed[..hide],
+            &renamed[hide + "\t\t\t(hide yes)\n".len()..]
+        );
+        let reason = readback_mismatch(&unhidden, FIXTURE, "FIELDS_FULL", &fields).unwrap();
+        assert!(reason.contains("is not 'LCSC' renamed"), "{reason}");
     }
 }
