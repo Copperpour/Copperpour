@@ -828,7 +828,10 @@ fn warn_if_ipc_unreachable(address: &str, error: &anyhow::Error) {
 pub(crate) fn ipc_target_error_result(error: &konnect_ipc::BoardTargetError) -> CallToolResult {
     use konnect_ipc::BoardTargetError;
 
-    let message = format!("{}. Konnect did not read or modify another board.", error);
+    let message = format!(
+        "{}. Copperpour did not read or modify another board.",
+        error
+    );
     match error {
         BoardTargetError::NoOpenDocuments { requested } => CallToolResult::error_kind(
             crate::mcp::error::ToolErrorKind::WrongDocument {

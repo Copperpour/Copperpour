@@ -203,7 +203,7 @@ fn unusable_config(path: &Path, which: &str, reason: String) -> CallToolResult {
             reason: reason.clone(),
         },
         format!(
-            "The {which} configuration at '{}' exists but cannot be used ({reason}). Konnect did \
+            "The {which} configuration at '{}' exists but cannot be used ({reason}). Copperpour did \
              not substitute defaults and wrote nothing, because saving over it would replace \
              your settings. Repair or move the file, then retry.",
             path.display()
@@ -408,9 +408,9 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "load_user_config",
-            "Load the user's global Konnect preferences. Call this at the start of every session \
+            "Load the user's global Copperpour preferences. Call this at the start of every session \
              to get preferred manufacturers, fab constraints, default passives, and design rules. \
-             'source' says whether the answer is the user's file or Konnect's defaults (no file \
+             'source' says whether the answer is the user's file or Copperpour's defaults (no file \
              existed; the defaults are then written for the user to edit and 'persisted' says \
              whether that worked). A file that exists but cannot be parsed or read is refused \
              with invalid_configuration and is never replaced by defaults.",
@@ -556,7 +556,7 @@ fn load_user_config_at(path: &Path) -> CallToolResult {
             }
         }
         body["note"] = json!(
-            "No user preferences file existed, so these are Konnect's defaults. Project config \
+            "No user preferences file existed, so these are Copperpour's defaults. Project config \
              may override these values."
         );
     } else {

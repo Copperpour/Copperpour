@@ -293,7 +293,7 @@ pub(crate) fn adopt_native_dsn(
     native_dsn: String,
 ) -> Result<ExportBundle> {
     validate_dsn_syntax(&native_dsn, "KiCad native DSN")?;
-    let baseline_tree = parse_dsn_sexp(&baseline.dsn).context("parse Konnect baseline DSN")?;
+    let baseline_tree = parse_dsn_sexp(&baseline.dsn).context("parse Copperpour baseline DSN")?;
     let native_tree = parse_dsn_sexp(&native_dsn).context("parse KiCad native DSN")?;
     let baseline_identity = dsn_identity(&baseline_tree)?;
     let native_identity = dsn_identity(&native_tree)?;
@@ -1599,7 +1599,7 @@ fn build_pcb(
         parser: Some(dsn::Parser {
             string_quote: Some('"'),
             space_in_quoted_tokens: Some(true),
-            host_cad: Some("Konnect".to_string()),
+            host_cad: Some("Copperpour".to_string()),
             host_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         }),
         resolution: dsn::Resolution {
@@ -2339,7 +2339,7 @@ pub(crate) mod tests {
         );
         let ses = std::fs::read_to_string(&ses_path).expect("read Freerouting SES");
         crate::specctra_ses::parse_import_plan(&board_path, source, &export.manifest, &ses)
-            .expect("Freerouting SES must pass Konnect's strict import planner");
+            .expect("Freerouting SES must pass Copperpour's strict import planner");
     }
 
     /// Real-engine parity for KiCad 10's native exporter identifiers plus the

@@ -29,7 +29,7 @@ const THICKNESS_TOLERANCE_MM: f64 = 0.001;
 /// εr and loss tangent are compared to within this.
 const PROPERTY_TOLERANCE: f64 = 1e-6;
 
-const BOARD_SETUP_HINT: &str = "Konnect cannot change a stackup: KiCad 10 declares \
+const BOARD_SETUP_HINT: &str = "Copperpour cannot change a stackup: KiCad 10 declares \
      UpdateBoardStackup but does not implement it (#716). Change it in KiCad's Board Setup, \
      under Board Stackup, then read it again.";
 

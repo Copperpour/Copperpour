@@ -1,4 +1,4 @@
-"""Tests for the Konnect settings dialog and window parenting behavior."""
+"""Tests for the Copperpour settings dialog and window parenting behavior."""
 
 import os
 from pathlib import Path

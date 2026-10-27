@@ -37,7 +37,7 @@ impl McpProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .expect("failed to start Konnect MCP server");
+            .expect("failed to start Copperpour MCP server");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut process = Self {
@@ -71,7 +71,7 @@ impl McpProcess {
             let mut line = String::new();
             assert!(
                 self.stdout.read_line(&mut line).unwrap() > 0,
-                "Konnect exited before replying"
+                "Copperpour exited before replying"
             );
             let response: Value = serde_json::from_str(line.trim()).unwrap();
             if response["id"] == id {

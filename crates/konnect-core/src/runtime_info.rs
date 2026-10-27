@@ -327,22 +327,22 @@ fn restart_guidance(source: &str, newer_than_running: Option<bool>) -> Vec<Strin
 
     #[cfg(target_os = "windows")]
     guidance.push(
-        "Windows: exit every MCP client or KiCad session that launched Konnect, then reopen the owning application; running executables may remain locked during an update."
+        "Windows: exit every MCP client or KiCad session that launched Copperpour, then reopen the owning application; running executables may remain locked during an update."
             .to_string(),
     );
     #[cfg(target_os = "macos")]
     guidance.push(
-        "macOS: restart the MCP client that launched Konnect; if KiCad launched it, quit and reopen KiCad after the update."
+        "macOS: restart the MCP client that launched Copperpour; if KiCad launched it, quit and reopen KiCad after the update."
             .to_string(),
     );
     #[cfg(target_os = "linux")]
     guidance.push(
-        "Linux: restart the MCP client that launched Konnect; if KiCad launched it, stop the plugin server or quit and reopen KiCad after the update."
+        "Linux: restart the MCP client that launched Copperpour; if KiCad launched it, stop the plugin server or quit and reopen KiCad after the update."
             .to_string(),
     );
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     guidance.push(
-        "Restart the MCP client or KiCad session that launched Konnect after replacing the binary."
+        "Restart the MCP client or KiCad session that launched Copperpour after replacing the binary."
             .to_string(),
     );
 

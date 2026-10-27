@@ -294,7 +294,7 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
         McpToolDescription {
             name: "get_installation_info".to_string(),
             description:
-                "Report read-only provenance for the Konnect process serving this call: build \
+                "Report read-only provenance for the Copperpour process serving this call: build \
                  version and commit when available, executable path, conservatively detected \
                  install source, on-disk binary version, KiCad CLI version, redacted IPC \
                  endpoint, proven newer-binary state, platform-specific restart guidance, and \
@@ -315,7 +315,7 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
         if reload_enabled {
             descriptions.push(McpToolDescription {
             name: "reload_server".to_string(),
-            description: "Replace this standalone Unix stdio server with the verified Konnect binary now on disk while preserving the client-owned pipes and original command-line arguments. The transport stops accepting requests and flushes this response, process bookkeeping is released, and then the validated executable identity is rechecked at the one-way exec handoff. Linux executes the open file directly. Loaded toolsets reset to startup state. Same-version development builds require allow_same_version=true."
+            description: "Replace this standalone Unix stdio server with the verified Copperpour binary now on disk while preserving the client-owned pipes and original command-line arguments. The transport stops accepting requests and flushes this response, process bookkeeping is released, and then the validated executable identity is rechecked at the one-way exec handoff. Linux executes the open file directly. Loaded toolsets reset to startup state. Same-version development builds require allow_same_version=true."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -409,7 +409,7 @@ async fn handle_reload_server(args: &Value, reload: &ReloadControl) -> CallToolR
                     reason: format!("cannot open candidate executable: {error}"),
                 },
                 format!(
-                    "reload_server could not open the Konnect binary at {}: {error}",
+                    "reload_server could not open the Copperpour binary at {}: {error}",
                     executable.display()
                 ),
             )

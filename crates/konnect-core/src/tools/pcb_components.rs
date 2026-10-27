@@ -2917,7 +2917,7 @@ fn flip_outcome_result(outcome: konnect_ipc::IpcFlipOutcome) -> CallToolResult {
             },
             format!(
                 "The running KiCad endpoint answered AS_UNHANDLED for the native footprint-flip \
-                 command. Konnect requires KiCad {FLIP_ITEMS_MIN_KICAD_VERSION} or newer to flip \
+                 command. Copperpour requires KiCad {FLIP_ITEMS_MIN_KICAD_VERSION} or newer to flip \
                  a footprint on an open board over IPC. The board file was not modified."
             ),
         ),
@@ -4850,7 +4850,7 @@ mod tests {
         assert!(
             out["warning"]
                 .as_str()
-                .is_some_and(|w| w.contains("current Konnect server session")
+                .is_some_and(|w| w.contains("current Copperpour server session")
                     && w.contains("crashed or was force-quit")),
             "the fallback must warn that the file was edited directly: {out}"
         );

@@ -289,7 +289,7 @@ pub fn tools() -> Vec<ToolDef> {
              Reference property and the instances block, then reads the file back; every count \
              in the response comes from that readback. Numbers used on the project's other \
              sheets are reserved through its sheet tree ('other_sheets_consulted'); duplicates \
-             already spread across sheets are not detected here. Konnect's own implementation \
+             already spread across sheets are not detected here. Copperpour's own implementation \
              — kicad-cli has no annotate command. dry_run returns the plan without writing.",
             json!({
                 "type": "object",

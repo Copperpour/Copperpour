@@ -1388,7 +1388,9 @@ fn apply_footprint_fields(
         // failure, not something to skip past silently.
         let mut pad =
             kiapi::board::types::Pad::decode(child.value.as_slice()).with_context(|| {
-                format!("footprint {reference} has a pad KiCad sent in a form Konnect cannot read")
+                format!(
+                    "footprint {reference} has a pad KiCad sent in a form Copperpour cannot read"
+                )
             })?;
         seen_pads.insert(pad.number.clone());
         pad.net = pad_nets
@@ -2035,7 +2037,7 @@ fn board_footprint_from_instance(
         let field =
             kiapi::board::types::Field::decode(child.value.as_slice()).with_context(|| {
                 format!(
-                    "footprint {} ({kiid}) has a field Konnect cannot read",
+                    "footprint {} ({kiid}) has a field Copperpour cannot read",
                     field_text(&footprint.reference_field)
                 )
             })?;
@@ -2398,7 +2400,7 @@ fn apply_symbol_fields(
             }
             let mut existing = kiapi::board::types::Field::decode(child.value.as_slice())
                 .with_context(|| {
-                    format!("footprint {reference} has a field Konnect cannot read")
+                    format!("footprint {reference} has a field Copperpour cannot read")
                 })?;
             if existing.name != field.name {
                 continue;

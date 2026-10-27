@@ -246,13 +246,13 @@ impl NoLiveBoard {
     pub(crate) fn warning(&self) -> String {
         let observed = match self {
             Self::Unreachable => {
-                "KiCad IPC was unreachable, so Konnect could not contact a live editor; no exact-board sibling lock was present.".to_string()
+                "KiCad IPC was unreachable, so Copperpour could not contact a live editor; no exact-board sibling lock was present.".to_string()
             }
             Self::NotOpen(answer) => format!("KiCad was reachable, and {answer}"),
         };
         format!(
-            "{observed} This board has not been observed live during the current Konnect server \
-             session, so Konnect edited the saved board file directly. If KiCad crashed or was \
+            "{observed} This board has not been observed live during the current Copperpour server \
+             session, so Copperpour edited the saved board file directly. If KiCad crashed or was \
              force-quit before this server started, reconcile any unsaved work before relying on \
              this change. Reload the file in KiCad before editing it there."
         )
@@ -381,9 +381,9 @@ fn unsafe_file_fallback(
         },
         format!(
             "{situation} The saved board file may be older than unsaved editor state, so \
-             Konnect did not modify it. Reopen or recover the board in KiCad, reconcile it, \
+             Copperpour did not modify it. Reopen or recover the board in KiCad, reconcile it, \
              and save the authoritative state. If KiCad was deliberately closed cleanly, \
-             restart Konnect only after confirming that the saved file is authoritative."
+             restart Copperpour only after confirming that the saved file is authoritative."
         ),
     )
 }
@@ -430,7 +430,7 @@ fn board_write_outcome(
                 paths: vec![path.clone()],
             },
             format!(
-                "Board '{path}' changed after Konnect read it, so {operation} wrote nothing. \
+                "Board '{path}' changed after Copperpour read it, so {operation} wrote nothing. \
                  Reload the board and retry."
             ),
         ))),
@@ -565,7 +565,7 @@ fn project_lock_refusal_from(
         },
         format!(
             "{situation} pcbnew and Eeschema rewrite the project file from their own copy when \
-             they save, so a {what} written to it now would be reverted. Konnect did not modify \
+             they save, so a {what} written to it now would be reverted. Copperpour did not modify \
              the project file. Close the project in KiCad, or make the change there, and retry. \
              If no KiCad program has this project open, the lock was left behind by a crash: \
              delete it and retry."
@@ -626,7 +626,7 @@ pub(crate) const DEFAULT_ZONE_MIN_WIDTH_MM: f64 = 0.2;
 /// preflight established only that no live KiCad is holding this board.
 pub(crate) const FILE_ONLY_EDIT_WARNING: &str =
     "No live KiCad is holding this board, and it has not been observed live during the current \
-     Konnect server session, and no KiCad sibling lock was present, so Konnect edited the saved \
+     Copperpour server session, and no KiCad sibling lock was present, so Copperpour edited the saved \
      board file directly. If KiCad crashed or was force-quit before this server started without \
      leaving a lock, reconcile any unsaved work before relying on this change. Reload the file in \
      KiCad before editing it there.";
@@ -1541,7 +1541,7 @@ fn partition_edge_cuts_shapes(items: &[prost_types::Any]) -> (Vec<String>, Vec<&
 fn outline_not_replaceable(kinds: &str) -> CallToolResult {
     CallToolResult::error(format!(
         "The existing board outline includes {kinds} on Edge.Cuts, which a plain \
-         rectangle cannot honestly replace — Konnect refused before writing \
+         rectangle cannot honestly replace — Copperpour refused before writing \
          anything. Edit the outline in pcbnew, or delete the old outline first \
          if the rectangle is really what you want."
     ))
@@ -2784,7 +2784,7 @@ async fn handle_add_mounting_hole(
     };
     let geometry_note = (geometry == "inline").then(|| {
         format!(
-            "KiCad's MountingHole library was not resolvable from this machine, so Konnect's \
+            "KiCad's MountingHole library was not resolvable from this machine, so Copperpour's \
              own unplated-hole geometry was placed under the shipped name {}; KiCad may \
              report lib_footprint_mismatch until the footprint is updated from the library",
             spec.lib_id
@@ -4053,7 +4053,10 @@ mod board_session_safety_tests {
             Some("unsafe_file_fallback")
         );
         let text = super::mounting_hole_tests::result_text(&result);
-        assert!(text.contains("Konnect previously reached KiCad"), "{text}");
+        assert!(
+            text.contains("Copperpour previously reached KiCad"),
+            "{text}"
+        );
         assert!(text.contains("did not modify"), "{text}");
         assert_eq!(std::fs::read(&board).unwrap(), before);
     }
@@ -5897,7 +5900,7 @@ mod zone_net_format_tests {
         assert!(warning.contains("IPC was unreachable"), "{warning}");
         assert!(warning.contains("no exact-board sibling lock"), "{warning}");
         assert!(
-            warning.contains("current Konnect server session"),
+            warning.contains("current Copperpour server session"),
             "{warning}"
         );
         assert!(warning.contains("crashed or was force-quit"), "{warning}");

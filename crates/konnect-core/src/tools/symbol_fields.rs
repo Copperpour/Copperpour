@@ -288,7 +288,7 @@ async fn handle_set_symbol_properties(
                         paths: vec![path.display().to_string()],
                     },
                     format!(
-                        "Symbol library '{}' changed after Konnect read it, so \
+                        "Symbol library '{}' changed after Copperpour read it, so \
                          set_symbol_properties wrote nothing. Reload it and retry.",
                         path.display()
                     ),

@@ -368,7 +368,7 @@ fn document_lock_path_in(state_root: &Path, path: &Path) -> Result<PathBuf, Sexp
     let lock_directory_metadata = std::fs::symlink_metadata(&lock_directory)?;
     if !lock_directory_metadata.file_type().is_dir() {
         return Err(SexpError::InvalidValue(format!(
-            "Konnect lock state must be a real directory, not a symlink or file: {}",
+            "Copperpour lock state must be a real directory, not a symlink or file: {}",
             lock_directory.display()
         )));
     }
@@ -378,7 +378,7 @@ fn document_lock_path_in(state_root: &Path, path: &Path) -> Result<PathBuf, Sexp
         let directory = std::fs::File::open(&lock_directory)?;
         if !directory.metadata()?.is_dir() {
             return Err(SexpError::InvalidValue(format!(
-                "Konnect lock state is not a directory: {}",
+                "Copperpour lock state is not a directory: {}",
                 lock_directory.display()
             )));
         }
