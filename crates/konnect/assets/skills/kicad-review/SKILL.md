@@ -42,7 +42,7 @@ Judge findings in this order:
 
 1. Exact design requirements and manufacturer datasheets.
 2. Direct KiCad ERC/DRC and saved or exported connectivity.
-3. Direct Konnect net, short, pad, trace, via, unrouted, and inventory evidence.
+3. Direct Copperpour net, short, pad, trace, via, unrouted, and inventory evidence.
 4. Aggregate review and manufacturing summaries.
 5. Heuristic orphan, single-pin, decoupling, protection, and best-practice findings.
 

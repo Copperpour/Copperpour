@@ -9,7 +9,7 @@ argument-hint: "[layout task]"
 
 # KiCAD PCB Layout Workflow
 
-This skill guides Claude to perform PCB layout using Konnect MCP tools.
+This skill guides Claude to perform PCB layout using Copperpour MCP tools.
 ALL modifications go through MCP tools — never edit .kicad_pcb files directly.
 
 ---
@@ -34,16 +34,16 @@ live KiCad holds the board. A reachable KiCad that predates 10.0.6 returns
 the structured error **unsupported_capability**; every reachable rejection stays closed instead of racing
 the editor with a file edit.
 
-`unsafe_file_fallback` is a stop condition. It means Konnect reached this board live
+`unsafe_file_fallback` is a stop condition. It means Copperpour reached this board live
 earlier in the current server session but IPC is now unreachable, so the saved file may
-be older than lost editor state. Pause mutation work, tell the user that Konnect left
+be older than lost editor state. Pause mutation work, tell the user that Copperpour left
 the file unchanged, and ask them to reopen/recover, reconcile, and save the board in
 KiCad. A read-only tool taking `board_source` can return the same kind, where nothing
 was going to be written: reporting the saved file as current would be the unsafe act.
 There, `board_source: "saved"` inspects that snapshot deliberately and says what it
 excludes — offer it instead of retrying the default. Continue through live IPC afterward. Preserve the guard: do not retry-loop,
-restart Konnect automatically, or edit `.kicad_pcb` directly. If the user confirms a
-clean close and an authoritative saved file, they may restart Konnect to deliberately
+restart Copperpour automatically, or edit `.kicad_pcb` directly. If the user confirms a
+clean close and an authoritative saved file, they may restart Copperpour to deliberately
 begin a new closed-board session.
 
 If connection fails:

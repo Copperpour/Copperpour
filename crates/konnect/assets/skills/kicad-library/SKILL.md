@@ -11,7 +11,7 @@ argument-hint: "[component or library task]"
 # KiCAD Library Management Workflow
 
 This skill guides Claude through creating and managing KiCAD symbols, footprints, and libraries
-using Konnect MCP tools. ALL modifications go through MCP tools — never edit
+using Copperpour MCP tools. ALL modifications go through MCP tools — never edit
 .kicad_sym or .kicad_mod files directly.
 
 ---
@@ -34,7 +34,7 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 ## Refresh Placed Footprints
 
 Editing a `.kicad_mod` library file does not change copies already embedded on a
-board. After a library edit, call `update_footprints_from_library`; it is Konnect's
+board. After a library edit, call `update_footprints_from_library`; it is Copperpour's
 MCP equivalent of KiCad **Tools → Update Footprints from Library**.
 
 This operation is not `update_pcb_from_schematic`. Schematic sync updates

@@ -1,7 +1,7 @@
 # Interactive architecture diagrams
 
 These five externally published diagrams provide focused visual explanations of
-Konnect's architecture and safety boundaries:
+Copperpour's architecture and safety boundaries:
 
 - [Diagram landing page](https://neusse.github.io/konnect-archify-tool/)
   provides one index for the complete published set.
@@ -44,7 +44,7 @@ links, and current Pages workflow are recorded at
 The standalone repository contains the typed sources, pinned Archify v2.16.0
 tooling, validation and delivery receipts, visual evidence, generated HTML, and
 the reusable `konnect-archify-refresh` Codex skill. None of those generated or
-tooling files are copied into Konnect.
+tooling files are copied into Copperpour.
 
 The runtime architecture passes Archify's strict browser containment check at
 all tested desktop sizes. The four detailed diagrams retain their raw
@@ -55,7 +55,7 @@ disclosure, not a claim that those raw visual checks passed.
 ## Maintenance
 
 Regeneration and publication happen in the standalone tool repository. Its
-refresh skill compares the previously pinned Konnect revision with the current
+refresh skill compares the previously pinned Copperpour revision with the current
 target, reviews behavior relevant to the five stable reader questions, updates
 the affected typed sources, validates and delivers every artifact, checks
 hashes, and captures light/dark browser evidence. A successful push of delivered
@@ -63,7 +63,7 @@ HTML to its `main` branch publishes the pages through its GitHub Pages workflow.
 
 When updating these links:
 
-1. Run the refresh in `konnect-archify-tool` against the intended Konnect
+1. Run the refresh in `konnect-archify-tool` against the intended Copperpour
    commit.
 2. Review every changed diagram and its visual evidence.
 3. Commit and publish the delivered HTML in that standalone repository.

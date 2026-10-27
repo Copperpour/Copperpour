@@ -63,7 +63,7 @@
 - [ ] Component values on silkscreen (or fab layer)
 - [ ] Test points accessible for debug
 
-## Using Konnect for Review
+## Using Copperpour for Review
 
 | Check | Tool |
 |-------|------|

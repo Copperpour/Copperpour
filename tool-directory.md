@@ -1,6 +1,6 @@
-# Konnect — Tool Directory
+# Copperpour — Tool Directory
 
-Canonical reference for every MCP tool exposed by Konnect. Generated from the Rust source (not from hand-maintained prose), so it reflects what the binary actually serves.
+Canonical reference for every MCP tool exposed by Copperpour. Generated from the Rust source (not from hand-maintained prose), so it reflects what the binary actually serves.
 
 **Source of truth**
 - Toolset metadata + declared counts: `crates/konnect-core/src/router/registry.rs` (`ALL_TOOLSETS`)
@@ -400,7 +400,7 @@ and Windows servers do not.
 
 Migration from the former `autoroute` tool: use `export_specctra_dsn`,
 `route_specctra_dsn`, then `plan_specctra_ses_import` / `apply_specctra_ses`.
-Konnect delegates routing to Freerouting's native MCP server instead of duplicating
+Copperpour delegates routing to Freerouting's native MCP server instead of duplicating
 the router or relying on the KiCad ActionPlugin workflow.
 
 ---

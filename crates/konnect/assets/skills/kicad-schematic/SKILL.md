@@ -9,7 +9,7 @@ argument-hint: "[circuit description or task]"
 
 # KiCAD Schematic Design Workflow
 
-This skill guides Claude to design schematics using Konnect MCP tools.
+This skill guides Claude to design schematics using Copperpour MCP tools.
 ALL modifications go through MCP tools — never edit .kicad_sch files directly.
 
 ---
@@ -351,7 +351,7 @@ Apply this order when evidence disagrees:
 
 1. Exact requirements and manufacturer datasheets.
 2. Direct KiCad ERC and saved/exported connectivity.
-3. Direct net, short, pin, and component evidence from Konnect.
+3. Direct net, short, pin, and component evidence from Copperpour.
 4. Aggregate review results.
 5. Heuristic orphan, single-pin, decoupling, and best-practice findings.
 

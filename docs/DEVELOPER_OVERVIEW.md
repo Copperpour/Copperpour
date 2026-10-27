@@ -1,12 +1,12 @@
 # Developer Overview
 
-This is the map layer for developers who need to understand Konnect before
+This is the map layer for developers who need to understand Copperpour before
 changing it. Detailed implementation notes and the authoritative current tool
 statistics remain in [`DEV.md`](../DEV.md); public naming and contribution rules
 remain in [`CONTRIBUTING.md`](../CONTRIBUTING.md) and
 [`NAMING_CONVENTIONS.md`](NAMING_CONVENTIONS.md).
 
-Konnect is a Rust MCP server with KiCad integration and packaging support. An
+Copperpour is a Rust MCP server with KiCad integration and packaging support. An
 MCP client talks to the `konnect` binary, which exposes a small starter surface,
 loads domain toolsets on demand, and routes each call to a file, IPC, or
 `kicad-cli` backend.

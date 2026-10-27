@@ -6,7 +6,7 @@ connector is physically rotated in Component Placements.
 
 `export_manufacturing_package(fab_house="jlcpcb")` applies a small, versioned
 built-in correction policy after KiCad exports the native component geometry.
-Pass `jlcpcb_cpl_corrections_path` to add project rules without editing Konnect.
+Pass `jlcpcb_cpl_corrections_path` to add project rules without editing Copperpour.
 Keep that JSON file with the KiCad project so the manufacturing decision is
 reviewable and repeatable.
 
@@ -45,7 +45,7 @@ overrides, empty IDs, and non-finite correction values fail the export.
 ## Matching and coordinates
 
 JLCPCB assembly export requires the exact board open in KiCad with IPC enabled.
-Konnect asks KiCad for each pad's native axis-aligned bounding box in board
+Copperpour asks KiCad for each pad's native axis-aligned bounding box in board
 coordinates and uses the centre of their union, not the footprint anchor or a
 rotated local bounding box. A footprint with no pads uses its observed anchor
 and reports `no_pads_observed_anchor`. Missing geometry or a board change during
@@ -66,10 +66,10 @@ behavior. Direct `export_position_file` remains KiCad's anchor-based export.
 
 Midpoint conversion precedes correction-policy offsets. Review old offsets that
 compensated for anchor-based positions: retaining them can double-correct the
-new midpoint. Konnect preserves explicit user policies rather than guessing
+new midpoint. Copperpour preserves explicit user policies rather than guessing
 which offsets are obsolete. Model-specific offsets can still be necessary.
 
-Konnect strips a KiCad library prefix such as `Package_SO:` before matching
+Copperpour strips a KiCad library prefix such as `Package_SO:` before matching
 `footprint_prefix`. Matching is case-sensitive. Precedence is deterministic:
 
 1. exact `designator` in the project policy;
@@ -105,6 +105,6 @@ JLCPCB's Component Placements view, and inspect every component—especially ICs
 connectors, diodes, LEDs, and other polarized parts. Only that preview validates
 the selected JLCPCB component models for the order.
 
-Konnect does not bundle the GPL-3.0 JLCKicadTools correction database. The
+Copperpour does not bundle the GPL-3.0 JLCKicadTools correction database. The
 built-in policy contains only narrowly scoped rules independently verified by
-the Konnect project and identifies its provenance in every response.
+the Copperpour project and identifies its provenance in every response.

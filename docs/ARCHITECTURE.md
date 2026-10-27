@@ -1,6 +1,6 @@
 # Architecture
 
-Konnect separates process concerns, MCP/tool behavior, and KiCad data access.
+Copperpour separates process concerns, MCP/tool behavior, and KiCad data access.
 This page describes both those static boundaries and the runtime flows through
 them. `DEV.md` remains the deeper implementation reference.
 
@@ -112,7 +112,7 @@ atomic replacement. If the source changes after it is read, the writer must
 return a conflict instead of overwriting it.
 
 Multi-file schematic changes use the write-ahead journal in
-`konnect-sexp/src/transaction.rs`. The `konnect transaction` commands in
+`konnect-sexp/src/transaction.rs`. The `copperpour transaction` commands in
 `crates/konnect/src/transaction_cli.rs` inspect, recover, or explicitly abandon
 those journals.
 

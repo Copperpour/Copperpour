@@ -1,6 +1,6 @@
-# Konnect naming conventions
+# Copperpour naming conventions
 
-Consistent names are part of Konnect's public API. They help contributors search the
+Consistent names are part of Copperpour's public API. They help contributors search the
 repository, let agents infer related operations, and prevent accidental compatibility
 breaks. New code and documentation must follow this guide. Existing public names are
 changed only with an explicit compatibility plan.

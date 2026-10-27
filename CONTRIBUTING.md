@@ -149,7 +149,7 @@ These are exactly the commands CI runs — if they pass locally, CI should be gr
   `layer_from_name`. The infallible one returns `BL_UNDEFINED` for a name it
   does not know, and KiCAD 10.0.5 does not validate that field — it faults and
   the editor dies, taking the user's unsaved board (#237). The fallible one
-  refuses at Konnect's boundary, where a refusal is still possible.
+  refuses at Copperpour's boundary, where a refusal is still possible.
 - **Fixtures for anything that parses a board or footprint should come from
   real KiCAD output.** A synthetic one passed 67 tests while `flip_component`
   refused every stock demo board, because KiCAD writes

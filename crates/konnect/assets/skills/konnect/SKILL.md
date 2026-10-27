@@ -1,13 +1,13 @@
 ---
 name: konnect
-description: "Mandatory operating rules for ANY task involving KiCAD projects. Loaded when the user mentions KiCAD, schematics, PCBs, or any .kicad_* file. Prevents file corruption by routing all changes through Konnect MCP tools."
+description: "Mandatory operating rules for ANY task involving KiCAD projects. Loaded when the user mentions KiCAD, schematics, PCBs, or any .kicad_* file. Prevents file corruption by routing all changes through Copperpour MCP tools."
 ---
 
-# Konnect — Operating Rules
+# Copperpour — Operating Rules
 
 ## The One Rule
 
-**KiCAD source files are not text files.** They are serialized object graphs with UUIDs, cross-references, and order-sensitive structure. Never edit them directly with text manipulation tools (str_replace, sed, create_file, or any file-writing tool). All modifications go through Konnect MCP tools.
+**KiCAD source files are not text files.** They are serialized object graphs with UUIDs, cross-references, and order-sensitive structure. Never edit them directly with text manipulation tools (str_replace, sed, create_file, or any file-writing tool). All modifications go through Copperpour MCP tools.
 
 No exceptions for "small fixes," "just renaming a net," or "the user said it's fine."
 
@@ -20,11 +20,11 @@ No exceptions for "small fixes," "just renaming a net," or "the user said it's f
 - `fp-lib-table` / `sym-lib-table` — library tables
 
 If asked to directly edit any of these:
-> KiCAD source files contain UUIDs and cross-references that text edits will break. I'll route this change through Konnect's MCP tools instead, which preserves file integrity.
+> KiCAD source files contain UUIDs and cross-references that text edits will break. I'll route this change through Copperpour's MCP tools instead, which preserves file integrity.
 
 ## The Three Channels
 
-### Channel 1: Konnect MCP (for ALL modifications)
+### Channel 1: Copperpour MCP (for ALL modifications)
 
 All writes go through MCP tools. Check they are available first (`list_toolboxes`). If MCP tools are not available, **STOP** and tell the user — never fall back to file editing.
 
@@ -48,7 +48,7 @@ does not establish that a missing server-side check ran.
 2. **Classify the task** — read-only (Channel 2 or 3) or write (Channel 1)
 3. **Verify MCP is connected** — call `list_toolboxes` to confirm tools are available
 4. **Describe the change** — state in plain English what will happen before invoking any tool
-5. **Execute** — use Konnect MCP tools only
+5. **Execute** — use Copperpour MCP tools only
 6. **Verify** — re-query the design to confirm the change landed correctly
 
 ## Decision Tree
@@ -72,15 +72,15 @@ does not establish that a missing server-side check ran.
 
 **PCB Editor (pcbnew):** Full CRUD via NNG + protobuf. Real-time communication with running KiCAD instance. Create, read, update, delete any PCB item with immediate UI refresh. **Requires KiCAD to be running.**
 
-**Schematic Editor (eeschema):** No item-level IPC API. Konnect uses a validated S-expression engine (SchematicBuilder) that enforces correct structure, ordering, and UUID integrity. File-based — **does not require KiCAD to be running.**
+**Schematic Editor (eeschema):** No item-level IPC API. Copperpour uses a validated S-expression engine (SchematicBuilder) that enforces correct structure, ordering, and UUID integrity. File-based — **does not require KiCAD to be running.**
 
-**Symbol/Footprint Libraries:** No IPC API. Edited through Konnect's S-expression engine with full validation.
+**Symbol/Footprint Libraries:** No IPC API. Edited through Copperpour's S-expression engine with full validation.
 
 **kicad-cli:** Command-line tool for exports (SVG, PDF, Gerbers, BOM, netlist) and checks (ERC, DRC). Does not require KiCAD GUI.
 
 ## Discovery — Finding Available Tools
 
-Konnect uses a meta-tool router pattern: tools are grouped into toolsets and loaded on demand to keep the context focused. Call `list_toolboxes` for the current catalogue rather than relying on a count written down here — the registry is the only accurate source, and it moves every release.
+Copperpour uses a meta-tool router pattern: tools are grouped into toolsets and loaded on demand to keep the context focused. Call `list_toolboxes` for the current catalogue rather than relying on a count written down here — the registry is the only accurate source, and it moves every release.
 
 ```
 list_toolboxes          → See all available toolsets with descriptions

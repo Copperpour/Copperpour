@@ -1,4 +1,4 @@
-# Developer Guide — Konnect
+# Developer Guide — Copperpour
 
 Internal reference for developing and maintaining the Rust port.
 
@@ -199,13 +199,13 @@ Konnect/
 - Symbol definitions auto-embedded from KiCAD 10's `.kicad_symdir` format
 - Power symbols (VCC, GND) embedded from `power.kicad_symdir`
 - Existing-file edits use revision-checked atomic replacement: read the exact
-  source, acquire a cooperative lock, reject any intervening KiCad or Konnect
+  source, acquire a cooperative lock, reject any intervening KiCad or Copperpour
   change, write a unique sibling scratch file, fsync, and rename.
 - Cooperative lock files live under `COPPERPOUR_STATE_DIR/locks` when that
   absolute override is set, otherwise under the platform local-data directory
   (`konnect/locks`). Reads never create files in the KiCad project.
 - Schematic writes also refuse while KiCad's sibling `~<name>.kicad_sch.lck`
-  exists. KiCad records only a username and hostname, so Konnect cannot prove
+  exists. KiCad records only a username and hostname, so Copperpour cannot prove
   that a same-host or remote lock is stale; valid, foreign, empty, and malformed
   locks all fail closed. The check runs before a transaction journal is created
   and again at the final target-write boundary.
@@ -231,8 +231,8 @@ replacement:
   revision-aware writer/command APIs; they must not delete the destination or
   weaken `save()` into an unconditional overwrite.
 
-For journal diagnosis and recovery, use `konnect transaction status`,
-`konnect transaction recover`, and the explicit force-gated `konnect
+For journal diagnosis and recovery, use `copperpour transaction status`,
+`copperpour transaction recover`, and the explicit force-gated `copperpour
 transaction abandon` escape hatch documented in
 [Troubleshooting](docs/TROUBLESHOOTING.md#transaction-recovery-is-blocked-by-divergent-content).
 
@@ -312,7 +312,7 @@ Tool-call failures are typed via the `ToolErrorKind` enum in `crates/konnect-cor
 | `stale_target` | A previously bound PCB document is no longer uniquely open, saved symbol instance metadata disagrees with the proven hierarchy, or prospective component state lacks the expected document, UUID/reference, unit, library, hierarchy, position, rotation, or property value — carries `target` and `reason`; the edit, annotation, and grouping preflight refuses before writing |
 | `mutation_outcome_uncertain` | An edit committed, but immediate readback could not prove its requested result — carries `operation`, `path`, and `reason`; reload and inspect the named file (or, for a live-board write, the board in KiCad) before retrying because it may have changed |
 | `ambiguous_open_board` | KiCad answered, and its open-document list could not be read as a complete set of comparable board identities — carries `path`; neither the live nor the file path may run |
-| `invalid_configuration` | A Konnect preferences file (`config.json`, `.copperpour/project.json`) exists but cannot be used — carries `path` and a `reason` starting `malformed_json:` or `unreadable:`; defaults are never substituted, because the next save would persist them over the user's settings |
+| `invalid_configuration` | A Copperpour preferences file (`config.json`, `.copperpour/project.json`) exists but cannot be used — carries `path` and a `reason` starting `malformed_json:` or `unreadable:`; defaults are never substituted, because the next save would persist them over the user's settings |
 | `handler_error` | Catch-all for unmigrated `anyhow::Error` returns |
 
 ### Producing structured errors in a handler
@@ -344,7 +344,7 @@ Most in-handler errors still use `CallToolResult::error("free text")` or bubble 
 
 ### One value KiCAD does not reject: an unrepresentable layer
 
-`builders::layer_from_name` maps a layer name to a `BoardLayer`, and anything it does not know becomes `BL_UNDEFINED`. KiCAD 10.0.5 does **not** validate that field on an incoming item — it indexes its layer bitset with whatever arrives — so `BL_UNDEFINED` is answered with an access violation that terminates the process and takes the user's unsaved board with it (#237). Konnect sees only an NNG receive timeout.
+`builders::layer_from_name` maps a layer name to a `BoardLayer`, and anything it does not know becomes `BL_UNDEFINED`. KiCAD 10.0.5 does **not** validate that field on an incoming item — it indexes its layer bitset with whatever arrives — so `BL_UNDEFINED` is answered with an access violation that terminates the process and takes the user's unsaved board with it (#237). Copperpour sees only an NNG receive timeout.
 
 So on any path that puts a layer into a message bound for KiCAD, use **`builders::try_layer_from_name`**, which refuses instead. `client.rs::build_footprint_item` validates the root layer, every pad layer and every graphic layer before it builds a single child; the `*.Cu`/`*.Mask`/`*.Paste` wildcards KiCAD itself writes are expanded rather than mapped, so they are skipped.
 
@@ -356,8 +356,8 @@ Every `tools/call` flows through `McpHandler::execute_tool`, which wraps the dis
 - A **ring buffer** of the last 100 `CallRecord`s (surfaced via `get_recent_calls` meta-tool).
 - **Per-tool counters** for totals, errors, cumulative duration, last-status, last-error (surfaced via `server_stats`).
 - **JSONL append** to `<konnect dir>/logs/calls.jsonl` (one line per call). Paths:
-  - Windows: `%APPDATA%\konnect\logs\calls.jsonl`
-  - macOS: `~/Library/Application Support/konnect/logs/calls.jsonl`
+  - Windows: `%APPDATA%\copperpour\logs\calls.jsonl`
+  - macOS: `~/Library/Application Support/copperpour/logs/calls.jsonl`
   - Linux: `~/.copperpour/logs/calls.jsonl`
 - **Structured `tracing` events** (`tool_call_start` + `tool_call_end`) carrying `call_id`, `tool`, `toolset`, `status`, `dur_ms` — greppable in the stderr log.
 
