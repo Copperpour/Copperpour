@@ -121,9 +121,9 @@ jobs:
       # of a transform assertion unwritten, and a handful of style lints (#121).
       - run: cargo clippy --workspace --locked --all-targets -- -D warnings
 
-  # Dependency license gate (deny.toml). Dual licensing (AGPL + commercial)
-  # means every dependency must be acceptable under BOTH — this job stops an
-  # incompatible license entering via an innocuous-looking dependency bump.
+  # Dependency license gate (deny.toml). Every dependency must be
+  # AGPL-compatible; this job stops an incompatible license entering via an
+  # innocuous-looking dependency bump.
   licenses:
     name: Dependency licenses
     runs-on: ubuntu-latest

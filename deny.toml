@@ -1,11 +1,8 @@
 # cargo-deny configuration — dependency license gate.
 #
-# Konnect is AGPL-3.0 with a commercial dual license (COMMERCIAL.md), so every
-# dependency's license matters twice: it must be AGPL-compatible AND
-# redistributable under a proprietary commercial grant. Everything allowed
-# below satisfies both. Notably MPL-2.0 (resvg's family) is file-level
-# copyleft: fine to link, but commercial distributions must keep those files'
-# source available — recorded in THIRD_PARTY.md territory, not a blocker.
+# Konnect is AGPL-3.0, so every dependency's license must be AGPL-compatible.
+# Notably MPL-2.0 (resvg's family) is file-level copyleft: fine to link, and
+# those files' source travels with Konnect's own.
 #
 # Run locally: cargo deny check licenses
 
@@ -14,7 +11,7 @@ allow = [
     # The project's own license (workspace members).
     "AGPL-3.0-only",
     "MIT",
-    # MIT No Attribution is MIT-equivalent and permits commercial redistribution.
+    # MIT No Attribution is MIT-equivalent.
     "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
