@@ -1,4 +1,4 @@
-"""Authenticated KiCad 10 native-operation bridge for Konnect.
+"""Authenticated KiCad 10 native-operation bridge for Copperpour.
 
 This module is loaded only by the legacy ``pcbnew.ActionPlugin``.  It exposes
 one deliberately narrow operation to the external Rust server: ask KiCad's
@@ -24,8 +24,9 @@ UI_TIMEOUT_SECONDS = 30
 
 
 def bridge_root():
-    """Return the per-user registration directory shared with Konnect Rust."""
-    override = os.environ.get("KONNECT_BRIDGE_DIR")
+    """Return the per-user registration directory shared with Copperpour Rust."""
+    # KONNECT_BRIDGE_DIR is the name before the rename to Copperpour.
+    override = os.environ.get("COPPERPOUR_BRIDGE_DIR") or os.environ.get("KONNECT_BRIDGE_DIR")
     if override:
         return os.path.abspath(os.path.expanduser(override))
     if os.name == "nt":
@@ -34,7 +35,7 @@ def bridge_root():
         base = os.path.expanduser("~/Library/Application Support")
     else:
         base = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
-    return os.path.join(base, "konnect", "native-bridge")
+    return os.path.join(base, "copperpour", "native-bridge")
 
 
 def sys_platform():

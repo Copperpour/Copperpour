@@ -5,11 +5,11 @@
 <img src="resources/images/KiCAD-MCP-Server-rust.svg" alt="KiCAD-MCP-Server Logo" height="240" />
 
 
-# Konnect *BETA Release
+# Copperpour *BETA Release
 
 </div>
 
-**AI-assisted PCB design for KiCAD 10.** Konnect is a native KiCAD plugin — a single
+**AI-assisted PCB design for KiCAD 10.** Copperpour is a native KiCAD plugin — a single
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
@@ -23,26 +23,16 @@ that teach Claude KiCAD conventions out of the box.
 > see [CONTRIBUTING.md](CONTRIBUTING.md) and the
 > [naming conventions](docs/NAMING_CONVENTIONS.md).
 >
-> **LibreKonnect (`v0.14.0`):** Community-maintained AGPL-3.0 continuation fork of
-> [`mixelpixx/Konnect`](https://github.com/mixelpixx/Konnect), integrating 60 open
-> community pull requests and fixes on top of upstream `v0.13.0` — see
-> [docs/UPSTREAM_BACKLOG.md](docs/UPSTREAM_BACKLOG.md).
+> **Formerly Konnect and LibreKonnect.** Copperpour is the community-maintained
+> AGPL-3.0 continuation of [`mixelpixx/Konnect`](https://github.com/mixelpixx/Konnect),
+> which went closed source in October 2026. It began as LibreKonnect, whose `v0.14.0`
+> integrated 60 open community pull requests and fixes on top of Konnect `v0.13.0` —
+> see [docs/UPSTREAM_BACKLOG.md](docs/UPSTREAM_BACKLOG.md). Upgrading? See
+> [Migrating from Konnect](#migrating-from-konnect-or-librekonnect).
 
-> ## Add realtime research to KiCAD MCP and Konnect. Introducing Nimrod
->
-> [**Nimrod**](https://nimrod.orchis.ai) is our web-research MCP server:
-> quality-scored Google search, clean webpage extraction, and deep multi-source
-> research. Design the board with Konnect while Nimrod pulls live parts availability, datasheets,
-> and errata — no more guessing from year-old training data
->
-> - Works with claude.ai, Claude Desktop, Claude Code, VS Code, and any MCP client
-> - 1 credit = 1 search · extraction always free · free 50-credit trial, no card
-> - Official MCP Registry: [`ai.orchis/nimrod`](https://registry.modelcontextprotocol.io)
+## Why Copperpour exists
 
-
-## Why Konnect exists
-
-Konnect is the successor to [KiCAD-MCP-Server](https://github.com/mixelpixx/KiCAD-MCP-Server),
+Copperpour continues Konnect, the successor to [KiCAD-MCP-Server](https://github.com/mixelpixx/KiCAD-MCP-Server),
 a Python/TypeScript project that proved AI-driven PCB design works — and, in the
 process, showed exactly where that architecture runs out of road. Konnect was built
 to fix those specific problems:
@@ -53,12 +43,12 @@ stdin/stdout, a command router, and finally SWIG-generated C++ proxy objects bef
 anything touches your board. That's four language and serialization boundaries, each
 with its own failure modes — subprocess lifecycle management, stdout parsing that
 filters out warnings KiCAD leaks into the stream, chunked-JSON reassembly. In
-Konnect, a tool call is a function call. One process, one language, no plumbing.
+Copperpour, a tool call is a function call. One process, one language, no plumbing.
 
 **The dependency surface was enormous.** Running the original means carrying Node.js
 and its npm tree, Python and its pip packages, wxPython, kicad-skip, and KiCAD's
 SWIG bindings — two package ecosystems plus a binding layer, every one of them a
-moving target that can break an install. Konnect is a single static binary —
+moving target that can break an install. Copperpour is a single static binary —
 20–25 MB depending on platform, a ~9 MB download. There is nothing to install
 alongside it and nothing to version-match.
 
@@ -66,17 +56,17 @@ alongside it and nothing to version-match.
 bindings, which KiCAD is deprecating in favor of its IPC API. SWIG also carried
 real operational scars: a zone-fill call that can segfault the backend, proxy-object
 comparison bugs, and a fallback path that can silently swap backends mid-session.
-Konnect talks to KiCAD 10 through the official IPC API (protobuf over NNG) — the
+Copperpour talks to KiCAD 10 through the official IPC API (protobuf over NNG) — the
 interface KiCAD is investing in — with real-time board edits that integrate with
 KiCAD's own undo/redo.
 
-**Schematic edits should not corrupt files.** Konnect edits `.kicad_sch` files
+**Schematic edits should not corrupt files.** Copperpour edits `.kicad_sch` files
 through its own S-expression engine with atomic writes (write, fsync, rename), UUID
 preservation, and round-trip tests — no third-party schematic library with known
 gaps, no text-manipulation workarounds.
 
 **Context economy is a feature.** Exposing all 241 tools to an LLM costs roughly 23K
-tokens of context on every listing. Konnect's router loads a starter kit (~2K
+tokens of context on every listing. Copperpour's router loads a starter kit (~2K
 tokens) and lets the model pull in toolsets on demand — plus built-in observability
 (`get_recent_calls`, `server_stats`, JSONL call logs) so the model can diagnose its
 own tool failures.
@@ -118,16 +108,16 @@ The full tool catalog is documented in [tool-directory.md](tool-directory.md).
 Explore the request path and safety boundaries in the
 [interactive architecture diagrams](docs/ARCHITECTURE_DIAGRAMS.md). They are
 published from a standalone documentation repository and add no dependencies to
-Konnect.
+Copperpour.
 
 ## Installation
 
 ### From the KiCAD Plugin Manager (recommended)
 
-1. Download the package for your OS from [Releases](https://github.com/mn89h/LibreKonnect/releases):
-   `konnect-pcm-v<version>-windows.zip`, `-macos.zip`, or `-linux.zip`. Each
+1. Download the package for your OS from [Releases](https://github.com/Copperpour/Copperpour/releases):
+   `copperpour-pcm-v<version>-windows.zip`, `-macos.zip`, or `-linux.zip`. Each
    bundles that platform's server binary — the macOS package is a universal
-   build, so one download covers Apple Silicon and Intel. (The `konnect-pcm-*`
+   build, so one download covers Apple Silicon and Intel. (The `copperpour-pcm-*`
    assets are the KiCAD plugin packages; the other archives are standalone
    server binaries.)
 2. Open KiCAD 10 → **Plugin and Content Manager**
@@ -135,14 +125,14 @@ Konnect.
 4. Restart KiCAD
 
 Verify: open the **PCB Editor** → **Tools → External Plugins** → you should see
-**Konnect**.
+**Copperpour**.
 
-For KiCad 10, the Konnect settings dialog also offers an optional **native
+For KiCad 10, the Copperpour settings dialog also offers an optional **native
 Specctra bridge**. When enabled, `export_specctra_dsn` can ask the active PCB
-Editor to generate its native DSN while Konnect still binds the export to the
+Editor to generate its native DSN while Copperpour still binds the export to the
 exact IPC snapshot and creates the strict reverse manifest used during SES
 import. The bridge is local-only, authenticated, disabled by default, and not
-the KiCad 11 integration path. Konnect uses its Rust exporter by default;
+the KiCad 11 integration path. Copperpour uses its Rust exporter by default;
 `native_bridge_mode: "prefer"` enables fallback to Rust when the bridge is
 unavailable, while `"require"` refuses instead.
 
@@ -163,43 +153,43 @@ geometry are rejected before mutation.
 # Windows: choco install protoc cmake
 # macOS:   brew install protobuf cmake
 # Linux:   apt install protobuf-compiler cmake
-cargo build --release -p konnect
+cargo build --release -p konnect   # builds target/release/copperpour
 ```
 
 ### Install guidance for your AI client
 
-Konnect bundles shared KiCad skills for Claude and Codex. Select the client when
+Copperpour bundles shared KiCad skills for Claude and Codex. Select the client when
 installing, checking, or removing that guidance:
 
 ```bash
 # Existing behavior remains the default: Claude skills, agents, and hooks
-konnect init
+copperpour init
 
 # Codex installs only the shared skills under ~/.agents/skills
-konnect init --client codex
-konnect status --client codex
-konnect uninstall --client codex
+copperpour init --client codex
+copperpour status --client codex
+copperpour uninstall --client codex
 ```
 
-MCP server startup never installs or restores guidance. Run `konnect init`
-explicitly when you want those files installed; after `konnect uninstall`,
+MCP server startup never installs or restores guidance. Run `copperpour init`
+explicitly when you want those files installed; after `copperpour uninstall`,
 starting the server leaves them removed.
 
-Guidance written by an older `konnect init` is not updated by upgrading the
-binary. `konnect status` compares every installed skill, agent, and hook with
+Guidance written by an older `copperpour init` is not updated by upgrading the
+binary. `copperpour status` compares every installed skill, agent, and hook with
 the bundle in the binary you run and marks each `current`, `different`, or
 `missing`. The server makes the same check once for each installed version:
-the first start after `konnect init` compares the files, records
-the result in `~/.konnect`, and adds a one-line notice to its `initialize`
+the first start after `copperpour init` compares the files, records
+the result in `~/.copperpour`, and adds a one-line notice to its `initialize`
 instructions if guidance is out of sync. Later starts reuse that record, so
 guidance you chose to keep is not reported again. `get_installation_info`
-shows the result. Re-run `konnect init` to update it.
+shows the result. Re-run `copperpour init` to update it.
 It overwrites differing files, so keep a copy of any file you edited. `--client` remains accepted in server
 commands for compatibility. For example, register a standalone binary with the
 Codex CLI using:
 
 ```bash
-codex mcp add konnect -- /path/to/konnect --client codex
+codex mcp add copperpour -- /path/to/copperpour --client codex
 ```
 
 Claude remains the default when `--client` is omitted. The installer tracks the
@@ -207,12 +197,12 @@ two clients independently, and a Codex install does not create or modify
 `~/.claude`.
 
 `--help` on any subcommand prints that subcommand's usage and writes nothing —
-`konnect init --help` describes the installer rather than running it. An
-argument Konnect does not recognise is an error rather than being ignored, so a
+`copperpour init --help` describes the installer rather than running it. An
+argument Copperpour does not recognise is an error rather than being ignored, so a
 typo such as `--cleint codex` stops instead of quietly installing for the
 default client.
 
-To verify which Konnect process an MCP client is actually using, call the
+To verify which Copperpour process an MCP client is actually using, call the
 always-visible `get_installation_info` tool. It reports the serving build,
 executable path, verified installation source when one can be proven, KiCad
 CLI and IPC detection, and restart guidance. A missing build commit or an
@@ -221,22 +211,22 @@ it is not silently guessed from a directory name.
 
 ### macOS
 
-The [Releases](https://github.com/mn89h/LibreKonnect/releases) page ships
+The [Releases](https://github.com/Copperpour/Copperpour/releases) page ships
 standalone server binaries for both Apple Silicon (`aarch64-apple-darwin`) and
 Intel (`x86_64-apple-darwin`). They are not yet code-signed, so if you download
 one through a browser, clear the quarantine flag before first launch:
 
 ```bash
-tar xzf konnect-v*-aarch64-apple-darwin.tar.gz
-xattr -d com.apple.quarantine ./konnect   # only needed for browser downloads
-./konnect --help
+tar xzf copperpour-v*-aarch64-apple-darwin.tar.gz
+xattr -d com.apple.quarantine ./copperpour   # only needed for browser downloads
+./copperpour --help
 ```
 
 Or build from source as above (verified on Apple Silicon; the same
-`target/release/konnect` binary is the MCP server).
+`target/release/copperpour` binary is the MCP server).
 
 KiCad on macOS keeps its tools inside the app bundle and they are not on
-`PATH`, so point Konnect at them in `~/Library/Application Support/konnect/config.toml`:
+`PATH`, so point Copperpour at them in `~/Library/Application Support/copperpour/config.toml`:
 
 ```toml
 kicad_cli = "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"
@@ -252,8 +242,8 @@ Claude Desktop's config lives at
 ```json
 {
   "mcpServers": {
-    "konnect": {
-      "command": "/path/to/konnect"
+    "copperpour": {
+      "command": "/path/to/copperpour"
     }
   }
 }
@@ -261,7 +251,7 @@ Claude Desktop's config lives at
 
 For Claude Code, put the same snippet in a `.mcp.json` in your project root.
 
-The macOS PCM package (`konnect-pcm-v<version>-macos.zip`) bundles a universal
+The macOS PCM package (`copperpour-pcm-v<version>-macos.zip`) bundles a universal
 server binary, so one download covers Apple Silicon and Intel. The schematic
 viewer compiles and launches on macOS (Tauri 2 uses the system WKWebView —
 WebView2 is only a Windows requirement) but hasn't had the same mileage as
@@ -272,7 +262,7 @@ the Windows build yet.
 After a PCM install, the server binary lives in your KiCAD documents folder:
 
 ```
-C:\Users\<YOU>\Documents\KiCad\10.0\3rdparty\plugins\com_github_mixelpixx_konnect\bin\konnect.exe
+C:\Users\<YOU>\Documents\KiCad\10.0\3rdparty\plugins\com_github_copperpour_copperpour\bin\copperpour.exe
 ```
 
 Edit `%APPDATA%\Claude\claude_desktop_config.json`:
@@ -280,15 +270,44 @@ Edit `%APPDATA%\Claude\claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
-    "konnect": {
-      "command": "C:\\Users\\<YOU>\\Documents\\KiCad\\10.0\\3rdparty\\plugins\\com_github_mixelpixx_konnect\\bin\\konnect.exe"
+    "copperpour": {
+      "command": "C:\\Users\\<YOU>\\Documents\\KiCad\\10.0\\3rdparty\\plugins\\com_github_copperpour_copperpour\\bin\\copperpour.exe"
     }
   }
 }
 ```
 
-Restart Claude Desktop and the Konnect tools appear. For Claude Code, drop the same
+Restart Claude Desktop and the Copperpour tools appear. For Claude Code, drop the same
 snippet into a `.mcp.json` in your project root (see [examples/](examples/)).
+
+## Migrating from Konnect or LibreKonnect
+
+Copperpour is a separate KiCad package from Konnect, with its own identifier, so
+KiCad installs it beside Konnect rather than over it.
+
+1. If you ran `konnect init`, run `konnect uninstall` first. It removes the hooks
+   that start the old binary, which stop working once its package is gone.
+2. Install the Copperpour package, then uninstall Konnect (or LibreKonnect) in the
+   Plugin and Content Manager.
+3. Point your MCP client at the new binary, `copperpour` (`copperpour.exe` on
+   Windows), as shown above. Renaming the server entry from `konnect` to
+   `copperpour` is optional: the bundled hooks and agents accept both names. A
+   renamed entry changes the tool names to `mcp__copperpour__*`, so update any
+   permission rules that name `mcp__konnect__*`.
+4. Run `copperpour init` to install the guidance again.
+
+Your files move on first use: `~/.konnect` to `~/.copperpour` on Linux and macOS,
+`%APPDATA%\konnect` to `%APPDATA%\copperpour` on Windows,
+`~/Library/Application Support/konnect` to `.../copperpour` on macOS,
+`~/.config/konnect` to `~/.config/copperpour` on Linux, and each project's
+`.konnect` directory to `.copperpour`. If a directory cannot be moved, it is used
+where it is. Nothing is moved when the new directory already exists.
+
+`KONNECT_STATE_DIR`, `KONNECT_BRIDGE_DIR` and `KONNECT_BUILD_COMMIT` are now
+`COPPERPOUR_*`; the old names are still read when the new ones are unset. A
+`konnect.toml` in the working directory is still read, after `copperpour.toml`.
+Source builds and the standalone archives also include a `konnect` executable
+that runs `copperpour`; it will be removed in a later release.
 
 ## Schematic viewer
 
@@ -326,22 +345,22 @@ the main workspace — see [DEV.md](DEV.md) for build steps.
 
 ## License: free for the little guys
 
-Konnect is licensed under the **[GNU AGPL-3.0](LICENSE)**.
+Copperpour is licensed under the **[GNU AGPL-3.0](LICENSE)**.
 
 If you're a hobbyist, student, freelancer, or open-source project: **use it freely,
 no strings attached.** Design boards, ship them, sell them.
 
 If you're a business: using it in-house is free too. The AGPL's conditions apply when
-you distribute Konnect, or let outside users interact with a modified copy over a
+you distribute Copperpour, or let outside users interact with a modified copy over a
 network. Then they get its source under the same license.
 
 ## Relationship to KiCAD-MCP-Server
 
 The original [Python/TypeScript project](https://github.com/mixelpixx/KiCAD-MCP-Server)
-remains fully open (MIT) and maintained. Konnect is where new development happens —
+remains fully open (MIT) and maintained. Konnect, now continued as Copperpour, is
 the architecture it proved, rebuilt for production:
 
-| | KiCAD-MCP-Server | Konnect |
+| | KiCAD-MCP-Server | Copperpour |
 |---|---|---|
 | Runtime | Node.js + Python + SWIG bindings | Single static binary (20–25 MB) |
 | Tool call path | TS → subprocess → Python → SWIG C++ | Direct function call |
@@ -370,7 +389,7 @@ that don't appear after `load_toolset`, and transaction recovery.
 
 **"kicad-cli not found"** — common install paths are auto-detected; set the path
 explicitly in the plugin settings dialog, in a `settings.json` beside the binary,
-or in a `konnect.toml` in the working directory. (A file under any other name
+or in a `copperpour.toml` in the working directory. (A file under any other name
 works only when passed with `--config`.)
 
 ## Support
@@ -378,7 +397,7 @@ works only when passed with `--config`.)
 - Community Discord: [join the Konnect community](https://discord.gg/NVp9RGMmDu)
   for installation help, AI-client setup, design-workflow discussion,
   contributor coordination, and live project-status updates
-- Issues & feature requests: [GitHub Issues](https://github.com/mn89h/LibreKonnect/issues)
+- Issues & feature requests: [GitHub Issues](https://github.com/Copperpour/Copperpour/issues)
 - Upstream backlog & merged PRs: [docs/UPSTREAM_BACKLOG.md](docs/UPSTREAM_BACKLOG.md)
 - Roadmap: [ROADMAP.md](ROADMAP.md)
 - Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)

@@ -23,7 +23,7 @@ impl McpServerState {
                 ..Default::default()
             },
             server_info: ServerInfo {
-                name: "konnect".to_string(),
+                name: crate::app_dirs::APP_NAME.to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
             instructions,

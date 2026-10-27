@@ -20,12 +20,12 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY_NAME: konnect
+  BINARY_NAME: copperpour
   RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
   RELEASE_ARTIFACT_LABEL: ${{ github.event_name == 'workflow_dispatch' && format('v{0}-smoke', inputs.version) || github.ref_name }}
   # Embedded into get_installation_info so release artifacts identify the
   # exact source commit even when built outside a Git working tree.
-  KONNECT_BUILD_COMMIT: ${{ github.sha }}
+  COPPERPOUR_BUILD_COMMIT: ${{ github.sha }}
 
 jobs:
   real-kicad-acceptance:
@@ -82,18 +82,20 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} -p konnect
 
+      # `konnect` is the name before the rename; it runs copperpour, so an
+      # archive unpacked over an older one updates configs that name it.
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ env.BINARY_NAME }}-${{ env.RELEASE_ARTIFACT_LABEL }}-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }}
+          tar czf ../../../${{ env.BINARY_NAME }}-${{ env.RELEASE_ARTIFACT_LABEL }}-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }} konnect
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           cd target/${{ matrix.target }}/release
-          Compress-Archive -Path "${{ env.BINARY_NAME }}.exe" -DestinationPath "../../../${{ env.BINARY_NAME }}-${{ env.RELEASE_ARTIFACT_LABEL }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path "${{ env.BINARY_NAME }}.exe", "konnect.exe" -DestinationPath "../../../${{ env.BINARY_NAME }}-${{ env.RELEASE_ARTIFACT_LABEL }}-${{ matrix.target }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -181,10 +183,10 @@ jobs:
             cargo build --release --locked -p konnect --target "$target"
           done
           mkdir -p dist/universal
-          lipo -create -output dist/universal/konnect \
-            target/aarch64-apple-darwin/release/konnect \
-            target/x86_64-apple-darwin/release/konnect
-          lipo -info dist/universal/konnect
+          lipo -create -output dist/universal/copperpour \
+            target/aarch64-apple-darwin/release/copperpour \
+            target/x86_64-apple-darwin/release/copperpour
+          lipo -info dist/universal/copperpour
 
       - name: Build universal schematic viewer (macOS, optional)
         if: matrix.platform == 'macos'
@@ -209,7 +211,7 @@ jobs:
         run: |
           $version = "${{ env.RELEASE_VERSION }}".TrimStart('v')
           ./packaging/build-pcm.ps1 -Version $version `
-            -BinaryPath target/release/konnect.exe `
+            -BinaryPath target/release/copperpour.exe `
             -ViewerPath crates/schematic-viewer/target/release/schematic-viewer.exe `
             -Platform windows `
             -OutDir dist
@@ -219,7 +221,7 @@ jobs:
         run: |
           version="${RELEASE_VERSION#v}"
           ./packaging/build-pcm.sh --version "$version" \
-            --binary dist/universal/konnect \
+            --binary dist/universal/copperpour \
             --viewer dist/universal/schematic-viewer \
             --platform macos --out dist
 
@@ -228,7 +230,7 @@ jobs:
         run: |
           version="${RELEASE_VERSION#v}"
           ./packaging/build-pcm.sh --version "$version" \
-            --binary target/release/konnect \
+            --binary target/release/copperpour \
             --viewer crates/schematic-viewer/target/release/schematic-viewer \
             --platform linux --out dist
 
@@ -245,13 +247,13 @@ jobs:
           python -m pip install jsonschema
           version="${RELEASE_VERSION#v}"
           python packaging/validate-pcm.py \
-            --zip "dist/konnect-pcm-v$version-${{ matrix.platform }}.zip"
+            --zip "dist/copperpour-pcm-v$version-${{ matrix.platform }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: konnect-pcm-${{ matrix.platform }}
-          path: dist/konnect-pcm-*.zip
+          name: copperpour-pcm-${{ matrix.platform }}
+          path: dist/copperpour-pcm-*.zip
 
   release:
     name: Create Release

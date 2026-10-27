@@ -1,7 +1,7 @@
 use std::process::Command;
 
 fn konnect() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_konnect"))
+    Command::new(env!("CARGO_BIN_EXE_copperpour"))
 }
 
 #[test]

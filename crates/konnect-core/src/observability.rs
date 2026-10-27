@@ -264,26 +264,28 @@ pub struct StatsSnapshot {
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
 
-/// Platform-specific path for konnect state files (config, logs, cache).
+/// Platform-specific path for Copperpour's state files (config, logs, cache).
 /// Matches the convention in `tools/config.rs::user_config_dir`.
 pub fn konnect_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         let appdata = std::env::var("APPDATA").unwrap_or_default();
-        PathBuf::from(appdata).join("konnect")
+        crate::app_dirs::user_dir(&PathBuf::from(appdata), false)
     }
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("konnect")
+        crate::app_dirs::user_dir(
+            &PathBuf::from(home)
+                .join("Library")
+                .join("Application Support"),
+            false,
+        )
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".konnect")
+        crate::app_dirs::user_dir(&PathBuf::from(home), true)
     }
 }
 

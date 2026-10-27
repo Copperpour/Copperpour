@@ -1,5 +1,5 @@
 {
-  description = "Development environment for Konnect";
+  description = "Development environment for Copperpour";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -37,8 +37,8 @@
         };
         version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
       in rec {
-        konnect = rustPlatform.buildRustPackage {
-          pname = "konnect";
+        copperpour = rustPlatform.buildRustPackage {
+          pname = "copperpour";
           inherit version;
 
           src = pkgs.lib.cleanSourceWith {
@@ -63,6 +63,9 @@
             "-p"
             "konnect"
             "--bin"
+            "copperpour"
+            # The name before the rename; runs copperpour.
+            "--bin"
             "konnect"
           ];
 
@@ -77,23 +80,26 @@
           # explicit writable state directory instead of Nix's read-only
           # sandbox home.
           preCheck = ''
-            export KONNECT_STATE_DIR="$TMPDIR/konnect-state"
-            mkdir -p "$KONNECT_STATE_DIR"
+            export COPPERPOUR_STATE_DIR="$TMPDIR/copperpour-state"
+            mkdir -p "$COPPERPOUR_STATE_DIR"
           '';
 
-          meta.mainProgram = "konnect";
+          meta.mainProgram = "copperpour";
         };
 
-        default = konnect;
+        # The name before the rename.
+        konnect = copperpour;
+        default = copperpour;
       }
     );
 
     apps = forAllSystems (system: {
-      konnect = {
+      copperpour = {
         type = "app";
-        program = "${self.packages.${system}.konnect}/bin/konnect";
+        program = "${self.packages.${system}.copperpour}/bin/copperpour";
       };
-      default = self.apps.${system}.konnect;
+      konnect = self.apps.${system}.copperpour;
+      default = self.apps.${system}.copperpour;
     });
 
     devShells = forAllSystems (

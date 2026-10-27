@@ -532,7 +532,7 @@ impl LocalMcpClient {
                 json!({
                     "protocolVersion": MCP_PROTOCOL_VERSION,
                     "capabilities": {},
-                    "clientInfo": { "name": "Konnect", "version": env!("CARGO_PKG_VERSION") }
+                    "clientInfo": { "name": "Copperpour", "version": env!("CARGO_PKG_VERSION") }
                 }),
                 STARTUP_TIMEOUT,
             ),

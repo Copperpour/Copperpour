@@ -68,7 +68,7 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "set_visual_baseline",
             "Capture the current render of a schematic sheet as its visual baseline, \
-             stored under the project's .konnect/baselines/ keyed by sheet name, with \
+             stored under the project's .copperpour/baselines/ keyed by sheet name, with \
              the source file's hash and the renderer identity recorded so a later \
              compare can tell design drift from a stale renderer.",
             json!({
@@ -317,7 +317,7 @@ async fn handle_render_png(
     Ok(CallToolResult::json(&response))
 }
 
-/// Baseline storage for a sheet: `<project>/.konnect/baselines/<stem>.png`
+/// Baseline storage for a sheet: `<project>/.copperpour/baselines/<stem>.png`
 /// plus a sibling json carrying the facts a compare needs. The project
 /// directory is the schematic's parent — baselines belong to the design they
 /// describe.
@@ -332,7 +332,7 @@ fn baseline_paths(
         .ok_or_else(|| anyhow::anyhow!("schematic path has no file name"))?
         .to_string_lossy()
         .into_owned();
-    let dir = parent.join(".konnect").join("baselines");
+    let dir = crate::app_dirs::project_state_dir(parent).join("baselines");
     Ok((
         dir.join(format!("{stem}.png")),
         dir.join(format!("{stem}.json")),
@@ -1701,12 +1701,12 @@ mod tests {
     }
 
     #[test]
-    fn baseline_paths_live_under_the_projects_konnect_dir() {
+    fn baseline_paths_live_under_the_projects_state_dir() {
         let (png, meta) = baseline_paths(std::path::Path::new("C:/proj/amp.kicad_sch")).unwrap();
         assert!(png
             .to_string_lossy()
             .replace('\\', "/")
-            .ends_with(".konnect/baselines/amp.png"));
+            .ends_with(".copperpour/baselines/amp.png"));
         assert!(meta.to_string_lossy().ends_with("amp.json"));
     }
 

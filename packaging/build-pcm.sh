@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Assemble the KiCAD PCM plugin package for Konnect (macOS/Linux port of build-pcm.ps1).
+# Assemble the KiCAD PCM plugin package for Copperpour (macOS/Linux port of build-pcm.ps1).
 #
 # Produces a zip laid out the way KiCAD's Plugin and Content Manager expects for
 # "Install from File" and for kicad-addons repository submission:
@@ -11,14 +11,14 @@
 #     settings_dialog.py          wxPython settings UI
 #     native_bridge.py            authenticated KiCad 10 native Specctra bridge
 #     resources/icon.png          toolbar icon (referenced by __init__.py)
-#     bin/konnect                 the MCP server binary
+#     bin/copperpour                 the MCP server binary
 #     bin/schematic-viewer        (optional) live schematic viewer
 #   resources/
 #     icon.png                    icon shown in the PCM dialog
 #
 # The IPC entrypoint in plugin.json is stamped to this platform's binary name
-# (bin/konnect) so the KiCAD 10 IPC action resolves on macOS/Linux, mirroring
-# build-pcm.ps1 which stamps bin/konnect.exe for Windows.
+# (bin/copperpour) so the KiCAD 10 IPC action resolves on macOS/Linux, mirroring
+# build-pcm.ps1 which stamps bin/copperpour.exe for Windows.
 #
 # The package declares the platform it carries binaries for, so KiCAD's PCM
 # only offers it to machines that can run it. A package bundles one native
@@ -28,13 +28,13 @@
 #   packaging/build-pcm.sh [--version X.Y.Z] [--binary PATH] [--viewer PATH]
 #                          [--platform macos|linux] [--out DIR]
 #
-# Defaults: version from Cargo.toml, binary target/release/konnect, platform
+# Defaults: version from Cargo.toml, binary target/release/copperpour, platform
 # from the host, output dist/.
 # Prints the zip path, size, and SHA256 (needed for the kicad-addons metadata).
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-bin_name="konnect"
+bin_name="copperpour"
 
 version=""
 binary="$repo_root/target/release/$bin_name"
@@ -48,7 +48,7 @@ Usage: packaging/build-pcm.sh [--version X.Y.Z] [--binary PATH] [--viewer PATH]
                               [--platform macos|linux] [--out DIR]
 
 Assembles the KiCAD PCM plugin zip (macOS/Linux port of build-pcm.ps1).
-Defaults: version from Cargo.toml, binary target/release/konnect, platform from
+Defaults: version from Cargo.toml, binary target/release/copperpour, platform from
 the host, output dist/.
 EOF
 }
@@ -90,7 +90,7 @@ if [ ! -f "$binary" ]; then
     exit 1
 fi
 
-staging="$(mktemp -d)/konnect-pcm-$version"
+staging="$(mktemp -d)/copperpour-pcm-$version"
 mkdir -p "$staging/plugins/bin" "$staging/plugins/resources" "$staging/resources"
 
 # Plugin files
@@ -111,7 +111,7 @@ cp "$repo_root/packaging/resources/icon.png" "$staging/resources/icon.png"
 cp "$repo_root/packaging/resources/icon.png" "$staging/plugins/resources/icon.png"
 
 # Stamp the IPC entrypoint to this platform's binary name. plugin.json ships a
-# Windows default (bin/konnect.exe); the packaging step is authoritative so a
+# Windows default (bin/copperpour.exe); the packaging step is authoritative so a
 # package built on any OS points at the binary it actually bundles.
 python3 - "$staging/plugins/plugin.json" "bin/$bin_name" <<'PY'
 import json, sys
@@ -156,7 +156,7 @@ mkdir -p "$out_dir"
 # zip runs from inside $staging below; a relative --out would resolve there
 # and fail with "Could not create output file". Absolutize it first.
 out_dir="$(cd "$out_dir" && pwd)"
-zip_path="$out_dir/konnect-pcm-v$version-$platform.zip"
+zip_path="$out_dir/copperpour-pcm-v$version-$platform.zip"
 rm -f "$zip_path"
 ( cd "$staging" && zip -rqX "$zip_path" metadata.json plugins resources )
 
@@ -173,4 +173,4 @@ echo "  download_size:   $size"
 echo "  install_size:    $install_size"
 echo "  download_sha256: $sha"
 echo "  platforms:       [$platform]"
-echo "  download_url:    https://github.com/mixelpixx/Konnect/releases/download/v$version/konnect-pcm-v$version-$platform.zip"
+echo "  download_url:    https://github.com/Copperpour/Copperpour/releases/download/v$version/copperpour-pcm-v$version-$platform.zip"

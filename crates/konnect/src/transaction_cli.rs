@@ -19,7 +19,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
 fn exact_project_path<'a>(args: &'a [String], command: &str) -> Result<&'a Path> {
     if args.len() != 2 {
-        bail!("usage: konnect transaction {command} <project-dir>");
+        bail!("usage: copperpour transaction {command} <project-dir>");
     }
     Ok(Path::new(&args[1]))
 }
@@ -65,7 +65,7 @@ fn recover(project: &Path) -> Result<()> {
 
 fn abandon(args: &[String]) -> Result<()> {
     if args.len() != 4 || args[3] != "--force" {
-        bail!("usage: konnect transaction abandon <project-dir> <transaction-id> --force");
+        bail!("usage: copperpour transaction abandon <project-dir> <transaction-id> --force");
     }
     let project = Path::new(&args[1]);
     let outcome = abandon_file_transaction(project, &args[2]).with_context(|| {

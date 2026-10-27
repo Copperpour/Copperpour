@@ -12,8 +12,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-fn konnect(home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+fn copperpour(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_copperpour"));
     command.env("HOME", home);
     command.env("XDG_CONFIG_HOME", home.join(".config"));
     command
@@ -47,9 +47,9 @@ fn guidance_snapshot(home: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
         }
     }
     for name in [
-        ".konnect/.installed",
-        ".konnect/.installed-claude",
-        ".konnect/.installed-codex",
+        ".copperpour/.installed",
+        ".copperpour/.installed-claude",
+        ".copperpour/.installed-codex",
     ] {
         let path = home.join(name);
         if path.exists() {
@@ -61,7 +61,7 @@ fn guidance_snapshot(home: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
 }
 
 fn start_and_initialize_server(home: &Path, client: &str) {
-    let mut child = konnect(home)
+    let mut child = copperpour(home)
         .args(["--client", client])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -114,12 +114,12 @@ fn mcp_start_does_not_reverse_an_explicit_uninstall() {
     for client in ["claude", "codex"] {
         let temp = tempfile::tempdir().unwrap();
 
-        assert!(konnect(temp.path())
+        assert!(copperpour(temp.path())
             .args(["init", "--client", client])
             .status()
             .unwrap()
             .success());
-        assert!(konnect(temp.path())
+        assert!(copperpour(temp.path())
             .args(["uninstall", "--client", client])
             .status()
             .unwrap()
@@ -129,4 +129,23 @@ fn mcp_start_does_not_reverse_an_explicit_uninstall() {
         start_and_initialize_server(temp.path(), client);
         assert_eq!(guidance_snapshot(temp.path()), before, "client: {client}");
     }
+}
+
+/// `konnect`, the name before the rename, runs `copperpour` with the same
+/// arguments and says so on stderr only.
+#[test]
+fn the_old_name_runs_copperpour() {
+    let output = Command::new(env!("CARGO_BIN_EXE_konnect"))
+        .arg("--version")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("copperpour {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("now called copperpour"));
 }

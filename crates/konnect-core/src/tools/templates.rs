@@ -1,6 +1,6 @@
 //! `templates` toolset — Reference circuit library for validated subcircuit templates.
 //!
-//! Templates are JSON files stored in `~/.konnect/templates/` (user) and
+//! Templates are JSON files stored in `~/.copperpour/templates/` (user) and
 //! shipped as embedded defaults. Claude retrieves a template and adapts it to the
 //! user's project — this prevents hallucinating component values.
 
@@ -201,12 +201,12 @@ fn user_templates_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         let appdata = std::env::var("APPDATA").unwrap_or_default();
-        PathBuf::from(appdata).join("konnect").join("templates")
+        crate::app_dirs::user_dir(&PathBuf::from(appdata), false).join("templates")
     }
     #[cfg(not(target_os = "windows"))]
     {
         let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".konnect").join("templates")
+        crate::app_dirs::user_dir(&PathBuf::from(home), true).join("templates")
     }
 }
 
@@ -726,9 +726,9 @@ mod tests {
         std::env::set_var("APPDATA", &config);
         std::env::set_var("HOME", &config);
         let template_dir = if cfg!(target_os = "windows") {
-            config.join("konnect").join("templates")
+            config.join("copperpour").join("templates")
         } else {
-            config.join(".konnect").join("templates")
+            config.join(".copperpour").join("templates")
         };
         std::fs::create_dir_all(&template_dir).unwrap();
         std::fs::write(

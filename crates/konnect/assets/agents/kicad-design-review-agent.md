@@ -7,6 +7,7 @@ skills:
   - kicad-review
   - kicad-manufacture
 tools:
+  - mcp__copperpour__*
   - mcp__konnect__*
 maxTurns: 25
 ---

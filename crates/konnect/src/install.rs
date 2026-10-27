@@ -93,7 +93,7 @@ fn client_from_args_allowing(args: &[String], also: &[&str]) -> Result<InstallCl
         } else if also.contains(&arg) {
             index += 2;
         } else {
-            bail!("unrecognised argument '{arg}'; run 'konnect --help' for usage");
+            bail!("unrecognised argument '{arg}'; run 'copperpour --help' for usage");
         }
     }
     Ok(selected.unwrap_or_default())
@@ -167,7 +167,8 @@ fn hook_matcher(hook: &crate::manifest::HookSkillManifest) -> Result<String> {
     if names.is_empty() {
         anyhow::bail!("hook '{}' has no registered tool targets", hook.name);
     }
-    Ok(format!("mcp__konnect__({})", names.join("|")))
+    // A client may still register the server under its old name, `konnect`.
+    Ok(format!("mcp__(copperpour|konnect)__({})", names.join("|")))
 }
 
 fn quote_command_arg(argument: &str) -> String {
@@ -213,7 +214,7 @@ fn legacy_hook_command_tail(hook_name: &str) -> String {
 /// Double-click behavior remains Claude-focused for backward compatibility.
 pub fn run_double_click_install() -> Result<()> {
     println!("===========================================");
-    println!("  Konnect v{}", env!("CARGO_PKG_VERSION"));
+    println!("  Copperpour v{}", env!("CARGO_PKG_VERSION"));
     println!("  First-time Setup");
     println!("===========================================\n");
     run_install(InstallClient::Claude)?;
@@ -223,7 +224,7 @@ pub fn run_double_click_install() -> Result<()> {
     println!("\n-------------------------------------------");
     println!("Add this to your Claude MCP config:");
     println!("-------------------------------------------\n");
-    println!(r#"  "konnect": {{"#);
+    println!(r#"  "copperpour": {{"#);
     println!(r#"    "command": "{}","#, exe_str);
     println!(r#"    "env": {{ "RUST_LOG": "info" }}"#);
     println!(r#"  }}"#);
@@ -250,7 +251,7 @@ impl InstallPaths {
     }
 
     fn data_dir(&self) -> PathBuf {
-        self.home.join(".konnect")
+        konnect_core::app_dirs::user_dir(&self.home, true)
     }
 
     fn skills_dir(&self, client: InstallClient) -> PathBuf {
@@ -285,9 +286,9 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
     if verbose {
         match client {
             InstallClient::Claude => {
-                println!("Installing Konnect skills, agents, and hooks for Claude...\n")
+                println!("Installing Copperpour skills, agents, and hooks for Claude...\n")
             }
-            InstallClient::Codex => println!("Installing Konnect skills for Codex...\n"),
+            InstallClient::Codex => println!("Installing Copperpour skills for Codex...\n"),
         }
     }
 
@@ -348,7 +349,7 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
         }
     } else {
         eprintln!(
-            "[konnect] Silent {client} install complete: {skill_count} skills, {agent_count} agents"
+            "[copperpour] Silent {client} install complete: {skill_count} skills, {agent_count} agents"
         );
     }
     Ok(())
@@ -423,7 +424,7 @@ fn install_skills(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
 
 fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) -> Result<()> {
     if verbose {
-        println!("Uninstalling Konnect guidance for {client}...\n");
+        println!("Uninstalling Copperpour guidance for {client}...\n");
     }
 
     let skills_dir = paths.skills_dir(client);
@@ -496,7 +497,7 @@ impl fmt::Display for StatusText<'_> {
         };
         writeln!(
             f,
-            "Konnect v{} — {client} Install Status\n",
+            "Copperpour v{} — {client} Install Status\n",
             env!("CARGO_PKG_VERSION")
         )?;
         writeln!(
@@ -690,8 +691,8 @@ impl ClientGuidance {
             InstallClient::Codex => " --client codex",
         };
         Some(format!(
-            "Konnect {} guidance ({installed_by}) does not match this server v{}: {counts}. \
-             Ask the user to run `konnect init{client_flag}`; it overwrites differing files, \
+            "Copperpour {} guidance ({installed_by}) does not match this server v{}: {counts}. \
+             Ask the user to run `copperpour init{client_flag}`; it overwrites differing files, \
              which may hold their own edits. Do not rewrite these files yourself.",
             self.client,
             env!("CARGO_PKG_VERSION"),
@@ -886,9 +887,12 @@ fn unquote_command_arg(quoted: &str) -> Option<String> {
     (quote_command_arg(&argument) == quoted).then_some(argument)
 }
 
+/// `copperpour`, or `konnect` as it was called before the rename.
 fn is_konnect_executable(path: &str) -> bool {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    name == "konnect" || name.eq_ignore_ascii_case("konnect.exe")
+    ["copperpour", "konnect"]
+        .iter()
+        .any(|program| name == *program || name.eq_ignore_ascii_case(&format!("{program}.exe")))
 }
 
 /// Serves drift for both clients to `get_installation_info` and `initialize`.
@@ -1384,7 +1388,7 @@ mod tests {
         for hook in HOOK_SKILLS {
             let matcher = hook_matcher(hook).unwrap();
             let targets = matcher
-                .strip_prefix("mcp__konnect__(")
+                .strip_prefix("mcp__(copperpour|konnect)__(")
                 .and_then(|value| value.strip_suffix(')'))
                 .unwrap()
                 .split('|')
@@ -1828,10 +1832,10 @@ mod tests {
         assert_eq!(guidance.state().as_str(), "out_of_sync");
         let notice = guidance.notice().unwrap();
         assert!(notice.starts_with(
-            "Konnect Claude guidance (installed by v0.2.2) does not match this server v"
+            "Copperpour Claude guidance (installed by v0.2.2) does not match this server v"
         ));
         assert!(notice.contains(": 2 different, 4 missing."), "{notice}");
-        assert!(notice.contains("`konnect init`"), "{notice}");
+        assert!(notice.contains("`copperpour init`"), "{notice}");
 
         // Detection is read-only.
         assert_eq!(fs::read(paths.claude_settings_path()).unwrap(), before);
@@ -1917,8 +1921,9 @@ mod tests {
         }
     }
 
-    /// Only the exact command `init` writes, for this or another `konnect`
-    /// binary, is ours. A command that ends in the same arguments is not.
+    /// Only the exact command `init` writes, for this or another `copperpour`
+    /// or `konnect` binary, is ours. A command that ends in the same arguments
+    /// is not.
     #[test]
     fn a_command_ending_in_a_hook_tail_is_not_attributed() {
         let temp = TempDir::new().unwrap();
@@ -1946,7 +1951,7 @@ mod tests {
         ];
         for command in &spoofed {
             fs::write(&settings, handlers(std::slice::from_ref(command))).unwrap();
-            for hook in inspect_hooks(&settings, "/usr/bin/konnect") {
+            for hook in inspect_hooks(&settings, "/usr/bin/copperpour") {
                 assert_eq!(hook.status, ItemStatus::Missing, "{command}: {}", hook.name);
             }
         }
@@ -1961,7 +1966,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        let hooks = inspect_hooks(&settings, "/usr/bin/konnect")
+        let hooks = inspect_hooks(&settings, "/usr/bin/copperpour")
             .into_iter()
             .map(|hook| (hook.name, hook.status.as_str(), hook.reason))
             .collect::<Vec<_>>();
@@ -2049,7 +2054,7 @@ mod tests {
             );
             let notice = guidance.notice().unwrap();
             assert!(
-                notice.starts_with("Konnect Codex guidance (unreadable install marker)"),
+                notice.starts_with("Copperpour Codex guidance (unreadable install marker)"),
                 "{notice}"
             );
             assert_eq!(notice.lines().count(), 1);
@@ -2093,8 +2098,11 @@ mod tests {
         assert_eq!(codex.files.len(), 16);
         assert_eq!(file_status(&codex, "kicad-library/SKILL.md"), "missing");
         let notice = codex.notice().unwrap();
-        assert!(notice.starts_with("Konnect Codex guidance"), "{notice}");
-        assert!(notice.contains("`konnect init --client codex`"), "{notice}");
+        assert!(notice.starts_with("Copperpour Codex guidance"), "{notice}");
+        assert!(
+            notice.contains("`copperpour init --client codex`"),
+            "{notice}"
+        );
         assert_eq!(
             inspect_guidance(InstallClient::Claude, &paths, &this_exe())
                 .state()
@@ -2147,8 +2155,8 @@ mod tests {
         let lines = loud.take_notice().unwrap();
         let lines = lines.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("Konnect Claude guidance (installed by v0.2.2)"));
-        assert!(lines[1].starts_with("Konnect Codex guidance (installed by v0.9.0)"));
+        assert!(lines[0].starts_with("Copperpour Claude guidance (installed by v0.2.2)"));
+        assert!(lines[1].starts_with("Copperpour Codex guidance (installed by v0.9.0)"));
     }
 
     /// The first start for an install scans, records the result even when it
@@ -2170,7 +2178,7 @@ mod tests {
         assert_eq!(detail["codex"]["state"], "current");
         let notice = first.take_notice().unwrap();
         assert_eq!(notice.lines().count(), 1, "{notice}");
-        assert!(notice.starts_with("Konnect Claude guidance (installed by v0.2.2)"));
+        assert!(notice.starts_with("Copperpour Claude guidance (installed by v0.2.2)"));
         assert_eq!(first.take_notice(), None, "one advisory per install");
         assert_eq!(first.detail(), detail, "one scan per process");
 
@@ -2247,7 +2255,7 @@ mod tests {
         assert_eq!(changed.detail()["claude"]["checked"], "now");
         assert_eq!(changed.detail()["codex"]["checked"], "earlier");
         let notice = changed.take_notice().unwrap();
-        assert!(notice.starts_with("Konnect Claude guidance (installed by v0.2.3)"));
+        assert!(notice.starts_with("Copperpour Claude guidance (installed by v0.2.3)"));
         assert_eq!(start(&temp).take_notice(), None);
 
         // A binary update over the same install marker stays quiet.

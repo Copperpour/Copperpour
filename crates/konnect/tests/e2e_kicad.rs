@@ -64,7 +64,7 @@ impl Mcp {
         config.flush().unwrap();
         let (_persist, config_path) = config.keep().unwrap();
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_konnect"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_copperpour"))
             .arg("--config")
             .arg(&config_path)
             .stdin(Stdio::piped())

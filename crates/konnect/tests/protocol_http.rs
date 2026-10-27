@@ -47,7 +47,7 @@ impl HttpServer {
         write!(config, r#"{{"transport":"http","http_address":"{addr}"}}"#).unwrap();
         config.flush().unwrap();
 
-        let child = Command::new(env!("CARGO_BIN_EXE_konnect"))
+        let child = Command::new(env!("CARGO_BIN_EXE_copperpour"))
             .arg("--config")
             .arg(config.path())
             .stdin(Stdio::piped()) // piped stdin so it doesn't detect a TTY
@@ -164,7 +164,7 @@ fn streamable_http_conformance() {
     let (status, headers, body) = server.post_mcp(&initialize_msg());
     assert_eq!(status, 200);
     assert!(headers.to_lowercase().contains("application/json"));
-    assert_eq!(body["result"]["serverInfo"]["name"], "konnect");
+    assert_eq!(body["result"]["serverInfo"]["name"], "copperpour");
 
     // 2. POST a notification → 202 Accepted, no body.
     let (status, _, _) = server
