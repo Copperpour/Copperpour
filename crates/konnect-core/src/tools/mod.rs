@@ -17,6 +17,8 @@ pub mod config;
 mod copy_routing_pattern_tests;
 pub(crate) mod cross_probe;
 pub mod design_review;
+#[cfg(test)]
+mod design_rules_tests;
 pub(crate) mod drc;
 pub mod easyeda;
 pub mod editor_navigation;
@@ -948,6 +950,26 @@ pub(crate) fn invalid_arg(field: &str, reason: &str) -> CallToolResult {
             reason: reason.to_string(),
         },
         format!("Argument '{}' is invalid: {}", field, reason),
+    )
+}
+
+/// A persistence step whose result cannot say what is on disk.
+pub(crate) fn file_outcome_uncertain(
+    path: &std::path::Path,
+    operation: &str,
+    reason: String,
+) -> CallToolResult {
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain {
+            operation: operation.to_string(),
+            path: path.display().to_string(),
+            reason: reason.clone(),
+        },
+        format!(
+            "{operation} could not prove what is now on disk at '{}': {reason}. The file may or \
+             may not have been replaced; read it before retrying.",
+            path.display()
+        ),
     )
 }
 
