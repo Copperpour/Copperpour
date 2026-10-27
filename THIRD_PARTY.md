@@ -1,12 +1,12 @@
 # Third-Party Notices
 
-Konnect incorporates data, algorithms, and code ported from the following
-projects. Konnect itself is licensed under the AGPL-3.0 (see LICENSE); the notices
-below travel with every distribution of Konnect.
+Copperpour incorporates data, algorithms, and code ported from the following
+projects. Copperpour itself is licensed under the AGPL-3.0 (see LICENSE); the notices
+below travel with every distribution of Copperpour.
 
 ## topola_specctra
 
-Konnect uses the `topola_specctra` parser, data model, and serializer from the
+Copperpour uses the `topola_specctra` parser, data model, and serializer from the
 [Topola project](https://codeberg.org/topola/topola) to validate and emit
 Specctra DSN syntax. Copyright 2024 Topola contributors; used under the MIT
 license. The MIT permission grant and warranty disclaimer reproduced below
@@ -14,7 +14,7 @@ apply to this dependency.
 
 ## kicad-mcp-pro
 
-Portions of Konnect — including the JLCPCB pick-and-place rotation
+Portions of Copperpour — including the JLCPCB pick-and-place rotation
 correction table (itself community-derived; see also yaqwsx/jlcparts and the
 KiCad forum), placement scoring weights and heuristics, engineering
 calculator formulas and their reference test vectors, and the release-gate

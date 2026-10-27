@@ -37,7 +37,7 @@ guarantee. Record the catalogue date and recheck the order before payment.
 
 ## 3. Bind BOM and CPL to current templates
 
-Generate BOM and position data through Konnect, then compare the exported headers,
+Generate BOM and position data through Copperpour, then compare the exported headers,
 units, side names, origin, delimiter, and designator grouping with the templates
 offered by the selected service. Map the project supplier field deliberately;
 do not assume one historical column spelling remains mandatory.

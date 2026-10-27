@@ -9,7 +9,7 @@ argument-hint: "[fab house or export task]"
 
 # KiCAD Manufacturing & Fabrication Workflow
 
-Prepare manufacturing outputs through Konnect MCP tools. Treat each tool result
+Prepare manufacturing outputs through Copperpour MCP tools. Treat each tool result
 as evidence with a named scope: a successful request is not by itself proof of a
 complete, current, upload-ready package. A required check or artifact that cannot
 be established makes the manufacturing verdict `INCOMPLETE`.
@@ -128,7 +128,7 @@ emits `BOM-<project>.csv` plus `CPL-<project>.csv`; the CPL uses JLCPCB's
 enumerate grouped BOM references instead of compressing them into ranges. DNP
 parts are excluded from both native exports; any remaining population mismatch
 caused by board/schematic exclusion flags makes the package incomplete. This
-conversion applies Konnect's independently verified built-in CPL correction
+conversion applies Copperpour's independently verified built-in CPL correction
 policy. Pass a checked-in project policy through
 `jlcpcb_cpl_corrections_path` when an unmatched footprint or one exact
 designator needs a correction. The precedence and JSON format are documented in

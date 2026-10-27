@@ -97,4 +97,4 @@ inside a repeated sheet ties every instance's 5V together.
 - Components: minimum 5.08mm (4 grid units) between component bodies
 - Labels: place at wire endpoints, not floating in space
 - Power symbols: directly on component power pins when possible
-- Junctions: added automatically by Konnect at T-intersections
+- Junctions: added automatically by Copperpour at T-intersections

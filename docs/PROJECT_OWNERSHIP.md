@@ -1,6 +1,6 @@
 # Schematic project ownership
 
-Konnect resolves saved schematic ownership by parsing candidate projects' sheet
+Copperpour resolves saved schematic ownership by parsing candidate projects' sheet
 trees. Directory ancestry alone does not establish ownership (#189). The shared
 resolver serves symbol placement, library resolution, and ERC root detection.
 Relative target paths are anchored at the process working directory before

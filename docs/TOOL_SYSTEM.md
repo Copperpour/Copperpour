@@ -1,6 +1,6 @@
 # Tool System
 
-Konnect exposes always-visible meta-tools plus domain toolsets loaded on demand.
+Copperpour exposes always-visible meta-tools plus domain toolsets loaded on demand.
 The implementation is split between `crates/konnect-core/src/mcp`, `router`, and
 `tools`.
 

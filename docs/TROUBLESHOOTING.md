@@ -16,7 +16,7 @@ Always inspect the fabricator's placement preview before ordering.
 
 ## IPC operation returned `ipc_outcome_unknown`
 
-Stop automatic retries. Konnect sent a request but could not establish its
+Stop automatic retries. Copperpour sent a request but could not establish its
 outcome, or a transaction's attempted rollback failed. The live board may
 contain some or all of the requested changes; this is not proof that nothing
 happened. The structured error reports `board_state: unknown` and
@@ -32,7 +32,7 @@ undo will reverse a pending, unpublished commit.
 
 ## Schematic sync returned `ipc_batch_recovered`
 
-The apply was aborted after a late IPC reply, not published. Konnect confirmed
+The apply was aborted after a late IPC reply, not published. Copperpour confirmed
 the known commit was dropped and compared a fresh serialized live snapshot
 with the exact target's pre-apply snapshot. This reports `board_state: unchanged`,
 `drop_confirmed: true`, and `retry_safe: false`. Review the live board and run a
@@ -48,10 +48,10 @@ Sync creates are sent in ordered groups of at most 32 footprints, with every
 group and the updates inside one KiCad commit. A successful apply is one Undo
 entry, not one entry per group. This bounds the item count, not the serialized
 request bytes: it does not establish KiCad's listener size limit or eliminate
-timeouts. A rejected or uncertain group stops the apply; Konnect never retries
+timeouts. A rejected or uncertain group stops the apply; Copperpour never retries
 it or publishes a partial group sequence automatically.
 
-## Which Konnect binary is this client using?
+## Which Copperpour binary is this client using?
 
 Call the always-visible `get_installation_info` tool in the affected MCP
 session. The result comes from the process serving that call and includes its
@@ -63,7 +63,7 @@ same path, KiCad CLI version, redacted IPC endpoint, and restart guidance.
 both stable versions can be parsed and the on-disk binary is newer. `null`
 means the comparison could not be proven, not that the process is current.
 Likewise, `installation.source: "unknown"` means no trusted package manifest
-identified the channel; Konnect does not guess from directory names. Endpoint
+identified the channel; Copperpour does not guess from directory names. Endpoint
 credentials and query or fragment data are redacted.
 
 Follow the returned platform-specific guidance, restart the MCP client (and
@@ -72,7 +72,7 @@ to verify the process that actually restarted. This diagnostic writes nothing.
 
 ## Installed guidance is out of date
 
-`copperpour init` writes skills, agents, and Claude hooks once. Upgrading Konnect
+`copperpour init` writes skills, agents, and Claude hooks once. Upgrading Copperpour
 does not touch them, so an older install keeps advising the old tools. Run
 `copperpour status` (add `--client codex` for Codex) with the binary your MCP
 client uses. Each file and hook is compared with that binary's bundle:
@@ -86,7 +86,7 @@ client uses. Each file and hook is compared with that binary's bundle:
 
 A `different` hook carries a reason: `legacy_handler` is the pre-hook-JSON
 `… skill <name>` form, which Claude ignores, and `other_executable` is a hook
-that runs another Konnect binary, written exactly as `copperpour init` writes it.
+that runs another Copperpour binary, written exactly as `copperpour init` writes it.
 
 The serving process makes the same comparison for both clients once per
 installed guidance version, meaning each install marker. The first start
@@ -105,18 +105,18 @@ update. It overwrites `different` files, so save any edits you made first.
 Any tool that talks to a live KiCAD session (`save_project`, PCB editing,
 `check_kicad_ui`, …) needs the IPC socket address.
 
-**At startup** — once, and only then — Konnect resolves it in order: the
+**At startup** — once, and only then — Copperpour resolves it in order: the
 `ipc_address` in your config, then `KICAD_API_SOCKET` (set only for plugins
 KiCad launches itself), then the platform default — `<temp dir>/kicad/api.sock`,
 used only if something is actually listening there. The startup log on stderr
 says which it picked, and warns when nothing was found.
 
-So **if KiCad is already running with the API enabled when Konnect starts**,
+So **if KiCad is already running with the API enabled when Copperpour starts**,
 no configuration is needed on any platform. That order matters and is easy to
-get wrong: an MCP client normally launches the Konnect server itself, before
-you open KiCad. Konnect does not re-probe afterwards, so a server started first
+get wrong: an MCP client normally launches the Copperpour server itself, before
+you open KiCad. Copperpour does not re-probe afterwards, so a server started first
 stays unresolved for its whole life no matter what you open later. Start KiCad
-first, or restart the Konnect server (in most clients, reconnect the MCP
+first, or restart the Copperpour server (in most clients, reconnect the MCP
 server) once KiCad is up — or set `ipc_address` explicitly, which never depends
 on ordering.
 
@@ -131,8 +131,8 @@ be configured by hand (#529); if you are on a Konnect older than that fix, set
 If the address is unresolved, both of the following must be correct — neither
 happens automatically:
 
-1. **The socket path in Konnect's plugin settings** (inside KiCAD)
-2. **The Konnect server registration in your AI client's MCP config**
+1. **The socket path in Copperpour's plugin settings** (inside KiCAD)
+2. **The Copperpour server registration in your AI client's MCP config**
 
 Step by step (based on the diagnostic guide contributed in
 [#18](https://github.com/mixelpixx/Konnect/issues/18)):
@@ -147,7 +147,7 @@ Step by step (based on the diagnostic guide contributed in
 
    Copy the whole address including the `ipc://` prefix — it is unique to
    your machine and user.
-3. In KiCAD, open **Tools → External Plugins → Konnect** to open the settings
+3. In KiCAD, open **Tools → External Plugins → Copperpour** to open the settings
    dialog.
 4. Paste the address into the **IPC Socket** field and click **Save**.
 5. Confirm your AI client (Claude Code, Claude Desktop, …) has the `konnect`
@@ -155,7 +155,7 @@ Step by step (based on the diagnostic guide contributed in
    `claude_desktop_config.json`) pointing at the `konnect` binary — see
    [examples/](../examples/). This registration is separate from the KiCAD
    plugin settings.
-6. Restart the AI client session so it spawns a fresh Konnect process that
+6. Restart the AI client session so it spawns a fresh Copperpour process that
    reads the saved settings.
 7. Verify: have the AI call `open_project`. Expected:
 
@@ -191,7 +191,7 @@ apart cases that used to share one `false`, and each has a different fix:
 |---|---|---|
 | `not_configured` | No address was configured or discovered. | See ["KiCAD IPC socket path not configured"](#kicad-ipc-socket-path-not-configured). |
 | `no_listener` | Nothing is listening at the address. | Open an editor with the API enabled, and check the address against KiCad's "Listening on" line. |
-| `access_denied` | The operating system refused this account access to the endpoint. Likely a different account or a restrictive ACL. | Run Konnect as the same operating-system user as KiCad; see below. |
+| `access_denied` | The operating system refused this account access to the endpoint. Likely a different account or a restrictive ACL. | Run Copperpour as the same operating-system user as KiCad; see below. |
 | `handshake_failed` | A listener accepted the connection and did not complete NNG's handshake. | Another program holds KiCad's address ([#52](https://github.com/Copperpour/Copperpour/issues/52)). Close it, then restart KiCad so it can bind. |
 | `transport_error` | Any other dial or send failure. | Read `message`. |
 | `request_failed` | The request did not complete and may have reached the endpoint. A KiCad status in `message` (for example `AS_NOT_READY` while an editor is still loading) proves it did; a receive timeout or a malformed reply does not. | With a KiCad status: wait for the editor to finish loading, then retry. Without one: treat the endpoint as unproven and check what holds the address. |
@@ -210,11 +210,11 @@ proves only that the operating system denied this account. The likely cause in
 that setup: KiCad's endpoint was created by the desktop user, and a Windows
 named pipe created without an explicit security descriptor gives full control
 only to its creator and read access to everyone else, while a request needs
-both read and write. A Konnect started inside the sandbox is then refused,
+both read and write. A Copperpour started inside the sandbox is then refused,
 however its address is configured. A restrictive ACL on the pipe produces the
 same kind.
 
-The known workaround: run Konnect outside the sandbox, as the same user as
+The known workaround: run Copperpour outside the sandbox, as the same user as
 KiCad, over HTTP:
 
 ```toml
@@ -251,7 +251,7 @@ is a tool error, and it says so.
 
 KiCad 10.x's IPC API covers the PCB editor; the schematic editor arrives with
 KiCad 11. A KiCad 10 schematic editor still answers the open-documents query,
-but with the sheet's file name only: no project and no sheet path. Konnect
+but with the sheet's file name only: no project and no sheet path. Copperpour
 cannot address a schematic without both and does not guess them from the
 saved file, the board or your arguments. So on KiCad 10:
 
@@ -278,7 +278,7 @@ refused before anything was sent. Nothing on the board changed.
 This refusal exists because the alternative is worse. KiCAD 10.0.5 does not
 validate the layer field on an incoming item, so an unrepresentable value used
 to reach it and **terminate the process**, discarding any unsaved board
-([#237](https://github.com/mixelpixx/Konnect/issues/237)). Konnect now stops at
+([#237](https://github.com/mixelpixx/Konnect/issues/237)). Copperpour now stops at
 its own boundary instead.
 
 Every layer a KiCAD 10 footprint can legally draw on is supported, including
@@ -294,12 +294,12 @@ Update to v0.6.1 or later.
 
 ## `unsafe_file_fallback` after KiCad disappears
 
-Konnect remembers each board it positively observes open through IPC during the
+Copperpour remembers each board it positively observes open through IPC during the
 current server process. If IPC later becomes unreachable, a board-file mutation
 for that same board fails with `error.kind: "unsafe_file_fallback"` instead of
 editing the saved file. KiCad may have crashed or been force-quit with unsaved
 state, so the saved `.kicad_pcb` is not known to be authoritative. The error
-confirms that Konnect left it unchanged
+confirms that Copperpour left it unchanged
 ([#240](https://github.com/mixelpixx/Konnect/issues/240)).
 
 KiCad running with no PCB editor open is *not* this state: nothing was ever
@@ -321,19 +321,19 @@ Recover deliberately:
 3. Continue through live IPC.
 
 If KiCad was intentionally closed cleanly and closed-board mode is desired,
-first confirm that the saved file is authoritative, then restart Konnect to
+first confirm that the saved file is authoritative, then restart Copperpour to
 begin a new server session. Repeating the tool call does not clear the safety
-memory, and an agent must not restart Konnect or edit `.kicad_pcb` directly to
+memory, and an agent must not restart Copperpour or edit `.kicad_pcb` directly to
 bypass the refusal.
 
 This memory is intentionally process-local. It cannot detect a KiCad crash that
-happened before the current Konnect process started. File-fallback success
+happened before the current Copperpour process started. File-fallback success
 therefore carries a warning describing that cold-start limitation.
 
 ## `invalid_configuration` from a config tool
 
 `load_user_config`, `get_effective_config` or a save refuses with
-`error.kind: "invalid_configuration"` when a Konnect preferences file exists
+`error.kind: "invalid_configuration"` when a Copperpour preferences file exists
 but cannot be used. `error.path` names the file and `error.reason` starts with
 `malformed_json:` (invalid JSON, or a root that is not an object — often a
 truncated write or a hand edit) or `unreadable:` (permissions, a directory at
@@ -388,7 +388,7 @@ wrong", which otherwise look identical.
 ## Native Specctra export used the Rust fallback
 
 The KiCad-native exporter is an optional KiCad 10 compatibility path. Open the
-PCB Editor, choose **Tools → External Plugins → Konnect**, enable **KiCad 10
+PCB Editor, choose **Tools → External Plugins → Copperpour**, enable **KiCad 10
 native Specctra bridge**, save, and close the dialog. The status changes to
 running after the setting is applied. The requested board must be saved and be
 the active PCB Editor document.
@@ -404,21 +404,21 @@ per-session bearer token. Registration and temporary DSN files live under the
 per-user local-data directory (`%LOCALAPPDATA%\copperpour\native-bridge` on
 Windows); `COPPERPOUR_BRIDGE_DIR` overrides it for diagnostics and tests. A clean
 plugin shutdown removes its own registration and temporary files. Stale
-registrations left by a hard KiCad crash are ignored because Konnect probes and
+registrations left by a hard KiCad crash are ignored because Copperpour probes and
 authenticates each candidate before use.
 
 This option is unavailable on KiCad 11 after removal of the legacy SWIG Python
-API. Konnect then uses its Rust exporter unless KiCad gains an equivalent
+API. Copperpour then uses its Rust exporter unless KiCad gains an equivalent
 supported IPC operation.
 
 ## A schematic write is blocked by a KiCad editor lock
 
-Konnect refuses to change a `.kicad_sch` file while the sibling
+Copperpour refuses to change a `.kicad_sch` file while the sibling
 `~<name>.kicad_sch.lck` exists. Close the schematic editor normally and retry.
 Read-only schematic tools remain available while the lock exists.
 
 KiCad's lock stores only a username and hostname, not a process identifier or
-document-instance token. Konnect therefore cannot distinguish a live lock from
+document-instance token. Copperpour therefore cannot distinguish a live lock from
 one left by a crash without risking unsaved editor state. It treats valid,
 foreign-host, empty, and malformed locks alike and never removes one
 automatically. If KiCad crashed, first confirm that no schematic editor owns the
@@ -429,21 +429,21 @@ the lock. Remove a confirmed stale lock manually only as a last resort.
 
 Multi-file schematic changes persist a `.konnect-transaction-<id>.json`
 write-ahead journal in the project before changing any target. On restart,
-Konnect safely completes files that still match either the recorded before
+Copperpour safely completes files that still match either the recorded before
 image or intended replacement. It never overwrites a file changed by KiCad or
 another process after the journal was written.
 
 Inspect active journals without printing their contents:
 
 ```text
-konnect transaction status <project-dir>
+copperpour transaction status <project-dir>
 ```
 
 Each target is reported as `pending`, `applied`, or `divergent`. Retry safe
 recovery with:
 
 ```text
-konnect transaction recover <project-dir>
+copperpour transaction recover <project-dir>
 ```
 
 If a target is divergent, first inspect the schematic in KiCad and preserve
@@ -451,7 +451,7 @@ the version you want. To unblock future transactions without changing any
 schematic file, explicitly abandon the journal:
 
 ```text
-konnect transaction abandon <project-dir> <transaction-id> --force
+copperpour transaction abandon <project-dir> <transaction-id> --force
 ```
 
 Abandonment renames the journal to
@@ -513,10 +513,10 @@ tool name — so it does nothing for a client whose tool list is stale.
 
 ## VS Code Copilot says a tool is "currently disabled by the user"
 
-That exact message comes from the VS Code Copilot client layer, not Konnect.
+That exact message comes from the VS Code Copilot client layer, not Copperpour.
 In the confirmed report in
 [#325](https://github.com/mixelpixx/Konnect/issues/325), the attempted calls did
-not appear in Konnect's `get_recent_calls` output because Copilot refused them
+not appear in Copperpour's `get_recent_calls` output because Copilot refused them
 before they reached the server.
 
 Two Copilot behaviors make the normal toolset settings ineffective:
@@ -524,13 +524,13 @@ Two Copilot behaviors make the normal toolset settings ineffective:
 - With `eager_toolsets = false`, Copilot caches the initial `tools/list` and
   does not re-fetch it after `notifications/tools/list_changed`. Tools loaded
   later therefore remain unavailable to the model.
-- With `eager_toolsets = true`, Konnect advertises its full catalog at startup,
+- With `eager_toolsets = true`, Copperpour advertises its full catalog at startup,
   but Copilot applies its own total callable-tool budget across all configured
   MCP servers. The #325 reporter measured a 128-tool ceiling and saw only an
-  arbitrary, changing subset of Konnect tools exposed. Tools outside that
+  arbitrary, changing subset of Copperpour tools exposed. Tools outside that
   subset produced "currently disabled by the user."
 
-Changing Konnect from stdio to HTTP/SSE does not remove a limit applied by the
+Changing Copperpour from stdio to HTTP/SSE does not remove a limit applied by the
 client after it receives `tools/list`. Reloading the VS Code window also does
 not make an over-budget catalog callable.
 
@@ -538,17 +538,17 @@ Current options are:
 
 1. Disable unrelated MCP servers or tools if that brings the complete set you
    need below the client's budget.
-2. Use an MCP client that honors `tools/list_changed` or can expose Konnect's
+2. Use an MCP client that honors `tools/list_changed` or can expose Copperpour's
    full catalog.
 3. Use the community two-tool proxy pattern demonstrated in
    [the #325 follow-up](https://github.com/mixelpixx/Konnect/issues/325#issuecomment-5407317596):
    expose only `konnect_help` and `konnect_call` to Copilot, let
    `konnect_help()` list names or return one tool's description and schema,
    and let `konnect_call(tool, arguments)` forward the actual call to a child
-   Konnect process started with `eager_toolsets = true`.
+   Copperpour process started with `eager_toolsets = true`.
 
 The proxy is a community workaround attached to the issue, not code shipped or
-reviewed by Konnect; inspect it and configure its executable path before use.
+reviewed by Copperpour; inspect it and configure its executable path before use.
 A native compact tool-surface mode and MCP tool-directory resource are tracked
 in [#60](https://github.com/Copperpour/Copperpour/issues/60), but are not available yet.
 

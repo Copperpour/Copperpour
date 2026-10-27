@@ -1,6 +1,6 @@
 # KiCad Integration
 
-Konnect uses direct KiCad file editing, KiCad IPC, and `kicad-cli`. The correct
+Copperpour uses direct KiCad file editing, KiCad IPC, and `kicad-cli`. The correct
 path depends on the operation and whether KiCad currently owns the document.
 
 ## Schematic File Editing
@@ -72,7 +72,7 @@ review.
 The observation preserves project and `DocumentSpecifier` sheet/board identity
 and labels its evidence as live IPC. KiCad 10 has no stable typed query for the
 foreground frame, active document, or active schematic sheet, so those fields
-remain unavailable; Konnect does not infer active state from open-document
+remain unavailable; Copperpour does not infer active state from open-document
 order. The same capability record reports stable typed activation and reveal
 as unsupported rather than routing callers through arbitrary `RunAction`
 strings.
@@ -99,7 +99,7 @@ fail closed before any editor mutation.
 Selection mutation uses KiCad's typed `ClearSelection`, `AddToSelection`, and
 `RemoveFromSelection` commands only after every non-clear KIID resolves in the
 explicit saved project/document/sheet. The transport response is not treated
-as success: Konnect performs a fresh exact-context `GetSelection`, compares the
+as success: Copperpour performs a fresh exact-context `GetSelection`, compares the
 entire observed set with the expected before/after transition, and returns a
 structured `readback_mismatch` if KiCad did not make precisely that change.
 Duplicate or empty KIID requests are rejected before IPC.
@@ -145,14 +145,14 @@ schematic, `run_drc` reads that statement and reports the category as
 unchecked, with a diagnostic naming the root it would have read, rather than
 as zero. A non-empty parity array is kept as KiCad's evidence regardless.
 
-Konnect's Freerouting bridge keeps the KiCad and routing responsibilities
+Copperpour's Freerouting bridge keeps the KiCad and routing responsibilities
 separate: `export_specctra_dsn` snapshots the live board and writes a
 revision-bound DSN job, `route_specctra_dsn` drives the discovered local JAR
 through Freerouting's native headless MCP server, and
 `plan_specctra_ses_import` / `apply_specctra_ses` validate and apply the result
 through one KiCad undo transaction. Board data stays local, output files are
 created without replacement, and the Freerouting child process is bounded and
-owned by Konnect.
+owned by Copperpour.
 
 On KiCad 10, `export_specctra_dsn` can optionally use the legacy Python
 ActionPlugin as a deliberately narrow native-export bridge. The plugin calls
@@ -173,7 +173,7 @@ through Python.
 
 ## Configuration
 
-Konnect selects the first existing server configuration file in the order below
+Copperpour selects the first existing server configuration file in the order below
 and loads only that file. It does not merge settings from later locations. Call
 `get_installation_info` to see which file configured the running process and
 which later files were shadowed.
