@@ -1,6 +1,6 @@
 //! The names Copperpour's files and environment variables go by.
 //!
-//! Copperpour was called Konnect, then LibreKonnect. A directory still under
+//! Copperpour was called Konnect. A directory still under
 //! the Konnect name is renamed the first time it is used, so config, logs,
 //! caches and project state carry over. A `KONNECT_*` variable is still read
 //! when its `COPPERPOUR_*` replacement is not set.

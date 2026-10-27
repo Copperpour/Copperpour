@@ -2,10 +2,7 @@
 
 <div align="center">
 
-<img src="resources/images/KiCAD-MCP-Server-rust.svg" alt="KiCAD-MCP-Server Logo" height="240" />
-
-
-# Copperpour *BETA Release
+# Copperpour
 
 </div>
 
@@ -23,12 +20,11 @@ that teach Claude KiCAD conventions out of the box.
 > see [CONTRIBUTING.md](CONTRIBUTING.md) and the
 > [naming conventions](docs/NAMING_CONVENTIONS.md).
 >
-> **Formerly Konnect and LibreKonnect.** Copperpour is the community-maintained
-> AGPL-3.0 continuation of [`mixelpixx/Konnect`](https://github.com/mixelpixx/Konnect),
-> which went closed source in October 2026. It began as LibreKonnect, whose `v0.14.0`
-> integrated 60 open community pull requests and fixes on top of Konnect `v0.13.0` —
-> see [docs/UPSTREAM_BACKLOG.md](docs/UPSTREAM_BACKLOG.md). Upgrading? See
-> [Migrating from Konnect](#migrating-from-konnect-or-librekonnect).
+> **Formerly Konnect.** Copperpour is the community-maintained AGPL-3.0
+> continuation of [`mixelpixx/Konnect`](https://github.com/mixelpixx/Konnect), which
+> went closed source in October 2026. Its `v0.14.0` integrated 60 open community pull
+> requests and fixes on top of Konnect `v0.13.0`. Upgrading? See
+> [Migrating from Konnect](#migrating-from-konnect).
 
 ## Why Copperpour exists
 
@@ -280,15 +276,15 @@ Edit `%APPDATA%\Claude\claude_desktop_config.json`:
 Restart Claude Desktop and the Copperpour tools appear. For Claude Code, drop the same
 snippet into a `.mcp.json` in your project root (see [examples/](examples/)).
 
-## Migrating from Konnect or LibreKonnect
+## Migrating from Konnect
 
 Copperpour is a separate KiCad package from Konnect, with its own identifier, so
 KiCad installs it beside Konnect rather than over it.
 
 1. If you ran `konnect init`, run `konnect uninstall` first. It removes the hooks
    that start the old binary, which stop working once its package is gone.
-2. Install the Copperpour package, then uninstall Konnect (or LibreKonnect) in the
-   Plugin and Content Manager.
+2. Install the Copperpour package, then uninstall Konnect in the Plugin and
+   Content Manager.
 3. Point your MCP client at the new binary, `copperpour` (`copperpour.exe` on
    Windows), as shown above. Renaming the server entry from `konnect` to
    `copperpour` is optional: the bundled hooks and agents accept both names. A
@@ -333,8 +329,7 @@ the main workspace — see [DEV.md](DEV.md) for build steps.
 
 - KiCAD 10 (Windows is the most-tested platform; macOS works from the release
   binaries or a source build — see the [macOS section](#macos) above. Linux
-  compiles and passes tests in CI but hasn't had per-platform QA yet; both are
-  tracked on the [roadmap](ROADMAP.md))
+  compiles and passes tests in CI but hasn't had per-platform QA yet)
 - `kicad-cli` (ships with KiCAD — used for exports, ERC, DRC)
 - For most PCB tools: KiCAD running with the target board open (IPC API).
   `place_component`, `move_component`, `rotate_component`, and (on KiCAD
@@ -394,10 +389,5 @@ works only when passed with `--config`.)
 
 ## Support
 
-- Community Discord: [join the Konnect community](https://discord.gg/NVp9RGMmDu)
-  for installation help, AI-client setup, design-workflow discussion,
-  contributor coordination, and live project-status updates
 - Issues & feature requests: [GitHub Issues](https://github.com/Copperpour/Copperpour/issues)
-- Upstream backlog & merged PRs: [docs/UPSTREAM_BACKLOG.md](docs/UPSTREAM_BACKLOG.md)
-- Roadmap: [ROADMAP.md](ROADMAP.md)
 - Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)

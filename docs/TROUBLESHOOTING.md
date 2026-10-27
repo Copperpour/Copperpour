@@ -192,7 +192,7 @@ apart cases that used to share one `false`, and each has a different fix:
 | `not_configured` | No address was configured or discovered. | See ["KiCAD IPC socket path not configured"](#kicad-ipc-socket-path-not-configured). |
 | `no_listener` | Nothing is listening at the address. | Open an editor with the API enabled, and check the address against KiCad's "Listening on" line. |
 | `access_denied` | The operating system refused this account access to the endpoint. Likely a different account or a restrictive ACL. | Run Konnect as the same operating-system user as KiCad; see below. |
-| `handshake_failed` | A listener accepted the connection and did not complete NNG's handshake. | Another program holds KiCad's address ([#531](https://github.com/mixelpixx/Konnect/issues/531)). Close it, then restart KiCad so it can bind. |
+| `handshake_failed` | A listener accepted the connection and did not complete NNG's handshake. | Another program holds KiCad's address ([#52](https://github.com/Copperpour/Copperpour/issues/52)). Close it, then restart KiCad so it can bind. |
 | `transport_error` | Any other dial or send failure. | Read `message`. |
 | `request_failed` | The request did not complete and may have reached the endpoint. A KiCad status in `message` (for example `AS_NOT_READY` while an editor is still loading) proves it did; a receive timeout or a malformed reply does not. | With a KiCad status: wait for the editor to finish loading, then retry. Without one: treat the endpoint as unproven and check what holds the address. |
 
@@ -549,9 +549,8 @@ Current options are:
 
 The proxy is a community workaround attached to the issue, not code shipped or
 reviewed by Konnect; inspect it and configure its executable path before use.
-A native compact tool-surface mode and MCP tool-directory resource are planned
-in the [client compatibility roadmap](../ROADMAP.md#4-client-compatibility),
-but are not available yet.
+A native compact tool-surface mode and MCP tool-directory resource are tracked
+in [#60](https://github.com/Copperpour/Copperpour/issues/60), but are not available yet.
 
 ## Muse (Meta) never sees tools loaded after startup
 

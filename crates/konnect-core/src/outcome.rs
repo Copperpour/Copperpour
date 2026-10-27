@@ -218,7 +218,8 @@ mod tests {
             );
             for issue in entry.tracking_issues {
                 assert!(
-                    issue.starts_with("https://github.com/mixelpixx/Konnect/issues/")
+                    (issue.starts_with("https://github.com/Copperpour/Copperpour/issues/")
+                        || issue.starts_with("https://github.com/mixelpixx/Konnect/issues/"))
                         && issue
                             .rsplit('/')
                             .next()
