@@ -42,3 +42,17 @@ The "KiCad writes" column is what `kicad-cli sch upgrade --force` writes for the
 same items after `fix_connectivity` and `move_labels_by_offset` run. Before the
 fix, a KiCad resave changed exactly those three lines. After it, the resave
 leaves the file byte-identical.
+
+## A zero-length stub (#143)
+
+`connect_to_net` with `reference: "R1"`, `pin_number: "2"`, `net: "RST"` and
+`stub_length: 0` adds one label, `RST` at `(139.7, 105.41)`, and no wire. KiCad
+10.0.6 on the result:
+
+| Check | As committed | After the call |
+|---|---|---|
+| `kicad-cli sch export netlist`, `R1` pin 2 | `unconnected-(R1-Pad2)` | `/RST` |
+| `kicad-cli sch erc --severity-all` | `pin_not_connected` on `R1` pin 2 | `isolated_pin_label` on `RST` instead; 11 violations either way |
+
+The label alone names the pin's net, so the wire the tool used to write added
+nothing.
