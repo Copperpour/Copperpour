@@ -682,24 +682,32 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    struct TemplateEnvironment {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        old_appdata: Option<std::ffi::OsString>,
-        old_home: Option<std::ffi::OsString>,
-    }
-
-    impl Drop for TemplateEnvironment {
-        fn drop(&mut self) {
-            restore_env("APPDATA", self.old_appdata.take());
-            restore_env("HOME", self.old_home.take());
+    /// Runs `test` again in a child process whose `HOME` and `APPDATA` are a
+    /// fresh directory, and returns whether this is that child. Setting them
+    /// in this process moved every parallel test's lock directory into a
+    /// directory that was then deleted (#160).
+    fn in_isolated_home(test: &str) -> bool {
+        const CHILD: &str = "COPPERPOUR_TEST_TEMPLATE_HOME_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
         }
-    }
-
-    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
-        match value {
-            Some(value) => std::env::set_var(name, value),
-            None => std::env::remove_var(name),
-        }
+        // The child inherits the `KICAD*_DIR` variables other tests set.
+        let _guard = KICAD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD, "1")
+            .env("APPDATA", home.path())
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
     }
 
     fn test_ctx() -> Arc<ToolContext> {
@@ -717,19 +725,10 @@ mod tests {
         ))
     }
 
-    fn template_fixture() -> (tempfile::TempDir, std::path::PathBuf, TemplateEnvironment) {
-        let guard = KICAD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    /// Run only inside [`in_isolated_home`], since it writes a user template.
+    fn template_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("config");
-        let old_appdata = std::env::var_os("APPDATA");
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("APPDATA", &config);
-        std::env::set_var("HOME", &config);
-        let template_dir = if cfg!(target_os = "windows") {
-            config.join("copperpour").join("templates")
-        } else {
-            config.join(".copperpour").join("templates")
-        };
+        let template_dir = user_templates_dir();
         std::fs::create_dir_all(&template_dir).unwrap();
         std::fs::write(
             template_dir.join("one_resistor.json"),
@@ -761,12 +760,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("derived_lib_name.kicad_pro"), "{}\n").unwrap();
 
-        let environment = TemplateEnvironment {
-            _guard: guard,
-            old_appdata,
-            old_home,
-        };
-        (dir, schematic, environment)
+        (dir, schematic)
     }
 
     async fn call_registered(
@@ -784,7 +778,12 @@ mod tests {
 
     #[tokio::test]
     async fn apply_template_uses_project_identity_and_leaves_batch_writes_usable() {
-        let (_dir, schematic, _environment) = template_fixture();
+        if !in_isolated_home(
+            "tools::templates::tests::apply_template_uses_project_identity_and_leaves_batch_writes_usable",
+        ) {
+            return;
+        }
+        let (_dir, schematic) = template_fixture();
         let ctx = test_ctx();
 
         let applied = call_registered(
@@ -845,7 +844,12 @@ mod tests {
 
     #[tokio::test]
     async fn apply_template_refuses_malformed_instance_metadata_without_writing() {
-        let (_dir, schematic, _environment) = template_fixture();
+        if !in_isolated_home(
+            "tools::templates::tests::apply_template_refuses_malformed_instance_metadata_without_writing",
+        ) {
+            return;
+        }
+        let (_dir, schematic) = template_fixture();
         let malformed = std::fs::read_to_string(&schematic).unwrap().replacen(
             "(project \"derived_lib_name\"",
             "(project \"\"",
