@@ -15,7 +15,7 @@ Issue: #
 ### Architectural fit
 
 <!--
-Does this change extend an existing KiCad capability or shared Konnect module?
+Does this change extend an existing KiCad capability or shared Copperpour module?
 If it introduces a workaround or duplicates behavior, explain why and when it
 can be retired. Keep the answer short; documentation-only changes may say N/A.
 This is a design review signal, not a requirement to migrate unrelated legacy behavior.
@@ -90,14 +90,9 @@ mark individual inapplicable rows with a reason. Do not invent runtime evidence.
 
 ## Maintainer merge state
 
-<!-- Maintainers complete this section. Auto-merge is an execution mechanism, not approval. -->
+<!-- Maintainers complete this section. -->
 
-- [ ] The PR has exactly one current `status:*` workflow label.
-- [ ] `status:ready-to-merge` applies to this exact head SHA.
-- [ ] The completed review is recorded; only stale automatic CODEOWNERS requests
-  were cleared under the review-request workflow (manual requests remain open).
+- [ ] A maintainer approved this exact head SHA, or a maintainer authored the PR.
 - [ ] All required checks and review conversations satisfy the `main` ruleset.
-- [ ] Merge authorization is established: standing authorization applies to a
-  `@mixelpixx`/`@neusse` PR, or explicit authorization names this exact head.
-- [ ] Auto-merge uses a merge commit, or an already-green PR will be merged with `gh pr merge N --merge`.
-- [ ] Terminal issue closure and the next PR to promote are identified.
+- [ ] A change in the other maintainer's CODEOWNERS area has their review.
+- [ ] It will be merged with `gh pr merge N --merge`, and the issues it closes are identified.
