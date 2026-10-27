@@ -3562,16 +3562,34 @@ mod jlcpcb_cache_tests {
         ).unwrap();
 
         // 1. Unhyphenated MPN query finds hyphenated part
-        assert_eq!(search_lcsc_ids(&db_path, "STM32F103C8T6").await, vec!["C8734"]);
-        assert_eq!(search_lcsc_ids(&db_path, "05FB40PH20").await, vec!["C2856837"]);
-        assert_eq!(search_lcsc_ids(&db_path, "FPC05FB40PH20").await, vec!["C2856837"]);
+        assert_eq!(
+            search_lcsc_ids(&db_path, "STM32F103C8T6").await,
+            vec!["C8734"]
+        );
+        assert_eq!(
+            search_lcsc_ids(&db_path, "05FB40PH20").await,
+            vec!["C2856837"]
+        );
+        assert_eq!(
+            search_lcsc_ids(&db_path, "FPC05FB40PH20").await,
+            vec!["C2856837"]
+        );
 
         // 2. URL slug combining manufacturer and MPN with separators
-        assert_eq!(search_lcsc_ids(&db_path, "XUNPU-FPC_05FB40PH20").await, vec!["C2856837"]);
+        assert_eq!(
+            search_lcsc_ids(&db_path, "XUNPU-FPC_05FB40PH20").await,
+            vec!["C2856837"]
+        );
 
         // 3. Exact query still works directly
-        assert_eq!(search_lcsc_ids(&db_path, "FPC-05FB-40PH20").await, vec!["C2856837"]);
-        assert_eq!(search_lcsc_ids(&db_path, "STM32F103-C8T6").await, vec!["C8734"]);
+        assert_eq!(
+            search_lcsc_ids(&db_path, "FPC-05FB-40PH20").await,
+            vec!["C2856837"]
+        );
+        assert_eq!(
+            search_lcsc_ids(&db_path, "STM32F103-C8T6").await,
+            vec!["C8734"]
+        );
     }
 
     #[tokio::test]
