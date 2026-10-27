@@ -1,8 +1,8 @@
 # `suggest_alternatives.tsv`
 
-Thirty-three rows of the `components` table Konnect builds from the JLCPCB
+Thirty-three rows of the `components` table Copperpour builds from the JLCPCB
 catalogue feed, copied verbatim. The `suggest_jlcpcb_alternatives` tests
-(#785) load them into a temporary database.
+ load them into a temporary database.
 
 ## Source
 
@@ -12,7 +12,7 @@ catalogue feed, copied verbatim. The `suggest_jlcpcb_alternatives` tests
   `main` at `bf7bfd6`. The resulting database held 797,477 parts.
 - Rows were selected by LCSC number. Every column is exactly as the import
   stored it, including a stored price of `0.0` where the feed gave none
-  (#582).
+  ([#63](https://github.com/Copperpour/Copperpour/issues/63)).
 
 The data is factual catalogue information: part numbers, packages, prices,
 stock and descriptions published by JLCPCB and LCSC.

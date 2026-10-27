@@ -4,7 +4,7 @@ A single `kiapi.board.types.FootprintInstance`, serialised exactly as KiCad's
 IPC API sent it, for a **board-only footprint** — one placed directly on the
 board with no schematic symbol behind it.
 
-Decoded by `pcb_sync`'s regression tests for issue #452, where the defect was
+Decoded by `pcb_sync`'s regression tests for mixelpixx/Konnect#452, where the defect was
 the reader turning the *absence* of a schematic identity into the shared
 identity `/`.
 
@@ -46,7 +46,8 @@ strings on a board-only footprint, which is why there is nothing to redact.
 Two things, both corrected by this capture:
 
 1. `symbol_path` is **present and empty** — `Some(SheetPath { path: [] })`,
-   with `path_human_readable: ""`, not `"/"` and not `None`. The whole #452 fix
+   with `path_human_readable: ""`, not `"/"` and not `None`. The whole
+   mixelpixx/Konnect#452 fix
    rests on that distinction.
 2. `not_in_schematic` is **false**. KiCad marks a board-only mounting hole
    `exclude_from_position_files` and `exclude_from_bill_of_materials` instead.

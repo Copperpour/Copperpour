@@ -1,6 +1,6 @@
 # Specctra per-layer padstack fixtures
 
-Three two-layer boards for #842, each with two stock
+Three two-layer boards for mixelpixx/Konnect#842, each with two stock
 `PinHeader_1x02_P2.54mm_Vertical` footprints (`J1` at (100, 50), `J2` at
 (110, 50), both at 0°). They differ only in J1 pad 1, a 1.7 mm square
 through-hole pad:

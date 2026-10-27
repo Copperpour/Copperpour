@@ -1,7 +1,7 @@
 # Footprint attribute fixtures
 
 Two stock KiCad 10.0.6 footprints, used by `set_footprint_metadata`'s
-reporting tests (#895):
+reporting tests:
 
 | File | Source | `(attr …)` |
 |---|---|---|
@@ -25,4 +25,5 @@ the solder-mask flag from `AllowSolderMaskBridges()`.
 
 `main` @ `9488e5f` wrote byte-identical files for every call and answered only
 `{"success":true,"changed_fields":["attributes"],…}`. `allow_soldermask_bridges`
-cannot be sent back, because the `attributes` enum refuses it (#902).
+cannot be sent back, because the `attributes` enum refuses it
+([#119](https://github.com/Copperpour/Copperpour/issues/119)).

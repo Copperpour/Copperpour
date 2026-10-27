@@ -4,7 +4,8 @@
 tools do. The default, `"file"`, plans one file as before; only the package
 rule below changes in it. `"hierarchy"`, given the project's root schematic,
 plans every sheet instance of the saved hierarchy together, as eeschema's
-Tools → Annotate does with its default "Entire schematic" scope (#42):
+Tools → Annotate does with its default "Entire schematic" scope
+([#42](https://github.com/Copperpour/Copperpour/issues/42)):
 
 - every `?` on any sheet instance gets the first free number for its prefix
   in the project;
@@ -23,7 +24,8 @@ numbering method, sort order and `reuse_designators` setting are not read.
 A record under the root belongs to the project by its path, and carries the
 project's name or none; records under another root are left alone unless they
 carry the project's name, which eeschema prunes as obsolete. Nothing is
-written when the target is not a proven root (`invalid_argument`, or #189's
+written when the target is not a proven root (`invalid_argument`, or
+mixelpixx/Konnect#189's
 `conflict`), when the project lists another top-level sheet or gives the root
 another uuid (`invalid_argument`), when any file of the hierarchy has a KiCad
 lock (`conflict`), when an unfinished transaction in the root's directory

@@ -7,7 +7,7 @@ version `20260206`).
 
 It was picked as the smallest stock footprint that has `default`, `solid` and
 `dash` strokes as well as visible `(unlocked yes)` text. `pcb_components`'
-tests read its graphics for #970.
+tests read its graphics for mixelpixx/Konnect#970.
 
 | Element | `(type …)` | Count |
 |---------|------------|-------|
@@ -19,4 +19,4 @@ tests read its graphics for #970.
 
 Its three `fp_text user` items (`PCB Thickness 1.4mm`, `Write Protect Notch`,
 `${REFERENCE}`) are all `(unlocked yes)`. The counts come from the file, not
-from Konnect's parser.
+from Copperpour's parser.

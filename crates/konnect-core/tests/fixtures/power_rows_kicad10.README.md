@@ -1,12 +1,12 @@
 # Power-row fixture
 
 `power_rows_kicad10.kicad_sch` holds rows of pins that `batch_add_power_symbol`
-should join under one power symbol, and pins it must leave apart (#856).
+should join under one power symbol, and pins it must leave apart.
 The tests in `sch_wiring.rs::batch_power_tests` run against it.
 
 ## Provenance
 
-The sheet was built through Konnect against KiCad's stock `MCU_ST_STM32F1`,
+The sheet was built through Copperpour against KiCad's stock `MCU_ST_STM32F1`,
 `Device` and `power` libraries. The calls were `create_project`,
 `batch_place_components`, one `add_schematic_net_label` (`BLOCK`), and two
 coordinate `add_power_symbol` calls. Those put `#PWR01` (GND) at

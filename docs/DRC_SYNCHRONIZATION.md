@@ -1,4 +1,4 @@
-# DRC source synchronization (#408, part of #574)
+# DRC source synchronization ([#58](https://github.com/Copperpour/Copperpour/issues/58))
 
 Both DRC tools share `tools::drc`, which owns source selection and execution
 ordering. Their existing summary/filter formats remain separate. `cli::run_drc`
@@ -42,7 +42,10 @@ also checked after CLI.
 This detects a changed final source, but cannot prove the absence of transient
 concurrent changes; callers must finish their mutations first. General live/file
 authority and the shared outcome-envelope migration remain tracked separately
-in #574/#119; #408 does not close those larger contracts.
+in [#58](https://github.com/Copperpour/Copperpour/issues/58) and
+[#16](https://github.com/Copperpour/Copperpour/issues/16); this synchronization does
+not close
+those larger contracts.
 
 ## Evidence
 

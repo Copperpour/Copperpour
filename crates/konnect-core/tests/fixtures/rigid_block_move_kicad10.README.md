@@ -2,13 +2,13 @@
 
 `rigid_block_move_kicad10.kicad_sch` holds a closed block of circuit beside
 items that a rigid `move_region` (`include: "all"`) must either leave alone or
-refuse to cut (#896). `rigid_block_move_child_kicad10.kicad_sch` is the blank
+refuse to cut. `rigid_block_move_child_kicad10.kicad_sch` is the blank
 child of its one hierarchical sheet, holding only the `SP` hierarchical label
 that its sheet pin names.
 
 ## Provenance
 
-Built through Konnect against KiCad's stock `Device` and `power` libraries:
+Built through Copperpour against KiCad's stock `Device` and `power` libraries:
 `create_schematic`, `add_schematic_component`, `add_wire` (which inserted both
 junctions at the T points), `add_schematic_net_label`, `add_power_symbol`,
 `add_no_connect`, `add_bus`, `add_bus_entry`, `add_hierarchical_sheet` and
@@ -21,7 +21,7 @@ kicad-cli sch upgrade --force rigid_block_move_child_kicad10.kicad_sch
 ```
 
 What is committed is that Eeschema serialization, with edits made before the
-last resaves, because Konnect has no tool for these items. Typed in by hand:
+last resaves, because Copperpour has no tool for these items. Typed in by hand:
 
 - a `(property "Netclass" "Power" (at 71.12 49.53 0) …)` field on the `SIG` label;
 - a `netclass_flag` directive label at `(66.04, 69.85)` on the bottom rail,
@@ -39,7 +39,7 @@ Each time KiCad kept the item, added `(show_name no)` and
 | the block, box `(50, 40)-(110, 92)` | `R1`, `C1`, `R2` at y 60.96, `#PWR01` (GND) at `(71.12, 72.39)` | moved as one piece |
 | 10 wires, 2 junctions | inside the box | top rail at y 52.07, bottom rail at y 69.85 |
 | `SIG` label, `OUT` global label | `(71.12, 52.07)`, `(101.6, 52.07)` | name the top rail; `SIG` carries a `Netclass` field at `(71.12, 49.53)` |
-| directive label, text box | `(66.04, 69.85)`, `(52.07, 41.91)` | kept by Konnect's model only as raw nodes |
+| directive label, text box | `(66.04, 69.85)`, `(52.07, 41.91)` | kept by Copperpour's model only as raw nodes |
 | bus `25b38bed`, bus entry `4b0ba710` | bus `(55.88, 83.82)-(101.6, 83.82)` | with labels `D[0..3]` and `D0` |
 | no-connect `f607abfb` | `(93.98, 64.77)`, on `R2` pin 2 | follows its pin |
 | `R3` | `(139.7, 60.96)` | joins the top rail by its own `SIG` label |

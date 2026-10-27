@@ -1,7 +1,7 @@
 # gr_poly outline fixture provenance
 
 `gr_poly_outline.kicad_pcb` is a minimal KiCad-authored board for the
-`gr_poly`-recognition regression covered by #593. It exists so that
+`gr_poly`-recognition regression covered by mixelpixx/Konnect#593. It exists so that
 `board_outline_bbox` (`crates/konnect-sexp/src/board.rs`) and its placement
 consumer are exercised against a real `gr_poly` Edge.Cuts outline as pcbnew
 actually serializes one, rather than only against a rectangle produced by
@@ -10,7 +10,7 @@ string surgery on another fixture.
 ## Source and reduction
 
 The outline is a real Edge.Cuts shape copied out of a large user project
-board on which Konnect's placement scoring hit the bug this fixture
+board on which Copperpour's placement scoring hit the bug this fixture
 regression-tests (outline recognized only for `gr_line`/`gr_rect`/`gr_arc`/
 `gr_circle`/`gr_curve`, so a `gr_poly`-outlined board was treated as having
 no outline at all). The outline was pasted into a brand-new, otherwise-empty

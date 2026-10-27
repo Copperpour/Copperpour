@@ -6,11 +6,11 @@
 - two pins that face each other 5.08 mm apart, so their 2.54 mm stubs meet
 - a pin whose stub end already carries a label of the net, with no wire to it
 
-In both cases each pin still needs its own wire (#701).
+In both cases each pin still needs its own wire.
 
 ## Provenance
 
-Built through Konnect against KiCad's stock `Device` library with
+Built through Copperpour against KiCad's stock `Device` library with
 `create_schematic`, `add_schematic_component` and `add_schematic_net_label`,
 then force-resaved by KiCad 10.0.6:
 

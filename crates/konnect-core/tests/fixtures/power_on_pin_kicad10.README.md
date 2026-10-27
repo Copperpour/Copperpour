@@ -3,12 +3,12 @@
 `power_on_pin_kicad10.kicad_sch` carries pins facing each way, a mirrored
 symbol, a power unit placed apart from its amplifier, a De Morgan gate, and a
 reference two symbols share. `add_power_symbol` with `reference` + `pin_number` is checked
-against it (#727). `power_on_off_grid_pin.kicad_sch` supplies a pin off the
+against it. `power_on_off_grid_pin.kicad_sch` supplies a pin off the
 1.27mm grid.
 
 ## Provenance
 
-`power_on_pin_kicad10.kicad_sch` was built through Konnect against KiCad's
+`power_on_pin_kicad10.kicad_sch` was built through Copperpour against KiCad's
 stock `Device`, `Amplifier_Operational`, `74xx` and `power` libraries: `create_project`,
 `add_schematic_component`, and two coordinate `add_power_symbol` calls that
 put `#PWR01` (GND) and `#PWR02` (+3V3) clear of every pin, so the sheet embeds
@@ -26,7 +26,7 @@ project `power_on_pin_kicad10`, so tests write the sheet under that name.
 `power_on_off_grid_pin.kicad_sch` is KiCad 10.0.6's
 `demos/simulation/power_supplies/hv_converter/hv_converter.kicad_sch`, copied
 byte for byte. Its instance records name project `HSCConverter4_load`. No
-Konnect placer can make an off-grid pin, because they all snap, so the off-grid
+Copperpour placer can make an off-grid pin, because they all snap, so the off-grid
 case comes from a file KiCad itself ships.
 
 ## Cases

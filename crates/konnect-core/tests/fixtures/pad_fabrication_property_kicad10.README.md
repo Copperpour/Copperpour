@@ -2,7 +2,7 @@
 
 Five versions of the same footprint, each written by KiCad, used to check that
 `edit_footprint_pad`'s `fabrication_property` argument writes a pad exactly as
-KiCad does (#961).
+KiCad does.
 
 The footprint is
 `Connector_USB.pretty/USB_C_Receptacle_GCT_USB4125-xx-x_6P_TopMnt_Horizontal`

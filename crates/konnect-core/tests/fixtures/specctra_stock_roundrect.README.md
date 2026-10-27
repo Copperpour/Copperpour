@@ -2,7 +2,8 @@
 
 `specctra_stock_roundrect.kicad_pcb` is a two-layer board built only from stock
 KiCad 10 footprints, each of which has rounded-rectangle (`roundrect`) pads.
-It is the fixture for #790. KiCad 10.0.6's `pcbnew` Python API built and saved
+It is the fixture for mixelpixx/Konnect#790. KiCad 10.0.6's `pcbnew` Python API built
+and saved
 it with the script below. Every byte of the board is KiCad's serialization.
 
 ```python
@@ -47,7 +48,7 @@ java -Djava.awt.headless=true -jar freerouting-2.3.0.jar \
   -do specctra_stock_roundrect.native-kicad-10.freerouting-2.3.0.ses -mp 20
 ```
 
-The first input is Konnect's Rust export of the board, using the default-netclass
+The first input is Copperpour's Rust export of the board, using the default-netclass
 rules in the tests. It is deterministic, so the tests regenerate it rather than
 commit it. The second input is the native DSN above. Freerouting reported
 `0 unrouted and 0 violations` for both.
@@ -57,7 +58,7 @@ commit it. The second input is the native DSN above. Freerouting reported
 KiCad's exporter names each rounded-rectangle padstack after the pad:
 `RoundRect[T]Pad_<width>x<height>_<radius>_um`. The radius in the name already
 includes the growth KiCad adds before approximating the corner,
-`r * (1 - cos(pi / 36))`. The tests assert Konnect's manifest against these
+`r * (1 - cos(pi / 36))`. The tests assert Copperpour's manifest against these
 rows:
 
 | footprint | KiCad padstack | size (µm) | KiCad radius (µm) | corner radius (µm) |
@@ -72,7 +73,8 @@ Every footprint sits at 0°, and every pad centre falls on a whole micrometre.
 Two pre-existing defects, not related to pad shape, would otherwise stop the
 tests before they reach the pads:
 
-- #840: the Rust exporter writes a rotated footprint's pad angle twice.
-- #841: native adoption refuses stock 0805 pads at ±912.5 µm. It also refuses
+- mixelpixx/Konnect#840: the Rust exporter writes a rotated footprint's pad angle twice.
+- [#98](https://github.com/Copperpour/Copperpour/issues/98): native adoption refuses
+  stock 0805 pads at ±912.5 µm. It also refuses
   courtyard `(outline (polygon ...))` lines, which is why the native tests drop
   those three lines in test code. The fixture file keeps them.

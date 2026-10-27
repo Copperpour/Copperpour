@@ -2,11 +2,11 @@
 
 `symbol_pin_contact_kicad10.kicad_sch` puts power symbols on resistor and
 regulator pins, so `check_schematic_overlaps` can be checked for telling a pin-tip
-connection apart from a collision (#745).
+connection apart from a collision.
 
 ## Provenance
 
-Built through Konnect against KiCad's stock `Device`, `Regulator_Linear` and
+Built through Copperpour against KiCad's stock `Device`, `Regulator_Linear` and
 `power` libraries with `create_schematic`, `add_schematic_component` and
 `add_power_symbol`, then parsed and force-resaved by KiCad 10.0.6:
 

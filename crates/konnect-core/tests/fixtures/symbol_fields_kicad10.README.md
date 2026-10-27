@@ -3,7 +3,7 @@
 `symbol_fields_kicad10.kicad_sym` holds two library symbols, one with every
 field `create_symbol` can write and one with none, so `create_symbol` and
 `set_symbol_properties` can be checked against KiCad's own reading of the
-fields (#892). `symbol_fields_kicad10.edited.kicad_sym` is the same library
+fields. `symbol_fields_kicad10.edited.kicad_sym` is the same library
 after two `set_symbol_properties` calls, as KiCad resaves it.
 
 ## Provenance
@@ -68,12 +68,11 @@ removes the property.
 
 `symbol_fields_kicad10.net` is a netlist of the kind `update_pcb_from_schematic`
 reads, exported by KiCad 10.0.6. Both components carry custom `LCSC` and `MPN`
-fields, so the sync can be checked for copying symbol fields onto footprints
-(#788).
+fields, so the sync can be checked for copying symbol fields onto footprints.
 
 ## Provenance
 
-The schematic was built through Konnect against KiCad's stock `Device` library
+The schematic was built through Copperpour against KiCad's stock `Device` library
 (`create_project`, `add_schematic_component`, `edit_schematic_component`). It
 was then parsed and force-resaved by KiCad 10.0.6, and the netlist exported:
 

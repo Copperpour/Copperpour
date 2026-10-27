@@ -2,11 +2,11 @@
 
 `written_coordinates_kicad10.kicad_sch` holds points whose coordinates come out
 of `f64` sums carrying noise, so the tests can check that a tool writes them the
-way KiCad does (#766).
+way KiCad does.
 
 ## Provenance
 
-Built through Konnect against KiCad's stock `Device` library with
+Built through Copperpour against KiCad's stock `Device` library with
 `create_schematic`, `add_schematic_component` and `add_schematic_net_label`.
 The two wires were then added as text, each ending 0.02 mm short of a pin, since
 `add_wire` snaps to the grid and would close the gap. The file was then
@@ -43,7 +43,7 @@ same items after `fix_connectivity` and `move_labels_by_offset` run. Before the
 fix, a KiCad resave changed exactly those three lines. After it, the resave
 leaves the file byte-identical.
 
-## A zero-length stub (#143)
+## A zero-length stub ([#143](https://github.com/Copperpour/Copperpour/issues/143))
 
 `connect_to_net` with `reference: "R1"`, `pin_number: "2"`, `net: "RST"` and
 `stub_length: 0` adds one label, `RST` at `(139.7, 105.41)`, and no wire. KiCad

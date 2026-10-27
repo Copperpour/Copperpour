@@ -11,7 +11,7 @@ sha256 52d86587d04bf71e5d9ebeffcbb259c0de8d5d7dce114f0f2a6b7cbcb7b9d0ab
 It is in the KiCad 6/7 format (`version 20220914`), which has no
 `Description` field. The description lives in a `ki_description` property, so
 `set_symbol_properties` has to edit that property for a new description to
-reach KiCad (#892).
+reach KiCad.
 
 `fiber_optic_kicad7.edited.kicad_sym` is what `set_symbol_properties` wrote for
 this call:

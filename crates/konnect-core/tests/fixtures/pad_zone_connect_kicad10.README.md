@@ -2,7 +2,7 @@
 
 Four versions of the same footprint, each written by KiCad, used to check that
 `edit_footprint_pad`'s `zone_connect` argument writes a pad exactly as KiCad
-does (#453).
+does.
 
 The footprint is `MountingHole.pretty/MountingHole_3.2mm_M3_Pad_TopBottom`
 from the KiCad 10.0.6 standard library: three pads that all share the number

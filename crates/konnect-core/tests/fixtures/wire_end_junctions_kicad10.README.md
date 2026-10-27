@@ -3,11 +3,11 @@
 `wire_end_junctions_kicad10.kicad_sch` is a sheet with no wires. It holds one
 of each item a junction count takes as an exit besides wires. The
 `wire_end_junction_tests` in `sch_wiring.rs` draw wires onto it and check
-which junction dots the wire tools write (#897).
+which junction dots the wire tools write.
 
 ## Provenance
 
-Built through Konnect, against KiCad's stock `Device` and `74xx` libraries:
+Built through Copperpour, against KiCad's stock `Device` and `74xx` libraries:
 
 | Step | Arguments |
 |---|---|
@@ -119,7 +119,8 @@ Each case starts from a fresh copy of the fixture.
 The duplicated segment has three wire ends at `(114.3, 101.6)` but only two
 exit angles, so a count of ends draws a dot there and KiCad's count of exits
 does not. The pin rows show that a pin tip counts as an exit. The collinear
-overlap has two exits at each of its inner ends; before #897 Konnect dotted
+overlap has two exits at each of its inner ends; before mixelpixx/Konnect#897
+Copperpour dotted
 both, because `find_t_junctions` saw a wire end landing mid-span. The gate row
 gives one wire exit plus one symbol. Counting pins rather than symbols makes it
-three, because Konnect's pin list carries pin 3 once per body style.
+three, because Copperpour's pin list carries pin 3 once per body style.

@@ -1,4 +1,4 @@
-# Board item bounds goldens (#688)
+# Board item bounds goldens
 
 KiCad 10.0.5's own answers for where every item of seven checked-in boards lies:
 one row per item, as `GetBoundingBox` in `BBM_ITEM_ONLY` mode returned it over
@@ -28,7 +28,7 @@ exercises the rule they pin:
   outlines from `royalblue54L_feather/RoyalBlue54L-Feather.kicad_pcb` (SHA-256
   `5f54a63b…52f6f1`), licensed CERN-OHL-P v2 (the demo's `LICENSE`).
 
-`bounds_text_boxes.kicad_pcb` is written by KiCad itself (#688). No demo board
+`bounds_text_boxes.kicad_pcb` is written by KiCad itself. No demo board
 has a board text box, and the only stock footprints with one put it on an
 annotation layer, so the board was built for the rule. A source file holding
 the items below was opened in `pcbnew.exe` 10.0.5. KiCad's own serialization of
@@ -47,7 +47,7 @@ re-serializes to the same bytes.
     libraries are CC BY-SA 4.0 with an exception that waives its conditions for
     designs using the footprints, which this board is.
 
-Everything else on the board is Konnect's own.
+Everything else on the board is Copperpour's own.
 
 Each cut board is the source's own header (version through nets), then the
 selected top-level items, byte for byte, then the closing paren.

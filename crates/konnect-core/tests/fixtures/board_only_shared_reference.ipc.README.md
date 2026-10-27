@@ -4,7 +4,7 @@ A single `kiapi.board.types.FootprintInstance`, serialised exactly as KiCad's
 IPC API sent it, for a **board-only footprint carrying the reference `REF**`** —
 one of two such footprints on the same board.
 
-Decoded by `pcb_sync`'s regression tests for issue #452, where the remaining
+Decoded by `pcb_sync`'s regression tests for mixelpixx/Konnect#452, where the remaining
 defect was `duplicate_board_reference` refusing to sync a board whose
 unannotated graphics all share KiCad's default reference. The sibling capture
 [`board_only_footprint.ipc.bin`](board_only_footprint.ipc.README.md) cannot
@@ -81,7 +81,7 @@ strings on a board-only footprint, which is why there is nothing to redact.
 CONTRIBUTING requires real-KiCad fixtures and names a specific failure: a
 hand-written footprint missing `(property ki_fp_filters "…")`. The source board
 here has none — and neither does `live_ipc.kicad_pcb`, the board upstream ships
-and the source of the capture accepted in #504.
+and the source of the capture accepted in mixelpixx/Konnect#504.
 
 Across the tracked `.kicad_pcb` fixtures, `ki_fp_filters` appears **only on
 boards whose footprints carry `(path ...)`** — `pic_programmer` (49),

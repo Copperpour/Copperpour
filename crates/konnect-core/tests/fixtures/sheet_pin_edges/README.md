@@ -1,7 +1,8 @@
-# Sheet-pin edge fixture (#687)
+# Sheet-pin edge fixture
 
 `sheet_pin_edges.kicad_sch` and `child.kicad_sch` reproduce the two-net
-hierarchy from #687. Generated through the local Konnect 0.12.1 MCP executable
+hierarchy from mixelpixx/Konnect#687. Generated through the local Konnect 0.12.1 MCP
+executable
 using stock `Device:R` symbols and hierarchical labels. Pin A's intended left
 edge was set to rotation 180 before both sheets were force-resaved by KiCad
 10.0.6 (`kicad-cli sch upgrade --force`). The committed pair is KiCad's

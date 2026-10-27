@@ -2,7 +2,7 @@
 
 `dnp_kicad10.kicad_sch` carries KiCad's native do-not-populate attribute,
 `(dnp yes|no)`, on a single-unit and a multi-unit component, a KiCad 10
-design-variant override beside it, and the custom `DNP` property that #415
+design-variant override beside it, and the custom `DNP` property that mixelpixx/Konnect#415
 reports in place of the attribute. `edit_schematic_component`,
 `batch_edit_schematic_components`, `get_schematic_component` and
 `list_schematic_components` are checked against KiCad's own reading of all
@@ -10,7 +10,7 @@ three.
 
 ## Provenance
 
-1. Built through Konnect against KiCad's stock `Device` and
+1. Built through Copperpour against KiCad's stock `Device` and
    `Amplifier_Operational` libraries (`create_project`,
    `add_schematic_component`).
 2. Two edits by hand: `C1`'s `(dnp no)` became `(dnp yes)`, and a `Lite`
@@ -21,8 +21,8 @@ three.
    kicad-cli sch upgrade --force dnp_kicad10.kicad_sch
    ```
 
-4. `R1` was given a custom property `DNP` = `yes` the way #415 reports it:
-   `edit_schematic_component` with `fields: {"DNP": "yes"}` on Konnect
+4. `R1` was given a custom property `DNP` = `yes` the way mixelpixx/Konnect#415 reports it:
+   `edit_schematic_component` with `fields: {"DNP": "yes"}` on Copperpour
    0.13.0, before this change. Then force-resaved by KiCad 10.0.6 again.
 
 What is committed is that Eeschema serialization: `(generator "eeschema")`,

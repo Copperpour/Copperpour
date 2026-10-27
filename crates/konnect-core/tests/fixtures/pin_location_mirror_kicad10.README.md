@@ -3,13 +3,13 @@
 `pin_location_mirror_kicad10.kicad_sch` places two LM358s whose units carry
 different mirrors, so `get_schematic_pin_locations` and
 `batch_get_schematic_pin_locations` can be checked to report each placement's
-own `mirror_x`/`mirror_y` beside its pins (#855).
+own `mirror_x`/`mirror_y` beside its pins.
 
 ## Provenance
 
-Built through Konnect against KiCad's stock `Amplifier_Operational` library:
+Built through Copperpour against KiCad's stock `Amplifier_Operational` library:
 `create_schematic`, then four `add_schematic_component` calls with `reference`,
-`unit` and `mirror` (#485). Then parsed and force-resaved by KiCad 10.0.6:
+`unit` and `mirror`. Then parsed and force-resaved by KiCad 10.0.6:
 
 ```text
 kicad-cli sch upgrade --force pin_location_mirror_kicad10.kicad_sch
@@ -17,7 +17,7 @@ kicad-cli sch upgrade --force pin_location_mirror_kicad10.kicad_sch
 
 What is committed is that Eeschema serialization: `(generator "eeschema")`,
 `(version 20260306)`, `(generator_version "10.0")`. KiCad kept every placement
-and mirror as Konnect wrote it.
+and mirror as Copperpour wrote it.
 
 ## Cases
 

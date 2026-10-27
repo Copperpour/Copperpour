@@ -11,7 +11,8 @@ Fedora 44 `kicad-10.0.6-1.fc44`). That library is Apache-2.0, per the demo's
 | `testpoint_keystone_5019_kicad6.kicad_mod` | `ttlib.pretty/TestPoint_Keystone_5019_Minature.kicad_mod` | KiCad 6, `(version 20211014)` |
 | `cui_ujc_hp_3_kicad7.kicad_mod` | `TinyTapeout.pretty/CUI_UJC-HP-3-SMT-TR.kicad_mod` | KiCad 7, `(version 20221018)` |
 
-`pcb_components`' tests read their graphics for #970. They are the forms the
+`pcb_components`' tests read their graphics for mixelpixx/Konnect#970. They are the
+forms the
 current format writes differently:
 
 - the test point's 24 `fp_line`s carry a bare `(width …)` and no stroke type;

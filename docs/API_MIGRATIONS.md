@@ -21,7 +21,7 @@ takes `"x"`, `"y"` or `"none"`, the vocabulary `add_schematic_component`
 already uses, and is absolute rather than a toggle. Without `unit`, every
 placed unit takes it. With `unit`, only that unit changes, because KiCad stores
 the mirror per placed unit and one gate of a package is often reflected while
-its siblings and power unit are not. Field text reflects with the body (#613).
+its siblings and power unit are not. Field text reflects with the body.
 Junctions and no-connect flags are handled as `rotate_schematic_component`
 handles them.
 
@@ -38,11 +38,11 @@ call that changes nothing leaves the file untouched.
 
 Until now a placed symbol could not be reflected at all: the only way was to
 delete it and place it again with `mirror`. No existing tool's arguments or
-responses change. `sch_components` rises from 18 to 19 tools (#450).
+responses change. `sch_components` rises from 18 to 19 tools.
 
 ### `batch_add_power_symbol`, and no second symbol on a pin already on its rail (minor release)
 
-New tool `batch_add_power_symbol` in `sch_batch` (#856). It takes
+New tool `batch_add_power_symbol` in `sch_batch`. It takes
 `power_net` and `pins: [{reference, pin_number}]`, plus optional `max_gap`
 (default 10.16 mm) and `stub_length` (default 2.54 mm, a multiple of 1.27).
 Pins that face the same way, end on one row and are within `max_gap` of a
@@ -67,7 +67,7 @@ KiCad marks a part do-not-populate with the symbol attribute `(dnp yes|no)`.
 No schematic tool could set it, so a caller fell back to a custom property
 named `DNP`. KiCad does not treat that property as DNP: its plot draws the part
 as fitted and `kicad-cli sch export bom --exclude-dnp` keeps it, while the
-property fills the BOM's DNP column (#415).
+property fills the BOM's DNP column.
 
 - **New argument:** an optional boolean `dnp` on `edit_schematic_component`,
   and on each `batch_edit_schematic_components` entry. `true` writes
@@ -106,7 +106,7 @@ property fills the BOM's DNP column (#415).
 rewrites the project file from its own copy when it saves too, and it holds no
 board. So with only the schematic editor open, these tools wrote the
 `.kicad_pro`, reported success, and the next schematic save reverted the change.
-Measured on KiCad 10.0.5 (#804).
+Measured on KiCad 10.0.5.
 
 All four now also refuse while KiCad's project lock, `~<project>.kicad_pro.lck`,
 sits beside the project file. pcbnew, Eeschema and the project manager each
@@ -127,7 +127,7 @@ holding the UUID KiCad wrote for that label, for net, global and hierarchical
 labels alike. Pass these to `batch_delete` to remove many labels in one call,
 as `list_schematic_wires`' UUIDs already allow for wires. The existing fields,
 including the `NetLabel`/`GlobalLabel`/`HierarchicalLabel` `type` values, are
-unchanged (#746).
+unchanged.
 
 ### computed schematic coordinates are reported as KiCad places them (patch release)
 
@@ -140,12 +140,12 @@ position, for `connect_to_net`'s and `batch_connect_to_net`'s stub ends, for
 `bounds_*` and `overlap_*_mm` and `get_schematic_layout`'s `width` and
 `height`. A value changes only past its sixth decimal, by at most 0.0000005
 mm; for the float noise this removes, by less than 1e-9 mm. Nothing else in
-the request or response changes (#747).
+the request or response changes.
 
 ### computed coordinates are written as KiCad writes them (patch release)
 
 Coordinates that come out of arithmetic rather than the grid snap are now
-rounded to the six decimals KiCad writes before they reach a file (#766):
+rounded to the six decimals KiCad writes before they reach a file:
 
 - `move_labels_by_offset` used to write a label at 167.64 moved by −5.08 as
   `162.55999999999997`. It now writes `162.56`.
@@ -153,7 +153,7 @@ rounded to the six decimals KiCad writes before they reach a file (#766):
   `97.78999999999999`. It now writes `97.79`, and `fixes[].to` reports the
   rounded point, both in a dry run and when applied.
 - `copy_routing_pattern` rounds the translated `(start …)`, `(end …)` and
-  `(at …)` it writes. It finds no tracks on a board KiCad saved (#802), so
+  `(at …)` it writes. It finds no tracks on a board KiCad saved, so
   this applies only to boards it can read. Its `dx` and `dy` response fields
   are unchanged.
 - Every schematic item written as raw text is rounded the same way: the wires,
@@ -169,7 +169,7 @@ A sum like those above moves by less than 1e-12 mm. A coordinate a caller
 passes with more than six decimals now moves by at most 0.0000005 mm, finer
 than the 0.0001 mm KiCad itself stores in a schematic. Responses are
 unchanged except `fixes[].to`: a computed point a response echoes is still
-unrounded (#747), and a caller's own coordinate is still echoed as given.
+unrounded, and a caller's own coordinate is still echoed as given.
 
 ### `launch_kicad_ui` reports a KiCad that exits during startup (patch release)
 
@@ -189,7 +189,7 @@ are unchanged.
 KiCad no longer inherits the server's stdin and stdout, which carry the stdio
 transport's JSON-RPC stream. Both are `/dev/null` (`NUL` on Windows). KiCad's
 stderr is read by the server and written to the server log as `kicad`
-warnings, so that output now stops when the server exits (#764).
+warnings, so that output now stops when the server exits.
 
 ### `check_schematic_overlaps` passes symbols that meet at a pin tip (patch release)
 
@@ -202,7 +202,7 @@ into the other symbol's drawing, or when two pins meet anywhere but tip to tip,
 as KiCad connects pins only there. Pins meeting tip to tip and drawings that only
 touch are not reported. Response fields are unchanged: `bounds_a`, `bounds_b`,
 `overlap_x_mm` and `overlap_y_mm` still describe the envelopes, so a pair
-reported only for its pins can show a depth of 0 on one axis (#745).
+reported only for its pins can show a depth of 0 on one axis.
 
 ### `move_labels_by_offset` moves the label it names, with its fields (patch release)
 
@@ -217,13 +217,12 @@ as KiCad's own move does, and leaves the name alone. Moved coordinates carry no
 float noise: `114.3 - 2.54` is written as `111.76`. After the write the tool
 reads the file back. If any label of that name is not at its moved anchor, the
 call fails with `mutation_outcome_uncertain`; the file has been written, so
-reload it before retrying. Arguments and the success response are unchanged
-(#803).
+reload it before retrying. Arguments and the success response are unchanged.
 
 ### `add_power_symbol` accepts a pin (minor release)
 
 `add_power_symbol` takes `reference` + `pin_number` as an alternative to
-`x` + `y`, like `connect_to_net` (#727). The symbol is placed on the pin's
+`x` + `y`, like `connect_to_net`. The symbol is placed on the pin's
 endpoint, unsnapped, so an off-grid pin is still reached. When `rotation` is
 omitted it is derived from the pin, so the symbol faces away from the
 component body; an explicit `rotation` still wins.
@@ -253,14 +252,14 @@ update the same way. A footprint's membership of a board-level group is not
 affected: KiCad restores it on replacement. An update still drops what a
 footprint owns beyond these three that the message does not carry, such as its
 unit metadata, which KiCad's own Update PCB restores. The response shape is
-unchanged (#836).
+unchanged.
 
 ### KiCad 10's schematic editor is reported as unsupported, not stale (minor release)
 
 KiCad 10.x reports an open schematic by its file name alone, with no project
 and no sheet path; KiCad 11 adds the schematic editor to its IPC API and
 reports both. The editor-navigation tools used to call that a malformed
-identity and refuse with `stale_target`, which read as a Konnect-side race.
+identity and refuse with `stale_target`, which read as a Copperpour-side race.
 
 - `get_editor_state` now succeeds on KiCad 10 with a schematic editor open.
   The schematic editor is reported with `addressable: false`, no documents,
@@ -276,12 +275,12 @@ identity and refuse with `stale_target`, which read as a Konnect-side race.
   the identity's own reason in every one of these tools.
 
 No argument changed, and no identity is taken from the saved file, the board
-or the caller in place of KiCad's (#771).
+or the caller in place of KiCad's.
 
 ### `create_netclass` and `get_netclasses` carry the differential-pair settings (minor release)
 
 `create_netclass` could not set a netclass's differential-pair width, gap or
-via gap, and `get_netclasses` did not report them (#777). `create_netclass`
+via gap, and `get_netclasses` did not report them. `create_netclass`
 now takes `diff_pair_width`, `diff_pair_gap` and `diff_pair_via_gap`,
 optional, in mm and greater than zero. An update changes only the ones named.
 A new named class without them leaves them out of the project file, so its
@@ -316,7 +315,7 @@ lists every label on it, and `label_count` counts them all. A net with one name
 answers as before, apart from the added `net` field.
 
 A schematic where a placed symbol's library entry cannot be found is refused
-with an error instead of answering with that symbol's pins missing (#853).
+with an error instead of answering with that symbol's pins missing.
 
 ### setting a schematic sheet's title block (minor release)
 
@@ -340,7 +339,7 @@ refused as `unsupported_capability` with `capability:
 It returns each sheet's block read back after the write and `changed`; a
 readback that differs is `mutation_outcome_uncertain`, naming every file the
 transaction replaced. The `sch_hierarchy` toolset description now mentions
-title blocks. Existing tools are unchanged (#714).
+title blocks. Existing tools are unchanged.
 
 ### setting the board's title block (minor release)
 
@@ -357,7 +356,8 @@ step. An older KiCad answers `unsupported_capability`, and the file is not
 touched. Otherwise the saved file's `(title_block …)` node is rewritten as KiCad
 writes it, and nothing else in the file changes. Both paths return the block
 read back after the write, `changed`, `source` and `saved` (`false` for the
-live board); a readback that differs is `mutation_outcome_uncertain`. Existing tools are unchanged (#714, board half).
+live board); a readback that differs is `mutation_outcome_uncertain`. Existing tools
+are unchanged.
 
 ### `move_region` can move a whole block rigidly (minor release)
 
@@ -377,7 +377,7 @@ for example because a moved pin lands on a wire outside the box. A successful
 response adds `items_moved`, counting the non-symbol items moved by kind;
 no-connects stay in `no_connects_moved`. A label now keeps its fields with it when it
 moves, as a global label's `Intersheetrefs`. Calls without `include` are
-unchanged (#896).
+unchanged.
 
 ### wire tools dot a T built from wire ends (patch release)
 
@@ -397,13 +397,13 @@ tip, a sheet pin or a bus entry also get one. A plain corner, or two wires that
 overlap and leave in the same direction, gets none. That includes a collinear
 overlap whose end lands mid-span, which used to get a dot. Pins that one symbol
 stacks on a point, or that two body styles put there, count once.
-Connectivity, schemas and response shapes are unchanged (#897).
+Connectivity, schemas and response shapes are unchanged.
 
 ### sheet tools keep symbol instance paths to live sheets (patch release)
 
 `add_hierarchical_sheet` used to add a path to each symbol of a reused child
 file and never remove one. After `delete_sheet` and a re-add, the child kept a
-path naming the deleted sheet, and every later Konnect write to it was refused
+path naming the deleted sheet, and every later Copperpour write to it was refused
 with `stale_target`. Linking a file now keys its symbols to exactly the sheets
 that place it in the project. Paths naming a sheet that no longer exists are
 dropped, but only when every sheet of the hierarchy can be read. Paths under
@@ -423,7 +423,7 @@ another project name are kept.
   new sheet (`invalid_argument` on `schematic`). A sheet file in a project
   folder that no project places is refused as `conflict`, because a sheet
   added inside it would be keyed to no real hierarchy. Each refusal comes
-  before anything is written (#478).
+  before anything is written.
 - Only a project root receives the `sheet_instances` footer. A nested parent
   no longer gets the root's page-1 entry written into it.
 
@@ -434,7 +434,7 @@ L-bend, horizontal leg first. A leg that passed over another pin's tip got a
 junction there, and a corner that landed on a sheet pin connected to it. Each
 route also dotted every junction-less T anywhere on the sheet, which KiCad
 reads as two nets. So pins, labels and sheet pins on other nets (or on none)
-silently joined, and the call still reported success (#887).
+silently joined, and the call still reported success.
 
 Each route now dots only the T's it forms itself, and is checked before it is
 written. If the horizontal-first bend would join anything beyond the nets at
@@ -459,18 +459,18 @@ is not a connection and is unchanged.
 return `mirror_x` and `mirror_y` beside `rotation`, at the top level (the
 lowest unit, like `x`, `y` and `rotation` there) and on each `units[]` entry.
 They are the names `get_schematic_component` already uses. The fields are
-additive; pin positions are unchanged (#855).
+additive; pin positions are unchanged.
 
 ### `add_schematic_text` writes coordinates as KiCad writes them (patch release)
 
 `add_schematic_text` wrote the caller's `x`, `y` and `rotation` into the file
 as given, so a value carrying float noise, such as `54.60999999999999` from an
-older response (#747), was written that way. Each is now rounded to the six
+older response, was written that way. Each is now rounded to the six
 decimals KiCad writes, moving the text by less than 1e-6 mm. The response still
 echoes the caller's values. When the saved file does not hold the text at the
 rounded position, the call returns `mutation_outcome_uncertain`. A value so
 large that rounding makes it infinite, such as `1.8e303`, is refused as
-`invalid_argument` before anything is written. Arguments are unchanged (#828).
+`invalid_argument` before anything is written. Arguments are unchanged.
 
 ### library symbols take Footprint, Description, keywords, filters and custom fields (minor release)
 
@@ -513,13 +513,13 @@ Refusals:
 - A file that is not a symbol library is a `handler_error`, like other paths
   that exist but cannot be used.
 - When the file does not hold the edit on readback, the tool reports
-  `mutation_outcome_uncertain` (#892).
+  `mutation_outcome_uncertain`.
 
 ### `set_footprint_metadata` reports what it replaced (patch release)
 
 `attributes` replaces the whole `(attr …)` block, so a caller who added
 `exclude_from_bom` without repeating `smd` or `through_hole` silently left the
-footprint with no type. KiCad then reads it as unspecified (#895).
+footprint with no type. KiCad then reads it as unspecified.
 
 The response now adds `changes`, which maps each changed field to its
 `previous` and `current` value: a string, or `null` when absent, for
@@ -527,7 +527,9 @@ The response now adds `changes`, which maps each changed field to its
 an array of strings that is empty when there is nothing to say. A warning is
 given when an `attributes` replacement drops the footprint type, or drops an
 attribute the `attributes` argument does not accept, such as
-`allow_soldermask_bridges` (#902). `current` reflects what was written.
+`allow_soldermask_bridges`
+([#119](https://github.com/Copperpour/Copperpour/issues/119)). `current` reflects what
+was written.
 `success`, `footprint_path` and `changed_fields` are unchanged, and so is what
 is written.
 
@@ -555,7 +557,7 @@ and refuses a board with two tables or a pad with a per-layer `(padstack …)`,
 whose inner entries KiCad would also move. The refresh takes KiCad's
 copper-layer count, and its `plan_revision` now includes that count, so a
 revision from an earlier build needs a new dry run. The native IPC flip is
-unchanged (#831).
+unchanged.
 
 ### a copper zone blocks pad-net changes only on its own net (patch release)
 
@@ -566,7 +568,7 @@ could change net. A board-level copper zone now counts as copper on its own net
 only, as KiCad reports it in `Zone.copper_settings.net`, and a rule area counts
 as none. A plan that conflicted only because of a pour on another net is now
 `ready`. A zone whose net KiCad does not report still blocks every net.
-Response shapes are unchanged (#779).
+Response shapes are unchanged.
 
 ### board file fallbacks refuse a board that changed mid-edit (patch release)
 
@@ -583,32 +585,32 @@ was read from. Otherwise the call returns `conflict` with the board in `paths`
 and leaves the newer file as it is; reload and retry. If the file no longer
 holds the edit when read back after the write, the call returns
 `mutation_outcome_uncertain`; reload and inspect the board before retrying.
-Successful responses and the IPC path are unchanged (#845).
+Successful responses and the IPC path are unchanged.
 
 ### board text, logo and zone writers refuse an unknown layer (patch release)
 
 `add_board_text`, `import_svg_logo`, `add_zone` and `add_copper_pour` now
 refuse a `layer` KiCad has no board layer for, such as the typo `F.Silk`, as
 `invalid_argument` with `field: "layer"`. Before, a live KiCad was sent the
-item on `BL_UNDEFINED`, which KiCad 10 does not validate (#237), and the file
+item on `BL_UNDEFINED`, which KiCad 10 does not validate, and the file
 fallback wrote the name into the board, which KiCad 10.0.6 then refuses to
 load. The refusal comes before KiCad is asked anything or the board is read,
 so neither changes. Every name these tools accepted and KiCad also accepts
 still works, and the `F.SilkS` default is unchanged. Response shapes are
-unchanged (#844).
+unchanged.
 
 ### `add_board_text` writes coordinates as KiCad writes them (patch release)
 
 When no live KiCad holds the board, `add_board_text` wrote the caller's `x`,
 `y` and `rotation` into the file as given, so a value carrying float noise,
-such as `54.60999999999999` from an older response (#747), was written that
+such as `54.60999999999999` from an older response, was written that
 way. Each is now rounded to the six decimals KiCad writes, moving the text by
 less than 1e-6 mm. The response still echoes the caller's values. When the
 saved file does not hold the text at the rounded position, the call returns
 `mutation_outcome_uncertain`. A value so large that rounding makes it
 infinite, such as `1.8e303`, is refused as `invalid_argument` before the file
-is written. The live-editor (IPC) path is unchanged. Arguments are unchanged
-(#838). The prose `message` of every `mutation_outcome_uncertain` result now
+is written. The live-editor (IPC) path is unchanged. Arguments are unchanged.
+The prose `message` of every `mutation_outcome_uncertain` result now
 says "file mutation" instead of "schematic mutation"; its fields are unchanged.
 
 ### `export_specctra_dsn` refuses per-layer padstacks (patch release)
@@ -623,7 +625,7 @@ the same, so the native bridge is no remedy.
 padstack, under every `native_bridge_mode`, with a `handler_error` naming the
 item and its mode. Nothing is written. A normal padstack, which KiCad saves
 with no `(padstack ...)` block, exports as before. To route the board, set the
-padstack back to normal in KiCad. Response shapes are unchanged (#842).
+padstack back to normal in KiCad. Response shapes are unchanged.
 
 ### `export_specctra_dsn` turns rotated footprints' pins once (patch release)
 
@@ -640,7 +642,7 @@ KiCad's native DSN of a board whose pins carry a `(rotate ...)` could not be
 read, so `native_bridge_mode` `prefer` fell back to the Rust export and
 `require` refused. Both now read it, and treat a native pin rotation that
 differs from the Rust export's like any other mismatch. Arguments, response
-fields and the manifest are unchanged (#840).
+fields and the manifest are unchanged.
 
 ### `export_specctra_dsn` exports rounded-rectangle pads (minor release)
 
@@ -649,7 +651,7 @@ most stock SMD footprints. It now exports them. Specctra has no rounded
 rectangle, so the DSN carries each one as a polygon, as KiCad's own exporter
 does. The polygon's edges are tangent to the corner arcs, so it encloses the
 rounded rectangle and stands at most about 1 µm outside it. As for every pad
-shape, the pad's size is first rounded to the micrometre (#790).
+shape, the pad's size is first rounded to the micrometre.
 
 What changes for a caller:
 
@@ -672,7 +674,8 @@ What changes for a caller:
   error is set above 5 µm fails this check, so `require` refuses and `prefer`
   falls back to the Rust export. Circle and rect pads still have to match
   exactly. KiCad's native DSN of most stock footprints is still refused before
-  this check, for reasons unrelated to pad shape (#841).
+  this check, for reasons unrelated to pad shape
+  ([#98](https://github.com/Copperpour/Copperpour/issues/98)).
 
 ### `export_pdf` and `export_svg` default to the front view (patch release)
 
@@ -687,8 +690,7 @@ in that order so the silkscreen sits on top. Inner
 and back copper are left out, because every copper layer on one page cannot
 be read. Pass `layers` for any other view. Both responses now include the
 `layers` that were plotted, as `export_gerber`'s already does. A `layers` item
-that is not a string is refused as `invalid_argument` instead of being dropped
-(#465).
+that is not a string is refused as `invalid_argument` instead of being dropped.
 
 ### `rename_project` refuses a file that changed mid-rename (patch release)
 
@@ -716,12 +718,11 @@ Three refusals now come before anything moves:
 When the outcome cannot be proven, the call returns
 `mutation_outcome_uncertain`. This happens when the transaction fails after its
 journal was written (the `path` is that journal, and the files stay renamed), or
-when undoing the renames fails. Arguments and the success response are unchanged
-(#851).
+when undoing the renames fails. Arguments and the success response are unchanged.
 
 ### Windows errors name resolved paths without `\\?\` (patch release)
 
-On Windows, errors printed a board or lock path that Konnect had resolved in
+On Windows, errors printed a board or lock path that Copperpour had resolved in
 its extended-length form, `\\?\C:\…`, beside the caller's own spelling of the
 same directory. These now print the ordinary form: `C:\…` for a drive path and
 `\\server\share\…` for a `\\?\UNC\…` network path. A path that the ordinary
@@ -735,7 +736,7 @@ and `ambiguous_open_board` (`requested`/`target`/`path`, `open_documents`,
 path in `unsafe_file_fallback` messages and in `source_evidence.detail`. A path
 the caller typed prints as typed unless it began with `\\?\` itself. Board
 matching still compares resolved paths. Field names and error kinds are
-unchanged, and other platforms are unaffected (#673).
+unchanged, and other platforms are unaffected.
 
 ### a listener that closes mid-negotiation is `handshake_failed` on Unix (patch release)
 
@@ -758,7 +759,7 @@ response shapes are unchanged.
 
 The sync dropped every symbol marked *Exclude from bill of materials*, so test
 points, wire pads and mounting holes never reached the board, and a part with
-both flags off was dropped without being listed (#875). KiCad's own Update PCB
+both flags off was dropped without being listed. KiCad's own Update PCB
 removes only a part marked *Exclude from board*; *Exclude from BOM* sets the
 footprint's attribute.
 
@@ -825,10 +826,10 @@ post-apply readback compares each one's text, layer and visibility, as it does
 the library's fields.
 
 Not covered: the per-variant field values a KiCad 10 netlist can carry, and the
-board's own text settings, which Konnect does not read. The styles above are
+board's own text settings, which Copperpour does not read. The styles above are
 KiCad's defaults. With Board Setup's "Apply board defaults to footprint fields"
 on, which is off by default, KiCad restyles every field of a footprint it adds
-from those settings, and the sync does not (#788).
+from those settings, and the sync does not.
 
 ### `update_pcb_from_schematic` gives footprints their library's fields (patch release)
 
@@ -869,7 +870,7 @@ stock footprint carries.
 `copy_routing_pattern` matched `(segment` and `(via` as two-space-indented
 text, which KiCad 10 never writes, so it copied nothing from a board KiCad had
 saved and reported `copied: 0`. It now reads top-level `segment`, `arc` and
-`via` items from the parsed board (#802).
+`via` items from the parsed board.
 
 - **Selection:** an item is copied when every point that places it (a
   segment's `start`/`end`, an arc's `start`/`mid`/`end`, a via's `at`) is
@@ -912,7 +913,7 @@ check comes before the file is read as well as before it is written, so a call
 that would change nothing is refused too: while KiCad holds the board, the file
 can be older than what KiCad holds. Close the board in KiCad, or make the
 change there, and retry. A KiCad that holds a different board, or none, does
-not affect these tools. Response shapes are unchanged (#791).
+not affect these tools. Response shapes are unchanged.
 
 ### `get_board_extents` names what KiCad will not list, and measures text boxes (minor release)
 
@@ -927,7 +928,7 @@ adds `unavailable_item_classes`, one entry per class it could not measure:
   does list a class the bundled protocol has no message for, so the items
   cannot be measured.
 
-A class that Konnect does measure, if KiCad refuses it the same way, is now
+A class that Copperpour does measure, if KiCad refuses it the same way, is now
 named there too, and the rest of the read still answers. It used to fail the
 whole read. Any other failure still fails the read. A saved-file answer
 carries `unavailable_item_classes: []`, since it lists every item and names
@@ -944,7 +945,7 @@ extent can therefore grow where a board has text boxes.
 
 A footprint point or a via layer whose `size` is present but unreadable is now
 skipped and counted in `skipped_item_count`. The point used to take the 1 mm
-default, and the via used to keep its base diameter (#688).
+default, and the via used to keep its base diameter.
 
 ### `update_pcb_from_schematic` places footprints with their library data (patch release)
 
@@ -979,7 +980,7 @@ where it used to be read as fully opaque. An absent opacity still defaults to
 fully opaque.
 
 Library properties (Datasheet, Description and custom fields) and each field's
-layer and visibility are not part of this change (#789).
+layer and visibility are not part of this change.
 
 ### grid-snapped coordinates are written as KiCad writes them (patch release)
 
@@ -988,7 +989,7 @@ writes. `bulk_move_schematic_components` used to write a symbol at
 132 × 1.27 as `(at … 167.64000000000001 …)` and report the same value as
 `placements[].new_y`. It now writes and reports `167.64`, and `add_wire`'s
 `added_wire` echo is rounded the same way. The values differ by less than
-1e-12 mm; nothing else in the request or response changes (#744).
+1e-12 mm; nothing else in the request or response changes.
 
 ### `open_schematic_viewer` reports a viewer that exits during startup (patch release)
 
@@ -1004,14 +1005,14 @@ longer, and on the stdio transport no other request is answered during it.
 The viewer no longer inherits the server's stdin and stdout, which carry the
 stdio transport's JSON-RPC stream. Its stderr is read by the server and written
 to the server log as `schematic_viewer` warnings, so that output now stops when
-the server exits (#702).
+the server exits.
 
 ### `get_board_extents` reads the live board and measures every item (minor release)
 
 `get_board_extents` used to ask KiCad for the box of an empty item list.
 KiCad 10.0.5 answers that with no boxes on every board, so the IPC branch never
 answered. The tool then discarded the failure and answered from the saved file,
-using only top-level `gr_line` endpoints and footprint anchor points (#688).
+using only top-level `gr_line` endpoints and footprint anchor points.
 
 It now lists each class of board item and has KiCad measure every one in
 `BBM_ITEM_ONLY` mode, which leaves footprint text out. It reads through the same
@@ -1090,8 +1091,7 @@ server's working directory, where the search reads it. A location reached twice,
 directory, is searched once. When `jar_path` is passed and is not a file, it
 reports `checked_path` and says so instead of giving download advice.
 `route_specctra_dsn` now refuses such a `jar_path` with `file_not_found` naming
-the path, where it used to answer "install Freerouting or pass jar_path"
-(#787).
+the path, where it used to answer "install Freerouting or pass jar_path".
 
 ### `suggest_jlcpcb_alternatives` matches KiCad footprints and ranks by library type (minor release)
 
@@ -1117,9 +1117,10 @@ Results used to be ordered by price alone. Parts with fewer than `min_stock_coun
 units in stock (new, default 100) are now excluded. The rest are ranked Basic,
 then Preferred, then Extended when `prefer_basic` (new, default true) is on,
 then known price before unknown, price ascending, stock descending and LCSC
-number. A stored price of 0 is treated as unknown (#582): it sorts after every
+number. A stored price of 0 is treated as unknown
+([#63](https://github.com/Copperpour/Copperpour/issues/63)): it sorts after every
 known price, and `max_price_usd` excludes it. The response adds
 `package_match` (the rule and the LCSC names searched), `value_match`,
 `ranking` (the criteria and the effective settings), `count`, `matched_count`
 and `exclusions`, which counts the parts the stock floor and the price limit
-removed (#785).
+removed.

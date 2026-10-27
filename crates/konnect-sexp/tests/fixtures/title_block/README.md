@@ -2,11 +2,11 @@
 
 Every file here is a pcbnew 10.0.6 save (`version 20260206`), built with KiCad's
 own Python API. None is hand-written. They back `konnect_sexp::title_block` and
-`set_board_title_block` (#714).
+`set_board_title_block`.
 
 `board.kicad_pcb` is the base board. Each other file is what KiCad itself saved
 after loading `board.kicad_pcb` (or `board_empty.kicad_pcb`), making one edit
-through `BOARD.GetTitleBlock()` / `SetTitleBlock()`, and saving. Konnect's file
+through `BOARD.GetTitleBlock()` / `SetTitleBlock()`, and saving. Copperpour's file
 path must produce exactly the same bytes for the same edit. A plain
 load-and-save of `board.kicad_pcb` is byte-identical to it, so every difference
 between KiCad's input and output files is the title block.

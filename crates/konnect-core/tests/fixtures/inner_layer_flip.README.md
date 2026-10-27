@@ -1,4 +1,4 @@
-# `inner_layer_flip_*` — inner copper through a side flip (#831)
+# `inner_layer_flip_*` — inner copper through a side flip
 
 Three boards and one library footprint, all written by KiCad 10.0.6's own
 `pcbnew` Python (`python3 -I build.py <out>`, script below). Nothing is
@@ -10,7 +10,7 @@ writer wrote every byte.
 | `inner_layer_flip_front.kicad_pcb` | 8 copper layers. `NT1` (stock `NetTie-3_SMD_Pad0.5mm`, its three pads and copper fill moved to `In2.Cu`) on F.Cu at 100,50 rotated -90°, and an unrelated stock `R1` (`R_0402_1005Metric`) on F.Cu. |
 | `inner_layer_flip_back.kicad_pcb` | The same board after KiCad's own `FOOTPRINT::Flip` of `NT1`: the oracle for `flip_component`. |
 | `inner_layer_flip_missing.kicad_pcb` | The back board after `SetCopperLayerCount(4)`. KiCad keeps `NT1`'s pads and fill on `In5.Cu`, which a 4-layer board does not have. |
-| `inner_layer_refresh_r0402.kicad_mod` | Stock `R_0402_1005Metric` with both pads moved to `In2.Cu` and an `IN2` text added on `In2.Cu`, saved with `PCB_IO_KICAD_SEXPR().FootprintSave`. The net tie can't be used here, because library refresh refuses `net_tie_pad_groups` (#775). |
+| `inner_layer_refresh_r0402.kicad_mod` | Stock `R_0402_1005Metric` with both pads moved to `In2.Cu` and an `IN2` text added on `In2.Cu`, saved with `PCB_IO_KICAD_SEXPR().FootprintSave`. The net tie can't be used here, because library refresh refuses `net_tie_pad_groups` ([#85](https://github.com/Copperpour/Copperpour/issues/85)). |
 | `inner_layer_flip_padstack.kicad_pcb` | 8 copper layers. Stock `PinHeader_1x01_P2.54mm_Vertical` as `J1`, its pad set to a custom padstack with a 2.2 mm `In2.Cu` entry. |
 
 The front and back boards come from one run; later runs differ only in UUIDs.
@@ -32,9 +32,9 @@ KiCad's flip of the refresh footprint on the same 8-layer board, printed by
 the script: pads `['In5.Cu', 'In5.Cu']`, text `In5.Cu mirrored`.
 
 KiCad's flip of `J1` moves the padstack's 2.2 mm entry from `In2.Cu` to
-`In5.Cu`. Konnect's file flip does not rewrite padstacks, so it refuses them.
+`In5.Cu`. Copperpour's file flip does not rewrite padstacks, so it refuses them.
 A pad's `zone_layer_connections "In2.Cu"` stays on `In2.Cu` through KiCad's
-flip (checked the same way with `SetZoneLayerOverride`), so Konnect leaves it
+flip (checked the same way with `SetZoneLayerOverride`), so Copperpour leaves it
 too.
 
 `pcbnew.FlipLayer(layer, N)` for the rows `konnect-sexp`'s
@@ -48,7 +48,7 @@ too.
 | 8 | In1↔In6, In2↔In5, In3↔In4 | clamped to `In1.Cu` |
 | 32 | In1↔In30, In8↔In23 | — |
 
-Konnect refuses where KiCad clamps, or keeps the layer, because neither result
+Copperpour refuses where KiCad clamps, or keeps the layer, because neither result
 is the footprint's mirror.
 
 ## Tests

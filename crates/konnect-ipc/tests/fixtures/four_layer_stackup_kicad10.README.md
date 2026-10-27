@@ -3,7 +3,8 @@
 A board that holds a four-layer fabrication stackup and nothing else, and KiCad's
 `GetBoardStackup` answer for it, serialised exactly as KiCad's IPC API sent it.
 
-Used by the `GetBoardStackup` client tests (#716):
+Used by the `GetBoardStackup` client tests
+([#78](https://github.com/Copperpour/Copperpour/issues/78)):
 
 - `mock_server_test.rs`, `kicads_captured_answer_is_the_stackup_its_board_file_declares`, which
   CI runs: the mock server replays the capture, and the decoded stackup is checked against the

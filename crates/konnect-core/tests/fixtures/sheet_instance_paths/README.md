@@ -1,7 +1,8 @@
-# Sheet instance path fixture (#478)
+# Sheet instance path fixture
 
-A one-project hierarchy whose child files carry the instance paths Konnect
-wrote before #478 was fixed: a path naming a deleted sheet beside the live one,
+A one-project hierarchy whose child files carry the instance paths Copperpour
+wrote before mixelpixx/Konnect#478 was fixed: a path naming a deleted sheet beside the
+live one,
 and an unplaced file whose only path names a deleted sheet.
 
 ## Provenance

@@ -2,11 +2,11 @@
 
 `no_connect_carry_kicad10.kicad_sch` carries the three ways a placement change
 can meet a no-connect marker, so the shared carry contract can be checked
-against an answer that is not its own (#626).
+against an answer that is not its own.
 
 ## Provenance
 
-Built through Konnect against KiCad's stock `Device` library —
+Built through Copperpour against KiCad's stock `Device` library —
 `create_schematic`, `add_wire`, `add_schematic_net_label`,
 `add_schematic_component`, `add_no_connect` — then parsed and force-resaved by
 KiCad 10.0.6 on Fedora:
@@ -102,6 +102,7 @@ them the cost of a sheet built out of deliberate stubs: 4 `pin_not_connected`,
 | `R2` shifted | 8 — unchanged |
 | `R2` shifted, no fix | 8, with the same **2** `no_connect_dangling` as the moved-no-fix row |
 
-ERC reports the stranded marker, which is how #626 was noticed. What it never
+ERC reports the stranded marker, which is how mixelpixx/Konnect#626 was noticed. What
+it never
 reports is the other half — that the pin the marker used to protect has joined
 a net — which is why the netlist table above is the primary oracle.

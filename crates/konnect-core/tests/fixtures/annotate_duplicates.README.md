@@ -1,9 +1,9 @@
-# annotate_duplicates fixtures (#454)
+# annotate_duplicates fixtures
 
 Three saves of one schematic, all written by KiCad 10.0.5, used to pin
 `annotate_schematic` to eeschema's own behaviour rather than to an assumption.
 
-- `annotate_duplicates.kicad_sch` — built through Konnect's `create_project`
+- `annotate_duplicates.kicad_sch` — built through Copperpour's `create_project`
   and `add_schematic_component` (three `Device:R` all named `R1`: 1k at
   x=101.6, 2k at x=50.8, 3k at x=127.0; two `Device:C` named `C?`: 100n at
   x=139.7, 1u at x=63.5), then re-serialised by `kicad-cli sch upgrade` so
@@ -26,7 +26,7 @@ child sheet, verbatim: its parent instantiates it four times, so every symbol
 carries four `(instances …)` paths. It pins per-sheet-instance numbering.
 `check_schematic_overlaps` also finds one overlap in it, C12 (at
 `(208.28, 67.31)`) over IC2's unit 2 (at `(213.36, 73.66)`), which reports
-7.62 × 0.762 mm and not `0.7620000000000005` (#747).
+7.62 × 0.762 mm and not `0.7620000000000005`.
 
 Byte evidence: this directory is `-text` in `.gitattributes`; never
 eol-normalise these files.

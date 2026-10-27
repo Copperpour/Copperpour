@@ -3,19 +3,18 @@
 A project whose netclasses carry the differential-pair settings three ways —
 complete on the Default, all three set on `USB`, none set on `Power` — in the
 bytes KiCad wrote. Used to check that `get_netclasses` reports them as KiCad
-resolves them and that `create_netclass` changes only what it is asked to
-(#777).
+resolves them and that `create_netclass` changes only what it is asked to.
 
 ## Provenance
 
-1. Konnect's `create_project` laid out `netclass_diff_pair_kicad10`, and its
+1. Copperpour's `create_project` laid out `netclass_diff_pair_kicad10`, and its
    schematic was removed. pcbnew 10.0.6, with the API server enabled, opened
-   the board, and Konnect's `save_project` had it save through the API's
+   the board, and Copperpour's `save_project` had it save through the API's
    `SaveDocument`. That save writes the board and, beside it, the project file
    (`pcbnew/api/api_handler_pcb.cpp:185-198`, `pcbnew/files.cpp:376-382`,
    `:999-1002`), so both files are KiCad's.
 2. With pcbnew closed, `create_netclass` and `assign_net_to_class` from this
-   change (#777) wrote:
+   change wrote:
 
    ```text
    create_netclass      name=USB   diff_pair_width=0.18 diff_pair_gap=0.15 diff_pair_via_gap=0.3
@@ -35,7 +34,7 @@ it wrote the Default first and the others by name
 (`common/project/net_settings.cpp:189-201`, a `std::map` at
 `include/project/net_settings.h:236`), and it added `pcb_color`,
 `schematic_color` and `tuning_profile` to `USB` and `Power`, which it always
-writes (`:76-80`). Every value Konnect wrote came back
+writes (`:76-80`). Every value Copperpour wrote came back
 unchanged, the Default and `netclass_patterns` included. A differential-pair
 key is written only when the class holds one (`:116-123`):
 

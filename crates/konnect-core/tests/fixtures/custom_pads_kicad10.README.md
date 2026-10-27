@@ -2,10 +2,10 @@
 
 `custom_pads_texas_rje0020a_kicad10.kicad_mod` and
 `custom_pads_vqfn20_kicad10.kicad_mod` are two stock KiCad footprints whose
-corner pads are `smd custom`. Konnect's typed placement path cannot carry a
+corner pads are `smd custom`. Copperpour's typed placement path cannot carry a
 custom-shape pad, so `update_pcb_from_schematic` refuses a plan that needs one.
 These are the two footprints that refusal met on a real board, where it named
-neither of them (#657).
+neither of them.
 
 ## Provenance
 

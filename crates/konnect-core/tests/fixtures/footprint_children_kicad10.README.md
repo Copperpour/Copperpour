@@ -1,4 +1,4 @@
-# Footprints owning groups, points and variants (#836)
+# Footprints owning groups, points and variants
 
 `footprint_children_kicad10.kicad_pcb` is a board saved by pcbnew 10.0.6 and
 not edited since. It was made in KiCad's GUI:

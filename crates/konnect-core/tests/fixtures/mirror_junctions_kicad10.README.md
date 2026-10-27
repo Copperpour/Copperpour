@@ -2,12 +2,12 @@
 
 `mirror_junctions_kicad10.kicad_sch` puts a wire where a reflected pin arrives,
 so `mirror_schematic_component` can be asked to reconcile the junction there
-and checked against an answer that is not its own (#450).
+and checked against an answer that is not its own.
 
 ## Provenance
 
 `mirror_fields_kicad10.kicad_sch`, plus a wire and a net label added through
-Konnect (`add_wire` from (147.32, 49.53) to (147.32, 52.07), and
+Copperpour (`add_wire` from (147.32, 49.53) to (147.32, 52.07), and
 `add_schematic_net_label` `NETM` at (147.32, 52.07)), then parsed and
 force-resaved by KiCad 10.0.6:
 

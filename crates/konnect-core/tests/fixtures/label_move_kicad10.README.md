@@ -1,13 +1,13 @@
 # Label move fixture
 
 `label_move_kicad10.kicad_sch` carries the two labels `move_labels_by_offset`
-used to get wrong (#803): a plain label whose name reads `(at 1 2)`, and a
+used to get wrong: a plain label whose name reads `(at 1 2)`, and a
 global label `PWR` with the `Intersheetrefs` field KiCad adds to every global
 label.
 
 ## Provenance
 
-Built through Konnect against KiCad's stock `Device` library —
+Built through Copperpour against KiCad's stock `Device` library —
 `create_schematic`, `add_schematic_component`, `add_wire`,
 `add_schematic_net_label` — then force-resaved by KiCad 10.0.6:
 
