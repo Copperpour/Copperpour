@@ -24,18 +24,52 @@ UI_TIMEOUT_SECONDS = 30
 
 
 def bridge_root():
-    """Return the per-user registration directory shared with Copperpour Rust."""
+    """Return the per-user registration directory shared with Copperpour Rust.
+
+    Follows the server's `native_specctra_bridge::registration_root`, which
+    uses `dirs::data_local_dir()`: an empty or relative `XDG_DATA_HOME` is
+    ignored, and `None` replaces any path that would be relative to KiCad's
+    working directory (#181). On Windows `dirs` asks for the LocalAppData known
+    folder; this reads `LOCALAPPDATA`, which names the same folder unless the
+    variable was changed.
+    """
     # KONNECT_BRIDGE_DIR is the name before the rename to Copperpour.
     override = os.environ.get("COPPERPOUR_BRIDGE_DIR") or os.environ.get("KONNECT_BRIDGE_DIR")
     if override:
-        return os.path.abspath(os.path.expanduser(override))
+        return _absolute(override)
     if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+        base = _absolute(os.environ.get("LOCALAPPDATA"))
     elif sys_platform() == "darwin":
-        base = os.path.expanduser("~/Library/Application Support")
+        base = _join(_home(), "Library", "Application Support")
     else:
-        base = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
-    return os.path.join(base, "copperpour", "native-bridge")
+        base = _absolute(os.environ.get("XDG_DATA_HOME")) or _join(_home(), ".local", "share")
+    return _join(base, "copperpour", "native-bridge")
+
+
+def _absolute(path):
+    if not path or not os.path.isabs(path):
+        return None
+    # On Windows, as Rust: a drive or UNC share, not just a root (`\b`).
+    if os.name == "nt" and not os.path.splitdrive(path)[0]:
+        return None
+    return path
+
+
+def _join(base, *parts):
+    return None if base is None else os.path.join(base, *parts)
+
+
+def _home():
+    # As `dirs`: a non-empty HOME, else the account's entry; never relative.
+    home = os.environ.get("HOME")
+    if not home:
+        try:
+            import pwd
+
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except (ImportError, KeyError):
+            return None
+    return _absolute(home)
 
 
 def sys_platform():
@@ -151,16 +185,14 @@ class NativeSpecctraBridge:
         self.token = secrets.token_urlsafe(32)
         self.server = None
         self.thread = None
-        self.registration_path = os.path.join(
-            self.root,
-            f"bridge-{os.getpid()}-{secrets.token_hex(8)}.json",
-        )
+        self.registration_path = None
         self.session_dir = None
         self.started_at = None
         self.operation_lock = threading.Lock()
 
     def available(self):
-        return callable(getattr(self.pcbnew, "ExportSpecctraDSN", None))
+        # Without an absolute root the server could not find the registration (#181).
+        return self.root is not None and callable(getattr(self.pcbnew, "ExportSpecctraDSN", None))
 
     def running(self):
         return self.server is not None and self.thread is not None and self.thread.is_alive()
@@ -170,6 +202,10 @@ class NativeSpecctraBridge:
             return True
         if not self.available():
             return False
+        self.registration_path = os.path.join(
+            self.root,
+            f"bridge-{os.getpid()}-{secrets.token_hex(8)}.json",
+        )
         os.makedirs(self.root, exist_ok=True)
         self.session_dir = tempfile.mkdtemp(prefix=f"session-{os.getpid()}-", dir=self.root)
         self.server = _BridgeServer(("127.0.0.1", 0), self)
@@ -208,10 +244,11 @@ class NativeSpecctraBridge:
             server.server_close()
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=5)
-        try:
-            os.remove(self.registration_path)
-        except OSError:
-            pass
+        if self.registration_path:
+            try:
+                os.remove(self.registration_path)
+            except OSError:
+                pass
         if self.session_dir:
             shutil.rmtree(self.session_dir, ignore_errors=True)
         self.session_dir = None

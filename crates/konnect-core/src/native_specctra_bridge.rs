@@ -65,9 +65,14 @@ struct ExportResponse {
 pub(crate) async fn try_export(board: &Path) -> NativeExportAttempt {
     let mut attempt = NativeExportAttempt::default();
     let Some(root) = registration_root() else {
-        attempt
-            .diagnostics
-            .push("native bridge registration directory is unavailable".to_string());
+        attempt.diagnostics.push(
+            if crate::app_dirs::env_var("BRIDGE_DIR").is_some() {
+                "COPPERPOUR_BRIDGE_DIR (or KONNECT_BRIDGE_DIR) is not an absolute path"
+            } else {
+                "no absolute local-data directory for the native bridge registration"
+            }
+            .to_string(),
+        );
         return attempt;
     };
     let entries = match registrations(&root) {
@@ -114,7 +119,8 @@ pub(crate) async fn try_export(board: &Path) -> NativeExportAttempt {
 
 pub(crate) fn registration_root() -> Option<PathBuf> {
     if let Some(path) = crate::app_dirs::env_var("BRIDGE_DIR") {
-        return Some(PathBuf::from(path));
+        // Relative would mean this process's working directory, not KiCad's (#181).
+        return Some(PathBuf::from(path)).filter(|path| path.is_absolute());
     }
     // The KiCad plugin writes here; it ships with this binary, so no move.
     crate::app_dirs::local_data_dir()
@@ -312,6 +318,46 @@ mod tests {
             };
             assert!(validate_registration(&invalid).is_err(), "{address}");
         }
+    }
+
+    /// A relative override is refused, not resolved against the working
+    /// directory, and does not fall back to the default (#181). The plugin's
+    /// half is `BridgeRootTests`. Run in a child process, since the variables
+    /// are process-wide; `CHILD` carries the expected root, empty for none.
+    #[test]
+    fn a_relative_bridge_dir_gives_no_root() {
+        const CHILD: &str = "COPPERPOUR_TEST_RELATIVE_BRIDGE_DIR_CHILD";
+        let Some(expected) = std::env::var_os(CHILD) else {
+            let absolute = std::env::temp_dir().join("bridge");
+            let (rel, empty) = (std::ffi::OsStr::new("rel"), std::ffi::OsStr::new(""));
+            for (copperpour, konnect, expected) in [
+                (rel, empty, empty),
+                (empty, rel, empty),
+                (rel, absolute.as_os_str(), empty),
+                (absolute.as_os_str(), empty, absolute.as_os_str()),
+            ] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "native_specctra_bridge::tests::a_relative_bridge_dir_gives_no_root",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, expected)
+                    .env("COPPERPOUR_BRIDGE_DIR", copperpour)
+                    .env("KONNECT_BRIDGE_DIR", konnect)
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success() && stdout.contains("1 passed"),
+                    "{copperpour:?} {konnect:?}: {stdout}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let expected = Some(PathBuf::from(expected)).filter(|path| !path.as_os_str().is_empty());
+        assert_eq!(registration_root(), expected);
     }
 
     #[test]

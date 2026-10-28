@@ -402,9 +402,11 @@ fallback. Use `disable` to force Rust output.
 The bridge listens only on an ephemeral IPv4 loopback port and requires a
 per-session bearer token. Registration and temporary DSN files live under the
 per-user local-data directory (`%LOCALAPPDATA%\copperpour\native-bridge` on
-Windows); `COPPERPOUR_BRIDGE_DIR` overrides it for diagnostics and tests. A clean
-plugin shutdown removes its own registration and temporary files. Stale
-registrations left by a hard KiCad crash are ignored because Copperpour probes and
+Windows); `COPPERPOUR_BRIDGE_DIR`, an absolute path, overrides it for diagnostics
+and tests. With no absolute directory (a relative `HOME`, `LOCALAPPDATA` or
+override) the settings dialog shows the bridge as unavailable; set `HOME` or
+`COPPERPOUR_BRIDGE_DIR` to an absolute path. A clean plugin shutdown removes its own registration and temporary files.
+Stale registrations left by a hard KiCad crash are ignored because Copperpour probes and
 authenticates each candidate before use.
 
 This option is unavailable on KiCad 11 after removal of the legacy SWIG Python
