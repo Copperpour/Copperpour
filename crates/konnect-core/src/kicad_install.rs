@@ -18,9 +18,9 @@ pub fn find_cli(configured: &str) -> Option<PathBuf> {
 
 /// Find the KiCad project-manager executable.
 ///
-/// An explicit GUI path wins. If the configured CLI is an absolute path, its
-/// sibling GUI is next so a selected KiCad version cannot be mixed with a
-/// different installation's libraries or UI.
+/// An explicit GUI path wins. If the configured CLI resolves to a binary under
+/// `<root>/bin`, its sibling GUI is next so a selected KiCad version cannot be
+/// mixed with a different installation's libraries or UI.
 pub fn find_gui(configured_binary: &str, configured_cli: &str) -> Option<PathBuf> {
     resolve_explicit_path(configured_binary)
         .or_else(|| {
@@ -29,7 +29,7 @@ pub fn find_gui(configured_binary: &str, configured_cli: &str) -> Option<PathBuf
                 .map(|root| root.join("bin").join(gui_filename()))
                 .filter(|path| path.is_file())
         })
-        .or_else(|| resolve_configured(configured_binary))
+        .or_else(|| find_bare_name(configured_binary))
         .or_else(|| gui_candidates().into_iter().find(|path| path.is_file()))
 }
 
@@ -167,18 +167,16 @@ fn discover_installation_roots() -> Vec<PathBuf> {
 }
 
 fn resolve_configured(configured: &str) -> Option<PathBuf> {
-    let configured = configured.trim();
-    if configured.is_empty() {
-        return None;
-    }
-    let path = PathBuf::from(configured);
-    if path.is_file() {
-        return Some(path);
-    }
-    if path.components().count() == 1 {
-        return find_on_path(&path);
-    }
-    None
+    resolve_explicit_path(configured).or_else(|| find_bare_name(configured))
+}
+
+/// A bare name is looked up on `PATH` only, so a same-named file in the working
+/// directory cannot stand in for it (#182).
+fn find_bare_name(configured: &str) -> Option<PathBuf> {
+    let path = Path::new(configured.trim());
+    (path.components().count() == 1)
+        .then(|| find_on_path(path))
+        .flatten()
 }
 
 fn resolve_explicit_path(configured: &str) -> Option<PathBuf> {
@@ -188,7 +186,9 @@ fn resolve_explicit_path(configured: &str) -> Option<PathBuf> {
 
 fn find_on_path(filename: &Path) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
+    // An empty or relative entry would search the working directory again.
     std::env::split_paths(&paths)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(filename))
         .find(|path| path.is_file())
 }
@@ -465,5 +465,20 @@ mod tests {
 
         assert_eq!(find_cli(cli.to_str().unwrap()), Some(cli.clone()));
         assert_eq!(find_gui(gui_filename(), cli.to_str().unwrap()), Some(gui));
+    }
+
+    /// Tests run in the package root, where `Cargo.toml` is a same-named file
+    /// a bare name must not resolve to (#182).
+    #[test]
+    fn a_bare_name_never_resolves_to_the_working_directory() {
+        assert!(Path::new("Cargo.toml").is_file());
+        let not_relative = |found: Option<PathBuf>| found.is_none_or(|path| path.is_absolute());
+
+        assert!(not_relative(find_cli("Cargo.toml")));
+        assert!(not_relative(find_gui("Cargo.toml", "")));
+        // A directory component makes it a path, which is taken as given.
+        let explicit = Some(PathBuf::from("./Cargo.toml"));
+        assert_eq!(find_cli("./Cargo.toml"), explicit);
+        assert_eq!(find_gui("./Cargo.toml", ""), explicit);
     }
 }
