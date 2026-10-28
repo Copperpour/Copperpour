@@ -5,11 +5,11 @@
 //! file. The first supported profile is intentionally narrow and rejects
 //! every feature it cannot represent without approximation.
 
+use crate::hex::sha256_hex;
 use anyhow::{bail, Context, Result};
 use konnect_ipc::IpcEffectiveRoutingRules;
 use konnect_sexp::{parse_sexp, SexpNode};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use specctra::read::{ListTokenizer, ReadDsn};
 use specctra::structure as dsn;
 use specctra::write::{ListWriter, WriteSes};
@@ -1925,10 +1925,6 @@ fn non_negative_um(value: Option<f64>, label: &str) -> Result<i64> {
         bail!("{label} must not be negative");
     }
     Ok(value)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[cfg(test)]

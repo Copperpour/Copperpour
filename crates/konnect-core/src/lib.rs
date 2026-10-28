@@ -4,6 +4,7 @@ pub mod design_hash;
 pub(crate) mod freerouting_mcp;
 pub mod gates;
 pub mod guidance;
+pub(crate) mod hex;
 pub mod kicad_install;
 pub mod mcp;
 pub(crate) mod native_specctra_bridge;

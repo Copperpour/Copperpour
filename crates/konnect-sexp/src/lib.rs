@@ -3,6 +3,7 @@ pub mod bounds;
 pub mod command;
 pub mod error;
 pub mod geometry;
+mod hex;
 pub mod layers;
 pub mod net;
 pub mod parser;

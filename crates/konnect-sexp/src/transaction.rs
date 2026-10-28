@@ -167,7 +167,7 @@ mod journal_path_serde {
         let (encoding, bytes) = native_bytes(path);
         EncodedPath {
             encoding: encoding.to_owned(),
-            hex: encode_hex(&bytes),
+            hex: crate::hex::encode_hex(&bytes),
         }
         .serialize(serializer)
     }
@@ -179,43 +179,11 @@ mod journal_path_serde {
         match StoredPath::deserialize(deserializer)? {
             StoredPath::Unicode(path) => Ok(PathBuf::from(path)),
             StoredPath::Encoded(path) => {
-                let bytes = decode_hex(&path.hex).map_err(serde::de::Error::custom)?;
+                let bytes = crate::hex::decode_hex(&path.hex).map_err(|reason| {
+                    serde::de::Error::custom(format!("encoded transaction path {reason}"))
+                })?;
                 path_from_native_bytes(&path.encoding, bytes).map_err(serde::de::Error::custom)
             }
-        }
-    }
-
-    fn encode_hex(bytes: &[u8]) -> String {
-        const DIGITS: &[u8; 16] = b"0123456789abcdef";
-        let mut encoded = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
-            encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
-        }
-        encoded
-    }
-
-    fn decode_hex(encoded: &str) -> Result<Vec<u8>, &'static str> {
-        if !encoded.len().is_multiple_of(2) {
-            return Err("encoded transaction path has an odd number of hex digits");
-        }
-        encoded
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|pair| {
-                let high = hex_digit(pair[0])?;
-                let low = hex_digit(pair[1])?;
-                Ok((high << 4) | low)
-            })
-            .collect()
-    }
-
-    fn hex_digit(byte: u8) -> Result<u8, &'static str> {
-        match byte {
-            b'0'..=b'9' => Ok(byte - b'0'),
-            b'a'..=b'f' => Ok(byte - b'a' + 10),
-            b'A'..=b'F' => Ok(byte - b'A' + 10),
-            _ => Err("encoded transaction path contains a non-hex digit"),
         }
     }
 

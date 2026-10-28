@@ -20,6 +20,7 @@
 //! reference the design they evaluated without the reference changing the
 //! referent.
 
+use crate::hex::encode_hex;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -45,7 +46,7 @@ pub fn design_state_hash(project_dir: &Path) -> Result<(String, Vec<String>)> {
         hasher.update(normalize_eol(&content));
         hasher.update([0]);
     }
-    Ok((format!("{:x}", hasher.finalize()), files))
+    Ok((encode_hex(&hasher.finalize()), files))
 }
 
 fn collect_design_files(root: &Path) -> Result<Vec<String>> {
@@ -140,6 +141,19 @@ mod tests {
         let (hash_a, _) = design_state_hash(a.path()).unwrap();
         let (hash_b, _) = design_state_hash(b.path()).unwrap();
         assert_eq!(hash_a, hash_b);
+    }
+
+    // Callers persist this hash, so its value is a promise across releases,
+    // computed with Python's hashlib.
+    #[test]
+    fn hash_value_is_stable_across_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "amp.kicad_pro", b"{}\n");
+        write(dir.path(), "amp.kicad_sch", b"(kicad_sch\r\n)\r\n");
+        assert_eq!(
+            design_state_hash(dir.path()).unwrap().0,
+            "b31056eeba3d39f5b2c645454a44bd4cdfee570a341edf016443201e55ea93a2"
+        );
     }
 
     #[test]

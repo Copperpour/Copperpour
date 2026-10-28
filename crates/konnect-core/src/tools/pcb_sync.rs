@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::hex::encode_hex;
 use crate::mcp::protocol::{CallToolResult, ToolContent};
 use crate::tools::{
     pcb_board::{attempt_ipc_write, BoardWrite},
@@ -1237,14 +1238,14 @@ fn plan_revision(netlist_source: &str, board: &BoardState) -> String {
         hasher.update(net.as_bytes());
         hasher.update(count.to_le_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    encode_hex(&hasher.finalize())
 }
 
 fn refresh_revision_with_staging(plan: &mut SyncPlan) {
     let mut hasher = Sha256::new();
     hasher.update(plan.plan_revision.as_bytes());
     hasher.update(serde_json::to_vec(&plan.changes).expect("planned changes serialize"));
-    plan.plan_revision = format!("{:x}", hasher.finalize());
+    plan.plan_revision = encode_hex(&hasher.finalize());
 }
 
 fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {

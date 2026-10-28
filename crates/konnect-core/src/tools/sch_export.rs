@@ -4,6 +4,7 @@
 //! `export_netlist_summary` and `fix_connectivity` operate directly on
 //! S-expression file content so they work without a running KiCAD instance.
 
+use crate::hex::sha256_hex;
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::{get_path, placed_pins, placed_pins_by_reference, ToolContext, ToolDef};
@@ -388,8 +389,7 @@ async fn handle_baseline_set(
     std::fs::create_dir_all(png_path.parent().expect("baseline dir has parent"))?;
     std::fs::write(&png_path, &rendered.png)?;
 
-    use sha2::Digest as _;
-    let source_sha256 = format!("{:x}", sha2::Sha256::digest(&source_bytes));
+    let source_sha256 = sha256_hex(&source_bytes);
     let meta = json!({
         "sheet": sch_path.display().to_string(),
         "source_sha256": source_sha256,
@@ -457,8 +457,7 @@ async fn handle_baseline_compare(
     }
 
     let source_bytes = std::fs::read(&sch_path)?;
-    use sha2::Digest as _;
-    let current_sha = format!("{:x}", sha2::Sha256::digest(&source_bytes));
+    let current_sha = sha256_hex(&source_bytes);
     let source_changed = meta["source_sha256"] != json!(current_sha);
 
     // Compare at the BASELINE's width so pixel counts stay commensurable.

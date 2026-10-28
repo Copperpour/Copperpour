@@ -1,5 +1,6 @@
 //! Revision-bound inventory and exact deletion for PCB zones.
 
+use crate::hex::encode_hex;
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -932,7 +933,7 @@ fn revision(board_path: &Path, source: &str, snapshot: &str) -> anyhow::Result<S
     digest.update(canonical.to_string_lossy().as_bytes());
     digest.update([0]);
     digest.update(snapshot.as_bytes());
-    Ok(format!("sha256:{:x}", digest.finalize()))
+    Ok(format!("sha256:{}", encode_hex(&digest.finalize())))
 }
 
 fn zone_json(zone: &ZoneRecord) -> Value {

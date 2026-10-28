@@ -4,10 +4,10 @@
 //! manifest, the Freerouting session, placement invariance, net/layer names,
 //! via geometry, and every route primitive before returning an apply plan.
 
+use crate::hex::sha256_hex;
 use anyhow::{bail, Context, Result};
 use konnect_sexp::{parse_sexp, SexpNode};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -840,10 +840,6 @@ fn ordered_f64(value: f64) -> u64 {
 
 fn canonical_existing(path: &Path) -> Result<std::path::PathBuf> {
     std::fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[cfg(test)]
