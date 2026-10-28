@@ -184,7 +184,7 @@ fn resolve_explicit_path(configured: &str) -> Option<PathBuf> {
     (path.components().count() > 1 && path.is_file()).then_some(path)
 }
 
-fn find_on_path(filename: &Path) -> Option<PathBuf> {
+pub(crate) fn find_on_path(filename: &Path) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     // An empty or relative entry would search the working directory again.
     std::env::split_paths(&paths)
