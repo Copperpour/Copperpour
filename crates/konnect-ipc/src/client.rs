@@ -6267,6 +6267,14 @@ mod recovery_tests {
             ),
         };
         let target = document.clone();
+        // The scenarios that must succeed or recover get a second or more of
+        // margin on every side, so a stalled runner can't make a prompt reply
+        // late, a late one prompt, or a late one miss the budget (#166).
+        let (receive_timeout, budget) = if matches!(scenario, Scenario::Success | Scenario::Late) {
+            (Duration::from_secs(1), Duration::from_secs(5))
+        } else {
+            (Duration::from_millis(60), Duration::from_millis(400))
+        };
         let worker = std::thread::spawn(move || {
             let mut mutated = false;
             let mut dropped = false;
@@ -6345,13 +6353,12 @@ mod recovery_tests {
                     }
                     "Ping" => {
                         mutated = true;
-                        if !matches!(scenario, Scenario::Success | Scenario::PublishLate) {
-                            std::thread::sleep(if matches!(scenario, Scenario::Exhausted) {
-                                Duration::from_millis(800)
-                            } else {
-                                Duration::from_millis(140)
-                            });
-                        }
+                        std::thread::sleep(match scenario {
+                            Scenario::Success | Scenario::PublishLate => Duration::ZERO,
+                            Scenario::Late => 2 * receive_timeout,
+                            Scenario::Exhausted => Duration::from_millis(800),
+                            _ => Duration::from_millis(140),
+                        });
                         if matches!(scenario, Scenario::Malformed) {
                             response.status = None;
                         }
@@ -6402,8 +6409,8 @@ mod recovery_tests {
                 )?;
                 Ok(())
             },
-            Duration::from_millis(60),
-            Duration::from_millis(400),
+            receive_timeout,
+            budget,
         );
         let elapsed = started.elapsed();
         control.close();
