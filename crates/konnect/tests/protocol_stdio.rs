@@ -593,6 +593,13 @@ fn installation_info_reports_defaults_when_no_config_file_exists() {
     assert_eq!(configuration["skipped_existing_paths"], json!([]));
 }
 
+/// Spawn in `dir` with `PATH` = empty, `.`, `bin`. The first two name the
+/// working directory too, so a lookup must skip them.
+fn spawn_with_path_to(dir: &std::path::Path, bin: &std::path::Path) -> McpProcess {
+    let path = std::env::join_paths([std::path::Path::new(""), ".".as_ref(), bin]).unwrap();
+    McpProcess::spawn_with_env(Some(dir), true, &[("PATH", path.to_str().unwrap())])
+}
+
 /// A `kicad-cli` in the working directory used to end discovery, so `cli_path`
 /// reported the relative bare name instead of the binary that runs (#182).
 #[test]
@@ -604,15 +611,49 @@ fn a_kicad_cli_in_the_working_directory_does_not_stop_discovery() {
     std::fs::write(tmp.path().join(&name), "").unwrap();
     std::fs::write(bin.join(&name), "").unwrap();
 
-    // Empty and `.` entries name the working directory too.
-    let path = std::env::join_paths([std::path::Path::new(""), ".".as_ref(), &bin]).unwrap();
-    let mut p =
-        McpProcess::spawn_with_env(Some(tmp.path()), true, &[("PATH", path.to_str().unwrap())]);
+    let mut p = spawn_with_path_to(tmp.path(), &bin);
     let result = p.call_tool("get_installation_info", json!({}));
     assert_ne!(result["isError"], json!(true), "{result:#?}");
     assert_eq!(
         McpProcess::tool_body(&result)["kicad"]["cli_path"],
         bin.join(name).to_str().unwrap()
+    );
+}
+
+/// A `schematic-viewer` in the working directory was returned as the bare
+/// relative name, which the spawn then looked up on `PATH`, so the response
+/// named a binary other than the one launched (#184). A script stands in for
+/// the viewer, so this runs on Unix only.
+#[cfg(unix)]
+#[test]
+fn a_viewer_in_the_working_directory_is_not_reported_as_launched() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(tmp.path().join("schematic-viewer"), "").unwrap();
+    let viewer = bin.join("schematic-viewer");
+    std::fs::write(&viewer, "#!/bin/sh\nPATH=/usr/bin:/bin exec sleep 3\n").unwrap();
+    std::fs::set_permissions(&viewer, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let schematic = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../konnect-core/tests/fixtures/derived_lib_name.kicad_sch"
+    );
+
+    // A viewer built into this target directory would be found first.
+    let server = std::path::Path::new(env!("CARGO_BIN_EXE_copperpour"));
+    assert!(
+        !server.with_file_name("schematic-viewer").exists(),
+        "a schematic-viewer next to {} shadows the PATH lookup",
+        server.display()
+    );
+    let mut p = spawn_with_path_to(tmp.path(), &bin);
+    let result = p.call_tool("open_schematic_viewer", json!({"schematic": schematic}));
+    assert_ne!(result["isError"], json!(true), "{result:#?}");
+    assert_eq!(
+        McpProcess::tool_body(&result)["viewer"],
+        viewer.to_str().unwrap()
     );
 }
 

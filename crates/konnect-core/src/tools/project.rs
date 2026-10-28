@@ -558,7 +558,6 @@ async fn handle_open_viewer(
         )));
     }
 
-    // Find the viewer binary — it should be next to the konnect binary
     let viewer_binary = find_viewer_binary();
 
     match viewer_binary {
@@ -590,10 +589,11 @@ async fn handle_open_viewer(
                 Err(message) => Ok(CallToolResult::error(message)),
             }
         }
-        None => Ok(CallToolResult::error(
-            "Schematic viewer binary (schematic-viewer.exe) not found. \
-             It should be in the same directory as copperpour.exe.",
-        )),
+        None => Ok(CallToolResult::error(format!(
+            "Schematic viewer binary ({}) not found. \
+             It should be in the same directory as the Copperpour server, or on PATH.",
+            viewer_filename()
+        ))),
     }
 }
 
@@ -609,29 +609,19 @@ async fn launch_viewer(cmd: std::process::Command, window: Duration) -> Result<(
     viewer.watch(window).await
 }
 
-fn find_viewer_binary() -> Option<std::path::PathBuf> {
-    // Check next to the current executable
-    if let Ok(exe_path) = std::env::current_exe() {
-        let dir = exe_path.parent()?;
-        let viewer = dir.join(if cfg!(target_os = "windows") {
-            "schematic-viewer.exe"
-        } else {
-            "schematic-viewer"
-        });
-        if viewer.exists() {
-            return Some(viewer);
-        }
-    }
+fn viewer_filename() -> String {
+    format!("schematic-viewer{}", std::env::consts::EXE_SUFFIX)
+}
 
-    // Check common locations
-    let candidates = ["schematic-viewer.exe", "schematic-viewer"];
-    for c in &candidates {
-        let p = std::path::PathBuf::from(c);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
+/// Next to the server binary, then on `PATH`. Never the working directory: a
+/// bare name found there would be spawned through `PATH` instead (#184).
+fn find_viewer_binary() -> Option<std::path::PathBuf> {
+    let name = viewer_filename();
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(&name)))
+        .filter(|viewer| viewer.is_file())
+        .or_else(|| crate::kicad_install::find_on_path(name.as_ref()))
 }
 
 // ─── Blank file templates ──────────────────────────────────────────────────────
