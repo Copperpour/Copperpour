@@ -86,7 +86,7 @@ case "$platform" in
 esac
 if [ ! -f "$binary" ]; then
     echo "Binary not found: $binary" >&2
-    echo "Build it first: cargo build --release -p konnect" >&2
+    echo "Build it first: cargo build --release -p copperpour" >&2
     exit 1
 fi
 

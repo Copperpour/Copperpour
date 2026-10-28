@@ -37,7 +37,7 @@ jobs:
       # regression gate; this makes contract drift immediately identifiable.
       - name: Reliability contract
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test -p konnect-core --locked reliability_contract -- --nocapture
+        run: cargo test -p copperpour-core --locked reliability_contract -- --nocapture
       - name: Test (unit + integration)
         run: cargo test --workspace --locked --lib --tests
       # --doc cannot be combined with --lib/--tests; doctests broke silently
@@ -63,7 +63,7 @@ jobs:
 
   # flake.nix pins its own toolchain, dependency set and build flags, so
   # nothing else in CI would notice it going stale — and it names things
-  # that move: `-p konnect --bin copperpour`, rust-toolchain.toml, and a
+  # that move: `-p copperpour --bin copperpour`, rust-toolchain.toml, and a
   # preCheck that supplies COPPERPOUR_STATE_DIR for the tests that need a
   # writable state dir. Without this job it is broken-on-arrival the first
   # time any of those changes, and only Nix users find out.

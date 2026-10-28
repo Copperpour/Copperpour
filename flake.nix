@@ -61,7 +61,7 @@
 
           cargoBuildFlags = [
             "-p"
-            "konnect"
+            "copperpour"
             "--bin"
             "copperpour"
             # The name before the rename; runs copperpour.
@@ -71,7 +71,7 @@
 
           cargoTestFlags = [
             "-p"
-            "konnect"
+            "copperpour"
             "--lib"
             "--tests"
           ];
@@ -134,7 +134,7 @@
 
           buildInputs = viewerLibraries;
 
-          # konnect-ipc/build.rs can discover these from PATH, but setting
+          # copperpour-ipc/build.rs can discover these from PATH, but setting
           # them explicitly also makes protobuf's well-known types reliable
           # with Nix store paths.
           PROTOC = "${pkgs.protobuf}/bin/protoc";

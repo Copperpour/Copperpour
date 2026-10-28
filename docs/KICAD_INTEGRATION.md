@@ -5,22 +5,22 @@ path depends on the operation and whether KiCad currently owns the document.
 
 ## Schematic File Editing
 
-Schematic handlers under `crates/konnect-core/src/tools/sch_*.rs` operate on
-saved `.kicad_sch` files through `konnect-schematic-editor` and
-`konnect-sexp`. These paths work without a running KiCad process and preserve
+Schematic handlers under `crates/copperpour-core/src/tools/sch_*.rs` operate on
+saved `.kicad_sch` files through `copperpour-schematic-editor` and
+`copperpour-sexp`. These paths work without a running KiCad process and preserve
 the embedded library definitions, UUIDs, and instance information needed by
 KiCad.
 
 Existing-file writes use the atomic/conflict-aware machinery in
-`konnect-sexp/src/writer.rs`. Multi-file changes use
-`konnect-sexp/src/transaction.rs`; a source revision change must become a
+`copperpour-sexp/src/writer.rs`. Multi-file changes use
+`copperpour-sexp/src/transaction.rs`; a source revision change must become a
 conflict rather than an overwrite.
 
 ## KiCad IPC
 
-`crates/konnect-ipc` sends typed protobuf requests over NNG. The socket comes
+`crates/copperpour-ipc` sends typed protobuf requests over NNG. The socket comes
 from `ipc_address`, then `KICAD_API_SOCKET`, then discovery of KiCad's default
-endpoint by `konnect-ipc/src/socket.rs`; KiCad-provided credentials such as
+endpoint by `copperpour-ipc/src/socket.rs`; KiCad-provided credentials such as
 `KICAD_API_TOKEN` are carried in the IPC client request metadata.
 
 Discovery is per-platform because the endpoint is: a Unix socket is a
@@ -34,9 +34,9 @@ would also consume a server instance. Liveness stays the job of the bounded
 
 The three board-write gates are:
 
-- `KiCadIpcClient::ensure_board_is_active` in `konnect-ipc/src/client.rs`
+- `KiCadIpcClient::ensure_board_is_active` in `copperpour-ipc/src/client.rs`
   prevents a request naming one board from changing another open board.
-- `attempt_ipc_write` in `konnect-core/src/tools/pcb_board.rs` permits a file
+- `attempt_ipc_write` in `copperpour-core/src/tools/pcb_board.rs` permits a file
   fallback only when IPC is unreachable. A response from KiCad, including a
   rejection, fails closed.
 - `refuse_if_board_open_in_kicad` in the same module protects file-only tools
@@ -63,7 +63,7 @@ returns `plan_blocked` for an inner layer the board lacks.
 
 ### Editor observation
 
-`konnect-ipc::KiCadIpcClient::observe_editor_state` queries the running KiCad
+`copperpour-ipc::KiCadIpcClient::observe_editor_state` queries the running KiCad
 version and schematic/PCB `GetOpenDocuments` surfaces on the configured
 endpoint. `tools/editor_navigation.rs` exposes that typed observation through
 the provisional `editor_navigation` toolset while its design is under
@@ -130,7 +130,7 @@ after commit.
 
 ## `kicad-cli`
 
-`crates/konnect-core/src/tools/cli.rs` is the shared subprocess and result parser
+`crates/copperpour-core/src/tools/cli.rs` is the shared subprocess and result parser
 for ERC, DRC, exports, and rendering. Callers should use it rather than build
 ad-hoc command lines.
 

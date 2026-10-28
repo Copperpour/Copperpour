@@ -1,12 +1,12 @@
 # Tool System
 
 Copperpour exposes always-visible meta-tools plus domain toolsets loaded on demand.
-The implementation is split between `crates/konnect-core/src/mcp`, `router`, and
+The implementation is split between `crates/copperpour-core/src/mcp`, `router`, and
 `tools`.
 
 ## Definitions And Context
 
-`ToolDef` in `crates/konnect-core/src/tools/mod.rs` is the unit exposed through
+`ToolDef` in `crates/copperpour-core/src/tools/mod.rs` is the unit exposed through
 MCP. It carries a public name, description, JSON input schema, and async handler.
 The `tool!` macro constructs definitions in each domain module.
 
@@ -17,7 +17,7 @@ the naming and compatibility rules in `docs/NAMING_CONVENTIONS.md` and
 
 ## Toolsets And Meta-Tools
 
-`crates/konnect-core/src/router/registry.rs` declares `ALL_TOOLSETS`, the starter
+`crates/copperpour-core/src/router/registry.rs` declares `ALL_TOOLSETS`, the starter
 set, each toolset's metadata, and the `tools_for` mapping. Registry tests compare
 declared per-toolset counts with the definitions returned by the domain module.
 
@@ -86,7 +86,7 @@ claim.
 ## Structured Errors
 
 `CallToolResult` does not provide a separate top-level structured error object.
-`crates/konnect-core/src/mcp/error.rs` serializes the error detail into text
+`crates/copperpour-core/src/mcp/error.rs` serializes the error detail into text
 content while setting `is_error`.
 
 Common error kinds include `toolset_not_loaded`, `unknown_tool`,
@@ -102,5 +102,5 @@ must reload and inspect the named file before retrying. Add a new kind in
 When tools are added, removed, or renamed, update the domain `tools()` list,
 `router/registry.rs`, `tool-directory.md`, and the guarded count locations named
 by `CONTRIBUTING.md`. Do not repeat catalogue totals in these map documents;
-`crates/konnect/tests/doc_tool_counts.rs` enforces the designated sources and
+`crates/copperpour/tests/doc_tool_counts.rs` enforces the designated sources and
 sweeps documentation for stale totals.

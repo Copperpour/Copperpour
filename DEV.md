@@ -16,7 +16,7 @@ set PROTOC=C:\path\to\protoc.exe   # or: choco install protoc
 
 cargo check                          # ~15s
 cargo test --workspace --lib --tests # all tests
-cargo build --release -p konnect     # MCP server binary
+cargo build --release -p copperpour     # MCP server binary
 cd crates/schematic-viewer && cargo build --release   # viewer (separate crate)
 ```
 
@@ -26,7 +26,7 @@ cd crates/schematic-viewer && cargo build --release   # viewer (separate crate)
 `nix build .#copperpour`, `nix run .#copperpour`, `nix develop` (pinned toolchain,
 protoc, kicad-small). The toolchain comes from `rust-toolchain.toml` and the version from
 the workspace `Cargo.toml`. Not tracked automatically: `cargoBuildFlags`
-(`-p konnect --bin copperpour`) and `preCheck` (exports `COPPERPOUR_STATE_DIR`).
+(`-p copperpour --bin copperpour`) and `preCheck` (exports `COPPERPOUR_STATE_DIR`).
 **Renaming the binary, adding a workspace member the server depends on, or adding a test
 that needs another env var breaks only the Nix build** — the `Nix flake` CI job catches
 that, so treat its failure as a real break.
@@ -35,12 +35,12 @@ that, so treat its failure as a real break.
 
 ```
 crates/
-├── konnect/                 # Binary + cdylib
+├── copperpour/                  # Binary + cdylib
 │   └── src/  main.rs (CLI: --config, subcommands) · lib.rs/ffi.rs (C ABI:
 │             kicad_plugin_init/version/shutdown) · config.rs (TOML + JSON, socket
 │             auto-detect) · transport/stdio.rs (JSON-RPC lines, default) ·
 │             transport/http.rs (streamable HTTP: POST + GET/SSE on /mcp)
-├── konnect-core/            # All tool logic
+├── copperpour-core/             # All tool logic
 │   └── src/
 │       ├── mcp/       protocol.rs (JSON-RPC types) · handler.rs (initialize,
 │       │              tools/list, tools/call) · server.rs (session state) · error.rs
@@ -67,20 +67,20 @@ crates/
 │           └── project, sch_bus, sch_export, pcb_routing, pcb_export, library,
 │               integration, verification, config, design_review, templates,
 │               manufacturing, placement, editor_navigation
-├── konnect-sexp/            # S-expression engine, no KiCad dependency
+├── copperpour-sexp/             # S-expression engine, no KiCad dependency
 │   └── src/  parser.rs (nom) · writer.rs (SexpEdit, apply_edits, write_atomic) ·
 │             schematic.rs (SymbolInstance, LibPin, pin_endpoint) · geometry.rs
 │             (CANONICAL pin math) · net.rs (KiCad-10 vs legacy net nodes) · layers.rs ·
 │             command.rs (reversible edits) · transaction.rs (multi-file journal) ·
 │             title_block.rs · error.rs (SexpError incl. Conflict)
-├── konnect-schematic-editor/ # Typed schematic model: parse → mutate → write
+├── copperpour-schematic-editor/ # Typed schematic model: parse → mutate → write
 │   └── src/  schematic/ · sexp/ (indent-preserving, mixelpixx/Konnect#210) ·
 │             library.rs · types.rs (fmt_f64, …)
-├── konnect-ipc/             # KiCad 10 IPC client
+├── copperpour-ipc/              # KiCad 10 IPC client
 │   └── proto/ (from KiCad v10) · build.rs (prost) · src/ gen.rs · client.rs (NNG
 │       req/rep) · builders.rs (protobuf helpers, mm→nm) · transform.rs (footprint
 │       children are ABSOLUTE board coords, mixelpixx/Konnect#23) · types.rs
-└── schematic-viewer/        # Tauri app, outside the workspace
+└── schematic-viewer/            # Tauri app, outside the workspace
     └── capabilities/default.json (core:default grant — without it event.listen() is
         silently denied) · src/main.rs (multi-sheet watcher, snapshot-isolated
         incremental kicad-cli SVG render) · frontend/index.html (pan/zoom, sheets)
@@ -123,7 +123,7 @@ no item CRUD.
   destination's mode, so a project an earlier Konnect created stays `0600` until
   `chmod`ed.
 
-`konnect_schematic_editor::Schematic` separates creation from replacement:
+`copperpour_schematic_editor::Schematic` separates creation from replacement:
 `save(new_path)` is create-only; `save(loaded_path)` and `overwrite()` replace only if
 the file still matches the loaded source, so KiCad autosave yields a conflict the caller
 resolves by reloading and reapplying. Intentional replacement uses the revision-aware
@@ -172,7 +172,7 @@ must choose `prefer` or `require` to use the bridge.
 
 ## Structured Errors
 
-Failures are typed by `ToolErrorKind` (`crates/konnect-core/src/mcp/error.rs`). MCP's
+Failures are typed by `ToolErrorKind` (`crates/copperpour-core/src/mcp/error.rs`). MCP's
 `CallToolResult` has no top-level `data`, so the error rides in the text content as JSON,
 with `is_error: true`:
 
@@ -231,7 +231,7 @@ structured, by three mechanisms in call order:
    the same way.
 3. **`get_path`** returns `anyhow::Result<PathBuf>` (171 call sites use `?`) with a
    `MissingArgument` marker that `dispatch_tool` downcasts. Classify by downcasting,
-   never by message text — as with `konnect_ipc::TransportUnreachable`.
+   never by message text — as with `copperpour_ipc::TransportUnreachable`.
 
 A path that is *present but unusable* (missing on disk, wrong extension) is **not** an
 argument error: it stays `handler_error` or `FileNotFound`, so "forgot an argument" and
@@ -273,7 +273,7 @@ questions.
 `dur_ms`, `status` (`ok`/`error`/`not_found`), `error_kind`, `args_bytes`,
 `result_bytes`. Built once by `McpHandler::new` and shared with `ToolContext` for the
 meta-tools. JSONL IO failures never fail a call (`tracing::warn!`, dropped). Tests use
-`ToolContext::new(...)`, in-memory only. Source: `crates/konnect-core/src/observability.rs`.
+`ToolContext::new(...)`, in-memory only. Source: `crates/copperpour-core/src/observability.rs`.
 
 ## Tool Routing
 
@@ -295,7 +295,7 @@ meta-tools. JSONL IO failures never fail a call (`tracing::warn!`, dropped). Tes
   `load_toolset` returns names, not schemas. `auto_load_toolsets` does not help there —
   it fires on a call, which needs the name already.
 
-Router: `crates/konnect-core/src/router/mod.rs`.
+Router: `crates/copperpour-core/src/router/mod.rs`.
 
 ## Build Requirements
 
@@ -322,12 +322,12 @@ Run all: `PROTOC=<path> cargo test --workspace --lib --tests`
 
 | Location | What |
 |----------|------|
-| `konnect-sexp` unit | Parser, writer, geometry transforms |
-| `konnect-core` unit | Router, starter kit, registry invariants, observability, error taxonomy, arg helpers |
-| `konnect-core` integration | Fixtures: parse, edit, write, observability, structured errors |
-| `konnect-schematic-editor` | Typed model + round-tripping |
-| `konnect-ipc` unit | Protobuf builders, client messages, rigid-body child transform |
-| `crates/konnect/tests/` | stdio protocol, doc/asset count guards, transaction CLI, `#[ignore]`d live-KiCad tests |
+| `copperpour-sexp` unit | Parser, writer, geometry transforms |
+| `copperpour-core` unit | Router, starter kit, registry invariants, observability, error taxonomy, arg helpers |
+| `copperpour-core` integration | Fixtures: parse, edit, write, observability, structured errors |
+| `copperpour-schematic-editor` | Typed model + round-tripping |
+| `copperpour-ipc` unit | Protobuf builders, client messages, rigid-body child transform |
+| `crates/copperpour/tests/` | stdio protocol, doc/asset count guards, transaction CLI, `#[ignore]`d live-KiCad tests |
 
 `schematic-viewer` is in `[workspace] exclude`, so `--workspace` never builds it; CI's
 `viewer` job runs its `cargo check` and `cargo test`. Locally:

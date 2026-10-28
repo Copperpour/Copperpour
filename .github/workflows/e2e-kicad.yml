@@ -69,25 +69,25 @@ jobs:
       - name: E2E design loop (create → wire → ERC → Gerber → DRC)
         env:
           KONNECT_E2E_KEEP_DIR: ${{ github.workspace }}/e2e-artifacts
-        run: cargo test -p konnect --test e2e_kicad -- --ignored --nocapture
+        run: cargo test -p copperpour --test e2e_kicad -- --ignored --nocapture
 
       # Bundled templates are hand-written JSON naming KiCad symbols and pins;
       # this is the only job with a symbol library to check them against (#783).
       - name: Bundled templates name real KiCad symbols and pins
-        run: cargo test -p konnect-core --lib builtin_templates_name_symbols_and_pins_that_exist_in_kicad -- --nocapture
+        run: cargo test -p copperpour-core --lib builtin_templates_name_symbols_and_pins_that_exist_in_kicad -- --nocapture
 
       - name: Demo-corpus conformance (115+ eeschema-authored schematics)
-        run: cargo test -p konnect-core --test conformance_test -- --nocapture
+        run: cargo test -p copperpour-core --test conformance_test -- --nocapture
 
       # The variant grammar of record (fixtures/variants/README.md) is
       # evidence adjudicated by kicad-cli; this re-runs the adjudication so a
       # KiCad update that changes variant handling is noticed here, not by a
       # user. kicad-cli-only — no GUI session required.
       - name: Variant-grammar adjudication (kicad-cli acceptance)
-        run: cargo test -p konnect-sexp --test variant_fixture_test -- --ignored --nocapture
+        run: cargo test -p copperpour-sexp --test variant_fixture_test -- --ignored --nocapture
 
       - name: IPC wedge timeout regression
-        run: cargo test -p konnect-ipc --test mock_server_test -- --ignored --nocapture
+        run: cargo test -p copperpour-ipc --test mock_server_test -- --ignored --nocapture
 
       - uses: actions/setup-python@v7
         with:
@@ -97,7 +97,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install jsonschema
-          cargo build --release --locked -p konnect
+          cargo build --release --locked -p copperpour
           ./packaging/build-pcm.ps1 -Version 0.0.0 -BinaryPath target/release/copperpour.exe -Platform windows -OutDir dist
           python packaging/validate-pcm.py --zip dist/copperpour-pcm-v0.0.0-windows.zip
 

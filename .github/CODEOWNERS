@@ -8,7 +8,7 @@
 *                                                  @pauliuszaleckas
 
 # JLCPCB and EasyEDA parts, decided by @mn89h.
-/crates/konnect-core/src/tools/easyeda.rs          @mn89h @pauliuszaleckas
-/crates/konnect-core/src/tools/jlcpcb_*            @mn89h @pauliuszaleckas
-/crates/konnect-core/src/tools/lcsc_packages.rs    @mn89h @pauliuszaleckas
+/crates/copperpour-core/src/tools/easyeda.rs          @mn89h @pauliuszaleckas
+/crates/copperpour-core/src/tools/jlcpcb_*            @mn89h @pauliuszaleckas
+/crates/copperpour-core/src/tools/lcsc_packages.rs    @mn89h @pauliuszaleckas
 /docs/JLCPCB_CPL_CORRECTIONS.md                    @mn89h @pauliuszaleckas

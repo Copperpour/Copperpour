@@ -15,11 +15,11 @@ loads domain toolsets on demand, and routes each call to a file, IPC, or
 
 | Component | Source | Responsibility |
 |---|---|---|
-| Server binary | `crates/konnect` | CLI classification, configuration, installer/status commands, MCP transports, and plugin FFI exports |
-| Core tool server | `crates/konnect-core` | MCP handling, routing, observability, tool definitions, and domain handlers |
-| S-expression engine | `crates/konnect-sexp` | KiCad file parsing/writing, atomic edits, reversible commands, and transaction journals |
-| Typed schematic editor | `crates/konnect-schematic-editor` | Higher-level schematic parse, mutation, library resolution, and serialization |
-| KiCad IPC client | `crates/konnect-ipc` | Typed KiCad IPC messages, NNG transport, board targeting, and failure classification |
+| Server binary | `crates/copperpour` | CLI classification, configuration, installer/status commands, MCP transports, and plugin FFI exports |
+| Core tool server | `crates/copperpour-core` | MCP handling, routing, observability, tool definitions, and domain handlers |
+| S-expression engine | `crates/copperpour-sexp` | KiCad file parsing/writing, atomic edits, reversible commands, and transaction journals |
+| Typed schematic editor | `crates/copperpour-schematic-editor` | Higher-level schematic parse, mutation, library resolution, and serialization |
+| KiCad IPC client | `crates/copperpour-ipc` | Typed KiCad IPC messages, NNG transport, board targeting, and failure classification |
 | Schematic viewer | `crates/schematic-viewer` | Separate Tauri application for live schematic rendering |
 | KiCad launcher plugin | `plugin` | Python ActionPlugin and settings UI for the packaged server |
 | Packaging | `packaging` | KiCad PCM metadata, package assembly, and package validation |
@@ -30,10 +30,10 @@ The main ownership flow is:
 
 ```text
 MCP client
-  -> transport in crates/konnect/src/transport
-  -> McpHandler in crates/konnect-core/src/mcp/handler.rs
-  -> ToolRouter in crates/konnect-core/src/router
-  -> handler in crates/konnect-core/src/tools
+  -> transport in crates/copperpour/src/transport
+  -> McpHandler in crates/copperpour-core/src/mcp/handler.rs
+  -> ToolRouter in crates/copperpour-core/src/router
+  -> handler in crates/copperpour-core/src/tools
   -> one of:
        schematic model or S-expression file edit
        KiCad IPC request
@@ -46,7 +46,7 @@ The backend is selected per operation, not merely by file type. The write-path
 decision and its safety gates are described in
 [`KICAD_INTEGRATION.md`](KICAD_INTEGRATION.md) and implemented principally in
 `tools/pcb_board.rs`, `tools/pcb_components.rs`, `tools/pcb_sync.rs`, and
-`konnect-ipc/src/client.rs`.
+`copperpour-ipc/src/client.rs`.
 
 ## Reading Order
 

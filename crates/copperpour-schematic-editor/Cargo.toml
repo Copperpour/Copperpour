@@ -1,0 +1,16 @@
+[package]
+name = "copperpour-schematic-editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Typed KiCAD schematic parser and manipulator with lossless round-trips"
+
+[dependencies]
+thiserror.workspace = true
+uuid.workspace = true
+copperpour-sexp.workspace = true  # For geometry (pin transforms, snap, T-junction detection)
+
+[dev-dependencies]
+tempfile = "3"

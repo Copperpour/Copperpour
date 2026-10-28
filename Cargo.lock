@@ -439,6 +439,129 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
+name = "copperpour"
+version = "0.15.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "copperpour-core",
+ "copperpour-ipc",
+ "copperpour-sexp",
+ "dirs",
+ "fs4",
+ "prost",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "copperpour-core"
+version = "0.15.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.23.1",
+ "copperpour-ipc",
+ "copperpour-render",
+ "copperpour-schematic-editor",
+ "copperpour-sexp",
+ "csv",
+ "dirs",
+ "jsonschema",
+ "nng",
+ "prost",
+ "prost-types",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "topola_specctra",
+ "tracing",
+ "usvg",
+ "uuid",
+ "winreg",
+ "zip",
+]
+
+[[package]]
+name = "copperpour-ipc"
+version = "0.15.0"
+dependencies = [
+ "anyhow",
+ "copperpour-sexp",
+ "libc",
+ "nng",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "copperpour-render"
+version = "0.15.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "resvg",
+]
+
+[[package]]
+name = "copperpour-schematic-editor"
+version = "0.15.0"
+dependencies = [
+ "copperpour-sexp",
+ "tempfile",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "copperpour-sexp"
+version = "0.15.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "fs4",
+ "nom",
+ "pretty_assertions",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "copperpour-vcs"
+version = "0.15.0"
+dependencies = [
+ "anyhow",
+ "gix",
+ "tempfile",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2669,129 +2792,6 @@ dependencies = [
  "num-traits",
  "serde_json",
  "zmij",
-]
-
-[[package]]
-name = "konnect"
-version = "0.15.0"
-dependencies = [
- "anyhow",
- "axum",
- "dirs",
- "fs4",
- "konnect-core",
- "konnect-ipc",
- "konnect-sexp",
- "prost",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "konnect-core"
-version = "0.15.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.23.1",
- "csv",
- "dirs",
- "jsonschema",
- "konnect-ipc",
- "konnect-render",
- "konnect-schematic-editor",
- "konnect-sexp",
- "nng",
- "prost",
- "prost-types",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "topola_specctra",
- "tracing",
- "usvg",
- "uuid",
- "winreg",
- "zip",
-]
-
-[[package]]
-name = "konnect-ipc"
-version = "0.15.0"
-dependencies = [
- "anyhow",
- "konnect-sexp",
- "libc",
- "nng",
- "prost",
- "prost-build",
- "prost-types",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "konnect-render"
-version = "0.15.0"
-dependencies = [
- "anyhow",
- "image",
- "resvg",
-]
-
-[[package]]
-name = "konnect-schematic-editor"
-version = "0.15.0"
-dependencies = [
- "konnect-sexp",
- "tempfile",
- "thiserror 1.0.69",
- "uuid",
-]
-
-[[package]]
-name = "konnect-sexp"
-version = "0.15.0"
-dependencies = [
- "anyhow",
- "dirs",
- "fs4",
- "nom",
- "pretty_assertions",
- "proptest",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "uuid",
-]
-
-[[package]]
-name = "konnect-vcs"
-version = "0.15.0"
-dependencies = [
- "anyhow",
- "gix",
- "tempfile",
 ]
 
 [[package]]
@@ -5332,7 +5332,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 name = "xtask"
 version = "0.0.0"
 dependencies = [
- "konnect-core",
+ "copperpour-core",
 ]
 
 [[package]]

@@ -37,7 +37,7 @@ struct SheetEntry {
 const MAX_SHEET_DEPTH: usize = 20;
 
 /// Walk the sheet tree starting at `root` in depth-first order, using
-/// `konnect-schematic-editor`'s typed `Sheet` model (the same one
+/// `copperpour-schematic-editor`'s typed `Sheet` model (the same one
 /// `sch_hierarchy`'s MCP tools are built on) rather than re-implementing
 /// `.kicad_sch` parsing here. Missing child files are skipped silently —
 /// this is a display surface, not a validator; `sch_hierarchy`'s own
@@ -76,7 +76,7 @@ fn walk_sheet_tree_inner(
         depth,
     });
 
-    if let Ok(sch) = konnect_schematic_editor::Schematic::load(path) {
+    if let Ok(sch) = copperpour_schematic_editor::Schematic::load(path) {
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         for sheet in sch.sheets.iter() {
             let child_path = dir.join(sheet.file());
@@ -892,7 +892,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use konnect_schematic_editor::{Schematic, Sheet};
+    use copperpour_schematic_editor::{Schematic, Sheet};
     use tempfile::TempDir;
 
     fn blank_schematic(dir: &Path, name: &str) -> PathBuf {

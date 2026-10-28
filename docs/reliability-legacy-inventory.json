@@ -12,10 +12,10 @@
     {
       "id": "drc-source-and-policy",
       "paths": [
-        "crates/konnect-core/src/tools/verification.rs",
-        "crates/konnect-core/src/tools/pcb_export.rs",
-        "crates/konnect-core/src/tools/cli.rs",
-        "crates/konnect-core/src/tools/drc.rs"
+        "crates/copperpour-core/src/tools/verification.rs",
+        "crates/copperpour-core/src/tools/pcb_export.rs",
+        "crates/copperpour-core/src/tools/cli.rs",
+        "crates/copperpour-core/src/tools/drc.rs"
       ],
       "rationale": "Explicit synchronization and provenance are shared through tools::drc after #408, but general source authority and the outcome-envelope migration remain incomplete.",
       "tracking_issues": [
@@ -27,8 +27,8 @@
     {
       "id": "explicit-config-startup",
       "paths": [
-        "crates/konnect/src/config.rs",
-        "crates/konnect/src/ffi.rs"
+        "crates/copperpour/src/config.rs",
+        "crates/copperpour/src/ffi.rs"
       ],
       "rationale": "The plugin startup path can substitute defaults after an explicitly requested configuration fails, obscuring the refusal from the caller.",
       "tracking_issues": [
@@ -39,8 +39,8 @@
     {
       "id": "live-file-board-readers",
       "paths": [
-        "crates/konnect-core/src/tools/pcb_board.rs",
-        "crates/konnect-core/src/tools/pcb_routing.rs"
+        "crates/copperpour-core/src/tools/pcb_board.rs",
+        "crates/copperpour-core/src/tools/pcb_routing.rs"
       ],
       "rationale": "get_layer_list and get_netclasses read the saved board while sibling mutations can target live KiCad state.",
       "tracking_issues": [

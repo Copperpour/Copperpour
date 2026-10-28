@@ -80,7 +80,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} -p konnect
+        run: cargo build --release --locked --target ${{ matrix.target }} -p copperpour
 
       # `konnect` is the name before the rename; it runs copperpour, so an
       # archive unpacked over an older one updates configs that name it.
@@ -153,7 +153,7 @@ jobs:
 
       - name: Build server binary
         if: matrix.platform != 'macos'
-        run: cargo build --release --locked -p konnect
+        run: cargo build --release --locked -p copperpour
 
       - name: Build schematic viewer (optional)
         if: matrix.platform != 'macos'
@@ -180,7 +180,7 @@ jobs:
         run: |
           set -euo pipefail
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
-            cargo build --release --locked -p konnect --target "$target"
+            cargo build --release --locked -p copperpour --target "$target"
           done
           mkdir -p dist/universal
           lipo -create -output dist/universal/copperpour \
