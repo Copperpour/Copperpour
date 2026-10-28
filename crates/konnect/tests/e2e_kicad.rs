@@ -277,12 +277,15 @@ fn full_design_loop_with_real_kicad() {
             "reference": "U1", "x": 140.0, "y": 100.0
         }),
     );
+    // Both bottom pins sit at the same height, so the wire is straight. C1
+    // pin 1 is above them: either L-route to it crosses another pin, which
+    // connect_pins refuses.
     p.tool(
         "connect_pins",
         json!({
             "schematic": sch.to_string_lossy(),
             "ref1": "R1", "pin1": "2",
-            "ref2": "C1", "pin2": "1"
+            "ref2": "C1", "pin2": "2"
         }),
     );
 
