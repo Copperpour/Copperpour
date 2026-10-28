@@ -47,10 +47,8 @@ fn cli_candidates() -> Vec<PathBuf> {
             PathBuf::from("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"),
             PathBuf::from("/usr/local/bin/kicad-cli"),
         ];
-        if let Some(home) = std::env::var_os("HOME") {
-            paths.push(
-                PathBuf::from(home).join("Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"),
-            );
+        if let Some(home) = crate::app_dirs::home_dir() {
+            paths.push(home.join("Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"));
         }
         paths
     }
@@ -104,10 +102,10 @@ pub fn share_roots() -> Vec<PathBuf> {
         );
         push_existing_unique(&mut roots, PathBuf::from("/usr/local/share/kicad"));
         push_existing_unique(&mut roots, PathBuf::from("/opt/homebrew/share/kicad"));
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = crate::app_dirs::home_dir() {
             push_existing_unique(
                 &mut roots,
-                PathBuf::from(home).join("Applications/KiCad/KiCad.app/Contents/SharedSupport"),
+                home.join("Applications/KiCad/KiCad.app/Contents/SharedSupport"),
             );
         }
     }
@@ -123,10 +121,10 @@ pub fn share_roots() -> Vec<PathBuf> {
         ] {
             push_existing_unique(&mut roots, root);
         }
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = crate::app_dirs::home_dir() {
             push_existing_unique(
                 &mut roots,
-                PathBuf::from(home).join(
+                home.join(
                     ".local/share/flatpak/app/org.kicad.KiCad/current/active/files/share/kicad",
                 ),
             );
@@ -235,15 +233,18 @@ fn windows_well_known_install_roots(
     program_files: Option<&std::ffi::OsStr>,
     program_files_x86: Option<&std::ffi::OsStr>,
 ) -> Vec<PathBuf> {
+    // A relative value would be searched below the working directory (#179).
+    let absolute =
+        |path: Option<&std::ffi::OsStr>| path.map(PathBuf::from).filter(|p| p.is_absolute());
     let mut bases = Vec::new();
-    if let Some(path) = local_app_data {
-        bases.push(PathBuf::from(path).join("Programs").join("KiCad"));
+    if let Some(path) = absolute(local_app_data) {
+        bases.push(path.join("Programs").join("KiCad"));
     }
-    if let Some(path) = program_files {
-        bases.push(PathBuf::from(path).join("KiCad"));
+    if let Some(path) = absolute(program_files) {
+        bases.push(path.join("KiCad"));
     }
-    if let Some(path) = program_files_x86 {
-        bases.push(PathBuf::from(path).join("KiCad"));
+    if let Some(path) = absolute(program_files_x86) {
+        bases.push(path.join("KiCad"));
     }
     for fallback in [
         r"C:\Program Files\KiCad",
@@ -344,6 +345,53 @@ fn windows_registry_install_roots() -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    /// With a relative `HOME`, no per-user KiCad root, `kicad-cli` or native
+    /// bridge directory is found below the working directory, even one
+    /// planted there (#179). Run in a child process, since `HOME` is
+    /// process-wide.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_home_finds_nothing_below_the_working_directory() {
+        const CHILD: &str = "COPPERPOUR_TEST_KICAD_INSTALL_HOME_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let cwd = tempfile::tempdir().unwrap();
+            for root in [
+                "home/.local/share/flatpak/app/org.kicad.KiCad/current/active/files/share/kicad",
+                "home/Applications/KiCad/KiCad.app/Contents/SharedSupport",
+            ] {
+                std::fs::create_dir_all(cwd.path().join(root)).unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "kicad_install::tests::a_relative_home_finds_nothing_below_the_working_directory",
+                    "--nocapture",
+                ])
+                .current_dir(cwd.path())
+                .env(CHILD, "1")
+                .env("HOME", "home")
+                .env("XDG_DATA_HOME", "")
+                .env("COPPERPOUR_BRIDGE_DIR", "")
+                .env("KONNECT_BRIDGE_DIR", "")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let found = share_roots()
+            .into_iter()
+            .chain(cli_candidates())
+            .chain(crate::native_specctra_bridge::registration_root());
+        for path in found {
+            assert!(path.is_absolute(), "{path:?}");
+        }
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn derives_install_root_from_cli() {
@@ -373,6 +421,22 @@ mod tests {
         assert!(roots.contains(&PathBuf::from(
             r"C:\Users\casey\AppData\Local\Programs\KiCad\9.0"
         )));
+    }
+
+    /// A relative `LOCALAPPDATA` or `ProgramFiles` is not searched below the
+    /// working directory (#179).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_relative_base_is_not_searched() {
+        use std::ffi::OsStr;
+
+        let roots = windows_well_known_install_roots(
+            Some(OsStr::new("relative")),
+            Some(OsStr::new("Program Files")),
+            Some(OsStr::new(r"C:\Program Files (x86)")),
+        );
+        assert!(roots.iter().all(|root| root.is_absolute()), "{roots:?}");
+        assert!(roots.contains(&PathBuf::from(r"C:\Program Files (x86)\KiCad\10.0")));
     }
 
     #[cfg(target_os = "windows")]

@@ -1971,7 +1971,7 @@ const FREEROUTING_KICAD_VERSIONS: [&str; 3] = ["10.0", "9.0", "8.0"];
 
 /// Plugin folders below a home directory: the variable naming the home, the
 /// folder below it (`<version>` stands for each version), and whether it is
-/// searched on Windows only.
+/// searched on Windows only. A home that is not absolute is skipped.
 const FREEROUTING_PLUGIN_FOLDERS: [(&str, &str, bool); 3] = [
     ("HOME", "Documents/KiCad/<version>/3rdparty/plugins", false),
     (
@@ -2088,8 +2088,9 @@ fn freerouting_jar_path_description() -> String {
 #[derive(Debug, Clone, PartialEq)]
 struct FreeroutingSearchRoot {
     location: FreeroutingLocation,
-    /// Always absolute: a relative value from the environment is taken from
-    /// the server's working directory, which is where the search reads it.
+    /// Always absolute: a relative `KICAD*_3RD_PARTY` or `PATH` entry is taken
+    /// from the server's working directory, which is where the search reads
+    /// it. A relative home is skipped instead (#179).
     path: PathBuf,
     depth: usize,
 }
@@ -2107,7 +2108,11 @@ impl FreeroutingSearchRoot {
 
 fn freerouting_search_roots() -> Vec<FreeroutingSearchRoot> {
     freerouting_search_roots_from(
-        |name| std::env::var_os(name),
+        // On Unix, `HOME` as everywhere else: the account's home when unset.
+        |name| match name {
+            "HOME" if cfg!(unix) => crate::app_dirs::home_dir().map(Into::into),
+            _ => std::env::var_os(name),
+        },
         &std::env::current_dir().unwrap_or_default(),
     )
 }
@@ -2153,7 +2158,11 @@ fn freerouting_search_roots_from(
         .collect();
     homes.dedup();
     for home_variable in homes {
-        let Some(home) = var(home_variable).map(PathBuf::from) else {
+        // A relative home is no home, not a folder below the cwd (#179).
+        let Some(home) = var(home_variable)
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute())
+        else {
             continue;
         };
         for version in FREEROUTING_KICAD_VERSIONS {
@@ -2776,9 +2785,47 @@ mod freerouting_tests {
         }
     }
 
-    /// Every searched location is reported as an absolute path. A relative value
-    /// from the environment is taken from the server's working directory, which
-    /// is where the search reads it.
+    /// With `HOME` unset, the plugin folders below the account's home are
+    /// still searched, as every other per-user path is (#179). Run in a child
+    /// process, since `HOME` is process-wide.
+    #[cfg(unix)]
+    #[test]
+    fn an_unset_home_searches_the_account_home() {
+        const CHILD: &str = "COPPERPOUR_TEST_FREEROUTING_HOME_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tools::integration::freerouting_tests::an_unset_home_searches_the_account_home",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("HOME")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let home = crate::app_dirs::home_dir().expect("the account has a home directory");
+        let folder = home.join(".local/share/kicad/10.0/3rdparty/plugins");
+        assert!(
+            freerouting_search_roots()
+                .iter()
+                .any(|root| root.path == folder),
+            "{folder:?} was not searched"
+        );
+    }
+
+    /// Every searched location is reported as an absolute path. A relative
+    /// `KICAD*_3RD_PARTY` or `PATH` entry is taken from the server's working
+    /// directory, which is where the search reads it; a relative `HOME` or
+    /// `USERPROFILE` is no home directory, so nothing below it is searched
+    /// (#179).
     #[test]
     fn every_searched_location_is_absolute() {
         let temp = tempfile::tempdir().unwrap();
@@ -2800,6 +2847,14 @@ mod freerouting_tests {
             .iter()
             .any(|root| root.path == cwd.join("third-party")));
         assert!(roots.iter().any(|root| root.path == cwd.join("bin")));
+        for home in ["home", "profile"] {
+            assert!(
+                !roots
+                    .iter()
+                    .any(|root| root.path.starts_with(cwd.join(home))),
+                "{home}: {roots:?}"
+            );
+        }
         let evidence = roots[0].evidence();
         assert_eq!(evidence["location_path"], json!(cwd.join("third-party")));
         assert!(evidence.get("path").is_none(), "{evidence}");

@@ -468,7 +468,9 @@ ignored by the repository `.gitignore`.
 Cooperative document locks are stored outside the project under the platform
 local-data directory. Set `COPPERPOUR_STATE_DIR` to an absolute directory to
 override that location. A relative override is rejected rather than falling
-back to project-local sidecars.
+back to project-local sidecars, and so is a relative default (a relative
+`HOME`, say): edits then refuse until `HOME`, `XDG_DATA_HOME` or
+`COPPERPOUR_STATE_DIR` is an absolute path.
 
 ## Tools don't appear after `load_toolset`
 
