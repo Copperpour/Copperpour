@@ -6242,6 +6242,17 @@ mod recovery_tests {
         BeginLate,
     }
 
+    // Every scenario gets a second or more of margin on every side, so a
+    // stalled runner can't make a prompt reply late, a late one prompt, or a
+    // late one miss the budget (Copperpour/Copperpour#166,
+    // Copperpour/Copperpour#175).
+    const RECEIVE_TIMEOUT: Duration = Duration::from_secs(1);
+    const BUDGET: Duration = Duration::from_secs(2);
+    /// A reply that lands after the receive timeout.
+    const LATE: Duration = Duration::from_secs(2);
+    /// A reply that misses every window; cut short once the client returns.
+    const HUNG: Duration = Duration::from_secs(30);
+
     fn exercise(scenario: Scenario) -> (Result<()>, Vec<String>, Duration) {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let address = format!(
@@ -6267,15 +6278,11 @@ mod recovery_tests {
             ),
         };
         let target = document.clone();
-        // The scenarios that must succeed or recover get a second or more of
-        // margin on every side, so a stalled runner can't make a prompt reply
-        // late, a late one prompt, or a late one miss the budget (#166).
-        let (receive_timeout, budget) = if matches!(scenario, Scenario::Success | Scenario::Late) {
-            (Duration::from_secs(1), Duration::from_secs(5))
-        } else {
-            (Duration::from_millis(60), Duration::from_millis(400))
-        };
+        let (release, released) = std::sync::mpsc::channel::<()>();
         let worker = std::thread::spawn(move || {
+            let pause = |delay| {
+                let _ = released.recv_timeout(delay);
+            };
             let mut mutated = false;
             let mut dropped = false;
             while let Ok(request) = server.recv() {
@@ -6340,7 +6347,7 @@ mod recovery_tests {
                     }
                     "BeginCommit" => {
                         if matches!(scenario, Scenario::BeginLate) {
-                            std::thread::sleep(Duration::from_millis(140));
+                            pause(LATE);
                         }
                         response.message = Some(pack_any(
                             &kiapi::common::commands::BeginCommitResponse {
@@ -6353,11 +6360,12 @@ mod recovery_tests {
                     }
                     "Ping" => {
                         mutated = true;
-                        std::thread::sleep(match scenario {
+                        pause(match scenario {
                             Scenario::Success | Scenario::PublishLate => Duration::ZERO,
-                            Scenario::Late => 2 * receive_timeout,
-                            Scenario::Exhausted => Duration::from_millis(800),
-                            _ => Duration::from_millis(140),
+                            // Past the whole window, but awake again while a
+                            // client that wrongly sent EndCommit still waits.
+                            Scenario::Exhausted => RECEIVE_TIMEOUT + BUDGET + LATE,
+                            _ => LATE,
                         });
                         if matches!(scenario, Scenario::Malformed) {
                             response.status = None;
@@ -6373,10 +6381,10 @@ mod recovery_tests {
                             .unwrap()
                             .push(format!("action:{}", command.action));
                         if matches!(scenario, Scenario::PublishLate) {
-                            std::thread::sleep(Duration::from_millis(140));
+                            pause(LATE);
                         }
                         if matches!(scenario, Scenario::CleanupSlow) {
-                            std::thread::sleep(Duration::from_millis(480));
+                            pause(HUNG);
                         }
                         if matches!(scenario, Scenario::DropFailed) {
                             response.status.as_mut().unwrap().status =
@@ -6409,10 +6417,11 @@ mod recovery_tests {
                 )?;
                 Ok(())
             },
-            receive_timeout,
-            budget,
+            RECEIVE_TIMEOUT,
+            BUDGET,
         );
         let elapsed = started.elapsed();
+        drop(release);
         control.close();
         worker.join().unwrap();
         let calls = calls.lock().unwrap().clone();
@@ -6454,7 +6463,7 @@ mod recovery_tests {
 
     #[test]
     fn bounded_recovery_never_claims_unproven_rollback() {
-        for scenario in [
+        let scenarios = [
             Scenario::Exhausted,
             Scenario::DropFailed,
             Scenario::Changed,
@@ -6465,14 +6474,36 @@ mod recovery_tests {
             Scenario::WrongSnapshot,
             Scenario::ObserveFailed,
             Scenario::BeginLate,
-        ] {
-            let (result, calls, elapsed) = exercise(scenario);
+        ];
+        // Each scenario takes seconds, so they run side by side.
+        let outcomes = std::thread::scope(|scope| {
+            scenarios
+                .map(|scenario| {
+                    std::thread::Builder::new()
+                        .name(format!("{scenario:?}"))
+                        .spawn_scoped(scope, move || (scenario, exercise(scenario)))
+                        .unwrap()
+                })
+                .map(|handle| handle.join().unwrap())
+        });
+        for (scenario, (result, calls, elapsed)) in outcomes {
             let failure = IpcFailure::from_error(result.unwrap_err());
-            assert!(matches!(failure, IpcFailure::Uncertain(_)), "{failure:?}");
             assert!(
-                elapsed < Duration::from_millis(650),
-                "shared budget exceeded: {elapsed:?}"
+                matches!(failure, IpcFailure::Uncertain(_)),
+                "{scenario:?}: {failure:?}"
             );
+            // A second of slack for a stalled runner; a client that waits past
+            // the shared deadline, or for a HUNG reply, takes longer.
+            assert!(
+                elapsed < RECEIVE_TIMEOUT + BUDGET + Duration::from_secs(1),
+                "{scenario:?}: shared budget exceeded: {elapsed:?}"
+            );
+            if matches!(scenario, Scenario::Exhausted | Scenario::CleanupSlow) {
+                assert!(
+                    elapsed >= BUDGET,
+                    "{scenario:?}: gave up before the budget: {elapsed:?}"
+                );
+            }
             if matches!(
                 scenario,
                 Scenario::Exhausted
