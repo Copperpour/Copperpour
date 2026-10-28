@@ -467,50 +467,10 @@ async fn handle_set_symbol_properties(
     };
 
     if replacement != source {
-        // A planning mistake is refused here, with nothing written.
-        if let Some(reason) = readback_mismatch(&replacement, &source, symbol, &fields) {
-            return Ok(handler_error(format!(
-                "set_symbol_properties wrote nothing: its planned edit failed its own check \
-                 ({reason})"
-            )));
-        }
-        #[cfg(test)]
-        write_hook::run(&path);
-        let written = transact_atomic(&path, |current| {
-            Ok(if current == source {
-                (replacement, true)
-            } else {
-                (current.to_owned(), false)
-            })
-        });
-        match written {
-            Ok(true) => {}
-            Ok(false) => {
-                return Ok(CallToolResult::error_kind(
-                    ToolErrorKind::Conflict {
-                        paths: vec![path.display().to_string()],
-                    },
-                    format!(
-                        "Symbol library '{}' changed after Copperpour read it, so \
-                         set_symbol_properties wrote nothing. Reload it and retry.",
-                        path.display()
-                    ),
-                ))
-            }
-            Err(SexpError::Conflict { .. }) => {
-                return Ok(uncertain(
-                    &path,
-                    "the library no longer held the edit when read back after the write",
-                ))
-            }
-            Err(error) => return Err(error.into()),
-        }
-        let reason = match read_consistent(&path) {
-            Ok(written) => readback_mismatch(&written, &source, symbol, &fields),
-            Err(error) => Some(format!("it could not be read back: {error}")),
-        };
-        if let Some(reason) = reason {
-            return Ok(uncertain(&path, reason));
+        let check = |text: &str| readback_mismatch(text, &source, symbol, &fields);
+        let refusal = write_checked(&path, &source, replacement, "set_symbol_properties", check)?;
+        if let Some(refusal) = refusal {
+            return Ok(refusal);
         }
     }
 
@@ -535,7 +495,7 @@ async fn handle_set_symbol_properties(
 
 /// A library that was named but cannot be edited. Like a missing file, that is
 /// not an argument error (DEV.md, "Structured Errors").
-fn unusable(path: &Path, reason: &str) -> CallToolResult {
+pub(super) fn unusable(path: &Path, reason: &str) -> CallToolResult {
     handler_error(format!(
         "Cannot edit symbol library '{}': {reason}",
         path.display()
@@ -551,18 +511,74 @@ fn handler_error(message: String) -> CallToolResult {
     )
 }
 
-fn uncertain(path: &Path, reason: impl Into<String>) -> CallToolResult {
+/// Replaces the library at `path` with `replacement` if it still holds
+/// `source`, then reads it back. `check` says why a text is not the planned
+/// edit; it is asked of `replacement` before the write and of the file after.
+/// `None` once the edit is written and read back.
+pub(super) fn write_checked(
+    path: &Path,
+    source: &str,
+    replacement: String,
+    operation: &str,
+    check: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<Option<CallToolResult>> {
+    // A planning mistake is refused here, with nothing written.
+    if let Some(reason) = check(&replacement) {
+        return Ok(Some(handler_error(format!(
+            "{operation} wrote nothing: its planned edit failed its own check ({reason})"
+        ))));
+    }
+    #[cfg(test)]
+    write_hook::run(path);
+    let written = transact_atomic(path, |current| {
+        Ok(if current == source {
+            (replacement, true)
+        } else {
+            (current.to_owned(), false)
+        })
+    });
+    match written {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(Some(CallToolResult::error_kind(
+                ToolErrorKind::Conflict {
+                    paths: vec![path.display().to_string()],
+                },
+                format!(
+                    "Symbol library '{}' changed after Copperpour read it, so {operation} wrote \
+                     nothing. Reload it and retry.",
+                    path.display()
+                ),
+            )))
+        }
+        Err(SexpError::Conflict { .. }) => {
+            return Ok(Some(uncertain(
+                path,
+                operation,
+                "the library no longer held the edit when read back after the write",
+            )))
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let reason = match read_consistent(path) {
+        Ok(written) => check(&written),
+        Err(error) => Some(format!("it could not be read back: {error}")),
+    };
+    Ok(reason.map(|reason| uncertain(path, operation, reason)))
+}
+
+fn uncertain(path: &Path, operation: &str, reason: impl Into<String>) -> CallToolResult {
     let path = path.display().to_string();
     let reason = reason.into();
     CallToolResult::error_kind(
         ToolErrorKind::MutationOutcomeUncertain {
-            operation: "set_symbol_properties".to_string(),
+            operation: operation.to_string(),
             path: path.clone(),
             reason: reason.clone(),
         },
         format!(
-            "set_symbol_properties replaced library '{path}', but {reason}. Another program \
-             may have saved it. Reload and inspect the library before retrying."
+            "{operation} replaced library '{path}', but {reason}. Another program may have \
+             saved it. Reload and inspect the library before retrying."
         ),
     )
 }
@@ -775,7 +791,7 @@ fn prepare_edit(
 }
 
 /// The top-level `(symbol "NAME" …)` block of the library.
-fn symbol_block(source: &str, symbol: &str) -> Result<(usize, usize), CallToolResult> {
+pub(super) fn symbol_block(source: &str, symbol: &str) -> Result<(usize, usize), CallToolResult> {
     let matches: Vec<(usize, usize)> = find_direct_child_blocks(source, "kicad_symbol_lib")
         .into_iter()
         .filter(|(start, _)| {
@@ -800,8 +816,8 @@ fn symbol_block(source: &str, symbol: &str) -> Result<(usize, usize), CallToolRe
                     .collect(),
             },
             format!(
-                "The library defines {} symbols named '{symbol}'; set_symbol_properties cannot \
-                 tell which one to change. Remove the duplicates first.",
+                "The library defines {} symbols named '{symbol}'; Copperpour cannot tell which \
+                 one to change. Remove the duplicates first.",
                 matches.len()
             ),
         )),
@@ -844,7 +860,7 @@ fn symbol_properties(source: &str, start: usize, end: usize) -> Result<Vec<Prope
 }
 
 /// The head and first argument of the block opening at `start`, as written.
-fn header(source: &str, start: usize) -> Option<(&str, &str)> {
+pub(super) fn header(source: &str, start: usize) -> Option<(&str, &str)> {
     let (head_start, head_end) = skip_sexp_token(source, start + 1)?;
     let (name_start, name_end) = skip_sexp_token(source, head_end)?;
     Some((&source[head_start..head_end], &source[name_start..name_end]))
@@ -934,7 +950,7 @@ fn readback_mismatch(
 /// A test-only seam between the read and the write: the next call writes
 /// the bytes set here first, as an intervening save would.
 #[cfg(test)]
-mod write_hook {
+pub(super) mod write_hook {
     use std::cell::RefCell;
     use std::path::Path;
 
@@ -942,7 +958,7 @@ mod write_hook {
         static SAVE: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
-    pub(super) fn set(content: String) {
+    pub(in crate::tools) fn set(content: String) {
         SAVE.with(|slot| *slot.borrow_mut() = Some(content));
     }
 
@@ -954,7 +970,7 @@ mod write_hook {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::mcp::handler::McpHandler;
     use crate::tools::ServerConfig;
@@ -1389,7 +1405,7 @@ mod tests {
     }
 
     /// Where KiCad's own symbol libraries are installed, if they are.
-    fn installed_symbol_dir() -> Option<std::path::PathBuf> {
+    pub(in crate::tools) fn installed_symbol_dir() -> Option<std::path::PathBuf> {
         ["KICAD10_SYMBOL_DIR", "KICAD_SYMBOL_DIR"]
             .iter()
             .filter_map(std::env::var_os)

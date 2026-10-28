@@ -14,7 +14,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **241 registered tools** + **7 always-visible meta-tools** = **248 total**
+- **242 registered tools** + **7 always-visible meta-tools** = **249 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<copperpour dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -352,7 +352,7 @@ and Windows servers do not.
 
 ## Library
 
-### `library` · 18 tools
+### `library` · 19 tools
 **Purpose:** Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models.
 **Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
 
@@ -368,6 +368,7 @@ and Windows servers do not.
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library, with optional footprint, description, keywords, footprint filters and custom fields. |
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
 | `set_symbol_properties` | Set the Value, Footprint, Description, keywords, footprint filters or custom fields of an existing library symbol, or rename or remove its custom fields, with a revision-checked write, reporting each field's previous and current value. Empty keywords or filters remove their property. |
+| `edit_symbol_pin` | Set the electrical type, graphic style or name of one pin of an existing library symbol, chosen by number, and by unit or body style where the number is in more than one, with a revision-checked write, reporting each changed part's previous and current value. |
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |
