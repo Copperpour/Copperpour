@@ -86,7 +86,11 @@ impl McpHandler {
             router.load_starter_kit().await;
         }
 
-        let observer = CallObserver::new(Some(default_calls_log_path()));
+        let log_path = default_calls_log_path();
+        if log_path.is_none() {
+            tracing::warn!("no call log: {}", crate::app_dirs::NO_USER_DIR);
+        }
+        let observer = CallObserver::new(log_path);
         let meta_input_validators = meta_tools::meta_tool_descriptions_for(cfg!(unix))
             .into_iter()
             .map(|tool| {

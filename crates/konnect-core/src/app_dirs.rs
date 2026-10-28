@@ -18,6 +18,50 @@ pub fn project_state_dir(project_dir: &Path) -> PathBuf {
     migrated(project_dir, ".konnect", ".copperpour")
 }
 
+/// Why a per-user path could not be resolved, for refusal messages.
+pub const NO_USER_DIR: &str = "the user's home directory is unknown (HOME is relative, or unset \
+     with no account entry; on Windows, APPDATA and the roaming profile folder are unavailable)";
+
+/// The user's home directory: `HOME`, or the account's own entry when `HOME`
+/// is unset or empty. `None` when that is not an absolute path (a relative
+/// `HOME` included), so a per-user file is never looked up relative to the
+/// working directory (#171).
+pub fn home_dir() -> Option<PathBuf> {
+    dirs::home_dir().filter(|path| path.is_absolute())
+}
+
+/// `%APPDATA%`, else the roaming application-data folder. `None` as for
+/// [`home_dir`].
+#[cfg(target_os = "windows")]
+pub fn app_data_dir() -> Option<PathBuf> {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(dirs::config_dir)
+        .filter(|path| path.is_absolute())
+}
+
+/// The per-user directory for config, logs and run records:
+/// `%APPDATA%\copperpour`, `~/Library/Application Support/copperpour`, or
+/// `~/.copperpour`.
+pub fn user_state_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    return app_data_dir().map(|dir| user_dir(&dir, false));
+    #[cfg(target_os = "macos")]
+    return home_dir().map(|home| user_dir(&home.join("Library/Application Support"), false));
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    return home_dir().map(|home| user_dir(&home, true));
+}
+
+/// The per-user directory for templates, the JLCPCB database and the EasyEDA
+/// cache: `%APPDATA%\copperpour`, else `~/.copperpour` (macOS included).
+pub fn user_data_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    return home_dir().map(|home| user_dir(&home, true));
+    #[cfg(not(target_os = "macos"))]
+    return user_state_dir();
+}
+
 /// `parent/<leaf>` for the app's per-user directory under `parent`: `.copperpour`
 /// when `hidden`, as in a home directory, else `copperpour`.
 pub fn user_dir(parent: &Path, hidden: bool) -> PathBuf {
@@ -111,6 +155,43 @@ mod tests {
             dir.path().join(".copperpour")
         );
         assert!(dir.path().join(".konnect").is_file());
+    }
+
+    /// A relative `HOME` or `APPDATA` never yields a relative per-user path
+    /// (#171). Run in a child process, since the variables are process-wide.
+    #[test]
+    fn a_relative_home_gives_no_relative_user_directory() {
+        const CHILD: &str = "COPPERPOUR_TEST_RELATIVE_HOME_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app_dirs::tests::a_relative_home_gives_no_relative_user_directory",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HOME", "relative")
+                .env("APPDATA", "relative")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // Windows falls back to the roaming profile; elsewhere there is none.
+        #[cfg(target_os = "windows")]
+        for path in [app_data_dir(), user_state_dir(), user_data_dir()] {
+            assert!(path.as_deref().is_some_and(Path::is_absolute), "{path:?}");
+        }
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            [home_dir(), user_state_dir(), user_data_dir()],
+            [None, None, None]
+        );
     }
 
     #[test]

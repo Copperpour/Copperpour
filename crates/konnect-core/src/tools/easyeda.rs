@@ -16,21 +16,9 @@ pub(crate) const EASYEDA_ATTRIBUTION: &str =
     "JLCEDA/EasyEDA Official Library (https://easyeda.com / https://lceda.cn/)";
 
 /// Resolve the local disk cache directory for EasyEDA API responses.
-pub(crate) fn easyeda_cache_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        crate::app_dirs::user_dir(&PathBuf::from(appdata), false)
-            .join("cache")
-            .join("easyeda")
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        crate::app_dirs::user_dir(&PathBuf::from(home), true)
-            .join("cache")
-            .join("easyeda")
-    }
+/// `None` when the user's home directory is unknown; the cache is then skipped.
+pub(crate) fn easyeda_cache_dir() -> Option<PathBuf> {
+    crate::app_dirs::user_data_dir().map(|dir| dir.join("cache").join("easyeda"))
 }
 
 /// Fetch an EasyEDA component bundle by LCSC ID, using local disk cache first
@@ -42,9 +30,11 @@ pub(crate) async fn fetch_easyeda_bundle(lcsc_id: &str) -> anyhow::Result<serde_
     }
 
     let cache_dir = easyeda_cache_dir();
-    let cache_file = cache_dir.join(format!("{clean_id}.json"));
-    if cache_file.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&cache_file) {
+    let cache_file = cache_dir
+        .as_ref()
+        .map(|dir| dir.join(format!("{clean_id}.json")));
+    if let Some(cache_file) = cache_file.as_ref().filter(|file| file.is_file()) {
+        if let Ok(content) = std::fs::read_to_string(cache_file) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                 if json.get("dataStr").is_some() {
                     return Ok(json);
@@ -86,10 +76,12 @@ pub(crate) async fn fetch_easyeda_bundle(lcsc_id: &str) -> anyhow::Result<serde_
         anyhow::anyhow!("Part '{clean_id}' not found in EasyEDA or could not be downloaded")
     })?;
 
-    if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-        tracing::warn!("Failed to create EasyEDA cache dir: {e}");
-    } else if let Ok(s) = serde_json::to_string(&result) {
-        let _ = std::fs::write(&cache_file, s);
+    if let (Some(cache_dir), Some(cache_file)) = (cache_dir, cache_file) {
+        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+            tracing::warn!("Failed to create EasyEDA cache dir: {e}");
+        } else if let Ok(s) = serde_json::to_string(&result) {
+            let _ = std::fs::write(&cache_file, s);
+        }
     }
 
     Ok(result)
@@ -537,8 +529,9 @@ pub(crate) async fn handle_import_jlcpcb_part(
     // Preferred verified PDF URL from EasyEDA packageDetail
     let mut datasheet_url = pkg_c_para["link"].as_str().unwrap_or("").to_string();
     if datasheet_url.is_empty() {
-        let db_path = crate::tools::integration::resolve_db_path(args, ctx);
-        if let Some(info) = crate::tools::integration::query_jlcpcb_db_part(&db_path, lcsc_id) {
+        let info = crate::tools::integration::resolve_db_path(args, ctx)
+            .and_then(|db_path| crate::tools::integration::query_jlcpcb_db_part(&db_path, lcsc_id));
+        if let Some(info) = info {
             datasheet_url = info.datasheet;
         }
     }
@@ -910,7 +903,7 @@ mod tests {
         let project_dir = tmp.path();
 
         // Seed mock EasyEDA response in cache
-        let cache_dir = easyeda_cache_dir();
+        let cache_dir = easyeda_cache_dir().unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
         let mock_lcsc_id = "C9999999";
         let mock_bundle = json!({
@@ -1017,7 +1010,7 @@ mod tests {
         )
         .unwrap();
 
-        let cache_dir = easyeda_cache_dir();
+        let cache_dir = easyeda_cache_dir().unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
         let mock_lcsc_id = "C8888888";
         let mock_bundle = json!({

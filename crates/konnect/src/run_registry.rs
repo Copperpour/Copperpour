@@ -10,7 +10,7 @@
 //! so the parent's death is invisible to it and it outlives the session.
 //!
 //! The record therefore lives here, written by the server about itself, as a
-//! pair under `<konnect_dir>/run/`:
+//! pair under `<user state dir>/run/`:
 //!
 //! - `<pid>.lock` — empty, held under an exclusive advisory lock for the whole
 //!   process lifetime. The lock, not the PID number, is the liveness proof: a
@@ -107,10 +107,10 @@ impl Drop for RunGuard {
     }
 }
 
-/// `<konnect_dir>/run` — same convention as the logs directory, not a second
-/// path scheme.
-fn run_dir() -> PathBuf {
-    konnect_core::observability::konnect_dir().join("run")
+/// `<user state dir>/run` — same convention as the logs directory, not a
+/// second path scheme.
+fn run_dir() -> Option<PathBuf> {
+    konnect_core::app_dirs::user_state_dir().map(|dir| dir.join("run"))
 }
 
 /// The body that belongs to a `<pid>.lock`.
@@ -143,7 +143,13 @@ fn is_our_stem(path: &Path) -> bool {
 /// Reap stale records, then register this process. Sweep first, so our own
 /// record is never a candidate for it.
 pub fn sweep_and_register(transport: &TransportMode) -> RunGuard {
-    let dir = run_dir();
+    let Some(dir) = run_dir() else {
+        warn!(
+            "no run directory ({}); this server will not be recorded",
+            konnect_core::app_dirs::NO_USER_DIR
+        );
+        return RunGuard::inert();
+    };
     sweep(&dir);
     register(
         &dir,

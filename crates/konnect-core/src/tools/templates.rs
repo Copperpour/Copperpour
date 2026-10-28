@@ -197,25 +197,15 @@ fn builtin_templates() -> Vec<serde_json::Value> {
 
 // ─── Template storage paths ──────────────────────────────────────────────────
 
-fn user_templates_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        crate::app_dirs::user_dir(&PathBuf::from(appdata), false).join("templates")
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        crate::app_dirs::user_dir(&PathBuf::from(home), true).join("templates")
-    }
+fn user_templates_dir() -> Option<PathBuf> {
+    crate::app_dirs::user_data_dir().map(|dir| dir.join("templates"))
 }
 
 /// Load all templates: builtins + any user-created ones from disk.
 async fn load_all_templates() -> Vec<serde_json::Value> {
     let mut templates = builtin_templates();
 
-    let user_dir = user_templates_dir();
-    if user_dir.is_dir() {
+    if let Some(user_dir) = user_templates_dir().filter(|dir| dir.is_dir()) {
         if let Ok(mut rd) = tokio::fs::read_dir(&user_dir).await {
             while let Ok(Some(entry)) = rd.next_entry().await {
                 let path = entry.path();
@@ -728,7 +718,7 @@ mod tests {
     /// Run only inside [`in_isolated_home`], since it writes a user template.
     fn template_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let template_dir = user_templates_dir();
+        let template_dir = user_templates_dir().unwrap();
         std::fs::create_dir_all(&template_dir).unwrap();
         std::fs::write(
             template_dir.join("one_resistor.json"),

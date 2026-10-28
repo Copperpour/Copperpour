@@ -246,7 +246,7 @@ struct InstallPaths {
 impl InstallPaths {
     fn for_current_user() -> Result<Self> {
         Ok(Self {
-            home: dirs::home_dir().context("could not locate home directory")?,
+            home: konnect_core::app_dirs::home_dir().context("could not locate home directory")?,
         })
     }
 

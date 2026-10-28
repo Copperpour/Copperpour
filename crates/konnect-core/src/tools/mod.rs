@@ -1832,41 +1832,44 @@ mod arg_helper_tests {
 
 // ─── KiCAD config directory detection ────────────────────────────────────────
 
+/// `path`, or the refusal naming `what` when the user's home directory is
+/// unknown and there is no per-user path (#171).
+pub(crate) fn require_user_path(
+    path: Option<std::path::PathBuf>,
+    what: &str,
+) -> Result<std::path::PathBuf, CallToolResult> {
+    path.ok_or_else(|| {
+        CallToolResult::error(format!(
+            "Cannot locate {what}: {}.",
+            crate::app_dirs::NO_USER_DIR
+        ))
+    })
+}
+
 /// Find the KiCAD user config directory by probing for installed version directories.
 /// Checks versions in descending order: 10.0, 9.0, 8.0, then bare "kicad".
-pub fn kicad_config_dir() -> std::path::PathBuf {
-    let base = kicad_config_base();
+/// `None` when the user's home directory is unknown.
+pub fn kicad_config_dir() -> Option<std::path::PathBuf> {
+    let base = kicad_config_base()?;
     let versions = ["10.0", "9.0", "8.0"];
     for ver in &versions {
         let dir = base.join(ver);
         if dir.is_dir() {
-            return dir;
+            return Some(dir);
         }
     }
     // Fallback: bare kicad dir or 10.0 (will be created on first use)
-    base.join("10.0")
+    Some(base.join("10.0"))
 }
 
 /// Platform-specific base directory for KiCAD configs.
-fn kicad_config_base() -> std::path::PathBuf {
+fn kicad_config_base() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
-    {
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        std::path::PathBuf::from(appdata).join("kicad")
-    }
+    return crate::app_dirs::app_data_dir().map(|dir| dir.join("kicad"));
     #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        std::path::PathBuf::from(home)
-            .join("Library")
-            .join("Preferences")
-            .join("kicad")
-    }
+    return crate::app_dirs::home_dir().map(|home| home.join("Library/Preferences/kicad"));
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        std::path::PathBuf::from(home).join(".config").join("kicad")
-    }
+    return crate::app_dirs::home_dir().map(|home| home.join(".config").join("kicad"));
 }
 
 // ─── lib_symbols embedding ──────────────────────────────────────────────────

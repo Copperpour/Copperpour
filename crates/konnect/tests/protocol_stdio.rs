@@ -935,3 +935,126 @@ fn check_freerouting_reports_every_location_it_searched_over_stdio() {
     assert_eq!(last["location_path"], json!(bin_s), "{last}");
     assert_eq!(last["max_depth"], 1, "{last}");
 }
+
+/// A relative `HOME` used to put every per-user path under the server's
+/// working directory, so the server read and wrote files there (#171). Each
+/// such file is planted where that path would land; none may be read, and the
+/// server must create nothing beside them.
+/// Unix only: Windows reads `APPDATA`, and falls back to the real profile.
+#[cfg(unix)]
+#[test]
+fn a_relative_home_never_reaches_the_working_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let table = "(sym_lib_table (version 7) (lib (name \"Planted\")(type \"KiCad\")(uri \"/planted.kicad_sym\")(options \"\")(descr \"\")))\n";
+    let toml = "log_level = \"trace\"\n";
+    let template = json!({"id": "planted", "name": "Planted", "components": [], "connections": []})
+        .to_string();
+    // Both the Linux and the macOS layouts, so one list serves either.
+    let planted = [
+        (user_config_under(&home), "{\"planted\": true}"),
+        (home.join(".copperpour/templates/planted.json"), &template),
+        (home.join(".config/kicad/10.0/sym-lib-table"), table),
+        (
+            home.join("Library/Preferences/kicad/10.0/sym-lib-table"),
+            table,
+        ),
+        (home.join(".config/copperpour/config.toml"), toml),
+        (
+            home.join("Library/Application Support/copperpour/config.toml"),
+            toml,
+        ),
+    ];
+    for (path, content) in &planted {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    // A spawned kicad-cli creates KiCad's own user directories under the
+    // `HOME` it inherits; that is KiCad's path, not one of Copperpour's, and
+    // the directories leading to it are skipped by comparing files only.
+    let kicad_data = home.join(".local/share/kicad");
+    let tree = |dir: &std::path::Path| {
+        let mut files: Vec<_> = walk(dir)
+            .into_iter()
+            .filter(|path| !path.starts_with(&kicad_data))
+            .collect();
+        files.sort();
+        files
+    };
+    let before = tree(tmp.path());
+
+    let mut p = McpProcess::spawn_with_env(Some(tmp.path()), false, &[("HOME", "home")]);
+    assert_ne!(
+        configuration_block(&mut p)["source"],
+        "search_path",
+        "the planted config.toml was selected"
+    );
+    for (tool, args) in [
+        ("load_user_config", json!({})),
+        (
+            "save_user_config",
+            json!({"key_path": "planted", "value": false}),
+        ),
+        ("get_effective_config", json!({})),
+        ("list_design_rules", json!({})),
+        (
+            "add_design_rule",
+            json!({"rule": "planted", "scope": "user"}),
+        ),
+    ] {
+        let result = p.call_tool(tool, args);
+        assert_eq!(result["isError"], json!(true), "{tool}: {result:#?}");
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("home directory is unknown"), "{tool}: {text}");
+    }
+
+    p.call_tool("load_toolset", json!({"name": "templates"}));
+    let template = p.call_tool("get_template", json!({"template_id": "planted"}));
+    assert!(
+        !template.to_string().contains("Planted"),
+        "the planted template was read: {template:#?}"
+    );
+
+    p.call_tool("load_toolset", json!({"name": "library"}));
+    let global = p.call_tool("list_symbol_libraries", json!({"scope": "global"}));
+    assert_eq!(global["isError"], json!(true), "{global:#?}");
+    assert!(
+        global.to_string().contains("home directory is unknown"),
+        "{global:#?}"
+    );
+    assert!(
+        !global.to_string().contains("Planted"),
+        "the planted sym-lib-table was read: {global:#?}"
+    );
+
+    p.call_tool("load_toolset", json!({"name": "integration"}));
+    let download = p.call_tool("download_jlcpcb_database", json!({}));
+    assert_eq!(download["isError"], json!(true), "{download:#?}");
+    assert!(
+        download.to_string().contains("home directory is unknown"),
+        "{download:#?}"
+    );
+
+    drop(p);
+    assert_eq!(
+        tree(tmp.path()),
+        before,
+        "no call log, run record, config or database was created under the working directory"
+    );
+    for (path, content) in &planted {
+        assert_eq!(std::fs::read_to_string(path).unwrap(), *content, "{path:?}");
+    }
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(walk(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}

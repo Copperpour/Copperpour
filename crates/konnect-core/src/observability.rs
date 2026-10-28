@@ -264,34 +264,9 @@ pub struct StatsSnapshot {
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
 
-/// Platform-specific path for Copperpour's state files (config, logs, cache).
-/// Matches the convention in `tools/config.rs::user_config_dir`.
-pub fn konnect_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        crate::app_dirs::user_dir(&PathBuf::from(appdata), false)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        crate::app_dirs::user_dir(
-            &PathBuf::from(home)
-                .join("Library")
-                .join("Application Support"),
-            false,
-        )
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        crate::app_dirs::user_dir(&PathBuf::from(home), true)
-    }
-}
-
-/// Default JSONL path for per-call logs.
-pub fn default_calls_log_path() -> PathBuf {
-    konnect_dir().join("logs").join("calls.jsonl")
+/// Default JSONL path for per-call logs; `None` turns the log off.
+pub fn default_calls_log_path() -> Option<PathBuf> {
+    crate::app_dirs::user_state_dir().map(|dir| dir.join("logs").join("calls.jsonl"))
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────────────

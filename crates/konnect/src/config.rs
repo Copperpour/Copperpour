@@ -274,7 +274,7 @@ fn default_config_paths() -> Vec<PathBuf> {
         PathBuf::from("settings.json"),
     ];
     config_paths.extend(exe_relative_settings_paths());
-    config_paths.push(dirs_config_path());
+    config_paths.extend(dirs_config_path());
     config_paths
 }
 
@@ -317,30 +317,16 @@ fn exe_relative_settings_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn dirs_config_path() -> PathBuf {
-    // Platform-specific config directory
-    #[cfg(target_os = "windows")]
-    {
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        konnect_core::app_dirs::user_dir(&PathBuf::from(appdata), false).join("config.toml")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        konnect_core::app_dirs::user_dir(
-            &PathBuf::from(home)
-                .join("Library")
-                .join("Application Support"),
-            false,
-        )
-        .join("config.toml")
-    }
+/// The per-user `config.toml`, or `None` when the user's home directory is
+/// unknown.
+fn dirs_config_path() -> Option<PathBuf> {
+    use konnect_core::app_dirs;
+    // Linux keeps it in `~/.config/copperpour`, not the state directory.
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        konnect_core::app_dirs::user_dir(&PathBuf::from(home).join(".config"), false)
-            .join("config.toml")
-    }
+    let dir = app_dirs::home_dir().map(|home| app_dirs::user_dir(&home.join(".config"), false));
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let dir = app_dirs::user_state_dir();
+    dir.map(|dir| dir.join("config.toml"))
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
