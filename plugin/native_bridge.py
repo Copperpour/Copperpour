@@ -4,6 +4,7 @@ This module is loaded only by the legacy ``pcbnew.ActionPlugin``.  It exposes
 one deliberately narrow operation to the external Rust server: ask KiCad's
 own SWIG binding to export the active board as Specctra DSN.  It is not a
 general Python execution service and is not the KiCad 11 integration path.
+It also resolves the plugin's per-user directories.
 """
 
 import json
@@ -44,6 +45,19 @@ def bridge_root():
     else:
         base = _absolute(os.environ.get("XDG_DATA_HOME")) or _join(_home(), ".local", "share")
     return _join(base, "copperpour", "native-bridge")
+
+
+def cache_root():
+    """Return the plugin's cache directory: server.pid and the staged binary.
+
+    `LOCALAPPDATA` on Windows, `~/.cache` elsewhere, or `None` when that
+    would be relative to KiCad's working directory (#190).
+    """
+    if os.name == "nt":
+        base = _absolute(os.environ.get("LOCALAPPDATA"))
+    else:
+        base = _join(_home(), ".cache")
+    return _join(base, "copperpour", "cache")
 
 
 def _absolute(path):

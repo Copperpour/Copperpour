@@ -76,7 +76,7 @@ _NTPATH_311 = types.SimpleNamespace(
 )
 
 
-def _bridge_root(env, platform="linux", os_name="posix"):
+def _resolve(root, env, platform="linux", os_name="posix"):
     # Only native_bridge sees the other platform's `os`, not the shared module.
     fake_os = types.SimpleNamespace(
         environ=env,
@@ -87,7 +87,15 @@ def _bridge_root(env, platform="linux", os_name="posix"):
     with mock.patch.object(native_bridge, "os", fake_os), mock.patch.object(
         native_bridge, "sys_platform", return_value=platform
     ):
-        return native_bridge.bridge_root()
+        return root()
+
+
+def _bridge_root(env, platform="linux", os_name="posix"):
+    return _resolve(native_bridge.bridge_root, env, platform, os_name)
+
+
+def _cache_root(env, platform="linux", os_name="posix"):
+    return _resolve(native_bridge.cache_root, env, platform, os_name)
 
 
 class BridgeRootTests(unittest.TestCase):
@@ -166,6 +174,39 @@ class BridgeRootTests(unittest.TestCase):
                 bridge.stop()
             self.assertFalse(bridge.running())
             self.assertEqual(os.listdir(cwd), [])
+
+
+class CacheRootTests(unittest.TestCase):
+    """The plugin's server.pid and staged binary (#190): never relative."""
+
+    LEAF = os.path.join("copperpour", "cache")
+
+    def test_bases(self):
+        posix = os.path.join("/h/.cache", self.LEAF)
+        cases = [
+            ({"HOME": "/h"}, "linux", "posix", posix),
+            ({"HOME": "/h", "LOCALAPPDATA": "/l"}, "linux", "posix", posix),
+            ({"HOME": "/h", "LOCALAPPDATA": "/l"}, "darwin", "posix", posix),
+            ({"LOCALAPPDATA": "C:\\L", "HOME": "C:\\H"}, "win32", "nt", "C:\\L\\copperpour\\cache"),
+        ]
+        for env, platform, os_name, expected in cases:
+            with self.subTest(env=env, platform=platform):
+                self.assertEqual(_cache_root(env, platform, os_name), expected)
+
+    def test_no_absolute_directory_gives_none(self):
+        cases = [
+            ({"HOME": "home"}, "linux", "posix"),
+            ({"HOME": "home", "LOCALAPPDATA": "/l"}, "linux", "posix"),
+            ({"HOME": "home"}, "darwin", "posix"),
+            ({"HOME": "C:\\H"}, "win32", "nt"),
+            ({"LOCALAPPDATA": ""}, "win32", "nt"),
+            ({"LOCALAPPDATA": "data"}, "win32", "nt"),
+            ({"LOCALAPPDATA": "\\Users\\x"}, "win32", "nt"),
+            ({"LOCALAPPDATA": "C:Users"}, "win32", "nt"),
+        ]
+        for env, platform, os_name in cases:
+            with self.subTest(env=env, platform=platform):
+                self.assertIsNone(_cache_root(env, platform, os_name))
 
 
 class NativeBridgeTests(unittest.TestCase):
