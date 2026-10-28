@@ -69,6 +69,7 @@ mod schematic_placement_tests;
 mod schematic_title_block_tests;
 pub mod svg_import;
 mod symbol_fields;
+mod symbol_pins;
 pub mod templates;
 pub(crate) mod title_block_args;
 pub mod verification;

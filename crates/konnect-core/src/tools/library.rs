@@ -370,6 +370,7 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_delete_symbol(args, ctx).await }
         ),
         super::symbol_fields::tool(),
+        super::symbol_pins::tool(),
         tool!(
             "list_symbols_in_library",
             "List all symbol names defined in a .kicad_sym library file.",
@@ -3094,7 +3095,7 @@ fn grow_to(lo: &mut f64, hi: &mut f64, needed: f64) {
 /// `(pin TYPE line …)` S-expression. Anything else makes eeschema refuse to
 /// load the library ("Failed to load schematic"-class parse error), so the
 /// value is validated instead of interpolated verbatim (#55).
-const ALLOWED_PIN_ELECTRICAL_TYPES: [&str; 12] = [
+pub(super) const ALLOWED_PIN_ELECTRICAL_TYPES: [&str; 12] = [
     "input",
     "output",
     "bidirectional",
