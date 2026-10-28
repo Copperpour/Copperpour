@@ -4,6 +4,9 @@ use prost::Message;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// How long the worker waits in `recv` before giving up on its own.
+const RECV_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// An already-listening in-process KiCad IPC double.
 ///
 /// The guard owns the endpoint for its entire lifetime. Dropping it closes the
@@ -44,7 +47,7 @@ impl MockIpcServer {
     ) -> Self {
         let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
         socket
-            .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(10)))
+            .set_opt::<nng::options::RecvTimeout>(Some(RECV_TIMEOUT))
             .expect("mock receive timeout");
         socket.listen(&address).expect("mock listen");
 
@@ -88,6 +91,54 @@ mod tests {
     use super::*;
     use nng::options::Options;
     use std::collections::HashSet;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// Well under the worker's receive timeout: a drop that relied on that
+    /// timeout instead of closing the socket would exceed it.
+    const PROMPT_RELEASE: Duration = Duration::from_millis(RECV_TIMEOUT.as_millis() as u64 / 10);
+
+    /// Drops the guard and asserts it finished well under the receive timeout.
+    fn drop_promptly(server: MockIpcServer) {
+        let started = Instant::now();
+        drop(server);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < PROMPT_RELEASE,
+            "dropping the guard took {elapsed:?}; it must close the socket, not wait out the receive timeout"
+        );
+    }
+
+    /// Under `PROMPT_RELEASE` and the failure test's 1 s client timeout, so a
+    /// joining guard and a panicked worker both set the flag in time.
+    const WORKER_EXIT_PAUSE: Duration = Duration::from_millis(200);
+
+    /// Moved into a responder, so the worker drops it only as it exits. The
+    /// pause keeps the flag clear for a guard that detaches the worker instead
+    /// of joining it.
+    struct WorkerExit(Arc<AtomicBool>);
+
+    impl Drop for WorkerExit {
+        fn drop(&mut self) {
+            std::thread::sleep(WORKER_EXIT_PAUSE);
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// As [`MockIpcServer::spawn`], with a flag the worker sets as it exits.
+    fn spawn_witnessed(
+        purpose: &str,
+        respond: impl Fn(kiapi::common::ApiRequest) -> kiapi::common::ApiResponse + Send + 'static,
+    ) -> (MockIpcServer, Arc<AtomicBool>) {
+        let exited = Arc::new(AtomicBool::new(false));
+        let witness = WorkerExit(Arc::clone(&exited));
+        let server = MockIpcServer::spawn(purpose, move |request| {
+            let _ = &witness;
+            respond(request)
+        });
+        (server, exited)
+    }
 
     fn ok_response() -> kiapi::common::ApiResponse {
         kiapi::common::ApiResponse {
@@ -141,9 +192,10 @@ mod tests {
 
     #[test]
     fn dropping_the_guard_closes_and_releases_its_endpoint() {
-        let server = MockIpcServer::spawn("release", |_| ok_response());
+        let (server, exited) = spawn_witnessed("release", |_| ok_response());
         let address = server.address().to_string();
-        drop(server);
+        drop_promptly(server);
+        assert!(exited.load(Ordering::SeqCst), "the worker must have exited");
 
         let replacement = nng::Socket::new(nng::Protocol::Rep0).expect("replacement socket");
         replacement
@@ -153,7 +205,8 @@ mod tests {
 
     #[test]
     fn responder_failure_still_releases_the_endpoint() {
-        let server = MockIpcServer::spawn("failed-response", |_| panic!("mock responder failed"));
+        let (server, exited) =
+            spawn_witnessed("failed-response", |_| panic!("mock responder failed"));
         let address = server.address().to_string();
         let socket = nng::Socket::new(nng::Protocol::Req0).expect("mock client socket");
         socket
@@ -168,8 +221,14 @@ mod tests {
             .send(nng::Message::from(request.encode_to_vec().as_slice()))
             .expect("request");
         assert!(socket.recv().is_err(), "failed responder must not reply");
+        // The panic ends the worker on its own, before the guard is dropped;
+        // only the endpoint check below depends on `Drop` here.
+        assert!(
+            exited.load(Ordering::SeqCst),
+            "the failed worker must have exited"
+        );
         drop(socket);
-        drop(server);
+        drop_promptly(server);
 
         let replacement = nng::Socket::new(nng::Protocol::Rep0).expect("replacement socket");
         replacement
@@ -183,7 +242,7 @@ mod tests {
             let server = MockIpcServer::spawn("repeated", |_| ok_response());
             round_trip(&server);
             let address = server.address().to_string();
-            drop(server);
+            drop_promptly(server);
 
             let replacement = nng::Socket::new(nng::Protocol::Rep0).expect("replacement socket");
             replacement
