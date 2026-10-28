@@ -12,7 +12,7 @@ use crate::tools::{
     with_bound_board_ipc_classified, BoardBinding, ToolContext, ToolDef,
 };
 use anyhow::Context;
-use copperpour_sexp::writer::{apply_edits, write_atomic, write_atomic_if_unchanged, SexpEdit};
+use copperpour_sexp::writer::{apply_edits, write_atomic_if_unchanged, SexpEdit};
 use prost::Message;
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
@@ -1819,9 +1819,11 @@ fn project_settings_path(board_path: &std::path::Path) -> std::path::PathBuf {
 
 /// Load the project JSON, refusing (rather than inventing a file KiCad never
 /// reads) when it is absent.
+///
+/// Also returns the text read, which a write must still find on disk.
 fn load_project_settings(
     board_path: &std::path::Path,
-) -> anyhow::Result<Result<(std::path::PathBuf, serde_json::Value), CallToolResult>> {
+) -> anyhow::Result<Result<(std::path::PathBuf, String, serde_json::Value), CallToolResult>> {
     let pro = project_settings_path(board_path);
     if !pro.exists() {
         return Ok(Err(CallToolResult::error(format!(
@@ -1831,9 +1833,10 @@ fn load_project_settings(
             pro.display()
         ))));
     }
-    let settings: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pro)?)
+    let text = std::fs::read_to_string(&pro)?;
+    let settings: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", pro.display()))?;
-    Ok(Ok((pro, settings)))
+    Ok(Ok((pro, text, settings)))
 }
 
 /// The netclass writers' guard. Saving the board in KiCad also rewrites the
@@ -1857,19 +1860,6 @@ async fn refuse_while_kicad_holds_the_project(
         &project_settings_path(board_path),
         "netclass change",
     ))
-}
-
-fn save_project_settings(
-    pro: &std::path::Path,
-    settings: &serde_json::Value,
-) -> anyhow::Result<()> {
-    // KiCad's own writer emits 2-space-indented JSON with alphabetical keys;
-    // serde_json's pretty printer matches both, so the diff stays minimal.
-    write_atomic(
-        pro,
-        &format!("{}\n", serde_json::to_string_pretty(settings)?),
-    )?;
-    Ok(())
 }
 
 /// The class every other class inherits from. `SetName` marks it on an exact
@@ -1929,7 +1919,7 @@ async fn handle_create_netclass(
     // Only the Default must be complete. Every other class may stay sparse.
     let is_default = name == DEFAULT_CLASS_NAME;
 
-    let (pro, mut settings) = match load_project_settings(&board_path)? {
+    let (pro, read, mut settings) = match load_project_settings(&board_path)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -2018,7 +2008,14 @@ async fn handle_create_netclass(
     // whole project file — the serialiser re-emits the document rather than
     // patching it — for a call that decided nothing.
     if changed {
-        save_project_settings(&pro, &settings)?;
+        if let Some(refusal) = crate::tools::pcb_board::write_project_if_unchanged(
+            &pro,
+            "create_netclass",
+            &read,
+            &settings,
+        )? {
+            return Ok(refusal);
+        }
     }
 
     let note = if backfilled.is_empty() {
@@ -2138,7 +2135,7 @@ async fn handle_get_netclasses(
         Ok(source) => source,
         Err(refusal) => return Ok(refusal),
     };
-    let (pro, settings) = match load_project_settings(&board_path)? {
+    let (pro, _, settings) = match load_project_settings(&board_path)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -2374,7 +2371,7 @@ async fn handle_assign_net_to_class(
         return Ok(refusal);
     }
 
-    let (pro, mut settings) = match load_project_settings(&board_path)? {
+    let (pro, read, mut settings) = match load_project_settings(&board_path)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -2435,7 +2432,14 @@ async fn handle_assign_net_to_class(
     } else {
         patterns.push(json!({ "netclass": netclass, "pattern": net_name }));
     }
-    save_project_settings(&pro, &settings)?;
+    if let Some(refusal) = crate::tools::pcb_board::write_project_if_unchanged(
+        &pro,
+        "assign_net_to_class",
+        &read,
+        &settings,
+    )? {
+        return Ok(refusal);
+    }
 
     Ok(CallToolResult::json(&json!({
         "assigned": true,
@@ -3189,7 +3193,7 @@ mod netclass_tests {
     }
 
     /// With the defaults gone from the update path, a call that names no value
-    /// decides nothing — so it must not write. `save_project_settings`
+    /// decides nothing — so it must not write. `write_project_if_unchanged`
     /// re-serialises the whole document rather than patching it, so saving
     /// anyway rewrites every line of the project file for a call that is, in
     /// effect, a read.

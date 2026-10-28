@@ -917,7 +917,7 @@ mod tests {
         let Some(stock) = stock_74xx() else { return };
         let (_dir, path) = library_with(&stock);
         let newer = stock.replace("(name \"VCC\"", "(name \"VCC1\"");
-        super::super::symbol_fields::write_hook::set(newer.clone());
+        crate::tools::write_hook::set(newer.clone());
         let body = call(json!({
             "library_path": path, "symbol_name": "74LS00", "pin_number": "7", "name": "VSS"
         }))

@@ -585,9 +585,14 @@ async fn handle_set_design_rules(
     }
 
     if !changed.is_empty() {
-        let mut content = serde_json::to_string_pretty(&project)?;
-        content.push('\n');
-        write_atomic(&project_path, &content)?;
+        if let Some(refusal) = crate::tools::pcb_board::write_project_if_unchanged(
+            &project_path,
+            "set_design_rules",
+            &project_content,
+            &project,
+        )? {
+            return Ok(refusal);
+        }
         // The file is replaced from here on, so a failed re-read is uncertain.
         let reread = tokio::fs::read_to_string(&project_path)
             .await
@@ -692,7 +697,10 @@ fn project_design_settings_mut(
         })
 }
 
-fn load_sibling_project(board: &Path) -> anyhow::Result<Result<(PathBuf, Value), CallToolResult>> {
+/// The project's path, the text read, and that text parsed.
+fn load_sibling_project(
+    board: &Path,
+) -> anyhow::Result<Result<(PathBuf, String, Value), CallToolResult>> {
     let project_path = sibling_project_path(board);
     if !project_path.exists() {
         return Ok(Err(CallToolResult::error(format!(
@@ -702,9 +710,10 @@ fn load_sibling_project(board: &Path) -> anyhow::Result<Result<(PathBuf, Value),
             project_path.display()
         ))));
     }
-    let settings: Value = serde_json::from_str(&std::fs::read_to_string(&project_path)?)
+    let text = std::fs::read_to_string(&project_path)?;
+    let settings: Value = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", project_path.display()))?;
-    Ok(Ok((project_path, settings)))
+    Ok(Ok((project_path, text, settings)))
 }
 
 fn finite_positive(value: f64, field: &str) -> Result<f64, CallToolResult> {
@@ -847,7 +856,7 @@ async fn handle_set_predefined_sizes(
         return Ok(refusal);
     }
 
-    let (project_path, mut project) = match load_sibling_project(&board)? {
+    let (project_path, project_text, mut project) = match load_sibling_project(&board)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -873,9 +882,14 @@ async fn handle_set_predefined_sizes(
         let settings = project_design_settings_mut(&mut project)?;
         settings.insert("track_widths".into(), track_widths.clone());
         settings.insert("via_dimensions".into(), via_dimensions.clone());
-        let mut content = serde_json::to_string_pretty(&project)?;
-        content.push('\n');
-        write_atomic(&project_path, &content)?;
+        if let Some(refusal) = crate::tools::pcb_board::write_project_if_unchanged(
+            &project_path,
+            "set_predefined_sizes",
+            &project_text,
+            &project,
+        )? {
+            return Ok(refusal);
+        }
     }
 
     Ok(CallToolResult::json(&json!({
@@ -894,7 +908,7 @@ async fn handle_get_predefined_sizes(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let (project_path, project) = match load_sibling_project(&board)? {
+    let (project_path, _, project) = match load_sibling_project(&board)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };

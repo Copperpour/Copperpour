@@ -26,7 +26,7 @@ use copperpour_sexp::{
     title_block::{self, TitleBlock},
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, new_uuid,
-        read_consistent, transact_atomic, SexpEdit,
+        read_consistent, SexpEdit,
     },
     SexpError,
 };
@@ -392,94 +392,37 @@ fn unsafe_file_fallback(
 /// while it still holds `content`, the bytes the edits were built from. A
 /// board that KiCad's autosave, an editor or another call saved in between is
 /// refused as `conflict` instead of being overwritten with an edit of the
-/// older read. `write_atomic_if_unchanged` would report that refusal and a
-/// failed post-write readback as the same `Conflict`; these need telling apart.
+/// older read.
 fn write_board_edits(
     board_path: &Path,
     operation: &str,
     content: String,
     edits: Vec<SexpEdit>,
 ) -> anyhow::Result<Option<CallToolResult>> {
-    #[cfg(test)]
-    board_write_hook::run(board_path);
-    // Compare under the writer's lock. A changed board is handed back as it
-    // is, and the writer does not rewrite an unchanged result.
-    let written = transact_atomic(board_path, move |current| {
-        Ok(if current == content {
-            (apply_edits(content, edits), true)
-        } else {
-            (current.to_owned(), false)
-        })
-    });
-    board_write_outcome(board_path, operation, written)
+    let next = apply_edits(content.clone(), edits);
+    crate::tools::replace_if_unchanged(board_path, "board", operation, &content, next)
 }
 
-/// What `write_board_edits` tells the caller. The writer reports a readback
-/// that no longer holds the edit as `SexpError::Conflict`; by then the board
-/// was replaced, so that is an uncertain outcome, not a refusal.
-fn board_write_outcome(
-    board_path: &Path,
+/// Replace a board's project file with `project` only while it still holds
+/// `read`, the text it was parsed from (#153), so a project file that KiCad,
+/// another call or another server rewrote in between is not put back.
+///
+/// KiCad's project lock is asked again here, at the write: a KiCad that
+/// opened the project after the caller's check leaves the bytes unchanged,
+/// and would revert the write on its next save (#804).
+pub(crate) fn write_project_if_unchanged(
+    project_path: &Path,
     operation: &str,
-    written: Result<bool, SexpError>,
+    read: &str,
+    project: &serde_json::Value,
 ) -> anyhow::Result<Option<CallToolResult>> {
-    let path = board_path.display().to_string();
-    match written {
-        Ok(true) => Ok(None),
-        Ok(false) => Ok(Some(CallToolResult::error_kind(
-            ToolErrorKind::Conflict {
-                paths: vec![path.clone()],
-            },
-            format!(
-                "Board '{path}' changed after Copperpour read it, so {operation} wrote nothing. \
-                 Reload the board and retry."
-            ),
-        ))),
-        Err(SexpError::Conflict { .. }) => {
-            let reason = "the board no longer held the edit when read back after the write";
-            Ok(Some(CallToolResult::error_kind(
-                ToolErrorKind::MutationOutcomeUncertain {
-                    operation: operation.to_string(),
-                    path: path.clone(),
-                    reason: reason.to_string(),
-                },
-                format!(
-                    "{operation} replaced board '{path}', but {reason}. Another program may \
-                     have saved it. Reload and inspect the board before retrying."
-                ),
-            )))
-        }
-        Err(error) => Err(error.into()),
+    if let Some(refusal) = refuse_if_project_locked_by_kicad(project_path, "change") {
+        return Ok(Some(refusal));
     }
-}
-
-/// A test-only seam between a fallback's read and its write, where a test
-/// plays the intervening save.
-#[cfg(test)]
-mod board_write_hook {
-    use std::cell::RefCell;
-    use std::path::Path;
-
-    type Hook = Box<dyn FnOnce(&Path)>;
-
-    thread_local! {
-        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
-    }
-
-    /// Run `hook` just before the next board write on this thread.
-    pub(super) fn set(hook: impl FnOnce(&Path) + 'static) {
-        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-    }
-
-    /// Whether a hook is still waiting for a write.
-    pub(super) fn armed() -> bool {
-        HOOK.with(|slot| slot.borrow().is_some())
-    }
-
-    pub(super) fn run(path: &Path) {
-        if let Some(hook) = HOOK.with(|slot| slot.borrow_mut().take()) {
-            hook(path);
-        }
-    }
+    // KiCad's own writer emits 2-space-indented JSON with alphabetical keys;
+    // serde_json's pretty printer matches both, so the diff stays minimal.
+    let next = format!("{}\n", serde_json::to_string_pretty(project)?);
+    crate::tools::replace_if_unchanged(project_path, "project file", operation, read, next)
 }
 
 /// A KiCad sibling lock is persistent evidence that the saved board may not be
@@ -6643,11 +6586,11 @@ mod board_revision_tests {
         let board = dir.path().join("board.kicad_pcb");
         for (tool, args) in cases(dir.path(), &board) {
             std::fs::write(&board, BOARD).unwrap();
-            board_write_hook::set(|path| std::fs::write(path, newer()).unwrap());
+            crate::tools::write_hook::set(newer());
             let result = call(tool, &args).await;
 
             assert!(
-                !board_write_hook::armed(),
+                !crate::tools::write_hook::armed(),
                 "{tool} bypassed the revision-checked write"
             );
             assert!(
@@ -6671,7 +6614,7 @@ mod board_revision_tests {
         let written = Err(SexpError::Conflict {
             path: board.to_path_buf(),
         });
-        let result = board_write_outcome(board, "add_board_text", written)
+        let result = crate::tools::replace_outcome(board, "board", "add_board_text", written)
             .unwrap()
             .expect("an error result");
         let error = &body(&result)["error"];
@@ -6679,13 +6622,15 @@ mod board_revision_tests {
         assert_eq!(error["operation"], "add_board_text", "{error}");
         assert_eq!(error["path"], "/boards/board.kicad_pcb", "{error}");
 
-        let refused = board_write_outcome(board, "add_board_text", Ok(false))
+        let refused = crate::tools::replace_outcome(board, "board", "add_board_text", Ok(false))
             .unwrap()
             .expect("an error result");
         assert_conflict("add_board_text", &body(&refused)["error"], board);
-        assert!(board_write_outcome(board, "add_board_text", Ok(true))
-            .unwrap()
-            .is_none());
+        assert!(
+            crate::tools::replace_outcome(board, "board", "add_board_text", Ok(true))
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The top-level blocks a tool edits: `set_board_size` replaces the
@@ -6742,7 +6687,7 @@ mod board_revision_tests {
         .await
         .expect("handler builds");
 
-        board_write_hook::set(|path| std::fs::write(path, newer()).unwrap());
+        crate::tools::write_hook::set(newer());
         let response = handler
             .handle_message(json!({
                 "jsonrpc": "2.0",

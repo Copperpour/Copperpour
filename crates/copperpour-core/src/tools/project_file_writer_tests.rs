@@ -295,3 +295,77 @@ async fn each_writer_writes_when_no_kicad_program_holds_the_project() {
         );
     }
 }
+
+/// The project file as another writer leaves it: KiCad, another server or a
+/// concurrent call that changed a key none of the four writers touches.
+fn rewritten_elsewhere(project_file: &Path) -> String {
+    let mut project: Value =
+        serde_json::from_str(&std::fs::read_to_string(project_file).unwrap()).unwrap();
+    project["meta"]["rewritten_elsewhere"] = json!(true);
+    format!("{}\n", serde_json::to_string_pretty(&project).unwrap())
+}
+
+/// Another writer replaces the project file between a tool's read and its
+/// write (#153). The tool refuses as `conflict` and leaves the file exactly as
+/// that writer left it, instead of putting its own older read back.
+#[tokio::test]
+async fn each_writer_refuses_a_project_file_changed_after_its_read() {
+    for tool in PROJECT_FILE_WRITERS {
+        let project = project();
+        let newer = rewritten_elsewhere(&project.project_file);
+        crate::tools::write_hook::set(newer.clone());
+        let handler = handler_talking_to("").await;
+
+        let result = call(&handler, tool, &project.board, &arguments_for(tool)).await;
+
+        assert!(
+            !crate::tools::write_hook::armed(),
+            "{tool} never reached the project write"
+        );
+        assert!(result.is_error, "{tool}: {}", text_of(&result));
+        let body = body_of(&result);
+        assert_eq!(body["error"]["kind"], "conflict", "{tool}: {body}");
+        assert_eq!(
+            body["error"]["paths"],
+            json!([project.project_file.display().to_string()]),
+            "{tool}: {body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&project.project_file).unwrap(),
+            newer,
+            "{tool} replaced the other writer's project file"
+        );
+    }
+}
+
+/// A KiCad program that opens the project after a writer's first lock check
+/// leaves the project file's bytes as they were, so the revision check alone
+/// would let the write through, for KiCad to revert on its next save (#804).
+/// The write itself asks for the lock again, and writes nothing.
+#[test]
+fn the_project_write_refuses_a_lock_taken_after_the_first_check() {
+    let project = project();
+    let read = std::fs::read_to_string(&project.project_file).unwrap();
+    let lock = lock_project(&project);
+
+    let refusal = crate::tools::pcb_board::write_project_if_unchanged(
+        &project.project_file,
+        "set_design_rules",
+        &read,
+        &json!({ "meta": { "filename": "placement_fixture.kicad_pro" } }),
+    )
+    .unwrap()
+    .expect("a refusal");
+
+    let body = body_of(&refusal);
+    assert_eq!(body["error"]["kind"], "unsafe_file_fallback", "{body}");
+    assert_eq!(
+        body["error"]["reason"], "kicad_project_lock_present",
+        "{body}"
+    );
+    assert!(lock.exists());
+    assert_eq!(
+        std::fs::read_to_string(&project.project_file).unwrap(),
+        read
+    );
+}

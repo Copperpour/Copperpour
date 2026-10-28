@@ -999,6 +999,101 @@ pub(crate) fn mutation_outcome_uncertain(
     )
 }
 
+/// Replace `path` with `next` only while it still holds `read`, the text the
+/// change was built from. A file another program saved in between is refused
+/// as `conflict` and left as that program left it. `write_atomic_if_unchanged`
+/// would report that refusal and a failed post-write readback as the same
+/// `Conflict`; the readback comes after the file was replaced, so it is an
+/// uncertain outcome. `what` names the file in messages, such as "board".
+/// `None` once the change is written and read back.
+pub(crate) fn replace_if_unchanged(
+    path: &std::path::Path,
+    what: &str,
+    operation: &str,
+    read: &str,
+    next: String,
+) -> anyhow::Result<Option<CallToolResult>> {
+    #[cfg(test)]
+    write_hook::run(path);
+    // Compare under the writer's lock. A changed file is handed back as it
+    // is, and the writer does not rewrite an unchanged result.
+    let written = copperpour_sexp::transact_atomic(path, move |current| {
+        Ok(if current == read {
+            (next, true)
+        } else {
+            (current.to_owned(), false)
+        })
+    });
+    replace_outcome(path, what, operation, written)
+}
+
+/// What [`replace_if_unchanged`] tells the caller about `written`, the
+/// writer's answer: `Ok(false)` when the file had changed before the write.
+pub(crate) fn replace_outcome(
+    path: &std::path::Path,
+    what: &str,
+    operation: &str,
+    written: Result<bool, copperpour_sexp::SexpError>,
+) -> anyhow::Result<Option<CallToolResult>> {
+    let shown = path.display().to_string();
+    match written {
+        Ok(true) => Ok(None),
+        Ok(false) => Ok(Some(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::Conflict {
+                paths: vec![shown.clone()],
+            },
+            format!(
+                "The {what} '{shown}' changed after Copperpour read it, so {operation} wrote \
+                 nothing. Reload it and retry."
+            ),
+        ))),
+        Err(copperpour_sexp::SexpError::Conflict { .. }) => {
+            let reason =
+                format!("the {what} no longer held the edit when read back after the write");
+            Ok(Some(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain {
+                    operation: operation.to_string(),
+                    path: shown.clone(),
+                    reason: reason.clone(),
+                },
+                format!(
+                    "{operation} replaced {what} '{shown}', but {reason}. Another program may \
+                     have saved it. Reload and inspect the {what} before retrying."
+                ),
+            )))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A test-only seam between a writer's read and [`replace_if_unchanged`]:
+/// the next write on this thread first writes the bytes set here, as an
+/// intervening save would.
+#[cfg(test)]
+pub(crate) mod write_hook {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    thread_local! {
+        static SAVE: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(content: String) {
+        SAVE.with(|slot| *slot.borrow_mut() = Some(content));
+    }
+
+    /// Whether a save is still waiting for a write.
+    pub(crate) fn armed() -> bool {
+        SAVE.with(|slot| slot.borrow().is_some())
+    }
+
+    pub(super) fn run(path: &Path) {
+        if let Some(content) = SAVE.with(|slot| slot.borrow_mut().take()) {
+            std::fs::write(path, content).unwrap();
+        }
+    }
+}
+
 /// The reason string for a footprint file whose root is not `(footprint ...)`.
 ///
 /// A pre-6.0 library file has a `(module ...)` root instead, and those are

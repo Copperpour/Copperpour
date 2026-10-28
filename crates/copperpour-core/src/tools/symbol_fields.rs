@@ -10,7 +10,7 @@ use crate::tools::sch_annotate::opt_string;
 use crate::tools::{invalid_arg, opt_str_list, ToolContext, ToolDef};
 use copperpour_sexp::writer::{
     apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, read_consistent,
-    transact_atomic, SexpEdit,
+    SexpEdit,
 };
 use copperpour_sexp::{SexpError, SexpNode};
 use serde_json::json;
@@ -528,37 +528,10 @@ pub(super) fn write_checked(
             "{operation} wrote nothing: its planned edit failed its own check ({reason})"
         ))));
     }
-    #[cfg(test)]
-    write_hook::run(path);
-    let written = transact_atomic(path, |current| {
-        Ok(if current == source {
-            (replacement, true)
-        } else {
-            (current.to_owned(), false)
-        })
-    });
-    match written {
-        Ok(true) => {}
-        Ok(false) => {
-            return Ok(Some(CallToolResult::error_kind(
-                ToolErrorKind::Conflict {
-                    paths: vec![path.display().to_string()],
-                },
-                format!(
-                    "Symbol library '{}' changed after Copperpour read it, so {operation} wrote \
-                     nothing. Reload it and retry.",
-                    path.display()
-                ),
-            )))
-        }
-        Err(SexpError::Conflict { .. }) => {
-            return Ok(Some(uncertain(
-                path,
-                operation,
-                "the library no longer held the edit when read back after the write",
-            )))
-        }
-        Err(error) => return Err(error.into()),
+    if let Some(refusal) =
+        crate::tools::replace_if_unchanged(path, "symbol library", operation, source, replacement)?
+    {
+        return Ok(Some(refusal));
     }
     let reason = match read_consistent(path) {
         Ok(written) => check(&written),
@@ -947,28 +920,6 @@ fn readback_mismatch(
     requested.or_else(removed).or_else(renamed)
 }
 
-/// A test-only seam between the read and the write: the next call writes
-/// the bytes set here first, as an intervening save would.
-#[cfg(test)]
-pub(super) mod write_hook {
-    use std::cell::RefCell;
-    use std::path::Path;
-
-    thread_local! {
-        static SAVE: RefCell<Option<String>> = const { RefCell::new(None) };
-    }
-
-    pub(in crate::tools) fn set(content: String) {
-        SAVE.with(|slot| *slot.borrow_mut() = Some(content));
-    }
-
-    pub(super) fn run(path: &Path) {
-        if let Some(content) = SAVE.with(|slot| slot.borrow_mut().take()) {
-            std::fs::write(path, content).unwrap();
-        }
-    }
-}
-
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -1312,7 +1263,7 @@ pub(super) mod tests {
         let handler = handler().await;
         let (_dir, path) = library_with(FIXTURE);
         let newer = FIXTURE.replace("\"CH347F\"", "\"CH347T\"");
-        write_hook::set(newer.clone());
+        crate::tools::write_hook::set(newer.clone());
 
         let body = call(&handler, "set_symbol_properties", bare_edit(&path)).await;
 
