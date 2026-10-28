@@ -593,6 +593,29 @@ fn installation_info_reports_defaults_when_no_config_file_exists() {
     assert_eq!(configuration["skipped_existing_paths"], json!([]));
 }
 
+/// A `kicad-cli` in the working directory used to end discovery, so `cli_path`
+/// reported the relative bare name instead of the binary that runs (#182).
+#[test]
+fn a_kicad_cli_in_the_working_directory_does_not_stop_discovery() {
+    let name = format!("kicad-cli{}", std::env::consts::EXE_SUFFIX);
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(tmp.path().join(&name), "").unwrap();
+    std::fs::write(bin.join(&name), "").unwrap();
+
+    // Empty and `.` entries name the working directory too.
+    let path = std::env::join_paths([std::path::Path::new(""), ".".as_ref(), &bin]).unwrap();
+    let mut p =
+        McpProcess::spawn_with_env(Some(tmp.path()), true, &[("PATH", path.to_str().unwrap())]);
+    let result = p.call_tool("get_installation_info", json!({}));
+    assert_ne!(result["isError"], json!(true), "{result:#?}");
+    assert_eq!(
+        McpProcess::tool_body(&result)["kicad"]["cli_path"],
+        bin.join(name).to_str().unwrap()
+    );
+}
+
 #[test]
 fn env_fallback_applies_without_disturbing_reported_provenance() {
     // Acceptance row: a selected file with a blank ipc_address plus
