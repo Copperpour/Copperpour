@@ -11,6 +11,420 @@ a release is cut.
 Changes from Konnect, up to its last release, v0.13.0, are in
 [Konnect's copy of this file](https://github.com/mixelpixx/Konnect/blob/v0.13.0/docs/API_MIGRATIONS.md).
 
+## v0.15.0
+
+### `annotate_schematic` annotates a whole hierarchy from its root (minor release)
+
+`annotate_schematic` takes an optional `schematic_scope`, as the design-review
+tools do. The default, `"file"`, plans one file as before; only the package
+rule below changes in it. `"hierarchy"`, given the project's root schematic,
+plans every sheet instance of the saved hierarchy together, as eeschema's
+Tools → Annotate does with its default "Entire schematic" scope
+([#42](https://github.com/Copperpour/Copperpour/issues/42)):
+
+- every `?` on any sheet instance gets the first free number for its prefix
+  in the project;
+- sheet instances are taken in eeschema's order: page number, after the repair
+  eeschema makes to empty or repeated pages when it loads them, then X, then Y;
+- a designator duplicated across sheets is reported in `unresolved`, and with
+  `resolve_duplicates` the first in that order keeps it;
+- a changed symbol's `Reference` property shows its file's first instance in
+  that order, the one eeschema saves it from;
+- every changed file is committed in one transaction journalled in the root's
+  directory.
+
+Like file scope, it follows Annotate's default options: a project's own
+numbering method, sort order and `reuse_designators` setting are not read.
+
+A record under the root belongs to the project by its path, and carries the
+project's name or none; records under another root are left alone unless they
+carry the project's name, which eeschema prunes as obsolete. Nothing is
+written when the target is not a proven root (`invalid_argument`, or
+mixelpixx/Konnect#189's
+`conflict`), when the project lists another top-level sheet or gives the root
+another uuid (`invalid_argument`), when any file of the hierarchy has a KiCad
+lock (`conflict`), when an unfinished transaction in the root's directory
+cannot be settled, or a dry run finds one (`conflict`), when a sheet file is
+missing or the walk fails (`file_not_found`, `handler_error`), when a file to
+be written lies outside the root's directory (`stale_target`), or when a
+placed symbol's records do not match the hierarchy: missing, repeated,
+obsolete, or under another project's name (`stale_target`). Nothing is pruned
+or created; opening and saving the project in KiCad repairs such records.
+
+The hierarchy response adds `sheets` (`path`, `schematic`, `page`,
+`sheet_number`, and `page_in_file` when the repair changed it), `schematic` on
+each `assigned` entry, `members` (`schematic`, `path`, `uuid`, `unit`) on each
+`duplicates_before` and `unresolved` group, and `remaining_unresolved` after a
+write. There, `paths` lists the instances holding the project's records sorted
+as strings (`sheets` gives eeschema's order), `other_sheets_consulted` lists
+the sheet files below the root, all of them annotated, `other_sheets_unreadable`
+is empty because an unreadable sheet refuses the call, and `assigned[].project`
+is the name the record carries, `""` where it carries none. Every non-error
+response now carries `schematic_scope`, and a file-scope call on a schematic
+that places sheets says that its sheets were not annotated. Two new
+`unresolved` reasons cover unannotated units of one multi-unit part that
+eeschema would put into a package with units elsewhere — on another sheet
+instance, or in a package already numbered — which is not reproduced; they
+stay unannotated.
+
+In both scopes the units of one package are now recognised by their library
+item, as eeschema recognises them, rather than by the name of their embedded
+definition: KiCad saves a unit whose definition differs from the library's
+with a copy named `Name_1`, and such units were reported as `unresolved`
+although they are one part. Their declared unit counts must agree.
+Unannotated, such units now take one number between them, where they took one
+per embedded copy; when the copies' unit counts differ they stay unannotated
+and are reported in `unresolved`, where before each copy was numbered.
+
+### A bare `kicad_cli` or `kicad_binary` is looked up on `PATH` only (patch release)
+
+A bare name, such as the default `kicad-cli`, no longer resolves to a file of
+that name in the server's working directory, and empty or relative `PATH`
+entries are skipped. A stray `kicad-cli` there used to stop discovery:
+`get_installation_info` reported `cli_path: "kicad-cli"`, and on Windows the
+installed KiCad was never found. The lookup now continues to `PATH` and the
+known install locations, and `cli_path` names the binary found. To use a
+binary in the working directory, configure it as `./kicad-cli`
+([#182](https://github.com/Copperpour/Copperpour/issues/182)).
+
+### The native bridge registers only where the server looks (patch release)
+
+The KiCad plugin now picks its native-bridge directory by the server's rule.
+It ignores an empty or relative `XDG_DATA_HOME` (and, on Windows,
+`LOCALAPPDATA`) instead of writing below KiCad's working directory. If no
+absolute directory remains, the settings dialog shows the bridge as
+unavailable and it stays off. On
+Windows the server reads the LocalAppData known folder, so a `LOCALAPPDATA`
+changed to name another folder still leaves the two apart.
+
+`COPPERPOUR_BRIDGE_DIR` must be an absolute path on both sides. A relative
+value, or one starting with `~`, now leaves the bridge off, and
+`export_specctra_dsn` reports it in `native_bridge_diagnostics`. Before this,
+the plugin and the server each resolved it against their own working
+directory ([#181](https://github.com/Copperpour/Copperpour/issues/181)).
+
+### `connect_to_net` with `stub_length: 0` writes no wire, and refuses a negative length (patch release)
+
+`stub_length: 0` used to write a wire whose two ends are the same point. It
+now writes only the label, on the pin or point itself, as
+`batch_connect_to_net` does, and the response's `wire` is `null` instead of an
+object with equal ends. A negative `stub_length` used to flip the stub to the
+opposite side; it is now refused with `invalid_argument` naming
+`stub_length`, before anything is written. Pass `direction` to choose the
+side ([#143](https://github.com/Copperpour/Copperpour/issues/143)).
+
+### New KiCad files name Copperpour as their generator (patch release)
+
+Schematics, boards, footprints and symbol libraries that Copperpour creates
+(`create_project`, `create_schematic`, `create_footprint`, `create_symbol` and
+the other tools that start a new file) now carry `(generator "copperpour")`
+instead of `(generator "konnect")`. KiCad replaces the value with its own the
+next time it saves the file, and nothing reads it back. The schematic viewer's
+window is titled "Schematic Viewer — Copperpour" and uses the Copperpour icon.
+
+### `edit_schematic_component` removes custom fields (minor release)
+
+`edit_schematic_component` accepts an optional `remove_fields` array of
+property names and deletes each one from every placed unit of the component,
+in the same atomic write as the call's other edits, `dnp` included. Omitting it
+reproduces the previous behavior exactly. An explicit `null` is refused as an
+invalid argument on `remove_fields`, as the advertised schema refuses it.
+
+KiCad's mandatory fields (Reference, Value, Footprint, Datasheet and
+Description) are refused in any case, as eeschema reads them in any case. So is
+a name also given in `fields` or `field_placements`. Both refusals come before
+anything is written. A name is matched whole, so removing `MP` leaves `MPN`.
+A stray property named `DNP` may be removed here; `fields` still refuses to
+write one, and the native attribute is set with `dnp`.
+
+When `remove_fields` names at least one field, the response adds
+`removed_fields`, the names deleted from at least one unit, and `absent_fields`,
+the names no unit carried. A call in which every name is absent and nothing
+else changes writes nothing. The readback checks that each named field is gone
+from every unit, before the write and after it.
+
+To carry a field over to a new name, set the new name in `fields` and remove
+the old one in the same call. The new field is added hidden at each unit's
+anchor with default text effects, as `fields` adds any field; give
+`field_placements` in the same call to place or show it. A field KiCad marks
+private, written `(property private "NAME" …)`, refuses the whole call as an
+invalid argument on `remove_fields`, naming the field and the component, before
+anything is written: none of the call's other edits is applied.
+
+### Footprint graphics keep their library line style, and an unchanged refresh plans `noop` (patch release)
+
+`update_footprints_from_library`, `place_component` and the footprints
+`update_pcb_from_schematic` adds over IPC used to send every footprint shape
+with no line style. KiCad saved each one as `(type default)`, including the
+`(type solid)` strokes of every stock footprint. Footprint user text was sent
+without keep-upright, so KiCad saved it `(unlocked yes)`. So were the custom
+properties the refresh writes, such as `KiLib_Generator`. Each shape now keeps
+the library's `(stroke (type …))`. A stroke without a type, or a KiCad 6 bare
+`(width …)`, is sent as solid, as KiCad 10.0.6 loads it. User text keeps
+upright unless the library marks it `(unlocked yes)` or, in a KiCad 7 or older
+file, `(at … unlocked)`. The refresh still refuses unlocked user text and
+properties, so its text always keeps upright. `place_component`'s Reference
+and Value fields are unchanged
+([#157](https://github.com/Copperpour/Copperpour/issues/157)).
+
+Footprint text and refreshed properties are now sent at their angle as placed,
+which KiCad turns upright itself, where they used to be turned by 180° past
+90°. That flip showed `(unlocked yes)` text upside down from the library. A
+rectangle turned by a multiple of 90° keeps its corners in rotated order, so
+KiCad saves the library's own `start` and `end`.
+
+`update_footprints_from_library` also stopped reporting changes that are only
+KiCad's representation: the parent each child names, an SMD pad's zero-size
+drill, chamfer and anchor settings a pad's shape does not use, and a pad angle
+of 270° against −90°. A footprint that matches its library now plans `noop`,
+and so does a dry run right after an apply. Before, every stock footprint
+planned `pads`, `graphics` and `metadata` on every run. A footprint an earlier
+Copperpour refreshed plans `graphics` and `metadata` once more, because its text
+was saved `(unlocked yes)` and turned; applying that plan settles it.
+
+KiCad 10.0.6 reports a `(type default)` stroke as solid over IPC, so the
+planner cannot see strokes that an earlier refresh turned into `default`, and
+does not offer to restore them. Use KiCad's own Update Footprints from Library
+for those. Arguments and response shapes are unchanged.
+
+### `update_footprints_from_library` can reset Reference and Value text (minor release)
+
+`update_footprints_from_library` accepts two optional booleans, both
+`false` by default, named after KiCad 10's own Update Footprints options:
+
+- `reset_text_sizes_and_styles` gives each refreshed footprint's Reference and
+  Value the library's text attributes: size, thickness, angle, justification,
+  mirroring and style.
+- `reset_text_positions` moves them to the library's position.
+
+Either keeps the fields' text, layer and visibility. A library Reference or
+Value with no position, layer or effects is refused for that footprint when a
+reset is asked for. With neither flag, Reference and Value keep their placed
+effects as before, and the plan revision is unchanged.
+
+A plan that resets a field reports `text_effects` in `changed_domains`. Each
+change then lists `text_effects`: the field, and its `before` and `after`
+position, angle, size, thickness (`null` for KiCad's default of one eighth of
+the height), style, mirroring, keep-upright and alignment. After the commit
+the board is read back, and a field that does not hold its reset returns
+`mutation_outcome_uncertain`.
+
+### `edit_footprint_pad` and `create_footprint` set a pad's fabrication property (minor release)
+
+`edit_footprint_pad` and each `create_footprint` pad accept an optional
+`fabrication_property`, one of KiCad's pad properties: `none`, `bga`,
+`fiducial_glob`, `fiducial_loc`, `testpoint`, `heatsink`, `castellated`,
+`mechanical` or `pressfit`. It is written as KiCad 10 writes it, and `none`
+removes the property. Without the field, `edit_footprint_pad` leaves the pad
+as it is and `create_footprint` writes no property. An unknown value is
+refused as `invalid_argument`, naming the field, and nothing is written.
+
+When the field is used, the response reports `fabrication_property` as read
+back from the written pads. A property that doesn't suit the pad type, such
+as `castellated` on an SMD pad, is still written, as KiCad allows, and the
+response carries KiCad's padstack warning in `warnings`.
+
+### The plugin's cache directory is never relative (patch release)
+
+The KiCad plugin keeps `server.pid`, and on Windows the staged server binary,
+in `%LOCALAPPDATA%\copperpour\cache` on Windows and `~/.cache/copperpour/cache`
+elsewhere. It no longer reads `LOCALAPPDATA` outside Windows, or falls back to
+`%USERPROFILE%\.cache` on Windows. A server recorded under the old directory
+is not reaped on the next start; stop it once by hand.
+
+When that directory would be missing or relative to KiCad's working directory
+(an unset, empty or relative `LOCALAPPDATA` on Windows, a relative `HOME`
+elsewhere), the plugin writes no PID file and runs the server from the plugin
+directory unstaged. Stop Server then reaches only the server started by the
+same plugin instance: not one orphaned by a crashed session, and not one
+started before a plugin reload
+([#190](https://github.com/Copperpour/Copperpour/issues/190)).
+
+### A relative `HOME` no longer reaches the working directory (patch release)
+
+The remaining per-user lookups now treat a relative `HOME` (and, on Windows, a
+relative `USERPROFILE`, `LOCALAPPDATA` or `ProgramFiles`) as no directory at
+all, instead of resolving it against the server's working directory:
+
+- Schematic and board edits refuse, as they already did with no local-data
+  directory: the cooperative document lock lives below the home directory.
+  Set `COPPERPOUR_STATE_DIR` to an absolute path to edit anyway.
+- `check_freerouting` and `route_specctra_dsn` skip the KiCad plugin folders
+  below a relative `HOME` or `USERPROFILE`, so `searched_locations` no longer
+  lists them. This supersedes the earlier note that a relative value is
+  searched below the working directory; it still holds for
+  `KICAD*_3RD_PARTY` and `PATH`.
+- KiCad install discovery (`kicad-cli`, the bundled libraries) and the native
+  Specctra bridge skip the per-user locations.
+
+On Unix, an unset `HOME` falls back to the account's home directory. Set
+`HOME` to an absolute path to restore the old locations
+([#179](https://github.com/Copperpour/Copperpour/issues/179)).
+
+### Renamed to Copperpour (minor release)
+
+The server now reports `serverInfo.name` `"copperpour"` instead of `"konnect"`,
+and the binary is `copperpour` (`copperpour.exe`). A `konnect` binary still
+ships in source builds and the standalone archives and runs `copperpour`; it
+will be removed in a later release. The KiCad package has a new identifier,
+`com.github.copperpour.copperpour`, so it installs beside Konnect's rather than
+over it, and `get_installation_info` recognises only the new identifier as a
+PCM install. A version line is read as `copperpour <version>` or
+`konnect <version>`.
+
+`COPPERPOUR_STATE_DIR`, `COPPERPOUR_BRIDGE_DIR` and `COPPERPOUR_BUILD_COMMIT`
+replace the `KONNECT_*` names, which are still read when the new ones are
+unset. `copperpour.toml` is searched before `konnect.toml`. User and project
+directories named `konnect` or `.konnect` are moved to `copperpour` or
+`.copperpour` on first use; when the new one already exists, nothing moves.
+
+`copperpour init` writes hook matchers of the form
+`mcp__(copperpour|konnect)__(...)`, and the bundled agents allow both
+`mcp__copperpour__*` and `mcp__konnect__*`, so either MCP server name works. No
+tool's arguments or responses change.
+
+### Messages and tool descriptions say Copperpour (patch release)
+
+Error messages, warnings, `source_evidence.detail` text, update instructions
+from `get_installation_info`, and tool and argument descriptions now name the
+server Copperpour instead of Konnect. A Specctra DSN from
+`export_specctra_dsn` names its `host_cad` as `Copperpour`. Kinds, reasons,
+JSON keys and tool names are unchanged; match on those, not on message text.
+An SES that Freerouting returns with `host_cad Konnect` still imports.
+
+### `set_design_rules` sets via annular width and hole clearance minima (minor release)
+
+`set_design_rules` accepts two more optional board-wide minima, in mm:
+`min_via_annular_width` (0 to 25) and `min_hole_clearance` (0 to 100), the
+ranges KiCad 10.0.6 loads. `min_via_annular_width` applies to plated
+through-hole pads as well as vias. `get_design_rules` and the
+`set_design_rules` response report both under `rules`, which now holds ten
+minima. As with `min_copper_edge_clearance`, `min_text_height` and
+`min_text_thickness`, a value outside the range is refused as
+`invalid_argument`, naming the field, and nothing is written.
+
+### `set_design_rules` sets copper-to-edge clearance and silkscreen text minima (minor release)
+
+`set_design_rules` accepts three optional board-wide minima, in mm:
+`min_copper_edge_clearance` (-0.01 to 25), `min_text_height` (0 to 100) and
+`min_text_thickness` (0 to 25). `get_design_rules` reports them under
+`rules`, beside the existing five. The ranges are the ones KiCad 10.0.6
+loads. It replaces a value outside them with its default when it opens the
+project, so Copperpour refuses such a value as `invalid_argument`, naming the
+field, and writes nothing.
+
+The `set_design_rules` response also carries `rules`, the eight minima as
+re-read from the written project. A rule that already holds the requested
+value, compared in nm as KiCad stores it, is no longer rewritten or listed in
+`changed`, and a call that changes nothing leaves the project file untouched.
+If the written file cannot be re-read, or does not hold a requested value,
+the call returns `mutation_outcome_uncertain`.
+
+### `set_symbol_properties` sets Value, and renames and removes custom fields (minor release)
+
+`set_symbol_properties` accepts three new optional arguments: `value`, the
+symbol's own Value field; `rename_fields`, custom fields as current name: new
+name; and `remove_fields`, an array of custom field names. Omitting them leaves
+the other arguments as they were, with two differences. A field written as
+`(property private "NAME" …)` is now read by its name; before, its name was
+taken to be `private`. And `fields` naming Value now points to the `value`
+argument, so `set_symbol_properties` no longer leaves Value alone: it changes
+Value only through `value`, and still does not change Reference or Datasheet.
+
+A rename replaces only the field's name, so its value, position, visibility and
+text effects stay as they were and it keeps its place among the fields, as
+KiCad's own resave keeps it. Names match whole and case-sensitively, as KiCad
+matches custom field names, so `MANUFACTURER` can be renamed `Manufacturer`.
+Mandatory and `ki_*` names, in any case, cannot be renamed, taken by a rename or
+removed. A current name the symbol does not carry, or a new name it already
+carries, is refused, and a rename to the same name changes nothing. A name may
+appear in only one of `fields`, `rename_fields` and `remove_fields`, and a chain
+or swap of names takes one call per step. An explicit `null` for `rename_fields`
+or `remove_fields` is refused as `invalid_argument` on that argument, as their
+schema types say, rather than read as omitted. Every refusal comes before
+anything is written. A `value` for a symbol without a Value field is refused
+rather than written hidden. On a derived symbol each argument edits that
+symbol's own fields, and an empty Value shows its parent's.
+
+In `changes` a rename appears twice, the old name with `current` null and the
+new name with `previous` null, and a removal appears with `current` null. When
+`remove_fields` names at least one field, the response adds `removed_fields`,
+the names deleted, and `absent_fields`, the names the symbol did not carry. A
+call in which every name is absent and nothing else changes writes nothing. The
+readback checks, before the write and after it, that each removed or
+renamed-away name is gone and that each renamed field is its old block with
+only the name changed.
+
+### Per-user paths are never relative to the working directory (patch release)
+
+Per-user paths used to resolve against the server's working directory when
+`HOME` (`APPDATA` on Windows) was unset, empty or relative. Now an unset `HOME`
+on Unix falls back to the account's home directory, and an unset `APPDATA`
+to the roaming profile folder. When there is still no absolute home directory
+(a relative `HOME`, say), per-user paths resolve to nothing:
+
+- `load_user_config`, `save_user_config`, `get_effective_config`,
+  `list_design_rules` and `add_design_rule` with `scope: "user"` refuse.
+- `list_symbol_libraries` and `list_footprint_libraries` with the global table
+  in scope, and `register_symbol_library` and `register_footprint_library` with
+  `scope: "global"`, refuse.
+- The JLCPCB tools refuse unless the server config sets `jlcpcb_db_path`
+  (or `download_jlcpcb_database` is given `output_path`); component placement
+  and part lookups that use the database only to enrich a result skip it.
+- `copperpour install`, `uninstall` and `status`, and the startup guidance
+  check, fail or are skipped as they already were for an unset `HOME`.
+- User templates, the EasyEDA cache, the global library tables used for
+  symbol and footprint lookup, the per-user `config.toml`, the call log and
+  the run registry are skipped.
+
+Set `HOME` (or `APPDATA`) to an absolute path to restore the old locations
+([#171](https://github.com/Copperpour/Copperpour/issues/171)).
+
+### `update_pcb_from_schematic` puts its verdict first and bounds its change list (minor release)
+
+The sync's response listed every planned change with every pad-to-net pair,
+and its keys were sorted, so `status` and `plan_revision` came after the whole
+list. For 340 footprints the dry run was 166 KB, more than a client would take,
+and the plan could not be applied from the chat session
+([#69](https://github.com/Copperpour/Copperpour/issues/69)).
+
+The top-level keys now come in this order: `status`, `plan_revision`,
+`coverage`, `changes_count`, `changes_shown`, `changes_truncated`, `staging`,
+`undo`, `diagnostics`, `unassigned_footprints`, then `changes`. `changes` is
+still an array, now of the first `limit` planned changes, 50 unless the call
+names another. `changes_count` is how many the plan has, and
+`changes_shown` and `changes_truncated` say how many are listed, as `run_drc`
+reports `shown` and `truncated` beside its violations. Only the response is
+bounded: `plan_revision` covers every change, and an apply sends every change,
+whatever `limit` the dry run used. `diagnostics` and `unassigned_footprints`
+are listed whole. A caller that needs every change passes a larger `limit` or
+an `output`.
+
+`output` names a file to receive the whole response, every change listed, as
+`run_drc` writes its report. It is written with every response that carries a
+plan: ready, noop, conflict, a stale revision and applied. A refusal before a
+plan exists, or an IPC failure, writes no file and leaves an earlier one in
+place. A path that is the board or a file of the saved hierarchy, a directory,
+or under something that is not a directory is refused before the board is
+read. A write that fails after that check fails the call, as `run_drc` does:
+with nothing applied the call can be repeated, and after an apply the error
+carries the applied response with an `output_not_written` diagnostic, so the
+commit is not repeated. `run_drc` and `get_drc_violations` share the same check
+and writer, unchanged.
+
+### `open_schematic_viewer` looks for the viewer next to the server, then on `PATH` (patch release)
+
+The viewer was looked for next to the server binary, then as
+`schematic-viewer` or `schematic-viewer.exe` in the server's working
+directory. A file found there was returned as a bare name, which the spawn
+looked up on `PATH`, so `viewer` named something other than the binary that
+ran, or the launch failed. The second step is now a `PATH` lookup over
+absolute entries, for the platform's file name only, and `viewer` is the full
+path launched. Keep the viewer next to the server binary, as the release
+packages install it, or put its directory on `PATH`. The not-found error now
+names both places
+([#184](https://github.com/Copperpour/Copperpour/issues/184)).
+
 ## v0.14.0
 
 ### `mirror_schematic_component` (minor release)
