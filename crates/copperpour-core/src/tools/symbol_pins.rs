@@ -1,5 +1,6 @@
-//! `edit_symbol_pin`: change one pin's electrical type, name or graphic style
-//! in an existing `.kicad_sym` symbol, leaving everything else as written.
+//! `edit_symbol_pin`: change one pin's electrical type, graphic style, name,
+//! number, position, angle or length in an existing `.kicad_sym` symbol,
+//! leaving everything else as written.
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -9,6 +10,7 @@ use crate::tools::library::{skip_sexp_token, ALLOWED_PIN_ELECTRICAL_TYPES};
 use crate::tools::sch_annotate::opt_string;
 use crate::tools::symbol_fields::{header, symbol_block, unusable, write_checked};
 use crate::tools::{invalid_arg, ToolContext, ToolDef};
+use copperpour_schematic_editor::types::fmt_f64;
 use copperpour_sexp::writer::{apply_edits, find_direct_child_blocks, read_consistent, SexpEdit};
 use copperpour_sexp::SexpError;
 use serde_json::json;
@@ -27,17 +29,27 @@ const PIN_STYLES: &[&str] = &[
     "non_logic",
 ];
 
-/// The first library version in which a pin named `~` is not an empty name
-/// (KiCad's `sch_file_versions.h`).
+/// The first library version in which a pin named or numbered `~` is not
+/// empty (KiCad's `sch_file_versions.h`).
 const TILDE_IS_TEXT: u32 = 20250318;
+
+/// The pin directions KiCad reads in `(at x y angle)`; any other angle stops it
+/// loading the library.
+const PIN_ANGLES: [u32; 4] = [0, 90, 180, 270];
+
+/// The parts of a pin a call can set, in the order [`Pin::parts`] gives them.
+const PARTS: [&str; 8] = [
+    "number", "type", "style", "name", "x", "y", "angle", "length",
+];
 
 pub(super) fn tool() -> ToolDef {
     tool!(
         "edit_symbol_pin",
-        "Set the electrical type, graphic style or name of one pin of an existing library \
-         symbol. A pin number found in more than one unit or body style needs unit or \
-         body_style to choose the pin. Position, length, text effects and the rest of the \
-         library are left as written. Reports each changed part's previous and current value.",
+        "Set the electrical type, graphic style, name, number, position, angle or length of \
+         one pin of an existing library symbol. A pin number found in more than one unit or \
+         body style needs unit or body_style to choose the pin. Everything else, and the rest \
+         of the library, is left as written. Reports each changed part's previous and current \
+         value.",
         json!({
             "type": "object",
             "properties": {
@@ -56,7 +68,12 @@ pub(super) fn tool() -> ToolDef {
                     "enum": PIN_STYLES,
                     "description": "New pin graphic style"
                 },
-                "name": { "type": "string", "description": "New pin name. KiCad keeps no space in a pin name, so a space is written as '_'" }
+                "name": { "type": "string", "description": "New pin name. KiCad keeps no space in a pin name, so a space is written as '_'" },
+                "new_number": { "type": "string", "description": "New pin number, a space written as '_'. Refused when another pin of the symbol has it, in any unit, unless the two are in different body styles: the pins KiCad's symbol checker reports as duplicates" },
+                "x": { "type": "number", "description": "New X of the pin's connection point in mm, in the symbol's coordinates as create_symbol writes them" },
+                "y": { "type": "number", "description": "New Y of the pin's connection point in mm, as for x" },
+                "angle": { "type": "integer", "enum": PIN_ANGLES, "description": "New pin direction in degrees, from the connection point toward the body" },
+                "length": { "type": "number", "minimum": 0, "description": "New pin length in mm" }
             },
             "required": ["library_path", "symbol_name", "pin_number"],
             "additionalProperties": false
@@ -65,39 +82,202 @@ pub(super) fn tool() -> ToolDef {
     )
 }
 
+/// KiCad's schematic unit, 0.0001 mm (`SCH_IU_PER_MM`, `include/base_units.h:72`).
+const UNITS_PER_MM: f64 = 1e4;
+
+/// The largest magnitude KiCad reads in its units, about 151848 mm; it clamps
+/// beyond (`parseInternalUnits`, `eeschema/sch_io/kicad_sexpr/sch_io_kicad_sexpr_parser.cpp:691-694`).
+/// KiCad's factor is the literal 0.7071, not 1/√2.
+const UNITS_LIMIT: f64 = i32::MAX as f64 * 7071.0 / 1e4;
+
 /// Which pin a call names, and what it asks to set; a `None` value leaves
 /// that part of the pin alone.
 struct Request<'a> {
     symbol: &'a str,
-    number: &'a str,
+    /// As KiCad reads a pin number, a space as '_'.
+    number: String,
     unit: Option<u32>,
     body_style: Option<u32>,
     pin_type: Option<String>,
     style: Option<String>,
     name: Option<String>,
+    new_number: Option<String>,
+    /// `x`, `y` and `length` in KiCad's units.
+    x: Option<i64>,
+    y: Option<i64>,
+    angle: Option<u32>,
+    length: Option<i64>,
 }
 
-/// One `(pin TYPE STYLE (at …) (length …) (name "N" …) (number "NUM" …))` block,
-/// with the spans of the parts a call can change.
+/// One `(pin TYPE STYLE (at X Y ANGLE) (length L) (name "N" …) (number "NUM" …))`
+/// block: each part a call can set, as written, with its span. KiCad defaults
+/// a missing `(at …)` or `(length …)`; such a part reads as empty and has no span.
 #[derive(Debug, Clone, PartialEq)]
 struct Pin {
     unit: u32,
     body_style: u32,
+    /// As KiCad reads it: a space as '_', and, for a library before
+    /// [`TILDE_IS_TEXT`], empty where the file says `~`; so is `name`.
     number: String,
     pin_type: String,
     style: String,
-    /// As KiCad reads it, which for a library before [`TILDE_IS_TEXT`] is
-    /// empty where the file says `~`.
     name: String,
-    type_span: (usize, usize),
-    style_span: (usize, usize),
-    name_span: (usize, usize),
+    x: String,
+    y: String,
+    angle: String,
+    length: String,
+    /// The spans of the parts, in [`PARTS`] order.
+    spans: [Option<(usize, usize)>; 8],
 }
 
 impl Pin {
     fn place(&self) -> String {
         format!("unit {} body style {}", self.unit, self.body_style)
     }
+
+    /// The parts a call can set, in [`PARTS`] order.
+    fn parts(&self) -> [&str; 8] {
+        [
+            &self.number,
+            &self.pin_type,
+            &self.style,
+            &self.name,
+            &self.x,
+            &self.y,
+            &self.angle,
+            &self.length,
+        ]
+    }
+
+    /// Whether KiCad's symbol checker counts two pins with one number as
+    /// duplicates: unless they are in different body styles, 0 sharing all
+    /// (`eeschema/symbol_checker.cpp`, `CheckDuplicatePins`).
+    fn shares_a_body_style(&self, other: &Pin) -> bool {
+        self.body_style == 0 || other.body_style == 0 || self.body_style == other.body_style
+    }
+}
+
+/// A length or coordinate written in mm, in KiCad's units as it reads them.
+fn units_of(text: &str) -> Option<i64> {
+    text.parse::<f64>()
+        .ok()
+        .map(|mm| (mm * UNITS_PER_MM).round() as i64)
+}
+
+/// KiCad's units as mm, written as `create_symbol` writes them.
+fn mm_text(units: i64) -> String {
+    fmt_f64(units as f64 / UNITS_PER_MM)
+}
+
+/// The whole number at the front of `text`, as KiCad reads a pin's angle
+/// (`parseInt`, through `strtol`).
+fn leading_integer(text: &str) -> Option<i64> {
+    let unsigned = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let digits = unsigned.len()
+        - unsigned
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .len();
+    text[..text.len() - unsigned.len() + digits].parse().ok()
+}
+
+/// `pin`'s parts once `request` is applied, as [`prepare_edit`] writes them: a
+/// part KiCad would already read as the asked value keeps its text.
+fn parts_as_asked(pin: &Pin, request: &Request) -> [String; 8] {
+    let measure = |new: Option<i64>, old: &str| match new {
+        Some(new) if units_of(old) != Some(new) => mm_text(new),
+        _ => old.to_string(),
+    };
+    let text = |new: &Option<String>, old: &str| new.clone().unwrap_or_else(|| old.to_string());
+    [
+        text(&request.new_number, &pin.number),
+        text(&request.pin_type, &pin.pin_type),
+        text(&request.style, &pin.style),
+        text(&request.name, &pin.name),
+        measure(request.x, &pin.x),
+        measure(request.y, &pin.y),
+        match request.angle {
+            Some(angle) if leading_integer(&pin.angle) != Some(i64::from(angle)) => {
+                angle.to_string()
+            }
+            _ => pin.angle.clone(),
+        },
+        measure(request.length, &pin.length),
+    ]
+}
+
+/// One element of a pin number in KiCad's stacked notation: a number, or a
+/// run `prefix first..=last` such as `A1-A3`.
+#[derive(Debug, PartialEq)]
+enum Stacked {
+    One(String),
+    Run(String, i64, i64),
+}
+
+/// A trailing run of digits and what comes before it, as KiCad's
+/// `ParseAlphaNumericPin` splits a pin number.
+fn alphanumeric(number: &str) -> (&str, Option<i64>) {
+    let digits = number.len() - number.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    let (prefix, value) = number.split_at(number.len() - digits);
+    (prefix, value.parse().ok())
+}
+
+/// A pin number as KiCad's `ExpandStackedPinNotation` reads it
+/// (`common/string_utils.cpp:1672-1757`), its runs kept as runs so that a
+/// long range costs nothing; anything else is the number itself.
+fn stacked(number: &str) -> Vec<Stacked> {
+    let whole = || vec![Stacked::One(number.to_string())];
+    let Some(inner) = number
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    else {
+        return whole();
+    };
+    let mut parts = Vec::new();
+    for part in inner
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let Some((from, to)) = part.split_once('-') else {
+            parts.push(Stacked::One(part.to_string()));
+            continue;
+        };
+        match (alphanumeric(from.trim()), alphanumeric(to.trim())) {
+            ((prefix, Some(first)), (end_prefix, Some(last)))
+                if prefix == end_prefix && first <= last =>
+            {
+                parts.push(Stacked::Run(prefix.to_string(), first, last));
+            }
+            _ => return whole(),
+        }
+    }
+    if parts.is_empty() {
+        whole()
+    } else {
+        parts
+    }
+}
+
+/// A number two pin numbers both stand for, written as KiCad writes one taken
+/// from a run, or `None`.
+fn shared_number(a: &[Stacked], b: &[Stacked]) -> Option<String> {
+    let in_run = |run: &Stacked, number: &str| match (run, alphanumeric(number)) {
+        (Stacked::Run(prefix, first, last), (own, Some(value))) => {
+            own == prefix
+                && (*first..=*last).contains(&value)
+                && format!("{prefix}{value}") == number
+        }
+        _ => false,
+    };
+    a.iter()
+        .flat_map(|x| b.iter().map(move |y| (x, y)))
+        .find_map(|pair| match pair {
+            (Stacked::One(m), Stacked::One(n)) => (m == n).then(|| m.clone()),
+            (Stacked::One(n), run) | (run, Stacked::One(n)) => in_run(run, n).then(|| n.clone()),
+            (Stacked::Run(p, f, l), Stacked::Run(q, g, m)) => {
+                (p == q && f.max(g) <= l.min(m)).then(|| format!("{p}{}", f.max(g)))
+            }
+        })
 }
 
 fn enum_arg(
@@ -118,21 +298,64 @@ fn enum_arg(
     }
 }
 
+/// A length or coordinate in mm, at least `minimum`, in KiCad's units as it
+/// would read it; `None` when absent.
+fn measure_arg(
+    args: &serde_json::Value,
+    key: &str,
+    minimum: f64,
+) -> Result<Option<i64>, CallToolResult> {
+    let mm = match args.get(key) {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(value) => value
+            .as_f64()
+            .ok_or_else(|| invalid_arg(key, "must be a number of mm"))?,
+    };
+    if mm < minimum {
+        Err(invalid_arg(key, &format!("must be at least {minimum}")))
+    } else if !mm.is_finite() || (mm * UNITS_PER_MM).abs() > UNITS_LIMIT {
+        Err(invalid_arg(key, "is beyond the 151848 mm KiCad reads"))
+    } else {
+        Ok(Some((mm * UNITS_PER_MM).round() as i64))
+    }
+}
+
 fn parse_request(args: &serde_json::Value) -> Result<Request<'_>, CallToolResult> {
+    let angle = super::opt_u32(args, "angle")?;
+    if angle.is_some_and(|angle| !PIN_ANGLES.contains(&angle)) {
+        return Err(invalid_arg(
+            "angle",
+            "must be 0, 90, 180 or 270, the directions KiCad reads",
+        ));
+    }
     let request = Request {
         symbol: super::require_str(args, "symbol_name")?,
-        number: super::require_str(args, "pin_number")?,
+        number: super::require_str(args, "pin_number")?.replace(' ', "_"),
         unit: super::opt_u32(args, "unit")?,
         body_style: super::opt_u32(args, "body_style")?,
         pin_type: enum_arg(args, "type", &ALLOWED_PIN_ELECTRICAL_TYPES)?,
         style: enum_arg(args, "style", PIN_STYLES)?,
-        // As eeschema's SCH_PIN::SetName stores it, so KiCad reads back what is written.
+        // As eeschema's SCH_PIN::SetName and SetNumber store them, so KiCad
+        // reads back what is written.
         name: opt_string(args, "name")?.map(|name| name.replace(' ', "_")),
+        new_number: opt_string(args, "new_number")?.map(|number| number.replace(' ', "_")),
+        x: measure_arg(args, "x", f64::NEG_INFINITY)?,
+        y: measure_arg(args, "y", f64::NEG_INFINITY)?,
+        angle,
+        length: measure_arg(args, "length", 0.0)?,
     };
-    if request.pin_type.is_none() && request.style.is_none() && request.name.is_none() {
+    if request.pin_type.is_none()
+        && request.style.is_none()
+        && request.name.is_none()
+        && request.new_number.is_none()
+        && request.x.is_none()
+        && request.y.is_none()
+        && request.angle.is_none()
+        && request.length.is_none()
+    {
         return Err(invalid_arg(
             "pin_change",
-            "supply at least one of type, style or name",
+            "supply at least one of type, style, name, new_number, x, y, angle or length",
         ));
     }
     Ok(request)
@@ -250,32 +473,63 @@ fn read_pin(
     let style_span = skip_sexp_token(source, type_span.1).ok_or(BAD)?;
     let mut name = None;
     let mut number = None;
+    let mut at = None;
+    let mut length = None;
     for (child_start, _) in find_direct_child_blocks(&source[start..end], "pin") {
         let child_start = start + child_start;
-        let slot = match header(source, child_start).map(|(head, _)| head) {
-            Some("name") => &mut name,
-            Some("number") => &mut number,
-            _ => continue,
-        };
         let (_, after_head) = skip_sexp_token(source, child_start + 1).ok_or(BAD)?;
-        let span = skip_sexp_token(source, after_head).ok_or(BAD)?;
-        let text = copperpour_sexp::parse_sexp(&source[span.0..span.1]).map_err(|_| BAD)?;
-        *slot = Some((text.as_str().ok_or(BAD)?.to_string(), span));
+        let first = skip_sexp_token(source, after_head).ok_or(BAD)?;
+        // As SCH_PIN::SetName and SetNumber store what the parser hands them.
+        let quoted = |span: (usize, usize)| -> Result<(String, (usize, usize)), String> {
+            let text = copperpour_sexp::parse_sexp(&source[span.0..span.1]).map_err(|_| BAD)?;
+            let mut text = text.as_str().ok_or(BAD)?.replace(' ', "_");
+            if tilde_is_empty && text == "~" {
+                text.clear();
+            }
+            Ok((text, span))
+        };
+        match header(source, child_start).map(|(head, _)| head) {
+            Some("name") => name = Some(quoted(first)?),
+            Some("number") => number = Some(quoted(first)?),
+            Some("at") => {
+                let second = skip_sexp_token(source, first.1).ok_or(BAD)?;
+                let third = skip_sexp_token(source, second.1).ok_or(BAD)?;
+                at = Some([first, second, third]);
+            }
+            Some("length") => length = Some(first),
+            _ => {}
+        }
     }
-    let ((mut name, name_span), (number, _)) = name.zip(number).ok_or(BAD)?;
-    if tilde_is_empty && name == "~" {
-        name.clear();
+    let ((name, name_span), (number, number_span)) = name.zip(number).ok_or(BAD)?;
+    let at = at.map_or([None; 3], |at| at.map(Some));
+    let spans = [
+        Some(number_span),
+        Some(type_span),
+        Some(style_span),
+        Some(name_span),
+        at[0],
+        at[1],
+        at[2],
+        length,
+    ];
+    let text = |index: usize| {
+        spans[index].map_or(String::new(), |(from, to)| source[from..to].to_string())
+    };
+    if (4..8).any(|index| spans[index].is_some() && text(index).parse::<f64>().is_err()) {
+        return Err(BAD.to_string());
     }
     Ok(Pin {
         unit: place.0,
         body_style: place.1,
         number,
-        pin_type: source[type_span.0..type_span.1].to_string(),
-        style: source[style_span.0..style_span.1].to_string(),
+        pin_type: text(1),
+        style: text(2),
         name,
-        type_span,
-        style_span,
-        name_span,
+        x: text(4),
+        y: text(5),
+        angle: text(6),
+        length: text(7),
+        spans,
     })
 }
 
@@ -317,7 +571,7 @@ fn choose_pin<'p>(
     pins: &'p [Pin],
     request: &Request,
 ) -> Result<&'p Pin, CallToolResult> {
-    let Request { symbol, number, .. } = *request;
+    let (symbol, number) = (request.symbol, request.number.as_str());
     let numbered: Vec<&Pin> = pins.iter().filter(|pin| pin.number == number).collect();
     if numbered.is_empty() {
         return Err(invalid_arg(
@@ -384,37 +638,95 @@ fn prepare_edit(
             ),
         ));
     }
+    let tilde_is_empty = library_version(source).is_some_and(|version| version < TILDE_IS_TEXT);
+    for (key, value) in [("name", &request.name), ("new_number", &request.new_number)] {
+        if tilde_is_empty && value.as_deref() == Some("~") {
+            return Err(invalid_arg(
+                key,
+                "this library is older than version 20250318, so KiCad reads '~' in it as \
+                 empty; give an empty string for none",
+            ));
+        }
+    }
     let pins = symbol_pins(source, start, end).map_err(|reason| unusable(path, &reason))?;
     let pin = choose_pin(path, &pins, request)?.clone();
 
+    if let Some(new) = request
+        .new_number
+        .as_ref()
+        .filter(|new| **new != pin.number)
+    {
+        let wanted = stacked(new);
+        let taken = pins
+            .iter()
+            .filter(|other| **other != pin && pin.shares_a_body_style(other))
+            .find_map(|other| {
+                shared_number(&wanted, &stacked(&other.number)).map(|shared| (other, shared))
+            });
+        if let Some((other, shared)) = taken {
+            return Err(invalid_arg(
+                "new_number",
+                &format!(
+                    "pin '{}' in {} of symbol '{}' already stands for number '{shared}', so \
+                     KiCad's symbol checker would report the two as duplicates",
+                    other.number,
+                    other.place(),
+                    request.symbol
+                ),
+            ));
+        }
+    }
+
     let mut edits = Vec::new();
     let mut changes = serde_json::Map::new();
-    for (key, new, old, span, text) in [
-        (
-            "type",
-            &request.pin_type,
-            &pin.pin_type,
-            pin.type_span,
-            None,
-        ),
-        ("style", &request.style, &pin.style, pin.style_span, None),
-        (
-            "name",
-            &request.name,
-            &pin.name,
-            pin.name_span,
-            request.name.as_deref().map(quote_string),
-        ),
-    ] {
-        let Some(new) = new.as_ref().filter(|new| *new != old) else {
+    let asked = parts_as_asked(&pin, request);
+    for (index, (old, new)) in pin.parts().into_iter().zip(&asked).enumerate() {
+        if old == new {
             continue;
+        }
+        let key = if PARTS[index] == "number" {
+            "new_number"
+        } else {
+            PARTS[index]
         };
+        let Some((start, end)) = pin.spans[index] else {
+            return Err(invalid_arg(
+                key,
+                &format!(
+                    "pin '{}' in {} writes no {}, which KiCad then defaults; add it in KiCad \
+                     before changing it",
+                    pin.number,
+                    pin.place(),
+                    if key == "length" {
+                        "(length …)"
+                    } else {
+                        "(at …)"
+                    }
+                ),
+            ));
+        };
+        let quoted = matches!(PARTS[index], "number" | "name");
         edits.push(SexpEdit::replace(
-            span.0,
-            span.1,
-            text.unwrap_or_else(|| new.clone()),
+            start,
+            end,
+            if quoted {
+                quote_string(new)
+            } else {
+                new.clone()
+            },
         ));
-        changes.insert(key.into(), json!({"previous": old, "current": new}));
+        // Measures and the angle are reported as numbers, as KiCad reads them.
+        let value = |text: &str| match PARTS[index] {
+            "x" | "y" | "length" => {
+                units_of(text).map_or(json!(text), |units| json!(units as f64 / UNITS_PER_MM))
+            }
+            "angle" => leading_integer(text).map_or(json!(text), |angle| json!(angle)),
+            _ => json!(text),
+        };
+        changes.insert(
+            PARTS[index].into(),
+            json!({"previous": value(old), "current": value(new)}),
+        );
     }
     Ok((
         pin,
@@ -424,8 +736,8 @@ fn prepare_edit(
 }
 
 /// Why `written` is not `before` with only the chosen pin changed as asked,
-/// or `None` when it is. Each pin's number, unit, body style, type, style and
-/// name are compared, in file order.
+/// or `None` when it is. Each pin's unit, body style and every part a call can
+/// set are compared, in file order.
 fn readback_mismatch(
     written: &str,
     before: &str,
@@ -447,22 +759,12 @@ fn readback_mismatch(
         return Some("the pin count changed".to_string());
     }
     for (was, now) in original.iter().zip(&after) {
-        let (pin_type, style, name) = if was == target {
-            (
-                request.pin_type.as_ref().unwrap_or(&was.pin_type),
-                request.style.as_ref().unwrap_or(&was.style),
-                request.name.as_ref().unwrap_or(&was.name),
-            )
+        let expected = if was == target {
+            parts_as_asked(was, request)
         } else {
-            (&was.pin_type, &was.style, &was.name)
+            was.parts().map(str::to_string)
         };
-        if now.number != was.number
-            || now.unit != was.unit
-            || now.body_style != was.body_style
-            || now.pin_type != *pin_type
-            || now.style != *style
-            || now.name != *name
-        {
+        if now.unit != was.unit || now.body_style != was.body_style || now.parts() != expected {
             return Some(format!(
                 "pin '{}' of {} does not read as asked",
                 was.number,
@@ -568,6 +870,20 @@ mod tests {
             .find(|&index| lines[index].trim_start().starts_with("(name "))
             .unwrap();
         (pin, name)
+    }
+
+    /// The index of the first line opening `(head …` in pin `number` of the
+    /// unit block `unit`, by text alone.
+    fn pin_line(library: &str, unit: &str, number: &str, head: &str) -> usize {
+        let (pin, _) = pin_lines(library, unit, number);
+        let opens = format!("({head} ");
+        library
+            .lines()
+            .enumerate()
+            .skip(pin)
+            .find(|(_, line)| line.trim_start().starts_with(&opens))
+            .unwrap()
+            .0
     }
 
     /// `text` with line `index` replaced by `line`, line endings kept.
@@ -793,6 +1109,17 @@ mod tests {
                 "is not one of",
             ),
             (
+                json!({"pin_number": "7", "angle": 45}),
+                "angle",
+                "is not one of",
+            ),
+            (
+                json!({"pin_number": "7", "length": -1}),
+                "length",
+                "minimum",
+            ),
+            (json!({"pin_number": "7", "x": "far"}), "x", "not of type"),
+            (
                 json!({"pin_number": "7"}),
                 "pin_change",
                 "supply at least one",
@@ -812,6 +1139,134 @@ mod tests {
             assert!(body.to_string().contains(says), "{arguments}: {body}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), stock);
         }
+    }
+
+    /// KiCad 10.0.6 reads the renumbered pin. Its next save also moves the pin
+    /// into number order (`SCH_PIN::compare`), as the tool does not.
+    #[tokio::test]
+    async fn a_renumber_changes_that_number_only() {
+        let Some(stock) = stock_74xx() else { return };
+        let (_dir, path) = library_with(&stock);
+        let body = call(json!({
+            "library_path": path, "symbol_name": "74LS00", "pin_number": "1",
+            "unit": 1, "body_style": 1, "new_number": "15"
+        }))
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(
+            body["changes"],
+            json!({"number": {"previous": "1", "current": "15"}})
+        );
+        let number = pin_line(&stock, "74LS00_1_1", "1", "number");
+        assert_eq!(
+            changed_lines(&stock, &std::fs::read_to_string(&path).unwrap()),
+            [(number, "\t\t\t\t(number \"1\"", "\t\t\t\t(number \"15\"")]
+        );
+
+        // A space is written as '_', as KiCad's SCH_PIN::SetNumber stores it.
+        let body = call(json!({
+            "library_path": path, "symbol_name": "74LS00", "pin_number": "15",
+            "new_number": "B 15"
+        }))
+        .await;
+        assert_eq!(
+            body["changes"],
+            json!({"number": {"previous": "15", "current": "B_15"}}),
+            "{body}"
+        );
+    }
+
+    /// KiCad's symbol checker reports two pins with one number as duplicates
+    /// across units, and across body styles where one is common to all; a
+    /// stacked number counts as each number it stands for.
+    #[tokio::test]
+    async fn a_renumber_onto_another_pin_s_number_is_refused() {
+        let Some(stock) = stock_74xx() else { return };
+        let fourteen = pin_line(&stock, "74LS00_5_0", "14", "number");
+        let stacked = with_line(&stock, fourteen, "\t\t\t\t(number \"[14-16]\"");
+        for (library, new_number, holder) in [
+            (stock.as_str(), "2", "pin '2' in unit 1 body style 1"),
+            (stock.as_str(), "4", "pin '4' in unit 2 body style 1"),
+            (stock.as_str(), "14", "pin '14' in unit 5 body style 0"),
+            (
+                stacked.as_str(),
+                "15",
+                "pin '[14-16]' in unit 5 body style 0",
+            ),
+        ] {
+            let (_dir, path) = library_with(library);
+            let body = call(json!({
+                "library_path": path, "symbol_name": "74LS00", "pin_number": "1",
+                "unit": 1, "body_style": 1, "new_number": new_number
+            }))
+            .await;
+            assert_eq!(
+                body["error"]["kind"], "invalid_argument",
+                "{new_number}: {body}"
+            );
+            assert_eq!(body["error"]["field"], "new_number", "{new_number}: {body}");
+            assert!(body.to_string().contains(holder), "{new_number}: {body}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), library);
+        }
+    }
+
+    /// The two drawings of a De Morgan pin may share a number: KiCad does not
+    /// count pins in different body styles as duplicates.
+    #[tokio::test]
+    async fn a_number_in_the_other_body_style_is_not_a_duplicate() {
+        let Some(stock) = stock_74xx() else { return };
+        let (_dir, path) = library_with(&stock);
+        for body_style in [1, 2] {
+            let body = call(json!({
+                "library_path": path, "symbol_name": "74LS00", "pin_number": "1",
+                "unit": 1, "body_style": body_style, "new_number": "15"
+            }))
+            .await;
+            assert_ne!(body["is_error"], true, "{body_style}: {body}");
+        }
+        let numbers = [("74LS00_1_1", "1"), ("74LS00_1_2", "1")]
+            .map(|(unit, number)| pin_line(&stock, unit, number, "number"));
+        assert_eq!(
+            changed_lines(&stock, &std::fs::read_to_string(&path).unwrap()),
+            numbers.map(|line| (line, "\t\t\t\t(number \"1\"", "\t\t\t\t(number \"15\""))
+        );
+    }
+
+    /// With KiCad 10.0.6's library, `kicad-cli sym upgrade --force` of this
+    /// output differs from the same resave of the untouched library in exactly
+    /// these two lines. A part already at the asked value is not reported.
+    #[tokio::test]
+    async fn position_angle_and_length_change_on_one_pin() {
+        let Some(stock) = stock_74xx() else { return };
+        let (_dir, path) = library_with(&stock);
+        let body = call(json!({
+            "library_path": path, "symbol_name": "74LS00", "pin_number": "1",
+            "unit": 1, "body_style": 1,
+            "x": -10.16, "y": 2.54, "angle": 90, "length": 6.35
+        }))
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(
+            body["changes"],
+            json!({
+                "x": {"previous": -7.62, "current": -10.16},
+                "angle": {"previous": 0, "current": 90},
+                "length": {"previous": 3.81, "current": 6.35}
+            })
+        );
+        let at = pin_line(&stock, "74LS00_1_1", "1", "at");
+        let length = pin_line(&stock, "74LS00_1_1", "1", "length");
+        assert_eq!(
+            changed_lines(&stock, &std::fs::read_to_string(&path).unwrap()),
+            [
+                (
+                    at,
+                    "\t\t\t\t(at -7.62 2.54 0)",
+                    "\t\t\t\t(at -10.16 2.54 90)"
+                ),
+                (length, "\t\t\t\t(length 3.81)", "\t\t\t\t(length 6.35)")
+            ]
+        );
     }
 
     /// Pin 1 is drawn in both body styles of unit 1. Pin 4 renumbered 1 puts
@@ -924,5 +1379,218 @@ mod tests {
         .await;
         assert_eq!(body["error"]["kind"], "conflict", "{body}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+    }
+
+    // The tests below need no installed KiCad, so CI runs them.
+
+    /// `create_symbol` output resaved by KiCad 10.0.6, committed for
+    /// `symbol_fields`' tests. FIELDS_BARE_0_1 holds pin 1 (VCC, at -8.89 0 0)
+    /// and pin 2 (GND, at 8.89 0 180), each 2.54 long.
+    const OURS: &str = include_str!("../../tests/fixtures/symbol_fields_kicad10.kicad_sym");
+    /// KiCad's stock Fiber_Optic library at 7.0.10, committed for
+    /// `symbol_fields`' tests: version 20220914, each pin on one line.
+    const KICAD7: &str = include_str!("../../tests/fixtures/fiber_optic_kicad7.kicad_sym");
+
+    #[tokio::test]
+    async fn renumber_move_and_resize_one_pin() {
+        let (_dir, path) = library_with(OURS);
+        let body = call(json!({
+            "library_path": path, "symbol_name": "FIELDS_BARE", "pin_number": "1",
+            "new_number": "3", "x": -10.16, "y": 2.54, "angle": 0, "length": 3.81
+        }))
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(
+            body["changes"],
+            json!({
+                "number": {"previous": "1", "current": "3"},
+                "x": {"previous": -8.89, "current": -10.16},
+                "y": {"previous": 0.0, "current": 2.54},
+                "length": {"previous": 2.54, "current": 3.81}
+            })
+        );
+        let line = |head| pin_line(OURS, "FIELDS_BARE_0_1", "1", head);
+        assert_eq!(
+            changed_lines(OURS, &std::fs::read_to_string(&path).unwrap()),
+            [
+                (
+                    line("at"),
+                    "\t\t\t\t(at -8.89 0 0)",
+                    "\t\t\t\t(at -10.16 2.54 0)"
+                ),
+                (
+                    line("length"),
+                    "\t\t\t\t(length 2.54)",
+                    "\t\t\t\t(length 3.81)"
+                ),
+                (
+                    line("number"),
+                    "\t\t\t\t(number \"1\"",
+                    "\t\t\t\t(number \"3\""
+                )
+            ]
+        );
+    }
+
+    /// KiCad keeps 0.0001 mm, so a value it would read the same is no change,
+    /// whatever its text; nor is the pin's own number.
+    #[tokio::test]
+    async fn what_kicad_reads_the_same_writes_nothing() {
+        let at = pin_line(OURS, "FIELDS_BARE_0_1", "1", "at");
+        let padded = with_line(OURS, at, "\t\t\t\t(at -8.890 0 0.0)");
+        let (_dir, path) = library_with(&padded);
+        let body = call(json!({
+            "library_path": path, "symbol_name": "FIELDS_BARE", "pin_number": "1",
+            "new_number": "1", "x": -8.89001, "y": -0.00001, "angle": 0, "length": 2.54
+        }))
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(body["changes"], json!({}));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), padded);
+    }
+
+    /// Pin 2's number is set in memory, pin 1 renumbered against it. A stacked
+    /// number collides through any number it stands for, as KiCad expands it;
+    /// a malformed one is taken whole, and a long range costs nothing.
+    #[tokio::test]
+    async fn a_renumber_collides_through_stacked_numbers() {
+        let two = pin_line(OURS, "FIELDS_BARE_0_1", "2", "number");
+        for (held, asked, shared) in [
+            ("2", "2", Some("2")),
+            ("[2-4]", "3", Some("3")),
+            ("4", "[3-5]", Some("4")),
+            ("[5-7]", "[6-9]", Some("6")),
+            ("[A1-A3]", "A2", Some("A2")),
+            ("[A1-A3]", "A02", None),
+            ("[3-1]", "3", None),
+            ("[1-99999999999]", "5", Some("5")),
+            ("2", "[100-99999999999]", None),
+        ] {
+            let library = with_line(OURS, two, &format!("\t\t\t\t(number \"{held}\""));
+            let (_dir, path) = library_with(&library);
+            let body = call(json!({
+                "library_path": path, "symbol_name": "FIELDS_BARE", "pin_number": "1",
+                "new_number": asked
+            }))
+            .await;
+            match shared {
+                Some(shared) => {
+                    assert_eq!(
+                        body["error"]["field"], "new_number",
+                        "{held} {asked}: {body}"
+                    );
+                    let says = format!("already stands for number '{shared}'");
+                    assert!(body.to_string().contains(&says), "{held} {asked}: {body}");
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), library);
+                }
+                None => assert_ne!(body["is_error"], true, "{held} {asked}: {body}"),
+            }
+        }
+    }
+
+    /// KiCad's own vectors, `qa/tests/eeschema/test_stacked_pin_conversion.cpp`.
+    #[test]
+    fn stacked_numbers_read_as_kicad_reads_them() {
+        let one = |number: &str| Stacked::One(number.to_string());
+        let run = |first, last| Stacked::Run(String::new(), first, last);
+        assert_eq!(stacked("[1,2,3]"), [one("1"), one("2"), one("3")]);
+        assert_eq!(stacked("[5-7]"), [run(5, 7)]);
+        assert_eq!(stacked("[1,3,5-7]"), [one("1"), one("3"), run(5, 7)]);
+        assert_eq!(stacked("1"), [one("1")]);
+        assert_eq!(stacked("[1,2"), [one("[1,2")]);
+    }
+
+    /// KiCad 7 writes a pin's at, length and hide on one line.
+    #[tokio::test]
+    async fn a_single_line_pin_changes_in_place() {
+        const OLD: &str = "(pin no_connect line (at -7.62 5.08 0) (length 2.54) hide";
+        const NEW: &str = "(pin no_connect line (at -10.16 5.08 0) (length 5.08) hide";
+        let (_dir, path) = library_with(KICAD7);
+        let body = call(json!({
+            "library_path": path, "symbol_name": "AFBR-1624Z", "pin_number": "2",
+            "x": -10.16, "length": 5.08, "new_number": "9"
+        }))
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        let at = KICAD7.find(OLD).unwrap();
+        let number = at + KICAD7[at..].find("(number \"2\"").unwrap();
+        let mut expected = KICAD7.to_string();
+        expected.replace_range(number..number + 11, "(number \"9\"");
+        expected.replace_range(at..at + OLD.len(), NEW);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    }
+
+    /// The Fiber_Optic library is version 20220914, before '~' was text.
+    #[tokio::test]
+    async fn a_tilde_kicad_would_read_as_empty_is_refused() {
+        let (_dir, path) = library_with(KICAD7);
+        for field in ["name", "new_number"] {
+            let mut arguments = json!({
+                "library_path": path, "symbol_name": "AFBR-1624Z", "pin_number": "2"
+            });
+            arguments[field] = json!("~");
+            let body = call(arguments).await;
+            assert_eq!(body["error"]["field"], field, "{body}");
+            assert!(
+                body.to_string().contains("reads '~' in it as empty"),
+                "{body}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), KICAD7);
+    }
+
+    /// KiCad defaults a pin's missing (length …); its other parts still change.
+    #[tokio::test]
+    async fn a_pin_without_a_length_takes_every_other_edit() {
+        let length = pin_line(OURS, "FIELDS_BARE_0_1", "1", "length");
+        let library = with_line(OURS, length, "");
+        let (_dir, path) = library_with(&library);
+        let body = call(json!({
+            "library_path": path, "symbol_name": "FIELDS_BARE", "pin_number": "1",
+            "length": 5.08
+        }))
+        .await;
+        assert_eq!(body["error"]["field"], "length", "{body}");
+        assert!(body.to_string().contains("writes no (length …)"), "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), library);
+        let body = call(json!({
+            "library_path": path, "symbol_name": "FIELDS_BARE", "pin_number": "1",
+            "type": "passive"
+        }))
+        .await;
+        assert_eq!(
+            body["changes"],
+            json!({"type": {"previous": "power_in", "current": "passive"}}),
+            "{body}"
+        );
+    }
+
+    /// The handler checks what the schema checks, for a call that reaches it
+    /// directly.
+    #[test]
+    fn arguments_are_checked_without_the_schema() {
+        let field_of = |error: CallToolResult| {
+            let crate::mcp::protocol::ToolContent::Text { text } = &error.content[0] else {
+                panic!("a refusal carries text");
+            };
+            serde_json::from_str::<serde_json::Value>(text).unwrap()["error"]["field"].clone()
+        };
+        for (extra, field) in [
+            (json!({"angle": 45}), "angle"),
+            (json!({"length": -1}), "length"),
+            (json!({"x": "far"}), "x"),
+            (json!({"y": 1e9}), "y"),
+            (json!({"new_number": 5}), "new_number"),
+            (json!({}), "pin_change"),
+        ] {
+            let mut arguments = json!({"symbol_name": "S", "pin_number": "1"});
+            for (key, value) in extra.as_object().unwrap() {
+                arguments[key] = value.clone();
+            }
+            let Err(error) = parse_request(&arguments) else {
+                panic!("{arguments} was taken");
+            };
+            assert_eq!(field_of(error), field, "{arguments}");
+        }
     }
 }
