@@ -46,7 +46,7 @@ merge-readiness criteria, and integration-branch ownership and cleanup rules.
 ## Development setup
 
 ```bash
-# protoc is required for protobuf code generation (konnect-ipc crate). The build also
+# protoc is required for protobuf code generation (copperpour-ipc crate). The build also
 # needs protobuf's well-known .proto files, which some distributions package separately.
 # Windows: choco install protoc   (shim installs may also need PROTOC_INCLUDE — see DEV.md)
 # macOS:   brew install protobuf
@@ -55,7 +55,7 @@ merge-readiness criteria, and integration-branch ownership and cleanup rules.
 
 cargo check --workspace
 cargo test --workspace --lib --tests
-cargo build --release -p konnect
+cargo build --release -p copperpour
 ```
 
 See [DEV.md](DEV.md) for the architecture guide, tool conventions, and how to add a

@@ -11,7 +11,7 @@ Use the official spelling in prose, comments, errors, and UI text:
 
 | Use | Do not introduce | Notes |
 |---|---|---|
-| `Copperpour` | `copperpour` as a product name | Lowercase remains correct for binaries, commands, and paths. Crates and some paths keep the earlier `konnect` name. |
+| `Copperpour` | `copperpour` as a product name | Lowercase remains correct for binaries, commands, and paths. Some paths keep the earlier `konnect` name. |
 | `KiCad` | `KiCAD`, `Kicad` | Applies to NEW prose only — the existing codebase uses `KiCAD` widely (hundreds of occurrences) and is not to be mass-renamed; match surrounding style when editing existing text. |
 | `MCP` | `Mcp` in prose | Rust type names use `Mcp`, for example `McpHandler`. |
 | `IPC` | `Ipc` in prose | Rust type names use `Ipc`, for example `KiCadIpcClient`. |
@@ -27,7 +27,7 @@ Prefer the domain's exact term: `footprint` for a PCB instance or library item,
 
 Follow the Rust API Guidelines and `rustfmt`, with these repository-specific choices:
 
-- Crates and Cargo packages use `kebab-case`: `konnect-core`, `konnect-ipc`.
+- Crates and Cargo packages use `kebab-case`: `copperpour-core`, `copperpour-ipc`.
 - Modules, files, functions, methods, variables, and fields use `snake_case`:
   `pcb_components`, `ensure_board_is_active`, `ipc_address`.
 - Types and traits use `UpperCamelCase`. Acronyms are words: `KiCadIpcClient`,

@@ -1,5 +1,0 @@
-# KiCad 10.0.5 GetBoundingBox (BBM_ITEM_ONLY) for every item of crates/konnect-sexp/tests/fixtures/board_bounds/bounds_zone_arcs.kicad_pcb
-# board sha256 d78498bfdf53cec13758fd7e04251cf13556cbe7b9d91d20a3eec4860bed2470
-# class	uuid	x_nm	y_nm	w_nm	h_nm
-zone	3fbf99d0-27e9-4110-a352-2139dde74d30	137360000	93730000	13100000	9400000
-zone	5735a8ec-4c09-4701-8363-571f8dfc4353	146880000	99160000	3300000	9900000

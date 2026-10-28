@@ -1,0 +1,16 @@
+[package]
+name = "copperpour-render"
+description = "Deterministic SVG rasterization and pixel diffing for Copperpour's visual-feedback tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+resvg.workspace = true
+image.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+image.workspace = true

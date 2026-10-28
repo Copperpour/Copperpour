@@ -64,7 +64,7 @@ copper inside that outline. Set `KONNECT_LIVE_KICAD_BOARD`, `KICAD_API_SOCKET`,
 and `KONNECT_TEST_KICAD_CLI`, then run:
 
 ```text
-cargo test -p konnect-core --locked --lib live_drc_drops_deleted_via_uuid_after_refill_and_save -- --ignored --nocapture --test-threads=1
+cargo test -p copperpour-core --locked --lib live_drc_drops_deleted_via_uuid_after_refill_and_save -- --ignored --nocapture --test-threads=1
 ```
 
 Never point that test at a tracked fixture or working project. Tests do not own

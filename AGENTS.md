@@ -17,7 +17,7 @@ Run what `.github/workflows/ci.yml` runs:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --locked --all-targets -- -D warnings
-cargo test -p konnect-core --locked reliability_contract
+cargo test -p copperpour-core --locked reliability_contract
 cargo test --workspace --locked --lib --tests
 cargo test --workspace --locked --doc
 ```
@@ -63,7 +63,7 @@ replaced. To tell them apart, call `transact_atomic` and compare inside its clos
 
 For a post-write readback, parse with `parse_sexp` and read positions with `parse_at`,
 as `sch_wiring.rs::observed_no_connect_moves` does. `Schematic::from_source` in
-`konnect-schematic-editor` prints every item it skips to stderr, so a readback through it
+`copperpour-schematic-editor` prints every item it skips to stderr, so a readback through it
 adds noise on each call.
 
 ## Parallel sessions

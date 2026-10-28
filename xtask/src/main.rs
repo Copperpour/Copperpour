@@ -16,7 +16,7 @@
 
 mod api_migrations;
 
-use konnect_core::router::{meta_tools, registry};
+use copperpour_core::router::{meta_tools, registry};
 use std::path::{Path, PathBuf};
 
 const SKIP: &[&str] = &["target", "node_modules", ".git", ".claude", "dist", "build"];

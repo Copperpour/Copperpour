@@ -1,0 +1,15 @@
+[package]
+name = "copperpour-vcs"
+description = "Project-scoped git checkpointing for Konnect, on pure-Rust gix"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gix.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

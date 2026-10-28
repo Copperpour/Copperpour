@@ -6,46 +6,46 @@ them. `DEV.md` remains the deeper implementation reference.
 
 ## Static Boundaries
 
-### Server process: `crates/konnect`
+### Server process: `crates/copperpour`
 
-`crates/konnect/src/main.rs` classifies help, version, installer, transaction,
+`crates/copperpour/src/main.rs` classifies help, version, installer, transaction,
 and server invocations before any server-side writes occur. It loads
 `Config`, initializes tracing on stderr, constructs `McpHandler`, and selects
 stdio, HTTP, or both transports.
 
-`crates/konnect/src/config.rs` owns TOML/JSON discovery and the environment
+`crates/copperpour/src/config.rs` owns TOML/JSON discovery and the environment
 fallback for `KICAD_API_SOCKET`. The transport implementations live in
-`crates/konnect/src/transport/stdio.rs` and `http.rs`. Client guidance
-installation is owned by `crates/konnect/src/install.rs`; schematic transaction
+`crates/copperpour/src/transport/stdio.rs` and `http.rs`. Client guidance
+installation is owned by `crates/copperpour/src/install.rs`; schematic transaction
 inspection and recovery commands are owned by `transaction_cli.rs`.
 
-### MCP and domain logic: `crates/konnect-core`
+### MCP and domain logic: `crates/copperpour-core`
 
-`crates/konnect-core/src/mcp/handler.rs` handles MCP methods, enforces required
+`crates/copperpour-core/src/mcp/handler.rs` handles MCP methods, enforces required
 argument presence, dispatches tool calls, emits tool-list notifications, and
 records calls through `observability.rs`.
 
-`crates/konnect-core/src/router/registry.rs` declares toolsets and resolves each
+`crates/copperpour-core/src/router/registry.rs` declares toolsets and resolves each
 toolset to its definitions. `router/mod.rs` tracks loaded definitions, and
 `router/meta_tools.rs` implements the always-visible discovery, loading, and
 observability tools. `runtime_info.rs` supplies the read-only serving-build,
 installation, KiCad, and IPC evidence returned by `get_installation_info`.
 
-`crates/konnect-core/src/tools/mod.rs` owns `ToolDef`, `ToolContext`,
+`crates/copperpour-core/src/tools/mod.rs` owns `ToolDef`, `ToolContext`,
 `ServerConfig`, the `tool!` macro, required-argument helpers, and shared path and
 library helpers. Domain handlers live in the other files under `src/tools`.
 
 ### KiCad data layers
 
-`crates/konnect-sexp` owns low-level KiCad S-expression parsing, edits, geometry,
+`crates/copperpour-sexp` owns low-level KiCad S-expression parsing, edits, geometry,
 layer/net primitives, atomic replacement, reversible commands, and multi-file
 transaction journals. It does not require a live KiCad process.
 
-`crates/konnect-schematic-editor` owns the typed schematic model, library symbol
+`crates/copperpour-schematic-editor` owns the typed schematic model, library symbol
 resolution, and parse-mutate-serialize workflows for symbols, wires, labels,
 sheets, and related schematic concepts.
 
-`crates/konnect-ipc` owns the KiCad IPC client, generated protobuf types, NNG
+`crates/copperpour-ipc` owns the KiCad IPC client, generated protobuf types, NNG
 request/reply transport, typed board operations, and the distinction among an
 unreachable transport, a requested board positively absent from KiCad's complete
 open-document set, an ambiguous document set, and a request KiCad rejected.
@@ -55,14 +55,14 @@ open-document set, an ambiguous document set, and a request KiCad rejected.
 `crates/schematic-viewer` is a separate Tauri application and is deliberately
 outside the Cargo workspace. `plugin` is the thin Python KiCad integration
 layer. `packaging` contains the PCM build scripts, metadata, schema, and package
-validation. Bundled AI guidance under `crates/konnect/assets/skills` and
+validation. Bundled AI guidance under `crates/copperpour/assets/skills` and
 `assets/agents` is user-facing workflow behavior and must track the tools it
 names.
 
 ## Server Startup
 
 ```text
-crates/konnect/src/main.rs
+crates/copperpour/src/main.rs
   -> classify invocation
   -> Config::load or Config::load_from
   -> McpHandler::new
@@ -74,7 +74,7 @@ crates/konnect/src/main.rs
 `router/registry.rs` unless `eager_toolsets` requests a complete initial list.
 The latter exists for clients that do not refresh after
 `notifications/tools/list_changed`; the configuration contract is documented
-beside the fields in `crates/konnect/src/config.rs`.
+beside the fields in `crates/copperpour/src/config.rs`.
 
 ## Listing, Loading, And Calling Tools
 
@@ -107,13 +107,13 @@ auto-loads its owner when configured or returns a structured
 ## Schematic File Mutation
 
 Schematic handlers in `tools/sch_*.rs` read a saved schematic, mutate it through
-`konnect-schematic-editor` or `konnect-sexp`, and commit with revision-aware
+`copperpour-schematic-editor` or `copperpour-sexp`, and commit with revision-aware
 atomic replacement. If the source changes after it is read, the writer must
 return a conflict instead of overwriting it.
 
 Multi-file schematic changes use the write-ahead journal in
-`konnect-sexp/src/transaction.rs`. The `copperpour transaction` commands in
-`crates/konnect/src/transaction_cli.rs` inspect, recover, or explicitly abandon
+`copperpour-sexp/src/transaction.rs`. The `copperpour transaction` commands in
+`crates/copperpour/src/transaction_cli.rs` inspect, recover, or explicitly abandon
 those journals.
 
 ## Board Mutation And Write Gates
@@ -121,9 +121,9 @@ those journals.
 Board writes use three distinct patterns:
 
 1. Live IPC handlers call `KiCadIpcClient::ensure_board_is_active` in
-   `konnect-ipc/src/client.rs` before changing the editor document.
+   `copperpour-ipc/src/client.rs` before changing the editor document.
 2. Hybrid handlers use `attempt_ipc_write` in
-   `konnect-core/src/tools/pcb_board.rs`. File fallback is allowed only when the
+   `copperpour-core/src/tools/pcb_board.rs`. File fallback is allowed only when the
    transport is unreachable or the requested board is positively absent from a
    complete, trustworthy set of open PCB document identities. Ambiguous document
    identities and reached-and-rejected requests fail closed. A board observed
@@ -144,7 +144,7 @@ success.
 
 ## Checks, Exports, And Verdicts
 
-`crates/konnect-core/src/tools/cli.rs` is the subprocess wrapper for KiCad CLI
+`crates/copperpour-core/src/tools/cli.rs` is the subprocess wrapper for KiCad CLI
 checks and exports. Domain-facing handlers in `verification.rs`,
 `pcb_export.rs`, `sch_export.rs`, `manufacturing.rs`, and `design_review.rs`
 interpret those results.
@@ -157,11 +157,11 @@ unconnected-item, and schematic-parity categories; `design_review.rs` and
 ## Ownership Rules
 
 - CLI lifecycle, configuration, installer behavior, and transports belong in
-  `crates/konnect`.
+  `crates/copperpour`.
 - MCP protocol handling, routing, tool responses, and observability belong in
-  `crates/konnect-core`.
-- Schematic and general KiCad file primitives belong in `konnect-sexp` or
-  `konnect-schematic-editor`.
-- Live board IPC behavior and transport classification belong in `konnect-ipc`;
-  policy for using it belongs in the calling `konnect-core` handler.
+  `crates/copperpour-core`.
+- Schematic and general KiCad file primitives belong in `copperpour-sexp` or
+  `copperpour-schematic-editor`.
+- Live board IPC behavior and transport classification belong in `copperpour-ipc`;
+  policy for using it belongs in the calling `copperpour-core` handler.
 - KiCad plugin and PCM changes belong in `plugin` and `packaging`.

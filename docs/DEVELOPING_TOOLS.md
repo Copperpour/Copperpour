@@ -8,20 +8,20 @@ the safest implementation usually follows an existing neighboring tool.
 
 | Operation | Preferred path | Required safety gate |
 |---|---|---|
-| Saved schematic mutation | `konnect-schematic-editor` or `konnect-sexp` | Revision-aware atomic write; transaction journal for multi-file changes |
-| Live board mutation | `konnect-ipc` | `KiCadIpcClient::ensure_board_is_active` before sending the mutation |
+| Saved schematic mutation | `copperpour-schematic-editor` or `copperpour-sexp` | Revision-aware atomic write; transaction journal for multi-file changes |
+| Live board mutation | `copperpour-ipc` | `KiCadIpcClient::ensure_board_is_active` before sending the mutation |
 | Board mutation with a safe closed-file implementation | IPC first, file fallback | `attempt_ipc_write` in `tools/pcb_board.rs`; fallback only when IPC is unreachable |
-| Board file mutation with no IPC implementation | `konnect-sexp` or focused parser/edit code | `refuse_if_board_open_in_kicad` before touching the file |
+| Board file mutation with no IPC implementation | `copperpour-sexp` or focused parser/edit code | `refuse_if_board_open_in_kicad` before touching the file |
 | KiCad-supported check or export | `kicad-cli` through `tools/cli.rs` | Validate exit status, output existence, and parsed result coverage |
 
 Do not fall back to a file edit after a request reached KiCad and was rejected or
-timed out. `konnect-ipc` classifies that differently from an unreachable
+timed out. `copperpour-ipc` classifies that differently from an unreachable
 transport because KiCad may already hold or have changed the target document.
 
 ## Define And Implement The Tool
 
 1. Add the definition to the related `tools()` vector under
-   `crates/konnect-core/src/tools`.
+   `crates/copperpour-core/src/tools`.
 2. Implement the handler near related handlers and reuse their target checks and
    response conventions.
 3. Use valid Draft 2020-12 JSON Schema, list every required field, declare
@@ -75,11 +75,11 @@ an explicit migration note.
 Add the lowest-level test that can prove the risky behavior, then add handler or
 protocol coverage when the public contract is involved:
 
-- parser/writer logic in `konnect-sexp`;
-- typed model behavior in `konnect-schematic-editor`;
-- handler and response behavior in `konnect-core`;
-- IPC message construction/classification in `konnect-ipc`;
-- MCP/CLI behavior in `crates/konnect/tests`.
+- parser/writer logic in `copperpour-sexp`;
+- typed model behavior in `copperpour-schematic-editor`;
+- handler and response behavior in `copperpour-core`;
+- IPC message construction/classification in `copperpour-ipc`;
+- MCP/CLI behavior in `crates/copperpour/tests`.
 
 Fixtures that parse boards, footprints, symbols, or KiCad reports should come
 from real KiCad output. Synthetic fixtures are useful for narrow grammar tests,

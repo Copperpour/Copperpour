@@ -118,7 +118,7 @@ geometry are rejected before mutation.
 # Windows: choco install protoc cmake
 # macOS:   brew install protobuf cmake
 # Linux:   apt install protobuf-compiler cmake
-cargo build --release -p konnect   # builds target/release/copperpour
+cargo build --release -p copperpour   # builds target/release/copperpour
 ```
 
 ### Install guidance for your AI client

@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/konnect",
-    "crates/konnect-core",
-    "crates/konnect-sexp",
-    "crates/konnect-ipc",
-    "crates/konnect-schematic-editor",
-    "crates/konnect-render",
-    "crates/konnect-vcs",
+    "crates/copperpour",
+    "crates/copperpour-core",
+    "crates/copperpour-sexp",
+    "crates/copperpour-ipc",
+    "crates/copperpour-schematic-editor",
+    "crates/copperpour-render",
+    "crates/copperpour-vcs",
     "xtask",
 ]
 exclude = [
@@ -83,29 +83,29 @@ winreg = "0.56"
 # SVG parsing (import_svg_logo)
 usvg = "0.48"
 
-# Rasterization for the visual-feedback tools (konnect-render). resvg and
+# Rasterization for the visual-feedback tools (copperpour-render). resvg and
 # tiny-skia are pinned EXACTLY: visual baselines compare pixel output across
 # machines, so a silent renderer bump must be a deliberate decision.
 resvg = "=0.48.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
-# Pure-Rust git for the vcs toolset (konnect-vcs). No libgit2, no C.
+# Pure-Rust git for the vcs toolset (copperpour-vcs). No libgit2, no C.
 # Default features for now — the T2.1 spike trims to the plumbing actually
 # used once the API surface is settled (default-features=false breaks
 # gix-hash's backend selection).
 gix = { version = "0.88", features = ["status", "worktree-mutation"] }
 
 # Internal crates
-konnect-sexp = { path = "crates/konnect-sexp" }
-konnect-ipc = { path = "crates/konnect-ipc" }
-konnect-core = { path = "crates/konnect-core" }
-konnect-schematic-editor = { path = "crates/konnect-schematic-editor" }
-konnect-render = { path = "crates/konnect-render" }
-konnect-vcs = { path = "crates/konnect-vcs" }
+copperpour-sexp = { path = "crates/copperpour-sexp" }
+copperpour-ipc = { path = "crates/copperpour-ipc" }
+copperpour-core = { path = "crates/copperpour-core" }
+copperpour-schematic-editor = { path = "crates/copperpour-schematic-editor" }
+copperpour-render = { path = "crates/copperpour-render" }
+copperpour-vcs = { path = "crates/copperpour-vcs" }
 
 # The S-expression parser is ~25x slower unoptimized. The installed-demo
 # tests parse 185 MB of KiCad boards, and debug servers parse real boards.
-[profile.dev.package.konnect-sexp]
+[profile.dev.package.copperpour-sexp]
 opt-level = 3
 
 [profile.dev.package.nom]

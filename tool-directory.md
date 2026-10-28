@@ -3,9 +3,9 @@
 Canonical reference for every MCP tool exposed by Copperpour. Generated from the Rust source (not from hand-maintained prose), so it reflects what the binary actually serves.
 
 **Source of truth**
-- Toolset metadata + declared counts: `crates/konnect-core/src/router/registry.rs` (`ALL_TOOLSETS`)
-- Meta-tool definitions: `crates/konnect-core/src/router/meta_tools.rs` (`meta_tool_descriptions()`)
-- Per-tool names + descriptions: `crates/konnect-core/src/tools/<toolset>.rs` (each `tool!(…)` in the `tools()` vec)
+- Toolset metadata + declared counts: `crates/copperpour-core/src/router/registry.rs` (`ALL_TOOLSETS`)
+- Meta-tool definitions: `crates/copperpour-core/src/router/meta_tools.rs` (`meta_tool_descriptions()`)
+- Per-tool names + descriptions: `crates/copperpour-core/src/tools/<toolset>.rs` (each `tool!(…)` in the `tools()` vec)
 
 Compatibility notes for removed or narrowed arguments are recorded in
 [`docs/API_MIGRATIONS.md`](docs/API_MIGRATIONS.md), and in
@@ -59,7 +59,7 @@ and Windows servers do not.
 
 ### `project` · 7 tools
 **Purpose:** Create, open, save, rename, snapshot KiCAD projects, and launch the live schematic viewer.
-**Source:** [`crates/konnect-core/src/tools/project.rs`](crates/konnect-core/src/tools/project.rs)
+**Source:** [`crates/copperpour-core/src/tools/project.rs`](crates/copperpour-core/src/tools/project.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -73,7 +73,7 @@ and Windows servers do not.
 
 ### `editor_navigation` · 5 tools
 **Purpose:** Observe and semantically navigate exact KiCad editor, document, sheet, selection, and cross-probe context.
-**Source:** [`crates/konnect-core/src/tools/editor_navigation.rs`](crates/konnect-core/src/tools/editor_navigation.rs)
+**Source:** [`crates/copperpour-core/src/tools/editor_navigation.rs`](crates/copperpour-core/src/tools/editor_navigation.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -89,7 +89,7 @@ and Windows servers do not.
 
 ### `sch_components` · 19 tools
 **Purpose:** Add, edit, move, rotate, mirror, and delete schematic symbols.
-**Source:** [`crates/konnect-core/src/tools/sch_components.rs`](crates/konnect-core/src/tools/sch_components.rs)
+**Source:** [`crates/copperpour-core/src/tools/sch_components.rs`](crates/copperpour-core/src/tools/sch_components.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -115,7 +115,7 @@ and Windows servers do not.
 
 ### `sch_wiring` · 20 tools
 **Purpose:** Wires, net labels, power symbols, junctions, no-connects, pin-to-pin connections.
-**Source:** [`crates/konnect-core/src/tools/sch_wiring.rs`](crates/konnect-core/src/tools/sch_wiring.rs)
+**Source:** [`crates/copperpour-core/src/tools/sch_wiring.rs`](crates/copperpour-core/src/tools/sch_wiring.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -142,7 +142,7 @@ and Windows servers do not.
 
 ### `sch_bus` · 4 tools
 **Purpose:** Buses, bus entries, and fanning a group of pins out onto a bus.
-**Source:** [`crates/konnect-core/src/tools/sch_bus.rs`](crates/konnect-core/src/tools/sch_bus.rs)
+**Source:** [`crates/copperpour-core/src/tools/sch_bus.rs`](crates/copperpour-core/src/tools/sch_bus.rs)
 
 | Tool | Description |
 |---|---|
@@ -153,7 +153,7 @@ and Windows servers do not.
 
 ### `sch_analysis` · 15 tools
 **Purpose:** Net connectivity, pin queries, trace paths, overlap/orphan detection.
-**Source:** [`crates/konnect-core/src/tools/sch_analysis.rs`](crates/konnect-core/src/tools/sch_analysis.rs)
+**Source:** [`crates/copperpour-core/src/tools/sch_analysis.rs`](crates/copperpour-core/src/tools/sch_analysis.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -175,7 +175,7 @@ and Windows servers do not.
 
 ### `sch_batch` · 13 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
-**Source:** [`crates/konnect-core/src/tools/sch_batch.rs`](crates/konnect-core/src/tools/sch_batch.rs)
+**Source:** [`crates/copperpour-core/src/tools/sch_batch.rs`](crates/copperpour-core/src/tools/sch_batch.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -195,7 +195,7 @@ and Windows servers do not.
 
 ### `sch_export` · 10 tools
 **Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB.
-**Source:** [`crates/konnect-core/src/tools/sch_export.rs`](crates/konnect-core/src/tools/sch_export.rs)
+**Source:** [`crates/copperpour-core/src/tools/sch_export.rs`](crates/copperpour-core/src/tools/sch_export.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -212,7 +212,7 @@ and Windows servers do not.
 
 ### `sch_hierarchy` · 15 tools
 **Purpose:** Sheet files and hierarchical sheets: create a schematic file and set its page size and title block, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
-**Source:** [`crates/konnect-core/src/tools/sch_hierarchy.rs`](crates/konnect-core/src/tools/sch_hierarchy.rs)
+**Source:** [`crates/copperpour-core/src/tools/sch_hierarchy.rs`](crates/copperpour-core/src/tools/sch_hierarchy.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -238,7 +238,7 @@ and Windows servers do not.
 
 ### `pcb_board` · 17 tools
 **Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import, custom fields on placed footprints.
-**Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
+**Source:** [`crates/copperpour-core/src/tools/pcb_board.rs`](crates/copperpour-core/src/tools/pcb_board.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -262,7 +262,7 @@ and Windows servers do not.
 
 ### `pcb_components` · 20 tools
 **Purpose:** Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics and 3D models.
-**Source:** [`crates/konnect-core/src/tools/pcb_components.rs`](crates/konnect-core/src/tools/pcb_components.rs)
+**Source:** [`crates/copperpour-core/src/tools/pcb_components.rs`](crates/copperpour-core/src/tools/pcb_components.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -289,7 +289,7 @@ and Windows servers do not.
 
 ### `pcb_routing` · 19 tools
 **Purpose:** Traces, vias, pad nets, copper pours, net classes, differential pairs, and strict Specctra SES import.
-**Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
+**Source:** [`crates/copperpour-core/src/tools/pcb_routing.rs`](crates/copperpour-core/src/tools/pcb_routing.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -315,7 +315,7 @@ and Windows servers do not.
 
 ### `placement` · 5 tools
 **Purpose:** Placement quality and automation — score, plan decoupling rows, plan BGA fanouts; every plan reports its own before/after score.
-**Source:** [`crates/konnect-core/src/tools/placement.rs`](crates/konnect-core/src/tools/placement.rs)
+**Source:** [`crates/copperpour-core/src/tools/placement.rs`](crates/copperpour-core/src/tools/placement.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -329,7 +329,7 @@ and Windows servers do not.
 
 ### `pcb_export` · 14 tools
 **Purpose:** Gerber, PDF, SVG, 3D model, BOM, revision-bound Specctra DSN, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++.
-**Source:** [`crates/konnect-core/src/tools/pcb_export.rs`](crates/konnect-core/src/tools/pcb_export.rs)
+**Source:** [`crates/copperpour-core/src/tools/pcb_export.rs`](crates/copperpour-core/src/tools/pcb_export.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -354,7 +354,7 @@ and Windows servers do not.
 
 ### `library` · 19 tools
 **Purpose:** Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models.
-**Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
+**Source:** [`crates/copperpour-core/src/tools/library.rs`](crates/copperpour-core/src/tools/library.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -384,7 +384,7 @@ and Windows servers do not.
 
 ### `integration` · 10 tools
 **Purpose:** JLCPCB parts database, local Freerouting MCP routing, datasheet URLs.
-**Source:** [`crates/konnect-core/src/tools/integration.rs`](crates/konnect-core/src/tools/integration.rs)
+**Source:** [`crates/copperpour-core/src/tools/integration.rs`](crates/copperpour-core/src/tools/integration.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -410,7 +410,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ### `verification` · 10 tools
 **Purpose:** DRC, design rules, layer constraints, clearance checks, KiCAD UI control. ERC lives in `sch_export` (`run_erc`), not here.
-**Source:** [`crates/konnect-core/src/tools/verification.rs`](crates/konnect-core/src/tools/verification.rs)
+**Source:** [`crates/copperpour-core/src/tools/verification.rs`](crates/copperpour-core/src/tools/verification.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -431,7 +431,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ### `config` · 7 tools
 **Purpose:** User preferences, project rules, design rules, fab constraints. **Call `load_user_config` at session start.**
-**Source:** [`crates/konnect-core/src/tools/config.rs`](crates/konnect-core/src/tools/config.rs)
+**Source:** [`crates/copperpour-core/src/tools/config.rs`](crates/copperpour-core/src/tools/config.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -449,7 +449,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ### `design_review` · 6 tools
 **Purpose:** AI-powered design audits: decoupling, connections, power rails, DFM, BOM health.
-**Source:** [`crates/konnect-core/src/tools/design_review.rs`](crates/konnect-core/src/tools/design_review.rs)
+**Source:** [`crates/copperpour-core/src/tools/design_review.rs`](crates/copperpour-core/src/tools/design_review.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -466,7 +466,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ### `templates` · 4 tools
 **Purpose:** Reference circuit library — USB-C, LDO, buck converter, STM32, I2C, LED — verified component values.
-**Source:** [`crates/konnect-core/src/tools/templates.rs`](crates/konnect-core/src/tools/templates.rs)
+**Source:** [`crates/copperpour-core/src/tools/templates.rs`](crates/copperpour-core/src/tools/templates.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -484,7 +484,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ### `manufacturing` · 3 tools
 **Purpose:** Design-to-fab pipeline: export Gerber+BOM+positions package, validate for fab house, estimate cost.
-**Source:** [`crates/konnect-core/src/tools/manufacturing.rs`](crates/konnect-core/src/tools/manufacturing.rs)
+**Source:** [`crates/copperpour-core/src/tools/manufacturing.rs`](crates/copperpour-core/src/tools/manufacturing.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -514,10 +514,10 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ### Implementation notes
 
-- The `tool!(name, description, input_schema, handler)` macro lives in `crates/konnect-core/src/tools/mod.rs` and produces a `ToolDef` inserted into each toolset's `tools()` vec.
+- The `tool!(name, description, input_schema, handler)` macro lives in `crates/copperpour-core/src/tools/mod.rs` and produces a `ToolDef` inserted into each toolset's `tools()` vec.
 - Dispatch: `router::registry::tools_for(name)` maps each toolset string to its `tools::<mod>::tools()` vec; `handler.rs` looks up `tools/call` in the currently-loaded toolsets. If the tool exists but its toolset isn't loaded, the error names the owning toolset for single-hop recovery (`router::ToolRouter::find_toolset_for_tool`).
-- Some schematic handlers are mid-migration from raw `konnect-sexp` to the typed `konnect-schematic-editor` model (Phase 2 Waves 1–4). Tool names and semantics are unchanged; only the internal implementation is in flux.
+- Some schematic handlers are mid-migration from raw `copperpour-sexp` to the typed `copperpour-schematic-editor` model (Phase 2 Waves 1–4). Tool names and semantics are unchanged; only the internal implementation is in flux.
 
 ### Regenerating this doc
 
-The tool list is extracted mechanically from the `tool!(...)` invocations in `crates/konnect-core/src/tools/*.rs`. To regenerate after adding tools, re-run the same extraction and re-verify counts against `registry.rs::ALL_TOOLSETS` — the row count in each table here must equal each toolset's `tool_count`.
+The tool list is extracted mechanically from the `tool!(...)` invocations in `crates/copperpour-core/src/tools/*.rs`. To regenerate after adding tools, re-run the same extraction and re-verify counts against `registry.rs::ALL_TOOLSETS` — the row count in each table here must equal each toolset's `tool_count`.

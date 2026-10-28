@@ -355,6 +355,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "copperpour-schematic-editor"
+version = "0.15.0"
+dependencies = [
+ "copperpour-sexp",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "copperpour-sexp"
+version = "0.15.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "fs4",
+ "nom",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1699,31 +1724,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "konnect-schematic-editor"
-version = "0.15.0"
-dependencies = [
- "konnect-sexp",
- "thiserror 1.0.69",
- "uuid",
-]
-
-[[package]]
-name = "konnect-sexp"
-version = "0.15.0"
-dependencies = [
- "anyhow",
- "dirs",
- "fs4",
- "nom",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "tempfile",
- "thiserror 1.0.69",
- "uuid",
-]
-
-[[package]]
 name = "kqueue"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2714,7 +2714,7 @@ dependencies = [
 name = "schematic-viewer"
 version = "0.15.0"
 dependencies = [
- "konnect-schematic-editor",
+ "copperpour-schematic-editor",
  "notify",
  "serde",
  "serde_json",

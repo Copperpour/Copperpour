@@ -11,19 +11,19 @@ cargo fmt --all -- --check
 ```
 
 `protoc` and its well-known type includes are required by
-`crates/konnect-ipc/build.rs`.
+`crates/copperpour-ipc/build.rs`.
 
 ## Coverage Map
 
 | Area | Source of tests |
 |---|---|
-| MCP protocol, CLI, and asset contracts | `crates/konnect/tests` and `crates/konnect/src` unit tests |
-| Router and toolset invariants | `crates/konnect-core/src/router` tests |
-| Dispatch and required-argument behavior | `crates/konnect-core/src/mcp/handler.rs` tests |
-| Domain handlers and evidence rules | tests beside modules in `crates/konnect-core/src/tools` |
-| S-expression parsing and atomic writes | `crates/konnect-sexp` tests |
-| Typed schematic model | `crates/konnect-schematic-editor` tests |
-| IPC builders, transport, and client behavior | `crates/konnect-ipc` tests |
+| MCP protocol, CLI, and asset contracts | `crates/copperpour/tests` and `crates/copperpour/src` unit tests |
+| Router and toolset invariants | `crates/copperpour-core/src/router` tests |
+| Dispatch and required-argument behavior | `crates/copperpour-core/src/mcp/handler.rs` tests |
+| Domain handlers and evidence rules | tests beside modules in `crates/copperpour-core/src/tools` |
+| S-expression parsing and atomic writes | `crates/copperpour-sexp` tests |
+| Typed schematic model | `crates/copperpour-schematic-editor` tests |
+| IPC builders, transport, and client behavior | `crates/copperpour-ipc` tests |
 | Real KiCad behavior | ignored live tests and `.github/workflows/e2e-kicad.yml` |
 | Viewer | `crates/schematic-viewer` tests and its CI job |
 | Python plugin | `plugin/tests` and the plugin CI job |
@@ -41,7 +41,7 @@ that field. The v0.7 reference cases include:
 - DRC-backed review/readiness decisions in `tools/design_review.rs` and
   `tools/manufacturing.rs`;
 - footprint-type discrimination and post-commit read-back in
-  `tools/pcb_sync.rs` and `konnect-ipc/src/builders.rs`;
+  `tools/pcb_sync.rs` and `copperpour-ipc/src/builders.rs`;
 - closed-board placement and flip refusal cases in `tools/pcb_components.rs`.
 
 Use real KiCad-generated fixtures for formats KiCad owns. For an IPC path, unit
@@ -49,7 +49,7 @@ tests should prove request construction and failure classification; an ignored
 live test or the end-to-end workflow should prove behavior that depends on a
 running editor.
 
-IPC doubles in `konnect-core` must use the shared `test_support::MockIpcServer`.
+IPC doubles in `copperpour-core` must use the shared `test_support::MockIpcServer`.
 The returned guard owns an already-listening, process-unique `inproc://`
 endpoint and joins its worker when dropped. Retain that guard for the whole
 test. Do not discover a free TCP port by binding it, dropping the listener, and
@@ -59,13 +59,13 @@ between, making otherwise deterministic tests fail with `AddressInUse`.
 The Specctra import undo boundary has a manual live gate because KiCad IPC can
 create a named commit but cannot invoke the editor's Undo action. Open a
 disposable copy of
-`crates/konnect-core/tests/fixtures/specctra_two_resistors_locked.kicad_pcb`,
+`crates/copperpour-core/tests/fixtures/specctra_two_resistors_locked.kicad_pcb`,
 set `KONNECT_LIVE_SPECCTRA_BOARD`, `KICAD_API_SOCKET`, and (when it is not on
 `PATH`) `KICAD_CLI_PATH`, set `FREEROUTING_JAR` to the local Freerouting 2.3.0
 JAR, then run:
 
 ```text
-cargo test -p konnect-core --locked one_undo_restores_the_exact_pre_import_board_snapshot -- --ignored --nocapture
+cargo test -p copperpour-core --locked one_undo_restores_the_exact_pre_import_board_snapshot -- --ignored --nocapture
 ```
 
 When the test prints `LIVE_UNDO_READY`, press Ctrl+Z once in PCB Editor. The
@@ -78,7 +78,7 @@ IPC API. Set `KONNECT_ZONE_TEST_BOARD` to that copy and
 `KONNECT_ZONE_TEST_IPC_ADDRESS` to the endpoint serving it, then run:
 
 ```text
-cargo test -p konnect-core --locked live_zone_delete_on_configured_disposable_board --lib -- --ignored --nocapture
+cargo test -p copperpour-core --locked live_zone_delete_on_configured_disposable_board --lib -- --ignored --nocapture
 ```
 
 This deletes one observed zone, waits through KiCad's asynchronous refill, and
@@ -122,9 +122,9 @@ infrastructure.
 
 For a public behavior change, inspect README, `DEV.md`, `tool-directory.md`,
 these developer maps, and bundled guidance under
-`crates/konnect/assets/skills` and `assets/agents`. Tool-count locations and
+`crates/copperpour/assets/skills` and `assets/agents`. Tool-count locations and
 their enforcement are defined by `CONTRIBUTING.md` and
-`crates/konnect/tests/doc_tool_counts.rs`; link to the authoritative catalogue
+`crates/copperpour/tests/doc_tool_counts.rs`; link to the authoritative catalogue
 instead of copying totals into new documents.
 
 Every behavioral claim in these maps should name its source module. When the
@@ -134,7 +134,7 @@ current capability.
 
 ## Packaging And Release
 
-Build the server with `cargo build --release -p konnect`. Build the viewer
+Build the server with `cargo build --release -p copperpour`. Build the viewer
 separately when it is in scope. Changes to plugin files, binary layout, metadata,
 icons, or release scripts require PCM assembly and
 `packaging/validate-pcm.py` validation.

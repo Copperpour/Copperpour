@@ -57,5 +57,5 @@ __pycache__/
 !crates/*/tests/fixtures/*.kicad_pro
 # Auto-generated beside the tracked bare boards (git ls-files '*.kicad_pcb').
 # Order matters: last match wins, so these must follow the negation.
-crates/konnect-ipc/tests/fixtures/live_ipc.kicad_pro
-crates/konnect-core/tests/fixtures/test.kicad_pro
+crates/copperpour-ipc/tests/fixtures/live_ipc.kicad_pro
+crates/copperpour-core/tests/fixtures/test.kicad_pro
