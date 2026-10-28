@@ -1731,14 +1731,26 @@ fn escape_library_string(value: &str) -> String {
 
 // ─── Library table helpers ────────────────────────────────────────────────────
 
-/// Returns the path to the global fp-lib-table file.
-fn global_fp_lib_table() -> PathBuf {
-    super::kicad_config_dir().join("fp-lib-table")
+/// Returns the path to the global fp-lib-table file, or `None` when the
+/// user's home directory is unknown.
+fn global_fp_lib_table() -> Option<PathBuf> {
+    super::kicad_config_dir().map(|dir| dir.join("fp-lib-table"))
 }
 
-/// Returns the path to the global sym-lib-table file.
-fn global_sym_lib_table() -> PathBuf {
-    super::kicad_config_dir().join("sym-lib-table")
+/// Returns the path to the global sym-lib-table file, or `None` as above.
+fn global_sym_lib_table() -> Option<PathBuf> {
+    super::kicad_config_dir().map(|dir| dir.join("sym-lib-table"))
+}
+
+/// What a global-table refusal names.
+const GLOBAL_TABLE: &str = "KiCad's global library table";
+
+/// The libraries in a global table, or none when there is no table path:
+/// the same answer as a table that does not exist.
+fn read_global_lib_table(table: Option<PathBuf>) -> Vec<serde_json::Value> {
+    table
+        .map(|path| read_flat_lib_table(&path))
+        .unwrap_or_default()
 }
 
 /// Directory of the structurally proven project that owns `file`, falling back
@@ -1811,7 +1823,7 @@ impl KiCadSymbolSource {
             if let Some(dir) = &self.project_dir {
                 libs.extend(read_flat_lib_table(&dir.join("sym-lib-table")));
             }
-            libs.extend(read_flat_lib_table(&global_sym_lib_table()));
+            libs.extend(read_global_lib_table(global_sym_lib_table()));
             libs
         })
     }
@@ -1894,7 +1906,8 @@ fn parse_lib_table(content: &str) -> Vec<serde_json::Value> {
 /// is perfectly normal and is the recommended way to keep a table portable
 /// across machines.
 fn kicad_user_path_vars() -> std::collections::HashMap<String, String> {
-    let Ok(text) = std::fs::read_to_string(super::kicad_config_dir().join("kicad_common.json"))
+    let Some(Ok(text)) =
+        super::kicad_config_dir().map(|dir| std::fs::read_to_string(dir.join("kicad_common.json")))
     else {
         return std::collections::HashMap::new();
     };
@@ -2107,7 +2120,7 @@ pub(crate) fn footprint_lib_nickname_for_dir(dir: &Path) -> Option<String> {
         }
     };
 
-    read_flat_lib_table(&global_fp_lib_table())
+    read_global_lib_table(global_fp_lib_table())
         .into_iter()
         .find(|lib| lib["path"].as_str().is_some_and(|p| same(Path::new(p))))
         .and_then(|lib| lib["nickname"].as_str().map(str::to_string))
@@ -2158,7 +2171,7 @@ pub(crate) fn resolve_footprint_path(
     if let Some(project) = project_dir.map(|d| d.join("fp-lib-table")) {
         libs.extend(read_flat_lib_table(&project));
     }
-    libs.extend(read_flat_lib_table(&global_fp_lib_table()));
+    libs.extend(read_global_lib_table(global_fp_lib_table()));
 
     if let Some(lib) = libs.iter().find(|l| l["nickname"].as_str() == Some(nick)) {
         let Some(dir) = lib["path"].as_str() else {
@@ -2294,7 +2307,11 @@ async fn handle_list_footprint_libraries(
     // as zero libraries — "0" is the symptom of the bug this PR fixes, so the
     // two must not look alike.
     if scope == "global" || scope == "all" {
-        let mut libs = match read_lib_table_checked(&global_fp_lib_table()) {
+        let table = match super::require_user_path(global_fp_lib_table(), GLOBAL_TABLE) {
+            Ok(table) => table,
+            Err(refusal) => return Ok(refusal),
+        };
+        let mut libs = match read_lib_table_checked(&table) {
             Ok(libs) => libs,
             Err(msg) => return Ok(CallToolResult::error(msg)),
         };
@@ -2474,11 +2491,14 @@ fn lib_table_target(
     scope: &str,
     project: Option<&str>,
     lib_path: &Path,
-    global_table: PathBuf,
+    global_table: Option<PathBuf>,
     table_filename: &str,
 ) -> Result<(PathBuf, String), CallToolResult> {
     if scope == "global" {
-        return Ok((global_table, portable_uri(lib_path)));
+        return Ok((
+            super::require_user_path(global_table, GLOBAL_TABLE)?,
+            portable_uri(lib_path),
+        ));
     }
     let Some(proj) = project else {
         return Err(CallToolResult::error(
@@ -2569,7 +2589,11 @@ async fn handle_list_symbol_libraries(
     // Same as the footprint listing: an unreadable table is an error, not a
     // zero count.
     if scope == "global" || scope == "all" {
-        let mut libs = match read_lib_table_checked(&global_sym_lib_table()) {
+        let table = match super::require_user_path(global_sym_lib_table(), GLOBAL_TABLE) {
+            Ok(table) => table,
+            Err(refusal) => return Ok(refusal),
+        };
+        let mut libs = match read_lib_table_checked(&table) {
             Ok(libs) => libs,
             Err(msg) => return Ok(CallToolResult::error(msg)),
         };
@@ -5114,7 +5138,7 @@ async fn handle_search_symbols(
     // references are followed and `${KICAD*_DIR}` URIs expanded, so the
     // libraries KiCad ships are included.
     let mut entries: Vec<(String, String)> = Vec::new();
-    let mut tables = vec![global_sym_lib_table()];
+    let mut tables: Vec<PathBuf> = global_sym_lib_table().into_iter().collect();
     if let Some(pd) = &project_dir {
         tables.push(pd.join("sym-lib-table"));
     }
@@ -5337,11 +5361,9 @@ async fn handle_search_footprints(
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
     // Walk global fp-lib-table
-    let fp_lib_table_path = super::kicad_config_dir().join("fp-lib-table");
-
     let mut results = Vec::new();
 
-    'outer: for lib in read_flat_lib_table(&fp_lib_table_path) {
+    'outer: for lib in read_global_lib_table(global_fp_lib_table()) {
         let nickname = lib["nickname"].as_str().unwrap_or("").to_string();
         let Some(dir) = lib["path"].as_str().map(PathBuf::from) else {
             continue;
@@ -10756,7 +10778,7 @@ mod symbol_source_tests {
             "global",
             None,
             &file,
-            PathBuf::from("/cfg/sym-lib-table"),
+            Some(PathBuf::from("/cfg/sym-lib-table")),
             "sym-lib-table",
         )
         .expect("global scope needs no project");

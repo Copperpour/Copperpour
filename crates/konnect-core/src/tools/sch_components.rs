@@ -556,7 +556,7 @@ pub(crate) async fn handle_add_schematic_component(
     let extras = ComponentPlacementExtras {
         lcsc_id,
         fields,
-        db_path: Some(&db_path),
+        db_path: db_path.as_deref(),
     };
 
     let placed = match place_one_component(

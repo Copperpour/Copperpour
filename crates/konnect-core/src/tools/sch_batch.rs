@@ -725,7 +725,7 @@ async fn handle_batch_place_components(
         let extras = super::sch_components::ComponentPlacementExtras {
             lcsc_id,
             fields,
-            db_path: Some(&db_path),
+            db_path: db_path.as_deref(),
         };
 
         match place_one_component(
