@@ -343,12 +343,14 @@ fn document_lock_path(path: &Path) -> Result<PathBuf, SexpError> {
             root
         }
         // Still named `konnect`, so a Konnect build editing the same file
-        // takes the same lock as this one.
+        // takes the same lock as this one. Never relative to the working
+        // directory (#179), as `konnect_core::app_dirs::local_data_dir`.
         None => dirs::data_local_dir()
+            .filter(|root| root.is_absolute())
             .map(|root| root.join("konnect"))
             .ok_or_else(|| {
                 SexpError::InvalidValue(
-                    "no platform local-data directory is available; set COPPERPOUR_STATE_DIR to an absolute path"
+                    "no platform local-data directory is available (on Unix: HOME is relative, or unset with no account entry); set COPPERPOUR_STATE_DIR to an absolute path"
                         .to_owned(),
                 )
             })?,

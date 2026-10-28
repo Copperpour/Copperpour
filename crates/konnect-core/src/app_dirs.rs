@@ -41,6 +41,13 @@ pub fn app_data_dir() -> Option<PathBuf> {
         .filter(|path| path.is_absolute())
 }
 
+/// The platform local-data directory (`~/.local/share`,
+/// `~/Library/Application Support`, `%LOCALAPPDATA%`). `None` as for
+/// [`home_dir`] (#179).
+pub fn local_data_dir() -> Option<PathBuf> {
+    dirs::data_local_dir().filter(|path| path.is_absolute())
+}
+
 /// The per-user directory for config, logs and run records:
 /// `%APPDATA%\copperpour`, `~/Library/Application Support/copperpour`, or
 /// `~/.copperpour`.
@@ -158,7 +165,7 @@ mod tests {
     }
 
     /// A relative `HOME` or `APPDATA` never yields a relative per-user path
-    /// (#171). Run in a child process, since the variables are process-wide.
+    /// (#171, #179). Run in a child process, since the variables are process-wide.
     #[test]
     fn a_relative_home_gives_no_relative_user_directory() {
         const CHILD: &str = "COPPERPOUR_TEST_RELATIVE_HOME_CHILD";
@@ -172,6 +179,7 @@ mod tests {
                 .env(CHILD, "1")
                 .env("HOME", "relative")
                 .env("APPDATA", "relative")
+                .env("XDG_DATA_HOME", "")
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -184,13 +192,23 @@ mod tests {
         }
         // Windows falls back to the roaming profile; elsewhere there is none.
         #[cfg(target_os = "windows")]
-        for path in [app_data_dir(), user_state_dir(), user_data_dir()] {
+        for path in [
+            app_data_dir(),
+            local_data_dir(),
+            user_state_dir(),
+            user_data_dir(),
+        ] {
             assert!(path.as_deref().is_some_and(Path::is_absolute), "{path:?}");
         }
         #[cfg(not(target_os = "windows"))]
         assert_eq!(
-            [home_dir(), user_state_dir(), user_data_dir()],
-            [None, None, None]
+            [
+                home_dir(),
+                local_data_dir(),
+                user_state_dir(),
+                user_data_dir()
+            ],
+            [None, None, None, None]
         );
     }
 

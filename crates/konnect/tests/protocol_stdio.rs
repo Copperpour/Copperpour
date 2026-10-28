@@ -950,6 +950,12 @@ fn a_relative_home_never_reaches_the_working_directory() {
     let toml = "log_level = \"trace\"\n";
     let template = json!({"id": "planted", "name": "Planted", "components": [], "connections": []})
         .to_string();
+    let schematic = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../konnect-core/tests/fixtures/derived_lib_name.kicad_sch"
+    ))
+    .unwrap();
+    let project = tmp.path().join("project");
     // Both the Linux and the macOS layouts, so one list serves either.
     let planted = [
         (user_config_under(&home), "{\"planted\": true}"),
@@ -964,6 +970,8 @@ fn a_relative_home_never_reaches_the_working_directory() {
             home.join("Library/Application Support/copperpour/config.toml"),
             toml,
         ),
+        (project.join("derived_lib_name.kicad_sch"), &schematic),
+        (project.join("derived_lib_name.kicad_pro"), "{}\n"),
     ];
     for (path, content) in &planted {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -983,7 +991,24 @@ fn a_relative_home_never_reaches_the_working_directory() {
     };
     let before = tree(tmp.path());
 
-    let mut p = McpProcess::spawn_with_env(Some(tmp.path()), false, &[("HOME", "home")]);
+    // Empty counts as unset, so the lock root comes from `HOME` alone. The
+    // Freerouting search is kept off any JAR this machine has.
+    let empty = tmp.path().join("empty");
+    let empty = empty.to_str().unwrap();
+    let mut p = McpProcess::spawn_with_env(
+        Some(tmp.path()),
+        false,
+        &[
+            ("HOME", "home"),
+            ("XDG_DATA_HOME", ""),
+            ("COPPERPOUR_STATE_DIR", ""),
+            ("KONNECT_STATE_DIR", ""),
+            ("PATH", empty),
+            ("KICAD10_3RD_PARTY", empty),
+            ("KICAD9_3RD_PARTY", empty),
+            ("KICAD8_3RD_PARTY", empty),
+        ],
+    );
     assert_ne!(
         configuration_block(&mut p)["source"],
         "search_path",
@@ -1035,11 +1060,40 @@ fn a_relative_home_never_reaches_the_working_directory() {
         "{download:#?}"
     );
 
+    // The document lock lives below the home directory too, so a schematic
+    // edit refuses rather than lock the file under the working directory
+    // (#179).
+    p.call_tool("load_toolset", json!({"name": "sch_wiring"}));
+    let wire = p.call_tool(
+        "add_wire",
+        json!({
+            "schematic": project.join("derived_lib_name.kicad_sch"),
+            "x1": 10.16, "y1": 10.16, "x2": 20.32, "y2": 10.16
+        }),
+    );
+    assert_eq!(wire["isError"], json!(true), "{wire:#?}");
+    assert!(
+        wire.to_string().contains("local-data directory"),
+        "{wire:#?}"
+    );
+
+    let freerouting = McpProcess::tool_body(&p.call_tool("check_freerouting", json!({})));
+    assert_eq!(freerouting["engine_found"], false, "{freerouting}");
+    // The server reports its canonical working directory (/private/var on macOS).
+    let reported_home = std::path::Path::new(&canonical(tmp.path())).join("home");
+    let searched = freerouting["searched_locations"].as_array().unwrap();
+    assert!(
+        !searched.iter().any(|location| location["location_path"]
+            .as_str()
+            .is_some_and(|path| std::path::Path::new(path).starts_with(&reported_home))),
+        "a plugin folder below the relative home was searched: {searched:#?}"
+    );
+
     drop(p);
     assert_eq!(
         tree(tmp.path()),
         before,
-        "no call log, run record, config or database was created under the working directory"
+        "no call log, run record, lock, config or database was created under the working directory"
     );
     for (path, content) in &planted {
         assert_eq!(std::fs::read_to_string(path).unwrap(), *content, "{path:?}");
