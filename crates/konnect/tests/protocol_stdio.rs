@@ -634,7 +634,13 @@ fn a_viewer_in_the_working_directory_is_not_reported_as_launched() {
     std::fs::create_dir(&bin).unwrap();
     std::fs::write(tmp.path().join("schematic-viewer"), "").unwrap();
     let viewer = bin.join("schematic-viewer");
-    std::fs::write(&viewer, "#!/bin/sh\nPATH=/usr/bin:/bin exec sleep 3\n").unwrap();
+    // The server runs with the PATH below, so take `sleep`'s full path from
+    // this process's; the Nix build sandbox has no /bin or /usr/bin.
+    let sleep = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("sleep"))
+        .find(|path| path.is_file())
+        .expect("sleep on PATH");
+    std::fs::write(&viewer, format!("#!/bin/sh\nexec {} 3\n", sleep.display())).unwrap();
     std::fs::set_permissions(&viewer, std::fs::Permissions::from_mode(0o755)).unwrap();
     let schematic = concat!(
         env!("CARGO_MANIFEST_DIR"),
