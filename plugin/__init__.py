@@ -26,7 +26,7 @@ if _plugin_dir not in sys.path:
     sys.path.insert(0, _plugin_dir)
 
 from settings_dialog import KonnectSettingsDialog, load_settings
-from native_bridge import NativeSpecctraBridge
+from native_bridge import NativeSpecctraBridge, cache_root
 import wx
 
 PLUGIN_DIR = _plugin_dir
@@ -43,11 +43,9 @@ _server_thread = None
 # suppresses the console; stdin=PIPE stays intact.
 _POPEN_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-_CACHE_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA", os.path.expanduser("~/.cache")),
-    "copperpour", "cache",
-)
-_PID_FILE = os.path.join(_CACHE_DIR, "server.pid")
+# None without an absolute directory: no PID file, no staging (#190).
+_CACHE_DIR = cache_root()
+_PID_FILE = None if _CACHE_DIR is None else os.path.join(_CACHE_DIR, "server.pid")
 _native_bridge = NativeSpecctraBridge(pcbnew, wx)
 
 
@@ -70,12 +68,14 @@ def _stop_native_bridge():
 def _stage(source_path):
     """Copy file to LOCALAPPDATA cache, return cached path.
 
+    Without a cache directory the file is used where it is (#190).
+
     OneDrive-redirected Documents (common in enterprise Windows) tag both
     the plugin's copperpour.exe AND settings.json with IO_REPARSE_TAG_CLOUD,
     which trips ERROR_ACCESS_DENIED on execute and on serde config read.
     Staging to %LOCALAPPDATA% (never OneDrive-synced) sidesteps it.
     """
-    if sys.platform != "win32":
+    if sys.platform != "win32" or _CACHE_DIR is None:
         return source_path
     os.makedirs(_CACHE_DIR, exist_ok=True)
     dst = os.path.join(_CACHE_DIR, os.path.basename(source_path))
@@ -85,6 +85,8 @@ def _stage(source_path):
 
 def _write_pid_file(pid):
     """Record the PID of the server this session just spawned."""
+    if _PID_FILE is None:
+        return
     os.makedirs(_CACHE_DIR, exist_ok=True)
     with open(_PID_FILE, "w") as f:
         f.write(str(pid))
@@ -98,6 +100,8 @@ def _clear_pid_file(pid):
     session whose server is still running: the survivor becomes untracked,
     so no later start_server preflight can ever reap it (#103).
     """
+    if _PID_FILE is None:
+        return
     try:
         with open(_PID_FILE) as f:
             recorded = int(f.read().strip())
@@ -123,8 +127,8 @@ def _terminate_owned_server():
     Best-effort by nature: a hard kill of KiCAD runs no atexit handler, which
     is why the preflight reap stays.
     """
-    process = _server_process
-    if process is None or process.poll() is not None:
+    process = _owned_server()
+    if process is None:
         return
     try:
         process.terminate()
@@ -134,6 +138,12 @@ def _terminate_owned_server():
     except OSError:
         return
     _clear_pid_file(process.pid)
+
+
+def _owned_server():
+    """The server this session spawned, while it is still running."""
+    process = _server_process
+    return process if process is not None and process.poll() is None else None
 
 
 atexit.register(_terminate_owned_server)
@@ -147,6 +157,8 @@ def _kill_tracked():
     signal value, so it would actually kill the process instead of probing.
     Use taskkill/kill by PID; if the PID is stale, the kill is a harmless no-op.
     """
+    if _PID_FILE is None:
+        return
     try:
         with open(_PID_FILE) as f:
             pid = int(f.read().strip())
@@ -231,7 +243,16 @@ def start_server(parent=None):
 
 def stop_server():
     """Stop the MCP server subprocess."""
-    _kill_tracked()
+    if _PID_FILE is not None:
+        _kill_tracked()
+        return
+    # No PID file: only the server this session spawned can be reached.
+    process = _owned_server()
+    if process is not None:
+        try:
+            process.kill()
+        except OSError:
+            pass
 
 
 def is_server_running():
@@ -239,7 +260,10 @@ def is_server_running():
 
     PID file existence as a proxy -- survives module re-imports. If the
     server crashed on its own, the next start_server preflight cleans up.
+    Without a PID file, only this module's own process handle is known.
     """
+    if _PID_FILE is None:
+        return _owned_server() is not None
     return os.path.exists(_PID_FILE)
 
 
