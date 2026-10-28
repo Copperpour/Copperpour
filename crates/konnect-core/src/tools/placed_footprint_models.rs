@@ -1,5 +1,6 @@
 //! Live, revision-aware edits to 3D models on placed footprints (#305).
 
+use crate::hex::encode_hex;
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -308,7 +309,7 @@ fn models_revision(board: &std::path::Path, snapshot: &IpcFootprint3DModelSnapsh
     hasher.update(snapshot.kiid.as_bytes());
     hasher.update([0]);
     hasher.update(serde_json::to_vec(&snapshot.models).expect("model snapshots serialize"));
-    format!("{:x}", hasher.finalize())
+    encode_hex(&hasher.finalize())
 }
 
 fn snapshot_result(

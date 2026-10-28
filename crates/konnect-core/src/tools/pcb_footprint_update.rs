@@ -1,3 +1,4 @@
+use crate::hex::encode_hex;
 use crate::mcp::protocol::{CallToolResult, ToolContent};
 use crate::tool;
 use crate::tools::{
@@ -860,7 +861,7 @@ fn plan_updates(
         coverage.changed.planned = 0;
         return UpdatePlan {
             status: PlanStatus::Conflict,
-            plan_revision: format!("{:x}", hasher.finalize()),
+            plan_revision: encode_hex(&hasher.finalize()),
             coverage,
             changes,
             diagnostics,
@@ -875,7 +876,7 @@ fn plan_updates(
     };
     UpdatePlan {
         status,
-        plan_revision: format!("{:x}", hasher.finalize()),
+        plan_revision: encode_hex(&hasher.finalize()),
         coverage,
         changes,
         diagnostics,

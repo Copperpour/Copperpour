@@ -4,6 +4,7 @@
 //! system and don't require a separate file-sync step. `get_board_2d_view` uses
 //! kicad-cli to render a PNG.
 
+use crate::hex::encode_hex;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
@@ -3191,7 +3192,7 @@ fn repair_plan_revision(
         hasher.update(reference.as_bytes());
         hasher.update(source);
     }
-    format!("{:x}", hasher.finalize())
+    encode_hex(&hasher.finalize())
 }
 
 async fn handle_repair_corrupted_footprints(

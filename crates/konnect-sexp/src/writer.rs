@@ -19,6 +19,7 @@
 //! Edits **must** be applied in **reverse byte-offset order** so that earlier
 //! offsets are not invalidated by later insertions.
 
+use crate::hex::encode_hex;
 use crate::SexpError;
 use fs4::FileExt;
 use sha2::{Digest, Sha256};
@@ -395,7 +396,7 @@ fn document_lock_name(canonical_parent: &OsStr, file_name: &OsStr) -> String {
     hasher.update(b"konnect-document-lock-v1\0");
     hash_native_os_str(&mut hasher, canonical_parent);
     hash_native_os_str(&mut hasher, file_name);
-    format!("{:x}.lock", hasher.finalize())
+    format!("{}.lock", encode_hex(&hasher.finalize()))
 }
 
 #[cfg(unix)]
@@ -1084,6 +1085,32 @@ mod atomic_write_tests {
             document_lock_path_in(state.path(), &second_path).unwrap()
         );
         assert_eq!(first_lock.parent().unwrap(), state.path().join("locks"));
+    }
+
+    // Lock names already on disk. Instances on either side of an upgrade must
+    // agree on them, so these are a promise, computed with Python's hashlib.
+    #[cfg(unix)]
+    #[test]
+    fn lock_name_is_stable_across_releases() {
+        assert_eq!(
+            document_lock_name(
+                OsStr::new("/home/user/project"),
+                OsStr::new("board.kicad_pcb")
+            ),
+            "a0e987ac0a17cb9a841bdf8736fa301bdf54bcfdd4cec3efce78a060cdd4059e.lock"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lock_name_is_stable_across_releases() {
+        assert_eq!(
+            document_lock_name(
+                OsStr::new(r"C:\Users\user\project"),
+                OsStr::new("board.kicad_pcb")
+            ),
+            "71d11cf010f4034c74f5ca072bc12426bda30303a62bab7b7495bfac30e72584.lock"
+        );
     }
 
     #[cfg(windows)]
