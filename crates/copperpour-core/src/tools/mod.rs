@@ -18,6 +18,7 @@ pub mod config;
 #[cfg(test)]
 mod copy_routing_pattern_tests;
 pub(crate) mod cross_probe;
+mod custom_rules;
 pub mod design_review;
 #[cfg(test)]
 mod design_rules_tests;

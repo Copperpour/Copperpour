@@ -229,6 +229,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_set_layer_constraints(args, ctx).await }
         ),
+        super::custom_rules::tool(),
         tool!(
             "check_clearance",
             "Measure spacing between two footprints on the requested board. `mode: anchor` \
@@ -355,7 +356,7 @@ fn sibling_project_path(board: &Path) -> PathBuf {
     board.with_extension("kicad_pro")
 }
 
-fn sibling_custom_rules_path(board: &Path) -> PathBuf {
+pub(super) fn sibling_custom_rules_path(board: &Path) -> PathBuf {
     board.with_extension("kicad_dru")
 }
 

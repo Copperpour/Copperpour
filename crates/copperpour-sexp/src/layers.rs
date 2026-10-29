@@ -141,6 +141,15 @@ pub fn is_canonical_name(name: &str) -> bool {
     false
 }
 
+/// Every name [`is_canonical_name`] accepts.
+pub fn canonical_names() -> impl Iterator<Item = String> {
+    FIXED_NAMES
+        .iter()
+        .map(|name| name.to_string())
+        .chain((1..=MAX_INNER_COPPER).map(|n| format!("In{n}.Cu")))
+        .chain((1..=MAX_USER).map(|n| format!("User.{n}")))
+}
+
 /// The copper stack a footprint flips through: `F.Cu`, `In1.Cu`..`In<N-2>.Cu`
 /// and `B.Cu`, which is the only shape KiCad gives a board.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,6 +405,14 @@ mod tests {
         ] {
             assert!(!is_canonical_name(name), "{name} should not be canonical");
         }
+    }
+
+    #[test]
+    fn canonical_names_lists_each_accepted_name_once() {
+        let names: BTreeSet<String> = canonical_names().collect();
+        assert_eq!(names.len(), canonical_names().count());
+        assert_eq!(names.len(), FIXED_NAMES.len() + 30 + 45);
+        assert!(names.iter().all(|name| is_canonical_name(name)));
     }
 
     #[test]

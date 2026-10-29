@@ -1,7 +1,7 @@
 {
   "identifier": "com.github.copperpour.copperpour",
   "name": "Copperpour",
-  "description": "AI-assisted PCB design via the Model Context Protocol. 242 tools for schematic editing, PCB layout, routing, design review, and manufacturing export.",
+  "description": "AI-assisted PCB design via the Model Context Protocol. 243 tools for schematic editing, PCB layout, routing, design review, and manufacturing export.",
   "runtime": {
     "type": "exec"
   },
