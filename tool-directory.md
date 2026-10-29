@@ -368,7 +368,7 @@ and Windows servers do not.
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library, with optional footprint, description, keywords, footprint filters and custom fields. |
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
 | `set_symbol_properties` | Set the Value, Footprint, Description, keywords, footprint filters or custom fields of an existing library symbol, or rename or remove its custom fields, with a revision-checked write, reporting each field's previous and current value. Empty keywords or filters remove their property. |
-| `edit_symbol_pin` | Set the electrical type, graphic style or name of one pin of an existing library symbol, chosen by number, and by unit or body style where the number is in more than one, with a revision-checked write, reporting each changed part's previous and current value. |
+| `edit_symbol_pin` | Set the electrical type, graphic style, name, number, position, angle or length of one pin of an existing library symbol, chosen by number, and by unit or body style where the number is in more than one, refusing a number KiCad's symbol checker would call a duplicate, with a revision-checked write, reporting each changed part's previous and current value. |
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |
