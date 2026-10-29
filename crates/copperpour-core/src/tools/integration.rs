@@ -1362,46 +1362,108 @@ async fn handle_jlcpcb_stats(
     ))
 }
 
+const LCSC_DETAIL_URL: &str = "https://wmsc.lcsc.com/ftps/wm/product/detail";
+
 fn lcsc_detail_url(args: &serde_json::Value, lcsc_id: &str) -> String {
-    if let Some(base) = args["_api_base_url"].as_str() {
-        let separator = if base.contains('?') { '&' } else { '?' };
-        format!("{base}{separator}productCode={lcsc_id}")
-    } else if let Ok(base) = std::env::var("COPPERPOUR_TEST_LCSC_API_URL") {
-        let separator = if base.contains('?') { '&' } else { '?' };
-        format!("{base}{separator}productCode={lcsc_id}")
-    } else {
-        format!("https://wmsc.lcsc.com/ftps/wm/product/detail?productCode={lcsc_id}")
-    }
+    let base = lcsc_api_base(args);
+    let separator = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{separator}productCode={lcsc_id}")
 }
 
+#[cfg(not(test))]
+fn lcsc_api_base(_args: &serde_json::Value) -> &str {
+    LCSC_DETAIL_URL
+}
+
+/// Tests point the LCSC fetches at a local mock server through
+/// `_api_base_url`; release builds always use [`LCSC_DETAIL_URL`].
+#[cfg(test)]
+fn lcsc_api_base(args: &serde_json::Value) -> &str {
+    args["_api_base_url"].as_str().unwrap_or(LCSC_DETAIL_URL)
+}
+
+/// What the local JLCPCB catalog contributed to a datasheet lookup.
+enum CatalogDatasheets {
+    /// The catalog was opened and queried: non-empty datasheets by LCSC ID.
+    Read(HashMap<String, String>),
+    /// No catalog was configured, and none is at the default path.
+    Skipped(String),
+    /// The configured or default catalog exists but could not be read.
+    Failed(String),
+}
+
+/// Look up datasheets in the local catalog. A `db_path` the caller gives must
+/// be a readable catalog: a missing or unreadable one is refused as
+/// `file_not_found` rather than replaced by the network.
 async fn datasheets_from_catalog_for_lcsc_ids(
     args: &serde_json::Value,
     ctx: &ToolContext,
     lcsc_ids: &[String],
-) -> anyhow::Result<HashMap<String, String>> {
-    let Some(db_path) = resolve_db_path(args, ctx).filter(|path| path.exists()) else {
-        return Ok(HashMap::new());
+) -> Result<CatalogDatasheets, CallToolResult> {
+    let explicit = args["db_path"].as_str().is_some();
+    let Some(db_path) = resolve_db_path(args, ctx) else {
+        return Ok(CatalogDatasheets::Skipped(
+            "no catalog path: jlcpcb_db_path is not set and the home directory is unknown"
+                .to_owned(),
+        ));
     };
-    if lcsc_ids.is_empty() {
-        return Ok(HashMap::new());
+    let refuse = |reason: String| {
+        CallToolResult::error_kind(
+            ToolErrorKind::FileNotFound {
+                path: db_path.display().to_string(),
+            },
+            reason,
+        )
+    };
+    if !db_path.is_file() {
+        if explicit {
+            return Err(refuse(format!(
+                "db_path is not a file: {}",
+                db_path.display()
+            )));
+        }
+        return Ok(CatalogDatasheets::Skipped(format!(
+            "no catalog at {}",
+            db_path.display()
+        )));
     }
+    let query_path = db_path.clone();
     let ids = lcsc_ids.to_vec();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<HashMap<String, String>> {
-        let conn = rusqlite::Connection::open(&db_path)?;
-        let mut stmt = conn.prepare("SELECT Datasheet FROM components WHERE LCSC = ?1 LIMIT 1")?;
-        let mut map = HashMap::new();
-        for id in ids {
-            let mut rows = stmt.query_map(rusqlite::params![id], |row| row.get::<_, String>(0))?;
-            if let Some(Ok(url)) = rows.next() {
-                let trimmed = url.trim();
-                if !trimmed.is_empty() && trimmed != "~" {
-                    map.insert(id, trimmed.to_owned());
-                }
+    let queried = tokio::task::spawn_blocking(move || query_catalog_datasheets(&query_path, &ids))
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+    match queried {
+        Ok(map) => Ok(CatalogDatasheets::Read(map)),
+        Err(error) => {
+            let reason = format!("cannot read catalog {}: {error}", db_path.display());
+            if explicit {
+                Err(refuse(format!("db_path is unreadable: {reason}")))
+            } else {
+                Ok(CatalogDatasheets::Failed(reason))
             }
         }
-        Ok(map)
-    })
-    .await?
+    }
+}
+
+fn query_catalog_datasheets(
+    db_path: &Path,
+    lcsc_ids: &[String],
+) -> anyhow::Result<HashMap<String, String>> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt = conn.prepare("SELECT Datasheet FROM components WHERE LCSC = ?1 LIMIT 1")?;
+    let mut map = HashMap::new();
+    for id in lcsc_ids {
+        let mut rows = stmt.query_map(rusqlite::params![id], |row| row.get::<_, String>(0))?;
+        if let Some(url) = rows.next().transpose()? {
+            let trimmed = url.trim();
+            if !trimmed.is_empty() && trimmed != "~" {
+                map.insert(id.clone(), trimmed.to_owned());
+            }
+        }
+    }
+    Ok(map)
 }
 
 fn count_skipped_existing_values(
@@ -1467,11 +1529,25 @@ async fn handle_enrich_datasheets(
     }
 
     let mut urls = HashMap::new();
-    let mut attempted_sources = vec!["local_catalog".to_string()];
+    let mut attempted_sources = Vec::new();
+    let mut local_catalog_skipped = None;
+    let mut local_catalog_error = None;
 
-    let local_map = datasheets_from_catalog_for_lcsc_ids(args, ctx, &lcsc_ids)
-        .await
-        .unwrap_or_default();
+    let local_map = match datasheets_from_catalog_for_lcsc_ids(args, ctx, &lcsc_ids).await {
+        Ok(CatalogDatasheets::Read(map)) => {
+            attempted_sources.push("local_catalog".to_string());
+            map
+        }
+        Ok(CatalogDatasheets::Skipped(reason)) => {
+            local_catalog_skipped = Some(reason);
+            HashMap::new()
+        }
+        Ok(CatalogDatasheets::Failed(reason)) => {
+            local_catalog_error = Some(reason);
+            HashMap::new()
+        }
+        Err(refusal) => return Ok(refusal),
+    };
 
     let mut local_hits = 0usize;
     let mut remaining_ids = Vec::new();
@@ -1542,20 +1618,26 @@ async fn handle_enrich_datasheets(
         Vec::new()
     };
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "lcsc_ids_found": lcsc_ids.len(),
-            "datasheets_enriched": observed_updates.len(),
-            "local_hits": local_hits,
-            "api_hits": api_hits,
-            "misses": misses,
-            "skipped_existing_values": skipped_existing,
-            "attempted_sources": attempted_sources,
-            "updated": observed_updates.len(),
-            "schematic": sch_path.to_str().unwrap_or("")
-        }))
-        .unwrap(),
-    ))
+    let mut body = json!({
+        "lcsc_ids_found": lcsc_ids.len(),
+        "datasheets_enriched": observed_updates.len(),
+        "local_hits": local_hits,
+        "api_hits": api_hits,
+        "misses": misses,
+        "skipped_existing_values": skipped_existing,
+        "attempted_sources": attempted_sources,
+        "updated": observed_updates.len(),
+        "schematic": sch_path.to_str().unwrap_or("")
+    });
+    if let Some(reason) = local_catalog_skipped {
+        body["local_catalog_skipped"] = json!(reason);
+        body["note"] = json!("No local JLCPCB catalog was read; run download_jlcpcb_database to resolve datasheets without the network");
+    }
+    if let Some(reason) = local_catalog_error {
+        body["local_catalog_error"] = json!(reason);
+        body["note"] = json!("The local JLCPCB catalog could not be read, so every part was looked up through the LCSC API; re-run download_jlcpcb_database with force to rebuild it");
+    }
+    Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
 #[derive(Debug, Clone)]
@@ -2750,6 +2832,134 @@ mod datasheet_enrichment_tests {
                 .count(),
             2
         );
+    }
+
+    fn ctx_with_catalog(path: PathBuf) -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                jlcpcb_db_path: Some(path),
+                ..ServerConfig::default()
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn schematic_file(lcsc_id: &str) -> (tempfile::NamedTempFile, String) {
+        let original = schematic(&symbol("R1", 1, Some("r1-uuid"), lcsc_id));
+        let mut file = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        file.write_all(original.as_bytes()).unwrap();
+        file.flush().unwrap();
+        (file, original)
+    }
+
+    #[tokio::test]
+    async fn a_missing_db_path_is_refused_before_any_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("typo.db");
+        let (_server, mock_url) = start_mock_lcsc_server(HashMap::from([(
+            "C14663".to_string(),
+            Some("https://example.com/c14663-api.pdf".to_string()),
+        )]))
+        .await;
+        let (file, original) = schematic_file("C14663");
+
+        let result = handle_enrich_datasheets(
+            &json!({
+                "schematic": file.path().to_str().unwrap(),
+                "db_path": missing.to_str().unwrap(),
+                "_api_base_url": mock_url
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let body = response_json(&result);
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert_eq!(body["error"]["path"], json!(missing.display().to_string()));
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_db_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("jlcpcb.db");
+        std::fs::write(&corrupt, b"not a sqlite database").unwrap();
+        let (file, original) = schematic_file("C14663");
+
+        let result = handle_enrich_datasheets(
+            &json!({
+                "schematic": file.path().to_str().unwrap(),
+                "db_path": corrupt.to_str().unwrap()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let body = response_json(&result);
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn a_configured_catalog_that_is_absent_is_reported_as_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_catalog(dir.path().join("jlcpcb.db"));
+        let (_server, mock_url) = start_mock_lcsc_server(HashMap::from([(
+            "C14663".to_string(),
+            Some("https://example.com/c14663-api.pdf".to_string()),
+        )]))
+        .await;
+        let (file, _) = schematic_file("C14663");
+
+        let result = handle_enrich_datasheets(
+            &json!({
+                "schematic": file.path().to_str().unwrap(),
+                "_api_base_url": mock_url
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let body = response_json(&result);
+        assert_eq!(body["attempted_sources"], json!(["lcsc_api"]));
+        assert_eq!(body["api_hits"], 1);
+        assert!(body["local_catalog_skipped"].is_string(), "{body}");
+        assert!(body.get("local_catalog_error").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_configured_catalog_that_cannot_be_read_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("jlcpcb.db");
+        std::fs::write(&corrupt, b"not a sqlite database").unwrap();
+        let ctx = ctx_with_catalog(corrupt);
+        let (_server, mock_url) = start_mock_lcsc_server(HashMap::from([(
+            "C14663".to_string(),
+            Some("https://example.com/c14663-api.pdf".to_string()),
+        )]))
+        .await;
+        let (file, _) = schematic_file("C14663");
+
+        let result = handle_enrich_datasheets(
+            &json!({
+                "schematic": file.path().to_str().unwrap(),
+                "_api_base_url": mock_url
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let body = response_json(&result);
+        assert_eq!(body["attempted_sources"], json!(["lcsc_api"]));
+        assert_eq!(body["api_hits"], 1);
+        assert!(body["local_catalog_error"].is_string(), "{body}");
+        assert!(body.get("local_catalog_skipped").is_none(), "{body}");
     }
 
     #[tokio::test]
