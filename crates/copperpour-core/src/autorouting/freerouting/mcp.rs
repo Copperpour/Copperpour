@@ -640,13 +640,22 @@ fn latest_activity(log: &str, tag: &str) -> Option<String> {
                 let verdict = rest.split([',', ')']).next()?.to_ascii_lowercase();
                 Some(format!("optimizer pass {pass}: score {scores} ({verdict})"))
             } else if text.contains("Optimization stage started") {
-                let violations = text
-                    .split_once("clearance violations: ")
-                    .map(|(_, v)| v.trim_end_matches('.'));
-                Some(match violations {
-                    Some(v) => format!("optimizing, {v} violations"),
-                    None => "optimizing".to_string(),
-                })
+                let field = |name: &str| {
+                    text.split_once(name)
+                        .and_then(|(_, rest)| rest.split([',', '.']).next())
+                };
+                Some(
+                    match (
+                        field("incomplete connections: "),
+                        field("clearance violations: "),
+                    ) {
+                        (Some(unrouted), Some(violations)) => {
+                            format!("optimizing, {unrouted} unrouted, {violations} violations")
+                        }
+                        (None, Some(violations)) => format!("optimizing, {violations} violations"),
+                        _ => "optimizing".to_string(),
+                    },
+                )
             } else {
                 None
             }
@@ -1192,7 +1201,7 @@ mod tests {
         );
         assert_eq!(
             latest_activity(&optimizing, "[A3AA32]").as_deref(),
-            Some("optimizing, 218 violations")
+            Some("optimizing, 0 unrouted, 218 violations")
         );
         let optimizer_pass = format!(
             "{optimizing}2026-10-29 17:58:00.204 INFO   [A3AA32] Optimizer pass #2 on board '008e' was completed in 152.08 seconds with the score of 84.26 (0 unrouted and 218 violations).
