@@ -474,7 +474,7 @@ impl LocalMcpClient {
     }
 
     fn server_command(jar: &Path) -> Command {
-        let mut command = Command::new("java");
+        let mut command = Command::new(crate::java_runtime::java_executable());
         command
             .arg(JAVA_HEADLESS_ARG)
             .arg("-jar")
