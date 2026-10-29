@@ -1,6 +1,6 @@
 //! `set_design_rules` / `get_design_rules` for the copper-to-edge clearance and
 //! silkscreen text minima (#960), and the via annular width and hole clearance
-//! minima (#776).
+//! minima (#776), and KiCad's ranges for the five older minima (#152).
 //!
 //! Driven through served `tools/call` against a copy of the KiCad-written
 //! placement project, with no KiCad reachable. KiCad wrote its rules as 0.5,
@@ -14,9 +14,14 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 /// KiCad 10.0.6 loads these ranges and resets anything outside them to the
-/// default (measured with pcbnew's loader, see the PR). They are the promise,
-/// not a mirror of the code.
-pub(super) const RANGES: [(&str, f64, f64); 5] = [
+/// default (measured with pcbnew's loader, see the PRs and #152). They are the
+/// promise, not a mirror of the code.
+pub(super) const RANGES: [(&str, f64, f64); 10] = [
+    ("min_clearance", 0.0, 25.0),
+    ("min_trace_width", 0.0, 25.0),
+    ("min_via_drill", 0.0, 25.0),
+    ("min_via_size", 0.0, 25.0),
+    ("min_hole_to_hole", 0.0, 10.0),
     ("min_via_annular_width", 0.0, 25.0),
     ("min_hole_clearance", 0.0, 100.0),
     ("min_copper_edge_clearance", -0.01, 25.0),
