@@ -56,7 +56,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "search_jlcpcb_parts",
-            "Search the local JLCPCB component database by keyword, value, or category. The query is split on whitespace and a part matches only if every word appears, in any order, in its LCSC number, MPN, package, manufacturer or description; case-insensitive. A word that is a value (a number with an optional prefix and unit, like 20pF, 4.7uF, 1k or 0402) must match as a whole value: 20pF does not find 220pF. Unit spellings are not converted: 100nF does not find 0.1uF.",
+            "Search the local JLCPCB component database by keyword, value, or category. The query is split on whitespace and a part matches only if every word appears, in any order, in its LCSC number, MPN, package, manufacturer or description; case-insensitive. A word that is a value (a number with an optional prefix and unit, like 20pF, 4.7uF, 1k or 0402) must match as a whole value: 20pF does not find 220pF. Unit spellings are not converted: 100nF does not find 0.1uF. Results rank in-stock parts first, then as suggest_jlcpcb_alternatives ranks them: Basic, then Preferred, then Extended parts, then known price before unknown, price ascending, stock descending, LCSC number.",
             json!({
                 "type": "object",
                 "properties": {
@@ -812,11 +812,7 @@ async fn handle_search_jlcpcb_parts(
         );
         let mut params: Vec<String> = Vec::new();
         for token in &sql_tokens {
-            let escaped = token
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            params.push(format!("%{}%", escaped));
+            params.push(format!("%{}%", escape_like(token)));
             let n = params.len();
             sql.push_str(&format!(
                 " AND (Description LIKE ?{n} ESCAPE '\\' OR MFR_Part LIKE ?{n} ESCAPE '\\' \
@@ -834,10 +830,12 @@ async fn handle_search_jlcpcb_parts(
             params.push(format!("%{}%", escape_like(cat)));
             sql.push_str(&format!(" AND Category LIKE ?{} ESCAPE '\\'", params.len()));
         }
-        // Stable order so a page is the same on every run (#432). The LIKE
+        // Ranked in-stock first, then as suggest_jlcpcb_alternatives ranks
+        // (#90), ending on the LCSC number so a page is the same on every run
+        // (#432). The LIKE
         // above cannot see value boundaries, so value words are checked
         // here, and the limit is applied after that check.
-        sql.push_str(" ORDER BY LCSC");
+        sql.push_str(&jlcpcb_ranking_order_by());
 
         let value_tokens: Vec<&String> = sql_tokens
             .iter()
@@ -885,20 +883,12 @@ async fn handle_search_jlcpcb_parts(
         );
         let mut fallback_params: Vec<String> = Vec::new();
         for token in &fallback_tokens {
-            let escaped = token
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            fallback_params.push(format!("%{}%", escaped));
+            fallback_params.push(format!("%{}%", escape_like(token)));
             let n1 = fallback_params.len();
 
             let clean: String = token.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
             if clean.len() >= 2 {
-                let clean_escaped = clean
-                    .replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_");
-                fallback_params.push(format!("%{}%", clean_escaped));
+                fallback_params.push(format!("%{}%", escape_like(&clean)));
                 let n2 = fallback_params.len();
                 fallback_sql.push_str(&format!(
                     " AND (Description LIKE ?{n1} ESCAPE '\\' OR MFR_Part LIKE ?{n1} ESCAPE '\\' \
@@ -928,7 +918,7 @@ async fn handle_search_jlcpcb_parts(
                 fallback_params.len()
             ));
         }
-        fallback_sql.push_str(" ORDER BY LCSC");
+        fallback_sql.push_str(&jlcpcb_ranking_order_by());
 
         let fallback_value_tokens: Vec<&String> = fallback_tokens
             .iter()
@@ -965,7 +955,8 @@ async fn handle_search_jlcpcb_parts(
         "results": results,
         "tokens": tokens,
         "value_tokens": tokens.iter().filter(|t| is_jlcpcb_value_token(t)).collect::<Vec<_>>(),
-        "search_fields": JLCPCB_SEARCH_FIELDS
+        "search_fields": JLCPCB_SEARCH_FIELDS,
+        "ranking": search_ranking_criteria()
     });
     ctx.jlcpcb_cache.put(key, body.clone());
 
@@ -1189,18 +1180,48 @@ struct AlternativePolicy {
 
 impl AlternativePolicy {
     fn criteria(&self) -> Vec<&'static str> {
-        let mut criteria = Vec::new();
-        if self.prefer_basic {
-            criteria.push("library_type: Basic, Preferred, Extended");
-        }
-        criteria.extend([
-            "known price before unknown price",
-            "price ascending",
-            "stock descending",
-            "LCSC number",
-        ]);
-        criteria
+        jlcpcb_ranking_criteria(self.prefer_basic)
     }
+}
+
+/// The ranking `suggest_jlcpcb_alternatives` and `search_jlcpcb_parts` share,
+/// most significant first, as the responses state it.
+fn jlcpcb_ranking_criteria(by_library_type: bool) -> Vec<&'static str> {
+    let mut criteria = Vec::new();
+    if by_library_type {
+        criteria.push("library_type: Basic, Preferred, Extended");
+    }
+    criteria.extend([
+        "known price before unknown price",
+        "price ascending",
+        "stock descending",
+        "LCSC number",
+    ]);
+    criteria
+}
+
+/// `search_jlcpcb_parts`' ranking: in-stock parts first, then
+/// [`jlcpcb_ranking_criteria`]. `suggest_jlcpcb_alternatives` needs no stock
+/// tier, because it drops parts below its stock floor; a search with
+/// `in_stock: false` keeps them, and they rank last.
+fn search_ranking_criteria() -> Vec<&'static str> {
+    std::iter::once("in stock before out of stock")
+        .chain(jlcpcb_ranking_criteria(true))
+        .collect()
+}
+
+/// [`search_ranking_criteria`] as an `ORDER BY`. The import stores an unknown
+/// price as 0, as [`AlternativeCandidate::price_known`] reads it.
+fn jlcpcb_ranking_order_by() -> String {
+    let tiers: String = LIBRARY_TYPE_ORDER
+        .iter()
+        .enumerate()
+        .map(|(rank, kind)| format!(" WHEN '{kind}' THEN {rank}"))
+        .collect();
+    format!(
+        " ORDER BY Stock > 0 DESC, CASE Library_Type{tiers} ELSE {} END, (Price > 0) DESC, Price, Stock DESC, LCSC",
+        LIBRARY_TYPE_ORDER.len()
+    )
 }
 
 /// What filtering removed and what was returned, so an empty or short result
@@ -1282,12 +1303,8 @@ fn query_alternative_candidates(
          FROM components WHERE Package COLLATE NOCASE IN ({placeholders}) \
          AND (Description LIKE ?{like} ESCAPE '\\' OR MFR_Part LIKE ?{like} ESCAPE '\\')"
     );
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
     let mut params: Vec<String> = packages.to_vec();
-    params.push(format!("%{escaped}%"));
+    params.push(format!("%{}%", escape_like(value)));
 
     let mut statement = conn.prepare(&sql)?;
     let rows = statement
@@ -4376,7 +4393,6 @@ mod jlcpcb_cache_tests {
     }
 
     /// The filters and LIMIT keep working alongside the tokenised match.
-    /// (The query has no ORDER BY, before or after the fix.)
     #[tokio::test]
     async fn search_jlcpcb_parts_preserves_stock_basic_category_and_limit_filters() {
         let (_dir, db_path) = seed_multi_word_db();
@@ -4569,6 +4585,41 @@ mod jlcpcb_cache_tests {
         assert_eq!(search("Gadgets").await, vec!["C3101", "C3102"]);
     }
 
+    /// The punctuation-normalised fallback filters by category the same way:
+    /// `FALLBACK1` finds `FALL-BACK1` only there.
+    #[tokio::test]
+    async fn search_jlcpcb_parts_fallback_category_filter_is_literal_and_case_insensitive() {
+        let (_dir, db_path) = seed_category_db();
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        for (lcsc, category) in [("C3201", "Gadgets_A"), ("C3202", "GadgetsXA")] {
+            conn.execute(
+                "INSERT INTO components VALUES (?1, 'FALL-BACK1', 'PKG', 'MFR', 'Extended', 'gizmo', '', 0.1, 1, ?2)",
+                rusqlite::params![lcsc, category],
+            )
+            .unwrap();
+        }
+        let search = |category: &'static str| {
+            let args = json!({
+                "query": "FALLBACK1",
+                "category": category,
+                "output_path": db_path.to_str().unwrap()
+            });
+            async move {
+                let result = handle_search_jlcpcb_parts(&args, &test_ctx())
+                    .await
+                    .unwrap();
+                response_json(&result)["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["lcsc"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(search("gadgets_a").await, vec!["C3201"]);
+        assert_eq!(search("Gadgets").await, vec!["C3201", "C3202"]);
+    }
+
     fn response_json(result: &CallToolResult) -> serde_json::Value {
         match &result.content[0] {
             crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
@@ -4640,7 +4691,7 @@ mod jlcpcb_cache_tests {
     }
 
     #[tokio::test]
-    async fn search_jlcpcb_parts_limit_page_is_ordered_by_lcsc() {
+    async fn search_jlcpcb_parts_ties_are_ordered_by_lcsc() {
         let (_dir, db_path) = seed_multi_word_db();
         let ctx = test_ctx();
         // Insert out of LCSC order so rowid order differs from LCSC order.
@@ -4665,6 +4716,86 @@ mod jlcpcb_cache_tests {
             .map(|r| r["lcsc"].as_str().unwrap())
             .collect();
         assert_eq!(ids, ["C3001", "C3002"]);
+    }
+
+    fn ranked_ids(body: &serde_json::Value) -> Vec<String> {
+        body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["lcsc"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Search results rank in-stock parts first, then as
+    /// suggest_jlcpcb_alternatives ranks them (#90): library type, then known
+    /// price, price, stock, LCSC number.
+    #[tokio::test]
+    async fn search_jlcpcb_parts_ranks_in_stock_first_then_like_suggest_alternatives() {
+        let (_dir, db_path) = seed_multi_word_db();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for (lcsc, library_type, price, stock) in [
+            ("C4001", "Extended", 0.01, 1000),
+            ("C4002", "Basic", 0.05, 10),
+            ("C4003", "Preferred", 0.02, 10),
+            ("C4004", "Basic", 0.0, 999_999),
+            ("C4005", "Basic", 0.05, 500),
+            ("C4006", "Basic", 0.001, 0),
+        ] {
+            conn.execute(
+                "INSERT INTO components VALUES (?1, 'RNK-1', '0805', 'Acme', ?2, 'rankcheck part', '', ?3, ?4, 'Misc')",
+                rusqlite::params![lcsc, library_type, price, stock],
+            )
+            .unwrap();
+        }
+        let search = |in_stock: bool| {
+            let args = json!({
+                "query": "rankcheck",
+                "in_stock": in_stock,
+                "output_path": db_path.to_str().unwrap()
+            });
+            async move {
+                response_json(
+                    &handle_search_jlcpcb_parts(&args, &test_ctx())
+                        .await
+                        .unwrap(),
+                )
+            }
+        };
+        let body = search(true).await;
+        assert_eq!(
+            ranked_ids(&body),
+            ["C4005", "C4002", "C4004", "C4003", "C4001"]
+        );
+        assert_eq!(body["ranking"][0], "in stock before out of stock");
+        assert_eq!(body["ranking"], json!(search_ranking_criteria()));
+        // The cheapest Basic part has no stock, so it ranks after every
+        // stocked part, Extended included.
+        assert_eq!(
+            ranked_ids(&search(false).await),
+            ["C4005", "C4002", "C4004", "C4003", "C4001", "C4006"]
+        );
+    }
+
+    /// The punctuation-normalised fallback ranks the same way.
+    #[tokio::test]
+    async fn search_jlcpcb_parts_fallback_ranks_like_suggest_alternatives() {
+        let (_dir, db_path) = seed_multi_word_db();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for (lcsc, library_type) in [("C4101", "Extended"), ("C4102", "Basic")] {
+            conn.execute(
+                "INSERT INTO components VALUES (?1, 'RANK-X1', '0805', 'Acme', ?2, 'part', '', 0.1, 10, 'Misc')",
+                rusqlite::params![lcsc, library_type],
+            )
+            .unwrap();
+        }
+        let args = json!({ "query": "RANKX1", "output_path": db_path.to_str().unwrap() });
+        let body = response_json(
+            &handle_search_jlcpcb_parts(&args, &test_ctx())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(ranked_ids(&body), ["C4102", "C4101"]);
     }
 
     #[tokio::test]
