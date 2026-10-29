@@ -63,6 +63,11 @@ pub(crate) struct RouteSettings {
     /// Once routing is complete and the optimizer has started, how long to let
     /// it run before taking the best board so far and stopping the job.
     pub optimize_seconds: Option<u64>,
+    /// Freerouting's `optimizer.max_passes` (its default is 100).
+    pub optimizer_max_passes: Option<u32>,
+    /// Freerouting's `optimizer.improvement_threshold`, in percent: the
+    /// optimizer stops after a pass that improves less (its default is 2.5).
+    pub optimizer_improvement_threshold: Option<f64>,
     pub poll_interval: Duration,
     pub overall_timeout: Duration,
 }
@@ -312,6 +317,18 @@ fn validate_inputs(
     {
         bail!("optimize_seconds must be between 0 and 86400");
     }
+    if settings
+        .optimizer_max_passes
+        .is_some_and(|passes| !(1..=100).contains(&passes))
+    {
+        bail!("optimizer_max_passes must be between 1 and 100");
+    }
+    if settings
+        .optimizer_improvement_threshold
+        .is_some_and(|percent| !(0.0..=100.0).contains(&percent))
+    {
+        bail!("optimizer_improvement_threshold must be between 0 and 100 (percent)");
+    }
     Ok(())
 }
 
@@ -352,19 +369,7 @@ async fn run_state_machine(
         )
         .await?;
 
-    let mut job_settings = Map::new();
-    if let Some(max_passes) = settings.max_passes {
-        job_settings.insert("maxPasses".to_string(), json!(max_passes));
-    }
-    if let Some(enabled) = settings.optimizer_enabled {
-        job_settings.insert("optimizer".to_string(), json!({ "enabled": enabled }));
-    }
-    if let Some(seconds) = settings.job_timeout_seconds {
-        job_settings.insert(
-            "jobTimeoutString".to_string(),
-            Value::String(duration_string(seconds)),
-        );
-    }
+    let job_settings = job_settings_body(settings);
     if !job_settings.is_empty() {
         if !tools.contains_key("update_job_settings") {
             bail!("Freerouting MCP does not expose update_job_settings");
@@ -1078,6 +1083,41 @@ fn temporary_output_path(output: &Path) -> Result<PathBuf> {
     )))
 }
 
+/// The `update_job_settings` body, in the keys Freerouting 2.5 deserializes
+/// (its `RouterSettings` JSON names, read back through
+/// `get_effective_settings`). The camelCase `maxPasses` and `jobTimeoutString`
+/// sent before were accepted and silently ignored: routing passes stayed
+/// unlimited and the job limit at 12 hours.
+fn job_settings_body(settings: &RouteSettings) -> Map<String, Value> {
+    let mut body = Map::new();
+    if let Some(max_passes) = settings.max_passes {
+        body.insert(
+            "autorouter".to_string(),
+            json!({ "max_passes": max_passes }),
+        );
+    }
+    let mut optimizer = Map::new();
+    if let Some(enabled) = settings.optimizer_enabled {
+        optimizer.insert("enabled".to_string(), json!(enabled));
+    }
+    if let Some(passes) = settings.optimizer_max_passes {
+        optimizer.insert("max_passes".to_string(), json!(passes));
+    }
+    if let Some(percent) = settings.optimizer_improvement_threshold {
+        optimizer.insert("improvement_threshold".to_string(), json!(percent));
+    }
+    if !optimizer.is_empty() {
+        body.insert("optimizer".to_string(), Value::Object(optimizer));
+    }
+    if let Some(seconds) = settings.job_timeout_seconds {
+        body.insert(
+            "job_timeout".to_string(),
+            Value::String(duration_string(seconds)),
+        );
+    }
+    body
+}
+
 fn duration_string(seconds: u64) -> String {
     let hours = seconds / 3600;
     let minutes = (seconds % 3600) / 60;
@@ -1288,6 +1328,8 @@ done
             optimizer_enabled: None,
             job_timeout_seconds: None,
             optimize_seconds: Some(0),
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
             poll_interval: Duration::from_millis(10),
             overall_timeout: Duration::from_secs(30),
         };
@@ -1457,6 +1499,8 @@ done
             optimizer_enabled: None,
             job_timeout_seconds: None,
             optimize_seconds,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };
@@ -1505,6 +1549,73 @@ done
     fn duration_settings_use_documented_shape() {
         assert_eq!(duration_string(5 * 60), "00:05:00");
         assert_eq!(duration_string(25 * 60 * 60), "25:00:00");
+    }
+
+    #[test]
+    fn optimizer_settings_out_of_range_are_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        std::fs::write(&jar, "").unwrap();
+        std::fs::write(&dsn, "").unwrap();
+        let settings = |passes, threshold| RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: passes,
+            optimizer_improvement_threshold: threshold,
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(900),
+        };
+        for (passes, threshold) in [(None, None), (Some(1), Some(0.0)), (Some(100), Some(100.0))] {
+            validate_inputs(&jar, &dsn, &ses, &settings(passes, threshold)).unwrap();
+        }
+        for (passes, threshold, named) in [
+            (Some(0), None, "optimizer_max_passes"),
+            (Some(101), None, "optimizer_max_passes"),
+            (None, Some(-0.1), "optimizer_improvement_threshold"),
+            (None, Some(100.1), "optimizer_improvement_threshold"),
+            (None, Some(f64::NAN), "optimizer_improvement_threshold"),
+        ] {
+            let error = validate_inputs(&jar, &dsn, &ses, &settings(passes, threshold))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(named), "{passes:?} {threshold:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn job_settings_use_the_keys_freerouting_reads() {
+        let settings = RouteSettings {
+            max_passes: Some(7),
+            optimizer_enabled: Some(true),
+            job_timeout_seconds: Some(300),
+            optimize_seconds: None,
+            optimizer_max_passes: Some(3),
+            optimizer_improvement_threshold: Some(0.5),
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(900),
+        };
+        // The shape get_effective_settings echoed back from Freerouting 2.5.0.
+        assert_eq!(
+            Value::Object(job_settings_body(&settings)),
+            json!({
+                "autorouter": { "max_passes": 7 },
+                "optimizer": { "enabled": true, "max_passes": 3, "improvement_threshold": 0.5 },
+                "job_timeout": "00:05:00"
+            })
+        );
+        let nothing = RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            ..settings
+        };
+        assert!(job_settings_body(&nothing).is_empty());
     }
 
     #[test]
@@ -1612,6 +1723,8 @@ done
                 optimizer_enabled: Some(false),
                 job_timeout_seconds: Some(300),
                 optimize_seconds: None,
+                optimizer_max_passes: None,
+                optimizer_improvement_threshold: None,
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(300),
             },
@@ -1647,6 +1760,8 @@ done
                     optimizer_enabled: Some(true),
                     job_timeout_seconds: Some(300),
                     optimize_seconds: None,
+                    optimizer_max_passes: None,
+                    optimizer_improvement_threshold: None,
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_millis(100),
                 },
@@ -1695,6 +1810,8 @@ done
                     optimizer_enabled: Some(true),
                     job_timeout_seconds: Some(300),
                     optimize_seconds: None,
+                    optimizer_max_passes: None,
+                    optimizer_improvement_threshold: None,
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_secs(300),
                 },
@@ -1729,6 +1846,8 @@ done
             optimizer_enabled: None,
             job_timeout_seconds: None,
             optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };

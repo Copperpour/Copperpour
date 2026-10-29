@@ -522,6 +522,12 @@ pub(crate) async fn route_specctra_dsn(
         optimizer_enabled: args["optimizer_enabled"].as_bool(),
         job_timeout_seconds,
         optimize_seconds: args["optimize_seconds"].as_u64(),
+        optimizer_max_passes: args["optimizer_max_passes"]
+            .as_u64()
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("optimizer_max_passes is too large"))?,
+        optimizer_improvement_threshold: args["optimizer_improvement_threshold"].as_f64(),
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
     };
