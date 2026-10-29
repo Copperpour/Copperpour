@@ -427,6 +427,20 @@ pub fn write_new_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
     write_new_atomic_unlocked(path, content)
 }
 
+/// [`write_new_atomic`], then read the new file back under the same lock.
+/// `Conflict` when it no longer holds `content`.
+pub fn write_new_atomic_verified(path: &Path, content: &str) -> Result<(), SexpError> {
+    let lock = open_document_lock(path)?;
+    <std::fs::File as FileExt>::lock(&lock)?;
+    write_new_atomic_unlocked(path, content)?;
+    if std::fs::read_to_string(path)? != content {
+        return Err(SexpError::Conflict {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
 /// What a create-only atomic write asks for as the new file's mode.
 ///
 /// The replace path copies the destination's mode; a create has no

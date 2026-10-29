@@ -11,6 +11,8 @@ mod board_source_contract_tests;
 mod board_stackup;
 #[cfg(test)]
 mod board_title_block_tests;
+#[cfg(test)]
+mod bus_and_rules_writer_tests;
 pub mod cli;
 pub mod config;
 #[cfg(test)]
@@ -1017,13 +1019,68 @@ pub(crate) fn replace_if_unchanged(
     write_hook::run(path);
     // Compare under the writer's lock. A changed file is handed back as it
     // is, and the writer does not rewrite an unchanged result.
-    let written = copperpour_sexp::transact_atomic(path, move |current| {
+    let written = match copperpour_sexp::transact_atomic(path, move |current| {
         Ok(if current == read {
             (next, true)
         } else {
             (current.to_owned(), false)
         })
-    });
+    }) {
+        // Removed or renamed since the read: changed, and nothing was written.
+        Err(copperpour_sexp::SexpError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(false)
+        }
+        other => other,
+    };
+    replace_outcome(path, what, operation, written)
+}
+
+/// Write `next` to `path` only while it still holds `read`, the text the change
+/// was built from, or, when `read` is `None`, while it is still absent. A file
+/// another program saved or created in between is refused as `conflict` and
+/// left as that program left it. `None` once the change is written and read
+/// back.
+pub(crate) fn write_if_unchanged(
+    path: &std::path::Path,
+    what: &str,
+    operation: &str,
+    read: Option<&str>,
+    next: String,
+) -> anyhow::Result<Option<CallToolResult>> {
+    let Some(read) = read else {
+        return create_if_absent(path, what, operation, &next);
+    };
+    replace_if_unchanged(path, what, operation, read, next)
+}
+
+fn create_if_absent(
+    path: &std::path::Path,
+    what: &str,
+    operation: &str,
+    next: &str,
+) -> anyhow::Result<Option<CallToolResult>> {
+    #[cfg(test)]
+    write_hook::run(path);
+    let written = match copperpour_sexp::write_new_atomic_verified(path, next) {
+        Ok(()) => Ok(true),
+        Err(copperpour_sexp::SexpError::Io(error))
+            if error.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            let shown = path.display().to_string();
+            return Ok(Some(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::Conflict {
+                    paths: vec![shown.clone()],
+                },
+                format!(
+                    "The {what} '{shown}' appeared after Copperpour found none, so {operation} \
+                     wrote nothing. Reload it and retry."
+                ),
+            )));
+        }
+        Err(error) => Err(error),
+    };
     replace_outcome(path, what, operation, written)
 }
 
