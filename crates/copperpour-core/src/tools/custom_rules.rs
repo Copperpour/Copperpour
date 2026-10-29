@@ -500,6 +500,8 @@ fn read_board(board: &Path) -> anyhow::Result<BoardFacts> {
 /// the write is refused. KiCad 10 drops a rules file it cannot parse without a
 /// word, so the probe runs kicad-cli's DRC on a copy of the board with the
 /// file and [`PROBE_RULE`] beside it, and looks for that rule in the report.
+/// The `.kicad_pro` is left behind on purpose: it holds the DRC severities,
+/// and one that ignores assertion failures would hide the probe.
 async fn kicad_verdict(
     cli: &str,
     board: &Path,
@@ -1803,6 +1805,23 @@ mod tests {
             ),
             ("", json!({"layer": "Top"}), "'Top' is not a layer name"),
             ("", json!({"layer": "F.Cuu"}), "'F.Cuu' is not a layer name"),
+            (
+                "",
+                json!({"condition": "A.NetName == '${NET}'"}),
+                "holds a text variable",
+            ),
+            (
+                "\n(rule \"twice\" (constraint clearance (min 1mm)) \
+                 (constraint clearance (min 2mm)))\n",
+                json!({}),
+                "second 'clearance' constraint",
+            ),
+            (
+                "\n(rule \"layers\" (layer outer) (layer inner) \
+                 (constraint clearance (min 1mm)))\n",
+                json!({}),
+                "second layer clause",
+            ),
         ] {
             let before = format!("{RULES}{added}");
             let (_dir, board) = board_with(Some(&before));
@@ -1870,6 +1889,17 @@ mod tests {
         request["constraints"] = json!([{"type": "disallow"}]);
         let body = call(request).await;
         assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(rules_of(&board).unwrap(), RULES);
+    }
+
+    #[tokio::test]
+    async fn a_name_on_two_lines_is_refused_as_an_argument() {
+        let (_dir, board) = board_with(Some(RULES));
+        let mut request = dp_pairs(&board);
+        request["name"] = json!("dp\npairs");
+        let body = call(request).await;
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert!(body.to_string().contains("on one line"), "{body}");
         assert_eq!(rules_of(&board).unwrap(), RULES);
     }
 
