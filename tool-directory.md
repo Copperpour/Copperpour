@@ -14,7 +14,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **244 registered tools** + **7 always-visible meta-tools** = **251 total**
+- **245 registered tools** + **7 always-visible meta-tools** = **252 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<copperpour dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -210,8 +210,8 @@ and Windows servers do not.
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. |
 
-### `sch_hierarchy` · 15 tools
-**Purpose:** Sheet files and hierarchical sheets: create a schematic file and set its page size and title block, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
+### `sch_hierarchy` · 16 tools
+**Purpose:** Sheet files and hierarchical sheets: create a schematic file and set its page size and title block, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, net label renames, pin/label sync validation.
 **Source:** [`crates/copperpour-core/src/tools/sch_hierarchy.rs`](crates/copperpour-core/src/tools/sch_hierarchy.rs)
 
 | Tool | Description |
@@ -229,6 +229,7 @@ and Windows servers do not.
 | `import_sheet_pins` | Scan the child sheet's hierarchical_labels and auto-generate matching pins on the parent sheet block, skipping names that already have a pin — the primary way pins get created. Optional `side` (`right`, `left`, `top`, `bottom`, default `right`) picks the edge and sets each pin's rotation, which is what KiCad reads the edge from; a `right`/`left` stack runs down the edge, a `top`/`bottom` one across it. Pins stack after the pin that reaches furthest along that edge, so an existing gap is left alone rather than filled — one pin on the last slot therefore fills the edge, and the refusal says so rather than suggesting a resize. An occupied slot is never written over, including one held by a pin whose rotation names no edge or one the sheet shrank away from. The whole import is planned and validated before anything is written, and refused entire — nothing written — if it would run past a corner, because KiCad clamps such a pin back onto the box. |
 | `add_sheet_pin` | Manually add a single pin to an existing sheet block. Optional `side` (`right`, `left`, `top`, `bottom`) selects the edge by writing the rotation KiCad reads it from, and makes the call validate `x`/`y` against that edge on both axes, corners included — an off-edge position is refused rather than written and then relocated by KiCad on load. Omitting `side` keeps the previous behavior: rotation `0` and no position check. `x`, `y`, and `side` in the response are read back off the saved pin. |
 | `edit_sheet_pin` | Rename a pin, change its electrical type, reposition it along the sheet border, or move it to another edge with the optional `side` (`right`, `left`, `top`, `bottom`). `side` is judged against the position the pin ends up with, so `side` and `x`+`y` in one call are checked together. `changed_fields` names only what actually differs — restating the side a pin already has is an honest no-op that writes nothing — alongside `requested_fields` and the `pin` read back off the file. |
+| `rename_schematic_net_label` | Rename a net label in place, by uuid or position, or every label of a net on a sheet or down the hierarchy with its sheet pins; refuses a rename that joins or splits nets unless allowed. |
 | `delete_sheet_pin` | Remove a single pin without touching the rest of the sheet. |
 | `validate_sheet_pins` | Read-only. Walk the sheet tree and report unmatched hierarchical labels/pins and stored pin positions inconsistent with their rotation-selected edge or its span. Geometry findings identify the pin, stored position, expected edge and recovery action; no pins are repaired. |
 
