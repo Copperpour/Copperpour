@@ -65,6 +65,22 @@ suffix, or ambiguous about top/bottom/mating view, stop before real schematic
 placement. Do not infer physical numbering from a generic symbol name or from
 the order pins appear on screen.
 
+### Manufacturing & Sourcing Metadata
+
+Manufacturing metadata maps placed symbols to real orderable parts for BOM generation and automated PCBA assembly.
+
+- **Standard vs. Vendor-Specific Fields:**
+  - **Universal metadata:** `MPN`, `Manufacturer`, `Datasheet`, and `Footprint` identify the physical part across any distributor (DigiKey, Mouser, LCSC) or fab house (JLCPCB, PCBWay, Aisler).
+  - **Vendor catalog IDs:** Distributor-specific properties like `LCSC` allow 1-click cart matching and automated part matching for specific assemblers (e.g. JLCPCB).
+- **When to attach metadata:**
+  - **Targeted turnkey PCBA / JLCPCB:** When the user prompt requests a turnkey manufactured board, specifies an assembler (e.g. JLCPCB), or works in an existing schematic populated with catalog parts:
+    - Attach universal fields (`MPN`, `Manufacturer`, `Footprint`, `Datasheet`).
+    - Attach the assembler's catalog ID (e.g. `LCSC` for JLCPCB) so the BOM resolves automatically without manual part matching.
+  - **Generic / Prototyping workflows:** When designing a general circuit, breadboard prototype, or when the fabricator is unspecified, keep generic passives (`Device:R`, `Device:C`, `Device:L`, `Device:D`) minimal with standard `Reference` and `Value` (plus `Footprint` when preparing for PCB layout). Do not inject vendor-specific IDs (`LCSC`) unprompted. When turnkey assembly intent is ambiguous, finish the generic placement cleanly and ask if the user wants JLCPCB/LCSC part numbers assigned.
+- **How to attach metadata:**
+  - *During placement:* Pass `fields` (e.g. `{"MPN": "...", "Manufacturer": "...", "LCSC": "..."}`), `footprint`, and `datasheet` in `add_schematic_component` or `batch_place_components`.
+  - *Post-placement enrichment:* Query catalog tools (`search_jlcpcb_parts`, `get_jlcpcb_part`), enrich datasheets local-first (`enrich_datasheets`), or edit fields in bulk (`batch_edit_schematic_components` with `create_missing: true`).
+
 ### Common Library IDs
 
 | Component       | lib_id                         |
@@ -323,6 +339,7 @@ Finds floating wires, labels, and symbols that are not connected to anything.
 6. Run direct KiCad ERC with `run_erc` and classify every violation.
 7. Run `render_schematic_png` with inline output and inspect the actual image.
 8. Fix findings and repeat every check invalidated by the edits.
+9. If targeting turnkey assembly / PCBA, run `check_bom_health` (or verify that assembled parts carry `MPN` and `LCSC` fields).
 
 ---
 
@@ -373,3 +390,4 @@ production-ready claim.
 8. **Save frequently** — call `save_project` after major operations
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need before starting
 10. **Batch for bulk** — use batch toolset for 3+ repetitive operations
+11. **BOM & assembly metadata on request** — attach vendor and assembly fields (`MPN`, `Manufacturer`, `LCSC`) to passives when the user requests turnkey PCBA, JLCPCB assembly, or BOM-readiness; keep generic passives vendor-neutral by default for general schematic design
