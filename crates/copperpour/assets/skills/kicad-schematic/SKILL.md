@@ -78,8 +78,8 @@ Manufacturing metadata maps placed symbols to real orderable parts for BOM gener
     - Attach the assembler's catalog ID (e.g. `LCSC` for JLCPCB) so the BOM resolves automatically without manual part matching.
   - **Generic / Prototyping workflows:** When designing a general circuit, breadboard prototype, or when the fabricator is unspecified, keep generic passives (`Device:R`, `Device:C`, `Device:L`, `Device:D`) minimal with standard `Reference` and `Value` (plus `Footprint` when preparing for PCB layout). Do not inject vendor-specific IDs (`LCSC`) unprompted. When turnkey assembly intent is ambiguous, finish the generic placement cleanly and ask if the user wants JLCPCB/LCSC part numbers assigned.
 - **How to attach metadata:**
-  - *During placement:* Pass `fields` (e.g. `{"MPN": "...", "Manufacturer": "...", "LCSC": "..."}`), `footprint`, and `datasheet` in `add_schematic_component` or `batch_place_components`.
-  - *Post-placement enrichment:* Query catalog tools (`search_jlcpcb_parts`, `get_jlcpcb_part`), enrich datasheets local-first (`enrich_datasheets`), or edit fields in bulk (`batch_edit_schematic_components` with `create_missing: true`).
+  - *During placement:* Pass `fields` (e.g. `{"MPN": "...", "Manufacturer": "...", "LCSC": "..."}`), `footprint`, and `lcsc_id` in `add_schematic_component` or `batch_place_components`. `lcsc_id` fills `LCSC`, `MPN`, `Manufacturer`, and `Datasheet` from the local JLCPCB catalog in the same write. To set a datasheet on its own, use `edit_schematic_component` with `datasheet`.
+  - *Post-placement enrichment:* Query catalog tools (`search_jlcpcb_parts`, `get_jlcpcb_part`), enrich datasheets (`enrich_datasheets`), or edit fields in bulk (`batch_edit_schematic_components` with `create_missing: true`).
 
 ### Common Library IDs
 
