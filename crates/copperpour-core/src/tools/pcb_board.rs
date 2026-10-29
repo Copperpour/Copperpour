@@ -681,7 +681,7 @@ const GRAPHIC_KINDS: [&str; 10] = [
 /// block. `(image …)` is deliberately absent: KiCad 10's `ReferenceImage`
 /// message is an empty placeholder, so the live path cannot see one and
 /// deleting it from the file only would make the two paths disagree.
-fn graphic_kind(tag: &str) -> Option<&'static str> {
+pub(super) fn graphic_kind(tag: &str) -> Option<&'static str> {
     Some(match tag {
         "gr_line" => "line",
         "gr_rect" => "rect",
@@ -718,7 +718,7 @@ struct FileGraphic {
 
 /// The first defining point of a graphic block: a segment's `start`, a
 /// circle's `center`, a text's `at`, or a polygon's first vertex.
-fn block_origin(node: &SexpNode) -> Option<(f64, f64)> {
+pub(super) fn block_origin(node: &SexpNode) -> Option<(f64, f64)> {
     for tag in ["start", "center", "at"] {
         if let Some(point) = node.find(tag) {
             if let (Some(x), Some(y)) = (point.get_f64(1), point.get_f64(2)) {
@@ -783,7 +783,14 @@ impl GraphicFilter {
 
 // ─── S-expression format helpers ──────────────────────────────────────────────
 
-fn format_gr_line(x1: f64, y1: f64, x2: f64, y2: f64, layer: &str, width: f64) -> String {
+pub(super) fn format_gr_line(
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    layer: &str,
+    width: f64,
+) -> String {
     let uuid = new_uuid();
     format!(
         "\n  (gr_line\n    (start {x1} {y1})\n    (end {x2} {y2})\n    \
@@ -791,7 +798,7 @@ fn format_gr_line(x1: f64, y1: f64, x2: f64, y2: f64, layer: &str, width: f64) -
     )
 }
 
-fn format_gr_arc(
+pub(super) fn format_gr_arc(
     start: (f64, f64),
     mid: (f64, f64),
     end: (f64, f64),
@@ -1309,6 +1316,7 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_add_board_outline(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
+        super::pcb_board_outline::tool(),
         tool!(
             "delete_graphics",
             "Delete board graphics — lines, rectangles, arcs, circles, polygons, curves, text, \
@@ -2507,7 +2515,7 @@ async fn handle_add_board_outline(
     })))
 }
 
-fn graphic_json(
+pub(super) fn graphic_json(
     uuid: &str,
     kind: &str,
     layer: &str,

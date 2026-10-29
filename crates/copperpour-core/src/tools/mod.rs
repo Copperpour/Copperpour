@@ -42,6 +42,7 @@ pub mod manufacturing;
 pub(crate) mod navigation_target;
 mod pad_nets;
 pub mod pcb_board;
+mod pcb_board_outline;
 mod pcb_board_zones;
 pub mod pcb_components;
 pub mod pcb_export;

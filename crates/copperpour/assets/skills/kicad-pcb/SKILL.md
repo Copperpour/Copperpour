@@ -94,7 +94,11 @@ Follow this sequence for a clean PCB workflow:
 
 1. **Board outline** — `set_board_size` or draw Edge.Cuts geometry. Both outline tools
    append, so resize with `delete_graphics(layer='Edge.Cuts')` first — a second call
-   without it leaves two overlapping outlines and a DRC failure.
+   without it leaves two overlapping outlines and a DRC failure. An outline of lines
+   and arcs, cut-outs included, is `replace_board_outline`: a dry run, then
+   `dry_run: false` with the revision it returned as `expected_plan_revision`; it
+   deletes the old Edge.Cuts shapes itself. Take its dimensions from a drawing or the
+   user, never from memory.
 2. **Update from schematic** — call `update_pcb_from_schematic` first with
    `dry_run: true`. Review `status`, `coverage`, `diagnostics`, and staged positions.
    Apply only with `dry_run: false` and the exact returned
