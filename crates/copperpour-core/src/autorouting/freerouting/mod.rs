@@ -545,6 +545,13 @@ pub(crate) async fn route_specctra_dsn(
             .transpose()
             .map_err(|_| anyhow::anyhow!("optimizer_max_passes is too large"))?,
         optimizer_improvement_threshold: args["optimizer_improvement_threshold"].as_f64(),
+        plane_nets: args["plane_nets"].as_array().map(|nets| {
+            nets.iter()
+                .filter_map(|net| net.as_str())
+                .map(str::to_string)
+                .collect()
+        }),
+        plane_as_obstacle: args["plane_as_obstacle"].as_bool(),
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
     };

@@ -2903,6 +2903,8 @@ mod specctra_live_undo_test {
                 optimize_seconds: None,
                 optimizer_max_passes: None,
                 optimizer_improvement_threshold: None,
+                plane_nets: None,
+                plane_as_obstacle: None,
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(180),
             },
