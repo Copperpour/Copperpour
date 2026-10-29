@@ -2800,6 +2800,10 @@ async fn handle_add_mounting_hole(
 /// does not validate an item's layer, and answered `BL_UNDEFINED` in footprint
 /// graphics with a crash (#237); it also refuses to load a board whose items
 /// name an undefined layer.
+///
+/// Returns the canonical name: KiCad refuses to load an item named by its
+/// display name, such as `F.Silkscreen` (#99). A layer number KiCad never
+/// writes (`In01.Cu`, `In+1.Cu`) is refused, not read as `In1.Cu`.
 fn board_layer_arg(
     args: &serde_json::Value,
     default: Option<&str>,
@@ -2808,16 +2812,23 @@ fn board_layer_arg(
         Some(default) if args["layer"].is_null() => default,
         _ => require_str(args, "layer")?,
     };
-    if builders::try_layer_from_name(layer).is_err() {
-        return Err(invalid_arg(
+    match builders::layer_name(builders::layer_from_name(layer)) {
+        // Only the fixed layers have display names; a numbered one must be
+        // spelled exactly.
+        Some(canonical)
+            if canonical == layer
+                || !(canonical.starts_with("In") || canonical.starts_with("User.")) =>
+        {
+            Ok(canonical.to_string())
+        }
+        _ => Err(invalid_arg(
             "layer",
             &format!(
                 "'{layer}' is not a KiCad board layer; use one such as F.Cu, B.Cu, \
                  In1.Cu..In30.Cu, F.SilkS, B.SilkS, Edge.Cuts or User.1..User.45"
             ),
-        ));
+        )),
     }
-    Ok(layer.to_string())
 }
 
 #[cfg(test)]

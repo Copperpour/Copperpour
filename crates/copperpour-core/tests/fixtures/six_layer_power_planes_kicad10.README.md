@@ -60,5 +60,11 @@ kicad-cli pcb export svg --layers F.SilkS,Edge.Cuts -o out.svg t.kicad_pcb
 | `F.SilkS` | loads, plots |
 | `F.Silk` | `Failed to load board: One or more items were found on undefined layers (F.Silk).` |
 | `Not.A.Layer` | `Failed to load board: … undefined layers (Not.A.Layer).` |
+| `B.SilkS`, `F.CrtYd`, `F.Adhes`, `Dwgs.User`, `Cmts.User`, `Eco1.User`, `Eco2.User`, `In1.Cu`, `User.1` | loads |
+| `F.Silkscreen`, `B.Silkscreen`, `F.Courtyard`, `F.Adhesive`, `User.Drawings`, `User.Comments`, `User.Eco1`, `User.Eco2` | `Failed to load board: … undefined layers (<name>).` |
+| `In01.Cu`, `In+1.Cu`, `User.01`, `User.+1` | `Failed to load board: … undefined layers (<name>).` |
 
-The tests refuse the two rejected names and still write `F.SilkS`.
+The tests refuse `F.Silk`, `Not.A.Layer` and the numbers in the last row, and
+still write `F.SilkS`. The display names in the row above it name a layer
+Copperpour knows, so the tools accept them but write the canonical name
+(`F.SilkS`, `Cmts.User`, `Dwgs.User`) instead (#99).

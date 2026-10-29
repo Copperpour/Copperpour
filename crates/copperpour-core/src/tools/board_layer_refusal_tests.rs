@@ -1,4 +1,5 @@
-//! Board writers refuse a layer KiCad has no board layer for (#844).
+//! Board writers refuse a layer KiCad has no board layer for (#844), and
+//! write an alias such as `F.Silkscreen` by its canonical name (#99).
 //!
 //! `add_board_text`, `import_svg_logo` and `add_zone`/`add_copper_pour` used to
 //! send an unknown name to KiCad as `BL_UNDEFINED`, or write it into the file.
@@ -176,8 +177,9 @@ fn body(result: &CallToolResult) -> Value {
 }
 
 /// Names KiCad 10.0.6 refuses to load a board item on (fixture README): the
-/// issue's typo, and a name that is no layer at all.
-const UNKNOWN_LAYERS: [&str; 2] = ["F.Silk", "Not.A.Layer"];
+/// issue's typo, a name that is no layer at all, and copper numbers KiCad
+/// never writes (#99).
+const UNKNOWN_LAYERS: [&str; 5] = ["F.Silk", "Not.A.Layer", "In01.Cu", "In+1.Cu", "User.01"];
 
 /// `tool` refuses each unknown layer as `invalid_argument` naming `layer`, with
 /// KiCad live and without, sending KiCad nothing and leaving the board alone.
@@ -227,24 +229,50 @@ async fn add_copper_pour_refuses_an_unknown_layer() {
     assert_refuses_unknown_layers("add_copper_pour").await;
 }
 
+/// How many board items name `layer`; a KiCad 10 zone uses `(layers …)`.
+fn items_on(board: &str, layer: &str) -> usize {
+    board.matches(&format!("(layer \"{layer}\")")).count()
+        + board.matches(&format!("(layers \"{layer}\")")).count()
+}
+
+/// KiCad's display names for a layer, which KiCad 10 refuses to load a board
+/// item on (#99, fixture README), go out by the canonical name.
 #[tokio::test]
 async fn a_known_layer_still_reaches_kicad_as_that_layer() {
     let cases = [
-        ("add_board_text", None, BoardLayer::BlFSilkS),
-        ("add_board_text", Some("B.SilkS"), BoardLayer::BlBSilkS),
-        ("import_svg_logo", None, BoardLayer::BlFSilkS),
-        ("import_svg_logo", Some("F.Cu"), BoardLayer::BlFCu),
-        ("add_zone", Some("In1.Cu"), BoardLayer::BlIn1Cu),
-        ("add_copper_pour", Some("B.Cu"), BoardLayer::BlBCu),
+        ("add_board_text", None, "F.SilkS", BoardLayer::BlFSilkS),
+        (
+            "add_board_text",
+            Some("B.SilkS"),
+            "B.SilkS",
+            BoardLayer::BlBSilkS,
+        ),
+        (
+            "add_board_text",
+            Some("F.Silkscreen"),
+            "F.SilkS",
+            BoardLayer::BlFSilkS,
+        ),
+        ("import_svg_logo", None, "F.SilkS", BoardLayer::BlFSilkS),
+        ("import_svg_logo", Some("F.Cu"), "F.Cu", BoardLayer::BlFCu),
+        (
+            "import_svg_logo",
+            Some("User.Drawings"),
+            "Dwgs.User",
+            BoardLayer::BlDwgsUser,
+        ),
+        ("add_zone", Some("In1.Cu"), "In1.Cu", BoardLayer::BlIn1Cu),
+        ("add_copper_pour", Some("B.Cu"), "B.Cu", BoardLayer::BlBCu),
     ];
     let scene = Scene::new(true).await;
     let before = std::fs::read(&scene.board).unwrap();
-    for (tool, layer, expected) in cases {
+    for (tool, layer, canonical, expected) in cases {
         let result = scene.call(tool, layer).await;
 
         let case = format!("{tool} {layer:?}");
         assert!(!result.is_error, "{case}: {:?}", result.content);
         assert_eq!(body(&result)["source"], "ipc", "{case}");
+        assert_eq!(body(&result)["layer"], canonical, "{case}");
         let created: Vec<_> = scene
             .take_received()
             .into_iter()
@@ -259,22 +287,31 @@ async fn a_known_layer_still_reaches_kicad_as_that_layer() {
 #[tokio::test]
 async fn a_known_layer_is_still_written_to_the_file() {
     let scene = Scene::new(false).await;
-    for (tool, layer, written) in [
-        ("add_board_text", None, "\"F.SilkS\""),
-        ("import_svg_logo", Some("B.SilkS"), "\"B.SilkS\""),
-        ("add_zone", Some("In1.Cu"), "\"In1.Cu\""),
+    for (tool, layer, canonical) in [
+        ("add_board_text", None, "F.SilkS"),
+        ("add_board_text", Some("F.Silkscreen"), "F.SilkS"),
+        ("add_board_text", Some("User.Comments"), "Cmts.User"),
+        ("import_svg_logo", Some("B.SilkS"), "B.SilkS"),
+        ("import_svg_logo", Some("User.Drawings"), "Dwgs.User"),
+        ("add_zone", Some("In1.Cu"), "In1.Cu"),
     ] {
         let before = std::fs::read_to_string(&scene.board).unwrap();
 
         let result = scene.call(tool, layer).await;
 
-        assert!(!result.is_error, "{tool}: {:?}", result.content);
-        assert_eq!(body(&result)["source"], "file", "{tool}");
+        let case = format!("{tool} {layer:?}");
+        assert!(!result.is_error, "{case}: {:?}", result.content);
+        assert_eq!(body(&result)["source"], "file", "{case}");
+        assert_eq!(body(&result)["layer"], canonical, "{case}");
         let after = std::fs::read_to_string(&scene.board).unwrap();
         assert_eq!(
-            after.matches(written).count(),
-            before.matches(written).count() + 1,
-            "{tool}"
+            items_on(&after, canonical),
+            items_on(&before, canonical) + 1,
+            "{case}"
         );
+        // The layer table still names `F.Silkscreen` as F.SilkS's user name.
+        if let Some(layer) = layer.filter(|layer| *layer != canonical) {
+            assert_eq!(items_on(&after, layer), 0, "{case}");
+        }
     }
 }
