@@ -608,11 +608,9 @@ impl LocalMcpClient {
                 .await
                 .map_err(|_| anyhow::anyhow!("Freerouting MCP request '{method}' timed out"))??
                 .context("Freerouting MCP closed stdout before responding")?;
-            if line.trim().is_empty() {
+            let Some(response) = json_rpc_message(&line) else {
                 continue;
-            }
-            let response: Value = serde_json::from_str(&line)
-                .with_context(|| format!("Freerouting MCP emitted non-JSON stdout: {line}"))?;
+            };
             if response.get("id") != Some(&json!(id)) {
                 if response.get("method").is_some() {
                     continue;
@@ -679,6 +677,23 @@ impl Drop for LocalMcpClient {
             task.abort();
         }
     }
+}
+
+/// A stdout line that is a JSON-RPC message, or `None` for anything else.
+///
+/// Freerouting 2.5 prints its routing progress bar (`#`, one line per tick)
+/// on the same stdout as the MCP stdio transport. Failing on such a line used
+/// to abort every routing job long enough to show progress, so non-message
+/// lines are skipped; a server that never answers still hits the request
+/// timeout.
+fn json_rpc_message(line: &str) -> Option<Value> {
+    let line = line.trim();
+    if !line.starts_with('{') {
+        return None;
+    }
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .filter(Value::is_object)
 }
 
 fn expand_text_content(mut result: Value) -> Value {
@@ -822,6 +837,23 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn progress_output_on_stdout_is_not_a_message() {
+        for line in [
+            "#",
+            "####",
+            "",
+            "   ",
+            "Routing pass 3...",
+            "{not json",
+            "[1,2]",
+        ] {
+            assert!(json_rpc_message(line).is_none(), "{line:?}");
+        }
+        let message = json_rpc_message(r#" {"jsonrpc":"2.0","id":7,"result":{}} "#).unwrap();
+        assert_eq!(message["id"], 7);
     }
 
     #[test]
