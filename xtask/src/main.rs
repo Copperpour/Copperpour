@@ -13,8 +13,12 @@
 //!
 //! `cargo xtask collect-api-migrations <version>` folds the unreleased notes in
 //! `docs/api-migrations/` into `docs/API_MIGRATIONS.md`; see `api_migrations`.
+//!
+//! `cargo xtask check-fixtures [--fix]` finds fixtures whose working copy went
+//! stale on an old checkout; see `fixtures`.
 
 mod api_migrations;
+mod fixtures;
 
 use copperpour_core::router::{meta_tools, registry};
 use std::path::{Path, PathBuf};
@@ -27,10 +31,12 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("fix-doc-counts") => fix_doc_counts(),
         Some("collect-api-migrations") => api_migrations::collect(args.get(2).map(String::as_str)),
+        Some("check-fixtures") => fixtures::check(&args[2..]),
         other => {
             eprintln!("unknown task: {other:?}");
             eprintln!("usage: cargo xtask fix-doc-counts");
             eprintln!("       cargo xtask collect-api-migrations vMAJOR.MINOR.PATCH");
+            eprintln!("       cargo xtask check-fixtures [--fix]");
             std::process::exit(2);
         }
     }
