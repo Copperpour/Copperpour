@@ -1800,24 +1800,72 @@ mod ipc_failure_dispatch_tests {
 /// Turn a JSON Schema failure into Konnect's stable structured argument shape.
 /// Prefer a concrete nested leaf over an applicator (`oneOf`/`anyOf`) wrapper,
 /// and include an unexpected property's own name rather than only its parent.
+/// A branch whose `const` tag (such as `type`) the item fails is not the one
+/// the caller meant, so it is reported only when every branch fails its tag.
 fn schema_validation_error(error: &jsonschema::ValidationError<'_>) -> (String, String) {
     use jsonschema::error::ValidationErrorKind;
 
+    /// The leaf to report, and a reason replacing its own when it stands for
+    /// every branch's tag.
     fn specific<'a>(
         error: &'a jsonschema::ValidationError<'a>,
-    ) -> &'a jsonschema::ValidationError<'a> {
+    ) -> (&'a jsonschema::ValidationError<'a>, Option<String>) {
         let alternatives = match error.kind() {
             ValidationErrorKind::OneOfNotValid { context }
             | ValidationErrorKind::AnyOf { context } => Some(context),
             _ => None,
         };
         let Some(alternatives) = alternatives else {
-            return error;
+            return (error, None);
         };
+
+        // A branch that rejects the item's JSON type, or fails a `const` on
+        // one of its properties (a tag such as `type`), is not the caller's.
+        let parent = error.instance_path().as_str();
+        let wrong_type = |errors: &[jsonschema::ValidationError<'a>]| {
+            errors.iter().any(|candidate| {
+                matches!(candidate.kind(), ValidationErrorKind::Type { .. })
+                    && candidate.instance_path() == error.instance_path()
+            })
+        };
+        let tag_miss = |errors: &'a [jsonschema::ValidationError<'a>]| {
+            errors.iter().find_map(|candidate| match candidate.kind() {
+                ValidationErrorKind::Constant { expected_value }
+                    if candidate
+                        .instance_path()
+                        .as_str()
+                        .strip_prefix(parent)
+                        .and_then(|rest| rest.strip_prefix('/'))
+                        .is_some_and(|property| !property.contains('/')) =>
+                {
+                    Some((candidate, expected_value))
+                }
+                _ => None,
+            })
+        };
+
+        let typed_misses: Vec<_> = alternatives
+            .iter()
+            .filter(|errors| !wrong_type(errors))
+            .map(|errors| tag_miss(errors))
+            .collect();
+        if let [Some((first, _)), ..] = typed_misses[..] {
+            if typed_misses.iter().all(|miss| {
+                miss.is_some_and(|(miss, _)| miss.instance_path() == first.instance_path())
+            }) {
+                let tags: Vec<String> = typed_misses
+                    .iter()
+                    .flatten()
+                    .map(|(_, tag)| tag.to_string())
+                    .collect();
+                let reason = format!("{} is not one of {}", first.instance(), tags.join(", "));
+                return (first, Some(reason));
+            }
+        }
 
         alternatives
             .iter()
-            .min_by_key(|errors| errors.len())
+            .min_by_key(|errors| (wrong_type(errors), tag_miss(errors).is_some(), errors.len()))
             .and_then(|errors| {
                 errors
                     .iter()
@@ -1832,7 +1880,7 @@ fn schema_validation_error(error: &jsonschema::ValidationError<'_>) -> (String, 
                     .or_else(|| errors.first())
             })
             .map(specific)
-            .unwrap_or(error)
+            .unwrap_or((error, None))
     }
 
     fn field_path(pointer: &str) -> String {
@@ -1853,7 +1901,7 @@ fn schema_validation_error(error: &jsonschema::ValidationError<'_>) -> (String, 
         field
     }
 
-    let error = specific(error);
+    let (error, reason) = specific(error);
     let mut field = field_path(&error.instance_path().to_string());
     match error.kind() {
         ValidationErrorKind::AdditionalProperties { unexpected } => {
@@ -1877,7 +1925,7 @@ fn schema_validation_error(error: &jsonschema::ValidationError<'_>) -> (String, 
     if field.is_empty() {
         field = "arguments".to_string();
     }
-    (field, error.to_string())
+    (field, reason.unwrap_or_else(|| error.to_string()))
 }
 
 fn schema_argument_error(
@@ -1969,13 +2017,19 @@ mod schema_validation_dispatch_tests {
         assert_eq!(call_status(&uncertain), CallStatus::Uncertain);
     }
 
-    async fn assert_invalid_field(handler: &McpHandler, tool: &str, args: Value, field: &str) {
+    async fn assert_invalid_field(
+        handler: &McpHandler,
+        tool: &str,
+        args: Value,
+        field: &str,
+    ) -> Value {
         let (result, status, kind) = handler.dispatch_tool(tool, &args).await;
         assert!(result.is_error, "{tool}: malformed input must be refused");
         assert_eq!(status, CallStatus::Error, "{tool}");
         assert_eq!(kind.as_deref(), Some("invalid_argument"), "{tool}");
         let body = error_json(&result);
         assert_eq!(body["error"]["field"], field, "{tool}: {body}");
+        body
     }
 
     #[tokio::test]
@@ -2145,6 +2199,157 @@ mod schema_validation_dispatch_tests {
             source,
             "dispatch refusal must happen before the footprint writer runs"
         );
+    }
+
+    /// #134: a `oneOf` item is reported against the branch its `type` tag
+    /// names, and an unknown tag lists the tags that exist.
+    #[tokio::test]
+    async fn a_tagged_one_of_reports_the_branch_its_type_names() {
+        let handler = handler().await;
+        let directory = tempfile::tempdir().unwrap();
+        let footprint = directory.path().join("socket.kicad_mod");
+        let source = include_str!("../../tests/fixtures/socket_kicad10.kicad_mod");
+        std::fs::write(&footprint, source).unwrap();
+        let (start, end) = (json!({"x": 0.0, "y": 0.0}), json!({"x": 1.0, "y": 1.0}));
+        let points = json!([{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.0}, {"x": 1.0, "y": 1.0}]);
+
+        for (graphic, field, reason) in [
+            (
+                json!({"type": "rect", "start": start, "end": end,
+                       "stroke_width_mm": 0.1}),
+                "graphics[0].fill",
+                "\"fill\" is a required property",
+            ),
+            (
+                json!({"type": "rectangle", "start": start, "end": end,
+                       "stroke_width_mm": 0.1}),
+                "graphics[0].type",
+                "\"rectangle\" is not one of \"line\", \"arc\", \"rect\", \"circle\", \"poly\"",
+            ),
+            (
+                json!({"type": "polygon", "points": points, "stroke_width_mm": 0.1}),
+                "graphics[0].type",
+                "\"polygon\" is not one of \"line\", \"arc\", \"rect\", \"circle\", \"poly\"",
+            ),
+            (
+                json!({"type": "poly", "points": points, "stroke_width_mm": 0.1}),
+                "graphics[0].fill",
+                "\"fill\" is a required property",
+            ),
+        ] {
+            let body = assert_invalid_field(
+                &handler,
+                "set_footprint_graphics",
+                json!({
+                    "footprint_path": footprint.display().to_string(),
+                    "selector": {"layer": "F.Fab"},
+                    "mode": "append",
+                    "graphics": [graphic]
+                }),
+                field,
+            )
+            .await;
+            assert_eq!(body["error"]["reason"], reason, "{body}");
+        }
+        assert_eq!(std::fs::read_to_string(&footprint).unwrap(), source);
+
+        // create_symbol shares the primitive vocabulary with its own fills.
+        let library = directory.path().join("new.kicad_sym");
+        assert_invalid_field(
+            &handler,
+            "create_symbol",
+            json!({
+                "library_path": library.display().to_string(),
+                "name": "U",
+                "reference_prefix": "U",
+                "graphics": [{"type": "rect", "start": start,
+                              "end": end, "stroke_width_mm": 0.1}]
+            }),
+            "graphics[0].fill",
+        )
+        .await;
+        let body = assert_invalid_field(
+            &handler,
+            "create_symbol",
+            json!({
+                "library_path": library.display().to_string(),
+                "name": "U",
+                "reference_prefix": "U",
+                "graphics": [{"type": "rectangle", "start": start,
+                              "end": end, "stroke_width_mm": 0.1, "fill": "none"}]
+            }),
+            "graphics[0].type",
+        )
+        .await;
+        assert_eq!(
+            body["error"]["reason"],
+            "\"rectangle\" is not one of \"line\", \"arc\", \"rect\", \"circle\", \"poly\""
+        );
+        assert!(!library.exists());
+    }
+
+    /// #134: only a `const` on the item's own property is a tag. A nested one
+    /// is a field of the branch the caller chose.
+    #[test]
+    fn a_nested_const_is_not_a_tag() {
+        let schema = json!({"oneOf": [
+            {"properties": {"type": {"const": "b"}}},
+            {"properties": {
+                "type": {"const": "a"},
+                "inner": {"properties": {"kind": {"const": "x"}}}
+            }}
+        ]});
+        let validator = jsonschema::draft202012::new(&schema).unwrap();
+        let instance = json!({"type": "a", "inner": {"kind": "y"}});
+        let error = validator.validate(&instance).unwrap_err();
+        let (field, _) = schema_validation_error(&error);
+        assert_eq!(field, "inner.kind");
+    }
+
+    /// #134: a branch that rejects the item's JSON type is not the one the
+    /// caller meant either, so a drill object hears about its own fields.
+    #[tokio::test]
+    async fn a_one_of_skips_branches_of_another_json_type() {
+        let handler = handler().await;
+        let directory = tempfile::tempdir().unwrap();
+        let footprint = directory.path().join("socket.kicad_mod");
+        let source = include_str!("../../tests/fixtures/socket_kicad10.kicad_mod");
+        std::fs::write(&footprint, source).unwrap();
+
+        for (drill, field, reason) in [
+            (
+                json!({"shape": "round", "width": 1.0, "height": 1.0}),
+                "drill.shape",
+                Some("\"round\" is not one of \"oval\""),
+            ),
+            (
+                json!({"shape": "oval", "width": 1.0, "height": 1.0, "depth": 1.0}),
+                "drill.depth",
+                None,
+            ),
+            (json!({"shape": "oval", "width": 1.0}), "drill.height", None),
+            (json!(-1.0), "drill", None),
+        ] {
+            let body = assert_invalid_field(
+                &handler,
+                "edit_footprint_pad",
+                json!({
+                    "footprint_path": footprint.display().to_string(),
+                    "pad_number": "1",
+                    "drill": drill
+                }),
+                field,
+            )
+            .await;
+            if let Some(reason) = reason {
+                assert_eq!(body["error"]["reason"], reason, "{body}");
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&footprint).unwrap(), source);
+
+        // anyOf too: an array of names is checked as an array.
+        assert_invalid_field(&handler, "load_toolset", json!({"name": [5]}), "name[0]").await;
+        assert_invalid_field(&handler, "load_toolset", json!({"name": 5}), "name").await;
     }
 
     #[tokio::test]

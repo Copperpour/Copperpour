@@ -142,7 +142,9 @@ pub(super) fn tool() -> ToolDef {
     tool!(
         "set_footprint_graphics",
         "Atomically append, replace, or delete graphical primitives on one layer of an existing \
-         .kicad_mod footprint. Replacement and deletion refuse graphics referenced by a group.",
+         .kicad_mod footprint. Each item's type is line, arc, rect, circle or poly; rect, circle \
+         and poly also require fill (none or solid). Replacement and deletion refuse graphics \
+         referenced by a group.",
         json!({
             "type": "object",
             "properties": {
