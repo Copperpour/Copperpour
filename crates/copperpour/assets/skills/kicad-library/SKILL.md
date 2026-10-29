@@ -341,8 +341,9 @@ create_footprint(
 
 ### Existing Footprint Graphics
 
-Use `set_footprint_graphics` to add or change line, arc, rectangle, circle, or polygon
-primitives in an existing `.kicad_mod`. Never patch the file directly.
+Use `set_footprint_graphics` to add or change `line`, `arc`, `rect`, `circle` or `poly`
+primitives in an existing `.kicad_mod`. Never patch the file directly. `rect`, `circle`
+and `poly` require `fill`: `none` for courtyard, fab and silk outlines.
 
 ```text
 set_footprint_graphics(
