@@ -155,6 +155,11 @@ These are exactly the commands CI runs — if they pass locally, CI should be gr
   refused every stock demo board, because KiCAD writes
   `(property ki_fp_filters "…")` — no position, no layer — into every footprint
   it places from a library, and the hand-written fixture had no such thing.
+- **A fixture test that fails only on your machine** may be reading a stale
+  copy. Fixtures are `-text`, but a checkout made before that rule keeps the
+  line endings `core.autocrlf` gave it, `git status` stays clean, and
+  `git checkout -- <file>` skips it. `cargo xtask check-fixtures` lists such
+  files; `--fix` checks them out again.
 - If you added or removed tools: set `tool_count` in `router/registry.rs`, add the
   tool's row to `tool-directory.md`, then run
 
