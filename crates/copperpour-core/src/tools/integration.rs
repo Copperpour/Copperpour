@@ -61,7 +61,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search words, separated by spaces. A part must contain every word, in any order, in its LCSC number, MPN, package, manufacturer or description (case-insensitive; % and _ are literal). Value words such as 20pF or 1k match only as whole values" },
-                    "category": { "type": "string", "description": "Component category filter (optional)" },
+                    "category": { "type": "string", "description": "Only parts whose category contains this text (case-insensitive; % and _ are literal). Categories read 'Group / Subcategory', e.g. 'Optoelectronics / LED Indication - Discrete'; list them with list_jlcpcb_categories" },
                     "basic_only": { "type": "boolean", "description": "Restrict to JLCPCB Basic Library parts only", "default": false },
                     "in_stock": { "type": "boolean", "description": "Only return parts currently in stock", "default": true },
                     "limit": { "type": "integer", "description": "Maximum number of results", "default": 20 }
@@ -69,6 +69,18 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["query"]
             }),
             |args, ctx| async move { handle_search_jlcpcb_parts(args, ctx).await }
+        ),
+        tool!(
+            "list_jlcpcb_categories",
+            "List the part categories in the local JLCPCB database, for search_jlcpcb_parts' category filter. Without contains, lists the top-level groups (e.g. 'Optoelectronics') with their part and subcategory counts. With contains, lists every full category name ('Group / Subcategory') containing that text, with its part counts.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "contains": { "type": "string", "description": "Only full category names containing this text, case-insensitive (optional). Without it, top-level groups are listed" }
+                },
+                "required": []
+            }),
+            |args, ctx| async move { handle_list_jlcpcb_categories(args, ctx).await }
         ),
         tool!(
             "get_jlcpcb_part",
@@ -121,7 +133,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_jlcpcb_database_stats",
-            "Return statistics about the local JLCPCB database cache: part count, last updated, file size.",
+            "Return statistics about the local JLCPCB database cache: part count, category count, file size.",
             json!({
                 "type": "object",
                 "properties": {},
@@ -815,8 +827,8 @@ async fn handle_search_jlcpcb_parts(
             sql.push_str(" AND Stock > 0");
         }
         if let Some(ref cat) = category {
-            params.push(format!("%{}%", cat));
-            sql.push_str(&format!(" AND Category LIKE ?{}", params.len()));
+            params.push(format!("%{}%", escape_like(cat)));
+            sql.push_str(&format!(" AND Category LIKE ?{} ESCAPE '\\'", params.len()));
         }
         // Stable order so a page is the same on every run (#432). The LIKE
         // above cannot see value boundaries, so value words are checked
@@ -906,8 +918,11 @@ async fn handle_search_jlcpcb_parts(
             fallback_sql.push_str(" AND Stock > 0");
         }
         if let Some(ref cat) = category {
-            fallback_params.push(format!("%{}%", cat));
-            fallback_sql.push_str(&format!(" AND Category LIKE ?{}", fallback_params.len()));
+            fallback_params.push(format!("%{}%", escape_like(cat)));
+            fallback_sql.push_str(&format!(
+                " AND Category LIKE ?{} ESCAPE '\\'",
+                fallback_params.len()
+            ));
         }
         fallback_sql.push_str(" ORDER BY LCSC");
 
@@ -952,6 +967,106 @@ async fn handle_search_jlcpcb_parts(
 
     let mut body = body;
     body["cached"] = json!(false);
+    Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
+}
+
+/// `%`, `_` and `\` matched literally by a `LIKE … ESCAPE '\'`.
+fn escape_like(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// The separator between a category's group and subcategory in the catalog,
+/// as the database build writes it.
+const JLCPCB_CATEGORY_SEPARATOR: &str = " / ";
+
+async fn handle_list_jlcpcb_categories(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let db_path = match require_db_path(args, ctx) {
+        Ok(path) => path,
+        Err(refusal) => return Ok(refusal),
+    };
+    if !db_path.exists() {
+        return Ok(CallToolResult::error(
+            "JLCPCB database not found. Run download_jlcpcb_database first.",
+        ));
+    }
+    let contains = args["contains"]
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_lowercase);
+
+    let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(String, i64, i64)>> {
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT Category, COUNT(*), SUM(Stock > 0) FROM components \
+             WHERE COALESCE(Category, '') <> '' GROUP BY Category ORDER BY Category",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+    .await??;
+
+    let body = match contains {
+        Some(text) => {
+            let categories: Vec<serde_json::Value> = rows
+                .into_iter()
+                .filter(|(category, _, _)| category.to_lowercase().contains(&text))
+                .map(|(category, parts, in_stock)| {
+                    json!({
+                        "category": category,
+                        "part_count": parts,
+                        "in_stock_count": in_stock
+                    })
+                })
+                .collect();
+            json!({
+                "count": categories.len(),
+                "categories": categories,
+                "note": "Full category names. Pass one, or any part of one, as search_jlcpcb_parts' category."
+            })
+        }
+        None => {
+            // (parts, in stock, subcategories) per top-level group.
+            let mut groups: std::collections::BTreeMap<String, (i64, i64, usize)> =
+                std::collections::BTreeMap::new();
+            for (category, parts, in_stock) in rows {
+                let (group, subcategory) = match category.split_once(JLCPCB_CATEGORY_SEPARATOR) {
+                    Some((group, _)) => (group.to_owned(), 1),
+                    None => (category, 0),
+                };
+                let entry = groups.entry(group).or_default();
+                entry.0 += parts;
+                entry.1 += in_stock;
+                entry.2 += subcategory;
+            }
+            let categories: Vec<serde_json::Value> = groups
+                .into_iter()
+                .map(|(group, (parts, in_stock, subcategories))| {
+                    json!({
+                        "category": group,
+                        "part_count": parts,
+                        "in_stock_count": in_stock,
+                        "subcategory_count": subcategories
+                    })
+                })
+                .collect();
+            json!({
+                "count": categories.len(),
+                "categories": categories,
+                "note": "Top-level groups. Pass contains, e.g. a group name, to list its full category names."
+            })
+        }
+    };
     Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
@@ -1337,12 +1452,17 @@ async fn handle_jlcpcb_stats(
     let meta = tokio::fs::metadata(&db_path).await?;
     let size_bytes = meta.len();
 
-    let count = tokio::task::spawn_blocking({
+    let (count, category_count) = tokio::task::spawn_blocking({
         let db_path = db_path.clone();
-        move || -> anyhow::Result<i64> {
+        move || -> anyhow::Result<(i64, i64)> {
             let conn = rusqlite::Connection::open(&db_path)?;
             let count: i64 = conn.query_row("SELECT COUNT(*) FROM components", [], |r| r.get(0))?;
-            Ok(count)
+            let category_count: i64 = conn.query_row(
+                "SELECT COUNT(DISTINCT Category) FROM components WHERE COALESCE(Category, '') <> ''",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((count, category_count))
         }
     })
     .await??;
@@ -1352,7 +1472,8 @@ async fn handle_jlcpcb_stats(
             "exists": true,
             "path": db_path.to_str().unwrap_or(""),
             "size_bytes": size_bytes,
-            "part_count": count
+            "part_count": count,
+            "category_count": category_count
         }))
         .unwrap(),
     ))
@@ -3752,6 +3873,133 @@ mod jlcpcb_cache_tests {
         assert_eq!(search_lcsc_ids(&db_path, "50%").await, vec!["C1003"]);
         assert_eq!(search_lcsc_ids(&db_path, "duty_cycle").await, vec!["C1003"]);
         assert!(search_lcsc_ids(&db_path, "%").await.len() == 1);
+    }
+
+    /// The seed part (`Resistors / Chip Resistor - Surface Mount`), plus a
+    /// group with two subcategories, a category with no subcategory, and a
+    /// part with none at all.
+    fn seed_category_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, db_path) = seed_test_db();
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        for (lcsc, stock, category) in [
+            ("C3001", 10, "Optoelectronics / LED Indication - Discrete"),
+            ("C3002", 0, "Optoelectronics / LED Indication - Discrete"),
+            ("C3003", 5, "Optoelectronics / RGB LEDs"),
+            ("C3004", 1, "Misc"),
+            ("C3005", 1, ""),
+        ] {
+            conn.execute(
+                "INSERT INTO components VALUES (?1, 'MPN', 'PKG', 'MFR', 'Extended', 'part', '', 0.1, ?2, ?3)",
+                rusqlite::params![lcsc, stock, category],
+            )
+            .unwrap();
+        }
+        (dir, db_path)
+    }
+
+    #[tokio::test]
+    async fn list_jlcpcb_categories_lists_top_level_groups() {
+        let (_dir, db_path) = seed_category_db();
+        let result = handle_list_jlcpcb_categories(
+            &json!({ "output_path": db_path.to_str().unwrap() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let body = response_json(&result);
+        assert_eq!(body["count"], 3, "{body}");
+        assert_eq!(
+            body["categories"],
+            json!([
+                { "category": "Misc", "part_count": 1, "in_stock_count": 1, "subcategory_count": 0 },
+                { "category": "Optoelectronics", "part_count": 3, "in_stock_count": 2, "subcategory_count": 2 },
+                { "category": "Resistors", "part_count": 1, "in_stock_count": 1, "subcategory_count": 1 }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn list_jlcpcb_categories_contains_lists_full_names() {
+        let (_dir, db_path) = seed_category_db();
+        let list = |contains: &'static str| {
+            let args = json!({ "output_path": db_path.to_str().unwrap(), "contains": contains });
+            async move {
+                response_json(
+                    &handle_list_jlcpcb_categories(&args, &test_ctx())
+                        .await
+                        .unwrap(),
+                )
+            }
+        };
+        let body = list("led").await;
+        assert_eq!(body["count"], 2, "{body}");
+        assert_eq!(
+            body["categories"],
+            json!([
+                { "category": "Optoelectronics / LED Indication - Discrete", "part_count": 2, "in_stock_count": 1 },
+                { "category": "Optoelectronics / RGB LEDs", "part_count": 1, "in_stock_count": 1 }
+            ])
+        );
+        assert_eq!(list("Light Emitting Diodes").await["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn list_jlcpcb_categories_without_a_database_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = handle_list_jlcpcb_categories(
+            &json!({ "output_path": dir.path().join("jlcpcb.db").to_str().unwrap() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn jlcpcb_stats_counts_categories() {
+        let (_dir, db_path) = seed_category_db();
+        let result = handle_jlcpcb_stats(
+            &json!({ "output_path": db_path.to_str().unwrap() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let body = response_json(&result);
+        assert_eq!(body["part_count"], 6, "{body}");
+        assert_eq!(body["category_count"], 4, "{body}");
+    }
+
+    #[tokio::test]
+    async fn search_jlcpcb_parts_category_filter_is_literal_and_case_insensitive() {
+        let (_dir, db_path) = seed_category_db();
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        for (lcsc, category) in [("C3101", "Gadgets_A"), ("C3102", "GadgetsXA")] {
+            conn.execute(
+                "INSERT INTO components VALUES (?1, 'MPN', 'PKG', 'MFR', 'Extended', 'widget', '', 0.1, 1, ?2)",
+                rusqlite::params![lcsc, category],
+            )
+            .unwrap();
+        }
+        let search = |category: &'static str| {
+            let args = json!({
+                "query": "widget",
+                "category": category,
+                "output_path": db_path.to_str().unwrap()
+            });
+            async move {
+                let result = handle_search_jlcpcb_parts(&args, &test_ctx())
+                    .await
+                    .unwrap();
+                response_json(&result)["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["lcsc"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(search("gadgets_a").await, vec!["C3101"]);
+        assert_eq!(search("Gadgets").await, vec!["C3101", "C3102"]);
     }
 
     fn response_json(result: &CallToolResult) -> serde_json::Value {
