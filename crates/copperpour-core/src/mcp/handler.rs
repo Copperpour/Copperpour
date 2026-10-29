@@ -30,6 +30,11 @@ pub struct McpHandler {
     /// to receive the same notifications. Without this, notifications are
     /// silently dropped on stdio — the cause of issue #19.
     notif_sinks: Arc<RwLock<Vec<mpsc::Sender<String>>>>,
+    /// Sinks the transport writes as soon as they arrive, while a call is still
+    /// running (`notifications/progress`). `notif_sinks` is flushed by stdio
+    /// only after the response, which is right for tools/list_changed and
+    /// useless for progress.
+    immediate_sinks: Arc<std::sync::RwLock<Vec<mpsc::Sender<String>>>>,
     observer: CallObserver,
     /// Meta-tools bypass the domain router, so their advertised schemas are
     /// compiled here once and enforced at the same dispatch boundary.
@@ -109,6 +114,7 @@ impl McpHandler {
             reload: meta_tools::ReloadControl::default(),
             sse_senders: Arc::new(RwLock::new(Vec::new())),
             notif_sinks: Arc::new(RwLock::new(Vec::new())),
+            immediate_sinks: Arc::new(std::sync::RwLock::new(Vec::new())),
             observer,
             meta_input_validators: Arc::new(meta_input_validators),
         })
@@ -149,6 +155,39 @@ impl McpHandler {
     /// JSON-RPC string, which the transport writes to its output stream.
     pub async fn register_notification_sink(&self, tx: mpsc::Sender<String>) {
         self.notif_sinks.write().await.push(tx);
+    }
+
+    /// Register a sink for notifications that must be written while the call
+    /// that emits them is still running (`notifications/progress`).
+    pub fn register_immediate_sink(&self, tx: mpsc::Sender<String>) {
+        if let Ok(mut sinks) = self.immediate_sinks.write() {
+            sinks.push(tx);
+        }
+    }
+
+    /// Progress channel for one `tools/call`, or `None` when the client sent no
+    /// `_meta.progressToken`. Delivery is best effort: `try_send` never blocks
+    /// the tool, and a full channel drops that one update.
+    fn progress_reporter(
+        &self,
+        params: &CallToolParams,
+    ) -> Option<crate::progress::ProgressReporter> {
+        let token = params.progress_token()?.clone();
+        let sinks = self.immediate_sinks.clone();
+        let sse = self.sse_senders.clone();
+        Some(crate::progress::ProgressReporter::new(token, move |json| {
+            if let Ok(sinks) = sinks.read() {
+                for tx in sinks.iter() {
+                    let _ = tx.try_send(json.clone());
+                }
+            }
+            if let Ok(senders) = sse.try_read() {
+                let event = Event::default().data(json);
+                for tx in senders.iter() {
+                    let _ = tx.try_send(event.clone());
+                }
+            }
+        }))
     }
 
     /// Process one JSON-RPC message and return an optional response.
@@ -252,7 +291,12 @@ impl McpHandler {
                 let params: CallToolParams =
                     serde_json::from_value(req.params.clone().unwrap_or(Value::Null))?;
 
-                let call_result = self.execute_tool(&params).await;
+                let reporter = self.progress_reporter(&params);
+                if reporter.is_some() {
+                    info!(tool = %params.name, "tool_call_progress_token");
+                }
+                let call_result =
+                    crate::progress::scope(reporter, self.execute_tool(&params)).await;
                 Ok(Some(serde_json::to_value(call_result)?))
             }
 

@@ -12,6 +12,7 @@ pub mod mcp;
 pub(crate) mod native_specctra_bridge;
 pub mod observability;
 pub mod outcome;
+pub mod progress;
 pub mod router;
 pub(crate) mod runtime_info;
 pub(crate) mod sourcing;

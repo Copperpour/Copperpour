@@ -1,8 +1,10 @@
 use anyhow::Result;
 use copperpour_core::mcp::{handler::McpHandler, protocol::*};
 use serde_json::Value;
+use std::sync::Arc;
+use tokio::io::Stdout;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info};
 
 pub enum StdioExit {
@@ -17,9 +19,10 @@ pub async fn run_stdio(handler: McpHandler) -> Result<StdioExit> {
     info!("Starting STDIO transport");
 
     let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
-    let mut stdout = stdout;
+    // Shared with the immediate-notification writer below: each JSON line is
+    // written and flushed under the lock, so lines never interleave.
+    let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let mut line = String::new();
 
     // Server-initiated notifications (e.g. tools/list_changed after
@@ -33,6 +36,20 @@ pub async fn run_stdio(handler: McpHandler) -> Result<StdioExit> {
     // no separate task or cancellation-prone select! over read_line is needed.
     let (notif_tx, mut notif_rx) = mpsc::channel::<String>(16);
     handler.register_notification_sink(notif_tx).await;
+
+    // notifications/progress is emitted *during* a tool call, while this loop
+    // is still awaiting handle_message, so it cannot wait for the drain below:
+    // a separate task writes it as it arrives.
+    let (immediate_tx, mut immediate_rx) = mpsc::channel::<String>(64);
+    handler.register_immediate_sink(immediate_tx);
+    let immediate_out = stdout.clone();
+    tokio::spawn(async move {
+        while let Some(notif) = immediate_rx.recv().await {
+            if write_line(&immediate_out, notif).await.is_err() {
+                break;
+            }
+        }
+    });
 
     loop {
         line.clear();
@@ -66,21 +83,16 @@ pub async fn run_stdio(handler: McpHandler) -> Result<StdioExit> {
         };
 
         if let Some(resp) = response {
-            let mut json = serde_json::to_string(&resp)?;
-            json.push('\n');
-            debug!("STDIO send: {}", json.trim());
-            stdout.write_all(json.as_bytes()).await?;
-            stdout.flush().await?;
+            let json = serde_json::to_string(&resp)?;
+            debug!("STDIO send: {}", json);
+            write_line(&stdout, json).await?;
         }
 
         // Flush any notifications the handler queued while processing this
         // message, after the response so the client sees the response first.
         while let Ok(notif) = notif_rx.try_recv() {
-            let mut json = notif;
-            json.push('\n');
-            debug!("STDIO send notification: {}", json.trim());
-            stdout.write_all(json.as_bytes()).await?;
-            stdout.flush().await?;
+            debug!("STDIO send notification: {}", notif);
+            write_line(&stdout, notif).await?;
         }
 
         // The handler only queues a reload. Reaching this point proves the
@@ -94,4 +106,11 @@ pub async fn run_stdio(handler: McpHandler) -> Result<StdioExit> {
     }
 
     Ok(StdioExit::Eof)
+}
+
+async fn write_line(stdout: &Mutex<Stdout>, mut json: String) -> std::io::Result<()> {
+    json.push('\n');
+    let mut stdout = stdout.lock().await;
+    stdout.write_all(json.as_bytes()).await?;
+    stdout.flush().await
 }
