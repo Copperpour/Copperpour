@@ -14,7 +14,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **243 registered tools** + **7 always-visible meta-tools** = **250 total**
+- **244 registered tools** + **7 always-visible meta-tools** = **251 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<copperpour dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -236,7 +236,7 @@ and Windows servers do not.
 
 ## PCB
 
-### `pcb_board` · 17 tools
+### `pcb_board` · 18 tools
 **Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import, custom fields on placed footprints.
 **Source:** [`crates/copperpour-core/src/tools/pcb_board.rs`](crates/copperpour-core/src/tools/pcb_board.rs)
 
@@ -251,6 +251,7 @@ and Windows servers do not.
 | `add_layer` | Add a new inner copper or technical layer to the board stack. Rejects a non-canonical layer name — KiCad refuses to open a board containing one. Use the canonical name and pass your own label as its user name. |
 | `set_active_layer` | Return `unsupported_capability` without writing: active layer is editor-session state and the bundled stable KiCad IPC protocol exposes no supported mutation/readback. |
 | `add_board_outline` | Add a rectangular Edge.Cuts outline with sharp or circular rounded corners, identically over IPC and file fallback. Appends — clear the old edges with `delete_graphics` first. |
+| `replace_board_outline` | Replace the board's own Edge.Cuts shapes with closed contours of lines and arcs (`start`, `mid`, `end` in mm), outlines and cut-outs alike. The default dry run lists what would go and returns a `plan_revision`; apply takes it as `expected_plan_revision`. Refuses, before writing, a joint whose points differ, a line or arc of 0.001 mm or less, and primitives that cross or touch other than at their shared joint. One KiCad commit on a live board, else the saved file; read back either way. |
 | `delete_graphics` | Delete board graphics (lines, rects, arcs, circles, polys, curves, text, textboxes, dimensions) matching a UUID/layer/type filter; `dry_run` lists them instead. |
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position, under the MountingHole library name stock KiCad 10 ships for that drill; a drill with no shipped footprint is refused. |
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
