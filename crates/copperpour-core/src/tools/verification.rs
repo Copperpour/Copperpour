@@ -16,8 +16,8 @@ use copperpour_sexp::board::exact_coordinate_pair;
 use copperpour_sexp::geometry::round6;
 use copperpour_sexp::net::{collect_net_keys, names_nets_in_place, net_name};
 use copperpour_sexp::writer::{
-    apply_edits, find_direct_child_blocks, new_uuid, read_consistent, write_atomic,
-    write_atomic_if_unchanged, SexpEdit,
+    apply_edits, find_direct_child_blocks, new_uuid, read_consistent, write_atomic_if_unchanged,
+    SexpEdit,
 };
 use copperpour_sexp::{parse_sexp, SexpError, SexpNode};
 use serde_json::{json, Value};
@@ -1460,11 +1460,14 @@ async fn handle_set_layer_constraints(
         "Layer name contains unsupported characters"
     );
     let rules_path = sibling_custom_rules_path(&board);
-    let mut content = match tokio::fs::read_to_string(&rules_path).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "(version 1)\n".to_string(),
+    // `None` when there is no rules file yet: the write must then create one,
+    // never replace a file that appeared in the meantime.
+    let read = match tokio::fs::read_to_string(&rules_path).await {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
+    let mut content = read.as_deref().unwrap_or("(version 1)\n").to_owned();
     let mut changed = Vec::new();
 
     if let Some(clearance) = args["min_clearance"].as_f64() {
@@ -1488,7 +1491,16 @@ async fn handle_set_layer_constraints(
     }
 
     if !changed.is_empty() {
-        write_atomic(&rules_path, &content)?;
+        let refusal = crate::tools::write_if_unchanged(
+            &rules_path,
+            "custom rules file",
+            "set_layer_constraints",
+            read.as_deref(),
+            content,
+        )?;
+        if let Some(refusal) = refusal {
+            return Ok(refusal);
+        }
     }
 
     Ok(CallToolResult::text(

@@ -28,7 +28,6 @@ use copperpour_sexp::{
         extract_lib_pins_for_unit, extract_symbol_instances, format_bus, format_bus_entry,
         format_net_label, format_wire, pin_endpoint, BusEntryDirection,
     },
-    writer::write_atomic,
 };
 use serde_json::json;
 
@@ -152,7 +151,15 @@ async fn handle_add_bus(
     let content = std::fs::read_to_string(&sch_path)?;
     let new_content =
         crate::tools::sch_wiring::insert_before_close(&content, &format_bus(x1, y1, x2, y2));
-    write_atomic(&sch_path, &new_content)?;
+    if let Some(refusal) = crate::tools::replace_if_unchanged(
+        &sch_path,
+        "schematic",
+        "add_bus",
+        &content,
+        new_content,
+    )? {
+        return Ok(refusal);
+    }
 
     Ok(CallToolResult::json(&json!({
         "added": "bus",
@@ -194,8 +201,19 @@ async fn handle_batch_add_bus(
     }
 
     let content = std::fs::read_to_string(&sch_path)?;
-    let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
-    write_atomic(&sch_path, &new_content)?;
+    // Nothing to add: leave the sheet as it is.
+    if !inserts.is_empty() {
+        let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
+        if let Some(refusal) = crate::tools::replace_if_unchanged(
+            &sch_path,
+            "schematic",
+            "batch_add_bus",
+            &content,
+            new_content,
+        )? {
+            return Ok(refusal);
+        }
+    }
 
     Ok(CallToolResult::json(&json!({
         "added_count": added.len(),
@@ -230,7 +248,15 @@ async fn handle_add_bus_entry(
     let content = std::fs::read_to_string(&sch_path)?;
     let new_content =
         crate::tools::sch_wiring::insert_before_close(&content, &format_bus_entry(x, y, direction));
-    write_atomic(&sch_path, &new_content)?;
+    if let Some(refusal) = crate::tools::replace_if_unchanged(
+        &sch_path,
+        "schematic",
+        "add_bus_entry",
+        &content,
+        new_content,
+    )? {
+        return Ok(refusal);
+    }
 
     // Which end is the bus side is a fact about the sheet, not about the
     // request: the entry's `at` corner is wherever the caller put it. The
@@ -397,8 +423,19 @@ async fn handle_connect_pins_to_bus(
         }));
     }
 
-    let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
-    write_atomic(&sch_path, &new_content)?;
+    // Nothing to add: leave the sheet as it is.
+    if !inserts.is_empty() {
+        let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
+        if let Some(refusal) = crate::tools::replace_if_unchanged(
+            &sch_path,
+            "schematic",
+            "connect_pins_to_bus",
+            &content,
+            new_content,
+        )? {
+            return Ok(refusal);
+        }
+    }
 
     Ok(CallToolResult::json(&json!({
         "connected_count": added.len(),

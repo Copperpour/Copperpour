@@ -28,5 +28,5 @@ pub use transaction::{
 };
 pub use writer::{
     apply_edits, read_consistent, transact_atomic, write_atomic, write_atomic_if_unchanged,
-    write_new_atomic, SexpEdit,
+    write_new_atomic, write_new_atomic_verified, SexpEdit,
 };

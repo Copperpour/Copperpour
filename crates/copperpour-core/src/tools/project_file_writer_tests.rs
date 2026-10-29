@@ -74,6 +74,15 @@ pub(super) async fn call(
 ) -> CallToolResult {
     let mut arguments = arguments.clone();
     arguments["board"] = json!(board.to_string_lossy());
+    served_call(handler, tool, arguments).await
+}
+
+/// `tool` called through served `tools/call`, with `arguments` as given.
+pub(super) async fn served_call(
+    handler: &McpHandler,
+    tool: &str,
+    arguments: Value,
+) -> CallToolResult {
     let response = handler
         .handle_message(json!({
             "jsonrpc": "2.0",
@@ -213,7 +222,7 @@ fn lock_project(project: &Project) -> PathBuf {
     lock
 }
 
-fn body_of(result: &CallToolResult) -> Value {
+pub(super) fn body_of(result: &CallToolResult) -> Value {
     serde_json::from_str(text_of(result)).expect("a structured refusal")
 }
 
