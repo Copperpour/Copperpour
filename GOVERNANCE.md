@@ -55,7 +55,9 @@ In short:
 ## Claiming work
 
 - **Assign the issue to yourself** when you take it. A claim written only in a
-  comment is invisible to everyone not reading that thread.
+  comment is invisible to everyone not reading that thread. Without write
+  access, comment `/assign` on the issue and a bot assigns you; `/unassign`
+  releases it. An issue already assigned to someone else is not reassigned.
 - Agree the approach on the issue for anything non-trivial, then open one
   focused PR.
 

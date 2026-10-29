@@ -1,0 +1,127 @@
+name: Self-assign
+
+# GitHub lets only collaborators assign issues. Anyone else claims one by
+# commenting `/assign` (or releases it with `/unassign`); commenting makes them
+# assignable, so the bot can do it for them.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+
+# One run per issue at a time, so two claims cannot both see it unassigned.
+concurrency:
+  group: self-assign-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  assign:
+    name: Handle /assign and /unassign
+    if: >-
+      !github.event.issue.pull_request &&
+      github.event.comment.user.type != 'Bot' &&
+      (startsWith(github.event.comment.body, '/assign') ||
+       startsWith(github.event.comment.body, '/unassign'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Update assignees
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = context.payload.issue.number;
+            const comment = context.payload.comment;
+            const login = comment.user.login;
+            const command = comment.body.split(/\s/)[0].toLowerCase();
+            if (command !== "/assign" && command !== "/unassign") return;
+
+            // The event's copy may be stale; decide on the issue as it is now.
+            const { data: issue } = await github.rest.issues.get({
+              owner, repo, issue_number
+            });
+            const assignees = issue.assignees.map(user => user.login);
+            const labels = issue.labels.map(label =>
+              typeof label === "string" ? label : label.name
+            );
+
+            // Confirmations are best effort: the claim already landed or was refused.
+            async function react(content) {
+              try {
+                await github.rest.reactions.createForIssueComment({
+                  owner, repo, comment_id: comment.id, content
+                });
+              } catch (error) {
+                core.warning(`Could not react to comment ${comment.id}: ${error.message}`);
+              }
+            }
+
+            async function reply(body) {
+              try {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number, body: `@${login} ${body}`
+                });
+              } catch (error) {
+                core.warning(`Could not reply on #${issue_number}: ${error.message}`);
+              }
+            }
+
+            if (command === "/unassign") {
+              if (!assignees.includes(login)) {
+                await react("confused");
+                return;
+              }
+              await github.rest.issues.removeAssignees({
+                owner, repo, issue_number, assignees: [login]
+              });
+              await react("+1");
+              return;
+            }
+
+            if (issue.state !== "open") {
+              await reply("this issue is closed, so it cannot be claimed.");
+              return;
+            }
+            if (labels.includes("wontfix")) {
+              await reply("this issue is marked `wontfix`, so it cannot be claimed.");
+              return;
+            }
+            if (assignees.includes(login)) {
+              await react("+1");
+              return;
+            }
+            if (assignees.length > 0) {
+              // Names without `@`, so repeated claims do not ping the assignee.
+              const current = assignees.map(name => `\`${name}\``).join(", ");
+              await reply(
+                `this issue is already assigned to ${current}. Ask on the issue ` +
+                `before working on it, or pick an unassigned one.`
+              );
+              return;
+            }
+
+            // The API drops assignees it cannot assign without an error, so
+            // check that the claim landed.
+            const { data } = await github.rest.issues.addAssignees({
+              owner, repo, issue_number, assignees: [login]
+            });
+            if (!data.assignees.some(user => user.login === login)) {
+              await reply("GitHub refused the assignment; a maintainer needs to assign you.");
+              core.setFailed(`GitHub did not assign ${login} to #${issue_number}`);
+              return;
+            }
+            const others = data.assignees
+              .map(user => user.login)
+              .filter(name => name !== login);
+            if (others.length > 0) {
+              // A maintainer assigned someone between the read and the write.
+              await github.rest.issues.removeAssignees({
+                owner, repo, issue_number, assignees: [login]
+              });
+              await reply("someone else was assigned at the same time; pick an unassigned issue.");
+              return;
+            }
+            await react("+1");
