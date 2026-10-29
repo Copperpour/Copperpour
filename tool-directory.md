@@ -14,7 +14,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **242 registered tools** + **7 always-visible meta-tools** = **249 total**
+- **243 registered tools** + **7 always-visible meta-tools** = **250 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<copperpour dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -408,7 +408,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ## Verification
 
-### `verification` · 10 tools
+### `verification` · 11 tools
 **Purpose:** DRC, design rules, layer constraints, clearance checks, KiCAD UI control. ERC lives in `sch_export` (`run_erc`), not here.
 **Source:** [`crates/copperpour-core/src/tools/verification.rs`](crates/copperpour-core/src/tools/verification.rs)
 
@@ -423,6 +423,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `launch_kicad_ui` | Launch the KiCAD GUI application and optionally open a project file. |
 | `copy_routing_pattern` | Copy the segments, arcs and vias inside a source region of a board KiCad is not holding, shifted by (dest_x - src_x1, dest_y - src_y1). An item is copied when all of its points (segment start/end, arc start/mid/end, via position) are inside the region, edges included; one that crosses the edge is listed in `excluded_crossing` and not copied. Copies keep every attribute and get fresh UUIDs. |
 | `set_layer_constraints` | Set per-layer design constraints (min trace width, clearance) as named rules in the sibling `.kicad_dru` custom-rules file. |
+| `set_custom_rule` | Add or replace one named rule in the sibling `.kicad_dru`: min/opt/max constraints with an optional condition, layer and severity, the rest of the file left as written. A new rule goes last, where KiCad gives it precedence over earlier rules. Refuses, writing nothing, when KiCad 10's rule parser would fault any rule in the resulting file, or when `kicad-cli` does not load it on a copy of the board; on a board with no item yet, the first check alone decides. |
 | `check_clearance` | Measure footprint spacing from the live KiCad board when open, otherwise the saved file. `mode: "anchor"` (default) preserves placement-origin distance and its deprecated `distance_mm` alias. `mode: "courtyard"` measures transformed authored-courtyard bbox edge distance, reports overlap, and refuses absent/unreadable courtyards or opposite-side comparisons. Neither mode measures copper clearance; use `run_drc` for that. |
 
 ---
