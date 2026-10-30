@@ -29,8 +29,13 @@ fn release_publication_requires_real_kicad_acceptance() {
     );
     assert_eq!(
         release["jobs"]["release"]["needs"],
-        serde_json::json!(["real-kicad-acceptance", "build", "pcm-package"]),
-        "the release publication job must require real-KiCad acceptance and both artifact jobs"
+        serde_json::json!([
+            "real-kicad-acceptance",
+            "build",
+            "pcm-package",
+            "pcm-submission-metadata"
+        ]),
+        "the release publication job must require real-KiCad acceptance and every artifact job"
     );
 }
 
@@ -69,6 +74,28 @@ fn release_pcm_validation_uses_the_effective_release_version() {
     assert!(
         !script.contains("GITHUB_REF_NAME"),
         "a workflow_dispatch run uses the main branch ref, not the synthetic package version"
+    );
+}
+
+#[test]
+fn pcm_submission_metadata_uses_the_effective_release_version() {
+    let release = workflow("release.yml");
+    let job = &release["jobs"]["pcm-submission-metadata"];
+
+    assert_eq!(
+        job["needs"], "pcm-package",
+        "submission metadata hashes the built PCM zips"
+    );
+    let script = job["steps"]
+        .as_array()
+        .expect("submission metadata steps must be an array")
+        .iter()
+        .find(|step| step["name"] == "Write submission metadata")
+        .and_then(|step| step["run"].as_str())
+        .expect("release workflow must write the submission metadata");
+    assert!(
+        script.contains("version=\"${RELEASE_VERSION#v}\""),
+        "submission metadata must name the version the zips were built with"
     );
 }
 

@@ -255,10 +255,47 @@ jobs:
           name: copperpour-pcm-${{ matrix.platform }}
           path: dist/copperpour-pcm-*.zip
 
+  # The metadata for a KiCAD addon repository submission: one version entry
+  # per platform zip, with the download_sha256/size/url only the built zips
+  # can supply. Runs on the dry run too, so a tag cannot be the first test.
+  pcm-submission-metadata:
+    name: KiCAD addon repository metadata
+    needs: pcm-package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: copperpour-pcm-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write submission metadata
+        run: |
+          set -euo pipefail
+          python -m pip install jsonschema
+          version="${RELEASE_VERSION#v}"
+          python packaging/pcm-submission-metadata.py --version "$version" \
+            --base-url "https://github.com/${{ github.repository }}/releases/download/v$version/" \
+            --out "metadata/copperpour-pcm-v$version-metadata.json" \
+            dist/copperpour-pcm-v"$version"-*.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: copperpour-pcm-submission-metadata
+          path: metadata/*.json
+
   release:
     name: Create Release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [real-kicad-acceptance, build, pcm-package]
+    needs: [real-kicad-acceptance, build, pcm-package, pcm-submission-metadata]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
