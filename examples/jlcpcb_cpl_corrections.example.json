@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "policy_id": "my-board-jlcpcb-v1",
+  "provenance": "Checked by the project owner in JLCPCB Component Placements (2D, top), my-board rev B order preview",
+  "rotation_insensitive_prefixes": ["Crystal_SMD_3215-"],
+  "footprint_rules": [
+    {
+      "id": "tssop-8-lying-model",
+      "footprint_prefix": "TSSOP-",
+      "rotation_degrees": 270,
+      "evidence": [
+        {
+          "board": "my-board rev B",
+          "designator": "U402",
+          "footprint": "TSSOP-8_4.4x3mm_P0.65mm",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "top-left",
+          "jlc_model_pin1": "bottom-left"
+        }
+      ]
+    }
+  ],
+  "component_overrides": [
+    {
+      "id": "j201-usb-c-kicad-rotation",
+      "designator": "J201",
+      "rotation_degrees": 0,
+      "note": "LCSC C165948: the SMD pins must land on the inner pads, opening at the board edge.",
+      "evidence": [
+        {
+          "board": "my-board rev B",
+          "designator": "J201",
+          "footprint": "USB_C_Receptacle_HRO_TYPE-C-31-M-12",
+          "kicad_rotation_degrees": 180,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "bottom-right",
+          "jlc_model_pin1": "top-left"
+        }
+      ]
+    }
+  ]
+}

@@ -1,17 +1,459 @@
 {
   "schema_version": 1,
   "policy_id": "konnect-jlcpcb-cpl-v1",
-  "provenance": "Konnect issue #518: independently observed KiCad 10 export and JLCPCB Component Placements evidence, 2026-09-10",
+  "provenance": "KiCad 10 library footprints compared with JLCPCB Component Placements (2D top view): Konnect issue #518 board, 2026-09-10; grumpf-bord, 2026-10-30. Every verified rule carries its observations; unverified families only raise warnings.",
+  "rotation_insensitive_prefixes": [
+    "R_",
+    "C_",
+    "L_",
+    "Fuse_",
+    "Fiducial_",
+    "TestPoint_",
+    "MountingHole_"
+  ],
   "footprint_rules": [
     {
-      "id": "kicad-soic-8-3.9x4.9-p1.27",
-      "footprint_prefix": "SOIC-8_3.9x4.9mm_P1.27mm",
-      "rotation_degrees": 270
+      "id": "kicad-soic",
+      "footprint_prefix": "SOIC-",
+      "rotation_degrees": 270,
+      "evidence": [
+        {
+          "board": "Konnect issue #518 blinker, PR #519 preview",
+          "designator": "U1",
+          "footprint": "SOIC-8_3.9x4.9mm_P1.27mm",
+          "kicad_rotation_degrees": 90,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "bottom-left",
+          "jlc_model_pin1": "bottom-left"
+        },
+        {
+          "board": "grumpf-bord",
+          "designator": "U202",
+          "footprint": "SOIC-16_3.9x9.9mm_P1.27mm",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "top-left",
+          "jlc_model_pin1": "bottom-left"
+        }
+      ]
+    },
+    {
+      "id": "kicad-ssop",
+      "footprint_prefix": "SSOP-",
+      "rotation_degrees": 270,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "U401",
+          "footprint": "SSOP-28_5.3x10.2mm_P0.65mm",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "top-left",
+          "jlc_model_pin1": "bottom-left"
+        }
+      ]
+    },
+    {
+      "id": "kicad-ti-so-powerpad",
+      "footprint_prefix": "TI_SO-PowerPAD-",
+      "rotation_degrees": 270,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "U101",
+          "footprint": "TI_SO-PowerPAD-8_ThermalVias",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "top-left",
+          "jlc_model_pin1": "bottom-left"
+        }
+      ]
+    },
+    {
+      "id": "kicad-tqfn",
+      "footprint_prefix": "TQFN-",
+      "rotation_degrees": 270,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "U4",
+          "footprint": "TQFN-20-1EP_5x5mm_P0.65mm_EP3.25x3.25mm",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "top-left",
+          "jlc_model_pin1": "bottom-left"
+        }
+      ]
+    },
+    {
+      "id": "kicad-vqfn",
+      "footprint_prefix": "VQFN-",
+      "rotation_degrees": 270,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "U301",
+          "footprint": "VQFN-24-1EP_4x4mm_P0.5mm_EP2.5x2.5mm_ThermalVias",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "top-left",
+          "jlc_model_pin1": "bottom-left"
+        }
+      ]
+    },
+    {
+      "id": "kicad-sot-23-6",
+      "footprint_exact": "SOT-23-6",
+      "rotation_degrees": 270,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "U203",
+          "footprint": "SOT-23-6",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "top-left",
+          "jlc_model_pin1": "bottom-left"
+        }
+      ]
+    },
+    {
+      "id": "kicad-sot-23",
+      "footprint_exact": "SOT-23",
+      "rotation_degrees": 180,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "Q1",
+          "footprint": "SOT-23",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "top-left",
+          "jlc_model_pin1": "bottom-right"
+        }
+      ]
+    },
+    {
+      "id": "kicad-sw-dip-spst",
+      "footprint_prefix": "SW_DIP_SPSTx",
+      "rotation_degrees": 270,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "SW1",
+          "footprint": "SW_DIP_SPSTx06_Slide_9.78x17.42mm_W8.61mm_P2.54mm",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "top-left",
+          "jlc_model_pin1": "bottom-left"
+        }
+      ]
+    },
+    {
+      "id": "espressif-esp32-wroom-32e",
+      "footprint_exact": "ESP32-WROOM-32E",
+      "rotation_degrees": 270,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "U201",
+          "footprint": "ESP32-WROOM-32E",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "top-left",
+          "jlc_model_pin1": "bottom-left"
+        }
+      ]
+    },
+    {
+      "id": "kicad-d-sod-123",
+      "footprint_prefix": "D_SOD-123",
+      "rotation_degrees": 0,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "D18",
+          "footprint": "D_SOD-123",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "left",
+          "jlc_model_pin1": "left"
+        }
+      ]
+    },
+    {
+      "id": "kicad-d-smb",
+      "footprint_prefix": "D_SMB",
+      "rotation_degrees": 0,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "D101",
+          "footprint": "D_SMB",
+          "kicad_rotation_degrees": 90,
+          "cpl_rotation_degrees": 90,
+          "footprint_pin1": "bottom",
+          "jlc_model_pin1": "bottom"
+        }
+      ]
+    },
+    {
+      "id": "kicad-d-sma",
+      "footprint_prefix": "D_SMA",
+      "rotation_degrees": 0,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "D102",
+          "footprint": "D_SMA",
+          "kicad_rotation_degrees": 270,
+          "cpl_rotation_degrees": 270,
+          "footprint_pin1": "top",
+          "jlc_model_pin1": "top"
+        }
+      ]
+    },
+    {
+      "id": "kicad-d-smc",
+      "footprint_prefix": "D_SMC",
+      "rotation_degrees": 0,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "D103",
+          "footprint": "D_SMC",
+          "kicad_rotation_degrees": 180,
+          "cpl_rotation_degrees": 180,
+          "footprint_pin1": "right",
+          "jlc_model_pin1": "right"
+        }
+      ]
+    },
+    {
+      "id": "kicad-led-0805",
+      "footprint_prefix": "LED_0805_",
+      "rotation_degrees": 0,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "D17",
+          "footprint": "LED_0805_2012Metric",
+          "kicad_rotation_degrees": 180,
+          "cpl_rotation_degrees": 180,
+          "footprint_pin1": "right",
+          "jlc_model_pin1": "right"
+        }
+      ]
+    },
+    {
+      "id": "kicad-led-0603",
+      "footprint_prefix": "LED_0603_",
+      "rotation_degrees": 0,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "D402",
+          "footprint": "LED_0603_1608Metric",
+          "kicad_rotation_degrees": 180,
+          "cpl_rotation_degrees": 180,
+          "footprint_pin1": "right",
+          "jlc_model_pin1": "right"
+        }
+      ]
+    },
+    {
+      "id": "kicad-cp-elec",
+      "footprint_prefix": "CP_Elec_",
+      "rotation_degrees": 0,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "C101",
+          "footprint": "CP_Elec_6.3x7.7",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "left",
+          "jlc_model_pin1": "left"
+        }
+      ]
+    },
+    {
+      "id": "kicad-sot-23-5",
+      "footprint_exact": "SOT-23-5",
+      "rotation_degrees": 180,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "U102",
+          "footprint": "SOT-23-5",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "top-left",
+          "jlc_model_pin1": "bottom-right"
+        }
+      ]
+    },
+    {
+      "id": "kicad-msop",
+      "footprint_prefix": "MSOP-",
+      "rotation_degrees": 270,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "U402",
+          "footprint": "MSOP-8_3x3mm_P0.65mm",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "top-left",
+          "jlc_model_pin1": "bottom-left"
+        }
+      ]
+    },
+    {
+      "id": "kicad-idc-header-2x05-vertical",
+      "footprint_prefix": "IDC-Header_2x05_P2.54mm_Vertical",
+      "rotation_degrees": 270,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "J401",
+          "footprint": "IDC-Header_2x05_P2.54mm_Vertical",
+          "kicad_rotation_degrees": 90,
+          "cpl_rotation_degrees": 90,
+          "footprint_pin1": "left",
+          "jlc_model_pin1": "bottom"
+        }
+      ]
+    },
+    {
+      "id": "kicad-sw-push-xkb-ts-1187a",
+      "footprint_prefix": "SW_Push_1P1T_XKB_TS-1187A",
+      "rotation_degrees": 0,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "SW202",
+          "footprint": "SW_Push_1P1T_XKB_TS-1187A",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "top-left",
+          "jlc_model_pin1": "top-left"
+        }
+      ]
+    },
+    {
+      "id": "kicad-relay-omron-g5q-1",
+      "footprint_prefix": "Relay_SPDT_Omron-G5Q-1",
+      "rotation_degrees": 0,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "K1",
+          "footprint": "Relay_SPDT_Omron-G5Q-1",
+          "kicad_rotation_degrees": 270,
+          "cpl_rotation_degrees": 270,
+          "footprint_pin1": "top-left",
+          "jlc_model_pin1": "top-left"
+        }
+      ]
+    },
+    {
+      "id": "kicad-phoenix-mc",
+      "footprint_prefix": "PhoenixContact_MC_",
+      "rotation_degrees": 0,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "J2",
+          "footprint": "PhoenixContact_MC_1,5_4-G-3.81_1x04_P3.81mm_Horizontal",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "left",
+          "jlc_model_pin1": "left"
+        }
+      ]
+    },
+    {
+      "id": "kicad-phoenix-mstba",
+      "footprint_prefix": "PhoenixContact_MSTBA_",
+      "rotation_degrees": 0,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "J101",
+          "footprint": "PhoenixContact_MSTBA_2,5_2-G-5,08_1x02_P5.08mm_Horizontal",
+          "kicad_rotation_degrees": 180,
+          "cpl_rotation_degrees": 180,
+          "footprint_pin1": "right",
+          "jlc_model_pin1": "right"
+        }
+      ]
+    },
+    {
+      "id": "kicad-rj45-hanrun-hr911105a",
+      "footprint_prefix": "RJ45_Hanrun_HR911105A",
+      "rotation_degrees": 0,
+      "evidence": [
+        {
+          "board": "grumpf-bord",
+          "designator": "J301",
+          "footprint": "RJ45_Hanrun_HR911105A_Horizontal",
+          "kicad_rotation_degrees": 180,
+          "cpl_rotation_degrees": 180,
+          "footprint_pin1": "bottom-right",
+          "jlc_model_pin1": "bottom-right"
+        }
+      ]
     },
     {
       "id": "kicad-hro-type-c-31-m-12",
-      "footprint_prefix": "USB_C_Receptacle_HRO_TYPE-C-31-M-12",
-      "rotation_degrees": 180
+      "footprint_exact": "USB_C_Receptacle_HRO_TYPE-C-31-M-12",
+      "status": "unverified",
+      "note": "Conflicting observations under the same footprint name: issue #518 needed +180 degrees, grumpf-bord (library footprint, pad A1 at the top at 0 degrees) needed none. Check which side the SMD pins land on and pin the rotation with a project component override.",
+      "evidence": [
+        {
+          "board": "Konnect issue #518 blinker, PR #519 preview",
+          "designator": "J1",
+          "footprint": "USB_C_Receptacle_HRO_TYPE-C-31-M-12",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 180,
+          "footprint_pin1": "bottom-right",
+          "jlc_model_pin1": "bottom-right"
+        },
+        {
+          "board": "grumpf-bord",
+          "designator": "J201",
+          "footprint": "USB_C_Receptacle_HRO_TYPE-C-31-M-12",
+          "kicad_rotation_degrees": 180,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "bottom-right",
+          "jlc_model_pin1": "top-left"
+        }
+      ]
+    },
+    {
+      "id": "kicad-tssop",
+      "footprint_prefix": "TSSOP-",
+      "status": "unverified",
+      "note": "No observation yet; SOIC, SSOP and MSOP need +270 degrees."
+    },
+    {
+      "id": "kicad-qfn",
+      "footprint_prefix": "QFN-",
+      "status": "unverified",
+      "note": "No observation yet; TQFN and VQFN need +270 degrees."
+    },
+    {
+      "id": "kicad-dfn",
+      "footprint_prefix": "DFN-",
+      "status": "unverified",
+      "note": "No observation yet."
+    },
+    {
+      "id": "kicad-idc-header",
+      "footprint_prefix": "IDC-Header_",
+      "status": "unverified",
+      "note": "Only the 2x05 vertical header has been observed (+270 degrees)."
     }
   ],
   "component_overrides": []

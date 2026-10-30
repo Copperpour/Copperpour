@@ -69,7 +69,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "jlcpcb_cpl_corrections_path": {
                         "type": "string",
-                        "description": "Optional path to a versioned JLCPCB CPL correction-policy JSON file. Project footprint rules override built-in rules, and exact designator overrides take highest precedence. Used only when fab_house is 'jlcpcb'."
+                        "description": "Optional path to a versioned JLCPCB CPL correction-policy JSON file, kept with the project (format and example: docs/JLCPCB_CPL_CORRECTIONS.md). Exact designator overrides take highest precedence, then project footprint rules, then built-in rules. Used only when fab_house is 'jlcpcb'."
                     }
                 },
                 "required": ["board", "output_dir"]
@@ -385,7 +385,16 @@ async fn handle_export_manufacturing_package(
     all_files.sort();
     all_files.dedup();
 
+    // Placement warnings do not make the files incomplete, but they must never
+    // be summarized as "No warnings": each names parts left at KiCad's raw
+    // rotation that the JLCPCB preview still has to confirm.
     let complete = warnings.is_empty();
+    let placement_warnings = cpl_orientation_evidence
+        .as_ref()
+        .map(crate::fab::jlcpcb::JlcpcbOrientationEvidence::review_warnings)
+        .unwrap_or_default();
+    let placement_warning_count = placement_warnings.len();
+    warnings.extend(placement_warnings);
 
     let summary = format!(
         "{} for {}. {} verified non-empty files. {}",
@@ -398,6 +407,11 @@ async fn handle_export_manufacturing_package(
         all_files.len(),
         if warnings.is_empty() {
             "No warnings.".to_string()
+        } else if placement_warning_count > 0 {
+            format!(
+                "{} warnings, {placement_warning_count} of them placement orientations to check in JLCPCB Component Placements.",
+                warnings.len()
+            )
         } else {
             format!("{} warnings.", warnings.len())
         }
