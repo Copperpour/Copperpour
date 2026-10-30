@@ -20,8 +20,9 @@ text variable, names nesting braces more than 16 deep, and a name that a bus on
 a renamed label's sheet carries as a member, bus aliases included, are refused.
 
 KiCad joins nets by name: on one sheet, wires that share a name; across
-sheets, nets whose chosen driver is global (not a `(power local)` symbol), by
-the global names they carry and by a global name such a net did not choose;
+sheets, nets whose chosen driver is global (a global label, a power symbol not
+`(power local)`, or a hidden `power_in` pin of another symbol), by the global
+names they carry and by a global name such a net did not choose;
 and a sheet pin with the hierarchical labels of its name. The check follows
 those rules over the whole hierarchy. A rename that would join two nets
 returns `plan_blocked` naming them, unless `allow_merge`; one that would break a

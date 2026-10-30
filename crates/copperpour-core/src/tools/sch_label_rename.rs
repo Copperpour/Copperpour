@@ -18,8 +18,8 @@ use crate::tools::{
     get_path, invalid_arg, opt_str, require_f64, require_str, ToolContext, ToolDef,
 };
 use copperpour_sexp::schematic::{
-    extract_power_symbol_labels, extract_symbol_instances, extract_wires, find_lib_symbol,
-    parse_at, Label, LabelKind,
+    extract_lib_pins_for_unit, extract_power_symbol_labels, extract_symbol_instances,
+    extract_wires, find_lib_symbol, parse_at, pin_endpoint, Label, LabelKind,
 };
 use copperpour_sexp::writer::{apply_edits, direct_children_with_tag, find_direct_child_blocks};
 use copperpour_sexp::{parse_sexp, read_consistent, FileTransition, SexpEdit, SexpNode};
@@ -546,10 +546,12 @@ struct SheetBlock {
     pins: Vec<PlacedPin>,
 }
 
-/// A power symbol's net-naming pin. Global unless its symbol is `(power local)`.
+/// A power symbol's net-naming pin, global unless its symbol is `(power local)`;
+/// or a hidden `power_in` pin of another symbol, which is always global.
 struct PowerPin {
     name: String,
     global: bool,
+    hidden: bool,
     segment: NetRoot,
 }
 
@@ -629,17 +631,36 @@ fn read_contents(content: &str, tree: &SexpNode) -> Result<SheetContents, String
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    let local_power: HashSet<String> = extract_symbol_instances(tree)
-        .into_iter()
+    let instances = extract_symbol_instances(tree);
+    let local_power: HashSet<&str> = instances
+        .iter()
         .filter(|inst| {
             find_lib_symbol(&lib_symbols, inst)
                 .and_then(|sym| sym.find("power"))
                 .and_then(|power| power.get(1).and_then(SexpNode::as_str))
                 == Some("local")
         })
-        .filter_map(|inst| inst.uuid)
+        .filter_map(|inst| inst.uuid.as_deref())
         .collect();
     let power_labels = extract_power_symbol_labels(tree);
+    // A hidden `power_in` pin of a symbol that is not a power symbol names a
+    // global net by the pin's name (`SCH_PIN::IsGlobalPower`,
+    // `eeschema/sch_pin.cpp:357-373`; `SCH_PIN::GetDefaultNetName`, `:1484-1504`).
+    let hidden_pins: Vec<(String, f64, f64)> = instances
+        .iter()
+        .filter_map(|inst| Some((inst, find_lib_symbol(&lib_symbols, inst)?)))
+        .filter(|(_, sym)| sym.find("power").is_none())
+        .flat_map(|(inst, sym)| {
+            let t = inst.pin_transform();
+            extract_lib_pins_for_unit(sym, inst.unit)
+                .into_iter()
+                .filter(|pin| pin.hidden && pin.electrical_type == "power_in")
+                .map(move |pin| {
+                    let (x, y) = pin_endpoint(&pin, t);
+                    (stored_name(&pin.name), x, y)
+                })
+        })
+        .collect();
 
     // Wires and junctions alone join segments here: every item goes into the
     // graph under a name of its own, so no two are joined by name.
@@ -647,6 +668,7 @@ fn read_contents(content: &str, tree: &SexpNode) -> Result<SheetContents, String
         .iter()
         .map(|l| (l.x, l.y))
         .chain(power_labels.iter().map(|p| (p.x, p.y)))
+        .chain(hidden_pins.iter().map(|&(_, x, y)| (x, y)))
         .enumerate()
         .map(|(i, (x, y))| Label {
             kind: LabelKind::NetLabel,
@@ -666,14 +688,23 @@ fn read_contents(content: &str, tree: &SexpNode) -> Result<SheetContents, String
             pin.segment = graph.root_at(pin.x, pin.y);
         }
     }
-    let powers = power_labels
+    let mut powers: Vec<PowerPin> = power_labels
         .iter()
         .map(|p| PowerPin {
             name: stored_name(&p.net),
-            global: !p.uuid.as_ref().is_some_and(|u| local_power.contains(u)),
+            global: !p.uuid.as_deref().is_some_and(|u| local_power.contains(u)),
+            hidden: false,
             segment: graph.root_at(p.x, p.y),
         })
         .collect();
+    for (name, x, y) in hidden_pins {
+        powers.push(PowerPin {
+            name,
+            global: true,
+            hidden: true,
+            segment: graph.root_at(x, y),
+        });
+    }
     Ok(SheetContents {
         labels,
         powers,
@@ -791,17 +822,21 @@ struct Driver {
     priority: u8,
     /// A sheet pin whose shape is `output`.
     output: bool,
+    /// A hidden power pin of a symbol that is not a power symbol.
+    hidden: bool,
 }
 
 /// The driver KiCad chooses to name a net (`CONNECTION_SUBGRAPH::ResolveDrivers`,
 /// `eeschema/connection_graph.cpp:134-262`): the highest priority; between
-/// sheet pins, an output one; then a name without `-Pad`; then the lower name.
+/// power pins, a power symbol's; between sheet pins, an output one; then a
+/// name without `-Pad`; then the lower name.
 fn chosen<'d>(drivers: impl IntoIterator<Item = &'d Driver>) -> &'d Driver {
     drivers
         .into_iter()
         .max_by(|a, b| {
             a.priority
                 .cmp(&b.priority)
+                .then_with(|| b.hidden.cmp(&a.hidden))
                 .then_with(|| a.output.cmp(&b.output))
                 .then_with(|| b.name.contains("-Pad").cmp(&a.name.contains("-Pad")))
                 .then_with(|| b.name.cmp(&a.name))
@@ -827,6 +862,7 @@ fn wire_drivers(
             name: naming.label(file, k),
             priority,
             output: false,
+            hidden: false,
         });
     }
     for power in &sheet.powers {
@@ -838,6 +874,7 @@ fn wire_drivers(
                 LOCAL_POWER_PIN
             },
             output: false,
+            hidden: power.hidden,
         });
     }
     let mut pin_wires: BTreeMap<NetRoot, Vec<Driver>> = BTreeMap::new();
@@ -848,6 +885,7 @@ fn wire_drivers(
                     name: naming.pin(file, s, k),
                     priority: SHEET_PIN,
                     output: pin.output,
+                    hidden: false,
                 });
             }
         }
@@ -1821,6 +1859,24 @@ mod tests {
         copied(&[ROOT, CHILD], Some("single_pin_nets.kicad_pro"))
     }
 
+    /// The pair with the root's `power:VCC` made `(power local)`.
+    fn local_vcc() -> tempfile::TempDir {
+        let global = "\t\t(symbol \"power:VCC\"\n\t\t\t(power global)";
+        assert!(fixture(ROOT).contains(global));
+        let dir = single_pin_nets();
+        let root = fixture(ROOT).replace(global, &global.replace("global", "local"));
+        std::fs::write(dir.path().join(ROOT), root).unwrap();
+        dir
+    }
+
+    /// The pair with `U99`, whose hidden `power_in` pin names the global net
+    /// `HIDDEN`: see its README.
+    const HIDDEN_ROOT: &str = "hidden_power_pin/single_pin_nets.kicad_sch";
+
+    fn hidden_power_pin() -> tempfile::TempDir {
+        copied(&[HIDDEN_ROOT, CHILD], Some("single_pin_nets.kicad_pro"))
+    }
+
     /// `tool` through served `tools/call`, schema gate included.
     async fn call(tool: &str, sheet: &Path, mut args: Value) -> CallToolResult {
         args["schematic"] = json!(sheet.to_str().unwrap());
@@ -2038,6 +2094,7 @@ mod tests {
             name: name.to_string(),
             priority,
             output,
+            hidden: false,
         };
         let pick = |drivers: &[Driver]| chosen(drivers).name.clone();
         assert_eq!(
@@ -2047,6 +2104,11 @@ mod tests {
             ]),
             "Z"
         );
+        let hidden = Driver {
+            hidden: true,
+            ..driver("A", GLOBAL_POWER_PIN, false)
+        };
+        assert_eq!(pick(&[hidden, driver("Z", GLOBAL_POWER_PIN, false)]), "Z");
         assert_eq!(
             pick(&[driver("A", SHEET_PIN, false), driver("B", SHEET_PIN, true)]),
             "B"
@@ -2295,12 +2357,7 @@ mod tests {
     #[tokio::test]
     async fn a_local_power_symbol_joins_on_its_own_sheet_only() {
         // The root's VCC symbol as the fixture has it, and as a local one.
-        let global = "\t\t(symbol \"power:VCC\"\n\t\t\t(power global)";
-        assert!(fixture(ROOT).contains(global));
-        for (power, joins) in [("(power global)", true), ("(power local)", false)] {
-            let dir = single_pin_nets();
-            let root = fixture(ROOT).replace(global, &global.replace("(power global)", power));
-            std::fs::write(dir.path().join(ROOT), root).unwrap();
+        for (dir, joins) in [(single_pin_nets(), true), (local_vcc(), false)] {
             let child = dir.path().join(CHILD);
             let add =
                 json!({ "net": "SPARE", "x": 120.65, "y": 100.33, "label_type": "global_label" });
@@ -2317,9 +2374,32 @@ mod tests {
                     "{message}"
                 );
             } else {
-                assert_eq!(body(&result)["merged"], json!([]), "{power}");
+                assert_eq!(body(&result)["merged"], json!([]));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_hidden_power_pin_names_a_global_net() {
+        let dir = hidden_power_pin();
+        let root = dir.path().join(ROOT);
+        let result = rename(&root, json!({ "uuid": TWO_PIN, "new_name": "HIDDEN" })).await;
+        refused(&result, "plan_blocked");
+        assert_eq!(read(&dir, ROOT), fixture(HIDDEN_ROOT));
+
+        let child = dir.path().join(CHILD);
+        let add = json!({ "net": "SPARE", "x": 120.65, "y": 100.33, "label_type": "global_label" });
+        body(&call("add_schematic_net_label", &child, add).await);
+        let result = rename(
+            &child,
+            json!({ "net": "SPARE", "scope": "sheet", "new_name": "HIDDEN" }),
+        )
+        .await;
+        let message = refused(&result, "plan_blocked");
+        assert!(
+            message.contains("'HIDDEN' on / ") && message.contains("'SPARE' on /Child/"),
+            "{message}"
+        );
     }
 
     #[tokio::test]
@@ -2518,8 +2598,16 @@ mod tests {
             "rename_schematic_net_label",
             json!({ "uuid": LOCAL_MIXED, "new_name": "OWN" }),
         );
-        let cases = [
+        let spare = (
+            CHILD,
+            "add_schematic_net_label",
+            json!({ "net": "SPARE", "x": 100.33, "y": 59.69, "label_type": "global_label" }),
+        );
+        // The pair a case starts from.
+        type Start = fn() -> tempfile::TempDir;
+        let cases: [(Start, Vec<_>, _, _, _, _); 22] = [
             (
+                single_pin_nets,
                 vec![],
                 CHILD,
                 json!({ "uuid": CHILD_LOCAL, "new_name": "TWO_PIN" }),
@@ -2527,6 +2615,7 @@ mod tests {
                 false,
             ),
             (
+                single_pin_nets,
                 vec![],
                 CHILD,
                 json!({ "uuid": CHILD_LOCAL, "new_name": "MIXED" }),
@@ -2534,6 +2623,7 @@ mod tests {
                 false,
             ),
             (
+                single_pin_nets,
                 vec![],
                 ROOT,
                 json!({ "net": "SPLIT", "scope": "sheet", "new_name": "SIDE" }),
@@ -2541,6 +2631,7 @@ mod tests {
                 false,
             ),
             (
+                single_pin_nets,
                 vec![],
                 ROOT,
                 json!({ "uuid": LOCAL_MIXED, "new_name": "OWN" }),
@@ -2548,6 +2639,7 @@ mod tests {
                 false,
             ),
             (
+                single_pin_nets,
                 vec![],
                 ROOT,
                 json!({ "net": "SHEET_NET", "scope": "hierarchy", "new_name": "LINK" }),
@@ -2555,6 +2647,7 @@ mod tests {
                 false,
             ),
             (
+                single_pin_nets,
                 vec![],
                 ROOT,
                 json!({ "uuid": SPLIT_LEFT, "new_name": "SIDE" }),
@@ -2562,6 +2655,7 @@ mod tests {
                 true,
             ),
             (
+                single_pin_nets,
                 vec![],
                 CHILD,
                 json!({ "uuid": CHILD_SHEET_NET, "new_name": "LINK" }),
@@ -2569,6 +2663,7 @@ mod tests {
                 true,
             ),
             (
+                single_pin_nets,
                 vec![],
                 ROOT,
                 json!({ "uuid": TWO_PIN, "new_name": "LONE" }),
@@ -2576,6 +2671,7 @@ mod tests {
                 false,
             ),
             (
+                single_pin_nets,
                 vec![own],
                 ROOT,
                 json!({ "uuid": TWO_PIN, "new_name": "MIXED" }),
@@ -2583,6 +2679,7 @@ mod tests {
                 false,
             ),
             (
+                single_pin_nets,
                 vec![across.clone()],
                 ROOT,
                 json!({ "net": "MIXED", "scope": "sheet", "new_name": "ACROSS" }),
@@ -2590,6 +2687,7 @@ mod tests {
                 false,
             ),
             (
+                single_pin_nets,
                 vec![across.clone(), zz],
                 CHILD,
                 json!({ "uuid": CHILD_LOCAL, "new_name": "ZZ" }),
@@ -2597,6 +2695,7 @@ mod tests {
                 false,
             ),
             (
+                single_pin_nets,
                 vec![across, aa],
                 CHILD,
                 json!({ "uuid": CHILD_LOCAL, "new_name": "AA" }),
@@ -2604,6 +2703,7 @@ mod tests {
                 false,
             ),
             (
+                single_pin_nets,
                 vec![unname.clone(), sheet_net_on_lone],
                 ROOT,
                 json!({ "net": "SHEET_NET", "x": 101.6, "y": 59.69, "new_name": "OTHER" }),
@@ -2611,6 +2711,7 @@ mod tests {
                 true,
             ),
             (
+                single_pin_nets,
                 vec![zmid, zother],
                 ROOT,
                 json!({ "net": "ZOTHER", "x": 104.14, "y": 59.69, "new_name": "ZMID" }),
@@ -2618,6 +2719,7 @@ mod tests {
                 false,
             ),
             (
+                single_pin_nets,
                 vec![
                     zz_global.clone(),
                     zz_local.clone(),
@@ -2630,6 +2732,7 @@ mod tests {
                 false,
             ),
             (
+                single_pin_nets,
                 vec![zz_global, zz_local, across_again],
                 CHILD,
                 json!({ "uuid": CHILD_LOCAL, "new_name": "ZZ" }),
@@ -2637,15 +2740,56 @@ mod tests {
                 false,
             ),
             (
+                single_pin_nets,
                 vec![unname],
                 ROOT,
                 json!({ "uuid": TWO_PIN, "new_name": "SHEET_NET" }),
                 false,
                 false,
             ),
+            (
+                single_pin_nets,
+                vec![spare.clone()],
+                CHILD,
+                json!({ "net": "SPARE", "scope": "sheet", "new_name": "VCC" }),
+                true,
+                false,
+            ),
+            (
+                local_vcc,
+                vec![spare.clone()],
+                CHILD,
+                json!({ "net": "SPARE", "scope": "sheet", "new_name": "VCC" }),
+                false,
+                false,
+            ),
+            (
+                hidden_power_pin,
+                vec![],
+                ROOT,
+                json!({ "uuid": TWO_PIN, "new_name": "HIDDEN" }),
+                true,
+                false,
+            ),
+            (
+                hidden_power_pin,
+                vec![spare],
+                CHILD,
+                json!({ "net": "SPARE", "scope": "sheet", "new_name": "HIDDEN" }),
+                true,
+                false,
+            ),
+            (
+                hidden_power_pin,
+                vec![],
+                CHILD,
+                json!({ "uuid": CHILD_LOCAL, "new_name": "HIDDEN" }),
+                false,
+                false,
+            ),
         ];
-        for (setup, sheet, mut args, merges, splits) in cases {
-            let dir = single_pin_nets();
+        for (start, setup, sheet, mut args, merges, splits) in cases {
+            let dir = start();
             let root = dir.path().join(ROOT);
             for (file, tool, step) in setup {
                 body(&call(tool, &dir.path().join(file), step).await);

@@ -1109,6 +1109,8 @@ pub struct LibPin {
     pub local_y: f64,
     pub rotation: f64,
     pub length: f64,
+    /// `(hide yes)`, or a bare `hide` in older files.
+    pub hidden: bool,
 }
 
 /// Parse pins from a library symbol definition node.
@@ -1199,6 +1201,12 @@ fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
         .and_then(|n| n.as_str())
         .unwrap_or("")
         .to_string();
+    let hidden = node.find_str("hide") == Some("yes")
+        || node
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .any(|child| child.as_str() == Some("hide"));
     Some(LibPin {
         number,
         name,
@@ -1207,6 +1215,7 @@ fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
         local_y: y,
         rotation,
         length,
+        hidden,
     })
 }
 
@@ -1738,6 +1747,25 @@ mod unit_pin_tests {
     }
 
     #[test]
+    fn extraction_reads_a_hidden_pin_in_either_form() {
+        let root = parse_sexp(
+            r#"(kicad_symbol_lib
+  (symbol "TEST"
+    (pin power_in line (at 0 0 0) (length 0) (hide yes) (name "A") (number "1"))
+    (pin power_in line (at 0 0 0) (length 0) hide (name "B") (number "2"))
+    (pin power_in line (at 0 0 0) (length 0) (hide no) (name "C") (number "3"))
+    (pin power_in line (at 0 0 0) (length 0) (name "D") (number "4"))))"#,
+        )
+        .unwrap();
+        let hidden: Vec<bool> = extract_lib_pins(root.find("symbol").unwrap())
+            .iter()
+            .map(|pin| pin.hidden)
+            .collect();
+
+        assert_eq!(hidden, [true, true, false, false]);
+    }
+
+    #[test]
     fn underscored_base_names_parse_their_unit_suffix() {
         assert_eq!(parse_subsymbol_unit("R_Small_1_1"), Some(1));
         assert_eq!(parse_subsymbol_unit("OP_DUAL_2_1"), Some(2));
@@ -1765,6 +1793,7 @@ mod pin_endpoint_tests {
             local_y,
             rotation,
             length: 1.27,
+            hidden: false,
         }
     }
 
@@ -2111,6 +2140,7 @@ mod pin_label_rotation_tests {
             local_y: -10.0 * rad.sin(),
             rotation: angle,
             length: 2.54,
+            hidden: false,
         }
     }
 
@@ -2208,6 +2238,7 @@ mod pin_label_rotation_tests {
                 local_y: 0.0,
                 rotation: angle,
                 length: 0.0,
+                hidden: false,
             };
             for direction in [0.0, 90.0, 180.0, 270.0] {
                 let t = PinTransform {
