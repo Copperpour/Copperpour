@@ -371,8 +371,8 @@ impl Sheet {
         }
         for pin in &mut self.pins {
             match pin.at.rotation {
-                Some(r) if r == 0.0 => pin.at.x += dw,
-                Some(r) if r == 270.0 => pin.at.y += dh,
+                Some(0.0) => pin.at.x += dw,
+                Some(270.0) => pin.at.y += dh,
                 _ => {}
             }
             pin.at.x = pin.at.x.clamp(self.at.x, self.at.x + width);
