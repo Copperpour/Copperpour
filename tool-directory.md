@@ -14,7 +14,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **244 registered tools** + **7 always-visible meta-tools** = **251 total**
+- **245 registered tools** + **7 always-visible meta-tools** = **252 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<copperpour dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -383,18 +383,19 @@ and Windows servers do not.
 
 ## Integration
 
-### `integration` · 10 tools
+### `integration` · 11 tools
 **Purpose:** JLCPCB parts database, local Freerouting MCP routing, datasheet URLs.
 **Source:** [`crates/copperpour-core/src/tools/integration.rs`](crates/copperpour-core/src/tools/integration.rs)
 
 | Tool | Description |
 |------|-------------|
 | `download_jlcpcb_database` | Download or update the local JLCPCB parts database cache (SQLite). |
-| `search_jlcpcb_parts` | Search the local JLCPCB database by keyword, value, or category. The query is split on whitespace; a part matches only if every word appears, in any order, in its LCSC number, MPN, package, manufacturer or description (case-insensitive, `%` and `_` literal). A word that is a value (`20pF`, `4.7uF`, `1k`, `0402`) matches only as a whole value, so `20pF` does not find `220pF`. |
+| `search_jlcpcb_parts` | Search the local JLCPCB database by keyword, value, or category. The query is split on whitespace; a part matches only if every word appears, in any order, in its LCSC number, MPN, package, manufacturer or description (case-insensitive, `%` and `_` literal). A word that is a value (`20pF`, `4.7uF`, `1k`, `0402`) matches only as a whole value, so `20pF` does not find `220pF`. `category` keeps parts whose category contains the given text (case-insensitive, `%` and `_` literal). |
+| `list_jlcpcb_categories` | List the category names of the local JLCPCB database for `search_jlcpcb_parts`' `category` filter: top-level groups with part, in-stock and subcategory counts, or with `contains`, every full `Group / Subcategory` name containing that text. |
 | `get_jlcpcb_part` | Retrieve full details for a single JLCPCB part by LCSC part number. |
 | `import_jlcpcb_part` | Import a symbol and footprint directly from JLCPCB / EasyEDA by LCSC part number (e.g. `C2856837`). Converts pins, pads, graphics, and custom properties (LCSC, MPN, Manufacturer, JLCPCB_Class, verified datasheet URL), saves to the project's KiCad symbol and footprint libraries, idempotently registers both in sym-lib-table and fp-lib-table, and optionally places the component onto the schematic. |
 | `suggest_jlcpcb_alternatives` | Suggest JLCPCB-stocked parts with the same value in the package a KiCad footprint maps to. Excludes parts below a stock floor and ranks Basic, then Preferred, then Extended parts, then known price and stock; the response states the LCSC package names matched, the ranking and what was excluded. |
-| `get_jlcpcb_database_stats` | Statistics about the local JLCPCB cache: part count, last updated, file size. |
+| `get_jlcpcb_database_stats` | Statistics about the local JLCPCB cache: part count, category count, file size. |
 | `enrich_datasheets` | Fetch and cache datasheet URLs for all components in a schematic (LCSC API). |
 | `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID — from the local JLCPCB catalog first, falling back to the LCSC API. |
 | `check_freerouting` | Locate a Freerouting installation, including KiCad PCM plugin directories, then report `engine_found`, `native_mcp_available`, and `bridge_available` as separate observed facts. |
