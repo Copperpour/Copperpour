@@ -835,6 +835,43 @@ impl SheetBox {
     }
 }
 
+/// The rotation of the edge a moved pin now sits on, or `None` to leave it alone.
+///
+/// A pin moved to another edge without a `side` keeps the rotation of the old
+/// one, and KiCad would then relocate it on load. A position on the edge it
+/// already names, including a corner it shares, stays as it is, and a position
+/// on no edge is left for the existing `side`-less behaviour.
+fn rotation_for_moved_pin(
+    sheet_box: SheetBox,
+    x: f64,
+    y: f64,
+    current: Option<f64>,
+) -> Option<f64> {
+    let on_edge = |side: &str| {
+        let Some(edge) = sheet_box.edge(side) else {
+            return false;
+        };
+        let (fixed, along) = if edge.axis == "x" { (x, y) } else { (y, x) };
+        (fixed - edge.coordinate).abs() <= SHEET_PIN_EDGE_TOLERANCE_MM
+            && along >= edge.span_start - SHEET_PIN_EDGE_TOLERANCE_MM
+            && along <= edge.span_end + SHEET_PIN_EDGE_TOLERANCE_MM
+    };
+    let sides: Vec<&str> = SHEET_PIN_SIDES
+        .iter()
+        .copied()
+        .filter(|side| on_edge(side))
+        .collect();
+    if sides
+        .iter()
+        .any(|side| rotation_for_sheet_pin_side(side) == current)
+    {
+        return None;
+    }
+    sides
+        .first()
+        .and_then(|side| rotation_for_sheet_pin_side(side))
+}
+
 /// One edge of a sheet box: the axis a pin on it is pinned to and the
 /// coordinate it must hold there, plus how far the edge runs along the other
 /// axis. KiCad constrains a pin on both — a position past a corner is clamped
@@ -3148,6 +3185,12 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
         pin.at.x = x;
         pin.at.y = y;
         changed.push("position");
+        if requested_side.is_none() {
+            if let Some(rotation) = rotation_for_moved_pin(sheet_box, x, y, pin.at.rotation) {
+                pin.at.rotation = Some(rotation);
+                changed.push("side");
+            }
+        }
     }
     // Checked against where the pin ends up, so `side` and `x`+`y` in one call
     // are judged together rather than against the position being replaced. The
@@ -4761,6 +4804,37 @@ mod tests {
         assert_eq!(body["changed_fields"], json!(["position", "side"]));
         assert_eq!(body["pin"]["side"], json!("bottom"));
         assert_eq!(pin_rotation(&root, "CLK"), Some(270.0));
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_pin_turns_a_pin_moved_to_another_edge() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        let sheet = cse::Schematic::load(&root).unwrap();
+        let sheet_box = SheetBox::of(sheet.sheets.by_name("A").unwrap());
+        let right = sheet_box.x + sheet_box.width;
+        let y = sheet_box.y + sheet_box.height / 2.0;
+        let (left, schematic) = (sheet_box.x, root.display().to_string());
+        handle_add_sheet_pin(
+            &json!({ "schematic": schematic, "sheet_name": "A", "pin_name": "CLK",
+                     "pin_type": "input", "x": left, "y": y, "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_edit_sheet_pin(
+            &json!({ "schematic": schematic, "sheet_name": "A", "pin_name": "CLK",
+                     "x": right, "y": y }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let body = result_json(&result);
+        assert_eq!(body["pin"]["side"], "right");
+        assert_eq!(body["changed_fields"], json!(["position", "side"]));
     }
 
     #[tokio::test]
