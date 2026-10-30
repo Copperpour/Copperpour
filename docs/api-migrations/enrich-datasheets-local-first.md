@@ -19,6 +19,10 @@ The tool response includes additional structured metric fields:
   configured or present at the configured or default path;
 - `local_catalog_error`: present when the configured or default catalog exists
   but could not be read; the parts were looked up through the LCSC API instead.
+- `local_catalog_unreadable_ids`: present when the catalog was read but some
+  parts' `Datasheet` is not text, such as a blob, which a catalog built by
+  `download_jlcpcb_database` never has; those parts were looked up through the
+  LCSC API instead. A NULL `Datasheet` counts as empty and is not listed.
 
 A `db_path` given in the arguments is not replaced by the network: when it is
 missing or cannot be read as a catalog, the call is refused as `file_not_found`

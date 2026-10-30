@@ -409,7 +409,7 @@ and Windows servers do not.
 | `import_jlcpcb_part` | Import a symbol and footprint directly from JLCPCB / EasyEDA by LCSC part number (e.g. `C2856837`). Converts pins, pads, graphics, and custom properties (LCSC, MPN, Manufacturer, JLCPCB_Class, verified datasheet URL), saves to the project's KiCad symbol and footprint libraries, idempotently registers both in sym-lib-table and fp-lib-table, and optionally places the component onto the schematic. |
 | `suggest_jlcpcb_alternatives` | Suggest JLCPCB-stocked parts with the same value in the package a KiCad footprint maps to. Excludes parts below a stock floor and ranks Basic, then Preferred, then Extended parts, then known price and stock; the response states the LCSC package names matched, the ranking and what was excluded. |
 | `get_jlcpcb_database_stats` | Statistics about the local JLCPCB cache: part count, category count, file size. |
-| `enrich_datasheets` | Fetch and cache datasheet URLs for all components in a schematic (LCSC API). |
+| `enrich_datasheets` | Fetch and cache datasheet URLs for all components in a schematic using the local JLCPCB catalog with LCSC API fallback. |
 | `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID — from the local JLCPCB catalog first, falling back to the LCSC API. |
 | `check_freerouting` | Locate a Freerouting installation, including KiCad PCM plugin directories, then report `engine_found`, `native_mcp_available`, and `bridge_available` as separate observed facts. |
 | `route_specctra_dsn` | Route a DSN through the discovered local Freerouting JAR's native headless MCP server and create a new SES without cloud upload or replacement. The owned unauthenticated service is loopback-only; its child is reaped on every exit path. |
