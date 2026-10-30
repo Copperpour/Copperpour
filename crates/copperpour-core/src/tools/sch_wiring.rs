@@ -2037,7 +2037,7 @@ struct LabelBlock {
 /// KiCAD's three label tags. `label` is the plain net label — the type
 /// `add_schematic_net_label` writes by default. (`net_label` is this codebase's
 /// internal name for it and never appears in a .kicad_sch.)
-const LABEL_TAGS: [&str; 3] = ["label", "global_label", "hierarchical_label"];
+pub(super) const LABEL_TAGS: [&str; 3] = ["label", "global_label", "hierarchical_label"];
 
 /// Locate every label block in `content` by scanning forward for the label tags
 /// and parsing each block, rather than searching for a name string and walking
@@ -2078,7 +2078,7 @@ fn find_label_blocks(content: &str) -> Vec<LabelBlock> {
 
 /// Compare schematic coordinates. KiCAD stores mm to 4 decimals, so this is an
 /// exact match in practice while tolerating float round-trip noise.
-fn same_point(a: f64, b: f64) -> bool {
+pub(super) fn same_point(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-6
 }
 
