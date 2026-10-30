@@ -31,11 +31,12 @@ fn release_publication_requires_real_kicad_acceptance() {
         release["jobs"]["release"]["needs"],
         serde_json::json!([
             "real-kicad-acceptance",
+            "doc-counts",
             "build",
             "pcm-package",
             "pcm-submission-metadata"
         ]),
-        "the release publication job must require real-KiCad acceptance and every artifact job"
+        "the release publication job must require real-KiCad acceptance, current doc counts and every artifact job"
     );
 }
 

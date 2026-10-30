@@ -34,6 +34,29 @@ jobs:
       contents: read
     uses: ./.github/workflows/e2e-kicad.yml
 
+  # Tool counts in the docs are updated once per release, not per PR (#222).
+  # A tag whose docs still quote the previous release's counts fails here.
+  doc-counts:
+    name: Documented tool counts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc@3.23.4
+          fallback: none
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Check documented tool counts
+        run: cargo test -p copperpour --locked --test doc_tool_counts -- --include-ignored
+
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -295,7 +318,7 @@ jobs:
   release:
     name: Create Release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [real-kicad-acceptance, build, pcm-package, pcm-submission-metadata]
+    needs: [real-kicad-acceptance, doc-counts, build, pcm-package, pcm-submission-metadata]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

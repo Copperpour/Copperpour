@@ -349,10 +349,10 @@ checked readers for domain rules.
 
 1. Add the `tool!(...)` definition to the toolset's `tools()` vec.
 2. Write the `async fn handle_*()` below it.
-3. Update `tool_count` in `registry.rs::ALL_TOOLSETS` (shown by `list_toolboxes`).
-4. If it belongs in the default set, add its toolset to `STARTER_KIT`.
-5. `cargo check`, then `cargo xtask fix-doc-counts` and re-run the tool-directory
-   extraction (see the `tool-directory.md` header).
+3. If it belongs in the default set, add its toolset to `STARTER_KIT`.
+4. `cargo check`, then add its row to `tool-directory.md` (see that file's header).
+   Leave the tool counts in the docs alone: `cargo xtask fix-doc-counts` updates them
+   at release, and `list_toolboxes` counts each toolset's `tools()`.
 
 ## Current Stats
 

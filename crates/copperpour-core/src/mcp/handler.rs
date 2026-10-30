@@ -2687,7 +2687,7 @@ mod client_adaptation_tests {
     fn full_catalogue() -> usize {
         crate::router::registry::ALL_TOOLSETS
             .iter()
-            .map(|t| t.tool_count)
+            .map(|t| t.tool_count())
             .sum::<usize>()
             + meta_tools::meta_tool_descriptions().len()
     }
