@@ -131,12 +131,13 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "enrich_datasheets",
-            "Fetch and cache datasheet URLs for all components in a schematic using the LCSC API.",
+            "Fetch and cache datasheet URLs for all components in a schematic using the local JLCPCB catalog with LCSC API fallback.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "overwrite_existing": { "type": "boolean", "description": "Replace existing Datasheet fields", "default": false }
+                    "overwrite_existing": { "type": "boolean", "description": "Replace existing Datasheet fields", "default": false },
+                    "db_path": { "type": "string", "description": "Local path to the JLCPCB SQLite database (optional, uses config default)" }
                 },
                 "required": ["schematic"]
             }),
@@ -196,7 +197,10 @@ pub(crate) fn default_jlcpcb_db_path() -> Option<PathBuf> {
 
 /// `None` when no path is given and the user's home directory is unknown.
 pub(crate) fn resolve_db_path(args: &serde_json::Value, ctx: &ToolContext) -> Option<PathBuf> {
-    if let Some(p) = args["output_path"].as_str() {
+    if let Some(p) = args["db_path"]
+        .as_str()
+        .or_else(|| args["output_path"].as_str())
+    {
         return Some(PathBuf::from(p));
     }
     if let Some(p) = &ctx.config.jlcpcb_db_path {
@@ -1358,9 +1362,133 @@ async fn handle_jlcpcb_stats(
     ))
 }
 
+const LCSC_DETAIL_URL: &str = "https://wmsc.lcsc.com/ftps/wm/product/detail";
+
+fn lcsc_detail_url(args: &serde_json::Value, lcsc_id: &str) -> String {
+    let base = lcsc_api_base(args);
+    let separator = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{separator}productCode={lcsc_id}")
+}
+
+#[cfg(not(test))]
+fn lcsc_api_base(_args: &serde_json::Value) -> &str {
+    LCSC_DETAIL_URL
+}
+
+/// Tests point the LCSC fetches at a local mock server through
+/// `_api_base_url`; release builds always use [`LCSC_DETAIL_URL`].
+#[cfg(test)]
+fn lcsc_api_base(args: &serde_json::Value) -> &str {
+    args["_api_base_url"].as_str().unwrap_or(LCSC_DETAIL_URL)
+}
+
+/// What the local JLCPCB catalog contributed to a datasheet lookup.
+enum CatalogDatasheets {
+    /// The catalog was opened and queried: non-empty datasheets by LCSC ID.
+    Read(HashMap<String, String>),
+    /// No catalog was configured, and none is at the default path.
+    Skipped(String),
+    /// The configured or default catalog exists but could not be read.
+    Failed(String),
+}
+
+/// Look up datasheets in the local catalog. A `db_path` the caller gives must
+/// be a readable catalog: a missing or unreadable one is refused as
+/// `file_not_found` rather than replaced by the network.
+async fn datasheets_from_catalog_for_lcsc_ids(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    lcsc_ids: &[String],
+) -> Result<CatalogDatasheets, CallToolResult> {
+    let explicit = args["db_path"].as_str().is_some();
+    let Some(db_path) = resolve_db_path(args, ctx) else {
+        return Ok(CatalogDatasheets::Skipped(
+            "no catalog path: jlcpcb_db_path is not set and the home directory is unknown"
+                .to_owned(),
+        ));
+    };
+    let refuse = |reason: String| {
+        CallToolResult::error_kind(
+            ToolErrorKind::FileNotFound {
+                path: db_path.display().to_string(),
+            },
+            reason,
+        )
+    };
+    if !db_path.is_file() {
+        if explicit {
+            return Err(refuse(format!(
+                "db_path is not a file: {}",
+                db_path.display()
+            )));
+        }
+        return Ok(CatalogDatasheets::Skipped(format!(
+            "no catalog at {}",
+            db_path.display()
+        )));
+    }
+    let query_path = db_path.clone();
+    let ids = lcsc_ids.to_vec();
+    let queried = tokio::task::spawn_blocking(move || query_catalog_datasheets(&query_path, &ids))
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+    match queried {
+        Ok(map) => Ok(CatalogDatasheets::Read(map)),
+        Err(error) => {
+            let reason = format!("cannot read catalog {}: {error}", db_path.display());
+            if explicit {
+                Err(refuse(format!("db_path is unreadable: {reason}")))
+            } else {
+                Ok(CatalogDatasheets::Failed(reason))
+            }
+        }
+    }
+}
+
+fn query_catalog_datasheets(
+    db_path: &Path,
+    lcsc_ids: &[String],
+) -> anyhow::Result<HashMap<String, String>> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt = conn.prepare("SELECT Datasheet FROM components WHERE LCSC = ?1 LIMIT 1")?;
+    let mut map = HashMap::new();
+    for id in lcsc_ids {
+        let mut rows = stmt.query_map(rusqlite::params![id], |row| row.get::<_, String>(0))?;
+        if let Some(url) = rows.next().transpose()? {
+            let trimmed = url.trim();
+            if !trimmed.is_empty() && trimmed != "~" {
+                map.insert(id.clone(), trimmed.to_owned());
+            }
+        }
+    }
+    Ok(map)
+}
+
+fn count_skipped_existing_values(
+    symbols: &[DatasheetSymbolTarget],
+    urls: &HashMap<String, String>,
+    overwrite: bool,
+) -> usize {
+    if overwrite {
+        return 0;
+    }
+    symbols
+        .iter()
+        .filter(|symbol| {
+            urls.contains_key(&symbol.lcsc_id)
+                && symbol
+                    .datasheet
+                    .as_deref()
+                    .is_some_and(|d| !d.is_empty() && d != "~")
+        })
+        .count()
+}
+
 async fn handle_enrich_datasheets(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let overwrite = args["overwrite_existing"].as_bool().unwrap_or(false);
@@ -1385,38 +1513,89 @@ async fn handle_enrich_datasheets(
     if lcsc_ids.is_empty() {
         return Ok(CallToolResult::text(
             serde_json::to_string(&json!({
+                "lcsc_ids_found": 0,
+                "datasheets_enriched": 0,
+                "local_hits": 0,
+                "api_hits": 0,
+                "misses": 0,
+                "skipped_existing_values": 0,
+                "attempted_sources": [],
                 "updated": 0,
+                "schematic": sch_path.to_str().unwrap_or(""),
                 "note": "No LCSC property found in schematic components"
             }))
             .unwrap(),
         ));
     }
 
-    // Query LCSC API for datasheet URLs
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-
     let mut urls = HashMap::new();
+    let mut attempted_sources = Vec::new();
+    let mut local_catalog_skipped = None;
+    let mut local_catalog_error = None;
 
-    for lcsc_id in &lcsc_ids {
-        let url = format!(
-            "https://wmsc.lcsc.com/ftps/wm/product/detail?productCode={}",
-            lcsc_id
-        );
-        if let Ok(resp) = get_with_backoff(&client, &url).await {
-            if resp.status().is_success() {
-                if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
-                    if let Some(datasheet_url) = json_resp
-                        .pointer("/result/dataManualUrl")
-                        .and_then(|v| v.as_str())
-                    {
-                        urls.insert(lcsc_id.clone(), datasheet_url.to_owned());
+    let local_map = match datasheets_from_catalog_for_lcsc_ids(args, ctx, &lcsc_ids).await {
+        Ok(CatalogDatasheets::Read(map)) => {
+            attempted_sources.push("local_catalog".to_string());
+            map
+        }
+        Ok(CatalogDatasheets::Skipped(reason)) => {
+            local_catalog_skipped = Some(reason);
+            HashMap::new()
+        }
+        Ok(CatalogDatasheets::Failed(reason)) => {
+            local_catalog_error = Some(reason);
+            HashMap::new()
+        }
+        Err(refusal) => return Ok(refusal),
+    };
+
+    let mut local_hits = 0usize;
+    let mut remaining_ids = Vec::new();
+
+    for id in &lcsc_ids {
+        if let Some(url) = local_map.get(id) {
+            urls.insert(id.clone(), url.clone());
+            local_hits += 1;
+        } else {
+            remaining_ids.push(id.clone());
+        }
+    }
+
+    let mut api_hits = 0usize;
+    let mut misses = 0usize;
+
+    if !remaining_ids.is_empty() {
+        attempted_sources.push("lcsc_api".to_string());
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+
+        for lcsc_id in &remaining_ids {
+            let url = lcsc_detail_url(args, lcsc_id);
+            let mut found = false;
+            if let Ok(resp) = get_with_backoff(&client, &url).await {
+                if resp.status().is_success() {
+                    if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
+                        if let Some(datasheet_url) = json_resp
+                            .pointer("/result/dataManualUrl")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty() && *s != "~")
+                        {
+                            urls.insert(lcsc_id.clone(), datasheet_url.to_owned());
+                            api_hits += 1;
+                            found = true;
+                        }
                     }
                 }
             }
+            if !found {
+                misses += 1;
+            }
         }
     }
+
+    let skipped_existing = count_skipped_existing_values(&symbols, &urls, overwrite);
 
     let plan = match plan_datasheet_enrichment(&content, &urls, overwrite) {
         Ok(plan) => plan,
@@ -1439,14 +1618,26 @@ async fn handle_enrich_datasheets(
         Vec::new()
     };
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "lcsc_ids_found": lcsc_ids.len(),
-            "datasheets_enriched": observed_updates.len(),
-            "schematic": sch_path.to_str().unwrap_or("")
-        }))
-        .unwrap(),
-    ))
+    let mut body = json!({
+        "lcsc_ids_found": lcsc_ids.len(),
+        "datasheets_enriched": observed_updates.len(),
+        "local_hits": local_hits,
+        "api_hits": api_hits,
+        "misses": misses,
+        "skipped_existing_values": skipped_existing,
+        "attempted_sources": attempted_sources,
+        "updated": observed_updates.len(),
+        "schematic": sch_path.to_str().unwrap_or("")
+    });
+    if let Some(reason) = local_catalog_skipped {
+        body["local_catalog_skipped"] = json!(reason);
+        body["note"] = json!("No local JLCPCB catalog was read; run download_jlcpcb_database to resolve datasheets without the network");
+    }
+    if let Some(reason) = local_catalog_error {
+        body["local_catalog_error"] = json!(reason);
+        body["note"] = json!("The local JLCPCB catalog could not be read, so every part was looked up through the LCSC API; re-run download_jlcpcb_database with force to rebuild it");
+    }
+    Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
 #[derive(Debug, Clone)]
@@ -1857,10 +2048,7 @@ async fn handle_get_datasheet_url(
 
     // Try LCSC API with lcsc_id first
     if let Some(id) = lcsc_id {
-        let url = format!(
-            "https://wmsc.lcsc.com/ftps/wm/product/detail?productCode={}",
-            id
-        );
+        let url = lcsc_detail_url(args, id);
         if let Ok(resp) = get_with_backoff(&client, &url).await {
             if resp.status().is_success() {
                 if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
@@ -2428,6 +2616,385 @@ mod datasheet_enrichment_tests {
         assert!(plan_datasheet_enrichment(&original, &same, true)
             .unwrap()
             .is_none());
+    }
+
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(ServerConfig::default(), Arc::new(ToolRouter::new()))
+    }
+
+    fn response_json(result: &CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    fn seed_catalog_db(parts: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("jlcpcb.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        conn.execute(
+            "CREATE TABLE components (
+                LCSC TEXT, MFR_Part TEXT, Package TEXT, Manufacturer TEXT,
+                Library_Type TEXT, Description TEXT, Datasheet TEXT,
+                Price REAL, Stock INTEGER, Category TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        for (lcsc, datasheet) in parts {
+            conn.execute(
+                "INSERT INTO components VALUES (?1, 'MPN', '0402', 'MFR', 'Basic', 'desc', ?2, 0.01, 100, 'cat')",
+                rusqlite::params![lcsc, datasheet],
+            )
+            .unwrap();
+        }
+        (dir, db_path)
+    }
+
+    async fn start_mock_lcsc_server(
+        routes: HashMap<String, Option<String>>,
+    ) -> (tokio::task::JoinHandle<()>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/ftps/wm/product/detail");
+        let handle = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 2048];
+                let n = match socket.read(&mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => continue,
+                };
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let code = req
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|path| path.split("productCode=").nth(1))
+                    .and_then(|code| code.split('&').next())
+                    .unwrap_or("");
+                let response = if let Some(Some(ds_url)) = routes.get(code) {
+                    let body = format!(r#"{{"result":{{"dataManualUrl":"{ds_url}"}}}}"#);
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                } else {
+                    let body = r#"{"result":null}"#;
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (handle, url)
+    }
+
+    #[tokio::test]
+    async fn local_catalog_hit_enriches_schematic_without_network_call() {
+        let (_dir, db_path) =
+            seed_catalog_db(&[("C14663", "https://example.com/c14663-local.pdf")]);
+        let ctx = test_ctx();
+
+        let original = schematic(&symbol("R1", 1, Some("r1-uuid"), "C14663"));
+        let mut file = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        file.write_all(original.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        let result = handle_enrich_datasheets(
+            &json!({
+                "schematic": file.path().to_str().unwrap(),
+                "db_path": db_path.to_str().unwrap()
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let body = response_json(&result);
+        assert_eq!(body["local_hits"], 1);
+        assert_eq!(body["api_hits"], 0);
+        assert_eq!(body["misses"], 0);
+        assert_eq!(body["datasheets_enriched"], 1);
+        assert_eq!(body["skipped_existing_values"], 0);
+        assert_eq!(body["attempted_sources"], json!(["local_catalog"]));
+
+        let committed = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            committed.contains(r#"(property "Datasheet" "https://example.com/c14663-local.pdf")"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_local_datasheet_and_catalog_miss_fall_back_to_api() {
+        let (_dir, db_path) = seed_catalog_db(&[("C100", "")]);
+        let ctx = test_ctx();
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "C100".to_string(),
+            Some("https://example.com/c100-api.pdf".to_string()),
+        );
+        routes.insert("C200".to_string(), None);
+        let (_server, mock_url) = start_mock_lcsc_server(routes).await;
+
+        let original = schematic(&format!(
+            "{}{}",
+            symbol("R1", 1, Some("r1-uuid"), "C100"),
+            symbol("R2", 1, Some("r2-uuid"), "C200"),
+        ));
+        let mut file = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        file.write_all(original.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        let result = handle_enrich_datasheets(
+            &json!({
+                "schematic": file.path().to_str().unwrap(),
+                "db_path": db_path.to_str().unwrap(),
+                "_api_base_url": mock_url
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let body = response_json(&result);
+        assert_eq!(body["local_hits"], 0);
+        assert_eq!(body["api_hits"], 1);
+        assert_eq!(body["misses"], 1);
+        assert_eq!(body["datasheets_enriched"], 1);
+        assert_eq!(body["skipped_existing_values"], 0);
+        assert_eq!(
+            body["attempted_sources"],
+            json!(["local_catalog", "lcsc_api"])
+        );
+
+        let committed = std::fs::read_to_string(file.path()).unwrap();
+        assert!(committed.contains(r#"(property "Datasheet" "https://example.com/c100-api.pdf")"#));
+    }
+
+    #[tokio::test]
+    async fn skipped_existing_values_and_multi_unit_component_behavior() {
+        let (_dir, db_path) = seed_catalog_db(&[("C500", "https://example.com/c500-new.pdf")]);
+        let ctx = test_ctx();
+
+        let original_body = format!(
+            "{}{}",
+            symbol("U1", 1, Some("u1-1"), "C500"),
+            symbol("U1", 2, Some("u1-2"), "C500"),
+        )
+        .replace(
+            r#"(property "Datasheet" "~")"#,
+            r#"(property "Datasheet" "https://example.com/u1-existing.pdf")"#,
+        );
+        let original = schematic(&original_body);
+
+        let mut file = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        file.write_all(original.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        // 1. overwrite_existing: false -> preserves existing values on both units
+        let result_preserve = handle_enrich_datasheets(
+            &json!({
+                "schematic": file.path().to_str().unwrap(),
+                "db_path": db_path.to_str().unwrap(),
+                "overwrite_existing": false
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let body_preserve = response_json(&result_preserve);
+        assert_eq!(body_preserve["local_hits"], 1);
+        assert_eq!(body_preserve["datasheets_enriched"], 0);
+        assert_eq!(body_preserve["skipped_existing_values"], 2);
+
+        // 2. overwrite_existing: true -> updates both units consistently
+        let result_overwrite = handle_enrich_datasheets(
+            &json!({
+                "schematic": file.path().to_str().unwrap(),
+                "db_path": db_path.to_str().unwrap(),
+                "overwrite_existing": true
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let body_overwrite = response_json(&result_overwrite);
+        assert_eq!(body_overwrite["local_hits"], 1);
+        assert_eq!(body_overwrite["datasheets_enriched"], 2);
+        assert_eq!(body_overwrite["skipped_existing_values"], 0);
+
+        let committed = std::fs::read_to_string(file.path()).unwrap();
+        assert_eq!(
+            committed
+                .matches(r#"(property "Datasheet" "https://example.com/c500-new.pdf")"#)
+                .count(),
+            2
+        );
+    }
+
+    fn ctx_with_catalog(path: PathBuf) -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                jlcpcb_db_path: Some(path),
+                ..ServerConfig::default()
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn schematic_file(lcsc_id: &str) -> (tempfile::NamedTempFile, String) {
+        let original = schematic(&symbol("R1", 1, Some("r1-uuid"), lcsc_id));
+        let mut file = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        file.write_all(original.as_bytes()).unwrap();
+        file.flush().unwrap();
+        (file, original)
+    }
+
+    #[tokio::test]
+    async fn a_missing_db_path_is_refused_before_any_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("typo.db");
+        let (_server, mock_url) = start_mock_lcsc_server(HashMap::from([(
+            "C14663".to_string(),
+            Some("https://example.com/c14663-api.pdf".to_string()),
+        )]))
+        .await;
+        let (file, original) = schematic_file("C14663");
+
+        let result = handle_enrich_datasheets(
+            &json!({
+                "schematic": file.path().to_str().unwrap(),
+                "db_path": missing.to_str().unwrap(),
+                "_api_base_url": mock_url
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let body = response_json(&result);
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert_eq!(body["error"]["path"], json!(missing.display().to_string()));
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_db_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("jlcpcb.db");
+        std::fs::write(&corrupt, b"not a sqlite database").unwrap();
+        let (file, original) = schematic_file("C14663");
+
+        let result = handle_enrich_datasheets(
+            &json!({
+                "schematic": file.path().to_str().unwrap(),
+                "db_path": corrupt.to_str().unwrap()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let body = response_json(&result);
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn a_configured_catalog_that_is_absent_is_reported_as_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_catalog(dir.path().join("jlcpcb.db"));
+        let (_server, mock_url) = start_mock_lcsc_server(HashMap::from([(
+            "C14663".to_string(),
+            Some("https://example.com/c14663-api.pdf".to_string()),
+        )]))
+        .await;
+        let (file, _) = schematic_file("C14663");
+
+        let result = handle_enrich_datasheets(
+            &json!({
+                "schematic": file.path().to_str().unwrap(),
+                "_api_base_url": mock_url
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let body = response_json(&result);
+        assert_eq!(body["attempted_sources"], json!(["lcsc_api"]));
+        assert_eq!(body["api_hits"], 1);
+        assert!(body["local_catalog_skipped"].is_string(), "{body}");
+        assert!(body.get("local_catalog_error").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_configured_catalog_that_cannot_be_read_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("jlcpcb.db");
+        std::fs::write(&corrupt, b"not a sqlite database").unwrap();
+        let ctx = ctx_with_catalog(corrupt);
+        let (_server, mock_url) = start_mock_lcsc_server(HashMap::from([(
+            "C14663".to_string(),
+            Some("https://example.com/c14663-api.pdf".to_string()),
+        )]))
+        .await;
+        let (file, _) = schematic_file("C14663");
+
+        let result = handle_enrich_datasheets(
+            &json!({
+                "schematic": file.path().to_str().unwrap(),
+                "_api_base_url": mock_url
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let body = response_json(&result);
+        assert_eq!(body["attempted_sources"], json!(["lcsc_api"]));
+        assert_eq!(body["api_hits"], 1);
+        assert!(body["local_catalog_error"].is_string(), "{body}");
+        assert!(body.get("local_catalog_skipped").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn total_miss_provenance_when_not_in_catalog_or_api() {
+        let (_dir, db_path) = seed_catalog_db(&[]);
+        let ctx = test_ctx();
+
+        let routes = HashMap::new();
+        let (_server, mock_url) = start_mock_lcsc_server(routes).await;
+
+        let original = schematic(&symbol("R1", 1, Some("r1"), "C9999"));
+        let mut file = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        file.write_all(original.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        let result = handle_enrich_datasheets(
+            &json!({
+                "schematic": file.path().to_str().unwrap(),
+                "db_path": db_path.to_str().unwrap(),
+                "_api_base_url": mock_url
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let body = response_json(&result);
+        assert_eq!(body["local_hits"], 0);
+        assert_eq!(body["api_hits"], 0);
+        assert_eq!(body["misses"], 1);
+        assert_eq!(body["datasheets_enriched"], 0);
+        assert_eq!(
+            body["attempted_sources"],
+            json!(["local_catalog", "lcsc_api"])
+        );
     }
 }
 
