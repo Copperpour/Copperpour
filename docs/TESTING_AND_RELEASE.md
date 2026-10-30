@@ -142,3 +142,13 @@ icons, or release scripts require PCM assembly and
 `packaging/build-pcm.ps1` and `build-pcm.sh` enumerate the files staged into the
 PCM archive. Developer documentation stays in the repository and is not added
 to release zips.
+
+KiCad's official addon repository lists a package from a metadata file whose
+versions carry `download_sha256` and `download_url`, values that exist only
+once the zips are built. `packaging/metadata.json` therefore stays a template
+with one bare version entry; do not stamp release hashes into it. The release
+workflow runs `packaging/pcm-submission-metadata.py` on the three PCM zips and
+attaches `copperpour-pcm-v<version>-metadata.json` to the GitHub release, with
+one version entry per platform. To list a release, copy its `versions` entries
+into `packages/<identifier>/metadata.json` in a merge request to
+<https://gitlab.com/kicad/addons/metadata>.
