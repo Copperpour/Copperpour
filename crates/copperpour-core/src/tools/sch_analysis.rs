@@ -17,8 +17,9 @@ use copperpour_sexp::{
     schematic::{
         extract_all_net_labels, extract_buses, extract_labels, extract_sheet_pins,
         extract_symbol_instances, extract_wires, find_lib_symbol, read_schematic,
-        symbol_geometry_for_instance, Label, LabelKind, LibPin, SymbolBounds, Wire,
+        symbol_geometry_for_instance, Label, LabelKind, LibPin, SymbolBounds, SymbolInstance, Wire,
     },
+    text_bounds::{text_extents, TextExtent, TextOwner},
 };
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -193,7 +194,8 @@ pub fn tools() -> Vec<ToolDef> {
              text): shared body area, a pin running into another symbol's body, or pins \
              meeting anywhere but tip to tip. Pin-tip contact and touching edges are not \
              reported. Also finds \
-             conflicting labels at the same location, and reports any symbol whose embedded \
+             conflicting labels at the same location, colliding label and field text \
+             (`text_overlap`), and reports any symbol whose embedded \
              geometry could not be resolved and used the origin fallback instead.",
             json!({ "type": "object",
                 "properties": {
@@ -1064,8 +1066,66 @@ async fn handle_check_overlaps(
         }
     }
 
+    // Label and field text against other text and other symbols' bodies
+    // (#111): text at its ink, and outlines and flags at their drawn line as
+    // bodies are, so that outlines which only meet do not overlap. A symbol's
+    // own fields may sit on its own body: stock Device:R puts its Value inside
+    // it. Two labels of different nets at one anchor are already a
+    // label_overlap.
+    let texts = text_extents(&tree);
+    let mut text_overlaps: Vec<serde_json::Value> = Vec::new();
+    let mut push_text = |a: serde_json::Value, a_box: SymbolBounds, b: serde_json::Value, b_box| {
+        let (overlap_x, overlap_y) = a_box.overlap_depth(b_box);
+        text_overlaps.push(json!({
+            "type": "text_overlap",
+            "a": a,
+            "b": b,
+            "overlap_x_mm": overlap_x,
+            "overlap_y_mm": overlap_y,
+            "bounds_a": bounds_json(a_box),
+            "bounds_b": bounds_json(b_box)
+        }));
+    };
+    for (index, a) in texts.iter().enumerate() {
+        for b in &texts[index + 1..] {
+            let already_reported = match (&a.owner, &b.owner) {
+                (
+                    TextOwner::Label {
+                        net: net_a,
+                        at: (ax, ay),
+                        ..
+                    },
+                    TextOwner::Label {
+                        net: net_b,
+                        at: (bx, by),
+                        ..
+                    },
+                ) => net_a != net_b && points_coincident(*ax, *ay, *bx, *by, tol),
+                _ => false,
+            };
+            if !already_reported && a.compared.interiors_intersect(b.compared) {
+                push_text(text_json(a), a.bounds, text_json(b), b.bounds);
+            }
+        }
+        for (instance, placed) in &placements {
+            let Some(body) = placed.as_ref().and_then(|(_, geometry)| geometry.body) else {
+                continue;
+            };
+            if !is_own_field(a, instance) && a.compared.interiors_intersect(body) {
+                let symbol = json!({
+                    "kind": "symbol_body",
+                    "reference": instance.reference,
+                    "unit": instance.unit,
+                    "symbol_uuid": instance.uuid
+                });
+                push_text(text_json(a), a.bounds, symbol, body);
+            }
+        }
+    }
+
     let mut all = comp_overlaps;
     all.extend(label_overlaps);
+    all.extend(text_overlaps);
     let bounds_unresolved = placements
         .iter()
         .filter(|(_, placed)| placed.is_none())
@@ -1077,6 +1137,56 @@ async fn handle_check_overlaps(
         "bounds_resolved": placements.len() - bounds_unresolved.len(),
         "bounds_unresolved": bounds_unresolved
     })))
+}
+
+/// Whether `text` is one of `instance`'s own fields: the same placed symbol by
+/// its uuid, or by reference and unit where either has none.
+fn is_own_field(text: &TextExtent, instance: &SymbolInstance) -> bool {
+    let TextOwner::Field {
+        reference,
+        unit,
+        symbol_uuid,
+        ..
+    } = &text.owner
+    else {
+        return false;
+    };
+    match (symbol_uuid, &instance.uuid) {
+        (Some(field_of), Some(uuid)) => field_of == uuid,
+        _ => *reference == instance.reference && *unit == instance.unit,
+    }
+}
+
+/// One side of a `text_overlap`: the label or field whose text it is.
+fn text_json(text: &TextExtent) -> serde_json::Value {
+    match &text.owner {
+        TextOwner::Label {
+            kind, net, uuid, ..
+        } => json!({
+            "kind": "label",
+            "label_type": match kind {
+                LabelKind::GlobalLabel => "global_label",
+                LabelKind::HierarchicalLabel => "hierarchical_label",
+                _ => "net_label",
+            },
+            "net": net,
+            "uuid": uuid,
+            "text": text.text
+        }),
+        TextOwner::Field {
+            reference,
+            unit,
+            symbol_uuid,
+            field,
+        } => json!({
+            "kind": "field",
+            "reference": reference,
+            "unit": unit,
+            "symbol_uuid": symbol_uuid,
+            "field": field,
+            "text": text.text
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1228,6 +1338,7 @@ mod placement_overlap_tests {
             .as_array()
             .unwrap()
             .iter()
+            .filter(|overlap| overlap["type"] == "component_overlap")
             .map(|overlap| {
                 assert_eq!(overlap["detection"], "symbol_geometry");
                 let mut pair = [
@@ -1244,7 +1355,42 @@ mod placement_overlap_tests {
             [["#PWR03", "R14"], ["#PWR05", "U1"], ["R12", "R13"]],
             "{body}"
         );
-        assert_eq!(body["overlap_count"], 3);
+        // The rest is text (#111): R12 and R13 overlap, so their fields cross
+        // each other and each other's bodies, and the power symbols on U1's
+        // pins meet its Value and body.
+        let side = |s: &serde_json::Value| {
+            let name = s["reference"].as_str().or(s["net"].as_str()).unwrap();
+            match s["field"].as_str() {
+                Some(field) => format!("{name}.{field}"),
+                None => format!("{name} body"),
+            }
+        };
+        let mut texts = body["overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|overlap| overlap["type"] == "text_overlap")
+            .map(|overlap| {
+                let mut pair = [side(&overlap["a"]), side(&overlap["b"])];
+                pair.sort();
+                pair
+            })
+            .collect::<Vec<_>>();
+        texts.sort();
+        let expected = [
+            ["#PWR04 body", "U1.Value"],
+            ["#PWR04.Value", "U1.Value"],
+            ["#PWR05.Value", "U1 body"],
+            ["R12 body", "R13.Value"],
+            ["R12.Reference", "R13 body"],
+            ["R12.Reference", "R13.Reference"],
+            ["R12.Reference", "R13.Value"],
+            ["R12.Value", "R13 body"],
+            ["R12.Value", "R13.Value"],
+        ]
+        .map(|pair| pair.map(String::from));
+        assert_eq!(texts, expected, "{body}");
+        assert_eq!(body["overlap_count"], 12, "{body}");
     }
 
     /// #747 on KiCad's own `multichannel` demo sheet, where C12 shifted over
@@ -1292,6 +1438,369 @@ mod placement_overlap_tests {
 
         assert_eq!(result["error"]["kind"], "invalid_argument");
         assert_eq!(result["error"]["field"], "tolerance");
+    }
+}
+
+#[cfg(test)]
+mod text_overlap_tests {
+    use super::*;
+    use copperpour_sexp::{parser::parse_sexp, schematic::parse_at};
+
+    const SHEET: &str = include_str!("../../tests/fixtures/text_overlap_kicad10.kicad_sch");
+    const SVG: &str = include_str!("../../tests/fixtures/text_overlap_kicad10.svg");
+
+    /// One string as kicad-cli plots it: the ink of its drawn strokes, along
+    /// the text and across it.
+    #[derive(Debug)]
+    struct Plotted {
+        text: String,
+        vertical: bool,
+        along: (f64, f64),
+        across: (f64, f64),
+    }
+
+    fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+        let key = format!(" {name}=\"");
+        let rest = &tag[tag.find(&key)? + key.len()..];
+        Some(&rest[..rest.find('"')?])
+    }
+
+    /// Half the stroke width of the style in force at `offset` in the plot.
+    fn half_stroke(offset: usize) -> f64 {
+        let prefix = &SVG[..offset];
+        let width = &prefix[prefix.rfind("stroke-width:").unwrap() + 13..];
+        width
+            .split(';')
+            .next()
+            .unwrap()
+            .trim()
+            .parse::<f64>()
+            .unwrap()
+            / 2.0
+    }
+
+    /// A path's points: kicad-cli writes `M x y L x y` for strokes and
+    /// `M x,y x,y` for shapes.
+    fn path_points(d: &str) -> Vec<(f64, f64)> {
+        let numbers = d
+            .split(|c: char| c.is_whitespace() || c == ',' || c.is_ascii_alphabetic())
+            .filter_map(|n| n.parse::<f64>().ok())
+            .collect::<Vec<_>>();
+        numbers.chunks(2).map(|p| (p[0], p[1])).collect()
+    }
+
+    /// Each invisible `<text>` kicad-cli writes, with the `stroked-text`
+    /// group that draws it. A repeat of the same string, anchor and turn
+    /// would be the same string; this plot has none.
+    fn plotted() -> Vec<Plotted> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        let mut rest = SVG;
+        while let Some(at) = rest.find("<text ") {
+            let before = &rest[..at];
+            rest = &rest[at..];
+            let tag_end = rest.find('>').unwrap();
+            let tag = rest[..tag_end].replace('\n', " ");
+            let close = rest.find("</text>").unwrap();
+            let text = rest[tag_end + 1..close]
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&apos;", "'")
+                .replace("&amp;", "&");
+            rest = &rest[close..];
+            if text.is_empty() {
+                continue;
+            }
+            // The strokes: every point of the group's paths, widened by half
+            // the stroke width its style sets.
+            let group = &rest[rest.find("<g class=\"stroked-text\">").unwrap()..];
+            let group = &group[..group.find("</g>").unwrap()];
+            let half = half_stroke(SVG.len() - rest.len());
+            let points = group
+                .split("d=\"")
+                .skip(1)
+                .flat_map(|d| path_points(&d[..d.find('"').unwrap()]))
+                .collect::<Vec<_>>();
+            let span = |axis: fn(&(f64, f64)) -> f64| {
+                let values = points.iter().map(axis);
+                (
+                    values.clone().fold(f64::INFINITY, f64::min) - half,
+                    values.fold(f64::NEG_INFINITY, f64::max) + half,
+                )
+            };
+            // A turned string sits in the `rotate(a cx cy)` group opened just
+            // before it.
+            let turn = before
+                .rfind("<g ")
+                .map(|g| &before[g..])
+                .filter(|g| !g.contains("</g>"))
+                .and_then(|g| attr(g, "transform"))
+                .and_then(|t| t.strip_prefix("rotate("))
+                .map(|t| {
+                    t.trim_end_matches(')')
+                        .split_whitespace()
+                        .map(String::from)
+                        .collect::<Vec<_>>()
+                });
+            if !seen.insert((text.clone(), tag.clone(), turn.clone())) {
+                continue;
+            }
+            out.push(match turn.as_deref() {
+                None => Plotted {
+                    text,
+                    vertical: false,
+                    along: span(|p| p.0),
+                    across: span(|p| p.1),
+                },
+                Some([a, _, _]) if a == "-90.000000" => Plotted {
+                    text,
+                    vertical: true,
+                    along: span(|p| p.1),
+                    across: span(|p| p.0),
+                },
+                Some(other) => {
+                    panic!("a turn kicad-cli does not write for upright text: {other:?}")
+                }
+            });
+        }
+        out
+    }
+
+    /// kicad-cli 10.0.6 as the oracle, as #111 asks: every label and visible
+    /// field of the fixture is one of the strings its SVG plots, and the
+    /// strings it plots beyond them are U1's pin names and numbers. Along the
+    /// text and across it, the extent is the ink of KiCad's drawn strokes, to
+    /// 0.005 mm.
+    #[test]
+    fn every_string_sits_where_kicad_cli_plots_it() {
+        let tree = parse_sexp(SHEET).unwrap();
+        let plotted = plotted();
+        let extents = text_extents(&tree);
+        let mut used = HashSet::new();
+        let near = |(a, b): (f64, f64), (c, d): (f64, f64)| (a - c).abs() + (b - d).abs();
+        for e in &extents {
+            let r = e.run;
+            let split = |p: &Plotted| {
+                if p.vertical {
+                    ((r.min_y, r.max_y), (r.min_x, r.max_x))
+                } else {
+                    ((r.min_x, r.max_x), (r.min_y, r.max_y))
+                }
+            };
+            let distance = |p: &Plotted| {
+                let (along, across) = split(p);
+                near(along, p.along) + near(across, p.across)
+            };
+            let (index, p) = plotted
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.text == e.text)
+                .min_by(|(_, p), (_, q)| distance(p).total_cmp(&distance(q)))
+                .unwrap_or_else(|| panic!("kicad-cli plots no {:?}", e.text));
+            assert!(
+                used.insert(index),
+                "two extents for one plotted {:?}",
+                e.text
+            );
+            let (along, across) = split(p);
+            for (axis, ours, ink) in [("along", along, p.along), ("across", across, p.across)] {
+                assert!(
+                    (ours.0 - ink.0).abs() < 0.005 && (ours.1 - ink.1).abs() < 0.005,
+                    "{:?}: {axis} {ours:?} against the ink {ink:?}",
+                    e.text
+                );
+            }
+        }
+        assert_eq!(extents.len(), 75);
+        for (index, p) in plotted.iter().enumerate() {
+            assert!(
+                used.contains(&index)
+                    || ["+", "-", "1", "2", "3", "5", "6", "7"].contains(&p.text.as_str()),
+                "no extent for plotted {p:?}"
+            );
+        }
+    }
+
+    /// The outline of every global label and the flag of every hierarchical
+    /// one, as kicad-cli draws them: a closed path at the label's anchor.
+    /// A global label's extent is its outline with half its stroke, and what
+    /// is compared the outline's own line, each on every edge. A hierarchical
+    /// label's extent holds its flag, and what is compared the flag's line,
+    /// each meeting it at the anchor.
+    #[test]
+    fn label_shapes_are_where_kicad_cli_draws_them() {
+        let tree = parse_sexp(SHEET).unwrap();
+        // Each path with the half stroke width its style sets.
+        let mut paths = Vec::new();
+        let mut rest = SVG;
+        while let Some(at) = rest.find("d=\"M ") {
+            let half_pen = half_stroke(SVG.len() - rest.len() + at);
+            rest = &rest[at + 3..];
+            paths.push((path_points(&rest[..rest.find('"').unwrap()]), half_pen));
+        }
+        let extents = text_extents(&tree);
+        let mut checked = 0;
+        for (tag, kind, outline) in [
+            ("global_label", LabelKind::GlobalLabel, true),
+            ("hierarchical_label", LabelKind::HierarchicalLabel, false),
+        ] {
+            for node in tree.find_all(tag) {
+                let net = node.get(1).and_then(|n| n.as_str()).unwrap();
+                let (x, y, _) = parse_at(node).unwrap();
+                // An outline starts at its anchor; a flag's path starts at
+                // its first template corner, all of them within its reach.
+                let (path, half_pen) = paths
+                    .iter()
+                    .find(|(p, _)| {
+                        if outline {
+                            (p[0].0 - x).abs() < 1e-3 && (p[0].1 - y).abs() < 1e-3
+                        } else {
+                            p.len() >= 4
+                                && p.iter()
+                                    .all(|q| (q.0 - x).abs() < 1.271 && (q.1 - y).abs() < 1.271)
+                        }
+                    })
+                    .unwrap_or_else(|| panic!("no shape drawn at {net}'s anchor"));
+                let half_pen = *half_pen;
+                let line = SymbolBounds {
+                    min_x: path.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
+                    min_y: path.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
+                    max_x: path.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
+                    max_y: path.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
+                };
+                let drawn = SymbolBounds {
+                    min_x: line.min_x - half_pen,
+                    min_y: line.min_y - half_pen,
+                    max_x: line.max_x + half_pen,
+                    max_y: line.max_y + half_pen,
+                };
+                let extent = extents
+                    .iter()
+                    .find(|e| {
+                        matches!(&e.owner, TextOwner::Label { kind: k, net: n, .. }
+                            if *k == kind && n == net)
+                    })
+                    .unwrap_or_else(|| panic!("no extent for {net}"));
+                for (ours, kicad) in [(extent.bounds, drawn), (extent.compared, line)] {
+                    let edges = [
+                        (ours.min_x, kicad.min_x),
+                        (ours.min_y, kicad.min_y),
+                        (kicad.max_x, ours.max_x),
+                        (kicad.max_y, ours.max_y),
+                    ];
+                    if outline {
+                        let exact = edges.iter().all(|(a, k)| (a - k).abs() < 1e-3);
+                        assert!(exact, "{net}: {ours:?} against {kicad:?}");
+                    } else {
+                        // The flag holds the anchor's side; the text the rest.
+                        let holds = edges.iter().all(|(low, high)| *low <= high + 1e-3)
+                            && edges.iter().any(|(a, k)| (a - k).abs() < 1e-3);
+                        assert!(holds, "{net}: {ours:?} does not hold {kicad:?}");
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 17);
+    }
+
+    /// The fixture's README names each case. Its controls stay clean: the
+    /// same pair of labels a gap apart, stock resistors whose Value sits
+    /// inside their own body, at each rotation and mirrored `x`, a row of
+    /// each label shape, two global labels stacked on the grid, an outline
+    /// whose corner meets a body's, two labels end to end whose ink does not
+    /// meet, strings with spaces, markup and the micro and ohm signs, and
+    /// fields justified right, top and bottom. Two labels of different nets
+    /// at one anchor, or within the tolerance, are one collision, which
+    /// `label_overlap` already reports; two of one net at one anchor are text
+    /// over text.
+    #[tokio::test]
+    async fn the_fixture_reports_its_collisions_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("text_overlap_kicad10.kicad_sch");
+        std::fs::write(&path, SHEET).unwrap();
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_check_overlaps(&json!({"schematic": path.display().to_string()}), &ctx)
+            .await
+            .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        let side = |s: &serde_json::Value| match s["kind"].as_str().unwrap() {
+            "label" => s["net"].as_str().unwrap().to_string(),
+            "field" => format!(
+                "{}.{}",
+                s["reference"].as_str().unwrap(),
+                s["field"].as_str().unwrap()
+            ),
+            _ => format!("{} body", s["reference"].as_str().unwrap()),
+        };
+        let overlaps = body["overlaps"].as_array().unwrap();
+        let (coincident, texts): (Vec<_>, Vec<_>) =
+            overlaps.iter().partition(|o| o["type"] == "label_overlap");
+        let mut coincident = coincident
+            .iter()
+            .map(|o| {
+                let mut nets = ["net_a", "net_b"].map(|k| o[k].as_str().unwrap());
+                nets.sort();
+                nets
+            })
+            .collect::<Vec<_>>();
+        coincident.sort();
+        assert_eq!(
+            coincident,
+            [["NEAR_A", "NEAR_B"], ["ONE_A", "ONE_B"]],
+            "{body}"
+        );
+        let mut pairs = texts
+            .iter()
+            .map(|o| {
+                assert_eq!(o["type"], "text_overlap", "{o}");
+                let mut pair = [side(&o["a"]), side(&o["b"])];
+                pair.sort();
+                pair
+            })
+            .collect::<Vec<_>>();
+        pairs.sort();
+        let expected = [
+            ["#PWR01.Value", "VBUS_SENSE"],
+            ["BBBB1", "BBBB2"],
+            ["CLK_OUT", "CLK_SRC"],
+            ["LONG_NET_NAME_ACROSS", "R3 body"],
+            ["LONG_NET_NAME_ACROSS", "R3.Reference"],
+            ["LONG_NET_NAME_ACROSS", "R3.Value"],
+            ["NRST_CH347", "XO"],
+            ["SAME", "SAME"],
+            ["SCL_PULLUP", "SDA"],
+        ]
+        .map(|pair| pair.map(String::from));
+        assert_eq!(pairs, expected, "{body}");
+        assert_eq!(body["overlap_count"], 11);
+
+        let power = texts
+            .iter()
+            .flat_map(|o| [&o["a"], &o["b"]])
+            .find(|side| side["reference"] == "#PWR01")
+            .unwrap();
+        assert!(power["symbol_uuid"].is_string(), "{power}");
+        let graze = texts
+            .iter()
+            .find(|o| o["a"]["net"] == "XO" || o["b"]["net"] == "XO")
+            .unwrap();
+        assert_eq!(graze["a"]["label_type"], "net_label");
+        assert!(graze["a"]["uuid"].is_string());
+        assert!(graze["overlap_x_mm"].as_f64().unwrap() > 1.0, "{graze}");
+        // A global label is reported with its stroke, though it is compared
+        // at its line: SDA's outline ends at its anchor, 50.8.
+        let sda = texts.iter().find(|o| o["b"]["net"] == "SDA").unwrap();
+        assert_eq!(sda["bounds_b"]["x_max"], 50.8762, "{sda}");
+        let noisy = crate::tools::noisy_numbers(&body);
+        assert!(noisy.is_empty(), "reported {noisy:?}");
     }
 }
 
