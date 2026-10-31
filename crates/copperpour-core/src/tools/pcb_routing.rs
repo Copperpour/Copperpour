@@ -8,8 +8,8 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::board_source::{self, BoardSource};
 use crate::tools::{
-    get_path, opt_f64, opt_positive_f64, require_f64, require_str, with_board_ipc_classified,
-    with_bound_board_ipc_classified, BoardBinding, ToolContext, ToolDef,
+    get_path, invalid_arg, opt_f64, opt_positive_f64, opt_str, require_f64, require_str,
+    with_board_ipc_classified, with_bound_board_ipc_classified, BoardBinding, ToolContext, ToolDef,
 };
 use anyhow::Context;
 use copperpour_sexp::writer::{apply_edits, write_atomic_if_unchanged, SexpEdit};
@@ -371,6 +371,29 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "net_name", "netclass"]
             }),
             |args, ctx| async move { handle_assign_net_to_class(args, ctx).await }
+        ),
+        tool!(
+            "delete_netclass",
+            "Delete a netclass, or one netclass_patterns entry, from the sibling \
+             .kicad_pro, as Board Setup does. With name, the class goes and every \
+             pattern that named it names Default instead; Default cannot be \
+             deleted. With pattern, the entry with exactly that text goes. \
+             Schematic netclass labels are left alone: run_erc reports one still \
+             naming a deleted class as undefined_netclass. Refuses while KiCad \
+             holds the board or the project (its ~<project>.kicad_pro.lck), \
+             because pcbnew and Eeschema rewrite the project file from their own \
+             copy when they save.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":     { "type": "string", "description": "Path to .kicad_pcb file; the sibling .kicad_pro is edited" },
+                    "name":      { "type": "string", "description": "Netclass to delete. Give name or pattern" },
+                    "pattern":   { "type": "string", "description": "netclass_patterns entry to delete, by its exact text. Give name or pattern" },
+                    "netclass":  { "type": "string", "description": "With pattern: the class whose entry goes, where several classes hold that text" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_delete_netclass(args, ctx).await }
         ),
         tool!(
             "route_differential_pair",
@@ -2450,6 +2473,258 @@ async fn handle_assign_net_to_class(
     })))
 }
 
+/// Deletes as KiCad 10.0.6's Board Setup does. A class's patterns are kept and
+/// pointed at the Default (`panel_setup_netclasses.cpp:753-780`): a pattern
+/// naming a class that is gone resolves to an implicit class, which DRC rules
+/// still match by name (`net_settings.cpp:750-769`). A pattern goes as its own
+/// row does (`panel_setup_netclasses.cpp:827-834`).
+async fn handle_delete_netclass(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let target = match (opt_str(args, "name"), opt_str(args, "pattern")) {
+        (Some(name), None) => Deletion::Class(name),
+        (None, Some(pattern)) => Deletion::Pattern(pattern),
+        (None, None) => return Ok(invalid_arg("name", "give name or pattern")),
+        (Some(_), Some(_)) => return Ok(invalid_arg("pattern", "give name or pattern, not both")),
+    };
+    let netclass = opt_str(args, "netclass");
+    if netclass.is_some() && matches!(target, Deletion::Class(_)) {
+        return Ok(invalid_arg("netclass", "give it only with pattern"));
+    }
+    if matches!(target, Deletion::Class(DEFAULT_CLASS_NAME)) {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "name".to_string(),
+                reason: "the Default netclass cannot be deleted".to_string(),
+            },
+            "The default net class is required: every other class falls back to it, so \
+             KiCad's Board Setup refuses to delete it too.",
+        ));
+    }
+    if let Some(refusal) = refuse_while_kicad_holds_the_project(ctx, &board_path).await? {
+        return Ok(refusal);
+    }
+
+    let (pro, read, mut settings) = match load_project_settings(&board_path)? {
+        Ok(v) => v,
+        Err(refusal) => return Ok(refusal),
+    };
+    let net_settings = settings
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{}: top level is not a JSON object", pro.display()))?
+        .entry("net_settings")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{}: net_settings is not an object", pro.display()))?;
+    let deleted = match target {
+        Deletion::Class(name) => delete_class(net_settings, name, &pro)?,
+        Deletion::Pattern(pattern) => delete_pattern(net_settings, pattern, netclass, &pro)?,
+    };
+    let mut body = match deleted {
+        Ok(body) => body,
+        Err(refusal) => return Ok(refusal),
+    };
+    if let Some(refusal) = crate::tools::pcb_board::write_project_if_unchanged(
+        &pro,
+        "delete_netclass",
+        &read,
+        &settings,
+    )? {
+        return Ok(refusal);
+    }
+
+    body["file"] = json!(pro.display().to_string());
+    Ok(CallToolResult::json(&body))
+}
+
+/// What one `delete_netclass` call removes.
+enum Deletion<'a> {
+    Class(&'a str),
+    Pattern(&'a str),
+}
+
+/// `netclass_patterns` as KiCad writes it, an array; none when absent or null.
+fn netclass_patterns_mut<'a>(
+    net_settings: &'a mut serde_json::Map<String, serde_json::Value>,
+    pro: &Path,
+) -> anyhow::Result<Option<&'a mut Vec<serde_json::Value>>> {
+    match net_settings.get_mut("netclass_patterns") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(patterns) => patterns.as_array_mut().map(Some).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}: net_settings.netclass_patterns is not an array",
+                pro.display()
+            )
+        }),
+    }
+}
+
+/// Removes the class and points its patterns at the Default. The nets that
+/// eeschema's label cache, `netclass_assignments`, gives the class are
+/// reported and the cache left as it is: eeschema rebuilds it from the
+/// schematic's labels on every save.
+fn delete_class(
+    net_settings: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    pro: &Path,
+) -> anyhow::Result<Result<serde_json::Value, CallToolResult>> {
+    {
+        let mut empty = Vec::new();
+        let classes = match net_settings.get_mut("classes") {
+            None | Some(serde_json::Value::Null) => &mut empty,
+            Some(classes) => classes.as_array_mut().ok_or_else(|| {
+                anyhow::anyhow!("{}: net_settings.classes is not an array", pro.display())
+            })?,
+        };
+        if !classes.iter().any(|c| c["name"] == json!(name)) {
+            let known: Vec<&str> = classes.iter().filter_map(|c| c["name"].as_str()).collect();
+            return Ok(Err(CallToolResult::error(format!(
+                "Netclass '{}' not found in {} — available: {}.",
+                name,
+                pro.display(),
+                if known.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    known.join(", ")
+                }
+            ))));
+        }
+        classes.retain(|c| c["name"] != json!(name));
+    }
+
+    let mut moved: Vec<String> = Vec::new();
+    if let Some(patterns) = netclass_patterns_mut(net_settings, pro)? {
+        // Board Setup saves through `addSinglePatternAssignment`, which drops an
+        // exact duplicate (`net_settings.cpp:602-615`), so a moved pattern the
+        // Default already holds is one entry, not two.
+        let mut on_default: HashSet<String> = patterns
+            .iter()
+            .filter(|p| p["netclass"] == json!(DEFAULT_CLASS_NAME))
+            .filter_map(|p| p["pattern"].as_str().map(String::from))
+            .collect();
+        patterns.retain_mut(|entry| {
+            if entry["netclass"] != json!(name) {
+                return true;
+            }
+            entry["netclass"] = json!(DEFAULT_CLASS_NAME);
+            let Some(text) = entry["pattern"].as_str().map(String::from) else {
+                return true;
+            };
+            if !moved.contains(&text) {
+                moved.push(text.clone());
+            }
+            on_default.insert(text)
+        });
+    }
+    let label_nets: Vec<String> = net_settings
+        .get("netclass_assignments")
+        .and_then(|a| a.as_object())
+        .map(|a| {
+            a.iter()
+                .filter(|(_, classes)| match classes {
+                    serde_json::Value::Array(c) => c.contains(&json!(name)),
+                    // One class per net before net_settings schema 4, as KiCad
+                    // migrates it (`net_settings.cpp:460-476`).
+                    serde_json::Value::String(c) => c == name,
+                    _ => false,
+                })
+                .map(|(net, _)| net.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let note = if label_nets.is_empty() {
+        "KiCad reads the change on next project open. run_erc reports any schematic \
+         netclass label still naming the class as undefined_netclass."
+            .to_string()
+    } else {
+        format!(
+            "Netclass labels gave '{name}' to {} net(s) when eeschema last saved \
+             (netclass_assignments). While a label names it, KiCad keeps the name as a \
+             class with no settings of its own, which DRC rules still match. The labels \
+             are not edited: run_erc lists each as undefined_netclass.",
+            label_nets.len()
+        )
+    };
+    Ok(Ok(json!({
+        "deleted_netclass": name,
+        "patterns_moved_to_default": moved,
+        "label_assigned_nets": label_nets,
+        "note": note
+    })))
+}
+
+/// Removes the entries whose text is exactly `pattern`, of the one class that
+/// holds it or of `netclass`. KiCad drops an exact duplicate when it loads the
+/// file, so every copy of the entry goes.
+fn delete_pattern(
+    net_settings: &mut serde_json::Map<String, serde_json::Value>,
+    pattern: &str,
+    netclass: Option<&str>,
+    pro: &Path,
+) -> anyhow::Result<Result<serde_json::Value, CallToolResult>> {
+    let mut empty = Vec::new();
+    let patterns = netclass_patterns_mut(net_settings, pro)?.unwrap_or(&mut empty);
+    let mut holders: Vec<String> = patterns
+        .iter()
+        .filter(|p| p["pattern"] == json!(pattern))
+        .filter_map(|p| p["netclass"].as_str().map(String::from))
+        .collect();
+    holders.sort();
+    holders.dedup();
+    if holders.is_empty() {
+        let mut held: Vec<&str> = patterns
+            .iter()
+            .filter_map(|p| p["pattern"].as_str())
+            .collect();
+        held.sort();
+        held.dedup();
+        return Ok(Err(CallToolResult::error(format!(
+            "Pattern '{}' not found in {} — patterns: {}.",
+            pattern,
+            pro.display(),
+            if held.is_empty() {
+                "(none)".to_string()
+            } else {
+                held.join(", ")
+            }
+        ))));
+    }
+    let class = match netclass {
+        Some(class) if holders.iter().any(|h| h == class) => class.to_string(),
+        Some(class) => {
+            return Ok(Err(CallToolResult::error(format!(
+                "Pattern '{}' is not assigned to '{}' in {} — it is assigned to: {}.",
+                pattern,
+                class,
+                pro.display(),
+                holders.join(", ")
+            ))))
+        }
+        None if holders.len() > 1 => {
+            let message = format!(
+                "Pattern '{}' is assigned to {} in {}; name the class whose entry goes \
+                 with netclass.",
+                pattern,
+                holders.join(", "),
+                pro.display()
+            );
+            return Ok(Err(CallToolResult::error_kind(
+                ToolErrorKind::AmbiguousTarget {
+                    target: pattern.to_string(),
+                    candidates: holders,
+                },
+                message,
+            )));
+        }
+        None => holders.remove(0),
+    };
+    patterns.retain(|p| !(p["pattern"] == json!(pattern) && p["netclass"] == json!(class)));
+    Ok(Ok(json!({ "deleted_pattern": pattern, "netclass": class })))
+}
+
 async fn handle_route_diff_pair(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -3385,8 +3660,8 @@ mod netclass_tests {
         assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
     }
 
-    /// A project file that is not JSON is refused by both tools, and one whose
-    /// net settings are not the shape KiCad writes is refused by the writer.
+    /// A project file that is not JSON is refused by every tool, and one whose
+    /// net settings are not the shape KiCad writes is refused by the writers.
     /// Neither file changes.
     #[tokio::test]
     async fn a_malformed_project_file_is_refused_and_left_alone() {
@@ -3398,16 +3673,28 @@ mod netclass_tests {
             json!({ "name": "USB", "diff_pair_gap": 0.15 }),
         );
         let read = ("get_netclasses", json!({}));
+        let delete_class = ("delete_netclass", json!({ "name": "USB" }));
+        let delete_pattern = ("delete_netclass", json!({ "pattern": "USB_DP" }));
         for (text, reason, calls) in [
             (
                 "{ \"net_settings\": ",
                 "is not valid JSON",
-                vec![write.clone(), read],
+                vec![write.clone(), read, delete_class.clone()],
             ),
             (
                 "{ \"net_settings\": [] }",
                 "net_settings is not an object",
-                vec![write],
+                vec![write, delete_class.clone()],
+            ),
+            (
+                "{ \"net_settings\": { \"classes\": {} } }",
+                "net_settings.classes is not an array",
+                vec![delete_class],
+            ),
+            (
+                "{ \"net_settings\": { \"netclass_patterns\": {} } }",
+                "net_settings.netclass_patterns is not an array",
+                vec![delete_pattern],
             ),
         ] {
             std::fs::write(&pro, text).unwrap();
@@ -4034,6 +4321,398 @@ mod netclass_tests {
         let msg = text_of(&result);
         assert!(msg.contains("HV"), "{msg}");
         assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
+    }
+
+    async fn delete(board: &std::path::Path, args: serde_json::Value) -> CallToolResult {
+        let mut args = args;
+        args["board"] = json!(board.to_str().unwrap());
+        handle_delete_netclass(&args, &test_ctx()).await.unwrap()
+    }
+
+    /// The project file with `net_settings[key]` replaced, as a hand edit or
+    /// another program leaves it.
+    fn put_net_setting(board: &std::path::Path, key: &str, value: serde_json::Value) {
+        let pro = board.with_extension("kicad_pro");
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pro).unwrap()).unwrap();
+        settings["net_settings"][key] = value;
+        std::fs::write(&pro, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+    }
+
+    fn read_project(board: &std::path::Path) -> String {
+        std::fs::read_to_string(board.with_extension("kicad_pro")).unwrap()
+    }
+
+    /// Board Setup's delete: the class goes and its patterns name the Default
+    /// instead, so none is left an orphan. Another class, its pattern and the
+    /// board are untouched.
+    #[tokio::test]
+    async fn deleting_a_class_moves_its_patterns_to_the_default() {
+        let (_dir, board) = fixture_with_nets(&["GND", "P5V", "VCC"]);
+        let board_before = std::fs::read_to_string(&board).unwrap();
+        for name in ["Default", "HV", "LV"] {
+            create(&board, json!({ "name": name })).await;
+        }
+        assign(&board, "GND", "HV").await;
+        assign(&board, "P5V", "HV").await;
+        assign(&board, "VCC", "LV").await;
+
+        let result = delete(&board, json!({ "name": "HV" })).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(body["deleted_netclass"], json!("HV"));
+        assert_eq!(body["patterns_moved_to_default"], json!(["GND", "P5V"]));
+        assert_eq!(body["label_assigned_nets"], json!([]));
+
+        let pro = project_json(&board);
+        let names: Vec<&str> = pro["net_settings"]["classes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert_eq!(names, ["Default", "LV"]);
+        assert_eq!(
+            pro["net_settings"]["netclass_patterns"],
+            json!([
+                { "netclass": "Default", "pattern": "GND" },
+                { "netclass": "Default", "pattern": "P5V" },
+                { "netclass": "LV", "pattern": "VCC" }
+            ])
+        );
+
+        let read = get_classes(&board).await;
+        assert_eq!(read["orphan_patterns"], json!([]), "{read}");
+        assert_eq!(read["netclasses"][1]["name"], json!("LV"));
+        assert_eq!(read["netclasses"][1]["matched_nets"], json!(["VCC"]));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), board_before);
+    }
+
+    /// Board Setup refuses the Default with this message, and so does the
+    /// tool, before it reads anything.
+    #[tokio::test]
+    async fn the_default_class_cannot_be_deleted() {
+        let (_dir, board) = fixture(true);
+        create(&board, json!({ "name": "Default" })).await;
+        let before = read_project(&board);
+
+        let result = delete(&board, json!({ "name": "Default" })).await;
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert!(
+            text_of(&result).contains("The default net class is required"),
+            "{}",
+            text_of(&result)
+        );
+        assert_eq!(read_project(&board), before);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_missing_class_names_the_ones_there_are() {
+        let (_dir, board) = fixture(true);
+        create(&board, json!({ "name": "HV" })).await;
+        let before = read_project(&board);
+
+        let result = delete(&board, json!({ "name": "NOPE" })).await;
+        assert!(result.is_error);
+        assert!(text_of(&result).contains("HV"), "{}", text_of(&result));
+        assert_eq!(read_project(&board), before);
+    }
+
+    /// A netclass label keeps a deleted class's name in effect. The nets
+    /// eeschema's cache gives the class are reported, and the cache, which
+    /// eeschema rebuilds from the labels, is left as it is.
+    #[tokio::test]
+    async fn label_assignments_to_a_deleted_class_are_reported_and_left_alone() {
+        let (_dir, board) = fixture(true);
+        for name in ["Default", "HV", "LV"] {
+            create(&board, json!({ "name": name })).await;
+        }
+        // `/OLD` is a net_settings schema 3 entry, one class as a string.
+        let assignments = json!({
+            "/SIG": ["HV"],
+            "/BUS0": ["HV", "LV"],
+            "/OTHER": ["LV"],
+            "/OLD": "HV"
+        });
+        put_net_setting(&board, "netclass_assignments", assignments.clone());
+
+        let result = delete(&board, json!({ "name": "HV" })).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(
+            body["label_assigned_nets"],
+            json!(["/BUS0", "/OLD", "/SIG"])
+        );
+        assert!(body["note"].as_str().unwrap().contains("run_erc"), "{body}");
+        assert_eq!(
+            project_json(&board)["net_settings"]["netclass_assignments"],
+            assignments
+        );
+    }
+
+    /// A pattern goes by its exact text: a wildcard beside it that also fits
+    /// the name stays, and so does the class.
+    #[tokio::test]
+    async fn deleting_a_pattern_removes_that_entry_alone() {
+        let (_dir, board) = fixture_with_nets(&["GND", "GND_A"]);
+        for name in ["Default", "HV"] {
+            create(&board, json!({ "name": name })).await;
+        }
+        put_net_setting(
+            &board,
+            "netclass_patterns",
+            json!([
+                { "netclass": "HV", "pattern": "GND" },
+                { "netclass": "HV", "pattern": "GND*" }
+            ]),
+        );
+
+        let result = delete(&board, json!({ "pattern": "GND" })).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(body["deleted_pattern"], json!("GND"));
+        assert_eq!(body["netclass"], json!("HV"));
+
+        let read = get_classes(&board).await;
+        assert_eq!(read["netclasses"][1]["name"], json!("HV"));
+        assert_eq!(read["netclasses"][1]["patterns"], json!(["GND*"]));
+        assert_eq!(
+            read["netclasses"][1]["matched_nets"],
+            json!(["GND", "GND_A"])
+        );
+        assert_eq!(read["orphan_patterns"], json!([]));
+    }
+
+    /// The same text held by two classes is two entries: without netclass the
+    /// tool cannot tell which goes, and with it only that class's goes.
+    #[tokio::test]
+    async fn a_pattern_two_classes_hold_needs_netclass() {
+        let (_dir, board) = fixture(true);
+        for name in ["Default", "HV", "LV"] {
+            create(&board, json!({ "name": name })).await;
+        }
+        put_net_setting(
+            &board,
+            "netclass_patterns",
+            json!([
+                { "netclass": "HV", "pattern": "GND" },
+                { "netclass": "LV", "pattern": "GND" }
+            ]),
+        );
+        let before = read_project(&board);
+
+        let ambiguous = delete(&board, json!({ "pattern": "GND" })).await;
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&ambiguous).as_deref(),
+            Some("ambiguous_target")
+        );
+        let body: serde_json::Value = serde_json::from_str(&text_of(&ambiguous)).unwrap();
+        assert_eq!(body["error"]["candidates"], json!(["HV", "LV"]), "{body}");
+        let elsewhere = delete(&board, json!({ "pattern": "GND", "netclass": "Power" })).await;
+        assert!(elsewhere.is_error);
+        assert!(
+            text_of(&elsewhere).contains("HV, LV"),
+            "{}",
+            text_of(&elsewhere)
+        );
+        assert_eq!(read_project(&board), before);
+
+        let result = delete(&board, json!({ "pattern": "GND", "netclass": "LV" })).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert_eq!(
+            project_json(&board)["net_settings"]["netclass_patterns"],
+            json!([{ "netclass": "HV", "pattern": "GND" }])
+        );
+    }
+
+    /// A pattern naming a class that does not exist is what get_netclasses
+    /// reports as an orphan; deleting it leaves none.
+    #[tokio::test]
+    async fn an_orphan_pattern_can_be_deleted() {
+        let (_dir, board) = fixture_with_nets(&["GND"]);
+        create(&board, json!({ "name": "Default" })).await;
+        put_net_setting(
+            &board,
+            "netclass_patterns",
+            json!([{ "netclass": "Vanished", "pattern": "GND" }]),
+        );
+        assert_eq!(
+            get_classes(&board).await["orphan_patterns"][0]["netclass"],
+            json!("Vanished")
+        );
+
+        let result = delete(&board, json!({ "pattern": "GND" })).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert_eq!(get_classes(&board).await["orphan_patterns"], json!([]));
+    }
+
+    /// A pattern the file does not hold names the ones it does.
+    #[tokio::test]
+    async fn deleting_a_missing_pattern_names_the_ones_there_are() {
+        let (_dir, board) = fixture(true);
+        create(&board, json!({ "name": "HV" })).await;
+        assign(&board, "GND", "HV").await;
+        let before = read_project(&board);
+
+        let result = delete(&board, json!({ "pattern": "VCC" })).await;
+        assert!(result.is_error);
+        assert!(text_of(&result).contains("GND"), "{}", text_of(&result));
+        assert_eq!(read_project(&board), before);
+    }
+
+    /// One of name and pattern, and netclass only beside pattern; anything
+    /// else is refused before the file is read.
+    #[tokio::test]
+    async fn name_and_pattern_are_given_one_at_a_time() {
+        let (_dir, board) = fixture(true);
+        create(&board, json!({ "name": "HV" })).await;
+        assign(&board, "GND", "HV").await;
+        let before = read_project(&board);
+
+        for (args, field) in [
+            (json!({}), "name"),
+            (json!({ "name": "HV", "pattern": "GND" }), "pattern"),
+            (json!({ "name": "HV", "netclass": "HV" }), "netclass"),
+        ] {
+            let result = delete(&board, args.clone()).await;
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("invalid_argument"),
+                "{args}"
+            );
+            let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+            assert_eq!(body["error"]["field"], json!(field), "{args}");
+        }
+        assert_eq!(read_project(&board), before);
+    }
+
+    /// A moved pattern the Default already holds stays one entry, as Board
+    /// Setup saves it, and so does a pattern the deleted class held twice.
+    #[tokio::test]
+    async fn a_moved_pattern_the_default_holds_is_kept_once() {
+        let (_dir, board) = fixture(true);
+        for name in ["Default", "HV"] {
+            create(&board, json!({ "name": name })).await;
+        }
+        put_net_setting(
+            &board,
+            "netclass_patterns",
+            json!([
+                { "netclass": "Default", "pattern": "GND" },
+                { "netclass": "HV", "pattern": "GND" },
+                { "netclass": "HV", "pattern": "P5V" },
+                { "netclass": "HV", "pattern": "P5V" }
+            ]),
+        );
+
+        let result = delete(&board, json!({ "name": "HV" })).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(body["patterns_moved_to_default"], json!(["GND", "P5V"]));
+        assert_eq!(
+            project_json(&board)["net_settings"]["netclass_patterns"],
+            json!([
+                { "netclass": "Default", "pattern": "GND" },
+                { "netclass": "Default", "pattern": "P5V" }
+            ])
+        );
+    }
+
+    /// Copies of one entry are one assignment to KiCad, and go together.
+    #[tokio::test]
+    async fn copies_of_one_pattern_go_together() {
+        let (_dir, board) = fixture(true);
+        create(&board, json!({ "name": "HV" })).await;
+        put_net_setting(
+            &board,
+            "netclass_patterns",
+            json!([
+                { "netclass": "HV", "pattern": "GND" },
+                { "netclass": "HV", "pattern": "GND" }
+            ]),
+        );
+
+        let result = delete(&board, json!({ "pattern": "GND" })).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert_eq!(
+            project_json(&board)["net_settings"]["netclass_patterns"],
+            json!([])
+        );
+    }
+
+    /// No class or pattern list, absent or null as KiCad may leave it, holds
+    /// nothing to delete: each call is refused and the file left alone.
+    #[tokio::test]
+    async fn a_project_without_classes_or_patterns_has_nothing_to_delete() {
+        let (_dir, board) = fixture(true);
+        let without = read_project(&board);
+        for args in [json!({ "name": "HV" }), json!({ "pattern": "GND" })] {
+            let result = delete(&board, args.clone()).await;
+            assert!(result.is_error, "{args}");
+            assert!(text_of(&result).contains("(none)"), "{}", text_of(&result));
+            assert_eq!(read_project(&board), without, "{args}");
+        }
+
+        create(&board, json!({ "name": "HV" })).await;
+        put_net_setting(&board, "classes", json!(null));
+        put_net_setting(&board, "netclass_patterns", json!(null));
+        let nulls = read_project(&board);
+        for args in [json!({ "name": "HV" }), json!({ "pattern": "GND" })] {
+            let result = delete(&board, args.clone()).await;
+            assert!(result.is_error, "{args}");
+            assert!(text_of(&result).contains("(none)"), "{}", text_of(&result));
+            assert_eq!(read_project(&board), nulls, "{args}");
+        }
+    }
+
+    /// Deleting a class of a project KiCad wrote removes that class and moves
+    /// its pattern to the Default, and nothing else: every other setting,
+    /// class and pattern is as KiCad left it, and the board keeps its bytes.
+    #[tokio::test]
+    async fn deleting_a_class_of_a_kicad_written_project_changes_only_that_class() {
+        let (_dir, board) = kicad_fixture();
+        let mut expected = project_json(&board);
+        expected["net_settings"]["classes"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|c| c["name"] != "USB");
+        expected["net_settings"]["netclass_patterns"] =
+            json!([{ "netclass": "Default", "pattern": "USB_DP" }]);
+        let board_bytes = std::fs::read(&board).unwrap();
+
+        let handler = served_handler().await;
+        let result = served(
+            &handler,
+            "delete_netclass",
+            &board,
+            json!({ "name": "USB" }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(body["patterns_moved_to_default"], json!(["USB_DP"]));
+
+        assert_eq!(project_json(&board), expected);
+        assert_eq!(std::fs::read(&board).unwrap(), board_bytes);
+    }
+
+    /// Without a project file there is no class to delete, and none is
+    /// invented: the call is refused with the reason and nothing is written.
+    #[tokio::test]
+    async fn deleting_without_a_project_file_refuses_and_writes_nothing() {
+        let (dir, board) = fixture(false);
+        let result = delete(&board, json!({ "name": "HV" })).await;
+        assert!(result.is_error, "{}", text_of(&result));
+        assert!(
+            text_of(&result).contains("No project file"),
+            "{}",
+            text_of(&result)
+        );
+        assert!(!board.with_extension("kicad_pro").exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
 
