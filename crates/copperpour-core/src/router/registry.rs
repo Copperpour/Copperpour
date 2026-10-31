@@ -57,7 +57,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_export",
-        description: "Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB",
+        description: "Export schematic to SVG/PDF/PNG/netlist, run ERC and set its checks' severities, and synchronize a live PCB",
         category: "schematic",
     },
     ToolsetMeta {

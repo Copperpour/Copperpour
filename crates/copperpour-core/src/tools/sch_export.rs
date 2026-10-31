@@ -170,6 +170,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_run_erc(args, ctx).await }
         ),
+        super::erc_severity::tool(),
         tool!(
             "fix_connectivity",
             "Scan the schematic for near-miss wire endpoints (within snap_tolerance of a \
@@ -1681,7 +1682,7 @@ mod tests {
         assert!(names.contains(&"render_schematic_png"), "{names:?}");
         assert!(names.contains(&"set_visual_baseline"), "{names:?}");
         assert!(names.contains(&"compare_visual_baseline"), "{names:?}");
-        assert_eq!(names.len(), 10, "sch_export tool count");
+        assert_eq!(names.len(), 11, "sch_export tool count");
     }
 
     #[tokio::test]
