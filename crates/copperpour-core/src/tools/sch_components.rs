@@ -82,7 +82,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_schematic_component",
-            "Update fields (Reference, Value, Footprint, custom properties) and KiCad's native do-not-populate (DNP) attribute consistently across every placed unit of a component, remove custom properties, and move or hide the text of any field.",
+            "Update fields (Reference, Value, Footprint, custom properties) and KiCad's native do-not-populate (DNP) attribute consistently across every placed unit of a component, remove custom properties, and move or hide the text of any field. On a sheet placed more than once, the change reaches every instance of the sheet.",
             json!({
                 "type": "object",
                 "properties": {
@@ -162,7 +162,8 @@ pub fn tools() -> Vec<ToolDef> {
              unjustified is removed and a pin landing mid-span on a wire gains one, \
              reported as junctions_pruned_count and junctions_added_count. A no-connect \
              flag travels with the pin it protects, reported as no_connects_moved; the \
-             move is refused before writing when that pin cannot be followed one-to-one.",
+             move is refused before writing when that pin cannot be followed one-to-one. \
+             On a sheet placed more than once, the change reaches every instance of the sheet.",
             json!({
                 "type": "object",
                 "properties": {
@@ -185,7 +186,8 @@ pub fn tools() -> Vec<ToolDef> {
              re-judged where the pins turned, reported as junctions_pruned_count and \
              junctions_added_count. A no-connect flag travels with the pin it protects, \
              reported as no_connects_moved; the turn is refused before writing when that \
-             pin cannot be followed one-to-one.",
+             pin cannot be followed one-to-one. On a sheet placed more than once, the \
+             change reaches every instance of the sheet.",
             json!({
                 "type": "object",
                 "properties": {
@@ -216,7 +218,8 @@ pub fn tools() -> Vec<ToolDef> {
              re-judged where the pins moved, reported as junctions_pruned_count and \
              junctions_added_count. A no-connect flag travels with the pin it protects, \
              reported as no_connects_moved; the change is refused before writing when \
-             that pin cannot be followed one-to-one.",
+             that pin cannot be followed one-to-one. On a sheet placed more than once, the \
+             change reaches every instance of the sheet.",
             json!({
                 "type": "object",
                 "properties": {
@@ -369,7 +372,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_component_annotation",
-            "Add or update a custom property consistently across every placed unit of a component. Reference, Value, Footprint and Datasheet are set through edit_schematic_component's own arguments, and a key named DNP is refused: do-not-populate is KiCad's native attribute, set with edit_schematic_component's 'dnp'.",
+            "Add or update a custom property consistently across every placed unit of a component. Reference, Value, Footprint and Datasheet are set through edit_schematic_component's own arguments, and a key named DNP is refused: do-not-populate is KiCad's native attribute, set with edit_schematic_component's 'dnp'. On a sheet placed more than once, the change reaches every instance of the sheet.",
             json!({
                 "type": "object",
                 "properties": {
@@ -384,7 +387,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "group_components",
-            "Add or update a group property on every placed unit of multiple components.",
+            "Add or update a group property on every placed unit of multiple components. On a sheet placed more than once, the change reaches every instance of the sheet.",
             json!({
                 "type": "object",
                 "properties": {
@@ -408,7 +411,8 @@ pub fn tools() -> Vec<ToolDef> {
              reported as junctions_pruned_count and junctions_added_count. A no-connect \
              flag follows the same symbol UUID, unit, and pin number when that mapping is \
              one-to-one; removed, renumbered, or duplicated protected pins refuse before \
-             writing.",
+             writing. On a sheet placed more than once, the change reaches every instance \
+             of the sheet.",
             json!({
                 "type": "object",
                 "properties": {
