@@ -114,14 +114,36 @@ fn arguments_for(tool: &str) -> Value {
         "assign_net_to_class" => json!({ "net_name": "VCC", "netclass": "Default" }),
         // The fixture's palette is empty, so any list is a change.
         "set_predefined_sizes" => json!({ "track_widths": [0.3] }),
+        // A class `project_for` adds.
+        "delete_netclass" => json!({ "name": "Power" }),
         other => panic!("no arguments for {other}"),
     }
+}
+
+/// The fixture project, holding what `tool`'s arguments act on: it has only
+/// `Default`, so `delete_netclass` is given a class to delete.
+fn project_for(tool: &str) -> Project {
+    let project = project();
+    if tool == "delete_netclass" {
+        let mut settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&project.project_file).unwrap()).unwrap();
+        settings["net_settings"]["classes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "name": "Power", "priority": 0 }));
+        std::fs::write(
+            &project.project_file,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+    }
+    project
 }
 
 /// KiCad holds this very board: the tool refuses, and neither the project
 /// file nor the board changes by a byte.
 async fn assert_refused_while_kicad_holds_the_board(tool: &str) {
-    let project = project();
+    let project = project_for(tool);
     let project_before = std::fs::read(&project.project_file).unwrap();
     let board_before = std::fs::read(&project.board).unwrap();
     let kicad = spawn_kicad_holding_boards(&[&project.board], |_| None);
@@ -162,6 +184,11 @@ async fn assign_net_to_class_refuses_while_kicad_holds_the_board() {
     assert_refused_while_kicad_holds_the_board("assign_net_to_class").await;
 }
 
+#[tokio::test]
+async fn delete_netclass_refuses_while_kicad_holds_the_board() {
+    assert_refused_while_kicad_holds_the_board("delete_netclass").await;
+}
+
 /// The control: a KiCad holding some other board does not own this project
 /// file, so each writer still writes, and the file says so.
 #[tokio::test]
@@ -174,8 +201,13 @@ async fn each_writer_still_writes_while_kicad_holds_a_different_board() {
     )
     .unwrap();
 
-    for tool in ["set_design_rules", "create_netclass", "assign_net_to_class"] {
-        let project = project();
+    for tool in [
+        "set_design_rules",
+        "create_netclass",
+        "assign_net_to_class",
+        "delete_netclass",
+    ] {
+        let project = project_for(tool);
         let kicad = spawn_kicad_holding_boards(&[&other_board], |_| None);
         let handler = handler_talking_to(kicad.address()).await;
 
@@ -199,17 +231,23 @@ async fn each_writer_still_writes_while_kicad_holds_a_different_board() {
                 net_settings["netclass_patterns"],
                 json!([{ "netclass": "Default", "pattern": "VCC" }])
             ),
+            "delete_netclass" => assert!(!net_settings["classes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|class| class["name"] == "Power")),
             _ => unreachable!(),
         }
     }
 }
 
 /// Every tool that writes the board's project file.
-const PROJECT_FILE_WRITERS: [&str; 4] = [
+const PROJECT_FILE_WRITERS: [&str; 5] = [
     "set_design_rules",
     "set_predefined_sizes",
     "create_netclass",
     "assign_net_to_class",
+    "delete_netclass",
 ];
 
 /// KiCad's project lock, where pcbnew, Eeschema and the project manager each
@@ -230,7 +268,7 @@ pub(super) fn body_of(result: &CallToolResult) -> Value {
 /// running, but a KiCad program holds the project: the tool refuses, names
 /// the lock, and the project file does not change by a byte.
 async fn assert_refused_while_kicad_holds_the_project(tool: &str) {
-    let project = project();
+    let project = project_for(tool);
     let lock = lock_project(&project);
     let before = std::fs::read(&project.project_file).unwrap();
     let handler = handler_talking_to("").await;
@@ -285,12 +323,17 @@ async fn assign_net_to_class_refuses_while_kicad_holds_the_project() {
     assert_refused_while_kicad_holds_the_project("assign_net_to_class").await;
 }
 
+#[tokio::test]
+async fn delete_netclass_refuses_while_kicad_holds_the_project() {
+    assert_refused_while_kicad_holds_the_project("delete_netclass").await;
+}
+
 /// The control: the same project with no lock and no KiCad is written by
-/// every one of the four.
+/// every one of the five.
 #[tokio::test]
 async fn each_writer_writes_when_no_kicad_program_holds_the_project() {
     for tool in PROJECT_FILE_WRITERS {
-        let project = project();
+        let project = project_for(tool);
         let before = std::fs::read(&project.project_file).unwrap();
         let handler = handler_talking_to("").await;
 
@@ -306,7 +349,7 @@ async fn each_writer_writes_when_no_kicad_program_holds_the_project() {
 }
 
 /// The project file as another writer leaves it: KiCad, another server or a
-/// concurrent call that changed a key none of the four writers touches.
+/// concurrent call that changed a key none of the five writers touches.
 fn rewritten_elsewhere(project_file: &Path) -> String {
     let mut project: Value =
         serde_json::from_str(&std::fs::read_to_string(project_file).unwrap()).unwrap();
@@ -320,7 +363,7 @@ fn rewritten_elsewhere(project_file: &Path) -> String {
 #[tokio::test]
 async fn each_writer_refuses_a_project_file_changed_after_its_read() {
     for tool in PROJECT_FILE_WRITERS {
-        let project = project();
+        let project = project_for(tool);
         let newer = rewritten_elsewhere(&project.project_file);
         crate::tools::write_hook::set(newer.clone());
         let handler = handler_talking_to("").await;
