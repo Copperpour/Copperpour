@@ -523,4 +523,4 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ### Regenerating this doc
 
-The tool list is extracted mechanically from the `tool!(...)` invocations in `crates/copperpour-core/src/tools/*.rs`. To regenerate after adding tools, re-run the same extraction and re-verify counts against `registry.rs::ALL_TOOLSETS` — the row count in each table here must equal each toolset's `tool_count`.
+The tool list is extracted mechanically from the `tool!(...)` invocations in `crates/copperpour-core/src/tools/*.rs`. To regenerate after adding tools, re-run the same extraction and leave the counts to `cargo xtask fix-doc-counts`, which runs at release — the row count in each table here must then equal each toolset's `tools()` length.

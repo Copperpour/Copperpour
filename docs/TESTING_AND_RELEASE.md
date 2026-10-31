@@ -99,8 +99,10 @@ per-PR gate. Apply the `run:e2e-kicad` label to run that same workflow for a
 pull request when KiCad-facing behavior needs hosted acceptance evidence.
 
 Before creating a release tag, run `cargo xtask collect-api-migrations
-<version>` and commit the result, which moves the notes in
-`docs/api-migrations/` into `docs/API_MIGRATIONS.md`. Then dispatch `.github/workflows/release.yml` against
+<version>` and `cargo xtask fix-doc-counts`, and commit the result. The first
+moves the notes in `docs/api-migrations/` into `docs/API_MIGRATIONS.md`; the
+second rewrites the tool counts in the docs, which PRs leave alone. The release
+workflow's `doc-counts` job fails on a stale count. Then dispatch `.github/workflows/release.yml` against
 the exact candidate ref. The manual entry point runs the release-profile target
 matrix, all three PCM package builds, and the reusable real-KiCad acceptance
 workflow with a synthetic `0.0.0` package version. Its publication job is

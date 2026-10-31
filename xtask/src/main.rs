@@ -3,13 +3,10 @@
 //! `cargo xtask fix-doc-counts` rewrites every tool and toolset count in the
 //! documentation from `router::registry`, which is the only source of truth.
 //!
-//! Why this exists: `doc_tool_counts` requires roughly seven documents to
-//! quote the catalogue totals, and `tool-directory.md` to carry a per-toolset
-//! heading. Every PR that adds a tool therefore edits the same handful of
-//! lines, so any two such PRs conflict by construction — and a release that
-//! moves the counts conflicts with the whole open queue at once. v0.10.0 did
-//! exactly that to eleven open pull requests. The guard stays; the
-//! hand-editing does not.
+//! It runs before tagging a release (#222). Roughly seven documents quote the
+//! catalogue totals, so PRs that each moved them conflicted by construction;
+//! now PRs leave them alone and the release workflow's `doc_tool_counts` run
+//! fails on a stale one.
 //!
 //! `cargo xtask collect-api-migrations <version>` folds the unreleased notes in
 //! `docs/api-migrations/` into `docs/API_MIGRATIONS.md`; see `api_migrations`.
@@ -100,7 +97,7 @@ fn counts_before(line: &str, word: &str) -> Vec<(usize, usize)> {
 
 fn fix_doc_counts() {
     let toolsets = registry::ALL_TOOLSETS.len();
-    let registered: usize = registry::ALL_TOOLSETS.iter().map(|t| t.tool_count).sum();
+    let registered: usize = registry::ALL_TOOLSETS.iter().map(|t| t.tool_count()).sum();
     let meta = meta_tools::meta_tool_descriptions().len();
     let total = registered + meta;
     let root = repo_root();
@@ -247,7 +244,7 @@ fn rewrite_section_heading(line: &str) -> Option<String> {
     let claimed = tail
         .split_whitespace()
         .find_map(|w| w.parse::<usize>().ok())?;
-    if claimed == meta.tool_count {
+    if claimed == meta.tool_count() {
         return None;
     }
     let needle = claimed.to_string();
@@ -255,7 +252,7 @@ fn rewrite_section_heading(line: &str) -> Option<String> {
     Some(format!(
         "### `{name}`{}{}{}",
         &tail[..at],
-        meta.tool_count,
+        meta.tool_count(),
         &tail[at + needle.len()..]
     ))
 }

@@ -24,127 +24,106 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "project",
         description: "Create, open, save, rename, snapshot KiCAD projects, and launch the live schematic viewer",
         category: "project",
-        tool_count: 7,
     },
     ToolsetMeta {
         name: "editor_navigation",
         description: "Observe and semantically navigate exact KiCad editor, document, sheet, selection, and cross-probe context",
         category: "project",
-        tool_count: 5,
     },
     ToolsetMeta {
         name: "sch_components",
         description: "Add, edit, move, rotate, mirror, and delete schematic symbols",
         category: "schematic",
-        tool_count: 19,
     },
     ToolsetMeta {
         name: "sch_wiring",
         description: "Wires, net labels, power symbols, junctions, no-connects, pin-to-pin connections",
         category: "schematic",
-        tool_count: 20,
     },
     ToolsetMeta {
         name: "sch_bus",
         description: "Buses, bus entries, and fanning a group of pins out onto a bus",
         category: "schematic",
-        tool_count: 4,
     },
     ToolsetMeta {
         name: "sch_analysis",
         description: "Net connectivity, pin queries, trace paths, overlap/orphan detection",
         category: "schematic",
-        tool_count: 15,
     },
     ToolsetMeta {
         name: "sch_batch",
         description: "Bulk add, edit, delete, and move schematic elements in one call",
         category: "schematic",
-        tool_count: 13,
     },
     ToolsetMeta {
         name: "sch_export",
         description: "Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB",
         category: "schematic",
-        tool_count: 10,
     },
     ToolsetMeta {
         name: "sch_hierarchy",
         description: "Sheet files and hierarchical sheets: create a schematic file and set its page size and title block, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, net label renames, pin/label sync validation",
         category: "schematic",
-        tool_count: 16,
     },
     ToolsetMeta {
         name: "pcb_board",
         description: "Board outline, layers, zones, mounting holes, board text, SVG logo import, custom fields on placed footprints",
         category: "pcb",
-        tool_count: 18,
     },
     ToolsetMeta {
         name: "pcb_components",
         description: "Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics",
         category: "pcb",
-        tool_count: 20,
     },
     ToolsetMeta {
         name: "pcb_routing",
         description: "Traces, vias, pad nets, copper pours, net classes, differential pairs, and strict Specctra SES import",
         category: "pcb",
-        tool_count: 19,
     },
     ToolsetMeta {
         name: "placement",
         description: "Placement quality and automation: score with named deductions, plan decoupling rows and BGA fanouts, first placement, force-directed refinement",
         category: "pcb",
-        tool_count: 5,
     },
     ToolsetMeta {
         name: "pcb_export",
         description: "Gerber, PDF, SVG, 3D model, BOM, Specctra DSN, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++",
         category: "pcb",
-        tool_count: 14,
     },
     ToolsetMeta {
         name: "library",
         description: "Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models",
         category: "library",
-        tool_count: 19,
     },
     ToolsetMeta {
         name: "integration",
         description: "JLCPCB parts database, local Freerouting MCP routing, datasheet URLs",
         category: "integration",
-        tool_count: 10,
     },
     ToolsetMeta {
         name: "verification",
         description: "DRC, design rules, layer constraints, clearance checks, KiCAD UI control (ERC is in sch_export)",
         category: "verification",
-        tool_count: 11,
     },
     ToolsetMeta {
         name: "config",
         description: "User preferences, project rules, design rules, fab constraints — call load_user_config at session start",
         category: "config",
-        tool_count: 7,
     },
     ToolsetMeta {
         name: "design_review",
         description: "AI-powered design audits: decoupling, connections, power rails, DFM, BOM health",
         category: "review",
-        tool_count: 6,
     },
     ToolsetMeta {
         name: "templates",
         description: "Reference circuit library: USB-C, LDO, buck converter, STM32, I2C, LED — verified component values",
         category: "templates",
-        tool_count: 4,
     },
     ToolsetMeta {
         name: "manufacturing",
         description: "Design-to-fab pipeline: export Gerber+BOM+positions package, validate for fab house, estimate cost",
         category: "manufacturing",
-        tool_count: 3,
     },
 ];
 
@@ -167,6 +146,11 @@ fn tool_catalogue() -> &'static HashMap<&'static str, Vec<ToolDef>> {
 /// Clones share each definition's compiled input validator through `Arc`.
 pub fn tools_for(name: &str) -> Option<Vec<ToolDef>> {
     tool_catalogue().get(name).cloned()
+}
+
+/// Number of tools a toolset registers; 0 for an unknown name.
+pub fn tool_count(name: &str) -> usize {
+    tool_catalogue().get(name).map_or(0, Vec::len)
 }
 
 fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {

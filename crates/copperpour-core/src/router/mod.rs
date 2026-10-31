@@ -21,7 +21,13 @@ pub struct ToolsetMeta {
     pub name: &'static str,
     pub description: &'static str,
     pub category: &'static str,
-    pub tool_count: usize,
+}
+
+impl ToolsetMeta {
+    /// Tools the toolset registers, counted from its definitions.
+    pub fn tool_count(&self) -> usize {
+        registry::tool_count(self.name)
+    }
 }
 
 impl ToolRouter {
@@ -296,7 +302,7 @@ mod tests {
 
         // And the listing it produces is the full catalogue.
         let listed = router.active_tools().await.len();
-        let registered: usize = registry::ALL_TOOLSETS.iter().map(|t| t.tool_count).sum();
+        let registered: usize = registry::ALL_TOOLSETS.iter().map(|t| t.tool_count()).sum();
         assert_eq!(
             listed, registered,
             "an eager tools/list must carry every registered tool"
@@ -323,9 +329,6 @@ mod tests {
     //
     // These are the guardrails that protect future work:
     //
-    // - The hand-written `tool_count` in ALL_TOOLSETS must match what
-    //   `tools_for(name)` actually returns. Otherwise `list_toolboxes` lies
-    //   to the LLM.
     // - No toolset grows past ~20 tools. Past that, split it — 20 tool
     //   descriptions at ~400 bytes each is already a 1.6KB payload in
     //   `tools/list` when loaded, and tool selection accuracy degrades.
@@ -334,23 +337,6 @@ mod tests {
     /// move tools to a sibling toolset or add a new one — don't raise this
     /// number without a conversation.
     const MAX_TOOLS_PER_TOOLSET: usize = 20;
-
-    #[test]
-    fn registry_tool_counts_match_reality() {
-        for meta in registry::ALL_TOOLSETS {
-            let defs = registry::tools_for(meta.name)
-                .unwrap_or_else(|| panic!("tools_for({}) returned None", meta.name));
-            assert_eq!(
-                defs.len(),
-                meta.tool_count,
-                "registry declares tool_count={} for '{}' but tools_for() returned {} tools — \
-                 update ALL_TOOLSETS in router/registry.rs",
-                meta.tool_count,
-                meta.name,
-                defs.len()
-            );
-        }
-    }
 
     #[test]
     fn no_toolset_has_duplicate_tool_names() {
@@ -401,11 +387,11 @@ mod tests {
     fn no_toolset_exceeds_max_size() {
         for meta in registry::ALL_TOOLSETS {
             assert!(
-                meta.tool_count <= MAX_TOOLS_PER_TOOLSET,
+                meta.tool_count() <= MAX_TOOLS_PER_TOOLSET,
                 "toolset '{}' has {} tools, which exceeds the soft cap of {}. \
                  Split it into two before bumping this cap.",
                 meta.name,
-                meta.tool_count,
+                meta.tool_count(),
                 MAX_TOOLS_PER_TOOLSET
             );
         }
