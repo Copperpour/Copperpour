@@ -9,6 +9,7 @@ mod board_source;
 #[cfg(test)]
 mod board_source_contract_tests;
 mod board_stackup;
+mod board_stackup_set;
 #[cfg(test)]
 mod board_title_block_tests;
 #[cfg(test)]

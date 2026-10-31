@@ -253,8 +253,8 @@ fn parse_point(value: &Value, field: &str) -> Result<Point, Fault> {
     Ok((coordinate("x")?, coordinate("y")?))
 }
 
-/// Millimetres as exact text, for messages.
-fn mm_text(nm: i64) -> String {
+/// Millimetres as exact text, as KiCad writes a board unit.
+pub(super) fn mm_text(nm: i64) -> String {
     let sign = if nm < 0 { "-" } else { "" };
     let (whole, fraction) = (nm.unsigned_abs() / 1_000_000, nm.unsigned_abs() % 1_000_000);
     let fraction = format!("{fraction:06}");
