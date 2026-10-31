@@ -88,7 +88,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "schematic": { "type": "string" },
                     "reference": { "type": "string", "description": "Current reference designator" },
-                    "new_reference": { "type": "string", "description": "New reference designator (optional)" },
+                    "new_reference": { "type": "string", "description": "New reference designator (optional). Refused as ambiguous_target on a sheet placed more than once whose instances carry different designators; annotate_schematic sets those" },
                     "value": { "type": "string", "description": "New value (optional)" },
                     "footprint": { "type": "string", "description": "New footprint (optional)" },
                     "datasheet": { "type": "string", "description": "New datasheet URL (optional)" },
@@ -1058,6 +1058,10 @@ pub(crate) struct ComponentTargetUnit {
     /// a DNP change that fails to reach the file cannot pass the readback.
     dnp: bool,
     instances: Vec<(String, String)>,
+    /// The designators the instance records carry, sorted. On a sheet placed
+    /// more than once they need not match the property, so the readback holds
+    /// them to what was bound rather than to it.
+    instance_references: Vec<String>,
 }
 
 impl ComponentTargetUnit {
@@ -1098,6 +1102,8 @@ impl ComponentTargetUnit {
             ]),
             absent_fields: BTreeSet::new(),
             instances,
+            // A placement writes its one reference to every record.
+            instance_references: vec![reference.to_owned()],
         }
     }
 }
@@ -1110,8 +1116,13 @@ fn checked_instance_paths(
 ) -> Result<Vec<(String, String)>, ComponentDeleteTargetError> {
     let mut identities = BTreeSet::new();
     let mut projects = BTreeSet::new();
+    let references = symbol
+        .instances()
+        .into_iter()
+        .filter_map(|instance| instance.reference)
+        .collect::<Vec<_>>();
     for instance in symbol.instances() {
-        let (Some(project), Some(instance_path), Some(reference), Some(unit)) = (
+        let (Some(project), Some(instance_path), Some(_), Some(unit)) = (
             instance.project,
             instance.path,
             instance.reference,
@@ -1125,12 +1136,17 @@ fn checked_instance_paths(
                 ),
             ));
         };
-        if symbol.reference() != Some(reference.as_str()) {
+        if symbol
+            .reference()
+            .is_none_or(|own| !crate::tools::instance_references_agree(own, &references))
+        {
             return Err(ComponentDeleteTargetError::stale(
                 path,
                 format!(
-                    "component UUID {} has a conflicting instance reference",
-                    symbol.uuid
+                    "component UUID {} has a conflicting instance reference: its records name {} and its Reference is {}",
+                    symbol.uuid,
+                    references.join(", "),
+                    symbol.reference().unwrap_or("absent")
                 ),
             ));
         }
@@ -1204,6 +1220,10 @@ fn verify_component_expectations(
                 "instance_paths",
                 unit["instance_paths"] == json!(target.instances),
             ),
+            (
+                "instance_references",
+                unit["instance_references"] == json!(target.instance_references),
+            ),
         ] {
             if !matches {
                 return Err(ComponentDeleteTargetError::stale(
@@ -1258,6 +1278,12 @@ impl ComponentTarget {
         }
         for unit in &mut expected.units {
             unit.fields.extend(fields.clone());
+            // A rename is refused unless every record carries the old one.
+            if let Some(reference) = fields.get("Reference") {
+                if !unit.instance_references.is_empty() {
+                    unit.instance_references = vec![reference.clone()];
+                }
+            }
         }
         expected
     }
@@ -1367,19 +1393,13 @@ fn component_target_from_source(
         for instances in node.find_all("instances") {
             for project in instances.find_all("project") {
                 for path_node in project.find_all("path") {
-                    let Some(instance_reference) = path_node.find_str("reference") else {
+                    // `checked_instance_paths` below holds the references to
+                    // the property.
+                    if path_node.find_str("reference").is_none() {
                         return Err(ComponentDeleteTargetError::stale(
                             path,
                             format!(
                                 "component {reference} UUID {uuid} has an instance path without a reference"
-                            ),
-                        ));
-                    };
-                    if instance_reference != reference {
-                        return Err(ComponentDeleteTargetError::stale(
-                            path,
-                            format!(
-                                "component {reference} UUID {uuid} has an instance path naming {instance_reference}"
                             ),
                         ));
                     }
@@ -1391,6 +1411,13 @@ fn component_target_from_source(
             .and_then(|node| cse::Symbol::from_sexp(&node))
             .map_err(|error| ComponentDeleteTargetError::stale(path, error.to_string()))?;
         let instance_paths = checked_instance_paths(path, &symbol)?;
+        let mut instance_references = symbol
+            .instances()
+            .into_iter()
+            .filter_map(|instance| instance.reference)
+            .collect::<Vec<_>>();
+        instance_references.sort();
+        instance_references.dedup();
         units.push(ComponentTargetUnit {
             uuid,
             unit: instance.unit,
@@ -1406,6 +1433,7 @@ fn component_target_from_source(
             mirror: symbol.mirror.clone(),
             dnp: symbol.dnp,
             instances: instance_paths,
+            instance_references,
         });
     }
     if let Some((unit, uuids)) = by_unit.iter().find(|(_, uuids)| uuids.len() > 1) {
@@ -1592,21 +1620,9 @@ fn component_mutation_readback_from_schematic(
                 }
             }
         }
+        // `checked_instance_paths` above has held these to the property.
         instance_references.sort();
         instance_references.dedup();
-        if let Some(stale_reference) = instance_references
-            .iter()
-            .find(|instance_reference| **instance_reference != reference)
-        {
-            return Err(ComponentDeleteTargetError::stale(
-                path,
-                format!(
-                    "component UUID {} renders as {reference} but an instance path still names {stale_reference}",
-                    symbol.uuid
-                ),
-            )
-            .into_result());
-        }
         // Where each field's text actually sits in the observed schematic, so
         // a move can be checked rather than taken on trust.
         let mut field_placements = serde_json::Map::new();
@@ -3268,6 +3284,23 @@ async fn handle_edit_schematic_component(
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
+    // On a sheet placed more than once with its own designator per instance,
+    // a rename would reach only the records that carry the old one, while
+    // every other edit reaches all of them; which instance is meant is the
+    // caller's to say, and `annotate_schematic` sets them per instance.
+    if opt_str(args, "new_reference").is_some() {
+        if let Some(unit) = target
+            .units
+            .iter()
+            .find(|unit| unit.instance_references.len() > 1)
+        {
+            return Ok(ComponentDeleteTargetError::Ambiguous {
+                target: format!("component {reference} sheet instances"),
+                candidates: unit.instance_references.clone(),
+            }
+            .into_result());
+        }
+    }
     let mut changed = Vec::new();
     let mut expected_fields = BTreeMap::new();
     let mut applied_dnp = None;
@@ -8196,6 +8229,293 @@ mod multi_unit_component_tests {
                 Some("ambiguous_target"),
                 "{corruption}"
             );
+        }
+    }
+
+    /// The nested fixture's `bank.kicad_sch`, saved by eeschema, is placed as
+    /// south (page 2) and north (page 10). eeschema writes each `Reference`
+    /// property from the first instance in page order, so R3's property shows
+    /// south's R3 while its north record names R10.
+    fn sheet_placed_twice() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bank.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/annotate_nested_hierarchy/bank.kicad_sch"),
+        )
+        .unwrap();
+        (directory, path)
+    }
+
+    #[tokio::test]
+    async fn a_field_moves_on_a_sheet_placed_twice() {
+        let (_directory, path) = sheet_placed_twice();
+        let result = body(
+            handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "R3",
+                    "field_placements": { "Value": { "x": 162.56, "y": 53.34 } }
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        let unit = &result["units"][0];
+        assert_eq!(unit["field_placements"]["Value"]["x"], 162.56);
+        assert_eq!(unit["field_placements"]["Value"]["y"], 53.34);
+        assert_eq!(unit["fields"]["Reference"], "R3");
+        assert_eq!(unit["instance_references"], json!(["R10", "R3"]));
+    }
+
+    /// A record the property does not agree with is still stale, before the
+    /// write and in the readback: a property that no record names (a rename
+    /// that reached the property alone), and a record of another prefix.
+    #[tokio::test]
+    async fn a_stale_record_is_refused_on_a_sheet_placed_twice() {
+        for (corruption, from, to, reference, records) in [
+            (
+                "renamed",
+                "(property \"Reference\" \"R3\"",
+                "(property \"Reference\" \"R99\"",
+                "R99",
+                "its records name R10, R3 and its Reference is R99",
+            ),
+            (
+                "prefix",
+                "(reference \"R10\")",
+                "(reference \"C10\")",
+                "R3",
+                "its records name C10, R3 and its Reference is R3",
+            ),
+        ] {
+            let (_directory, path) = sheet_placed_twice();
+            let source = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(source.matches(from).count(), 1, "{corruption}");
+            let source = source.replacen(from, to, 1);
+            std::fs::write(&path, &source).unwrap();
+            let refused = handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": reference,
+                    "field_placements": { "Value": { "x": 162.56, "y": 53.34 } }
+                }),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                extract_error_kind(&refused).as_deref(),
+                Some("stale_target"),
+                "{corruption}"
+            );
+            assert!(
+                tool_error_summary(&refused).contains(records),
+                "{corruption}: {}",
+                tool_error_summary(&refused)
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+
+            let committed = cse::Schematic::load(&path).unwrap();
+            let readback = component_mutation_readback_from_schematic(
+                &path,
+                &committed,
+                &["57ee0d14-2c2d-442a-b0f1-343e05b94ebd".to_owned()],
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(
+                extract_error_kind(&readback).as_deref(),
+                Some("stale_target"),
+                "{corruption}"
+            );
+            assert!(
+                tool_error_summary(&readback).contains(records),
+                "{corruption}"
+            );
+        }
+    }
+
+    /// The readback holds each record's designator to what was bound, so a
+    /// write that renumbers one is caught although the property still names
+    /// a record.
+    #[test]
+    fn a_renumbered_record_fails_the_readback_on_a_sheet_placed_twice() {
+        let (_directory, path) = sheet_placed_twice();
+        let source = std::fs::read_to_string(&path).unwrap();
+        let target = component_target_from_source(&path, &source, "R3").unwrap();
+        assert!(
+            verified_component_readback(&path, &cse::Schematic::load(&path).unwrap(), &target)
+                .is_ok()
+        );
+        assert_eq!(source.matches("(reference \"R10\")").count(), 1);
+        std::fs::write(
+            &path,
+            source.replacen("(reference \"R10\")", "(reference \"R12\")", 1),
+        )
+        .unwrap();
+        let error =
+            verified_component_readback(&path, &cse::Schematic::load(&path).unwrap(), &target)
+                .unwrap_err();
+        assert_eq!(extract_error_kind(&error).as_deref(), Some("stale_target"));
+        assert!(tool_error_summary(&error).contains("observed instance_references differs"));
+    }
+
+    /// A rename would reach only the instance whose record carries the old
+    /// designator, so on a sheet placed twice it is refused before writing.
+    #[tokio::test]
+    async fn a_rename_is_ambiguous_on_a_sheet_placed_twice() {
+        let (_directory, path) = sheet_placed_twice();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let refused = handle_edit_schematic_component(
+            &json!({ "schematic": path, "reference": "R3", "new_reference": "R17" }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            extract_error_kind(&refused).as_deref(),
+            Some("ambiguous_target")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// Each edit tool, served as a client calls it, on the whole project: it
+    /// succeeds, changes `bank.kicad_sch` and no other sheet, and R3 keeps both
+    /// of its records.
+    #[tokio::test]
+    async fn every_edit_tool_is_served_on_a_sheet_placed_twice() {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .unwrap();
+        for (tool, arguments) in [
+            (
+                "edit_schematic_component",
+                json!({"field_placements": {"Value": {"x": 162.56, "y": 53.34}}}),
+            ),
+            ("edit_schematic_component", json!({"value": "10k"})),
+            ("move_schematic_component", json!({"x": 170.18, "y": 50.8})),
+            ("rotate_schematic_component", json!({"rotation": 180.0})),
+            ("mirror_schematic_component", json!({"mirror": "y"})),
+            (
+                "add_component_annotation",
+                json!({"key": "Note", "value": "x"}),
+            ),
+            ("group_components", json!({"group_name": "G"})),
+            ("replace_component", json!({"new_lib_id": "Device:R_Small"})),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            for (name, content) in [
+                (
+                    "nested_pages.kicad_pro",
+                    include_str!(
+                        "../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_pro"
+                    ),
+                ),
+                (
+                    "nested_pages.kicad_sch",
+                    include_str!(
+                        "../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_sch"
+                    ),
+                ),
+                (
+                    "bank.kicad_sch",
+                    include_str!("../../tests/fixtures/annotate_nested_hierarchy/bank.kicad_sch"),
+                ),
+                (
+                    "cell.kicad_sch",
+                    include_str!("../../tests/fixtures/annotate_nested_hierarchy/cell.kicad_sch"),
+                ),
+            ] {
+                std::fs::write(directory.path().join(name), content).unwrap();
+            }
+            // `replace_component` resolves the new symbol from the project's
+            // own table, so the developer's installed libraries cannot answer.
+            let library = directory.path().join("Device.kicad_symdir");
+            std::fs::create_dir_all(&library).unwrap();
+            std::fs::write(
+                library.join("R_Small.kicad_sym"),
+                "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"R_Small\"\n\t\t(property \"Reference\" \"R\" (at 0 0 0))\n\t\t(property \"Value\" \"R_Small\" (at 0 0 0))\n\t\t(symbol \"R_Small_0_1\"\n\t\t\t(pin passive line (at 0 3.81 270) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t\t(pin passive line (at 0 -3.81 90) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"2\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n",
+            )
+            .unwrap();
+            std::fs::write(
+                directory.path().join("sym-lib-table"),
+                format!(
+                    "(sym_lib_table\n  (version 7)\n  (lib (name \"Device\") (type \"KiCad\") (uri \"{}\") (options \"\") (descr \"\"))\n)\n",
+                    library.display()
+                ),
+            )
+            .unwrap();
+            let bank = directory.path().join("bank.kicad_sch");
+            let mut arguments = arguments;
+            arguments["schematic"] = json!(bank.display().to_string());
+            if tool == "group_components" {
+                arguments["references"] = json!(["R3"]);
+            } else {
+                arguments["reference"] = json!("R3");
+            }
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": { "name": tool, "arguments": arguments }
+                }))
+                .await
+                .expect("tools/call receives a response");
+            let result = response.result.expect("a JSON-RPC result");
+            assert_ne!(
+                result["isError"],
+                json!(true),
+                "{tool} {arguments}: {result}"
+            );
+            // The edit lands in `bank.kicad_sch` alone.
+            for (name, content) in [
+                (
+                    "nested_pages.kicad_sch",
+                    include_str!(
+                        "../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_sch"
+                    ),
+                ),
+                (
+                    "cell.kicad_sch",
+                    include_str!("../../tests/fixtures/annotate_nested_hierarchy/cell.kicad_sch"),
+                ),
+            ] {
+                assert_eq!(
+                    std::fs::read_to_string(directory.path().join(name)).unwrap(),
+                    content,
+                    "{tool}: {name}"
+                );
+            }
+            assert_ne!(
+                std::fs::read_to_string(&bank).unwrap(),
+                include_str!("../../tests/fixtures/annotate_nested_hierarchy/bank.kicad_sch"),
+                "{tool}: the edit reached the file"
+            );
+            let committed = cse::Schematic::load(&bank).unwrap();
+            let r3 = committed
+                .symbols
+                .iter()
+                .find(|symbol| symbol.uuid == "57ee0d14-2c2d-442a-b0f1-343e05b94ebd")
+                .unwrap();
+            assert_eq!(r3.reference(), Some("R3"), "{tool}");
+            let mut records = r3
+                .instances()
+                .into_iter()
+                .filter_map(|instance| instance.reference)
+                .collect::<Vec<_>>();
+            records.sort();
+            assert_eq!(records, ["R10", "R3"], "{tool} {arguments}");
         }
     }
 
