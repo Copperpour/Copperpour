@@ -194,7 +194,7 @@ and Windows servers do not.
 | `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. A pair whose route would join another net is skipped and listed in `errors`. |
 
 ### `sch_export` · 10 tools
-**Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB.
+**Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC and set its checks' severities, and synchronize a live PCB.
 **Source:** [`crates/copperpour-core/src/tools/sch_export.rs`](crates/copperpour-core/src/tools/sch_export.rs)
 
 | Tool | Description |
@@ -207,6 +207,7 @@ and Windows servers do not.
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. A report that is not in kicad-cli's ERC shape is an error, never zero violations. |
+| `set_erc_severity` | Set ERC checks' severities (`error`, `warning`, `ignore`) under `erc.rule_severities` in the `.kicad_pro`, by the check keys KiCad 10.0.6 has or the file already names; only the named keys change, and the reply gives each one's previous and current severity. Refused while KiCad holds the project. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. |
 
