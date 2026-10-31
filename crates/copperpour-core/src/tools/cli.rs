@@ -1872,6 +1872,15 @@ pub(crate) async fn upgrade_legacy_footprint(
     Ok(text)
 }
 
+/// KiCAD 10: `pcb upgrade --force <board>`, which loads the board and saves it
+/// in place through KiCad's own reader and writer, whatever its version
+/// (`PCBNEW_JOBS_HANDLER::JobUpgrade`).
+pub(crate) async fn resave_board(cli: &str, board: &Path) -> Result<()> {
+    let board = board.to_str().context("board path is not UTF-8")?;
+    run_cli(cli, &["pcb", "upgrade", "--force", board], LONG_TIMEOUT).await?;
+    Ok(())
+}
+
 /// KiCAD 10: `pcb export dxf --output <dir> [--layers <csv>] --mode-multi <input>`
 ///
 /// `--layers` takes a single comma-separated value, the same as every PCB
