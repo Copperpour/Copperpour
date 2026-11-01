@@ -1,5 +1,5 @@
 ---
-name: konnect
+name: copperpour
 description: "Mandatory operating rules for ANY task involving KiCAD projects. Loaded when the user mentions KiCAD, schematics, PCBs, or any .kicad_* file. Prevents file corruption by routing all changes through Copperpour MCP tools."
 ---
 

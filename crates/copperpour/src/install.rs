@@ -3,7 +3,9 @@
 //! Handles explicit client-scoped install, uninstall, status, and Claude hook
 //! integration without writing into another client's directories.
 
-use crate::manifest::{AGENTS, HOOK_SKILLS, SKILLS};
+use crate::manifest::{
+    AGENTS, HOOK_SKILLS, LEGACY_OPERATING_RULES_SKILL, OPERATING_RULES_SKILL, SKILLS,
+};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -113,20 +115,30 @@ pub fn print_status(client: InstallClient) -> Result<()> {
 
 /// Print bundled guidance for Claude hook integration.
 pub fn print_skill_content(name: &str) -> Result<()> {
-    for hook in HOOK_SKILLS {
-        if hook.name == name {
-            print!("{}", hook.content);
-            return Ok(());
-        }
-    }
-    for skill in SKILLS {
-        if skill.name == name {
-            print!("{}", skill.content);
-            return Ok(());
-        }
-    }
-    eprintln!("Unknown skill: {}", name);
-    std::process::exit(1);
+    let Some(content) = skill_content(name) else {
+        eprintln!("Unknown skill: {name}");
+        std::process::exit(1);
+    };
+    print!("{content}");
+    Ok(())
+}
+
+fn skill_content(name: &str) -> Option<&'static str> {
+    let name = if name == LEGACY_OPERATING_RULES_SKILL {
+        OPERATING_RULES_SKILL
+    } else {
+        name
+    };
+    HOOK_SKILLS
+        .iter()
+        .find(|hook| hook.name == name)
+        .map(|hook| hook.content)
+        .or_else(|| {
+            SKILLS
+                .iter()
+                .find(|skill| skill.name == name)
+                .map(|skill| skill.content)
+        })
 }
 
 /// Emit the structured response Claude consumes for a hook event. Stdout is
@@ -384,7 +396,7 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
 /// A bundled file `init` writes and `status` compares.
 struct ManagedFile {
     kind: &'static str,
-    /// Relative to the skills or agents directory, e.g. `konnect/SKILL.md`.
+    /// Relative to the skills or agents directory, e.g. `copperpour/SKILL.md`.
     name: String,
     path: PathBuf,
     content: &'static str,
@@ -440,6 +452,11 @@ fn install_skills(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
             write_managed_file(&file)?;
         }
     }
+    if remove_renamed_skill(&paths.skills_dir(client))? && verbose {
+        println!(
+            "  [-] Removed skill: {LEGACY_OPERATING_RULES_SKILL} (now {OPERATING_RULES_SKILL})"
+        );
+    }
     if verbose {
         for skill in SKILLS {
             println!("  [+] Skill: {}", skill.name);
@@ -462,6 +479,9 @@ fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) 
                 println!("  [-] Removed skill: {}", skill.name);
             }
         }
+    }
+    if remove_renamed_skill(&skills_dir)? && verbose {
+        println!("  [-] Removed skill: {LEGACY_OPERATING_RULES_SKILL}");
     }
 
     if client == InstallClient::Claude {
@@ -614,7 +634,7 @@ impl GuidanceState {
 #[derive(Debug)]
 struct FileCheck {
     kind: &'static str,
-    /// Relative to the skills or agents directory, e.g. `konnect/SKILL.md`.
+    /// Relative to the skills or agents directory, e.g. `copperpour/SKILL.md`.
     name: String,
     path: PathBuf,
     status: ItemStatus,
@@ -1082,11 +1102,54 @@ fn install_marker(client: InstallClient, paths: &InstallPaths) -> Option<PathBuf
     None
 }
 
-fn remove_if_present(path: &Path) -> Result<()> {
-    if path.exists() {
-        fs::remove_file(path)?;
+/// Remove the files `init` wrote under [`LEGACY_OPERATING_RULES_SKILL`],
+/// then its directories once empty, so the rules are not loaded twice. Files
+/// the user added there stay, and a link is never followed: a `konnect`
+/// linked elsewhere is not ours to empty. Returns whether a file went.
+fn remove_renamed_skill(skills_dir: &Path) -> Result<bool> {
+    let dir = skills_dir.join(LEGACY_OPERATING_RULES_SKILL);
+    if !is_real_dir(&dir) {
+        return Ok(false);
     }
-    Ok(())
+    // What releases before #239 wrote there, not the current skill's files.
+    let mut removed = remove_if_present(&dir.join("SKILL.md"))?;
+    let references = dir.join("references");
+    if is_real_dir(&references) {
+        removed |= remove_if_present(&references.join("reliability-contract.md"))?;
+        remove_empty_dir(&references)?;
+    }
+    remove_empty_dir(&dir)?;
+    Ok(removed)
+}
+
+/// A directory itself, not a link to one.
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// Remove `path` if it is an empty directory; one still holding files stays.
+fn remove_empty_dir(path: &Path) -> Result<()> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// Whether there was a file to remove.
+fn remove_if_present(path: &Path) -> Result<bool> {
+    if path.exists() {
+        fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn display_home_path(path: &Path, home: &Path) -> String {
@@ -1249,6 +1312,110 @@ mod tests {
         }
     }
 
+    fn write_old_skill(dir: &Path) {
+        fs::create_dir_all(dir.join("references")).unwrap();
+        fs::write(dir.join("SKILL.md"), "---\nname: konnect\n---\n").unwrap();
+        fs::write(dir.join("references/reliability-contract.md"), "old").unwrap();
+    }
+
+    /// #239: the operating-rules skill moved from `konnect/` to
+    /// `copperpour/`. `init` removes what it wrote under the old name, for
+    /// either client, and keeps the user's own files there.
+    #[test]
+    fn install_removes_the_skill_under_its_old_name() {
+        for client in [InstallClient::Claude, InstallClient::Codex] {
+            let temp = TempDir::new().unwrap();
+            let paths = test_paths(&temp);
+            let old = paths.skills_dir(client).join("konnect");
+            write_old_skill(&old);
+
+            run_install_at(client, &paths, false).unwrap();
+            assert!(!old.exists(), "{client}");
+            assert!(paths
+                .skills_dir(client)
+                .join("copperpour/SKILL.md")
+                .is_file());
+
+            write_old_skill(&old);
+            fs::write(old.join("references/my-notes.md"), "mine").unwrap();
+            run_install_at(client, &paths, false).unwrap();
+            assert!(!old.join("SKILL.md").exists(), "{client}");
+            assert!(
+                !old.join("references/reliability-contract.md").exists(),
+                "{client}"
+            );
+            assert_eq!(
+                fs::read_to_string(old.join("references/my-notes.md")).unwrap(),
+                "mine",
+                "{client}"
+            );
+        }
+    }
+
+    /// A `konnect` that is a link or a file is left as it is, and does not
+    /// stop the install.
+    #[cfg(unix)]
+    #[test]
+    fn install_leaves_an_old_skill_path_that_is_not_a_directory() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        let skills = paths.skills_dir(InstallClient::Claude);
+        let elsewhere = temp.path().join("checkout/konnect");
+        write_old_skill(&elsewhere);
+        fs::create_dir_all(&skills).unwrap();
+        for (case, make) in [
+            ("link", Some(elsewhere.as_path())),
+            ("dangling link", Some(temp.path().join("gone").as_path())),
+            ("file", None),
+        ]
+        .map(|(case, target)| (case, target.map(Path::to_path_buf)))
+        {
+            let old = skills.join("konnect");
+            let _ = fs::remove_file(&old);
+            match make {
+                Some(target) => std::os::unix::fs::symlink(target, &old).unwrap(),
+                None => fs::write(&old, "not a directory").unwrap(),
+            }
+            run_install_at(InstallClient::Claude, &paths, false).unwrap();
+            run_uninstall_at(InstallClient::Claude, &paths, false).unwrap();
+            assert!(fs::symlink_metadata(&old).is_ok(), "{case}");
+        }
+        assert!(elsewhere.join("SKILL.md").is_file());
+        assert!(elsewhere
+            .join("references/reliability-contract.md")
+            .is_file());
+
+        // A real `konnect/` whose `references` links elsewhere.
+        let old = skills.join("konnect");
+        fs::remove_file(&old).unwrap();
+        fs::create_dir(&old).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("references"), old.join("references")).unwrap();
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+        assert!(elsewhere
+            .join("references/reliability-contract.md")
+            .is_file());
+    }
+
+    #[test]
+    fn uninstall_removes_the_skill_under_its_old_name() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+        let old = paths.skills_dir(InstallClient::Claude).join("konnect");
+        write_old_skill(&old);
+        run_uninstall_at(InstallClient::Claude, &paths, false).unwrap();
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn the_old_skill_name_prints_the_operating_rules() {
+        let rules = skill_content("copperpour").unwrap();
+        // Lines, not bytes: a Windows checkout embeds CRLF.
+        assert_eq!(rules.lines().nth(1), Some("name: copperpour"));
+        assert_eq!(skill_content("konnect"), Some(rules));
+        assert_eq!(skill_content("kicad-pcb-missing"), None);
+    }
+
     #[test]
     fn client_argument_defaults_to_claude() {
         assert_eq!(client_from_args(&[]).unwrap(), InstallClient::Claude);
@@ -1391,7 +1558,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let paths = test_paths(&temp);
         run_install_at(InstallClient::Claude, &paths, false).unwrap();
-        let skill_dir = paths.skills_dir(InstallClient::Claude).join("konnect");
+        let skill_dir = paths.skills_dir(InstallClient::Claude).join("copperpour");
         let installed = fs::read(skill_dir.join("references/reliability-contract.md")).unwrap();
         assert_eq!(
             installed,
@@ -1925,7 +2092,7 @@ mod tests {
         fs::write(
             paths
                 .skills_dir(InstallClient::Claude)
-                .join("konnect/SKILL.md"),
+                .join("copperpour/SKILL.md"),
             "# Konnect\n\n187 tools across 18 toolsets.\n",
         )
         .unwrap();
@@ -1954,7 +2121,7 @@ mod tests {
         let before = fs::read(paths.claude_settings_path()).unwrap();
 
         let guidance = inspect_guidance(InstallClient::Claude, &paths, &exe);
-        assert_eq!(file_status(&guidance, "konnect/SKILL.md"), "different");
+        assert_eq!(file_status(&guidance, "copperpour/SKILL.md"), "different");
         assert_eq!(
             file_status(&guidance, "kicad-design-review-agent.md"),
             "missing"
@@ -2026,7 +2193,7 @@ mod tests {
 
         let text = StatusText(&guidance, &paths).to_string();
         assert!(text.contains("  [different] kicad-pcb/references/design-rules.md\n"));
-        assert!(text.contains("  [current] konnect/SKILL.md\n"));
+        assert!(text.contains("  [current] copperpour/SKILL.md\n"));
         assert!(text.contains("Guidance: out_of_sync\n"));
         assert!(!text.contains("[+]"));
     }
@@ -2369,7 +2536,7 @@ mod tests {
         fs::write(
             paths
                 .skills_dir(InstallClient::Codex)
-                .join("konnect/SKILL.md"),
+                .join("copperpour/SKILL.md"),
             "mine",
         )
         .unwrap();
@@ -2429,7 +2596,7 @@ mod tests {
         run_install_at(InstallClient::Claude, &paths, false).unwrap();
         let skill = paths
             .skills_dir(InstallClient::Claude)
-            .join("konnect/SKILL.md");
+            .join("copperpour/SKILL.md");
         fs::write(&skill, "edited").unwrap();
         let edited = start(&temp);
         assert_eq!(edited.detail()["claude"]["state"], "out_of_sync");
