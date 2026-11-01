@@ -1,0 +1,181 @@
+{
+  "schema_version": 1,
+  "board_path": "specctra_stock_roundrect.kicad_pcb",
+  "source_sha256": "2fdc2515e6177c77c99a64007c37e7a5ecc33dcfc2d58c4a40bbc9ed7714590e",
+  "coordinate_unit": "um",
+  "resolution": 10,
+  "supported_profile": {
+    "copper_layers": 2,
+    "component_side": "front",
+    "pad_shapes": [
+      "circle",
+      "rect",
+      "roundrect"
+    ],
+    "existing_routing": false,
+    "locked_track_count": 0,
+    "locked_via_count": 0,
+    "copper_zones": false,
+    "custom_rules": false,
+    "outline": "one closed loop of straight Edge.Cuts lines"
+  },
+  "layers": [
+    {
+      "kicad_name": "F.Cu",
+      "dsn_name": "F.Cu",
+      "index": 0
+    },
+    {
+      "kicad_name": "B.Cu",
+      "dsn_name": "B.Cu",
+      "index": 1
+    }
+  ],
+  "components": [
+    {
+      "reference": "C1",
+      "kiid": "7acf39aa-3add-4fe6-ba01-5581b470e31a",
+      "image_name": "konnect_image_C1",
+      "x_um": 110000,
+      "y_um": -50000,
+      "rotation_degrees": 0.0,
+      "side": "front",
+      "pads": [
+        {
+          "pad_number": "1",
+          "dsn_pin": "C1-1",
+          "net": "SIG",
+          "padstack_name": "konnect_pad_0003"
+        },
+        {
+          "pad_number": "2",
+          "dsn_pin": "C1-2",
+          "net": "GND",
+          "padstack_name": "konnect_pad_0003"
+        }
+      ]
+    },
+    {
+      "reference": "R1",
+      "kiid": "a2b77abb-0c81-4192-b06c-7d659cccd939",
+      "image_name": "konnect_image_R1",
+      "x_um": 100000,
+      "y_um": -50000,
+      "rotation_degrees": 0.0,
+      "side": "front",
+      "pads": [
+        {
+          "pad_number": "1",
+          "dsn_pin": "R1-1",
+          "net": "VCC",
+          "padstack_name": "konnect_pad_0001"
+        },
+        {
+          "pad_number": "2",
+          "dsn_pin": "R1-2",
+          "net": "SIG",
+          "padstack_name": "konnect_pad_0001"
+        }
+      ]
+    },
+    {
+      "reference": "R2",
+      "kiid": "509ab3e4-7d3c-447f-8db9-d320d12e8d2e",
+      "image_name": "konnect_image_R2",
+      "x_um": 105000,
+      "y_um": -60000,
+      "rotation_degrees": 0.0,
+      "side": "front",
+      "pads": [
+        {
+          "pad_number": "1",
+          "dsn_pin": "R2-1",
+          "net": "VCC",
+          "padstack_name": "konnect_pad_0002"
+        },
+        {
+          "pad_number": "2",
+          "dsn_pin": "R2-2",
+          "net": "GND",
+          "padstack_name": "konnect_pad_0002"
+        }
+      ]
+    }
+  ],
+  "nets": [
+    {
+      "name": "GND",
+      "pins": [
+        "C1-2",
+        "R2-2"
+      ],
+      "class_name": "konnect_class_0001"
+    },
+    {
+      "name": "SIG",
+      "pins": [
+        "C1-1",
+        "R1-2"
+      ],
+      "class_name": "konnect_class_0001"
+    },
+    {
+      "name": "VCC",
+      "pins": [
+        "R1-1",
+        "R2-1"
+      ],
+      "class_name": "konnect_class_0001"
+    }
+  ],
+  "padstacks": [
+    {
+      "name": "konnect_pad_0001",
+      "purpose": "pad",
+      "shape": "roundrect",
+      "layers": [
+        "F.Cu"
+      ],
+      "size_x_um": 540,
+      "size_y_um": 640,
+      "corner_radius_um": 135,
+      "drill_um": null
+    },
+    {
+      "name": "konnect_pad_0002",
+      "purpose": "pad",
+      "shape": "roundrect",
+      "layers": [
+        "F.Cu"
+      ],
+      "size_x_um": 800,
+      "size_y_um": 950,
+      "corner_radius_um": 200,
+      "drill_um": null
+    },
+    {
+      "name": "konnect_pad_0003",
+      "purpose": "pad",
+      "shape": "roundrect",
+      "layers": [
+        "F.Cu"
+      ],
+      "size_x_um": 900,
+      "size_y_um": 950,
+      "corner_radius_um": 225,
+      "drill_um": null
+    },
+    {
+      "name": "konnect_via_0001",
+      "purpose": "via",
+      "shape": "circle",
+      "layers": [
+        "F.Cu",
+        "B.Cu"
+      ],
+      "size_x_um": 600,
+      "size_y_um": 600,
+      "drill_um": 300
+    }
+  ]
+}

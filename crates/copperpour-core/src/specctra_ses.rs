@@ -872,15 +872,15 @@ mod tests {
   (base_design board)
   (placement
     (resolution um 10)
-    (component konnect_image_R1 (place R1 1000000 -500000 front 0))
-    (component konnect_image_R2 (place R2 1100000 -500000 front 0))
+    (component copperpour_image_R1 (place R1 1000000 -500000 front 0))
+    (component copperpour_image_R2 (place R2 1100000 -500000 front 0))
   )
   (was_is)
   (routes
     (resolution um 10)
     (parser (host_cad KiCad) (host_version 10.0.5))
     (library_out
-      (padstack konnect_via_0001
+      (padstack copperpour_via_0001
         (shape (circle F.Cu 6000 0 0))
         (shape (circle B.Cu 6000 0 0))
         (attach off)
@@ -889,7 +889,7 @@ mod tests {
     (network_out
       (net GND
         (wire (path F.Cu 2500 995000 -500000 1050000 -500000 1050000 -510000))
-        (via konnect_via_0001 1050000 -510000 (net GND) (type protect))
+        (via copperpour_via_0001 1050000 -510000 (net GND) (type protect))
       )
     )
   )
