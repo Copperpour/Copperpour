@@ -2709,6 +2709,23 @@ fn join_bounded<T>(items: &[T], limit: usize, render: impl Fn(&T) -> String) -> 
     joined
 }
 
+/// Whether a symbol's `Reference` property agrees with its instance records:
+/// one of them names it, and every one keeps its prefix. eeschema writes the
+/// property from one record only: the ordinal instance since 9.0
+/// (`eeschema/sch_io/kicad_sexpr/sch_io_kicad_sexpr.cpp:735-760,793-799` at
+/// 10.0.6), the first instance at 8.0.0 (`:727-730` there). So on a sheet
+/// placed more than once the other records name references of their own.
+/// With one record that is equality.
+pub(crate) fn instance_references_agree(reference: &str, records: &[impl AsRef<str>]) -> bool {
+    fn prefix(reference: &str) -> &str {
+        reference.trim_end_matches(|character: char| character.is_ascii_digit() || character == '?')
+    }
+    records.iter().any(|record| record.as_ref() == reference)
+        && records
+            .iter()
+            .all(|record| prefix(record.as_ref()) == prefix(reference))
+}
+
 /// Prove that every existing placed symbol is keyed to exactly the hierarchy
 /// identities observed from the parsed project root.
 ///
@@ -2743,10 +2760,6 @@ pub(crate) fn validate_sheet_instance_state(
             .join(", ")
     }
 
-    fn reference_prefix(reference: &str) -> &str {
-        reference.trim_end_matches(|character: char| character.is_ascii_digit() || character == '?')
-    }
-
     // One entry per distinct diagnosis, in first-seen order, each naming the
     // symbols that share it. The overwhelmingly common stale sheet has every
     // symbol disagreeing the same way, so it collapses to a single entry.
@@ -2769,18 +2782,16 @@ pub(crate) fn validate_sheet_instance_state(
         let wrong_unit = instances
             .iter()
             .any(|instance| instance.unit != Some(symbol.unit));
-        let wrong_reference = symbol_reference.is_none_or(|reference| {
-            let prefix = reference_prefix(reference);
-            !instances
-                .iter()
-                .any(|instance| instance.reference.as_deref() == Some(reference))
-                || instances.iter().any(|instance| {
-                    instance
-                        .reference
-                        .as_deref()
-                        .is_none_or(|candidate| reference_prefix(candidate) != prefix)
-                })
-        });
+        let references = instances
+            .iter()
+            .map(|instance| instance.reference.as_deref())
+            .collect::<Option<Vec<_>>>();
+        let wrong_reference = match (symbol_reference, references) {
+            (Some(reference), Some(references)) => {
+                !instance_references_agree(reference, &references)
+            }
+            _ => true,
+        };
         if malformed || observed != expected || wrong_unit || wrong_reference {
             let identity = symbol_reference.unwrap_or(symbol.uuid.as_str());
             let mut reasons = Vec::new();
