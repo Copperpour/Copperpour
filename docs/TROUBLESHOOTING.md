@@ -438,8 +438,10 @@ the lock. Remove a confirmed stale lock manually only as a last resort.
 
 ## Transaction recovery is blocked by divergent content
 
-Multi-file schematic changes persist a `.konnect-transaction-<id>.json`
-write-ahead journal in the project before changing any target. On restart,
+Multi-file schematic changes persist a `.copperpour-transaction-<id>.json`
+write-ahead journal in the project before changing any target. Releases before
+the rename to Copperpour named it `.konnect-transaction-<id>.json`; those
+journals are still found, recovered and abandoned the same way. On restart,
 Copperpour safely completes files that still match either the recorded before
 image or intended replacement. It never overwrites a file changed by KiCad or
 another process after the journal was written.
@@ -466,7 +468,8 @@ copperpour transaction abandon <project-dir> <transaction-id> --force
 ```
 
 Abandonment renames the journal to
-`.konnect-transaction-<id>.abandoned.json`; it does not restore, replace, or
+`.copperpour-transaction-<id>.abandoned.json` (an old journal keeps its
+`.konnect-` prefix); it does not restore, replace, or
 delete a target. The abandoned file is retained as recovery evidence and is
 ignored by future transactions. Delete it only after you have made any backup
 you need.

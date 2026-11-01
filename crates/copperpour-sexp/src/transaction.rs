@@ -18,7 +18,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 const JOURNAL_VERSION: u32 = 1;
-const JOURNAL_PREFIX: &str = ".konnect-transaction-";
+const JOURNAL_PREFIX: &str = ".copperpour-transaction-";
+/// Written before the rename to Copperpour; such journals are still recovered.
+const LEGACY_JOURNAL_PREFIX: &str = ".konnect-transaction-";
+const JOURNAL_PREFIXES: [&str; 2] = [JOURNAL_PREFIX, LEGACY_JOURNAL_PREFIX];
 const JOURNAL_SUFFIX: &str = ".json";
 
 /// One exact file transition in a durable project transaction.
@@ -376,14 +379,7 @@ pub fn recover_file_transaction(
     id: &str,
 ) -> Result<RecoveryOutcome, SexpError> {
     let root = canonical_directory(journal_directory.as_ref())?;
-    validate_transaction_id(id)?;
-    let path = journal_path(&root, id);
-    if !path.is_file() {
-        return Err(SexpError::InvalidValue(format!(
-            "transaction journal '{id}' was not found in {}",
-            root.display()
-        )));
-    }
+    let path = existing_journal_path(&root, id)?;
     recover_journal(&root, &path)
 }
 
@@ -404,14 +400,7 @@ pub fn abandon_file_transaction(
     id: &str,
 ) -> Result<AbandonedTransaction, SexpError> {
     let root = canonical_directory(journal_directory.as_ref())?;
-    validate_transaction_id(id)?;
-    let path = journal_path(&root, id);
-    if !path.is_file() {
-        return Err(SexpError::InvalidValue(format!(
-            "transaction journal '{id}' was not found in {}",
-            root.display()
-        )));
-    }
+    let path = existing_journal_path(&root, id)?;
 
     let mut held_locks = None;
     let was_valid = match read_validated_journal(&root, &path) {
@@ -433,7 +422,7 @@ pub fn abandon_file_transaction(
         Err(_) => false,
     };
 
-    let abandoned_journal = abandoned_journal_path(&root, id);
+    let abandoned_journal = abandoned_journal_path(&path);
     if abandoned_journal.exists() {
         return Err(SexpError::InvalidValue(format!(
             "abandoned journal already exists: {}",
@@ -509,7 +498,7 @@ fn read_validated_journal(root: &Path, path: &Path) -> Result<Journal, SexpError
         ))
     })?;
     validate_transaction_id(&journal.id)?;
-    if journal_path(root, &journal.id) != path {
+    if path.parent() != Some(root) || journal_id(path) != Some(journal.id.as_str()) {
         return Err(SexpError::InvalidValue(format!(
             "transaction journal ID does not match its filename: {}",
             path.display()
@@ -750,11 +739,37 @@ fn remove_journal(path: &Path) -> Result<(), SexpError> {
 }
 
 fn journal_path(root: &Path, id: &str) -> PathBuf {
-    root.join(format!("{JOURNAL_PREFIX}{id}{JOURNAL_SUFFIX}"))
+    prefixed_journal_path(root, JOURNAL_PREFIX, id)
 }
 
-fn abandoned_journal_path(root: &Path, id: &str) -> PathBuf {
-    root.join(format!("{JOURNAL_PREFIX}{id}.abandoned{JOURNAL_SUFFIX}"))
+fn prefixed_journal_path(root: &Path, prefix: &str, id: &str) -> PathBuf {
+    root.join(format!("{prefix}{id}{JOURNAL_SUFFIX}"))
+}
+
+/// The active journal for `id`, under either prefix.
+fn existing_journal_path(root: &Path, id: &str) -> Result<PathBuf, SexpError> {
+    validate_transaction_id(id)?;
+    let mut found = JOURNAL_PREFIXES
+        .iter()
+        .map(|prefix| prefixed_journal_path(root, prefix, id))
+        .filter(|path| path.is_file());
+    match (found.next(), found.next()) {
+        (Some(path), None) => Ok(path),
+        (None, _) => Err(SexpError::InvalidValue(format!(
+            "transaction journal '{id}' was not found in {}",
+            root.display()
+        ))),
+        (Some(first), Some(second)) => Err(SexpError::InvalidValue(format!(
+            "transaction '{id}' has two journals, {} and {}; move the one you do not want out of the project",
+            first.display(),
+            second.display()
+        ))),
+    }
+}
+
+/// Keeps the active journal's prefix, so an old journal stays recognizable.
+fn abandoned_journal_path(journal: &Path) -> PathBuf {
+    journal.with_extension("abandoned.json")
 }
 
 fn validate_transaction_id(id: &str) -> Result<(), SexpError> {
@@ -771,13 +786,17 @@ fn validate_transaction_id(id: &str) -> Result<(), SexpError> {
     Ok(())
 }
 
+/// The ID in a journal's filename, under either prefix.
+fn journal_id(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    JOURNAL_PREFIXES
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))?
+        .strip_suffix(JOURNAL_SUFFIX)
+}
+
 fn is_journal_path(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| {
-            name.strip_prefix(JOURNAL_PREFIX)
-                .and_then(|name| name.strip_suffix(JOURNAL_SUFFIX))
-        })
+    journal_id(path)
         .is_some_and(|id| !id.ends_with(".abandoned") && validate_transaction_id(id).is_ok())
 }
 
@@ -894,6 +913,8 @@ mod tests {
             .journal
             .unwrap_or_else(|| panic!("{:?}", failure.error));
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "a after");
+        let name = journal.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with(".copperpour-transaction-"), "{name}");
         let active = inspect_file_transactions(directory.path()).unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].journal, journal);
@@ -1268,6 +1289,100 @@ mod tests {
         assert!(!path.exists());
         assert!(outcome.abandoned_journal.exists());
         assert!(recover_file_transactions(&root).unwrap().is_empty());
+    }
+
+    /// A journal a Konnect-named release left behind, restated as a literal
+    /// rather than read from the prefix constants.
+    fn legacy_journal(root: &Path, id: &str, target: &str) -> PathBuf {
+        let path = root.join(format!(".konnect-transaction-{id}.json"));
+        let journal = Journal {
+            version: JOURNAL_VERSION,
+            id: id.to_owned(),
+            entries: vec![JournalEntry {
+                path: PathBuf::from(target),
+                expected: Some("before".to_owned()),
+                replacement: "after".to_owned(),
+            }],
+        };
+        persist_journal(&path, &journal).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_new_transaction_first_completes_a_legacy_journal() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("old.kicad_sch"), "before").unwrap();
+        let legacy = legacy_journal(&root, "legacy-pending", "old.kicad_sch");
+        let statuses = inspect_file_transactions(&root).unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].journal, legacy);
+
+        let target = root.join("new.kicad_sch");
+        commit_file_transaction(&root, vec![FileTransition::create(&target, "new")]).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("old.kicad_sch")).unwrap(),
+            "after"
+        );
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn a_legacy_journal_is_recovered_by_id() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("root.kicad_sch"), "before").unwrap();
+        let legacy = legacy_journal(&root, "legacy-by-id", "root.kicad_sch");
+
+        let outcome = recover_file_transaction(&root, "legacy-by-id").unwrap();
+
+        assert_eq!(outcome.completed_files, 1);
+        assert_eq!(
+            std::fs::read_to_string(root.join("root.kicad_sch")).unwrap(),
+            "after"
+        );
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn an_abandoned_legacy_journal_keeps_its_prefix() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("root.kicad_sch"), "external edit").unwrap();
+        let legacy = legacy_journal(&root, "legacy-divergent", "root.kicad_sch");
+
+        let outcome = abandon_file_transaction(&root, "legacy-divergent").unwrap();
+
+        assert!(outcome.was_valid);
+        assert_eq!(outcome.journal, legacy);
+        assert_eq!(
+            outcome.abandoned_journal,
+            root.join(".konnect-transaction-legacy-divergent.abandoned.json")
+        );
+        assert!(outcome.abandoned_journal.exists());
+        assert!(inspect_file_transactions(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_id_under_both_prefixes_is_refused() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("root.kicad_sch"), "external edit").unwrap();
+        let legacy = legacy_journal(&root, "twice", "root.kicad_sch");
+        let current = root.join(".copperpour-transaction-twice.json");
+        std::fs::copy(&legacy, &current).unwrap();
+
+        for error in [
+            recover_file_transaction(&root, "twice").unwrap_err(),
+            abandon_file_transaction(&root, "twice").unwrap_err(),
+        ] {
+            assert!(
+                matches!(&error, SexpError::InvalidValue(reason) if reason.contains("two journals")),
+                "{error:?}"
+            );
+        }
+        assert!(legacy.exists() && current.exists());
     }
 
     #[test]

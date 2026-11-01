@@ -243,7 +243,7 @@ fn a_sheet_changed_after_it_was_read_is_a_conflict() {
     assert_eq!(read(dir.path(), CHILD), "(kicad_sch (version 1))");
 
     // A journal left behind means a write may have happened: not this refusal.
-    let journal = dir.path().join(".konnect-transaction-left.json");
+    let journal = dir.path().join(".copperpour-transaction-left.json");
     std::fs::write(&journal, "{}").unwrap();
     let kept = copperpour_sexp::SexpError::TransactionConflict {
         path: sheet,
@@ -251,6 +251,40 @@ fn a_sheet_changed_after_it_was_read_is_a_conflict() {
         reason: "replacement did not remain durable".into(),
     };
     assert!(super::sch_hierarchy::stale_sheet_refusal(&kept).is_none());
+}
+
+/// A journal an earlier, Konnect-named release left in the project is
+/// completed before the edit when it can be, and blocks it when it cannot.
+#[tokio::test]
+async fn a_legacy_konnect_journal_is_settled_before_a_hierarchy_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = project(dir.path());
+    let journal = dir.path().join(".konnect-transaction-legacy-left.json");
+    let left = json!({
+        "version": 1, "id": "legacy-left",
+        "entries": [{ "path": "old.kicad_sch", "expected": "before", "replacement": "after" }]
+    });
+    let mut arguments = edit();
+    arguments["scope"] = json!("hierarchy");
+
+    std::fs::write(dir.path().join("old.kicad_sch"), "edited since").unwrap();
+    std::fs::write(&journal, left.to_string()).unwrap();
+    let result = call(&root, arguments.clone()).await;
+    assert!(result.is_error);
+    assert!(
+        body(&result).to_string().contains("legacy-left"),
+        "{}",
+        body(&result)
+    );
+    assert_untouched(dir.path());
+    assert!(journal.exists());
+
+    std::fs::write(dir.path().join("old.kicad_sch"), "before").unwrap();
+    let result = call(&root, arguments).await;
+    assert!(!result.is_error, "{}", body(&result));
+    assert_eq!(read(dir.path(), "old.kicad_sch"), "after");
+    assert!(!journal.exists());
+    assert!(read(dir.path(), CHILD).contains("(rev \"B\")"));
 }
 
 /// The journal sits beside the project root, so a child sheet in a

@@ -666,7 +666,7 @@ async fn handle_download_jlcpcb(
 
     let db_parent = db_path.parent().unwrap_or_else(|| Path::new("."));
     let work_dir = tempfile::Builder::new()
-        .prefix("konnect-jlcpcb-")
+        .prefix("copperpour-jlcpcb-")
         .tempdir_in(db_parent)?;
     let archive_path = work_dir.path().join(JLCPCB_FEED_ARCHIVE);
     let upstream_path = work_dir.path().join("upstream.db");

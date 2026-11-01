@@ -9,8 +9,9 @@ crates/schematic-viewer/target/
 *.dylib
 *.tmp
 *.bak
+# Transaction journals, active and abandoned; .konnect- from earlier releases.
+.copperpour-transaction-*.json
 .konnect-transaction-*.json
-.konnect-transaction-*.abandoned.json
 dist/
 
 # Python bytecode. The plugin and packaging scripts are Python; running
