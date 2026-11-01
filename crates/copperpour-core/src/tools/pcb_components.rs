@@ -8191,3 +8191,144 @@ mod required_count_tests {
         assert!(result.is_error, "an explicit zero must still be rejected");
     }
 }
+
+#[cfg(test)]
+mod off_axis_rotation_tests {
+    use crate::tools::pcb_board::board_mock::{spawn_kicad_holding_items, ItemStore};
+    use copperpour_ipc::builders::{self, pack_any};
+    use copperpour_ipc::gen::kiapi;
+    use kiapi::common::types::graphic_shape::Geometry;
+    use prost::Message;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    /// A courtyard rectangle as KiCad 10 sends it: `corner_radius` is always
+    /// set, to 0 for square corners.
+    fn courtyard(corner_radius_nm: i64) -> prost_types::Any {
+        let mut rect = builders::board_rectangle("F.CrtYd", 0.05, 99.0, 99.0, 101.0, 101.0, false);
+        if let Some(Geometry::Rectangle(r)) = rect
+            .shape
+            .as_mut()
+            .and_then(|shape| shape.geometry.as_mut())
+        {
+            r.corner_radius = Some(kiapi::common::types::Distance {
+                value_nm: corner_radius_nm,
+            });
+        }
+        pack_any(&rect, "kiapi.board.types.BoardGraphicShape")
+    }
+
+    fn footprint(id: &str, reference: &str, items: Vec<prost_types::Any>) -> prost_types::Any {
+        pack_any(
+            &kiapi::board::types::FootprintInstance {
+                id: Some(kiapi::common::types::Kiid {
+                    value: id.to_string(),
+                }),
+                position: Some(builders::vec2(100.0, 100.0)),
+                reference_field: Some(kiapi::board::types::Field {
+                    text: Some(kiapi::board::types::BoardText {
+                        text: Some(kiapi::common::types::Text {
+                            text: reference.to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                definition: Some(kiapi::board::types::Footprint {
+                    items,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "kiapi.board.types.FootprintInstance",
+        )
+    }
+
+    /// Serves the issue's batch, Y1 at -45° and U1 at 45°, to a KiCad
+    /// holding Y1 with a courtyard of `corner_radius_nm` and U1 with none.
+    async fn served_placements(corner_radius_nm: i64) -> (bool, String, Arc<Mutex<ItemStore>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![
+                footprint("y1", "Y1", vec![courtyard(corner_radius_nm)]),
+                footprint("u1", "U1", vec![]),
+            ],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(&board, vec![], store.clone(), |_| {}, |_, _| None);
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            ipc_address: server.address().to_string(),
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 224,
+                "method": "tools/call",
+                "params": {
+                    "name": "set_component_placements",
+                    "arguments": {
+                        "board": board.to_string_lossy(),
+                        "placements": [
+                            {"reference": "Y1", "x": 100.0, "y": 100.0, "rotation": -45.0},
+                            {"reference": "U1", "x": 100.0, "y": 100.0, "rotation": 45.0}
+                        ]
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        let result = response.result.unwrap();
+        (
+            result["isError"] == json!(true),
+            result["content"][0]["text"].as_str().unwrap().to_string(),
+            store,
+        )
+    }
+
+    fn held_shape(store: &ItemStore) -> Option<Geometry> {
+        let fp = kiapi::board::types::FootprintInstance::decode(store.items[0].value.as_slice())
+            .unwrap();
+        let item = &fp.definition.unwrap().items[0];
+        kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+            .unwrap()
+            .shape
+            .unwrap()
+            .geometry
+    }
+
+    /// #224: a square-cornered rectangle rotates off-axis as a polygon, and
+    /// the rest of the batch lands with it.
+    #[tokio::test]
+    async fn square_cornered_rectangle_rotates_off_axis_in_a_batch() {
+        let (is_error, text, store) = served_placements(0).await;
+
+        assert!(!is_error, "{text}");
+        let held = store.lock().unwrap();
+        assert_eq!(held.updates, 1);
+        let shape = held_shape(&held);
+        assert!(matches!(shape, Some(Geometry::Polygon(_))), "{shape:?}");
+        let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(response["placements"][0]["rotation"], -45.0, "{response}");
+        assert_eq!(response["placements"][1]["rotation"], 45.0, "{response}");
+    }
+
+    /// #224: a really rounded rectangle is still refused, the refusal names
+    /// the footprint and the layer, and nothing in the batch is applied.
+    #[tokio::test]
+    async fn rounded_rectangle_refusal_names_the_part_and_applies_nothing() {
+        let (is_error, text, store) = served_placements(250_000).await;
+
+        assert!(is_error, "{text}");
+        assert!(text.contains("'Y1'") && text.contains("F.CrtYd"), "{text}");
+        let held = store.lock().unwrap();
+        assert_eq!(held.updates, 0, "no footprint may be updated");
+        assert!(matches!(held_shape(&held), Some(Geometry::Rectangle(_))));
+    }
+}
