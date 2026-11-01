@@ -87,8 +87,15 @@ client uses. Each file and hook is compared with that binary's bundle:
 A `different` hook carries a reason: `legacy_handler` is the pre-hook-JSON
 `… skill <name>` form, which Claude ignores; `alias_handler` is a hook for the
 `konnect` alias beside this binary, which runs this binary and which `init`
-replaces; and `other_executable` is a hook that runs another Copperpour
-binary, written exactly as `copperpour init` writes it.
+replaces; `duplicate_handler` is the current hook with another handler of
+ours beside it, or a second entry for it, which `init` removes;
+`stale_matcher` is our entry under a tool matcher from an older release,
+which `init` rewrites; `shared_entry` is the current hook only inside an entry
+that also holds your handlers under your matcher, which `init` moves into an
+entry of its own; and `other_executable` is a hook that runs another
+Copperpour binary, written exactly as `copperpour init` writes it. A hook is
+`current` exactly when `copperpour init` would leave our handler for it
+unchanged.
 
 The serving process makes the same comparison for both clients once per
 installed guidance version, meaning each install marker. The first start
