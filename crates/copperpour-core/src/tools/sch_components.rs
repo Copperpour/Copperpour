@@ -1394,22 +1394,6 @@ fn component_target_from_source(
                 });
             }
         }
-        for instances in node.find_all("instances") {
-            for project in instances.find_all("project") {
-                for path_node in project.find_all("path") {
-                    // `checked_instance_paths` below holds the references to
-                    // the property.
-                    if path_node.find_str("reference").is_none() {
-                        return Err(ComponentDeleteTargetError::stale(
-                            path,
-                            format!(
-                                "component {reference} UUID {uuid} has an instance path without a reference"
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
         by_unit.entry(instance.unit).or_default().push(uuid.clone());
         let symbol = cse::sexp::parser::parse(&item.source)
             .and_then(|node| cse::Symbol::from_sexp(&node))
@@ -8275,10 +8259,18 @@ mod multi_unit_component_tests {
 
     /// A record the property does not agree with is still stale, before the
     /// write and in the readback: a property that no record names (a rename
-    /// that reached the property alone), and a record of another prefix.
+    /// that reached the property alone), a record of another prefix, and a
+    /// record without a designator.
     #[tokio::test]
     async fn a_stale_record_is_refused_on_a_sheet_placed_twice() {
-        for (corruption, from, to, reference, records) in [
+        for (corruption, from, to, reference, reason) in [
+            (
+                "missing",
+                "\t\t\t\t\t(reference \"R10\")\n",
+                "",
+                "R3",
+                "has incomplete instance metadata",
+            ),
             (
                 "renamed",
                 "(property \"Reference\" \"R3\"",
@@ -8315,7 +8307,7 @@ mod multi_unit_component_tests {
                 "{corruption}"
             );
             assert!(
-                tool_error_summary(&refused).contains(records),
+                tool_error_summary(&refused).contains(reason),
                 "{corruption}: {}",
                 tool_error_summary(&refused)
             );
@@ -8335,7 +8327,7 @@ mod multi_unit_component_tests {
                 "{corruption}"
             );
             assert!(
-                tool_error_summary(&readback).contains(records),
+                tool_error_summary(&readback).contains(reason),
                 "{corruption}"
             );
         }
@@ -8385,12 +8377,58 @@ mod multi_unit_component_tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
-    /// Each edit tool, served as a client calls it, on the whole project: it
-    /// succeeds, changes `bank.kicad_sch` and no other sheet, and R3 keeps both
-    /// of its records.
-    #[tokio::test]
-    async fn every_edit_tool_is_served_on_a_sheet_placed_twice() {
-        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+    const NESTED_PAGES: [(&str, &str); 4] = [
+        (
+            "nested_pages.kicad_pro",
+            include_str!("../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_pro"),
+        ),
+        (
+            "nested_pages.kicad_sch",
+            include_str!("../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_sch"),
+        ),
+        (
+            "bank.kicad_sch",
+            include_str!("../../tests/fixtures/annotate_nested_hierarchy/bank.kicad_sch"),
+        ),
+        (
+            "cell.kicad_sch",
+            include_str!("../../tests/fixtures/annotate_nested_hierarchy/cell.kicad_sch"),
+        ),
+    ];
+
+    /// The nested fixture's project, with a project table of two libraries
+    /// KiCad 10.0.6 saved: `Device`, holding the stock `Device:R`, and
+    /// `Fields`, whose two-pin `FIELDS_BARE` `create_symbol` made. The project
+    /// table is read first, so the developer's installed libraries cannot
+    /// answer.
+    fn nested_pages_project() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, content) in NESTED_PAGES {
+            std::fs::write(directory.path().join(name), content).unwrap();
+        }
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let lib = |name: &str, file: &str| {
+            format!(
+                "  (lib (name \"{name}\") (type \"KiCad\") (uri {}) (options \"\") (descr \"\"))\n",
+                crate::tools::library::quote_lib_table_string(
+                    &fixtures.join(file).display().to_string()
+                )
+            )
+        };
+        std::fs::write(
+            directory.path().join("sym-lib-table"),
+            format!(
+                "(sym_lib_table\n  (version 7)\n{}{})\n",
+                lib("Device", "reference_prefix_kicad10/Device.kicad_sym"),
+                lib("Fields", "symbol_fields_kicad10.kicad_sym")
+            ),
+        )
+        .unwrap();
+        directory
+    }
+
+    async fn served_handler() -> crate::mcp::handler::McpHandler {
+        crate::mcp::handler::McpHandler::new(ServerConfig {
             kicad_cli: String::new(),
             kicad_binary: String::new(),
             ipc_address: String::new(),
@@ -8400,127 +8438,162 @@ mod multi_unit_component_tests {
             eager_toolsets: true,
         })
         .await
-        .unwrap();
-        for (tool, arguments) in [
+        .unwrap()
+    }
+
+    /// A `tools/call` the way a client makes it, which must succeed.
+    async fn served_call(
+        handler: &crate::mcp::handler::McpHandler,
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("a JSON-RPC result");
+        assert_ne!(
+            result["isError"],
+            json!(true),
+            "{tool} {arguments}: {result}"
+        );
+    }
+
+    /// Each edit tool, served as a client calls it, on the whole project: it
+    /// succeeds, changes the part's sheet and no other, and the part keeps
+    /// every record. R3's records read `R10, R3`, already sorted; R6's, on
+    /// `cell.kicad_sch` placed four times, read `R15, R13, R6, R8`.
+    #[tokio::test]
+    async fn every_edit_tool_is_served_on_a_sheet_placed_twice() {
+        let handler = served_handler().await;
+        for (sheet, reference, uuid, records) in [
             (
-                "edit_schematic_component",
-                json!({"field_placements": {"Value": {"x": 162.56, "y": 53.34}}}),
+                "bank.kicad_sch",
+                "R3",
+                "57ee0d14-2c2d-442a-b0f1-343e05b94ebd",
+                &["R10", "R3"][..],
             ),
-            ("edit_schematic_component", json!({"value": "10k"})),
-            ("move_schematic_component", json!({"x": 170.18, "y": 50.8})),
-            ("rotate_schematic_component", json!({"rotation": 180.0})),
-            ("mirror_schematic_component", json!({"mirror": "y"})),
             (
-                "add_component_annotation",
-                json!({"key": "Note", "value": "x"}),
+                "cell.kicad_sch",
+                "R6",
+                "9dfa3ea7-feb4-46a5-8eec-8b2d81900c0c",
+                &["R13", "R15", "R6", "R8"][..],
             ),
-            ("group_components", json!({"group_name": "G"})),
-            ("replace_component", json!({"new_lib_id": "Device:R_Small"})),
         ] {
-            let directory = tempfile::tempdir().unwrap();
-            for (name, content) in [
+            for (tool, arguments) in [
                 (
-                    "nested_pages.kicad_pro",
-                    include_str!(
-                        "../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_pro"
-                    ),
+                    "edit_schematic_component",
+                    json!({"field_placements": {"Value": {"x": 162.56, "y": 53.34}}}),
                 ),
+                ("edit_schematic_component", json!({"value": "10k"})),
+                ("move_schematic_component", json!({"x": 170.18, "y": 50.8})),
+                ("rotate_schematic_component", json!({"rotation": 180.0})),
+                ("mirror_schematic_component", json!({"mirror": "y"})),
                 (
-                    "nested_pages.kicad_sch",
-                    include_str!(
-                        "../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_sch"
-                    ),
+                    "add_component_annotation",
+                    json!({"key": "Note", "value": "x"}),
                 ),
+                ("group_components", json!({"group_name": "G"})),
                 (
-                    "bank.kicad_sch",
-                    include_str!("../../tests/fixtures/annotate_nested_hierarchy/bank.kicad_sch"),
-                ),
-                (
-                    "cell.kicad_sch",
-                    include_str!("../../tests/fixtures/annotate_nested_hierarchy/cell.kicad_sch"),
+                    "replace_component",
+                    json!({"new_lib_id": "Fields:FIELDS_BARE"}),
                 ),
             ] {
-                std::fs::write(directory.path().join(name), content).unwrap();
+                let directory = nested_pages_project();
+                let path = directory.path().join(sheet);
+                let mut arguments = arguments;
+                arguments["schematic"] = json!(path.display().to_string());
+                if tool == "group_components" {
+                    arguments["references"] = json!([reference]);
+                } else {
+                    arguments["reference"] = json!(reference);
+                }
+                served_call(&handler, tool, &arguments).await;
+                // The edit lands in the part's sheet alone.
+                for (name, content) in NESTED_PAGES {
+                    if !name.ends_with(".kicad_sch") {
+                        continue;
+                    }
+                    let now = std::fs::read_to_string(directory.path().join(name)).unwrap();
+                    if name == sheet {
+                        assert_ne!(
+                            now, content,
+                            "{reference} {tool}: the edit reached the file"
+                        );
+                    } else {
+                        assert_eq!(now, content, "{reference} {tool}: {name}");
+                    }
+                }
+                let committed = cse::Schematic::load(&path).unwrap();
+                let symbol = committed
+                    .symbols
+                    .iter()
+                    .find(|symbol| symbol.uuid == uuid)
+                    .unwrap();
+                assert_eq!(symbol.reference(), Some(reference), "{tool}");
+                let mut found = symbol
+                    .instances()
+                    .into_iter()
+                    .filter_map(|instance| instance.reference)
+                    .collect::<Vec<_>>();
+                found.sort();
+                assert_eq!(found, records, "{reference} {tool} {arguments}");
             }
-            // `replace_component` resolves the new symbol from the project's
-            // own table, so the developer's installed libraries cannot answer.
-            let library = directory.path().join("Device.kicad_symdir");
-            std::fs::create_dir_all(&library).unwrap();
-            std::fs::write(
-                library.join("R_Small.kicad_sym"),
-                "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"R_Small\"\n\t\t(property \"Reference\" \"R\" (at 0 0 0))\n\t\t(property \"Value\" \"R_Small\" (at 0 0 0))\n\t\t(symbol \"R_Small_0_1\"\n\t\t\t(pin passive line (at 0 3.81 270) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t\t(pin passive line (at 0 -3.81 90) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"2\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n",
-            )
-            .unwrap();
-            std::fs::write(
-                directory.path().join("sym-lib-table"),
-                format!(
-                    "(sym_lib_table\n  (version 7)\n  (lib (name \"Device\") (type \"KiCad\") (uri \"{}\") (options \"\") (descr \"\"))\n)\n",
-                    library.display()
-                ),
-            )
-            .unwrap();
-            let bank = directory.path().join("bank.kicad_sch");
-            let mut arguments = arguments;
-            arguments["schematic"] = json!(bank.display().to_string());
-            if tool == "group_components" {
-                arguments["references"] = json!(["R3"]);
-            } else {
-                arguments["reference"] = json!("R3");
-            }
-            let response = handler
-                .handle_message(json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": { "name": tool, "arguments": arguments }
-                }))
-                .await
-                .expect("tools/call receives a response");
-            let result = response.result.expect("a JSON-RPC result");
-            assert_ne!(
-                result["isError"],
-                json!(true),
-                "{tool} {arguments}: {result}"
-            );
-            // The edit lands in `bank.kicad_sch` alone.
-            for (name, content) in [
-                (
-                    "nested_pages.kicad_sch",
-                    include_str!(
-                        "../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_sch"
-                    ),
-                ),
-                (
-                    "cell.kicad_sch",
-                    include_str!("../../tests/fixtures/annotate_nested_hierarchy/cell.kicad_sch"),
-                ),
-            ] {
-                assert_eq!(
-                    std::fs::read_to_string(directory.path().join(name)).unwrap(),
-                    content,
-                    "{tool}: {name}"
-                );
-            }
-            assert_ne!(
-                std::fs::read_to_string(&bank).unwrap(),
-                include_str!("../../tests/fixtures/annotate_nested_hierarchy/bank.kicad_sch"),
-                "{tool}: the edit reached the file"
-            );
+        }
+    }
+
+    /// A placement writes its one designator to every record, so a part
+    /// placed on a reused sheet repeats it: the edit tools bind it as one
+    /// designator, and a rename reaches both records.
+    #[tokio::test]
+    async fn a_part_placed_on_a_sheet_placed_twice_is_edited_and_renamed() {
+        let handler = served_handler().await;
+        let directory = nested_pages_project();
+        let bank = directory.path().join("bank.kicad_sch");
+        let records = |reference: &str| {
             let committed = cse::Schematic::load(&bank).unwrap();
-            let r3 = committed
+            let symbol = committed
                 .symbols
                 .iter()
-                .find(|symbol| symbol.uuid == "57ee0d14-2c2d-442a-b0f1-343e05b94ebd")
+                .find(|symbol| symbol.reference() == Some(reference))
                 .unwrap();
-            assert_eq!(r3.reference(), Some("R3"), "{tool}");
-            let mut records = r3
+            let found = symbol
                 .instances()
                 .into_iter()
                 .filter_map(|instance| instance.reference)
                 .collect::<Vec<_>>();
-            records.sort();
-            assert_eq!(records, ["R10", "R3"], "{tool} {arguments}");
+            (found, symbol.property("Value").map(str::to_owned))
+        };
+        served_call(
+            &handler,
+            "add_schematic_component",
+            &json!({"schematic": bank, "lib_id": "Device:R", "reference": "R50",
+                "x": 228.6, "y": 76.2}),
+        )
+        .await;
+        assert_eq!(records("R50").0, ["R50", "R50"]);
+        for (tool, arguments) in [
+            ("edit_schematic_component", json!({"value": "10k"})),
+            ("move_schematic_component", json!({"x": 228.6, "y": 88.9})),
+            ("edit_schematic_component", json!({"new_reference": "R51"})),
+        ] {
+            let mut arguments = arguments;
+            arguments["schematic"] = json!(bank);
+            arguments["reference"] = json!("R50");
+            served_call(&handler, tool, &arguments).await;
         }
+        assert_eq!(
+            records("R51"),
+            (
+                vec!["R51".to_owned(), "R51".to_owned()],
+                Some("10k".to_owned())
+            )
+        );
     }
 
     #[tokio::test]
