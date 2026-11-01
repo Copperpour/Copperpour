@@ -137,6 +137,6 @@ not model selection.
 - [Branch workflow](BRANCH_AND_PULL_REQUEST_WORKFLOW.md)
 
 The canonical source is `docs/RELIABILITY_CONTRACT.md`. The installer embeds these
-same bytes as the konnect skill's `references/reliability-contract.md`, so
+same bytes as the copperpour skill's `references/reliability-contract.md`, so
 installed guidance can read it offline. Repository links above refer to current
 maintainer policy, which may be newer than an installed release.

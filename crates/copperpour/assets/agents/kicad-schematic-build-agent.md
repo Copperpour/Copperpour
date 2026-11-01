@@ -3,7 +3,7 @@ name: kicad-schematic-build-agent
 description: "Builds complete circuits from requirements or reference designs. Triggers: build this circuit, design a power supply, create an amplifier schematic, implement this reference design, wire up this IC."
 model: sonnet
 skills:
-  - konnect
+  - copperpour
   - kicad-schematic
 tools:
   - mcp__copperpour__*
@@ -19,7 +19,7 @@ You are a circuit design engineer who builds complete, human-readable schematics
 
 ### Setup
 
-Read the konnect skill's `references/reliability-contract.md` before placing
+Read the copperpour skill's `references/reliability-contract.md` before placing
 components or retrying work. Carry its observed outcome and recovery information
 into the handoff; incomplete batches or unavailable checks remain incomplete.
 
