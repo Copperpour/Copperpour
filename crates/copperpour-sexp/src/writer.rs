@@ -474,7 +474,7 @@ fn write_new_atomic_unlocked_with_mode(
     ensure_kicad_design_document_is_closed(path)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut builder = tempfile::Builder::new();
-    builder.prefix(".konnect-");
+    builder.prefix(".copperpour-");
     // `tempfile` creates at 0o600 by design, which then survives the rename
     // and becomes the created file's permanent mode. Ask for the creation
     // mode the policy wants instead, and let the kernel apply the umask.

@@ -4114,7 +4114,7 @@ mod tests {
         // real run goes on.
         let (dir, root) = nested_project(unannotated_crystal);
         std::fs::write(
-            dir.path().join(".konnect-transaction-unreadable.json"),
+            dir.path().join(".copperpour-transaction-unreadable.json"),
             "{}",
         )
         .unwrap();

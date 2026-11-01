@@ -469,7 +469,7 @@ fn export_staging_dir(destination: &Path) -> Result<tempfile::TempDir> {
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
     tempfile::Builder::new()
-        .prefix(".konnect-export-")
+        .prefix(".copperpour-export-")
         .tempdir_in(parent)
         .context("failed to create an export staging directory")
 }
@@ -492,7 +492,7 @@ async fn publish_verified_file(staged: &Path, destination: &Path, artifact: &str
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("artifact");
-    let backup = staged.with_file_name(format!(".konnect-previous-{file_name}"));
+    let backup = staged.with_file_name(format!(".copperpour-previous-{file_name}"));
     tokio::fs::rename(destination, &backup)
         .await
         .with_context(|| {
@@ -739,9 +739,9 @@ async fn run_erc_with_temp_root(
 ) -> Result<ErcReport> {
     let report_dir = match temp_root {
         Some(root) => tempfile::Builder::new()
-            .prefix("konnect-erc-")
+            .prefix("copperpour-erc-")
             .tempdir_in(root),
-        None => tempfile::Builder::new().prefix("konnect-erc-").tempdir(),
+        None => tempfile::Builder::new().prefix("copperpour-erc-").tempdir(),
     }
     .context("failed to create temporary ERC report directory")?;
     let out_path = report_dir.path().join("report.json");
