@@ -211,6 +211,31 @@ fn legacy_hook_command_tail(hook_name: &str) -> String {
     format!(" skill {hook_name}")
 }
 
+/// The `konnect` alias beside `copperpour` at `exe`, if `exe` is one. The
+/// alias runs that binary, so hooks naming it are this install's own (#244).
+fn alias_beside(exe: &str) -> Option<String> {
+    let name = program_name(exe);
+    let suffix = std::env::consts::EXE_SUFFIX;
+    let program = format!("copperpour{suffix}");
+    // Windows names are case-insensitive, as in `is_konnect_executable`.
+    (name == program || (!suffix.is_empty() && name.eq_ignore_ascii_case(&program)))
+        .then(|| format!("{}konnect{suffix}", &exe[..exe.len() - name.len()]))
+}
+
+/// Every command an install by `exe` or its alias wrote for `hook_name`,
+/// in the current and the legacy form.
+fn own_hook_commands(exe: &str, hook_name: &str) -> Vec<String> {
+    std::iter::once(exe.to_string())
+        .chain(alias_beside(exe))
+        .flat_map(|exe| {
+            [
+                hook_command(&exe, "hook", hook_name),
+                legacy_hook_command(&exe, hook_name),
+            ]
+        })
+        .collect()
+}
+
 /// Double-click behavior remains Claude-focused for backward compatibility.
 pub fn run_double_click_install() -> Result<()> {
     println!("===========================================");
@@ -773,9 +798,10 @@ fn read_marker(client: InstallClient, paths: &InstallPaths) -> Option<MarkerInfo
 }
 
 /// Classify each hook by the exact command `init` would write for `exe_str`.
-/// A handler for the same hook in the pre-#358 plain-stdout form, or that
-/// form or the current one for another Konnect executable, is `different`;
-/// nothing else is attributed to us.
+/// A handler for the same hook in the pre-#358 plain-stdout form, the
+/// current form for the `konnect` alias beside `exe_str`, or either form for
+/// another Konnect executable, is `different`; nothing else is attributed to
+/// us.
 fn inspect_hooks(settings_path: &Path, exe_str: &str) -> Vec<HookCheck> {
     // `None` when settings.json exists but cannot be read or parsed.
     let settings = match fs::read_to_string(settings_path) {
@@ -840,6 +866,10 @@ fn classify_hook(
         *c == legacy_hook_command(exe_str, hook_name) || is_legacy_konnect_hook(c, hook_name)
     }) {
         (ItemStatus::Different, Some("legacy_handler"))
+    } else if alias_beside(exe_str)
+        .is_some_and(|alias| commands.contains(&hook_command(&alias, "hook", hook_name).as_str()))
+    {
+        (ItemStatus::Different, Some("alias_handler"))
     } else if commands.iter().any(|c| is_konnect_hook(c, hook_name)) {
         (ItemStatus::Different, Some("other_executable"))
     } else {
@@ -888,9 +918,14 @@ fn unquote_command_arg(quoted: &str) -> Option<String> {
     (quote_command_arg(&argument) == quoted).then_some(argument)
 }
 
+/// The file name at the end of `path`, split on either separator.
+fn program_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
 /// `copperpour`, or `konnect` as it was called before the rename.
 fn is_konnect_executable(path: &str) -> bool {
-    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let name = program_name(path);
     ["copperpour", "konnect"]
         .iter()
         .any(|program| name == *program || name.eq_ignore_ascii_case(&format!("{program}.exe")))
@@ -1081,7 +1116,8 @@ fn patch_claude_settings(path: &Path, exe_str: &str) -> Result<usize> {
     let mut patched = 0;
     for hook in HOOK_SKILLS {
         let command = hook_command(exe_str, "hook", hook.name);
-        let legacy_command = legacy_hook_command(exe_str, hook.name);
+        let mut stale = own_hook_commands(exe_str, hook.name);
+        stale.retain(|own| *own != command);
         let matcher = hook_matcher(hook)?;
         let event_arr = hooks_obj
             .entry(hook.event)
@@ -1089,10 +1125,11 @@ fn patch_claude_settings(path: &Path, exe_str: &str) -> Result<usize> {
             .as_array_mut()
             .context("hook event field is not an array")?;
         let before = event_arr.clone();
-        // Migrate the exact handler installed by the old plain-stdout form.
-        // Do not use substring matching: user-authored neighboring handlers
-        // and unrelated commands containing "konnect" are not ours.
-        remove_exact_commands(event_arr, &[legacy_command.as_str()]);
+        // Migrate the exact handlers installed by the old plain-stdout form
+        // or through the alias. Do not use substring matching: user-authored
+        // neighboring handlers and unrelated commands containing "konnect"
+        // are not ours.
+        remove_exact_commands(event_arr, &stale);
         let holds_ours = |entry: &serde_json::Value| {
             entry["hooks"].as_array().is_some_and(|handlers| {
                 handlers
@@ -1139,14 +1176,14 @@ fn patch_claude_settings(path: &Path, exe_str: &str) -> Result<usize> {
     Ok(patched)
 }
 
-fn remove_exact_commands(event_arr: &mut Vec<serde_json::Value>, commands: &[&str]) {
+fn remove_exact_commands(event_arr: &mut Vec<serde_json::Value>, commands: &[impl AsRef<str>]) {
     remove_exact_commands_except(event_arr, commands, None);
 }
 
 /// [`remove_exact_commands`], leaving the entry at index `keep` untouched.
 fn remove_exact_commands_except(
     event_arr: &mut Vec<serde_json::Value>,
-    commands: &[&str],
+    commands: &[impl AsRef<str>],
     keep: Option<usize>,
 ) {
     for (index, entry) in event_arr.iter_mut().enumerate() {
@@ -1161,7 +1198,7 @@ fn remove_exact_commands_except(
                 !handler
                     .get("command")
                     .and_then(|command| command.as_str())
-                    .is_some_and(|command| commands.contains(&command))
+                    .is_some_and(|command| commands.iter().any(|own| own.as_ref() == command))
             });
         }
     }
@@ -1188,9 +1225,7 @@ fn remove_hooks_from_settings(path: &Path, exe_str: &str) -> Result<()> {
                 .get_mut(hook.event)
                 .and_then(|event| event.as_array_mut())
             {
-                let current = hook_command(exe_str, "hook", hook.name);
-                let legacy = legacy_hook_command(exe_str, hook.name);
-                remove_exact_commands(event_arr, &[current.as_str(), legacy.as_str()]);
+                remove_exact_commands(event_arr, &own_hook_commands(exe_str, hook.name));
             }
         }
     }
@@ -1692,6 +1727,120 @@ mod tests {
 
         assert_eq!(patch_claude_settings(&settings_path, exe).unwrap(), 0);
         assert_eq!(fs::read_to_string(&settings_path).unwrap(), seeded);
+    }
+
+    fn in_bin(dir: &str, program: &str) -> String {
+        format!("{dir}/{program}{}", std::env::consts::EXE_SUFFIX)
+    }
+
+    fn handler_commands(settings_path: &Path, event: &str) -> Vec<String> {
+        let settings = serde_json::from_str(&fs::read_to_string(settings_path).unwrap()).unwrap();
+        event_commands(&settings, event)
+            .unwrap()
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    /// #244: an install made through the `konnect` alias wrote hooks naming
+    /// it. `init` from the `copperpour` beside it replaces them, in either
+    /// form, instead of adding its own next to them.
+    #[test]
+    fn install_replaces_the_hooks_of_the_konnect_alias_beside_it() {
+        let temp = TempDir::new().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let alias = in_bin("/opt/cp/bin", "konnect");
+        let exe = in_bin("/opt/cp/bin", "copperpour");
+        patch_claude_settings(&settings_path, &alias).unwrap();
+        let event = HOOK_SKILLS[0].event;
+        let mut entries = read_entries(&settings_path, event);
+        // The matchers an install before the rename wrote.
+        for entry in &mut entries {
+            let matcher = entry["matcher"].as_str().unwrap().to_string();
+            entry["matcher"] = matcher
+                .replace("mcp__(copperpour|konnect)__", "mcp__konnect__")
+                .into();
+        }
+        entries.push(serde_json::json!({
+            "matcher": "mcp__konnect__.*",
+            "hooks": [{"type": "command", "command": legacy_hook_command(&alias, HOOK_SKILLS[0].name)}]
+        }));
+        seed_settings(&settings_path, event, entries.into());
+
+        patch_claude_settings(&settings_path, &exe).unwrap();
+        let mut expected: Vec<String> = HOOK_SKILLS
+            .iter()
+            .filter(|hook| hook.event == event)
+            .map(|hook| hook_command(&exe, "hook", hook.name))
+            .collect();
+        expected.sort();
+        let mut commands = handler_commands(&settings_path, event);
+        commands.sort();
+        assert_eq!(commands, expected);
+
+        let before = fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(patch_claude_settings(&settings_path, &exe).unwrap(), 0);
+        assert_eq!(fs::read_to_string(&settings_path).unwrap(), before);
+    }
+
+    #[test]
+    fn hooks_of_the_konnect_alias_beside_it_read_alias_handler() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        patch_claude_settings(
+            &paths.claude_settings_path(),
+            &in_bin("/opt/cp/bin", "konnect"),
+        )
+        .unwrap();
+        let guidance = inspect_guidance(
+            InstallClient::Claude,
+            &paths,
+            &in_bin("/opt/cp/bin", "copperpour"),
+        );
+        for hook in &guidance.hooks {
+            assert_eq!(
+                (hook.status.as_str(), hook.reason),
+                ("different", Some("alias_handler")),
+                "{}",
+                hook.name
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_alias_is_found_beside_copperpour_exe_in_any_case() {
+        assert_eq!(
+            alias_beside(r"C:\X\bin\Copperpour.EXE").as_deref(),
+            Some(r"C:\X\bin\konnect.exe")
+        );
+    }
+
+    /// A `konnect` elsewhere may be a separate install the user keeps.
+    #[test]
+    fn install_keeps_the_hooks_of_a_konnect_in_another_directory() {
+        let temp = TempDir::new().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let other = in_bin("/opt/old", "konnect");
+        patch_claude_settings(&settings_path, &other).unwrap();
+        patch_claude_settings(&settings_path, &in_bin("/opt/cp/bin", "copperpour")).unwrap();
+        let commands = handler_commands(&settings_path, HOOK_SKILLS[0].event);
+        for hook in HOOK_SKILLS {
+            assert!(
+                commands.contains(&hook_command(&other, "hook", hook.name)),
+                "{}",
+                hook.name
+            );
+        }
+    }
+
+    #[test]
+    fn uninstall_removes_the_hooks_of_the_konnect_alias_beside_it() {
+        let temp = TempDir::new().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        patch_claude_settings(&settings_path, &in_bin("/opt/cp/bin", "konnect")).unwrap();
+        remove_hooks_from_settings(&settings_path, &in_bin("/opt/cp/bin", "copperpour")).unwrap();
+        assert!(handler_commands(&settings_path, HOOK_SKILLS[0].event).is_empty());
     }
 
     #[test]
