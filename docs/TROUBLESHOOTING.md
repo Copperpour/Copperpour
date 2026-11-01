@@ -85,8 +85,10 @@ client uses. Each file and hook is compared with that binary's bundle:
 | `unreadable` | Present but could not be read, or `settings.json` is not valid JSON or not the shape Claude expects |
 
 A `different` hook carries a reason: `legacy_handler` is the pre-hook-JSON
-`… skill <name>` form, which Claude ignores, and `other_executable` is a hook
-that runs another Copperpour binary, written exactly as `copperpour init` writes it.
+`… skill <name>` form, which Claude ignores; `alias_handler` is a hook for the
+`konnect` alias beside this binary, which runs this binary and which `init`
+replaces; and `other_executable` is a hook that runs another Copperpour
+binary, written exactly as `copperpour init` writes it.
 
 The serving process makes the same comparison for both clients once per
 installed guidance version, meaning each install marker. The first start
