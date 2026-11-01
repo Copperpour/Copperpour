@@ -38,7 +38,9 @@ pcbnew.SaveBoard(sys.argv[1], b)
 KiCad 10.0.6's `pcbnew.ExportSpecctraDSN(board, path)`. Only the absolute output
 path in the root `(pcb ...)` atom was normalized to `board.dsn`.
 
-The two `.freerouting-2.3.0.ses` files are Freerouting 2.3.0's unedited output:
+Three `.freerouting-2.3.0.ses` files are Freerouting 2.3.0's unedited output.
+The jar is the `freerouting/freerouting` v2.3.0 release asset (SHA-256
+`3cf18d608437740bc497db6b8ef5888e2e60a08de0def20691d1bad0c0e0ee24`):
 
 ```text
 java -Djava.awt.headless=true -jar freerouting-2.3.0.jar \
@@ -51,7 +53,28 @@ java -Djava.awt.headless=true -jar freerouting-2.3.0.jar \
 The first input is Copperpour's Rust export of the board, using the default-netclass
 rules in the tests. It is deterministic, so the tests regenerate it rather than
 commit it. The second input is the native DSN above. Freerouting reported
-`0 unrouted and 0 violations` for both.
+`0 unrouted and 0 violations` for both. The first file was routed again for
+[#250](https://github.com/Copperpour/Copperpour/issues/250) from the export with `copperpour_*` names (input DSN SHA-256
+`8dfd3896df70d8e2d1b952a2808804fbe07f0feff4d561caf8ac327474ba65aa`).
+
+### A job from before the rename ([#250](https://github.com/Copperpour/Copperpour/issues/250))
+
+Earlier releases named the Rust export's padstacks, images and classes
+`konnect_*`. `specctra_stock_roundrect.konnect.freerouting-2.3.0.ses` is the
+first command's output from such a release, committed for mixelpixx/Konnect#790
+and renamed here without edits. Its parser block records the exporter as
+`Konnect 0.13.0`. `specctra_stock_roundrect.konnect-manifest.json` is the
+reverse manifest `main` at 1349a0be, the last commit with `konnect_*` names,
+wrote for the same board and rules. Only its absolute `board_path` was
+normalized to `specctra_stock_roundrect.kicad_pcb`, and the test points it at
+the board it writes. The planner checks the parser block's shape, not its values, so this pair stands for
+a job left by an earlier release; `main` at 1349a0be already accepted it.
+
+| file | SHA-256 |
+|---|---|
+| `specctra_stock_roundrect.freerouting-2.3.0.ses` | `37f3f76931fe5ea7f9c39ef0371eb0a8121ad193d08f407eadfabccedc2306f5` |
+| `specctra_stock_roundrect.konnect.freerouting-2.3.0.ses` | `9c40c6ca1748fc7f573508fe113398d541e2336d984eb63021dec3c2d0412894` |
+| `specctra_stock_roundrect.konnect-manifest.json` | `b9d556addec7f70ff0742cfa1e4b7cfbe8e489d36b13ac190a10ff536712616c` |
 
 ## Oracle
 

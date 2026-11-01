@@ -321,7 +321,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "manifest_output_path": {
                         "type": "string",
-                        "description": "Optional new reverse-manifest JSON path. Defaults to <output>.konnect.json. Existing files are never replaced."
+                        "description": "Optional new reverse-manifest JSON path. Defaults to <output>.copperpour.json. Existing files are never replaced."
                     },
                     "native_bridge_mode": {
                         "type": "string",
@@ -683,7 +683,7 @@ fn extension_is(path: &Path, expected: &str) -> bool {
 
 fn default_specctra_manifest_path(output_path: &Path) -> PathBuf {
     let mut name = output_path.as_os_str().to_os_string();
-    name.push(".konnect.json");
+    name.push(".copperpour.json");
     PathBuf::from(name)
 }
 
@@ -1195,7 +1195,7 @@ mod new_export_format_tests {
     fn specctra_manifest_defaults_beside_dsn() {
         assert_eq!(
             default_specctra_manifest_path(Path::new("build/clock.dsn")),
-            PathBuf::from("build/clock.dsn.konnect.json")
+            PathBuf::from("build/clock.dsn.copperpour.json")
         );
     }
 
@@ -1212,7 +1212,7 @@ mod new_export_format_tests {
     fn specctra_pair_writer_removes_partial_dsn_if_manifest_creation_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
         let dsn = dir.path().join("board.dsn");
-        let manifest = dir.path().join("board.dsn.konnect.json");
+        let manifest = dir.path().join("board.dsn.copperpour.json");
         std::fs::write(&manifest, "owned by another process").expect("seed conflict");
 
         let error = write_specctra_export_pair(&dsn, "(pcb board)", &manifest, "{}")
@@ -1805,7 +1805,7 @@ mod specctra_roundrect_served_tests {
         let dsn = std::fs::read_to_string(&output).unwrap();
         assert_eq!(dsn.matches("(polygon F.Cu 0").count(), 3, "{dsn}");
         let manifest: Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join("board.dsn.konnect.json")).unwrap(),
+            &std::fs::read_to_string(dir.path().join("board.dsn.copperpour.json")).unwrap(),
         )
         .unwrap();
         let radii = manifest["padstacks"]
@@ -1981,7 +1981,7 @@ mod specctra_padstack_served_tests {
         let board = root.join("specctra_padstack_front_inner_back.kicad_pcb");
         std::fs::write(&board, FRONT_INNER_BACK).unwrap();
         let output = root.join("board.dsn");
-        let manifest = root.join("board.dsn.konnect.json");
+        let manifest = root.join("board.dsn.copperpour.json");
         let nets = ["GND", "VCC"];
         let server = spawn_kicad_holding_board(&board, move |command| {
             let name = command.type_url.rsplit('.').next().unwrap();

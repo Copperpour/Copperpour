@@ -234,14 +234,14 @@ pub(crate) fn export_dsn(
     let padstack_names: BTreeMap<PadstackKey, String> = padstack_keys
         .into_iter()
         .enumerate()
-        .map(|(index, key)| (key, format!("konnect_pad_{:04}", index + 1)))
+        .map(|(index, key)| (key, format!("copperpour_pad_{:04}", index + 1)))
         .collect();
 
     let via_keys: BTreeSet<RuleKey> = class_nets.keys().cloned().collect();
     let via_names: BTreeMap<RuleKey, String> = via_keys
         .into_iter()
         .enumerate()
-        .map(|(index, key)| (key, format!("konnect_via_{:04}", index + 1)))
+        .map(|(index, key)| (key, format!("copperpour_via_{:04}", index + 1)))
         .collect();
 
     let pcb = build_pcb(
@@ -1181,7 +1181,7 @@ fn footprints(
         let x_um = finite_um(at.get_f64(1), "footprint x")?;
         let y_um = -finite_um(at.get_f64(2), "footprint y")?;
         let rotation_degrees = finite_number(at.get_f64(3).or(Some(0.0)), "footprint rotation")?;
-        let image_name = format!("konnect_image_{reference}");
+        let image_name = format!("copperpour_image_{reference}");
 
         let mut pads = Vec::new();
         let mut pad_numbers = BTreeSet::new();
@@ -1372,6 +1372,11 @@ fn pin_rotation(pad_degrees: f64, footprint_degrees: f64) -> f64 {
         % 360.0
 }
 
+/// The DSN name of the `index`th net class, shared with the manifest.
+fn class_name(index: usize) -> String {
+    format!("copperpour_class_{:04}", index + 1)
+}
+
 fn normalize_rules(
     net_pins: &BTreeMap<String, Vec<String>>,
     effective_rules: &IpcEffectiveRoutingRules,
@@ -1401,7 +1406,7 @@ fn normalize_rules(
     }
     let mut net_classes = BTreeMap::new();
     for (index, nets) in class_nets.values().enumerate() {
-        let name = format!("konnect_class_{:04}", index + 1);
+        let name = class_name(index);
         for net in nets {
             net_classes.insert(net.clone(), name.clone());
         }
@@ -1516,7 +1521,7 @@ fn build_pcb(
         .iter()
         .enumerate()
         .map(|(index, (rule, nets))| dsn::Class {
-            name: format!("konnect_class_{:04}", index + 1),
+            name: class_name(index),
             nets: nets.clone(),
             circuit: dsn::Circuit {
                 use_via: via_names[rule].clone(),
@@ -2116,7 +2121,10 @@ pub(crate) mod tests {
     }
 
     /// Freerouting 2.3.0 routed both exports of the stock board completely;
-    /// the strict import planner accepts each against its own manifest.
+    /// the strict import planner accepts each against its own manifest. It
+    /// still accepts a `konnect_*` job written before the rename
+    /// (Copperpour/Copperpour#250), because SES names are checked against the
+    /// manifest, and refuses an SES paired with the other naming.
     #[test]
     fn freerouting_sessions_of_stock_roundrect_pads_pass_the_import_planner() {
         let temp = tempfile::tempdir().unwrap();
@@ -2124,11 +2132,20 @@ pub(crate) mod tests {
         std::fs::write(&board_path, STOCK_ROUNDRECT).unwrap();
         let rust = export_dsn(&board_path, STOCK_ROUNDRECT, &stock_rules()).unwrap();
         let native = adopt_native_dsn(rust.clone(), stock_roundrect_native()).unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/specctra_stock_roundrect.konnect-manifest.json"
+        ))
+        .unwrap();
+        legacy["board_path"] = board_path.to_string_lossy().into();
+        let legacy = legacy.to_string();
+        let current_ses =
+            include_str!("../tests/fixtures/specctra_stock_roundrect.freerouting-2.3.0.ses");
+        let legacy_ses = include_str!(
+            "../tests/fixtures/specctra_stock_roundrect.konnect.freerouting-2.3.0.ses"
+        );
         for (manifest, ses) in [
-            (
-                &rust.manifest,
-                include_str!("../tests/fixtures/specctra_stock_roundrect.freerouting-2.3.0.ses"),
-            ),
+            (&rust.manifest, current_ses),
+            (&legacy, legacy_ses),
             (
                 &native.manifest,
                 include_str!(
@@ -2145,6 +2162,19 @@ pub(crate) mod tests {
                 .map(|track| track.net_name.as_str())
                 .collect::<BTreeSet<_>>();
             assert_eq!(nets, BTreeSet::from(["GND", "SIG", "VCC"]));
+        }
+        for (manifest, ses, expected) in [
+            (&rust.manifest, legacy_ses, "copperpour_image_C1"),
+            (&legacy, current_ses, "konnect_image_C1"),
+        ] {
+            let error =
+                crate::specctra_ses::parse_import_plan(&board_path, STOCK_ROUNDRECT, manifest, ses)
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains(&format!("changed from '{expected}'")),
+                "{error}"
+            );
         }
     }
 
@@ -2408,7 +2438,15 @@ pub(crate) mod tests {
         let export = export_dsn(Path::new("board.kicad_pcb"), source, &rules()).unwrap();
         assert!(export.dsn.contains("(type fix)"));
         assert!(export.dsn.contains("(path F.Cu 250"));
-        assert!(export.dsn.contains("(via konnect_via_"));
+        // The names a DSN, its manifest and Freerouting's SES share (Copperpour/Copperpour#250).
+        for name in [
+            "(via copperpour_via_",
+            "(image copperpour_image_",
+            "(pin copperpour_pad_",
+            "(class copperpour_class_",
+        ] {
+            assert!(export.dsn.contains(name), "{name}");
+        }
         let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
         assert_eq!(manifest["supported_profile"]["existing_routing"], true);
         assert_eq!(manifest["supported_profile"]["locked_track_count"], 1);
