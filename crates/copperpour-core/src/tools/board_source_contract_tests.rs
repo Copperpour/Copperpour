@@ -1,4 +1,5 @@
-//! `board_source` contract for `get_layer_list` and `get_netclasses` (#542).
+//! `board_source` contract for `get_layer_list` and `get_netclasses` (#542), and
+//! the refusal live PCB writes give in the same KiCad states (#83).
 //!
 //! Driven through served `tools/call` rather than the handlers, so the
 //! advertised schema, the dispatch gate and the response body are all under
@@ -1060,4 +1061,122 @@ async fn omitting_the_selector_reads_the_saved_board_and_says_so() {
     );
     // The request is never echoed back as evidence that a source was used.
     assert!(body.get("board_source").is_none(), "{body}");
+}
+
+// ─── Writes in the same states (#83) ─────────────────────────────────────────
+//
+// A write refuses where a read answers from the saved file; that boundary is
+// mixelpixx/Konnect#577's to move, not these tests'. What they pin is the
+// refusal's explanation: it must state what KiCad said, not more.
+
+/// The text of a result, which for a plain refusal is prose rather than JSON.
+fn text_of(result: &CallToolResult) -> String {
+    match result.content.first() {
+        Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    }
+}
+
+/// Two writers that share the live-write gate: one naming its document
+/// (`set_board_title_block`) and one that does not (`add_board_text`).
+fn writes_through_the_live_gate(board: &Path) -> [(&'static str, Value); 2] {
+    let board = board.to_string_lossy();
+    [
+        (
+            "set_board_title_block",
+            json!({ "board": board, "title": "Never written" }),
+        ),
+        (
+            "add_board_text",
+            json!({ "board": board, "text": "Never written", "x": 5.0, "y": 5.0 }),
+        ),
+    ]
+}
+
+/// The issue: with only the project manager running, every live PCB write
+/// said KiCad "may hold this board open". `AS_UNHANDLED` on the open-document
+/// list says there is no PCB editor at all, so the refusal now says that and
+/// how to get the write through, and the board file is left alone.
+#[tokio::test]
+async fn a_write_with_no_board_editor_says_so_and_leaves_the_file() {
+    let scene = Scene::without_a_board_editor().await;
+    let before = std::fs::read(&scene.board).unwrap();
+
+    for (tool, arguments) in writes_through_the_live_gate(&scene.board) {
+        let refused = scene.call_with(tool, arguments).await;
+
+        assert!(refused.is_error, "{tool}: {}", text_of(&refused));
+        let text = text_of(&refused);
+        assert!(
+            text.contains("KiCad is running but reports no PCB editor at this endpoint"),
+            "{tool} must say what KiCad answered: {text}"
+        );
+        assert!(
+            text.contains("Open this board in the PCB Editor and retry")
+                && text.contains("quit KiCad"),
+            "{tool} must say how to get the write through: {text}"
+        );
+        assert!(
+            !text.contains("may hold this"),
+            "{tool} must not claim an editor might hold the board: {text}"
+        );
+        assert!(text.contains("not modified"), "{tool}: {text}");
+    }
+    assert_eq!(
+        std::fs::read(&scene.board).unwrap(),
+        before,
+        "the refusal still never falls back to the file"
+    );
+}
+
+/// `AS_UNIMPLEMENTED` establishes nothing about the editors, so a write there
+/// keeps the cautious explanation.
+#[tokio::test]
+async fn a_write_to_a_kicad_not_naming_its_documents_keeps_the_cautious_refusal() {
+    let scene = Scene::not_implementing_open_documents().await;
+    let before = std::fs::read(&scene.board).unwrap();
+
+    for (tool, arguments) in writes_through_the_live_gate(&scene.board) {
+        let refused = scene.call_with(tool, arguments).await;
+
+        assert!(refused.is_error, "{tool}: {}", text_of(&refused));
+        let text = text_of(&refused);
+        assert!(text.contains("may hold this"), "{tool}: {text}");
+        assert!(
+            !text.contains("reports no PCB editor"),
+            "{tool} must not claim more than the status carried: {text}"
+        );
+    }
+    assert_eq!(std::fs::read(&scene.board).unwrap(), before);
+}
+
+/// After this session saw the board live, quitting KiCad does not open the
+/// file path: the saved file may be older than what that editor held. So the
+/// refusal offers only the PCB Editor.
+#[tokio::test]
+async fn a_write_after_the_board_was_seen_live_does_not_offer_quitting_kicad() {
+    let mut scene = Scene::live().await;
+    scene.body("get_layer_list", None).await;
+
+    let endpoint = scene.endpoint();
+    scene.lose_kicad();
+    scene.kicad = Some(spawn_kicad_without_a_board_editor_at(endpoint));
+    let before = std::fs::read(&scene.board).unwrap();
+
+    for (tool, arguments) in writes_through_the_live_gate(&scene.board) {
+        let refused = scene.call_with(tool, arguments).await;
+
+        assert!(refused.is_error, "{tool}: {}", text_of(&refused));
+        let text = text_of(&refused);
+        assert!(
+            text.contains("reports no PCB editor at this endpoint")
+                && text.contains("Open this board in the PCB Editor and retry"),
+            "{tool}: {text}"
+        );
+        assert!(
+            !text.contains("quit KiCad"),
+            "{tool} must not offer a file path that would refuse too: {text}"
+        );
+    }
+    assert_eq!(std::fs::read(&scene.board).unwrap(), before);
 }

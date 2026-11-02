@@ -291,6 +291,25 @@ where
     attempt_ipc_write_in(ctx, board_path, what, move |client, _| f(client)).await
 }
 
+/// The refusal for a write that reached KiCad's project manager with no PCB
+/// editor open (#83): what was observed, and how to get the write through.
+///
+/// Quitting KiCad is offered only for a board this session never saw live. A
+/// board it did see is refused on the file path as well, because the saved
+/// file may be older than what that editor held.
+fn no_pcb_editor_write_refusal(what: &str, observed_live: bool) -> String {
+    let alternative = if observed_live {
+        ""
+    } else {
+        ", or quit KiCad so the saved file can be edited instead"
+    };
+    format!(
+        "The {what} was not written: KiCad is running but {}. The board file was not \
+         modified. Open this board in the PCB Editor and retry{alternative}.",
+        crate::tools::BoardEditorAbsence::NoPcbEditor.observed()
+    )
+}
+
 /// As [`attempt_ipc_write`], handing `f` the document KiCad identified as
 /// the requested board, for commands that name their document.
 pub(crate) async fn attempt_ipc_write_in<T, F>(
@@ -316,11 +335,22 @@ where
         LiveBoard::Uncertain(message) => {
             BoardWrite::Refused(crate::tools::ipc_uncertain_result(&message))
         }
-        // An endpoint that served no board is mapped exactly as a
-        // rejection, which is what it was before those cases had names —
-        // `observed_live` and `absence` deliberately unread here. Whether
-        // a write should instead treat a proven-absent editor as
-        // permission is #577's question, not this one's.
+        // An endpoint that served no board still refuses, as a rejection
+        // does. Whether a write should instead treat a proven-absent editor
+        // as permission is #577's question, not this one's. Only the
+        // explanation differs: with no PCB editor behind the endpoint, no
+        // editor can be holding this board, so the refusal says what was
+        // observed instead of claiming one might (#83).
+        LiveBoard::Unserved {
+            absence: crate::tools::BoardEditorAbsence::NoPcbEditor,
+            observed_live,
+            ..
+        } => BoardWrite::Refused(CallToolResult::error(no_pcb_editor_write_refusal(
+            what,
+            observed_live,
+        ))),
+        // `OpenDocumentsUnimplemented` establishes nothing about the editors,
+        // so it keeps the rejection's cautious wording.
         LiveBoard::Rejected(message) | LiveBoard::Unserved { message, .. } => {
             BoardWrite::Refused(CallToolResult::error(format!(
                 "KiCAD rejected the {what} over IPC: {message}. \
