@@ -1081,7 +1081,7 @@ impl KiCadIpcClient {
         KiCadIpcClient {
             socket_path: effective_path,
             kicad_token: std::env::var("KICAD_API_TOKEN").unwrap_or_default(),
-            client_name: format!("konnect-{}", std::process::id()),
+            client_name: format!("copperpour-{}", std::process::id()),
             bound_board: std::sync::Mutex::new(None),
             recovery: None,
         }

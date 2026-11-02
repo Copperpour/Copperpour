@@ -226,6 +226,9 @@ class NativeBridgeTests(unittest.TestCase):
         with open(self.bridge.registration_path, encoding="utf-8") as stream:
             self.registration = json.load(stream)
 
+    def test_the_bridge_thread_is_named_copperpour(self):
+        self.assertEqual(self.bridge.thread.name, "copperpour-native-bridge")
+
     def test_status_and_export_require_the_registration_token(self):
         status, payload = _request(self.registration, "/v1/status")
         self.assertEqual(status, 200)

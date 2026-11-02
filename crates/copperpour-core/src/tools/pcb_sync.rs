@@ -3292,7 +3292,7 @@ mod chunk_tests {
         let request = kiapi::common::ApiRequest {
             header: Some(kiapi::common::ApiRequestHeader {
                 kicad_token: std::env::var("KICAD_API_TOKEN").unwrap_or_default(),
-                client_name: "konnect-chunk-acceptance".into(),
+                client_name: "copperpour-chunk-acceptance".into(),
             }),
             message: Some(pack_any(
                 &kiapi::common::commands::RunAction {

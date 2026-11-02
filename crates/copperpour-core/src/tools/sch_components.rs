@@ -4423,7 +4423,7 @@ fn schematic_view_dir(schematic: &std::path::Path) -> std::path::PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     schematic.hash(&mut hasher);
     std::env::temp_dir()
-        .join("konnect-schematic-views")
+        .join("copperpour-schematic-views")
         .join(format!("{:016x}", hasher.finish()))
 }
 
@@ -7238,7 +7238,7 @@ mod schematic_view_tests {
     fn the_view_slot_lives_under_the_system_temp_dir() {
         let dir = schematic_view_dir(Path::new("/projects/alpha/power.kicad_sch"));
         assert!(
-            dir.starts_with(std::env::temp_dir()),
+            dir.starts_with(std::env::temp_dir().join("copperpour-schematic-views")),
             "views must not be written next to the caller's project: {}",
             dir.display()
         );

@@ -455,7 +455,7 @@ fn ping_roundtrips_through_mock() {
         // The envelope must carry a client name and a packed command.
         assert!(req.header.is_some());
         let header = req.header.unwrap();
-        assert!(header.client_name.starts_with("konnect-"));
+        assert!(header.client_name.starts_with("copperpour-"));
         let msg = req.message.expect("request must pack a command");
         assert!(
             msg.type_url.ends_with("kiapi.common.commands.Ping"),
