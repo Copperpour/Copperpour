@@ -12,6 +12,8 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::board_source::{self, BoardSource};
 use crate::tools::live_board::{self, LiveBoard};
+use crate::tools::sch_annotate::opt_bool;
+use crate::tools::sch_hierarchy::{paper_dimensions, PAPER_SIZES};
 use crate::tools::title_block_args::{self, TitleBlockUpdate};
 use crate::tools::{
     get_path, invalid_arg, opt_str_list, require_f64, require_str, with_board_ipc_classified,
@@ -25,8 +27,8 @@ use copperpour_sexp::{
     schematic::parse_at,
     title_block::{self, TitleBlock},
     writer::{
-        apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, new_uuid,
-        read_consistent, SexpEdit,
+        apply_edits, find_block_starts, find_block_with_leading_whitespace,
+        find_direct_child_blocks, new_uuid, read_consistent, SexpEdit,
     },
     SexpError,
 };
@@ -1251,6 +1253,36 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
+            "set_board_page",
+            "Set the paper size (A0-A5, A-E, USLetter, USLegal, USLedger) and orientation \
+             of a board KiCad does not hold open, in its saved file; nothing on the board \
+             moves. KiCad 10 has no command that sets a live board's page, so a board KiCad \
+             holds open is refused with unsupported_capability: change it in the PCB \
+             Editor's File > Page Settings, or close the board and retry. Returns 'paper' \
+             and 'paper_size_mm' read back from the file, as get_board_info reports them, \
+             with 'portrait', and 'changed', false when the file already said so and was \
+             left alone.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "size": {
+                        "type": "string",
+                        "description": "Paper size, e.g. 'A4', 'A3', 'A2', 'USLetter'",
+                        "enum": PAPER_SIZES.iter().map(|(name, _, _)| *name).collect::<Vec<_>>()
+                    },
+                    "portrait": {
+                        "type": "boolean",
+                        "description": "Portrait instead of the default landscape",
+                        "default": false
+                    }
+                },
+                "required": ["board", "size"]
+            }),
+            |args, ctx| async move { handle_set_board_page(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
+        tool!(
             "get_board_extents",
             "Return the box enclosing the board's items: footprints (without their \
              text), graphics, tracks, vias and zones, plus board text and dimensions \
@@ -1951,6 +1983,197 @@ async fn handle_set_board_title_block(
         "file": board_path.display().to_string(),
         "title_block": title_block_args::to_json(&after),
         "changed": after.changed_from(&before),
+        "source": "file",
+        "saved": true,
+        "fallback_reason": fallback_reason.evidence(),
+        "warning": fallback_reason.warning()
+    })))
+}
+
+/// The `(paper …)` token KiCad 10 writes for a named size
+/// (`PAGE_INFO::Format`): the name quoted, then `portrait` when it is.
+fn paper_token(size: &str, portrait: bool) -> String {
+    if portrait {
+        format!("(paper \"{size}\" portrait)")
+    } else {
+        format!("(paper \"{size}\")")
+    }
+}
+
+/// Whether a parsed board's `(paper …)` says `portrait`, which KiCad writes
+/// after a named size and never after a `User` one's dimensions.
+fn paper_is_portrait(tree: &SexpNode) -> bool {
+    tree.find("paper")
+        .and_then(SexpNode::children)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .skip(2)
+                .any(|item| matches!(item, SexpNode::Atom(word) if word == "portrait"))
+        })
+}
+
+/// `source` with its page set to `token`, or `None` when the board already
+/// holds exactly that token.
+///
+/// The existing `(paper …)` node is replaced whole, whatever its form — named,
+/// portrait, or `"User"` with dimensions — as is the `(page …)` a KiCad 5
+/// board holds instead. A board with neither is A4 to KiCad, and gets the
+/// token where KiCad writes it: directly after `(general …)`, or after the
+/// last of the header nodes when there is no `(general …)`, on its own line,
+/// indented as the board's other top-level nodes are.
+fn with_paper(source: &str, token: &str) -> Result<Option<String>, SexpError> {
+    let children = find_direct_child_blocks(source, "kicad_pcb");
+    let tag = |&(start, end): &(usize, usize)| block_tag(&source[start..end]).unwrap_or_default();
+    let mut out = source.to_string();
+
+    if let Some(&(start, end)) = children
+        .iter()
+        .find(|child| matches!(tag(child), "paper" | "page"))
+    {
+        if source[start..end] == *token {
+            return Ok(None);
+        }
+        out.replace_range(start..end, token);
+        return Ok(Some(out));
+    }
+
+    let &(_, anchor_end) = children
+        .iter()
+        .find(|child| tag(child) == "general")
+        .or_else(|| {
+            children
+                .iter()
+                .rev()
+                .find(|child| matches!(tag(child), "version" | "generator" | "generator_version"))
+        })
+        .ok_or_else(|| {
+            SexpError::MissingNode("(general …) or (version …) in (kicad_pcb …)".into())
+        })?;
+    let indent = find_block_starts(source, "kicad_pcb")
+        .first()
+        .and_then(|&root| entry_indent(source, root))
+        .unwrap_or_else(|| "\t".to_string());
+    out.insert_str(anchor_end, &format!("\n{indent}{token}"));
+    Ok(Some(out))
+}
+
+/// The saved board after a page write, parsed; `Err` says how its page
+/// differs from `size` in the requested orientation.
+fn read_back_page(board_path: &Path, size: &str, portrait: bool) -> Result<SexpNode, String> {
+    let source = read_consistent(board_path).map_err(|error| error.to_string())?;
+    let tree = parse_sexp(&source).map_err(|error| error.to_string())?;
+    let orientation = |portrait| if portrait { "portrait" } else { "landscape" };
+    let (saved, saved_portrait) = (paper_name(&tree), paper_is_portrait(&tree));
+    if saved != size || saved_portrait != portrait {
+        return Err(format!(
+            "the saved board's paper reads back as {saved} {}, not the requested {size} {}",
+            orientation(saved_portrait),
+            orientation(portrait)
+        ));
+    }
+    Ok(tree)
+}
+
+async fn handle_set_board_page(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    const OPERATION: &str = "set_board_page";
+    let board_path = get_path(args, "board")?;
+    let size = match require_str(args, "size") {
+        Ok(size) => size.to_string(),
+        Err(refusal) => return Ok(refusal),
+    };
+    // `User` is not in the table: a custom size is not offered, as
+    // set_schematic_page offers none.
+    if let Err(refusal) = paper_dimensions(&size) {
+        return Ok(refusal);
+    }
+    let portrait = match opt_bool(args, "portrait") {
+        Ok(portrait) => portrait,
+        Err(refusal) => return Ok(refusal),
+    };
+
+    // KiCad 10 has no command that sets a board's page, so the gate is asked
+    // only whether KiCad holds this board: the closure sends nothing. Its own
+    // refusals pass through, and only a board no live KiCad holds reaches the
+    // file, which an open editor would overwrite on its next save.
+    let fallback_reason = match attempt_ipc_write_in(
+        ctx,
+        &board_path,
+        "page settings change",
+        |_, _| Ok(()),
+    )
+    .await?
+    {
+        BoardWrite::Ipc(()) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::UnsupportedCapability {
+                    capability: OPERATION.to_string(),
+                    kicad_version: None,
+                },
+                format!(
+                    "KiCad holds '{}' open, and KiCad 10 has no command that sets a \
+                     board's page settings, so the board file was not modified: KiCad would \
+                     overwrite the change on its next save. Set the paper in the PCB Editor \
+                     (File > Page Settings), or close the board in KiCad and retry.",
+                    board_path.display()
+                ),
+            ));
+        }
+        BoardWrite::Refused(refusal) => return Ok(refusal),
+        BoardWrite::File(reason) => reason,
+    };
+
+    let token = paper_token(&size, portrait);
+    // The unchanged board's tree when the file already holds `token`.
+    let unchanged = copperpour_sexp::transact_atomic(&board_path, |current| {
+        let before = parse_sexp(current)?;
+        Ok(match with_paper(current, &token)? {
+            Some(next) => (next, None),
+            None => (current.to_string(), Some(before)),
+        })
+    });
+    let unchanged = match unchanged {
+        Ok(unchanged) => unchanged,
+        // Nothing is compared before the write, so a conflict can only be the
+        // readback after it.
+        Err(SexpError::Conflict { .. }) => {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &board_path,
+                OPERATION,
+                "the board file did not read back as written",
+            ))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let (tree, changed) = match unchanged {
+        Some(tree) => (tree, false),
+        None => {
+            // Test seam: another program saving between the write and the
+            // read-back.
+            #[cfg(test)]
+            crate::tools::write_hook::run(&board_path);
+            match read_back_page(&board_path, &size, portrait) {
+                Ok(tree) => (tree, true),
+                Err(reason) => {
+                    return Ok(crate::tools::mutation_outcome_uncertain(
+                        &board_path,
+                        OPERATION,
+                        reason,
+                    ))
+                }
+            }
+        }
+    };
+
+    Ok(CallToolResult::json(&json!({
+        "file": board_path.display().to_string(),
+        "paper": paper_name(&tree),
+        "paper_size_mm": paper_size_mm(&tree).map(|(w, h)| json!({"width": w, "height": h})),
+        "portrait": paper_is_portrait(&tree),
+        "changed": changed,
         "source": "file",
         "saved": true,
         "fallback_reason": fallback_reason.evidence(),
