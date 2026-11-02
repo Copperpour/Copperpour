@@ -38,6 +38,12 @@ moved pads tested; `layers`, the copper layers they were tested on; and
 `via_count`, `track_count` and `arc_count`, the copper read from KiCad. The
 other response fields are unchanged.
 
+Holes are not checked. Only a pad's copper is tested and an NPTH pad has none,
+so a footprint whose only pads are NPTH, such as `MountingHole_3.2mm_M3`,
+reports `status: "clear"` with `pad_count: 0` and `layers: []`: a mounting
+hole moved onto a track reads as clear. Read `clear` with a `pad_count` of 0
+as nothing tested.
+
 The closed-file path cannot run the check, because it needs KiCad's own pad
 shapes. With no live KiCad the tools still edit the saved board as before, and
 report `copper_check` as `{"status": "not_run", "reason": "no_live_board",

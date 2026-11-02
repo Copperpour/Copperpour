@@ -1291,7 +1291,8 @@ mod geometry_tests {
 }
 
 /// The transform the check moves KiCad's `before` outlines by, against
-/// KiCad's own outlines at the planned poses (`issue_96_ipc.README.md`).
+/// KiCad's own outlines at the planned poses (`issue_96_ipc.README.md`,
+/// `issue_96_layers_ipc.README.md`), and the poses it plans.
 #[cfg(test)]
 mod transform_evidence_tests {
     use super::*;
@@ -1388,6 +1389,125 @@ mod transform_evidence_tests {
             }
         }
     }
+
+    /// The four-layer board's footprints as KiCad 10.0.8 holds them
+    /// (`issue_96_layers_ipc.README.md`): R1 at (110, 95) 0°, R3 at
+    /// (110, 105) 90°, and two R4s.
+    fn layers_footprints() -> Vec<kiapi::board::types::FootprintInstance> {
+        kiapi::common::commands::GetItemsResponse::decode(
+            include_bytes!("../../tests/fixtures/issue_96_layers_footprints.ipc.bin").as_slice(),
+        )
+        .unwrap()
+        .items
+        .iter()
+        .map(|item| kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap())
+        .collect()
+    }
+
+    fn move_to(reference: &str, x_mm: f64, y_mm: f64) -> PoseRequest {
+        PoseRequest::Move {
+            reference: reference.to_string(),
+            x_mm,
+            y_mm,
+        }
+    }
+
+    /// `move_component` changes the position only: R3, which KiCad holds at
+    /// 90°, is planned at 90° at its new position, not at 0°.
+    #[test]
+    fn a_move_keeps_the_rotation_kicad_holds() {
+        let poses = plan_poses(&layers_footprints(), &[move_to("R3", 175.0, 90.0)]).unwrap();
+        assert_eq!(
+            poses[0].current,
+            Pose {
+                position: vec2(110.0, 105.0),
+                rotation_deg: 90.0,
+            }
+        );
+        assert_eq!(
+            poses[0].target,
+            Pose {
+                position: vec2(175.0, 90.0),
+                rotation_deg: 90.0,
+            }
+        );
+    }
+
+    /// Spots A-E move R1 (held at 0°) and spot F moves R3 (held at 90°),
+    /// each as `move_component` plans it. KiCad's `before` outlines carried
+    /// by the planned transforms match KiCad's own outlines with the
+    /// footprint moved there (measured: 0 nm, and 1 nm at A, where `mm_to_nm`
+    /// truncates 130.825 mm to 130 824 999 nm), so F also shows the held 90°
+    /// is what a move keeps.
+    #[test]
+    fn moved_outlines_match_kicads_own_on_the_four_layer_board() {
+        let before = PadShapeAsPolygonResponse::decode(
+            include_bytes!("../../tests/fixtures/issue_96_layers_polygons_before_F_Cu.ipc.bin")
+                .as_slice(),
+        )
+        .unwrap();
+        let footprints = layers_footprints();
+        let spots: [(&str, &str, f64, &[u8]); 6] = [
+            (
+                "A",
+                "R1",
+                130.825,
+                include_bytes!("../../tests/fixtures/issue_96_layers_polygons_A_F_Cu.ipc.bin"),
+            ),
+            (
+                "B",
+                "R1",
+                140.825,
+                include_bytes!("../../tests/fixtures/issue_96_layers_polygons_B_F_Cu.ipc.bin"),
+            ),
+            (
+                "C",
+                "R1",
+                146.825,
+                include_bytes!("../../tests/fixtures/issue_96_layers_polygons_C_F_Cu.ipc.bin"),
+            ),
+            (
+                "D",
+                "R1",
+                155.825,
+                include_bytes!("../../tests/fixtures/issue_96_layers_polygons_D_F_Cu.ipc.bin"),
+            ),
+            (
+                "E",
+                "R1",
+                165.825,
+                include_bytes!("../../tests/fixtures/issue_96_layers_polygons_E_F_Cu.ipc.bin"),
+            ),
+            (
+                "F",
+                "R3",
+                175.0,
+                include_bytes!("../../tests/fixtures/issue_96_layers_polygons_F_F_Cu.ipc.bin"),
+            ),
+        ];
+        for (spot, reference, x, capture) in spots {
+            let kicad = PadShapeAsPolygonResponse::decode(capture).unwrap();
+            let poses = plan_poses(&footprints, &[move_to(reference, x, 90.0)]).unwrap();
+            assert_eq!(poses[0].pads.len(), 2, "spot {spot}");
+            for pad in &poses[0].pads {
+                let mut moved = outline(&before, &pad.kiid);
+                for xform in &poses[0].xforms {
+                    transform_polygon(&mut moved, xform);
+                }
+                let (ours, theirs) = (vertices(&moved), vertices(&outline(&kicad, &pad.kiid)));
+                assert!(
+                    same_ring(&ours, &theirs, 2),
+                    "spot {spot}, {reference} pad {}:\n ours  {ours:?}\n KiCad {theirs:?}",
+                    pad.number
+                );
+                assert!(!same_ring(
+                    &vertices(&outline(&before, &pad.kiid)),
+                    &theirs,
+                    2
+                ));
+            }
+        }
+    }
 }
 
 /// The three tools through served `tools/call`, against a KiCad double that
@@ -1401,6 +1521,7 @@ mod served_tests {
     use copperpour_ipc::builders::{any_type_name, pack_any};
     use copperpour_ipc::gen::kiapi;
     use kiapi::board::commands as board_commands;
+    use kiapi::board::types::BoardLayer;
     use kiapi::common::types::KiCadObjectType as Kot;
     use prost::Message;
     use serde_json::{json, Value};
@@ -1426,6 +1547,79 @@ mod served_tests {
     const STUB: &str = "3236141c-2c15-4b0f-9c9f-b39f826067c1";
     const TIED_TRACK: &str = "e86c73df-a536-483a-8c1e-cf0b7f96cf64";
 
+    /// One board's recorded KiCad answers, as [`replay_from`] serves them.
+    struct Capture {
+        /// The file name KiCad holds the board under.
+        board_name: &'static str,
+        board: &'static str,
+        footprints: &'static [u8],
+        tracks: &'static [u8],
+        vias: &'static [u8],
+        arcs: &'static [u8],
+        enabled_layers: &'static [u8],
+        presence: &'static [u8],
+        /// `GetPadShapeAsPolygon` for every pad as placed, by layer.
+        outlines: &'static [(BoardLayer, &'static [u8])],
+    }
+
+    /// The #96 repro board (`issue_96_ipc.README.md`).
+    static ISSUE_96: Capture = Capture {
+        board_name: "issue_96.kicad_pcb",
+        board: BOARD,
+        footprints: FOOTPRINTS,
+        tracks: TRACKS,
+        vias: VIAS,
+        arcs: ARCS,
+        enabled_layers: ENABLED_LAYERS,
+        presence: PRESENCE,
+        outlines: &[
+            (BoardLayer::BlFCu, OUTLINES_F_CU),
+            (BoardLayer::BlBCu, OUTLINES_B_CU),
+        ],
+    };
+
+    /// The four-layer board with copper on B.Cu, blind vias and arc tracks
+    /// (`issue_96_layers_ipc.README.md`).
+    static LAYERS: Capture = Capture {
+        board_name: "issue_96_layers.kicad_pcb",
+        board: include_str!("../../tests/fixtures/issue_96_layers.kicad_pcb"),
+        footprints: include_bytes!("../../tests/fixtures/issue_96_layers_footprints.ipc.bin"),
+        tracks: include_bytes!("../../tests/fixtures/issue_96_layers_tracks.ipc.bin"),
+        vias: include_bytes!("../../tests/fixtures/issue_96_layers_vias.ipc.bin"),
+        arcs: include_bytes!("../../tests/fixtures/issue_96_layers_arcs.ipc.bin"),
+        enabled_layers: include_bytes!(
+            "../../tests/fixtures/issue_96_layers_enabled_layers.ipc.bin"
+        ),
+        presence: include_bytes!("../../tests/fixtures/issue_96_layers_presence.ipc.bin"),
+        outlines: &[
+            (
+                BoardLayer::BlFCu,
+                include_bytes!("../../tests/fixtures/issue_96_layers_polygons_before_F_Cu.ipc.bin"),
+            ),
+            (
+                BoardLayer::BlIn1Cu,
+                include_bytes!(
+                    "../../tests/fixtures/issue_96_layers_polygons_before_In1_Cu.ipc.bin"
+                ),
+            ),
+            (
+                BoardLayer::BlIn2Cu,
+                include_bytes!(
+                    "../../tests/fixtures/issue_96_layers_polygons_before_In2_Cu.ipc.bin"
+                ),
+            ),
+            (
+                BoardLayer::BlBCu,
+                include_bytes!("../../tests/fixtures/issue_96_layers_polygons_before_B_Cu.ipc.bin"),
+            ),
+        ],
+    };
+
+    // The four-layer board's NET_C copper on F.Cu, as KiCad names it.
+    const VIA_F_TO_IN1_CU: &str = "ab6f8834-1aac-4fb7-b536-bb2b9e1d69cf";
+    const F_CU_ARC: &str = "37d64abc-9509-4951-b192-03a717da9b67";
+    const F_CU_TRACK: &str = "2b77c1c4-22b4-48fe-bffd-db391fd65958";
+
     fn recorded(type_name: &str, bytes: &[u8]) -> prost_types::Any {
         prost_types::Any {
             type_url: format!("type.googleapis.com/{type_name}"),
@@ -1433,32 +1627,37 @@ mod served_tests {
         }
     }
 
+    /// [`replay_from`] the #96 repro board.
+    fn replay(command: &prost_types::Any) -> Option<prost_types::Any> {
+        replay_from(&ISSUE_96, command)
+    }
+
     /// KiCad's recorded answer to the commands the check sends, cut down to
     /// the items and layers asked for, as KiCad answers. Footprints come from
     /// the store, so an applied move is read back.
-    fn replay(command: &prost_types::Any) -> Option<prost_types::Any> {
+    fn replay_from(capture: &Capture, command: &prost_types::Any) -> Option<prost_types::Any> {
         match any_type_name(command) {
             "kiapi.common.commands.GetItems" => {
                 let request =
                     kiapi::common::commands::GetItems::decode(command.value.as_slice()).unwrap();
                 let bytes = match request.types.as_slice() {
-                    [kind] if *kind == Kot::KotPcbTrace as i32 => TRACKS,
-                    [kind] if *kind == Kot::KotPcbVia as i32 => VIAS,
-                    [kind] if *kind == Kot::KotPcbArc as i32 => ARCS,
+                    [kind] if *kind == Kot::KotPcbTrace as i32 => capture.tracks,
+                    [kind] if *kind == Kot::KotPcbVia as i32 => capture.vias,
+                    [kind] if *kind == Kot::KotPcbArc as i32 => capture.arcs,
                     _ => return None,
                 };
                 Some(recorded("kiapi.common.commands.GetItemsResponse", bytes))
             }
             "kiapi.board.commands.GetBoardEnabledLayers" => Some(recorded(
                 "kiapi.board.commands.BoardEnabledLayersResponse",
-                ENABLED_LAYERS,
+                capture.enabled_layers,
             )),
             "kiapi.board.commands.CheckPadstackPresenceOnLayers" => {
                 let request =
                     board_commands::CheckPadstackPresenceOnLayers::decode(command.value.as_slice())
                         .unwrap();
                 let mut answer =
-                    board_commands::PadstackPresenceResponse::decode(PRESENCE).unwrap();
+                    board_commands::PadstackPresenceResponse::decode(capture.presence).unwrap();
                 answer.entries.retain(|entry| {
                     request.items.contains(entry.item.as_ref().unwrap())
                         && request.layers.contains(&entry.layer)
@@ -1471,13 +1670,10 @@ mod served_tests {
             "kiapi.board.commands.GetPadShapeAsPolygon" => {
                 let request =
                     board_commands::GetPadShapeAsPolygon::decode(command.value.as_slice()).unwrap();
-                let bytes = if request.layer == kiapi::board::types::BoardLayer::BlFCu as i32 {
-                    OUTLINES_F_CU
-                } else if request.layer == kiapi::board::types::BoardLayer::BlBCu as i32 {
-                    OUTLINES_B_CU
-                } else {
-                    return None;
-                };
+                let &(_, bytes) = capture
+                    .outlines
+                    .iter()
+                    .find(|(layer, _)| *layer as i32 == request.layer)?;
                 let all = board_commands::PadShapeAsPolygonResponse::decode(bytes).unwrap();
                 let mut answer = board_commands::PadShapeAsPolygonResponse::default();
                 for pad in &request.pads {
@@ -1509,11 +1705,24 @@ mod served_tests {
     async fn kicad_with(
         answer: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
     ) -> Kicad {
+        kicad_holding(&ISSUE_96, answer).await
+    }
+
+    /// A KiCad holding the four-layer board, replaying its recorded answers.
+    async fn layers_kicad() -> Kicad {
+        kicad_holding(&LAYERS, |command| replay_from(&LAYERS, command)).await
+    }
+
+    /// A KiCad holding `capture`'s board, its footprints in the store.
+    async fn kicad_holding(
+        capture: &Capture,
+        answer: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
+    ) -> Kicad {
         let dir = tempfile::tempdir().unwrap();
-        let board = dir.path().join("issue_96.kicad_pcb");
-        std::fs::write(&board, BOARD).unwrap();
+        let board = dir.path().join(capture.board_name);
+        std::fs::write(&board, capture.board).unwrap();
         let store = Arc::new(Mutex::new(ItemStore {
-            items: kiapi::common::commands::GetItemsResponse::decode(FOOTPRINTS)
+            items: kiapi::common::commands::GetItemsResponse::decode(capture.footprints)
                 .unwrap()
                 .items,
             ..Default::default()
@@ -1586,6 +1795,24 @@ mod served_tests {
                 "UpdateItems reached KiCad"
             );
             assert!(!self.sent("UpdateItems") && !self.sent("BeginCommit"));
+        }
+
+        /// Asserts every command that reached KiCad only read the board.
+        fn assert_only_reads(&self) {
+            let sent = self.sent.lock().unwrap();
+            assert!(!sent.is_empty());
+            for command in sent.iter() {
+                assert!(
+                    matches!(
+                        command.as_str(),
+                        "GetItems"
+                            | "GetBoardEnabledLayers"
+                            | "CheckPadstackPresenceOnLayers"
+                            | "GetPadShapeAsPolygon"
+                    ),
+                    "{command} reached KiCad: {sent:?}"
+                );
+            }
         }
 
         /// The anchor and angle KiCad holds for `reference`, in nm and degrees.
@@ -1983,5 +2210,187 @@ mod served_tests {
             assert!(!is_error, "{tool}: {body:#}");
             not_run(&body);
         }
+    }
+
+    /// A dry run moving R1 to `(x, 90)` on the four-layer board, which puts
+    /// pad 1 at `(x - 0.825, 90)` on the NET_C copper of one spot. Its pads
+    /// have copper on F.Cu only, so they are tested there alone, and only
+    /// reads reach KiCad. Returns `copper_check`.
+    async fn r1_dry_run_on_the_four_layer_board(x: f64) -> Value {
+        let kicad = layers_kicad().await;
+        let mut arguments = r1_to(x, 90.0);
+        arguments["dry_run"] = json!(true);
+        let (is_error, body) = kicad.call("set_component_placements", arguments).await;
+        assert!(!is_error, "{body:#}");
+        let placement = &body["placements"][0];
+        assert_eq!(body["count"], 1, "{body:#}");
+        assert_eq!(placement["reference"], "R1", "{body:#}");
+        assert_eq!(
+            placement["current"],
+            json!({ "x": 110.0, "y": 95.0, "rotation": 0.0 }),
+            "{body:#}"
+        );
+        // To the nanometre: `mm_to_nm` truncates, so 130.825 mm is planned,
+        // and applied, at 130 824 999 nm.
+        let target = &placement["target"];
+        assert!(
+            (target["x"].as_f64().unwrap() - x).abs() * 1e6 < 1.5,
+            "{body:#}"
+        );
+        assert_eq!(target["y"], 90.0, "{body:#}");
+        assert_eq!(target["rotation"], 0.0, "{body:#}");
+        assert_eq!(
+            body["copper_check"]["coverage"],
+            json!({
+                "pad_count": 2,
+                "layers": ["F.Cu"],
+                "via_count": 2,
+                "track_count": 2,
+                "arc_count": 2,
+            }),
+            "{body:#}"
+        );
+        kicad.assert_only_reads();
+        kicad.assert_untouched();
+        body["copper_check"].clone()
+    }
+
+    fn assert_clear(check: &Value) {
+        assert_eq!(check["status"], "clear", "{check:#}");
+        assert_eq!(check["conflicts"], json!([]), "{check:#}");
+    }
+
+    /// Spot A: both pads, at (130, 90) and (131.65, 90), lie over the NET_C
+    /// track (128, 90)-(134, 90), which is on B.Cu.
+    #[tokio::test]
+    async fn a_pad_over_a_track_on_another_layer_is_clear() {
+        assert_clear(&r1_dry_run_on_the_four_layer_board(130.825).await);
+    }
+
+    /// Spot B: pad 1 lands on the blind via at (140, 90), which spans In2.Cu
+    /// to B.Cu. KiCad reports it not present on F.Cu.
+    #[tokio::test]
+    async fn a_pad_over_a_blind_via_absent_from_its_layer_is_clear() {
+        assert_clear(&r1_dry_run_on_the_four_layer_board(140.825).await);
+    }
+
+    /// Spot C: pad 1 lands on the blind via at (146, 90), which spans F.Cu
+    /// to In1.Cu.
+    #[tokio::test]
+    async fn a_pad_over_a_blind_via_on_its_layer_conflicts() {
+        let check = r1_dry_run_on_the_four_layer_board(146.825).await;
+        assert_eq!(check["status"], "conflicts", "{check:#}");
+        assert_eq!(
+            check["conflicts"],
+            json!([conflict("R1", "1", "NET_A", "via", VIA_F_TO_IN1_CU)]),
+            "{check:#}"
+        );
+    }
+
+    /// Spot D: the F.Cu arc (153.5, 91)-(155, 90)-(156.5, 91) peaks at
+    /// (155, 90), inside pad 1 (155 ± 0.4, 90 ± 0.475), while its chord
+    /// along y = 91 passes 0.4 mm below the pad: only the curve reaches it.
+    /// Pad 2 clears the arc by about 31 µm at its rounded corner.
+    #[tokio::test]
+    async fn a_pad_over_an_arc_on_its_layer_conflicts() {
+        let check = r1_dry_run_on_the_four_layer_board(155.825).await;
+        assert_eq!(check["status"], "conflicts", "{check:#}");
+        assert_eq!(
+            check["conflicts"],
+            json!([conflict("R1", "1", "NET_A", "arc", F_CU_ARC)]),
+            "{check:#}"
+        );
+    }
+
+    /// Spot E: the same arc on B.Cu, at (163.5, 91)-(165, 90)-(166.5, 91).
+    #[tokio::test]
+    async fn a_pad_over_an_arc_on_another_layer_is_clear() {
+        assert_clear(&r1_dry_run_on_the_four_layer_board(165.825).await);
+    }
+
+    /// Spot A applied: a move whose only copper is on another layer goes
+    /// through.
+    #[tokio::test]
+    async fn a_clear_move_over_copper_on_another_layer_applies() {
+        let kicad = layers_kicad().await;
+        let (is_error, body) = kicad
+            .call("set_component_placements", r1_to(130.825, 90.0))
+            .await;
+        assert!(!is_error, "{body:#}");
+        assert_eq!(kicad.store.lock().unwrap().updates, 1);
+        let (x, y, rotation) = kicad.held("R1");
+        assert!(
+            (x - 130_825_000).abs() <= 1 && (y, rotation) == (90_000_000, 0.0),
+            "R1 held at {:?}",
+            (x, y, rotation)
+        );
+        assert_eq!(body["copper_check"]["status"], "clear", "{body:#}");
+        assert_eq!(body["copper_check"]["conflicts"], json!([]), "{body:#}");
+        assert!(body.get("warning").is_none(), "{body:#}");
+    }
+
+    /// Spot F: R3, held at 90°, moved to (175, 90) stays at 90°, so pad 2
+    /// lands at (175 ± 0.475, 89.175 ± 0.4) on the NET_C track along
+    /// y = 88.9 (± 0.125). At 0° both pads would clear it.
+    #[tokio::test]
+    async fn move_component_checks_the_rotation_kicad_holds() {
+        let kicad = layers_kicad().await;
+        let expected = [conflict("R3", "2", "NET_F", "track", F_CU_TRACK)];
+        let (is_error, body) = kicad
+            .call(
+                "move_component",
+                json!({ "reference": "R3", "x": 175.0, "y": 90.0, "dry_run": true }),
+            )
+            .await;
+        assert!(!is_error, "{body:#}");
+        assert_eq!(
+            body["placements"],
+            json!([{
+                "reference": "R3",
+                "current": { "x": 110.0, "y": 105.0, "rotation": 90.0 },
+                "target": { "x": 175.0, "y": 90.0, "rotation": 90.0 },
+            }]),
+            "{body:#}"
+        );
+        assert_eq!(
+            body["copper_check"]["conflicts"],
+            json!(expected),
+            "{body:#}"
+        );
+
+        let (is_error, body) = kicad
+            .call(
+                "move_component",
+                json!({ "reference": "R3", "x": 175.0, "y": 90.0 }),
+            )
+            .await;
+        assert!(is_error, "{body:#}");
+        assert_refused(&body, "move_component", &expected);
+        kicad.assert_untouched();
+        assert_eq!(kicad.held("R3"), (110_000_000, 105_000_000, 90.0));
+    }
+
+    /// Two footprints are R4. A batch refuses a reference the board holds
+    /// twice, and so does its dry run, rather than checking one of them.
+    #[tokio::test]
+    async fn a_dry_run_naming_a_reference_held_twice_is_refused() {
+        let kicad = layers_kicad().await;
+        let (is_error, body) = kicad
+            .call(
+                "set_component_placements",
+                json!({
+                    "placements": [{ "reference": "R4", "x": 130.0, "y": 110.0, "rotation": 0.0 }],
+                    "dry_run": true,
+                }),
+            )
+            .await;
+        assert!(is_error, "{body:#}");
+        assert!(
+            body.to_string()
+                .contains("footprint reference 'R4' appears more than once on the board"),
+            "{body:#}"
+        );
+        kicad.assert_only_reads();
+        kicad.assert_untouched();
     }
 }
