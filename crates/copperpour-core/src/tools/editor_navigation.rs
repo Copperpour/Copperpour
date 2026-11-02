@@ -1334,6 +1334,15 @@ mod tests {
         assert_eq!(body["kicad_version"]["full_version"], "10.0.5");
         assert_eq!(body["evidence_source"], "kicad_ipc");
         assert_eq!(body["editors"].as_array().map(Vec::len), Some(2));
+        let capabilities = &body["editors"][0]["capabilities"];
+        assert_eq!(
+            capabilities["reveal_object"]["evidence_source"],
+            "copperpour_bundled_kicad_protocol"
+        );
+        assert_eq!(
+            capabilities["cross_probe"]["evidence_source"],
+            "copperpour_saved_structure_and_typed_live_context"
+        );
         assert!(body["active_editor"].is_null());
         assert!(body["active_document"].is_null());
         assert!(body["active_sheet_instance"].is_null());
