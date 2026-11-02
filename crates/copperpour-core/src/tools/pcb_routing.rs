@@ -2881,7 +2881,7 @@ mod specctra_live_undo_test {
 
         let temp = tempfile::tempdir().expect("create output directory");
         let dsn = temp.path().join("board.dsn");
-        let manifest = temp.path().join("board.dsn.konnect.json");
+        let manifest = temp.path().join("board.dsn.copperpour.json");
         let ses = temp.path().join("board.ses");
         let candidate = temp.path().join("board.freerouted.kicad_pcb");
         std::fs::write(&dsn, export.dsn).expect("write deterministic DSN");
