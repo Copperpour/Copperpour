@@ -127,7 +127,7 @@ class _BridgeServer(ThreadingHTTPServer):
 
 
 class _BridgeRequestHandler(BaseHTTPRequestHandler):
-    server_version = "KonnectNativeBridge/1"
+    server_version = "CopperpourNativeBridge/1"
 
     def log_message(self, _format, *_args):
         # pcbnew has no reliable stderr and the bearer token must never enter logs.

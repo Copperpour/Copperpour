@@ -5982,11 +5982,11 @@ fn editor_capabilities(
         )
     };
     let no_active_context = unsupported(
-        "konnect_bundled_kicad_protocol",
+        "copperpour_bundled_kicad_protocol",
         "no stable typed active-frame, active-document, or active-sheet query is available",
     );
     let no_activation = unsupported(
-        "konnect_bundled_kicad_protocol",
+        "copperpour_bundled_kicad_protocol",
         match editor {
             IpcEditorKind::Schematic => {
                 "no stable typed exact schematic/sheet activation command is available"
@@ -5995,14 +5995,14 @@ fn editor_capabilities(
         },
     );
     let no_reveal = unsupported(
-        "konnect_bundled_kicad_protocol",
+        "copperpour_bundled_kicad_protocol",
         "selection is typed, but reveal/center/fit has no stable typed command",
     );
     let cross_probe = if addressable && version.major >= 10 {
-        available("konnect_saved_structure_and_typed_live_context")
+        available("copperpour_saved_structure_and_typed_live_context")
     } else {
         unsupported(
-            "konnect_saved_structure_and_typed_live_context",
+            "copperpour_saved_structure_and_typed_live_context",
             "cross-probe resolution requires an addressable KiCad 10-or-newer editor endpoint",
         )
     };

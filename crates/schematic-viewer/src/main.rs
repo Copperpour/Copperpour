@@ -933,6 +933,16 @@ mod tests {
     }
 
     #[test]
+    fn tauri_identifier_is_copperpours() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(
+            config["identifier"],
+            "com.github.copperpour.copperpour.viewer"
+        );
+    }
+
+    #[test]
     fn is_relevant_sch_change_ignores_autosave_and_lock_files() {
         assert!(!is_relevant_sch_change(Path::new(
             "/proj/_autosave-Root.kicad_sch"

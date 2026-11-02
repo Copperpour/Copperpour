@@ -229,6 +229,15 @@ class NativeBridgeTests(unittest.TestCase):
     def test_the_bridge_thread_is_named_copperpour(self):
         self.assertEqual(self.bridge.thread.name, "copperpour-native-bridge")
 
+    def test_the_bridge_names_itself_copperpour_in_responses(self):
+        request = urllib.request.Request(
+            self.registration["address"] + "/v1/status",
+            headers={"Authorization": f"Bearer {self.registration['token']}"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            server = response.headers["Server"]
+        self.assertTrue(server.startswith("CopperpourNativeBridge/1"), server)
+
     def test_status_and_export_require_the_registration_token(self):
         status, payload = _request(self.registration, "/v1/status")
         self.assertEqual(status, 200)

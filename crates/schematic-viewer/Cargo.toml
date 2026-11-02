@@ -23,9 +23,5 @@ copperpour-schematic-editor = { path = "../copperpour-schematic-editor" }
 [dev-dependencies]
 tempfile = "3"
 
-[package.metadata.bundle]
-identifier = "com.konnect.schematic-viewer"
-icon = ["icons/icon.png"]
-
 [build-dependencies]
 tauri-build = "2"

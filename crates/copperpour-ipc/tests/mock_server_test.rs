@@ -209,11 +209,8 @@ fn editor_state_observation_keeps_live_sheet_identity_and_unsupported_context_ho
         schematic.capabilities.read_selection.availability,
         copperpour_ipc::IpcCapabilityAvailability::Available
     );
-    assert_eq!(
-        schematic.capabilities.observe_active_context.availability,
-        copperpour_ipc::IpcCapabilityAvailability::Unsupported
-    );
     for capability in [
+        &schematic.capabilities.observe_active_context,
         &schematic.capabilities.activate_document,
         &schematic.capabilities.activate_sheet,
         &schematic.capabilities.reveal_object,
@@ -224,7 +221,10 @@ fn editor_state_observation_keeps_live_sheet_identity_and_unsupported_context_ho
             capability.availability,
             copperpour_ipc::IpcCapabilityAvailability::Unsupported
         );
-        assert_eq!(capability.evidence_source, "konnect_bundled_kicad_protocol");
+        assert_eq!(
+            capability.evidence_source,
+            "copperpour_bundled_kicad_protocol"
+        );
         assert!(capability
             .reason
             .as_deref()
@@ -234,11 +234,23 @@ fn editor_state_observation_keeps_live_sheet_identity_and_unsupported_context_ho
         schematic.capabilities.cross_probe.availability,
         copperpour_ipc::IpcCapabilityAvailability::Available
     );
+    assert_eq!(
+        schematic.capabilities.cross_probe.evidence_source,
+        "copperpour_saved_structure_and_typed_live_context"
+    );
 
     let pcb = &state.editors[1];
     assert_eq!(pcb.editor, copperpour_ipc::IpcEditorKind::Pcb);
     assert!(!pcb.addressable);
     assert!(pcb.documents.is_empty());
+    assert_eq!(
+        pcb.capabilities.cross_probe.availability,
+        copperpour_ipc::IpcCapabilityAvailability::Unsupported
+    );
+    assert_eq!(
+        pcb.capabilities.cross_probe.evidence_source,
+        "copperpour_saved_structure_and_typed_live_context"
+    );
     assert!(pcb
         .unavailable_reason
         .as_deref()
