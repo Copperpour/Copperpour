@@ -294,18 +294,14 @@ where
 /// The refusal for a write that reached KiCad's project manager with no PCB
 /// editor open (#83): what was observed, and how to get the write through.
 ///
-/// Quitting KiCad is offered only for a board this session never saw live. A
-/// board it did see is refused on the file path as well, because the saved
-/// file may be older than what that editor held.
-fn no_pcb_editor_write_refusal(what: &str, observed_live: bool) -> String {
-    let alternative = if observed_live {
-        ""
-    } else {
-        ", or quit KiCad so the saved file can be edited instead"
-    };
+/// It offers only the PCB Editor. Quitting KiCad is not offered: the
+/// live-only writers (`update_footprints_from_library`,
+/// `update_pcb_from_schematic`, `repair_corrupted_footprints`) never edit the
+/// file, and a board this session saw live is refused on the file path too.
+fn no_pcb_editor_write_refusal(what: &str) -> String {
     format!(
         "The {what} was not written: KiCad is running but {}. The board file was not \
-         modified. Open this board in the PCB Editor and retry{alternative}.",
+         modified. Open this board in the PCB Editor and retry.",
         crate::tools::BoardEditorAbsence::NoPcbEditor.observed()
     )
 }
@@ -343,12 +339,8 @@ where
         // observed instead of claiming one might (#83).
         LiveBoard::Unserved {
             absence: crate::tools::BoardEditorAbsence::NoPcbEditor,
-            observed_live,
             ..
-        } => BoardWrite::Refused(CallToolResult::error(no_pcb_editor_write_refusal(
-            what,
-            observed_live,
-        ))),
+        } => BoardWrite::Refused(CallToolResult::error(no_pcb_editor_write_refusal(what))),
         // `OpenDocumentsUnimplemented` establishes nothing about the editors,
         // so it keeps the rejection's cautious wording.
         LiveBoard::Rejected(message) | LiveBoard::Unserved { message, .. } => {

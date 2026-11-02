@@ -1112,9 +1112,12 @@ async fn a_write_with_no_board_editor_says_so_and_leaves_the_file() {
             "{tool} must say what KiCad answered: {text}"
         );
         assert!(
-            text.contains("Open this board in the PCB Editor and retry")
-                && text.contains("quit KiCad"),
+            text.contains("Open this board in the PCB Editor and retry"),
             "{tool} must say how to get the write through: {text}"
+        );
+        assert!(
+            !text.contains("quit KiCad"),
+            "{tool} must not offer a file path the live-only writers never take: {text}"
         );
         assert!(
             !text.contains("may hold this"),
@@ -1150,33 +1153,35 @@ async fn a_write_to_a_kicad_not_naming_its_documents_keeps_the_cautious_refusal(
     assert_eq!(std::fs::read(&scene.board).unwrap(), before);
 }
 
-/// After this session saw the board live, quitting KiCad does not open the
-/// file path: the saved file may be older than what that editor held. So the
-/// refusal offers only the PCB Editor.
+/// A live-only writer never edits the file, so quitting KiCad would only lead
+/// to its own file-path refusal ("is live-IPC-only and never edits the board
+/// file directly"). It gets the same advice as every other writer: open the
+/// board in the PCB Editor.
 #[tokio::test]
-async fn a_write_after_the_board_was_seen_live_does_not_offer_quitting_kicad() {
-    let mut scene = Scene::live().await;
-    scene.body("get_layer_list", None).await;
-
-    let endpoint = scene.endpoint();
-    scene.lose_kicad();
-    scene.kicad = Some(spawn_kicad_without_a_board_editor_at(endpoint));
+async fn a_live_only_write_with_no_board_editor_offers_only_the_pcb_editor() {
+    let scene = Scene::without_a_board_editor().await;
     let before = std::fs::read(&scene.board).unwrap();
 
-    for (tool, arguments) in writes_through_the_live_gate(&scene.board) {
-        let refused = scene.call_with(tool, arguments).await;
+    let result = scene
+        .call_with(
+            "update_footprints_from_library",
+            json!({ "board": scene.board.to_string_lossy(), "dry_run": true }),
+        )
+        .await;
 
-        assert!(refused.is_error, "{tool}: {}", text_of(&refused));
-        let text = text_of(&refused);
-        assert!(
-            text.contains("reports no PCB editor at this endpoint")
-                && text.contains("Open this board in the PCB Editor and retry"),
-            "{tool}: {text}"
-        );
-        assert!(
-            !text.contains("quit KiCad"),
-            "{tool} must not offer a file path that would refuse too: {text}"
-        );
-    }
+    let body = body_of(&result);
+    assert_eq!(body["status"], "conflict", "{body}");
+    let message = body["diagnostics"][0]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a diagnostic message: {body}"));
+    assert!(
+        message.contains("KiCad is running but reports no PCB editor at this endpoint")
+            && message.contains("Open this board in the PCB Editor and retry"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("quit KiCad"),
+        "quitting KiCad would only reach the live-only refusal: {message}"
+    );
     assert_eq!(std::fs::read(&scene.board).unwrap(), before);
 }
