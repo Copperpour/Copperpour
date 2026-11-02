@@ -42,7 +42,7 @@ const MIN_SIZE_NM: i64 = 1_000;
 
 /// KiCad's board reader clamps a coordinate beyond this (`INT_LIMIT` in
 /// `pcb_io_kicad_sexpr_parser.cpp`).
-const COORDINATE_LIMIT_NM: i64 = i32::MAX as i64 - 10;
+pub(super) const COORDINATE_LIMIT_NM: i64 = i32::MAX as i64 - 10;
 
 /// The crossing check follows an arc by chords that stray no further than
 /// this from it: KiCad's smallest outline item.

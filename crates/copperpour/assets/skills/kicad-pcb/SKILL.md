@@ -61,6 +61,7 @@ Before any PCB work, load the required toolsets:
 load_toolset('pcb_board')        # board outline, layers, setup, stackup
 load_toolset('pcb_components')   # place, refresh, move, rotate, align footprints
 load_toolset('pcb_routing')      # traces, vias, differential pairs
+load_toolset('pcb_copper')       # apply_copper: a planned batch of tracks and vias
 load_toolset('sch_export')       # update PCB from the saved schematic hierarchy
 ```
 
@@ -258,6 +259,7 @@ geometry field is unavailable evidence, not a zero-size pad.
 | `route_trace`             | Manual segment-by-segment routing           |
 | `route_differential_pair` | Matched-length USB/LVDS/Ethernet pairs      |
 | `add_via`                 | Layer transition                            |
+| `apply_copper` (`pcb_copper`) | Planned batch of tracks and vias, one undo |
 | `create_netclass`         | Define width/clearance rules for net groups |
 
 ### route_pad_to_pad
@@ -287,6 +289,24 @@ route_trace(board, net_name, layer, x1, y1, x2, y2, width?)
 - Use when auto-routing creates suboptimal paths
 - There is no waypoint list: call it once per segment to build a polyline
 - Coordinates are board-space mm
+
+### apply_copper
+
+In the `pcb_copper` toolset. A planned batch of straight tracks and through vias,
+created in one KiCad commit.
+
+```
+apply_copper(board, tracks?: [{start, end, width, layer, net}], vias?: [{position, drill, size, net}], dry_run?, expected_plan_revision?)
+```
+
+- Dry run first (the default), then apply with `dry_run: false` and the revision
+  it returned as `expected_plan_revision`
+- One undo step, and the board is not saved: `save_project` saves it
+- One commit plus a read-back, not an atomic transaction: KiCad can store an item
+  on the net of the copper it touches. Such a batch is removed again and refused
+  with `plan_blocked`, naming each item; on `mutation_outcome_uncertain`, inspect
+  the listed UUIDs first
+- Copper already on the board is not skipped, so applying a plan twice adds it twice
 
 ### route_differential_pair
 

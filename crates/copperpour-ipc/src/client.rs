@@ -504,6 +504,58 @@ fn unpack_required<M: Message + Default>(
     unpack_any(&response)
 }
 
+/// What one per-item result of `CreateItems` says: KiCad's status code, and
+/// whether the item counts as created.
+///
+/// `created_items` is documented as the status of each item *to be* created:
+/// a rejected item still occupies a result slot (with e.g.
+/// `ISC_INVALID_DATA` and no item attached). Only `ISC_OK` counts, or a
+/// status left at the protobuf default while an item came back, since proto3
+/// cannot distinguish "unset" from an explicit `ISC_UNKNOWN`. (Outcome
+/// semantics follow emolitor's PR #66.)
+fn creation_outcome(
+    result: &kiapi::common::commands::ItemCreationResult,
+) -> (kiapi::common::commands::ItemStatusCode, bool) {
+    use kiapi::common::commands::ItemStatusCode;
+    let code = result
+        .status
+        .as_ref()
+        .map(|status| status.code())
+        .unwrap_or(ItemStatusCode::IscUnknown);
+    let created = match code {
+        ItemStatusCode::IscOk => true,
+        // A defaulted status is only evidence of success when the created
+        // item itself came back alongside it.
+        ItemStatusCode::IscUnknown => result.item.is_some(),
+        _ => false,
+    };
+    (code, created)
+}
+
+/// One per-item answer of KiCad's `CreateItems`, in request order
+/// ([`KiCadIpcClient::create_items_in_reporting`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IpcItemCreation {
+    /// KiCad's per-item status, by its protobuf name (`ISC_OK`,
+    /// `ISC_INVALID_DATA`, …).
+    pub status: String,
+    /// KiCad's reason when it refused the item; empty otherwise.
+    pub error_message: String,
+    /// Whether KiCad created the item, by the rule of `creation_outcome`.
+    pub created: bool,
+    /// The item as KiCad created it, carrying the KIID it assigned. KiCad
+    /// serializes it before the commit is pushed, so its other fields echo
+    /// the request: the net in it is the one asked for, not necessarily the
+    /// one KiCad stores (recorded on KiCad 10.0.8 for #95).
+    pub item: Option<prost_types::Any>,
+}
+
+/// KiCad's refusal of a `GetItemsById` that resolves none of its IDs:
+/// `AS_BAD_REQUEST` with this text, not an empty list (KiCad 10.0.8,
+/// recorded for #95). [`KiCadIpcClient::get_items_by_id_in`] reads it as
+/// "none of these items exist"; no other refusal is.
+pub const GET_ITEMS_BY_ID_NONE_FOUND: &str = "none of the requested IDs were found or valid";
+
 fn ensure_item_request_ok(status: i32, operation: &str) -> Result<()> {
     let status = kiapi::common::types::ItemRequestStatus::try_from(status)
         .unwrap_or(kiapi::common::types::ItemRequestStatus::IrsUnknown);
@@ -2226,6 +2278,49 @@ impl KiCadIpcClient {
         }
     }
 
+    /// The items carrying `ids` on one exact open board, as KiCad holds
+    /// them, through `GetItemsById`.
+    ///
+    /// KiCad leaves out an ID it cannot resolve. When it resolves none of
+    /// them it refuses the request instead of answering with an empty list
+    /// ([`GET_ITEMS_BY_ID_NONE_FOUND`]); that one answer is returned as an
+    /// empty list, because it is KiCad saying none of these items exist.
+    /// Every other refusal stays an error: a read that failed says nothing
+    /// about whether the items are there. An empty `ids` sends nothing.
+    /// Callers check the returned items against what they asked for.
+    pub fn get_items_by_id_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        ids: &[String],
+    ) -> Result<Vec<prost_types::Any>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cmd = kiapi::common::commands::GetItemsById {
+            header: Some(header_for(document)),
+            items: ids
+                .iter()
+                .map(|id| kiapi::common::types::Kiid { value: id.clone() })
+                .collect(),
+        };
+        let response = match self.send_command(&cmd, "kiapi.common.commands.GetItemsById") {
+            Ok(response) => response,
+            Err(error)
+                if ApiStatusError::from_error(&error).is_some_and(|status| {
+                    status.code == kiapi::common::ApiStatusCode::AsBadRequest as i32
+                        && status.message == GET_ITEMS_BY_ID_NONE_FOUND
+                }) =>
+            {
+                return Ok(Vec::new())
+            }
+            Err(error) => return Err(error),
+        };
+        let response =
+            unpack_required::<kiapi::common::commands::GetItemsResponse>(response, "GetItemsById")?;
+        ensure_item_request_ok(response.status, "item lookup")?;
+        Ok(response.items)
+    }
+
     /// List all footprints on the board.
     pub fn list_footprints(&self) -> Result<Vec<IpcFootprint>> {
         self.list_footprints_in(self.get_board_document()?)
@@ -2352,19 +2447,7 @@ impl KiCadIpcClient {
         let mut created_items = Vec::new();
         let mut rejections = Vec::new();
         for (index, result) in response.created_items.iter().enumerate() {
-            use kiapi::common::commands::ItemStatusCode;
-            let code = result
-                .status
-                .as_ref()
-                .map(|status| status.code())
-                .unwrap_or(ItemStatusCode::IscUnknown);
-            let is_created = match code {
-                ItemStatusCode::IscOk => true,
-                // A defaulted status is only evidence of success when the
-                // created item itself came back alongside it.
-                ItemStatusCode::IscUnknown => result.item.is_some(),
-                _ => false,
-            };
+            let (code, is_created) = creation_outcome(result);
             if is_created {
                 created += 1;
                 // KiCad echoes the created item back with the KIID it
@@ -2391,6 +2474,60 @@ impl KiCadIpcClient {
             );
         }
         Ok(created_items)
+    }
+
+    /// As [`Self::create_items_in_returning`], reporting what KiCad did with
+    /// each item instead of failing when it refused some of them.
+    ///
+    /// KiCad answers `CreateItems` per item, in request order, and creates the
+    /// items it accepts even when it refuses others, so a caller that must
+    /// undo a partial batch needs the KIIDs of the ones it did create. The
+    /// results come back one per requested item, in that order; a response
+    /// that does not carry exactly one result per item cannot be matched to
+    /// the request and is an error. Inside an explicit commit the created
+    /// items are staged, not yet on the board.
+    pub fn create_items_in_reporting(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        items: Vec<prost_types::Any>,
+    ) -> Result<Vec<IpcItemCreation>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let expected_count = items.len();
+        let cmd = kiapi::common::commands::CreateItems {
+            header: Some(header_for(document)),
+            items,
+            container: None,
+        };
+        let response = unpack_required::<kiapi::common::commands::CreateItemsResponse>(
+            self.send_command(&cmd, "kiapi.common.commands.CreateItems")?,
+            "CreateItems",
+        )?;
+        ensure_item_request_ok(response.status, "item creation")?;
+        if response.created_items.len() != expected_count {
+            anyhow::bail!(
+                "KiCad answered {} per-item results for {expected_count} requested items, so \
+                 its answer cannot be matched to the request",
+                response.created_items.len()
+            );
+        }
+        Ok(response
+            .created_items
+            .into_iter()
+            .map(|result| {
+                let (code, created) = creation_outcome(&result);
+                IpcItemCreation {
+                    status: code.as_str_name().to_string(),
+                    error_message: result
+                        .status
+                        .map(|status| status.error_message)
+                        .unwrap_or_default(),
+                    created,
+                    item: result.item,
+                }
+            })
+            .collect())
     }
 
     /// Update existing items by KIID. Generic wrapper mirroring create_items/delete_items;

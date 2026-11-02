@@ -64,7 +64,7 @@ crates/
 │           ├── pcb_board.rs        S-expr editing, IPC fallback, SVG logo
 │           ├── pcb_components.rs   IPC real-time + safe headless single placement
 │           ├── footprint_{graphics,metadata,models}.rs  validated atomic footprint edits
-│           └── project, sch_bus, sch_export, pcb_routing, pcb_export, library,
+│           └── project, sch_bus, sch_export, pcb_routing, pcb_copper, pcb_export, library,
 │               integration, verification, config, design_review, templates,
 │               manufacturing, placement, editor_navigation
 ├── copperpour-sexp/             # S-expression engine, no KiCad dependency
@@ -357,7 +357,7 @@ checked readers for domain rules.
 
 ## Current Stats
 
-- **21 toolsets, 245 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime
+- **22 toolsets, 245 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime
   diagnostic — see `tool-directory.md`). The standalone Unix executable adds
   `reload_server` over stdio only — not embedded, HTTP, mixed transport or Windows.
 - Baseline `tools/list`: 21 tools / ~2K tokens. Full catalogue: 252 tools (245 registered + 7 meta) / ~25K tokens.

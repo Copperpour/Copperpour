@@ -712,6 +712,7 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // Structured MCP error discriminant, not a callable tool.
         "unsafe_file_fallback",
         "unsupported_capability",
+        "mutation_outcome_uncertain",
         // Structured manufacturing response field, not a callable tool.
         "files_generated",
         "placement_orientation",

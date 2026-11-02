@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **21 toolsets** organized into 10 categories
+- **22 toolsets** organized into 10 categories
 - **245 registered tools** + **7 always-visible meta-tools** = **252 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<copperpour dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
@@ -29,7 +29,7 @@ and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 21 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 22 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -317,6 +317,14 @@ and Windows servers do not.
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |
 | `delete_netclass` | Delete a netclass, or one `netclass_patterns` entry by its exact text, in the `.kicad_pro`, as Board Setup does: a deleted class's patterns move to `Default`, and `Default` cannot be deleted. Schematic netclass labels are reported, not edited. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
+
+### `pcb_copper` · 1 tool
+**Purpose:** Batched copper edits on the board open in KiCad: create a planned set of tracks and through vias in one commit.
+**Source:** [`crates/copperpour-core/src/tools/pcb_copper.rs`](crates/copperpour-core/src/tools/pcb_copper.rs)
+
+| Tool | Description |
+|------|-------------|
+| `apply_copper` | Create a batch of straight tracks and through vias on the live board in one KiCad commit (one undo step), without saving. Dry run by default: checks every item (nets and copper layers the board has, sizes above zero, drill smaller than size, no zero-length track) and returns the plan rounded to the nanometre with a `plan_revision`; apply needs it as `expected_plan_revision`. One commit plus a read-back by UUID, not an atomic transaction: a batch KiCad stores partly on other nets is removed again in a second commit and refused with `plan_blocked`; a partial create is dropped; an unconfirmed removal is `mutation_outcome_uncertain` with the UUIDs. |
 
 ### `placement` · 5 tools
 **Purpose:** Placement quality and automation — score, plan decoupling rows, plan BGA fanouts; every plan reports its own before/after score.

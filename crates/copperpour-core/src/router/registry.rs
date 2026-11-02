@@ -81,6 +81,11 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         category: "pcb",
     },
     ToolsetMeta {
+        name: "pcb_copper",
+        description: "Batched copper edits on the board open in KiCad: create a planned set of tracks and through vias in one commit",
+        category: "pcb",
+    },
+    ToolsetMeta {
         name: "placement",
         description: "Placement quality and automation: score with named deductions, plan decoupling rows and BGA fanouts, first placement, force-directed refinement",
         category: "pcb",
@@ -168,6 +173,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "pcb_board" => Some(pcb_board::tools()),
         "pcb_components" => Some(pcb_components::tools()),
         "pcb_routing" => Some(pcb_routing::tools()),
+        "pcb_copper" => Some(pcb_copper::tools()),
         "placement" => Some(placement::tools()),
         "pcb_export" => Some(pcb_export::tools()),
         "library" => Some(library::tools()),
