@@ -80,12 +80,10 @@ expansion is deferred.
 
 ## Releases
 
-- **Never hand-edit tool counts.** `cargo xtask fix-doc-counts` rewrites them
-  all from `router/registry.rs`. Hand-editing is what made every tool-adding PR
-  conflict with every other one.
-- **Announce intent before bumping**, and **land count-changing PRs first.**
-  Every PR that adds a tool touches the same handful of documented counts, so a
-  release that moves those counts conflicts with the entire open queue at once.
+- **Tool counts move at release, not in PRs.** Before tagging,
+  `cargo xtask fix-doc-counts` rewrites them all from the registry; commit the
+  result. Hand-editing them in each PR made every tool-adding PR conflict with
+  every other one.
 - Version choice: a new tool, a renamed tool, or a changed response shape is a
   **minor**. Fixes — even ones that narrow behaviour nobody could have relied
   on — are a **patch**.

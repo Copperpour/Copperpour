@@ -437,6 +437,20 @@ pub fn any_is(item: &prost_types::Any, type_name: &str) -> bool {
     any_type_name(item) == type_name
 }
 
+/// The reference designator text of a placed footprint, or `""` when the
+/// instance carries no reference field.
+pub(crate) fn footprint_reference(
+    footprint: &crate::gen::kiapi::board::types::FootprintInstance,
+) -> &str {
+    footprint
+        .reference_field
+        .as_ref()
+        .and_then(|field| field.text.as_ref())
+        .and_then(|text| text.text.as_ref())
+        .map(|text| text.text.as_str())
+        .unwrap_or("")
+}
+
 /// The fully-qualified message name a packed `Any` declares, without the
 /// `type.googleapis.com/` prefix.
 ///

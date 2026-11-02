@@ -469,7 +469,7 @@ fn export_staging_dir(destination: &Path) -> Result<tempfile::TempDir> {
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
     tempfile::Builder::new()
-        .prefix(".konnect-export-")
+        .prefix(".copperpour-export-")
         .tempdir_in(parent)
         .context("failed to create an export staging directory")
 }
@@ -492,7 +492,7 @@ async fn publish_verified_file(staged: &Path, destination: &Path, artifact: &str
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("artifact");
-    let backup = staged.with_file_name(format!(".konnect-previous-{file_name}"));
+    let backup = staged.with_file_name(format!(".copperpour-previous-{file_name}"));
     tokio::fs::rename(destination, &backup)
         .await
         .with_context(|| {
@@ -739,9 +739,9 @@ async fn run_erc_with_temp_root(
 ) -> Result<ErcReport> {
     let report_dir = match temp_root {
         Some(root) => tempfile::Builder::new()
-            .prefix("konnect-erc-")
+            .prefix("copperpour-erc-")
             .tempdir_in(root),
-        None => tempfile::Builder::new().prefix("konnect-erc-").tempdir(),
+        None => tempfile::Builder::new().prefix("copperpour-erc-").tempdir(),
     }
     .context("failed to create temporary ERC report directory")?;
     let out_path = report_dir.path().join("report.json");
@@ -1870,6 +1870,15 @@ pub(crate) async fn upgrade_legacy_footprint(
         anyhow::bail!("kicad-cli fp upgrade did not produce a (footprint …) root");
     }
     Ok(text)
+}
+
+/// KiCAD 10: `pcb upgrade --force <board>`, which loads the board and saves it
+/// in place through KiCad's own reader and writer, whatever its version
+/// (`PCBNEW_JOBS_HANDLER::JobUpgrade`).
+pub(crate) async fn resave_board(cli: &str, board: &Path) -> Result<()> {
+    let board = board.to_str().context("board path is not UTF-8")?;
+    run_cli(cli, &["pcb", "upgrade", "--force", board], LONG_TIMEOUT).await?;
+    Ok(())
 }
 
 /// KiCAD 10: `pcb export dxf --output <dir> [--layers <csv>] --mode-multi <input>`

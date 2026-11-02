@@ -1,17 +1,14 @@
 //! The tool counts quoted in the docs must match the registry.
 //!
-//! CONTRIBUTING asks for `router/registry.rs`, `tool-directory.md`, DEV.md's
-//! "Current Stats" and the README to move together, and notes that "those
-//! three counts have drifted apart before precisely because only one of them
-//! got updated". Nothing enforced it: `registry_tool_counts_match_reality`
-//! only checks each toolset's `tool_count` against `tools_for()`, so a PR that
-//! adds a tool and updates two of the four documents is green.
+//! PRs #159 and #160 each moved the counts in three documents and left the
+//! README behind, and CI said nothing; hence these checks, derived from the
+//! registry.
 //!
-//! That is not hypothetical — PRs #159 and #160 each bump `registry.rs`,
-//! `tool-directory.md` and DEV.md while leaving README.md behind, and CI has
-//! nothing to say about it.
-//!
-//! So derive the numbers from the registry and require the prose to agree.
+//! Tool counts move only at release (#222): every tool-adding PR used to edit
+//! the same lines in about seven files, so any two such PRs conflicted. The
+//! checks that would fail on a new tool are `#[ignore]`d and run in
+//! `release.yml`; before tagging, `cargo xtask fix-doc-counts` makes them pass.
+//! The directory row, toolset and meta-tool checks still run on every PR.
 
 use copperpour_core::router::registry;
 use std::path::{Path, PathBuf};
@@ -33,7 +30,7 @@ fn read(rel: &str) -> String {
 /// Ground truth: what the registry actually declares.
 fn counts() -> (usize, usize, usize) {
     let toolsets = registry::ALL_TOOLSETS.len();
-    let registered: usize = registry::ALL_TOOLSETS.iter().map(|t| t.tool_count).sum();
+    let registered: usize = registry::ALL_TOOLSETS.iter().map(|t| t.tool_count()).sum();
     // Documentation quotes the cross-platform baseline. Unix stdio adds the
     // optional reload_server tool at runtime without changing that baseline.
     let meta = copperpour_core::router::meta_tools::meta_tool_descriptions().len();
@@ -69,6 +66,7 @@ fn required_phrases() -> Vec<(&'static str, String)> {
 }
 
 #[test]
+#[ignore = "release check: run `cargo xtask fix-doc-counts` before tagging"]
 fn docs_quote_the_registry_tool_counts() {
     let mut wrong = Vec::new();
     for (file, phrase) in required_phrases() {
@@ -123,6 +121,7 @@ fn tool_directory_lists_every_registered_tool() {
 /// `MAX_TOOLS_PER_TOOLSET` at 20, so DEV.md's per-toolset tables are
 /// unambiguously not catalogue totals and are left alone.
 #[test]
+#[ignore = "release check: run `cargo xtask fix-doc-counts` before tagging"]
 fn no_file_quotes_a_stale_catalogue_total() {
     let (_, registered, meta) = counts();
     let total = registered + meta;
@@ -268,6 +267,7 @@ fn no_file_quotes_a_stale_toolset_count() {
 /// and `tool_directory_lists_every_registered_tool` only checks that each tool
 /// appears *somewhere* in the file, not that the section headings add up.
 #[test]
+#[ignore = "release check: run `cargo xtask fix-doc-counts` before tagging"]
 fn tool_directory_section_headings_match_the_registry() {
     let directory = read("tool-directory.md");
     let mut wrong = Vec::new();
@@ -288,11 +288,11 @@ fn tool_directory_section_headings_match_the_registry() {
             .split_whitespace()
             .find_map(|word| word.parse::<usize>().ok());
         match claimed {
-            Some(n) if n == meta.tool_count => {}
+            Some(n) if n == meta.tool_count() => {}
             Some(n) => wrong.push(format!(
                 "tool-directory.md:{}: `{name}` heading says {n} tools, registry says {}",
                 lineno + 1,
-                meta.tool_count
+                meta.tool_count()
             )),
             None => wrong.push(format!(
                 "tool-directory.md:{}: `{name}` heading states no tool count",

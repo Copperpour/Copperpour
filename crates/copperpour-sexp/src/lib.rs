@@ -9,6 +9,7 @@ pub mod net;
 pub mod parser;
 pub mod paths;
 pub mod schematic;
+pub mod text_bounds;
 pub mod title_block;
 pub mod transaction;
 pub mod writer;

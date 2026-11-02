@@ -743,7 +743,10 @@ fn temporary_output_path(output: &Path) -> Result<PathBuf> {
         .file_name()
         .and_then(|name| name.to_str())
         .context("SES output has no UTF-8 filename")?;
-    Ok(parent.join(format!(".{name}.konnect-{}.tmp.ses", uuid::Uuid::new_v4())))
+    Ok(parent.join(format!(
+        ".{name}.copperpour-{}.tmp.ses",
+        uuid::Uuid::new_v4()
+    )))
 }
 
 fn duration_string(seconds: u64) -> String {
@@ -843,6 +846,8 @@ mod tests {
         assert_eq!(first.parent(), output.parent());
         assert_ne!(first, second);
         assert!(extension_is(&first, "ses"));
+        let name = first.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with(".board.ses.copperpour-"), "{name}");
     }
 
     #[test]

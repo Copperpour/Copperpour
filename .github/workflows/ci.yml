@@ -192,3 +192,33 @@ jobs:
             exit 1
           fi
           echo "OK: mismatched binary/platform correctly rejected"
+
+      # release.yml writes this file for the KiCAD addon repository; the hashes
+      # are checked against sha256sum, not against the script's own reading.
+      - name: Write addon repository metadata from the three stub zips
+        run: |
+          set -euo pipefail
+          printf '\317\372\355\376' > stub-copperpour-mac
+          ./packaging/build-pcm.sh --version 0.0.0 --binary stub-copperpour-mac \
+            --platform macos --out dist
+          url=https://github.com/Copperpour/Copperpour/releases/download/v0.0.0/
+          if python packaging/pcm-submission-metadata.py --version 0.0.0 --base-url "$url" \
+              --out partial.json dist/copperpour-pcm-v0.0.0-{linux,windows}.zip; then
+            echo "::error::submission metadata accepted a release without a macOS package"
+            exit 1
+          fi
+          if python packaging/pcm-submission-metadata.py --version 0.0.1 --base-url "$url" \
+              --out mislabeled.json dist/copperpour-pcm-v0.0.0-*.zip; then
+            echo "::error::submission metadata accepted zips built for another version"
+            exit 1
+          fi
+          python packaging/pcm-submission-metadata.py --version 0.0.0 --base-url "$url" \
+            --out submission.json dist/copperpour-pcm-v0.0.0-*.zip
+          for platform in linux macos windows; do
+            zip="dist/copperpour-pcm-v0.0.0-$platform.zip"
+            jq -e --arg p "$platform" --arg sha "$(sha256sum "$zip" | cut -d' ' -f1)" \
+              --argjson size "$(stat -c %s "$zip")" --arg url "$url${zip#dist/}" \
+              '[.versions[] | select(.platforms == [$p])] | length == 1 and
+               .[0].download_sha256 == $sha and .[0].download_size == $size and
+               .[0].download_url == $url' submission.json
+          done

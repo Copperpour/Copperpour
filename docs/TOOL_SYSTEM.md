@@ -99,8 +99,8 @@ must reload and inspect the named file before retrying. Add a new kind in
 
 ## Documentation Coupling
 
-When tools are added, removed, or renamed, update the domain `tools()` list,
-`router/registry.rs`, `tool-directory.md`, and the guarded count locations named
-by `CONTRIBUTING.md`. Do not repeat catalogue totals in these map documents;
+When tools are added, removed, or renamed, update the domain `tools()` list and
+`tool-directory.md`; the guarded counts named by `CONTRIBUTING.md` move at
+release. Do not repeat catalogue totals in these map documents;
 `crates/copperpour/tests/doc_tool_counts.rs` enforces the designated sources and
 sweeps documentation for stale totals.

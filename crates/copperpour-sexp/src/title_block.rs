@@ -125,7 +125,7 @@ fn comment_index(number: &str) -> Option<usize> {
 
 /// KiCad's quoting: `\`, `"` and line breaks are escaped, a tab stays literal.
 /// pcbnew 10.0.6 writes a tab raw, so this is not `command.rs`'s escaper.
-fn quote(value: &str) -> String {
+pub fn quote(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
     for character in value.chars() {

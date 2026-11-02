@@ -1108,6 +1108,7 @@ fn native_placement_readback_refuses_wrong_document_and_missing_evidence() {
         "Footprint",
         "instances",
         "stale",
+        "renumbered",
     ] {
         let (_directory, _root, child) = fixture(true);
         let mut schematic = Schematic::load(&child).unwrap();
@@ -1150,6 +1151,15 @@ fn native_placement_readback_refuses_wrong_document_and_missing_evidence() {
                 .get_mut(0)
                 .unwrap()
                 .set_instance_path("foreign", "/foreign", "U999", 1),
+            // The reused sheet's second record names another designator, as
+            // an edit accepts and a placement never writes.
+            "renumbered" => {
+                let symbol = schematic.symbols.get_mut(0).unwrap();
+                let (project, path) = symbol.instance_paths().last().unwrap().clone();
+                let reference = format!("{}0", symbol.reference().unwrap());
+                let unit = symbol.unit;
+                symbol.set_instance_path(&project, &path, &reference, unit);
+            }
             "document" => {}
             _ => unreachable!(),
         }
@@ -1162,14 +1172,25 @@ fn native_placement_readback_refuses_wrong_document_and_missing_evidence() {
             &child
         })
         .unwrap();
-        let result =
-            sch_components::placed_component_readback(&child, &committed, &expected, &context)
-                .expect_err("incomplete readback must not return success");
+        let result = match sch_components::placed_component_readback(
+            &child, &committed, &expected, &context,
+        ) {
+            Ok(observed) => {
+                panic!("{missing}: incomplete readback must not return success: {observed}")
+            }
+            Err(result) => result,
+        };
         assert_eq!(body(&result)["error"]["kind"], "stale_target", "{missing}");
         assert!(!body(&result)["message"]
             .as_str()
             .unwrap()
             .contains("did not modify"));
+        if missing == "renumbered" {
+            assert!(body(&result)["message"]
+                .as_str()
+                .unwrap()
+                .contains("observed instance_references differs"));
+        }
     }
 }
 

@@ -295,6 +295,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_edit_sheet_pin(args, ctx).await }
         ),
+        super::sch_label_rename::tool(),
         tool!(
             "delete_sheet_pin",
             "Remove a single pin from a sheet without touching the rest of the sheet.",
@@ -526,6 +527,54 @@ fn title_block_targets(
     Ok(Ok(targets))
 }
 
+/// Write `transitions` as one transaction, journaled beside `root`, the
+/// project's root schematic or a loose sheet, where recovery looks. `sheets`
+/// are the sheets the edit was planned for, written or not. Refused with
+/// nothing written when one lies outside that directory, while KiCad holds
+/// `root` or one of them open, or when a sheet changed after it was read.
+pub(super) fn commit_sheets(
+    root: &Path,
+    sheets: &[&Path],
+    transitions: Vec<FileTransition>,
+) -> anyhow::Result<Result<(), CallToolResult>> {
+    let journal_dir = parent_dir(root);
+    let journal_root = journal_dir.canonicalize()?;
+    if let Some(outside) = sheets.iter().find(|path| {
+        !path
+            .canonicalize()
+            .is_ok_and(|path| path.starts_with(&journal_root))
+    }) {
+        return Ok(Err(CallToolResult::error_kind(
+            ToolErrorKind::UnsupportedCapability {
+                capability: "sheet_outside_project_directory".to_string(),
+                kicad_version: None,
+            },
+            format!(
+                "Sheet file '{}' lies outside the project directory '{}', where the \
+                 transaction journal is kept. No sheet was modified.",
+                outside.display(),
+                journal_dir.display()
+            ),
+        )));
+    }
+    // Eeschema locks only the root schematic and saves every sheet from
+    // memory, so the root's lock guards sheets the transaction never names;
+    // the transaction checks its own targets again as it writes them. An
+    // unchanged sheet is checked too: the editor may hold a newer one.
+    for path in std::iter::once(root).chain(sheets.iter().copied()) {
+        copperpour_sexp::writer::ensure_kicad_design_document_is_closed(path)?;
+    }
+    if !transitions.is_empty() {
+        if let Err(error) = commit_file_transaction(&journal_dir, transitions) {
+            return match stale_sheet_refusal(&error) {
+                Some(refusal) => Ok(Err(refusal)),
+                None => Err(error.into()),
+            };
+        }
+    }
+    Ok(Ok(()))
+}
+
 /// A commit refused because a sheet changed after it was read. That check
 /// runs before the journal is written, so a conflict whose journal does not
 /// exist changed nothing. Any other failure (a journal left for recovery, or
@@ -582,29 +631,6 @@ async fn handle_set_schematic_title_block(
         Ok(targets) => targets,
         Err(refusal) => return Ok(refusal),
     };
-    // The project's journal lives beside its root, where recovery looks.
-    let journal_dir = parent_dir(root.as_deref().unwrap_or(&schematic));
-    let journal_root = journal_dir.canonicalize()?;
-    if let Some(outside) = targets.iter().find(|target| {
-        !target
-            .path
-            .canonicalize()
-            .is_ok_and(|path| path.starts_with(&journal_root))
-    }) {
-        return Ok(CallToolResult::error_kind(
-            ToolErrorKind::UnsupportedCapability {
-                capability: "sheet_outside_project_directory".to_string(),
-                kicad_version: None,
-            },
-            format!(
-                "Sheet file '{}' lies outside the project directory '{}', where the \
-                 transaction journal is kept. No sheet was modified.",
-                outside.path.display(),
-                journal_dir.display()
-            ),
-        ));
-    }
-
     let mut sheets = Vec::new();
     let mut transitions = Vec::new();
     for TitleBlockTarget {
@@ -621,21 +647,10 @@ async fn handle_set_schematic_title_block(
         }
         sheets.push((path, block, intended, changed));
     }
-
-    // Eeschema locks only the root schematic and saves every sheet from
-    // memory, so the root's lock guards sheets the transaction never names;
-    // the transaction checks its own targets again as it writes them. An
-    // unchanged target is checked too: the editor may hold a newer one.
-    for path in root.iter().chain(sheets.iter().map(|(path, ..)| path)) {
-        copperpour_sexp::writer::ensure_kicad_design_document_is_closed(path)?;
-    }
-    if !transitions.is_empty() {
-        if let Err(error) = commit_file_transaction(&journal_dir, transitions) {
-            return match stale_sheet_refusal(&error) {
-                Some(refusal) => Ok(refusal),
-                None => Err(error.into()),
-            };
-        }
+    let paths: Vec<&Path> = sheets.iter().map(|(path, ..)| path.as_path()).collect();
+    if let Err(refusal) = commit_sheets(root.as_deref().unwrap_or(&schematic), &paths, transitions)?
+    {
+        return Ok(refusal);
     }
 
     let committed: Vec<String> = sheets

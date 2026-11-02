@@ -160,18 +160,12 @@ These are exactly the commands CI runs — if they pass locally, CI should be gr
   line endings `core.autocrlf` gave it, `git status` stays clean, and
   `git checkout -- <file>` skips it. `cargo xtask check-fixtures` lists such
   files; `--fix` checks them out again.
-- If you added or removed tools: set `tool_count` in `router/registry.rs`, add the
-  tool's row to `tool-directory.md`, then run
-
-  ```
-  cargo xtask fix-doc-counts
-  ```
-
-  which rewrites every count in every document from the registry. Do not edit the
-  numbers by hand. Roughly seven files quote them, so two PRs that both add a tool
-  used to conflict by construction, and a release that moved the counts conflicted
-  with the whole open queue at once. The guard (`doc_tool_counts`) still fails if
-  anything is stale; the command is how you satisfy it.
+- If you added or removed tools: add or remove the tool's row in `tool-directory.md`,
+  and leave the tool counts in the docs alone. Roughly seven files quote them, so two
+  PRs that both edited them conflicted by construction. They now move once per
+  release, when `cargo xtask fix-doc-counts` rewrites them from the registry; each
+  toolset's count is read from its `tools()` list, so `router/registry.rs` changes
+  only for a new toolset.
 - If a tool's caller can see the change, add a migration note as its own file in
   `docs/api-migrations/` (see its README), not to `docs/API_MIGRATIONS.md`. Every
   PR used to add its note at the top of that one file, so any two open PRs

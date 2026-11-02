@@ -86,7 +86,7 @@ mark individual inapplicable rows with a reason. Do not invent runtime evidence.
 - [ ] New behavior and failure paths have regression coverage.
 - [ ] File mutations are atomic and preserve unrelated content.
 - [ ] IPC mutations verify the requested board; atomic/partial behavior and safe recovery are explicit under the reliability contract.
-- [ ] If tools were added/removed: counts and docs updated per CONTRIBUTING.md (registry `tool_count`, `tool-directory.md`, DEV.md stats, README count).
+- [ ] If tools were added/removed: `tool-directory.md` rows updated; tool counts left for the release (CONTRIBUTING.md).
 
 ## Maintainer merge state
 

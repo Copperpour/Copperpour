@@ -99,8 +99,10 @@ per-PR gate. Apply the `run:e2e-kicad` label to run that same workflow for a
 pull request when KiCad-facing behavior needs hosted acceptance evidence.
 
 Before creating a release tag, run `cargo xtask collect-api-migrations
-<version>` and commit the result, which moves the notes in
-`docs/api-migrations/` into `docs/API_MIGRATIONS.md`. Then dispatch `.github/workflows/release.yml` against
+<version>` and `cargo xtask fix-doc-counts`, and commit the result. The first
+moves the notes in `docs/api-migrations/` into `docs/API_MIGRATIONS.md`; the
+second rewrites the tool counts in the docs, which PRs leave alone. The release
+workflow's `doc-counts` job fails on a stale count. Then dispatch `.github/workflows/release.yml` against
 the exact candidate ref. The manual entry point runs the release-profile target
 matrix, all three PCM package builds, and the reusable real-KiCad acceptance
 workflow with a synthetic `0.0.0` package version. Its publication job is
@@ -142,3 +144,13 @@ icons, or release scripts require PCM assembly and
 `packaging/build-pcm.ps1` and `build-pcm.sh` enumerate the files staged into the
 PCM archive. Developer documentation stays in the repository and is not added
 to release zips.
+
+KiCad's official addon repository lists a package from a metadata file whose
+versions carry `download_sha256` and `download_url`, values that exist only
+once the zips are built. `packaging/metadata.json` therefore stays a template
+with one bare version entry; do not stamp release hashes into it. The release
+workflow runs `packaging/pcm-submission-metadata.py` on the three PCM zips and
+attaches `copperpour-pcm-v<version>-metadata.json` to the GitHub release, with
+one version entry per platform. To list a release, copy its `versions` entries
+into `packages/<identifier>/metadata.json` in a merge request to
+<https://gitlab.com/kicad/addons/metadata>.

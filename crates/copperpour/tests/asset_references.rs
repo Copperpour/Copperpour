@@ -126,7 +126,7 @@ fn agents_preload_existing_skills() {
 /// deliberately instead of leaving agents undiscoverable (#357).
 #[test]
 fn top_level_skill_routes_every_bundled_agent() {
-    let router = std::fs::read_to_string(assets_root().join("skills/konnect/SKILL.md")).unwrap();
+    let router = std::fs::read_to_string(assets_root().join("skills/copperpour/SKILL.md")).unwrap();
     let mut missing = Vec::new();
     for entry in std::fs::read_dir(assets_root().join("agents"))
         .unwrap()
@@ -143,7 +143,7 @@ fn top_level_skill_routes_every_bundled_agent() {
 
     assert!(
         missing.is_empty(),
-        "top-level konnect skill does not route bundled agent(s): {}",
+        "top-level copperpour skill does not route bundled agent(s): {}",
         missing.join(", ")
     );
 }

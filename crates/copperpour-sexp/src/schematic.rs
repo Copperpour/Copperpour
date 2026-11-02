@@ -355,7 +355,7 @@ pub struct SymbolBounds {
 }
 
 impl SymbolBounds {
-    fn spanning((x1, y1): (f64, f64), (x2, y2): (f64, f64)) -> Self {
+    pub(crate) fn spanning((x1, y1): (f64, f64), (x2, y2): (f64, f64)) -> Self {
         let mut bounds = Self::point(x1, y1);
         bounds.include(x2, y2);
         bounds
@@ -370,7 +370,7 @@ impl SymbolBounds {
         }
     }
 
-    fn include(&mut self, x: f64, y: f64) {
+    pub(crate) fn include(&mut self, x: f64, y: f64) {
         if !x.is_finite() || !y.is_finite() {
             return;
         }
@@ -393,7 +393,7 @@ impl SymbolBounds {
     /// Whether the relative interiors meet. A box flat on an axis is a line
     /// there, so a line counts only where it passes strictly inside the other
     /// box, or along a coincident line, never where it merely touches an edge.
-    fn interiors_intersect(self, other: Self) -> bool {
+    pub fn interiors_intersect(self, other: Self) -> bool {
         let axis = |a_min: f64, a_max: f64, b_min: f64, b_max: f64| {
             let a_flat = a_max - a_min <= GEOMETRY_EPSILON;
             let b_flat = b_max - b_min <= GEOMETRY_EPSILON;
@@ -961,63 +961,67 @@ mod symbol_bounds_tests {
 
 pub fn extract_symbol_instances(tree: &SexpNode) -> Vec<SymbolInstance> {
     tree.find_all("symbol")
-        .iter()
-        .filter_map(|node| {
-            // Top-level symbols only have lib_id and at; filter out library definitions
-            let lib_id = node.find("lib_id")?.get(1)?.as_str()?.to_string();
-            let lib_name = node
-                .find("lib_name")
-                .and_then(|n| n.get(1))
-                .and_then(|n| n.as_str())
-                .map(String::from);
-            let (x, y, rotation) = parse_at(node)?;
-
-            let mirror_node = node.find("mirror");
-            let mirror_x = mirror_node
-                .and_then(|m| m.get(1))
-                .and_then(|m| m.as_str())
-                .map(|s| s == "x" || s == "xy")
-                .unwrap_or(false);
-            let mirror_y = mirror_node
-                .and_then(|m| m.get(1))
-                .and_then(|m| m.as_str())
-                .map(|s| s == "y" || s == "xy")
-                .unwrap_or(false);
-
-            let prop = |name: &str| -> String {
-                node.find_all("property")
-                    .iter()
-                    .find(|p| p.get(1).and_then(|n| n.as_str()) == Some(name))
-                    .and_then(|p| p.get(2))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            };
-
-            let uuid = node
-                .find("uuid")
-                .and_then(|u| u.get(1))
-                .and_then(|u| u.as_str())
-                .map(String::from);
-
-            let unit = node.find_f64("unit").map(|u| u as u32).unwrap_or(1);
-
-            Some(SymbolInstance {
-                reference: prop("Reference"),
-                value: prop("Value"),
-                footprint: prop("Footprint"),
-                lib_name,
-                lib_id,
-                x,
-                y,
-                rotation,
-                mirror_x,
-                mirror_y,
-                uuid,
-                unit,
-            })
-        })
+        .into_iter()
+        .filter_map(symbol_instance)
         .collect()
+}
+
+/// One sheet-level `symbol` node as a placed instance, or `None` for a node
+/// that is not one.
+pub fn symbol_instance(node: &SexpNode) -> Option<SymbolInstance> {
+    // Top-level symbols only have lib_id and at; filter out library definitions
+    let lib_id = node.find("lib_id")?.get(1)?.as_str()?.to_string();
+    let lib_name = node
+        .find("lib_name")
+        .and_then(|n| n.get(1))
+        .and_then(|n| n.as_str())
+        .map(String::from);
+    let (x, y, rotation) = parse_at(node)?;
+
+    let mirror_node = node.find("mirror");
+    let mirror_x = mirror_node
+        .and_then(|m| m.get(1))
+        .and_then(|m| m.as_str())
+        .map(|s| s == "x" || s == "xy")
+        .unwrap_or(false);
+    let mirror_y = mirror_node
+        .and_then(|m| m.get(1))
+        .and_then(|m| m.as_str())
+        .map(|s| s == "y" || s == "xy")
+        .unwrap_or(false);
+
+    let prop = |name: &str| -> String {
+        node.find_all("property")
+            .iter()
+            .find(|p| p.get(1).and_then(|n| n.as_str()) == Some(name))
+            .and_then(|p| p.get(2))
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let uuid = node
+        .find("uuid")
+        .and_then(|u| u.get(1))
+        .and_then(|u| u.as_str())
+        .map(String::from);
+
+    let unit = node.find_f64("unit").map(|u| u as u32).unwrap_or(1);
+
+    Some(SymbolInstance {
+        reference: prop("Reference"),
+        value: prop("Value"),
+        footprint: prop("Footprint"),
+        lib_name,
+        lib_id,
+        x,
+        y,
+        rotation,
+        mirror_x,
+        mirror_y,
+        uuid,
+        unit,
+    })
 }
 
 /// Resolve an instance's embedded `lib_symbols` definition the way KiCAD does:
@@ -1109,6 +1113,8 @@ pub struct LibPin {
     pub local_y: f64,
     pub rotation: f64,
     pub length: f64,
+    /// `(hide yes)`, or a bare `hide` in older files.
+    pub hidden: bool,
 }
 
 /// Parse pins from a library symbol definition node.
@@ -1199,6 +1205,12 @@ fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
         .and_then(|n| n.as_str())
         .unwrap_or("")
         .to_string();
+    let hidden = node.find_str("hide") == Some("yes")
+        || node
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .any(|child| child.as_str() == Some("hide"));
     Some(LibPin {
         number,
         name,
@@ -1207,6 +1219,7 @@ fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
         local_y: y,
         rotation,
         length,
+        hidden,
     })
 }
 
@@ -1738,6 +1751,25 @@ mod unit_pin_tests {
     }
 
     #[test]
+    fn extraction_reads_a_hidden_pin_in_either_form() {
+        let root = parse_sexp(
+            r#"(kicad_symbol_lib
+  (symbol "TEST"
+    (pin power_in line (at 0 0 0) (length 0) (hide yes) (name "A") (number "1"))
+    (pin power_in line (at 0 0 0) (length 0) hide (name "B") (number "2"))
+    (pin power_in line (at 0 0 0) (length 0) (hide no) (name "C") (number "3"))
+    (pin power_in line (at 0 0 0) (length 0) (name "D") (number "4"))))"#,
+        )
+        .unwrap();
+        let hidden: Vec<bool> = extract_lib_pins(root.find("symbol").unwrap())
+            .iter()
+            .map(|pin| pin.hidden)
+            .collect();
+
+        assert_eq!(hidden, [true, true, false, false]);
+    }
+
+    #[test]
     fn underscored_base_names_parse_their_unit_suffix() {
         assert_eq!(parse_subsymbol_unit("R_Small_1_1"), Some(1));
         assert_eq!(parse_subsymbol_unit("OP_DUAL_2_1"), Some(2));
@@ -1765,6 +1797,7 @@ mod pin_endpoint_tests {
             local_y,
             rotation,
             length: 1.27,
+            hidden: false,
         }
     }
 
@@ -2111,6 +2144,7 @@ mod pin_label_rotation_tests {
             local_y: -10.0 * rad.sin(),
             rotation: angle,
             length: 2.54,
+            hidden: false,
         }
     }
 
@@ -2208,6 +2242,7 @@ mod pin_label_rotation_tests {
                 local_y: 0.0,
                 rotation: angle,
                 length: 0.0,
+                hidden: false,
             };
             for direction in [0.0, 90.0, 180.0, 270.0] {
                 let t = PinTransform {

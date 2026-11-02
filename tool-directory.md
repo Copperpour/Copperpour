@@ -171,7 +171,7 @@ and Windows servers do not.
 | `find_shorted_nets` | Detect accidentally merged nets — distinct net names that KiCad nets together, through a wire path they share or through a name that joins their segments. |
 | `find_single_pin_nets` | Find nets that reach at most one pin — often a missing counterpart, an orphan label, or a stub left by a deleted component. Component pins and hierarchical sheet pins count; a power symbol's own pin names the rail rather than consuming it and does not. Reports the pin and label counts, and every label kind that named the net. Read per sheet: a net a global, hierarchical or power label can carry off this one is flagged cross_sheet_unverified. |
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
-| `check_schematic_overlaps` | Find collisions using transformed symbol drawings and pins (excluding free text), with a reported origin fallback when geometry is unavailable. |
+| `check_schematic_overlaps` | Find collisions using transformed symbol drawings, pins, and label and field text (excluding free text), with a reported origin fallback when geometry is unavailable. |
 
 ### `sch_batch` · 13 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
@@ -194,7 +194,7 @@ and Windows servers do not.
 | `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. A pair whose route would join another net is skipped and listed in `errors`. |
 
 ### `sch_export` · 10 tools
-**Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB.
+**Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC and set its checks' severities, and synchronize a live PCB.
 **Source:** [`crates/copperpour-core/src/tools/sch_export.rs`](crates/copperpour-core/src/tools/sch_export.rs)
 
 | Tool | Description |
@@ -207,11 +207,12 @@ and Windows servers do not.
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. A report that is not in kicad-cli's ERC shape is an error, never zero violations. |
+| `set_erc_severity` | Set ERC checks' severities (`error`, `warning`, `ignore`) under `erc.rule_severities` in the `.kicad_pro`, by the check keys KiCad 10.0.6 has or the file already names; only the named keys change, and the reply gives each one's previous and current severity. Refused while KiCad holds the project. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. |
 
-### `sch_hierarchy` · 15 tools
-**Purpose:** Sheet files and hierarchical sheets: create a schematic file and set its page size and title block, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
+### `sch_hierarchy` · 16 tools
+**Purpose:** Sheet files and hierarchical sheets: create a schematic file and set its page size and title block, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, net label renames, pin/label sync validation.
 **Source:** [`crates/copperpour-core/src/tools/sch_hierarchy.rs`](crates/copperpour-core/src/tools/sch_hierarchy.rs)
 
 | Tool | Description |
@@ -229,6 +230,7 @@ and Windows servers do not.
 | `import_sheet_pins` | Scan the child sheet's hierarchical_labels and auto-generate matching pins on the parent sheet block, skipping names that already have a pin — the primary way pins get created. Optional `side` (`right`, `left`, `top`, `bottom`, default `right`) picks the edge and sets each pin's rotation, which is what KiCad reads the edge from; a `right`/`left` stack runs down the edge, a `top`/`bottom` one across it. Pins stack after the pin that reaches furthest along that edge, so an existing gap is left alone rather than filled — one pin on the last slot therefore fills the edge, and the refusal says so rather than suggesting a resize. An occupied slot is never written over, including one held by a pin whose rotation names no edge or one the sheet shrank away from. The whole import is planned and validated before anything is written, and refused entire — nothing written — if it would run past a corner, because KiCad clamps such a pin back onto the box. |
 | `add_sheet_pin` | Manually add a single pin to an existing sheet block. Optional `side` (`right`, `left`, `top`, `bottom`) selects the edge by writing the rotation KiCad reads it from, and makes the call validate `x`/`y` against that edge on both axes, corners included — an off-edge position is refused rather than written and then relocated by KiCad on load. Omitting `side` keeps the previous behavior: rotation `0` and no position check. `x`, `y`, and `side` in the response are read back off the saved pin. |
 | `edit_sheet_pin` | Rename a pin, change its electrical type, reposition it along the sheet border, or move it to another edge with the optional `side` (`right`, `left`, `top`, `bottom`). `side` is judged against the position the pin ends up with, so `side` and `x`+`y` in one call are checked together. `changed_fields` names only what actually differs — restating the side a pin already has is an honest no-op that writes nothing — alongside `requested_fields` and the `pin` read back off the file. |
+| `rename_schematic_net_label` | Rename a net label in place, by uuid or position, or every label of a net on a sheet or down the hierarchy with its sheet pins; refuses a rename that joins or splits nets unless allowed. |
 | `delete_sheet_pin` | Remove a single pin without touching the rest of the sheet. |
 | `validate_sheet_pins` | Read-only. Walk the sheet tree and report unmatched hierarchical labels/pins and stored pin positions inconsistent with their rotation-selected edge or its span. Geometry findings identify the pin, stored position, expected edge and recovery action; no pins are repaired. |
 
@@ -247,7 +249,8 @@ and Windows servers do not.
 | `set_board_title_block` | Set any of the board's title-block fields — `title`, `date`, `revision`, `company`, `comment_1`..`comment_9`, which `${TITLE}`, `${REVISION}`, `${COMMENT1}` and the like resolve from. An omitted field is kept and an empty string clears it. Writes the open board over IPC (KiCad 10.0.1+, else `unsupported_capability`, never a file fallback), unsaved and without an undo step, or the saved file when KiCad does not hold it. Returns the block read back, `changed` and `source`. |
 | `get_board_extents` | Return the box enclosing the board's items, footprint text excluded. Reads the live board where it can (`board_source`); a saved-file answer names what it could not measure, and a live answer names each item class KiCad would not list (tables and generators on KiCad 10). |
 | `get_layer_list` | Return the board's enabled layers: `name`, `display_name` and a `copper` flag, plus the file-backed `id`, `type` and optional `user_name`. IPC-first, so an unsaved stackup change in a live KiCad is visible; `board_source` (`auto`/`live`/`saved`) selects the board state and `sources` names where each part of the answer came from. |
-| `get_board_stackup` | Read the physical stackup of the board KiCad holds open: each layer's type, thickness and material, dielectric εr and loss tangent, the copper finish, impedance control, edge settings, and the board thickness KiCad computes from the stack. `findings` lists unspecified fabrication values and, given `expected`, every value that differs from it. Live only and read-only; changes are made in Board Setup. |
+| `get_board_stackup` | Read the physical stackup of the board KiCad holds open: each layer's type, thickness and material, dielectric εr and loss tangent, the copper finish, impedance control, edge settings, and the board thickness KiCad computes from the stack. `findings` lists unspecified fabrication values and, given `expected`, every value that differs from it. Live only and read-only; changes are made in Board Setup, or by `set_board_stackup` on a closed board. |
+| `set_board_stackup` | Replace the physical stackup of a board KiCad does not hold open: copper thicknesses (or ounces, read as KiCad reads `oz`), each dielectric's type, thickness, material, εr and loss tangent, solder mask color and thickness, silkscreen color, finish and impedance control; a value left out is the board's, else KiCad's default. The board thickness written is the stack's sum. kicad-cli loads and saves a copy first, and the write is refused unless KiCad reads back every value, or with no kicad-cli. Does not change the copper-layer count. |
 | `add_layer` | Add a new inner copper or technical layer to the board stack. Rejects a non-canonical layer name — KiCad refuses to open a board containing one. Use the canonical name and pass your own label as its user name. |
 | `set_active_layer` | Return `unsupported_capability` without writing: active layer is editor-session state and the bundled stable KiCad IPC protocol exposes no supported mutation/readback. |
 | `add_board_outline` | Add a rectangular Edge.Cuts outline with sharp or circular rounded corners, identically over IPC and file fallback. Appends — clear the old edges with `delete_graphics` first. |
@@ -312,6 +315,7 @@ and Windows servers do not.
 | `create_netclass` | Create or update a netclass in the project's `net_settings` (the sibling `.kicad_pro`, where KiCad keeps netclasses since v7). Never touches the board file. An update changes only the settings named; use `get_netclasses` to look, since naming an unknown class here creates it. |
 | `get_netclasses` | Read every netclass with its settings, its `netclass_patterns` and the board nets those patterns match. Mixed-source: definitions and patterns come from the `.kicad_pro`, the board nets from a live KiCad where one holds the board and from the saved board file otherwise (`board_source` selects that), and `sources` names each. KiCad need not be running. Reports `Default` (marked) and any pattern naming a class that does not exist. |
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |
+| `delete_netclass` | Delete a netclass, or one `netclass_patterns` entry by its exact text, in the `.kicad_pro`, as Board Setup does: a deleted class's patterns move to `Default`, and `Default` cannot be deleted. Schematic netclass labels are reported, not edited. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
 
 ### `placement` · 5 tools
@@ -383,7 +387,7 @@ and Windows servers do not.
 
 ## Integration
 
-### `integration` · 11 tools
+### `integration` · 10 tools
 **Purpose:** JLCPCB parts database, local Freerouting MCP routing, datasheet URLs.
 **Source:** [`crates/copperpour-core/src/tools/integration.rs`](crates/copperpour-core/src/tools/integration.rs)
 
@@ -523,4 +527,4 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ### Regenerating this doc
 
-The tool list is extracted mechanically from the `tool!(...)` invocations in `crates/copperpour-core/src/tools/*.rs`. To regenerate after adding tools, re-run the same extraction and re-verify counts against `registry.rs::ALL_TOOLSETS` — the row count in each table here must equal each toolset's `tool_count`.
+The tool list is extracted mechanically from the `tool!(...)` invocations in `crates/copperpour-core/src/tools/*.rs`. To regenerate after adding tools, re-run the same extraction and leave the counts to `cargo xtask fix-doc-counts`, which runs at release — the row count in each table here must then equal each toolset's `tools()` length.

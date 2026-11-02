@@ -25,7 +25,8 @@ cargo test --workspace --locked --doc
 `crates/schematic-viewer` is outside the workspace, so the commands above never build it.
 If you touched it, also run
 `cargo test --locked --manifest-path crates/schematic-viewer/Cargo.toml`. If you added or
-removed a tool, run `cargo xtask fix-doc-counts` and commit the result.
+removed a tool, add or remove its `tool-directory.md` row but leave the tool counts in the
+docs alone: they move at release.
 
 ## Public API
 

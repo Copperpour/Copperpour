@@ -116,9 +116,10 @@ no item CRUD.
 - Writes refuse while KiCad's `~<name>.kicad_sch.lck` exists. It records only user and
   host, so staleness is unprovable: valid, foreign, empty and malformed locks all fail
   closed. Checked before the journal is created and again at the final write.
-- Multi-file changes use project-local `.konnect-transaction-*.json` write-ahead
+- Multi-file changes use project-local `.copperpour-transaction-*.json` write-ahead
   journals holding full before/after images — sensitive project data. Unix creates them
-  `0600` regardless of umask; elsewhere keep the project directory private.
+  `0600` regardless of umask; elsewhere keep the project directory private. Journals
+  named `.konnect-transaction-*.json` by earlier releases are still recovered.
 - New design files and exports get `0666 & ~umask` on Unix. A replacement keeps the
   destination's mode, so a project an earlier Konnect created stays `0600` until
   `chmod`ed.
@@ -349,10 +350,10 @@ checked readers for domain rules.
 
 1. Add the `tool!(...)` definition to the toolset's `tools()` vec.
 2. Write the `async fn handle_*()` below it.
-3. Update `tool_count` in `registry.rs::ALL_TOOLSETS` (shown by `list_toolboxes`).
-4. If it belongs in the default set, add its toolset to `STARTER_KIT`.
-5. `cargo check`, then `cargo xtask fix-doc-counts` and re-run the tool-directory
-   extraction (see the `tool-directory.md` header).
+3. If it belongs in the default set, add its toolset to `STARTER_KIT`.
+4. `cargo check`, then add its row to `tool-directory.md` (see that file's header).
+   Leave the tool counts in the docs alone: `cargo xtask fix-doc-counts` updates them
+   at release, and `list_toolboxes` counts each toolset's `tools()`.
 
 ## Current Stats
 

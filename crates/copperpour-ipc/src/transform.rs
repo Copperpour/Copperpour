@@ -144,9 +144,14 @@ fn xform_polyset(ps: &mut common::PolySet, xf: &Xform) {
     }
 }
 
-fn xform_graphic_shape(gs: &mut board::BoardGraphicShape, xf: &Xform) -> Result<()> {
+fn xform_graphic_shape(
+    gs: &mut board::BoardGraphicShape,
+    xf: &Xform,
+    reference: &str,
+) -> Result<()> {
     use common::graphic_shape::Geometry;
 
+    let layer = gs.layer();
     let Some(shape) = gs.shape.as_mut() else {
         return Ok(());
     };
@@ -159,13 +164,16 @@ fn xform_graphic_shape(gs: &mut board::BoardGraphicShape, xf: &Xform) -> Result<
             if xf.is_cardinal() {
                 xform_vec2(&mut rect.top_left, xf);
                 xform_vec2(&mut rect.bottom_right, xf);
-            } else if rect.corner_radius.is_some() {
-                // A rounded rectangle can't be represented off-axis; KiCAD
-                // itself converts plain rectangles to polygons here, but has
-                // no lossless form for rounded ones.
+            } else if rect.corner_radius.is_some_and(|r| r.value_nm > 0) {
+                // KiCAD always sends `corner_radius`, 0 for a square corner,
+                // so only a positive radius is rounded. KiCAD approximates a
+                // rotated rounded rectangle with a segmented polygon; refuse
+                // rather than guess its arc tolerance.
                 anyhow::bail!(
-                    "cannot rotate a footprint containing a rounded-rectangle \
-                     graphic by a non-90° angle; use a multiple of 90°"
+                    "cannot rotate footprint '{reference}' by a non-90° angle: its \
+                     rounded-rectangle graphic on {} has no off-axis form; use a \
+                     multiple of 90°",
+                    crate::builders::layer_name(layer).unwrap_or(layer.as_str_name())
                 );
             } else {
                 // Mirror KiCAD's EDA_SHAPE::Rotate: an off-axis rectangle
@@ -269,6 +277,7 @@ fn xform_dimension(dim: &mut board::Dimension, xf: &Xform) {
 /// mandatory fields plus all `definition.items`. Does NOT touch
 /// `fp.position` / `fp.orientation` — the caller sets those.
 pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xform) -> Result<()> {
+    let reference = crate::builders::footprint_reference(fp).to_owned();
     xform_field(&mut fp.reference_field, xf);
     xform_field(&mut fp.value_field, xf);
     xform_field(&mut fp.datasheet_field, xf);
@@ -297,8 +306,8 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
         } else if url == "kiapi.board.types.BoardTextBox" {
             if !xf.is_cardinal() {
                 anyhow::bail!(
-                    "cannot rotate a footprint containing a textbox by a \
-                     non-90° angle; use a multiple of 90°"
+                    "cannot rotate footprint '{reference}' by a non-90° angle: it \
+                     contains a textbox; use a multiple of 90°"
                 );
             }
             let mut tb = board::BoardTextBox::decode(item.value.as_slice())?;
@@ -318,7 +327,7 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
             item.value = field.encode_to_vec();
         } else if url == "kiapi.board.types.BoardGraphicShape" {
             let mut shape = board::BoardGraphicShape::decode(item.value.as_slice())?;
-            xform_graphic_shape(&mut shape, xf)?;
+            xform_graphic_shape(&mut shape, xf, &reference)?;
             item.value = shape.encode_to_vec();
         } else if url == "kiapi.board.types.Zone" {
             let mut zone = board::Zone::decode(item.value.as_slice())?;
@@ -334,7 +343,7 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
             // KiCAD would re-create this item wherever the stale message
             // says it is; refusing beats silently corrupting the board.
             anyhow::bail!(
-                "footprint contains an item of unsupported type '{url}'; \
+                "footprint '{reference}' contains an item of unsupported type '{url}'; \
                  refusing to move/rotate it via IPC to avoid detaching it"
             );
         }
@@ -487,6 +496,84 @@ mod tests {
         }
     }
 
+    /// A rectangle as KiCAD sends it: `EDA_SHAPE::Serialize` always sets
+    /// `corner_radius`, to 0 for a square-cornered one (#224).
+    fn kicad_rectangle(layer: &str, corner_radius_nm: i64) -> prost_types::Any {
+        let mut rect = builders::board_rectangle(layer, 0.05, 99.0, 99.0, 101.0, 101.0, false);
+        if let Some(common::graphic_shape::Geometry::Rectangle(r)) = rect
+            .shape
+            .as_mut()
+            .and_then(|shape| shape.geometry.as_mut())
+        {
+            r.corner_radius = Some(common::Distance {
+                value_nm: corner_radius_nm,
+            });
+        }
+        builders::pack_any(&rect, "kiapi.board.types.BoardGraphicShape")
+    }
+
+    #[test]
+    fn square_cornered_rectangle_with_zero_radius_rotates_to_polygon() {
+        let mut fp = instance_with(vec![kicad_rectangle("F.CrtYd", 0)]);
+
+        let xf = Xform::Rotate {
+            cx_nm: builders::mm_to_nm(100.0),
+            cy_nm: builders::mm_to_nm(100.0),
+            delta_deg: -45.0,
+        };
+        transform_footprint_children(&mut fp, &xf).unwrap();
+
+        let shape = board::BoardGraphicShape::decode(
+            fp.definition.as_ref().unwrap().items[0].value.as_slice(),
+        )
+        .unwrap();
+        let common::graphic_shape::Geometry::Polygon(ps) = shape.shape.unwrap().geometry.unwrap()
+        else {
+            panic!("expected a polygon after a -45° rotation");
+        };
+        let corners: Vec<_> = ps.polygons[0]
+            .outline
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|node| match node.geometry {
+                Some(common::poly_line_node::Geometry::Point(p)) => (p.x_nm, p.y_nm),
+                ref other => panic!("expected a point, got {other:?}"),
+            })
+            .collect();
+        // The 2 mm square around the anchor turns into a diamond whose
+        // corners lie √2 mm (1 414 214 nm) from it.
+        assert_eq!(
+            corners,
+            vec![
+                (100_000_000, 98_585_786),
+                (101_414_214, 100_000_000),
+                (100_000_000, 101_414_214),
+                (98_585_786, 100_000_000),
+            ]
+        );
+    }
+
+    #[test]
+    fn rounded_rectangle_refusal_names_the_footprint_and_layer() {
+        let mut fp = instance_with(vec![kicad_rectangle("F.Fab", 250_000)]);
+        let reference = fp.reference_field.as_mut().unwrap().text.as_mut().unwrap();
+        reference.text.as_mut().unwrap().text = "Y1".to_string();
+        let before = fp.clone();
+
+        let xf = Xform::Rotate {
+            cx_nm: builders::mm_to_nm(100.0),
+            cy_nm: builders::mm_to_nm(100.0),
+            delta_deg: 45.0,
+        };
+        let err = transform_footprint_children(&mut fp, &xf)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'Y1'") && err.contains("F.Fab"), "{err}");
+        assert_eq!(fp.definition, before.definition);
+    }
+
     #[test]
     fn cardinal_rotation_keeps_rectangle_a_rectangle() {
         let rect = builders::pack_any(
@@ -513,19 +600,47 @@ mod tests {
     }
 
     #[test]
+    fn textbox_refusal_names_the_footprint() {
+        let textbox = builders::pack_any(
+            &board::BoardTextBox::default(),
+            "kiapi.board.types.BoardTextBox",
+        );
+        let mut fp = instance_with(vec![textbox]);
+        let reference = fp.reference_field.as_mut().unwrap().text.as_mut().unwrap();
+        reference.text.as_mut().unwrap().text = "U3".to_string();
+
+        let xf = Xform::Rotate {
+            cx_nm: builders::mm_to_nm(100.0),
+            cy_nm: builders::mm_to_nm(100.0),
+            delta_deg: 30.0,
+        };
+        let err = transform_footprint_children(&mut fp, &xf)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'U3'") && err.contains("textbox"), "{err}");
+    }
+
+    #[test]
     fn unknown_item_type_is_rejected_not_corrupted() {
         let bogus = prost_types::Any {
             type_url: "type.googleapis.com/kiapi.board.types.SomethingNew".to_string(),
             value: vec![],
         };
         let mut fp = instance_with(vec![bogus]);
+        let reference = fp.reference_field.as_mut().unwrap().text.as_mut().unwrap();
+        reference.text.as_mut().unwrap().text = "J2".to_string();
 
         let xf = Xform::Translate {
             dx_nm: 1000,
             dy_nm: 0,
         };
-        let err = transform_footprint_children(&mut fp, &xf).unwrap_err();
-        assert!(err.to_string().contains("SomethingNew"));
+        let err = transform_footprint_children(&mut fp, &xf)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("SomethingNew") && err.contains("'J2'"),
+            "{err}"
+        );
     }
 
     #[test]

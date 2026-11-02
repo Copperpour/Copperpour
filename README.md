@@ -136,6 +136,12 @@ copperpour status --client codex
 copperpour uninstall --client codex
 ```
 
+The skill with Copperpour's operating rules is `copperpour`; earlier releases
+installed it as `konnect`. `copperpour init` and `copperpour uninstall` delete
+that old copy's `SKILL.md` and `references/reliability-contract.md` under
+`konnect/`, and the directory once it is empty. A `konnect` that is a link is
+left alone. `copperpour skill konnect` still prints the rules.
+
 MCP server startup never installs or restores guidance. Run `copperpour init`
 explicitly when you want those files installed; after `copperpour uninstall`,
 starting the server leaves them removed.

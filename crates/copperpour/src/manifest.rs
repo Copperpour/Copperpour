@@ -20,7 +20,7 @@ pub struct AgentManifest {
 
 /// A hook-bound skill: triggers before/after specific MCP tool calls.
 /// Installed as a hook entry in `~/.claude/settings.json` that runs
-/// `konnect.exe hook <name>` to emit Claude's structured hook JSON.
+/// `copperpour hook <name>` to emit Claude's structured hook JSON.
 pub struct HookSkillManifest {
     pub name: &'static str,
     pub content: &'static str,
@@ -30,10 +30,17 @@ pub struct HookSkillManifest {
 
 // ─── Skills ──────────────────────────────────────────────────────────────────
 
+/// The skill with Copperpour's operating rules.
+pub const OPERATING_RULES_SKILL: &str = "copperpour";
+
+/// [`OPERATING_RULES_SKILL`]'s name before #239. `copperpour skill` still
+/// accepts it; `init` and `uninstall` remove what was installed under it.
+pub const LEGACY_OPERATING_RULES_SKILL: &str = "konnect";
+
 pub const SKILLS: &[SkillManifest] = &[
     SkillManifest {
-        name: "konnect",
-        content: include_str!("../assets/skills/konnect/SKILL.md"),
+        name: OPERATING_RULES_SKILL,
+        content: include_str!("../assets/skills/copperpour/SKILL.md"),
         references: &[(
             "reliability-contract.md",
             include_str!("../../../docs/RELIABILITY_CONTRACT.md"),

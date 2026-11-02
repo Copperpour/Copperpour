@@ -26,7 +26,9 @@ child sheet, verbatim: its parent instantiates it four times, so every symbol
 carries four `(instances …)` paths. It pins per-sheet-instance numbering.
 `check_schematic_overlaps` also finds one overlap in it, C12 (at
 `(208.28, 67.31)`) over IC2's unit 2 (at `(213.36, 73.66)`), which reports
-7.62 × 0.762 mm and not `0.7620000000000005`.
+7.62 × 0.762 mm and not `0.7620000000000005`. Its text adds two
+`text_overlap`s (#111): R11's and C9's References lie 0.26 mm into R10's and
+R9's bodies.
 
 Byte evidence: this directory is `-text` in `.gitattributes`; never
 eol-normalise these files.

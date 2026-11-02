@@ -1,11 +1,11 @@
 //! The board's physical stackup, read from the board KiCad holds open (#716).
 //!
 //! Read-only by design. KiCad 10 declares `UpdateBoardStackup` but does not
-//! implement it, and #716 settled that Konnect will not write a stackup into a
-//! board file meanwhile: the answer names KiCad's Board Setup as the place to
-//! change one. There is no saved-file fallback either — reading the file's
-//! `(stackup …)` block would be a second parser of KiCad's format — so a board
-//! KiCad does not hold open is refused.
+//! implement it, so the answer names KiCad's Board Setup as the place to change
+//! the stackup of an open board; `set_board_stackup` writes a closed board's
+//! (#78), and has kicad-cli read what it writes. There is no saved-file
+//! fallback, so a board KiCad does not hold open is refused: the answer is
+//! KiCad's own reading of the board.
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -24,14 +24,15 @@ const NOT_SPECIFIED: &str = "Not specified";
 
 /// Thickness is compared to within a micrometre, the finest step a
 /// fabricator's stackup table states.
-const THICKNESS_TOLERANCE_MM: f64 = 0.001;
+pub(super) const THICKNESS_TOLERANCE_MM: f64 = 0.001;
 
 /// εr and loss tangent are compared to within this.
 const PROPERTY_TOLERANCE: f64 = 1e-6;
 
-const BOARD_SETUP_HINT: &str = "Copperpour cannot change a stackup: KiCad 10 declares \
-     UpdateBoardStackup but does not implement it (#716). Change it in KiCad's Board Setup, \
-     under Board Stackup, then read it again.";
+const BOARD_SETUP_HINT: &str = "Copperpour cannot change the stackup of a board KiCad holds \
+     open: KiCad 10 declares UpdateBoardStackup but does not implement it (#716). Change it in \
+     KiCad's Board Setup, under Board Stackup, then read it again; or close the board, use \
+     set_board_stackup, and open it again to read it.";
 
 /// KiCad's own default finish is "None" (`BOARD_STACKUP::BOARD_STACKUP`), and
 /// "None" is also a finish its list offers, so the answer cannot tell a board
@@ -49,7 +50,7 @@ pub(crate) fn tool() -> ToolDef {
          control, edge settings, and the board thickness KiCad computes from the stack. \
          'findings' lists unspecified fabrication values and, given 'expected', every value \
          that differs from it. Live only, with no file fallback; read-only, so changes are \
-         made in Board Setup.",
+         made in Board Setup, or by set_board_stackup on a closed board.",
         json!({
             "type": "object",
             "properties": {
@@ -151,12 +152,12 @@ async fn handle_get_board_stackup(
 
 // ─── The answer ───────────────────────────────────────────────────────────────
 
-fn mm(nm: i64) -> f64 {
+pub(super) fn mm(nm: i64) -> f64 {
     nm as f64 / 1_000_000.0
 }
 
 /// Whether KiCad left a text parameter unset.
-fn unspecified(value: &str) -> bool {
+pub(super) fn unspecified(value: &str) -> bool {
     let value = value.trim();
     value.is_empty() || value.eq_ignore_ascii_case(NOT_SPECIFIED)
 }

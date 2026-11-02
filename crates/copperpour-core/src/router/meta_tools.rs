@@ -523,7 +523,7 @@ async fn handle_list_toolboxes(ctx: &std::sync::Arc<ToolContext>) -> CallToolRes
                 "name": t.name,
                 "description": t.description,
                 "category": t.category,
-                "tool_count": t.tool_count,
+                "tool_count": t.tool_count(),
                 "loaded": loaded,
             })
         })
@@ -683,7 +683,7 @@ async fn handle_get_active_toolsets(ctx: &std::sync::Arc<ToolContext>) -> CallTo
                 json!({
                     "name": meta.name,
                     "description": meta.description,
-                    "tool_count": meta.tool_count
+                    "tool_count": meta.tool_count()
                 })
             })
         })

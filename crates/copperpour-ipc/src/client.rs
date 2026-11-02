@@ -2736,7 +2736,7 @@ impl KiCadIpcClient {
             }
             let fp = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
                 .context("KiCad returned an unreadable footprint instance")?;
-            if footprint_reference(&fp) != reference {
+            if crate::builders::footprint_reference(&fp) != reference {
                 continue;
             }
             if found.is_some() {
@@ -5583,18 +5583,6 @@ fn build_graphic_child(
             builders::pack_any(&text, "kiapi.board.types.BoardText")
         }
     }
-}
-
-/// The reference designator text of a placed footprint, or `""` when the
-/// instance carries no reference field.
-fn footprint_reference(footprint: &kiapi::board::types::FootprintInstance) -> &str {
-    footprint
-        .reference_field
-        .as_ref()
-        .and_then(|field| field.text.as_ref())
-        .and_then(|text| text.text.as_ref())
-        .map(|text| text.text.as_str())
-        .unwrap_or("")
 }
 
 fn header_for(

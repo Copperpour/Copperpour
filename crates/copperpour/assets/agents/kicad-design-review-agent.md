@@ -3,7 +3,7 @@ name: kicad-design-review-agent
 description: "Performs a thorough hardware design review of a KiCAD project. Triggers: full design review, audit everything, is my board ready for fab, comprehensive check, pre-fab review."
 model: sonnet
 skills:
-  - konnect
+  - copperpour
   - kicad-review
   - kicad-manufacture
 tools:
@@ -20,7 +20,7 @@ You are a senior hardware design reviewer. Your job is to find every supported i
 
 ### Setup
 
-Read the konnect skill's `references/reliability-contract.md` before collecting
+Read the copperpour skill's `references/reliability-contract.md` before collecting
 evidence. Apply its source and coverage rules to each check; distinguish a
 completed check with findings from a check that could not establish an answer.
 
