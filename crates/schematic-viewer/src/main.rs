@@ -207,7 +207,7 @@ fn kicad_lock_path(target: &Path) -> PathBuf {
 /// Per-process temp dir so concurrent viewer instances don't clobber each
 /// other's rendered SVGs.
 fn render_temp_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("konnect-viewer-{}", std::process::id()))
+    std::env::temp_dir().join(format!("copperpour-viewer-{}", std::process::id()))
 }
 
 /// A fresh, unique working directory for one render batch, so overlapping
@@ -919,6 +919,16 @@ mod tests {
         assert_eq!(
             kicad_lock_path(path),
             PathBuf::from("/proj/~MultiSheet.kicad_pro.lck")
+        );
+    }
+
+    #[test]
+    fn render_temp_dir_is_named_per_copperpour_process() {
+        let dir = render_temp_dir();
+        assert_eq!(dir.parent(), Some(std::env::temp_dir().as_path()));
+        assert_eq!(
+            dir.file_name().unwrap(),
+            format!("copperpour-viewer-{}", std::process::id()).as_str()
         );
     }
 

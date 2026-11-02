@@ -236,7 +236,7 @@ class NativeSpecctraBridge:
             _write_owner_only_json(self.registration_path, registration)
             self.thread = threading.Thread(
                 target=self.server.serve_forever,
-                name="konnect-native-bridge",
+                name="copperpour-native-bridge",
                 daemon=True,
             )
             self.thread.start()
