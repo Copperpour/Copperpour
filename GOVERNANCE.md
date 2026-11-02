@@ -38,6 +38,24 @@ settings or the `main` ruleset.
   full local gate again after a merge only when the merged tree differs from
   what CI tested, or something on `main` gives a specific reason to.
 
+### While GitHub Actions is disabled (temporary)
+
+GitHub disabled Actions on this repository on 2026-11-01, without a settings
+change on our side. Until it is restored:
+
+- The required checks come from the **Copperpour Local CI** app instead of
+  GitHub Actions: the same `ci.yml` jobs and check names, run on a maintainer's
+  machine against each PR's merge commit. A check's details show the end of
+  its log.
+- **Check & Test on `windows-latest` is not required** until a Windows runner
+  joins local CI. Before merging a change to platform-specific code, a
+  maintainer runs the tests on Windows and says so on the PR.
+- PRs by maintainers run automatically; anyone else's run only after a
+  maintainer approves that exact head.
+
+When Actions is back, the ruleset returns to the GitHub Actions checks and this
+section is removed.
+
 ## Branches and pull requests
 
 The contributor workflow is in
