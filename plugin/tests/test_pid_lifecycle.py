@@ -182,7 +182,7 @@ class ActionPluginIdentity(unittest.TestCase):
             for value in vars(plugin).values()
             if isinstance(value, type) and issubclass(value, base) and value is not base
         ]
-        self.assertEqual(names, ["KonnectPlugin"])
+        self.assertEqual(names, ["CopperpourPlugin"])
 
 
 if __name__ == "__main__":

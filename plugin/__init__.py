@@ -334,9 +334,9 @@ def find_pcb_editor_window():
 
 # ─── KiCAD Action Plugin entry point ─────────────────────────────────────────
 
-# Still `KonnectPlugin`: KiCad stores the toolbar button setting under
-# `<file>/<class name>`, so a rename would reset it for every install.
-class KonnectPlugin(pcbnew.ActionPlugin):
+# KiCad stores the toolbar button setting under `<file>/<class name>`, so
+# renaming this class resets it for every install.
+class CopperpourPlugin(pcbnew.ActionPlugin):
     def defaults(self):
         self.name = "Copperpour"
         self.category = "AI Tools"
@@ -382,4 +382,4 @@ class KonnectPlugin(pcbnew.ActionPlugin):
 
 # Register the plugin with KiCAD
 _sync_native_bridge()
-KonnectPlugin().register()
+CopperpourPlugin().register()
