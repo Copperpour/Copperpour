@@ -1928,10 +1928,18 @@ fn normalized_items(
                     }) {
                         stack.drill = None;
                     }
-                    // Chamfer and anchor settings only mean something for the
-                    // shapes that use them, and KiCad saves them only there.
+                    // Rounding, chamfer and anchor settings only mean something
+                    // for the shapes that use them, and KiCad saves them only
+                    // there. It reports its default rounding, 0.25, on
+                    // circles and rectangles too (#254).
                     for layer in &mut stack.copper_layers {
                         use kiapi::board::types::PadStackShape;
+                        if !matches!(
+                            layer.shape(),
+                            PadStackShape::PssRoundrect | PadStackShape::PssChamferedrect
+                        ) {
+                            layer.corner_rounding_ratio = 0.0;
+                        }
                         if layer.shape() != PadStackShape::PssChamferedrect {
                             layer.chamfer_ratio = 0.0;
                             layer.chamfered_corners = None;
@@ -3245,15 +3253,31 @@ mod tests {
         entry: &str,
         source: &str,
     ) -> (tempfile::TempDir, std::path::PathBuf) {
+        libraries_project(&[(nickname, entry, source)])
+    }
+
+    /// A board beside project libraries holding each `(nickname, entry,
+    /// source)`.
+    fn libraries_project(
+        entries: &[(&str, &str, &str)],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let board = temp.path().join("board.kicad_pcb");
         std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
-        let library_dir = temp.path().join(format!("{nickname}.pretty"));
-        std::fs::create_dir(&library_dir).unwrap();
-        std::fs::write(library_dir.join(format!("{entry}.kicad_mod")), source).unwrap();
+        let mut nicknames = BTreeSet::new();
+        for (nickname, entry, source) in entries {
+            let library_dir = temp.path().join(format!("{nickname}.pretty"));
+            std::fs::create_dir_all(&library_dir).unwrap();
+            std::fs::write(library_dir.join(format!("{entry}.kicad_mod")), source).unwrap();
+            nicknames.insert(*nickname);
+        }
+        let libraries = nicknames
+            .iter()
+            .map(|nickname| format!("(lib (name \"{nickname}\") (type \"KiCad\") (uri \"${{KIPRJMOD}}/{nickname}.pretty\") (options \"\") (descr \"\"))"))
+            .collect::<String>();
         std::fs::write(
             temp.path().join("fp-lib-table"),
-            format!("(fp_lib_table (lib (name \"{nickname}\") (type \"KiCad\") (uri \"${{KIPRJMOD}}/{nickname}.pretty\") (options \"\") (descr \"\")))"),
+            format!("(fp_lib_table {libraries})"),
         )
         .unwrap();
         (temp, board)
@@ -3804,6 +3828,306 @@ mod tests {
         assert!(capture.update_batches.is_empty());
     }
 
+    /// Four stock footprints as KiCad 10.0.8 reported them over IPC (#254).
+    /// Provenance is in `issue_254_ipc.README.md`.
+    const ISSUE_254_CAPTURES: [(&str, &[u8]); 4] = [
+        (
+            "J1",
+            include_bytes!("../../tests/fixtures/issue_254_j1.ipc.bin"),
+        ),
+        (
+            "J2",
+            include_bytes!("../../tests/fixtures/issue_254_j2.ipc.bin"),
+        ),
+        (
+            "H1",
+            include_bytes!("../../tests/fixtures/issue_254_h1.ipc.bin"),
+        ),
+        (
+            "H2",
+            include_bytes!("../../tests/fixtures/issue_254_h2.ipc.bin"),
+        ),
+    ];
+
+    /// The captures' stock libraries as `(nickname, entry, source)`.
+    const ISSUE_254_LIBRARIES: [(&str, &str, &str); 3] = [
+        (
+            "Connector_PinHeader_1.27mm",
+            "PinHeader_2x10_P1.27mm_Vertical",
+            include_str!(
+                "../../tests/fixtures/issue_254_pinheader_2x10_p1.27mm_vertical_kicad10.kicad_mod"
+            ),
+        ),
+        (
+            "Connector_Coaxial",
+            "BNC_TEConnectivity_1478035_Horizontal",
+            include_str!(
+                "../../tests/fixtures/issue_254_bnc_teconnectivity_1478035_horizontal_kicad10.kicad_mod"
+            ),
+        ),
+        (
+            "MountingHole",
+            "MountingHole_3.2mm_M3",
+            include_str!("../../tests/fixtures/issue_254_mountinghole_3.2mm_m3_kicad10.kicad_mod"),
+        ),
+    ];
+
+    fn issue_254_capture(reference: &str) -> kiapi::board::types::FootprintInstance {
+        let (_, bytes) = ISSUE_254_CAPTURES
+            .iter()
+            .find(|(capture, _)| *capture == reference)
+            .unwrap();
+        kiapi::board::types::FootprintInstance::decode(*bytes).unwrap()
+    }
+
+    /// KiCad's report of `reference` and the update its library builds.
+    fn issue_254_refresh(
+        reference: &str,
+    ) -> (
+        kiapi::board::types::FootprintInstance,
+        kiapi::board::types::FootprintInstance,
+    ) {
+        let current = issue_254_capture(reference);
+        let id = current.definition.as_ref().unwrap().id.as_ref().unwrap();
+        let (nickname, entry, source) = ISSUE_254_LIBRARIES
+            .into_iter()
+            .find(|(nickname, entry, _)| {
+                *nickname == id.library_nickname && *entry == id.entry_name
+            })
+            .unwrap();
+        let library = parse_library_footprint(&format!("{nickname}:{entry}"), source).unwrap();
+        let prepared = build_updated_instance(
+            &current,
+            &library,
+            two_layers(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            TextReset::default(),
+        )
+        .unwrap();
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        (current, updated)
+    }
+
+    /// `instance`'s circles as centre and radius point in nm, sorted.
+    fn circle_points(instance: &kiapi::board::types::FootprintInstance) -> Vec<[i64; 4]> {
+        let mut points = instance
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| item.type_url.ends_with("BoardGraphicShape"))
+            .filter_map(|item| {
+                let shape = kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+                    .unwrap()
+                    .shape?;
+                let Some(kiapi::common::types::graphic_shape::Geometry::Circle(circle)) =
+                    shape.geometry
+                else {
+                    return None;
+                };
+                let (center, radius_point) = (circle.center.unwrap(), circle.radius_point.unwrap());
+                Some([
+                    center.x_nm,
+                    center.y_nm,
+                    radius_point.x_nm,
+                    radius_point.y_nm,
+                ])
+            })
+            .collect::<Vec<_>>();
+        points.sort_unstable();
+        points
+    }
+
+    /// `instance` with `edit` applied to the first graphic shape it changes;
+    /// `edit` returns whether it changed one.
+    fn with_first_shape_edited(
+        instance: &kiapi::board::types::FootprintInstance,
+        edit: impl Fn(&mut kiapi::common::types::graphic_shape::Geometry) -> bool,
+    ) -> kiapi::board::types::FootprintInstance {
+        let mut instance = instance.clone();
+        let edited = instance
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .iter_mut()
+            .filter(|item| item.type_url.ends_with("BoardGraphicShape"))
+            .any(|item| {
+                let mut shape =
+                    kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).unwrap();
+                let Some(geometry) = shape
+                    .shape
+                    .as_mut()
+                    .and_then(|shape| shape.geometry.as_mut())
+                else {
+                    return false;
+                };
+                if !edit(geometry) {
+                    return false;
+                }
+                item.value = shape.encode_to_vec();
+                true
+            });
+        assert!(edited, "no shape to edit");
+        instance
+    }
+
+    fn graphics_changed(
+        current: &kiapi::board::types::FootprintInstance,
+        updated: &kiapi::board::types::FootprintInstance,
+    ) -> bool {
+        changed_domains(current, updated)
+            .unwrap()
+            .contains(&ChangedDomain::Graphics)
+    }
+
+    /// H1's circles as KiCad reported them are the library build's to the
+    /// nanometre, so H1 plans no graphics change.
+    #[test]
+    fn h1_circles_match_their_library_exactly() {
+        let (current, updated) = issue_254_refresh("H1");
+        let expected = [
+            [54_000_000, 54_000_000, 57_200_000, 54_000_000],
+            [54_000_000, 54_000_000, 57_450_000, 54_000_000],
+        ];
+        assert_eq!(circle_points(&current), expected);
+        assert_eq!(circle_points(&updated), expected);
+        assert!(!graphics_changed(&current, &updated));
+    }
+
+    /// Synthetic: KiCad's H1 with one circle's radius point moved 1 nm in
+    /// code, drift a board copy can hold (#254). KiCad's DRC compares graphic
+    /// points within 10 nm (`TEST_PT`) and would accept it; the refresh
+    /// compares exactly, so it plans the graphics change that corrects it.
+    #[test]
+    fn a_circle_radius_point_1_nm_off_does_not_match() {
+        let (current, updated) = issue_254_refresh("H1");
+        let drifted = with_first_shape_edited(&current, |geometry| match geometry {
+            kiapi::common::types::graphic_shape::Geometry::Circle(circle) => {
+                circle.radius_point.as_mut().unwrap().x_nm -= 1;
+                true
+            }
+            _ => false,
+        });
+        assert!(graphics_changed(&drifted, &updated));
+    }
+
+    /// No point has a tolerance: J2's graphics as KiCad reported them match
+    /// the library build, and one line end moved 1 nm does not.
+    #[test]
+    fn a_non_circle_point_1_nm_off_does_not_match() {
+        let (current, updated) = issue_254_refresh("J2");
+        assert!(!graphics_changed(&current, &updated));
+        let moved = with_first_shape_edited(&current, |geometry| match geometry {
+            kiapi::common::types::graphic_shape::Geometry::Segment(segment) => {
+                segment.end.as_mut().unwrap().x_nm += 1;
+                true
+            }
+            _ => false,
+        });
+        assert!(graphics_changed(&moved, &updated));
+    }
+
+    /// Whether `definition`'s pads, as KiCad reported them, compare equal to
+    /// the same pads with `edit` applied to each copper layer of `shape`.
+    fn pads_match_after(
+        definition: &kiapi::board::types::Footprint,
+        shape: kiapi::board::types::PadStackShape,
+        edit: impl Fn(&mut kiapi::board::types::PadStackLayer),
+    ) -> bool {
+        let mut edited = definition.clone();
+        let mut layers = 0;
+        for item in &mut edited.items {
+            if !item.type_url.ends_with("kiapi.board.types.Pad") {
+                continue;
+            }
+            let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+            for layer in &mut pad.pad_stack.as_mut().unwrap().copper_layers {
+                if layer.shape() == shape {
+                    edit(layer);
+                    layers += 1;
+                }
+            }
+            item.value = pad.encode_to_vec();
+        }
+        assert!(layers > 0, "no {shape:?} pad");
+        normalized_items(definition, "Pad").unwrap() == normalized_items(&edited, "Pad").unwrap()
+    }
+
+    /// KiCad reports its default rounding, 0.25, on J1's circular pads and
+    /// its rectangular pin 1, where the builder leaves 0 (#254).
+    #[test]
+    fn a_pad_differing_only_in_a_rounding_its_shape_does_not_use_matches() {
+        let j1 = issue_254_capture("J1").definition.unwrap();
+        for shape in [
+            kiapi::board::types::PadStackShape::PssCircle,
+            kiapi::board::types::PadStackShape::PssRectangle,
+        ] {
+            assert!(
+                pads_match_after(&j1, shape, |layer| {
+                    assert_eq!(layer.corner_rounding_ratio, 0.25);
+                    layer.corner_rounding_ratio = 0.0;
+                }),
+                "{shape:?}"
+            );
+        }
+    }
+
+    /// KiCad 10.0.6's rounded-rectangle `C_0603_1608Metric` pads: none of
+    /// #254's stock footprints has one.
+    #[test]
+    fn a_rounded_rectangle_pad_whose_rounding_differs_does_not_match() {
+        let c_0603 = c_0603_capture("loaded_front_0").definition.unwrap();
+        assert!(!pads_match_after(
+            &c_0603,
+            kiapi::board::types::PadStackShape::PssRoundrect,
+            |layer| layer.corner_rounding_ratio += 0.05
+        ));
+    }
+
+    /// Through the served dispatch, KiCad 10.0.8's own report of four stock
+    /// footprints (#254). J1, J2 and H1 are as the library ships them and
+    /// plan nothing. H2 had its position-file and BOM exclusions cleared on
+    /// the board and plans exactly that.
+    #[tokio::test]
+    async fn served_dry_run_plans_only_real_library_differences() {
+        // The mock answers a 2-layer stack, as KiCad did for this board.
+        let enabled_layers = kiapi::board::commands::BoardEnabledLayersResponse::decode(
+            include_bytes!("../../tests/fixtures/issue_254_enabled_layers.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        assert_eq!(enabled_layers.copper_layer_count, 2);
+        let (_temp, board) = libraries_project(&ISSUE_254_LIBRARIES);
+        let footprints = ISSUE_254_CAPTURES
+            .iter()
+            .map(|(_, bytes)| prost_types::Any {
+                type_url: "type.googleapis.com/kiapi.board.types.FootprintInstance".to_string(),
+                value: bytes.to_vec(),
+            })
+            .collect();
+        let mock = spawn_planner_mock_keeping(&board, footprints, false, true);
+        let handler = served(&mock.url).await;
+
+        let body = result_json(&served_call(&handler, serde_json::json!({ "board": board })).await);
+        assert_eq!(body["status"], "ready", "{body}");
+        assert_eq!(body["coverage"]["selected"]["planned"], 4, "{body}");
+        assert_eq!(body["coverage"]["unchanged"]["planned"], 3, "{body}");
+        assert_eq!(body["coverage"]["changed"]["planned"], 1, "{body}");
+        let changes = body["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1, "{body}");
+        assert_eq!(changes[0]["reference"], "H2");
+        assert_eq!(
+            changes[0]["changed_domains"],
+            serde_json::json!(["attributes"])
+        );
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 0);
+        assert!(capture.update_batches.is_empty());
+    }
+
     #[tokio::test]
     async fn apply_without_a_reviewed_revision_is_rejected_before_ipc() {
         let temp = tempfile::tempdir().unwrap();
@@ -3890,14 +4214,14 @@ mod tests {
         footprint: prost_types::Any,
         fail_update: bool,
     ) -> PlannerMock {
-        spawn_planner_mock_keeping(board, footprint, fail_update, true)
+        spawn_planner_mock_keeping(board, vec![footprint], fail_update, true)
     }
 
     /// `keeps_updates` off answers later reads with the board as it was, like
     /// a KiCad that accepted the update but dropped what it could not take.
     fn spawn_planner_mock_keeping(
         board: &Path,
-        footprint: prost_types::Any,
+        footprints: Vec<prost_types::Any>,
         fail_update: bool,
         keeps_updates: bool,
     ) -> PlannerMock {
@@ -3918,7 +4242,7 @@ mod tests {
         let capture = std::sync::Arc::new(std::sync::Mutex::new(MutationCapture::default()));
         let captured = capture.clone();
         let thread = std::thread::spawn(move || {
-            let mut footprints = vec![footprint];
+            let mut footprints = footprints;
             while let Ok(message) = socket.recv() {
                 let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
                 let message = request.message.expect("request message");
@@ -4407,7 +4731,7 @@ mod tests {
         keeps_updates: bool,
     ) -> (crate::mcp::protocol::CallToolResult, PlannerMock) {
         let (_temp, board, items) = plan_fixture();
-        let mock = spawn_planner_mock_keeping(&board, items[2].clone(), false, keeps_updates);
+        let mock = spawn_planner_mock_keeping(&board, vec![items[2].clone()], false, keeps_updates);
         let handler = served(&mock.url).await;
         let arguments = serde_json::json!({
             "board": board,
