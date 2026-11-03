@@ -649,6 +649,81 @@ fn accepted_update_without_matching_readback_is_uncertain() {
     ));
 }
 
+fn placement(reference: &str) -> copperpour_ipc::types::IpcFootprintPlacement {
+    copperpour_ipc::types::IpcFootprintPlacement {
+        reference: reference.to_string(),
+        x: 50.0,
+        y: 50.0,
+        rotation: 0.0,
+    }
+}
+
+/// The refusal Copperpour typed for `error`, as a caller classifies it.
+fn preflight_cause(error: anyhow::Error) -> copperpour_ipc::PreflightCause {
+    match copperpour_ipc::IpcFailure::from_error(error) {
+        copperpour_ipc::IpcFailure::Preflight(refusal) => {
+            assert!(
+                !refusal.reason.contains("KiCad batch failed"),
+                "{}",
+                refusal.reason
+            );
+            refusal.cause
+        }
+        other => panic!("expected Copperpour's own refusal, got {other:?}"),
+    }
+}
+
+/// A reference the board does not hold, or holds twice, is refused by the
+/// batch itself inside its commit, before `UpdateItems`, as Copperpour's own
+/// refusal (#240). The served tools refuse both in the copper check first;
+/// this guards the batch when the board changes between the two reads.
+#[test]
+fn placement_batch_refuses_a_reference_missing_or_held_twice_before_any_update() {
+    let (mock, captured) = spawn_footprints_mock(vec![mk_footprint_r1()]);
+    let client = KiCadIpcClient::new(&mock.url);
+    let error = client
+        .set_footprint_placements(&[placement("R1"), placement("R9")])
+        .unwrap_err();
+    assert_eq!(
+        preflight_cause(error),
+        copperpour_ipc::PreflightCause::MissingReferences {
+            references: vec!["R9".to_string()]
+        }
+    );
+    assert!(captured.lock().unwrap().is_none(), "UpdateItems was sent");
+
+    let (mock, captured) = spawn_footprints_mock(vec![mk_footprint_r1(), mk_footprint_r1()]);
+    let client = KiCadIpcClient::new(&mock.url);
+    let error = client
+        .set_footprint_placements(&[placement("R1")])
+        .unwrap_err();
+    assert_eq!(
+        preflight_cause(error),
+        copperpour_ipc::PreflightCause::DuplicateReference {
+            reference: "R1".to_string()
+        }
+    );
+    assert!(captured.lock().unwrap().is_none(), "UpdateItems was sent");
+}
+
+#[test]
+fn move_and_rotate_refuse_a_missing_reference_before_any_update() {
+    let (mock, captured) = spawn_footprint_mock(mk_footprint_r1());
+    let client = KiCadIpcClient::new(&mock.url);
+    let missing = || copperpour_ipc::PreflightCause::MissingReferences {
+        references: vec!["R9".to_string()],
+    };
+    assert_eq!(
+        preflight_cause(client.move_footprint("R9", 1.0, 2.0).unwrap_err()),
+        missing()
+    );
+    assert_eq!(
+        preflight_cause(client.rotate_footprint("R9", 90.0).unwrap_err()),
+        missing()
+    );
+    assert!(captured.lock().unwrap().is_none(), "UpdateItems was sent");
+}
+
 #[test]
 fn model_target_must_be_present_and_unique() {
     let (missing_mock, _) = spawn_footprints_mock(vec![]);

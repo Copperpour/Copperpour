@@ -8,7 +8,9 @@ use crate::hex::encode_hex;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
-use crate::tools::pcb_board::{attempt_ipc_write, attempt_ipc_write_in, BoardWrite, NoLiveBoard};
+use crate::tools::pcb_board::{
+    attempt_ipc_write, attempt_ipc_write_naming, BoardWrite, NoLiveBoard,
+};
 use crate::tools::pcb_copper_check::{self, CheckOptions, Checked, PoseRequest};
 use crate::tools::{
     get_path, require_array, require_f64, require_str, require_u64, with_board_ipc_classified,
@@ -47,9 +49,14 @@ macro_rules! ipc {
             Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
                 return Ok(crate::tools::ipc_target_error_result(&error))
             }
-            Err(copperpour_ipc::IpcFailure::Rejected(msg)) => {
-                return Ok(CallToolResult::error(msg))
-            }
+            // No closure given to this raises a refusal of its own (#240).
+            Err(
+                copperpour_ipc::IpcFailure::Rejected(msg)
+                | copperpour_ipc::IpcFailure::Preflight(copperpour_ipc::PreflightRefusal {
+                    reason: msg,
+                    ..
+                }),
+            ) => return Ok(CallToolResult::error(msg)),
             Err(copperpour_ipc::IpcFailure::Recovered(msg)) => {
                 return Ok(crate::tools::ipc_recovered_result(&msg))
             }
@@ -2706,11 +2713,18 @@ async fn handle_move_component(
         x_mm: x,
         y_mm: y,
     }];
-    match attempt_ipc_write_in(ctx, &board, "move", move |c, document| {
-        pcb_copper_check::check_then_apply(c, document, &requests, options, |c| {
-            c.move_footprint(&ref_ipc, x, y)
-        })
-    })
+    let named = requests.clone();
+    match attempt_ipc_write_naming(
+        ctx,
+        &board,
+        "move",
+        move |refusal| pcb_copper_check::refusal_kind("move_component", &named, refusal),
+        move |c, document| {
+            pcb_copper_check::check_then_apply(c, document, &requests, options, |c| {
+                c.move_footprint(&ref_ipc, x, y)
+            })
+        },
+    )
     .await?
     {
         BoardWrite::Ipc(Checked::Applied { check, .. }) => Ok(
@@ -2828,11 +2842,18 @@ async fn handle_rotate_component(
         reference: reference.clone(),
         rotation_deg: rotation,
     }];
-    match attempt_ipc_write_in(ctx, &board, "rotation", move |c, document| {
-        pcb_copper_check::check_then_apply(c, document, &requests, options, |c| {
-            c.rotate_footprint(&ref_ipc, rotation)
-        })
-    })
+    let named = requests.clone();
+    match attempt_ipc_write_naming(
+        ctx,
+        &board,
+        "rotation",
+        move |refusal| pcb_copper_check::refusal_kind("rotate_component", &named, refusal),
+        move |c, document| {
+            pcb_copper_check::check_then_apply(c, document, &requests, options, |c| {
+                c.rotate_footprint(&ref_ipc, rotation)
+            })
+        },
+    )
     .await?
     {
         BoardWrite::Ipc(Checked::Applied { check, .. }) => Ok(check.applied_result(json!({
@@ -2945,10 +2966,12 @@ async fn handle_set_component_placements(
 
     let placements_ipc = placements.clone();
     let requests: Vec<_> = placements.iter().cloned().map(PoseRequest::Set).collect();
-    match attempt_ipc_write_in(
+    let named = requests.clone();
+    match attempt_ipc_write_naming(
         ctx,
         &board,
         "component placement batch",
+        move |refusal| pcb_copper_check::refusal_kind("set_component_placements", &named, refusal),
         move |client, document| {
             pcb_copper_check::check_then_apply(client, document, &requests, options, |client| {
                 client.set_footprint_placements(&placements_ipc)
@@ -3925,7 +3948,14 @@ async fn handle_get_component_pads(
         Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
             return Ok(crate::tools::ipc_target_error_result(&error));
         }
-        Err(copperpour_ipc::IpcFailure::Rejected(message)) => {
+        // Reading the pads raises no refusal of Copperpour's own (#240).
+        Err(
+            copperpour_ipc::IpcFailure::Rejected(message)
+            | copperpour_ipc::IpcFailure::Preflight(copperpour_ipc::PreflightRefusal {
+                reason: message,
+                ..
+            }),
+        ) => {
             return Ok(CallToolResult::error(message));
         }
         Err(copperpour_ipc::IpcFailure::Recovered(message)) => {
@@ -4272,14 +4302,20 @@ async fn handle_align_components(
         Err(e) => return Ok(e),
     };
 
+    let named = references.clone();
     let aligned = match with_board_ipc_classified(ctx, &board, move |c, _| {
         c.run_commit("Align footprints", |c| {
             references
                 .iter()
                 .map(|reference| {
-                    let footprint = c
-                        .get_footprint(reference)?
-                        .with_context(|| format!("footprint '{reference}' not found"))?;
+                    let footprint = c.get_footprint(reference)?.ok_or_else(|| {
+                        copperpour_ipc::PreflightRefusal::new(
+                            copperpour_ipc::PreflightCause::MissingReferences {
+                                references: vec![reference.clone()],
+                            },
+                            format!("footprint '{reference}' not found"),
+                        )
+                    })?;
                     let (x, y) = if axis == "y" {
                         (footprint.position.x, value)
                     } else {
@@ -4294,6 +4330,22 @@ async fn handle_align_components(
     .await?
     {
         Ok(aligned) => aligned,
+        // Copperpour's own refusal, inside the commit it then dropped (#240).
+        Err(copperpour_ipc::IpcFailure::Preflight(refusal)) => {
+            let kind = crate::tools::pcb_board::preflight_refusal_kind(
+                "align_components",
+                &refusal,
+                |reference, _| match named.iter().position(|named| named == reference) {
+                    Some(index) => format!("references[{index}]"),
+                    None => "references".to_string(),
+                },
+            );
+            return Ok(crate::tools::pcb_board::preflight_refusal_result(
+                "alignment",
+                &refusal,
+                Some(kind),
+            ));
+        }
         Err(error) => return Ok(CallToolResult::error(format!("IPC align error: {error}"))),
     };
     Ok(CallToolResult::json(
