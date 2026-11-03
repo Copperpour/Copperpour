@@ -862,7 +862,7 @@ mod reload_tests {
     // Only the Linux/Android test below reads it; ungated, it is dead code
     // under `clippy -D warnings` on Windows and macOS.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    const REPLACED_BINARY_CHILD: &str = "KONNECT_TEST_REPLACED_BINARY_CHILD";
+    const REPLACED_BINARY_CHILD: &str = "COPPERPOUR_TEST_REPLACED_BINARY_CHILD";
 
     /// Runs this test binary as the "server" from a link in a scratch dir,
     /// replaces the file at that path with a new inode, then has the child
@@ -883,7 +883,7 @@ mod reload_tests {
                 serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
             };
 
-            // Precondition set by the kernel, not by Konnect.
+            // Precondition set by the kernel, not by Copperpour.
             assert_eq!(
                 std::env::current_exe().unwrap().to_str().unwrap(),
                 format!("{installed_text} (deleted)")

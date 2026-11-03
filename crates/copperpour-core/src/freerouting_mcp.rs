@@ -1,6 +1,6 @@
 //! Local Freerouting MCP orchestration.
 //!
-//! Konnect deliberately does not reimplement the router. It starts the local
+//! Copperpour deliberately does not reimplement the router. It starts the local
 //! Freerouting JAR in its documented headless stdio MCP mode, follows the
 //! server's routing state machine, and returns only compact job evidence.
 

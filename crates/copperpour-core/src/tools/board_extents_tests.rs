@@ -334,7 +334,7 @@ async fn the_classes_kicad_will_not_list_are_named_with_its_answer() {
     );
 }
 
-/// A class Konnect does measure, refused the same way, is named the same way
+/// A class Copperpour does measure, refused the same way, is named the same way
 /// instead of failing a read whose other classes KiCad did answer.
 #[tokio::test]
 async fn a_measured_class_kicad_refuses_is_named_not_dropped() {

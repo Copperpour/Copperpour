@@ -212,7 +212,7 @@ class SettingsDialogFocusTests(unittest.TestCase):
             self.assertIs(found, pcb_editor)
 
     def test_on_save_passes_parent_self_to_messagebox(self):
-        dlg = self.dialog_mod.KonnectSettingsDialog(
+        dlg = self.dialog_mod.CopperpourSettingsDialog(
             parent=None,
             plugin_dir=str(PLUGIN_DIR),
             binary_path="/fake/konnect",
@@ -236,7 +236,7 @@ class SettingsDialogFocusTests(unittest.TestCase):
         def on_stop():
             stop_called[0] = True
 
-        dlg = self.dialog_mod.KonnectSettingsDialog(
+        dlg = self.dialog_mod.CopperpourSettingsDialog(
             parent=None,
             plugin_dir=str(PLUGIN_DIR),
             binary_path="/fake/konnect",
@@ -259,7 +259,7 @@ class SettingsDialogFocusTests(unittest.TestCase):
             self.assertIsNone(dlg._end_modal_code, "EndModal must not be called when callback is present")
 
     def test_on_start_stop_fallback_without_callbacks_calls_endmodal(self):
-        dlg = self.dialog_mod.KonnectSettingsDialog(
+        dlg = self.dialog_mod.CopperpourSettingsDialog(
             parent=None,
             plugin_dir=str(PLUGIN_DIR),
             binary_path="/fake/konnect",

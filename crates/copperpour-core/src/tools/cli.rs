@@ -159,7 +159,7 @@ pub enum OwnershipStatus {
     /// KiCad reported this item without a UUID, so there is nothing to look
     /// up. `owner` is null.
     UuidMissing,
-    /// The item's UUID is not in the board Konnect indexed — a stale report,
+    /// The item's UUID is not in the board Copperpour indexed — a stale report,
     /// or a board saved after the run. `owner` is null.
     NotFound,
     /// The same UUID appears on more than one board item, so file order cannot
@@ -439,7 +439,7 @@ async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Re
 
 /// An export command returning success is necessary but not sufficient: KiCad
 /// can exit successfully without creating the path a caller asked for. Every
-/// path Konnect reports as an artifact passes this check first (#252).
+/// path Copperpour reports as an artifact passes this check first (#252).
 async fn verify_nonempty_file(path: &Path, artifact: &str) -> Result<u64> {
     let metadata = tokio::fs::metadata(path).await.with_context(|| {
         format!(
@@ -871,7 +871,7 @@ fn parse_kicad_version(version: &str) -> Option<(u64, u64, u64)> {
 
 /// Decode `kicad-cli sch erc --format json`.
 ///
-/// A report Konnect does not recognise is an error, never an empty list. Zero
+/// A report Copperpour does not recognise is an error, never an empty list. Zero
 /// violations is what a clean schematic looks like, so a missing `sheets`
 /// array, an empty one, or a sheet without a `violations` array would each
 /// read as "ERC passed" (#581). kicad-cli writes all three for every
@@ -1734,7 +1734,7 @@ fn position_args<'a>(
 /// KiCad 10: `pcb export pos --output <path> --format <fmt> --side <side>
 /// [--units <units>] [--exclude-dnp] <input>`
 ///
-/// KiCad itself omits footprints carrying `exclude_from_pos_files`; Konnect
+/// KiCad itself omits footprints carrying `exclude_from_pos_files`; Copperpour
 /// deliberately leaves that source-of-truth filtering to the exporter rather
 /// than trying to post-process CSV and Gerber output differently.
 pub async fn export_position_file(
@@ -2833,7 +2833,7 @@ mod erc_parse_tests {
         include_str!("../../tests/fixtures/erc_coordinate_scale_kicad10_branch.json");
 
     /// The release upstream fixed kicad#25582 in. Restated here as the promise
-    /// the tests hold Konnect to, deliberately not read from the constant the
+    /// the tests hold Copperpour to, deliberately not read from the constant the
     /// implementation gates on.
     const FIRST_FIXED_KICAD: &str = "10.0.7";
 
@@ -2890,7 +2890,7 @@ mod erc_parse_tests {
             );
             assert!(item.kicad_reported_pos.is_none(), "nothing was withheld");
             // KiCad scales the measurement inside its own violation text the
-            // same way, and Konnect does not rewrite KiCad's prose — so the
+            // same way, and Copperpour does not rewrite KiCad's prose — so the
             // three wire items keep the description KiCad wrote.
             if !description.contains("length") {
                 assert_eq!(&item.description, description);
@@ -3745,7 +3745,7 @@ mod drc_ownership_tests {
             .all(|status| *status == Some(OwnershipStatus::NotFound)));
     }
 
-    /// A board Konnect cannot parse must not cost the caller their DRC results,
+    /// A board Copperpour cannot parse must not cost the caller their DRC results,
     /// but the failed enrichment must remain visible in the response.
     #[test]
     fn an_unparseable_board_marks_ownership_unavailable() {

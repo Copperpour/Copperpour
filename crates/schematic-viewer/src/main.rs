@@ -3,7 +3,7 @@
     windows_subsystem = "windows"
 )]
 
-//! Konnect — Live Schematic Viewer
+//! Copperpour — Live Schematic Viewer
 //!
 //! Watches a .kicad_sch file (and, for hierarchical designs, every sheet
 //! reachable from it), renders each to SVG via kicad-cli, and displays them

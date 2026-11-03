@@ -21,7 +21,7 @@ identity `/`.
 
 ## Regenerating it
 
-Set `KONNECT_CAPTURE_IPC_FIXTURE=1` when running the ignored live test
+Set `COPPERPOUR_CAPTURE_IPC_FIXTURE=1` when running the ignored live test
 `kicad_reports_an_empty_sheet_path_for_a_board_only_footprint` in
 `crates/copperpour-ipc/tests/live_kicad_test.rs`. That test also *verifies* the
 property this capture exists to encode, so a regeneration that changes the

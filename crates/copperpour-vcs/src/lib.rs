@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// Design-file globs a Konnect repository tracks. Everything else — backups,
+/// Design-file globs a Copperpour repository tracks. Everything else — backups,
 /// fab output, cache libraries — is ignored by the vcs_init .gitignore.
 pub const DESIGN_FILE_SUFFIXES: &[&str] = &[".kicad_pro", ".kicad_sch", ".kicad_pcb", ".kicad_dru"];
 

@@ -2302,7 +2302,7 @@ fn record_routed_net(
     }
 }
 
-/// A library footprint the plan wants to place and Konnect could not prepare,
+/// A library footprint the plan wants to place and Copperpour could not prepare,
 /// with every part that needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnpreparedFootprint {
@@ -2545,7 +2545,7 @@ fn apply_symbol_fields(
 
 /// The field KiCad's Update PCB adds for a symbol field the footprint lacks:
 /// hidden, on F.Fab or B.Fab, at the footprint's position and turned with it,
-/// styled as the board's fabrication text and mirrored on the back. Konnect
+/// styled as the board's fabrication text and mirrored on the back. Copperpour
 /// does not read the board's text settings, so this is KiCad's default for
 /// them: 1.0 mm text, 0.15 mm stroke, upright and italic off.
 fn added_symbol_field(
@@ -2564,7 +2564,7 @@ fn added_symbol_field(
 /// PCB only sets their text, since every footprint is constructed with them:
 /// hidden on F.Fab, 1.27 mm, kept upright. That is KiCad's default; with Board
 /// Setup's "Apply board defaults to footprint fields" on, KiCad restyles them,
-/// and Konnect reads neither that option nor the board's text settings.
+/// and Copperpour reads neither that option nor the board's text settings.
 fn mandatory_symbol_field(
     field: &SymbolField,
     position: copperpour_ipc::gen::kiapi::common::types::Vector2,
@@ -3328,10 +3328,10 @@ mod chunk_tests {
     }
 
     #[test]
-    #[ignore = "requires KONNECT_LIVE_CHUNK_BOARD: disposable sole open PCB and KiCad 10.0.6 API"]
+    #[ignore = "requires COPPERPOUR_LIVE_CHUNK_BOARD: disposable sole open PCB and KiCad 10.0.6 API"]
     fn sync_chunk_live_one_undo_restores_entire_board() {
         let board = std::path::PathBuf::from(
-            std::env::var("KONNECT_LIVE_CHUNK_BOARD").expect("disposable board required"),
+            crate::app_dirs::env_var("LIVE_CHUNK_BOARD").expect("disposable board required"),
         );
         let address = std::env::var("KICAD_API_SOCKET")
             .ok()
@@ -4929,7 +4929,7 @@ mod tests {
     /// fixture set that flag true, which made the rename branch below
     /// unreachable from its own tests.
     ///
-    /// Regenerate with `KONNECT_CAPTURE_IPC_FIXTURE=1` on the ignored live
+    /// Regenerate with `COPPERPOUR_CAPTURE_IPC_FIXTURE=1` on the ignored live
     /// test `kicad_reports_an_empty_sheet_path_for_a_board_only_footprint`;
     /// provenance is in the fixture's README.
     const BOARD_ONLY_CAPTURE: &[u8] =
@@ -4966,7 +4966,7 @@ mod tests {
     /// a board KiCad wrote holding two such footprints — and `REF**` is the
     /// library's own string, not one an editing session left behind.
     ///
-    /// Regenerate with `KONNECT_CAPTURE_IPC_FIXTURE=1` on the ignored live
+    /// Regenerate with `COPPERPOUR_CAPTURE_IPC_FIXTURE=1` on the ignored live
     /// test `kicad_reports_the_same_reference_for_two_board_only_footprints`;
     /// provenance is in the fixture's README.
     const SHARED_REFERENCE_CAPTURE: &[u8] =

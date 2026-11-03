@@ -266,7 +266,7 @@ fn without_deleted_suffix(path: PathBuf) -> PathBuf {
     }
 }
 
-/// Probe a Konnect executable for the version it reports. Reload validation
+/// Probe a Copperpour executable for the version it reports. Reload validation
 /// uses the same parser and timeout as installation diagnostics so the two
 /// paths cannot disagree about whether a candidate is runnable.
 #[cfg(unix)]

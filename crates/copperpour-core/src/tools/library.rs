@@ -4082,7 +4082,7 @@ fn validate_graphics(graphics: &[serde_json::Value]) -> Result<(), String> {
             // The schema makes `fill` required on the three closed shapes. The
             // emitter answered a missing one with `(fill (type none))` — an
             // unfilled body where the stock libraries use KiCad's pale
-            // `background`, chosen by Konnect rather than by the caller.
+            // `background`, chosen by Copperpour rather than by the caller.
             serde_json::Value::Null if matches!(kind, "rect" | "circle" | "poly") => {
                 return Err(format!(
                     "graphics[{at}] ({kind}): 'fill' is required and must be \"none\", \"outline\" or \"background\""
@@ -4383,7 +4383,7 @@ mod omitted_rect_pin_tests {
         let report: serde_json::Value =
             serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
         // Optional local evidence only: hosted regression does not require KiCad.
-        if let Some(cli) = std::env::var_os("KONNECT_TEST_SYMBOL_CLI") {
+        if let Some(cli) = crate::app_dirs::env_var("TEST_SYMBOL_CLI") {
             let result = std::process::Command::new(cli)
                 .args(["sym", "upgrade", "--force"])
                 .arg(&path)
@@ -10619,7 +10619,7 @@ mod symbol_source_tests {
     /// Reported on #136: a sheet under `<proj>/sheets/` saw no project library,
     /// because the table was looked for beside the sheet rather than at the
     /// project root. `add_hierarchical_sheet` accepts such a `sheet_file`, so
-    /// this is reachable through Konnect alone.
+    /// this is reachable through Copperpour alone.
     #[test]
     fn a_sheet_in_a_subdirectory_resolves_against_the_project_table() {
         let proj = tempfile::tempdir().unwrap();

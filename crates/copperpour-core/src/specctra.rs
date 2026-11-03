@@ -284,7 +284,7 @@ pub(crate) fn export_dsn(
     })
 }
 
-/// Replace Konnect's deterministic DSN with a KiCad-native DSN while keeping
+/// Replace Copperpour's deterministic DSN with a KiCad-native DSN while keeping
 /// the same fail-closed board profile and rewriting the reverse manifest to
 /// the exact identifiers KiCad emitted. This lets the strict SES importer
 /// remain authoritative instead of trusting a second, looser return path.
@@ -727,7 +727,7 @@ fn correlate_components(
 }
 
 /// A rounded rectangle is judged against its pad; every other shape must be
-/// the one Konnect wrote.
+/// the one Copperpour wrote.
 fn pad_geometry_matches(
     baseline: &[DsnShapeIdentity],
     native: &[DsnShapeIdentity],

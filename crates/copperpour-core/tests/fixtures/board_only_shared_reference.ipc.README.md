@@ -37,7 +37,7 @@ in place and destroys the legacy-format coverage it exists to provide.
 
 ## Regenerating it
 
-Set `KONNECT_CAPTURE_IPC_FIXTURE=1` when running the ignored live test
+Set `COPPERPOUR_CAPTURE_IPC_FIXTURE=1` when running the ignored live test
 `kicad_reports_the_same_reference_for_two_board_only_footprints` in
 `crates/copperpour-ipc/tests/live_kicad_test.rs`. That test also *verifies* the
 properties this capture exists to encode — that the shared reference is

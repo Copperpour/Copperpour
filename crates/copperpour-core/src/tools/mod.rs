@@ -683,7 +683,7 @@ pub(crate) enum BoardBinding<T> {
 
 /// Why KiCad answered a board-targeted call without naming a board.
 ///
-/// Both leave Konnect with no live board, and both are answers rather than
+/// Both leave Copperpour with no live board, and both are answers rather than
 /// transport failures — but only one of them says anything about KiCad's
 /// editors, and the disclosure a caller reads must not claim more than the
 /// status code carried.
@@ -815,7 +815,7 @@ where
 ///
 /// Nothing else records this: a tool that then reads the project files reports
 /// a plain success, and one that fails closed reports an error the user may
-/// read as "KiCad said no" rather than "Konnect never got through". KiCad
+/// read as "KiCad said no" rather than "Copperpour never got through". KiCad
 /// *rejected* the call is a different thing, and is not warned about here.
 fn warn_if_ipc_unreachable(address: &str, error: &anyhow::Error) {
     if !copperpour_ipc::is_transport_unreachable(error) {
@@ -1900,7 +1900,7 @@ mod symbol_block_tests {
     const EESCHEMA_STYLE: &str = "(kicad_sch\n\t(lib_symbols\n\t\t(symbol \"Device:R\"\n\t\t\t(property \"Reference\" \"R\"\n\t\t\t\t(at 2.032 0 90)\n\t\t\t)\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 100 80 0)\n\t\t(property \"Reference\" \"R1\"\n\t\t\t(at 102 78 0)\n\t\t)\n\t\t(property \"Value\" \"10k\"\n\t\t\t(at 102 82 0)\n\t\t)\n\t)\n)\n";
 
     /// Same shape, two-space indented, as this crate's writer emits.
-    const KONNECT_STYLE: &str = "(kicad_sch\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\"\n        (at 2.032 0 90)\n      )\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 100 80 0)\n    (property \"Reference\" \"R1\"\n      (at 102 78 0)\n    )\n  )\n)\n";
+    const COPPERPOUR_STYLE: &str = "(kicad_sch\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\"\n        (at 2.032 0 90)\n      )\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 100 80 0)\n    (property \"Reference\" \"R1\"\n      (at 102 78 0)\n    )\n  )\n)\n";
 
     #[test]
     fn finds_instance_in_tab_indented_file() {
@@ -1917,8 +1917,8 @@ mod symbol_block_tests {
 
     #[test]
     fn finds_instance_in_space_indented_file() {
-        let (start, end) = find_symbol_instance_block(KONNECT_STYLE, "R1").expect("R1 block");
-        assert!(KONNECT_STYLE[start..end].contains("(lib_id \"Device:R\")"));
+        let (start, end) = find_symbol_instance_block(COPPERPOUR_STYLE, "R1").expect("R1 block");
+        assert!(COPPERPOUR_STYLE[start..end].contains("(lib_id \"Device:R\")"));
     }
 
     #[test]
@@ -2962,7 +2962,7 @@ pub(crate) mod schematic_target_tests {
 
     #[test]
     fn relative_target_uses_project_ancestors_above_working_directory() {
-        const CHILD_ROOT: &str = "KONNECT_TEST_OWNERSHIP_CHILD_ROOT";
+        const CHILD_ROOT: &str = "COPPERPOUR_TEST_OWNERSHIP_CHILD_ROOT";
         if let Some(root) = std::env::var_os(CHILD_ROOT) {
             let root = PathBuf::from(root);
             let target = Path::new("ampli_ht.kicad_sch");

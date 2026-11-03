@@ -29,7 +29,7 @@ board-space union from rotation of a local centre. CPL coordinates invert Y
 once, preserve X on both sides, and retain the existing rotation policy.
 
 To reproduce: open a disposable copy of the board, enable IPC, set
-`KONNECT_MIDPOINT_BOARD` to that copy's absolute path and run:
+`COPPERPOUR_MIDPOINT_BOARD` to that copy's absolute path and run:
 
 ```text
 cargo test -p copperpour-core --locked --lib live_native_midpoint_acceptance -- --ignored --nocapture
@@ -38,10 +38,10 @@ cargo test -p copperpour-core --locked --lib live_native_midpoint_acceptance -- 
 The acceptance test reads the live board and exports through real `kicad-cli`.
 `KICAD_CLI_PATH` overrides the CLI executable. Fixture generation is a separate
 ignored test (`live_native_midpoint_fixture`) for a disposable empty board and
-the official installed footprint given by `KONNECT_MIDPOINT_LIBRARY`. Setting
-`KONNECT_MIDPOINT_CENTERED_LIBRARY` names the installed 0805 footprint for that
+the official installed footprint given by `COPPERPOUR_MIDPOINT_LIBRARY`. Setting
+`COPPERPOUR_MIDPOINT_CENTERED_LIBRARY` names the installed 0805 footprint for that
 generator. Setting
-`KONNECT_MIDPOINT_CAPTURE_DIR` during acceptance records the native artifacts;
+`COPPERPOUR_MIDPOINT_CAPTURE_DIR` during acceptance records the native artifacts;
 ordinary CI never regenerates the oracle.
 
 The position-exclusion regression replays these native messages with targeted

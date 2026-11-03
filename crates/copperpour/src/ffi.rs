@@ -77,7 +77,7 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
                 TransportMode::Stdio => {
                     // This server is embedded in the host process. Even on
                     // Unix stdio, current_exe() names that host (for example
-                    // KiCad), not the Konnect cdylib, so in-place reload is a
+                    // KiCad), not the Copperpour cdylib, so in-place reload is a
                     // standalone-binary capability and is not enabled here.
                     run_embedded_stdio(handler).await;
                 }

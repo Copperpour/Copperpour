@@ -569,7 +569,7 @@ fn create_scratch_file(path: &Path) -> Result<(PathBuf, std::fs::File), SexpErro
 ///
 /// So the name is built from the full file name, and carries a process id and
 /// a per-process counter: the file name separates a project's files, the pid
-/// separates concurrent Konnect processes, and the counter separates
+/// separates concurrent Copperpour processes, and the counter separates
 /// concurrent writes within one process.
 fn scratch_path_for(path: &Path) -> PathBuf {
     use std::ffi::OsString;
@@ -862,7 +862,7 @@ pub(crate) mod mode_probe {
     use std::path::{Path, PathBuf};
 
     /// Names the directory the probe writes into.
-    const PROBE_DIRECTORY: &str = "KONNECT_PROBE_DIR";
+    const PROBE_DIRECTORY: &str = "COPPERPOUR_PROBE_DIR";
 
     /// Run `probe` under `umask`, and hand back the directory it wrote into.
     pub(crate) fn run_under_umask(probe: &str, umask: &str) -> tempfile::TempDir {

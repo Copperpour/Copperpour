@@ -45,14 +45,14 @@ no dielectric sub-layers and no specified colours.
 ## Regenerating it
 
 Open a copy of the board in KiCad with its API enabled, and run the ignored live test with
-`KONNECT_CAPTURE_IPC_FIXTURE` set. `live_kicad_test.rs`'s header says how to find the socket.
+`COPPERPOUR_CAPTURE_IPC_FIXTURE` set. `live_kicad_test.rs`'s header says how to find the socket.
 
 ```sh
 cp crates/copperpour-ipc/tests/fixtures/four_layer_stackup_kicad10.kicad_pcb /tmp/live/
 # open /tmp/live/four_layer_stackup_kicad10.kicad_pcb in pcbnew, then:
 KICAD_API_SOCKET=<the editor's socket> \
-KONNECT_LIVE_KICAD_BOARD=/tmp/live/four_layer_stackup_kicad10.kicad_pcb \
-KONNECT_CAPTURE_IPC_FIXTURE=1 \
+COPPERPOUR_LIVE_KICAD_BOARD=/tmp/live/four_layer_stackup_kicad10.kicad_pcb \
+COPPERPOUR_CAPTURE_IPC_FIXTURE=1 \
 cargo test -p copperpour-ipc --test live_kicad_test -- \
   --ignored --exact the_live_stackup_is_the_one_the_board_file_declares
 ```

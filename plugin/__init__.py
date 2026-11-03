@@ -25,7 +25,7 @@ _plugin_dir = os.path.dirname(os.path.abspath(__file__))
 if _plugin_dir not in sys.path:
     sys.path.insert(0, _plugin_dir)
 
-from settings_dialog import KonnectSettingsDialog, load_settings
+from settings_dialog import CopperpourSettingsDialog, load_settings
 from native_bridge import NativeSpecctraBridge, cache_root
 import wx
 
@@ -334,6 +334,8 @@ def find_pcb_editor_window():
 
 # ─── KiCAD Action Plugin entry point ─────────────────────────────────────────
 
+# Still `KonnectPlugin`: KiCad stores the toolbar button setting under
+# `<file>/<class name>`, so a rename would reset it for every install.
 class KonnectPlugin(pcbnew.ActionPlugin):
     def defaults(self):
         self.name = "Copperpour"
@@ -349,7 +351,7 @@ class KonnectPlugin(pcbnew.ActionPlugin):
         """Open the settings dialog. Server start/stop is handled via dialog buttons."""
         parent = find_pcb_editor_window()
 
-        dlg = KonnectSettingsDialog(
+        dlg = CopperpourSettingsDialog(
             parent=parent,
             plugin_dir=PLUGIN_DIR,
             binary_path=BINARY_PATH,

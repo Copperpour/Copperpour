@@ -8,7 +8,7 @@
 //! readiness than "we evaluated it and found problems", because the latter at
 //! least bounds what is wrong.
 //!
-//! The composite verdict maps onto Konnect's existing release vocabulary:
+//! The composite verdict maps onto Copperpour's existing release vocabulary:
 //! anything other than `Pass` composes to the "NOT READY" / "INCOMPLETE"
 //! family — the exact strings stay with the tools that own them
 //! (`validate_for_manufacturing`, `run_design_review`); this module only

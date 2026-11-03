@@ -67,7 +67,7 @@ fn detect_ipc_address_in(
         .map(|path| format_address(path))
 }
 
-/// Whether this socket belongs to the user running Konnect.
+/// Whether this socket belongs to the user running Copperpour.
 ///
 /// A detected socket is adopted as the board endpoint unread, so a path
 /// another account can create is a path another account can be handed the
@@ -127,7 +127,7 @@ const PIPE_NAMESPACE: &str = r"\\.\pipe";
 /// On Windows the endpoint is not a file. NNG maps `ipc://<path>` to the named
 /// pipe `\\.\pipe\<path>`, and with KiCad running the path itself does not
 /// exist while that pipe does. Probing the path therefore answered "no" on
-/// every Windows install, and a client-launched Konnect — the shipped PCM
+/// every Windows install, and a client-launched Copperpour — the shipped PCM
 /// package registered with an MCP client, with no `ipc_address` and no
 /// `KICAD_API_SOCKET` — took the file fallback on every hybrid tool while
 /// KiCad held the board open. That is the one outcome `attempt_ipc_write`'s

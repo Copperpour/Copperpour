@@ -60,7 +60,7 @@ The Specctra import undo boundary has a manual live gate because KiCad IPC can
 create a named commit but cannot invoke the editor's Undo action. Open a
 disposable copy of
 `crates/copperpour-core/tests/fixtures/specctra_two_resistors_locked.kicad_pcb`,
-set `KONNECT_LIVE_SPECCTRA_BOARD`, `KICAD_API_SOCKET`, and (when it is not on
+set `COPPERPOUR_LIVE_SPECCTRA_BOARD`, `KICAD_API_SOCKET`, and (when it is not on
 `PATH`) `KICAD_CLI_PATH`, set `FREEROUTING_JAR` to the local Freerouting 2.3.0
 JAR, then run:
 
@@ -74,8 +74,8 @@ test passes only when the exact pre-import IPC snapshot returns.
 ## Zone deletion live check
 
 Open a disposable board with at least two copper zones in KiCad and enable its
-IPC API. Set `KONNECT_ZONE_TEST_BOARD` to that copy and
-`KONNECT_ZONE_TEST_IPC_ADDRESS` to the endpoint serving it, then run:
+IPC API. Set `COPPERPOUR_ZONE_TEST_BOARD` to that copy and
+`COPPERPOUR_ZONE_TEST_IPC_ADDRESS` to the endpoint serving it, then run:
 
 ```text
 cargo test -p copperpour-core --locked live_zone_delete_on_configured_disposable_board --lib -- --ignored --nocapture

@@ -147,7 +147,7 @@ def detect_kicad_cli():
 
 # ─── Dialog ──────────────────────────────────────────────────────────────────
 
-class KonnectSettingsDialog(wx.Dialog):
+class CopperpourSettingsDialog(wx.Dialog):
     """Settings dialog for the Copperpour plugin."""
 
     def __init__(

@@ -1,4 +1,4 @@
-//! Client-aware installer for Konnect's bundled guidance.
+//! Client-aware installer for Copperpour's bundled guidance.
 //!
 //! Handles explicit client-scoped install, uninstall, status, and Claude hook
 //! integration without writing into another client's directories.
@@ -2262,7 +2262,7 @@ mod tests {
     fn a_client_never_installed_is_not_installed_and_raises_no_notice() {
         let temp = TempDir::new().unwrap();
         let paths = test_paths(&temp);
-        // A broken settings.json alone is not evidence that Konnect installed.
+        // A broken settings.json alone is not evidence that Copperpour installed.
         fs::create_dir_all(paths.claude_settings_path().parent().unwrap()).unwrap();
         fs::write(paths.claude_settings_path(), "{ not json").unwrap();
         for client in [InstallClient::Claude, InstallClient::Codex] {

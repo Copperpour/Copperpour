@@ -2801,7 +2801,7 @@ async fn handle_route_diff_pair(
 /// editor's Undo action. This test therefore performs the complete import,
 /// proves that routing appeared, and then waits for the operator to press
 /// Ctrl+Z once in PCB Editor. It passes only when the exact pre-import IPC
-/// snapshot returns. The UI action is test evidence; Konnect's runtime remains
+/// snapshot returns. The UI action is test evidence; Copperpour's runtime remains
 /// IPC-only.
 #[cfg(test)]
 mod specctra_live_undo_test {
@@ -2857,8 +2857,8 @@ mod specctra_live_undo_test {
     #[ignore = "requires a disposable locked fixture open in KiCad and one manual Ctrl+Z"]
     async fn one_undo_restores_the_exact_pre_import_board_snapshot() {
         let board = std::path::PathBuf::from(
-            std::env::var_os("KONNECT_LIVE_SPECCTRA_BOARD")
-                .expect("set KONNECT_LIVE_SPECCTRA_BOARD to the disposable open board"),
+            crate::app_dirs::env_var("LIVE_SPECCTRA_BOARD")
+                .expect("set COPPERPOUR_LIVE_SPECCTRA_BOARD to the disposable open board"),
         )
         .canonicalize()
         .expect("resolve disposable board");

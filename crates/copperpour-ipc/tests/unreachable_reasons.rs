@@ -1,7 +1,7 @@
 //! Why a Ping never reached KiCad, measured against real endpoints (#532).
 //!
 //! Every case here used to surface as `ipc_responsive: false` with nothing
-//! else. They need different fixes — start KiCad, run Konnect as KiCad's user,
+//! else. They need different fixes — start KiCad, run Copperpour as KiCad's user,
 //! free the address — so each is dialed for real and its typed reason pinned.
 //! No KiCad is involved: the listeners are plain pipes and sockets that behave
 //! the way the failing endpoint does.

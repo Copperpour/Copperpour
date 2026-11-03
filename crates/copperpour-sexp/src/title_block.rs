@@ -16,7 +16,7 @@ use crate::SexpError;
 /// KiCad's Page Settings dialog offers comments 1 to 9.
 pub const COMMENT_COUNT: usize = 9;
 
-/// Field names in KiCad's write order, in Konnect's argument vocabulary:
+/// Field names in KiCad's write order, in Copperpour's argument vocabulary:
 /// `revision` is the file's `rev`, `comment_N` its `(comment N …)`.
 pub const FIELDS: [&str; 4 + COMMENT_COUNT] = [
     "title",

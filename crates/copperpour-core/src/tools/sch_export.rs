@@ -1959,7 +1959,7 @@ mod erc_response_tests {
         );
     }
 
-    /// The `output` file is the copy that leaves Konnect, so it carries the
+    /// The `output` file is the copy that leaves Copperpour, so it carries the
     /// same disclosure the response does. Writing the violation array alone
     /// put corrected — or withheld — coordinates in a file with nothing
     /// saying which.

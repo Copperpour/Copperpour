@@ -851,7 +851,7 @@ struct SheetEdge {
 ///
 /// KiCad would accept the write and then move the pin to the edge the rotation
 /// selects, leaving the tool reporting a position the editor does not use. A
-/// refusal at Konnect's boundary is the only point at which the caller still
+/// refusal at Copperpour's boundary is the only point at which the caller still
 /// learns that the request cannot be carried out.
 fn ensure_pin_is_on_sheet_edge(
     sheet_box: SheetBox,
@@ -3662,7 +3662,7 @@ mod tests {
             "x": 30.0, "y": 30.0
         });
 
-        // The first edit rewrites the sheet in Konnect's own serialisation, so
+        // The first edit rewrites the sheet in Copperpour's own serialisation, so
         // the block round-trips byte-for-byte from here on. That is the state
         // in which the reported error appeared.
         let first = handle_edit_sheet(&move_it, &ctx).await.unwrap();
@@ -6178,7 +6178,7 @@ mod instance_path_lifecycle_tests {
             .clone()
     }
 
-    /// The precondition every later Konnect write to `file` checks.
+    /// The precondition every later Copperpour write to `file` checks.
     fn writable(file: &Path) -> Result<(), String> {
         let mut schematic = cse::Schematic::load(file).unwrap();
         let context = sheet_instance_context(file, &mut schematic).map_err(|e| e.to_string())?;

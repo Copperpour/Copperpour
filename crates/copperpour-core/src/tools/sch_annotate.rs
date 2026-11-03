@@ -1,4 +1,4 @@
-//! `annotate_schematic` (#454): Konnect's own annotator, because kicad-cli has
+//! `annotate_schematic` (#454): Copperpour's own annotator, because kicad-cli has
 //! no `sch annotate`.
 //!
 //! The semantics are eeschema's Tools → Annotate defaults, pinned against

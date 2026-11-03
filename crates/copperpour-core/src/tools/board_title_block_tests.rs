@@ -2,7 +2,7 @@
 //!
 //! The file half runs on pcbnew 10.0.6 saves (`copperpour-sexp/tests/fixtures/
 //! title_block/`): each expected file is KiCad's own save after the same edit,
-//! so a passing test means Konnect wrote the bytes KiCad writes. The live half
+//! so a passing test means Copperpour wrote the bytes KiCad writes. The live half
 //! runs on a KiCad double that keeps one title block, records what each
 //! request names, and can answer as KiCad 10.0.0 does (no `SetTitleBlockInfo`)
 //! or lose a field on the way in.

@@ -1,4 +1,4 @@
-//! One run record per Konnect server process, and the startup sweep that
+//! One run record per Copperpour server process, and the startup sweep that
 //! reaps the records whose owner is gone (#103).
 //!
 //! `server.pid` only ever named the last server started through the Python
@@ -37,7 +37,7 @@
 //! readable on every platform, by a person or by whatever reads these next.
 //!
 //! The sweep deletes *records* and nothing else. It never signals a process.
-//! Konnect is also spawned directly by external MCP clients (Claude Desktop,
+//! Copperpour is also spawned directly by external MCP clients (Claude Desktop,
 //! Cursor) whose servers have legitimately separate lifecycles, so any scheme
 //! that reaches for a kill reaches for one of those too.
 //!
@@ -439,7 +439,7 @@ mod tests {
     /// A registration is unavoidably visible on disk for an instant before it
     /// holds its lock. If that instant is spent under a name the sweep
     /// considers, a concurrent startup reaps a record that is about to become
-    /// live — and Konnect is back to an untracked running server, which is the
+    /// live — and Copperpour is back to an untracked running server, which is the
     /// state this module exists to remove. Two simultaneous launches are the
     /// ordinary case in #103, not a corner.
     ///

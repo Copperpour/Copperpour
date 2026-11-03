@@ -60,8 +60,8 @@ KiCad, with a named net. It creates/saves a via, deletes it without saving,
 proves file-only DRC still reports its UUID, adds an unfilled native copper zone,
 and proves both synchronized tools remove the UUID and compute actual copper
 after refill/save. The fixture needs a line-based board outline and named-net
-copper inside that outline. Set `KONNECT_LIVE_KICAD_BOARD`, `KICAD_API_SOCKET`,
-and `KONNECT_TEST_KICAD_CLI`, then run:
+copper inside that outline. Set `COPPERPOUR_LIVE_KICAD_BOARD`, `KICAD_API_SOCKET`,
+and `COPPERPOUR_TEST_KICAD_CLI`, then run:
 
 ```text
 cargo test -p copperpour-core --locked --lib live_drc_drops_deleted_via_uuid_after_refill_and_save -- --ignored --nocapture --test-threads=1

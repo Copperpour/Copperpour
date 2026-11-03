@@ -1,6 +1,6 @@
 //! Which configuration file configured the running process.
 //!
-//! Konnect selects the **first existing** server configuration file from its
+//! Copperpour selects the **first existing** server configuration file from its
 //! search list and loads only that one; later files are not merged in. Nothing
 //! in the protocol reported which file won, so a user whose settings appeared to
 //! be ignored had no way to tell a shadowed file from a malformed one (#419).

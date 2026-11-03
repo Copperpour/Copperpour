@@ -568,7 +568,7 @@ pub enum UnreachableReason {
     /// The operating system refused this account access to the endpoint.
     /// That proves an authorization refusal, not who owns the endpoint. The
     /// likely causes are an endpoint created by a different account — KiCad as
-    /// the desktop user while a sandboxed client runs Konnect as another — or
+    /// the desktop user while a sandboxed client runs Copperpour as another — or
     /// a restrictive ACL.
     AccessDenied,
     /// A listener accepted the connection but did not complete NNG's
@@ -787,7 +787,7 @@ impl std::fmt::Display for IpcDocumentObservationError {
 
 impl std::error::Error for IpcDocumentObservationError {}
 
-/// KiCad answered for an editor whose documents carry no identity Konnect can
+/// KiCad answered for an editor whose documents carry no identity Copperpour can
 /// address, rather than a malformed one. KiCad 10.x reports an open schematic
 /// by its file name alone: no project and no sheet path. KiCad 11 adds the
 /// schematic editor to its IPC API and reports both (#771). Nothing is
@@ -1067,7 +1067,7 @@ impl KiCadIpcClient {
     /// If empty, tries KICAD_API_SOCKET environment variable.
     ///
     /// This is the last-resort fallback for embedders that construct a client
-    /// directly. Konnect's server resolves the address once at startup — config
+    /// directly. Copperpour's server resolves the address once at startup — config
     /// file, then the env var, then [`crate::socket::detect_ipc_address`] — and
     /// hands the result in, so an empty path here means that resolution already
     /// came up empty.
@@ -2055,7 +2055,7 @@ impl KiCadIpcClient {
     /// Return the effective merged routing rules for every connected net in
     /// one open board.
     ///
-    /// KiCad performs the class-priority merge. Konnect preserves missing
+    /// KiCad performs the class-priority merge. Copperpour preserves missing
     /// protobuf values as `None` so callers can fail closed.
     pub fn get_effective_routing_rules_in(
         &self,
@@ -6204,7 +6204,7 @@ fn select_requested_board(
 /// `board_filename` is documented as "a PCB with a given filename, e.g.
 /// `board.kicad_pcb`", with `ProjectSpecifier.path` supplying the directory —
 /// so a bare name *with* a project path is the ordinary case, and a bare name
-/// *without* one is a record Konnect cannot place on disk.
+/// *without* one is a record Copperpour cannot place on disk.
 fn board_document_identity(
     document: &kiapi::common::types::DocumentSpecifier,
 ) -> std::result::Result<PathBuf, String> {
@@ -6282,7 +6282,7 @@ fn lexically_normalized(path: &Path) -> PathBuf {
 }
 
 /// The first identity that appears twice, if any. KiCad opening one board
-/// twice is not a list Konnect models, so it is not one absence can be read
+/// twice is not a list Copperpour models, so it is not one absence can be read
 /// from either.
 fn first_duplicate<'a>(paths: &[&'a PathBuf]) -> Option<&'a PathBuf> {
     let mut seen = std::collections::HashSet::new();
@@ -6595,10 +6595,18 @@ mod recovery_tests {
     /// The proxy forwards an actual mutation to KiCad, then withholds ONLY
     /// that reply. The rollback must restore actual serialized live state.
     #[test]
-    #[ignore = "requires KONNECT_LIVE_RECOVERY_BOARD (disposable open PCB) and enabled KiCad API"]
+    #[ignore = "requires COPPERPOUR_LIVE_RECOVERY_BOARD (disposable open PCB) and enabled KiCad API"]
     fn bounded_recovery_live_delayed_create_restores_snapshot() {
         let board = PathBuf::from(
-            std::env::var("KONNECT_LIVE_RECOVERY_BOARD").expect("disposable board path required"),
+            // KONNECT_LIVE_RECOVERY_BOARD is the name before the rename; an empty
+            // value counts as unset, as in `copperpour_core::app_dirs::env_var`.
+            [
+                "COPPERPOUR_LIVE_RECOVERY_BOARD",
+                "KONNECT_LIVE_RECOVERY_BOARD",
+            ]
+            .iter()
+            .find_map(|key| std::env::var_os(key).filter(|v| !v.is_empty()))
+            .expect("disposable board path required"),
         );
         let real_address = std::env::var("KICAD_API_SOCKET")
             .ok()
@@ -6947,7 +6955,7 @@ mod document_path_tests {
     }
 
     /// A PCB document identified as something other than a board filename is
-    /// a shape Konnect does not model. It is not a board that is absent.
+    /// a shape Copperpour does not model. It is not a board that is absent.
     #[test]
     fn a_non_board_identifier_is_not_an_identity() {
         let document = kiapi::common::types::DocumentSpecifier {
