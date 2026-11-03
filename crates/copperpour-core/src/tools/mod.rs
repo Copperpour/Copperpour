@@ -47,6 +47,8 @@ pub mod pcb_board;
 mod pcb_board_outline;
 mod pcb_board_zones;
 pub mod pcb_components;
+pub mod pcb_copper;
+mod pcb_copper_apply;
 pub(crate) mod pcb_copper_check;
 pub mod pcb_export;
 pub(crate) mod pcb_footprint_update;
