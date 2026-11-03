@@ -4766,7 +4766,7 @@ mod tests {
     /// with one footprint, plus an empty board. The project fp-lib-table makes
     /// `Resistor_SMD:R_0805_2012Metric` resolve hermetically — no global
     /// table, no environment.
-    fn fallback_fixture(dir: &Path) -> std::path::PathBuf {
+    pub(super) fn fallback_fixture(dir: &Path) -> std::path::PathBuf {
         let pretty = dir.join("Resistor_SMD.pretty");
         std::fs::create_dir_all(&pretty).unwrap();
         std::fs::write(
@@ -8330,5 +8330,173 @@ mod off_axis_rotation_tests {
         let held = store.lock().unwrap();
         assert_eq!(held.updates, 0, "no footprint may be updated");
         assert!(matches!(held_shape(&held), Some(Geometry::Rectangle(_))));
+    }
+}
+
+/// #84: a millimetre value reaches KiCad on the nanometre it names. Each test
+/// drives served `tools/call` against the item-holding KiCad double and
+/// decodes the protobuf KiCad would store. The expected nanometres are
+/// literals, never `mm_to_nm`, so truncation inside the conversion fails them.
+#[cfg(test)]
+mod nanometre_rounding_tests {
+    use crate::tools::pcb_board::board_mock::{spawn_kicad_holding_items, ItemStore};
+    use copperpour_ipc::builders::{any_is, pack_any};
+    use copperpour_ipc::gen::kiapi;
+    use kiapi::board::types::{FootprintInstance, Pad};
+    use prost::Message;
+    use serde_json::{json, Value};
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    /// `tool` called through served dispatch on a KiCad holding `board` and
+    /// the items in `store`.
+    async fn served(
+        board: &Path,
+        store: Arc<Mutex<ItemStore>>,
+        tool: &str,
+        arguments: Value,
+    ) -> (bool, String) {
+        let server = spawn_kicad_holding_items(board, vec![], store, |_| {}, |_, _| None);
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            ipc_address: server.address().to_string(),
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 84, "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .await
+            .unwrap();
+        let result = response.result.unwrap();
+        (
+            result["isError"] == json!(true),
+            result["content"][0]["text"].as_str().unwrap().to_string(),
+        )
+    }
+
+    fn held_footprint(store: &Mutex<ItemStore>) -> FootprintInstance {
+        let held = store.lock().unwrap();
+        assert_eq!(held.items.len(), 1, "KiCad holds one footprint");
+        FootprintInstance::decode(held.items[0].value.as_slice()).unwrap()
+    }
+
+    /// R1 anchored at (100, 100) mm, as KiCad lists it.
+    fn r1_at_100_100() -> prost_types::Any {
+        pack_any(
+            &FootprintInstance {
+                id: Some(kiapi::common::types::Kiid {
+                    value: "r1".to_string(),
+                }),
+                position: Some(kiapi::common::types::Vector2 {
+                    x_nm: 100_000_000,
+                    y_nm: 100_000_000,
+                }),
+                reference_field: Some(kiapi::board::types::Field {
+                    text: Some(kiapi::board::types::BoardText {
+                        text: Some(kiapi::common::types::Text {
+                            text: "R1".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                definition: Some(kiapi::board::types::Footprint::default()),
+                ..Default::default()
+            },
+            "kiapi.board.types.FootprintInstance",
+        )
+    }
+
+    /// The issue's coordinate reached by arithmetic, `128.2 - 5.9`
+    /// (122.29999999999998), and `-4.1` (−4099999.9999999995 nm) arrive as
+    /// 122.3 and −4.1 mm exactly, through both tools that move a footprint.
+    /// Truncation sent 122299999 and −4099999.
+    #[tokio::test]
+    async fn a_moved_footprint_reaches_kicad_on_the_nanometre_asked_for() {
+        let x = 128.2 - 5.9;
+        let y = -4.1;
+        for (tool, arguments) in [
+            (
+                "move_component",
+                json!({ "reference": "R1", "x": x, "y": y }),
+            ),
+            (
+                "set_component_placements",
+                json!({ "placements": [{ "reference": "R1", "x": x, "y": y, "rotation": 0.0 }] }),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("target.kicad_pcb");
+            std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+            let store = Arc::new(Mutex::new(ItemStore {
+                items: vec![r1_at_100_100()],
+                ..Default::default()
+            }));
+            let mut arguments = arguments;
+            arguments["board"] = json!(board.to_string_lossy());
+
+            let (is_error, text) = served(&board, store.clone(), tool, arguments).await;
+
+            assert!(!is_error, "{tool}: {text}");
+            assert_eq!(store.lock().unwrap().updates, 1, "{tool}");
+            let position = held_footprint(&store).position.unwrap();
+            assert_eq!(
+                (position.x_nm, position.y_nm),
+                (122_300_000, -4_100_000),
+                "{tool}"
+            );
+        }
+    }
+
+    /// #238: placing `Resistor_SMD:R_0805_2012Metric`, whose pad is
+    /// `(at -0.9125 0) (size 1.025 1.4)`, at x = 25.4 mm. KiCad must receive
+    /// the library's 1.025 mm as 1025000 nm (truncation sent 1024999, which
+    /// DRC reports as `lib_footprint_mismatch`), and the pad at 25.4 − 0.9125
+    /// = 24.4875 mm (24.487499999999997 in f64) as 24487500 nm.
+    #[tokio::test]
+    async fn a_placed_library_pad_reaches_kicad_at_the_library_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::tests::fallback_fixture(dir.path());
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+
+        let (is_error, text) = served(
+            &board,
+            store.clone(),
+            "place_component",
+            json!({
+                "board": board.to_string_lossy(),
+                "footprint": "Resistor_SMD:R_0805_2012Metric",
+                "reference": "R1",
+                "x": 25.4,
+                "y": 20.0,
+            }),
+        )
+        .await;
+
+        assert!(!is_error, "{text}");
+        assert_eq!(store.lock().unwrap().creates, 1);
+        let footprint = held_footprint(&store);
+        let anchor = footprint.position.unwrap();
+        assert_eq!((anchor.x_nm, anchor.y_nm), (25_400_000, 20_000_000));
+        let pads: Vec<Pad> = footprint
+            .definition
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| any_is(item, "kiapi.board.types.Pad"))
+            .map(|item| Pad::decode(item.value.as_slice()).unwrap())
+            .collect();
+        assert_eq!(pads.len(), 1, "the fixture's one pad");
+        let size = pads[0].pad_stack.as_ref().unwrap().copper_layers[0]
+            .size
+            .unwrap();
+        assert_eq!((size.x_nm, size.y_nm), (1_025_000, 1_400_000));
+        let position = pads[0].position.unwrap();
+        assert_eq!((position.x_nm, position.y_nm), (24_487_500, 20_000_000));
     }
 }

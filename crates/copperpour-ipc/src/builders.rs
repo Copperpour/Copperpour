@@ -5,9 +5,24 @@
 
 use crate::gen::kiapi;
 
-/// Converts millimeters to KiCAD nanometers.
+/// Converts millimeters to KiCAD nanometers, rounded to the nearest one.
+///
+/// Most decimal millimetres are not exact in binary: `4.1 * 1e6` is
+/// `4099999.9999999995`, and `128.2 - 5.9` mm is `122.29999999999998`. A bare
+/// cast truncated those toward zero, KiCad stored the value 1 nm off, and it
+/// showed in read-back, the position file and DRC's `lib_footprint_mismatch`
+/// for a library pad of 1.025 mm (#84, #238). Rounding leaves an exact
+/// product alone and gives any other at most 1 nm from what the cast gave.
+///
+/// A product exactly half-way between two nanometres rounds away from zero
+/// (`f64::round`), the same for both signs: 7812.5 nm becomes 7813 and
+/// −7812.5 nm becomes −7813.
+///
+/// No value is refused here: the cast saturates, so a product beyond `i64`,
+/// and an infinity, becomes `i64::MAX` or `i64::MIN`, and NaN becomes 0.
+/// Callers that must refuse such input check it before converting.
 pub fn mm_to_nm(mm: f64) -> i64 {
-    (mm * 1_000_000.0) as i64
+    (mm * 1_000_000.0).round() as i64
 }
 
 /// Converts KiCAD nanometers to millimeters.
@@ -740,6 +755,72 @@ pub fn board_text_with_stroke_width(
 pub(crate) mod tests {
     use super::*;
     use kiapi::common::types::graphic_shape::Geometry;
+
+    /// #84: 2⁻⁷ mm and 1 + 2⁻⁷ mm are exact in binary, and so are their
+    /// products, 7812.5 and 1007812.5 nm. Exactly half-way rounds away from
+    /// zero; one ulp either side rounds to the nearer nanometre; a negative
+    /// input mirrors its positive one.
+    #[test]
+    fn mm_to_nm_rounds_half_a_nanometre_away_from_zero_for_both_signs() {
+        const SMALL: f64 = 0.0078125;
+        const LARGE: f64 = 1.0078125;
+        for (mm, nm) in [
+            (SMALL.next_down(), 7812),
+            (SMALL, 7813),
+            (SMALL.next_up(), 7813),
+            (-SMALL.next_down(), -7812),
+            (-SMALL, -7813),
+            (-SMALL.next_up(), -7813),
+            (LARGE.next_down(), 1_007_812),
+            (LARGE, 1_007_813),
+            (LARGE.next_up(), 1_007_813),
+            (-LARGE.next_down(), -1_007_812),
+            (-LARGE, -1_007_813),
+            (-LARGE.next_up(), -1_007_813),
+        ] {
+            assert_eq!(mm_to_nm(mm), nm, "{mm:e} mm");
+        }
+    }
+
+    /// #84, #238: decimals that binary cannot hold exactly land on the
+    /// nanometre they name, for both signs, and so does a value KiCad
+    /// reported back. The exact values are controls the change must leave
+    /// alone.
+    #[test]
+    fn mm_to_nm_lands_inexact_decimals_on_the_nanometre_they_name() {
+        for (mm, nm) in [
+            // 4099999.9999999995, 122299999.99999999, 1024999.9999999999,
+            // 7592499.999999999 and 264649999.99999997 nm as products.
+            (4.1, 4_100_000),
+            (128.2 - 5.9, 122_300_000),
+            (1.025, 1_025_000),
+            (6.68 + 0.9125, 7_592_500),
+            (264.65, 264_650_000),
+            // Exact as products.
+            (0.0, 0),
+            (0.000_001, 1),
+            (0.9125, 912_500),
+            (1.0, 1_000_000),
+            (122.3, 122_300_000),
+            (146.268, 146_268_000),
+        ] {
+            assert_eq!(mm_to_nm(mm), nm, "{mm} mm");
+            assert_eq!(mm_to_nm(-mm), -nm, "-{mm} mm");
+            assert_eq!(mm_to_nm(nm_to_mm(nm)), nm, "{nm} nm read back");
+        }
+    }
+
+    /// What the doc comment promises for input no board can hold: the cast
+    /// saturates and NaN becomes 0. Callers that must refuse such input
+    /// check before converting; this conversion decides nothing.
+    #[test]
+    fn mm_to_nm_saturates_beyond_i64_and_maps_nan_to_zero() {
+        assert_eq!(mm_to_nm(f64::NAN), 0);
+        assert_eq!(mm_to_nm(f64::INFINITY), i64::MAX);
+        assert_eq!(mm_to_nm(f64::NEG_INFINITY), i64::MIN);
+        assert_eq!(mm_to_nm(1e300), i64::MAX);
+        assert_eq!(mm_to_nm(-1e300), i64::MIN);
+    }
 
     /// A shape built without a style asks for KiCad's `default`, not the
     /// proto's `SLS_UNKNOWN` (#970).
