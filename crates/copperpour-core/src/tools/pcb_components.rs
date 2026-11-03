@@ -8,7 +8,8 @@ use crate::hex::encode_hex;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
-use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite};
+use crate::tools::pcb_board::{attempt_ipc_write, attempt_ipc_write_in, BoardWrite, NoLiveBoard};
+use crate::tools::pcb_copper_check::{self, CheckOptions, Checked, PoseRequest};
 use crate::tools::{
     get_path, require_array, require_f64, require_str, require_u64, with_board_ipc_classified,
     ToolContext, ToolDef,
@@ -1280,21 +1281,12 @@ pub(crate) fn update_closed_board_footprints(
     // -90), and the response has to say the number the file now holds.
     let mut applied = Vec::with_capacity(placements.len());
     for placement in placements {
-        let root_at = find_direct_child_blocks(&updated, "kicad_pcb")
-            .into_iter()
-            .filter_map(|(start, end)| copperpour_sexp::parse_sexp(&updated[start..end]).ok())
-            .filter(|node| node.head() == Some("footprint"))
-            .find(|node| footprint_reference(node).as_deref() == Some(&placement.reference))
-            .and_then(|node| {
-                let at = node.find("at")?;
-                Some((at.get_f64(1)?, at.get_f64(2)?, at.get_f64(3).unwrap_or(0.0)))
-            })
-            .ok_or_else(|| {
-                ClosedBoardError::Unusable(format!(
-                    "footprint '{}' was updated but cannot be read back from the written board",
-                    placement.reference
-                ))
-            })?;
+        let root_at = footprint_root_at(&updated, &placement.reference).ok_or_else(|| {
+            ClosedBoardError::Unusable(format!(
+                "footprint '{}' was updated but cannot be read back from the written board",
+                placement.reference
+            ))
+        })?;
         applied.push(copperpour_ipc::types::IpcFootprintPlacement {
             reference: placement.reference.clone(),
             x: root_at.0,
@@ -1303,6 +1295,69 @@ pub(crate) fn update_closed_board_footprints(
         });
     }
     Ok(applied)
+}
+
+/// The root `(at x y angle)` of the footprint `reference` in a board's text.
+fn footprint_root_at(content: &str, reference: &str) -> Option<(f64, f64, f64)> {
+    find_direct_child_blocks(content, "kicad_pcb")
+        .into_iter()
+        .filter_map(|(start, end)| copperpour_sexp::parse_sexp(&content[start..end]).ok())
+        .filter(|node| node.head() == Some("footprint"))
+        .find(|node| footprint_reference(node).as_deref() == Some(reference))
+        .and_then(|node| {
+            let at = node.find("at")?;
+            Some((at.get_f64(1)?, at.get_f64(2)?, at.get_f64(3).unwrap_or(0.0)))
+        })
+}
+
+/// A dry run on the closed-file path: the updates are prepared exactly as an
+/// apply prepares them, so the same references and board shapes are refused,
+/// and each footprint's current and target pose is read from the board text
+/// before and after. Nothing is written, and the copper check, which needs a
+/// live KiCad, is reported as not run.
+fn closed_board_dry_run(
+    board_path: &Path,
+    updates: &[(String, FootprintPlacementUpdate)],
+    reason: &NoLiveBoard,
+) -> CallToolResult {
+    let planned = read_consistent(board_path)
+        .map_err(|error| ClosedBoardError::Io(error.into()))
+        .and_then(|content| {
+            let mut updated = content.clone();
+            for (reference, update) in updates {
+                updated = prepare_closed_board_footprint_update(&updated, reference, *update)?;
+            }
+            updates
+                .iter()
+                .map(|(reference, _)| {
+                    let pose = |text: &str| {
+                        footprint_root_at(text, reference)
+                            .map(|(x, y, rotation)| json!({ "x": x, "y": y, "rotation": rotation }))
+                    };
+                    match (pose(&content), pose(&updated)) {
+                        (Some(current), Some(target)) => Ok(json!({
+                            "reference": reference,
+                            "current": current,
+                            "target": target,
+                        })),
+                        _ => Err(ClosedBoardError::Unusable(format!(
+                            "footprint '{reference}' has no readable root placement"
+                        ))),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+        });
+    match planned {
+        Ok(placements) => CallToolResult::json(&json!({
+            "dry_run": true,
+            "count": placements.len(),
+            "placements": placements,
+            "source": "file",
+            "fallback_reason": reason.evidence(),
+            "copper_check": pcb_copper_check::not_run_on_closed_board()
+        })),
+        Err(error) => error.into_result(),
+    }
 }
 
 fn prepare_closed_board_footprint_update(
@@ -2033,14 +2088,29 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "move_component",
             "Move a placed footprint to a new X/Y position. Uses live KiCAD IPC when reachable; \
-             otherwise safely edits a closed board file with revision checks.",
+             otherwise safely edits a closed board file with revision checks. On a live board it \
+             first checks that no moved pad would overlap a via, track or arc of another net \
+             (overlap only, not clearance; zones and other footprints' pads are not checked) and \
+             refuses as plan_blocked, moving nothing, if one would. allow_copper_conflicts applies \
+             anyway; dry_run only reports. The closed-file path cannot run the check and reports \
+             copper_check.status not_run.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":     { "type": "string" },
                     "reference": { "type": "string" },
                     "x":         { "type": "number" },
-                    "y":         { "type": "number" }
+                    "y":         { "type": "number" },
+                    "dry_run": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": pcb_copper_check::DRY_RUN_DESCRIPTION
+                    },
+                    "allow_copper_conflicts": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": pcb_copper_check::ALLOW_COPPER_CONFLICTS_DESCRIPTION
+                    }
                 },
                 "required": ["board", "reference", "x", "y"]
             }),
@@ -2050,13 +2120,28 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "rotate_component",
             "Set the rotation angle of a placed footprint. Uses live KiCAD IPC when reachable; \
-             otherwise safely edits a closed board file with revision checks.",
+             otherwise safely edits a closed board file with revision checks. On a live board it \
+             first checks that no rotated pad would overlap a via, track or arc of another net \
+             (overlap only, not clearance; zones and other footprints' pads are not checked) and \
+             refuses as plan_blocked, moving nothing, if one would. allow_copper_conflicts applies \
+             anyway; dry_run only reports. The closed-file path cannot run the check and reports \
+             copper_check.status not_run.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":     { "type": "string" },
                     "reference": { "type": "string" },
-                    "rotation":  { "type": "number", "description": "Rotation angle in degrees" }
+                    "rotation":  { "type": "number", "description": "Rotation angle in degrees" },
+                    "dry_run": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": pcb_copper_check::DRY_RUN_DESCRIPTION
+                    },
+                    "allow_copper_conflicts": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": pcb_copper_check::ALLOW_COPPER_CONFLICTS_DESCRIPTION
+                    }
                 },
                 "required": ["board", "reference", "rotation"]
             }),
@@ -2065,7 +2150,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "set_component_placements",
-            "Set X/Y positions and rotations for multiple existing footprints atomically. Uses one live KiCAD IPC update and one undo step when reachable; otherwise safely edits a closed board file once with revision checks.",
+            "Set X/Y positions and rotations for multiple existing footprints atomically. Uses one live KiCAD IPC update and one undo step when reachable; otherwise safely edits a closed board file once with revision checks. On a live board it first checks that no moved pad would overlap a via, track or arc of another net (overlap only, not clearance; zones and other footprints' pads, including others in the batch, are not checked) and refuses the whole batch as plan_blocked, moving nothing, if one would. allow_copper_conflicts applies anyway; dry_run only reports. The closed-file path cannot run the check and reports copper_check.status not_run.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2083,6 +2168,16 @@ pub fn tools() -> Vec<ToolDef> {
                             },
                             "required": ["reference", "x", "y", "rotation"]
                         }
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": pcb_copper_check::DRY_RUN_DESCRIPTION
+                    },
+                    "allow_copper_conflicts": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": pcb_copper_check::ALLOW_COPPER_CONFLICTS_DESCRIPTION
                     }
                 },
                 "required": ["board", "placements"]
@@ -2600,16 +2695,35 @@ async fn handle_move_component(
         Err(e) => return Ok(e),
     };
 
+    let options = match CheckOptions::from_args(args) {
+        Ok(options) => options,
+        Err(e) => return Ok(e),
+    };
+
     let ref_ipc = reference.clone();
-    match attempt_ipc_write(ctx, &board, "move", move |c| {
-        c.move_footprint(&ref_ipc, x, y)
+    let requests = vec![PoseRequest::Move {
+        reference: reference.clone(),
+        x_mm: x,
+        y_mm: y,
+    }];
+    match attempt_ipc_write_in(ctx, &board, "move", move |c, document| {
+        pcb_copper_check::check_then_apply(c, document, &requests, options, |c| {
+            c.move_footprint(&ref_ipc, x, y)
+        })
     })
     .await?
     {
-        BoardWrite::Ipc(()) => Ok(CallToolResult::json(
-            &json!({ "moved": reference, "x": x, "y": y, "source": "ipc" }),
-        )),
+        BoardWrite::Ipc(Checked::Applied { check, .. }) => Ok(
+            check.applied_result(json!({ "moved": reference, "x": x, "y": y, "source": "ipc" }))
+        ),
+        BoardWrite::Ipc(Checked::Blocked(check)) => Ok(check.blocked_result("move_component")),
+        BoardWrite::Ipc(Checked::DryRun(check)) => Ok(check.dry_run_result()),
         BoardWrite::Refused(result) => Ok(result),
+        BoardWrite::File(reason) if options.dry_run => Ok(closed_board_dry_run(
+            &board,
+            &[(reference, FootprintPlacementUpdate::Move { x, y })],
+            &reason,
+        )),
         BoardWrite::File(reason) => {
             match update_closed_board_footprint(
                 &board,
@@ -2622,7 +2736,8 @@ async fn handle_move_component(
                     "y": y,
                     "source": "file",
                     "fallback_reason": reason.evidence(),
-                    "warning": reason.warning()
+                    "warning": reason.warning(),
+                    "copper_check": pcb_copper_check::not_run_on_closed_board()
                 }))),
                 Err(error) => Ok(error.into_result()),
             }
@@ -2703,18 +2818,36 @@ async fn handle_rotate_component(
         Err(e) => return Ok(e),
     };
 
+    let options = match CheckOptions::from_args(args) {
+        Ok(options) => options,
+        Err(e) => return Ok(e),
+    };
+
     let ref_ipc = reference.clone();
-    match attempt_ipc_write(ctx, &board, "rotation", move |c| {
-        c.rotate_footprint(&ref_ipc, rotation)
+    let requests = vec![PoseRequest::Rotate {
+        reference: reference.clone(),
+        rotation_deg: rotation,
+    }];
+    match attempt_ipc_write_in(ctx, &board, "rotation", move |c, document| {
+        pcb_copper_check::check_then_apply(c, document, &requests, options, |c| {
+            c.rotate_footprint(&ref_ipc, rotation)
+        })
     })
     .await?
     {
-        BoardWrite::Ipc(()) => Ok(CallToolResult::json(&json!({
+        BoardWrite::Ipc(Checked::Applied { check, .. }) => Ok(check.applied_result(json!({
             "rotated": reference,
             "rotation": rotation,
             "source": "ipc"
         }))),
+        BoardWrite::Ipc(Checked::Blocked(check)) => Ok(check.blocked_result("rotate_component")),
+        BoardWrite::Ipc(Checked::DryRun(check)) => Ok(check.dry_run_result()),
         BoardWrite::Refused(result) => Ok(result),
+        BoardWrite::File(reason) if options.dry_run => Ok(closed_board_dry_run(
+            &board,
+            &[(reference, FootprintPlacementUpdate::Rotate { rotation })],
+            &reason,
+        )),
         BoardWrite::File(reason) => {
             match update_closed_board_footprint(
                 &board,
@@ -2726,7 +2859,8 @@ async fn handle_rotate_component(
                     "rotation": rotation,
                     "source": "file",
                     "fallback_reason": reason.evidence(),
-                    "warning": reason.warning()
+                    "warning": reason.warning(),
+                    "copper_check": pcb_copper_check::not_run_on_closed_board()
                 }))),
                 Err(error) => Ok(error.into_result()),
             }
@@ -2804,26 +2938,60 @@ async fn handle_set_component_placements(
         Err(error) => return Ok(error),
     };
 
+    let options = match CheckOptions::from_args(args) {
+        Ok(options) => options,
+        Err(error) => return Ok(error),
+    };
+
     let placements_ipc = placements.clone();
-    match attempt_ipc_write(ctx, &board, "component placement batch", move |client| {
-        client.set_footprint_placements(&placements_ipc)
-    })
+    let requests: Vec<_> = placements.iter().cloned().map(PoseRequest::Set).collect();
+    match attempt_ipc_write_in(
+        ctx,
+        &board,
+        "component placement batch",
+        move |client, document| {
+            pcb_copper_check::check_then_apply(client, document, &requests, options, |client| {
+                client.set_footprint_placements(&placements_ipc)
+            })
+        },
+    )
     .await?
     {
-        BoardWrite::Ipc(applied) => Ok(CallToolResult::json(&json!({
+        BoardWrite::Ipc(Checked::Applied { applied, check }) => Ok(check.applied_result(json!({
             "count": applied.len(),
             "placements": applied,
             "source": "ipc",
             "undo": "One KiCad undo step reverses the whole placement batch."
         }))),
+        BoardWrite::Ipc(Checked::Blocked(check)) => {
+            Ok(check.blocked_result("set_component_placements"))
+        }
+        BoardWrite::Ipc(Checked::DryRun(check)) => Ok(check.dry_run_result()),
         BoardWrite::Refused(result) => Ok(result),
+        BoardWrite::File(reason) if options.dry_run => {
+            let updates: Vec<_> = placements
+                .iter()
+                .map(|placement| {
+                    (
+                        placement.reference.clone(),
+                        FootprintPlacementUpdate::Set {
+                            x: placement.x,
+                            y: placement.y,
+                            rotation: placement.rotation,
+                        },
+                    )
+                })
+                .collect();
+            Ok(closed_board_dry_run(&board, &updates, &reason))
+        }
         BoardWrite::File(reason) => match update_closed_board_footprints(&board, &placements) {
             Ok(applied) => Ok(CallToolResult::json(&json!({
                 "count": applied.len(),
                 "placements": applied,
                 "source": "file",
                 "fallback_reason": reason.evidence(),
-                "warning": reason.warning()
+                "warning": reason.warning(),
+                "copper_check": pcb_copper_check::not_run_on_closed_board()
             }))),
             Err(error) => Ok(error.into_result()),
         },

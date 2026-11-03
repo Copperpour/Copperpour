@@ -351,6 +351,56 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
     Ok(())
 }
 
+/// The transforms that carry a footprint's children from the pose KiCad
+/// holds it at to `position` and `rotation_deg`: a rotation about the held
+/// anchor by the change in orientation, then a translation by the change in
+/// position. A step that changes nothing is left out.
+///
+/// `KiCadIpcClient::set_footprint_placements` moves the children by exactly
+/// these, and the placement copper check (#96) moves KiCad's pad outlines by
+/// them, so the check tests the copper where the placement will put it.
+pub fn placement_xforms(
+    fp: &board::FootprintInstance,
+    position: common::Vector2,
+    rotation_deg: f64,
+) -> Vec<Xform> {
+    let old_position = fp.position.unwrap_or_default();
+    let old_rotation = fp
+        .orientation
+        .as_ref()
+        .map(|angle| angle.value_degrees)
+        .unwrap_or(0.0);
+    let mut xforms = Vec::with_capacity(2);
+    let rotation_delta = rotation_deg - old_rotation;
+    if rotation_delta != 0.0 {
+        xforms.push(Xform::Rotate {
+            cx_nm: old_position.x_nm,
+            cy_nm: old_position.y_nm,
+            delta_deg: rotation_delta,
+        });
+    }
+    let (dx_nm, dy_nm) = (
+        position.x_nm - old_position.x_nm,
+        position.y_nm - old_position.y_nm,
+    );
+    if dx_nm != 0 || dy_nm != 0 {
+        xforms.push(Xform::Translate { dx_nm, dy_nm });
+    }
+    xforms
+}
+
+/// Move a polygon KiCad reported in board coordinates by `xf`, node by node,
+/// as a footprint's own polygon children move: points directly, arcs by
+/// their start, mid and end.
+pub fn transform_polygon(polygon: &mut common::PolygonWithHoles, xf: &Xform) {
+    if let Some(outline) = polygon.outline.as_mut() {
+        xform_polyline(outline, xf);
+    }
+    for hole in polygon.holes.iter_mut() {
+        xform_polyline(hole, xf);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

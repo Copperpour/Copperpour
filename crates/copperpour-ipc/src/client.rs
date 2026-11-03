@@ -2796,6 +2796,106 @@ impl KiCadIpcClient {
         Ok(found)
     }
 
+    /// Each pad's copper outline on `layer` as KiCad computes it
+    /// (`GetPadShapeAsPolygon`), in the order of `pad_ids`.
+    ///
+    /// KiCad answers for a layer a pad has no copper on as well: 10.0.8
+    /// returned an SMD pad's F.Cu outline when asked for B.Cu. An outline
+    /// coming back therefore says nothing about presence; ask
+    /// [`Self::check_padstack_presence_in`] which layers hold copper. Every
+    /// pad asked for must be answered exactly once, because a missing outline
+    /// is not an empty one.
+    pub fn get_pad_shapes_as_polygons_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        pad_ids: &[String],
+        layer: kiapi::board::types::BoardLayer,
+    ) -> Result<Vec<kiapi::common::types::PolygonWithHoles>> {
+        if pad_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let layer_label = crate::builders::layer_name(layer).unwrap_or(layer.as_str_name());
+        let command = kiapi::board::commands::GetPadShapeAsPolygon {
+            board: Some(document),
+            pads: pad_ids
+                .iter()
+                .map(|id| kiapi::common::types::Kiid { value: id.clone() })
+                .collect(),
+            layer: layer as i32,
+        };
+        let response: kiapi::board::commands::PadShapeAsPolygonResponse = unpack_required(
+            self.send_command(&command, "kiapi.board.commands.GetPadShapeAsPolygon")?,
+            "GetPadShapeAsPolygon",
+        )?;
+        anyhow::ensure!(
+            response.pads.len() == response.polygons.len(),
+            "KiCad's pad outlines on {layer_label} pair {} pads with {} outlines",
+            response.pads.len(),
+            response.polygons.len()
+        );
+        let mut by_pad = std::collections::HashMap::new();
+        for (pad, polygon) in response.pads.into_iter().zip(response.polygons) {
+            anyhow::ensure!(
+                by_pad.insert(pad.value.clone(), polygon).is_none(),
+                "KiCad answered pad {} twice for its outline on {layer_label}",
+                pad.value
+            );
+        }
+        let outlines = pad_ids
+            .iter()
+            .map(|id| {
+                by_pad.remove(id).with_context(|| {
+                    format!("KiCad returned no copper outline for pad {id} on {layer_label}")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(extra) = by_pad.keys().next() {
+            anyhow::bail!("KiCad returned an outline for pad {extra}, which was not asked for");
+        }
+        Ok(outlines)
+    }
+
+    /// Whether each pad or via in `item_ids` has copper on each of `layers`
+    /// (`CheckPadstackPresenceOnLayers`), keyed by item KIID and layer.
+    ///
+    /// KiCad answers only the pairs it finds valid, so a pair it left out is
+    /// absent from the map, for the caller to treat as unknown.
+    pub fn check_padstack_presence_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        item_ids: &[String],
+        layers: &[kiapi::board::types::BoardLayer],
+    ) -> Result<std::collections::HashMap<(String, i32), kiapi::board::commands::PadstackPresence>>
+    {
+        if item_ids.is_empty() || layers.is_empty() {
+            return Ok(Default::default());
+        }
+        let command = kiapi::board::commands::CheckPadstackPresenceOnLayers {
+            board: Some(document),
+            items: item_ids
+                .iter()
+                .map(|id| kiapi::common::types::Kiid { value: id.clone() })
+                .collect(),
+            layers: layers.iter().map(|layer| *layer as i32).collect(),
+        };
+        let response: kiapi::board::commands::PadstackPresenceResponse = unpack_required(
+            self.send_command(
+                &command,
+                "kiapi.board.commands.CheckPadstackPresenceOnLayers",
+            )?,
+            "CheckPadstackPresenceOnLayers",
+        )?;
+        Ok(response
+            .entries
+            .into_iter()
+            .map(|entry| {
+                let presence = kiapi::board::commands::PadstackPresence::try_from(entry.presence)
+                    .unwrap_or(kiapi::board::commands::PadstackPresence::PspUnknown);
+                ((kiid_value(entry.item), entry.layer), presence)
+            })
+            .collect())
+    }
+
     /// Read the board's graphics — shapes, text, textboxes, and dimensions —
     /// from a specific open document.
     ///
@@ -3934,32 +4034,13 @@ impl KiCadIpcClient {
                     );
                 }
 
-                let old_position = footprint.position.unwrap_or_default();
-                let old_rotation = footprint
-                    .orientation
-                    .as_ref()
-                    .map(|angle| angle.value_degrees)
-                    .unwrap_or(0.0);
-                let rotation_delta = target.rotation - old_rotation;
-                if rotation_delta != 0.0 {
-                    crate::transform::transform_footprint_children(
-                        &mut footprint,
-                        &crate::transform::Xform::Rotate {
-                            cx_nm: old_position.x_nm,
-                            cy_nm: old_position.y_nm,
-                            delta_deg: rotation_delta,
-                        },
-                    )?;
-                }
-
+                // Rotation about the held anchor, then translation: the same
+                // transforms the copper check (#96) moves pad outlines by.
                 let new_position = crate::builders::vec2(target.x, target.y);
-                let dx_nm = new_position.x_nm - old_position.x_nm;
-                let dy_nm = new_position.y_nm - old_position.y_nm;
-                if dx_nm != 0 || dy_nm != 0 {
-                    crate::transform::transform_footprint_children(
-                        &mut footprint,
-                        &crate::transform::Xform::Translate { dx_nm, dy_nm },
-                    )?;
+                for xform in
+                    crate::transform::placement_xforms(&footprint, new_position, target.rotation)
+                {
+                    crate::transform::transform_footprint_children(&mut footprint, &xform)?;
                 }
                 footprint.position = Some(new_position);
                 footprint.orientation = Some(kiapi::common::types::Angle {
