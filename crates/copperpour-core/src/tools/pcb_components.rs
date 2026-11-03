@@ -89,7 +89,7 @@ pub(crate) fn resolve_footprint_file(lib_id: &str, board_path: &Path) -> anyhow:
 ///
 /// Placing on the back is not a layer rename: KiCAD's flip mirrors the
 /// footprint's geometry (pad X positions negate, every front layer swaps with
-/// its back counterpart per item). Until Konnect implements that mirror,
+/// its back counterpart per item). Until Copperpour implements that mirror,
 /// Read a `[{x, y}, …]` argument into footprint-local millimetre pairs.
 ///
 /// Each rejection names the offending index, because "each point needs a
@@ -1183,7 +1183,7 @@ enum FootprintPlacementUpdate {
 /// Why a closed-board placement update could not be applied.
 ///
 /// The handlers have to tell a caller's mistake — a reference that is not on
-/// this board — from a board Konnect declines to edit, from a genuine I/O
+/// this board — from a board Copperpour declines to edit, from a genuine I/O
 /// failure, and report each differently. Deciding that by matching on the
 /// error's message text is exactly what [`with_board_ipc_classified`]'s contract
 /// forbids two screens up, and it left every case except the missing
@@ -2998,7 +2998,7 @@ async fn handle_set_component_placements(
     }
 }
 
-/// Minimum KiCad version whose native `FlipItems` command Konnect drives over
+/// Minimum KiCad version whose native `FlipItems` command Copperpour drives over
 /// IPC (issue #604). Older reachable KiCad answers `AS_UNHANDLED`, which this
 /// handler treats as authoritative capability evidence, never inferred from a
 /// version string on its own.
@@ -5157,7 +5157,7 @@ mod tests {
     ///
     /// KiCad's own writer emits `at` before properties and pads, so this shape
     /// never comes out of KiCad — but it is legal S-expression, KiCad loads it,
-    /// and Konnect reads boards it did not write.
+    /// and Copperpour reads boards it did not write.
     fn board_with_a_property_before_the_root_at(property_angle: &str) -> String {
         format!(
             "(kicad_pcb (version 20241229) (generator \"pcbnew\")\n\
@@ -5273,7 +5273,7 @@ mod tests {
     }
 
     /// A reference naming two footprints identifies none of them, and a board
-    /// Konnect cannot parse is not one it will write to. Both refuse, both
+    /// Copperpour cannot parse is not one it will write to. Both refuse, both
     /// with a structured reason, and both leave the file byte-identical.
     ///
     /// Added because neutering each guard found nothing: the PR describes all

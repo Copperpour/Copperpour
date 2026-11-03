@@ -34,7 +34,7 @@ def _load_plugin():
     sys.modules.setdefault("wx", wx)
 
     settings_dialog = types.ModuleType("settings_dialog")
-    settings_dialog.KonnectSettingsDialog = object
+    settings_dialog.CopperpourSettingsDialog = object
     settings_dialog.load_settings = lambda *a, **k: {}
     sys.modules.setdefault("settings_dialog", settings_dialog)
 
@@ -169,6 +169,20 @@ class WithoutCacheDirectory(unittest.TestCase):
         self.plugin.stop_server()
         self.assertTrue(process.killed)
         self.assertFalse(self.plugin.is_server_running())
+
+
+class ActionPluginIdentity(unittest.TestCase):
+    def test_the_action_plugin_class_keeps_its_name(self):
+        # KiCad stores the toolbar button setting under `<file>/<class name>`,
+        # so renaming the class resets it for every install (#250).
+        plugin = _load_plugin()
+        base = sys.modules["pcbnew"].ActionPlugin
+        names = [
+            value.__name__
+            for value in vars(plugin).values()
+            if isinstance(value, type) and issubclass(value, base) and value is not base
+        ]
+        self.assertEqual(names, ["CopperpourPlugin"])
 
 
 if __name__ == "__main__":

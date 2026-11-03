@@ -318,7 +318,7 @@ async fn kicad_10s_schematic_editor_is_reported_unsupported_beside_its_pcb_edito
 /// Every schematic-side tool refuses KiCad 10's schematic editor as an
 /// unsupported capability naming the version, without guessing an identity
 /// from the caller's project, the saved file or the board. Each used to be a
-/// `stale_target` that read as a Konnect-side race.
+/// `stale_target` that read as a Copperpour-side race.
 #[tokio::test]
 async fn every_schematic_tool_refuses_kicad_10s_schematic_editor_as_unsupported() {
     let project = Project::new();

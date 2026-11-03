@@ -504,7 +504,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the generated midpoint fixture open in KiCad IPC and kicad-cli"]
     async fn live_native_midpoint_acceptance() {
-        let board = std::path::PathBuf::from(std::env::var("KONNECT_MIDPOINT_BOARD").unwrap());
+        let board = std::path::PathBuf::from(crate::app_dirs::env_var("MIDPOINT_BOARD").unwrap());
         let client = KiCadIpcClient::new(copperpour_ipc::detect_ipc_address().unwrap());
         let document = client.find_open_board(&board).unwrap();
         let snapshot = capture(&client, document.clone()).unwrap();
@@ -579,7 +579,7 @@ mod tests {
             "a failed conversion must preserve the previously published CPL"
         );
         // Capture real native protobuf fixtures for deterministic replay in CI.
-        if let Ok(destination) = std::env::var("KONNECT_MIDPOINT_CAPTURE_DIR") {
+        if let Some(destination) = crate::app_dirs::env_var("MIDPOINT_CAPTURE_DIR") {
             let destination = std::path::PathBuf::from(destination);
             std::fs::create_dir_all(&destination).unwrap();
             std::fs::write(destination.join("midpoints.kicad_pcb"), snapshot.contents).unwrap();
@@ -626,10 +626,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires disposable sole open KONNECT_MIDPOINT_BOARD and KONNECT_MIDPOINT_LIBRARY; KiCad IPC enabled"]
+    #[ignore = "requires disposable sole open COPPERPOUR_MIDPOINT_BOARD and COPPERPOUR_MIDPOINT_LIBRARY; KiCad IPC enabled"]
     fn live_native_midpoint_fixture() {
-        let board = std::path::PathBuf::from(std::env::var("KONNECT_MIDPOINT_BOARD").unwrap());
-        let library = std::path::PathBuf::from(std::env::var("KONNECT_MIDPOINT_LIBRARY").unwrap());
+        let board = std::path::PathBuf::from(crate::app_dirs::env_var("MIDPOINT_BOARD").unwrap());
+        let library =
+            std::path::PathBuf::from(crate::app_dirs::env_var("MIDPOINT_LIBRARY").unwrap());
         let client = KiCadIpcClient::new(copperpour_ipc::detect_ipc_address().unwrap());
         let document = client.find_open_board(&board).unwrap();
         assert_eq!(client.get_open_documents().unwrap(), vec![document.clone()]);
@@ -658,7 +659,7 @@ mod tests {
             }
         }
         let centered =
-            std::fs::read_to_string(std::env::var("KONNECT_MIDPOINT_CENTERED_LIBRARY").unwrap())
+            std::fs::read_to_string(crate::app_dirs::env_var("MIDPOINT_CENTERED_LIBRARY").unwrap())
                 .unwrap();
         creates.push(
             KiCadIpcClient::build_footprint_item(

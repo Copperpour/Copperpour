@@ -1586,13 +1586,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a disposable board open in an isolated KiCad IPC endpoint; see KONNECT_ZONE_TEST_BOARD and KONNECT_ZONE_TEST_IPC_ADDRESS"]
+    #[ignore = "requires a disposable board open in an isolated KiCad IPC endpoint; see COPPERPOUR_ZONE_TEST_BOARD and COPPERPOUR_ZONE_TEST_IPC_ADDRESS"]
     async fn live_zone_delete_on_configured_disposable_board() {
         let board = PathBuf::from(
-            std::env::var("KONNECT_ZONE_TEST_BOARD").expect("KONNECT_ZONE_TEST_BOARD"),
+            crate::app_dirs::env_var("ZONE_TEST_BOARD").expect("COPPERPOUR_ZONE_TEST_BOARD"),
         );
-        let endpoint =
-            std::env::var("KONNECT_ZONE_TEST_IPC_ADDRESS").expect("KONNECT_ZONE_TEST_IPC_ADDRESS");
+        let endpoint = crate::app_dirs::env_var("ZONE_TEST_IPC_ADDRESS")
+            .and_then(|address| address.into_string().ok())
+            .expect("COPPERPOUR_ZONE_TEST_IPC_ADDRESS");
         let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(endpoint);
         let args = json!({"board":board,"board_source":"live"});
         let listed = handle_list_zones(&args, &ctx).await.unwrap();

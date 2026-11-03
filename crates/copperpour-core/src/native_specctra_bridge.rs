@@ -1,9 +1,9 @@
-//! Optional KiCad 10 native Specctra export through Konnect's legacy ActionPlugin.
+//! Optional KiCad 10 native Specctra export through Copperpour's legacy ActionPlugin.
 //!
 //! The bridge is deliberately capability-scoped. It may export the active
 //! board into its own private temporary directory; it cannot execute arbitrary
 //! Python or write a caller-selected path. KiCad 11 and installations without
-//! the legacy plugin continue through Konnect's Rust exporter.
+//! the legacy plugin continue through Copperpour's Rust exporter.
 
 use anyhow::{bail, Context, Result};
 use reqwest::Url;

@@ -13,6 +13,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
+/// `COPPERPOUR_<name>`, or else `KONNECT_<name>`, its name before the rename.
+fn test_env(name: &str) -> Option<String> {
+    copperpour_core::app_dirs::env_var(name).and_then(|value| value.into_string().ok())
+}
+
 struct McpProcess {
     child: Child,
     stdin: ChildStdin,
@@ -194,13 +199,12 @@ fn footprint_text_stroke_widths(footprint: &kiapi::board::types::FootprintInstan
 #[test]
 #[ignore = "requires a running KiCad GUI, API socket, and standard footprint libraries"]
 fn place_component_loads_real_library_geometry() {
-    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
-        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
+    let board = test_env("LIVE_KICAD_BOARD")
+        .expect("COPPERPOUR_LIVE_KICAD_BOARD must name the disposable open board");
     let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
-    let lib_id = std::env::var("KONNECT_LIVE_KICAD_FOOTPRINT")
-        .unwrap_or_else(|_| "Resistor_SMD:R_0402_1005Metric".into());
-    let reference =
-        std::env::var("KONNECT_LIVE_KICAD_PLACE_REFERENCE").unwrap_or_else(|_| "R900".into());
+    let lib_id =
+        test_env("LIVE_KICAD_FOOTPRINT").unwrap_or_else(|| "Resistor_SMD:R_0402_1005Metric".into());
+    let reference = test_env("LIVE_KICAD_PLACE_REFERENCE").unwrap_or_else(|| "R900".into());
 
     let ipc = KiCadIpcClient::new(&socket);
     let ready = (0..100).any(|_| {
@@ -329,12 +333,11 @@ fn place_component_loads_real_library_geometry() {
 #[ignore = "requires a running KiCad GUI, API socket, disposable open board, and standard footprint libraries"]
 fn add_mounting_hole_round_trips_through_live_kicad() {
     let board = std::path::PathBuf::from(
-        std::env::var("KONNECT_LIVE_KICAD_BOARD")
-            .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board"),
+        test_env("LIVE_KICAD_BOARD")
+            .expect("COPPERPOUR_LIVE_KICAD_BOARD must name the disposable open board"),
     );
     let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
-    let reference =
-        std::env::var("KONNECT_LIVE_KICAD_HOLE_REFERENCE").unwrap_or_else(|_| "H900".to_string());
+    let reference = test_env("LIVE_KICAD_HOLE_REFERENCE").unwrap_or_else(|| "H900".to_string());
     let expected_lib_id = "MountingHole:MountingHole_3.2mm_M3";
 
     let ipc = KiCadIpcClient::new(&socket);
@@ -397,10 +400,10 @@ fn add_mounting_hole_round_trips_through_live_kicad() {
 #[test]
 #[ignore = "requires a running KiCad GUI, API socket, saved schematic, and matching open board"]
 fn schematic_sync_apply_then_dry_run_is_noop() {
-    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
-        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
-    let schematic = std::env::var("KONNECT_LIVE_KICAD_SCHEMATIC")
-        .expect("KONNECT_LIVE_KICAD_SCHEMATIC must name the saved, closed root schematic");
+    let board = test_env("LIVE_KICAD_BOARD")
+        .expect("COPPERPOUR_LIVE_KICAD_BOARD must name the disposable open board");
+    let schematic = test_env("LIVE_KICAD_SCHEMATIC")
+        .expect("COPPERPOUR_LIVE_KICAD_SCHEMATIC must name the saved, closed root schematic");
     let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
     let mut mcp = McpProcess::spawn(&socket);
     mcp.tool("load_toolset", json!({"name": "sch_export"}));
@@ -444,8 +447,8 @@ fn schematic_sync_apply_then_dry_run_is_noop() {
 #[ignore = "requires a running KiCad GUI and a disposable open board"]
 fn footprint_library_update_apply_then_dry_run_is_noop() {
     let board = std::path::PathBuf::from(
-        std::env::var("KONNECT_LIVE_KICAD_BOARD")
-            .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board"),
+        test_env("LIVE_KICAD_BOARD")
+            .expect("COPPERPOUR_LIVE_KICAD_BOARD must name the disposable open board"),
     );
     let project = board.with_extension("kicad_pro");
     assert!(
@@ -707,12 +710,12 @@ fn footprint_library_update_apply_then_dry_run_is_noop() {
 /// `ProjectSpecifier.path` supplying the directory. A gate built on that
 /// reading is only as good as the reading, so this prints every field of every
 /// open document and then asserts the property the gate depends on: a live
-/// KiCad's open-document list is one Konnect can resolve in full.
+/// KiCad's open-document list is one Copperpour can resolve in full.
 ///
 /// Run it against a KiCad holding the disposable board:
 ///
 /// ```text
-/// KICAD_API_SOCKET=… KONNECT_LIVE_KICAD_BOARD=… \
+/// KICAD_API_SOCKET=… COPPERPOUR_LIVE_KICAD_BOARD=… \
 ///   cargo test -p copperpour --test live_kicad_tools -- --ignored --nocapture \
 ///   real_kicad_open_documents_resolve_to_comparable_paths
 /// ```
@@ -720,8 +723,8 @@ fn footprint_library_update_apply_then_dry_run_is_noop() {
 #[ignore = "requires a running KiCad GUI with a board open and its API socket"]
 fn real_kicad_open_documents_resolve_to_comparable_paths() {
     let board = std::path::PathBuf::from(
-        std::env::var("KONNECT_LIVE_KICAD_BOARD")
-            .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board"),
+        test_env("LIVE_KICAD_BOARD")
+            .expect("COPPERPOUR_LIVE_KICAD_BOARD must name the disposable open board"),
     );
     let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
     let ipc = KiCadIpcClient::new(&socket);
@@ -771,8 +774,7 @@ fn real_kicad_open_documents_resolve_to_comparable_paths() {
 #[ignore = "requires a running KiCad GUI with an unedited board open and its API socket"]
 fn board_extents_live_and_saved_agree_on_an_unedited_board() {
     let board = std::path::PathBuf::from(
-        std::env::var("KONNECT_LIVE_KICAD_BOARD")
-            .expect("KONNECT_LIVE_KICAD_BOARD must name the open board"),
+        test_env("LIVE_KICAD_BOARD").expect("COPPERPOUR_LIVE_KICAD_BOARD must name the open board"),
     );
     let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
     let ipc = KiCadIpcClient::new(&socket);

@@ -3,7 +3,7 @@
 //! These tests are ignored by default; run them with `-- --ignored`, and with
 //! `--test-threads=1`, since they all drive the one board KiCad has open.
 //!
-//! ## Point `KONNECT_LIVE_KICAD_BOARD` at a COPY
+//! ## Point `COPPERPOUR_LIVE_KICAD_BOARD` at a COPY
 //!
 //! These tests mutate the open board and call `save_board()` — the move test
 //! relocates and rotates a mounting hole. Opening the tracked fixture directly
@@ -15,7 +15,7 @@
 //!
 //! ```sh
 //! cp crates/copperpour-ipc/tests/fixtures/live_ipc.kicad_pcb /tmp/live/
-//! export KONNECT_LIVE_KICAD_BOARD=/tmp/live/live_ipc.kicad_pcb
+//! export COPPERPOUR_LIVE_KICAD_BOARD=/tmp/live/live_ipc.kicad_pcb
 //! ```
 //!
 //! ## The fixture
@@ -61,6 +61,15 @@ use copperpour_sexp::{parse_sexp, SexpNode};
 use std::path::Path;
 
 mod common;
+
+/// `COPPERPOUR_<name>`, or else `KONNECT_<name>`, its name before the rename.
+/// An empty value counts as unset, as in `copperpour_core::app_dirs::env_var`.
+fn test_env(name: &str) -> Option<String> {
+    ["COPPERPOUR", "KONNECT"]
+        .iter()
+        .find_map(|app| std::env::var_os(format!("{app}_{name}")).filter(|v| !v.is_empty()))
+        .and_then(|value| value.into_string().ok())
+}
 
 /// Where `adding_a_via_actually_creates_it_on_the_board` puts its via, and the
 /// outline `adding_a_zone_creates_it_on_the_live_board` pours. Both are
@@ -201,8 +210,8 @@ fn kicad_reports_an_empty_sheet_path_for_a_board_only_footprint() {
     use kiapi::common::types::KiCadObjectType as ObjectType;
     use prost::Message;
 
-    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
-        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
+    let board = test_env("LIVE_KICAD_BOARD")
+        .expect("COPPERPOUR_LIVE_KICAD_BOARD must name the disposable open board");
     let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
     let client = KiCadIpcClient::new(socket);
 
@@ -275,7 +284,7 @@ fn kicad_reports_an_empty_sheet_path_for_a_board_only_footprint() {
 
     // Regeneration + provenance inspection for the checked-in capture. Off by
     // default; the assertions below are what runs normally.
-    if std::env::var("KONNECT_CAPTURE_IPC_FIXTURE").is_ok() {
+    if test_env("CAPTURE_IPC_FIXTURE").is_some() {
         for (reference, raw, decoded) in &captures {
             eprintln!("--- {reference} ({} bytes) ---\n{decoded:#?}", raw.len());
         }
@@ -317,7 +326,7 @@ fn kicad_reports_an_empty_sheet_path_for_a_board_only_footprint() {
 /// `pcb_sync` narrows `duplicate_board_reference` to references the schematic
 /// export actually names, so a board carrying repeated `REF**` graphics stops
 /// blocking a sync. That narrowing rests on a claim about KiCad, not about
-/// Konnect: that a footprint placed on the board without annotation keeps the
+/// Copperpour: that a footprint placed on the board without annotation keeps the
 /// library's own `REF**`, and that a second one keeps it too — the duplicate
 /// is normal, not a corrupt board.
 ///
@@ -325,7 +334,7 @@ fn kicad_reports_an_empty_sheet_path_for_a_board_only_footprint() {
 /// annotated `MH1`-`MH4`. `fixtures/board_only_shared_reference.kicad_pcb` is
 /// a board KiCad itself wrote for this, holding two unannotated
 /// `MountingHole:MountingHole_2.7mm_M2.5_DIN965` instances. Point
-/// `KONNECT_LIVE_KICAD_SHARED_REFERENCE_BOARD` at a copy of it.
+/// `COPPERPOUR_LIVE_KICAD_SHARED_REFERENCE_BOARD` at a copy of it.
 ///
 /// Observing only, like the test above: no `save_board()`, so it cannot
 /// rewrite the board it is reading.
@@ -337,8 +346,8 @@ fn kicad_reports_the_same_reference_for_two_board_only_footprints() {
     use prost::Message;
     use std::collections::BTreeMap;
 
-    let board = std::env::var("KONNECT_LIVE_KICAD_SHARED_REFERENCE_BOARD").expect(
-        "KONNECT_LIVE_KICAD_SHARED_REFERENCE_BOARD must name the open copy of \
+    let board = test_env("LIVE_KICAD_SHARED_REFERENCE_BOARD").expect(
+        "COPPERPOUR_LIVE_KICAD_SHARED_REFERENCE_BOARD must name the open copy of \
          fixtures/board_only_shared_reference.kicad_pcb",
     );
     let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
@@ -412,7 +421,7 @@ fn kicad_reports_the_same_reference_for_two_board_only_footprints() {
 
     // Regeneration + provenance inspection for the checked-in capture. Off by
     // default; the assertions below are what runs normally.
-    if std::env::var("KONNECT_CAPTURE_IPC_FIXTURE").is_ok() {
+    if test_env("CAPTURE_IPC_FIXTURE").is_some() {
         for (reference, raw, decoded) in &captures {
             eprintln!("--- {reference} ({} bytes) ---\n{decoded:#?}", raw.len());
         }
@@ -445,9 +454,9 @@ fn kicad_reports_the_same_reference_for_two_board_only_footprints() {
 #[test]
 #[ignore = "requires a running KiCad GUI with its IPC API enabled"]
 fn moving_and_rotating_footprint_preserves_child_geometry() {
-    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
-        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
-    let reference = std::env::var("KONNECT_LIVE_KICAD_REFERENCE").unwrap_or_else(|_| "MH1".into());
+    let board = test_env("LIVE_KICAD_BOARD")
+        .expect("COPPERPOUR_LIVE_KICAD_BOARD must name the disposable open board");
+    let reference = test_env("LIVE_KICAD_REFERENCE").unwrap_or_else(|| "MH1".into());
     let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
     let client = KiCadIpcClient::new(socket);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -528,9 +537,9 @@ fn confirmed_flip(outcome: IpcFlipOutcome) -> (String, Vec<IpcFootprint3DModel>)
 #[test]
 #[ignore = "requires KiCad 10.0.6+ with a disposable board open and IPC enabled"]
 fn placed_footprint_model_entries_round_trip_through_live_kicad() {
-    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
-        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
-    let reference = std::env::var("KONNECT_LIVE_KICAD_REFERENCE").unwrap_or_else(|_| "P3".into());
+    let board = test_env("LIVE_KICAD_BOARD")
+        .expect("COPPERPOUR_LIVE_KICAD_BOARD must name the disposable open board");
+    let reference = test_env("LIVE_KICAD_REFERENCE").unwrap_or_else(|| "P3".into());
     let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
     let client = KiCadIpcClient::new(socket);
     let document = client
@@ -666,9 +675,9 @@ fn placed_footprint_model_entries_round_trip_through_live_kicad() {
 #[test]
 #[ignore = "requires KiCad 10.0.6+ with a disposable board open and IPC enabled"]
 fn native_flip_round_trip_preserves_models_and_unrelated_footprint_content() {
-    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
-        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
-    let reference = std::env::var("KONNECT_LIVE_KICAD_REFERENCE").unwrap_or_else(|_| "P3".into());
+    let board = test_env("LIVE_KICAD_BOARD")
+        .expect("COPPERPOUR_LIVE_KICAD_BOARD must name the disposable open board");
+    let reference = test_env("LIVE_KICAD_REFERENCE").unwrap_or_else(|| "P3".into());
     let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
     let client = KiCadIpcClient::new(socket);
 
@@ -748,8 +757,8 @@ fn native_flip_round_trip_preserves_models_and_unrelated_footprint_content() {
 #[test]
 #[ignore = "requires a running KiCad GUI with its IPC API enabled"]
 fn adding_a_via_actually_creates_it_on_the_board() {
-    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
-        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
+    let board = test_env("LIVE_KICAD_BOARD")
+        .expect("COPPERPOUR_LIVE_KICAD_BOARD must name the disposable open board");
     let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
     let client = KiCadIpcClient::new(socket);
 
@@ -807,8 +816,8 @@ fn adding_a_via_actually_creates_it_on_the_board() {
 #[test]
 #[ignore = "requires a running KiCad GUI with its IPC API enabled and a disposable open board"]
 fn verified_trace_delete_round_trips_through_live_kicad() {
-    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
-        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
+    let board = test_env("LIVE_KICAD_BOARD")
+        .expect("COPPERPOUR_LIVE_KICAD_BOARD must name the disposable open board");
     let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
     let client = KiCadIpcClient::new(socket);
     let net = client
@@ -1021,15 +1030,15 @@ fn adding_a_zone_creates_it_on_the_live_board() {
 /// fixture: `live_ipc.kicad_pcb` declares a two-layer stackup, and
 /// `four_layer_stackup_kicad10.kicad_pcb` a four-layer fabrication stackup.
 ///
-/// With the second open, `KONNECT_CAPTURE_IPC_FIXTURE` also writes KiCad's
+/// With the second open, `COPPERPOUR_CAPTURE_IPC_FIXTURE` also writes KiCad's
 /// answer, unchanged, as that fixture's `.ipc.bin`. See the fixture's README.
 #[test]
 #[ignore = "requires a running KiCad GUI with its IPC API enabled"]
 fn the_live_stackup_is_the_one_the_board_file_declares() {
     const CAPTURED_BOARD: &str = "four_layer_stackup_kicad10.kicad_pcb";
 
-    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
-        .expect("KONNECT_LIVE_KICAD_BOARD must name the open board");
+    let board =
+        test_env("LIVE_KICAD_BOARD").expect("COPPERPOUR_LIVE_KICAD_BOARD must name the open board");
     let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
     let client = KiCadIpcClient::new(socket);
     let document = client
@@ -1037,7 +1046,7 @@ fn the_live_stackup_is_the_one_the_board_file_declares() {
         .expect("KiCad has not got the requested board open");
 
     // Regeneration of the checked-in capture. Off by default.
-    if std::env::var("KONNECT_CAPTURE_IPC_FIXTURE").is_ok() {
+    if test_env("CAPTURE_IPC_FIXTURE").is_some() {
         if board.ends_with(CAPTURED_BOARD) {
             let answer = client
                 .get_board_stackup_response_in(document.clone())

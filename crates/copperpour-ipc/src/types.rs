@@ -818,7 +818,7 @@ pub struct IpcVector3 {
 
 /// A footprint's associated 3D model, as read back from a placed instance.
 /// `flip_footprint` reports these so a caller can independently confirm the
-/// model transform native `FlipItems` applied, without Konnect reimplementing
+/// model transform native `FlipItems` applied, without Copperpour reimplementing
 /// KiCad's own 3D-model flip math.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IpcFootprint3DModel {

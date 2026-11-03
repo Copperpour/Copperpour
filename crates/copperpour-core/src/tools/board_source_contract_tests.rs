@@ -119,7 +119,7 @@ async fn handler_talking_to(address: &str) -> McpHandler {
     .expect("handler builds")
 }
 
-/// A served Konnect, the fixture board, and whatever KiCad the case needs.
+/// A served Copperpour, the fixture board, and whatever KiCad the case needs.
 ///
 /// The temp dir is held for the scene's lifetime, so the board outlives every
 /// call made against it.
@@ -725,7 +725,7 @@ async fn an_empty_enabled_layer_reply_is_not_reported_as_a_live_stackup() {
     );
 }
 
-/// `AS_UNHANDLED` and `AS_UNIMPLEMENTED` both leave Konnect with no live
+/// `AS_UNHANDLED` and `AS_UNIMPLEMENTED` both leave Copperpour with no live
 /// board, and both fall back to the saved file — but only the first is
 /// evidence about KiCad's editors. A build that does not implement the
 /// open-document command may well have a board open with unsaved changes, so

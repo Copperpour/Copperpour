@@ -799,7 +799,7 @@ async fn kicad_netlist_connects_the_region_moved_pin_to_netc() {
 }
 
 /// KiCad's exported netlist proves replacement connected the new horizontal
-/// pin, not merely that Konnect inserted a plausible-looking dot.
+/// pin, not merely that Copperpour inserted a plausible-looking dot.
 #[tokio::test]
 #[ignore = "needs an installed KiCad 10 kicad-cli"]
 async fn kicad_netlist_connects_the_replacement_pin_to_netc() {

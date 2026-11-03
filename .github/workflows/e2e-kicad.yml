@@ -68,7 +68,7 @@ jobs:
 
       - name: E2E design loop (create → wire → ERC → Gerber → DRC)
         env:
-          KONNECT_E2E_KEEP_DIR: ${{ github.workspace }}/e2e-artifacts
+          COPPERPOUR_E2E_KEEP_DIR: ${{ github.workspace }}/e2e-artifacts
         run: cargo test -p copperpour --test e2e_kicad -- --ignored --nocapture
 
       # Bundled templates are hand-written JSON naming KiCad symbols and pins;

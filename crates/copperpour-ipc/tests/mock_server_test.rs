@@ -1368,7 +1368,7 @@ fn placement_targets_the_named_board_among_several_open() {
 /// `ProjectSpecifier.path` — the form its own proto documents ("a PCB with a
 /// given filename, e.g. `board.kicad_pcb`"). A mock sending `project: None`
 /// was reproducing a document form KiCad does not emit, and it was the one
-/// form Konnect cannot place on disk.
+/// form Copperpour cannot place on disk.
 /// Absolute on the platform running the test: `Path::is_absolute` is what
 /// lets a project directory place a bare board filename, and a POSIX-rooted
 /// path is not absolute on Windows.

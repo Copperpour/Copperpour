@@ -10781,7 +10781,7 @@ mod rotate_field_text_tests {
     #[tokio::test]
     async fn turning_a_symbol_the_whole_way_round_restores_the_sheet() {
         let (_directory, path) = fixture();
-        // The first write reserializes KiCad's formatting into Konnect's, so
+        // The first write reserializes KiCad's formatting into Copperpour's, so
         // the baseline is the sheet after a no-op turn, not the fixture bytes.
         assert!(!rotate(&path, "D1", 0.0).await.is_error);
         let baseline = std::fs::read_to_string(&path).unwrap();
@@ -10841,7 +10841,7 @@ mod mirror_field_text_tests {
     use super::*;
 
     const SHEET: &str = include_str!("../../tests/fixtures/mirror_fields_kicad10.kicad_sch");
-    /// Drawn in KiCad, not built by Konnect: its mirrored connectors carry
+    /// Drawn in KiCad, not built by Copperpour: its mirrored connectors carry
     /// fields on the reflected library anchors, as eeschema wrote them.
     const DEMO: &str =
         include_str!("../../tests/fixtures/project_ownership/complex_hierarchy.kicad_sch");
@@ -10919,7 +10919,7 @@ mod mirror_field_text_tests {
         assert_eq!(to_nanometres(reflected), twin("U8"));
     }
 
-    /// KiCad drew these, not Konnect. P102 is a `CONN_2` placed `(mirror y)`
+    /// KiCad drew these, not Copperpour. P102 is a `CONN_2` placed `(mirror y)`
     /// whose library anchors put Reference at local x = −1.27 and Value at
     /// +1.27; eeschema wrote them reflected, at 43.18 and 40.64 about the
     /// origin at 41.91. Clearing the mirror must put each on its library side.
@@ -10936,7 +10936,7 @@ mod mirror_field_text_tests {
         );
     }
 
-    /// The twins above take their answer from Konnect's own placement
+    /// The twins above take their answer from Copperpour's own placement
     /// transform, so they cannot tell whether that transform mirrors before or
     /// after it turns. KiCad can. L2 is an `INDUCTOR` at 270° with
     /// `(mirror x)`, whose library anchors its Value at (2.54, 0); eeschema

@@ -93,7 +93,7 @@ fn block_by_uuid(text: &str, uuid: &str) -> String {
 }
 
 /// A block with its line endings folded to LF. The demos are CRLF, as KiCad on
-/// Windows saves them, and Konnect writes the whole file with LF; line endings
+/// Windows saves them, and Copperpour writes the whole file with LF; line endings
 /// are a property of the file, not of a label, so byte comparisons ignore them.
 fn lf(block: String) -> String {
     block.replace("\r\n", "\n")
@@ -101,7 +101,7 @@ fn lf(block: String) -> String {
 
 /// A label's children by tag, in order, with each child rendered as its text so
 /// that a quoted and an unquoted UUID compare equal. KiCad 7 writes compact,
-/// unquoted blocks that Konnect's writer re-lays out (#210), so for those files
+/// unquoted blocks that Copperpour's writer re-lays out (#210), so for those files
 /// this is the comparison that isolates which children survived and where.
 fn children(block: &str) -> Vec<String> {
     fn render(n: &SexpNode) -> String {

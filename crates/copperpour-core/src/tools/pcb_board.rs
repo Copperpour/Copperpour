@@ -1571,7 +1571,7 @@ async fn handle_set_board_size(
                 "source": "ipc"
             })))
         }
-        // The refusal is Konnect's, not KiCAD's — do not route it through the
+        // The refusal is Copperpour's, not KiCAD's — do not route it through the
         // Refused arm, whose wording attributes the rejection to KiCAD (#230).
         BoardWrite::Ipc(OutlineIpcOutcome::NotPlainSegments(kinds)) => {
             return Ok(outline_not_replaceable(&kinds))
@@ -2719,7 +2719,7 @@ async fn handle_add_mounting_hole(
     // the hole placed is that library footprint — pads, courtyard, comments
     // layer circle and all — exactly as `place_component` would place it, so
     // the name and the geometry are KiCad's and `lib_footprint_mismatch` has
-    // nothing to say. Without a resolvable library, Konnect's own NPTH
+    // nothing to say. Without a resolvable library, Copperpour's own NPTH
     // geometry is written under the same shipped name and the response says
     // so.
     let library_source =
@@ -3498,7 +3498,7 @@ pub(crate) mod board_mock {
     }
 
     /// As [`spawn_kicad_holding_boards`], but the caller supplies the open
-    /// documents verbatim — including the shapes Konnect cannot place on
+    /// documents verbatim — including the shapes Copperpour cannot place on
     /// disk, which is the whole subject of the ambiguity gate.
     pub fn spawn_kicad_reporting_documents(
         documents: Vec<kiapi::common::types::DocumentSpecifier>,
@@ -3730,7 +3730,7 @@ pub(crate) mod board_mock {
 /// `BoardNotOpen` is what unlocks a direct file write, so it may only be
 /// reached from an open-document list that was read in full. Every shape that
 /// cannot be placed on disk — no identifier, an empty or bare filename, a
-/// duplicate — has to stop there instead, because a record Konnect skipped is
+/// duplicate — has to stop there instead, because a record Copperpour skipped is
 /// not evidence that the board is closed (#426).
 #[cfg(test)]
 mod open_document_ambiguity_tests {
@@ -3744,7 +3744,7 @@ mod open_document_ambiguity_tests {
         crate::mcp::error::extract_error_kind(result)
     }
 
-    /// A document KiCad reports that Konnect cannot place on disk: a bare
+    /// A document KiCad reports that Copperpour cannot place on disk: a bare
     /// filename with no project directory. KiCad's own contract pairs a bare
     /// `board_filename` with `ProjectSpecifier.path`; without one there is no
     /// directory, and the record names no file.
@@ -3847,7 +3847,7 @@ mod open_document_ambiguity_tests {
         assert!(!entered);
     }
 
-    /// KiCad opening one board twice is not a list Konnect models, so it is
+    /// KiCad opening one board twice is not a list Copperpour models, so it is
     /// not one absence can be read from either.
     #[tokio::test]
     async fn a_duplicated_open_document_refuses() {
@@ -4566,7 +4566,7 @@ mod board_session_safety_tests {
     }
 
     /// KiCad up on another project is the ordinary state of a machine where
-    /// one board is being edited by hand and another by Konnect. It used to
+    /// one board is being edited by hand and another by Copperpour. It used to
     /// classify as a rejection, so every `attempt_ipc_write` caller refused
     /// and wrote nothing, quoting a KiCad that had said no such thing.
     #[tokio::test]

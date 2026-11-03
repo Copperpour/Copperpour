@@ -233,15 +233,15 @@ fn full_design_loop_with_real_kicad() {
     let Some(kicad_cli) = find_kicad_cli() else {
         panic!("kicad-cli not found — set KICAD_CLI or install KiCAD (this test is e2e-only)");
     };
-    // KONNECT_E2E_KEEP_DIR: persist the generated project there (CI uploads
+    // COPPERPOUR_E2E_KEEP_DIR: persist the generated project there (CI uploads
     // it as a failure artifact so file-format rejections can be diagnosed).
     let tmp = tempfile::tempdir().unwrap();
-    let base: std::path::PathBuf = match std::env::var("KONNECT_E2E_KEEP_DIR") {
-        Ok(d) => {
+    let base: std::path::PathBuf = match copperpour_core::app_dirs::env_var("E2E_KEEP_DIR") {
+        Some(d) => {
             std::fs::create_dir_all(&d).unwrap();
             d.into()
         }
-        Err(_) => tmp.path().to_path_buf(),
+        None => tmp.path().to_path_buf(),
     };
     let proj = base.join("e2e");
     let proj_s = proj.to_string_lossy().to_string();
@@ -422,7 +422,7 @@ fn full_design_loop_with_real_kicad() {
         "R1 pin 1 is not a node of VIN — the label did not bind its pin:\n{vin}"
     );
 
-    // The review's runtime coverage uses Konnect's parser so the tool remains
+    // The review's runtime coverage uses Copperpour's parser so the tool remains
     // usable without kicad-cli. Cross-check that count here against KiCad's
     // own netlist so parser drift cannot turn incomplete extraction into a
     // clean verdict (#184).

@@ -97,7 +97,7 @@ async fn handle_get_board_stackup(
         Err(refusal) => return Ok(refusal),
     };
 
-    // The read's own failure is carried back as data, so an answer Konnect
+    // The read's own failure is carried back as data, so an answer Copperpour
     // could not decode is reported as that, never as KiCad refusing (#658).
     let live = with_bound_board_ipc_classified(ctx, &board, move |client, document| {
         Ok(client.get_board_stackup_in(document))
@@ -1223,7 +1223,7 @@ mod tests {
     #[tokio::test]
     async fn an_answer_konnect_cannot_read_is_its_own_failure_not_kicads() {
         let (_dir, board) = absent_board();
-        // KiCad answers `AS_OK` with no body: Konnect's read fails, and the
+        // KiCad answers `AS_OK` with no body: Copperpour's read fails, and the
         // result says so rather than reporting KiCad as having refused.
         let server = spawn_kicad_holding_board(&board, |_| None);
         let ctx = ctx_talking_to(server.address().to_string());

@@ -3,7 +3,7 @@
 //! Keep executable and bundled-library discovery behind this module so every
 //! caller sees the same installations in the same order.  Discovery is
 //! intentionally read-only: Windows and KiCad already persist install state,
-//! while an explicit Konnect configuration remains the durable override.
+//! while an explicit Copperpour configuration remains the durable override.
 
 use std::path::{Path, PathBuf};
 

@@ -761,11 +761,11 @@ mod tests {
     #[ignore = "requires disposable live KiCad board and KICAD_API_SOCKET"]
     async fn live_drc_drops_deleted_via_uuid_after_refill_and_save() {
         let board = std::path::PathBuf::from(
-            std::env::var("KONNECT_LIVE_KICAD_BOARD").expect("disposable board path"),
+            crate::app_dirs::env_var("LIVE_KICAD_BOARD").expect("disposable board path"),
         );
         let address = std::env::var("KICAD_API_SOCKET").expect("live IPC endpoint");
         let executable = std::path::PathBuf::from(
-            std::env::var("KONNECT_TEST_KICAD_CLI").expect("CLI executable"),
+            crate::app_dirs::env_var("TEST_KICAD_CLI").expect("CLI executable"),
         );
         let client = copperpour_ipc::KiCadIpcClient::new(&address);
         client.find_open_board(&board).unwrap();

@@ -1797,7 +1797,7 @@ mod ipc_failure_dispatch_tests {
     }
 }
 
-/// Turn a JSON Schema failure into Konnect's stable structured argument shape.
+/// Turn a JSON Schema failure into Copperpour's stable structured argument shape.
 /// Prefer a concrete nested leaf over an applicator (`oneOf`/`anyOf`) wrapper,
 /// and include an unexpected property's own name rather than only its parent.
 /// A branch whose `const` tag (such as `type`) the item fails is not the one

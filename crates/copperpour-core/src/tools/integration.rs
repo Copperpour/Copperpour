@@ -1,7 +1,7 @@
 //! `integration` toolset — JLCPCB parts database, datasheet enrichment, and Freerouting discovery.
 //!
 //! JLCPCB tools query a local SQLite cache of the JLCPCB parts database.
-//! Freerouting discovery locates the JAR and verifies the Java runtime. Konnect
+//! Freerouting discovery locates the JAR and verifies the Java runtime. Copperpour
 //! does not advertise an autorouter until it has a real PCB-editor bridge.
 //! Datasheet enrichment uses the LCSC HTTP API.
 //!
@@ -269,7 +269,7 @@ mod configured_db_path_tests {
 
     #[tokio::test]
     async fn blank_database_configuration_uses_the_default_through_served_tools() {
-        const CHILD: &str = "KONNECT_TEST_JLCPCB_PATH_CHILD";
+        const CHILD: &str = "COPPERPOUR_TEST_JLCPCB_PATH_CHILD";
         if std::env::var_os(CHILD).is_none() {
             // Isolate platform path environment from other tests and user caches.
             let dir = tempfile::tempdir().unwrap();
@@ -2099,7 +2099,7 @@ fn datasheet_commit_refusal(path: &Path, error: &SexpError) -> Option<CallToolRe
 }
 
 /// The datasheet URL from the local JLCPCB catalog, keyed by LCSC ID or MPN.
-/// The database Konnect already downloads carries the exact LCSC PDF URL in
+/// The database Copperpour already downloads carries the exact LCSC PDF URL in
 /// its `Datasheet` column for most parts, so a hit here answers without a
 /// network round trip. `Ok(None)` is an ordinary miss; `Err` means the
 /// database could not be read at all.
@@ -4741,7 +4741,7 @@ mod suggest_alternatives_tests {
     use super::*;
     use crate::tools::ServerConfig;
 
-    /// Real rows of the Konnect-built catalogue (`components` table), copied
+    /// Real rows of the Copperpour-built catalogue (`components` table), copied
     /// verbatim from a `download_jlcpcb_database` run on 2026-10-03. The
     /// README beside it records the source and how the rows were chosen.
     const FIXTURE: &str = include_str!("../../tests/fixtures/jlcpcb/suggest_alternatives.tsv");

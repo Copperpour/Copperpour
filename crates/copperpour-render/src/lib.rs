@@ -1,4 +1,4 @@
-//! Deterministic SVG rasterization for Konnect's visual-feedback tools.
+//! Deterministic SVG rasterization for Copperpour's visual-feedback tools.
 //!
 //! Determinism is the design constraint, not a nice-to-have: rendered PNGs
 //! become stored visual baselines that are compared pixel-for-pixel across
