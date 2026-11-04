@@ -26,6 +26,12 @@ def template() -> dict:
     return json.loads((PACKAGING / "metadata.json").read_text(encoding="utf-8"))
 
 
+def plugin_manifest() -> dict:
+    return json.loads(
+        (PACKAGING.parent / "plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+
+
 def errors(meta: dict) -> list[str]:
     return validate_pcm.validate_metadata(meta, "metadata.json")
 
@@ -45,9 +51,7 @@ class MetadataTemplate(unittest.TestCase):
 
     def test_descriptions_quote_no_tool_or_toolset_count(self):
         meta = template()
-        plugin = json.loads(
-            (PACKAGING.parent / "plugin" / "plugin.json").read_text(encoding="utf-8")
-        )
+        plugin = plugin_manifest()
         for label, text in (
             ("description", meta["description"]),
             ("description_full", meta["description_full"]),
@@ -103,6 +107,17 @@ class Runtime(unittest.TestCase):
         found = errors(self.with_runtime("swig"))
         self.assertEqual(len(found), 1, found)
         self.assertIn("'swig'", found[0])
+
+
+class IpcAction(unittest.TestCase):
+    def test_actions_hide_their_toolbar_button(self):
+        # The IPC action has no icon and runs a stdio server that exits on EOF,
+        # so its button does nothing (Copperpour/Copperpour#277). Show it once
+        # Copperpour/Copperpour#24 fixes both.
+        plugin = plugin_manifest()
+        self.assertTrue(plugin["actions"])
+        for action in plugin["actions"]:
+            self.assertIs(action.get("show-button"), False, action["identifier"])
 
 
 if __name__ == "__main__":

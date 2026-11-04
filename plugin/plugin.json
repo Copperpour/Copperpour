@@ -11,7 +11,7 @@
       "name": "Copperpour",
       "description": "Start the Copperpour AI design server",
       "entrypoint": "bin/copperpour.exe",
-      "show-button": true,
+      "show-button": false,
       "scopes": ["pcb"]
     }
   ]
