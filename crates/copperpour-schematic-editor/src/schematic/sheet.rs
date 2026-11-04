@@ -618,7 +618,9 @@ mod tests {
             "(property \"Sheetname\" \"Power\" (at 100 49.2 0)) ",
             "(property \"Sheetfile\" \"power.kicad_sch\" (at 100 80.4 0)) ",
             "(pin \"VIN\" input (at 140 60 0) ",
-            "(uuid \"8b1f0000-0000-0000-0000-000000000000\")))"
+            "(uuid \"8b1f0000-0000-0000-0000-000000000000\")) ",
+            "(pin \"VOUT\" output (at 120 80 270) ",
+            "(uuid \"8b1f0001-0000-0000-0000-000000000000\")))"
         );
         Sheet::from_sexp(&parse_one(src)).unwrap()
     }
@@ -669,12 +671,15 @@ mod tests {
         );
     }
 
+    /// `VIN` is on the right edge (rotation 0) and `VOUT` on the bottom one
+    /// (rotation 270): each moves with its own edge and keeps the other axis.
     #[test]
-    fn set_size_keeps_the_right_edge_pin_and_file_caption_attached() {
+    fn set_size_keeps_the_edge_pins_and_file_caption_attached() {
         let mut sheet = placed_sheet();
         sheet.set_size(60.0, 45.0);
 
         assert_eq!((sheet.pins[0].at.x, sheet.pins[0].at.y), (160.0, 60.0));
+        assert_eq!((sheet.pins[1].at.x, sheet.pins[1].at.y), (120.0, 95.0));
         assert_eq!(property_position(&sheet, "Sheetname"), (100.0, 49.2));
         assert_eq!(property_position(&sheet, "Sheetfile"), (100.0, 95.4));
     }
@@ -685,6 +690,14 @@ mod tests {
         sheet.set_size(40.0, 5.0);
 
         assert_eq!((sheet.pins[0].at.x, sheet.pins[0].at.y), (140.0, 55.0));
+        assert_eq!((sheet.pins[1].at.x, sheet.pins[1].at.y), (120.0, 55.0));
+
+        // A narrower box leaves `VOUT` past the end of the bottom edge, so it
+        // is pulled back to the bottom-right corner.
+        let mut sheet = placed_sheet();
+        sheet.set_size(10.0, 30.0);
+
+        assert_eq!((sheet.pins[1].at.x, sheet.pins[1].at.y), (110.0, 80.0));
     }
 
     #[test]

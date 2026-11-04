@@ -6814,3 +6814,143 @@ mod saved_hierarchy_tests {
         );
     }
 }
+
+/// `edit_sheet` and `edit_sheet_pin` on a KiCad-saved sheet with a pin on each
+/// edge, through the served dispatch. Every expected coordinate is the one
+/// KiCad 10.0.7 keeps when it resaves the tool's output (see the fixture's
+/// README), not one computed by the code under test.
+#[cfg(test)]
+mod sheet_pin_resize_tests {
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::project_file_writer_tests::{served_call, text_of};
+    use crate::tools::ServerConfig;
+    use copperpour_sexp::schematic::parse_at;
+    use serde_json::{json, Value};
+    use std::path::{Path, PathBuf};
+
+    /// eeschema-saved; sheet `child` at (50.8, 50.8), 81.28 × 50.8, with `R`,
+    /// `L`, `T` and `B` on its right, left, top and bottom edges.
+    const ROOT: &str =
+        include_str!("../../tests/fixtures/sheet_pin_resize/sheet_pin_resize.kicad_sch");
+    const CHILD: &str = include_str!("../../tests/fixtures/sheet_pin_resize/child.kicad_sch");
+
+    fn sheet() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sheet_pin_resize.kicad_sch");
+        std::fs::write(&root, ROOT).unwrap();
+        std::fs::write(dir.path().join("child.kicad_sch"), CHILD).unwrap();
+        (dir, root)
+    }
+
+    async fn call(tool: &str, arguments: Value) -> Value {
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+        let result = served_call(&handler, tool, arguments).await;
+        assert!(!result.is_error, "{:?}", result.content);
+        serde_json::from_str(text_of(&result)).unwrap()
+    }
+
+    /// The `(at x y rotation)` the file holds for pin `name`, or for the
+    /// `Sheetfile` caption when `name` is that.
+    fn at_in_file(path: &Path, name: &str) -> (f64, f64, f64) {
+        let tree = copperpour_sexp::parse_sexp(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let sheet = tree.find("sheet").expect("one sheet");
+        sheet
+            .find_all("pin")
+            .into_iter()
+            .chain(sheet.find_all("property"))
+            .find(|node| node.get(1).and_then(|n| n.as_str()) == Some(name))
+            .and_then(parse_at)
+            .unwrap_or_else(|| panic!("{name} not in the sheet"))
+    }
+
+    async fn resize(path: &Path, width: f64, height: f64) {
+        let out = call(
+            "edit_sheet",
+            json!({ "schematic": path.display().to_string(), "sheet_name": "child",
+                    "width": width, "height": height }),
+        )
+        .await;
+        assert_eq!(out["changed_fields"], json!(["size"]), "{out}");
+    }
+
+    async fn move_pin(path: &Path, pin: &str, x: f64, y: f64) -> Value {
+        call(
+            "edit_sheet_pin",
+            json!({ "schematic": path.display().to_string(), "sheet_name": "child",
+                    "pin_name": pin, "x": x, "y": y }),
+        )
+        .await
+    }
+
+    /// The right and bottom edges move out, and their pins and the file
+    /// caption with them; the left and top pins stay.
+    #[tokio::test]
+    async fn growing_a_sheet_carries_the_right_and_bottom_pins() {
+        let (_d, path) = sheet();
+        resize(&path, 101.6, 63.5).await;
+
+        assert_eq!(at_in_file(&path, "R"), (152.4, 71.12, 0.0));
+        assert_eq!(at_in_file(&path, "B"), (91.44, 114.3, 270.0));
+        assert_eq!(at_in_file(&path, "L"), (50.8, 71.12, 180.0));
+        assert_eq!(at_in_file(&path, "T"), (71.12, 50.8, 90.0));
+        assert_eq!(at_in_file(&path, "Sheetfile"), (50.8, 114.935, 0.0));
+    }
+
+    /// A pin left past the end of a shrunken edge lands on its corner, where
+    /// KiCad would otherwise put it on load.
+    #[tokio::test]
+    async fn shrinking_a_sheet_pulls_its_pins_back_onto_the_edges() {
+        let (_d, path) = sheet();
+        resize(&path, 30.48, 17.78).await;
+
+        assert_eq!(at_in_file(&path, "R"), (81.28, 68.58, 0.0));
+        assert_eq!(at_in_file(&path, "L"), (50.8, 68.58, 180.0));
+        assert_eq!(at_in_file(&path, "B"), (81.28, 68.58, 270.0));
+        assert_eq!(at_in_file(&path, "T"), (71.12, 50.8, 90.0));
+        assert_eq!(at_in_file(&path, "Sheetfile"), (50.8, 69.215, 0.0));
+    }
+
+    /// Moved onto the right edge without `side`, the left pin is turned to it.
+    #[tokio::test]
+    async fn a_pin_moved_to_another_edge_takes_that_edge() {
+        let (_d, path) = sheet();
+        let out = move_pin(&path, "L", 132.08, 81.28).await;
+
+        assert_eq!(out["changed_fields"], json!(["position", "side"]), "{out}");
+        assert_eq!(out["pin"]["side"], "right", "{out}");
+        assert_eq!(at_in_file(&path, "L"), (132.08, 81.28, 0.0));
+    }
+
+    /// Sliding along its own edge moves the pin and nothing else.
+    #[tokio::test]
+    async fn a_pin_moved_along_its_own_edge_keeps_its_side() {
+        let (_d, path) = sheet();
+        let out = move_pin(&path, "R", 132.08, 86.36).await;
+
+        assert_eq!(out["changed_fields"], json!(["position"]), "{out}");
+        assert_eq!(out["pin"]["side"], "right", "{out}");
+        assert_eq!(at_in_file(&path, "R"), (132.08, 86.36, 0.0));
+    }
+
+    /// A corner is on two edges. The pin keeps the one it already names
+    /// rather than taking whichever edge is listed first.
+    #[tokio::test]
+    async fn a_pin_moved_to_a_corner_of_its_edge_keeps_its_side() {
+        let (_d, path) = sheet();
+        let out = move_pin(&path, "T", 132.08, 50.8).await;
+
+        assert_eq!(out["changed_fields"], json!(["position"]), "{out}");
+        assert_eq!(out["pin"]["side"], "top", "{out}");
+        assert_eq!(at_in_file(&path, "T"), (132.08, 50.8, 90.0));
+
+        let out = move_pin(&path, "B", 50.8, 101.6).await;
+        assert_eq!(out["changed_fields"], json!(["position"]), "{out}");
+        assert_eq!(out["pin"]["side"], "bottom", "{out}");
+        assert_eq!(at_in_file(&path, "B"), (50.8, 101.6, 270.0));
+    }
+}

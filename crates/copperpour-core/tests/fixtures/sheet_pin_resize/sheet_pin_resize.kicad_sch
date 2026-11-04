@@ -1,0 +1,99 @@
+(kicad_sch
+	(version 20260306)
+	(generator "eeschema")
+	(generator_version "10.0")
+	(uuid "2dd824ed-f516-4ed5-8fdb-383cae3d6fdc")
+	(paper "A4")
+	(lib_symbols)
+	(sheet
+		(at 50.8 50.8)
+		(size 81.28 50.8)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0)
+		)
+		(uuid "e630203a-47de-4df6-a4da-f3eaea09886d")
+		(property "Sheetname" "child"
+			(at 50.8 50.165 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "child.kicad_sch"
+			(at 50.8 102.235 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(pin "R" output
+			(at 132.08 71.12 0)
+			(uuid "c61e8b9d-c9c2-45f4-b771-150d5980bdbc")
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+			)
+		)
+		(pin "L" input
+			(at 50.8 71.12 180)
+			(uuid "139b4693-d8e2-4839-9f38-6f1c01dcd20c")
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(pin "T" input
+			(at 71.12 50.8 90)
+			(uuid "0694dc66-3e01-47a9-9ac2-99958b9cd141")
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+			)
+		)
+		(pin "B" output
+			(at 91.44 101.6 270)
+			(uuid "95a45679-e4e3-4b9f-baa3-65aeced550bf")
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(instances
+			(project "sheet_pin_resize"
+				(path "/2dd824ed-f516-4ed5-8fdb-383cae3d6fdc"
+					(page "2")
+				)
+			)
+		)
+	)
+	(sheet_instances
+		(path "/"
+			(page "1")
+		)
+	)
+)
