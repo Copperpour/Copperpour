@@ -56,6 +56,10 @@ test. Do not discover a free TCP port by binding it, dropping the listener, and
 then asking NNG to bind the same port: another process can claim the port in
 between, making otherwise deterministic tests fail with `AddressInUse`.
 
+`copperpour-ipc`'s integration tests cannot reach that type; they use
+`tests/mock_kicad`, the same guard. Neither has a receive timeout, so a double
+keeps answering however long a loaded runner idles before its first request.
+
 The Specctra import undo boundary has a manual live gate because KiCad IPC can
 create a named commit but cannot invoke the editor's Undo action. Open a
 disposable copy of

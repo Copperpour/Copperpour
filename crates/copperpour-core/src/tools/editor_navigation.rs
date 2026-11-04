@@ -904,18 +904,18 @@ mod tests {
     use crate::mcp::error::extract_error_kind;
     use crate::mcp::protocol::ToolContent;
     use crate::router::ToolRouter;
+    use crate::test_support::MockIpcServer;
     use crate::tools::ServerConfig;
     use copperpour_ipc::builders;
     use copperpour_ipc::gen::kiapi;
-    use nng::options::Options;
     use prost::Message;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
-    fn context(ipc_address: String) -> ToolContext {
+    fn context(ipc_address: &str) -> ToolContext {
         ToolContext::new(
             ServerConfig {
-                ipc_address,
+                ipc_address: ipc_address.to_string(),
                 ..Default::default()
             },
             Arc::new(ToolRouter::new()),
@@ -930,275 +930,183 @@ mod tests {
         }
     }
 
-    fn spawn_observation_mock() -> String {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let url = format!(
-            "inproc://editor-state-core-{}",
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock socket");
-        socket
-            .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(10)))
-            .expect("timeout");
-        socket.listen(&url).expect("listen");
-        std::thread::spawn(move || {
-            for _ in 0..3 {
-                let message = socket.recv().expect("request");
-                let request =
-                    kiapi::common::ApiRequest::decode(message.as_slice()).expect("decode request");
-                let command = request.message.expect("command");
-                let response_any = if command.type_url.ends_with("GetVersion") {
-                    builders::pack_any(
-                        &kiapi::common::commands::GetVersionResponse {
-                            version: Some(kiapi::common::types::KiCadVersion {
-                                major: 10,
-                                minor: 0,
-                                patch: 5,
-                                full_version: "10.0.5".to_string(),
-                            }),
-                        },
-                        "kiapi.common.commands.GetVersionResponse",
-                    )
-                } else {
-                    builders::pack_any(
-                        &kiapi::common::commands::GetOpenDocumentsResponse {
-                            documents: Vec::new(),
-                        },
-                        "kiapi.common.commands.GetOpenDocumentsResponse",
-                    )
-                };
-                let response = kiapi::common::ApiResponse {
-                    status: Some(kiapi::common::ApiResponseStatus {
-                        status: kiapi::common::ApiStatusCode::AsOk as i32,
-                        error_message: String::new(),
-                    }),
-                    header: None,
-                    message: Some(response_any),
-                };
-                socket
-                    .send(nng::Message::from(response.encode_to_vec().as_slice()))
-                    .expect("response");
-            }
-        });
-        url
+    fn ok(message: prost_types::Any) -> kiapi::common::ApiResponse {
+        kiapi::common::ApiResponse {
+            status: Some(kiapi::common::ApiResponseStatus {
+                status: kiapi::common::ApiStatusCode::AsOk as i32,
+                error_message: String::new(),
+            }),
+            header: None,
+            message: Some(message),
+        }
     }
 
-    fn spawn_selection_mock() -> String {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let url = format!(
-            "inproc://editor-selection-core-{}",
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock socket");
-        socket.listen(&url).expect("listen");
-        std::thread::spawn(move || {
-            for _ in 0..3 {
-                let message = socket.recv().expect("request");
-                let request =
-                    kiapi::common::ApiRequest::decode(message.as_slice()).expect("decode request");
-                let command = request.message.expect("command");
-                let response_any = if command.type_url.ends_with("GetOpenDocuments") {
-                    builders::pack_any(
-                        &kiapi::common::commands::GetOpenDocumentsResponse {
-                            documents: vec![kiapi::common::types::DocumentSpecifier {
-                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-                                identifier: Some(
-                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                                        "navigation.kicad_pcb".to_string(),
-                                    ),
-                                ),
-                                project: Some(kiapi::common::types::ProjectSpecifier {
-                                    name: "navigation".to_string(),
-                                    path: selection_project_path().to_string(),
-                                }),
-                            }],
-                        },
-                        "kiapi.common.commands.GetOpenDocumentsResponse",
-                    )
-                } else {
-                    let footprint = kiapi::board::types::FootprintInstance {
-                        id: Some(kiapi::common::types::Kiid {
-                            value: "footprint-kiid".to_string(),
+    fn board(
+        name: &str,
+        project_name: &str,
+        project_path: &str,
+    ) -> kiapi::common::types::DocumentSpecifier {
+        kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            identifier: Some(
+                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                    name.to_string(),
+                ),
+            ),
+            project: Some(kiapi::common::types::ProjectSpecifier {
+                name: project_name.to_string(),
+                path: project_path.to_string(),
+            }),
+        }
+    }
+
+    fn open_documents(document: kiapi::common::types::DocumentSpecifier) -> prost_types::Any {
+        builders::pack_any(
+            &kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: vec![document],
+            },
+            "kiapi.common.commands.GetOpenDocumentsResponse",
+        )
+    }
+
+    /// Answers at most `limit` requests and fails the worker on the next, so
+    /// a handler that adds an IPC round trip fails its test.
+    fn spawn_limited(
+        purpose: &'static str,
+        limit: usize,
+        respond: impl Fn(kiapi::common::ApiRequest) -> kiapi::common::ApiResponse + Send + 'static,
+    ) -> MockIpcServer {
+        let served = AtomicUsize::new(0);
+        MockIpcServer::spawn(purpose, move |request| {
+            assert!(
+                served.fetch_add(1, Ordering::SeqCst) < limit,
+                "{purpose}: more than {limit} requests"
+            );
+            respond(request)
+        })
+    }
+
+    fn spawn_observation_mock() -> MockIpcServer {
+        spawn_limited("editor-state", 3, |request| {
+            let command = request.message.expect("command");
+            ok(if command.type_url.ends_with("GetVersion") {
+                builders::pack_any(
+                    &kiapi::common::commands::GetVersionResponse {
+                        version: Some(kiapi::common::types::KiCadVersion {
+                            major: 10,
+                            minor: 0,
+                            patch: 5,
+                            full_version: "10.0.5".to_string(),
                         }),
-                        ..Default::default()
-                    };
-                    builders::pack_any(
-                        &kiapi::common::commands::SelectionResponse {
-                            items: vec![builders::pack_any(
-                                &footprint,
-                                "kiapi.board.types.FootprintInstance",
-                            )],
-                        },
-                        "kiapi.common.commands.SelectionResponse",
-                    )
-                };
-                socket
-                    .send(nng::Message::from(
-                        kiapi::common::ApiResponse {
-                            status: Some(kiapi::common::ApiResponseStatus {
-                                status: kiapi::common::ApiStatusCode::AsOk as i32,
-                                error_message: String::new(),
-                            }),
-                            header: None,
-                            message: Some(response_any),
-                        }
-                        .encode_to_vec()
-                        .as_slice(),
-                    ))
-                    .expect("response");
-            }
-        });
-        url
+                    },
+                    "kiapi.common.commands.GetVersionResponse",
+                )
+            } else {
+                builders::pack_any(
+                    &kiapi::common::commands::GetOpenDocumentsResponse {
+                        documents: Vec::new(),
+                    },
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                )
+            })
+        })
     }
 
-    fn spawn_open_board_mock(project_path: String) -> String {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let url = format!(
-            "inproc://navigation-resolver-core-{}",
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock socket");
-        socket.listen(&url).expect("listen");
-        std::thread::spawn(move || {
-            let message = socket.recv().expect("request");
-            let request =
-                kiapi::common::ApiRequest::decode(message.as_slice()).expect("decode request");
+    fn spawn_selection_mock() -> MockIpcServer {
+        spawn_limited("editor-selection", 3, |request| {
+            let command = request.message.expect("command");
+            ok(if command.type_url.ends_with("GetOpenDocuments") {
+                open_documents(board(
+                    "navigation.kicad_pcb",
+                    "navigation",
+                    selection_project_path(),
+                ))
+            } else {
+                let footprint = kiapi::board::types::FootprintInstance {
+                    id: Some(kiapi::common::types::Kiid {
+                        value: "footprint-kiid".to_string(),
+                    }),
+                    ..Default::default()
+                };
+                builders::pack_any(
+                    &kiapi::common::commands::SelectionResponse {
+                        items: vec![builders::pack_any(
+                            &footprint,
+                            "kiapi.board.types.FootprintInstance",
+                        )],
+                    },
+                    "kiapi.common.commands.SelectionResponse",
+                )
+            })
+        })
+    }
+
+    fn spawn_open_board_mock(project_path: String) -> MockIpcServer {
+        spawn_limited("navigation-resolver", 1, move |request| {
             assert!(request
                 .message
                 .as_ref()
                 .is_some_and(|message| message.type_url.ends_with("GetOpenDocuments")));
-            let response = kiapi::common::ApiResponse {
-                status: Some(kiapi::common::ApiResponseStatus {
-                    status: kiapi::common::ApiStatusCode::AsOk as i32,
-                    error_message: String::new(),
-                }),
-                header: None,
-                message: Some(builders::pack_any(
-                    &kiapi::common::commands::GetOpenDocumentsResponse {
-                        documents: vec![kiapi::common::types::DocumentSpecifier {
-                            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-                            identifier: Some(
-                                kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                                    "layout.kicad_pcb".to_string(),
-                                ),
-                            ),
-                            project: Some(kiapi::common::types::ProjectSpecifier {
-                                name: "nav".to_string(),
-                                path: project_path,
-                            }),
-                        }],
-                    },
-                    "kiapi.common.commands.GetOpenDocumentsResponse",
-                )),
-            };
-            socket
-                .send(nng::Message::from(response.encode_to_vec().as_slice()))
-                .expect("response");
-        });
-        url
+            ok(open_documents(board(
+                "layout.kicad_pcb",
+                "nav",
+                &project_path,
+            )))
+        })
     }
 
-    fn spawn_add_selection_mock(project_path: String, apply_mutation: bool) -> String {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let url = format!(
-            "inproc://selection-mutation-core-{}",
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock socket");
-        socket.listen(&url).expect("listen");
-        std::thread::spawn(move || {
-            let mut selected = false;
-            for _ in 0..8 {
-                let message = socket.recv().expect("request");
-                let request =
-                    kiapi::common::ApiRequest::decode(message.as_slice()).expect("decode request");
-                let command = request.message.expect("command");
-                let response_any = if command.type_url.ends_with("GetOpenDocuments") {
-                    builders::pack_any(
-                        &kiapi::common::commands::GetOpenDocumentsResponse {
-                            documents: vec![kiapi::common::types::DocumentSpecifier {
-                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-                                identifier: Some(
-                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                                        "layout.kicad_pcb".to_string(),
-                                    ),
-                                ),
-                                project: Some(kiapi::common::types::ProjectSpecifier {
-                                    name: "nav".to_string(),
-                                    path: project_path.clone(),
-                                }),
-                            }],
-                        },
-                        "kiapi.common.commands.GetOpenDocumentsResponse",
-                    )
-                } else {
-                    if command.type_url.ends_with("AddToSelection") && apply_mutation {
-                        let add = kiapi::common::commands::AddToSelection::decode(
-                            command.value.as_slice(),
-                        )
-                        .expect("add selection");
-                        assert_eq!(add.items[0].value, "fp-c10");
-                        selected = true;
-                    }
-                    let items = selected
-                        .then(|| {
-                            builders::pack_any(
-                                &kiapi::board::types::FootprintInstance {
-                                    id: Some(kiapi::common::types::Kiid {
-                                        value: "fp-c10".to_string(),
-                                    }),
-                                    ..Default::default()
-                                },
-                                "kiapi.board.types.FootprintInstance",
-                            )
-                        })
-                        .into_iter()
-                        .collect();
-                    builders::pack_any(
-                        &kiapi::common::commands::SelectionResponse { items },
-                        "kiapi.common.commands.SelectionResponse",
-                    )
-                };
-                let response = kiapi::common::ApiResponse {
-                    status: Some(kiapi::common::ApiResponseStatus {
-                        status: kiapi::common::ApiStatusCode::AsOk as i32,
-                        error_message: String::new(),
-                    }),
-                    header: None,
-                    message: Some(response_any),
-                };
-                socket
-                    .send(nng::Message::from(response.encode_to_vec().as_slice()))
-                    .expect("response");
+    fn spawn_add_selection_mock(project_path: String, apply_mutation: bool) -> MockIpcServer {
+        let selected = AtomicBool::new(false);
+        spawn_limited("selection-mutation", 8, move |request| {
+            let command = request.message.expect("command");
+            if command.type_url.ends_with("GetOpenDocuments") {
+                return ok(open_documents(board(
+                    "layout.kicad_pcb",
+                    "nav",
+                    &project_path,
+                )));
             }
-        });
-        url
+            if command.type_url.ends_with("AddToSelection") && apply_mutation {
+                let add = kiapi::common::commands::AddToSelection::decode(command.value.as_slice())
+                    .expect("add selection");
+                assert_eq!(add.items[0].value, "fp-c10");
+                selected.store(true, Ordering::SeqCst);
+            }
+            let items = selected
+                .load(Ordering::SeqCst)
+                .then(|| {
+                    builders::pack_any(
+                        &kiapi::board::types::FootprintInstance {
+                            id: Some(kiapi::common::types::Kiid {
+                                value: "fp-c10".to_string(),
+                            }),
+                            ..Default::default()
+                        },
+                        "kiapi.board.types.FootprintInstance",
+                    )
+                })
+                .into_iter()
+                .collect();
+            ok(builders::pack_any(
+                &kiapi::common::commands::SelectionResponse { items },
+                "kiapi.common.commands.SelectionResponse",
+            ))
+        })
     }
 
     fn spawn_cross_probe_context_mock(
         project_path: String,
         commands: Arc<Mutex<Vec<String>>>,
-    ) -> String {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let url = format!(
-            "inproc://cross-probe-core-{}",
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock socket");
-        socket.listen(&url).expect("listen");
-        std::thread::spawn(move || {
-            for _ in 0..2 {
-                let message = socket.recv().expect("request");
-                let request =
-                    kiapi::common::ApiRequest::decode(message.as_slice()).expect("decode request");
-                let command = request.message.expect("command");
-                commands.lock().unwrap().push(command.type_url.clone());
-                let query =
-                    kiapi::common::commands::GetOpenDocuments::decode(command.value.as_slice())
-                        .expect("open documents");
-                let document = if query.r#type
-                    == kiapi::common::types::DocumentType::DoctypeSchematic as i32
-                {
+    ) -> MockIpcServer {
+        spawn_limited("cross-probe", 2, move |request| {
+            let command = request.message.expect("command");
+            commands.lock().unwrap().push(command.type_url.clone());
+            let query = kiapi::common::commands::GetOpenDocuments::decode(command.value.as_slice())
+                .expect("open documents");
+            let board = board("nav.kicad_pcb", "nav", &project_path);
+            // Echo the asked type, so a query for the wrong one is caught.
+            ok(open_documents(
+                if query.r#type == kiapi::common::types::DocumentType::DoctypeSchematic as i32 {
                     kiapi::common::types::DocumentSpecifier {
                         r#type: query.r#type,
                         identifier: Some(
@@ -1211,44 +1119,16 @@ mod tests {
                                 },
                             ),
                         ),
-                        project: Some(kiapi::common::types::ProjectSpecifier {
-                            name: "nav".to_string(),
-                            path: project_path.clone(),
-                        }),
+                        ..board
                     }
                 } else {
                     kiapi::common::types::DocumentSpecifier {
                         r#type: query.r#type,
-                        identifier: Some(
-                            kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                                "nav.kicad_pcb".to_string(),
-                            ),
-                        ),
-                        project: Some(kiapi::common::types::ProjectSpecifier {
-                            name: "nav".to_string(),
-                            path: project_path.clone(),
-                        }),
+                        ..board
                     }
-                };
-                let response = kiapi::common::ApiResponse {
-                    status: Some(kiapi::common::ApiResponseStatus {
-                        status: kiapi::common::ApiStatusCode::AsOk as i32,
-                        error_message: String::new(),
-                    }),
-                    header: None,
-                    message: Some(builders::pack_any(
-                        &kiapi::common::commands::GetOpenDocumentsResponse {
-                            documents: vec![document],
-                        },
-                        "kiapi.common.commands.GetOpenDocumentsResponse",
-                    )),
-                };
-                socket
-                    .send(nng::Message::from(response.encode_to_vec().as_slice()))
-                    .expect("response");
-            }
-        });
-        url
+                },
+            ))
+        })
     }
 
     #[test]
@@ -1311,7 +1191,7 @@ mod tests {
 
     #[tokio::test]
     async fn unconfigured_endpoint_is_a_structured_editor_unavailable_refusal() {
-        let result = handle_get_editor_state(&json!({}), &context(String::new()))
+        let result = handle_get_editor_state(&json!({}), &context(""))
             .await
             .expect("handler result");
         assert!(result.is_error);
@@ -1323,7 +1203,8 @@ mod tests {
 
     #[tokio::test]
     async fn public_result_is_derived_from_typed_ipc_observation() {
-        let result = handle_get_editor_state(&json!({}), &context(spawn_observation_mock()))
+        let kicad = spawn_observation_mock();
+        let result = handle_get_editor_state(&json!({}), &context(kicad.address()))
             .await
             .expect("handler result");
         assert!(!result.is_error);
@@ -1351,6 +1232,7 @@ mod tests {
     #[tokio::test]
     async fn public_selection_result_is_derived_from_exact_document_readback() {
         let project_path = selection_project_path();
+        let kicad = spawn_selection_mock();
         let result = handle_get_editor_selection(
             &json!({
                 "editor": "pcb",
@@ -1358,7 +1240,7 @@ mod tests {
                 "project_path": project_path,
                 "document_path": std::path::Path::new(project_path).join("navigation.kicad_pcb")
             }),
-            &context(spawn_selection_mock()),
+            &context(kicad.address()),
         )
         .await
         .expect("handler result");
@@ -1457,6 +1339,7 @@ mod tests {
         )
         .unwrap();
         let project_path = temp.path().display().to_string();
+        let kicad = spawn_open_board_mock(project_path.clone());
         let result = handle_resolve_navigation_target(
             &json!({
                 "editor": "pcb",
@@ -1465,7 +1348,7 @@ mod tests {
                 "document_path": board.display().to_string(),
                 "human_reference": "C10"
             }),
-            &context(spawn_open_board_mock(project_path)),
+            &context(kicad.address()),
         )
         .await
         .expect("handler result");
@@ -1523,6 +1406,7 @@ mod tests {
         )
         .unwrap();
         let project_path = temp.path().display().to_string();
+        let kicad = spawn_add_selection_mock(project_path.clone(), true);
         let result = handle_mutate_editor_selection(
             &json!({
                 "operation": "add",
@@ -1532,7 +1416,7 @@ mod tests {
                 "document_path": board.display().to_string(),
                 "object_kiids": ["fp-c10"]
             }),
-            &context(spawn_add_selection_mock(project_path, true)),
+            &context(kicad.address()),
         )
         .await
         .expect("handler result");
@@ -1564,6 +1448,7 @@ mod tests {
         )
         .unwrap();
         let project_path = temp.path().display().to_string();
+        let kicad = spawn_add_selection_mock(project_path.clone(), false);
         let result = handle_mutate_editor_selection(
             &json!({
                 "operation": "add",
@@ -1573,7 +1458,7 @@ mod tests {
                 "document_path": board.display().to_string(),
                 "object_kiids": ["fp-c10"]
             }),
-            &context(spawn_add_selection_mock(project_path, false)),
+            &context(kicad.address()),
         )
         .await
         .expect("handler result");
@@ -1620,6 +1505,7 @@ mod tests {
         .unwrap();
         let project_path = temp.path().display().to_string();
         let commands = Arc::new(Mutex::new(Vec::new()));
+        let kicad = spawn_cross_probe_context_mock(project_path.clone(), commands.clone());
         let result = handle_resolve_cross_probe_target(
             &json!({
                 "source_editor": "schematic",
@@ -1631,10 +1517,7 @@ mod tests {
                 "sheet_path_human_readable": "/",
                 "source_object_kiid": "sym-c10"
             }),
-            &context(spawn_cross_probe_context_mock(
-                project_path,
-                commands.clone(),
-            )),
+            &context(kicad.address()),
         )
         .await
         .expect("handler result");

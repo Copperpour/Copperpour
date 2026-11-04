@@ -192,6 +192,41 @@ mod tests {
         );
     }
 
+    /// `docs/TESTING_AND_RELEASE.md`: IPC doubles in this crate use this guard.
+    /// A hand-rolled `Rep0` worker in a detached thread can only end on a
+    /// receive timeout, which a loaded runner outwaits
+    /// (Copperpour/Copperpour#272).
+    #[test]
+    fn no_other_kicad_double_listens_in_this_crate() {
+        fn sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read source dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        sources(&crate_dir.join("src"), &mut files);
+        sources(&crate_dir.join("tests"), &mut files);
+        let hand_rolled: Vec<_> = files
+            .iter()
+            .filter(|path| !path.ends_with("src/test_support.rs"))
+            .filter(|path| {
+                std::fs::read_to_string(path)
+                    .expect("read source")
+                    .contains("Protocol::Rep0")
+            })
+            .collect();
+        assert!(
+            hand_rolled.is_empty(),
+            "use test_support::MockIpcServer instead of a Rep0 socket in {hand_rolled:?}"
+        );
+    }
+
     #[test]
     fn concurrent_servers_own_distinct_endpoints() {
         let servers: Vec<_> = (0..64)

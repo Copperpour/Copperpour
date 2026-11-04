@@ -14,6 +14,7 @@
 use crate::mcp::error::extract_error_kind;
 use crate::mcp::handler::McpHandler;
 use crate::mcp::protocol::{CallToolResult, ToolContent};
+use crate::test_support::MockIpcServer;
 use crate::tools::ServerConfig;
 use copperpour_ipc::builders;
 use copperpour_ipc::gen::kiapi;
@@ -21,11 +22,9 @@ use copperpour_ipc::gen::kiapi::common::types::{
     document_specifier::Identifier, DocumentSpecifier, DocumentType, Kiid, ProjectSpecifier,
     SheetPath,
 };
-use nng::options::Options;
 use prost::Message;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 const FIXTURE_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -45,89 +44,67 @@ struct Endpoint {
     pcb: Option<Vec<DocumentSpecifier>>,
 }
 
-fn spawn(endpoint: Endpoint) -> String {
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let url = format!(
-        "inproc://kicad10-schematic-identity-{}",
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
-    let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock socket");
-    socket
-        .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(10)))
-        .expect("timeout");
-    socket.listen(&url).expect("listen");
-    std::thread::spawn(move || {
-        while let Ok(message) = socket.recv() {
-            let request =
-                kiapi::common::ApiRequest::decode(message.as_slice()).expect("decode request");
-            let command = request.message.expect("command");
-            let answer = if command.type_url.ends_with("GetVersion") {
-                endpoint.version.map(|(major, minor, patch)| {
-                    builders::pack_any(
-                        &kiapi::common::commands::GetVersionResponse {
-                            version: Some(kiapi::common::types::KiCadVersion {
-                                major,
-                                minor,
-                                patch,
-                                full_version: format!("{major}.{minor}.{patch}"),
-                            }),
-                        },
-                        "kiapi.common.commands.GetVersionResponse",
-                    )
-                })
-            } else if command.type_url.ends_with("GetOpenDocuments") {
-                let query =
-                    kiapi::common::commands::GetOpenDocuments::decode(command.value.as_slice())
-                        .expect("open documents");
-                let documents = if query.r#type == DocumentType::DoctypeSchematic as i32 {
-                    endpoint.schematic.clone()
-                } else {
-                    endpoint.pcb.clone()
-                };
-                documents.map(|documents| {
-                    builders::pack_any(
-                        &kiapi::common::commands::GetOpenDocumentsResponse { documents },
-                        "kiapi.common.commands.GetOpenDocumentsResponse",
-                    )
-                })
-            } else if command.type_url.ends_with("GetSelection")
-                || command.type_url.ends_with("ClearSelection")
-            {
-                Some(builders::pack_any(
-                    &kiapi::common::commands::SelectionResponse { items: Vec::new() },
-                    "kiapi.common.commands.SelectionResponse",
-                ))
-            } else {
-                None
-            };
-            let (status, error_message) = if answer.is_some() {
-                (kiapi::common::ApiStatusCode::AsOk, String::new())
-            } else {
-                (
-                    kiapi::common::ApiStatusCode::AsUnhandled,
-                    format!(
-                        "no handler available for request of type {}",
-                        command.type_url
-                    ),
+fn spawn(endpoint: Endpoint) -> MockIpcServer {
+    MockIpcServer::spawn("kicad10-schematic-identity", move |request| {
+        let command = request.message.expect("command");
+        let answer = if command.type_url.ends_with("GetVersion") {
+            endpoint.version.map(|(major, minor, patch)| {
+                builders::pack_any(
+                    &kiapi::common::commands::GetVersionResponse {
+                        version: Some(kiapi::common::types::KiCadVersion {
+                            major,
+                            minor,
+                            patch,
+                            full_version: format!("{major}.{minor}.{patch}"),
+                        }),
+                    },
+                    "kiapi.common.commands.GetVersionResponse",
                 )
+            })
+        } else if command.type_url.ends_with("GetOpenDocuments") {
+            let query = kiapi::common::commands::GetOpenDocuments::decode(command.value.as_slice())
+                .expect("open documents");
+            let documents = if query.r#type == DocumentType::DoctypeSchematic as i32 {
+                endpoint.schematic.clone()
+            } else {
+                endpoint.pcb.clone()
             };
-            let response = kiapi::common::ApiResponse {
-                status: Some(kiapi::common::ApiResponseStatus {
-                    status: status as i32,
-                    error_message,
-                }),
-                header: None,
-                message: answer,
-            };
-            if socket
-                .send(nng::Message::from(response.encode_to_vec().as_slice()))
-                .is_err()
-            {
-                break;
-            }
+            documents.map(|documents| {
+                builders::pack_any(
+                    &kiapi::common::commands::GetOpenDocumentsResponse { documents },
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                )
+            })
+        } else if command.type_url.ends_with("GetSelection")
+            || command.type_url.ends_with("ClearSelection")
+        {
+            Some(builders::pack_any(
+                &kiapi::common::commands::SelectionResponse { items: Vec::new() },
+                "kiapi.common.commands.SelectionResponse",
+            ))
+        } else {
+            None
+        };
+        let (status, error_message) = if answer.is_some() {
+            (kiapi::common::ApiStatusCode::AsOk, String::new())
+        } else {
+            (
+                kiapi::common::ApiStatusCode::AsUnhandled,
+                format!(
+                    "no handler available for request of type {}",
+                    command.type_url
+                ),
+            )
+        };
+        kiapi::common::ApiResponse {
+            status: Some(kiapi::common::ApiResponseStatus {
+                status: status as i32,
+                error_message,
+            }),
+            header: None,
+            message: answer,
         }
-    });
-    url
+    })
 }
 
 /// The fixture project, copied so its path is this test's own.
@@ -195,9 +172,9 @@ fn pcb(project: &Project, filename: &str) -> DocumentSpecifier {
     }
 }
 
-async fn call(address: &str, tool: &str, arguments: Value) -> CallToolResult {
+async fn call(kicad: &MockIpcServer, tool: &str, arguments: Value) -> CallToolResult {
     let handler = McpHandler::new(ServerConfig {
-        ipc_address: address.to_string(),
+        ipc_address: kicad.address().to_string(),
         eager_toolsets: true,
         ..Default::default()
     })
@@ -273,13 +250,13 @@ fn assert_unsupported_identity(result: &CallToolResult, version: Value) {
 #[tokio::test]
 async fn kicad_10s_schematic_editor_is_reported_unsupported_beside_its_pcb_editor() {
     let project = Project::new();
-    let address = spawn(Endpoint {
+    let kicad = spawn(Endpoint {
         version: Some((10, 0, 6)),
         schematic: Some(vec![kicad_10_schematic()]),
         pcb: Some(vec![pcb(&project, &format!("{PROJECT}.kicad_pcb"))]),
     });
 
-    let result = call(&address, "get_editor_state", json!({})).await;
+    let result = call(&kicad, "get_editor_state", json!({})).await;
 
     assert!(!result.is_error, "{:#}", body(&result));
     let state = body(&result);
@@ -373,14 +350,14 @@ async fn every_schematic_tool_refuses_kicad_10s_schematic_editor_as_unsupported(
 #[tokio::test]
 async fn a_standalone_kicad_10_schematic_editor_is_refused_without_a_version() {
     let project = Project::new();
-    let address = spawn(Endpoint {
+    let kicad = spawn(Endpoint {
         version: None,
         schematic: Some(vec![kicad_10_schematic()]),
         pcb: None,
     });
 
     let selection = call(
-        &address,
+        &kicad,
         "get_editor_selection",
         schematic_selection(&project),
     )
