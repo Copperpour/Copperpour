@@ -134,9 +134,13 @@ pub(crate) async fn run(
             }),
         }
     };
-    let (sync, refill) = match (option("sync_live_board"), option("refill_zones")) {
-        (Ok(sync), Ok(refill)) => (sync, refill),
-        (Err(error), _) | (_, Err(error)) => return Ok(Err(error)),
+    let (sync, refill, skip_creepage) = match (
+        option("sync_live_board"),
+        option("refill_zones"),
+        option("skip_creepage"),
+    ) {
+        (Ok(sync), Ok(refill), Ok(skip)) => (sync, refill, skip),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => return Ok(Err(error)),
     };
     // Refuse obvious publication errors before any live save/refill. Later
     // permission changes or filesystem races still need applied-state recovery.
@@ -184,11 +188,13 @@ pub(crate) async fn run(
     }
     // CLI refill is analysis-only. In synchronized mode the persisted IPC fill
     // is authoritative, so do not refill a second time in a different process.
-    let report = match cli::run_drc(&ctx.config.kicad_cli, board, refill && !sync).await {
-        Ok(report) => report,
-        Err(error) if sync => return Ok(Err(uncertain(board, "drc_after_save", error))),
-        Err(error) => return Err(error),
-    };
+    let report =
+        match cli::run_drc_with(&ctx.config.kicad_cli, board, refill && !sync, skip_creepage).await
+        {
+            Ok(report) => report,
+            Err(error) if sync => return Ok(Err(uncertain(board, "drc_after_save", error))),
+            Err(error) => return Err(error),
+        };
     if let Some(snapshot) = saved_snapshot {
         match tokio::fs::read_to_string(board).await {
             Ok(current) if current == snapshot => {}

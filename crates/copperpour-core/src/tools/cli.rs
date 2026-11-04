@@ -281,6 +281,10 @@ pub struct DrcReport {
     /// category at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schematic_parity_diagnostic: Option<String>,
+    /// True when this DRC ran with the project's `creepage` constraints
+    /// removed (`skip_creepage`): creepage was NOT checked. Absent otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub creepage_skipped: bool,
 }
 
 impl DrcReport {
@@ -1002,11 +1006,39 @@ fn parse_item_pos(item: &serde_json::Value) -> Option<ReportPos> {
 /// KiCAD 10: `pcb drc --output <path> --format json --schematic-parity
 /// [--refill-zones] <input>`
 pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcReport> {
-    let out_path = pcb.with_extension("drc.json");
+    run_drc_with(cli, pcb, refill_zones, false).await
+}
+
+/// [`run_drc`], optionally without the project's `creepage` constraints.
+///
+/// KiCad 10 checks creepage single-threaded over every net pair and copper
+/// layer; one conditional `(constraint creepage …)` makes a 4-layer board's
+/// DRC take 20+ minutes instead of seconds. With `skip_creepage`, kicad-cli
+/// runs on a view of the project directory (symbolic links to every entry)
+/// whose `.kicad_dru` has those constraints removed, so every other rule,
+/// the schematic for parity and the libraries stay exactly the project's. The
+/// source project is never modified. The report says `creepage_skipped`.
+/// Nothing changes when the project has no creepage constraint, or on a
+/// platform without symbolic links (the full DRC runs).
+pub async fn run_drc_with(
+    cli: &str,
+    pcb: &Path,
+    refill_zones: bool,
+    skip_creepage: bool,
+) -> Result<DrcReport> {
+    let view = if skip_creepage {
+        creepage_free_view(pcb)?
+    } else {
+        None
+    };
+    let checked_pcb = view
+        .as_ref()
+        .map_or_else(|| pcb.to_path_buf(), |(_, path)| path.clone());
+    let out_path = checked_pcb.with_extension("drc.json");
     let args = drc_args(
         out_path.to_str().unwrap(),
         refill_zones,
-        pcb.to_str().unwrap(),
+        checked_pcb.to_str().unwrap(),
     );
     let output = run_cli_captured(cli, &args, LONG_TIMEOUT).await?;
 
@@ -1017,6 +1049,8 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcRep
     let _ = tokio::fs::remove_file(&out_path).await;
 
     let mut report = parse_drc_report(&raw)?;
+    report.creepage_skipped = view.is_some();
+    drop(view);
     apply_parity_evidence(&mut report, &output.stderr, pcb);
 
     // Ownership comes from the exact board this DRC ran on, and it is attached
@@ -1038,6 +1072,161 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcRep
     }
 
     Ok(report)
+}
+
+/// A temporary view of `pcb`'s directory in which the sibling `.kicad_dru`
+/// has no creepage constraint, and the board path inside it. `None` when there
+/// is nothing to remove or the platform cannot link.
+fn creepage_free_view(pcb: &Path) -> Result<Option<(tempfile::TempDir, PathBuf)>> {
+    let dru_path = pcb.with_extension("kicad_dru");
+    let Ok(dru) = std::fs::read_to_string(&dru_path) else {
+        return Ok(None);
+    };
+    let Some(stripped) = strip_creepage_constraints(&dru) else {
+        return Ok(None);
+    };
+    #[cfg(unix)]
+    {
+        let dir = pcb
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let dir = dir
+            .canonicalize()
+            .with_context(|| format!("resolve {}", dir.display()))?;
+        let view = tempfile::Builder::new()
+            .prefix("copperpour-drc-")
+            .tempdir()
+            .context("create DRC project view")?;
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("list {}", dir.display()))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if Path::new(&name) == dru_path.file_name().map(Path::new).unwrap_or(Path::new("")) {
+                continue;
+            }
+            std::os::unix::fs::symlink(entry.path(), view.path().join(&name))
+                .with_context(|| format!("link {}", entry.path().display()))?;
+        }
+        let dru_name = dru_path.file_name().context("rules file name")?;
+        std::fs::write(view.path().join(dru_name), stripped).context("write DRC rules view")?;
+        let board_name = pcb.file_name().context("board file name")?;
+        let board = view.path().join(board_name);
+        Ok(Some((view, board)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = stripped;
+        warn!("skip_creepage needs symbolic links; running the full DRC");
+        Ok(None)
+    }
+}
+
+/// Removes every `(constraint creepage …)` from a KiCad custom rules file, and
+/// any `(rule …)` left without a constraint. `None` when there is none. The
+/// scan honours quoted strings and `#` comments, so parentheses inside a
+/// condition or a comment do not count; everything else is kept byte for byte.
+pub(crate) fn strip_creepage_constraints(dru: &str) -> Option<String> {
+    // Spans [start, end) of every parenthesised expression, with its depth
+    // and head atoms.
+    struct Expr {
+        start: usize,
+        end: usize,
+        depth: usize,
+        head: String,
+        second: String,
+    }
+    let bytes = dru.as_bytes();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut exprs: Vec<Expr> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'(' => stack.push(i),
+            b')' => {
+                let start = stack.pop()?;
+                let mut atoms = dru[start + 1..i]
+                    .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+                    .filter(|atom| !atom.is_empty());
+                let head = atoms.next().unwrap_or("").to_string();
+                let second = atoms.next().unwrap_or("").to_string();
+                exprs.push(Expr {
+                    start,
+                    end: i + 1,
+                    depth: stack.len(),
+                    head,
+                    second,
+                });
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if !stack.is_empty() {
+        return None;
+    }
+    let creepage: Vec<&Expr> = exprs
+        .iter()
+        .filter(|e| e.depth == 1 && e.head == "constraint" && e.second == "creepage")
+        .collect();
+    if creepage.is_empty() {
+        return None;
+    }
+    let mut cut: Vec<(usize, usize)> = Vec::new();
+    for rule in exprs.iter().filter(|e| e.depth == 0 && e.head == "rule") {
+        let removed: Vec<&Expr> = creepage
+            .iter()
+            .copied()
+            .filter(|e| e.start > rule.start && e.end <= rule.end)
+            .collect();
+        if removed.is_empty() {
+            continue;
+        }
+        let kept = exprs
+            .iter()
+            .filter(|e| e.depth == 1 && e.head == "constraint" && e.second != "creepage")
+            .any(|e| e.start > rule.start && e.end <= rule.end);
+        if kept {
+            for e in removed {
+                // Take the whitespace before the constraint along with it.
+                let mut start = e.start;
+                while start > 0 && (bytes[start - 1] == b' ' || bytes[start - 1] == b'\t') {
+                    start -= 1;
+                }
+                if start > 0 && bytes[start - 1] == b'\n' {
+                    start -= 1;
+                }
+                cut.push((start, e.end));
+            }
+        } else {
+            cut.push((rule.start, rule.end));
+        }
+    }
+    cut.sort();
+    let mut out = String::with_capacity(dru.len());
+    let mut at = 0;
+    for (start, end) in cut {
+        if start >= at {
+            out.push_str(&dru[at..start]);
+            at = end;
+        }
+    }
+    out.push_str(&dru[at..]);
+    Some(out)
 }
 
 /// The `kicad-cli pcb drc` argument list. Split out so a test can pin what is
@@ -1182,6 +1371,7 @@ fn parse_drc_report(raw: &serde_json::Value) -> Result<DrcReport> {
         schematic_parity: category(raw, "schematic_parity"),
         ownership_diagnostic: None,
         schematic_parity_diagnostic: None,
+        creepage_skipped: false,
     })
 }
 
@@ -3896,5 +4086,101 @@ mod cli_discovery_tests {
             "resolved path is not a file: {}",
             resolved.display()
         );
+    }
+}
+
+#[cfg(test)]
+mod creepage_view_tests {
+    use super::*;
+
+    const DRU: &str = r#"(version 1)
+
+# Generated: do not edit (a comment with a "(rule" in it)
+
+(rule "mains_8mm"
+	(condition "A.NetClass == 'MAINS' && B.NetClass != 'MAINS'")
+	(constraint clearance (min 8mm))
+	(constraint creepage (min 8mm)))
+
+(rule "only_creepage"
+	(condition "A.NetName == '/x(1)'")
+	(constraint creepage (min 2mm)))
+
+(rule "fine_pitch"
+	(condition "A.memberOfFootprint('U408')")
+	(constraint clearance (min 0.125mm)))
+"#;
+
+    #[test]
+    fn strips_creepage_and_keeps_rules_well_formed() {
+        let out = strip_creepage_constraints(DRU).expect("creepage present");
+        assert!(!out.contains("creepage"), "{out}");
+        assert!(
+            !out.contains("only_creepage"),
+            "a rule left without constraint goes: {out}"
+        );
+        assert!(
+            out.contains("\t(constraint clearance (min 8mm)))\n\n\n\n(rule \"fine_pitch\""),
+            "the mains rule keeps its closing parenthesis: {out}"
+        );
+        assert!(out.contains("(constraint clearance (min 0.125mm)))"));
+        assert!(out.contains("# Generated: do not edit (a comment with a \"(rule\" in it)"));
+        assert!(strip_creepage_constraints(&out).is_none());
+    }
+
+    #[test]
+    fn nothing_to_strip_and_malformed_files_are_left_alone() {
+        assert!(strip_creepage_constraints(
+            "(version 1)\n(rule a (constraint clearance (min 1mm)))\n"
+        )
+        .is_none());
+        assert!(strip_creepage_constraints("(rule a (constraint creepage (min 1mm))").is_none());
+        // `creepage` in a condition string is not a constraint.
+        assert!(strip_creepage_constraints(
+            "(rule a (condition \"A.NetName == '(constraint creepage'\") (constraint clearance (min 1mm)))"
+        )
+        .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn view_links_the_project_and_rewrites_only_the_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let pcb = dir.path().join("b.kicad_pcb");
+        std::fs::write(&pcb, "(kicad_pcb)").unwrap();
+        std::fs::write(dir.path().join("b.kicad_pro"), "{}").unwrap();
+        std::fs::write(dir.path().join("b.kicad_sch"), "(kicad_sch)").unwrap();
+        std::fs::write(dir.path().join("b.kicad_dru"), DRU).unwrap();
+        let (view, board) = creepage_free_view(&pcb).unwrap().expect("view");
+        assert_eq!(board, view.path().join("b.kicad_pcb"));
+        for name in ["b.kicad_pcb", "b.kicad_pro", "b.kicad_sch"] {
+            let link = view.path().join(name);
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{name}"
+            );
+        }
+        let rules = std::fs::read_to_string(view.path().join("b.kicad_dru")).unwrap();
+        assert!(!rules.contains("creepage"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.kicad_dru")).unwrap(),
+            DRU
+        );
+        let view_path = view.path().to_path_buf();
+        drop(view);
+        assert!(!view_path.exists(), "the view is removed after use");
+    }
+
+    #[test]
+    fn no_view_without_creepage() {
+        let dir = tempfile::tempdir().unwrap();
+        let pcb = dir.path().join("b.kicad_pcb");
+        std::fs::write(&pcb, "(kicad_pcb)").unwrap();
+        assert!(creepage_free_view(&pcb).unwrap().is_none());
+        std::fs::write(dir.path().join("b.kicad_dru"), "(version 1)\n").unwrap();
+        assert!(creepage_free_view(&pcb).unwrap().is_none());
     }
 }

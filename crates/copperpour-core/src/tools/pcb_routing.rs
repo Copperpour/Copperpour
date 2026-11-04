@@ -153,7 +153,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "board": { "type": "string", "description": "Open source .kicad_pcb used for the DSN export" },
                     "ses_path": { "type": "string", "description": "Freerouting .ses result" },
                     "manifest_path": { "type": "string", "description": "Copperpour reverse manifest written with the DSN" },
-                    "candidate_output_path": { "type": "string", "description": "New .kicad_pcb path. Existing files are never replaced." }
+                    "candidate_output_path": { "type": "string", "description": "New .kicad_pcb path. Existing files are never replaced." },
+                    "skip_creepage": { "type": "boolean", "default": false, "description": "Run the candidate DRC without the project's creepage constraints (single-threaded in KiCad, minutes to hours on a large board). The result says creepage_skipped; run run_drc in full before manufacturing." }
                 },
                 "required": ["board", "ses_path", "manifest_path", "candidate_output_path"]
             }),
@@ -964,6 +965,7 @@ struct ApplyEvidence {
     drc_violations: usize,
     unconnected_items: usize,
     schematic_parity_violations: usize,
+    creepage_skipped: bool,
 }
 
 fn created_route_item_ids(items: &[prost_types::Any]) -> anyhow::Result<Vec<String>> {
@@ -1048,6 +1050,18 @@ async fn handle_apply_specctra_ses(
     let candidate_for_ipc = candidate.clone();
     let drc_output_for_ipc = drc_output.clone();
     let cli_path = ctx.config.kicad_cli.clone();
+    let skip_creepage = match args.get("skip_creepage") {
+        None => false,
+        Some(value) => match value.as_bool() {
+            Some(skip) => skip,
+            None => {
+                return Ok(invalid_specctra_argument(
+                    "skip_creepage",
+                    "must be a boolean",
+                ))
+            }
+        },
+    };
     let runtime = tokio::runtime::Handle::current();
 
     let result = with_board_ipc_classified(ctx, &board, move |client, document| {
@@ -1185,7 +1199,12 @@ async fn handle_apply_specctra_ses(
             let candidate_source = client.save_document_to_string_in(document.clone())?;
             copperpour_sexp::write_new_atomic(&candidate_for_ipc, &candidate_source)
                 .with_context(|| format!("create candidate {}", candidate_for_ipc.display()))?;
-            let drc = runtime.block_on(cli::run_drc(&cli_path, &candidate_for_ipc, false))?;
+            let drc = runtime.block_on(cli::run_drc_with(
+                &cli_path,
+                &candidate_for_ipc,
+                false,
+                skip_creepage,
+            ))?;
             let parity_count = drc.schematic_parity.as_ref().map_or(0, Vec::len);
             Ok(ApplyEvidence {
                 source_sha256: plan.source_sha256.clone(),
@@ -1199,6 +1218,7 @@ async fn handle_apply_specctra_ses(
                 drc_violations: drc.violations.len(),
                 unconnected_items: drc.unconnected_items.as_ref().map_or(0, Vec::len),
                 schematic_parity_violations: parity_count,
+                creepage_skipped: drc.creepage_skipped,
             })
         })();
         match operation {
@@ -1265,7 +1285,8 @@ async fn handle_apply_specctra_ses(
                     && evidence.schematic_parity_violations == 0,
                 "violations": evidence.drc_violations,
                 "unconnected_items": evidence.unconnected_items,
-                "schematic_parity_violations": evidence.schematic_parity_violations
+                "schematic_parity_violations": evidence.schematic_parity_violations,
+                "creepage_skipped": evidence.creepage_skipped
             }
         }))),
         Err(failure) => {

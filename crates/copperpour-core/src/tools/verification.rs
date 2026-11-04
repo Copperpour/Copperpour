@@ -43,6 +43,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Optional path to write DRC report JSON" },
                     "sync_live_board": { "type": "boolean", "default": false, "description": "Bind the requested open board, optionally refill, save and verify its persisted snapshot before CLI DRC. Finish other mutations first." },
                     "refill_zones": { "type": "boolean", "default": false, "description": "Refill before checking: persisted IPC fill with sync_live_board, analysis-only CLI fill otherwise." },
+                    "skip_creepage": { "type": "boolean", "default": false, "description": "Check without the project's creepage constraints (KiCad checks creepage single-threaded over every net pair: minutes to hours on a large board). Every other rule still applies; the result says creepage_skipped. For iterations only: run the full DRC before manufacturing." },
                     "severity": {
                         "type": "string",
                         "description": "Minimum violation severity to include: 'error', 'warning' (default), 'info'",
@@ -313,6 +314,7 @@ async fn handle_run_drc(
             "live_board_synced": provenance.live_board_synced,
             "zones_refilled": provenance.zones_refilled,
             "zone_refill_source": provenance.zone_refill_source,
+            "creepage_skipped": report.creepage_skipped,
             "design_rule_violations": report.violations.len(),
             // Null, not zero, when this kicad-cli did not report the category:
             // "none found" and "never asked" are different answers.
