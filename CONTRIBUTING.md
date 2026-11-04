@@ -171,9 +171,10 @@ These are exactly the commands CI runs — if they pass locally, CI should be gr
   PR used to add its note at the top of that one file, so any two open PRs
   conflicted there.
 
-First PR from a fork? CI workflows may sit at "waiting for approval" until a
-maintainer approves the run — that's a GitHub setting for first-time contributors,
-not a failure on your part.
+CI runs on a maintainer's machine, not on GitHub Actions (see
+[GOVERNANCE.md](GOVERNANCE.md#where-ci-runs)). If your PR changes CI or build
+configuration, its checks stay queued until a maintainer approves them. That is
+the rule for every contributor, not a failure on your part.
 
 ## Licensing your contribution
 
