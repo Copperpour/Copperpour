@@ -143,7 +143,11 @@ current capability.
 Build the server with `cargo build --release -p copperpour`. Build the viewer
 separately when it is in scope. Changes to plugin files, binary layout, metadata,
 icons, or release scripts require PCM assembly and
-`packaging/validate-pcm.py` validation.
+`packaging/validate-pcm.py` validation, which also applies KiCad's addon
+guidelines; its tests run with `python -m unittest discover -s packaging/tests`.
+Keep tool and toolset counts out of the package descriptions, since they change
+every release. The template's version `status` is `testing` until KiCad's
+addon repository has listed a release; then set it to `stable`.
 
 `packaging/build-pcm.ps1` and `build-pcm.sh` enumerate the files staged into the
 PCM archive. Developer documentation stays in the repository and is not added
