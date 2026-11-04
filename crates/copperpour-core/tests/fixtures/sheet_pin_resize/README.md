@@ -1,7 +1,7 @@
-# Sheet-resize fixture
+# Sheet-resize fixture ([#285](https://github.com/Copperpour/Copperpour/issues/285))
 
 `sheet_pin_resize.kicad_sch` and `child.kicad_sch` hold one hierarchical sheet
-with a pin on each edge, so `edit_sheet` resizes and `edit_sheet_pin` moves can
+with a pin on each edge, beside a minimal `sheet_pin_resize.kicad_pro`, so `edit_sheet` resizes and `edit_sheet_pin` moves can
 be checked against the coordinates KiCad itself keeps.
 
 ## Provenance
@@ -17,7 +17,11 @@ be checked against the coordinates KiCad itself keeps.
    ```
 
 What is committed is that Eeschema serialization: `(generator "eeschema")`,
-`(version 20260306)`. A second resave reproduces the committed bytes exactly.
+`(version 20260306)`. Resaving the committed pair again, with
+`sheet_pin_resize.kicad_pro` beside it, reproduces the committed bytes
+exactly. Without the project file KiCad does not know the project name and
+rewrites the sheet's instance as `(project "")`, so keep the three files
+together when resaving.
 
 | Pin | Edge | `at` |
 |---|---|---|
@@ -30,8 +34,8 @@ The `Sheetfile` caption is at (50.8, 102.235), 0.635 below the bottom edge.
 
 ## KiCad's own answer
 
-Each case below was run through the server on a copy of the committed pair,
-then that copy was force-resaved by KiCad 10.0.7. In every case KiCad kept
+Each case below was run through the server on a copy of the three files, then
+that copy was force-resaved by KiCad 10.0.7. In every case KiCad kept
 every pin and caption position the tool wrote; the resave only reorders each
 pin's `uuid` and writes `(fields_autoplaced yes)`.
 
@@ -43,6 +47,7 @@ pin's `uuid` and writes `(fields_autoplaced yes)`.
 | `edit_sheet_pin` `R` to (132.08, 86.36) | (132.08, 86.36, 0): along its own edge |
 | `edit_sheet_pin` `T` to (132.08, 50.8) | (132.08, 50.8, 90): the top-right corner, still a top pin |
 | `edit_sheet_pin` `B` to (50.8, 101.6) | (50.8, 101.6, 270): the bottom-left corner, still a bottom pin |
+| `edit_sheet_pin` `L` to (132.08, 50.8) | (132.08, 50.8, 0): the top-right corner, not on the left edge, so the first of right and top |
 
 The regressions in `sch_hierarchy.rs` (`sheet_pin_resize_tests`) assert these
 literal values.

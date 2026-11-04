@@ -289,7 +289,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "new_name": { "type": "string" },
                     "pin_type": { "type": "string", "enum": ALLOWED_PIN_TYPES },
                     "x": { "type": "number" }, "y": { "type": "number" },
-                    "side": { "type": "string", "enum": ["right", "left", "top", "bottom"], "description": SHEET_PIN_SIDE_DESC }
+                    "side": { "type": "string", "enum": ["right", "left", "top", "bottom"], "description": EDIT_SHEET_PIN_SIDE_DESC }
                 },
                 "required": ["schematic", "sheet_name", "pin_name"]
             }),
@@ -724,6 +724,16 @@ const SHEET_PIN_SIDE_DESC: &str =
      the call is refused, because KiCad would otherwise move the pin to the named edge on \
      load. Default: 'right', which is what these tools have always written.";
 
+const EDIT_SHEET_PIN_SIDE_DESC: &str =
+    "Which edge of the sheet box the pin sits on. This is what KiCad reads the pin's \
+     orientation from (right 0°, top 90°, left 180°, bottom 270°). When given, the position \
+     the pin ends up with must be on that edge or the call is refused, because KiCad would \
+     otherwise move the pin to the named edge on load. When omitted with x+y, the side follows \
+     the new position: on another edge, the pin takes that edge; on its own edge or a corner \
+     of it, the pin keeps its side; on a corner of two other edges, it takes the first of \
+     right, left, top, bottom; on no edge, the side is left unchanged. Omitted without x+y, \
+     the side is left unchanged.";
+
 const PROJECT_NAME_DESC: &str =
     "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)";
 const PLACED_PROJECT_NAME_DESC: &str = "Project name key for instance entries. Default: the \
@@ -840,7 +850,9 @@ impl SheetBox {
 /// A pin moved to another edge without a `side` keeps the rotation of the old
 /// one, and KiCad would then relocate it on load. A position on the edge it
 /// already names, including a corner it shares, stays as it is, and a position
-/// on no edge is left for the existing `side`-less behaviour.
+/// on no edge is left for the existing `side`-less behaviour. A corner of two
+/// edges the pin is not on takes the first of them in [`SHEET_PIN_SIDES`]
+/// (right, left, top, bottom).
 fn rotation_for_moved_pin(
     sheet_box: SheetBox,
     x: f64,
@@ -4807,37 +4819,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_sheet_pin_turns_a_pin_moved_to_another_edge() {
-        let tmp = TempDir::new().unwrap();
-        let ctx = test_ctx();
-        let root = sheet_for_pins(&tmp, &ctx).await;
-        let sheet = cse::Schematic::load(&root).unwrap();
-        let sheet_box = SheetBox::of(sheet.sheets.by_name("A").unwrap());
-        let right = sheet_box.x + sheet_box.width;
-        let y = sheet_box.y + sheet_box.height / 2.0;
-        let (left, schematic) = (sheet_box.x, root.display().to_string());
-        handle_add_sheet_pin(
-            &json!({ "schematic": schematic, "sheet_name": "A", "pin_name": "CLK",
-                     "pin_type": "input", "x": left, "y": y, "side": "left" }),
-            &ctx,
-        )
-        .await
-        .unwrap();
-
-        let result = handle_edit_sheet_pin(
-            &json!({ "schematic": schematic, "sheet_name": "A", "pin_name": "CLK",
-                     "x": right, "y": y }),
-            &ctx,
-        )
-        .await
-        .unwrap();
-
-        let body = result_json(&result);
-        assert_eq!(body["pin"]["side"], "right");
-        assert_eq!(body["changed_fields"], json!(["position", "side"]));
-    }
-
-    #[tokio::test]
     async fn edit_sheet_pin_judges_the_side_against_the_position_it_is_given() {
         // `side` and `x`+`y` in one call describe the pin's end state, so the
         // check has to run after the move, not against the position replaced.
@@ -6985,5 +6966,18 @@ mod sheet_pin_resize_tests {
         assert_eq!(out["changed_fields"], json!(["position"]), "{out}");
         assert_eq!(out["pin"]["side"], "bottom", "{out}");
         assert_eq!(at_in_file(&path, "B"), (50.8, 101.6, 270.0));
+    }
+
+    /// A corner of two edges the pin is not on takes the first of them in
+    /// `right, left, top, bottom`: the left pin at the top-right corner is a
+    /// right pin.
+    #[tokio::test]
+    async fn a_pin_moved_to_a_corner_of_two_other_edges_takes_the_first() {
+        let (_d, path) = sheet();
+        let out = move_pin(&path, "L", 132.08, 50.8).await;
+
+        assert_eq!(out["changed_fields"], json!(["position", "side"]), "{out}");
+        assert_eq!(out["pin"]["side"], "right", "{out}");
+        assert_eq!(at_in_file(&path, "L"), (132.08, 50.8, 0.0));
     }
 }
