@@ -63,6 +63,7 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
             .with_env_filter(filter)
             .try_init();
         ipc_source.log(&config.ipc_address);
+        copperpour_core::tools::cli::set_long_timeout(config.kicad_cli_timeout_seconds);
         let server_config = copperpour_core::tools::ServerConfig {
             kicad_cli: config.kicad_cli.clone(),
             kicad_binary: config.kicad_binary.clone(),

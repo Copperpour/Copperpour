@@ -59,6 +59,12 @@ pub struct Config {
     /// cannot help because it only fires once a call is actually attempted.
     #[serde(default)]
     pub eager_toolsets: bool,
+
+    /// Timeout, in seconds, of long kicad-cli operations (DRC, ERC, exports). A full DRC of a
+    /// large board with creepage rules can take more than the default 600 s, all the more on a
+    /// loaded machine. A timed-out kicad-cli is killed.
+    #[serde(default = "default_kicad_cli_timeout_seconds")]
+    pub kicad_cli_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -117,6 +123,10 @@ impl IpcAddressSource {
             copperpour_ipc::redact_endpoint(address)
         ))
     }
+}
+
+fn default_kicad_cli_timeout_seconds() -> u64 {
+    copperpour_core::tools::cli::DEFAULT_LONG_TIMEOUT_SECS
 }
 
 fn default_kicad_cli() -> String {
@@ -260,6 +270,7 @@ impl Default for Config {
             log_level: default_log_level(),
             auto_load_toolsets: false,
             eager_toolsets: false,
+            kicad_cli_timeout_seconds: default_kicad_cli_timeout_seconds(),
         }
     }
 }
@@ -401,6 +412,21 @@ mod tests {
         let f = write_temp("toml", "");
         let c = Config::load_from(f.path()).unwrap();
         assert_eq!(c.log_level, "info");
+    }
+
+    #[test]
+    fn kicad_cli_timeout_defaults_to_600_seconds() {
+        let f = write_temp("toml", "");
+        let c = Config::load_from(f.path()).unwrap();
+        assert_eq!(c.kicad_cli_timeout_seconds, 600);
+        assert_eq!(Config::default().kicad_cli_timeout_seconds, 600);
+    }
+
+    #[test]
+    fn kicad_cli_timeout_is_read_from_toml() {
+        let f = write_temp("toml", "kicad_cli_timeout_seconds = 1800\n");
+        let c = Config::load_from(f.path()).unwrap();
+        assert_eq!(c.kicad_cli_timeout_seconds, 1800);
     }
 
     #[test]

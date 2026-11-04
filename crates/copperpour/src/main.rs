@@ -172,6 +172,7 @@ async fn main() -> Result<()> {
     // below: it holds the lock that proves this process is still alive.
     let _run_record = run_registry::sweep_and_register(&config.transport);
 
+    copperpour_core::tools::cli::set_long_timeout(config.kicad_cli_timeout_seconds);
     let server_config = copperpour_core::tools::ServerConfig {
         kicad_cli: config.kicad_cli.clone(),
         kicad_binary: config.kicad_binary.clone(),
