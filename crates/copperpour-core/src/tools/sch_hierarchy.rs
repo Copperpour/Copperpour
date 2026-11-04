@@ -362,7 +362,7 @@ pub(crate) async fn handle_create_schematic(
 /// Paper sizes KiCad accepts in a `(paper …)` node, with their landscape
 /// dimensions in mm — reported back so the caller can sanity-check the layout
 /// against the frame instead of discovering the overflow at print time.
-const PAPER_SIZES: &[(&str, f64, f64)] = &[
+pub(crate) const PAPER_SIZES: &[(&str, f64, f64)] = &[
     ("A0", 1189.0, 841.0),
     ("A1", 841.0, 594.0),
     ("A2", 594.0, 420.0),
@@ -381,7 +381,7 @@ const PAPER_SIZES: &[(&str, f64, f64)] = &[
 
 /// Landscape width and height of a named paper size, or the `invalid_argument`
 /// refusal naming every size that would have worked.
-fn paper_dimensions(size: &str) -> Result<(f64, f64), CallToolResult> {
+pub(crate) fn paper_dimensions(size: &str) -> Result<(f64, f64), CallToolResult> {
     match PAPER_SIZES.iter().find(|(n, _, _)| *n == size) {
         Some(&(_, w, h)) => Ok((w, h)),
         None => {

@@ -4,6 +4,8 @@
 mod board_extents_tests;
 #[cfg(test)]
 mod board_layer_refusal_tests;
+#[cfg(test)]
+mod board_page_tests;
 mod board_session;
 mod board_source;
 #[cfg(test)]
@@ -1133,7 +1135,8 @@ pub(crate) fn replace_outcome(
 
 /// A test-only seam between a writer's read and [`replace_if_unchanged`]:
 /// the next write on this thread first writes the bytes set here, as an
-/// intervening save would.
+/// intervening save would. `set_board_page` runs it between its write and
+/// its read-back instead.
 #[cfg(test)]
 pub(crate) mod write_hook {
     use std::cell::RefCell;
