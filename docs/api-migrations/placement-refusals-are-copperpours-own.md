@@ -8,8 +8,8 @@ on what they read from KiCad, before KiCad keeps any change
 - a rotation that is not a multiple of 90° of a footprint holding a
   rounded rectangle or a textbox;
 - a footprint holding an item Copperpour cannot carry along, such as a
-  KiCad 10 reference point (`kiapi.board.types.ReferencePoint`, in the
-  stock DIP packages among others);
+  barcode (`kiapi.board.types.Barcode`) or a table
+  (`kiapi.board.types.Table`);
 - a reference no footprint on the board carries, or, in a
   `set_component_placements` batch, one two footprints carry;
 - a copper check that could not complete.

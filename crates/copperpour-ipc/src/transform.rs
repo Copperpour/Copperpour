@@ -357,6 +357,13 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
             let mut dim = board::Dimension::decode(item.value.as_slice())?;
             xform_dimension(&mut dim, xf);
             item.value = dim.encode_to_vec();
+        } else if url == "kiapi.board.types.ReferencePoint" {
+            // A footprint's `(point …)`, sent since KiCad 10.0.7 (#270). It
+            // has a position and no angle: `PCB_POINT::Rotate` turns only the
+            // position about the centre.
+            let mut point = board::ReferencePoint::decode(item.value.as_slice())?;
+            xform_vec2(&mut point.position, xf);
+            item.value = point.encode_to_vec();
         } else if url == "kiapi.board.types.Footprint3DModel" || url == "kiapi.board.types.Group" {
             // No board-space geometry of their own — nothing to shift.
         } else {
@@ -742,6 +749,54 @@ mod tests {
                 item_type: "kiapi.board.types.SomethingNew".to_string(),
             }
         );
+    }
+
+    /// A reference point moves and turns with its footprint, like a pad,
+    /// and keeps everything else it carries (#270).
+    #[test]
+    fn a_reference_point_follows_a_move_and_a_rotation() {
+        let point = board::ReferencePoint {
+            id: Some(common::Kiid {
+                value: "09df91a3-71d6-4eb0-83b3-da5f6b670a55".to_string(),
+            }),
+            layer: board::BoardLayer::BlFFab as i32,
+            position: Some(builders::vec2(103.81, 103.81)),
+            size: Some(common::Distance {
+                value_nm: 1_270_000,
+            }),
+            locked: common::LockedState::LsUnlocked as i32,
+            parent: Some(common::Kiid {
+                value: "83a1c1ab-7932-487b-8ebc-9a7a98d9cd20".to_string(),
+            }),
+        };
+        let at = |position| board::ReferencePoint {
+            position: Some(position),
+            ..point.clone()
+        };
+        let carried = |xf: Xform| {
+            let mut fp = instance_with(vec![builders::pack_any(
+                &point,
+                "kiapi.board.types.ReferencePoint",
+            )]);
+            transform_footprint_children(&mut fp, &xf).unwrap();
+            let items = fp.definition.unwrap().items;
+            board::ReferencePoint::decode(items[0].value.as_slice()).unwrap()
+        };
+
+        let moved = carried(Xform::Translate {
+            dx_nm: builders::mm_to_nm(5.0),
+            dy_nm: builders::mm_to_nm(-2.0),
+        });
+        assert_eq!(moved, at(builders::vec2(108.81, 101.81)));
+
+        // (+3.81, +3.81) from the anchor turns to (+3.81, −3.81), KiCad's
+        // counterclockwise on screen with Y down.
+        let turned = carried(Xform::Rotate {
+            cx_nm: builders::mm_to_nm(100.0),
+            cy_nm: builders::mm_to_nm(100.0),
+            delta_deg: 90.0,
+        });
+        assert_eq!(turned, at(builders::vec2(103.81, 96.19)));
     }
 
     #[test]
