@@ -31,6 +31,10 @@ pub(crate) enum LiveBoard<T> {
     /// naming the board. It may hold it, so the saved file is not
     /// authoritative.
     Rejected(String),
+    /// KiCad named the board, and Copperpour refused the request itself on
+    /// what it read, before KiCad kept any of it (#240). KiCad rejected
+    /// nothing, so this is not [`Self::Rejected`].
+    Preflight(copperpour_ipc::PreflightRefusal),
     Uncertain(String),
     Recovered(String),
     /// KiCad answered without ever naming a board document, so nothing was
@@ -116,6 +120,7 @@ where
 
     Ok(match failure {
         copperpour_ipc::IpcFailure::Rejected(message) => LiveBoard::Rejected(message),
+        copperpour_ipc::IpcFailure::Preflight(refusal) => LiveBoard::Preflight(refusal),
         copperpour_ipc::IpcFailure::Uncertain(message) => LiveBoard::Uncertain(message),
         copperpour_ipc::IpcFailure::Recovered(message) => LiveBoard::Recovered(message),
         copperpour_ipc::IpcFailure::Target { error, message } if error.proves_not_open() => {

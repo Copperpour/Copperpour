@@ -260,7 +260,14 @@ async fn handle_score_placement(
         Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
             return Ok(crate::tools::ipc_target_error_result(&error));
         }
-        Err(copperpour_ipc::IpcFailure::Rejected(message)) => {
+        // Reading the board raises no refusal of Copperpour's own (#240).
+        Err(
+            copperpour_ipc::IpcFailure::Rejected(message)
+            | copperpour_ipc::IpcFailure::Preflight(copperpour_ipc::PreflightRefusal {
+                reason: message,
+                ..
+            }),
+        ) => {
             return Ok(CallToolResult::error(message));
         }
         Err(copperpour_ipc::IpcFailure::Recovered(message)) => {

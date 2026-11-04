@@ -18,6 +18,7 @@ use copperpour_ipc::builders::{any_is, nm_to_mm, vec2};
 use copperpour_ipc::client::KiCadIpcClient;
 use copperpour_ipc::gen::kiapi;
 use copperpour_ipc::transform::{placement_xforms, transform_polygon, Xform};
+use copperpour_ipc::{PreflightCause, PreflightRefusal};
 use kiapi::board::types::BoardLayer;
 use kiapi::common::types::{DocumentSpecifier, Vector2};
 use prost::Message;
@@ -360,8 +361,37 @@ pub(crate) fn check_live(
         }
     }
     let poses = plan_poses(&footprints, requests)?;
-    test_copper(client, document, poses)
-        .context("the copper check could not complete, so nothing was moved")
+    test_copper(client, document, poses).map_err(|error| {
+        // Copperpour's refusal, over the failure it rests on (#240).
+        let refusal = PreflightRefusal::check_incomplete(
+            "the copper check could not complete, so nothing was moved",
+            &error,
+        );
+        error.context(refusal)
+    })
+}
+
+/// The structured kind of a refusal Copperpour made inside `tool`'s
+/// placement (#240), naming the argument it is about as `tool` names it:
+/// `reference` or `rotation`, and `placements[i].reference` or
+/// `placements[i].rotation` in a batch.
+pub(crate) fn refusal_kind(
+    tool: &str,
+    requests: &[PoseRequest],
+    refusal: &PreflightRefusal,
+) -> ToolErrorKind {
+    let argument = |reference: &str, name: &str| {
+        let index = requests
+            .iter()
+            .position(|request| request.reference() == reference);
+        match index {
+            Some(index) if matches!(requests[index], PoseRequest::Set(_)) => {
+                format!("placements[{index}].{name}")
+            }
+            _ => name.to_string(),
+        }
+    };
+    crate::tools::pcb_board::preflight_refusal_kind(tool, refusal, argument)
 }
 
 /// Test the planned pads against the board's vias, tracks and arcs.
@@ -526,7 +556,13 @@ fn plan_poses(
             continue;
         };
         if matches!(request, PoseRequest::Set(_)) && matches.next().is_some() {
-            anyhow::bail!("footprint reference '{reference}' appears more than once on the board");
+            return Err(PreflightRefusal::new(
+                PreflightCause::DuplicateReference {
+                    reference: reference.to_string(),
+                },
+                format!("footprint reference '{reference}' appears more than once on the board"),
+            )
+            .into());
         }
         let current = Pose::held_by(footprint);
         let target = match request {
@@ -551,11 +587,21 @@ fn plan_poses(
             pads: pads_of(footprint, reference)?,
         });
     }
-    match missing.as_slice() {
-        [] => Ok(poses),
-        [one] => anyhow::bail!("footprint {one} not found on board"),
-        many => anyhow::bail!("footprints {} not found on board", many.join(", ")),
-    }
+    let reason = match missing.as_slice() {
+        [] => return Ok(poses),
+        [one] => format!("footprint {one} not found on board"),
+        many => format!("footprints {} not found on board", many.join(", ")),
+    };
+    Err(PreflightRefusal::new(
+        PreflightCause::MissingReferences {
+            references: missing
+                .iter()
+                .map(|reference| reference.to_string())
+                .collect(),
+        },
+        reason,
+    )
+    .into())
 }
 
 fn footprint_reference(footprint: &kiapi::board::types::FootprintInstance) -> &str {
@@ -1694,6 +1740,8 @@ mod served_tests {
     struct Kicad {
         _dir: tempfile::TempDir,
         board: std::path::PathBuf,
+        /// The board file as written, to prove it unchanged.
+        board_text: &'static str,
         store: Arc<Mutex<ItemStore>>,
         sent: Arc<Mutex<Vec<String>>>,
         handler: McpHandler,
@@ -1731,13 +1779,7 @@ mod served_tests {
         let log = sent.clone();
         let server = spawn_kicad_holding_items(&board, vec![], store.clone(), |_| {}, {
             move |command, _| {
-                log.lock().unwrap().push(
-                    any_type_name(command)
-                        .rsplit('.')
-                        .next()
-                        .unwrap()
-                        .to_string(),
-                );
+                log.lock().unwrap().push(command_name(command));
                 answer(command)
             }
         });
@@ -1751,6 +1793,7 @@ mod served_tests {
         Kicad {
             _dir: dir,
             board,
+            board_text: capture.board,
             store,
             sent,
             handler,
@@ -1760,6 +1803,21 @@ mod served_tests {
 
     async fn kicad() -> Kicad {
         kicad_with(replay).await
+    }
+
+    /// The command's short name, with what an `EndCommit` did to the commit:
+    /// `EndCommit(drop)` or `EndCommit(commit)`.
+    fn command_name(command: &prost_types::Any) -> String {
+        let name = any_type_name(command).rsplit('.').next().unwrap();
+        if name != "EndCommit" {
+            return name.to_string();
+        }
+        let end = kiapi::common::commands::EndCommit::decode(command.value.as_slice()).unwrap();
+        match kiapi::common::commands::CommitAction::try_from(end.action) {
+            Ok(kiapi::common::commands::CommitAction::CmaDrop) => "EndCommit(drop)".to_string(),
+            Ok(kiapi::common::commands::CommitAction::CmaCommit) => "EndCommit(commit)".to_string(),
+            other => format!("EndCommit({other:?})"),
+        }
     }
 
     impl Kicad {
@@ -2087,29 +2145,56 @@ mod served_tests {
     }
 
     /// A pad KiCad gives no outline for cannot be checked, so the move is
-    /// refused, never applied on a check that did not run.
+    /// refused, never applied on a check that did not run. The refusal is
+    /// Copperpour's, decided before any commit, and no argument is at fault:
+    /// `plan_blocked`, naming the tool (#240).
     #[tokio::test]
     async fn a_check_that_cannot_complete_moves_nothing() {
-        let kicad = kicad_with(|command| {
-            if any_type_name(command) == "kiapi.board.commands.GetPadShapeAsPolygon" {
-                return Some(pack_any(
-                    &board_commands::PadShapeAsPolygonResponse::default(),
-                    "kiapi.board.commands.PadShapeAsPolygonResponse",
-                ));
-            }
-            replay(command)
-        })
-        .await;
-        let mut arguments = r1_to(110.0, 90.0);
-        arguments["allow_copper_conflicts"] = json!(true);
-        let (is_error, body) = kicad.call("set_component_placements", arguments).await;
-        assert!(is_error, "{body:#}");
-        let text = body.to_string();
-        assert!(
-            text.contains("copper check could not complete") && text.contains("no copper outline"),
-            "{text}"
+        let reason = format!(
+            "the copper check could not complete, so nothing was moved: KiCad returned no \
+             copper outline for pad {} on F.Cu",
+            first_pad_kiid(FOOTPRINTS, "R1")
         );
-        kicad.assert_untouched();
+        let mut placement = r1_to(110.0, 90.0);
+        placement["allow_copper_conflicts"] = json!(true);
+        for (tool, what, arguments) in [
+            (
+                "set_component_placements",
+                "component placement batch",
+                placement,
+            ),
+            (
+                "move_component",
+                "move",
+                json!({ "reference": "R1", "x": 110.0, "y": 90.0 }),
+            ),
+            (
+                "rotate_component",
+                "rotation",
+                json!({ "reference": "R1", "rotation": 90.0 }),
+            ),
+        ] {
+            let kicad = kicad_with(|command| {
+                if any_type_name(command) == "kiapi.board.commands.GetPadShapeAsPolygon" {
+                    return Some(pack_any(
+                        &board_commands::PadShapeAsPolygonResponse::default(),
+                        "kiapi.board.commands.PadShapeAsPolygonResponse",
+                    ));
+                }
+                replay(command)
+            })
+            .await;
+            let (is_error, body) = kicad.call(tool, arguments).await;
+            assert!(is_error, "{tool}: {body:#}");
+            kicad.assert_own_refusal(
+                &body,
+                what,
+                &reason,
+                json!({ "kind": "plan_blocked", "operation": tool, "reasons": [reason] }),
+                &[],
+            );
+            kicad.assert_only_reads();
+        }
     }
 
     /// With no live KiCad the file is still edited, but the check is reported
@@ -2371,6 +2456,36 @@ mod served_tests {
     }
 
     /// Two footprints are R4. A batch refuses a reference the board holds
+    /// twice in the check, before any commit, as Copperpour's own refusal
+    /// naming the placement's reference (#240). A single move or rotation
+    /// takes the first, as `move_footprint` does, so only the batch refuses.
+    #[tokio::test]
+    async fn a_batch_naming_a_reference_held_twice_is_refused_as_copperpours_own() {
+        let kicad = layers_kicad().await;
+        let (is_error, body) = kicad
+            .call(
+                "set_component_placements",
+                json!({
+                    "placements": [
+                        { "reference": "R1", "x": 110.0, "y": 95.0, "rotation": 0.0 },
+                        { "reference": "R4", "x": 130.0, "y": 110.0, "rotation": 0.0 },
+                    ],
+                }),
+            )
+            .await;
+        assert!(is_error, "{body:#}");
+        let reason = "footprint reference 'R4' appears more than once on the board";
+        kicad.assert_own_refusal(
+            &body,
+            "component placement batch",
+            reason,
+            invalid_argument("placements[1].reference", reason),
+            &[],
+        );
+        kicad.assert_only_reads();
+    }
+
+    /// Two footprints are R4. A batch refuses a reference the board holds
     /// twice, and so does its dry run, rather than checking one of them.
     #[tokio::test]
     async fn a_dry_run_naming_a_reference_held_twice_is_refused() {
@@ -2392,5 +2507,423 @@ mod served_tests {
         );
         kicad.assert_only_reads();
         kicad.assert_untouched();
+    }
+
+    // ─── Refusals Copperpour makes itself inside a live placement (#240) ────
+
+    /// The #240 board (`issue_240_ipc.README.md`): Y1, the stock crystal with
+    /// one added rounded rectangle on F.Fab; U1, the stock Honeywell_ABPDAN
+    /// and its two textboxes; U2, the stock DIP-8, whose reference point is a
+    /// type Copperpour does not know. No copper, so every check is clear.
+    static ISSUE_240: Capture = Capture {
+        board_name: "issue240.kicad_pcb",
+        board: include_str!("../../tests/fixtures/issue_240.kicad_pcb"),
+        footprints: include_bytes!("../../tests/fixtures/issue_240_footprints.ipc.bin"),
+        tracks: include_bytes!("../../tests/fixtures/issue_240_tracks.ipc.bin"),
+        vias: include_bytes!("../../tests/fixtures/issue_240_vias.ipc.bin"),
+        arcs: include_bytes!("../../tests/fixtures/issue_240_arcs.ipc.bin"),
+        enabled_layers: include_bytes!("../../tests/fixtures/issue_240_enabled_layers.ipc.bin"),
+        presence: include_bytes!("../../tests/fixtures/issue_240_presence.ipc.bin"),
+        outlines: &[
+            (
+                BoardLayer::BlFCu,
+                include_bytes!("../../tests/fixtures/issue_240_polygons_F_Cu.ipc.bin"),
+            ),
+            (
+                BoardLayer::BlBCu,
+                include_bytes!("../../tests/fixtures/issue_240_polygons_B_Cu.ipc.bin"),
+            ),
+        ],
+    };
+
+    async fn issue_240_kicad() -> Kicad {
+        kicad_holding(&ISSUE_240, |command| replay_from(&ISSUE_240, command)).await
+    }
+
+    // The refusals, written out rather than read from the code under test.
+    const ROUNDED_RECTANGLE: &str = "cannot rotate footprint 'Y1' by a non-90° angle: its \
+         rounded-rectangle graphic on F.Fab has no off-axis form; use a multiple of 90°";
+    const TEXTBOX: &str =
+        "cannot rotate footprint 'U1' by a non-90° angle: it contains a textbox; use a multiple \
+         of 90°";
+    const REFERENCE_POINT: &str = "footprint 'U2' contains an item of unsupported type \
+         'kiapi.board.types.ReferencePoint'; refusing to move/rotate it via IPC to avoid \
+         detaching it";
+
+    /// The commit commands of a write refused inside its commit: the commit
+    /// is dropped, never pushed.
+    const DROPPED: &[&str] = &["BeginCommit", "EndCommit(drop)"];
+
+    fn invalid_argument(field: &str, reason: &str) -> Value {
+        json!({ "kind": "invalid_argument", "field": field, "reason": reason })
+    }
+
+    fn unsupported(tool: &str) -> Value {
+        json!({ "kind": "unsupported_capability", "capability": tool, "kicad_version": null })
+    }
+
+    /// The KIID of `reference`'s first pad in a recorded `GetItemsResponse`.
+    fn first_pad_kiid(footprints: &[u8], reference: &str) -> String {
+        kiapi::common::commands::GetItemsResponse::decode(footprints)
+            .unwrap()
+            .items
+            .iter()
+            .map(|item| {
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap()
+            })
+            .find(|footprint| super::footprint_reference(footprint) == reference)
+            .unwrap()
+            .definition
+            .unwrap()
+            .items
+            .iter()
+            .find(|item| any_type_name(item) == "kiapi.board.types.Pad")
+            .map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap())
+            .and_then(|pad| pad.id)
+            .unwrap()
+            .value
+    }
+
+    impl Kicad {
+        /// The commit commands KiCad received, in order.
+        fn commits(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|command| command.contains("Commit"))
+                .cloned()
+                .collect()
+        }
+
+        /// Asserts a refusal Copperpour made itself: worded as its own and
+        /// never as KiCad's, with `error` exactly, the board file as written,
+        /// no command that adds, changes or deletes an item, and `commits` as
+        /// the commit commands KiCad received.
+        fn assert_own_refusal(
+            &self,
+            body: &Value,
+            what: &str,
+            reason: &str,
+            error: Value,
+            commits: &[&str],
+        ) {
+            assert_eq!(
+                body["message"],
+                format!("The {what} was not written: {reason}. The board file was not modified."),
+                "{body:#}"
+            );
+            let text = body.to_string();
+            assert!(
+                !text.contains("KiCAD rejected") && !text.contains("may hold this board open"),
+                "{text}"
+            );
+            assert_eq!(body["error"], error, "{body:#}");
+            assert_eq!(
+                std::fs::read_to_string(&self.board).unwrap(),
+                self.board_text
+            );
+            {
+                let store = self.store.lock().unwrap();
+                assert_eq!((store.creates, store.updates, store.deletes), (0, 0, 0));
+            }
+            for mutation in ["CreateItems", "UpdateItems", "DeleteItems"] {
+                assert!(!self.sent(mutation), "{mutation} reached KiCad");
+            }
+            assert_eq!(self.commits(), commits, "{:?}", self.sent.lock().unwrap());
+        }
+    }
+
+    /// #240's own case: a non-90° rotation of a footprint holding a rounded
+    /// rectangle. `rotate_component` refuses it before any commit opens; the
+    /// batch refuses it inside its commit, which it drops.
+    #[tokio::test]
+    async fn a_rounded_rectangle_refuses_an_off_axis_rotation_as_copperpours_own() {
+        let kicad = issue_240_kicad().await;
+        let (is_error, body) = kicad
+            .call(
+                "rotate_component",
+                json!({ "reference": "Y1", "rotation": -45.0 }),
+            )
+            .await;
+        assert!(is_error, "{body:#}");
+        kicad.assert_own_refusal(
+            &body,
+            "rotation",
+            ROUNDED_RECTANGLE,
+            invalid_argument("rotation", ROUNDED_RECTANGLE),
+            &[],
+        );
+
+        let kicad = issue_240_kicad().await;
+        let (is_error, body) = kicad
+            .call(
+                "set_component_placements",
+                json!({
+                    "placements": [
+                        { "reference": "U1", "x": 125.0, "y": 95.0, "rotation": 0.0 },
+                        { "reference": "Y1", "x": 110.0, "y": 95.0, "rotation": -45.0 },
+                    ],
+                }),
+            )
+            .await;
+        assert!(is_error, "{body:#}");
+        kicad.assert_own_refusal(
+            &body,
+            "component placement batch",
+            ROUNDED_RECTANGLE,
+            invalid_argument("placements[1].rotation", ROUNDED_RECTANGLE),
+            DROPPED,
+        );
+    }
+
+    /// A textbox refuses an off-axis rotation the same way: before any
+    /// commit for `rotate_component`, inside the batch's dropped commit.
+    #[tokio::test]
+    async fn a_textbox_refuses_an_off_axis_rotation_as_copperpours_own() {
+        let kicad = issue_240_kicad().await;
+        let (is_error, body) = kicad
+            .call(
+                "rotate_component",
+                json!({ "reference": "U1", "rotation": 30.0 }),
+            )
+            .await;
+        assert!(is_error, "{body:#}");
+        kicad.assert_own_refusal(
+            &body,
+            "rotation",
+            TEXTBOX,
+            invalid_argument("rotation", TEXTBOX),
+            &[],
+        );
+
+        let kicad = issue_240_kicad().await;
+        let (is_error, body) = kicad
+            .call(
+                "set_component_placements",
+                json!({ "placements": [{ "reference": "U1", "x": 125.0, "y": 95.0, "rotation": 30.0 }] }),
+            )
+            .await;
+        assert!(is_error, "{body:#}");
+        kicad.assert_own_refusal(
+            &body,
+            "component placement batch",
+            TEXTBOX,
+            invalid_argument("placements[0].rotation", TEXTBOX),
+            DROPPED,
+        );
+    }
+
+    /// An item Copperpour cannot carry along refuses every move of its
+    /// footprint, of any angle: `move_component` and `rotate_component`
+    /// before any commit, the batch and `align_components` inside their
+    /// commits, which they drop. The footprint is a valid argument, so the
+    /// refusal is `unsupported_capability`, naming the tool.
+    #[tokio::test]
+    async fn an_unsupported_item_refuses_every_move_as_copperpours_own() {
+        for (tool, what, arguments, commits) in [
+            (
+                "move_component",
+                "move",
+                json!({ "reference": "U2", "x": 145.0, "y": 95.0 }),
+                &[][..],
+            ),
+            (
+                "rotate_component",
+                "rotation",
+                json!({ "reference": "U2", "rotation": 90.0 }),
+                &[][..],
+            ),
+            (
+                "set_component_placements",
+                "component placement batch",
+                json!({ "placements": [{ "reference": "U2", "x": 145.0, "y": 95.0, "rotation": 0.0 }] }),
+                DROPPED,
+            ),
+            (
+                "align_components",
+                "alignment",
+                json!({ "references": ["U2"], "axis": "x", "value": 145.0 }),
+                DROPPED,
+            ),
+        ] {
+            let kicad = issue_240_kicad().await;
+            let (is_error, body) = kicad.call(tool, arguments).await;
+            assert!(is_error, "{tool}: {body:#}");
+            kicad.assert_own_refusal(&body, what, REFERENCE_POINT, unsupported(tool), commits);
+        }
+    }
+
+    /// A reference no footprint carries: the three placement tools refuse
+    /// it in the check, before any commit, and `align_components` inside its
+    /// commit, which it drops. Each names its own argument.
+    #[tokio::test]
+    async fn a_missing_reference_is_refused_as_copperpours_own() {
+        let in_check = "footprint R9 not found on board";
+        let in_align = "footprint 'R9' not found";
+        for (tool, what, arguments, reason, field, commits) in [
+            (
+                "move_component",
+                "move",
+                json!({ "reference": "R9", "x": 110.0, "y": 90.0 }),
+                in_check,
+                "reference",
+                &[][..],
+            ),
+            (
+                "rotate_component",
+                "rotation",
+                json!({ "reference": "R9", "rotation": 90.0 }),
+                in_check,
+                "reference",
+                &[][..],
+            ),
+            (
+                "set_component_placements",
+                "component placement batch",
+                json!({
+                    "placements": [
+                        { "reference": "R1", "x": 110.0, "y": 95.0, "rotation": 0.0 },
+                        { "reference": "R9", "x": 110.0, "y": 90.0, "rotation": 0.0 },
+                    ],
+                }),
+                in_check,
+                "placements[1].reference",
+                &[][..],
+            ),
+            (
+                "align_components",
+                "alignment",
+                json!({ "references": ["R9"], "axis": "x", "value": 110.0 }),
+                in_align,
+                "references[0]",
+                DROPPED,
+            ),
+        ] {
+            let kicad = kicad().await;
+            let (is_error, body) = kicad.call(tool, arguments).await;
+            assert!(is_error, "{tool}: {body:#}");
+            kicad.assert_own_refusal(
+                &body,
+                what,
+                reason,
+                invalid_argument(field, reason),
+                commits,
+            );
+        }
+    }
+
+    /// The control: KiCad itself refusing the batch's `UpdateItems` with an
+    /// error status is still KiCad's rejection, worded as before and with no
+    /// error kind, and the commit is dropped.
+    #[tokio::test]
+    async fn kicads_own_rejection_keeps_its_wording() {
+        use crate::tools::pcb_board::board_mock::board_document;
+        use kiapi::common::{ApiResponse, ApiResponseStatus, ApiStatusCode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join(ISSUE_96.board_name);
+        std::fs::write(&board, ISSUE_96.board).unwrap();
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: kiapi::common::commands::GetItemsResponse::decode(FOOTPRINTS)
+                .unwrap()
+                .items,
+            ..Default::default()
+        }));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let (log, held) = (sent.clone(), store.clone());
+        let documents = vec![board_document(&board.to_string_lossy())];
+        let server = MockIpcServer::spawn("kicad-refusing-updates", move |request| {
+            let command = request.message.expect("a command");
+            let answer = |status: ApiStatusCode, error: &str, message| ApiResponse {
+                status: Some(ApiResponseStatus {
+                    status: status as i32,
+                    error_message: error.to_string(),
+                }),
+                header: None,
+                message,
+            };
+            let name = command_name(&command);
+            let message = match name.as_str() {
+                "GetOpenDocuments" => {
+                    return answer(
+                        ApiStatusCode::AsOk,
+                        "",
+                        Some(pack_any(
+                            &kiapi::common::commands::GetOpenDocumentsResponse {
+                                documents: documents.clone(),
+                            },
+                            "kiapi.common.commands.GetOpenDocumentsResponse",
+                        )),
+                    )
+                }
+                "UpdateItems" => {
+                    log.lock().unwrap().push(name);
+                    return answer(
+                        ApiStatusCode::AsBadRequest,
+                        "mock KiCad refuses this update",
+                        None,
+                    );
+                }
+                "BeginCommit" => Some(pack_any(
+                    &kiapi::common::commands::BeginCommitResponse {
+                        id: Some(kiapi::common::types::Kiid {
+                            value: "mock-commit".to_string(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                )),
+                end if end.starts_with("EndCommit") => Some(pack_any(
+                    &kiapi::common::commands::EndCommitResponse {},
+                    "kiapi.common.commands.EndCommitResponse",
+                )),
+                _ => replay(&command).or_else(|| {
+                    // The footprints, the one class `replay` leaves to the store.
+                    Some(pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items: held.lock().unwrap().items.clone(),
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ))
+                    .filter(|_| name == "GetItems")
+                }),
+            };
+            log.lock().unwrap().push(name);
+            answer(ApiStatusCode::AsOk, "", message)
+        });
+        let handler = McpHandler::new(crate::tools::ServerConfig {
+            ipc_address: server.address().to_string(),
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let kicad = Kicad {
+            _dir: dir,
+            board,
+            board_text: ISSUE_96.board,
+            store,
+            sent,
+            handler,
+            _server: server,
+        };
+
+        let (is_error, body) = kicad
+            .call("set_component_placements", r1_to(110.0, 90.0))
+            .await;
+        assert!(is_error, "{body:#}");
+        let text = body.as_str().expect("a plain-text error, with no kind");
+        assert_eq!(
+            text,
+            "KiCAD rejected the component placement batch over IPC: KiCad batch failed; changes \
+             dropped: KiCad IPC error: mock KiCad refuses this update (AS_BAD_REQUEST). The board \
+             file was not modified — KiCAD is reachable and may hold this board open, so editing \
+             the file directly could be silently overwritten."
+        );
+        assert_eq!(kicad.commits(), DROPPED, "{:?}", kicad.sent.lock().unwrap());
+        assert!(kicad.sent("UpdateItems"));
+        assert_eq!(std::fs::read_to_string(&kicad.board).unwrap(), BOARD);
     }
 }

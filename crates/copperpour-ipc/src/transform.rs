@@ -10,6 +10,7 @@
 //! `UpdateItems`, every child must get the same rigid-body transform KiCAD
 //! would apply natively (`FOOTPRINT::SetPosition` / `SetOrientation`).
 
+use crate::client::{PreflightCause, PreflightRefusal};
 use crate::gen::kiapi;
 use anyhow::Result;
 use kiapi::board::types as board;
@@ -169,12 +170,15 @@ fn xform_graphic_shape(
                 // so only a positive radius is rounded. KiCAD approximates a
                 // rotated rounded rectangle with a segmented polygon; refuse
                 // rather than guess its arc tolerance.
-                anyhow::bail!(
-                    "cannot rotate footprint '{reference}' by a non-90° angle: its \
-                     rounded-rectangle graphic on {} has no off-axis form; use a \
-                     multiple of 90°",
-                    crate::builders::layer_name(layer).unwrap_or(layer.as_str_name())
-                );
+                return Err(rotation_refusal(
+                    reference,
+                    format!(
+                        "cannot rotate footprint '{reference}' by a non-90° angle: its \
+                         rounded-rectangle graphic on {} has no off-axis form; use a \
+                         multiple of 90°",
+                        crate::builders::layer_name(layer).unwrap_or(layer.as_str_name())
+                    ),
+                ));
             } else {
                 // Mirror KiCAD's EDA_SHAPE::Rotate: an off-axis rectangle
                 // becomes a closed polygon of its four rotated corners.
@@ -231,6 +235,19 @@ fn xform_graphic_shape(
         None => {}
     }
     Ok(())
+}
+
+/// The refusal of a rotation one of footprint `reference`'s children cannot
+/// follow: Copperpour's own, raised before the footprint's update is sent
+/// (#240).
+fn rotation_refusal(reference: &str, reason: String) -> anyhow::Error {
+    PreflightRefusal::new(
+        PreflightCause::Rotation {
+            reference: reference.to_string(),
+        },
+        reason,
+    )
+    .into()
 }
 
 fn xform_zone(zone: &mut board::Zone, xf: &Xform) {
@@ -305,10 +322,13 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
             item.value = text.encode_to_vec();
         } else if url == "kiapi.board.types.BoardTextBox" {
             if !xf.is_cardinal() {
-                anyhow::bail!(
-                    "cannot rotate footprint '{reference}' by a non-90° angle: it \
-                     contains a textbox; use a multiple of 90°"
-                );
+                return Err(rotation_refusal(
+                    &reference,
+                    format!(
+                        "cannot rotate footprint '{reference}' by a non-90° angle: it \
+                         contains a textbox; use a multiple of 90°"
+                    ),
+                ));
             }
             let mut tb = board::BoardTextBox::decode(item.value.as_slice())?;
             if let Some(textbox) = tb.textbox.as_mut() {
@@ -342,10 +362,17 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
         } else {
             // KiCAD would re-create this item wherever the stale message
             // says it is; refusing beats silently corrupting the board.
-            anyhow::bail!(
-                "footprint '{reference}' contains an item of unsupported type '{url}'; \
-                 refusing to move/rotate it via IPC to avoid detaching it"
-            );
+            return Err(PreflightRefusal::new(
+                PreflightCause::UnsupportedItem {
+                    reference: reference.clone(),
+                    item_type: url.to_string(),
+                },
+                format!(
+                    "footprint '{reference}' contains an item of unsupported type '{url}'; \
+                     refusing to move/rotate it via IPC to avoid detaching it"
+                ),
+            )
+            .into());
         }
     }
     Ok(())
@@ -617,11 +644,24 @@ mod tests {
             cy_nm: builders::mm_to_nm(100.0),
             delta_deg: 45.0,
         };
-        let err = transform_footprint_children(&mut fp, &xf)
-            .unwrap_err()
-            .to_string();
+        let error = transform_footprint_children(&mut fp, &xf).unwrap_err();
+        let err = error.to_string();
         assert!(err.contains("'Y1'") && err.contains("F.Fab"), "{err}");
         assert_eq!(fp.definition, before.definition);
+        assert_eq!(
+            refusal_cause(&error),
+            PreflightCause::Rotation {
+                reference: "Y1".to_string()
+            }
+        );
+    }
+
+    /// The typed refusal a caller classifies the error by (#240).
+    fn refusal_cause(error: &anyhow::Error) -> PreflightCause {
+        PreflightRefusal::from_error(error)
+            .expect("Copperpour's own refusal, typed")
+            .cause
+            .clone()
     }
 
     #[test]
@@ -664,10 +704,15 @@ mod tests {
             cy_nm: builders::mm_to_nm(100.0),
             delta_deg: 30.0,
         };
-        let err = transform_footprint_children(&mut fp, &xf)
-            .unwrap_err()
-            .to_string();
+        let error = transform_footprint_children(&mut fp, &xf).unwrap_err();
+        let err = error.to_string();
         assert!(err.contains("'U3'") && err.contains("textbox"), "{err}");
+        assert_eq!(
+            refusal_cause(&error),
+            PreflightCause::Rotation {
+                reference: "U3".to_string()
+            }
+        );
     }
 
     #[test]
@@ -684,12 +729,18 @@ mod tests {
             dx_nm: 1000,
             dy_nm: 0,
         };
-        let err = transform_footprint_children(&mut fp, &xf)
-            .unwrap_err()
-            .to_string();
+        let error = transform_footprint_children(&mut fp, &xf).unwrap_err();
+        let err = error.to_string();
         assert!(
             err.contains("SomethingNew") && err.contains("'J2'"),
             "{err}"
+        );
+        assert_eq!(
+            refusal_cause(&error),
+            PreflightCause::UnsupportedItem {
+                reference: "J2".to_string(),
+                item_type: "kiapi.board.types.SomethingNew".to_string(),
+            }
         );
     }
 

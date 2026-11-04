@@ -325,8 +325,58 @@ where
         + Send
         + 'static,
 {
+    write_through_gate(ctx, board_path, what, |_| None, f).await
+}
+
+/// As [`attempt_ipc_write_in`], for a write whose `f` can refuse a request
+/// itself ([`copperpour_ipc::PreflightRefusal`]): `kind_of` gives that
+/// refusal the structured kind a client matches, naming the tool's own
+/// argument (#240).
+pub(crate) async fn attempt_ipc_write_naming<T, F, K>(
+    ctx: &ToolContext,
+    board_path: &std::path::Path,
+    what: &str,
+    kind_of: K,
+    f: F,
+) -> anyhow::Result<BoardWrite<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            &copperpour_ipc::client::KiCadIpcClient,
+            copperpour_ipc::gen::kiapi::common::types::DocumentSpecifier,
+        ) -> anyhow::Result<T>
+        + Send
+        + 'static,
+    K: FnOnce(&copperpour_ipc::PreflightRefusal) -> ToolErrorKind + Send,
+{
+    write_through_gate(ctx, board_path, what, |refusal| Some(kind_of(refusal)), f).await
+}
+
+async fn write_through_gate<T, F, K>(
+    ctx: &ToolContext,
+    board_path: &std::path::Path,
+    what: &str,
+    kind_of: K,
+    f: F,
+) -> anyhow::Result<BoardWrite<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            &copperpour_ipc::client::KiCadIpcClient,
+            copperpour_ipc::gen::kiapi::common::types::DocumentSpecifier,
+        ) -> anyhow::Result<T>
+        + Send
+        + 'static,
+    K: FnOnce(&copperpour_ipc::PreflightRefusal) -> Option<ToolErrorKind> + Send,
+{
     Ok(match live_board::observe(ctx, board_path, f).await? {
         LiveBoard::Answered(value) => BoardWrite::Ipc(value),
+        // Copperpour refused the write itself, and KiCad kept nothing of it:
+        // not a rejection, so not worded as KiCad's (#240).
+        LiveBoard::Preflight(refusal) => {
+            let kind = kind_of(&refusal);
+            BoardWrite::Refused(preflight_refusal_result(what, &refusal, kind))
+        }
         LiveBoard::Recovered(message) => {
             BoardWrite::Refused(crate::tools::ipc_recovered_result(&message))
         }
@@ -335,7 +385,7 @@ where
         }
         // An endpoint that served no board still refuses, as a rejection
         // does. Whether a write should instead treat a proven-absent editor
-        // as permission is #577's question, not this one's. Only the
+        // as permission is mixelpixx/Konnect#577's question, not this one's. Only the
         // explanation differs: with no PCB editor behind the endpoint, no
         // editor can be holding this board, so the refusal says what was
         // observed instead of claiming one might (#83).
@@ -371,6 +421,61 @@ where
             ipc_unreachable,
         } => BoardWrite::Refused(lost_board_refusal(board_path, situation, ipc_unreachable)),
     })
+}
+
+/// The result for a refusal Copperpour made inside a live write, before
+/// KiCad kept any of it: worded as Copperpour's own, never as KiCad's
+/// rejection, and with `kind` when the tool names the argument it is about.
+pub(crate) fn preflight_refusal_result(
+    what: &str,
+    refusal: &copperpour_ipc::PreflightRefusal,
+    kind: Option<ToolErrorKind>,
+) -> CallToolResult {
+    let message = format!(
+        "The {what} was not written: {}. The board file was not modified.",
+        refusal.reason
+    );
+    match kind {
+        Some(kind) => CallToolResult::error_kind(kind, message),
+        None => CallToolResult::error(message),
+    }
+}
+
+/// The structured kind of a [`copperpour_ipc::PreflightRefusal`] made inside
+/// `tool`. `argument(reference, name)` is the tool's own name for argument
+/// `name` (`rotation` or `reference`) of the footprint `reference`, such as
+/// `placements[1].rotation`. A refusal with no argument at fault names the
+/// tool instead.
+pub(crate) fn preflight_refusal_kind(
+    tool: &str,
+    refusal: &copperpour_ipc::PreflightRefusal,
+    argument: impl Fn(&str, &str) -> String,
+) -> ToolErrorKind {
+    use copperpour_ipc::PreflightCause;
+    let invalid = |field: String| ToolErrorKind::InvalidArgument {
+        field,
+        reason: refusal.reason.clone(),
+    };
+    match &refusal.cause {
+        PreflightCause::Rotation { reference } => invalid(argument(reference, "rotation")),
+        PreflightCause::MissingReferences { references } => invalid(argument(
+            references.first().map_or("", String::as_str),
+            "reference",
+        )),
+        PreflightCause::DuplicateReference { reference } => {
+            invalid(argument(reference, "reference"))
+        }
+        // The footprint is a valid argument: Copperpour cannot carry one of
+        // its items, as `set_active_layer` reports what it cannot do.
+        PreflightCause::UnsupportedItem { .. } => ToolErrorKind::UnsupportedCapability {
+            capability: tool.to_string(),
+            kicad_version: None,
+        },
+        PreflightCause::CheckIncomplete => ToolErrorKind::PlanBlocked {
+            operation: tool.to_string(),
+            reasons: vec![refusal.reason.clone()],
+        },
+    }
 }
 
 /// A board observed live and now out of reach. When the transport is what
@@ -568,7 +673,10 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
             // it does in `attempt_ipc_write`: preserved as it was before those
             // cases had names, not decided. These two gates disagree about what
             // it permits, and that disagreement is #577's to settle.
-            LiveBoard::Rejected(_) | LiveBoard::Unserved { .. } | LiveBoard::NotOpen { .. } => None,
+            LiveBoard::Rejected(_)
+            | LiveBoard::Preflight(_)
+            | LiveBoard::Unserved { .. }
+            | LiveBoard::NotOpen { .. } => None,
             LiveBoard::Uncertain(message) => Some(crate::tools::ipc_uncertain_result(&message)),
             LiveBoard::Recovered(message) => Some(crate::tools::ipc_recovered_result(&message)),
             LiveBoard::Unresolved(error) => Some(crate::tools::ipc_target_error_result(&error)),
@@ -4706,6 +4814,38 @@ mod board_session_safety_tests {
             crate::mcp::error::extract_error_kind(&result).as_deref(),
             Some("unsafe_file_fallback")
         );
+    }
+
+    /// A refusal Copperpour makes inside a write is worded as its own even
+    /// when the writer names no argument for it, and the board file is left
+    /// alone (#240). Writers that name one are served in `pcb_copper_check`.
+    #[tokio::test]
+    async fn a_refusal_from_a_writer_naming_no_argument_is_still_copperpours_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let before = std::fs::read(&board).unwrap();
+        let server = spawn_one_document_response(&board);
+        let ctx = ctx_talking_to(server.address().to_string());
+        let answer = attempt_ipc_write::<(), _>(&ctx, &board, "test write", |_| {
+            Err(copperpour_ipc::PreflightRefusal::new(
+                copperpour_ipc::PreflightCause::MissingReferences {
+                    references: vec!["R9".to_string()],
+                },
+                "footprint R9 not found on board",
+            )
+            .into())
+        })
+        .await
+        .unwrap();
+        let BoardWrite::Refused(result) = answer else {
+            panic!("a refusal must not permit the file write")
+        };
+        assert_eq!(
+            super::mounting_hole_tests::result_text(&result),
+            "The test write was not written: footprint R9 not found on board. The board file was \
+             not modified."
+        );
+        assert_eq!(std::fs::read(&board).unwrap(), before);
     }
 
     #[tokio::test]

@@ -928,6 +928,17 @@ impl std::fmt::Display for FootprintTargetError {
 
 impl std::error::Error for FootprintTargetError {}
 
+/// `move_footprint`'s and `rotate_footprint`'s refusal of a reference no
+/// footprint on the board carries.
+fn missing_footprint(reference: &str) -> PreflightRefusal {
+    PreflightRefusal::new(
+        PreflightCause::MissingReferences {
+            references: vec![reference.to_string()],
+        },
+        format!("Footprint '{reference}' not found"),
+    )
+}
+
 impl BoardTargetError {
     pub fn proves_not_open(&self) -> bool {
         matches!(
@@ -992,7 +1003,8 @@ impl std::error::Error for BoardTargetError {}
 /// [`BoardTargetError::proves_not_open`] is true may permit a file fallback.
 ///
 /// `Uncertain` means no authoritative reply established the delivered
-/// request's outcome, or a transaction's rollback failed. `Rejected` covers
+/// request's outcome, or a transaction's rollback failed. `Preflight` is a
+/// refusal Copperpour made itself ([`PreflightRefusal`]). `Rejected` covers
 /// the remaining failures, including explicit API refusals.
 /// KiCad is — or may be — alive on the other end, so a file edit could be
 /// silently overwritten on its next save. Fail closed.
@@ -1000,6 +1012,9 @@ impl std::error::Error for BoardTargetError {}
 pub enum IpcFailure {
     Unreachable(String),
     Rejected(String),
+    /// Copperpour refused the request itself, on what it read from KiCad,
+    /// before KiCad kept any of it. Its message is the refusal's `reason`.
+    Preflight(PreflightRefusal),
     /// A delivered request has no confirmed outcome. Never retry a mutation
     /// or fall back to a file write on this evidence.
     Uncertain(String),
@@ -1031,6 +1046,12 @@ impl IpcFailure {
             }
         } else if is_transport_unreachable(&error) {
             IpcFailure::Unreachable(message)
+        } else if let Some(refusal) = PreflightRefusal::from_error(&error) {
+            // After every marker above: a check that failed because KiCad went
+            // away or never answered keeps that classification, which governs
+            // the file fallback and retry advice; only what would otherwise be
+            // read as KiCad's rejection is Copperpour's own refusal.
+            IpcFailure::Preflight(refusal.clone())
         } else {
             IpcFailure::Rejected(message)
         }
@@ -1043,9 +1064,92 @@ impl IpcFailure {
             | IpcFailure::Uncertain(message)
             | IpcFailure::Recovered(message)
             | IpcFailure::Target { message, .. } => message,
+            IpcFailure::Preflight(refusal) => &refusal.reason,
         }
     }
 }
+
+/// A refusal Copperpour decided itself, on what it read from KiCad, rather
+/// than one KiCad returned (#240): a rotation a footprint's children cannot
+/// follow, an item the transform cannot carry, a reference that names no
+/// footprint or two, or a placement check that could not complete.
+///
+/// It is raised before the command that would apply the refused change, and a
+/// commit already open for the write is dropped, so KiCad keeps nothing of it.
+/// [`IpcFailure::from_error`] finds it by walking the error chain, as it finds
+/// [`IpcOutcomeUnknown`], never by matching text; callers word it as
+/// Copperpour's own refusal and name the argument it is about from `cause`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightRefusal {
+    /// What was refused, for the caller to name the argument it is about.
+    pub cause: PreflightCause,
+    /// The whole refusal in Copperpour's words, including any failure it
+    /// rests on.
+    pub reason: String,
+    /// What this layer of an error chain says: `reason`, or for a refusal
+    /// raised as context over the failure it rests on, only its own sentence,
+    /// so the chain does not say that failure twice.
+    headline: String,
+}
+
+/// What a [`PreflightRefusal`] refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreflightCause {
+    /// Footprint `reference` cannot take the rotation asked of it: one of its
+    /// children has no faithful form at that angle.
+    Rotation { reference: String },
+    /// No footprint on the board carries these references, in the order
+    /// they were asked for.
+    MissingReferences { references: Vec<String> },
+    /// More than one footprint on the board carries `reference`.
+    DuplicateReference { reference: String },
+    /// Footprint `reference` holds an item of `item_type`, which Copperpour
+    /// cannot carry along when it moves or rotates the footprint.
+    UnsupportedItem {
+        reference: String,
+        item_type: String,
+    },
+    /// A check the write depends on could not complete. No argument of the
+    /// request is at fault.
+    CheckIncomplete,
+}
+
+impl PreflightRefusal {
+    pub fn new(cause: PreflightCause, reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            cause,
+            headline: reason.clone(),
+            reason,
+        }
+    }
+
+    /// The refusal of a write whose check failed with `error`, to attach as
+    /// context over it. The context keeps `error`'s chain, so a check that
+    /// failed because KiCad went away or never answered still classifies as
+    /// that; `reason` carries `error`'s text for the caller.
+    pub fn check_incomplete(headline: impl Into<String>, error: &anyhow::Error) -> Self {
+        let headline = headline.into();
+        Self {
+            cause: PreflightCause::CheckIncomplete,
+            reason: format!("{headline}: {error:#}"),
+            headline,
+        }
+    }
+
+    /// The refusal anywhere in `error`'s chain, root or context.
+    pub fn from_error(error: &anyhow::Error) -> Option<&Self> {
+        error.downcast_ref::<Self>()
+    }
+}
+
+impl std::fmt::Display for PreflightRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.headline)
+    }
+}
+
+impl std::error::Error for PreflightRefusal {}
 
 /// The request was sent, but no authoritative response was obtained.
 #[derive(Debug)]
@@ -3475,7 +3579,7 @@ impl KiCadIpcClient {
                 }
             }
         }
-        anyhow::bail!("Footprint '{}' not found", reference)
+        Err(missing_footprint(reference).into())
     }
 
     /// List the graphic items inside a placed footprint.
@@ -4108,7 +4212,7 @@ impl KiCadIpcClient {
                 }
             }
         }
-        anyhow::bail!("Footprint '{}' not found", reference)
+        Err(missing_footprint(reference).into())
     }
 
     /// Set the complete placement of several footprints in one KiCad undo
@@ -4165,10 +4269,15 @@ impl KiCadIpcClient {
                     continue;
                 };
                 if !matched.insert(reference.to_string()) {
-                    anyhow::bail!(
-                        "footprint reference '{}' appears more than once on the board",
-                        reference
-                    );
+                    return Err(PreflightRefusal::new(
+                        PreflightCause::DuplicateReference {
+                            reference: reference.to_string(),
+                        },
+                        format!(
+                            "footprint reference '{reference}' appears more than once on the board"
+                        ),
+                    )
+                    .into());
                 }
 
                 // Rotation about the held anchor, then translation: the same
@@ -4195,11 +4304,20 @@ impl KiCadIpcClient {
                 .map(|placement| placement.reference.as_str())
                 .collect();
             if !missing.is_empty() {
-                anyhow::bail!(
-                    "footprint{} {} not found on board",
-                    if missing.len() == 1 { "" } else { "s" },
-                    missing.join(", ")
-                );
+                return Err(PreflightRefusal::new(
+                    PreflightCause::MissingReferences {
+                        references: missing
+                            .iter()
+                            .map(|reference| reference.to_string())
+                            .collect(),
+                    },
+                    format!(
+                        "footprint{} {} not found on board",
+                        if missing.len() == 1 { "" } else { "s" },
+                        missing.join(", ")
+                    ),
+                )
+                .into());
             }
 
             client.update_items(updates)
@@ -8231,5 +8349,88 @@ mod stackup_tests {
         assert_eq!(stackup.edge_connector, "unknown");
         assert!(!stackup.has_edge_plating);
         assert!(stackup.layers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod preflight_refusal_tests {
+    use super::*;
+
+    fn refusal() -> PreflightRefusal {
+        PreflightRefusal::new(
+            PreflightCause::Rotation {
+                reference: "Y1".to_string(),
+            },
+            "cannot rotate footprint 'Y1' by a non-90° angle",
+        )
+    }
+
+    /// Raised inside a batch, the refusal travels under `run_commit`'s
+    /// "KiCad batch failed" context. It is classified by type, and its
+    /// message is its own reason: KiCad's batch did not fail, Copperpour
+    /// refused it.
+    #[test]
+    fn a_refusal_under_a_batch_context_is_copperpours_and_keeps_only_its_reason() {
+        let error = anyhow::Error::new(refusal()).context("KiCad batch failed; changes dropped");
+        let IpcFailure::Preflight(found) = IpcFailure::from_error(error) else {
+            panic!("a typed refusal must not be read as KiCad's rejection");
+        };
+        assert_eq!(found, refusal());
+        assert_eq!(
+            IpcFailure::Preflight(found).message(),
+            "cannot rotate footprint 'Y1' by a non-90° angle"
+        );
+    }
+
+    #[test]
+    fn the_same_words_without_the_marker_stay_a_rejection() {
+        let error = anyhow::anyhow!("cannot rotate footprint 'Y1' by a non-90° angle");
+        assert!(matches!(
+            IpcFailure::from_error(error),
+            IpcFailure::Rejected(_)
+        ));
+    }
+
+    /// A check that failed because KiCad went away, or never answered, keeps
+    /// that classification: it decides the file fallback and retry advice.
+    #[test]
+    fn an_incomplete_check_over_transport_loss_or_an_unknown_outcome_keeps_that_class() {
+        let lost = anyhow::Error::new(TransportUnreachable);
+        let refusal = PreflightRefusal::check_incomplete("the check could not complete", &lost);
+        assert!(matches!(
+            IpcFailure::from_error(lost.context(refusal)),
+            IpcFailure::Unreachable(_)
+        ));
+
+        let unknown = anyhow::Error::new(IpcOutcomeUnknown {
+            command: "GetPadShapeAsPolygon".to_string(),
+            reason: "receive timed out".to_string(),
+        });
+        let refusal = PreflightRefusal::check_incomplete("the check could not complete", &unknown);
+        assert!(matches!(
+            IpcFailure::from_error(unknown.context(refusal)),
+            IpcFailure::Uncertain(_)
+        ));
+    }
+
+    /// An incomplete check carries what it rests on in its reason, and the
+    /// error chain says that cause once.
+    #[test]
+    fn an_incomplete_check_over_a_plain_failure_is_copperpours_and_says_its_cause_once() {
+        let cause = anyhow::anyhow!("KiCad gave no copper outline for pad 1");
+        let refusal = PreflightRefusal::check_incomplete("the check could not complete", &cause);
+        let error = cause.context(refusal);
+        assert_eq!(
+            format!("{error:#}"),
+            "the check could not complete: KiCad gave no copper outline for pad 1"
+        );
+        let IpcFailure::Preflight(found) = IpcFailure::from_error(error) else {
+            panic!("an incomplete check is Copperpour's refusal");
+        };
+        assert_eq!(found.cause, PreflightCause::CheckIncomplete);
+        assert_eq!(
+            found.reason,
+            "the check could not complete: KiCad gave no copper outline for pad 1"
+        );
     }
 }

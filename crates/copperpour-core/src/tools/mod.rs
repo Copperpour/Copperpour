@@ -616,7 +616,12 @@ pub(crate) fn ipc_failure_result(failure: copperpour_ipc::IpcFailure) -> CallToo
             "KiCAD must be running with the board loaded (IPC error: {message})"
         )),
         copperpour_ipc::IpcFailure::Target { error, .. } => ipc_target_error_result(&error),
-        copperpour_ipc::IpcFailure::Rejected(message) => CallToolResult::error(message),
+        // No caller of this raises a refusal of its own (#240).
+        copperpour_ipc::IpcFailure::Rejected(message)
+        | copperpour_ipc::IpcFailure::Preflight(copperpour_ipc::PreflightRefusal {
+            reason: message,
+            ..
+        }) => CallToolResult::error(message),
         copperpour_ipc::IpcFailure::Recovered(message) => ipc_recovered_result(&message),
         copperpour_ipc::IpcFailure::Uncertain(message) => ipc_uncertain_result(&message),
     }

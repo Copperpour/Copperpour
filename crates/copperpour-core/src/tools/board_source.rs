@@ -178,8 +178,12 @@ where
 
         // KiCad is on the other end and refused the request, or never finished
         // answering it. Nothing here explains the live board away, so the saved
-        // file cannot stand in for it under any automatic mode.
-        LiveBoard::Rejected(message) => BoardRead::Refused(CallToolResult::error_kind(
+        // file cannot stand in for it under any automatic mode. No read raises
+        // a refusal of its own (#240); one would be kept with these.
+        LiveBoard::Rejected(message)
+        | LiveBoard::Preflight(copperpour_ipc::PreflightRefusal {
+            reason: message, ..
+        }) => BoardRead::Refused(CallToolResult::error_kind(
             ToolErrorKind::EditorUnavailable {
                 editor: "pcb".to_string(),
                 reason: message.clone(),
