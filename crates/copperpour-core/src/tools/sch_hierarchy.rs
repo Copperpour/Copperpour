@@ -6868,7 +6868,7 @@ mod sheet_pin_resize_tests {
             .unwrap_or_else(|| panic!("{name} not in the sheet"))
     }
 
-    async fn resize(path: &Path, width: f64, height: f64) {
+    async fn resize(path: &Path, width: f64, height: f64) -> Value {
         let out = call(
             "edit_sheet",
             json!({ "schematic": path.display().to_string(), "sheet_name": "child",
@@ -6876,6 +6876,19 @@ mod sheet_pin_resize_tests {
         )
         .await;
         assert_eq!(out["changed_fields"], json!(["size"]), "{out}");
+        out
+    }
+
+    /// The response's `sheet.pins`, as `[name, x, y]` in file order.
+    fn reported_pins(out: &Value) -> Value {
+        Value::Array(
+            out["sheet"]["pins"]
+                .as_array()
+                .unwrap_or_else(|| panic!("no sheet.pins in {out}"))
+                .iter()
+                .map(|pin| json!([pin["name"], pin["x"], pin["y"]]))
+                .collect(),
+        )
     }
 
     async fn move_pin(path: &Path, pin: &str, x: f64, y: f64) -> Value {
@@ -6892,7 +6905,17 @@ mod sheet_pin_resize_tests {
     #[tokio::test]
     async fn growing_a_sheet_carries_the_right_and_bottom_pins() {
         let (_d, path) = sheet();
-        resize(&path, 101.6, 63.5).await;
+        let out = resize(&path, 101.6, 63.5).await;
+
+        assert_eq!(
+            reported_pins(&out),
+            json!([
+                ["R", 152.4, 71.12],
+                ["L", 50.8, 71.12],
+                ["T", 71.12, 50.8],
+                ["B", 91.44, 114.3]
+            ])
+        );
 
         assert_eq!(at_in_file(&path, "R"), (152.4, 71.12, 0.0));
         assert_eq!(at_in_file(&path, "B"), (91.44, 114.3, 270.0));
@@ -6906,7 +6929,17 @@ mod sheet_pin_resize_tests {
     #[tokio::test]
     async fn shrinking_a_sheet_pulls_its_pins_back_onto_the_edges() {
         let (_d, path) = sheet();
-        resize(&path, 30.48, 17.78).await;
+        let out = resize(&path, 30.48, 17.78).await;
+
+        assert_eq!(
+            reported_pins(&out),
+            json!([
+                ["R", 81.28, 68.58],
+                ["L", 50.8, 68.58],
+                ["T", 71.12, 50.8],
+                ["B", 81.28, 68.58]
+            ])
+        );
 
         assert_eq!(at_in_file(&path, "R"), (81.28, 68.58, 0.0));
         assert_eq!(at_in_file(&path, "L"), (50.8, 68.58, 180.0));

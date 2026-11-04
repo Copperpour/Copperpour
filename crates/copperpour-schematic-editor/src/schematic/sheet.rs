@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::sexp::{atom, qstr, tagged, SexpNode};
 use crate::types::{fmt_f64, At, Effects, Property};
+use copperpour_sexp::geometry::round6;
 
 // ---- SheetPin -----------------------------------------------------------------
 
@@ -362,6 +363,8 @@ impl Sheet {
     /// The right and bottom edges move, so the pins on them and the `Sheetfile`
     /// caption below the box move too. A pin past the end of a shrunken edge is
     /// pulled back to its corner, which is where KiCad would put it on load.
+    /// Moved pin coordinates are rounded to the six decimals KiCad writes, so
+    /// the in-memory sheet reports what the file will hold.
     pub fn set_size(&mut self, width: f64, height: f64) {
         let (dw, dh) = (width - self.width, height - self.height);
         self.width = width;
@@ -375,8 +378,8 @@ impl Sheet {
                 Some(270.0) => pin.at.y += dh,
                 _ => {}
             }
-            pin.at.x = pin.at.x.clamp(self.at.x, self.at.x + width);
-            pin.at.y = pin.at.y.clamp(self.at.y, self.at.y + height);
+            pin.at.x = round6(pin.at.x.clamp(self.at.x, self.at.x + width));
+            pin.at.y = round6(pin.at.y.clamp(self.at.y, self.at.y + height));
         }
     }
 
