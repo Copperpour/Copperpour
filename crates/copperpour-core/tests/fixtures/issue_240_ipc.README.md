@@ -1,10 +1,12 @@
 # `issue_240_*`
 
 KiCad 10.0.8's own IPC answers for a board holding one footprint for each
-refusal the footprint transform makes inside a live placement, and that
+refusal the footprint transform made inside a live placement, and that
 board. `pcb_copper_check`'s served tests replay them for
 [#240](https://github.com/Copperpour/Copperpour/issues/240), where those
-refusals, Copperpour's own, reached the caller as KiCad rejections.
+refusals, Copperpour's own, reached the caller as KiCad rejections. Since
+[#270](https://github.com/Copperpour/Copperpour/issues/270), U2 is no longer
+refused (below).
 
 | File | What |
 |------|------|
@@ -47,12 +49,13 @@ copper, so the check is clear.
   (125, 95) mm, unchanged. Its two `fp_text_box` on Cmts.User come back as
   `kiapi.board.types.BoardTextBox`, which the transform refuses to turn off
   axis. Its pads are through-hole, so they have copper on both layers.
-- **U2: an item the transform does not know.** The stock
-  `Package_DIP:DIP-8_W7.62mm` at (140, 95) mm, unchanged. KiCad 10.0.8 sends
-  its `(point …)` as `kiapi.board.types.ReferencePoint`, a type Copperpour's
-  transform does not handle, so it refuses to move or rotate U2 at all. This
-  case depends on that gap: once the transform carries reference points,
-  the test needs a footprint with another item type it does not know.
+- **U2: a reference point.** The stock `Package_DIP:DIP-8_W7.62mm` at
+  (140, 95) mm, unchanged. KiCad 10.0.8 sends its `(point …)` as
+  `kiapi.board.types.ReferencePoint`, (3.81, 3.81) mm from the anchor. Until
+  #270 the transform did not know that type and refused to move or rotate U2
+  at all. It now carries the point, and `a_reference_point_follows_its_footprint`
+  checks where each placement tool puts it. The unsupported-item refusal is
+  tested on `issue_270_unknown_*`, a footprint holding a barcode.
 
 ## Redaction
 

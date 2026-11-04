@@ -2513,8 +2513,8 @@ mod served_tests {
 
     /// The #240 board (`issue_240_ipc.README.md`): Y1, the stock crystal with
     /// one added rounded rectangle on F.Fab; U1, the stock Honeywell_ABPDAN
-    /// and its two textboxes; U2, the stock DIP-8, whose reference point is a
-    /// type Copperpour does not know. No copper, so every check is clear.
+    /// and its two textboxes; U2, the stock DIP-8 and its reference point,
+    /// which moves with it since #270. No copper, so every check is clear.
     static ISSUE_240: Capture = Capture {
         board_name: "issue240.kicad_pcb",
         board: include_str!("../../tests/fixtures/issue_240.kicad_pcb"),
@@ -2540,15 +2540,47 @@ mod served_tests {
         kicad_holding(&ISSUE_240, |command| replay_from(&ISSUE_240, command)).await
     }
 
+    /// The #270 board (`issue_270_unknown_ipc.README.md`): J1, the stock
+    /// 1×4 pin header with one added QR barcode, a type the transform does
+    /// not carry. No copper, so every check is clear.
+    static ISSUE_270_UNKNOWN: Capture = Capture {
+        board_name: "issue270_unknown.kicad_pcb",
+        board: include_str!("../../tests/fixtures/issue_270_unknown.kicad_pcb"),
+        footprints: include_bytes!("../../tests/fixtures/issue_270_unknown_footprints.ipc.bin"),
+        tracks: include_bytes!("../../tests/fixtures/issue_270_unknown_tracks.ipc.bin"),
+        vias: include_bytes!("../../tests/fixtures/issue_270_unknown_vias.ipc.bin"),
+        arcs: include_bytes!("../../tests/fixtures/issue_270_unknown_arcs.ipc.bin"),
+        enabled_layers: include_bytes!(
+            "../../tests/fixtures/issue_270_unknown_enabled_layers.ipc.bin"
+        ),
+        presence: include_bytes!("../../tests/fixtures/issue_270_unknown_presence.ipc.bin"),
+        outlines: &[
+            (
+                BoardLayer::BlFCu,
+                include_bytes!("../../tests/fixtures/issue_270_unknown_polygons_F_Cu.ipc.bin"),
+            ),
+            (
+                BoardLayer::BlBCu,
+                include_bytes!("../../tests/fixtures/issue_270_unknown_polygons_B_Cu.ipc.bin"),
+            ),
+        ],
+    };
+
+    async fn issue_270_unknown_kicad() -> Kicad {
+        kicad_holding(&ISSUE_270_UNKNOWN, |command| {
+            replay_from(&ISSUE_270_UNKNOWN, command)
+        })
+        .await
+    }
+
     // The refusals, written out rather than read from the code under test.
     const ROUNDED_RECTANGLE: &str = "cannot rotate footprint 'Y1' by a non-90° angle: its \
          rounded-rectangle graphic on F.Fab has no off-axis form; use a multiple of 90°";
     const TEXTBOX: &str =
         "cannot rotate footprint 'U1' by a non-90° angle: it contains a textbox; use a multiple \
          of 90°";
-    const REFERENCE_POINT: &str = "footprint 'U2' contains an item of unsupported type \
-         'kiapi.board.types.ReferencePoint'; refusing to move/rotate it via IPC to avoid \
-         detaching it";
+    const BARCODE: &str = "footprint 'J1' contains an item of unsupported type \
+         'kiapi.board.types.Barcode'; refusing to move/rotate it via IPC to avoid detaching it";
 
     /// The commit commands of a write refused inside its commit: the commit
     /// is dropped, never pushed.
@@ -2632,6 +2664,32 @@ mod served_tests {
             }
             assert_eq!(self.commits(), commits, "{:?}", self.sent.lock().unwrap());
         }
+
+        /// Where KiCad holds `reference`'s one reference point, in nm.
+        fn held_point(&self, reference: &str) -> (i64, i64) {
+            let store = self.store.lock().unwrap();
+            let footprint = store
+                .items
+                .iter()
+                .map(|item| {
+                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap()
+                })
+                .find(|footprint| super::footprint_reference(footprint) == reference)
+                .unwrap();
+            let points: Vec<_> = footprint
+                .definition
+                .unwrap()
+                .items
+                .iter()
+                .filter(|item| any_type_name(item) == "kiapi.board.types.ReferencePoint")
+                .map(|item| {
+                    kiapi::board::types::ReferencePoint::decode(item.value.as_slice()).unwrap()
+                })
+                .collect();
+            assert_eq!(points.len(), 1, "{reference}: {points:?}");
+            let position = points[0].position.unwrap();
+            (position.x_nm, position.y_nm)
+        }
     }
 
     /// #240's own case: a non-90° rotation of a footprint holding a rounded
@@ -2714,8 +2772,8 @@ mod served_tests {
         );
     }
 
-    /// An item Copperpour cannot carry along refuses every move of its
-    /// footprint, of any angle: `move_component` and `rotate_component`
+    /// An item Copperpour cannot carry along, here J1's barcode, refuses
+    /// every move of its footprint, of any angle: `move_component` and `rotate_component`
     /// before any commit, the batch and `align_components` inside their
     /// commits, which they drop. The footprint is a valid argument, so the
     /// refusal is `unsupported_capability`, naming the tool.
@@ -2725,32 +2783,78 @@ mod served_tests {
             (
                 "move_component",
                 "move",
-                json!({ "reference": "U2", "x": 145.0, "y": 95.0 }),
+                json!({ "reference": "J1", "x": 115.0, "y": 95.0 }),
                 &[][..],
             ),
             (
                 "rotate_component",
                 "rotation",
-                json!({ "reference": "U2", "rotation": 90.0 }),
+                json!({ "reference": "J1", "rotation": 90.0 }),
                 &[][..],
             ),
             (
                 "set_component_placements",
                 "component placement batch",
-                json!({ "placements": [{ "reference": "U2", "x": 145.0, "y": 95.0, "rotation": 0.0 }] }),
+                json!({ "placements": [{ "reference": "J1", "x": 115.0, "y": 95.0, "rotation": 0.0 }] }),
                 DROPPED,
             ),
             (
                 "align_components",
                 "alignment",
-                json!({ "references": ["U2"], "axis": "x", "value": 145.0 }),
+                json!({ "references": ["J1"], "axis": "x", "value": 115.0 }),
                 DROPPED,
             ),
         ] {
-            let kicad = issue_240_kicad().await;
+            let kicad = issue_270_unknown_kicad().await;
             let (is_error, body) = kicad.call(tool, arguments).await;
             assert!(is_error, "{tool}: {body:#}");
-            kicad.assert_own_refusal(&body, what, REFERENCE_POINT, unsupported(tool), commits);
+            kicad.assert_own_refusal(&body, what, BARCODE, unsupported(tool), commits);
+        }
+    }
+
+    /// U2's reference point, which KiCad 10.0.8 sent (3.81, 3.81) mm from
+    /// its anchor at (140, 95) mm, moves and turns with it in the
+    /// `UpdateItems` each placement tool commits (#270). KiCad re-creates
+    /// the point where that message says, so one left behind would detach
+    /// from its package. The expected poses are worked out by hand: a
+    /// rotation of 90° turns (+3.81, +3.81) about the anchor to
+    /// (+3.81, −3.81), KiCad's counterclockwise with Y down.
+    #[tokio::test]
+    async fn a_reference_point_follows_its_footprint() {
+        for (tool, arguments, anchor, point) in [
+            (
+                "move_component",
+                json!({ "reference": "U2", "x": 145.0, "y": 95.0 }),
+                (145_000_000, 95_000_000, 0.0),
+                (148_810_000, 98_810_000),
+            ),
+            (
+                "rotate_component",
+                json!({ "reference": "U2", "rotation": 90.0 }),
+                (140_000_000, 95_000_000, 90.0),
+                (143_810_000, 91_190_000),
+            ),
+            (
+                "set_component_placements",
+                json!({ "placements": [{ "reference": "U2", "x": 145.0, "y": 95.0, "rotation": 90.0 }] }),
+                (145_000_000, 95_000_000, 90.0),
+                (148_810_000, 91_190_000),
+            ),
+            (
+                "align_components",
+                json!({ "references": ["U2"], "axis": "x", "value": 145.0 }),
+                (145_000_000, 95_000_000, 0.0),
+                (148_810_000, 98_810_000),
+            ),
+        ] {
+            let kicad = issue_240_kicad().await;
+            assert_eq!(kicad.held_point("U2"), (143_810_000, 98_810_000));
+            let (is_error, body) = kicad.call(tool, arguments).await;
+            assert!(!is_error, "{tool}: {body:#}");
+            assert_eq!(kicad.held("U2"), anchor, "{tool}");
+            assert_eq!(kicad.held_point("U2"), point, "{tool}");
+            assert_eq!(kicad.store.lock().unwrap().updates, 1, "{tool}");
+            assert!(!kicad.sent("EndCommit(drop)"), "{tool}");
         }
     }
 
