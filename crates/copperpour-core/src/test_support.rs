@@ -1,11 +1,6 @@
 use copperpour_ipc::gen::kiapi;
-use nng::options::Options;
 use prost::Message;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-
-/// How long the worker waits in `recv` before giving up on its own.
-const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// An already-listening in-process KiCad IPC double.
 ///
@@ -13,6 +8,11 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 /// shared NNG socket, wakes the receive loop, joins the worker, and releases
 /// the endpoint name. Tests therefore never probe and relinquish a TCP port or
 /// leave a detached mock thread behind.
+///
+/// The worker has no receive timeout, so idling never ends it. A timeout would
+/// end it while the guard keeps the socket open, so a request sent after a long
+/// idle (a loaded runner, Copperpour/Copperpour#271) is accepted and never
+/// answered.
 pub(crate) struct MockIpcServer {
     address: String,
     control: nng::Socket,
@@ -46,9 +46,6 @@ impl MockIpcServer {
         respond: impl Fn(kiapi::common::ApiRequest) -> kiapi::common::ApiResponse + Send + 'static,
     ) -> Self {
         let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
-        socket
-            .set_opt::<nng::options::RecvTimeout>(Some(RECV_TIMEOUT))
-            .expect("mock receive timeout");
         socket.listen(&address).expect("mock listen");
 
         let control = socket.clone();
@@ -93,20 +90,23 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::Duration;
 
-    /// Well under the worker's receive timeout: a drop that relied on that
-    /// timeout instead of closing the socket would exceed it.
-    const PROMPT_RELEASE: Duration = Duration::from_millis(RECV_TIMEOUT.as_millis() as u64 / 10);
+    /// How long closing the socket and joining the worker may take.
+    const PROMPT_RELEASE: Duration = Duration::from_secs(1);
 
-    /// Drops the guard and asserts it finished well under the receive timeout.
+    /// Drops the guard and asserts it finished promptly. The drop runs on its
+    /// own thread: with no receive timeout, a guard that never woke the worker
+    /// would otherwise hang the test instead of failing it.
     fn drop_promptly(server: MockIpcServer) {
-        let started = Instant::now();
-        drop(server);
-        let elapsed = started.elapsed();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(server);
+            let _ = done.send(());
+        });
         assert!(
-            elapsed < PROMPT_RELEASE,
-            "dropping the guard took {elapsed:?}; it must close the socket, not wait out the receive timeout"
+            finished.recv_timeout(PROMPT_RELEASE).is_ok(),
+            "dropping the guard took over {PROMPT_RELEASE:?}; it must close the socket to wake the worker"
         );
     }
 
@@ -176,6 +176,20 @@ mod tests {
     fn returned_server_is_already_bound_and_responsive() {
         let server = MockIpcServer::spawn("ready", |_| ok_response());
         round_trip(&server);
+    }
+
+    /// Checks the option, since no idle test can outwait every finite timeout.
+    #[test]
+    fn worker_has_no_idle_deadline() {
+        let server = MockIpcServer::spawn("idle", |_| ok_response());
+        assert_eq!(
+            server
+                .control
+                .get_opt::<nng::options::RecvTimeout>()
+                .expect("receive timeout"),
+            None,
+            "the worker must wait for requests until the guard closes its socket"
+        );
     }
 
     #[test]
