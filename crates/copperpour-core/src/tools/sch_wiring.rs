@@ -6,6 +6,7 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::sch_connectivity::COINCIDENT_TOLERANCE as TOLERANCE;
 use crate::tools::{
     get_path, opt_f64, opt_str, require_array, require_f64, require_str, ToolContext, ToolDef,
 };
@@ -307,7 +308,8 @@ pub fn tools() -> Vec<ToolDef> {
             "add_junction",
             "Add a junction dot at a point where wires cross or T-intersect, or where \
              a pin lands mid-wire. A junction alone connects a mid-wire pin; \
-             splitting the wire is not required.",
+             splitting the wire is not required. A point that already has a dot \
+             is reported as `already_present` and the file is left unwritten.",
             json!({
                 "type": "object",
                 "properties": {
@@ -320,7 +322,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_add_junction",
-            "Add multiple junction dots in a single file read/write cycle.",
+            "Add multiple junction dots in a single file read/write cycle. `added` \
+             counts the dots written; points that already have one, or repeat in \
+             the call, count as `already_present`. A call that adds none writes nothing.",
             json!({
                 "type": "object",
                 "properties": {
@@ -517,16 +521,77 @@ fn new_wire_junctions(
 /// `find_t_junctions` reports every T on the sheet, not only the ones the new
 /// wire made, so an unguarded loop re-emits a dot at every existing T on every
 /// call — quadratic in a batch. `insert_wire_with_junctions` guards the same
-/// way on the string path.
-fn add_missing_junctions(sch: &mut cse::Schematic, positions: &[(f64, f64)]) {
+/// way on the string path. Returns how many it added.
+fn add_missing_junctions(sch: &mut cse::Schematic, positions: &[(f64, f64)]) -> usize {
+    let before = sch.junctions.len();
     for &(x, y) in positions {
         if !sch
             .junctions
             .iter()
-            .any(|j| copperpour_sexp::geometry::points_coincident(x, y, j.x, j.y, 0.01))
+            .any(|j| copperpour_sexp::geometry::points_coincident(x, y, j.x, j.y, TOLERANCE))
         {
             sch.add_junction(x, y);
         }
+    }
+    sch.junctions.len() - before
+}
+
+/// The junctions `content` holds, or `None` when it does not parse.
+fn junctions_of(content: &str) -> Option<Vec<(f64, f64)>> {
+    copperpour_sexp::parse_sexp(content)
+        .ok()
+        .map(|tree| copperpour_sexp::schematic::extract_junctions(&tree))
+}
+
+/// Whether `content` holds `total` junctions, one or more at each of `positions`.
+fn junctions_landed(content: &str, positions: &[(f64, f64)], total: usize) -> bool {
+    let Some(dots) = junctions_of(content) else {
+        return false;
+    };
+    dots.len() == total
+        && positions.iter().all(|&(x, y)| {
+            dots.iter().any(|&(jx, jy)| {
+                copperpour_sexp::geometry::points_coincident(x, y, jx, jy, TOLERANCE)
+            })
+        })
+}
+
+/// Add the missing dots among `positions` and read the file back. `Ok(added)`, or
+/// the refusal or `mutation_outcome_uncertain` result. A call that adds nothing
+/// writes nothing, so a repeat cannot reserialize the sheet or hit KiCad's
+/// autosave; it still refuses while KiCad holds the sheet, whose unsaved state
+/// the file may not show.
+fn commit_junctions(
+    sch_path: &std::path::Path,
+    positions: &[(f64, f64)],
+    operation: &str,
+) -> anyhow::Result<Result<usize, CallToolResult>> {
+    let source = read_consistent(sch_path)?;
+    // Counted from the file, not the model, so a dot the model failed to load
+    // and the rewrite dropped fails the readback.
+    let before = junctions_of(&source).map_or(0, |dots| dots.len());
+    let mut sch = cse::Schematic::from_source(sch_path, source.clone())?;
+    let added = add_missing_junctions(&mut sch, positions);
+    if added == 0 {
+        copperpour_sexp::writer::ensure_kicad_design_document_is_closed(sch_path)?;
+        return Ok(Ok(0));
+    }
+    if let Some(refusal) = crate::tools::replace_if_unchanged(
+        sch_path,
+        "schematic",
+        operation,
+        &source,
+        sch.to_source(),
+    )? {
+        return Ok(Err(refusal));
+    }
+    match read_consistent(sch_path) {
+        Ok(written) if junctions_landed(&written, positions, before + added) => Ok(Ok(added)),
+        _ => Ok(Err(crate::tools::mutation_outcome_uncertain(
+            sch_path,
+            operation,
+            "the written file does not hold the sheet's junctions plus one at each missing point",
+        ))),
     }
 }
 
@@ -3487,13 +3552,16 @@ async fn handle_add_junction(
         Err(e) => return Ok(e),
     };
 
-    let mut sch = cse::Schematic::load(&sch_path)?;
-    // A second dot at the point would leave KiCad's ERC a duplicate to report.
-    add_missing_junctions(&mut sch, &[(x, y)]);
-    sch.overwrite()?;
-    Ok(CallToolResult::json(
-        &json!({ "added_junction": { "x": x, "y": y } }),
-    ))
+    // KiCad keeps a stacked dot through a resave and ERC never reports it, so
+    // a repeat would leave clutter nothing cleans up.
+    let added = match commit_junctions(&sch_path, &[(x, y)], "add_junction")? {
+        Ok(n) => n,
+        Err(uncertain) => return Ok(uncertain),
+    };
+    Ok(CallToolResult::json(&json!({
+        "added_junction": { "x": x, "y": y },
+        "already_present": added == 0
+    })))
 }
 
 async fn handle_batch_add_junction(
@@ -3502,17 +3570,26 @@ async fn handle_batch_add_junction(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let positions = match require_array(args, "positions") {
-        Ok(a) => a.clone(),
+        Ok(a) => a,
         Err(e) => return Ok(e),
     };
-    let mut sch = cse::Schematic::load(&sch_path)?;
-    for pos in &positions {
-        let x = pos["x"].as_f64().unwrap_or(0.0);
-        let y = pos["y"].as_f64().unwrap_or(0.0);
-        add_missing_junctions(&mut sch, &[(x, y)]);
-    }
-    sch.overwrite()?;
-    Ok(CallToolResult::json(&json!({ "added": positions.len() })))
+    let points: Vec<(f64, f64)> = positions
+        .iter()
+        .map(|pos| {
+            (
+                pos["x"].as_f64().unwrap_or(0.0),
+                pos["y"].as_f64().unwrap_or(0.0),
+            )
+        })
+        .collect();
+    let added = match commit_junctions(&sch_path, &points, "batch_add_junction")? {
+        Ok(n) => n,
+        Err(uncertain) => return Ok(uncertain),
+    };
+    Ok(CallToolResult::json(&json!({
+        "added": added,
+        "already_present": points.len() - added
+    })))
 }
 
 async fn handle_connect_to_net(
@@ -7064,53 +7141,186 @@ mod batch_power_tests {
 #[cfg(test)]
 mod add_junction_tests {
     use super::*;
-    use crate::router::ToolRouter;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::project_file_writer_tests::{served_call, text_of};
     use crate::tools::ServerConfig;
-    use std::sync::Arc;
+    use copperpour_sexp::geometry::points_coincident;
+    use serde_json::Value;
+    use std::time::{Duration, SystemTime};
 
-    fn ctx() -> ToolContext {
-        ToolContext::new(
-            ServerConfig {
-                kicad_cli: String::new(),
-                kicad_binary: String::new(),
-                ipc_address: String::new(),
-                project_dir: None,
-                jlcpcb_db_path: None,
-                auto_load_toolsets: false,
-                eager_toolsets: false,
-            },
-            Arc::new(ToolRouter::new()),
-        )
+    /// eeschema-saved; its T at (120.65, 170.18) already has its dot, and
+    /// (190.5, 140.0) is a plain crossing with none (see `RECONCILE_SCH`).
+    const SHEET: &str = include_str!("../../tests/fixtures/junction_reconcile.kicad_sch");
+    /// An mtime no write can leave behind.
+    fn aged() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1)
     }
 
-    #[tokio::test]
-    async fn repeating_a_junction_keeps_one_dot() {
+    fn sheet() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.kicad_sch");
-        std::fs::write(
-            &path,
-            "(kicad_sch (version 20250114) (generator \"t\") (uuid \"a\") (paper \"A4\") \
-             (lib_symbols) (sheet_instances (path \"/\" (page \"1\"))))",
-        )
-        .unwrap();
-        let schematic = path.display().to_string();
-        for _ in 0..2 {
-            handle_add_junction(
-                &json!({ "schematic": schematic, "x": 10.16, "y": 10.16 }),
-                &ctx(),
-            )
-            .await
-            .unwrap();
-        }
-        handle_batch_add_junction(
-            &json!({ "schematic": schematic, "positions": [
-                { "x": 10.16, "y": 10.16 }, { "x": 20.32, "y": 10.16 }, { "x": 20.32, "y": 10.16 }
-            ] }),
-            &ctx(),
-        )
-        .await
-        .unwrap();
+        let path = dir.path().join("junction_reconcile.kicad_sch");
+        std::fs::write(&path, SHEET).unwrap();
+        (dir, path)
+    }
 
-        assert_eq!(cse::Schematic::load(&path).unwrap().junctions.len(), 2);
+    fn dots_at(path: &std::path::Path, x: f64, y: f64) -> usize {
+        let tree = copperpour_sexp::parse_sexp(&std::fs::read_to_string(path).unwrap()).unwrap();
+        copperpour_sexp::schematic::extract_junctions(&tree)
+            .iter()
+            .filter(|&&(jx, jy)| points_coincident(x, y, jx, jy, 0.01))
+            .count()
+    }
+
+    fn mtime(path: &std::path::Path) -> SystemTime {
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    fn age(path: &std::path::Path) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(aged())
+            .unwrap();
+    }
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    async fn call(handler: &McpHandler, tool: &str, arguments: Value) -> Value {
+        let result = served_call(handler, tool, arguments).await;
+        assert!(!result.is_error, "{:?}", result.content);
+        serde_json::from_str(text_of(&result)).unwrap()
+    }
+
+    /// A dot already at the T is reported, not stacked, and the file is not
+    /// rewritten (#281).
+    #[tokio::test]
+    async fn add_junction_on_a_dotted_t_adds_and_writes_nothing() {
+        let (_d, path) = sheet();
+        age(&path);
+        let out = call(
+            &handler().await,
+            "add_junction",
+            json!({ "schematic": path.display().to_string(), "x": 120.65, "y": 170.18 }),
+        )
+        .await;
+        assert_eq!(out["already_present"], json!(true), "{out}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
+        assert_eq!(mtime(&path), aged(), "file rewritten");
+    }
+
+    /// A new point gets one dot, and a second call at it adds none.
+    #[tokio::test]
+    async fn add_junction_twice_leaves_one_dot() {
+        let (_d, path) = sheet();
+        let args = json!({ "schematic": path.display().to_string(), "x": 190.5, "y": 140.0 });
+        let handler = handler().await;
+        let first = call(&handler, "add_junction", args.clone()).await;
+        assert_eq!(first["already_present"], json!(false), "{first}");
+        let second = call(&handler, "add_junction", args).await;
+        assert_eq!(second["already_present"], json!(true), "{second}");
+        assert_eq!(dots_at(&path, 190.5, 140.0), 1);
+    }
+
+    /// `added` counts the dots written: a point listed twice and one already
+    /// dotted are `already_present` (#281).
+    #[tokio::test]
+    async fn batch_add_junction_counts_only_the_dots_it_writes() {
+        let (_d, path) = sheet();
+        let out = call(
+            &handler().await,
+            "batch_add_junction",
+            json!({ "schematic": path.display().to_string(), "positions": [
+                { "x": 120.65, "y": 170.18 }, { "x": 190.5, "y": 140.0 }, { "x": 190.5, "y": 140.0 }
+            ] }),
+        )
+        .await;
+        assert_eq!(out, json!({ "added": 1, "already_present": 2 }));
+        assert_eq!(dots_at(&path, 120.65, 170.18), 1);
+        assert_eq!(dots_at(&path, 190.5, 140.0), 1);
+    }
+
+    /// A batch that adds nothing leaves the file alone.
+    #[tokio::test]
+    async fn batch_add_junction_of_present_dots_writes_nothing() {
+        let (_d, path) = sheet();
+        age(&path);
+        let out = call(
+            &handler().await,
+            "batch_add_junction",
+            json!({ "schematic": path.display().to_string(), "positions": [
+                { "x": 120.65, "y": 170.18 }, { "x": 120.65, "y": 139.7 }
+            ] }),
+        )
+        .await;
+        assert_eq!(out, json!({ "added": 0, "already_present": 2 }));
+        assert_eq!(mtime(&path), aged(), "file rewritten");
+    }
+
+    /// KiCad holding the sheet refuses even a call that would add nothing,
+    /// since its unsaved state may lack the dot the file shows.
+    #[tokio::test]
+    async fn add_junction_refuses_while_kicad_holds_the_sheet() {
+        let (dir, path) = sheet();
+        std::fs::write(dir.path().join("~junction_reconcile.kicad_sch.lck"), "{}").unwrap();
+        let handler = handler().await;
+        for (x, y) in [(120.65, 170.18), (190.5, 140.0)] {
+            let result = served_call(
+                &handler,
+                "add_junction",
+                json!({ "schematic": path.display().to_string(), "x": x, "y": y }),
+            )
+            .await;
+            let body: Value = serde_json::from_str(text_of(&result)).unwrap();
+            assert_eq!(
+                body["error"]["kind"],
+                json!("conflict"),
+                "({x}, {y}): {body}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
+    }
+
+    /// A save between the read and the write is refused as `conflict` and kept.
+    #[tokio::test]
+    async fn batch_add_junction_keeps_a_save_made_after_its_read() {
+        let (_d, path) = sheet();
+        let saved = SHEET.replacen("(paper \"A4\")", "(paper \"A3\")", 1);
+        assert_ne!(saved, SHEET);
+        crate::tools::write_hook::set(saved.clone());
+        let result = served_call(
+            &handler().await,
+            "batch_add_junction",
+            json!({ "schematic": path.display().to_string(),
+                    "positions": [{ "x": 190.5, "y": 140.0 }] }),
+        )
+        .await;
+        assert!(!crate::tools::write_hook::armed(), "the write never ran");
+        let body: Value = serde_json::from_str(text_of(&result)).unwrap();
+        assert_eq!(body["error"]["kind"], json!("conflict"), "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+    }
+
+    /// The readback refuses a file missing a requested dot, or holding an extra one.
+    #[test]
+    fn junctions_landed_refuses_a_missing_or_extra_dot() {
+        let tree = copperpour_sexp::parse_sexp(SHEET).unwrap();
+        let n = copperpour_sexp::schematic::extract_junctions(&tree).len();
+        assert!(junctions_landed(SHEET, &[(120.65, 170.18)], n));
+        assert!(
+            !junctions_landed(SHEET, &[(190.5, 140.0)], n),
+            "missing dot"
+        );
+        assert!(
+            !junctions_landed(SHEET, &[(120.65, 170.18)], n + 1),
+            "wrong total"
+        );
     }
 }
