@@ -8,3 +8,6 @@ crates/copperpour-sexp/tests/fixtures/** -text
 crates/copperpour-core/tests/fixtures/** -text
 crates/copperpour-ipc/tests/fixtures/** -text
 crates/copperpour-schematic-editor/tests/fixtures/** -text
+
+# The vendored KiCad protocol is hashed byte for byte in proto-manifest.toml.
+crates/copperpour-ipc/proto/** -text

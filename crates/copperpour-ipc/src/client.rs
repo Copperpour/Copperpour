@@ -2804,7 +2804,8 @@ impl KiCadIpcClient {
 
     /// Begin a commit (undo group).
     pub fn begin_commit(&self) -> Result<String> {
-        let cmd = kiapi::common::commands::BeginCommit {};
+        // `header` (KiCad 10.0.7+) is left unset, as before the sync.
+        let cmd = kiapi::common::commands::BeginCommit { header: None };
         let response_any = self.send_command(&cmd, "kiapi.common.commands.BeginCommit")?;
         let response: kiapi::common::commands::BeginCommitResponse =
             unpack_required(response_any, "BeginCommit")?;
@@ -2831,6 +2832,8 @@ impl KiCadIpcClient {
             }),
             action: action as i32,
             message: message.to_string(),
+            // KiCad 10.0.7+; left unset, as before the sync.
+            header: None,
         };
         let _: kiapi::common::commands::EndCommitResponse = unpack_required(
             self.send_command(&cmd, "kiapi.common.commands.EndCommit")?,

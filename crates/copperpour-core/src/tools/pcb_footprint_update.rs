@@ -1913,6 +1913,13 @@ fn normalized_items(
                 pad.pad_to_die_length = None;
                 pad.symbol_pin = None;
                 pad.pad_to_die_delay = None;
+                // KiCad 10.0.7+ reports these, but the library pad builder
+                // doesn't read them from a .kicad_mod yet, so a built pad
+                // never has them. Compare without them, as before the proto
+                // sync, when Copperpour couldn't see them at all.
+                pad.fab_property = 0;
+                pad.teardrop = None;
+                pad.zone_layer_overrides.clear();
                 if let Some(stack) = pad.pad_stack.as_mut() {
                     stack.layers.sort_unstable();
                     if let Some(angle) = stack.angle.as_mut() {
@@ -2482,6 +2489,10 @@ mod tests {
             symbol_sheet_filename: "keyboard.kicad_sch".to_string(),
             symbol_footprint_filters: "Test:*".to_string(),
             parent: None,
+            // KiCad 10.0.7+ fields; this instance has none, like 10.0.6's.
+            embedded_files: None,
+            variants: vec![],
+            symbol_units: vec![],
         }
     }
 

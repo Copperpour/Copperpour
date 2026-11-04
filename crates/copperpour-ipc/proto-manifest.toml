@@ -1,0 +1,38 @@
+# Where the vendored KiCad IPC protocol in proto/ came from (#67).
+#
+# proto/ is one KiCad tag's api/proto tree, byte for byte: generated Rust is
+# built from it, never from hand-written message definitions. A sync replaces
+# the whole tree from a new tag and rewrites this file. The test
+# tests/proto_manifest_test.rs checks offline that proto/ holds exactly the
+# files below with these SHA-256 hashes.
+
+upstream = "https://gitlab.com/kicad/code/kicad"
+tag = "10.0.8"
+commit = "e432beac2668303194ba2040274f9e5efe773fc0"
+commit_date = "2026-10-29"
+synced = "2026-11-04"
+source_root = "api/proto"
+
+# KiCad versions this snapshot is meant to work with. Fields newer than the
+# running KiCad are absent on the wire, so older 10.0 releases read the
+# messages as they always did.
+[supported]
+oldest = "10.0.0"
+newest = "10.0.8"
+
+[files]
+"board/board.proto" = "128e9429cbd5446d71cf3b69943754c051f7337ee9b3986c92aedc2ee686f4d3"
+"board/board_commands.proto" = "662c14f4a701fa542c906e75e0a3ab4f2b5d4cdc116c178c6b0e39c5a9acb716"
+"board/board_types.proto" = "fa7b175e769215541e8adb61200be2dafe473f3ec9f18d54801bada9be866587"
+"common/commands/base_commands.proto" = "44ee37af7b9533653d6d5a28fee89d37b1e42207baecd1a6f2e97287d9d79bff"
+"common/commands/editor_commands.proto" = "194a0028c3be57a79f1b57da702856d910c9c20537de013c43e9967785642f3f"
+"common/commands/project_commands.proto" = "c165376f2b1dcd4a26c784247aef4ee0313d0d30c709caf763aaec2ed9ef0164"
+"common/commands/variant_commands.proto" = "8eba68a867126f789d6299a3cb9f28403b6a71d5cb5c5831b3170e914746e264"
+"common/envelope.proto" = "fc2d727416a2e79d131d0ae56f0965ef2b7441b365df9e718828ac355e2cc8c6"
+"common/types/base_types.proto" = "a4b1cc365cce89ee4b9823f985ae41d1e677dbe34636243ee53f365ffd47462e"
+"common/types/embedded_files.proto" = "595d9c2a2be963709f8302a7cce877f0756bc71da6736b0cfb91e8d02d606868"
+"common/types/enums.proto" = "18338434b703f96844cc40ea964382ebf5a4d949d8678324768557d64e6bdacd"
+"common/types/project_settings.proto" = "4552846e15cc07645a681034026018b4fb1186f39ac0b9a8cb0c2c893226b0ca"
+"common/types/variants.proto" = "d94c3de12c5f161d4f23719de75d6be41a76506d7eff26c61bc9f675bd7e8ed9"
+"schematic/schematic_commands.proto" = "bf59e513a9b28db917dac442b1a1317be910bb3265251e231cd29b1bec32744d"
+"schematic/schematic_types.proto" = "37f55edd4274a814c32926f19233c90a4ab9c8c664226d63c0ef9b90a1690988"
