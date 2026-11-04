@@ -6947,8 +6947,10 @@ mod diagnostic_tests {
         socket
             .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(2)))
             .unwrap();
+        // The timeout only bounds the join; a request that arrives after it
+        // (a loaded runner) is unanswered either way, which is what's tested.
         let worker = std::thread::spawn(move || {
-            let _request = socket.recv().unwrap();
+            let _request = socket.recv();
             std::thread::sleep(std::time::Duration::from_millis(100));
         });
         let error = KiCadIpcClient::new(address)

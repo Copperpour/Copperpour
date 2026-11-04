@@ -12,74 +12,14 @@ use copperpour_ipc::{
     IpcSelectionMutationError, IpcSelectionMutationErrorKind, IpcSelectionObservationError,
     IpcSelectionObservationErrorKind, IpcSheetInstancePath, KiCadIpcClient, PingOutcome,
 };
-use nng::options::Options;
 use prost::Message;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 mod common;
 
-/// A rep0 server answering each request via `respond`.
-/// Returns the inproc:// URL to dial. The server thread exits when the socket
-/// errors (i.e. when `_socket_keepalive` is dropped by the returned guard).
-struct MockKicad {
-    url: String,
-    _thread: std::thread::JoinHandle<()>,
-}
-
-fn spawn_mock<F>(respond: F) -> MockKicad
-where
-    F: Fn(kiapi::common::ApiRequest) -> Option<kiapi::common::ApiResponse> + Send + 'static,
-{
-    // inproc:// needs no port, so there is no bind-a-TcpListener-then-relisten
-    // TOCTOU window (that pattern intermittently died with AddressInUse on CI
-    // when another process grabbed the probed port). The name only has to be
-    // unique within this test process; a counter suffices.
-    static NEXT_MOCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let url = format!(
-        "inproc://mock-kicad-{}",
-        NEXT_MOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
-
-    // Listen BEFORE returning (and before the receive thread spawns): the
-    // client dials the moment spawn_mock returns, and NNG's dial fails
-    // immediately if nothing is bound yet. Doing the listen inside the
-    // thread raced the caller — flaky on slow CI runners.
-    let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
-    socket
-        .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(20)))
-        .unwrap();
-    socket.listen(&url).expect("mock listen");
-
-    let thread = std::thread::spawn(move || {
-        while let Ok(msg) = socket.recv() {
-            let request = match kiapi::common::ApiRequest::decode(msg.as_slice()) {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-            match respond(request) {
-                Some(resp) => {
-                    let out = nng::Message::from(resp.encode_to_vec().as_slice());
-                    if socket.send(out).is_err() {
-                        break;
-                    }
-                }
-                None => {
-                    // Simulate a wedged KiCAD: never reply. The rep socket
-                    // can't take another request until it replies, so just
-                    // park until the test ends.
-                    std::thread::sleep(Duration::from_secs(20));
-                    break;
-                }
-            }
-        }
-    });
-
-    MockKicad {
-        url,
-        _thread: thread,
-    }
-}
+mod mock_kicad;
+use mock_kicad::{spawn_mock, MockKicad};
 
 fn ok_response() -> kiapi::common::ApiResponse {
     kiapi::common::ApiResponse {
@@ -2950,14 +2890,31 @@ mod layer_name_budget {
 
     /// Counts the name lookups, so a test can prove the loop stopped rather
     /// than inferring it from the absence of names.
-    fn spawn_kicad_naming_layers(asked: Arc<Mutex<usize>>) -> MockKicad {
+    fn spawn_kicad_naming_layers(asked: Arc<Mutex<usize>>) -> SlowKicad {
         spawn_kicad_naming_layers_after(asked, Duration::ZERO)
+    }
+
+    /// A mock whose slow answers are cut short when the test ends. Fields drop
+    /// in order: closing `_release` wakes a responder still waiting out its
+    /// delay, so dropping `server` joins the worker at once.
+    struct SlowKicad {
+        _release: std::sync::mpsc::Sender<()>,
+        server: MockKicad,
+    }
+
+    impl std::ops::Deref for SlowKicad {
+        type Target = MockKicad;
+
+        fn deref(&self) -> &MockKicad {
+            &self.server
+        }
     }
 
     /// The same, with KiCad taking `delay` to answer each name lookup — a
     /// KiCad that has slowed to a crawl without dying.
-    fn spawn_kicad_naming_layers_after(asked: Arc<Mutex<usize>>, delay: Duration) -> MockKicad {
-        spawn_mock(move |request| {
+    fn spawn_kicad_naming_layers_after(asked: Arc<Mutex<usize>>, delay: Duration) -> SlowKicad {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let server = spawn_mock(move |request| {
             let command = request.message.expect("a command");
             if command.type_url.ends_with("GetBoardEnabledLayers") {
                 return Some(reply_with(builders::pack_any(
@@ -2973,7 +2930,7 @@ mod layer_name_budget {
             }
             if command.type_url.ends_with("GetBoardLayerName") {
                 *asked.lock().unwrap() += 1;
-                std::thread::sleep(delay);
+                let _ = released.recv_timeout(delay);
                 return Some(reply_with(builders::pack_any(
                     &kiapi::board::commands::BoardLayerNameResponse {
                         name: "renamed in the editor".to_string(),
@@ -2982,7 +2939,11 @@ mod layer_name_budget {
                 )));
             }
             Some(ok_response())
-        })
+        });
+        SlowKicad {
+            _release: release,
+            server,
+        }
     }
 
     #[test]

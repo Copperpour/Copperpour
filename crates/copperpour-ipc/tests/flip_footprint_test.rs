@@ -10,56 +10,11 @@
 use copperpour_ipc::gen::kiapi;
 use copperpour_ipc::types::{IpcFlipOutcome, IpcFootprint3DModel, IpcVector3};
 use copperpour_ipc::{builders, KiCadIpcClient};
-use nng::options::Options;
 use prost::Message;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-struct MockKicad {
-    url: String,
-    _thread: std::thread::JoinHandle<()>,
-}
-
-fn spawn_mock<F>(respond: F) -> MockKicad
-where
-    F: Fn(kiapi::common::ApiRequest) -> Option<kiapi::common::ApiResponse> + Send + 'static,
-{
-    static NEXT_MOCK: AtomicUsize = AtomicUsize::new(0);
-    let url = format!(
-        "inproc://mock-kicad-flip-{}",
-        NEXT_MOCK.fetch_add(1, Ordering::Relaxed)
-    );
-
-    let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
-    socket
-        .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(20)))
-        .unwrap();
-    socket.listen(&url).expect("mock listen");
-
-    let thread = std::thread::spawn(move || {
-        while let Ok(msg) = socket.recv() {
-            let request = match kiapi::common::ApiRequest::decode(msg.as_slice()) {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-            match respond(request) {
-                Some(resp) => {
-                    let out = nng::Message::from(resp.encode_to_vec().as_slice());
-                    if socket.send(out).is_err() {
-                        break;
-                    }
-                }
-                None => break,
-            }
-        }
-    });
-
-    MockKicad {
-        url,
-        _thread: thread,
-    }
-}
+mod mock_kicad;
+use mock_kicad::{spawn_mock, MockKicad};
 
 fn ok_response() -> kiapi::common::ApiResponse {
     kiapi::common::ApiResponse {

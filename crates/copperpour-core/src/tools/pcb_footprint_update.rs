@@ -3799,7 +3799,7 @@ mod tests {
         let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
             kicad_cli: String::new(),
             kicad_binary: String::new(),
-            ipc_address: mock.url.clone(),
+            ipc_address: mock.kicad.address().to_string(),
             project_dir: None,
             jlcpcb_db_path: None,
             auto_load_toolsets: true,
@@ -4109,7 +4109,7 @@ mod tests {
             })
             .collect();
         let mock = spawn_planner_mock_keeping(&board, footprints, false, true);
-        let handler = served(&mock.url).await;
+        let handler = served(mock.kicad.address()).await;
 
         let body = result_json(&served_call(&handler, serde_json::json!({ "board": board })).await);
         assert_eq!(body["status"], "ready", "{body}");
@@ -4186,9 +4186,8 @@ mod tests {
     }
 
     struct PlannerMock {
-        url: String,
+        kicad: crate::test_support::MockIpcServer,
         capture: std::sync::Arc<std::sync::Mutex<MutationCapture>>,
-        _thread: std::thread::JoinHandle<()>,
     }
 
     fn api_ok() -> kiapi::common::ApiResponse {
@@ -4225,171 +4224,144 @@ mod tests {
         fail_update: bool,
         keeps_updates: bool,
     ) -> PlannerMock {
-        use nng::options::Options;
-
-        static NEXT_MOCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let url = format!(
-            "inproc://footprint-update-{}",
-            NEXT_MOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
-        socket
-            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(20)))
-            .unwrap();
-        socket.listen(&url).unwrap();
-
         let board_name = board.to_string_lossy().to_string();
         let capture = std::sync::Arc::new(std::sync::Mutex::new(MutationCapture::default()));
         let captured = capture.clone();
-        let thread = std::thread::spawn(move || {
-            let mut footprints = footprints;
-            while let Ok(message) = socket.recv() {
-                let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
-                let message = request.message.expect("request message");
-                let response = if message.type_url.ends_with("GetOpenDocuments") {
-                    api_reply(builders::pack_any(
-                        &kiapi::common::commands::GetOpenDocumentsResponse {
-                            documents: vec![kiapi::common::types::DocumentSpecifier {
-                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-                                identifier: Some(
-                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                                        board_name.clone(),
-                                    ),
+        let footprints = std::sync::Mutex::new(footprints);
+        let kicad = crate::test_support::MockIpcServer::spawn("footprint-update", move |request| {
+            let message = request.message.expect("request message");
+            if message.type_url.ends_with("GetOpenDocuments") {
+                api_reply(builders::pack_any(
+                    &kiapi::common::commands::GetOpenDocumentsResponse {
+                        documents: vec![kiapi::common::types::DocumentSpecifier {
+                            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                            identifier: Some(
+                                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                    board_name.clone(),
                                 ),
-                                project: None,
-                            }],
-                        },
-                        "kiapi.common.commands.GetOpenDocumentsResponse",
-                    ))
-                } else if message.type_url.ends_with("GetItems") {
-                    let command =
-                        kiapi::common::commands::GetItems::decode(message.value.as_slice())
-                            .unwrap();
-                    let items = if command.types
-                        == vec![kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32]
-                    {
-                        footprints.clone()
-                    } else {
-                        Vec::new()
-                    };
-                    api_reply(builders::pack_any(
-                        &kiapi::common::commands::GetItemsResponse {
-                            header: None,
-                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                            items,
-                        },
-                        "kiapi.common.commands.GetItemsResponse",
-                    ))
-                } else if message.type_url.ends_with("GetBoardEnabledLayers") {
-                    let command = kiapi::board::commands::GetBoardEnabledLayers::decode(
-                        message.value.as_slice(),
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        command.board.and_then(|board| board.identifier),
-                        Some(
-                            kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                                board_name.clone()
-                            )
-                        ),
-                        "the stack is read from the board being updated"
-                    );
-                    api_reply(builders::pack_any(
-                        &kiapi::board::commands::BoardEnabledLayersResponse {
-                            copper_layer_count: 2,
-                            layers: vec![
-                                kiapi::board::types::BoardLayer::BlFCu as i32,
-                                kiapi::board::types::BoardLayer::BlBCu as i32,
-                                kiapi::board::types::BoardLayer::BlEdgeCuts as i32,
-                            ],
-                        },
-                        "kiapi.board.commands.BoardEnabledLayersResponse",
-                    ))
-                } else if message.type_url.ends_with("GetNets") {
-                    api_reply(builders::pack_any(
-                        &kiapi::board::commands::NetsResponse {
-                            nets: vec![builders::net("ROW1", 11), builders::net("COL1", 12)],
-                        },
-                        "kiapi.board.commands.NetsResponse",
-                    ))
-                } else if message.type_url.ends_with("BeginCommit") {
-                    captured.lock().unwrap().begin_count += 1;
-                    api_reply(builders::pack_any(
-                        &kiapi::common::commands::BeginCommitResponse {
-                            id: Some(kiapi::common::types::Kiid {
-                                value: "commit-1".to_string(),
-                            }),
-                        },
-                        "kiapi.common.commands.BeginCommitResponse",
-                    ))
-                } else if message.type_url.ends_with("UpdateItems") {
-                    let update =
-                        kiapi::common::commands::UpdateItems::decode(message.value.as_slice())
-                            .unwrap();
-                    captured
-                        .lock()
-                        .unwrap()
-                        .update_batches
-                        .push(update.items.len());
-                    if keeps_updates && !fail_update {
-                        footprints = update.items.clone();
-                    }
-                    let updated_items = update
-                        .items
-                        .into_iter()
-                        .map(|item| kiapi::common::commands::ItemUpdateResult {
-                            status: Some(kiapi::common::commands::ItemStatus {
-                                code: if fail_update {
-                                    kiapi::common::commands::ItemStatusCode::IscInvalidData as i32
-                                } else {
-                                    kiapi::common::commands::ItemStatusCode::IscOk as i32
-                                },
-                                error_message: if fail_update {
-                                    "mock update failure".to_string()
-                                } else {
-                                    String::new()
-                                },
-                            }),
-                            item: Some(item),
-                        })
-                        .collect();
-                    api_reply(builders::pack_any(
-                        &kiapi::common::commands::UpdateItemsResponse {
-                            header: None,
-                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                            updated_items,
-                        },
-                        "kiapi.common.commands.UpdateItemsResponse",
-                    ))
-                } else if message.type_url.ends_with("EndCommit") {
-                    let end = kiapi::common::commands::EndCommit::decode(message.value.as_slice())
-                        .unwrap();
-                    captured.lock().unwrap().commit_actions.push(end.action());
-                    api_reply(builders::pack_any(
-                        &kiapi::common::commands::EndCommitResponse {},
-                        "kiapi.common.commands.EndCommitResponse",
-                    ))
+                            ),
+                            project: None,
+                        }],
+                    },
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                ))
+            } else if message.type_url.ends_with("GetItems") {
+                let command =
+                    kiapi::common::commands::GetItems::decode(message.value.as_slice()).unwrap();
+                let items = if command.types
+                    == vec![kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32]
+                {
+                    footprints.lock().unwrap().clone()
                 } else {
-                    panic!("unexpected mock request {}", message.type_url);
+                    Vec::new()
                 };
-                let response = nng::Message::from(response.encode_to_vec().as_slice());
-                if socket.send(response).is_err() {
-                    break;
+                api_reply(builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items,
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ))
+            } else if message.type_url.ends_with("GetBoardEnabledLayers") {
+                let command =
+                    kiapi::board::commands::GetBoardEnabledLayers::decode(message.value.as_slice())
+                        .unwrap();
+                assert_eq!(
+                    command.board.and_then(|board| board.identifier),
+                    Some(
+                        kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                            board_name.clone()
+                        )
+                    ),
+                    "the stack is read from the board being updated"
+                );
+                api_reply(builders::pack_any(
+                    &kiapi::board::commands::BoardEnabledLayersResponse {
+                        copper_layer_count: 2,
+                        layers: vec![
+                            kiapi::board::types::BoardLayer::BlFCu as i32,
+                            kiapi::board::types::BoardLayer::BlBCu as i32,
+                            kiapi::board::types::BoardLayer::BlEdgeCuts as i32,
+                        ],
+                    },
+                    "kiapi.board.commands.BoardEnabledLayersResponse",
+                ))
+            } else if message.type_url.ends_with("GetNets") {
+                api_reply(builders::pack_any(
+                    &kiapi::board::commands::NetsResponse {
+                        nets: vec![builders::net("ROW1", 11), builders::net("COL1", 12)],
+                    },
+                    "kiapi.board.commands.NetsResponse",
+                ))
+            } else if message.type_url.ends_with("BeginCommit") {
+                captured.lock().unwrap().begin_count += 1;
+                api_reply(builders::pack_any(
+                    &kiapi::common::commands::BeginCommitResponse {
+                        id: Some(kiapi::common::types::Kiid {
+                            value: "commit-1".to_string(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                ))
+            } else if message.type_url.ends_with("UpdateItems") {
+                let update =
+                    kiapi::common::commands::UpdateItems::decode(message.value.as_slice()).unwrap();
+                captured
+                    .lock()
+                    .unwrap()
+                    .update_batches
+                    .push(update.items.len());
+                if keeps_updates && !fail_update {
+                    *footprints.lock().unwrap() = update.items.clone();
                 }
+                let updated_items = update
+                    .items
+                    .into_iter()
+                    .map(|item| kiapi::common::commands::ItemUpdateResult {
+                        status: Some(kiapi::common::commands::ItemStatus {
+                            code: if fail_update {
+                                kiapi::common::commands::ItemStatusCode::IscInvalidData as i32
+                            } else {
+                                kiapi::common::commands::ItemStatusCode::IscOk as i32
+                            },
+                            error_message: if fail_update {
+                                "mock update failure".to_string()
+                            } else {
+                                String::new()
+                            },
+                        }),
+                        item: Some(item),
+                    })
+                    .collect();
+                api_reply(builders::pack_any(
+                    &kiapi::common::commands::UpdateItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        updated_items,
+                    },
+                    "kiapi.common.commands.UpdateItemsResponse",
+                ))
+            } else if message.type_url.ends_with("EndCommit") {
+                let end =
+                    kiapi::common::commands::EndCommit::decode(message.value.as_slice()).unwrap();
+                captured.lock().unwrap().commit_actions.push(end.action());
+                api_reply(builders::pack_any(
+                    &kiapi::common::commands::EndCommitResponse {},
+                    "kiapi.common.commands.EndCommitResponse",
+                ))
+            } else {
+                panic!("unexpected mock request {}", message.type_url);
             }
         });
-        PlannerMock {
-            url,
-            capture,
-            _thread: thread,
-        }
+        PlannerMock { kicad, capture }
     }
 
     #[tokio::test]
     async fn dry_run_and_stale_revision_never_open_a_commit_or_send_updates() {
         let (_temp, board, items) = plan_fixture();
         let mock = spawn_planner_mock(&board, items[2].clone(), false);
-        let context = test_context(&mock.url);
+        let context = test_context(mock.kicad.address());
 
         let dry_run =
             handle_update_footprints_from_library(&serde_json::json!({ "board": board }), &context)
@@ -4732,7 +4704,7 @@ mod tests {
     ) -> (crate::mcp::protocol::CallToolResult, PlannerMock) {
         let (_temp, board, items) = plan_fixture();
         let mock = spawn_planner_mock_keeping(&board, vec![items[2].clone()], false, keeps_updates);
-        let handler = served(&mock.url).await;
+        let handler = served(mock.kicad.address()).await;
         let arguments = serde_json::json!({
             "board": board,
             "references": ["SW1"],
@@ -4808,7 +4780,7 @@ mod tests {
     async fn apply_sends_one_batch_in_one_commit() {
         let (_temp, board, items) = plan_fixture();
         let mock = spawn_planner_mock(&board, items[2].clone(), false);
-        let context = test_context(&mock.url);
+        let context = test_context(mock.kicad.address());
         let dry_run =
             handle_update_footprints_from_library(&serde_json::json!({ "board": board }), &context)
                 .await
@@ -4845,7 +4817,7 @@ mod tests {
     async fn failed_update_drops_the_single_commit() {
         let (_temp, board, items) = plan_fixture();
         let mock = spawn_planner_mock(&board, items[2].clone(), true);
-        let context = test_context(&mock.url);
+        let context = test_context(mock.kicad.address());
         let dry_run =
             handle_update_footprints_from_library(&serde_json::json!({ "board": board }), &context)
                 .await
