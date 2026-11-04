@@ -4,7 +4,8 @@
 Two modes, combinable:
 
   python packaging/validate-pcm.py --metadata packaging/metadata.json
-      Validate a metadata.json file against the vendored packages.v1 schema.
+      Validate a metadata.json file against the vendored packages.v2 schema
+      and KiCad's addon guidelines.
 
   python packaging/validate-pcm.py --zip dist/copperpour-pcm-v0.1.2.zip
       Assert the PCM zip structure (metadata at root, plugin launcher,
@@ -25,7 +26,11 @@ from pathlib import Path
 
 import jsonschema
 
-SCHEMA_PATH = Path(__file__).parent / "schema" / "packages.v1.schema.json"
+SCHEMA_PATH = Path(__file__).parent / "schema" / "packages.v2.schema.json"
+
+# https://dev-docs.kicad.org/en/addons/ caps `description` at 150 characters;
+# the schema allows 500, so only this check enforces it.
+MAX_DESCRIPTION = 150
 
 REQUIRED_ZIP_ENTRIES = [
     "metadata.json",
@@ -69,7 +74,23 @@ def validate_metadata(meta: dict, label: str) -> list[str]:
     try:
         jsonschema.validate(meta, load_schema())
     except jsonschema.ValidationError as e:
-        errors.append(f"{label}: schema violation at {e.json_path}: {e.message}")
+        # The checks below assume the schema's shapes.
+        return [f"{label}: schema violation at {e.json_path}: {e.message}"]
+    description = meta["description"]
+    if len(description) > MAX_DESCRIPTION:
+        errors.append(
+            f"{label}: description is {len(description)} characters; KiCad's "
+            f"addon guidelines allow {MAX_DESCRIPTION}"
+        )
+    # Without `runtime`, PCM assumes SWIG, and KiCad 11 marks SWIG plugins
+    # incompatible. The IPC action needs the API server, which `ipc` prompts for.
+    for v in meta.get("versions", []):
+        runtime = v.get("runtime")
+        if runtime != "ipc":
+            declared = "no runtime" if runtime is None else f"runtime {runtime!r}"
+            errors.append(
+                f"{label}: version {v['version']} declares {declared}, not 'ipc'"
+            )
     return errors
 
 

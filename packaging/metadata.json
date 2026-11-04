@@ -1,8 +1,8 @@
 {
-  "$schema": "https://go.kicad.org/pcm/schemas/v1",
+  "$schema": "https://go.kicad.org/pcm/schemas/v2",
   "name": "Copperpour",
-  "description": "AI-assisted PCB design via the Model Context Protocol. Enables Claude and other AI assistants to design schematics and PCBs with 245 tools organized into on-demand toolsets.",
-  "description_full": "Copperpour exposes a complete set of KiCAD design tools to AI assistants via the Model Context Protocol (MCP). It supports schematic editing, PCB layout, local Freerouting MCP routing, library management, JLCPCB part search, ERC/DRC, design review audits, and full export pipelines. Tools are organized into 22 toolsets loaded on demand so the AI only sees relevant tools at once.",
+  "description": "AI-assisted schematic and PCB design via the Model Context Protocol: Claude and other AI assistants edit, route, review and export KiCad designs.",
+  "description_full": "Copperpour exposes a complete set of KiCad design tools to AI assistants via the Model Context Protocol (MCP). It supports schematic editing, PCB layout, local Freerouting MCP routing, library management, JLCPCB part search, ERC/DRC, design review audits, and full export pipelines. Tools are organized into toolsets loaded on demand so the AI only sees relevant tools at once.",
   "identifier": "com.github.copperpour.copperpour",
   "type": "plugin",
   "author": {
@@ -11,14 +11,18 @@
       "web": "https://github.com/Copperpour"
     }
   },
-  "license": "open-source",
+  "license": "AGPL-3.0-only",
   "resources": {
-    "homepage": "https://github.com/Copperpour/Copperpour"
+    "homepage": "https://github.com/Copperpour/Copperpour",
+    "repository": "https://github.com/Copperpour/Copperpour",
+    "bugtracker": "https://github.com/Copperpour/Copperpour/issues"
   },
+  "tags": ["ai", "mcp", "pcbnew", "schematic", "routing", "fabrication"],
   "versions": [
     {
       "version": "0.15.0",
-      "status": "stable",
+      "status": "testing",
+      "runtime": "ipc",
       "kicad_version": "10.0",
       "kicad_version_max": "10.99"
     }
