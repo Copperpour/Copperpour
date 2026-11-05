@@ -398,7 +398,7 @@ and Windows servers do not.
 
 ### `integration` · 10 tools
 **Purpose:** JLCPCB parts database, local Freerouting MCP routing, datasheet URLs.
-**Source:** [`crates/copperpour-core/src/tools/integration.rs`](crates/copperpour-core/src/tools/integration.rs); the Freerouting code in [`crates/copperpour-core/src/autorouting/freerouting/`](crates/copperpour-core/src/autorouting/freerouting/)
+**Source:** [`crates/copperpour-core/src/tools/integration.rs`](crates/copperpour-core/src/tools/integration.rs); the catalog and the LCSC and EasyEDA APIs in [`crates/copperpour-core/src/sourcing/`](crates/copperpour-core/src/sourcing/); the Freerouting code in [`crates/copperpour-core/src/autorouting/freerouting/`](crates/copperpour-core/src/autorouting/freerouting/)
 
 | Tool | Description |
 |------|-------------|

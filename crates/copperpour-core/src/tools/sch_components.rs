@@ -60,7 +60,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "value": { "type": "string", "description": "Optional override for the library symbol's Value" },
                     "footprint": { "type": "string", "description": "Optional override for the library symbol's Footprint" },
                     "unit": { "type": "integer", "minimum": 1, "description": "Unit number for multi-unit symbols (gate/part selection). Default 1.", "default": 1 },
-                    "lcsc_id": { "type": "string", "description": "Optional LCSC part number (e.g. 'C2856837'). Automatically enriches LCSC, MPN, Manufacturer, and Datasheet from ~/.konnect/jlcpcb.db at placement time." },
+                    "lcsc_id": { "type": "string", "description": "Optional LCSC part number (e.g. 'C2856837'). Fills MPN, Manufacturer, Datasheet and Description from the local JLCPCB catalog (the jlcpcb_db_path setting, else its default path) at placement time; the response's lcsc_catalog says what the catalog gave." },
                     "fields": { "type": "object", "additionalProperties": true, "description": "Additional custom properties to set on the placed component instance (e.g. {\"LCSC\": \"C123\", \"MPN\": \"...\"})" }
                 },
                 "required": ["schematic", "lib_id", "x", "y"]
@@ -556,11 +556,11 @@ pub(crate) async fn handle_add_schematic_component(
 
     let lcsc_id = opt_str(args, "lcsc_id");
     let fields = args["fields"].as_object();
-    let db_path = crate::tools::integration::resolve_db_path(args, _ctx);
+    let catalog = crate::sourcing::LcscCatalog::resolve(args, _ctx);
     let extras = ComponentPlacementExtras {
         lcsc_id,
         fields,
-        db_path: db_path.as_deref(),
+        catalog: Some(&catalog),
     };
 
     let placed = match place_one_component(
@@ -693,6 +693,9 @@ pub(crate) async fn handle_add_schematic_component(
         .iter()
         .map(|(x, y)| json!({ "x": x, "y": y }))
         .collect::<Vec<_>>());
+    if let Some(report) = &placed.lcsc_catalog {
+        result["lcsc_catalog"] = report.clone();
+    }
 
     Ok(crate::outcome::attach(
         CallToolResult::json(&result),
@@ -763,7 +766,9 @@ pub(crate) fn mirror_arg<'a>(
 pub(crate) struct ComponentPlacementExtras<'a> {
     pub lcsc_id: Option<&'a str>,
     pub fields: Option<&'a serde_json::Map<String, serde_json::Value>>,
-    pub db_path: Option<&'a std::path::Path>,
+    /// Where the LCSC number's MPN, manufacturer, datasheet and description
+    /// come from. `None` skips the lookup, as templates do.
+    pub catalog: Option<&'a crate::sourcing::LcscCatalog>,
 }
 
 /// Place one symbol into `sch`: embeds the lib_symbols definition, validates
@@ -911,6 +916,7 @@ pub(crate) fn place_one_component(
         .or_else(|| sym.property("LCSC"))
         .map(String::from);
 
+    let mut lcsc_catalog = None;
     if let Some(lcsc) = effective_lcsc {
         if let Some(p) = sym.properties.iter_mut().find(|p| p.name == "LCSC") {
             p.value = lcsc.clone();
@@ -919,8 +925,10 @@ pub(crate) fn place_one_component(
                 .push(positioned("LCSC", &lcsc, x, y, 0.0, true, centred));
         }
 
-        if let Some(path) = extras.db_path {
-            if let Some(info) = crate::tools::integration::query_jlcpcb_db_part(path, &lcsc) {
+        if let Some(catalog) = extras.catalog {
+            let lookup = catalog.part_info(&lcsc);
+            lcsc_catalog = Some(placement_catalog_report(&lookup, catalog));
+            if let crate::sourcing::Lookup::Read(Some(info)) = lookup {
                 if !info.mfr_part.is_empty()
                     && (sym.property("MPN").is_none() || sym.property("MPN") == Some(""))
                 {
@@ -1004,7 +1012,21 @@ pub(crate) fn place_one_component(
         uuid,
         reference,
         fields,
+        lcsc_catalog,
     })
+}
+
+/// What the catalog gave for a placed symbol's LCSC number: `{ read, path,
+/// reason }` as every catalog report, plus `part_found` when it was read.
+fn placement_catalog_report(
+    lookup: &crate::sourcing::Lookup<Option<crate::sourcing::catalog::JlcpchPartInfo>>,
+    catalog: &crate::sourcing::LcscCatalog,
+) -> serde_json::Value {
+    let mut report = lookup.report(catalog);
+    if let crate::sourcing::Lookup::Read(part) = lookup {
+        report["part_found"] = json!(part.is_some());
+    }
+    report
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1041,6 +1063,8 @@ pub(crate) struct PlacedComponent {
     pub(crate) uuid: String,
     pub(crate) reference: String,
     pub(crate) fields: PlacementFields,
+    /// The catalog's report on the symbol's LCSC number, when it has one.
+    pub(crate) lcsc_catalog: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -5129,6 +5153,18 @@ mod tests {
     use crate::tools::ServerConfig;
     use std::sync::Arc;
 
+    /// A context whose `jlcpcb_db_path` setting names `db_path`, as a caller
+    /// configures the catalog: the placement tools take no path argument.
+    fn ctx_with_catalog(db_path: &std::path::Path) -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                jlcpcb_db_path: Some(db_path.to_path_buf()),
+                ..Default::default()
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
     fn test_ctx() -> ToolContext {
         ToolContext::new(
             ServerConfig {
@@ -6403,9 +6439,8 @@ mod tests {
                 "x": 100.0,
                 "y": 50.0,
                 "lcsc_id": "C2856837",
-                "output_path": db_path.display().to_string()
             }),
-            &test_ctx(),
+            &ctx_with_catalog(&db_path),
         )
         .await
         .unwrap();
@@ -6423,10 +6458,76 @@ mod tests {
         assert_eq!(field("MPN"), Some("FPC-05FB-40PH20"));
         assert_eq!(field("Manufacturer"), Some("XUNPU"));
         assert_eq!(field("Datasheet"), Some("https://example.com/fpc.pdf"));
+
+        // The response says the catalog was read and had the part (#209).
+        let body: serde_json::Value = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert_eq!(body["lcsc_catalog"]["read"], true, "{body}");
+        assert_eq!(body["lcsc_catalog"]["part_found"], true, "{body}");
+        assert_eq!(body["lcsc_catalog"]["path"], json!(db_path), "{body}");
         assert_eq!(
             field("Description"),
             Some("0.5mm Pitch 40 Pin FPC Connector")
         );
+    }
+
+    /// A catalog that can't be read doesn't stop the placement, and the
+    /// response says why the fields weren't filled, as every catalog tool
+    /// reports it (#209). Before, the lookup failed silently.
+    #[tokio::test]
+    async fn placement_reports_an_unreadable_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("jlcpcb.db");
+        std::fs::write(&db_path, "not a database").unwrap();
+        let path = dir.path().join("unreadable.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:CONN\"\n      (property \"Reference\" \"J\" (at 0 0 0))\n      (property \"Value\" \"CONN\" (at 0 0 0))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:CONN",
+                "reference": "J1",
+                "x": 100.0,
+                "y": 50.0,
+                "lcsc_id": "C2856837",
+            }),
+            &ctx_with_catalog(&db_path),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let body: serde_json::Value = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text content, got {other:?}"),
+        };
+        let report = &body["lcsc_catalog"];
+        assert_eq!(report["read"], false, "{body}");
+        assert!(report.get("part_found").is_none(), "{body}");
+        assert!(
+            report["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("cannot read the catalog at "),
+            "{body}"
+        );
+        let sch = cse::Schematic::load(&path).unwrap();
+        let lcsc = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("J1"))
+            .and_then(|s| s.properties.iter().find(|p| p.name == "LCSC"))
+            .map(|p| p.value.clone());
+        assert_eq!(lcsc.as_deref(), Some("C2856837"));
     }
 
     #[tokio::test]

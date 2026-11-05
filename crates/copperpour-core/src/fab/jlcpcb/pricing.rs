@@ -103,54 +103,18 @@ pub(crate) async fn price_jlcpcb_components(
         pricing.catalog = json!({ "read": false, "reason": "no part has an LCSC field" });
         None
     } else {
-        match crate::tools::integration::resolve_db_path(args, ctx) {
-            Some(db_path) if db_path.is_file() => {
-                let path = db_path.clone();
-                let queried = tokio::task::spawn_blocking(move || {
-                    crate::tools::integration::query_catalog_prices(&path, &ids)
-                })
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result);
-                match queried {
-                    Ok(prices) => {
-                        pricing.catalog = if prices.has_price_breaks {
-                            json!({ "read": true, "path": db_path, "price_breaks": true })
-                        } else {
-                            json!({
-                                "read": true,
-                                "path": db_path,
-                                "price_breaks": false,
-                                "reason": "the catalog was built before price breaks were kept, so parts are at their first break's price; re-run download_jlcpcb_database with force to rebuild it"
-                            })
-                        };
-                        Some(prices.parts)
-                    }
-                    Err(error) => {
-                        pricing.catalog = json!({
-                            "read": false,
-                            "path": db_path,
-                            "reason": format!("cannot read the catalog: {error:#}")
-                        });
-                        None
-                    }
+        let catalog = crate::sourcing::LcscCatalog::resolve(args, ctx);
+        let lookup = catalog.prices(&ids).await;
+        pricing.catalog = lookup.report(&catalog);
+        match lookup {
+            crate::sourcing::Lookup::Read(prices) => {
+                pricing.catalog["price_breaks"] = json!(prices.has_price_breaks);
+                if !prices.has_price_breaks {
+                    pricing.catalog["reason"] = json!("the catalog was built before price breaks were kept, so parts are at their first break's price; re-run download_jlcpcb_database with force to rebuild it");
                 }
+                Some(prices.parts)
             }
-            Some(db_path) => {
-                pricing.catalog = json!({
-                    "read": false,
-                    "path": db_path,
-                    "reason": "no catalog at this path; run download_jlcpcb_database"
-                });
-                None
-            }
-            None => {
-                pricing.catalog = json!({
-                    "read": false,
-                    "reason": "no catalog path: jlcpcb_db_path is not set and the home directory is unknown"
-                });
-                None
-            }
+            _ => None,
         }
     };
 

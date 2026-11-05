@@ -37,7 +37,7 @@ pub mod integration;
 #[cfg(test)]
 mod kicad10_schematic_identity_tests;
 pub(crate) mod launch;
-mod lcsc_packages;
+pub(crate) mod lcsc_packages;
 pub mod library;
 mod library_footprint;
 pub(crate) mod live_board;

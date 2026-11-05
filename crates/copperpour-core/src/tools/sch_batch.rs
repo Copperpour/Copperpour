@@ -157,7 +157,7 @@ pub fn tools() -> Vec<ToolDef> {
                                 "value": { "type": "string" },
                                 "footprint": { "type": "string" },
                                 "unit": { "type": "integer", "minimum": 1, "default": 1 },
-                                "lcsc_id": { "type": "string", "description": "Optional LCSC part number (e.g. 'C2856837'). Automatically enriches LCSC, MPN, Manufacturer, and Datasheet from ~/.konnect/jlcpcb.db at placement time." },
+                                "lcsc_id": { "type": "string", "description": "Optional LCSC part number (e.g. 'C2856837'). Fills MPN, Manufacturer, Datasheet and Description from the local JLCPCB catalog (the jlcpcb_db_path setting, else its default path) at placement time; the response's lcsc_catalog says what the catalog gave." },
                                 "fields": { "type": "object", "additionalProperties": true, "description": "Additional custom properties to set on the placed component instance (e.g. {\"LCSC\": \"C123\", \"MPN\": \"...\"})" }
                             },
                             "required": ["lib_id", "x", "y"]
@@ -674,6 +674,10 @@ async fn handle_batch_place_components(
     };
 
     let mut placements = Vec::new();
+    // The catalog's report on each placement's LCSC number, in step with
+    // `placements`.
+    let mut lcsc_catalogs = Vec::new();
+    let catalog = crate::sourcing::LcscCatalog::resolve(args, _ctx);
     let mut errors: Vec<String> = Vec::new();
     let mut failures: Vec<Value> = Vec::new();
 
@@ -721,11 +725,10 @@ async fn handle_batch_place_components(
 
         let lcsc_id = comp["lcsc_id"].as_str();
         let fields = comp["fields"].as_object();
-        let db_path = crate::tools::integration::resolve_db_path(args, _ctx);
         let extras = super::sch_components::ComponentPlacementExtras {
             lcsc_id,
             fields,
-            db_path: db_path.as_deref(),
+            catalog: Some(&catalog),
         };
 
         match place_one_component(
@@ -758,6 +761,7 @@ async fn handle_batch_place_components(
                     &placed.fields,
                     unit,
                 ));
+                lcsc_catalogs.push(placed.lcsc_catalog);
             }
             Err(error) => {
                 let kind = crate::mcp::error::extract_error_kind(&error)
@@ -825,9 +829,14 @@ async fn handle_batch_place_components(
                 ));
             }
         };
-        for placement in &placements {
+        for (placement, lcsc_catalog) in placements.iter().zip(&lcsc_catalogs) {
             match placed_component_readback(&sch_path, &committed, placement, &context) {
-                Ok(result) => placed.push(result),
+                Ok(mut result) => {
+                    if let Some(report) = lcsc_catalog {
+                        result["lcsc_catalog"] = report.clone();
+                    }
+                    placed.push(result)
+                }
                 Err(error) => {
                     let reason = error_text(&error);
                     let uncertain = super::mutation_outcome_uncertain(
@@ -2588,6 +2597,18 @@ mod batch_place_and_connect_tests {
     use crate::tools::{ServerConfig, ToolContext};
     use std::sync::Arc;
 
+    /// A context whose `jlcpcb_db_path` setting names `db_path`, as a caller
+    /// configures the catalog: the placement tools take no path argument.
+    fn ctx_with_catalog(db_path: &std::path::Path) -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                jlcpcb_db_path: Some(db_path.to_path_buf()),
+                ..Default::default()
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
     fn test_ctx() -> ToolContext {
         ToolContext::new(
             ServerConfig {
@@ -2684,6 +2705,42 @@ mod batch_place_and_connect_tests {
         assert_eq!(r1.property("LCSC"), Some("C12345"));
         assert_eq!(r1.property("Manufacturer"), Some("Yageo"));
         assert_eq!(r1.property("Tolerance"), Some("1%"));
+    }
+
+    /// Each placed entry with an LCSC number carries the catalog's report;
+    /// one without has none (#209).
+    #[tokio::test]
+    async fn batch_place_components_reports_the_catalog_per_entry() {
+        let (dir, path) = seeded_schematic();
+        let db_path = dir.path().join("jlcpcb.db");
+        std::fs::write(&db_path, "not a database").unwrap();
+        let result = handle_batch_place_components(
+            &json!({
+                "schematic": path.display().to_string(),
+                "components": [
+                    { "lib_id": "Device:R", "x": 100.0, "y": 100.0, "reference": "R1", "lcsc_id": "C12345" },
+                    { "lib_id": "Device:R", "x": 110.0, "y": 100.0, "reference": "R2" }
+                ]
+            }),
+            &ctx_with_catalog(&db_path),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let body: serde_json::Value = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text content, got {other:?}"),
+        };
+        let placed = body["placed"].as_array().expect("placed");
+        assert_eq!(placed.len(), 2, "{body}");
+        assert_eq!(placed[0]["lcsc_catalog"]["read"], false, "{body}");
+        assert!(placed[0]["lcsc_catalog"]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("cannot read the catalog at "));
+        assert!(placed[1].get("lcsc_catalog").is_none(), "{body}");
     }
 
     /// An entry without `reference` keeps the stock library prefix (#669).
