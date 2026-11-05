@@ -50,6 +50,10 @@ struct JlcpcbCorrectionPolicy {
     /// reported for review instead of passing silently.
     #[serde(default)]
     rotation_insensitive_prefixes: Vec<String>,
+    /// Exceptions to `rotation_insensitive_prefixes`: footprints under one of
+    /// these prefixes always matter, as `R_Array_` does under `R_`.
+    #[serde(default)]
+    rotation_sensitive_prefixes: Vec<String>,
     #[serde(default)]
     footprint_rules: Vec<JlcpcbCorrectionRule>,
     #[serde(default)]
@@ -140,10 +144,26 @@ struct JlcpcbRotationObservation {
     designator: String,
     #[serde(default)]
     footprint: Option<String>,
+    /// The LCSC part placed: the part, not the footprint, decides which way
+    /// JLCPCB's model faces.
+    #[serde(default)]
+    lcsc: Option<String>,
+    /// Board side of the observed part. Only `top` is accepted: the pin-1
+    /// arithmetic assumes the preview's top view.
+    #[serde(default)]
+    side: ObservationSide,
     kicad_rotation_degrees: f64,
     cpl_rotation_degrees: f64,
     footprint_pin1: PinDirection,
     jlc_model_pin1: PinDirection,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ObservationSide {
+    #[default]
+    Top,
+    Bottom,
 }
 
 impl JlcpcbRotationObservation {
@@ -236,11 +256,14 @@ impl JlcpcbCorrectionPolicies {
     }
 
     fn rotation_insensitive(&self, footprint: &str) -> bool {
-        self.project
-            .iter()
-            .chain(std::iter::once(&self.built_in))
-            .flat_map(|policy| &policy.rotation_insensitive_prefixes)
-            .any(|prefix| footprint.starts_with(prefix.as_str()))
+        let policies = || self.project.iter().chain(std::iter::once(&self.built_in));
+        let listed = |prefixes: fn(&JlcpcbCorrectionPolicy) -> &Vec<String>| {
+            policies()
+                .flat_map(prefixes)
+                .any(|prefix| footprint.starts_with(prefix.as_str()))
+        };
+        listed(|policy| &policy.rotation_insensitive_prefixes)
+            && !listed(|policy| &policy.rotation_sensitive_prefixes)
     }
 }
 
@@ -309,12 +332,19 @@ fn parse_jlcpcb_correction_policy(
     if policy.policy_id.trim().is_empty() || policy.provenance.trim().is_empty() {
         bail!("JLCPCB correction policy {description} requires policy_id and provenance");
     }
-    if policy
-        .rotation_insensitive_prefixes
-        .iter()
-        .any(|prefix| prefix.trim().is_empty())
-    {
-        bail!("JLCPCB correction policy {description} has an empty rotation_insensitive_prefixes entry");
+    for (field, prefixes) in [
+        (
+            "rotation_insensitive_prefixes",
+            &policy.rotation_insensitive_prefixes,
+        ),
+        (
+            "rotation_sensitive_prefixes",
+            &policy.rotation_sensitive_prefixes,
+        ),
+    ] {
+        if prefixes.iter().any(|prefix| prefix.trim().is_empty()) {
+            bail!("JLCPCB correction policy {description} has an empty {field} entry");
+        }
     }
     let mut ids = BTreeSet::new();
     for rule in &policy.footprint_rules {
@@ -340,6 +370,7 @@ fn parse_jlcpcb_correction_policy(
                 rule.id
             );
         }
+        validate_observation_fields(description, &rule.id, &rule.evidence)?;
         if rule.status == JlcpcbRuleStatus::Verified {
             validate_observations(description, &rule.id, rule.rotation_degrees, &rule.evidence)?;
         }
@@ -385,6 +416,7 @@ fn parse_jlcpcb_correction_policy(
                 rule.designator
             );
         }
+        validate_observation_fields(description, &rule.id, &rule.evidence)?;
         validate_observations(description, &rule.id, rule.rotation_degrees, &rule.evidence)?;
         validate_finite_correction(
             description,
@@ -397,9 +429,37 @@ fn parse_jlcpcb_correction_policy(
     Ok(policy)
 }
 
-/// A rule whose own observations contradict its rotation is the J201 failure
-/// (an HRO USB-C turned 180 degrees from a correct KiCad rotation): refuse it
-/// before it reaches a CPL.
+/// Observations the pin-1 arithmetic cannot check are refused: a bottom-side
+/// part (the preview's top view mirrors it), or an empty LCSC part number.
+fn validate_observation_fields(
+    description: &str,
+    id: &str,
+    evidence: &[JlcpcbRotationObservation],
+) -> anyhow::Result<()> {
+    for observation in evidence {
+        if observation.side != ObservationSide::Top {
+            bail!(
+                "JLCPCB correction rule '{id}' in {description} cites a bottom-side observation of {}: only top-side observations can be checked",
+                observation.designator
+            );
+        }
+        if observation
+            .lcsc
+            .as_deref()
+            .is_some_and(|lcsc| lcsc.trim().is_empty())
+        {
+            bail!(
+                "JLCPCB correction rule '{id}' in {description} has an empty lcsc in its observation of {}",
+                observation.designator
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A rule whose own observations contradict its rotation is the failure that
+/// started this check (an HRO USB-C turned 180 degrees from a correct KiCad
+/// rotation): refuse it before it reaches a CPL.
 fn validate_observations(
     description: &str,
     id: &str,
@@ -987,6 +1047,8 @@ mod jlcpcb_assembly_tests {
             board: "test".into(),
             designator: "U1".into(),
             footprint: None,
+            lcsc: None,
+            side: ObservationSide::Top,
             kicad_rotation_degrees: kicad,
             cpl_rotation_degrees: cpl,
             footprint_pin1,
@@ -1008,7 +1070,7 @@ mod jlcpcb_assembly_tests {
             observation(90.0, 0.0, BottomLeft, BottomLeft).implied_rotation_degrees(),
             270.0
         );
-        // grumpf-bord J201: KiCad 180 was right, the 180 rule flipped it.
+        // The second HRO USB-C board: KiCad 180 was right, a +180 rule flipped it.
         assert_eq!(
             observation(180.0, 0.0, BottomRight, TopLeft).implied_rotation_degrees(),
             0.0
@@ -1017,8 +1079,8 @@ mod jlcpcb_assembly_tests {
 
     #[test]
     fn a_rule_contradicted_by_its_own_observation_is_refused() {
-        // The rule that turned grumpf-bord J201 upside down, with the
-        // observation that caught it.
+        // The rule that turned a correctly rotated USB-C connector upside
+        // down, with the observation that caught it.
         let contradicted = r#"{
           "schema_version": 1,
           "policy_id": "old-usb-c",
@@ -1028,7 +1090,7 @@ mod jlcpcb_assembly_tests {
             "footprint_prefix": "USB_C_Receptacle_HRO_TYPE-C-31-M-12",
             "rotation_degrees": 180,
             "evidence": [{
-              "board": "grumpf-bord", "designator": "J201",
+              "board": "example-board", "designator": "J1",
               "kicad_rotation_degrees": 180, "cpl_rotation_degrees": 0,
               "footprint_pin1": "bottom-right", "jlc_model_pin1": "top-left"
             }]
@@ -1038,6 +1100,41 @@ mod jlcpcb_assembly_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("implies 0 degrees"), "{error}");
+    }
+
+    #[test]
+    fn bottom_side_and_empty_lcsc_observations_are_refused() {
+        let policy = |observation_extra: &str| {
+            format!(
+                r#"{{"schema_version": 1, "policy_id": "p", "provenance": "test",
+                  "component_overrides": [{{"id": "u1", "designator": "U1",
+                    "rotation_degrees": 270,
+                    "evidence": [{{"board": "b", "designator": "U1",
+                      "kicad_rotation_degrees": 0, "cpl_rotation_degrees": 0,
+                      "footprint_pin1": "top-left", "jlc_model_pin1": "bottom-left"
+                      {observation_extra}}}]}}]}}"#
+            )
+        };
+        parse_jlcpcb_correction_policy(&policy(r#", "lcsc": "C7950", "side": "top""#), "test")
+            .expect("a top-side observation naming its part is accepted");
+        let bottom = parse_jlcpcb_correction_policy(&policy(r#", "side": "bottom""#), "test")
+            .unwrap_err()
+            .to_string();
+        assert!(bottom.contains("bottom-side observation of U1"), "{bottom}");
+        let empty = parse_jlcpcb_correction_policy(&policy(r#", "lcsc": " ""#), "test")
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("empty lcsc"), "{empty}");
+        // Unverified rules carry observations too: the same checks apply.
+        let unverified_bottom = r#"{"schema_version": 1, "policy_id": "p", "provenance": "test",
+          "footprint_rules": [{"id": "usb", "footprint_exact": "USB", "status": "unverified",
+            "evidence": [{"board": "b", "designator": "J1", "side": "bottom",
+              "kicad_rotation_degrees": 0, "cpl_rotation_degrees": 0,
+              "footprint_pin1": "top-left", "jlc_model_pin1": "top-left"}]}]}"#;
+        assert!(parse_jlcpcb_correction_policy(unverified_bottom, "test")
+            .unwrap_err()
+            .to_string()
+            .contains("bottom-side observation"));
     }
 
     #[test]
@@ -1069,23 +1166,39 @@ mod jlcpcb_assembly_tests {
     }
 
     #[test]
-    fn sot_23_variants_do_not_share_a_correction() {
+    fn footprint_exact_keeps_sot_23_from_its_5_and_6_pin_variants() {
+        let project = parse_jlcpcb_correction_policy(
+            r#"{
+              "schema_version": 1, "policy_id": "p", "provenance": "test",
+              "footprint_rules": [
+                {"id": "sot-23", "footprint_exact": "SOT-23", "rotation_degrees": 180},
+                {"id": "sot-23-6", "footprint_exact": "SOT-23-6", "rotation_degrees": 270}
+              ]
+            }"#,
+            "test",
+        )
+        .unwrap();
+        let policies = JlcpcbCorrectionPolicies {
+            built_in: built_in_policies().built_in,
+            project: Some(project),
+        };
         let source = concat!(
             "Ref,Val,Package,PosX,PosY,Rot,Side\n",
             "Q1,npn,Package_TO_SOT_SMD:SOT-23,1,2,0,top\n",
             "U1,ldo,Package_TO_SOT_SMD:SOT-23-5,1,2,0,top\n",
             "U2,mux,Package_TO_SOT_SMD:SOT-23-6,1,2,0,top\n",
         );
-        let export = jlcpcb_cpl_from_kicad_csv(source, &built_in_policies()).unwrap();
+        let export = jlcpcb_cpl_from_kicad_csv(source, &policies).unwrap();
         let rows = csv_rows(&export.bytes);
-        // Three packages, three JLCPCB models: the exact names keep SOT-23's
-        // +180 from reaching the 5- and 6-pin variants.
+        // Three packages, three JLCPCB models: SOT-23's +180 reaches neither
+        // the 5-pin variant, left for review, nor the 6-pin one.
         assert_eq!(rows[1][4], "180.000000");
-        assert_eq!(rows[2][4], "180.000000");
+        assert_eq!(rows[2][4], "0.000000");
         assert_eq!(rows[3][4], "270.000000");
-        let rules = &export.orientation_evidence.applied_corrections;
-        assert_eq!(rules[1].rule_id, "kicad-sot-23-5");
-        assert_eq!(rules[2].rule_id, "kicad-sot-23-6");
+        let evidence = &export.orientation_evidence;
+        assert_eq!(evidence.applied_corrections[1].rule_id, "sot-23-6");
+        assert_eq!(evidence.unmatched_footprints[0].designator, "U1");
+        assert!(evidence.unmatched_footprints[0].review_required);
     }
 
     #[test]
@@ -1097,13 +1210,16 @@ mod jlcpcb_assembly_tests {
             "U1,ldo,Package_TO_SOT_SMD:SOT-223-3_TabPin2,1,2,0,top\n",
             "U2,ldo,Package_TO_SOT_SMD:SOT-223-3_TabPin2,1,2,90,top\n",
             "K1,relay,Relay_THT:Relay_SPDT_Finder_36.11,1,2,0,top\n",
+            "RN1,4x10k,Resistor_SMD:R_Array_Convex_4x0603,1,2,0,top\n",
         );
         let export = jlcpcb_cpl_from_kicad_csv(source, &built_in_policies()).unwrap();
         let warnings = export.orientation_evidence.review_warnings();
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("for 2 polarized or multi-pin footprint(s)"));
+        assert!(warnings[0].contains("for 3 polarized or multi-pin footprint(s)"));
         assert!(warnings[0].contains("SOT-223-3_TabPin2 (U1, U2)"));
         assert!(warnings[0].contains("Relay_SPDT_Finder_36.11 (K1)"));
+        // Under `R_`, but pin 1 of a resistor array matters.
+        assert!(warnings[0].contains("R_Array_Convex_4x0603 (RN1)"));
         assert!(!warnings[0].contains("R1"));
 
         let passives_only =
@@ -1125,8 +1241,8 @@ mod jlcpcb_assembly_tests {
         };
         let source = concat!(
             "Ref,Val,Package,PosX,PosY,Rot,Side\n",
-            "J201,usb,Connector_USB:USB_C_Receptacle_HRO_TYPE-C-31-M-12,1,2,180,top\n",
-            "U402,amp,Package_SO:TSSOP-8_4.4x3mm_P0.65mm,1,2,0,top\n",
+            "J1,usb,Connector_USB:USB_C_Receptacle_HRO_TYPE-C-31-M-12,1,2,180,top\n",
+            "U3,amp,Package_SO:TSSOP-8_4.4x3mm_P0.65mm,1,2,0,top\n",
         );
         let export = jlcpcb_cpl_from_kicad_csv(source, &policies).unwrap();
         let rows = csv_rows(&export.bytes);

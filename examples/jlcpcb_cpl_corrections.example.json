@@ -6,13 +6,15 @@
   "footprint_rules": [
     {
       "id": "tssop-8-lying-model",
-      "footprint_prefix": "TSSOP-",
+      "footprint_exact": "TSSOP-8_4.4x3mm_P0.65mm",
       "rotation_degrees": 270,
       "evidence": [
         {
           "board": "my-board rev B",
-          "designator": "U402",
+          "designator": "U3",
           "footprint": "TSSOP-8_4.4x3mm_P0.65mm",
+          "lcsc": "C7950",
+          "side": "top",
           "kicad_rotation_degrees": 0,
           "cpl_rotation_degrees": 0,
           "footprint_pin1": "top-left",
@@ -23,15 +25,17 @@
   ],
   "component_overrides": [
     {
-      "id": "j201-usb-c-kicad-rotation",
-      "designator": "J201",
+      "id": "j1-usb-c-kicad-rotation",
+      "designator": "J1",
       "rotation_degrees": 0,
-      "note": "LCSC C165948: the SMD pins must land on the inner pads, opening at the board edge.",
+      "note": "rotation_degrees is the correction added to KiCad's rotation, not the final CPL rotation: 0 keeps KiCad's 180. The SMD pins must land on the inner pads, opening at the board edge.",
       "evidence": [
         {
           "board": "my-board rev B",
-          "designator": "J201",
+          "designator": "J1",
           "footprint": "USB_C_Receptacle_HRO_TYPE-C-31-M-12",
+          "lcsc": "C165948",
+          "side": "top",
           "kicad_rotation_degrees": 180,
           "cpl_rotation_degrees": 0,
           "footprint_pin1": "bottom-right",

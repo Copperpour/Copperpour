@@ -12,25 +12,27 @@ reviewable and repeatable.
 
 ## Policy format
 
-A complete project file is in
+This example is made up (board, designators and parts). A complete project file is in
 [`examples/jlcpcb_cpl_corrections.example.json`](../examples/jlcpcb_cpl_corrections.example.json):
 
 ```json
 {
   "schema_version": 1,
   "policy_id": "my-board-jlcpcb-v1",
-  "provenance": "Checked in JLCPCB Component Placements (2D, top), rev B preview",
+  "provenance": "Checked by the project owner in JLCPCB Component Placements (2D, top), my-board rev B order preview",
   "rotation_insensitive_prefixes": ["Crystal_SMD_3215-"],
   "footprint_rules": [
     {
       "id": "tssop-8-lying-model",
-      "footprint_prefix": "TSSOP-",
+      "footprint_exact": "TSSOP-8_4.4x3mm_P0.65mm",
       "rotation_degrees": 270,
       "evidence": [
         {
           "board": "my-board rev B",
-          "designator": "U402",
+          "designator": "U3",
           "footprint": "TSSOP-8_4.4x3mm_P0.65mm",
+          "lcsc": "C7950",
+          "side": "top",
           "kicad_rotation_degrees": 0,
           "cpl_rotation_degrees": 0,
           "footprint_pin1": "top-left",
@@ -41,10 +43,23 @@ A complete project file is in
   ],
   "component_overrides": [
     {
-      "id": "j201-usb-c-kicad-rotation",
-      "designator": "J201",
+      "id": "j1-usb-c-kicad-rotation",
+      "designator": "J1",
       "rotation_degrees": 0,
-      "note": "LCSC C165948: SMD pins on the inner pads, opening at the board edge."
+      "note": "rotation_degrees is the correction added to KiCad's rotation, not the final CPL rotation: 0 keeps KiCad's 180. The SMD pins must land on the inner pads, opening at the board edge.",
+      "evidence": [
+        {
+          "board": "my-board rev B",
+          "designator": "J1",
+          "footprint": "USB_C_Receptacle_HRO_TYPE-C-31-M-12",
+          "lcsc": "C165948",
+          "side": "top",
+          "kicad_rotation_degrees": 180,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "bottom-right",
+          "jlc_model_pin1": "top-left"
+        }
+      ]
     }
   ]
 }
@@ -57,6 +72,7 @@ Policy level:
 | `schema_version` | yes | `1` |
 | `policy_id`, `provenance` | yes | Reported verbatim in every response |
 | `rotation_insensitive_prefixes` | no | Footprint-name prefixes whose rotation does not matter; added to the built-in list (`R_`, `C_`, `L_`, `Fuse_`, `Fiducial_`, `TestPoint_`, `MountingHole_`) |
+| `rotation_sensitive_prefixes` | no | Exceptions to the list above, whose rotation always matters; added to the built-in `R_Array_` (pin 1 of a resistor array matters, though it starts with `R_`) |
 | `footprint_rules` | no | First match wins inside the file |
 | `component_overrides` | no | One entry per designator |
 
@@ -66,13 +82,16 @@ Footprint rule (`footprint_rules[]`):
 |---|---|
 | `id` | Unique in the file |
 | `footprint_prefix` **or** `footprint_exact` | Exactly one. Use `footprint_exact` when a longer name shares the prefix: `SOT-23` must not match `SOT-23-5` |
-| `rotation_degrees`, `offset_x_mm`, `offset_y_mm` | Correction, default 0 |
+| `rotation_degrees`, `offset_x_mm`, `offset_y_mm` | Correction, default 0. `rotation_degrees` is **added** to KiCad's rotation; it is not the rotation written to the CPL |
 | `status` | `verified` (default) or `unverified`. An unverified rule carries no correction: matching parts keep KiCad's rotation and are listed in `warnings` |
 | `evidence` | Preview observations, see below |
 | `note` | Free text, repeated in the warning of an unverified rule |
 
 Designator override (`component_overrides[]`): `id`, `designator`,
-`rotation_degrees`, `offset_x_mm`, `offset_y_mm`, `evidence`, `note`. This is
+`rotation_degrees`, `offset_x_mm`, `offset_y_mm`, `evidence`, `note`. As in a
+footprint rule, `rotation_degrees` is a correction added to KiCad's rotation,
+not the final CPL rotation: to keep a part KiCad rotated by 180 degrees as it
+is, write `0`, not `180`. This is
 how a project freezes the rotations it checked part by part: one override per
 designator, kept in a versioned file next to the board. An override with
 `rotation_degrees: 0` is meaningful: it states that KiCad's rotation was seen to
@@ -85,6 +104,8 @@ Each `evidence[]` entry records one look at the preview:
 | Key | Meaning |
 |---|---|
 | `board`, `designator`, `footprint` | What was looked at (`footprint` optional) |
+| `lcsc` | The LCSC part placed (optional, recommended): the part, not the footprint, decides which way JLCPCB's model faces |
+| `side` | `top` (default). `bottom` is refused: the pin-1 arithmetic below assumes the top view, which mirrors a bottom-side part |
 | `kicad_rotation_degrees` | The footprint's rotation in KiCad |
 | `cpl_rotation_degrees` | The rotation in the CPL that was actually uploaded |
 | `footprint_pin1` | Where pin 1 of the KiCad footprint lies from the part centre |
@@ -99,8 +120,8 @@ proves, `footprint_pin1 − jlc_model_pin1 + cpl − kicad`, and refuses the pol
 if it differs from the rule's `rotation_degrees`. A rule cannot then say one
 thing while its own evidence says another.
 
-`evidence` is optional in a project file. Every built-in verified rule has
-some, and a test checks them all.
+`evidence` is optional in a project file. A test checks every observation of
+the built-in rules.
 
 ## Matching and coordinates
 
@@ -182,20 +203,19 @@ the Copperpour project and identifies its provenance in every response.
 
 ## Built-in rules
 
-`konnect-jlcpcb-cpl-v1`, observed on KiCad 10 library footprints:
+`copperpour-jlcpcb-cpl-v2`:
 
 | Footprints | Correction | Seen on |
 |---|---|---|
-| `SOIC-*` | +270 | #518 U1 (SOIC-8), grumpf-bord U202 (SOIC-16) |
-| `SSOP-*`, `MSOP-*`, `TI_SO-PowerPAD-*`, `TQFN-*`, `VQFN-*`, `SOT-23-6`, `SW_DIP_SPSTx*`, `ESP32-WROOM-32E`, `IDC-Header_2x05_P2.54mm_Vertical` | +270 | grumpf-bord |
-| `SOT-23`, `SOT-23-5` (exact names) | +180 | grumpf-bord |
-| `D_SOD-123*`, `D_SMA*`, `D_SMB*`, `D_SMC*`, `LED_0603_*`, `LED_0805_*`, `CP_Elec_*`, `SW_Push_1P1T_XKB_TS-1187A`, `Relay_SPDT_Omron-G5Q-1`, `PhoenixContact_MC_*`, `PhoenixContact_MSTBA_*`, `RJ45_Hanrun_HR911105A*` | 0 | grumpf-bord |
+| `SOIC-8_3.9x4.9mm_P1.27mm*` | +270 | Konnect issue #518, U1 |
 
-Unverified, so warned about and left at KiCad's rotation: `TSSOP-*`, `QFN-*`,
-`DFN-*`, other `IDC-Header_*`, and
-`USB_C_Receptacle_HRO_TYPE-C-31-M-12`. The HRO rule (+180) from #518 was
-withdrawn: on grumpf-bord, with the library footprint (pad A1 at the top at
-0 degrees), KiCad's rotation was already right and the rule turned the
-connector upside down. The #518 preview shows the pads at the bottom for the
-same name and rotation, so the two boards did not carry the same geometry.
-Pin it per project with a designator override.
+Unverified, so warned about and left at KiCad's rotation:
+`USB_C_Receptacle_HRO_TYPE-C-31-M-12`. Its +180 rule from #518 was withdrawn in
+v2: on another board, with the KiCad 10 library footprint, KiCad's rotation was
+already right and the rule turned the connector upside down. Pin it per project
+with a designator override, as in the example above.
+
+The built-in list grows only by rules anyone can check again: observations
+from more than one board, naming the LCSC part, and a pattern no wider than the
+parts observed. Until then a project keeps its own observations in its policy
+file.
