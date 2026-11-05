@@ -458,7 +458,7 @@ pub(crate) async fn check_freerouting(
                     java_path.display()
                 )
             });
-            Ok(CallToolResult::json(&json!({
+            let mut body = json!({
                 "available": version_checked,
                 "engine_found": true,
                 "native_mcp_available": bridge.native_mcp_available,
@@ -474,9 +474,13 @@ pub(crate) async fn check_freerouting(
                 "server_protocol_version": bridge.server_protocol_version,
                 "native_mcp_tool_count": bridge.tool_count,
                 "native_mcp_diagnostics": bridge.diagnostics,
-                "bridge_error": bridge.error,
-                "note": note
-            })))
+                "bridge_error": bridge.error
+            });
+            // The key stays absent when the JAR ran, as before this change.
+            if let Some(note) = note {
+                body["note"] = json!(note);
+            }
+            Ok(CallToolResult::json(&body))
         }
     }
 }
@@ -986,6 +990,24 @@ mod freerouting_tests {
             body["note"].as_str().unwrap().contains("did not run"),
             "{body}"
         );
+    }
+
+    /// A recent enough Java that runs the JAR is `available`, and the
+    /// response has no `note` key, as before the Java check was added.
+    #[cfg(unix)]
+    #[test]
+    fn served_check_freerouting_is_available_without_a_note_when_the_jar_runs() {
+        let _env = crate::java_runtime::JAVA_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let body = block_on(served_check_with_fake_java(
+            "#!/bin/sh\n\
+             if [ \"$1\" = -version ]; then echo 'openjdk version \"25.0.1\" 2025-10-21' >&2; exit 0; fi\n\
+             echo 'Freerouting 2.5.0'; exit 0\n",
+        ));
+        assert_eq!(body["available"], true, "{body}");
+        assert_eq!(body["version_checked"], true, "{body}");
+        assert!(body.get("note").is_none(), "{body}");
     }
 
     /// A directory reached twice is searched, and reported, once, under the
