@@ -4142,6 +4142,34 @@ mod creepage_view_tests {
         .is_none());
     }
 
+    #[test]
+    fn unbalanced_parentheses_in_strings_and_comments_do_not_count() {
+        // A scan that counted these would end with an open expression, give
+        // up, and run the full DRC without saying why.
+        let in_string = "(version 1)\n(rule \"a\"\n\t(condition \"A.NetName == '/x('\")\n\t(constraint clearance (min 1mm))\n\t(constraint creepage (min 2mm)))\n";
+        let out = strip_creepage_constraints(in_string).expect("strips despite the string");
+        assert!(!out.contains("creepage"), "{out}");
+        assert!(out.contains("(condition \"A.NetName == '/x('\")"), "{out}");
+        assert!(out.contains("(constraint clearance (min 1mm)))"), "{out}");
+
+        let in_comment = "(version 1)\n# a lone ( here\n(rule \"b\"\n\t(constraint clearance (min 1mm))\n\t(constraint creepage (min 2mm)))\n";
+        let out = strip_creepage_constraints(in_comment).expect("strips despite the comment");
+        assert!(!out.contains("creepage"), "{out}");
+        assert!(out.contains("# a lone ( here\n"), "{out}");
+        assert!(out.contains("(constraint clearance (min 1mm)))"), "{out}");
+    }
+
+    #[test]
+    fn a_rule_left_with_only_non_constraint_clauses_is_dropped_whole() {
+        // A rule without a constraint does nothing, whatever else it says.
+        let dru = "(version 1)\n(rule \"c\" (layer outer) (constraint creepage (min 1mm)))\n(rule \"d\" (constraint clearance (min 1mm)))\n";
+        let out = strip_creepage_constraints(dru).expect("creepage present");
+        assert_eq!(
+            out,
+            "(version 1)\n\n(rule \"d\" (constraint clearance (min 1mm)))\n"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn view_links_the_project_and_rewrites_only_the_rules() {
