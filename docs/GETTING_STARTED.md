@@ -38,7 +38,7 @@ LDO, buck, STM32, I2C, LED) come with verified component values.
 ### 4. Optional: source parts from JLCPCB
 
 If you plan to have JLCPCB assemble the board, Copperpour can match parts against
-their stock. This needs a one-time download of their catalog (about 2.5M parts,
+their stock. This needs a one-time download of their catalog (about 800k parts,
 takes a while):
 
 > Download the JLCPCB parts database.

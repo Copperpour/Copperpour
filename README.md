@@ -55,8 +55,8 @@ directly:
 - **Run design checks** — ERC, DRC, connectivity validation, decoupling audits,
   power-rail review, BOM health checks
 - **Export production files** — Gerbers, drill, BOM, pick-and-place, 3D models, PDF
-- **Search JLCPCB parts** — find in-stock components in a local 2.5M-part catalog and
-  suggest alternatives
+- **Search JLCPCB parts** — find in-stock components in a local catalog of about
+  800k parts and suggest alternatives
 - **Start from reference circuits** — USB-C, LDO, buck converter, STM32, I2C, LED
   templates with verified component values
 - **Watch it happen** — a live schematic viewer auto-refreshes as the AI edits
@@ -219,7 +219,8 @@ You need [Rust](https://rustup.rs), `protoc` and `cmake`:
 | --- | --- |
 | Windows | `choco install protoc cmake` |
 | macOS | `brew install protobuf cmake` |
-| Linux | `apt install protobuf-compiler cmake` |
+| Debian, Ubuntu | `apt install protobuf-compiler libprotobuf-dev cmake` |
+| Fedora | `dnf install protobuf-compiler protobuf-devel cmake` |
 
 Then build:
 
@@ -236,6 +237,9 @@ separately; see [DEV.md](DEV.md).
 <summary><b>Managing skills</b>: check, update or remove what <code>copperpour init</code> installed</summary>
 
 - `copperpour status` shows whether the installed skills match your Copperpour version.
+- The server makes the same check once for each installed version. If the skills
+  differ, it adds a one-line notice to its `initialize` instructions, and
+  `get_installation_info` shows the result.
 - Re-run `copperpour init` to update them.
 - `copperpour uninstall` removes them. Add `--client codex` for Codex.
 
@@ -311,7 +315,8 @@ the main workspace — see [DEV.md](DEV.md) for build steps.
 
 ## Requirements
 
-- KiCAD 10 on Windows, macOS or Linux
+- KiCAD 10 on Windows, macOS or Linux. Windows is the most tested; macOS and Linux
+  have had less hands-on testing.
 - `kicad-cli` (ships with KiCAD — used for exports, ERC, DRC)
 - For most PCB tools: KiCAD running with the target board open (IPC API).
   `place_component`, `move_component`, `rotate_component`, and (on KiCAD
