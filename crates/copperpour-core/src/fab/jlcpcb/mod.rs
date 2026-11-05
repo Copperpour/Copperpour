@@ -1065,6 +1065,12 @@ mod jlcpcb_assembly_tests {
             observation(0.0, 0.0, TopLeft, BottomRight).implied_rotation_degrees(),
             180.0
         );
+        // A CPL rotation of 90 pins the sign of the `cpl` term: 0 and 180
+        // read the same whether it is added or subtracted.
+        assert_eq!(
+            observation(0.0, 90.0, TopLeft, BottomLeft).implied_rotation_degrees(),
+            0.0
+        );
         // Issue #518 after its correction: aligned at CPL 0 for KiCad 90.
         assert_eq!(
             observation(90.0, 0.0, BottomLeft, BottomLeft).implied_rotation_degrees(),
@@ -1135,6 +1141,29 @@ mod jlcpcb_assembly_tests {
             .unwrap_err()
             .to_string()
             .contains("bottom-side observation"));
+    }
+
+    #[test]
+    fn a_rule_citing_a_footprint_it_does_not_match_is_refused() {
+        // An observation of SOT-23-5 proves nothing about a rule for SOT-23.
+        let policy = r#"{
+          "schema_version": 1, "policy_id": "p", "provenance": "test",
+          "footprint_rules": [{
+            "id": "sot-23", "footprint_exact": "SOT-23", "rotation_degrees": 180,
+            "evidence": [{
+              "board": "b", "designator": "U1", "footprint": "SOT-23-5",
+              "kicad_rotation_degrees": 0, "cpl_rotation_degrees": 0,
+              "footprint_pin1": "top-left", "jlc_model_pin1": "bottom-right"
+            }]
+          }]
+        }"#;
+        let error = parse_jlcpcb_correction_policy(policy, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cites an observation of SOT-23-5, which it does not match"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -209,6 +209,10 @@ the Copperpour project and identifies its provenance in every response.
 |---|---|---|
 | `SOIC-8_3.9x4.9mm_P1.27mm*` | +270 | Konnect issue #518, U1 |
 
+The SOIC-8 rule predates the bar below: one board, no LCSC number. It stays
+`verified` for now and is re-evaluated in the rule-set change, since turning it
+`unverified` would change the CPL of every SOIC-8 board.
+
 Unverified, so warned about and left at KiCad's rotation:
 `USB_C_Receptacle_HRO_TYPE-C-31-M-12`. Its +180 rule from #518 was withdrawn in
 v2: on another board, with the KiCad 10 library footprint, KiCad's rotation was

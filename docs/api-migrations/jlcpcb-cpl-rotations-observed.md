@@ -9,9 +9,10 @@ rotation of one footprint, and reports more:
   keeps KiCad's rotation and is listed in `warnings`. The SOIC-8 rule is
   unchanged.
 - `warnings` now lists unverified matches and the polarized or multi-pin
-  footprints no rule covers (resistors except arrays, capacitors, inductors,
-  fuses, fiducials, test points and mounting holes excepted); the package is
-  not marked incomplete for them, but the summary no longer says "No warnings".
+  footprints no rule covers (all but resistors, capacitors, inductors, fuses,
+  fiducials, test points and mounting holes; resistor arrays are reviewed); the
+  package is not marked incomplete for them, but the summary no longer says
+  "No warnings".
 
 The `jlcpcb_cpl_corrections` policy file gains optional `footprint_exact`,
 `status: "unverified"`, `evidence` (with `lcsc` and `side`),
