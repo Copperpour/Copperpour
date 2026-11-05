@@ -30,7 +30,7 @@ Load additional toolsets as needed:
 
 ```
 load_toolset('library')          # search_symbols, get_symbol_info, list_symbol_libraries
-load_toolset('sch_batch')        # batch operations for 3+ items
+load_toolset('sch_batch')        # batch operations for 3+ items; free text items
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.

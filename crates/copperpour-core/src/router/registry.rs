@@ -52,7 +52,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_batch",
-        description: "Bulk add, edit, delete, and move schematic elements in one call",
+        description: "Bulk add, edit, delete, and move schematic elements in one call; add, list, edit and delete free text items",
         category: "schematic",
     },
     ToolsetMeta {

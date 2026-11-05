@@ -174,7 +174,7 @@ and Windows servers do not.
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings, pins, and label and field text (excluding free text), with a reported origin fallback when geometry is unavailable. |
 
 ### `sch_batch` · 13 tools
-**Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
+**Purpose:** Bulk add, edit, delete, and move schematic elements in one call; add, list, edit and delete free text items.
 **Source:** [`crates/copperpour-core/src/tools/sch_batch.rs`](crates/copperpour-core/src/tools/sch_batch.rs)
 
 | Tool | Description |
@@ -187,6 +187,9 @@ and Windows servers do not.
 | `batch_delete_schematic_components` | Delete multiple components by reference designator in a single atomic write. |
 | `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. Direction defaults to `auto`. |
 | `add_schematic_text` | Add a text annotation (non-net label) to the schematic at a given position. Aligns the text against that position with `justify`, per axis and defaulting to `left bottom` as KiCad does; an omitted axis is centred, and `center` centres both. Takes `bold`, `italic`, `thickness` and `color` for the font. |
+| `list_schematic_texts` | List a sheet's free text items, as `add_schematic_text` writes them: uuid, text, position and rotation, with the sheet's revision for `edit_schematic_text` and `delete_schematic_text`. |
+| `edit_schematic_text` | Replace one free text item's text by uuid and revision; only the quoted string changes. Refused on a stale revision, or while KiCad holds the sheet or its project's root open. |
+| `delete_schematic_text` | Delete one free text item by uuid and revision. Refused on a stale revision, for a member of a group, or while KiCad holds the sheet or its project's root open. |
 | `get_schematic_layout` | Return component positions and transformed drawing/pin bounds (excluding free text), reporting unresolved geometry; optionally include wires and labels. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
