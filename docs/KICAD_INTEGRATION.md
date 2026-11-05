@@ -215,8 +215,8 @@ list above is not consulted, and `get_installation_info` reports
 `kicad_binary`, `ipc_address`, `transport`, `http_address`, `jlcpcb_db_path`,
 `log_level`, `auto_load_toolsets`, `eager_toolsets`, and `kicad_cli_timeout_seconds` (timeout of
 long kicad-cli operations such as DRC, default 600 s, 0 read as 1 s; a timed-out kicad-cli is
-killed). The legacy
-`ipc_socket_path` alias is accepted by the serde definition in `config.rs`.
+killed). The legacy `ipc_socket_path` alias is accepted by the serde definition
+in `config.rs`.
 
 A blank or whitespace-only configured `jlcpcb_db_path` means unset for all
 JLCPCB database tools. They use the platform default (`%APPDATA%/copperpour/jlcpcb.db`
