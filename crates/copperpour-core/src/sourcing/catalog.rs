@@ -115,17 +115,18 @@ pub(crate) fn query_catalog_prices(
     Ok(prices)
 }
 
-pub(crate) fn query_jlcpcb_db_part(db_path: &Path, lcsc_id: &str) -> Option<JlcpchPartInfo> {
-    if !db_path.exists() {
-        return None;
-    }
-    let conn = rusqlite::Connection::open(db_path).ok()?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT LCSC, MFR_Part, Manufacturer, Datasheet, Description FROM components WHERE LCSC = ?1 LIMIT 1",
-        )
-        .ok()?;
-    stmt.query_row(rusqlite::params![lcsc_id], |row| {
+/// The part with this LCSC number, or `None` when the catalog doesn't have
+/// it. A field the row doesn't hold as text reads as empty.
+pub(crate) fn query_part_info(
+    db_path: &Path,
+    lcsc_id: &str,
+) -> anyhow::Result<Option<JlcpchPartInfo>> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt = conn.prepare(
+        "SELECT LCSC, MFR_Part, Manufacturer, Datasheet, Description FROM components WHERE LCSC = ?1 LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map(rusqlite::params![lcsc_id], |row| {
         Ok(JlcpchPartInfo {
             lcsc: row.get::<_, String>(0).unwrap_or_default(),
             mfr_part: row.get::<_, String>(1).unwrap_or_default(),
@@ -133,8 +134,38 @@ pub(crate) fn query_jlcpcb_db_part(db_path: &Path, lcsc_id: &str) -> Option<Jlcp
             datasheet: row.get::<_, String>(3).unwrap_or_default(),
             description: row.get::<_, String>(4).unwrap_or_default(),
         })
-    })
-    .ok()
+    })?;
+    Ok(rows.next().transpose()?)
+}
+
+/// The datasheet of the part with this LCSC number, or else this MPN. `None`
+/// when the catalog doesn't have the part, or has no datasheet for it.
+pub(crate) fn query_datasheet(
+    db_path: &Path,
+    lcsc_id: Option<&str>,
+    mpn: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let (sql, param) = match (lcsc_id, mpn) {
+        // An LCSC ID is the primary key shape, so it wins when both are given.
+        (Some(id), _) => (
+            "SELECT Datasheet FROM components WHERE LCSC = ?1 LIMIT 1",
+            id,
+        ),
+        (None, Some(mpn)) => (
+            "SELECT Datasheet FROM components WHERE MFR_Part = ?1 LIMIT 1",
+            mpn,
+        ),
+        (None, None) => return Ok(None),
+    };
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query_map(rusqlite::params![param], |row| catalog_text(row, 0))?;
+    Ok(rows
+        .next()
+        .transpose()?
+        .flatten()
+        .filter(|url| !url.is_empty()))
 }
 
 pub(crate) fn parse_jlcpcb_chunk_count(value: &str) -> anyhow::Result<usize> {

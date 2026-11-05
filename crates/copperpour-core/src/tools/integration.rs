@@ -950,49 +950,26 @@ async fn datasheets_from_catalog_for_lcsc_ids(
     ctx: &ToolContext,
     lcsc_ids: &[String],
 ) -> Result<CatalogDatasheets, CallToolResult> {
-    let explicit = args["db_path"].as_str().is_some();
-    let Some(db_path) = resolve_db_path(args, ctx) else {
-        return Ok(CatalogDatasheets::Skipped(
-            "no catalog path: jlcpcb_db_path is not set and the home directory is unknown"
-                .to_owned(),
-        ));
-    };
+    let catalog = crate::sourcing::LcscCatalog::resolve(args, ctx);
     let refuse = |reason: String| {
+        let path = catalog.path().map(|path| path.display().to_string());
         CallToolResult::error_kind(
             ToolErrorKind::FileNotFound {
-                path: db_path.display().to_string(),
+                path: path.unwrap_or_default(),
             },
             reason,
         )
     };
-    if !db_path.is_file() {
-        if explicit {
-            return Err(refuse(format!(
-                "db_path is not a file: {}",
-                db_path.display()
-            )));
+    match catalog.datasheets(lcsc_ids).await {
+        crate::sourcing::Lookup::Read(read) => Ok(CatalogDatasheets::Read(read)),
+        crate::sourcing::Lookup::Missing(reason) if catalog.is_explicit() => {
+            Err(refuse(format!("db_path is not a file: {reason}")))
         }
-        return Ok(CatalogDatasheets::Skipped(format!(
-            "no catalog at {}",
-            db_path.display()
-        )));
-    }
-    let query_path = db_path.clone();
-    let ids = lcsc_ids.to_vec();
-    let queried = tokio::task::spawn_blocking(move || query_catalog_datasheets(&query_path, &ids))
-        .await
-        .map_err(anyhow::Error::from)
-        .and_then(|result| result);
-    match queried {
-        Ok(read) => Ok(CatalogDatasheets::Read(read)),
-        Err(error) => {
-            let reason = format!("cannot read catalog {}: {error}", db_path.display());
-            if explicit {
-                Err(refuse(format!("db_path is unreadable: {reason}")))
-            } else {
-                Ok(CatalogDatasheets::Failed(reason))
-            }
+        crate::sourcing::Lookup::Missing(reason) => Ok(CatalogDatasheets::Skipped(reason)),
+        crate::sourcing::Lookup::Unreadable(reason) if catalog.is_explicit() => {
+            Err(refuse(format!("db_path is unreadable: {reason}")))
         }
+        crate::sourcing::Lookup::Unreadable(reason) => Ok(CatalogDatasheets::Failed(reason)),
     }
 }
 
@@ -1518,40 +1495,6 @@ fn datasheet_commit_refusal(path: &Path, error: &SexpError) -> Option<CallToolRe
 /// its `Datasheet` column for most parts, so a hit here answers without a
 /// network round trip. `Ok(None)` is an ordinary miss; `Err` means the
 /// database could not be read at all.
-async fn datasheet_from_catalog(
-    args: &serde_json::Value,
-    ctx: &ToolContext,
-    lcsc_id: Option<&str>,
-    mpn: Option<&str>,
-) -> anyhow::Result<Option<String>> {
-    let Some(db_path) = resolve_db_path(args, ctx).filter(|path| path.exists()) else {
-        return Ok(None);
-    };
-    let lcsc_id = lcsc_id.map(String::from);
-    let mpn = mpn.map(String::from);
-    tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
-        let conn = rusqlite::Connection::open(&db_path)?;
-        let (sql, param): (&str, String) = match (&lcsc_id, &mpn) {
-            // An LCSC ID is the primary key shape, so it wins when both are
-            // given — same precedence the web path used.
-            (Some(id), _) => (
-                "SELECT Datasheet FROM components WHERE LCSC = ?1 LIMIT 1",
-                id.clone(),
-            ),
-            (None, Some(mpn)) => (
-                "SELECT Datasheet FROM components WHERE MFR_Part = ?1 LIMIT 1",
-                mpn.clone(),
-            ),
-            // Unreachable: the caller rejects both-absent before calling.
-            (None, None) => return Ok(None),
-        };
-        let mut stmt = conn.prepare(sql)?;
-        let mut rows = stmt.query_map(rusqlite::params![param], |row| row.get::<_, String>(0))?;
-        Ok(rows.next().transpose()?.filter(|url| !url.is_empty()))
-    })
-    .await?
-}
-
 async fn handle_get_datasheet_url(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1565,8 +1508,14 @@ async fn handle_get_datasheet_url(
 
     // The local catalog first: it already holds exact URLs, so a hit saves a
     // network round trip and works offline. Only a miss falls through to the
-    // live LCSC API.
-    if let Ok(Some(url)) = datasheet_from_catalog(args, ctx, lcsc_id, mpn).await {
+    // live LCSC API. A catalog that can't be read is reported, not hidden.
+    let catalog = crate::sourcing::LcscCatalog::resolve(args, ctx);
+    let local = catalog.datasheet(lcsc_id, mpn).await;
+    let local_catalog_error = match &local {
+        crate::sourcing::Lookup::Unreadable(reason) => Some(reason.clone()),
+        _ => None,
+    };
+    if let crate::sourcing::Lookup::Read(Some(url)) = local {
         return Ok(CallToolResult::text(
             serde_json::to_string(&json!({
                 "mpn": mpn,
@@ -1592,14 +1541,15 @@ async fn handle_get_datasheet_url(
                         .pointer("/result/dataManualUrl")
                         .and_then(|v| v.as_str())
                     {
-                        return Ok(CallToolResult::text(
-                            serde_json::to_string(&json!({
-                                "lcsc_id": id,
-                                "datasheet_url": ds_url,
-                                "source": "lcsc_api"
-                            }))
-                            .unwrap(),
-                        ));
+                        let mut body = json!({
+                            "lcsc_id": id,
+                            "datasheet_url": ds_url,
+                            "source": "lcsc_api"
+                        });
+                        if let Some(error) = &local_catalog_error {
+                            body["local_catalog_error"] = json!(error);
+                        }
+                        return Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()));
                     }
                 }
             }
@@ -1608,24 +1558,23 @@ async fn handle_get_datasheet_url(
 
     // Both sources missed — say which were tried, not just that the answer
     // is null (#255).
-    let mut tried = vec![];
-    match resolve_db_path(&serde_json::Value::Null, ctx) {
-        Some(path) if path.exists() => tried.push("local catalog"),
-        Some(_) => tried.push("local catalog (database not downloaded)"),
-        None => tried.push("local catalog (home directory unknown)"),
-    }
+    let mut tried = vec![match local.reason() {
+        None => "local catalog".to_owned(),
+        Some(reason) => format!("local catalog ({reason})"),
+    }];
     if lcsc_id.is_some() {
-        tried.push("LCSC API");
+        tried.push("LCSC API".to_owned());
     }
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "mpn": mpn,
-            "lcsc_id": lcsc_id,
-            "datasheet_url": null,
-            "note": format!("Datasheet not found via {}", tried.join(" or "))
-        }))
-        .unwrap(),
-    ))
+    let mut body = json!({
+        "mpn": mpn,
+        "lcsc_id": lcsc_id,
+        "datasheet_url": null,
+        "note": format!("Datasheet not found via {}", tried.join(" or "))
+    });
+    if let Some(error) = &local_catalog_error {
+        body["local_catalog_error"] = json!(error);
+    }
+    Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
 // ─── Freerouting ──────────────────────────────────────────────────────────────
@@ -3240,6 +3189,69 @@ mod jlcpcb_cache_tests {
         assert_eq!(body["datasheet_url"], serde_json::Value::Null);
         let note = body["note"].as_str().unwrap();
         assert!(note.contains("local catalog"), "{note}");
+    }
+
+    fn ctx_with_catalog(path: &Path) -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                jlcpcb_db_path: Some(path.to_path_buf()),
+                ..Default::default()
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// An unreadable catalog no longer passes for a miss: the lookup still
+    /// falls through to the LCSC API, and the response says why the catalog
+    /// wasn't read, in the words every catalog tool uses (#209).
+    #[tokio::test]
+    async fn an_unreadable_catalog_is_reported_not_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("jlcpcb.db");
+        std::fs::write(&db_path, "not a database").unwrap();
+
+        let result = handle_get_datasheet_url(
+            // A closed port, so the API misses without the network.
+            &json!({ "lcsc_id": "C1", "_api_base_url": "http://127.0.0.1:9/detail" }),
+            &ctx_with_catalog(&db_path),
+        )
+        .await
+        .unwrap();
+        let body = response_json(&result);
+        assert_eq!(body["datasheet_url"], serde_json::Value::Null);
+        let error = body["local_catalog_error"].as_str().expect("reported");
+        assert!(error.starts_with("cannot read the catalog at "), "{error}");
+        let note = body["note"].as_str().unwrap();
+        assert!(note.contains(error), "{note}");
+    }
+
+    /// A part whose datasheet is NULL is a miss, not an unreadable catalog.
+    /// The old lookup read the NULL as a failed query.
+    #[tokio::test]
+    async fn a_null_datasheet_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("jlcpcb.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE components (LCSC TEXT, MFR_Part TEXT, Datasheet TEXT);
+             INSERT INTO components VALUES ('C1', 'M1', NULL);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = handle_get_datasheet_url(
+            &json!({ "lcsc_id": "C1", "_api_base_url": "http://127.0.0.1:9/detail" }),
+            &ctx_with_catalog(&db_path),
+        )
+        .await
+        .unwrap();
+        let body = response_json(&result);
+        assert_eq!(body["datasheet_url"], serde_json::Value::Null);
+        assert!(body.get("local_catalog_error").is_none(), "{body}");
+        assert_eq!(
+            body["note"], "Datasheet not found via local catalog or LCSC API",
+            "{body}"
+        );
     }
 }
 

@@ -459,10 +459,14 @@ pub(crate) async fn handle_import_jlcpcb_part(
 
     // Preferred verified PDF URL from EasyEDA packageDetail
     let mut datasheet_url = pkg_c_para["link"].as_str().unwrap_or("").to_string();
+    // Without one from EasyEDA, the local catalog's; the response says what
+    // the catalog gave.
+    let mut lcsc_catalog = None;
     if datasheet_url.is_empty() {
-        let info = crate::sourcing::catalog::resolve_db_path(args, ctx)
-            .and_then(|db_path| crate::sourcing::catalog::query_jlcpcb_db_part(&db_path, lcsc_id));
-        if let Some(info) = info {
+        let catalog = crate::sourcing::LcscCatalog::resolve(args, ctx);
+        let lookup = catalog.part_info(lcsc_id);
+        lcsc_catalog = Some(lookup.report(&catalog));
+        if let crate::sourcing::Lookup::Read(Some(info)) = lookup {
             datasheet_url = info.datasheet;
         }
     }
@@ -695,6 +699,9 @@ pub(crate) async fn handle_import_jlcpcb_part(
     if let Some(placement) = placement_readback {
         body["placement"] = placement;
     }
+    if let Some(report) = lcsc_catalog {
+        body["lcsc_catalog"] = report;
+    }
 
     Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
@@ -829,16 +836,10 @@ mod tests {
         assert_eq!(fab[0]["layer"], "F.Fab");
     }
 
-    #[tokio::test]
-    async fn handle_import_jlcpcb_part_with_mock_cache() {
-        let tmp = tempfile::tempdir().unwrap();
-        let project_dir = tmp.path();
-
-        // Seed mock EasyEDA response in cache
-        let cache_dir = easyeda_cache_dir().unwrap();
-        std::fs::create_dir_all(&cache_dir).unwrap();
-        let mock_lcsc_id = "C9999999";
-        let mock_bundle = json!({
+    /// An EasyEDA bundle for a two-pin mock part, with `link` as its
+    /// datasheet.
+    fn mock_bundle(link: &str) -> serde_json::Value {
+        json!({
             "title": "MOCK-PART-40P",
             "description": "Mock 40-Pin Connector",
             "dataStr": {
@@ -867,7 +868,7 @@ mod tests {
                         "y": 100.0,
                         "c_para": {
                             "package": "MOCK-PKG-40P",
-                            "link": "https://example.com/mock.pdf"
+                            "link": link
                         }
                     },
                     "shape": [
@@ -877,7 +878,59 @@ mod tests {
                     ]
                 }
             }
+        })
+    }
+
+    /// Without a datasheet from EasyEDA, the import takes the catalog's, and
+    /// says what the catalog gave, as every catalog tool reports it (#209).
+    #[tokio::test]
+    async fn import_falls_back_to_the_catalogs_datasheet_and_reports_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = easyeda_cache_dir().unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let mock_lcsc_id = "C9999998";
+        std::fs::write(
+            cache_dir.join(format!("{mock_lcsc_id}.json")),
+            serde_json::to_string(&mock_bundle("")).unwrap(),
+        )
+        .unwrap();
+        let db_path = tmp.path().join("jlcpcb.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE components (LCSC TEXT, MFR_Part TEXT, Manufacturer TEXT, Datasheet TEXT, Description TEXT);
+             INSERT INTO components VALUES ('{mock_lcsc_id}', 'MOCK-PART-40P', 'MockMfr', 'https://example.com/catalog.pdf', 'd');"
+        ))
+        .unwrap();
+        drop(conn);
+
+        let args = json!({
+            "project_dir": tmp.path().join("project").display().to_string(),
+            "lcsc_id": mock_lcsc_id,
+            "library_name": "test_jlc",
+            "db_path": db_path.display().to_string()
         });
+        std::fs::create_dir_all(tmp.path().join("project")).unwrap();
+        let result = handle_import_jlcpcb_part(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text response");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["datasheet_url"], "https://example.com/catalog.pdf");
+        assert_eq!(body["lcsc_catalog"]["read"], true, "{body}");
+        assert_eq!(body["lcsc_catalog"]["path"], json!(db_path), "{body}");
+    }
+
+    #[tokio::test]
+    async fn handle_import_jlcpcb_part_with_mock_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path();
+
+        // Seed mock EasyEDA response in cache
+        let cache_dir = easyeda_cache_dir().unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let mock_lcsc_id = "C9999999";
+        let mock_bundle = mock_bundle("https://example.com/mock.pdf");
         std::fs::write(
             cache_dir.join(format!("{mock_lcsc_id}.json")),
             serde_json::to_string(&mock_bundle).unwrap(),
@@ -906,6 +959,8 @@ mod tests {
         assert_eq!(body["footprint_id"], "test_jlc:MOCK-PKG-40P");
         assert_eq!(body["datasheet_url"], "https://example.com/mock.pdf");
         assert_eq!(body["source_attribution"], EASYEDA_ATTRIBUTION);
+        // EasyEDA had a datasheet, so the catalog wasn't asked.
+        assert!(body.get("lcsc_catalog").is_none(), "{body}");
 
         // Verify .kicad_sym was created and contains symbol with custom fields
         let sym_file = project_dir.join("test_jlc.kicad_sym");
