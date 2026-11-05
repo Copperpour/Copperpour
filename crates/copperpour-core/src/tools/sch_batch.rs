@@ -721,7 +721,7 @@ async fn handle_batch_place_components(
 
         let lcsc_id = comp["lcsc_id"].as_str();
         let fields = comp["fields"].as_object();
-        let db_path = crate::tools::integration::resolve_db_path(args, _ctx);
+        let db_path = crate::sourcing::catalog::resolve_db_path(args, _ctx);
         let extras = super::sch_components::ComponentPlacementExtras {
             lcsc_id,
             fields,

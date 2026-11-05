@@ -556,7 +556,7 @@ pub(crate) async fn handle_add_schematic_component(
 
     let lcsc_id = opt_str(args, "lcsc_id");
     let fields = args["fields"].as_object();
-    let db_path = crate::tools::integration::resolve_db_path(args, _ctx);
+    let db_path = crate::sourcing::catalog::resolve_db_path(args, _ctx);
     let extras = ComponentPlacementExtras {
         lcsc_id,
         fields,
@@ -920,7 +920,7 @@ pub(crate) fn place_one_component(
         }
 
         if let Some(path) = extras.db_path {
-            if let Some(info) = crate::tools::integration::query_jlcpcb_db_part(path, &lcsc) {
+            if let Some(info) = crate::sourcing::catalog::query_jlcpcb_db_part(path, &lcsc) {
                 if !info.mfr_part.is_empty()
                     && (sym.property("MPN").is_none() || sym.property("MPN") == Some(""))
                 {

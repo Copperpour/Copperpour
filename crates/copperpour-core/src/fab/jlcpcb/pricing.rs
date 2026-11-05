@@ -103,11 +103,11 @@ pub(crate) async fn price_jlcpcb_components(
         pricing.catalog = json!({ "read": false, "reason": "no part has an LCSC field" });
         None
     } else {
-        match crate::tools::integration::resolve_db_path(args, ctx) {
+        match crate::sourcing::catalog::resolve_db_path(args, ctx) {
             Some(db_path) if db_path.is_file() => {
                 let path = db_path.clone();
                 let queried = tokio::task::spawn_blocking(move || {
-                    crate::tools::integration::query_catalog_prices(&path, &ids)
+                    crate::sourcing::catalog::query_catalog_prices(&path, &ids)
                 })
                 .await
                 .map_err(anyhow::Error::from)
