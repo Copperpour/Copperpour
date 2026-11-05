@@ -103,7 +103,9 @@ pub fn tools() -> Vec<ToolDef> {
             "estimate_cost",
             "Estimate the total manufacturing cost for PCB fabrication and assembly at a given fab house. \
              Counts components from board footprints and returns an itemized rough estimate: \
-             PCB, components, assembly, and total.",
+             PCB, components, assembly, and total. For jlcpcb, parts with an LCSC field are priced \
+             from the local JLCPCB catalog, plus the fee per unique Extended part; the response \
+             lists which parts were priced from the catalog and which at an average.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1169,9 +1171,191 @@ async fn handle_validate_for_manufacturing(
     ))
 }
 
+/// JLCPCB's loading fee per unique Extended part under Economic PCBA, whose
+/// setup fee the estimate assumes. Basic and Preferred Extended parts have none.
+const JLCPCB_EXTENDED_PART_FEE: f64 = 3.07;
+const JLCPCB_FEE_SOURCE: &str = "JLCPCB Economic PCBA: $3.07 per unique Extended part, none for Basic or Preferred Extended parts (https://jlcpcb.com/blog/reduce-pcb-assembly-cost-prototype, prices as of 2026-10-09)";
+
+/// A footprint the BOM lists, by reference and LCSC field.
+struct BomFootprint {
+    reference: String,
+    lcsc: Option<String>,
+}
+
+/// The board's footprints that a BOM lists, and the references of those it
+/// leaves out (`exclude_from_bom` or `dnp`), which are not bought.
+fn bom_footprints(tree: &copperpour_sexp::SexpNode) -> (Vec<BomFootprint>, Vec<String>) {
+    let property = |footprint: &copperpour_sexp::SexpNode, name: &str| {
+        footprint
+            .find_all("property")
+            .into_iter()
+            .find(|property| {
+                property.get(1).and_then(copperpour_sexp::SexpNode::as_str) == Some(name)
+            })
+            .and_then(|property| property.get(2))
+            .and_then(copperpour_sexp::SexpNode::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "~")
+            .map(str::to_string)
+    };
+    let mut listed = Vec::new();
+    let mut excluded = Vec::new();
+    for footprint in tree.find_all("footprint") {
+        // KiCad 7 and older keep the reference in `fp_text reference`.
+        let reference = property(footprint, "Reference")
+            .or_else(|| {
+                footprint
+                    .find_all("fp_text")
+                    .into_iter()
+                    .find(|text| {
+                        text.get(1).and_then(copperpour_sexp::SexpNode::as_str) == Some("reference")
+                    })
+                    .and_then(|text| text.get(2))
+                    .and_then(copperpour_sexp::SexpNode::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "?".to_string());
+        let left_out = footprint.find("attr").is_some_and(|attr| {
+            attr.children()
+                .unwrap_or(&[])
+                .iter()
+                .any(|flag| matches!(flag.as_str(), Some("exclude_from_bom" | "dnp")))
+        });
+        if left_out {
+            excluded.push(reference);
+        } else {
+            listed.push(BomFootprint {
+                reference,
+                lcsc: property(footprint, "LCSC"),
+            });
+        }
+    }
+    (listed, excluded)
+}
+
+/// What the JLCPCB components cost per board, and how each part was priced.
+#[derive(Debug, Default)]
+struct JlcpcbComponentPricing {
+    per_board: f64,
+    extended_unique_parts: usize,
+    priced_from_catalog: Vec<serde_json::Value>,
+    estimated: Vec<serde_json::Value>,
+    catalog: serde_json::Value,
+}
+
+/// Price each part with an LCSC field from the local catalog, at its unit
+/// price; every other part, and one the catalog has no price for, at
+/// `average`. Without a catalog every part is at `average` (#92).
+async fn price_jlcpcb_components(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    footprints: &[BomFootprint],
+    average: f64,
+) -> JlcpcbComponentPricing {
+    let mut by_lcsc: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut pricing = JlcpcbComponentPricing::default();
+    for footprint in footprints {
+        match &footprint.lcsc {
+            Some(lcsc) => by_lcsc
+                .entry(lcsc.clone())
+                .or_default()
+                .push(footprint.reference.clone()),
+            None => {
+                pricing.per_board += average;
+                pricing.estimated.push(json!({
+                    "references": [footprint.reference],
+                    "lcsc": null,
+                    "reason": "no LCSC field"
+                }));
+            }
+        }
+    }
+
+    let ids: Vec<String> = by_lcsc.keys().cloned().collect();
+    let prices = if ids.is_empty() {
+        pricing.catalog = json!({ "read": false, "reason": "no part has an LCSC field" });
+        None
+    } else {
+        match crate::tools::integration::resolve_db_path(args, ctx) {
+            Some(db_path) if db_path.is_file() => {
+                let path = db_path.clone();
+                let queried = tokio::task::spawn_blocking(move || {
+                    crate::tools::integration::query_catalog_prices(&path, &ids)
+                })
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result);
+                match queried {
+                    Ok(prices) => {
+                        pricing.catalog = json!({ "read": true, "path": db_path });
+                        Some(prices)
+                    }
+                    Err(error) => {
+                        pricing.catalog = json!({
+                            "read": false,
+                            "path": db_path,
+                            "reason": format!("cannot read the catalog: {error:#}")
+                        });
+                        None
+                    }
+                }
+            }
+            Some(db_path) => {
+                pricing.catalog = json!({
+                    "read": false,
+                    "path": db_path,
+                    "reason": "no catalog at this path; run download_jlcpcb_database"
+                });
+                None
+            }
+            None => {
+                pricing.catalog = json!({
+                    "read": false,
+                    "reason": "no catalog path: jlcpcb_db_path is not set and the home directory is unknown"
+                });
+                None
+            }
+        }
+    };
+
+    for (lcsc, references) in by_lcsc {
+        let count = references.len() as f64;
+        let found = prices.as_ref().and_then(|prices| prices.get(&lcsc));
+        // The fee follows the library type, whether or not the price is known.
+        if found.is_some_and(|part| part.library_type == "Extended") {
+            pricing.extended_unique_parts += 1;
+        }
+        match found {
+            Some(part) if part.price > 0.0 => {
+                pricing.per_board += part.price * count;
+                pricing.priced_from_catalog.push(json!({
+                    "lcsc": lcsc,
+                    "references": references,
+                    "library_type": part.library_type,
+                    "unit_price": part.price
+                }));
+            }
+            _ => {
+                pricing.per_board += average * count;
+                let reason = match (&prices, found) {
+                    (None, _) => "catalog not read",
+                    (Some(_), None) => "not in the catalog",
+                    (Some(_), Some(_)) => "the catalog has no price",
+                };
+                pricing.estimated.push(json!({
+                    "references": references,
+                    "lcsc": lcsc,
+                    "reason": reason
+                }));
+            }
+        }
+    }
+    pricing
+}
+
 async fn handle_estimate_cost(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let fab_house = args["fab_house"].as_str().unwrap_or("jlcpcb");
@@ -1217,6 +1401,14 @@ async fn handle_estimate_cost(
     // Estimate board dimensions from Edge.Cuts
     let (width_mm, height_mm) = estimate_board_dimensions(&content);
 
+    let (bom_parts, excluded_from_bom) = bom_footprints(&tree);
+    const JLCPCB_AVERAGE_PART_PRICE: f64 = 0.05;
+    let jlcpcb_components = if fab_house == "jlcpcb" {
+        Some(price_jlcpcb_components(args, ctx, &bom_parts, JLCPCB_AVERAGE_PART_PRICE).await)
+    } else {
+        None
+    };
+
     // Rough cost estimation based on fab house pricing models
     let (pcb_cost, assembly_cost, component_est) = match fab_house {
         "jlcpcb" => {
@@ -1229,8 +1421,14 @@ async fn handle_estimate_cost(
             };
             let smt_setup = if component_count > 0 { 8.0 } else { 0.0 };
             let smt_per_board = component_count as f64 * 0.003 * quantity as f64;
-            let comp_est = component_count as f64 * 0.05; // rough avg per component
-            (pcb, smt_setup + smt_per_board, comp_est * quantity as f64)
+            let comp_per_board = jlcpcb_components
+                .as_ref()
+                .map_or(0.0, |pricing| pricing.per_board);
+            (
+                pcb,
+                smt_setup + smt_per_board,
+                comp_per_board * quantity as f64,
+            )
         }
         "pcbway" => {
             let pcb = match copper_layers {
@@ -1248,7 +1446,45 @@ async fn handle_estimate_cost(
         }
     };
 
-    let total = pcb_cost + assembly_cost + component_est;
+    // Charged once per order for each unique Extended part, not per board.
+    let extended_parts_fee = jlcpcb_components.as_ref().map_or(0.0, |pricing| {
+        pricing.extended_unique_parts as f64 * JLCPCB_EXTENDED_PART_FEE
+    });
+    let total = pcb_cost + assembly_cost + component_est + extended_parts_fee;
+
+    let mut notes = vec![
+        "Estimates are approximate — actual cost depends on board size, finish, and specific components"
+            .to_string(),
+    ];
+    let components = match &jlcpcb_components {
+        Some(pricing) => {
+            notes.push(format!(
+                "Parts with an LCSC field are priced at the local JLCPCB catalog's unit price, without \
+                 quantity price breaks; other parts at an average of ${JLCPCB_AVERAGE_PART_PRICE:.2}. \
+                 components lists which is which; search_jlcpcb_parts finds an LCSC number for a part."
+            ));
+            notes.push(JLCPCB_FEE_SOURCE.to_string());
+            json!({
+                "catalog": pricing.catalog,
+                "priced_from_catalog": pricing.priced_from_catalog,
+                "estimated": pricing.estimated,
+                "average_unit_price": JLCPCB_AVERAGE_PART_PRICE,
+                "extended_unique_parts": pricing.extended_unique_parts,
+                "excluded_from_bom": excluded_from_bom
+            })
+        }
+        None => {
+            notes.push(format!(
+                "Component costs are rough averages per footprint; catalog prices are used only for jlcpcb, not {fab_house}"
+            ));
+            json!({ "priced_from_catalog": [], "excluded_from_bom": excluded_from_bom })
+        }
+    };
+    notes.push(format!(
+        "Based on {} quantity from {}",
+        quantity,
+        fab_house.to_uppercase()
+    ));
 
     debug!(
         pcb_cost = pcb_cost,
@@ -1272,18 +1508,16 @@ async fn handle_estimate_cost(
                 "component_count": component_count
             },
             "warnings": warnings,
+            "components": components,
             "cost_estimate": {
                 "pcb_fabrication": format!("${:.2}", pcb_cost),
                 "smt_assembly": format!("${:.2}", assembly_cost),
                 "components_estimate": format!("${:.2}", component_est),
+                "extended_parts_fee": format!("${:.2}", extended_parts_fee),
                 "total_estimate": format!("${:.2}", total),
                 "per_board": format!("${:.2}", total / quantity as f64)
             },
-            "notes": [
-                "Estimates are approximate — actual cost depends on board size, finish, and specific components",
-                "Component costs are rough averages — use generate_bom with supply chain data for accurate pricing",
-                format!("Based on {} quantity from {}", quantity, fab_house.to_uppercase())
-            ],
+            "notes": notes,
             "disclaimer": "BETA: Cost estimates are indicative only. Always confirm with the fab house's online quoting tool."
         }))
         .unwrap(),
@@ -2293,5 +2527,169 @@ mod copper_layer_count_tests {
 
         let control = validate(TWO_LAYER).await;
         assert_eq!(control["board_info"]["copper_layers"], 2);
+    }
+}
+
+#[cfg(test)]
+mod estimate_cost_catalog_tests {
+    //! Issue #92: `estimate_cost` priced every part at a flat average, added no
+    //! fee for Extended parts, and pointed to a `generate_bom` that does not
+    //! exist.
+
+    use super::*;
+    use serde_json::json;
+
+    /// Three resistors on one Basic part (R3 saved the KiCad 7 way), an
+    /// Extended MCU, a part the catalog lacks, an Extended part with no price,
+    /// a part without an LCSC field, and two footprints the BOM leaves out.
+    const BOARD: &str = "(kicad_pcb\n\
+        \t(version 20260206)\n\
+        \t(generator \"pcbnew\")\n\
+        \t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(31 \"B.Cu\" signal)\n\t)\n\
+        \t(footprint \"R_0402\" (layer \"F.Cu\") (attr smd) (property \"Reference\" \"R1\" (at 0 0 0)) (property \"LCSC\" \"C25744\" (at 0 0 0)))\n\
+        \t(footprint \"R_0402\" (layer \"F.Cu\") (attr smd) (property \"Reference\" \"R2\" (at 0 0 0)) (property \"LCSC\" \"C25744\" (at 0 0 0)))\n\
+        \t(footprint \"QFN\" (layer \"F.Cu\") (attr smd) (property \"Reference\" \"U1\" (at 0 0 0)) (property \"LCSC\" \"C8734\" (at 0 0 0)))\n\
+        \t(footprint \"QFN\" (layer \"F.Cu\") (attr smd) (property \"Reference\" \"U2\" (at 0 0 0)) (property \"LCSC\" \"C99999999\" (at 0 0 0)))\n\
+        \t(footprint \"Conn\" (layer \"F.Cu\") (attr smd) (property \"Reference\" \"J1\" (at 0 0 0)) (property \"LCSC\" \"C1111\" (at 0 0 0)))\n\
+        \t(footprint \"C_0402\" (layer \"F.Cu\") (attr smd) (property \"Reference\" \"C1\" (at 0 0 0)) (property \"LCSC\" \"\" (at 0 0 0)))\n\
+        \t(footprint \"MountingHole\" (layer \"F.Cu\") (attr exclude_from_pos_files exclude_from_bom) (property \"Reference\" \"H1\" (at 0 0 0)))\n\
+        \t(footprint \"LED\" (layer \"F.Cu\") (attr smd dnp) (property \"Reference\" \"D1\" (at 0 0 0)) (property \"LCSC\" \"C25744\" (at 0 0 0)))\n\
+        \t(footprint \"R_0402\" (layer \"F.Cu\") (attr smd) (fp_text reference \"R3\" (at 0 0)) (property \"LCSC\" \"C25744\"))\n\
+        )\n";
+
+    fn seed_catalog(dir: &Path) -> PathBuf {
+        let db_path = dir.join("jlcpcb.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE components (LCSC TEXT, MFR_Part TEXT, Package TEXT, Manufacturer TEXT, \
+             Library_Type TEXT, Description TEXT, Datasheet TEXT, Price REAL, Stock INTEGER, Category TEXT);",
+        )
+        .unwrap();
+        for (lcsc, library_type, price) in [
+            ("C25744", "Basic", 0.002),
+            ("C8734", "Extended", 5.62),
+            ("C1111", "Extended", 0.0),
+        ] {
+            conn.execute(
+                "INSERT INTO components VALUES (?1, 'MPN', 'PKG', 'MFR', ?2, 'part', '', ?3, 100, 'cat')",
+                rusqlite::params![lcsc, library_type, price],
+            )
+            .unwrap();
+        }
+        db_path
+    }
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    async fn estimate(fab_house: &str, db_path: &Path) -> serde_json::Value {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, BOARD).unwrap();
+        let args = json!({
+            "board": board.to_str().unwrap(),
+            "fab_house": fab_house,
+            "quantity": 5,
+            "db_path": db_path.to_str().unwrap()
+        });
+        match handle_estimate_cost(&args, &ctx())
+            .await
+            .unwrap()
+            .content
+            .first()
+        {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    /// Parts with catalog prices are priced from them, the rest at the
+    /// average, and each unique Extended part adds its fee once.
+    #[tokio::test]
+    async fn jlcpcb_prices_parts_from_the_catalog_and_adds_extended_fees() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = estimate("jlcpcb", &seed_catalog(dir.path())).await;
+        let components = &report["components"];
+        assert_eq!(components["catalog"]["read"], true, "{report}");
+
+        let priced: Vec<(&str, serde_json::Value)> = components["priced_from_catalog"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| (part["lcsc"].as_str().unwrap(), part["references"].clone()))
+            .collect();
+        assert_eq!(
+            priced,
+            [
+                ("C25744", json!(["R1", "R2", "R3"])),
+                ("C8734", json!(["U1"]))
+            ]
+        );
+
+        let estimated: Vec<(serde_json::Value, &str)> = components["estimated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| (part["references"].clone(), part["reason"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            estimated,
+            [
+                (json!(["C1"]), "no LCSC field"),
+                (json!(["J1"]), "the catalog has no price"),
+                (json!(["U2"]), "not in the catalog"),
+            ]
+        );
+        assert_eq!(components["excluded_from_bom"], json!(["H1", "D1"]));
+        // U1 and J1 are Extended; J1's unknown price does not waive its fee.
+        assert_eq!(components["extended_unique_parts"], 2);
+
+        // Per board: 3 x 0.002 + 5.62 + 3 x 0.05 = 5.776, for 5 boards.
+        let cost = &report["cost_estimate"];
+        assert_eq!(cost["components_estimate"], "$28.88", "{report}");
+        assert_eq!(cost["extended_parts_fee"], "$6.14");
+        let notes = report["notes"].to_string();
+        assert!(notes.contains("search_jlcpcb_parts"), "{notes}");
+        assert!(!notes.contains("generate_bom"), "{notes}");
+    }
+
+    /// Without a catalog every part is at the average, and the response says
+    /// why, rather than presenting averages as prices.
+    #[tokio::test]
+    async fn jlcpcb_without_a_catalog_reports_every_part_as_estimated() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = estimate("jlcpcb", &dir.path().join("missing.db")).await;
+        let components = &report["components"];
+        assert_eq!(components["catalog"]["read"], false, "{report}");
+        assert!(components["catalog"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("download_jlcpcb_database"));
+        assert_eq!(components["priced_from_catalog"], json!([]));
+        let estimated = components["estimated"].as_array().unwrap();
+        assert!(estimated[1..]
+            .iter()
+            .all(|part| part["reason"] == "catalog not read"));
+        // Seven parts the BOM lists, at 0.05, for 5 boards; no Extended fee.
+        assert_eq!(report["cost_estimate"]["components_estimate"], "$1.75");
+        assert_eq!(report["cost_estimate"]["extended_parts_fee"], "$0.00");
+    }
+
+    /// PCBWay keeps its per-footprint average and does not read the catalog.
+    #[tokio::test]
+    async fn pcbway_keeps_its_average() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = estimate("pcbway", &seed_catalog(dir.path())).await;
+        // Nine footprints at 0.08, for 5 boards, as before.
+        assert_eq!(report["cost_estimate"]["components_estimate"], "$3.60");
+        assert_eq!(report["cost_estimate"]["extended_parts_fee"], "$0.00");
+        assert_eq!(report["components"]["priced_from_catalog"], json!([]));
+        assert!(report["components"].get("catalog").is_none());
     }
 }

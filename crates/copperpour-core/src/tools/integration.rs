@@ -239,6 +239,41 @@ pub(crate) struct JlcpchPartInfo {
     pub description: String,
 }
 
+/// A part's catalog price and library type, as `estimate_cost` prices it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CatalogPrice {
+    /// The catalog's unit price. The import stores an unknown price as 0
+    /// (#63), so 0 or less is unknown.
+    pub price: f64,
+    pub library_type: String,
+}
+
+/// Prices and library types of the given LCSC IDs in the local catalog,
+/// opened read-only. An ID the catalog lacks is absent from the map; a price
+/// that is not a number reads as unknown (0).
+pub(crate) fn query_catalog_prices(
+    db_path: &Path,
+    lcsc_ids: &[String],
+) -> anyhow::Result<HashMap<String, CatalogPrice>> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt =
+        conn.prepare("SELECT Price, Library_Type FROM components WHERE LCSC = ?1 LIMIT 1")?;
+    let mut prices = HashMap::new();
+    for id in lcsc_ids {
+        let mut rows = stmt.query_map(rusqlite::params![id], |row| {
+            Ok(CatalogPrice {
+                price: row.get::<_, f64>(0).unwrap_or(0.0),
+                library_type: row.get::<_, String>(1).unwrap_or_default(),
+            })
+        })?;
+        if let Some(price) = rows.next().transpose()? {
+            prices.insert(id.clone(), price);
+        }
+    }
+    Ok(prices)
+}
+
 pub(crate) fn query_jlcpcb_db_part(db_path: &Path, lcsc_id: &str) -> Option<JlcpchPartInfo> {
     if !db_path.exists() {
         return None;
