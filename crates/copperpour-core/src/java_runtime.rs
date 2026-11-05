@@ -18,21 +18,46 @@ const HOMEBREW_JAVA: &[&str] = &[
 /// macOS's launcher stub, only usable when a JDK is registered system-wide.
 const MACOS_STUB_JAVA: &str = "/usr/bin/java";
 
+/// The launcher's file name on this platform.
+const JAVA_BINARY: &str = if cfg!(windows) { "java.exe" } else { "java" };
+
+/// Serialises tests that set `JAVA_HOME` or `PATH`, or that resolve `java`
+/// through them: both are process-wide.
+#[cfg(test)]
+pub(crate) static JAVA_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The `java` to run: `JAVA_HOME`, then the PATH, then Homebrew's OpenJDK on
 /// macOS (ahead of the system stub). Falls back to a bare `java`.
 pub(crate) fn java_executable() -> PathBuf {
-    candidates(
+    first_runnable(candidates(
         std::env::var_os("JAVA_HOME"),
         std::env::var_os("PATH"),
         cfg!(target_os = "macos"),
-    )
-    .into_iter()
-    .find(|path| path.is_file())
+    ))
     .unwrap_or_else(|| PathBuf::from("java"))
 }
 
+/// The first candidate that is a file this process may run. On Unix a file
+/// without an execute bit is skipped, so a broken `$JAVA_HOME/bin/java` does
+/// not hide a working `java` further down.
+fn first_runnable(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|path| is_runnable(path))
+}
+
+#[cfg(unix)]
+fn is_runnable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_runnable(path: &Path) -> bool {
+    path.is_file()
+}
+
 fn candidates(java_home: Option<OsString>, path: Option<OsString>, macos: bool) -> Vec<PathBuf> {
-    let binary = if cfg!(windows) { "java.exe" } else { "java" };
+    let binary = JAVA_BINARY;
     let mut found = Vec::new();
     if let Some(home) = java_home.filter(|home| !home.is_empty()) {
         found.push(PathBuf::from(home).join("bin").join(binary));
@@ -110,16 +135,56 @@ mod tests {
     fn java_home_comes_first_then_the_path() {
         let path = std::env::join_paths(["/usr/local/bin", "/usr/bin"]).unwrap();
         let found = candidates(Some("/jdk".into()), Some(path), false);
+        // `java.exe` on Windows: built with `join`, as the resolver does.
         assert_eq!(
             found,
             [
-                PathBuf::from("/jdk/bin/java"),
-                PathBuf::from("/usr/local/bin/java"),
-                PathBuf::from("/usr/bin/java"),
+                Path::new("/jdk").join("bin").join(JAVA_BINARY),
+                Path::new("/usr/local/bin").join(JAVA_BINARY),
+                Path::new("/usr/bin").join(JAVA_BINARY),
             ]
         );
     }
 
+    #[test]
+    fn a_directory_or_a_missing_file_is_not_runnable() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("java");
+        std::fs::write(&file, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let found = first_runnable(vec![
+            temp.path().join("missing"),
+            temp.path().to_path_buf(),
+            file.clone(),
+        ]);
+        assert_eq!(found, Some(file));
+    }
+
+    /// A `java` without an execute bit is skipped for the next candidate.
+    #[cfg(unix)]
+    #[test]
+    fn a_java_without_an_execute_bit_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let broken = temp.path().join("broken");
+        let working = temp.path().join("working");
+        for (path, mode) in [(&broken, 0o644), (&working, 0o755)] {
+            std::fs::write(path, b"").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        assert_eq!(
+            first_runnable(vec![broken.clone(), working.clone()]),
+            Some(working)
+        );
+        assert_eq!(first_runnable(vec![broken]), None);
+    }
+
+    /// On macOS (a Unix-only layout: the stub is `/usr/bin/java`).
+    #[cfg(unix)]
     #[test]
     fn macos_tries_homebrew_before_the_system_stub() {
         let path = std::env::join_paths(["/usr/bin", "/opt/tools/bin"]).unwrap();
