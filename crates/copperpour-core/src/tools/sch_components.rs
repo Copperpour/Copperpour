@@ -82,7 +82,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_schematic_component",
-            "Update fields (Reference, Value, Footprint, custom properties) and KiCad's native do-not-populate (DNP) attribute consistently across every placed unit of a component, remove custom properties, and move or hide the text of any field. On a sheet placed more than once, the change reaches every instance of the sheet.",
+            "Update fields (Reference, Value, Footprint, custom properties), KiCad's native do-not-populate (DNP) attribute and its Exclude from BOM and Exclude from board flags consistently across every placed unit of a component, remove custom properties, and move or hide the text of any field. On a sheet placed more than once, the change reaches every instance of the sheet.",
             json!({
                 "type": "object",
                 "properties": {
@@ -95,6 +95,14 @@ pub fn tools() -> Vec<ToolDef> {
                     "dnp": {
                         "type": "boolean",
                         "description": "Set KiCad's native do-not-populate attribute, (dnp yes|no), on every placed unit (never one unit: 'unit' scopes field_placements only): true marks the part DNP, false fits it. This is the attribute KiCad's plot marks and a BOM export with DNP exclusion honours; a property named DNP is not, and 'fields' refuses one. Per-variant DNP overrides are left as they are."
+                    },
+                    "in_bom": {
+                        "type": "boolean",
+                        "description": "Set KiCad's native (in_bom yes|no) flag on every placed unit (never one unit: 'unit' scopes field_placements only): false is Exclude from bill of materials, which leaves the part out of a BOM export; true lists it. Omitted, the file's value is kept."
+                    },
+                    "on_board": {
+                        "type": "boolean",
+                        "description": "Set KiCad's native (on_board yes|no) flag on every placed unit (never one unit: 'unit' scopes field_placements only): false is Exclude from board, which keeps the part off the PCB when the board is updated from the schematic; true puts it there. Omitted, the file's value is kept."
                     },
                     "fields": {
                         "type": "object",
@@ -1061,6 +1069,10 @@ pub(crate) struct ComponentTargetUnit {
     /// The placement's native `(dnp …)` attribute, bound like the mirror so
     /// a DNP change that fails to reach the file cannot pass the readback.
     dnp: bool,
+    /// The placement's native `(in_bom …)` and `(on_board …)` flags, bound
+    /// like `dnp`.
+    in_bom: bool,
+    on_board: bool,
     instances: Vec<(String, String)>,
     /// The designators the instance records carry, sorted. On a sheet placed
     /// more than once they need not match the property, so the readback holds
@@ -1099,6 +1111,9 @@ impl ComponentTargetUnit {
             mirror: mirror.map(str::to_owned),
             // Placement writes `(dnp no)`: a new part is fitted.
             dnp: false,
+            // And `(in_bom yes)` and `(on_board yes)`, as `Symbol::new` sets them.
+            in_bom: true,
+            on_board: true,
             fields: BTreeMap::from([
                 ("Reference".to_owned(), reference.to_owned()),
                 ("Value".to_owned(), fields.value.clone()),
@@ -1220,6 +1235,11 @@ fn verify_component_expectations(
                         == Some(target.mirror.as_deref().is_some_and(|m| m.contains('y'))),
             ),
             ("dnp", unit["dnp"].as_bool() == Some(target.dnp)),
+            ("in_bom", unit["in_bom"].as_bool() == Some(target.in_bom)),
+            (
+                "on_board",
+                unit["on_board"].as_bool() == Some(target.on_board),
+            ),
             (
                 "instance_paths",
                 unit["instance_paths"] == json!(target.instances),
@@ -1296,6 +1316,18 @@ impl ComponentTarget {
         if let Some(dnp) = dnp {
             for unit in &mut self.units {
                 unit.dnp = dnp;
+            }
+        }
+        self
+    }
+
+    fn with_bom_and_board(mut self, in_bom: Option<bool>, on_board: Option<bool>) -> Self {
+        for unit in &mut self.units {
+            if let Some(in_bom) = in_bom {
+                unit.in_bom = in_bom;
+            }
+            if let Some(on_board) = on_board {
+                unit.on_board = on_board;
             }
         }
         self
@@ -1420,6 +1452,8 @@ fn component_target_from_source(
             // readback assert they left it alone.
             mirror: symbol.mirror.clone(),
             dnp: symbol.dnp,
+            in_bom: symbol.in_bom,
+            on_board: symbol.on_board,
             instances: instance_paths,
             instance_references,
         });
@@ -1658,6 +1692,8 @@ fn component_mutation_readback_from_schematic(
             "mirror_x": unit_mirror.contains('x'),
             "mirror_y": unit_mirror.contains('y'),
             "dnp": symbol.dnp,
+            "in_bom": symbol.in_bom,
+            "on_board": symbol.on_board,
             "lib_id": symbol.lib_id,
             "fields": fields,
             "field_placements": field_placements,
@@ -1682,6 +1718,8 @@ fn component_mutation_readback_from_schematic(
         "mirror_x": anchor_mirror.contains('x'),
         "mirror_y": anchor_mirror.contains('y'),
         "dnp": anchor.dnp,
+        "in_bom": anchor.in_bom,
+        "on_board": anchor.on_board,
         "unit_count": units.len(),
         "units": units,
         "fields": fields
@@ -1900,6 +1938,8 @@ fn copy_component_observation(result: &mut serde_json::Value, observed: &serde_j
         "mirror_x",
         "mirror_y",
         "dnp",
+        "in_bom",
+        "on_board",
         "unit_count",
         "units",
         "fields",
@@ -2507,10 +2547,10 @@ fn block_tag(block: &str) -> &str {
     &inner[..end]
 }
 
-/// The symbol header tokens eeschema writes before `(dnp …)`, in its order.
-/// A file from before KiCad 7 carries no `(dnp …)`; a new one goes after the
-/// last of these that the symbol has.
-const TOKENS_BEFORE_DNP: [&str; 10] = [
+/// The symbol header tokens eeschema writes, in its order, up to `(dnp …)`.
+/// A flag a file does not carry, such as `(dnp …)` in one from before KiCad 7,
+/// goes after the last token before it here that the symbol has.
+const SYMBOL_HEADER_TOKENS: [&str; 11] = [
     "lib_id",
     "at",
     "mirror",
@@ -2521,19 +2561,26 @@ const TOKENS_BEFORE_DNP: [&str; 10] = [
     "in_bom",
     "on_board",
     "in_pos_files",
+    "dnp",
 ];
 
-/// Set the native `(dnp yes|no)` attribute in each placed-symbol block of
-/// `blocks`, rewriting the existing token in place. Only a symbol's own
-/// direct children are considered: a KiCad 10 variant's `(dnp …)` inside
-/// `(instances …)`, or text inside a property value, is never touched.
-fn set_dnp_in_blocks(
+/// Set a native `(flag yes|no)` attribute — `dnp`, `in_bom` or `on_board` —
+/// in each placed-symbol block of `blocks`, rewriting the existing token in
+/// place. Only a symbol's own direct children are considered: a KiCad 10
+/// variant's `(dnp …)` inside `(instances …)`, or text inside a property
+/// value, is never touched.
+fn set_flag_in_blocks(
     content: &str,
     blocks: &[(usize, usize)],
     reference: &str,
-    dnp: bool,
+    flag: &str,
+    value: bool,
 ) -> Result<String, String> {
-    let token = format!("(dnp {})", if dnp { "yes" } else { "no" });
+    let token = format!("({flag} {})", if value { "yes" } else { "no" });
+    let before = SYMBOL_HEADER_TOKENS
+        .iter()
+        .position(|tag| *tag == flag)
+        .map_or(&SYMBOL_HEADER_TOKENS[..], |at| &SYMBOL_HEADER_TOKENS[..at]);
     let mut edits = Vec::new();
     for &(start, end) in blocks {
         let block = &content[start..end];
@@ -2547,7 +2594,7 @@ fn set_dnp_in_blocks(
                 })
                 .collect::<Vec<_>>()
         };
-        match tagged("dnp").as_slice() {
+        match tagged(flag).as_slice() {
             [(child_start, child_end)] => edits.push(SexpEdit::replace(
                 start + child_start,
                 start + child_end,
@@ -2558,7 +2605,7 @@ fn set_dnp_in_blocks(
                     .iter()
                     .copied()
                     .filter(|&(child_start, child_end)| {
-                        TOKENS_BEFORE_DNP.contains(&block_tag(&block[child_start..child_end]))
+                        before.contains(&block_tag(&block[child_start..child_end]))
                     })
                     .max_by_key(|&(_, child_end)| child_end)
                     .ok_or_else(|| {
@@ -2583,7 +2630,7 @@ fn set_dnp_in_blocks(
             }
             _ => {
                 return Err(format!(
-                    "a placed unit of '{reference}' carries more than one (dnp …) attribute"
+                    "a placed unit of '{reference}' carries more than one ({flag} …) attribute"
                 ))
             }
         }
@@ -2604,7 +2651,7 @@ pub(crate) fn set_dnp_attribute(
         return Err(format!("symbol '{reference}' not found in this schematic"));
     }
     Ok((
-        set_dnp_in_blocks(content, &blocks, reference, dnp)?,
+        set_flag_in_blocks(content, &blocks, reference, "dnp", dnp)?,
         blocks.len(),
     ))
 }
@@ -3237,18 +3284,35 @@ async fn handle_edit_schematic_component(
         Some(serde_json::Value::Bool(dnp)) => Some(*dnp),
         Some(_) => return Ok(crate::tools::invalid_arg("dnp", "must be a boolean")),
     };
-    // `unit` scopes field_placements only. Read beside `dnp` alone it looks
-    // like a request for one gate, and every unit would change instead.
-    if requested_dnp.is_some()
-        && !args["unit"].is_null()
-        && args["field_placements"]
-            .as_object()
-            .is_none_or(|p| p.is_empty())
-    {
-        return Ok(crate::tools::invalid_arg(
-            "unit",
-            "selects the unit for field_placements only; dnp is set on every placed unit",
-        ));
+    // Exclude from BOM and Exclude from board, KiCad's `(in_bom …)` and
+    // `(on_board …)`, set as `dnp` is (#34).
+    let mut requested_flags = Vec::new();
+    for flag in ["in_bom", "on_board"] {
+        match args.get(flag) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Bool(value)) => requested_flags.push((flag, *value)),
+            Some(_) => return Ok(crate::tools::invalid_arg(flag, "must be a boolean")),
+        }
+    }
+    // `unit` scopes field_placements only. Read beside `dnp`, `in_bom` or
+    // `on_board` alone it looks like a request for one gate, and every unit
+    // would change instead.
+    let whole_part_flag = requested_dnp
+        .map(|_| "dnp")
+        .or_else(|| requested_flags.first().map(|(flag, _)| *flag));
+    if let Some(flag) = whole_part_flag {
+        if !args["unit"].is_null()
+            && args["field_placements"]
+                .as_object()
+                .is_none_or(|p| p.is_empty())
+        {
+            return Ok(crate::tools::invalid_arg(
+                "unit",
+                &format!(
+                    "selects the unit for field_placements only; {flag} is set on every placed unit"
+                ),
+            ));
+        }
     }
     // A property named DNP refuses the whole request, before anything is
     // read for writing: none of its other edits is applied either.
@@ -3292,6 +3356,7 @@ async fn handle_edit_schematic_component(
     let mut changed = Vec::new();
     let mut expected_fields = BTreeMap::new();
     let mut applied_dnp = None;
+    let (mut applied_in_bom, mut applied_on_board) = (None, None);
     let mut edit_reference = reference.as_str();
 
     let mut errors: Vec<String> = Vec::new();
@@ -3376,7 +3441,7 @@ async fn handle_edit_schematic_component(
         // Bound by UUID; a unit missed here fails the prospective readback,
         // before anything is committed.
         let blocks = symbol_blocks_by_uuid(&content, &target.uuids());
-        match set_dnp_in_blocks(&content, &blocks, &reference, dnp) {
+        match set_flag_in_blocks(&content, &blocks, &reference, "dnp", dnp) {
             Ok(updated) => {
                 content = updated;
                 applied_dnp = Some(dnp);
@@ -3393,6 +3458,33 @@ async fn handle_edit_schematic_component(
                 return Ok(ComponentDeleteTargetError::stale(
                     &sch_path,
                     format!("no fields were updated on '{reference}': dnp: {why}"),
+                )
+                .into_result())
+            }
+        }
+    }
+    // KiCad keeps these per unit too, and the board sync refuses a part
+    // whose units disagree on them.
+    for (flag, value) in requested_flags {
+        let blocks = symbol_blocks_by_uuid(&content, &target.uuids());
+        match set_flag_in_blocks(&content, &blocks, &reference, flag, value) {
+            Ok(updated) => {
+                content = updated;
+                if flag == "in_bom" {
+                    applied_in_bom = Some(value);
+                } else {
+                    applied_on_board = Some(value);
+                }
+                changed.push(format!(
+                    "{flag} → {} ({} unit(s))",
+                    if value { "yes" } else { "no" },
+                    blocks.len()
+                ));
+            }
+            Err(why) => {
+                return Ok(ComponentDeleteTargetError::stale(
+                    &sch_path,
+                    format!("no fields were updated on '{reference}': {flag}: {why}"),
                 )
                 .into_result())
             }
@@ -3552,7 +3644,8 @@ async fn handle_edit_schematic_component(
         target
             .with_fields(&expected_fields)
             .without_fields(&remove_names)
-            .with_dnp(applied_dnp),
+            .with_dnp(applied_dnp)
+            .with_bom_and_board(applied_in_bom, applied_on_board),
     )
     .with_field_placements(applied_placements, placement_unit);
     let observed = if !changed.is_empty() {
@@ -11491,7 +11584,8 @@ mod private_field_tests {
 #[cfg(test)]
 mod native_dnp_tests {
     //! KiCad's native do-not-populate attribute through the component tools
-    //! (#415). The fixture is KiCad-saved; see its README.
+    //! (#415), and its Exclude from BOM and Exclude from board flags (#34).
+    //! The fixture is KiCad-saved; see its README.
     use super::*;
     use crate::mcp::{error::extract_error_kind, protocol::ToolContent};
     use crate::tools::ServerConfig;
@@ -12469,6 +12563,340 @@ mod native_dnp_tests {
         assert!(
             result["errors"][0].as_str().unwrap().contains("Duplicate"),
             "{result}"
+        );
+    }
+
+    // Exclude from BOM and Exclude from board, KiCad's native `(in_bom …)` and
+    // `(on_board …)`, set through the same path as `dnp` (#34).
+
+    /// Each placed unit of `reference` as (unit, the value of its direct
+    /// `(flag …)` child), read as `native_dnp` reads `(dnp …)`.
+    fn native_flag(content: &str, reference: &str, flag: &str) -> Vec<(u32, Option<String>)> {
+        let tree = parse_sexp(content).unwrap();
+        let mut units = tree
+            .children()
+            .unwrap()
+            .iter()
+            .filter(|node| node.head() == Some("symbol") && node.find("lib_id").is_some())
+            .filter(|node| {
+                node.find_all("property").iter().any(|property| {
+                    property.get(1).and_then(SexpNode::as_str) == Some("Reference")
+                        && property.get(2).and_then(SexpNode::as_str) == Some(reference)
+                })
+            })
+            .map(|node| {
+                let values = node
+                    .children()
+                    .unwrap()
+                    .iter()
+                    .filter(|child| child.head() == Some(flag))
+                    .map(|child| child.get(1).and_then(SexpNode::as_str).unwrap().to_owned())
+                    .collect::<Vec<_>>();
+                assert!(values.len() <= 1, "one ({flag} …) per placed unit");
+                let unit = node.find_str("unit").unwrap().parse().unwrap();
+                (unit, values.into_iter().next())
+            })
+            .collect::<Vec<_>>();
+        units.sort();
+        units
+    }
+
+    /// `kicad_with` for any of the flags: KiCad's text with `flag` flipped on
+    /// every placed unit of `reference`.
+    fn kicad_with_flag(content: &str, reference: &str, flag: &str, from: &str, to: &str) -> String {
+        let mut out = content.to_owned();
+        for (start, end) in kicad_blocks(content, reference) {
+            let block = &content[start..end];
+            let flipped = block.replacen(
+                &format!("\n\t\t({flag} {from})"),
+                &format!("\n\t\t({flag} {to})"),
+                1,
+            );
+            assert_ne!(block, flipped, "{reference} carries ({flag} {from})");
+            out = out.replacen(block, &flipped, 1);
+        }
+        out
+    }
+
+    /// Each flag goes to `no` and back on KiCad's own bytes, and the reply
+    /// reads it back; the other flags stay as the file has them.
+    #[tokio::test]
+    async fn in_bom_and_on_board_round_trip_to_kicads_own_bytes() {
+        for (flag, other) in [("in_bom", "on_board"), ("on_board", "in_bom")] {
+            let (_dir, path) = fixture(SHEET);
+            let off = body(
+                &call(
+                    "edit_schematic_component",
+                    &path,
+                    json!({ "reference": "C1", flag: false }),
+                )
+                .await,
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                kicad_with_flag(SHEET, "C1", flag, "yes", "no"),
+                "{flag}"
+            );
+            assert_eq!(off[flag], false, "{off}");
+            assert_eq!(off["units"][0][flag], false, "{off}");
+            assert_eq!(off[other], true, "{off}");
+            assert_eq!(off["dnp"], true, "C1 is DNP in the fixture: {off}");
+
+            let on = body(
+                &call(
+                    "edit_schematic_component",
+                    &path,
+                    json!({ "reference": "C1", flag: true }),
+                )
+                .await,
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                SHEET,
+                "{flag}: back to KiCad's bytes"
+            );
+            assert_eq!(on[flag], true, "{on}");
+        }
+    }
+
+    /// Both flags in one call reach every placed unit of U1.
+    #[tokio::test]
+    async fn every_placed_unit_takes_in_bom_and_on_board() {
+        let (_dir, path) = fixture(SHEET);
+        let result = call(
+            "edit_schematic_component",
+            &path,
+            json!({ "reference": "U1", "in_bom": false, "on_board": false }),
+        )
+        .await;
+        let changes = text(&result);
+        let result = body(&result);
+        let expected = kicad_with_flag(
+            &kicad_with_flag(SHEET, "U1", "in_bom", "yes", "no"),
+            "U1",
+            "on_board",
+            "yes",
+            "no",
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        for flag in ["in_bom", "on_board"] {
+            assert_eq!(native_flag(&expected, "U1", flag).len(), 3);
+            assert!(
+                changes.contains(&format!("{flag} → no (3 unit(s))")),
+                "{changes}"
+            );
+        }
+        let units = result["units"].as_array().unwrap();
+        assert_eq!(units.len(), 3, "{result}");
+        assert!(
+            units
+                .iter()
+                .all(|unit| unit["in_bom"] == false && unit["on_board"] == false),
+            "{result}"
+        );
+    }
+
+    /// A call that names neither flag keeps what the file holds, here a C1
+    /// excluded from both, while it edits the value.
+    #[tokio::test]
+    async fn an_edit_without_the_flags_keeps_the_files_values() {
+        let excluded = kicad_with_flag(
+            &kicad_with_flag(SHEET, "C1", "in_bom", "yes", "no"),
+            "C1",
+            "on_board",
+            "yes",
+            "no",
+        );
+        let (_dir, path) = fixture(&excluded);
+        let result = body(
+            &call(
+                "edit_schematic_component",
+                &path,
+                json!({ "reference": "C1", "value": "220n" }),
+            )
+            .await,
+        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        for flag in ["in_bom", "on_board"] {
+            assert_eq!(
+                native_flag(&saved, "C1", flag),
+                vec![(1, Some("no".to_owned()))]
+            );
+            assert_eq!(result[flag], false, "{result}");
+        }
+        assert_eq!(native_dnp(&saved, "C1"), native_dnp(SHEET, "C1"));
+    }
+
+    /// Setting the value a file already holds leaves KiCad's bytes.
+    #[tokio::test]
+    async fn setting_the_stored_value_leaves_kicads_bytes() {
+        let (_dir, path) = fixture(SHEET);
+        let result = body(
+            &call(
+                "edit_schematic_component",
+                &path,
+                json!({ "reference": "U1", "in_bom": true, "on_board": true }),
+            )
+            .await,
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
+        assert_eq!(result["in_bom"], true, "{result}");
+        assert_eq!(result["on_board"], true, "{result}");
+    }
+
+    /// A value that is not a boolean, a reference the sheet lacks, `unit`
+    /// beside a flag alone, and a sheet KiCad holds are each refused, and
+    /// nothing is written. The malformed value is refused by the served schema
+    /// and, for direct callers, by the handler.
+    #[tokio::test]
+    async fn in_bom_and_on_board_refusals_write_nothing() {
+        for flag in ["in_bom", "on_board"] {
+            let (_dir, path) = fixture(SHEET);
+            let malformed = json!({ "reference": "R1", flag: "no", "value": "1k" });
+            for result in [
+                call("edit_schematic_component", &path, malformed.clone()).await,
+                call_direct("edit_schematic_component", &path, malformed).await,
+            ] {
+                assert_eq!(
+                    extract_error_kind(&result).as_deref(),
+                    Some("invalid_argument"),
+                    "{flag}: {}",
+                    text(&result)
+                );
+            }
+            for (args, kind) in [
+                (json!({ "reference": "R99", flag: false }), None),
+                (
+                    json!({ "reference": "U1", "unit": 2, flag: false }),
+                    Some("invalid_argument"),
+                ),
+            ] {
+                let result = call("edit_schematic_component", &path, args).await;
+                assert!(result.is_error, "{flag}: {}", text(&result));
+                if let Some(kind) = kind {
+                    assert_eq!(extract_error_kind(&result).as_deref(), Some(kind));
+                }
+            }
+            let lock = path.with_file_name(format!(
+                "~{}.lck",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            std::fs::write(&lock, "locked").unwrap();
+            let result = call(
+                "edit_schematic_component",
+                &path,
+                json!({ "reference": "R1", flag: false }),
+            )
+            .await;
+            assert_eq!(
+                extract_error_kind(&result).as_deref(),
+                Some("conflict"),
+                "{flag}: {}",
+                text(&result)
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET, "{flag}");
+        }
+    }
+
+    /// A placed symbol with neither token gets each where KiCad 10 writes it,
+    /// `(in_bom …)` after `(exclude_from_sim …)` and `(on_board …)` after it:
+    /// U1 lands on KiCad's own bytes.
+    #[tokio::test]
+    async fn a_symbol_without_the_flags_gets_them_where_kicad_writes_them() {
+        let strip = |sheet: &str| {
+            sheet
+                .replace("\n\t\t(in_bom yes)", "")
+                .replace("\n\t\t(on_board yes)", "")
+        };
+        let mut expected = kicad_with_flag(
+            &kicad_with_flag(SHEET, "U1", "in_bom", "yes", "no"),
+            "U1",
+            "on_board",
+            "yes",
+            "no",
+        );
+        for (start, end) in kicad_blocks(&expected, "R1")
+            .into_iter()
+            .chain(kicad_blocks(&expected, "C1"))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .rev()
+        {
+            let block = strip(&expected[start..end]);
+            expected.replace_range(start..end, &block);
+        }
+        let tokenless = strip(SHEET);
+        assert!(native_flag(&tokenless, "U1", "in_bom")
+            .iter()
+            .all(|(_, value)| value.is_none()));
+        let (_dir, path) = fixture(&tokenless);
+        body(
+            &call(
+                "edit_schematic_component",
+                &path,
+                json!({ "reference": "U1", "in_bom": false, "on_board": false }),
+            )
+            .await,
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    }
+
+    /// KiCad's BOM export leaves out a part whose `in_bom` was set to false,
+    /// and lists it again once it is set back. Needs a real kicad-cli, named
+    /// by `KICAD_CLI`.
+    #[tokio::test]
+    #[ignore = "needs a real kicad-cli, named by KICAD_CLI"]
+    async fn kicads_bom_export_follows_in_bom() {
+        let cli = std::env::var("KICAD_CLI").expect("KICAD_CLI names kicad-cli");
+        let (dir, path) = fixture(SHEET);
+        let bom = dir.path().join("bom.csv");
+        let listed = |content: &str| {
+            content
+                .lines()
+                .skip(1)
+                .any(|row| row.split(',').next() == Some("\"R1\""))
+        };
+        let options = crate::tools::cli::BomOptions {
+            fields: Some("Reference,Value"),
+            ..Default::default()
+        };
+        crate::tools::cli::export_bom(&cli, &path, &bom, &options)
+            .await
+            .unwrap();
+        assert!(listed(&std::fs::read_to_string(&bom).unwrap()), "R1 listed");
+
+        body(
+            &call(
+                "edit_schematic_component",
+                &path,
+                json!({ "reference": "R1", "in_bom": false }),
+            )
+            .await,
+        );
+        crate::tools::cli::export_bom(&cli, &path, &bom, &options)
+            .await
+            .unwrap();
+        let excluded = std::fs::read_to_string(&bom).unwrap();
+        assert!(!listed(&excluded), "R1 left out:\n{excluded}");
+        assert!(
+            excluded.lines().any(|row| row.starts_with("\"C1\"")),
+            "C1 still listed:\n{excluded}"
+        );
+
+        body(
+            &call(
+                "edit_schematic_component",
+                &path,
+                json!({ "reference": "R1", "in_bom": true }),
+            )
+            .await,
+        );
+        crate::tools::cli::export_bom(&cli, &path, &bom, &options)
+            .await
+            .unwrap();
+        assert!(
+            listed(&std::fs::read_to_string(&bom).unwrap()),
+            "R1 listed again"
         );
     }
 }
