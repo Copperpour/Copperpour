@@ -8,26 +8,37 @@ use copperpour_core::router::registry;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-fn tools_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+/// The source directories that hold tool handlers: `tools/`, and the domain
+/// modules #209 moves handlers into, such as `autorouting/`. Each is read
+/// recursively.
+fn handler_dirs() -> Vec<PathBuf> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(1)
         .expect("crates directory above konnect")
-        .join("copperpour-core/src/tools")
+        .join("copperpour-core/src");
+    ["tools", "autorouting"]
+        .into_iter()
+        .map(|dir| src.join(dir))
+        .collect()
 }
 
 fn tool_sources() -> Vec<(PathBuf, String)> {
-    let mut sources = std::fs::read_dir(tools_dir())
-        .expect("read tools source directory")
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        .map(|path| {
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-            (path, source)
-        })
-        .collect::<Vec<_>>();
+    let mut stack = handler_dirs();
+    let mut sources = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+                sources.push((path, source));
+            }
+        }
+    }
     sources.sort_by(|a, b| a.0.cmp(&b.0));
     sources
 }

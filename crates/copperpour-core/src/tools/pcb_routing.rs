@@ -2886,11 +2886,11 @@ mod specctra_live_undo_test {
         let candidate = temp.path().join("board.freerouted.kicad_pcb");
         std::fs::write(&dsn, export.dsn).expect("write deterministic DSN");
         std::fs::write(&manifest, export.manifest).expect("write reverse manifest");
-        crate::freerouting_mcp::route_local(
+        crate::autorouting::freerouting::mcp::route_local(
             &freerouting_jar,
             &dsn,
             &ses,
-            &crate::freerouting_mcp::RouteSettings {
+            &crate::autorouting::freerouting::mcp::RouteSettings {
                 max_passes: Some(20),
                 optimizer_enabled: Some(false),
                 job_timeout_seconds: Some(120),

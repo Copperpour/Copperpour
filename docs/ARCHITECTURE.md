@@ -35,6 +35,13 @@ installation, KiCad, and IPC evidence returned by `get_installation_info`.
 `ServerConfig`, the `tool!` macro, required-argument helpers, and shared path and
 library helpers. Domain handlers live in the other files under `src/tools`.
 
+Code that serves a vendor or an external program, rather than KiCad data, is
+moving out of `src/tools` into domain modules (#209). The toolset's handler
+stays in its `src/tools` file and delegates. `autorouting/freerouting` holds
+Freerouting discovery, the Java checks and the headless routing session; the
+`integration` toolset's `check_freerouting` and `route_specctra_dsn` handlers
+call it.
+
 ### KiCad data layers
 
 `crates/copperpour-sexp` owns low-level KiCad S-expression parsing, edits, geometry,
