@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::sexp::{atom, qstr, tagged, SexpNode};
 use crate::types::{fmt_f64, At, Effects, Property};
+use copperpour_sexp::geometry::round6;
 
 // ---- SheetPin -----------------------------------------------------------------
 
@@ -357,9 +358,29 @@ impl Sheet {
             pin.at.translate(dx, dy);
         }
     }
+    /// Resize the box from its top-left corner, keeping what is anchored to it.
+    ///
+    /// The right and bottom edges move, so the pins on them and the `Sheetfile`
+    /// caption below the box move too. A pin past the end of a shrunken edge is
+    /// pulled back to its corner, which is where KiCad would put it on load.
+    /// Moved pin coordinates are rounded to the six decimals KiCad writes, so
+    /// the in-memory sheet reports what the file will hold.
     pub fn set_size(&mut self, width: f64, height: f64) {
+        let (dw, dh) = (width - self.width, height - self.height);
         self.width = width;
         self.height = height;
+        for prop in self.properties.iter_mut().filter(|p| p.name == "Sheetfile") {
+            prop.translate(0.0, dh);
+        }
+        for pin in &mut self.pins {
+            match pin.at.rotation {
+                Some(0.0) => pin.at.x += dw,
+                Some(270.0) => pin.at.y += dh,
+                _ => {}
+            }
+            pin.at.x = round6(pin.at.x.clamp(self.at.x, self.at.x + width));
+            pin.at.y = round6(pin.at.y.clamp(self.at.y, self.at.y + height));
+        }
     }
 
     // ---- pins -------------------------------------------------------------------
@@ -600,7 +621,9 @@ mod tests {
             "(property \"Sheetname\" \"Power\" (at 100 49.2 0)) ",
             "(property \"Sheetfile\" \"power.kicad_sch\" (at 100 80.4 0)) ",
             "(pin \"VIN\" input (at 140 60 0) ",
-            "(uuid \"8b1f0000-0000-0000-0000-000000000000\")))"
+            "(uuid \"8b1f0000-0000-0000-0000-000000000000\")) ",
+            "(pin \"VOUT\" output (at 120 80 270) ",
+            "(uuid \"8b1f0001-0000-0000-0000-000000000000\")))"
         );
         Sheet::from_sexp(&parse_one(src)).unwrap()
     }
@@ -649,6 +672,35 @@ mod tests {
             (240.0, 100.0),
             "pin must stay on the box edge"
         );
+    }
+
+    /// `VIN` is on the right edge (rotation 0) and `VOUT` on the bottom one
+    /// (rotation 270): each moves with its own edge and keeps the other axis.
+    #[test]
+    fn set_size_keeps_the_edge_pins_and_file_caption_attached() {
+        let mut sheet = placed_sheet();
+        sheet.set_size(60.0, 45.0);
+
+        assert_eq!((sheet.pins[0].at.x, sheet.pins[0].at.y), (160.0, 60.0));
+        assert_eq!((sheet.pins[1].at.x, sheet.pins[1].at.y), (120.0, 95.0));
+        assert_eq!(property_position(&sheet, "Sheetname"), (100.0, 49.2));
+        assert_eq!(property_position(&sheet, "Sheetfile"), (100.0, 95.4));
+    }
+
+    #[test]
+    fn set_size_pulls_a_pin_back_onto_a_shrunken_edge() {
+        let mut sheet = placed_sheet();
+        sheet.set_size(40.0, 5.0);
+
+        assert_eq!((sheet.pins[0].at.x, sheet.pins[0].at.y), (140.0, 55.0));
+        assert_eq!((sheet.pins[1].at.x, sheet.pins[1].at.y), (120.0, 55.0));
+
+        // A narrower box leaves `VOUT` past the end of the bottom edge, so it
+        // is pulled back to the bottom-right corner.
+        let mut sheet = placed_sheet();
+        sheet.set_size(10.0, 30.0);
+
+        assert_eq!((sheet.pins[1].at.x, sheet.pins[1].at.y), (110.0, 80.0));
     }
 
     #[test]
