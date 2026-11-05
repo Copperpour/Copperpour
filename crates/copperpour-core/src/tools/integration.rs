@@ -1361,8 +1361,9 @@ fn search_ranking_criteria() -> Vec<&'static str> {
 /// from using the index here; the `Stock IS NULL` count still uses it.
 const JLCPCB_IN_STOCK_FILTER: &str = " AND +Stock > 0";
 
-/// [`search_ranking_criteria`] as an `ORDER BY`. The import stores an unknown
-/// price as 0, as [`AlternativeCandidate::price_known`] reads it.
+/// [`search_ranking_criteria`] as an `ORDER BY`. A current catalog stores an
+/// unknown price as NULL and one from before #63 as 0. Both rank as unknown
+/// and sort as 0, as [`AlternativeCandidate`] reads them.
 fn jlcpcb_ranking_order_by() -> String {
     let tiers: String = LIBRARY_TYPE_ORDER
         .iter()
@@ -1370,7 +1371,7 @@ fn jlcpcb_ranking_order_by() -> String {
         .map(|(rank, kind)| format!(" WHEN '{kind}' THEN {rank}"))
         .collect();
     format!(
-        " ORDER BY Stock > 0 DESC, CASE Library_Type{tiers} ELSE {} END, (Price > 0) DESC, Price, Stock DESC, LCSC",
+        " ORDER BY Stock > 0 DESC, CASE Library_Type{tiers} ELSE {} END, COALESCE(Price, 0) > 0 DESC, COALESCE(Price, 0), Stock DESC, LCSC",
         LIBRARY_TYPE_ORDER.len()
     )
 }
@@ -5083,12 +5084,14 @@ mod jlcpcb_cache_tests {
         let (_dir, db_path) = seed_multi_word_db();
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         for (lcsc, library_type, price, stock) in [
-            ("C4001", "Extended", 0.01, 1000),
-            ("C4002", "Basic", 0.05, 10),
-            ("C4003", "Preferred", 0.02, 10),
-            ("C4004", "Basic", 0.0, 999_999),
-            ("C4005", "Basic", 0.05, 500),
-            ("C4006", "Basic", 0.001, 0),
+            ("C4001", "Extended", Some(0.01), 1000),
+            ("C4002", "Basic", Some(0.05), 10),
+            ("C4003", "Preferred", Some(0.02), 10),
+            ("C4004", "Basic", Some(0.0), 999_999),
+            ("C4005", "Basic", Some(0.05), 500),
+            ("C4006", "Basic", Some(0.001), 0),
+            // An unknown price ranks with a 0 price, by stock (#63).
+            ("C4007", "Basic", None, 5_000_000),
         ] {
             conn.execute(
                 "INSERT INTO components VALUES (?1, 'RNK-1', '0805', 'Acme', ?2, 'rankcheck part', '', ?3, ?4, 'Misc')",
@@ -5113,7 +5116,7 @@ mod jlcpcb_cache_tests {
         let body = search(true).await;
         assert_eq!(
             ranked_ids(&body),
-            ["C4005", "C4002", "C4004", "C4003", "C4001"]
+            ["C4005", "C4002", "C4007", "C4004", "C4003", "C4001"]
         );
         assert_eq!(body["ranking"][0], "in stock before out of stock");
         assert_eq!(body["ranking"], json!(search_ranking_criteria()));
@@ -5121,7 +5124,7 @@ mod jlcpcb_cache_tests {
         // stocked part, Extended included.
         assert_eq!(
             ranked_ids(&search(false).await),
-            ["C4005", "C4002", "C4004", "C4003", "C4001", "C4006"]
+            ["C4005", "C4002", "C4007", "C4004", "C4003", "C4001", "C4006"]
         );
     }
 
