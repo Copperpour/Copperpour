@@ -84,6 +84,27 @@ pub(crate) fn lcsc_api_base(args: &serde_json::Value) -> &str {
     args["_api_base_url"].as_str().unwrap_or(LCSC_DETAIL_URL)
 }
 
+/// The datasheet URL the LCSC API gives for a part, trimmed. `None` when it
+/// gives none (an empty URL or `~` included), or when the request fails.
+pub(crate) async fn datasheet_url(
+    client: &reqwest::Client,
+    args: &serde_json::Value,
+    lcsc_id: &str,
+) -> Option<String> {
+    let response = get_with_backoff(client, &lcsc_detail_url(args, lcsc_id))
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.json::<serde_json::Value>().await.ok()?;
+    body.pointer("/result/dataManualUrl")
+        .and_then(|url| url.as_str())
+        .map(str::trim)
+        .filter(|url| !url.is_empty() && *url != "~")
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod retry_backoff_tests {
     use super::*;

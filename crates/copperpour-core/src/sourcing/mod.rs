@@ -52,6 +52,11 @@ impl LcscCatalog {
         self.explicit
     }
 
+    /// The catalog's path when there is a file at it, or why there isn't.
+    pub(crate) fn available_path(&self) -> Result<PathBuf, String> {
+        self.available().map(Path::to_path_buf)
+    }
+
     fn available(&self) -> Result<&Path, String> {
         match &self.path {
             None => Err(

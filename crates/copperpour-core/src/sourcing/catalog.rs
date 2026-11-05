@@ -757,7 +757,8 @@ pub(crate) fn query_alternative_candidates(
     value: &str,
     packages: &[String],
 ) -> anyhow::Result<(Vec<AlternativeCandidate>, i64)> {
-    let conn = rusqlite::Connection::open(db_path)?;
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let schema_version = catalog_schema_version(&conn)?;
     let placeholders = (1..=packages.len())
         .map(|i| format!("?{i}"))
@@ -842,6 +843,246 @@ pub(crate) fn query_catalog_datasheets(
         }
     }
     Ok(read)
+}
+
+/// The parts found, how many parts with unknown stock `in_stock` left out
+/// (counted only where the catalog can say so), and the catalog's version.
+pub(crate) type SearchOutcome = (Vec<serde_json::Value>, Option<usize>, i64);
+
+/// `search_jlcpcb_parts`' query: every word in `tokens` must match one of the
+/// searchable columns; with no match, a punctuation-normalised retry of
+/// `query`.
+pub(crate) fn search_parts(
+    db_path: &Path,
+    query: &str,
+    tokens: &[String],
+    category: Option<&str>,
+    basic_only: bool,
+    in_stock: bool,
+    limit: usize,
+) -> anyhow::Result<SearchOutcome> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let schema_version = catalog_schema_version(&conn)?;
+    // A catalog from before #63 stored unknown stock as 0, so it has none
+    // to count.
+    let count_unknown_stock = in_stock && schema_version >= JLCPCB_CATALOG_SCHEMA_VERSION;
+
+    // The JLCPCB db schema has columns: LCSC, MFR_Part, Package, Solder_Joint,
+    // Manufacturer, Library_Type, Description, Datasheet, Price, Stock
+    //
+    // Every whitespace-separated word must match somewhere in one of
+    // the searchable columns, in any order (#432). `%`, `_` and `\` in a
+    // word are matched literally, and every value is a bound parameter.
+    let mut sql = String::from(
+        "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
+         FROM components WHERE 1=1",
+    );
+    let mut params: Vec<String> = Vec::new();
+    for token in tokens {
+        params.push(format!("%{}%", escape_like(token)));
+        let n = params.len();
+        sql.push_str(&format!(
+            " AND (Description LIKE ?{n} ESCAPE '\\' OR MFR_Part LIKE ?{n} ESCAPE '\\' \
+             OR LCSC LIKE ?{n} ESCAPE '\\' OR Package LIKE ?{n} ESCAPE '\\' \
+             OR Manufacturer LIKE ?{n} ESCAPE '\\')"
+        ));
+    }
+    if basic_only {
+        sql.push_str(" AND Library_Type = 'Basic'");
+    }
+    if let Some(cat) = category {
+        params.push(format!("%{}%", escape_like(cat)));
+        sql.push_str(&format!(" AND Category LIKE ?{} ESCAPE '\\'", params.len()));
+    }
+    // `in_stock` keeps parts whose stock is known and above 0; those with
+    // unknown stock are counted instead of silently dropped (#63).
+    let unknown_stock_sql = format!("{sql} AND Stock IS NULL");
+    if in_stock {
+        sql.push_str(JLCPCB_IN_STOCK_FILTER);
+    }
+    // Ranked in-stock first, then as suggest_jlcpcb_alternatives ranks
+    // (#90), ending on the LCSC number so a page is the same on every run
+    // (#432). The LIKE
+    // above cannot see value boundaries, so value words are checked
+    // here, and the limit is applied after that check.
+    sql.push_str(&jlcpcb_ranking_order_by());
+
+    let value_tokens: Vec<&String> = tokens
+        .iter()
+        .filter(|token| is_jlcpcb_value_token(token))
+        .collect();
+    let unknown_stock = |sql: &str, params: &[String], value_tokens: &[&String]| {
+        count_unknown_stock
+            .then(|| {
+                let mut statement = conn.prepare(sql)?;
+                collect_catalog_parts(&mut statement, params, value_tokens, usize::MAX)
+                    .map(|parts| parts.len())
+            })
+            .transpose()
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = collect_catalog_parts(&mut stmt, &params, &value_tokens, limit)?;
+    let main_unknown_stock = unknown_stock(&unknown_stock_sql, &params, &value_tokens)?;
+
+    if !rows.is_empty() {
+        return Ok((rows, main_unknown_stock, schema_version));
+    }
+
+    // Fallback: If exact token search yielded 0 results, retry with punctuation-normalized
+    // MPN and token matching. This resolves part numbers where hyphens or underscores
+    // were omitted, altered, or where a URL slug combines manufacturer and part number
+    // (e.g. "XUNPU-FPC_05FB40PH20" or "STM32F103C8T6").
+    let fallback_tokens: Vec<String> = query
+        .split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '/')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+
+    if fallback_tokens.is_empty() {
+        return Ok((Vec::new(), main_unknown_stock, schema_version));
+    }
+
+    let mut fallback_sql = String::from(
+        "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
+         FROM components WHERE 1=1",
+    );
+    let mut fallback_params: Vec<String> = Vec::new();
+    for token in &fallback_tokens {
+        fallback_params.push(format!("%{}%", escape_like(token)));
+        let n1 = fallback_params.len();
+
+        let clean: String = token
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        if clean.len() >= 2 {
+            fallback_params.push(format!("%{}%", escape_like(&clean)));
+            let n2 = fallback_params.len();
+            fallback_sql.push_str(&format!(
+                " AND (Description LIKE ?{n1} ESCAPE '\\' OR MFR_Part LIKE ?{n1} ESCAPE '\\' \
+                 OR LCSC LIKE ?{n1} ESCAPE '\\' OR Package LIKE ?{n1} ESCAPE '\\' \
+                 OR Manufacturer LIKE ?{n1} ESCAPE '\\' \
+                 OR REPLACE(REPLACE(REPLACE(REPLACE(MFR_Part, '-', ''), '_', ''), '/', ''), ' ', '') LIKE ?{n2} ESCAPE '\\' \
+                 OR REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(Manufacturer, '') || MFR_Part, '-', ''), '_', ''), '/', ''), ' ', '') LIKE ?{n2} ESCAPE '\\')"
+            ));
+        } else {
+            fallback_sql.push_str(&format!(
+                " AND (Description LIKE ?{n1} ESCAPE '\\' OR MFR_Part LIKE ?{n1} ESCAPE '\\' \
+                 OR LCSC LIKE ?{n1} ESCAPE '\\' OR Package LIKE ?{n1} ESCAPE '\\' \
+                 OR Manufacturer LIKE ?{n1} ESCAPE '\\')"
+            ));
+        }
+    }
+    if basic_only {
+        fallback_sql.push_str(" AND Library_Type = 'Basic'");
+    }
+    if let Some(cat) = category {
+        fallback_params.push(format!("%{}%", escape_like(cat)));
+        fallback_sql.push_str(&format!(
+            " AND Category LIKE ?{} ESCAPE '\\'",
+            fallback_params.len()
+        ));
+    }
+    let fallback_unknown_stock_sql = format!("{fallback_sql} AND Stock IS NULL");
+    if in_stock {
+        fallback_sql.push_str(JLCPCB_IN_STOCK_FILTER);
+    }
+    fallback_sql.push_str(&jlcpcb_ranking_order_by());
+
+    let fallback_value_tokens: Vec<&String> = fallback_tokens
+        .iter()
+        .filter(|token| is_jlcpcb_value_token(token))
+        .collect();
+    let mut fallback_stmt = conn.prepare(&fallback_sql)?;
+    let fallback_rows = collect_catalog_parts(
+        &mut fallback_stmt,
+        &fallback_params,
+        &fallback_value_tokens,
+        limit,
+    )?;
+    // Count the unknown-stock parts of the query whose results are
+    // returned: the fallback's when it found some, else the main query's.
+    let fallback_unknown_stock = if fallback_rows.is_empty() {
+        main_unknown_stock
+    } else {
+        unknown_stock(
+            &fallback_unknown_stock_sql,
+            &fallback_params,
+            &fallback_value_tokens,
+        )?
+    };
+
+    Ok((fallback_rows, fallback_unknown_stock, schema_version))
+}
+
+/// Every category with its part count and in-stock count, by name.
+pub(crate) fn list_categories(db_path: &Path) -> anyhow::Result<Vec<(String, i64, i64)>> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt = conn.prepare(
+        "SELECT Category, COUNT(*), SUM(Stock > 0) FROM components \
+         WHERE COALESCE(Category, '') <> '' GROUP BY Category ORDER BY Category",
+    )?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The part with this LCSC number as the catalog tools report it, with a
+/// note for a catalog from before #63, or `None` when the catalog lacks it.
+pub(crate) fn get_part(db_path: &Path, lcsc_id: &str) -> anyhow::Result<Option<serde_json::Value>> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let schema_version = catalog_schema_version(&conn)?;
+    let mut stmt = conn.prepare(
+    "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
+     FROM components WHERE LCSC = ?1 LIMIT 1"
+)?;
+    let mut rows = stmt.query_map(rusqlite::params![lcsc_id], row_to_part_json)?;
+    // A row that cannot be read is an error, not "not found" (#63).
+    let part = rows.next().transpose().map_err(|error| {
+        anyhow::anyhow!("cannot read part {lcsc_id} from the JLCPCB catalog: {error}")
+    })?;
+    Ok(part.map(|mut part| {
+        if let Some(note) = old_catalog_note(schema_version) {
+            part["catalog_note"] = json!(note);
+        }
+        part
+    }))
+}
+
+/// Parts, categories, schema version, and how many prices and stock counts
+/// are unknown, where the catalog can say.
+pub(crate) type CatalogStats = (i64, i64, i64, Option<(i64, i64)>);
+
+/// `get_jlcpcb_database_stats`' counts.
+pub(crate) fn catalog_stats(db_path: &Path) -> anyhow::Result<CatalogStats> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM components", [], |r| r.get(0))?;
+    let category_count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT Category) FROM components WHERE COALESCE(Category, '') <> ''",
+        [],
+        |r| r.get(0),
+    )?;
+    let schema_version = catalog_schema_version(&conn)?;
+    let unknown = if schema_version >= JLCPCB_CATALOG_SCHEMA_VERSION {
+        Some(conn.query_row(
+            "SELECT SUM(Price IS NULL), SUM(Stock IS NULL) FROM components",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                ))
+            },
+        )?)
+    } else {
+        None
+    };
+    Ok((count, category_count, schema_version, unknown))
 }
 
 #[cfg(test)]

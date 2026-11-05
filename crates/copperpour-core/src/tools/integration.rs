@@ -1,13 +1,13 @@
 //! `integration` toolset — JLCPCB parts database, datasheet enrichment, and Freerouting.
 //!
-//! JLCPCB tools query a local SQLite cache of the JLCPCB parts database.
-//! Datasheet enrichment uses the LCSC HTTP API. The Freerouting tools are
-//! registered here, and their discovery and routing code lives in
-//! `crate::autorouting::freerouting` (#209).
+//! The tools are registered and handled here. The local JLCPCB catalog (its
+//! path, import, queries and ranking) and the LCSC and EasyEDA APIs live in
+//! `crate::sourcing`, and every catalog read goes through its `LcscCatalog`.
+//! The Freerouting code lives in `crate::autorouting::freerouting` (#209).
 //!
-//! The three network calls (JLCPCB database download, LCSC datasheet lookups)
-//! go through `get_with_backoff`, which retries transient failures (network
-//! errors, 429, 5xx) with exponential backoff before giving up.
+//! The network calls (JLCPCB database download, LCSC datasheet lookups) go
+//! through `sourcing::lcsc_api::get_with_backoff`, which retries transient
+//! failures (network errors, 429, 5xx) with exponential backoff.
 //!
 //! The three JLCPCB query tools (`search_jlcpcb_parts`, `get_jlcpcb_part`,
 //! `suggest_jlcpcb_alternatives`) cache results in `ToolContext::jlcpcb_cache`
@@ -16,11 +16,7 @@
 //! can see whether a given result came from cache.
 
 use crate::autorouting::freerouting::{self, freerouting_jar_path_description};
-// The catalog and the LCSC API moved to `sourcing` (#209); the handlers here
-// call them as they did when they lived in this file.
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
-use crate::sourcing::catalog::*;
-use crate::sourcing::lcsc_api::*;
 use crate::tool;
 use crate::tools::{get_path, lcsc_packages, require_str, ToolContext, ToolDef};
 use copperpour_sexp::{
@@ -32,6 +28,11 @@ use copperpour_sexp::{
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+// The catalog and the LCSC API live in `sourcing` (#209); the handlers here
+// call them by name, as they did when the code was in this file.
+use crate::sourcing::catalog::*;
+use crate::sourcing::lcsc_api::*;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -205,6 +206,22 @@ fn require_db_path(args: &serde_json::Value, ctx: &ToolContext) -> Result<PathBu
         resolve_db_path(args, ctx),
         "the JLCPCB database (set jlcpcb_db_path in the server config)",
     )
+}
+
+/// A query tool's catalog read, or the refusal to return, in the words every
+/// catalog tool uses (#209). An unreadable catalog keeps the `handler_error`
+/// kind a failed query had before.
+fn catalog_result<T>(lookup: crate::sourcing::Lookup<T>) -> Result<T, CallToolResult> {
+    match lookup {
+        crate::sourcing::Lookup::Read(value) => Ok(value),
+        crate::sourcing::Lookup::Missing(reason) => Err(CallToolResult::error(reason)),
+        crate::sourcing::Lookup::Unreadable(reason) => Err(CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: reason.clone(),
+            },
+            format!("Tool error: {reason}"),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -391,15 +408,11 @@ async fn handle_search_jlcpcb_parts(
         Err(e) => return Ok(e),
     };
 
-    let db_path = match require_db_path(args, ctx) {
+    let catalog = crate::sourcing::LcscCatalog::resolve(args, ctx);
+    let db_path = match catalog.available_path() {
         Ok(path) => path,
-        Err(refusal) => return Ok(refusal),
+        Err(reason) => return Ok(CallToolResult::error(reason)),
     };
-    if !db_path.exists() {
-        return Ok(CallToolResult::error(
-            "JLCPCB database not found. Run download_jlcpcb_database first.",
-        ));
-    }
     let basic_only = args["basic_only"].as_bool().unwrap_or(false);
     let in_stock = args["in_stock"].as_bool().unwrap_or(true);
     let limit = args["limit"].as_u64().unwrap_or(20) as usize;
@@ -425,153 +438,24 @@ async fn handle_search_jlcpcb_parts(
     let tokens = jlcpcb_search_tokens(&query);
     let sql_tokens = tokens.clone();
     let query_for_fallback = query.clone();
-    // The parts found, how many parts with unknown stock `in_stock` left out
-    // (counted only where the catalog can say so), and the catalog's version.
-    type SearchOutcome = (Vec<serde_json::Value>, Option<usize>, i64);
-    let (results, unknown_stock_excluded, schema_version) = tokio::task::spawn_blocking(move || -> anyhow::Result<SearchOutcome> {
-        let conn = rusqlite::Connection::open(&db_path)?;
-        let schema_version = catalog_schema_version(&conn)?;
-        // A catalog from before #63 stored unknown stock as 0, so it has none
-        // to count.
-        let count_unknown_stock = in_stock && schema_version >= JLCPCB_CATALOG_SCHEMA_VERSION;
-
-        // The JLCPCB db schema has columns: LCSC, MFR_Part, Package, Solder_Joint,
-        // Manufacturer, Library_Type, Description, Datasheet, Price, Stock
-        //
-        // Every whitespace-separated word must match somewhere in one of
-        // the searchable columns, in any order (#432). `%`, `_` and `\` in a
-        // word are matched literally, and every value is a bound parameter.
-        let mut sql = String::from(
-            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
-             FROM components WHERE 1=1",
-        );
-        let mut params: Vec<String> = Vec::new();
-        for token in &sql_tokens {
-            params.push(format!("%{}%", escape_like(token)));
-            let n = params.len();
-            sql.push_str(&format!(
-                " AND (Description LIKE ?{n} ESCAPE '\\' OR MFR_Part LIKE ?{n} ESCAPE '\\' \
-                 OR LCSC LIKE ?{n} ESCAPE '\\' OR Package LIKE ?{n} ESCAPE '\\' \
-                 OR Manufacturer LIKE ?{n} ESCAPE '\\')"
-            ));
-        }
-        if basic_only {
-            sql.push_str(" AND Library_Type = 'Basic'");
-        }
-        if let Some(ref cat) = category {
-            params.push(format!("%{}%", escape_like(cat)));
-            sql.push_str(&format!(" AND Category LIKE ?{} ESCAPE '\\'", params.len()));
-        }
-        // `in_stock` keeps parts whose stock is known and above 0; those with
-        // unknown stock are counted instead of silently dropped (#63).
-        let unknown_stock_sql = format!("{sql} AND Stock IS NULL");
-        if in_stock {
-            sql.push_str(JLCPCB_IN_STOCK_FILTER);
-        }
-        // Ranked in-stock first, then as suggest_jlcpcb_alternatives ranks
-        // (#90), ending on the LCSC number so a page is the same on every run
-        // (#432). The LIKE
-        // above cannot see value boundaries, so value words are checked
-        // here, and the limit is applied after that check.
-        sql.push_str(&jlcpcb_ranking_order_by());
-
-        let value_tokens: Vec<&String> = sql_tokens
-            .iter()
-            .filter(|token| is_jlcpcb_value_token(token))
-            .collect();
-        let unknown_stock = |sql: &str, params: &[String], value_tokens: &[&String]| {
-            count_unknown_stock
-                .then(|| {
-                    let mut statement = conn.prepare(sql)?;
-                    collect_catalog_parts(&mut statement, params, value_tokens, usize::MAX)
-                        .map(|parts| parts.len())
-                })
-                .transpose()
-        };
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = collect_catalog_parts(&mut stmt, &params, &value_tokens, limit)?;
-        let main_unknown_stock = unknown_stock(&unknown_stock_sql, &params, &value_tokens)?;
-
-        if !rows.is_empty() {
-            return Ok((rows, main_unknown_stock, schema_version));
-        }
-
-        // Fallback: If exact token search yielded 0 results, retry with punctuation-normalized
-        // MPN and token matching. This resolves part numbers where hyphens or underscores
-        // were omitted, altered, or where a URL slug combines manufacturer and part number
-        // (e.g. "XUNPU-FPC_05FB40PH20" or "STM32F103C8T6").
-        let fallback_tokens: Vec<String> = query_for_fallback
-            .split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '/')
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect();
-
-        if fallback_tokens.is_empty() {
-            return Ok((Vec::new(), main_unknown_stock, schema_version));
-        }
-
-        let mut fallback_sql = String::from(
-            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
-             FROM components WHERE 1=1",
-        );
-        let mut fallback_params: Vec<String> = Vec::new();
-        for token in &fallback_tokens {
-            fallback_params.push(format!("%{}%", escape_like(token)));
-            let n1 = fallback_params.len();
-
-            let clean: String = token.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-            if clean.len() >= 2 {
-                fallback_params.push(format!("%{}%", escape_like(&clean)));
-                let n2 = fallback_params.len();
-                fallback_sql.push_str(&format!(
-                    " AND (Description LIKE ?{n1} ESCAPE '\\' OR MFR_Part LIKE ?{n1} ESCAPE '\\' \
-                     OR LCSC LIKE ?{n1} ESCAPE '\\' OR Package LIKE ?{n1} ESCAPE '\\' \
-                     OR Manufacturer LIKE ?{n1} ESCAPE '\\' \
-                     OR REPLACE(REPLACE(REPLACE(REPLACE(MFR_Part, '-', ''), '_', ''), '/', ''), ' ', '') LIKE ?{n2} ESCAPE '\\' \
-                     OR REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(Manufacturer, '') || MFR_Part, '-', ''), '_', ''), '/', ''), ' ', '') LIKE ?{n2} ESCAPE '\\')"
-                ));
-            } else {
-                fallback_sql.push_str(&format!(
-                    " AND (Description LIKE ?{n1} ESCAPE '\\' OR MFR_Part LIKE ?{n1} ESCAPE '\\' \
-                     OR LCSC LIKE ?{n1} ESCAPE '\\' OR Package LIKE ?{n1} ESCAPE '\\' \
-                     OR Manufacturer LIKE ?{n1} ESCAPE '\\')"
-                ));
-            }
-        }
-        if basic_only {
-            fallback_sql.push_str(" AND Library_Type = 'Basic'");
-        }
-        if let Some(ref cat) = category {
-            fallback_params.push(format!("%{}%", escape_like(cat)));
-            fallback_sql.push_str(&format!(
-                " AND Category LIKE ?{} ESCAPE '\\'",
-                fallback_params.len()
-            ));
-        }
-        let fallback_unknown_stock_sql = format!("{fallback_sql} AND Stock IS NULL");
-        if in_stock {
-            fallback_sql.push_str(JLCPCB_IN_STOCK_FILTER);
-        }
-        fallback_sql.push_str(&jlcpcb_ranking_order_by());
-
-        let fallback_value_tokens: Vec<&String> = fallback_tokens
-            .iter()
-            .filter(|token| is_jlcpcb_value_token(token))
-            .collect();
-        let mut fallback_stmt = conn.prepare(&fallback_sql)?;
-        let fallback_rows =
-            collect_catalog_parts(&mut fallback_stmt, &fallback_params, &fallback_value_tokens, limit)?;
-        // Count the unknown-stock parts of the query whose results are
-        // returned: the fallback's when it found some, else the main query's.
-        let fallback_unknown_stock = if fallback_rows.is_empty() {
-            main_unknown_stock
-        } else {
-            unknown_stock(&fallback_unknown_stock_sql, &fallback_params, &fallback_value_tokens)?
-        };
-
-        Ok((fallback_rows, fallback_unknown_stock, schema_version))
-    })
-    .await??;
+    let category_for_query = category.clone();
+    let read = catalog
+        .read(move |path| {
+            search_parts(
+                path,
+                &query_for_fallback,
+                &sql_tokens,
+                category_for_query.as_deref(),
+                basic_only,
+                in_stock,
+                limit,
+            )
+        })
+        .await;
+    let (results, unknown_stock_excluded, schema_version) = match catalog_result(read) {
+        Ok(outcome) => outcome,
+        Err(refusal) => return Ok(refusal),
+    };
 
     let mut body = json!({
         "query": args["query"].as_str().unwrap_or(""),
@@ -598,36 +482,17 @@ async fn handle_list_jlcpcb_categories(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let db_path = match require_db_path(args, ctx) {
-        Ok(path) => path,
-        Err(refusal) => return Ok(refusal),
-    };
-    if !db_path.exists() {
-        return Ok(CallToolResult::error(
-            "JLCPCB database not found. Run download_jlcpcb_database first.",
-        ));
-    }
+    let catalog = crate::sourcing::LcscCatalog::resolve(args, ctx);
     let contains = args["contains"]
         .as_str()
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_lowercase);
 
-    let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(String, i64, i64)>> {
-        let conn = rusqlite::Connection::open_with_flags(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        let mut stmt = conn.prepare(
-            "SELECT Category, COUNT(*), SUM(Stock > 0) FROM components \
-             WHERE COALESCE(Category, '') <> '' GROUP BY Category ORDER BY Category",
-        )?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    })
-    .await??;
+    let rows = match catalog_result(catalog.read(list_categories).await) {
+        Ok(rows) => rows,
+        Err(refusal) => return Ok(refusal),
+    };
 
     let body = match contains {
         Some(text) => {
@@ -687,15 +552,11 @@ async fn handle_get_jlcpcb_part(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let db_path = match require_db_path(args, ctx) {
+    let catalog = crate::sourcing::LcscCatalog::resolve(args, ctx);
+    let db_path = match catalog.available_path() {
         Ok(path) => path,
-        Err(refusal) => return Ok(refusal),
+        Err(reason) => return Ok(CallToolResult::error(reason)),
     };
-    if !db_path.exists() {
-        return Ok(CallToolResult::error(
-            "JLCPCB database not found. Run download_jlcpcb_database first.",
-        ));
-    }
     let lcsc_id = require_str(args, "lcsc_id")
         .map_err(|e| anyhow::anyhow!("{:?}", e))?
         .to_string();
@@ -708,27 +569,16 @@ async fn handle_get_jlcpcb_part(
         ));
     }
 
-    let result =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
-            let conn = rusqlite::Connection::open(&db_path)?;
-            let schema_version = catalog_schema_version(&conn)?;
-            let mut stmt = conn.prepare(
-            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
-             FROM components WHERE LCSC = ?1 LIMIT 1"
-        )?;
-            let mut rows = stmt.query_map(rusqlite::params![lcsc_id], row_to_part_json)?;
-            // A row that cannot be read is an error, not "not found" (#63).
-            let part = rows.next().transpose().map_err(|error| {
-                anyhow::anyhow!("cannot read part {lcsc_id} from the JLCPCB catalog: {error}")
-            })?;
-            Ok(part.map(|mut part| {
-                if let Some(note) = old_catalog_note(schema_version) {
-                    part["catalog_note"] = json!(note);
-                }
-                part
-            }))
+    let read = catalog
+        .read({
+            let lcsc_id = lcsc_id.clone();
+            move |path| get_part(path, &lcsc_id)
         })
-        .await??;
+        .await;
+    let result = match catalog_result(read) {
+        Ok(result) => result,
+        Err(refusal) => return Ok(refusal),
+    };
 
     match result {
         Some(part) => {
@@ -783,15 +633,11 @@ async fn handle_suggest_alternatives(
         ));
     };
 
-    let db_path = match require_db_path(args, ctx) {
+    let catalog = crate::sourcing::LcscCatalog::resolve(args, ctx);
+    let db_path = match catalog.available_path() {
         Ok(path) => path,
-        Err(refusal) => return Ok(refusal),
+        Err(reason) => return Ok(CallToolResult::error(reason)),
     };
-    if !db_path.exists() {
-        return Ok(CallToolResult::error(
-            "JLCPCB database not found. Run download_jlcpcb_database first.",
-        ));
-    }
     let policy = AlternativePolicy {
         min_stock_count: args["min_stock_count"]
             .as_u64()
@@ -821,10 +667,13 @@ async fn handle_suggest_alternatives(
 
     let packages = package_match.packages.clone();
     let query_value = value.clone();
-    let (candidates, schema_version) = tokio::task::spawn_blocking(move || {
-        query_alternative_candidates(&db_path, &query_value, &packages)
-    })
-    .await??;
+    let read = catalog
+        .read(move |path| query_alternative_candidates(path, &query_value, &packages))
+        .await;
+    let (candidates, schema_version) = match catalog_result(read) {
+        Ok(found) => found,
+        Err(refusal) => return Ok(refusal),
+    };
     let (alternatives, counts) = rank_alternatives(candidates, &policy);
 
     let body = json!({
@@ -870,11 +719,15 @@ async fn handle_jlcpcb_stats(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let db_path = match require_db_path(args, ctx) {
-        Ok(path) => path,
-        Err(refusal) => return Ok(refusal),
+    let catalog = crate::sourcing::LcscCatalog::resolve(args, ctx);
+    let Some(db_path) = catalog.path().map(Path::to_path_buf) else {
+        return Ok(CallToolResult::error(
+            catalog
+                .available_path()
+                .expect_err("no path is unavailable"),
+        ));
     };
-    if !db_path.exists() {
+    if !db_path.is_file() {
         return Ok(CallToolResult::text(
             serde_json::to_string(&json!({
                 "exists": false,
@@ -887,32 +740,11 @@ async fn handle_jlcpcb_stats(
     let meta = tokio::fs::metadata(&db_path).await?;
     let size_bytes = meta.len();
 
-    // How many prices and stock counts are unknown, where the catalog can say.
-    type Stats = (i64, i64, i64, Option<(i64, i64)>);
-    let (count, category_count, schema_version, unknown) = tokio::task::spawn_blocking({
-        let db_path = db_path.clone();
-        move || -> anyhow::Result<Stats> {
-            let conn = rusqlite::Connection::open(&db_path)?;
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM components", [], |r| r.get(0))?;
-            let category_count: i64 = conn.query_row(
-                "SELECT COUNT(DISTINCT Category) FROM components WHERE COALESCE(Category, '') <> ''",
-                [],
-                |r| r.get(0),
-            )?;
-            let schema_version = catalog_schema_version(&conn)?;
-            let unknown = if schema_version >= JLCPCB_CATALOG_SCHEMA_VERSION {
-                Some(conn.query_row(
-                    "SELECT SUM(Price IS NULL), SUM(Stock IS NULL) FROM components",
-                    [],
-                    |r| Ok((r.get::<_, Option<i64>>(0)?.unwrap_or(0), r.get::<_, Option<i64>>(1)?.unwrap_or(0))),
-                )?)
-            } else {
-                None
-            };
-            Ok((count, category_count, schema_version, unknown))
-        }
-    })
-    .await??;
+    let (count, category_count, schema_version, unknown) =
+        match catalog_result(catalog.read(catalog_stats).await) {
+            Ok(stats) => stats,
+            Err(refusal) => return Ok(refusal),
+        };
 
     let mut body = json!({
         "exists": true,
@@ -1080,26 +912,12 @@ async fn handle_enrich_datasheets(
             .build()?;
 
         for lcsc_id in &remaining_ids {
-            let url = lcsc_detail_url(args, lcsc_id);
-            let mut found = false;
-            if let Ok(resp) = get_with_backoff(&client, &url).await {
-                if resp.status().is_success() {
-                    if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
-                        if let Some(datasheet_url) = json_resp
-                            .pointer("/result/dataManualUrl")
-                            .and_then(|v| v.as_str())
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty() && *s != "~")
-                        {
-                            urls.insert(lcsc_id.clone(), datasheet_url.to_owned());
-                            api_hits += 1;
-                            found = true;
-                        }
-                    }
+            match datasheet_url(&client, args, lcsc_id).await {
+                Some(url) => {
+                    urls.insert(lcsc_id.clone(), url);
+                    api_hits += 1;
                 }
-            }
-            if !found {
-                misses += 1;
+                None => misses += 1,
             }
         }
     }
@@ -1533,26 +1351,16 @@ async fn handle_get_datasheet_url(
 
     // Try LCSC API with lcsc_id first
     if let Some(id) = lcsc_id {
-        let url = lcsc_detail_url(args, id);
-        if let Ok(resp) = get_with_backoff(&client, &url).await {
-            if resp.status().is_success() {
-                if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
-                    if let Some(ds_url) = json_resp
-                        .pointer("/result/dataManualUrl")
-                        .and_then(|v| v.as_str())
-                    {
-                        let mut body = json!({
-                            "lcsc_id": id,
-                            "datasheet_url": ds_url,
-                            "source": "lcsc_api"
-                        });
-                        if let Some(error) = &local_catalog_error {
-                            body["local_catalog_error"] = json!(error);
-                        }
-                        return Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()));
-                    }
-                }
+        if let Some(ds_url) = datasheet_url(&client, args, id).await {
+            let mut body = json!({
+                "lcsc_id": id,
+                "datasheet_url": ds_url,
+                "source": "lcsc_api"
+            });
+            if let Some(error) = &local_catalog_error {
+                body["local_catalog_error"] = json!(error);
             }
+            return Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()));
         }
     }
 
@@ -1860,6 +1668,45 @@ mod datasheet_enrichment_tests {
             }
         });
         (handle, url)
+    }
+
+    /// `get_datasheet_url` reads the LCSC API as `enrich_datasheets` does: a
+    /// URL is trimmed, and `~` is no datasheet (#209). It used to return them
+    /// as given.
+    #[tokio::test]
+    async fn get_datasheet_url_reads_the_api_as_enrich_does() {
+        let routes = HashMap::from([
+            ("C99999997".to_string(), Some("~".to_string())),
+            (
+                "C99999998".to_string(),
+                Some(" https://example.com/c8.pdf ".to_string()),
+            ),
+        ]);
+        let (_server, url) = start_mock_lcsc_server(routes).await;
+        let ctx = test_ctx();
+
+        let tilde = response_json(
+            &handle_get_datasheet_url(
+                &json!({ "lcsc_id": "C99999997", "_api_base_url": url }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(tilde["datasheet_url"], serde_json::Value::Null, "{tilde}");
+        let trimmed = response_json(
+            &handle_get_datasheet_url(
+                &json!({ "lcsc_id": "C99999998", "_api_base_url": url }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            trimmed["datasheet_url"], "https://example.com/c8.pdf",
+            "{trimmed}"
+        );
+        assert_eq!(trimmed["source"], "lcsc_api");
     }
 
     #[tokio::test]
@@ -3921,6 +3768,77 @@ mod catalog_unknown_values_tests {
     }
 
     /// A row that cannot be read is an error, not a missing result.
+    /// Through served dispatch, every query tool refuses a missing or an
+    /// unreadable catalog in the same words, and keeps `handler_error` for
+    /// the unreadable one (#209).
+    #[tokio::test]
+    async fn query_tools_report_a_missing_or_unreadable_catalog_alike() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.db");
+        let garbage = dir.path().join("garbage.db");
+        std::fs::write(&garbage, "not a database").unwrap();
+        let calls = [
+            ("search_jlcpcb_parts", json!({ "query": "10k" })),
+            ("get_jlcpcb_part", json!({ "lcsc_id": "C1" })),
+            ("list_jlcpcb_categories", json!({})),
+            (
+                "suggest_jlcpcb_alternatives",
+                json!({ "value": "10k", "footprint": "Resistor_SMD:R_0402_1005Metric" }),
+            ),
+        ];
+
+        // A missing catalog is a plain-text refusal, as it was before.
+        let raw = |handler: McpHandler, tool: &'static str, arguments: serde_json::Value| async move {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": tool, "arguments": arguments }
+                }))
+                .await
+                .expect("tools/call receives a response");
+            let result: CallToolResult =
+                serde_json::from_value(response.result.expect("a result")).unwrap();
+            match result.content.first() {
+                Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                    (result.is_error, text.clone())
+                }
+                other => panic!("expected text content, got {other:?}"),
+            }
+        };
+        for (tool, arguments) in &calls {
+            let (is_error, text) = raw(served(&missing).await, tool, arguments.clone()).await;
+            assert!(is_error, "{tool}: {text}");
+            assert_eq!(
+                text,
+                format!(
+                    "no catalog at {}; run download_jlcpcb_database to build it",
+                    missing.display()
+                ),
+                "{tool}"
+            );
+        }
+        let handler = served(&missing).await;
+        let stats = call(&handler, "get_jlcpcb_database_stats", json!({})).await;
+        assert_eq!(stats["exists"], false, "{stats}");
+
+        let handler = served(&garbage).await;
+        for (tool, arguments) in calls
+            .iter()
+            .chain([&("get_jlcpcb_database_stats", json!({}))])
+        {
+            let body = call(&handler, tool, arguments.clone()).await;
+            assert_eq!(body["is_error"], true, "{tool}: {body}");
+            assert_eq!(body["error"]["kind"], "handler_error", "{tool}: {body}");
+            assert!(
+                body["message"].as_str().unwrap().starts_with(&format!(
+                    "Tool error: cannot read the catalog at {}",
+                    garbage.display()
+                )),
+                "{tool}: {body}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn an_unreadable_row_is_an_error_not_a_missing_result() {
         let dir = tempfile::tempdir().unwrap();
