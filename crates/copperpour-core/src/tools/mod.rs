@@ -2087,9 +2087,12 @@ pub fn ensure_lib_symbol_in_schematic(
     lib_id: &str,
     src: &dyn copperpour_schematic_editor::library::SymbolLibrarySource,
 ) -> bool {
-    // Check if already present
-    let lib_id_check = format!("(symbol \"{}\"", lib_id);
-    if content.contains(&lib_id_check) {
+    // Already present: a direct child of lib_symbols with this name, on
+    // whichever line the name sits (see `lib_symbol_name`).
+    if copperpour_sexp::writer::find_direct_child_blocks(content, "lib_symbols")
+        .iter()
+        .any(|&(start, end)| lib_symbol_name(&content[start..end]) == Some(lib_id))
+    {
         return true;
     }
 
