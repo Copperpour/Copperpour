@@ -100,9 +100,11 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         description: "Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models",
         category: "library",
     },
+    // A toolset whose tools are all compiled out isn't listed (#210).
+    #[cfg(any(feature = "jlcpcb", feature = "freerouting"))]
     ToolsetMeta {
         name: "integration",
-        description: "JLCPCB parts database, local Freerouting MCP routing, datasheet URLs",
+        description: INTEGRATION_DESCRIPTION,
         category: "integration",
     },
     ToolsetMeta {
@@ -131,6 +133,15 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         category: "manufacturing",
     },
 ];
+
+/// What this build's `integration` toolset holds.
+#[cfg(all(feature = "jlcpcb", feature = "freerouting"))]
+const INTEGRATION_DESCRIPTION: &str =
+    "JLCPCB parts database, local Freerouting MCP routing, datasheet URLs";
+#[cfg(all(feature = "jlcpcb", not(feature = "freerouting")))]
+const INTEGRATION_DESCRIPTION: &str = "JLCPCB parts database, datasheet URLs";
+#[cfg(all(not(feature = "jlcpcb"), feature = "freerouting"))]
+const INTEGRATION_DESCRIPTION: &str = "Local Freerouting MCP routing";
 
 static TOOL_CATALOGUE: OnceLock<HashMap<&'static str, Vec<ToolDef>>> = OnceLock::new();
 
@@ -177,6 +188,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "placement" => Some(placement::tools()),
         "pcb_export" => Some(pcb_export::tools()),
         "library" => Some(library::tools()),
+        #[cfg(any(feature = "jlcpcb", feature = "freerouting"))]
         "integration" => Some(integration::tools()),
         "verification" => Some(verification::tools()),
         "config" => Some(config::tools()),

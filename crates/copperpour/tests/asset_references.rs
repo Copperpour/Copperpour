@@ -393,6 +393,10 @@ fn manufacturing_guidance_is_contract_bound_and_fail_closed() {
 
 /// Every `load_toolset('name')` in the shipped prose names a real toolset.
 #[test]
+#[cfg_attr(
+    not(all(feature = "jlcpcb", feature = "freerouting")),
+    ignore = "the shipped prose names the default build's tools (#210)"
+)]
 fn documented_toolsets_exist_in_the_registry() {
     let known: BTreeSet<&str> = registry::ALL_TOOLSETS.iter().map(|ts| ts.name).collect();
     let mut bad = Vec::new();
@@ -629,6 +633,10 @@ fn display(path: &Path) -> String {
 /// exemption from the registry means a name only escapes this check by being a
 /// real property of a real tool (#183).
 #[test]
+#[cfg_attr(
+    not(all(feature = "jlcpcb", feature = "freerouting")),
+    ignore = "the shipped prose names the default build's tools (#210)"
+)]
 fn backticked_tool_names_in_prose_exist_in_the_registry() {
     let known: BTreeSet<String> = registry::ALL_TOOLSETS
         .iter()

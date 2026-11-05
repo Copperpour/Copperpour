@@ -47,7 +47,7 @@ pub fn tools() -> Vec<ToolDef> {
              committed-file readback, copies the library Value and Footprint unless explicitly \
              overridden, and refuses stale instance metadata before writing. \
              Specify position in schematic mm coordinates.",
-            json!({
+            super::placement_schema(json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
@@ -64,7 +64,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "fields": { "type": "object", "additionalProperties": true, "description": "Additional custom properties to set on the placed component instance (e.g. {\"LCSC\": \"C123\", \"MPN\": \"...\"})" }
                 },
                 "required": ["schematic", "lib_id", "x", "y"]
-            }),
+            })),
             |args, ctx| async move { handle_add_schematic_component(args, ctx).await }
         ),
         tool!(
@@ -1027,7 +1027,7 @@ pub(crate) fn place_one_component(
 /// What the catalog gave for a placed symbol's LCSC number: `{ read, path,
 /// reason }` as every catalog report, plus `part_found` when it was read.
 fn placement_catalog_report(
-    lookup: &crate::sourcing::Lookup<Option<crate::sourcing::catalog::JlcpchPartInfo>>,
+    lookup: &crate::sourcing::Lookup<Option<crate::sourcing::JlcpchPartInfo>>,
     catalog: &crate::sourcing::LcscCatalog,
 ) -> serde_json::Value {
     let mut report = lookup.report(catalog);
@@ -5248,6 +5248,7 @@ mod tests {
 
     /// A context whose `jlcpcb_db_path` setting names `db_path`, as a caller
     /// configures the catalog: the placement tools take no path argument.
+    #[cfg(feature = "jlcpcb")]
     fn ctx_with_catalog(db_path: &std::path::Path) -> ToolContext {
         ToolContext::new(
             ServerConfig {
@@ -6503,7 +6504,31 @@ mod tests {
         );
     }
 
+    /// `lcsc_id` fills fields from the catalog, so a build without it doesn't
+    /// offer the argument, in either placement tool (#210).
+    #[test]
+    fn placement_offers_lcsc_id_only_with_the_catalog() {
+        for (toolset, name) in [
+            ("sch_components", "add_schematic_component"),
+            ("sch_batch", "batch_place_components"),
+        ] {
+            let tool = crate::router::registry::tools_for(toolset)
+                .unwrap()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .unwrap();
+            let schema = tool.input_schema.to_string();
+            assert_eq!(
+                schema.contains("\"lcsc_id\""),
+                cfg!(feature = "jlcpcb"),
+                "{name}"
+            );
+            assert!(schema.contains("\"fields\""), "{name}");
+        }
+    }
+
     #[tokio::test]
+    #[cfg(feature = "jlcpcb")]
     async fn placement_enriches_from_jlcpcb_db_using_lcsc_id() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("jlcpcb.db");
@@ -6572,6 +6597,7 @@ mod tests {
     /// response says why the fields weren't filled, as every catalog tool
     /// reports it (#209). Before, the lookup failed silently.
     #[tokio::test]
+    #[cfg(feature = "jlcpcb")]
     async fn placement_reports_an_unreadable_catalog() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("jlcpcb.db");

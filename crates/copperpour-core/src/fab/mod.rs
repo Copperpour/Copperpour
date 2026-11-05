@@ -103,6 +103,13 @@ pub(crate) enum ComponentPrice {
     },
 }
 
+#[cfg(feature = "jlcpcb")]
+const JLCPCB_EXTENDED_FEE_SOURCE: &str = "JLCPCB Economic PCBA: $3.07 per unique Extended part, none for Basic or Preferred Extended parts (https://jlcpcb.com/blog/reduce-pcb-assembly-cost-prototype, prices as of 2026-10-09)";
+/// Without the catalog no part's library type is known, so no Extended fee is
+/// counted, and the offline build carries no vendor URL (#210).
+#[cfg(not(feature = "jlcpcb"))]
+const JLCPCB_EXTENDED_FEE_SOURCE: &str = "JLCPCB Economic PCBA charges $3.07 per unique Extended part, none for Basic or Preferred Extended parts (prices as of 2026-10-09). This build has no JLCPCB catalog, so it doesn't know which parts are Extended and counts no such fee";
+
 const JLCPCB_COSTS: CostModel = CostModel {
     source: None,
     pcb: PcbPrice {
@@ -121,7 +128,7 @@ const JLCPCB_COSTS: CostModel = CostModel {
         // whose setup fee the estimate assumes. Basic and Preferred Extended
         // parts have none.
         extended_part_fee: 3.07,
-        fee_source: "JLCPCB Economic PCBA: $3.07 per unique Extended part, none for Basic or Preferred Extended parts (https://jlcpcb.com/blog/reduce-pcb-assembly-cost-prototype, prices as of 2026-10-09)",
+        fee_source: JLCPCB_EXTENDED_FEE_SOURCE,
     },
 };
 

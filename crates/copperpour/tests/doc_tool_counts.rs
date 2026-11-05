@@ -221,6 +221,10 @@ fn counts_in(line: &str) -> Vec<usize> {
 /// a toolset count is small enough that no digit-width heuristic can separate
 /// it from an unrelated number.
 #[test]
+#[cfg_attr(
+    not(all(feature = "jlcpcb", feature = "freerouting")),
+    ignore = "the docs quote the default build's registry (#210)"
+)]
 fn no_file_quotes_a_stale_toolset_count() {
     let (toolsets, _, _) = counts();
 

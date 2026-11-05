@@ -140,6 +140,10 @@ fn tool_like_words_after_triggers(text: &str) -> Vec<String> {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "jlcpcb", feature = "freerouting")),
+    ignore = "the tool text names the default build's tools (#210)"
+)]
 fn tool_text_names_only_tools_that_exist() {
     let tools = registry::ALL_TOOLSETS
         .iter()

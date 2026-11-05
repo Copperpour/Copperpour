@@ -15,10 +15,16 @@
 //! lookups within a session. Responses carry a `"cached"` field so callers
 //! can see whether a given result came from cache.
 
+#[cfg(feature = "freerouting")]
 use crate::autorouting::freerouting::{self, freerouting_jar_path_description};
-use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
+#[cfg(feature = "jlcpcb")]
+use crate::mcp::error::ToolErrorKind;
+use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, lcsc_packages, require_str, ToolContext, ToolDef};
+#[cfg(feature = "jlcpcb")]
+use crate::tools::{get_path, lcsc_packages, require_str};
+use crate::tools::{ToolContext, ToolDef};
+#[cfg(feature = "jlcpcb")]
 use copperpour_sexp::{
     command::{commit_command, prepare_command, ItemId, SchematicCommand},
     parse_sexp,
@@ -26,18 +32,23 @@ use copperpour_sexp::{
     SexpError, SexpNode,
 };
 use serde_json::json;
+#[cfg(feature = "jlcpcb")]
 use std::collections::HashMap;
+#[cfg(feature = "jlcpcb")]
 use std::path::{Path, PathBuf};
 
 // The catalog and the LCSC API live in `sourcing` (#209); the handlers here
 // call them by name, as they did when the code was in this file.
+#[cfg(feature = "jlcpcb")]
 use crate::sourcing::catalog::*;
+#[cfg(feature = "jlcpcb")]
 use crate::sourcing::lcsc_api::*;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
+        #[cfg(feature = "jlcpcb")]
         tool!(
             "download_jlcpcb_database",
             "Download or update the local JLCPCB component parts database cache (SQLite).",
@@ -51,6 +62,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_download_jlcpcb(args, ctx).await }
         ),
+        #[cfg(feature = "jlcpcb")]
         tool!(
             "search_jlcpcb_parts",
             "Search the local JLCPCB component database by keyword, value, or category. The query is split on whitespace and a part matches only if every word appears, in any order, in its LCSC number, MPN, package, manufacturer or description; case-insensitive. A word that is a value (a number with an optional prefix and unit, like 20pF, 4.7uF, 1k or 0402) must match as a whole value: 20pF does not find 220pF. Unit spellings are not converted: 100nF does not find 0.1uF. Results rank in-stock parts first, then as suggest_jlcpcb_alternatives ranks them: Basic, then Preferred, then Extended parts, then known price before unknown, price ascending, stock descending, LCSC number.",
@@ -67,6 +79,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_search_jlcpcb_parts(args, ctx).await }
         ),
+        #[cfg(feature = "jlcpcb")]
         tool!(
             "list_jlcpcb_categories",
             "List the part categories in the local JLCPCB database, for search_jlcpcb_parts' category filter. Without contains, lists the top-level groups (e.g. 'Optoelectronics') with their part and subcategory counts. With contains, lists every full category name ('Group / Subcategory') containing that text, with its part counts.",
@@ -79,6 +92,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_list_jlcpcb_categories(args, ctx).await }
         ),
+        #[cfg(feature = "jlcpcb")]
         tool!(
             "get_jlcpcb_part",
             "Retrieve full details for a single JLCPCB part by its LCSC part number.",
@@ -91,6 +105,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_get_jlcpcb_part(args, ctx).await }
         ),
+        #[cfg(feature = "jlcpcb")]
         tool!(
             "import_jlcpcb_part",
             "Import a symbol and footprint directly from JLCPCB / EasyEDA by LCSC part number (e.g. 'C2856837'). Converts pins, pads, graphics, and custom properties (LCSC, MPN, Manufacturer, JLCPCB_Class, verified datasheet URL), saves to the project's KiCad symbol and footprint libraries, idempotently registers both in sym-lib-table and fp-lib-table, and optionally places the component onto the schematic.",
@@ -111,6 +126,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { super::easyeda::handle_import_jlcpcb_part(args, ctx).await }
         ),
+        #[cfg(feature = "jlcpcb")]
         tool!(
             "suggest_jlcpcb_alternatives",
             "Suggest JLCPCB-stocked parts with the same value in the package a KiCad footprint uses. The footprint is mapped to LCSC's package names, the value must match as a whole value, and parts below a stock floor are excluded. Results rank Basic, then Preferred, then Extended parts, then known price and stock; the response states the package names matched, the ranking, and what was excluded.",
@@ -128,6 +144,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_suggest_alternatives(args, ctx).await }
         ),
+        #[cfg(feature = "jlcpcb")]
         tool!(
             "get_jlcpcb_database_stats",
             "Return statistics about the local JLCPCB database cache: part count, category count, file size.",
@@ -138,6 +155,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_jlcpcb_stats(args, ctx).await }
         ),
+        #[cfg(feature = "jlcpcb")]
         tool!(
             "enrich_datasheets",
             "Fetch and cache datasheet URLs for all components in a schematic using the local JLCPCB catalog with LCSC API fallback.",
@@ -152,6 +170,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_enrich_datasheets(args, ctx).await }
         ),
+        #[cfg(feature = "jlcpcb")]
         tool!(
             "get_datasheet_url",
             "Retrieve the datasheet URL for a component by MPN or LCSC ID.",
@@ -165,6 +184,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_get_datasheet_url(args, ctx).await }
         ),
+        #[cfg(feature = "freerouting")]
         tool!(
             "check_freerouting",
             "Locate a Freerouting installation, including KiCad PCM plugin directories, and verify that its Java runtime is available.",
@@ -177,6 +197,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_check_freerouting(args, ctx).await }
         ),
+        #[cfg(feature = "freerouting")]
         tool!(
             "route_specctra_dsn",
             "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output.",
@@ -201,6 +222,7 @@ pub fn tools() -> Vec<ToolDef> {
 // ─── JLCPCB database path helper ─────────────────────────────────────────────
 
 /// [`resolve_db_path`], or the refusal to return when there is none.
+#[cfg(feature = "jlcpcb")]
 fn require_db_path(args: &serde_json::Value, ctx: &ToolContext) -> Result<PathBuf, CallToolResult> {
     super::require_user_path(
         resolve_db_path(args, ctx),
@@ -211,6 +233,7 @@ fn require_db_path(args: &serde_json::Value, ctx: &ToolContext) -> Result<PathBu
 /// A query tool's catalog read, or the refusal to return, in the words every
 /// catalog tool uses (#209). An unreadable catalog keeps the `handler_error`
 /// kind a failed query had before.
+#[cfg(feature = "jlcpcb")]
 fn catalog_result<T>(lookup: crate::sourcing::Lookup<T>) -> Result<T, CallToolResult> {
     match lookup {
         crate::sourcing::Lookup::Read(value) => Ok(value),
@@ -225,6 +248,7 @@ fn catalog_result<T>(lookup: crate::sourcing::Lookup<T>) -> Result<T, CallToolRe
 }
 
 #[cfg(test)]
+#[cfg(feature = "jlcpcb")]
 mod configured_db_path_tests {
     use super::*;
     use crate::mcp::handler::McpHandler;
@@ -321,6 +345,7 @@ mod configured_db_path_tests {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "jlcpcb")]
 async fn handle_download_jlcpcb(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -391,10 +416,12 @@ async fn handle_download_jlcpcb(
 /// Build a deterministic cache key from a tool name, the resolved DB path
 /// (so pointing at a different `output_path` never serves stale results),
 /// and the query parameters that affect the result set.
+#[cfg(feature = "jlcpcb")]
 fn cache_key(tool: &str, db_path: &std::path::Path, parts: &[&str]) -> String {
     format!("{}|{}|{}", tool, db_path.display(), parts.join("|"))
 }
 
+#[cfg(feature = "jlcpcb")]
 async fn handle_search_jlcpcb_parts(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -478,6 +505,7 @@ async fn handle_search_jlcpcb_parts(
     Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
+#[cfg(feature = "jlcpcb")]
 async fn handle_list_jlcpcb_categories(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -548,6 +576,7 @@ async fn handle_list_jlcpcb_categories(
     Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
+#[cfg(feature = "jlcpcb")]
 async fn handle_get_jlcpcb_part(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -594,6 +623,7 @@ async fn handle_get_jlcpcb_part(
     }
 }
 
+#[cfg(feature = "jlcpcb")]
 async fn handle_suggest_alternatives(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -715,6 +745,7 @@ async fn handle_suggest_alternatives(
     Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
+#[cfg(feature = "jlcpcb")]
 async fn handle_jlcpcb_stats(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -765,6 +796,7 @@ async fn handle_jlcpcb_stats(
 }
 
 /// What the local JLCPCB catalog contributed to a datasheet lookup.
+#[cfg(feature = "jlcpcb")]
 enum CatalogDatasheets {
     /// The catalog was opened and queried.
     Read(CatalogRead),
@@ -777,6 +809,7 @@ enum CatalogDatasheets {
 /// Look up datasheets in the local catalog. A `db_path` the caller gives must
 /// be a readable catalog: a missing or unreadable one is refused as
 /// `file_not_found` rather than replaced by the network.
+#[cfg(feature = "jlcpcb")]
 async fn datasheets_from_catalog_for_lcsc_ids(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -805,6 +838,7 @@ async fn datasheets_from_catalog_for_lcsc_ids(
     }
 }
 
+#[cfg(feature = "jlcpcb")]
 fn count_skipped_existing_values(
     symbols: &[DatasheetSymbolTarget],
     urls: &HashMap<String, String>,
@@ -825,6 +859,7 @@ fn count_skipped_existing_values(
         .count()
 }
 
+#[cfg(feature = "jlcpcb")]
 async fn handle_enrich_datasheets(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -972,6 +1007,7 @@ async fn handle_enrich_datasheets(
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "jlcpcb")]
 struct DatasheetSymbolTarget {
     uuid: String,
     reference: String,
@@ -981,12 +1017,14 @@ struct DatasheetSymbolTarget {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "jlcpcb")]
 struct PlannedDatasheetUpdate {
     target: DatasheetSymbolTarget,
     datasheet_url: String,
 }
 
 #[derive(Debug)]
+#[cfg(feature = "jlcpcb")]
 enum DatasheetTargetError {
     Ambiguous {
         target: String,
@@ -998,6 +1036,7 @@ enum DatasheetTargetError {
     },
 }
 
+#[cfg(feature = "jlcpcb")]
 impl DatasheetTargetError {
     fn stale(target: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::Stale {
@@ -1036,6 +1075,7 @@ impl DatasheetTargetError {
     }
 }
 
+#[cfg(feature = "jlcpcb")]
 fn direct_property_values(node: &SexpNode, name: &str) -> Vec<String> {
     node.find_all("property")
         .into_iter()
@@ -1045,6 +1085,7 @@ fn direct_property_values(node: &SexpNode, name: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "jlcpcb")]
 fn one_identity_value(
     values: Vec<String>,
     field: &str,
@@ -1063,6 +1104,7 @@ fn one_identity_value(
     }
 }
 
+#[cfg(feature = "jlcpcb")]
 fn validated_datasheet_symbols(
     content: &str,
 ) -> Result<Vec<DatasheetSymbolTarget>, DatasheetTargetError> {
@@ -1181,6 +1223,7 @@ fn validated_datasheet_symbols(
     Ok(symbols)
 }
 
+#[cfg(feature = "jlcpcb")]
 fn plan_datasheet_enrichment(
     content: &str,
     urls: &HashMap<String, String>,
@@ -1242,6 +1285,7 @@ fn plan_datasheet_enrichment(
     Ok(Some((command, planned)))
 }
 
+#[cfg(feature = "jlcpcb")]
 fn observe_datasheet_updates(
     content: &str,
     planned: &[PlannedDatasheetUpdate],
@@ -1287,6 +1331,7 @@ fn observe_datasheet_updates(
     Ok(observed)
 }
 
+#[cfg(feature = "jlcpcb")]
 fn datasheet_commit_refusal(path: &Path, error: &SexpError) -> Option<CallToolResult> {
     let reason = match error {
         SexpError::Conflict { .. } => "the schematic changed after enrichment was planned",
@@ -1313,6 +1358,7 @@ fn datasheet_commit_refusal(path: &Path, error: &SexpError) -> Option<CallToolRe
 /// its `Datasheet` column for most parts, so a hit here answers without a
 /// network round trip. `Ok(None)` is an ordinary miss; `Err` means the
 /// database could not be read at all.
+#[cfg(feature = "jlcpcb")]
 async fn handle_get_datasheet_url(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1390,6 +1436,7 @@ async fn handle_get_datasheet_url(
 // Discovery, the Java checks and the headless routing session live in
 // `autorouting::freerouting` (#209); these handlers keep the tools in this toolset.
 
+#[cfg(feature = "freerouting")]
 async fn handle_check_freerouting(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1397,6 +1444,7 @@ async fn handle_check_freerouting(
     freerouting::check_freerouting(args, ctx).await
 }
 
+#[cfg(feature = "freerouting")]
 async fn handle_route_specctra_dsn(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1404,7 +1452,7 @@ async fn handle_route_specctra_dsn(
     freerouting::route_specctra_dsn(args, ctx).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "jlcpcb"))]
 mod datasheet_enrichment_tests {
     use super::*;
     use crate::mcp::error::extract_error_kind;
@@ -2157,7 +2205,7 @@ mod datasheet_enrichment_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "jlcpcb"))]
 mod jlcpcb_cache_tests {
     use super::*;
     use crate::router::ToolRouter;
@@ -3102,7 +3150,7 @@ mod jlcpcb_cache_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "jlcpcb"))]
 mod suggest_alternatives_tests {
     use super::*;
     use crate::tools::ServerConfig;
@@ -3411,7 +3459,7 @@ mod suggest_alternatives_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "jlcpcb"))]
 mod catalog_unknown_values_tests {
     //! Issue #63: an unknown price or stock was stored and reported as 0, an
     //! unknown text field as "", and an unreadable row was dropped.

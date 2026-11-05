@@ -173,7 +173,11 @@ async fn router_loads_all_toolsets() {
     assert!(router.load("project").await.is_some());
     assert!(router.load("sch_wiring").await.is_some());
     assert!(router.load("pcb_board").await.is_some());
-    assert!(router.load("integration").await.is_some());
+    // Only a build with one of its integrations has the toolset (#210).
+    assert_eq!(
+        router.load("integration").await.is_some(),
+        cfg!(any(feature = "jlcpcb", feature = "freerouting"))
+    );
     assert!(router.load("verification").await.is_some());
     assert!(router.load("no_such_toolset").await.is_none());
 }

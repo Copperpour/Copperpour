@@ -1,4 +1,5 @@
 pub mod app_dirs;
+#[cfg(feature = "freerouting")]
 pub(crate) mod autorouting;
 pub mod config_resolution;
 pub mod design_hash;
