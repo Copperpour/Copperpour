@@ -986,14 +986,15 @@ fn jlcpcb_bom_designators(
 }
 
 /// Whether `token` has the shape KiCad gives a compressed group of references:
-/// one prefix with no digits, a number, `-`, the same prefix and a higher
-/// number, such as `C3-C18`. The prefix may itself contain `-`.
+/// a prefix, a number, `-`, the same prefix and a higher number, such as
+/// `C3-C18`. Like KiCad's `SCH_REFERENCE_LIST::Shorthand`, only the trailing
+/// number is split off, so the prefix may contain `-` and digits
+/// (`SMB-19-A1-SMB-19-A4`).
 fn is_kicad_reference_range(token: &str) -> bool {
     fn split_number(reference: &str) -> Option<(&str, u64)> {
         let prefix = reference.trim_end_matches(|c: char| c.is_ascii_digit());
         let number = reference[prefix.len()..].parse().ok()?;
-        (!prefix.is_empty() && !prefix.contains(|c: char| c.is_ascii_digit()))
-            .then_some((prefix, number))
+        (!prefix.is_empty()).then_some((prefix, number))
     }
     token.match_indices('-').any(|(at, _)| {
         match (split_number(&token[..at]), split_number(&token[at + 1..])) {
@@ -1761,7 +1762,15 @@ mod jlcpcb_assembly_tests {
 
     #[test]
     fn kicad_reference_range_shape() {
-        for range in ["C3-C18", "R1-R2", "SW-A1-SW-A9", "C01-C2"] {
+        for range in [
+            "C3-C18",
+            "R1-R2",
+            "SW-A1-SW-A9",
+            "C01-C2",
+            // kicad-cli 10.0.6, `sch export bom --group-by Value
+            // --ref-range-delimiter '-'`, with references SMB-19-A1..A4.
+            "SMB-19-A1-SMB-19-A4",
+        ] {
             assert!(is_kicad_reference_range(range), "{range}");
         }
         for reference in [
