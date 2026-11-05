@@ -102,10 +102,11 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "estimate_cost",
             "Estimate the total manufacturing cost for PCB fabrication and assembly at a given fab house. \
-             Counts components from board footprints and returns an itemized rough estimate: \
+             Counts the parts the board's BOM lists and returns an itemized rough estimate: \
              PCB, components, assembly, and total. For jlcpcb, parts with an LCSC field are priced \
-             from the local JLCPCB catalog, plus the fee per unique Extended part; the response \
-             lists which parts were priced from the catalog and which at an average.",
+             from the local JLCPCB catalog at the price break for the order's quantity, plus the \
+             fee per unique Extended part; the response lists which parts were priced from the \
+             catalog and which at an average.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1265,6 +1266,59 @@ fn bom_footprints(tree: &copperpour_sexp::SexpNode) -> (Vec<BomFootprint>, Vec<S
     (listed, excluded)
 }
 
+/// The unit price for `quantity` from the feed's price breaks, such as
+/// `1-9:0.014,10-99:0.012,100-:0.010`, and the break that gave it. Each break
+/// is `min-max:price`, both ends included; an open `min-` has no upper end.
+/// Below the first break, the first break's price applies, as
+/// kicad-jlcpcb-tools, which builds the feed, reads it. A part sold in steps
+/// has gaps between its breaks (`10-90:0.018,100-590:0.014` sells in tens),
+/// and an order that falls in one rounds up to the next break, so that
+/// break's price applies. `None` when the text has no break this can read,
+/// or the quantity is past a closed last break.
+///
+/// The feed rounds prices to 3 decimals and drops every break below $0.01
+/// except the first, so a cheap part has one price, and a large order of a
+/// part whose price falls below $0.01 is priced at the last break kept. A
+/// price under $0.0005 rounds to `0.000`, which is read as $0.
+fn price_at_quantity(price_breaks: &str, quantity: u64) -> Option<BreakPrice> {
+    let mut breaks: Vec<(u64, Option<u64>, f64, &str)> = Vec::new();
+    for token in price_breaks.split(',').map(str::trim) {
+        let (range, price) = token.split_once(':')?;
+        let (min, max) = range.split_once('-')?;
+        let min: u64 = min.trim().parse().ok()?;
+        let max: Option<u64> = match max.trim() {
+            "" => None,
+            max => Some(max.parse().ok()?),
+        };
+        let price: f64 = price.trim().parse().ok()?;
+        if !(price.is_finite() && price >= 0.0) || max.is_some_and(|max| max < min) {
+            return None;
+        }
+        breaks.push((min, max, price, token));
+    }
+    breaks.sort_by_key(|&(min, ..)| min);
+    let minimum_order = breaks.first()?.0;
+    breaks
+        .iter()
+        .find(|(min, max, ..)| *min <= quantity && max.is_none_or(|max| quantity <= max))
+        .or_else(|| breaks.iter().find(|(min, ..)| *min > quantity))
+        .map(|&(_, _, price, token)| BreakPrice {
+            price,
+            price_break: token.to_string(),
+            minimum_order,
+        })
+}
+
+/// A unit price from [`price_at_quantity`].
+#[derive(Debug, PartialEq)]
+struct BreakPrice {
+    price: f64,
+    /// The break that gave it, as the feed writes it.
+    price_break: String,
+    /// The first break's lower end, the least JLCPCB sells.
+    minimum_order: u64,
+}
+
 /// What the JLCPCB components cost per board, and how each part was priced.
 #[derive(Debug, Default)]
 struct JlcpcbComponentPricing {
@@ -1275,14 +1329,16 @@ struct JlcpcbComponentPricing {
     catalog: serde_json::Value,
 }
 
-/// Price each part with an LCSC field from the local catalog, at its unit
-/// price; every other part, and one the catalog has no price for, at
-/// `average`. Without a catalog every part is at `average` (#92).
+/// Price each part with an LCSC field from the local catalog, at the price
+/// break for the order's quantity of it, `boards` times its count per board;
+/// every other part, and one the catalog has no price for, at `average`.
+/// Without a catalog every part is at `average` (#92).
 async fn price_jlcpcb_components(
     args: &serde_json::Value,
     ctx: &ToolContext,
     footprints: &[BomFootprint],
     average: f64,
+    boards: u64,
 ) -> JlcpcbComponentPricing {
     let mut by_lcsc: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let mut pricing = JlcpcbComponentPricing::default();
@@ -1319,8 +1375,17 @@ async fn price_jlcpcb_components(
                 .and_then(|result| result);
                 match queried {
                     Ok(prices) => {
-                        pricing.catalog = json!({ "read": true, "path": db_path });
-                        Some(prices)
+                        pricing.catalog = if prices.has_price_breaks {
+                            json!({ "read": true, "path": db_path, "price_breaks": true })
+                        } else {
+                            json!({
+                                "read": true,
+                                "path": db_path,
+                                "price_breaks": false,
+                                "reason": "the catalog was built before price breaks were kept, so parts are at their first break's price; re-run download_jlcpcb_database with force to rebuild it"
+                            })
+                        };
+                        Some(prices.parts)
                     }
                     Err(error) => {
                         pricing.catalog = json!({
@@ -1357,17 +1422,41 @@ async fn price_jlcpcb_components(
         if found.is_some_and(|part| part.library_type == "Extended") {
             pricing.extended_unique_parts += 1;
         }
-        match found {
-            Some(part) if part.price > 0.0 => {
-                pricing.per_board += part.price * count;
-                pricing.priced_from_catalog.push(json!({
+        match found.and_then(|part| Some((part, part.price?))) {
+            Some((part, first_price)) => {
+                let order_quantity = (references.len() as u64).saturating_mul(boards);
+                // A part whose breaks can't be read keeps the first break's
+                // price, which the import stores on its own.
+                let at_quantity = part
+                    .price_breaks
+                    .as_deref()
+                    .and_then(|breaks| price_at_quantity(breaks, order_quantity));
+                let unit_price = at_quantity.as_ref().map_or(first_price, |at| at.price);
+                pricing.per_board += unit_price * count;
+                let mut entry = json!({
                     "lcsc": lcsc,
                     "references": references,
                     "library_type": part.library_type,
-                    "unit_price": part.price
-                }));
+                    "order_quantity": order_quantity,
+                    "unit_price": unit_price,
+                    "price_break": at_quantity.as_ref().map(|at| &at.price_break)
+                });
+                // JLCPCB sells at least the first break's quantity; the
+                // estimate prices only the parts the boards use.
+                if let Some(at) = at_quantity
+                    .as_ref()
+                    .filter(|at| order_quantity < at.minimum_order)
+                {
+                    entry["below_minimum_order"] = json!(at.minimum_order);
+                }
+                if unit_price == 0.0 {
+                    entry["note"] = json!(
+                        "the feed rounds this part's price to $0.000, so it is under $0.0005"
+                    );
+                }
+                pricing.priced_from_catalog.push(entry);
             }
-            _ => {
+            None => {
                 pricing.per_board += average * count;
                 let reason = match (&prices, found) {
                     (None, _) => "catalog not read",
@@ -1434,9 +1523,19 @@ async fn handle_estimate_cost(
     let (width_mm, height_mm) = estimate_board_dimensions(&content);
 
     let (bom_parts, excluded_from_bom) = bom_footprints(&tree);
+    let placed_count = bom_parts.len();
     const JLCPCB_AVERAGE_PART_PRICE: f64 = 0.05;
     let jlcpcb_components = if fab_house == "jlcpcb" {
-        Some(price_jlcpcb_components(args, ctx, &bom_parts, JLCPCB_AVERAGE_PART_PRICE).await)
+        Some(
+            price_jlcpcb_components(
+                args,
+                ctx,
+                &bom_parts,
+                JLCPCB_AVERAGE_PART_PRICE,
+                quantity as u64,
+            )
+            .await,
+        )
     } else {
         None
     };
@@ -1451,8 +1550,10 @@ async fn handle_estimate_cost(
                 6 => 15.0 + (quantity as f64 - 5.0).max(0.0) * 3.00,
                 _ => 30.0 + (quantity as f64 - 5.0).max(0.0) * 5.00,
             };
-            let smt_setup = if component_count > 0 { 8.0 } else { 0.0 };
-            let smt_per_board = component_count as f64 * 0.003 * quantity as f64;
+            // Only the parts the BOM lists are placed; a mounting hole or a
+            // `dnp` part is not.
+            let smt_setup = if placed_count > 0 { 8.0 } else { 0.0 };
+            let smt_per_board = placed_count as f64 * 0.003 * quantity as f64;
             let comp_per_board = jlcpcb_components
                 .as_ref()
                 .map_or(0.0, |pricing| pricing.per_board);
@@ -1468,8 +1569,8 @@ async fn handle_estimate_cost(
                 4 => 12.0 + (quantity as f64 - 5.0).max(0.0) * 2.00,
                 _ => 25.0 + (quantity as f64 - 5.0).max(0.0) * 4.00,
             };
-            let smt = component_count as f64 * 0.005 * quantity as f64;
-            let comp_est = component_count as f64 * 0.08 * quantity as f64;
+            let smt = placed_count as f64 * 0.005 * quantity as f64;
+            let comp_est = placed_count as f64 * 0.08 * quantity as f64;
             (pcb, smt, comp_est)
         }
         _ => {
@@ -1491,9 +1592,10 @@ async fn handle_estimate_cost(
     let components = match &jlcpcb_components {
         Some(pricing) => {
             notes.push(format!(
-                "Parts with an LCSC field are priced at the local JLCPCB catalog's unit price, without \
-                 quantity price breaks; other parts at an average of ${JLCPCB_AVERAGE_PART_PRICE:.2}. \
-                 components lists which is which; search_jlcpcb_parts finds an LCSC number for a part."
+                "Parts with an LCSC field are priced from the local JLCPCB catalog, at the price break \
+                 for the order's quantity of each; other parts at an average of \
+                 ${JLCPCB_AVERAGE_PART_PRICE:.2}. components lists which is which; search_jlcpcb_parts \
+                 finds an LCSC number for a part."
             ));
             notes.push(JLCPCB_FEE_SOURCE.to_string());
             json!({
@@ -2635,7 +2737,8 @@ mod estimate_cost_catalog_tests {
 
     /// Three resistors on one Basic part (R3 saved the KiCad 7 way), an
     /// Extended MCU, a part the catalog lacks, an Extended part with no price,
-    /// a part without an LCSC field, and two footprints the BOM leaves out.
+    /// a part without an LCSC field, two footprints the BOM leaves out, and a
+    /// resistor whose price the feed rounds to $0.000 (R4).
     const BOARD: &str = "(kicad_pcb\n\
         \t(version 20260206)\n\
         \t(generator \"pcbnew\")\n\
@@ -2649,9 +2752,26 @@ mod estimate_cost_catalog_tests {
         \t(footprint \"MountingHole\" (layer \"F.Cu\") (attr exclude_from_pos_files exclude_from_bom) (property \"Reference\" \"H1\" (at 0 0 0)))\n\
         \t(footprint \"LED\" (layer \"F.Cu\") (attr smd dnp) (property \"Reference\" \"D1\" (at 0 0 0)) (property \"LCSC\" \"C25744\" (at 0 0 0)))\n\
         \t(footprint \"R_0402\" (layer \"F.Cu\") (attr smd) (fp_text reference \"R3\" (at 0 0)) (property \"LCSC\" \"C25744\"))\n\
+        \t(footprint \"R_0402\" (layer \"F.Cu\") (attr smd) (property \"Reference\" \"R4\" (at 0 0 0)) (property \"LCSC\" \"C1119\" (at 0 0 0)))\n\
         )\n";
 
+    /// A current catalog, with price breaks as the feed writes them: rounded
+    /// to 3 decimals, breaks below $0.01 dropped, the last one open
+    /// (kicad-jlcpcb-tools `common/translate.py`). C25744's order of 15 falls
+    /// in its second break. C8734 has one break, from 10 up, as some parts
+    /// have. C1119's price rounds to $0.000, as 671 parts' do in the
+    /// 2026-11-04 feed. C1111 has no price: NULL here, and 0 in a catalog
+    /// from before #63.
     fn seed_catalog(dir: &Path) -> PathBuf {
+        seed(dir, true)
+    }
+
+    /// A catalog from before #63: no `Price_Breaks` column, user_version 1.
+    fn seed_old_catalog(dir: &Path) -> PathBuf {
+        seed(dir, false)
+    }
+
+    fn seed(dir: &Path, with_price_breaks: bool) -> PathBuf {
         let db_path = dir.join("jlcpcb.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute_batch(
@@ -2659,38 +2779,84 @@ mod estimate_cost_catalog_tests {
              Library_Type TEXT, Description TEXT, Datasheet TEXT, Price REAL, Stock INTEGER, Category TEXT);",
         )
         .unwrap();
-        for (lcsc, library_type, price) in [
-            ("C25744", "Basic", 0.002),
-            ("C8734", "Extended", 5.62),
-            ("C1111", "Extended", 0.0),
+        if with_price_breaks {
+            conn.execute_batch(
+                "ALTER TABLE components ADD COLUMN Price_Breaks TEXT; PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        for (lcsc, library_type, price, breaks) in [
+            (
+                "C25744",
+                "Basic",
+                Some(0.014),
+                Some("1-9:0.014,10-99:0.012,100-:0.010"),
+            ),
+            ("C8734", "Extended", Some(5.62), Some("10-:5.620")),
+            ("C1119", "Basic", Some(0.0), Some("1-:0.000")),
+            (
+                "C1111",
+                "Extended",
+                (!with_price_breaks).then_some(0.0),
+                None,
+            ),
         ] {
             conn.execute(
-                "INSERT INTO components VALUES (?1, 'MPN', 'PKG', 'MFR', ?2, 'part', '', ?3, 100, 'cat')",
+                "INSERT INTO components (LCSC, MFR_Part, Package, Manufacturer, Library_Type, \
+                 Description, Datasheet, Price, Stock, Category) \
+                 VALUES (?1, 'MPN', 'PKG', 'MFR', ?2, 'part', '', ?3, 100, 'cat')",
                 rusqlite::params![lcsc, library_type, price],
             )
             .unwrap();
+            if with_price_breaks {
+                conn.execute(
+                    "UPDATE components SET Price_Breaks = ?2 WHERE LCSC = ?1",
+                    rusqlite::params![lcsc, breaks],
+                )
+                .unwrap();
+            }
         }
         db_path
     }
 
-    fn ctx() -> ToolContext {
-        ToolContext::new(
-            crate::tools::ServerConfig::default(),
-            std::sync::Arc::new(crate::router::ToolRouter::new()),
-        )
+    /// The `priced_from_catalog` entry for `lcsc`.
+    fn priced<'a>(report: &'a serde_json::Value, lcsc: &str) -> &'a serde_json::Value {
+        report["components"]["priced_from_catalog"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|part| part["lcsc"] == lcsc)
+            .unwrap_or_else(|| panic!("{lcsc} not priced: {report}"))
+    }
+
+    /// `estimate_cost` takes no `db_path` argument: a caller points it at a
+    /// catalog through the `jlcpcb_db_path` setting, as these tests do.
+    fn config(db_path: &Path) -> crate::tools::ServerConfig {
+        crate::tools::ServerConfig {
+            jlcpcb_db_path: Some(db_path.to_path_buf()),
+            eager_toolsets: true,
+            ..Default::default()
+        }
+    }
+
+    fn write_board(dir: &Path) -> PathBuf {
+        let board = dir.join("board.kicad_pcb");
+        std::fs::write(&board, BOARD).unwrap();
+        board
     }
 
     async fn estimate(fab_house: &str, db_path: &Path) -> serde_json::Value {
         let dir = tempfile::tempdir().unwrap();
-        let board = dir.path().join("board.kicad_pcb");
-        std::fs::write(&board, BOARD).unwrap();
         let args = json!({
-            "board": board.to_str().unwrap(),
+            "board": write_board(dir.path()).to_str().unwrap(),
             "fab_house": fab_house,
-            "quantity": 5,
-            "db_path": db_path.to_str().unwrap()
+            "quantity": 5
         });
-        match handle_estimate_cost(&args, &ctx())
+        let ctx = ToolContext::new(
+            config(db_path),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        match handle_estimate_cost(&args, &ctx)
             .await
             .unwrap()
             .content
@@ -2711,18 +2877,50 @@ mod estimate_cost_catalog_tests {
         let report = estimate("jlcpcb", &seed_catalog(dir.path())).await;
         let components = &report["components"];
         assert_eq!(components["catalog"]["read"], true, "{report}");
+        assert_eq!(components["catalog"]["price_breaks"], true, "{report}");
 
-        let priced: Vec<(&str, serde_json::Value)> = components["priced_from_catalog"]
+        let priced: Vec<serde_json::Value> = components["priced_from_catalog"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|part| (part["lcsc"].as_str().unwrap(), part["references"].clone()))
+            .map(|part| {
+                json!([
+                    part["lcsc"],
+                    part["references"],
+                    part["order_quantity"],
+                    part["unit_price"],
+                    part["price_break"]
+                ])
+            })
             .collect();
+        // Three per board for 5 boards is 15, in C25744's 10-99 break. C1119
+        // is priced at $0, and C8734's order of 5 is below its minimum of 10.
         assert_eq!(
             priced,
             [
-                ("C25744", json!(["R1", "R2", "R3"])),
-                ("C8734", json!(["U1"]))
+                json!(["C1119", ["R4"], 5, 0.0, "1-:0.000"]),
+                json!(["C25744", ["R1", "R2", "R3"], 15, 0.012, "10-99:0.012"]),
+                json!(["C8734", ["U1"], 5, 5.62, "10-:5.620"])
+            ]
+        );
+        let flags: Vec<serde_json::Value> = components["priced_from_catalog"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| {
+                json!([
+                    part["lcsc"],
+                    part["below_minimum_order"],
+                    part.get("note").is_some()
+                ])
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                json!(["C1119", null, true]),
+                json!(["C25744", null, false]),
+                json!(["C8734", 10, false])
             ]
         );
 
@@ -2744,10 +2942,13 @@ mod estimate_cost_catalog_tests {
         // U1 and J1 are Extended; J1's unknown price does not waive its fee.
         assert_eq!(components["extended_unique_parts"], 2);
 
-        // Per board: 3 x 0.002 + 5.62 + 3 x 0.05 = 5.776, for 5 boards.
+        // Per board: 3 x 0.012 + 5.62 + 3 x 0.05 = 5.806, for 5 boards.
         let cost = &report["cost_estimate"];
-        assert_eq!(cost["components_estimate"], "$28.88", "{report}");
+        assert_eq!(cost["components_estimate"], "$29.03", "{report}");
         assert_eq!(cost["extended_parts_fee"], "$6.14");
+        // Setup plus the eight parts the BOM lists, not H1 or D1:
+        // 8 + 8 x 0.003 x 5.
+        assert_eq!(cost["smt_assembly"], "$8.12", "{report}");
         let notes = report["notes"].to_string();
         assert!(notes.contains("search_jlcpcb_parts"), "{notes}");
         assert!(!notes.contains("generate_bom"), "{notes}");
@@ -2770,18 +2971,184 @@ mod estimate_cost_catalog_tests {
         assert!(estimated[1..]
             .iter()
             .all(|part| part["reason"] == "catalog not read"));
-        // Seven parts the BOM lists, at 0.05, for 5 boards; no Extended fee.
-        assert_eq!(report["cost_estimate"]["components_estimate"], "$1.75");
+        // Eight parts the BOM lists, at 0.05, for 5 boards; no Extended fee.
+        assert_eq!(report["cost_estimate"]["components_estimate"], "$2.00");
         assert_eq!(report["cost_estimate"]["extended_parts_fee"], "$0.00");
     }
 
-    /// PCBWay keeps its per-footprint average and does not read the catalog.
+    /// A catalog from before #63 has no price breaks: parts are at their
+    /// first break's price, and the response says so.
+    #[tokio::test]
+    async fn an_old_catalog_prices_at_the_first_break_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = estimate("jlcpcb", &seed_old_catalog(dir.path())).await;
+        let catalog = &report["components"]["catalog"];
+        assert_eq!(catalog["read"], true, "{report}");
+        assert_eq!(catalog["price_breaks"], false);
+        assert!(catalog["reason"]
+            .as_str()
+            .unwrap()
+            .contains("download_jlcpcb_database"));
+        let resistor = priced(&report, "C25744");
+        assert_eq!(resistor["unit_price"], 0.014, "{report}");
+        assert_eq!(resistor["price_break"], json!(null));
+        // Before #63 a 0 meant unknown, so C1119 and C1111 are at the average.
+        let estimated: Vec<&serde_json::Value> = report["components"]["estimated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| &part["lcsc"])
+            .collect();
+        assert_eq!(
+            estimated,
+            [
+                &json!(null),
+                &json!("C1111"),
+                &json!("C1119"),
+                &json!("C99999999")
+            ]
+        );
+        // Per board: 3 x 0.014 + 5.62 + 4 x 0.05 = 5.862, for 5 boards.
+        assert_eq!(report["cost_estimate"]["components_estimate"], "$29.31");
+    }
+
+    /// Through served dispatch, with the catalog from the setting: the
+    /// schema accepts the call, and a part is priced at its quantity break.
+    #[tokio::test]
+    async fn served_estimate_prices_at_the_quantity_break() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = crate::mcp::handler::McpHandler::new(config(&seed_catalog(dir.path())))
+            .await
+            .unwrap();
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "estimate_cost",
+                    "arguments": {
+                        "board": write_board(dir.path()).to_str().unwrap(),
+                        "quantity": 40
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result: CallToolResult =
+            serde_json::from_value(response.result.expect("a result")).unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let body: serde_json::Value = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text content, got {other:?}"),
+        };
+        // Three per board for 40 boards is 120, in the open 100- break.
+        let resistor = priced(&body, "C25744");
+        assert_eq!(resistor["order_quantity"], 120, "{body}");
+        assert_eq!(resistor["unit_price"], 0.01);
+        assert_eq!(resistor["price_break"], "100-:0.010");
+    }
+
+    /// A quantity so large that count x boards overflows saturates instead
+    /// of panicking or wrapping to a small order.
+    #[tokio::test]
+    async fn a_huge_quantity_saturates_the_order_quantity() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = json!({
+            "board": write_board(dir.path()).to_str().unwrap(),
+            "quantity": u64::MAX
+        });
+        let ctx = ToolContext::new(
+            config(&seed_catalog(dir.path())),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_estimate_cost(&args, &ctx).await.unwrap();
+        let body: serde_json::Value = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text content, got {other:?}"),
+        };
+        let resistor = priced(&body, "C25744");
+        assert_eq!(resistor["order_quantity"], u64::MAX, "{body}");
+        assert_eq!(resistor["price_break"], "100-:0.010");
+    }
+
+    #[test]
+    fn price_breaks_resolve_by_quantity() {
+        let breaks = "1-9:0.12,10-99:0.08,100-:0.05";
+        for (quantity, price, token) in [
+            (1, 0.12, "1-9:0.12"),
+            (9, 0.12, "1-9:0.12"),
+            (10, 0.08, "10-99:0.08"),
+            (99, 0.08, "10-99:0.08"),
+            (100, 0.05, "100-:0.05"),
+            (1_000_000, 0.05, "100-:0.05"),
+        ] {
+            assert_eq!(
+                price_at_quantity(breaks, quantity).map(|at| (at.price, at.price_break)),
+                Some((price, token.to_string())),
+                "{quantity}"
+            );
+        }
+        // Below the first break, and out of order, the first break applies.
+        assert_eq!(
+            price_at_quantity("100-:0.05,20-99:0.07", 5).map(|at| (at.price, at.price_break)),
+            Some((0.07, "20-99:0.07".to_string()))
+        );
+        // C2141 in the 2026-11-04 feed sells in tens: 95 rounds up to 100.
+        let tens = "10-90:0.018,100-590:0.014,600-1190:0.012,1200-:0.010";
+        assert_eq!(
+            price_at_quantity(tens, 95).map(|at| (at.price, at.price_break)),
+            Some((0.014, "100-590:0.014".to_string()))
+        );
+        assert_eq!(
+            price_at_quantity(tens, 90).map(|at| (at.price, at.price_break)),
+            Some((0.018, "10-90:0.018".to_string()))
+        );
+        // A price the feed rounds to zero is $0; the first break's lower end
+        // is the minimum order.
+        assert_eq!(
+            price_at_quantity("1-:0.000", 5),
+            Some(BreakPrice {
+                price: 0.0,
+                price_break: "1-:0.000".to_string(),
+                minimum_order: 1
+            })
+        );
+        assert_eq!(
+            price_at_quantity("10-49:0.180,50-:0.144", 5).map(|at| at.minimum_order),
+            Some(10)
+        );
+        // A single closed break: a quantity above it has no price.
+        assert_eq!(price_at_quantity("1-9:0.12", 10), None);
+        for unreadable in [
+            "",
+            "0.12",
+            "1-9",
+            "a-9:0.12",
+            "1-9:x",
+            "9-1:0.12",
+            "1-:-0.1",
+            "1-:NaN",
+            "1-9:0.1,10:0.2",
+        ] {
+            assert_eq!(price_at_quantity(unreadable, 5), None, "{unreadable}");
+        }
+    }
+
+    /// PCBWay keeps its per-part average and does not read the catalog.
     #[tokio::test]
     async fn pcbway_keeps_its_average() {
         let dir = tempfile::tempdir().unwrap();
         let report = estimate("pcbway", &seed_catalog(dir.path())).await;
-        // Nine footprints at 0.08, for 5 boards, as before.
-        assert_eq!(report["cost_estimate"]["components_estimate"], "$3.60");
+        // The eight parts the BOM lists at 0.08, for 5 boards. H1 and D1 are
+        // neither bought nor placed.
+        assert_eq!(report["cost_estimate"]["components_estimate"], "$3.20");
+        // 8 x 0.005 x 5, not ten footprints' $0.25.
+        assert_eq!(report["cost_estimate"]["smt_assembly"], "$0.20");
         assert_eq!(report["cost_estimate"]["extended_parts_fee"], "$0.00");
         assert_eq!(report["components"]["priced_from_catalog"], json!([]));
         assert!(report["components"].get("catalog").is_none());
