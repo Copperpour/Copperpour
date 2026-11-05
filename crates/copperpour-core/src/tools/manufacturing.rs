@@ -744,8 +744,16 @@ async fn handle_estimate_cost(
         );
     }
 
-    // Estimate board dimensions from Edge.Cuts
-    let (width_mm, height_mm) = estimate_board_dimensions(&content);
+    // A board without a readable outline keeps the 0 x 0 it always reported,
+    // but now says why instead of passing it off as a size.
+    let (width_mm, height_mm) = board_outline_size(&tree).unwrap_or_else(|| {
+        warnings.push(
+            "no complete board outline was read from Edge.Cuts (none is drawn, or one \
+             of its graphics is malformed); width_mm and height_mm are reported as 0"
+                .to_string(),
+        );
+        (0.0, 0.0)
+    });
 
     let (bom_parts, excluded_from_bom) = bom_footprints(&tree);
     // Only the parts the BOM lists are bought and placed; a mounting hole or a
@@ -1103,74 +1111,20 @@ fn find_setup_value(content: &str, key: &str) -> Option<f64> {
     after[..end].trim().parse().ok()
 }
 
-fn estimate_board_dimensions(content: &str) -> (f64, f64) {
-    let mut min_x = f64::MAX;
-    let mut max_x = f64::MIN;
-    let mut min_y = f64::MAX;
-    let mut max_y = f64::MIN;
-    let mut found = false;
-
-    // Scan gr_line on Edge.Cuts for board outline coordinates
-    let mut pos = 0;
-    while let Some(line_pos) = content[pos..].find("(gr_line") {
-        let abs = pos + line_pos;
-        let block_end = content[abs..].find(")\n").unwrap_or(300) + abs;
-        let block = &content[abs..block_end.min(content.len())];
-
-        if block.contains("Edge.Cuts") {
-            // Extract start and end coordinates
-            if let (Some(sx), Some(sy)) = (
-                extract_coord(block, "start", 0),
-                extract_coord(block, "start", 1),
-            ) {
-                if sx < min_x {
-                    min_x = sx;
-                }
-                if sx > max_x {
-                    max_x = sx;
-                }
-                if sy < min_y {
-                    min_y = sy;
-                }
-                if sy > max_y {
-                    max_y = sy;
-                }
-                found = true;
-            }
-            if let (Some(ex), Some(ey)) = (
-                extract_coord(block, "end", 0),
-                extract_coord(block, "end", 1),
-            ) {
-                if ex < min_x {
-                    min_x = ex;
-                }
-                if ex > max_x {
-                    max_x = ex;
-                }
-                if ey < min_y {
-                    min_y = ey;
-                }
-                if ey > max_y {
-                    max_y = ey;
-                }
-            }
-        }
-        pos = abs + 1;
-    }
-
-    if found {
-        ((max_x - min_x).abs(), (max_y - min_y).abs())
-    } else {
-        (0.0, 0.0) // Unknown
-    }
-}
-
-fn extract_coord(block: &str, keyword: &str, index: usize) -> Option<f64> {
-    let pat = format!("({} ", keyword);
-    let pos = block.find(&pat)? + pat.len();
-    let rest = &block[pos..];
-    let parts: Vec<&str> = rest.split([' ', ')']).collect();
-    parts.get(index)?.parse().ok()
+/// Width and height of the board outline: the bbox of the top-level Edge.Cuts
+/// graphics, read from the parsed tree by the function placement reads the
+/// outline with ([`copperpour_sexp::board::board_outline_bbox`]), so
+/// lines, arcs (by their real extent), rects, circles, curves and polygons all
+/// count, in any layout KiCad writes. `None` when the board has no outline, or
+/// when one of its edge graphics cannot be read.
+///
+/// Rounded to KiCad's 1 nm grid: an arc's extrema are computed in floating
+/// point and land a few femtometres off, which would otherwise surface as a
+/// 30.000000000004 mm board.
+fn board_outline_size(tree: &copperpour_sexp::SexpNode) -> Option<(f64, f64)> {
+    let to_nm = |mm: f64| (mm * 1e6).round() / 1e6;
+    copperpour_sexp::board::board_outline_bbox(tree)
+        .map(|(x0, y0, x1, y1)| (to_nm(x1 - x0), to_nm(y1 - y0)))
 }
 
 #[cfg(test)]
@@ -1438,7 +1392,7 @@ mod copper_layer_count_tests {
         }
     }
 
-    async fn estimate(board_text: &str, extra: serde_json::Value) -> serde_json::Value {
+    pub(super) async fn estimate(board_text: &str, extra: serde_json::Value) -> serde_json::Value {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("board.kicad_pcb");
         std::fs::write(&board, board_text).unwrap();
@@ -1919,5 +1873,160 @@ mod estimate_cost_catalog_tests {
         assert_eq!(report["cost_estimate"]["extended_parts_fee"], "$0.00");
         assert_eq!(report["components"]["priced_from_catalog"], json!([]));
         assert!(report["components"].get("catalog").is_none());
+    }
+}
+
+#[cfg(test)]
+mod board_outline_size_tests {
+    //! `estimate_cost` reported every board KiCad 10 saved as 0 x 0 mm. It
+    //! text-scanned `(gr_line` blocks, cut each at its first `)\n`, and only
+    //! then looked for `Edge.Cuts`; KiCad writes one field per line, so the
+    //! cut ends at `(start …)` and the layer is never inside it. Arcs, rects,
+    //! circles and polygons were not read at all.
+    //!
+    //! The fixture is pcbnew 10.0.6's own save of a 100 mm x 50 mm outline
+    //! with 3 mm rounded corners (four `gr_line`, four `gr_arc`) — provenance
+    //! in `tests/fixtures/board_outline_kicad10.README.md`.
+
+    use super::copper_layer_count_tests::estimate;
+    use serde_json::json;
+
+    const ROUNDED_KICAD_10: &str =
+        include_str!("../../tests/fixtures/board_outline_kicad10.kicad_pcb");
+
+    /// A hand-written board with each item on one line, a 50 mm x 40 mm
+    /// rectangle of four `gr_line`s: the case the text scan already got right.
+    const SINGLE_LINE: &str = include_str!("../../tests/fixtures/test.kicad_pcb");
+
+    /// pcbnew 9's own save, the board the IPC tests drive.
+    const RECT_KICAD_9: &str =
+        include_str!("../../../copperpour-ipc/tests/fixtures/live_ipc.kicad_pcb");
+
+    /// pcbnew 10's own save — `copperpour-sexp/tests/fixtures/gr_poly_outline.README.md`.
+    const POLY_KICAD_10: &str =
+        include_str!("../../../copperpour-sexp/tests/fixtures/gr_poly_outline.kicad_pcb");
+
+    const OUTLINE_WARNING: &str = "no complete board outline";
+
+    /// A KiCad-10-layout board around `graphics`, with a two-layer table.
+    fn board(graphics: &str) -> String {
+        format!(
+            "(kicad_pcb\n\
+             \t(version 20260206)\n\
+             \t(generator \"pcbnew\")\n\
+             \t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(31 \"B.Cu\" signal)\n\t\t(25 \"Edge.Cuts\" user)\n\t)\n\
+             {graphics}\
+             )\n"
+        )
+    }
+
+    fn size(report: &serde_json::Value) -> (f64, f64) {
+        let board = &report["board"];
+        (
+            board["width_mm"].as_f64().unwrap(),
+            board["height_mm"].as_f64().unwrap(),
+        )
+    }
+
+    fn assert_size(report: &serde_json::Value, expected: (f64, f64)) {
+        let (w, h) = size(report);
+        assert!(
+            (w - expected.0).abs() < 1e-6 && (h - expected.1).abs() < 1e-6,
+            "expected {expected:?}, got ({w}, {h}): {report}"
+        );
+    }
+
+    fn warns_of_missing_outline(report: &serde_json::Value) -> bool {
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains(OUTLINE_WARNING))
+    }
+
+    /// The fixture really is in the layout that defeated the text scan: its
+    /// first `gr_line`, cut at the first `)\n`, does not name its layer. If a
+    /// future resave changed that, the fixture test would prove nothing.
+    #[test]
+    fn the_fixture_hides_the_layer_from_a_line_cut() {
+        let at = ROUNDED_KICAD_10.find("(gr_line").unwrap();
+        let cut = ROUNDED_KICAD_10[at..].find(")\n").unwrap() + at;
+        let block = &ROUNDED_KICAD_10[at..cut];
+        assert!(!block.contains("Edge.Cuts"), "{block}");
+        assert!(ROUNDED_KICAD_10.contains("(gr_arc"));
+    }
+
+    /// The reported case: a KiCad-saved rounded outline is measured, not 0 x 0.
+    #[tokio::test]
+    async fn a_kicad_10_rounded_outline_reports_its_size() {
+        let report = estimate(ROUNDED_KICAD_10, json!({})).await;
+        // Exact: the corner arcs' extrema come out of floating-point maths a
+        // few femtometres off, and a size is reported at KiCad's 1 nm grid.
+        assert_eq!(size(&report), (100.0, 50.0), "{report}");
+        assert!(!warns_of_missing_outline(&report), "{report}");
+    }
+
+    #[tokio::test]
+    async fn a_single_line_outline_still_reports_its_size() {
+        let report = estimate(SINGLE_LINE, json!({})).await;
+        assert_size(&report, (50.0, 40.0));
+        assert!(!warns_of_missing_outline(&report), "{report}");
+    }
+
+    /// A D-shaped board: the arc bulges 10 mm past its endpoints, which both
+    /// sit on the straight edge, so only the arc's extent gives the width.
+    /// Hand-written: the fixtures' KiCad-saved arcs are corner fillets, which
+    /// stay inside the box their neighbouring lines already span.
+    #[tokio::test]
+    async fn an_arc_counts_by_its_extent_not_its_endpoints() {
+        let report = estimate(
+            &board(
+                "\t(gr_line\n\t\t(start 0 0)\n\t\t(end 0 20)\n\t\t(layer \"Edge.Cuts\")\n\t)\n\
+                 \t(gr_arc\n\t\t(start 0 0)\n\t\t(mid 10 10)\n\t\t(end 0 20)\n\t\t(layer \"Edge.Cuts\")\n\t)\n",
+            ),
+            json!({}),
+        )
+        .await;
+        assert_size(&report, (10.0, 20.0));
+    }
+
+    /// KiCad 9's save of a 160 mm x 100 mm `gr_rect` outline.
+    #[tokio::test]
+    async fn a_rect_outline_reports_its_size() {
+        let report = estimate(RECT_KICAD_9, json!({})).await;
+        assert_size(&report, (160.0, 100.0));
+    }
+
+    /// No board in the fixtures has a circular outline, so this one is
+    /// written by hand in KiCad 10's layout.
+    #[tokio::test]
+    async fn a_circle_outline_reports_its_diameter() {
+        let report = estimate(
+            &board("\t(gr_circle\n\t\t(center 50 50)\n\t\t(end 62.5 50)\n\t\t(layer \"Edge.Cuts\")\n\t)\n"),
+            json!({}),
+        )
+        .await;
+        assert_size(&report, (25.0, 25.0));
+    }
+
+    /// pcbnew 10's save of a concave 12-vertex `gr_poly` outline spanning
+    /// (103.42, 78.96)..(154.48, 116.96).
+    #[tokio::test]
+    async fn a_poly_outline_reports_its_size() {
+        let report = estimate(POLY_KICAD_10, json!({})).await;
+        assert_size(&report, (51.06, 38.0));
+    }
+
+    /// No outline: 0 x 0, and a warning that says so, so the zero is never
+    /// read as a size. Graphics on other layers are not the outline.
+    #[tokio::test]
+    async fn a_board_without_an_outline_reports_zero_and_says_why() {
+        let report = estimate(
+            &board("\t(gr_rect\n\t\t(start 0 0)\n\t\t(end 30 20)\n\t\t(layer \"F.SilkS\")\n\t)\n"),
+            json!({}),
+        )
+        .await;
+        assert_size(&report, (0.0, 0.0));
+        assert!(warns_of_missing_outline(&report), "{report}");
     }
 }

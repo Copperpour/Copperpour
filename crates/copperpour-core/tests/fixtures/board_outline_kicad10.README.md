@@ -63,3 +63,6 @@ New UUIDs come out of each run, so the tests' UUIDs change with the file.
 
 `crates/copperpour-core/src/tools/pcb_board_outline.rs`: the saved-board tests,
 the board KiCad holds in the live tests, and the `kicad-cli` test.
+
+`crates/copperpour-core/src/tools/manufacturing.rs`: `board_outline_size_tests`,
+which read the outline's size through `estimate_cost`.
