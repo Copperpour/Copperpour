@@ -49,7 +49,9 @@ maintainer's machine instead, as the **Copperpour Local CI** app. Other workflow
 - Nix flake and Schematic viewer show as skipped (neutral) on a PR that changes
   nothing they build from. Nix flake also runs on `main` after each merge.
 - PR builds other than Nix flake have no network access: crates are downloaded
-  first with `cargo vendor --locked`, then the jobs build from that copy.
+  first with `cargo vendor --locked`, then the jobs build from that copy. Nix
+  flake has network access, so on a contributor's PR it waits for a maintainer to
+  approve that exact head; the other checks run meanwhile.
 - PRs run automatically, except a contributor's PR that changes CI or build
   configuration: anything under `.github/` or `.cargo/`, `rust-toolchain.toml`,
   `flake.nix`, `flake.lock`, `deny.toml`, a `build.rs`, a `Cargo.lock`, or a
