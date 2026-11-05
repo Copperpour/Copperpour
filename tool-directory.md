@@ -500,7 +500,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ### `manufacturing` · 3 tools
 **Purpose:** Design-to-fab pipeline: export Gerber+BOM+positions package, validate for fab house, estimate cost.
-**Source:** [`crates/copperpour-core/src/tools/manufacturing.rs`](crates/copperpour-core/src/tools/manufacturing.rs)
+**Source:** [`crates/copperpour-core/src/tools/manufacturing.rs`](crates/copperpour-core/src/tools/manufacturing.rs); fab house profiles and JLCPCB assembly in [`crates/copperpour-core/src/fab/`](crates/copperpour-core/src/fab/)
 
 | Tool | Description |
 |------|-------------|

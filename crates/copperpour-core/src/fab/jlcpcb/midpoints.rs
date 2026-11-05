@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Serialize)]
-pub(super) struct Midpoint {
+pub(crate) struct Midpoint {
     pub designator: String,
     pub anchor_x_mm: f64,
     pub anchor_y_mm: f64,
@@ -16,12 +16,12 @@ pub(super) struct Midpoint {
     pub algorithm: &'static str,
 }
 
-pub(super) struct Snapshot {
+pub(crate) struct Snapshot {
     pub contents: String,
     pub midpoints: BTreeMap<String, Midpoint>,
 }
 
-pub(super) fn capture(
+pub(crate) fn capture(
     client: &KiCadIpcClient,
     document: kiapi::common::types::DocumentSpecifier,
 ) -> Result<Snapshot> {
@@ -114,7 +114,7 @@ fn union_center<'a>(
     ))
 }
 
-pub(super) fn convert_positions(
+pub(crate) fn convert_positions(
     source: &str,
     midpoints: &BTreeMap<String, Midpoint>,
 ) -> Result<(String, Vec<Midpoint>)> {
@@ -177,7 +177,7 @@ mod tests {
     fn fixture_server(board: &std::path::Path, mode: &'static str) -> MockIpcServer {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let document =
-            super::super::pcb_board::board_mock::board_document(&board.to_string_lossy());
+            crate::tools::pcb_board::board_mock::board_document(&board.to_string_lossy());
         let reads = AtomicUsize::new(0);
         MockIpcServer::spawn("midpoint-capture", move |request| {
             let command = request.message.unwrap();
@@ -198,7 +198,7 @@ mod tests {
                         .unwrap();
                 assert_eq!(command.document.as_ref(), Some(&document));
                 let mut contents =
-                    include_str!("../../tests/fixtures/jlcpcb_midpoints/midpoints.kicad_pcb")
+                    include_str!("../../../tests/fixtures/jlcpcb_midpoints/midpoints.kicad_pcb")
                         .to_string();
                 if mode == "drift" && reads.fetch_add(1, Ordering::SeqCst) > 0 {
                     contents.push('\n');
@@ -215,7 +215,7 @@ mod tests {
                     kiapi::common::commands::GetItems::decode(command.value.as_slice()).unwrap();
                 assert_eq!(command.header.unwrap().document.as_ref(), Some(&document));
                 let mut items = kiapi::common::commands::GetItemsResponse::decode(
-                    include_bytes!("../../tests/fixtures/jlcpcb_midpoints/footprints.pb")
+                    include_bytes!("../../../tests/fixtures/jlcpcb_midpoints/footprints.pb")
                         .as_slice(),
                 )
                 .unwrap();
@@ -268,7 +268,7 @@ mod tests {
                         .unwrap();
                 assert_eq!(requested.header.unwrap().document.as_ref(), Some(&document));
                 let captured = kiapi::common::commands::GetBoundingBoxResponse::decode(
-                    include_bytes!("../../tests/fixtures/jlcpcb_midpoints/boxes.pb").as_slice(),
+                    include_bytes!("../../../tests/fixtures/jlcpcb_midpoints/boxes.pb").as_slice(),
                 )
                 .unwrap();
                 let map: BTreeMap<_, _> = captured
@@ -303,7 +303,7 @@ mod tests {
     fn position_exclusions_precede_duplicate_detection_and_geometry() {
         let board = std::path::Path::new("midpoints.kicad_pcb");
         let document =
-            super::super::pcb_board::board_mock::board_document(&board.to_string_lossy());
+            crate::tools::pcb_board::board_mock::board_document(&board.to_string_lossy());
         for mode in ["excluded-with-pads", "excluded-no-pads", "dnp"] {
             let mock = fixture_server(board, mode);
             let snapshot = capture(&KiCadIpcClient::new(mock.address()), document.clone()).unwrap();
@@ -319,7 +319,7 @@ mod tests {
             assert_eq!(evidence.len(), 1, "{mode}");
             assert_eq!(
                 snapshot.contents,
-                include_str!("../../tests/fixtures/jlcpcb_midpoints/midpoints.kicad_pcb")
+                include_str!("../../../tests/fixtures/jlcpcb_midpoints/midpoints.kicad_pcb")
             );
         }
         for mode in ["duplicate", "bom-only"] {
@@ -338,7 +338,7 @@ mod tests {
     fn captured_native_geometry_matches_literal_board_space_oracle() {
         let board = std::path::Path::new("midpoints.kicad_pcb");
         let document =
-            super::super::pcb_board::board_mock::board_document(&board.to_string_lossy());
+            crate::tools::pcb_board::board_mock::board_document(&board.to_string_lossy());
         let mock = fixture_server(board, "good");
         let snapshot = capture(&KiCadIpcClient::new(mock.address()), document.clone()).unwrap();
         let expected = [
@@ -382,7 +382,8 @@ mod tests {
         for mode in ["closed", "drift", "missing-box", "duplicate", "bom-only"] {
             let dir = tempfile::tempdir().unwrap();
             let board = dir.path().join("midpoints.kicad_pcb");
-            let before = include_str!("../../tests/fixtures/jlcpcb_midpoints/midpoints.kicad_pcb");
+            let before =
+                include_str!("../../../tests/fixtures/jlcpcb_midpoints/midpoints.kicad_pcb");
             std::fs::write(&board, before).unwrap();
             let output = dir.path().join("package");
             let mock = fixture_server(&board, mode);
@@ -527,7 +528,7 @@ mod tests {
         std::fs::write(&staged, &snapshot.contents).unwrap();
         let output = dir.path().join("CPL.csv");
         let cli = std::env::var("KICAD_CLI_PATH").unwrap_or_else(|_| "kicad-cli".into());
-        let export = super::super::manufacturing::export_jlcpcb_cpl(
+        let export = super::super::export_jlcpcb_cpl(
             &cli,
             &staged,
             &output,
@@ -563,16 +564,11 @@ mod tests {
         let published = std::fs::read(&output).unwrap();
         let mut incomplete = snapshot.midpoints.clone();
         incomplete.remove("JF0");
-        assert!(super::super::manufacturing::export_jlcpcb_cpl(
-            &cli,
-            &staged,
-            &output,
-            "both",
-            None,
-            &incomplete
-        )
-        .await
-        .is_err());
+        assert!(
+            super::super::export_jlcpcb_cpl(&cli, &staged, &output, "both", None, &incomplete)
+                .await
+                .is_err()
+        );
         assert_eq!(
             std::fs::read(&output).unwrap(),
             published,
@@ -635,9 +631,9 @@ mod tests {
         let document = client.find_open_board(&board).unwrap();
         assert_eq!(client.get_open_documents().unwrap(), vec![document.clone()]);
         let source = std::fs::read_to_string(library).unwrap();
-        let pads = super::super::pcb_components::extract_pad_definitions(&source).unwrap();
-        let graphics = super::super::pcb_components::extract_graphic_definitions(&source).unwrap();
-        let fields = super::super::pcb_components::extract_field_placement(&source);
+        let pads = crate::tools::pcb_components::extract_pad_definitions(&source).unwrap();
+        let graphics = crate::tools::pcb_components::extract_graphic_definitions(&source).unwrap();
+        let fields = crate::tools::pcb_components::extract_field_placement(&source);
         let mut creates = Vec::new();
         for (i, angle) in [0.0, 90.0, 180.0, 270.0, 45.0].iter().enumerate() {
             for (side, layer) in [("F", "F.Cu"), ("B", "B.Cu")] {
@@ -666,9 +662,9 @@ mod tests {
                 "Resistor_SMD:R_0805_2012Metric",
                 "R1",
                 "10k",
-                &super::super::pcb_components::extract_pad_definitions(&centered).unwrap(),
-                &super::super::pcb_components::extract_graphic_definitions(&centered).unwrap(),
-                &super::super::pcb_components::extract_field_placement(&centered),
+                &crate::tools::pcb_components::extract_pad_definitions(&centered).unwrap(),
+                &crate::tools::pcb_components::extract_graphic_definitions(&centered).unwrap(),
+                &crate::tools::pcb_components::extract_field_placement(&centered),
                 80.0,
                 20.0,
                 0.0,

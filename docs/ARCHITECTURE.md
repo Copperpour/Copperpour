@@ -40,7 +40,11 @@ moving out of `src/tools` into domain modules (#209). The toolset's handler
 stays in its `src/tools` file and delegates. `autorouting/freerouting` holds
 Freerouting discovery, the Java checks and the headless routing session; the
 `integration` toolset's `check_freerouting` and `route_specctra_dsn` handlers
-call it.
+call it. `fab` describes each fab house as a `FabProfile`: its design-rule
+limits, its price model and its assembly format. `fab/jlcpcb` holds JLCPCB's
+assembly output (the CPL from native pad midpoints, its rotation corrections,
+and the BOM and CPL designator checks) and its catalog part pricing. The
+`manufacturing` handlers read the profile instead of naming a fab house.
 
 ### KiCad data layers
 
