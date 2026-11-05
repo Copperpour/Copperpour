@@ -63,16 +63,7 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
             .with_env_filter(filter)
             .try_init();
         ipc_source.log(&config.ipc_address);
-        copperpour_core::tools::cli::set_long_timeout(config.kicad_cli_timeout_seconds);
-        let server_config = copperpour_core::tools::ServerConfig {
-            kicad_cli: config.kicad_cli.clone(),
-            kicad_binary: config.kicad_binary.clone(),
-            ipc_address: config.ipc_address.clone(),
-            project_dir: config.project_dir.clone(),
-            jlcpcb_db_path: config.jlcpcb_db_path.clone(),
-            auto_load_toolsets: config.auto_load_toolsets,
-            eager_toolsets: config.eager_toolsets,
-        };
+        let server_config = config.apply_to_process();
         match McpHandler::new_with_config_resolution(server_config, config_resolution).await {
             Ok(handler) => match config.transport {
                 TransportMode::Stdio => {

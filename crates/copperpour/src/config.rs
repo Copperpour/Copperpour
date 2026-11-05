@@ -62,7 +62,8 @@ pub struct Config {
 
     /// Timeout, in seconds, of long kicad-cli operations (DRC, ERC, exports). A full DRC of a
     /// large board with creepage rules can take more than the default 600 s, all the more on a
-    /// loaded machine. A timed-out kicad-cli is killed.
+    /// loaded machine. A timed-out kicad-cli is killed. Zero is read as one second, since zero
+    /// would fail every call before kicad-cli could answer.
     #[serde(default = "default_kicad_cli_timeout_seconds")]
     pub kicad_cli_timeout_seconds: u64,
 }
@@ -122,6 +123,24 @@ impl IpcAddressSource {
             "KiCad IPC address from {source}: {}",
             copperpour_ipc::redact_endpoint(address)
         ))
+    }
+}
+
+impl Config {
+    /// Apply the process-wide settings (the kicad-cli timeout) and build the server's
+    /// configuration. Both entry points, the binary and the plugin FFI, start the server
+    /// through this, so neither can leave a setting unapplied.
+    pub fn apply_to_process(&self) -> copperpour_core::tools::ServerConfig {
+        copperpour_core::tools::cli::set_long_timeout(self.kicad_cli_timeout_seconds);
+        copperpour_core::tools::ServerConfig {
+            kicad_cli: self.kicad_cli.clone(),
+            kicad_binary: self.kicad_binary.clone(),
+            ipc_address: self.ipc_address.clone(),
+            project_dir: self.project_dir.clone(),
+            jlcpcb_db_path: self.jlcpcb_db_path.clone(),
+            auto_load_toolsets: self.auto_load_toolsets,
+            eager_toolsets: self.eager_toolsets,
+        }
     }
 }
 
@@ -420,6 +439,27 @@ mod tests {
         let c = Config::load_from(f.path()).unwrap();
         assert_eq!(c.kicad_cli_timeout_seconds, 600);
         assert_eq!(Config::default().kicad_cli_timeout_seconds, 600);
+    }
+
+    /// The only test in this crate that touches the process-wide kicad-cli timeout.
+    #[test]
+    fn applying_the_config_sets_the_kicad_cli_timeout() {
+        use copperpour_core::tools::cli::{long_timeout, DEFAULT_LONG_TIMEOUT_SECS};
+        use std::time::Duration;
+
+        let f = write_temp("toml", "kicad_cli_timeout_seconds = 1800\n");
+        Config::load_from(f.path()).unwrap().apply_to_process();
+        assert_eq!(long_timeout(), Duration::from_secs(1800));
+
+        let f = write_temp("toml", "kicad_cli_timeout_seconds = 0\n");
+        Config::load_from(f.path()).unwrap().apply_to_process();
+        assert_eq!(long_timeout(), Duration::from_secs(1), "0 is read as 1 s");
+
+        Config::default().apply_to_process();
+        assert_eq!(
+            long_timeout(),
+            Duration::from_secs(DEFAULT_LONG_TIMEOUT_SECS)
+        );
     }
 
     #[test]

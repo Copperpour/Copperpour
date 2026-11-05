@@ -28,12 +28,14 @@ pub const DEFAULT_LONG_TIMEOUT_SECS: u64 = 600;
 /// all the more on a loaded machine.
 static LONG_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(DEFAULT_LONG_TIMEOUT_SECS);
 
-/// Set the timeout of long kicad-cli operations. Zero is refused: it would fail every call.
+/// Set the timeout of long kicad-cli operations. Zero is read as one second: zero would fail
+/// every call before kicad-cli could answer.
 pub fn set_long_timeout(seconds: u64) {
     LONG_TIMEOUT_SECS.store(seconds.max(1), Ordering::Relaxed);
 }
 
-fn long_timeout() -> Duration {
+/// The timeout of long kicad-cli operations currently in force.
+pub fn long_timeout() -> Duration {
     Duration::from_secs(LONG_TIMEOUT_SECS.load(Ordering::Relaxed))
 }
 
@@ -724,6 +726,65 @@ pub(crate) mod test_support {
         release_writer.join().unwrap();
 
         assert_eq!(output, "ready");
+    }
+
+    /// The state `ps` reports for `pid`, or `None` once the process is gone.
+    #[cfg(unix)]
+    fn process_state(pid: &str) -> Option<String> {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !state.is_empty()).then_some(state)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_cli_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        // `exec` so the PID written is the process left running, not a shell around it.
+        let cli = write_script(
+            dir.path(),
+            "hung-kicad-cli",
+            "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 30\n",
+            "",
+        );
+
+        let error = run_cli_captured(
+            cli.to_str().unwrap(),
+            &[pid_file.to_str().unwrap()],
+            Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .expect("a CLI that outlives the timeout must fail the call");
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "unexpected error: {error:#}"
+        );
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_string();
+        // SIGKILL is sent when the timed-out future drops the child; the process may stay a
+        // zombie until tokio reaps it, which no longer runs anything.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut state = process_state(&pid);
+        while state.as_deref().is_some_and(|s| !s.starts_with('Z'))
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            state = process_state(&pid);
+        }
+        if state.as_deref().is_some_and(|s| !s.starts_with('Z')) {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid])
+                .status();
+            panic!("kicad-cli {pid} is still running after the timeout (state {state:?})");
+        }
     }
 }
 
