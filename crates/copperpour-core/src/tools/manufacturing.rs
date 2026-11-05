@@ -1082,12 +1082,7 @@ async fn handle_validate_for_manufacturing(
     );
 
     // Fab-specific checks
-    let (min_trace, _min_drill, _max_layers) = match fab_house {
-        "jlcpcb" => (0.127, 0.3, 32),
-        "oshpark" => (0.152, 0.254, 4),
-        "pcbway" => (0.1, 0.2, 32),
-        _ => (0.15, 0.3, 32),
-    };
+    let min_trace = crate::fab::profile(fab_house).min_trace_mm;
 
     // Check design rules
     if let Some(min_tw) = find_setup_value(&content, "min_trace_width") {
@@ -1203,11 +1198,6 @@ async fn handle_validate_for_manufacturing(
         .unwrap(),
     ))
 }
-
-/// JLCPCB's loading fee per unique Extended part under Economic PCBA, whose
-/// setup fee the estimate assumes. Basic and Preferred Extended parts have none.
-const JLCPCB_EXTENDED_PART_FEE: f64 = 3.07;
-const JLCPCB_FEE_SOURCE: &str = "JLCPCB Economic PCBA: $3.07 per unique Extended part, none for Basic or Preferred Extended parts (https://jlcpcb.com/blog/reduce-pcb-assembly-cost-prototype, prices as of 2026-10-09)";
 
 /// A footprint the BOM lists, by reference and LCSC field.
 struct BomFootprint {
@@ -1523,86 +1513,72 @@ async fn handle_estimate_cost(
     let (width_mm, height_mm) = estimate_board_dimensions(&content);
 
     let (bom_parts, excluded_from_bom) = bom_footprints(&tree);
+    // Only the parts the BOM lists are bought and placed; a mounting hole or a
+    // `dnp` part is not.
     let placed_count = bom_parts.len();
-    const JLCPCB_AVERAGE_PART_PRICE: f64 = 0.05;
-    let jlcpcb_components = if fab_house == "jlcpcb" {
-        Some(
-            price_jlcpcb_components(
-                args,
-                ctx,
-                &bom_parts,
-                JLCPCB_AVERAGE_PART_PRICE,
-                quantity as u64,
-            )
-            .await,
-        )
-    } else {
-        None
+    let cost_model = crate::fab::profile(fab_house).cost_model;
+    let catalog_pricing = match cost_model.components {
+        crate::fab::ComponentPrice::JlcpcbCatalog {
+            average,
+            extended_part_fee,
+            fee_source,
+        } => Some((
+            price_jlcpcb_components(args, ctx, &bom_parts, average, quantity as u64).await,
+            average,
+            extended_part_fee,
+            fee_source,
+        )),
+        _ => None,
     };
 
     // Rough cost estimation based on fab house pricing models
-    let (pcb_cost, assembly_cost, component_est) = match fab_house {
-        "jlcpcb" => {
-            let pcb = match copper_layers {
-                // JLCPCB prices single-sided boards on the two-layer scale.
-                1 | 2 => 2.0 + (quantity as f64 - 5.0).max(0.0) * 0.40,
-                4 => 7.0 + (quantity as f64 - 5.0).max(0.0) * 1.40,
-                6 => 15.0 + (quantity as f64 - 5.0).max(0.0) * 3.00,
-                _ => 30.0 + (quantity as f64 - 5.0).max(0.0) * 5.00,
-            };
-            // Only the parts the BOM lists are placed; a mounting hole or a
-            // `dnp` part is not.
-            let smt_setup = if placed_count > 0 { 8.0 } else { 0.0 };
-            let smt_per_board = placed_count as f64 * 0.003 * quantity as f64;
-            let comp_per_board = jlcpcb_components
-                .as_ref()
-                .map_or(0.0, |pricing| pricing.per_board);
-            (
-                pcb,
-                smt_setup + smt_per_board,
-                comp_per_board * quantity as f64,
-            )
+    let pcb_cost = cost_model.pcb.cost(copper_layers, quantity);
+    let assembly_cost = cost_model
+        .assembly
+        .as_ref()
+        .map_or(0.0, |assembly| assembly.cost(placed_count, quantity));
+    let component_est = match (&cost_model.components, &catalog_pricing) {
+        (_, Some((pricing, ..))) => pricing.per_board * quantity as f64,
+        (crate::fab::ComponentPrice::PerPart(price), None) => {
+            placed_count as f64 * price * quantity as f64
         }
-        "pcbway" => {
-            let pcb = match copper_layers {
-                1 | 2 => 5.0 + (quantity as f64 - 5.0).max(0.0) * 0.50,
-                4 => 12.0 + (quantity as f64 - 5.0).max(0.0) * 2.00,
-                _ => 25.0 + (quantity as f64 - 5.0).max(0.0) * 4.00,
-            };
-            let smt = placed_count as f64 * 0.005 * quantity as f64;
-            let comp_est = placed_count as f64 * 0.08 * quantity as f64;
-            (pcb, smt, comp_est)
-        }
-        _ => {
-            let pcb = 10.0 + quantity as f64 * 2.0;
-            (pcb, 0.0, 0.0)
-        }
+        _ => 0.0,
     };
 
     // Charged once per order for each unique Extended part, not per board.
-    let extended_parts_fee = jlcpcb_components.as_ref().map_or(0.0, |pricing| {
-        pricing.extended_unique_parts as f64 * JLCPCB_EXTENDED_PART_FEE
-    });
+    let extended_parts_fee = catalog_pricing
+        .as_ref()
+        .map_or(0.0, |(pricing, _, fee, _)| {
+            pricing.extended_unique_parts as f64 * fee
+        });
     let total = pcb_cost + assembly_cost + component_est + extended_parts_fee;
 
     let mut notes = vec![
         "Estimates are approximate — actual cost depends on board size, finish, and specific components"
             .to_string(),
     ];
-    let components = match &jlcpcb_components {
-        Some(pricing) => {
+    let approximate = cost_model.source.is_none();
+    match cost_model.source {
+        Some(source) => notes.push(source.to_string()),
+        None => notes.push(format!(
+            "{}'s PCB and assembly prices here are rough figures with no cited source",
+            fab_house.to_uppercase()
+        )),
+    }
+    let components = match &catalog_pricing {
+        Some((pricing, average, _, fee_source)) => {
             notes.push(format!(
                 "Parts with an LCSC field are priced from the local JLCPCB catalog, at the price break \
                  for the order's quantity of each; other parts at an average of \
-                 ${JLCPCB_AVERAGE_PART_PRICE:.2}. components lists which is which; search_jlcpcb_parts \
+                 ${average:.2}. components lists which is which; search_jlcpcb_parts \
                  finds an LCSC number for a part."
             ));
-            notes.push(JLCPCB_FEE_SOURCE.to_string());
+            notes.push(fee_source.to_string());
             json!({
                 "catalog": pricing.catalog,
                 "priced_from_catalog": pricing.priced_from_catalog,
                 "estimated": pricing.estimated,
-                "average_unit_price": JLCPCB_AVERAGE_PART_PRICE,
+                "average_unit_price": average,
                 "extended_unique_parts": pricing.extended_unique_parts,
                 "excluded_from_bom": excluded_from_bom
             })
@@ -1649,7 +1625,9 @@ async fn handle_estimate_cost(
                 "components_estimate": format!("${:.2}", component_est),
                 "extended_parts_fee": format!("${:.2}", extended_parts_fee),
                 "total_estimate": format!("${:.2}", total),
-                "per_board": format!("${:.2}", total / quantity as f64)
+                "per_board": format!("${:.2}", total / quantity as f64),
+                // The PCB and assembly prices have no cited source (#209).
+                "approximate": approximate
             },
             "notes": notes,
             "disclaimer": "BETA: Cost estimates are indicative only. Always confirm with the fab house's online quoting tool."
@@ -2949,6 +2927,14 @@ mod estimate_cost_catalog_tests {
         // Setup plus the eight parts the BOM lists, not H1 or D1:
         // 8 + 8 x 0.003 x 5.
         assert_eq!(cost["smt_assembly"], "$8.12", "{report}");
+        // No price model cites a source yet, so the estimate says so (#209).
+        assert_eq!(cost["approximate"], true);
+        assert!(
+            report["notes"].to_string().contains(
+                "JLCPCB's PCB and assembly prices here are rough figures with no cited source"
+            ),
+            "{report}"
+        );
         let notes = report["notes"].to_string();
         assert!(notes.contains("search_jlcpcb_parts"), "{notes}");
         assert!(!notes.contains("generate_bom"), "{notes}");
