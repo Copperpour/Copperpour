@@ -69,6 +69,50 @@ fn string_literals(line: &str) -> Vec<String> {
     literals
 }
 
+/// The lines of `source` to check, with their 0-based numbers: every line
+/// except comments and the items gated by `#[cfg(test)]`, whose strings are
+/// fixtures.
+///
+/// A gated item ends at its first line indented no deeper than the attribute,
+/// unless that line closes the item (`}`). Production code often follows a
+/// `#[cfg(test)]` item, so the scan must not stop there. If a line inside the
+/// item is less indented, such as a raw string's content, the skip ends early
+/// and the rest of the item is scanned: a false alarm, never a missed file.
+fn scanned_lines(source: &str) -> Vec<(usize, &str)> {
+    fn indent(line: &str) -> usize {
+        line.len() - line.trim_start().len()
+    }
+    let mut lines = Vec::new();
+    // While skipping: the attribute's indent, and whether the gated item's
+    // first line (after any further attributes) has been seen.
+    let mut skip: Option<(usize, bool)> = None;
+    for (lineno, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if let Some((depth, started)) = skip {
+            if trimmed.is_empty() || indent(line) > depth {
+                continue;
+            }
+            if !started {
+                let header = trimmed.starts_with("#[") || trimmed.starts_with("///");
+                skip = Some((depth, !header));
+                continue;
+            }
+            skip = None;
+            if trimmed.starts_with('}') {
+                continue;
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("#[cfg(test)]") {
+            skip = Some((indent(line), !rest.trim().is_empty()));
+            continue;
+        }
+        if !trimmed.starts_with("//") {
+            lines.push((lineno, line));
+        }
+    }
+    lines
+}
+
 /// `snake_case` words with at least two parts that directly follow a trigger
 /// word, with any backticks around them removed.
 fn tool_like_words_after_triggers(text: &str) -> Vec<String> {
@@ -125,14 +169,7 @@ fn tool_text_names_only_tools_that_exist() {
     let mut phantom = Vec::new();
     for path in source_files() {
         let source = std::fs::read_to_string(&path).unwrap();
-        for (lineno, line) in source.lines().enumerate() {
-            // Test modules come last in these files; their strings are fixtures.
-            if line.trim_start().starts_with("#[cfg(test)]") {
-                break;
-            }
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
+        for (lineno, line) in scanned_lines(&source) {
             for literal in string_literals(line) {
                 for word in tool_like_words_after_triggers(&literal) {
                     if known.contains(&word)
@@ -174,4 +211,47 @@ fn the_scan_finds_a_phantom_in_a_string_literal() {
         ["export_bom"]
     );
     assert!(string_literals(r#"let x = 1; // use generate_bom"#).is_empty());
+}
+
+#[test]
+fn the_scan_skips_only_the_items_gated_by_cfg_test() {
+    let source = r#"fn before() -> &'static str { "use before_tool" }
+#[cfg(test)] mod inline_tests;
+fn after_inline() -> &'static str { "use after_inline" }
+#[cfg(test)]
+#[allow(dead_code)]
+/// Doc.
+mod tests {
+    fn fixture() -> &'static str {
+        "use test_fixture"
+    }
+
+    #[cfg(test)]
+    fn nested() {}
+}
+fn after_mod() -> &'static str { "use after_mod" }
+struct Flags {
+    #[cfg(test)]
+    test_field: bool,
+    real_field: bool,
+}
+// use commented_out
+fn last() -> &'static str { "use last_tool" }
+"#;
+    let scanned: Vec<&str> = scanned_lines(source)
+        .into_iter()
+        .map(|(_, line)| line.trim())
+        .collect();
+    assert_eq!(
+        scanned,
+        [
+            r#"fn before() -> &'static str { "use before_tool" }"#,
+            r#"fn after_inline() -> &'static str { "use after_inline" }"#,
+            r#"fn after_mod() -> &'static str { "use after_mod" }"#,
+            "struct Flags {",
+            "real_field: bool,",
+            "}",
+            r#"fn last() -> &'static str { "use last_tool" }"#,
+        ]
+    );
 }
