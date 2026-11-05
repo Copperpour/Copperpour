@@ -450,6 +450,21 @@ impl JobProgress {
         if let Some(activity) = self.read_activity() {
             self.activity = Some(activity);
         }
+        if let Some(message) = self.next_message(state, details, started, Instant::now()) {
+            crate::progress::report(f64::from(self.sent), None, &message);
+        }
+    }
+
+    /// The notification to send for this poll, or `None` when the job looks
+    /// the same as last time and the heartbeat is not due. `now` is a
+    /// parameter so that deduplication and the heartbeat can be tested.
+    fn next_message(
+        &mut self,
+        state: &str,
+        details: &Value,
+        started: Instant,
+        now: Instant,
+    ) -> Option<String> {
         let mut message = state.to_ascii_lowercase();
         match &self.activity {
             Some(activity) => message = format!("{message}, {activity}"),
@@ -461,23 +476,20 @@ impl JobProgress {
         }
         let due = self
             .last_sent
-            .is_none_or(|sent| sent.elapsed() >= PROGRESS_HEARTBEAT);
+            .is_none_or(|sent| now.duration_since(sent) >= PROGRESS_HEARTBEAT);
         if message == self.last_message && !due {
-            return;
+            return None;
         }
         self.sent += 1;
-        self.last_sent = Some(Instant::now());
-        let elapsed = started.elapsed().as_secs();
-        crate::progress::report(
-            f64::from(self.sent),
-            None,
-            &format!(
-                "Freerouting {message} ({}m{:02}s)",
-                elapsed / 60,
-                elapsed % 60
-            ),
+        self.last_sent = Some(now);
+        let elapsed = now.duration_since(started).as_secs();
+        let text = format!(
+            "Freerouting {message} ({}m{:02}s)",
+            elapsed / 60,
+            elapsed % 60
         );
         self.last_message = message;
+        Some(text)
     }
 
     fn read_activity(&self) -> Option<String> {
@@ -1096,6 +1108,60 @@ mod tests {
             Some("optimizer pass 2: score 73.70 -> 84.26 (improved)")
         );
         assert_eq!(latest_activity(log, "[C11111]"), None);
+    }
+
+    #[test]
+    fn an_unchanged_job_is_reported_once_then_at_each_heartbeat() {
+        let mut progress = JobProgress::new("a3aa32eb");
+        progress.log = None;
+        let details = json!({ "current_pass": 3 });
+        let started = Instant::now();
+        let at = |seconds| started + Duration::from_secs(seconds);
+
+        assert_eq!(
+            progress
+                .next_message("RUNNING", &details, started, at(5))
+                .as_deref(),
+            Some("Freerouting running, pass 3 (0m05s)")
+        );
+        // Same state, inside the heartbeat: nothing new to say.
+        assert_eq!(
+            progress.next_message("RUNNING", &details, started, at(10)),
+            None
+        );
+        assert_eq!(
+            progress.next_message("RUNNING", &details, started, at(64)),
+            None
+        );
+        // Still the same, but a minute after the last report: the heartbeat.
+        assert_eq!(
+            progress
+                .next_message("RUNNING", &details, started, at(65))
+                .as_deref(),
+            Some("Freerouting running, pass 3 (1m05s)")
+        );
+        // A change is reported at once, and progress keeps increasing.
+        assert_eq!(
+            progress
+                .next_message("RUNNING", &json!({ "current_pass": 4 }), started, at(66))
+                .as_deref(),
+            Some("Freerouting running, pass 4 (1m06s)")
+        );
+        assert_eq!(progress.sent, 3);
+    }
+
+    #[test]
+    fn the_log_activity_replaces_the_pass_number() {
+        let mut progress = JobProgress::new("a3aa32eb");
+        progress.log = None;
+        progress.activity = Some("pass 7: 9 unrouted, 218 violations".to_string());
+        let started = Instant::now();
+        assert_eq!(
+            progress
+                .next_message("RUNNING", &json!({ "current_pass": 3 }), started, started)
+                .as_deref(),
+            Some("Freerouting running, pass 7: 9 unrouted, 218 violations (0m00s)")
+        );
     }
 
     #[test]
