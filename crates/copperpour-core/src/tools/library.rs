@@ -1400,7 +1400,7 @@ fn set_pad_child(pad_block: String, head: &str, child: Option<String>) -> String
 /// A pad's fabrication property, KiCad's `PAD_PROP`. KiCad writes it as
 /// `(property pad_prop_<name>)` and writes nothing for `None`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PadFabricationProperty {
+pub(crate) enum PadFabricationProperty {
     None,
     Bga,
     FiducialGlobal,
@@ -1491,7 +1491,7 @@ impl PadFabricationProperty {
 
     /// The property KiCad would load from a pad: the last token it
     /// recognizes across every `(property …)` child, unknown tokens skipped.
-    fn of_pad(pad: &SexpNode) -> Self {
+    pub(crate) fn of_pad(pad: &SexpNode) -> Self {
         let mut property = Self::None;
         for child in pad.find_all("property") {
             for token in child.children().unwrap_or_default().iter().skip(1) {

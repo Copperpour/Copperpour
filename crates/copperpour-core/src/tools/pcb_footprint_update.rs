@@ -1,3 +1,4 @@
+use super::library::PadFabricationProperty;
 use crate::hex::encode_hex;
 use crate::mcp::protocol::{CallToolResult, ToolContent};
 use crate::tool;
@@ -26,8 +27,61 @@ struct LibraryFootprint {
     value_field: Option<kiapi::board::types::Field>,
     properties: Vec<kiapi::board::types::Field>,
     pads: Vec<copperpour_ipc::IpcPadDefinition>,
+    /// Each pad's fabrication property, in the order of `pads`.
+    pad_properties: Vec<PadFabricationProperty>,
     graphics: Vec<copperpour_ipc::IpcGraphicDefinition>,
+    points: Vec<LibraryPoint>,
     models: Vec<kiapi::board::types::Footprint3DModel>,
+}
+
+impl LibraryFootprint {
+    /// What this footprint has that KiCad's API carries only from 10.0.7
+    /// (`PadFabricationProperty` and `ReferencePoint` are `Since: 10.0.7`),
+    /// or `None` when it has neither.
+    fn needs_kicad_10_0_7(&self) -> Option<&'static str> {
+        let properties = self
+            .pad_properties
+            .iter()
+            .any(|property| *property != PadFabricationProperty::None);
+        match (properties, !self.points.is_empty()) {
+            (false, false) => None,
+            (true, false) => Some("pad fabrication properties"),
+            (false, true) => Some("a reference point"),
+            (true, true) => Some("pad fabrication properties and a reference point"),
+        }
+    }
+}
+
+/// A library footprint's `(point …)`, in footprint-local millimetres.
+#[derive(Debug, Clone, PartialEq)]
+struct LibraryPoint {
+    x: f64,
+    y: f64,
+    size: f64,
+    layer: String,
+}
+
+/// KiCad's API value for a pad's fabrication property, as
+/// `pcbnew/api/api_pcb_enums.cpp` maps `PAD_PROP`.
+fn fab_property(property: PadFabricationProperty) -> kiapi::board::types::PadFabricationProperty {
+    use kiapi::board::types::PadFabricationProperty as Proto;
+    match property {
+        PadFabricationProperty::None => Proto::PfpNone,
+        PadFabricationProperty::Bga => Proto::PfpBga,
+        PadFabricationProperty::FiducialGlobal => Proto::PfpFiducialGlobal,
+        PadFabricationProperty::FiducialLocal => Proto::PfpFiducialLocal,
+        PadFabricationProperty::Testpoint => Proto::PfpTestpoint,
+        PadFabricationProperty::Heatsink => Proto::PfpHeatsink,
+        PadFabricationProperty::Castellated => Proto::PfpCastellated,
+        PadFabricationProperty::Mechanical => Proto::PfpMechanical,
+        PadFabricationProperty::Pressfit => Proto::PfpPressfit,
+    }
+}
+
+/// Whether `version`'s API carries pad fabrication properties and reference
+/// points: both arrived in KiCad 10.0.7.
+fn carries_kicad_10_0_7_fields(version: &copperpour_ipc::IpcKiCadVersion) -> bool {
+    (version.major, version.minor, version.patch) >= (10, 0, 7)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -352,6 +406,7 @@ pub(crate) async fn handle_update_footprints_from_library(
         operation,
         move |client| {
             let document = client.find_open_board(&ipc_board_path)?;
+            let kicad = client.get_kicad_version()?;
             let footprint_items =
                 client.get_items_in(document.clone(), ObjectType::KotPcbFootprint)?;
             let nets = client.get_nets_in(document.clone())?;
@@ -372,6 +427,7 @@ pub(crate) async fn handle_update_footprints_from_library(
                 &net_codes,
                 &routed_nets,
                 &filters,
+                &kicad,
             );
 
             if dry_run || plan.status == PlanStatus::Conflict {
@@ -633,6 +689,7 @@ fn plan_updates(
     net_codes: &BTreeMap<String, i32>,
     routed_nets: &BTreeSet<String>,
     filters: &UpdateFilters,
+    kicad: &copperpour_ipc::IpcKiCadVersion,
 ) -> UpdatePlan {
     #[derive(Debug)]
     struct Candidate {
@@ -816,6 +873,23 @@ fn plan_updates(
                 continue;
             }
         };
+        // An older KiCad would drop these on apply, which is worse than
+        // refusing the footprint as before.
+        if let Some(what) = library
+            .needs_kicad_10_0_7()
+            .filter(|_| !carries_kicad_10_0_7_fields(kicad))
+        {
+            diagnostics.push(UpdateDiagnostic {
+                code: "unsupported_library_footprint".to_string(),
+                message: format!(
+                    "footprint '{}' has {what}, which KiCad's API carries only from \
+                     KiCad 10.0.7; this KiCad is {}",
+                    candidate.library_id, kicad.full_version
+                ),
+                reference: Some(candidate.reference),
+            });
+            continue;
+        }
         let prepared = match build_updated_instance(
             &candidate.instance,
             &library,
@@ -897,6 +971,26 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     validate_supported_children(&root)?;
     let properties = super::library_footprint::properties(&root)?;
     let pads = super::pcb_components::extract_pad_definitions(source)?;
+    // `extract_pad_definitions` reads the same `pad` nodes in the same order.
+    let pad_properties = root
+        .find_all("pad")
+        .into_iter()
+        .map(PadFabricationProperty::of_pad)
+        .collect::<Vec<_>>();
+    if pad_properties.len() != pads.len() {
+        bail!(
+            "read {} pad properties for {} pads",
+            pad_properties.len(),
+            pads.len()
+        );
+    }
+    let points = root
+        .children()
+        .unwrap_or_default()
+        .iter()
+        .filter(|child| child.head() == Some("point"))
+        .map(library_point)
+        .collect::<Result<Vec<_>>>()?;
     // Custom properties travel as typed Field items below. Treating visible
     // properties as generic graphics as well would duplicate their text.
     let graphics = super::pcb_components::extract_graphic_definitions_without_properties(source)?;
@@ -921,9 +1015,44 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         value_field: properties.value,
         properties: properties.custom,
         pads,
+        pad_properties,
         graphics,
+        points,
         models,
     })
+}
+
+/// A footprint's `(point (at x y) (size s) (layer "L") (uuid …))`, the only
+/// clauses KiCad's `parsePCB_POINT` reads; `validate_point` refused any other.
+fn library_point(point: &copperpour_sexp::SexpNode) -> Result<LibraryPoint> {
+    let at = point
+        .find("at")
+        .context("footprint point is missing (at …)")?;
+    Ok(LibraryPoint {
+        x: at.get_f64(1).context("footprint point has an invalid X")?,
+        y: at.get_f64(2).context("footprint point has an invalid Y")?,
+        size: point
+            .find_f64("size")
+            .context("footprint point is missing (size …)")?,
+        layer: point
+            .find("layer")
+            .and_then(|layer| layer.get(1))
+            .and_then(copperpour_sexp::SexpNode::as_str)
+            .context("footprint point is missing (layer …)")?
+            .to_string(),
+    })
+}
+
+fn validate_point(point: &copperpour_sexp::SexpNode) -> Result<()> {
+    for child in point.children().unwrap_or_default().iter().skip(1) {
+        let Some(tag) = child.head() else {
+            bail!("footprint point has an unexpected atom");
+        };
+        if !matches!(tag, "at" | "size" | "layer" | "uuid") {
+            bail!("footprint point clause '{tag}' is not supported by typed library refresh");
+        }
+    }
+    Ok(())
 }
 
 fn validate_supported_children(root: &copperpour_sexp::SexpNode) -> Result<()> {
@@ -934,7 +1063,7 @@ fn validate_supported_children(root: &copperpour_sexp::SexpNode) -> Result<()> {
         match tag {
             "version" | "generator" | "generator_version" | "layer" | "descr" | "tags" | "attr"
             | "property" | "fp_text" | "fp_line" | "fp_rect" | "fp_circle" | "fp_arc"
-            | "fp_poly" | "pad" | "model" => {}
+            | "fp_poly" | "pad" | "model" | "point" => {}
             // KiCad 10 writes these two flags into every footprint it saves
             // (all 15,428 official library files carry them, every one at its
             // default). At the default the typed rebuild loses nothing;
@@ -954,6 +1083,7 @@ fn validate_supported_children(root: &copperpour_sexp::SexpNode) -> Result<()> {
         }
         match tag {
             "pad" => validate_pad(child)?,
+            "point" => validate_point(child)?,
             "fp_line" | "fp_rect" | "fp_circle" | "fp_arc" | "fp_poly" => {
                 validate_graphic(child, tag)?
             }
@@ -1223,6 +1353,9 @@ fn validate_pad(pad: &copperpour_sexp::SexpNode) -> Result<()> {
                 | "uuid"
                 | "tstamp"
                 | "remove_unused_layers"
+                // The fabrication property, read as KiCad loads it
+                // (`PadFabricationProperty::of_pad`).
+                | "property"
         ) {
             bail!("pad clause '{tag}' is not supported by typed library refresh");
         }
@@ -1365,9 +1498,21 @@ fn build_updated_instance(
     definition.items.extend(library.models.iter().map(|model| {
         copperpour_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
     }));
+    for point in &library.points {
+        definition.items.push(copperpour_ipc::builders::pack_any(
+            &build_reference_point(point, &position, rotation, is_back.then_some(stack))?,
+            "kiapi.board.types.ReferencePoint",
+        ));
+    }
+    // The builder emits the pads in the library's order.
+    let mut pad_properties = library.pad_properties.iter();
     for item in &mut definition.items {
         if item.type_url.ends_with("kiapi.board.types.Pad") {
             let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+            let property = pad_properties
+                .next()
+                .context("typed footprint builder returned more pads than the library has")?;
+            pad.fab_property = fab_property(*property) as i32;
             pad.net = old_nets
                 .get(&pad.number)
                 .map(|old| kiapi::board::types::Net {
@@ -1390,6 +1535,9 @@ fn build_updated_instance(
             }
             *item = copperpour_ipc::builders::pack_any(&text, "kiapi.board.types.BoardText");
         }
+    }
+    if pad_properties.next().is_some() {
+        bail!("typed footprint builder returned fewer pads than the library has");
     }
     merge_custom_properties(
         &mut definition,
@@ -1715,6 +1863,37 @@ pub(super) fn transform_library_property(
     Ok(property)
 }
 
+/// A library point as KiCad places it: mirrored top to bottom on the back,
+/// like the pads, then turned about the anchor. A point has no angle of its
+/// own (`PCB_POINT::Rotate` turns only its position).
+fn build_reference_point(
+    point: &LibraryPoint,
+    footprint_position: &kiapi::common::types::Vector2,
+    footprint_rotation: f64,
+    mirror: Option<CopperStack>,
+) -> Result<kiapi::board::types::ReferencePoint> {
+    let local_y = if mirror.is_some() { -point.y } else { point.y };
+    let (x, y) = copperpour_sexp::geometry::transform_pad(
+        point.x,
+        local_y,
+        copperpour_ipc::builders::nm_to_mm(footprint_position.x_nm),
+        copperpour_ipc::builders::nm_to_mm(footprint_position.y_nm),
+        footprint_rotation,
+    );
+    let layer = match mirror {
+        Some(stack) => flip_layer(&point.layer, stack)?,
+        None => point.layer.clone(),
+    };
+    Ok(kiapi::board::types::ReferencePoint {
+        id: None,
+        layer: copperpour_ipc::builders::try_layer_from_name(&layer)? as i32,
+        position: Some(copperpour_ipc::builders::vec2(x, y)),
+        size: Some(copperpour_ipc::builders::distance(point.size)),
+        locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+        parent: None,
+    })
+}
+
 fn mirror_pad(
     pad: &copperpour_ipc::IpcPadDefinition,
     stack: CopperStack,
@@ -1913,11 +2092,18 @@ fn normalized_items(
                 pad.pad_to_die_length = None;
                 pad.symbol_pin = None;
                 pad.pad_to_die_delay = None;
+                // KiCad before 10.0.7 doesn't send the fabrication property,
+                // so a pad without one reads `PFP_UNKNOWN` there and
+                // `PFP_NONE` on 10.0.7+.
+                if pad.fab_property
+                    == kiapi::board::types::PadFabricationProperty::PfpUnknown as i32
+                {
+                    pad.fab_property = kiapi::board::types::PadFabricationProperty::PfpNone as i32;
+                }
                 // KiCad 10.0.7+ reports these, but the library pad builder
                 // doesn't read them from a .kicad_mod yet, so a built pad
                 // never has them. Compare without them, as before the proto
                 // sync, when Copperpour couldn't see them at all.
-                pad.fab_property = 0;
                 pad.teardrop = None;
                 pad.zone_layer_overrides.clear();
                 if let Some(stack) = pad.pad_stack.as_mut() {
@@ -2045,6 +2231,19 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                             text.id = None;
                             text.parent = None;
                             text.encode_to_vec()
+                        },
+                    ),
+                )
+            } else if item.type_url.ends_with("ReferencePoint") {
+                // A fab-layer drawing aid like the shapes, so it counts as
+                // `graphics` (#283).
+                Some(
+                    kiapi::board::types::ReferencePoint::decode(item.value.as_slice()).map(
+                        |mut point| {
+                            point.id = None;
+                            point.parent = None;
+                            point.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
+                            point.encode_to_vec()
                         },
                     ),
                 )
@@ -3324,6 +3523,7 @@ mod tests {
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
             &UpdateFilters::default(),
+            &kicad_10_0_8(),
         );
 
         assert_eq!(plan.status, PlanStatus::Conflict);
@@ -3360,6 +3560,7 @@ mod tests {
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
             &parse_filters(&serde_json::json!({ "references": [] })).unwrap(),
+            &kicad_10_0_8(),
         );
         assert_eq!(empty.status, PlanStatus::Noop);
         assert_eq!(empty.coverage.selected.planned, 0);
@@ -3382,6 +3583,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &UpdateFilters::default(),
+            &kicad_10_0_8(),
         );
         assert_eq!(all.status, PlanStatus::Ready);
         assert_eq!(all.coverage.selected.planned, 2);
@@ -3406,6 +3608,7 @@ mod tests {
                 "library_ids": ["Other:Socket"]
             }))
             .unwrap(),
+            &kicad_10_0_8(),
         );
         assert_eq!(intersection.status, PlanStatus::Noop);
         assert_eq!(intersection.coverage.selected.planned, 0);
@@ -3422,6 +3625,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &parse_filters(&serde_json::json!({ "references": ["SW404"] })).unwrap(),
+            &kicad_10_0_8(),
         );
         assert_eq!(missing.status, PlanStatus::Conflict);
         assert!(missing
@@ -3437,6 +3641,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &parse_filters(&serde_json::json!({ "references": ["SW1"] })).unwrap(),
+            &kicad_10_0_8(),
         );
         assert_eq!(duplicate.status, PlanStatus::Conflict);
         assert!(duplicate
@@ -3456,6 +3661,7 @@ mod tests {
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
             &parse_filters(&serde_json::json!({ "references": ["TP1"] })).unwrap(),
+            &kicad_10_0_8(),
         );
 
         assert_eq!(plan.status, PlanStatus::Conflict);
@@ -3477,6 +3683,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &UpdateFilters::default(),
+            &kicad_10_0_8(),
         );
         assert_eq!(first.status, PlanStatus::Ready);
 
@@ -3487,6 +3694,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &UpdateFilters::default(),
+            &kicad_10_0_8(),
         );
 
         assert_eq!(second.status, PlanStatus::Noop);
@@ -3545,6 +3753,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &filters,
+            &kicad_10_0_8(),
         );
         let identical = plan_updates(
             &board,
@@ -3553,6 +3762,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &filters,
+            &kicad_10_0_8(),
         );
         assert_eq!(first.plan_revision, identical.plan_revision);
 
@@ -3564,6 +3774,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &filters,
+            &kicad_10_0_8(),
         );
         assert_eq!(first.plan_revision, unrelated.plan_revision);
 
@@ -3575,6 +3786,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &filters,
+            &kicad_10_0_8(),
         );
         assert_ne!(first.plan_revision, board_changed.plan_revision);
 
@@ -3590,6 +3802,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &filters,
+            &kicad_10_0_8(),
         );
         assert_ne!(board_changed.plan_revision, library_changed.plan_revision);
 
@@ -3600,6 +3813,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &parse_filters(&serde_json::json!({ "references": ["SW2"] })).unwrap(),
+            &kicad_10_0_8(),
         );
         assert_ne!(
             library_changed.plan_revision,
@@ -3614,6 +3828,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &filters,
+            &kicad_10_0_8(),
         );
         assert_ne!(library_changed.plan_revision, different_stack.plan_revision);
     }
@@ -4219,6 +4434,16 @@ mod tests {
         }
     }
 
+    /// The KiCad these tests plan against unless they say otherwise.
+    fn kicad_10_0_8() -> copperpour_ipc::IpcKiCadVersion {
+        copperpour_ipc::IpcKiCadVersion {
+            major: 10,
+            minor: 0,
+            patch: 8,
+            full_version: "10.0.8".to_string(),
+        }
+    }
+
     fn spawn_planner_mock(
         board: &Path,
         footprint: prost_types::Any,
@@ -4235,13 +4460,37 @@ mod tests {
         fail_update: bool,
         keeps_updates: bool,
     ) -> PlannerMock {
+        spawn_planner_mock_on(board, footprints, fail_update, keeps_updates, (10, 0, 8))
+    }
+
+    /// The mock as a KiCad of `version` (major, minor, patch).
+    fn spawn_planner_mock_on(
+        board: &Path,
+        footprints: Vec<prost_types::Any>,
+        fail_update: bool,
+        keeps_updates: bool,
+        version: (u32, u32, u32),
+    ) -> PlannerMock {
         let board_name = board.to_string_lossy().to_string();
         let capture = std::sync::Arc::new(std::sync::Mutex::new(MutationCapture::default()));
         let captured = capture.clone();
         let footprints = std::sync::Mutex::new(footprints);
         let kicad = crate::test_support::MockIpcServer::spawn("footprint-update", move |request| {
             let message = request.message.expect("request message");
-            if message.type_url.ends_with("GetOpenDocuments") {
+            if message.type_url.ends_with("GetVersion") {
+                let (major, minor, patch) = version;
+                api_reply(builders::pack_any(
+                    &kiapi::common::commands::GetVersionResponse {
+                        version: Some(kiapi::common::types::KiCadVersion {
+                            major,
+                            minor,
+                            patch,
+                            full_version: format!("{major}.{minor}.{patch}"),
+                        }),
+                    },
+                    "kiapi.common.commands.GetVersionResponse",
+                ))
+            } else if message.type_url.ends_with("GetOpenDocuments") {
                 api_reply(builders::pack_any(
                     &kiapi::common::commands::GetOpenDocumentsResponse {
                         documents: vec![kiapi::common::types::DocumentSpecifier {
@@ -4662,6 +4911,7 @@ mod tests {
                     },
                     ..Default::default()
                 },
+                &kicad_10_0_8(),
             )
             .plan_revision
         };
@@ -4857,5 +5107,427 @@ mod tests {
             capture.commit_actions,
             vec![kiapi::common::commands::CommitAction::CmaDrop]
         );
+    }
+
+    // ─── #283: pad fabrication properties and reference points ──────────────
+
+    /// KiCad 10.0.8's stock `Package_DFN_QFN.pretty/
+    /// DFN-14-1EP_3x4.5mm_P0.65mm_EP1.65x4.25mm_ThermalVias.kicad_mod`,
+    /// unchanged: `(property pad_prop_heatsink)` on its eight thermal-via pads.
+    const ISSUE_283_DFN14: &str =
+        include_str!("../../tests/fixtures/issue_283_dfn14_thermalvias_kicad10.kicad_mod");
+    const ISSUE_283_DFN14_ID: &str =
+        "Package_DFN_QFN:DFN-14-1EP_3x4.5mm_P0.65mm_EP1.65x4.25mm_ThermalVias";
+    /// KiCad 10.0.8's stock `Package_DIP.pretty/DIP-8_W7.62mm.kicad_mod`,
+    /// unchanged: one `(point (at 3.81 3.81) (size 1.27) (layer "F.Fab"))`.
+    const ISSUE_283_DIP8: &str =
+        include_str!("../../tests/fixtures/issue_283_dip8_kicad10.kicad_mod");
+    const ISSUE_283_DIP8_ID: &str = "Package_DIP:DIP-8_W7.62mm";
+
+    fn kicad(major: u32, minor: u32, patch: u32) -> copperpour_ipc::IpcKiCadVersion {
+        copperpour_ipc::IpcKiCadVersion {
+            major,
+            minor,
+            patch,
+            full_version: format!("{major}.{minor}.{patch}"),
+        }
+    }
+
+    #[test]
+    fn a_library_pads_fabrication_properties_are_read() {
+        let library = parse_library_footprint(ISSUE_283_DFN14_ID, ISSUE_283_DFN14).unwrap();
+        assert_eq!(library.pads.len(), 33);
+        assert_eq!(library.pad_properties.len(), 33);
+        let heatsink = library
+            .pads
+            .iter()
+            .zip(&library.pad_properties)
+            .filter(|(_, property)| **property == PadFabricationProperty::Heatsink)
+            .map(|(pad, _)| (pad.number.as_str(), pad.pad_type.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(heatsink, vec![("15", "thru_hole"); 8]);
+        assert!(library.points.is_empty());
+        assert_eq!(
+            library.needs_kicad_10_0_7(),
+            Some("pad fabrication properties")
+        );
+    }
+
+    #[test]
+    fn a_library_reference_point_is_read() {
+        let library = parse_library_footprint(ISSUE_283_DIP8_ID, ISSUE_283_DIP8).unwrap();
+        assert_eq!(
+            library.points,
+            vec![LibraryPoint {
+                x: 3.81,
+                y: 3.81,
+                size: 1.27,
+                layer: "F.Fab".to_string(),
+            }]
+        );
+        assert!(library
+            .pad_properties
+            .iter()
+            .all(|property| *property == PadFabricationProperty::None));
+        assert_eq!(library.needs_kicad_10_0_7(), Some("a reference point"));
+    }
+
+    #[test]
+    fn a_point_clause_kicad_does_not_read_is_refused() {
+        let source = ISSUE_283_DIP8.replace(
+            "\t\t(layer \"F.Fab\")\n\t)\n\t(embedded_fonts",
+            "\t\t(layer \"F.Fab\")\n\t\t(future_clause yes)\n\t)\n\t(embedded_fonts",
+        );
+        assert_ne!(source, ISSUE_283_DIP8, "the edit must land");
+        let error = parse_library_footprint(ISSUE_283_DIP8_ID, &source).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "footprint point clause 'future_clause' is not supported by typed library refresh"
+        );
+    }
+
+    /// Plans `library` for one placed footprint `reference` on a KiCad of
+    /// `version`.
+    fn plan_on(
+        version: &copperpour_ipc::IpcKiCadVersion,
+        library_id: &str,
+        source: &str,
+    ) -> UpdatePlan {
+        let (nickname, entry) = library_id.split_once(':').unwrap();
+        let (_temp, board) = library_project(nickname, entry, source);
+        plan_updates(
+            &board,
+            &[plan_item("U1", Some(library_id), "kiid-1")],
+            two_layers(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &UpdateFilters::default(),
+            version,
+        )
+    }
+
+    fn names_10_0_7(plan: &UpdatePlan) -> Option<&str> {
+        plan.diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("10.0.7"))
+            .map(|diagnostic| diagnostic.message.as_str())
+    }
+
+    #[test]
+    fn kicad_before_10_0_7_keeps_refusing_both_clauses() {
+        for (library_id, source, what) in [
+            (
+                ISSUE_283_DFN14_ID,
+                ISSUE_283_DFN14,
+                "pad fabrication properties",
+            ),
+            (ISSUE_283_DIP8_ID, ISSUE_283_DIP8, "a reference point"),
+        ] {
+            let plan = plan_on(&kicad(10, 0, 6), library_id, source);
+            assert_eq!(plan.status, PlanStatus::Conflict, "{library_id}");
+            assert!(plan.prepared_items.is_empty());
+            assert_eq!(plan.diagnostics.len(), 1, "{:?}", plan.diagnostics);
+            let diagnostic = &plan.diagnostics[0];
+            assert_eq!(diagnostic.code, "unsupported_library_footprint");
+            assert_eq!(diagnostic.reference.as_deref(), Some("U1"));
+            assert_eq!(
+                diagnostic.message,
+                format!(
+                    "footprint '{library_id}' has {what}, which KiCad's API carries only from \
+                     KiCad 10.0.7; this KiCad is 10.0.6"
+                )
+            );
+            // From 10.0.7 the gate lets the footprint through.
+            for version in [kicad(10, 0, 7), kicad(10, 0, 8), kicad(10, 99, 0)] {
+                let plan = plan_on(&version, library_id, source);
+                assert_eq!(
+                    names_10_0_7(&plan),
+                    None,
+                    "{library_id} on {}",
+                    version.full_version
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kicad_before_10_0_7_still_refreshes_a_footprint_without_either() {
+        // `(property none)` is KiCad's own "no property": nothing to carry.
+        let none = ISSUE_283_DFN14.replace("(property pad_prop_heatsink)", "(property none)");
+        let plan = plan_on(&kicad(10, 0, 6), ISSUE_283_DFN14_ID, &none);
+        assert_eq!(names_10_0_7(&plan), None, "{:?}", plan.diagnostics);
+        let plan = plan_on(&kicad(10, 0, 0), "Test:Socket", KICAD_LIBRARY_FOOTPRINT);
+        assert_eq!(names_10_0_7(&plan), None, "{:?}", plan.diagnostics);
+    }
+
+    /// U1 (the DFN-14), U2 (a DIP-8) and U3 (a DIP-8 on the back, turned
+    /// 90°) as KiCad 10.0.8 reported them over IPC (#283). Provenance is in
+    /// `issue_283_ipc.README.md`.
+    const ISSUE_283_CAPTURES: [(&str, &[u8]); 3] = [
+        (
+            "U1",
+            include_bytes!("../../tests/fixtures/issue_283_u1.ipc.bin"),
+        ),
+        (
+            "U2",
+            include_bytes!("../../tests/fixtures/issue_283_u2.ipc.bin"),
+        ),
+        (
+            "U3",
+            include_bytes!("../../tests/fixtures/issue_283_u3.ipc.bin"),
+        ),
+    ];
+
+    const ISSUE_283_LIBRARIES: [(&str, &str, &str); 2] = [
+        (
+            "Package_DFN_QFN",
+            "DFN-14-1EP_3x4.5mm_P0.65mm_EP1.65x4.25mm_ThermalVias",
+            ISSUE_283_DFN14,
+        ),
+        ("Package_DIP", "DIP-8_W7.62mm", ISSUE_283_DIP8),
+    ];
+
+    fn issue_283_capture(reference: &str) -> kiapi::board::types::FootprintInstance {
+        let (_, bytes) = ISSUE_283_CAPTURES
+            .iter()
+            .find(|(capture, _)| *capture == reference)
+            .unwrap();
+        kiapi::board::types::FootprintInstance::decode(*bytes).unwrap()
+    }
+
+    /// KiCad's report of `reference`, the update `source` builds for it, and
+    /// the domains the plan reports.
+    fn issue_283_refresh(
+        reference: &str,
+        source: &str,
+    ) -> (
+        kiapi::board::types::FootprintInstance,
+        kiapi::board::types::FootprintInstance,
+        BTreeSet<ChangedDomain>,
+    ) {
+        let current = issue_283_capture(reference);
+        let id = current.definition.as_ref().unwrap().id.as_ref().unwrap();
+        let library_id = format!("{}:{}", id.library_nickname, id.entry_name);
+        let library = parse_library_footprint(&library_id, source).unwrap();
+        let prepared = build_updated_instance(
+            &current,
+            &library,
+            two_layers(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            TextReset::default(),
+        )
+        .unwrap();
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        (current, updated, prepared.changed_domains)
+    }
+
+    fn fab_properties(instance: &kiapi::board::types::FootprintInstance) -> Vec<(String, i32)> {
+        instance
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
+            .map(|item| {
+                let pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                (pad.number, pad.fab_property)
+            })
+            .collect()
+    }
+
+    /// `instance`'s reference points as (layer, x nm, y nm, size nm).
+    fn reference_points(
+        instance: &kiapi::board::types::FootprintInstance,
+    ) -> Vec<(i32, i64, i64, i64)> {
+        instance
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| item.type_url.ends_with("kiapi.board.types.ReferencePoint"))
+            .map(|item| {
+                let point =
+                    kiapi::board::types::ReferencePoint::decode(item.value.as_slice()).unwrap();
+                let position = point.position.unwrap();
+                (
+                    point.layer,
+                    position.x_nm,
+                    position.y_nm,
+                    point.size.unwrap().value_nm,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stock_footprints_with_a_pad_property_or_a_point_match_their_library() {
+        let heatsink = kiapi::board::types::PadFabricationProperty::PfpHeatsink as i32;
+        let none = kiapi::board::types::PadFabricationProperty::PfpNone as i32;
+        for (reference, source) in [
+            ("U1", ISSUE_283_DFN14),
+            ("U2", ISSUE_283_DIP8),
+            ("U3", ISSUE_283_DIP8),
+        ] {
+            let (current, updated, changed) = issue_283_refresh(reference, source);
+            if reference == "U3" {
+                // U3's `${REFERENCE}` text differs for a reason outside #283
+                // (see the fixture README), so only its pads and point are
+                // compared.
+                let definition = |instance: &kiapi::board::types::FootprintInstance| {
+                    instance.definition.clone().unwrap()
+                };
+                assert_eq!(
+                    normalized_items(&definition(&updated), "Pad").unwrap(),
+                    normalized_items(&definition(&current), "Pad").unwrap()
+                );
+            } else {
+                assert!(changed.is_empty(), "{reference}: {changed:?}");
+            }
+            // What the update sends is what KiCad reported, not just equal
+            // after normalizing.
+            assert_eq!(
+                fab_properties(&updated),
+                fab_properties(&current),
+                "{reference}"
+            );
+            assert_eq!(
+                reference_points(&updated),
+                reference_points(&current),
+                "{reference}"
+            );
+        }
+        let (current, _, _) = issue_283_refresh("U1", ISSUE_283_DFN14);
+        let properties = fab_properties(&current);
+        assert_eq!(
+            properties
+                .iter()
+                .filter(|(_, property)| *property == heatsink)
+                .count(),
+            8
+        );
+        // Only pad 15's thermal vias carry it; every other pad reads none.
+        assert!(properties.iter().all(|(number, property)| {
+            *property == none || (*property == heatsink && number == "15")
+        }));
+        for reference in ["U2", "U3"] {
+            assert_eq!(
+                reference_points(&issue_283_capture(reference)).len(),
+                1,
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_changed_pad_property_plans_pads() {
+        let bga = ISSUE_283_DFN14.replace("pad_prop_heatsink", "pad_prop_bga");
+        let (_, updated, changed) = issue_283_refresh("U1", &bga);
+        assert_eq!(changed, BTreeSet::from([ChangedDomain::Pads]));
+        let bga_pads = fab_properties(&updated)
+            .into_iter()
+            .filter(|(_, property)| {
+                *property == kiapi::board::types::PadFabricationProperty::PfpBga as i32
+            })
+            .count();
+        assert_eq!(bga_pads, 8);
+
+        let removed = ISSUE_283_DFN14.replace("(property pad_prop_heatsink)", "");
+        let (_, _, changed) = issue_283_refresh("U1", &removed);
+        assert_eq!(changed, BTreeSet::from([ChangedDomain::Pads]));
+    }
+
+    #[test]
+    fn a_moved_point_plans_graphics_at_its_place_on_either_side() {
+        let moved = ISSUE_283_DIP8.replace("(point\n\t\t(at 3.81 3.81)", "(point\n\t\t(at 3.81 3)");
+        assert_ne!(moved, ISSUE_283_DIP8, "the edit must land");
+        let f_fab = kiapi::board::types::BoardLayer::BlFFab as i32;
+        let b_fab = kiapi::board::types::BoardLayer::BlBFab as i32;
+        // U2 at (125, 95), 0°: the point is (3.81, 3) from the anchor.
+        let (_, updated, changed) = issue_283_refresh("U2", &moved);
+        assert_eq!(changed, BTreeSet::from([ChangedDomain::Graphics]));
+        assert_eq!(
+            reference_points(&updated),
+            vec![(f_fab, 128_810_000, 98_000_000, 1_270_000)]
+        );
+        // U3 at (145, 95), 90°, on the back: mirrored to (3.81, -3), then
+        // turned to (-3, -3.81).
+        let (_, updated, _) = issue_283_refresh("U3", &moved);
+        assert_eq!(
+            reference_points(&updated),
+            vec![(b_fab, 142_000_000, 91_190_000, 1_270_000)]
+        );
+    }
+
+    #[test]
+    fn a_point_only_one_side_has_plans_graphics() {
+        // The library without its point, against a board copy that has one.
+        let start = ISSUE_283_DIP8.find("\t(point\n").unwrap();
+        let end = start + ISSUE_283_DIP8[start..].find("\n\t)\n").unwrap() + "\n\t)\n".len();
+        let without = format!("{}{}", &ISSUE_283_DIP8[..start], &ISSUE_283_DIP8[end..]);
+        assert!(!without.contains("(point"));
+        let (_, updated, changed) = issue_283_refresh("U2", &without);
+        assert_eq!(changed, BTreeSet::from([ChangedDomain::Graphics]));
+        assert!(reference_points(&updated).is_empty());
+    }
+
+    /// A dry run of the `references` captures on a KiCad of `version`.
+    async fn issue_283_served_dry_run(
+        version: (u32, u32, u32),
+        references: &[&str],
+    ) -> serde_json::Value {
+        // The mock answers a 2-layer stack, as KiCad did for this board.
+        let enabled_layers = kiapi::board::commands::BoardEnabledLayersResponse::decode(
+            include_bytes!("../../tests/fixtures/issue_283_enabled_layers.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        assert_eq!(enabled_layers.copper_layer_count, 2);
+        let (_temp, board) = libraries_project(&ISSUE_283_LIBRARIES);
+        let footprints = ISSUE_283_CAPTURES
+            .iter()
+            .filter(|(reference, _)| references.contains(reference))
+            .map(|(_, bytes)| prost_types::Any {
+                type_url: "type.googleapis.com/kiapi.board.types.FootprintInstance".to_string(),
+                value: bytes.to_vec(),
+            })
+            .collect();
+        let mock = spawn_planner_mock_on(&board, footprints, false, true, version);
+        let handler = served(mock.kicad.address()).await;
+        let body = result_json(&served_call(&handler, serde_json::json!({ "board": board })).await);
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 0);
+        assert!(capture.update_batches.is_empty());
+        body
+    }
+
+    #[tokio::test]
+    async fn served_dry_run_of_stock_footprints_with_a_pad_property_or_a_point_is_noop() {
+        // U3 is left out: its `${REFERENCE}` text differs for a reason
+        // outside #283 (see the fixture README).
+        let body = issue_283_served_dry_run((10, 0, 8), &["U1", "U2"]).await;
+        assert_eq!(body["status"], "noop", "{body}");
+        assert_eq!(body["coverage"]["unchanged"]["planned"], 2, "{body}");
+    }
+
+    #[tokio::test]
+    async fn served_dry_run_on_kicad_10_0_6_refuses_them_naming_10_0_7() {
+        let body = issue_283_served_dry_run((10, 0, 6), &["U1", "U2", "U3"]).await;
+        assert_eq!(body["status"], "conflict", "{body}");
+        let diagnostics = body["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 3, "{body}");
+        for diagnostic in diagnostics {
+            assert_eq!(
+                diagnostic["code"], "unsupported_library_footprint",
+                "{body}"
+            );
+            let message = diagnostic["message"].as_str().unwrap();
+            assert!(
+                message.contains("only from KiCad 10.0.7; this KiCad is 10.0.6"),
+                "{message}"
+            );
+        }
     }
 }
