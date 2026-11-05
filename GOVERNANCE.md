@@ -29,32 +29,39 @@ settings or the `main` ruleset.
 - **Merge commits only** (`gh pr merge N --merge`), so authorship survives.
 - **The `main` ruleset enforces the rest:** pull requests only, resolved review
   conversations, merge commits only, no force-push or deletion, and these
-  required checks: Check & Test on `ubuntu-latest` and `windows-latest`,
-  Clippy, Format, Schematic viewer, Plugin (Python), Nix flake, PCM packaging
-  validation and Dependency licenses. Check & Test on `macos-latest` is not
-  required, because GitHub often cancels it for runner capacity. A cancelled
-  macOS job counts as passed; a failed one blocks the merge like any other.
+  required checks: Check & Test on `ubuntu-latest`, Clippy, Format, Schematic
+  viewer, Plugin (Python), Nix flake, PCM packaging validation and Dependency
+  licenses. Check & Test on `windows-latest` joins them later (see
+  [Where CI runs](#where-ci-runs)). Check & Test on `macos-latest` does not run:
+  Apple's licence allows macOS virtual machines only on Apple hardware.
 - **The required checks on the reviewed head are the merge evidence.** Run the
   full local gate again after a merge only when the merged tree differs from
   what CI tested, or something on `main` gives a specific reason to.
 
-### While GitHub Actions is disabled (temporary)
+### Where CI runs
 
-GitHub disabled Actions on this repository on 2026-11-01, without a settings
-change on our side. Until it is restored:
+`ci.yml`, `release.yml` and `e2e-kicad.yml` are disabled on GitHub and run on a
+maintainer's machine instead, as the **Copperpour Local CI** app. Other workflows
+(issue self-assignment) still run on GitHub.
 
-- The required checks come from the **Copperpour Local CI** app instead of
-  GitHub Actions: the same `ci.yml` jobs and check names, run on a maintainer's
-  machine against each PR's merge commit. A check's details show the end of
-  its log.
-- **Check & Test on `windows-latest` is not required** until a Windows runner
-  joins local CI. Before merging a change to platform-specific code, a
-  maintainer runs the tests on Windows and says so on the PR.
-- PRs by maintainers run automatically; anyone else's run only after a
-  maintainer approves that exact head.
-
-When Actions is back, the ruleset returns to the GitHub Actions checks and this
-section is removed.
+- The required checks are that app's: the same `ci.yml` jobs and check names, run
+  against each PR's merge commit. A check's details show the end of its log.
+- Nix flake and Schematic viewer show as skipped (neutral) on a PR that changes
+  nothing they build from. Nix flake also runs on `main` after each merge.
+- PR builds other than Nix flake have no network access: crates are downloaded
+  first with `cargo vendor --locked`, then the jobs build from that copy. Nix
+  flake has network access, so on a contributor's PR it waits for a maintainer to
+  approve that exact head; the other checks run meanwhile.
+- PRs run automatically, except a contributor's PR that changes CI or build
+  configuration: anything under `.github/` or `.cargo/`, `rust-toolchain.toml`,
+  `flake.nix`, `flake.lock`, `deny.toml`, a `build.rs`, a `Cargo.lock`, or a
+  `Cargo.toml` line that adds a build script, a proc macro or build
+  dependencies. Its checks show as queued until a maintainer approves that exact
+  head; a new push needs a new approval.
+- **Check & Test on `windows-latest` is not required yet.** It runs on every PR,
+  and becomes required once it has passed on a few. Until then, before merging a
+  change to platform-specific code, a maintainer checks its Windows result and
+  says so on the PR.
 
 ## Branches and pull requests
 
@@ -107,11 +114,10 @@ expansion is deferred.
   on — are a **patch**.
 - Release notes state behaviour changes **and** known limitations. A reader who
   sees "fixed" and stops checking has been failed by the notes.
-- Before creating the tag, manually dispatch `.github/workflows/release.yml`
-  against the exact candidate ref. That non-publishing entry point runs the
-  release-profile target matrix, PCM packages, and reusable real-KiCad gate;
-  only a pushed `v*` tag may execute the publication job.
-- The pre-release gate is CI, the real-KiCad E2E workflow, the live IPC tests,
+- Before creating the tag, run local CI's release job against the exact
+  candidate ref. It builds the Linux and Windows release binaries and PCM
+  packages and runs the real-KiCad gate, without publishing anything.
+- The pre-release gate is CI, the real-KiCad E2E job, the live IPC tests,
   and an end-to-end benchmark run against the candidate. The benchmark has
   twice found what CI could not; it is a step, not a nicety.
 
@@ -131,14 +137,14 @@ The house rule, and the reason most of this file exists:
 
 ### Risk-proportionate validation
 
-Required hosted CI, deterministic regression tests, and evidence for material
+Required CI, deterministic regression tests, and evidence for material
 safety properties remain hard merge gates. Environment-dependent observations
 are shared project work:
 
 - A contributor supplies real-environment evidence from an affected environment
   they reasonably have access to. They are not expected to personally own every
   supported operating system, KiCad version, or hardware configuration.
-- Hosted CI owns supported-platform regression coverage. Maintainers recruit the
+- CI owns supported-platform regression coverage. Maintainers recruit the
   original reporter or community testers when their environment can resolve a
   remaining uncertainty more directly.
 - An unavailable secondary-environment observation may become explicit

@@ -24,7 +24,7 @@ cargo fmt --all -- --check
 | S-expression parsing and atomic writes | `crates/copperpour-sexp` tests |
 | Typed schematic model | `crates/copperpour-schematic-editor` tests |
 | IPC builders, transport, and client behavior | `crates/copperpour-ipc` tests |
-| Real KiCad behavior | ignored live tests and `.github/workflows/e2e-kicad.yml` |
+| Real KiCad behavior | ignored live tests and local CI's real-KiCad job (`e2e-kicad.yml`'s steps) |
 | Viewer | `crates/schematic-viewer` tests and its CI job |
 | Python plugin | `plugin/tests` and the plugin CI job |
 | PCM package | `packaging/validate-pcm.py` and packaging CI jobs |
@@ -96,29 +96,29 @@ saved zones, footprints/pads, tracks/vias, and drawing identities with pcbnew.
 
 ## CI And Live Validation
 
-`.github/workflows/ci.yml` covers the Rust workspace, formatting, clippy,
-documentation tests, viewer, plugin, Nix, and PCM validation. The real-KiCad
-workflow remains separate because it installs KiCad and is not an ordinary
-per-PR gate. Apply the `run:e2e-kicad` label to run that same workflow for a
-pull request when KiCad-facing behavior needs hosted acceptance evidence.
+CI runs on a maintainer's machine, not on GitHub Actions
+([GOVERNANCE.md](../GOVERNANCE.md#where-ci-runs)). It runs `.github/workflows/ci.yml`'s
+jobs on every PR: the Rust workspace, formatting, clippy, documentation tests,
+viewer, plugin, Nix, and PCM validation. The real-KiCad job runs
+`e2e-kicad.yml`'s steps against KiCad 10.0.5 in a Windows VM. It is not a per-PR
+check, because it takes over half an hour. Ask a maintainer to run it on a pull
+request when KiCad-facing behavior needs that evidence. The `run:e2e-kicad`
+label no longer triggers anything.
 
 Before creating a release tag, run `cargo xtask collect-api-migrations
 <version>` and `cargo xtask fix-doc-counts`, and commit the result. The first
 moves the notes in `docs/api-migrations/` into `docs/API_MIGRATIONS.md`; the
-second rewrites the tool counts in the docs, which PRs leave alone. The release
-workflow's `doc-counts` job fails on a stale count. Then dispatch `.github/workflows/release.yml` against
-the exact candidate ref. The manual entry point runs the release-profile target
-matrix, all three PCM package builds, and the reusable real-KiCad acceptance
-workflow with a synthetic `0.0.0` package version. Its publication job is
-tag-only, so this pre-tag smoke run cannot create a GitHub release.
+second rewrites the tool counts in the docs, which PRs leave alone. Then a
+maintainer runs local CI's release job against the exact candidate ref, with a
+synthetic `0.0.0` version. It runs the `doc-counts` check, which fails on a
+stale count, then builds the Linux x86_64 and Windows release binaries and PCM
+packages, validates both packages and runs the real-KiCad job. It publishes
+nothing.
 
-On a release tag, `.github/workflows/release.yml` calls
-`.github/workflows/e2e-kicad.yml` as a reusable workflow. The called workflow
-checks out the caller's exact tag commit. The `Create Release` job depends on
-that acceptance job and both artifact-building jobs, so failed real-KiCad
-acceptance leaves the diagnostic build artifacts in the workflow run but cannot
-create a GitHub release or upload a partial release asset set. Weekly and manual
-real-KiCad runs continue to use the standalone workflow entry points.
+For the tag, the same job builds the release artifacts from the tagged commit.
+A failure in any build or in the real-KiCad job means the release is not cut,
+so no partial set of assets is published. macOS and Linux aarch64 builds, which
+`release.yml` produced on GitHub, are not built locally.
 
 In the PR description, list every command run and explicitly name checks skipped
 because they require KiCad, another operating system, credentials, or release
