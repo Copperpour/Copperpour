@@ -5118,8 +5118,19 @@ mod jlcpcb_cache_tests {
             ranked_ids(&body),
             ["C4005", "C4002", "C4007", "C4004", "C4003", "C4001"]
         );
-        assert_eq!(body["ranking"][0], "in stock before out of stock");
-        assert_eq!(body["ranking"], json!(search_ranking_criteria()));
+        // The order the response promises is public, so it is restated here
+        // rather than read back from the code that builds it.
+        assert_eq!(
+            body["ranking"],
+            json!([
+                "in stock before out of stock",
+                "library_type: Basic, Preferred, Extended",
+                "known price before unknown price",
+                "price ascending",
+                "stock descending",
+                "LCSC number",
+            ])
+        );
         // The cheapest Basic part has no stock, so it ranks after every
         // stocked part, Extended included.
         assert_eq!(
