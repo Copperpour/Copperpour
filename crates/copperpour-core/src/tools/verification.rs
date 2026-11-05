@@ -230,6 +230,7 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_set_layer_constraints(args, ctx).await }
         ),
         super::custom_rules::tool(),
+        super::custom_rules::delete_tool(),
         tool!(
             "check_clearance",
             "Measure spacing between two footprints on the requested board. `mode: anchor` \
