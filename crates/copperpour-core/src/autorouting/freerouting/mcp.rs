@@ -488,7 +488,13 @@ impl LocalMcpClient {
     }
 
     fn spawn(jar: &Path) -> Result<Self> {
-        let mut command = Self::server_command(jar);
+        Self::spawn_command(Self::server_command(jar))
+    }
+
+    /// Starts `command` as the MCP server; it must have piped stdin, stdout
+    /// and stderr. Split from [`Self::spawn`] so tests can drive `request()`
+    /// against a scripted server instead of the Freerouting JAR.
+    fn spawn_command(mut command: Command) -> Result<Self> {
         let mut child = command
             .spawn()
             .context("start local Freerouting MCP server")?;
@@ -609,6 +615,13 @@ impl LocalMcpClient {
                 .map_err(|_| anyhow::anyhow!("Freerouting MCP request '{method}' timed out"))??
                 .context("Freerouting MCP closed stdout before responding")?;
             let Some(response) = json_rpc_message(&line) else {
+                if !line.trim().is_empty() {
+                    tracing::debug!(
+                        method,
+                        line = %line,
+                        "skipped a Freerouting MCP stdout line that is not a JSON-RPC message"
+                    );
+                }
                 continue;
             };
             if response.get("id") != Some(&json!(id)) {
@@ -691,9 +704,8 @@ fn json_rpc_message(line: &str) -> Option<Value> {
     if !line.starts_with('{') {
         return None;
     }
-    serde_json::from_str::<Value>(line)
-        .ok()
-        .filter(Value::is_object)
+    // A JSON value that starts with `{` can only be an object.
+    serde_json::from_str::<Value>(line).ok()
 }
 
 fn expand_text_content(mut result: Value) -> Value {
@@ -854,6 +866,49 @@ mod tests {
         }
         let message = json_rpc_message(r#" {"jsonrpc":"2.0","id":7,"result":{}} "#).unwrap();
         assert_eq!(message["id"], 7);
+    }
+
+    /// A client whose "server" is `sh -c script`: it reads the request line,
+    /// then prints whatever the script prints.
+    #[cfg(unix)]
+    fn scripted_client(script: &str) -> LocalMcpClient {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        LocalMcpClient::spawn_command(command).expect("spawn scripted MCP server")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn request_skips_progress_lines_before_the_response() {
+        let mut client = scripted_client(
+            r#"read line; echo '#'; echo '####'; echo; echo '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'"#,
+        );
+        let result = client
+            .request("tools/list", json!({}), Duration::from_secs(10))
+            .await
+            .expect("the response after the progress lines is returned");
+        assert_eq!(result, json!({ "ok": true }));
+        client.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn request_with_only_progress_lines_times_out() {
+        let mut client = scripted_client("read line; while true; do echo '#'; sleep 0.1; done");
+        let error = client
+            .request("tools/list", json!({}), Duration::from_secs(1))
+            .await
+            .expect_err("progress lines alone are not a response");
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected error: {error:#}"
+        );
+        client.close().await;
     }
 
     #[test]
