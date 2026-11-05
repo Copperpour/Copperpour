@@ -1,6 +1,6 @@
-//! `set_custom_rule`: add or replace one named rule in a board's sibling
-//! `.kicad_dru`, after checking the whole file as KiCad 10 reads it and
-//! having kicad-cli load it.
+//! `set_custom_rule` and `delete_custom_rule`: add, replace or delete one
+//! named rule in a board's sibling `.kicad_dru`, after checking the whole file
+//! as KiCad 10 reads it and having kicad-cli load it.
 //!
 //! KiCad loads a custom rules file whole or not at all, and `kicad-cli`
 //! swallows the parse error and checks against its implicit rules alone
@@ -248,6 +248,28 @@ pub(super) fn tool() -> ToolDef {
     )
 }
 
+pub(super) fn delete_tool() -> ToolDef {
+    tool!(
+        "delete_custom_rule",
+        "Delete one named rule from the board's sibling .kicad_dru custom rules file, with \
+         the blank space before it; the rest of the file is left as written. kicad-cli drops \
+         a rules file it cannot parse, so, as for set_custom_rule, the file left is first \
+         checked as KiCad 10 reads it, then loaded by kicad-cli on a copy of the board; a \
+         fault, or kicad-cli not loading it, refuses the delete. On a board with no item yet \
+         the first check alone decides. A name no rule has, or one two rules have, is refused.",
+        json!({
+            "type": "object",
+            "properties": {
+                "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                "name": { "type": "string", "description": "Name of the rule to delete" }
+            },
+            "required": ["board", "name"],
+            "additionalProperties": false
+        }),
+        |args, ctx| async move { handle_delete_custom_rule(args, ctx).await }
+    )
+}
+
 /// One constraint of the requested rule.
 struct Constraint {
     kind: String,
@@ -352,21 +374,12 @@ async fn handle_set_custom_rule(
         .filter(|rule| rule.name == request.name)
         .collect();
     if named.len() > 1 {
-        return Ok(CallToolResult::error_kind(
-            ToolErrorKind::AmbiguousTarget {
-                target: request.name.clone(),
-                candidates: named
-                    .iter()
-                    .map(|rule| format!("line {}", line_of(&base, rule.start)))
-                    .collect(),
-            },
-            format!(
-                "'{}' has {} rules named '{}', so Copperpour cannot tell which one to replace. \
-                 Rename all but one, then retry.",
-                rules_path.display(),
-                named.len(),
-                request.name
-            ),
+        return Ok(ambiguous_name(
+            &rules_path,
+            &base,
+            &named,
+            &request.name,
+            "replace",
         ));
     }
     let rule = request.text();
@@ -385,38 +398,18 @@ async fn handle_set_custom_rule(
     };
 
     let checked = check_rules(&next, &user_layers);
-    if !checked.faults.is_empty() {
-        return Ok(CallToolResult::error_kind(
-            ToolErrorKind::PlanBlocked {
-                operation: OPERATION.to_string(),
-                reasons: checked.faults.clone(),
-            },
-            format!(
-                "{OPERATION} wrote nothing: with this rule, KiCad would report errors in '{}': \
-                 {}. kicad-cli drops a rules file it cannot parse and checks against its \
-                 implicit rules alone.",
-                rules_path.display(),
-                checked.faults.join("; ")
-            ),
-        ));
-    }
-    // With no item on the board the probe could not tell a loaded file from a
-    // dropped one, and no rule acts on anything yet.
-    if has_items {
-        let verdict =
-            kicad_verdict(&ctx.config.kicad_cli, &board, &next, &checked.properties).await?;
-        if let Some(reason) = verdict {
-            return Ok(CallToolResult::error_kind(
-                ToolErrorKind::PlanBlocked {
-                    operation: OPERATION.to_string(),
-                    reasons: vec![reason.clone()],
-                },
-                format!(
-                    "{OPERATION} wrote nothing to '{}': {reason}",
-                    rules_path.display()
-                ),
-            ));
-        }
+    if let Some(refusal) = refusal_to_write(
+        ctx,
+        OPERATION,
+        &board,
+        &next,
+        &checked,
+        has_items,
+        "with this rule",
+    )
+    .await?
+    {
+        return Ok(refusal);
     }
 
     let changed = read.as_deref() != Some(next.as_str());
@@ -466,6 +459,229 @@ async fn handle_set_custom_rule(
         "kicad_checked": has_items,
         "unchecked_properties": if has_items { BTreeSet::new() } else { checked.properties },
     })))
+}
+
+async fn handle_delete_custom_rule(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    const OPERATION: &str = "delete_custom_rule";
+    let board = get_path(args, "board")?;
+    let name = match require_str(args, "name") {
+        Ok(name) => name,
+        Err(refusal) => return Ok(refusal),
+    };
+    let BoardFacts {
+        user_layers,
+        has_items,
+    } = read_board(&board)?;
+    let rules_path = sibling_custom_rules_path(&board);
+    let read = match read_consistent(&rules_path) {
+        Ok(text) => text,
+        Err(SexpError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::FileNotFound {
+                    path: rules_path.display().to_string(),
+                },
+                format!(
+                    "'{}' does not exist, so it holds no rule '{name}' to delete.",
+                    rules_path.display()
+                ),
+            ))
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let found = check_rules(&read, &user_layers);
+    let named: Vec<RuleSpan> = found
+        .rules
+        .iter()
+        .filter(|rule| rule.name == name)
+        .cloned()
+        .collect();
+    let span = match named.as_slice() {
+        [span] => span,
+        [] => {
+            let names: Vec<String> = found
+                .rules
+                .iter()
+                .map(|rule| format!("'{}'", rule.name))
+                .collect();
+            let mut reason = format!(
+                "'{}' holds no rule named '{name}'; the rules read are {}",
+                rules_path.display(),
+                if names.is_empty() {
+                    "none".to_string()
+                } else {
+                    names.join(", ")
+                }
+            );
+            if !found.faults.is_empty() {
+                reason += &format!(
+                    ". The check also found: {}. A fault it cannot read past hides every \
+                     rule after it",
+                    found.faults.join("; ")
+                );
+            }
+            return Ok(invalid_arg("name", &reason));
+        }
+        _ => return Ok(ambiguous_name(&rules_path, &read, &named, name, "delete")),
+    };
+    let previous = read[span.start..span.end].to_string();
+    let next = without_rule(&read, span);
+    if !only_the_rule_went(&read, &next, span) {
+        let reason = format!(
+            "cutting rule '{name}' out would change how KiCad reads the text beside it on \
+             its line: text that then opens the line with '#' is read as a comment"
+        );
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::PlanBlocked {
+                operation: OPERATION.to_string(),
+                reasons: vec![reason.clone()],
+            },
+            format!(
+                "{OPERATION} wrote nothing to '{}': {reason}. Edit the file by hand.",
+                rules_path.display()
+            ),
+        ));
+    }
+
+    let checked = check_rules(&next, &user_layers);
+    if let Some(refusal) = refusal_to_write(
+        ctx,
+        OPERATION,
+        &board,
+        &next,
+        &checked,
+        has_items,
+        "without this rule",
+    )
+    .await?
+    {
+        return Ok(refusal);
+    }
+    if let Some(refusal) = write_if_unchanged(
+        &rules_path,
+        "custom rules file",
+        OPERATION,
+        Some(&read),
+        next,
+    )? {
+        return Ok(refusal);
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "success": true,
+        "rules_file": rules_path,
+        "name": name,
+        "previous": previous,
+        "kicad_checked": has_items,
+        "unchecked_properties": if has_items { BTreeSet::new() } else { checked.properties },
+    })))
+}
+
+/// `text` without the rule at `span`. A rule that ends its line goes with the
+/// blank space before it, so a rule `set_custom_rule` added goes as it came;
+/// one that shares its line with what follows goes with the spaces after it,
+/// so that the rest of its line does not join a comment line above it.
+fn without_rule(text: &str, span: &RuleSpan) -> String {
+    let rest = text[span.end..].trim_start_matches([' ', '\t']);
+    if rest.is_empty() || rest.starts_with(['\n', '\r']) {
+        let before =
+            text[..span.start].trim_end_matches(|c: char| c.is_ascii() && is_space(c as u8));
+        format!("{before}{rest}")
+    } else {
+        format!("{}{rest}", &text[..span.start])
+    }
+}
+
+/// Whether `next` reads as `text`'s tokens less those of the rule at `span`:
+/// the cut moved nothing beside the rule into a comment line or another token.
+fn only_the_rule_went(text: &str, next: &str, span: &RuleSpan) -> bool {
+    let (Ok(before), Ok(after)) = (lex(text), lex(next)) else {
+        return false;
+    };
+    before
+        .iter()
+        .filter(|token| token.end <= span.start || token.start >= span.end)
+        .map(|token| &token.tok)
+        .eq(after.iter().map(|token| &token.tok))
+}
+
+/// The refusal for a name two or more rules in `text` have: Copperpour cannot
+/// tell which one the call means.
+fn ambiguous_name(
+    rules_path: &Path,
+    text: &str,
+    named: &[RuleSpan],
+    name: &str,
+    action: &str,
+) -> CallToolResult {
+    CallToolResult::error_kind(
+        ToolErrorKind::AmbiguousTarget {
+            target: name.to_string(),
+            candidates: named
+                .iter()
+                .map(|rule| format!("line {}", line_of(text, rule.start)))
+                .collect(),
+        },
+        format!(
+            "'{}' has {} rules named '{}', so Copperpour cannot tell which one to {action}. \
+             Rename all but one, then retry.",
+            rules_path.display(),
+            named.len(),
+            name
+        ),
+    )
+}
+
+/// The refusal when `next`, the file a call would write, is not one KiCad 10
+/// loads: `checked`, its check, found a fault, or, on a board with an item,
+/// kicad-cli does not load it. `change` says what the call does to the file.
+async fn refusal_to_write(
+    ctx: &ToolContext,
+    operation: &str,
+    board: &Path,
+    next: &str,
+    checked: &Checked,
+    has_items: bool,
+    change: &str,
+) -> anyhow::Result<Option<CallToolResult>> {
+    let rules_path = sibling_custom_rules_path(board);
+    if !checked.faults.is_empty() {
+        return Ok(Some(CallToolResult::error_kind(
+            ToolErrorKind::PlanBlocked {
+                operation: operation.to_string(),
+                reasons: checked.faults.clone(),
+            },
+            format!(
+                "{operation} wrote nothing: {change}, KiCad would report errors in '{}': \
+                 {}. kicad-cli drops a rules file it cannot parse and checks against its \
+                 implicit rules alone.",
+                rules_path.display(),
+                checked.faults.join("; ")
+            ),
+        )));
+    }
+    // With no item on the board the probe could not tell a loaded file from a
+    // dropped one, and no rule acts on anything yet.
+    if has_items {
+        let verdict =
+            kicad_verdict(&ctx.config.kicad_cli, board, next, &checked.properties).await?;
+        if let Some(reason) = verdict {
+            return Ok(Some(CallToolResult::error_kind(
+                ToolErrorKind::PlanBlocked {
+                    operation: operation.to_string(),
+                    reasons: vec![reason.clone()],
+                },
+                format!(
+                    "{operation} wrote nothing to '{}': {reason}",
+                    rules_path.display()
+                ),
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// What the check and the probe need from the board.
@@ -1630,6 +1846,21 @@ mod tests {
     }
 
     async fn call_with(kicad_cli: &str, arguments: serde_json::Value) -> serde_json::Value {
+        call_tool("set_custom_rule", kicad_cli, arguments).await
+    }
+
+    /// `delete_custom_rule`, called with a kicad-cli that loads the rules.
+    async fn delete(arguments: serde_json::Value) -> serde_json::Value {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_kicad_cli(dir.path(), Some(PROBE_HIT), 0);
+        call_tool("delete_custom_rule", &cli.display().to_string(), arguments).await
+    }
+
+    async fn call_tool(
+        tool: &str,
+        kicad_cli: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
         let handler = McpHandler::new(ServerConfig {
             eager_toolsets: true,
             kicad_cli: kicad_cli.to_string(),
@@ -1640,7 +1871,7 @@ mod tests {
         let response = handler
             .handle_message(json!({
                 "jsonrpc": "2.0", "id": 108, "method": "tools/call",
-                "params": {"name": "set_custom_rule", "arguments": arguments}
+                "params": {"name": tool, "arguments": arguments}
             }))
             .await
             .unwrap()
@@ -1957,6 +2188,223 @@ mod tests {
             (&json!(false), &json!(["Width"]))
         );
         assert!(rules_of(&board).unwrap().contains("A.Width > 0.1mm"));
+    }
+
+    #[tokio::test]
+    async fn a_deleted_rule_goes_with_the_blank_lines_before_it() {
+        let (_dir, board) = board_with(Some(RULES));
+        let body = delete(json!({"board": board, "name": "keepout"})).await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(
+            rules_of(&board).unwrap(),
+            RULES.replace(&format!("\n\n{KEEPOUT}"), "")
+        );
+        assert_eq!(body["previous"], json!(KEEPOUT));
+        assert_eq!(
+            (&body["kicad_checked"], &body["unchecked_properties"]),
+            (&json!(true), &json!([]))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rule_set_then_deleted_leaves_the_file_as_it_was() {
+        let (_dir, board) = board_with(Some(RULES));
+        call(dp_pairs(&board)).await;
+        let body = delete(json!({"board": board, "name": "dp"})).await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(rules_of(&board).unwrap(), RULES);
+    }
+
+    /// The next rule on the deleted one's line stays on that line, not on
+    /// the comment line above it, where KiCad would read it as comment.
+    #[tokio::test]
+    async fn a_rule_sharing_its_line_leaves_the_rest_of_the_line() {
+        let shared = "(version 1)\n# two rules\n(rule \"a\" (constraint clearance (min 1mm))) \
+                      (rule \"b\" (constraint clearance (min 2mm)))\n";
+        let (_dir, board) = board_with(Some(shared));
+        let body = delete(json!({"board": board, "name": "a"})).await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(
+            rules_of(&board).unwrap(),
+            "(version 1)\n# two rules\n(rule \"b\" (constraint clearance (min 2mm)))\n"
+        );
+    }
+
+    /// `#x` after a rule is a symbol; with the rule cut out it would open the
+    /// line, and KiCad would read it and rule `b` as a comment.
+    #[tokio::test]
+    async fn a_cut_that_would_open_a_line_with_a_hash_is_refused() {
+        let hash = "(version 1)\n(rule \"a\" (constraint clearance (min 1mm))) #x \
+                    (rule \"b\" (constraint clearance (min 2mm)))\n";
+        let (_dir, board) = board_with(Some(hash));
+        let body = delete(json!({"board": board, "name": "a"})).await;
+        assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+        assert!(
+            body["error"]["reasons"].to_string().contains("'#'"),
+            "{body}"
+        );
+        assert_eq!(rules_of(&board).unwrap(), hash);
+    }
+
+    /// Where each cut ends: line endings, tabs and a missing final newline are
+    /// kept as the file had them.
+    #[test]
+    fn a_cut_keeps_the_line_endings_around_it() {
+        let rule = "(rule \"a\" (constraint clearance (min 1mm)))";
+        let b = "(rule \"b\" (constraint clearance (min 2mm)))";
+        for (text, left) in [
+            (
+                format!("(version 1)\r\n\r\n{rule}\r\n"),
+                "(version 1)\r\n".to_string(),
+            ),
+            (format!("(version 1)\n\n{rule}"), "(version 1)".to_string()),
+            (format!("(version 1) {rule}\n"), "(version 1)\n".to_string()),
+            (
+                format!("(version 1)\n\t{rule}\t\n{b}\n"),
+                format!("(version 1)\n{b}\n"),
+            ),
+            (
+                format!("(version 1)\n# two rules\n{rule} {b}\n"),
+                format!("(version 1)\n# two rules\n{b}\n"),
+            ),
+        ] {
+            let span = check_rules(&text, &[])
+                .rules
+                .into_iter()
+                .find(|span| span.name == "a")
+                .unwrap();
+            let next = without_rule(&text, &span);
+            assert_eq!(next, left, "{text:?}");
+            assert!(only_the_rule_went(&text, &next, &span), "{text:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_no_rule_has_is_refused_naming_the_rules() {
+        let (_dir, board) = board_with(Some(RULES));
+        let body = delete(json!({"board": board, "name": "dp"})).await;
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert!(body.to_string().contains("'fanout', 'keepout'"), "{body}");
+        assert_eq!(rules_of(&board).unwrap(), RULES);
+    }
+
+    /// A rule never closed stops the check, so a rule after it is not read:
+    /// the refusal says so rather than that the file has none.
+    #[tokio::test]
+    async fn a_name_after_a_fault_the_check_stops_at_is_refused_naming_the_fault() {
+        let before =
+            format!("{RULES}\n(rule \"open\"\n  (constraint clearance (min 1mm))\n\n{DP_PAIRS}\n");
+        let (_dir, board) = board_with(Some(&before));
+        let body = delete(json!({"board": board, "name": "dp"})).await;
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert!(body.to_string().contains("never closed"), "{body}");
+        assert!(
+            body.to_string().contains("hides every rule after it"),
+            "{body}"
+        );
+        assert_eq!(rules_of(&board).unwrap(), before);
+    }
+
+    /// As for set_custom_rule: with no item on the board, kicad-cli is not
+    /// run (this one would fail) and the reply names what was left unchecked.
+    #[tokio::test]
+    async fn a_delete_on_a_board_with_no_item_rests_on_the_check_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("empty.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb\n\t(version 20241229)\n\t(generator \"pcbnew\")\n\t(general\n\t\t(thickness 1.6)\n\t)\n\t(paper \"A4\")\n\t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(2 \"B.Cu\" signal)\n\t)\n\t(setup)\n)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            board.with_extension("kicad_dru"),
+            format!(
+                "(version 1)\n\n(rule \"w\" (condition \"A.Width > 0.1mm\") \
+                 (constraint clearance (min 1mm)))\n\n{DP_PAIRS}\n"
+            ),
+        )
+        .unwrap();
+        let cli = fake_kicad_cli(dir.path(), None, 9);
+        let body = call_tool(
+            "delete_custom_rule",
+            &cli.display().to_string(),
+            json!({"board": board, "name": "dp"}),
+        )
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(
+            (&body["kicad_checked"], &body["unchecked_properties"]),
+            (&json!(false), &json!(["Width"]))
+        );
+        assert!(!rules_of(&board).unwrap().contains("\"dp\""));
+    }
+
+    #[tokio::test]
+    async fn a_delete_from_no_file_is_refused() {
+        let (_dir, board) = board_with(None);
+        let body = delete(json!({"board": board, "name": "dp"})).await;
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert_eq!(rules_of(&board), None);
+    }
+
+    #[tokio::test]
+    async fn a_delete_does_not_guess_between_two_rules_of_the_name() {
+        let twice = format!("{RULES}\n{DP_PAIRS}\n\n{DP_PAIRS}\n");
+        let (_dir, board) = board_with(Some(&twice));
+        let body = delete(json!({"board": board, "name": "dp"})).await;
+        assert_eq!(body["error"]["kind"], "ambiguous_target", "{body}");
+        assert_eq!(body["error"]["candidates"], json!(["line 25", "line 29"]));
+        assert_eq!(rules_of(&board).unwrap(), twice);
+    }
+
+    /// A fault in a rule left refuses the delete; deleting the faulty rule
+    /// itself mends the file.
+    #[tokio::test]
+    async fn a_delete_leaving_a_fault_is_refused() {
+        let before = format!("{RULES}\n(rule \"u\" (constraint clearance (min 0.2)))\n");
+        let (_dir, board) = board_with(Some(&before));
+        let body = delete(json!({"board": board, "name": "keepout"})).await;
+        assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+        assert!(
+            body["error"]["reasons"].to_string().contains("needs units"),
+            "{body}"
+        );
+        assert_eq!(rules_of(&board).unwrap(), before);
+        let body = delete(json!({"board": board, "name": "u"})).await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(rules_of(&board).unwrap(), RULES);
+    }
+
+    #[tokio::test]
+    async fn a_delete_kicad_cli_does_not_load_is_refused() {
+        let (_dir, board) = board_with(Some(RULES));
+        let cli_dir = tempfile::tempdir().unwrap();
+        let cli = fake_kicad_cli(cli_dir.path(), Some(PROBE_MISS), 0);
+        let body = call_tool(
+            "delete_custom_rule",
+            &cli.display().to_string(),
+            json!({"board": board, "name": "keepout"}),
+        )
+        .await;
+        assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+        assert!(
+            body["error"]["reasons"]
+                .to_string()
+                .contains("did not load the file"),
+            "{body}"
+        );
+        assert_eq!(rules_of(&board).unwrap(), RULES);
+    }
+
+    #[tokio::test]
+    async fn a_delete_after_a_save_leaves_the_file_as_saved() {
+        let (_dir, board) = board_with(Some(RULES));
+        let saved = format!("{RULES}\n(rule \"theirs\" (constraint clearance (min 1mm)))\n");
+        write_hook::set(saved.clone());
+        let body = delete(json!({"board": board, "name": "keepout"})).await;
+        assert!(!write_hook::armed());
+        assert_eq!(body["error"]["kind"], "conflict", "{body}");
+        assert_eq!(rules_of(&board).unwrap(), saved);
     }
 
     /// Live, against a real kicad-cli on the fixture board: a known property
