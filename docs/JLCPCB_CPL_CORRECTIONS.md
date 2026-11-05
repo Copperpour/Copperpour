@@ -12,7 +12,7 @@ reviewable and repeatable.
 
 ## Policy format
 
-This example is made up (board, designators and parts). A complete project file is in
+This example is illustrative: the board, designators and LCSC numbers are made up, and the rotations it shows prove nothing about a real part. The part decides how JLCPCB's model faces, so check the preview for your own part. A complete project file is in
 [`examples/jlcpcb_cpl_corrections.example.json`](../examples/jlcpcb_cpl_corrections.example.json):
 
 ```json
@@ -31,7 +31,7 @@ This example is made up (board, designators and parts). A complete project file 
           "board": "my-board rev B",
           "designator": "U3",
           "footprint": "TSSOP-8_4.4x3mm_P0.65mm",
-          "lcsc": "C7950",
+          "lcsc": "C0000001",
           "side": "top",
           "kicad_rotation_degrees": 0,
           "cpl_rotation_degrees": 0,
@@ -52,7 +52,7 @@ This example is made up (board, designators and parts). A complete project file 
           "board": "my-board rev B",
           "designator": "J1",
           "footprint": "USB_C_Receptacle_HRO_TYPE-C-31-M-12",
-          "lcsc": "C165948",
+          "lcsc": "C0000002",
           "side": "top",
           "kicad_rotation_degrees": 180,
           "cpl_rotation_degrees": 0,

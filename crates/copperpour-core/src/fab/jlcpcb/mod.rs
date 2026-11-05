@@ -1115,7 +1115,7 @@ mod jlcpcb_assembly_tests {
                       {observation_extra}}}]}}]}}"#
             )
         };
-        parse_jlcpcb_correction_policy(&policy(r#", "lcsc": "C7950", "side": "top""#), "test")
+        parse_jlcpcb_correction_policy(&policy(r#", "lcsc": "C0000001", "side": "top""#), "test")
             .expect("a top-side observation naming its part is accepted");
         let bottom = parse_jlcpcb_correction_policy(&policy(r#", "side": "bottom""#), "test")
             .unwrap_err()
