@@ -1806,10 +1806,10 @@ async fn datasheets_from_catalog_for_lcsc_ids(
 struct CatalogRead {
     /// Non-empty datasheets by LCSC ID.
     urls: HashMap<String, String>,
-    /// IDs whose `Datasheet` is not text, such as a blob. A catalog from
-    /// `download_jlcpcb_database` has none, but a hand-made or older one can;
-    /// these IDs are looked up through the LCSC API rather than failing the
-    /// whole catalog. A NULL `Datasheet` is no datasheet, like an empty one.
+    /// IDs whose `Datasheet` can't be read as text: a blob, a number, or text
+    /// that isn't valid UTF-8. A catalog from `download_jlcpcb_database` has
+    /// none, but a hand-made or older one can; these IDs are looked up through
+    /// the LCSC API rather than failing the whole catalog. A NULL `Datasheet` is no datasheet, like an empty one.
     unreadable_ids: Vec<String>,
 }
 
@@ -2017,7 +2017,7 @@ async fn handle_enrich_datasheets(
     }
     if !local_catalog_unreadable_ids.is_empty() {
         body["local_catalog_unreadable_ids"] = json!(local_catalog_unreadable_ids);
-        body["note"] = json!("The local JLCPCB catalog has a Datasheet that is not text for the parts in local_catalog_unreadable_ids, so they were looked up through the LCSC API; re-run download_jlcpcb_database with force to rebuild it");
+        body["note"] = json!("The local JLCPCB catalog has a Datasheet that can't be read as text for the parts in local_catalog_unreadable_ids, so they were looked up through the LCSC API; re-run download_jlcpcb_database with force to rebuild it");
     }
     Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
@@ -3286,9 +3286,9 @@ mod datasheet_enrichment_tests {
         assert_eq!(std::fs::read_to_string(file.path()).unwrap(), original);
     }
 
-    /// A row whose `Datasheet` is not text is skipped and named, and its part
-    /// goes to the API, rather than failing the whole catalog. A NULL one is
-    /// no datasheet, like an empty one: it goes to the API unnamed.
+    /// A row whose `Datasheet` can't be read as text is skipped and named, and
+    /// its part goes to the API, rather than failing the whole catalog. A NULL
+    /// one is no datasheet, like an empty one: it goes to the API unnamed.
     #[tokio::test]
     async fn a_datasheet_that_is_not_text_is_skipped_and_reported() {
         let (_dir, db_path) = seed_catalog_db(&[("C100", "https://example.com/c100-local.pdf")]);
