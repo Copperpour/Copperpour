@@ -103,6 +103,11 @@ copperpour-schematic-editor = { path = "crates/copperpour-schematic-editor" }
 copperpour-render = { path = "crates/copperpour-render" }
 copperpour-vcs = { path = "crates/copperpour-vcs" }
 
+# Full debuginfo doubles the workspace test compile (221 s vs 109 s, #291).
+# Backtraces keep file:line; CARGO_PROFILE_DEV_DEBUG=true restores variables.
+[profile.dev]
+debug = "line-tables-only"
+
 # The S-expression parser is ~25x slower unoptimized. The installed-demo
 # tests parse 185 MB of KiCad boards, and debug servers parse real boards.
 [profile.dev.package.copperpour-sexp]
