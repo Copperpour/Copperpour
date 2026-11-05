@@ -16,6 +16,7 @@ set PROTOC=C:\path\to\protoc.exe   # or: choco install protoc
 
 cargo check                          # ~15s
 cargo test --workspace --lib --tests # all tests
+cargo test -p copperpour-core -p copperpour --no-default-features --lib --tests  # the offline build (#210)
 cargo build --release -p copperpour     # MCP server binary
 cd crates/schematic-viewer && cargo build --release   # viewer (separate crate)
 ```
@@ -89,7 +90,7 @@ plugin/      Python launcher inside KiCad: __init__.py (PCB-editor ActionPlugin 
 packaging/   build-pcm.{ps1,sh} · metadata.json · validate-pcm.py · schema/ · resources/
 .github/workflows/  disabled on GitHub; local CI runs their jobs (GOVERNANCE.md)
     ci.yml        check+test (Linux, Windows), clippy, fmt, viewer, Python plugin,
-                  Nix, PCM validation, licenses — per PR
+                  Nix, PCM validation, licenses, offline build — per PR
     e2e-kicad.yml real KiCad 10.0.5: e2e suite, demo-corpus conformance, PCM;
                   release gate, on request for a PR
     release.yml   real-KiCad gate, build, PCM (the local job: Linux x86_64, Windows)
@@ -316,6 +317,30 @@ Router: `crates/copperpour-core/src/router/mod.rs`.
   `--kicad-cli <path>`. On Windows, if `cargo` is missing in a fresh shell, run
   `set PATH=%PATH%;%USERPROFILE%\.cargo\bin`, and close the viewer before rebuilding (a
   running `.exe` is locked, so linking fails).
+
+## Build Features
+
+`copperpour-core` has a feature for each integration that reaches the network or
+an outside program, and `copperpour` forwards them (#210). All are on by default,
+and release, PCM and Nix builds use the defaults:
+
+| Feature | Adds | Dependencies |
+| --- | --- | --- |
+| `jlcpcb` | JLCPCB parts catalog, its download, LCSC and EasyEDA lookups | `rusqlite`, `reqwest`, `zip` |
+| `freerouting` | Freerouting discovery and headless routing (a Java subprocess) | none |
+| `native-bridge` | KiCad plugin's Specctra export bridge (HTTP to localhost) | `reqwest` |
+
+Cargo features only add code, so the offline build is `--no-default-features`, not
+a feature of its own. CI's `offline` job builds, lints and tests it, fails if its
+dependency tree has an HTTP client, SQLite or `zip`, or its binaries name an LCSC,
+JLCPCB or EasyEDA host, and checks each feature alone. `xtask` keeps the default
+features: the documented tool counts are for the default build, and the tests that
+check prose against the registry are ignored in other builds.
+
+A tool of a missing feature isn't registered, so a call to it is `unknown_tool`, and
+a toolset left with no tools isn't listed. `sourcing::LcscCatalog` stays in every
+build: without `jlcpcb` it reports every catalog as missing from the build, so
+placement and `estimate_cost` work unchanged.
 
 ## Test Suite
 
