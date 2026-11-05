@@ -90,3 +90,19 @@ For a mutating tool, cover the refusal path before the success path: wrong open
 board, reachable IPC rejection, stale file revision, unsupported geometry, or
 missing evidence. For IPC behavior that mocks cannot prove, add an ignored live
 test and record the live validation command in the PR.
+
+## Adding A Fab House
+
+A fab house that differs only in limits or prices is one `FabProfile` in
+`PROFILES` (`crates/copperpour-core/src/fab/mod.rs`): its `fab_house` id, its
+minimum trace width, a `CostModel`, and `AssemblyFormat::KicadNative`. Give the
+`CostModel` a `source` naming where its prices come from and when; without one,
+`estimate_cost` marks the estimate approximate. Name the new id in the
+`fab_house` descriptions of `export_manufacturing_package`,
+`validate_for_manufacturing` and `estimate_cost`, and extend
+`profiles_hold_each_fab_houses_limits_and_prices`.
+
+Assembly output of its own, as JLCPCB has in `fab/jlcpcb`, is a new
+`AssemblyFormat` variant with a module beside `fab/jlcpcb`, and an arm in each
+of its methods. That changes a public tool's output, so it needs tests for each
+step and a migration note.

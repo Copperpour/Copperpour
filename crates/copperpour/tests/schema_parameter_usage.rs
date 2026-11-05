@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The source directories that hold tool handlers: `tools/`, and the domain
-/// modules #209 moves handlers into, such as `autorouting/`. Each is read
+/// modules #209 moves handlers' code into, such as `autorouting/` and `fab/`. Each is read
 /// recursively.
 fn handler_dirs() -> Vec<PathBuf> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -17,7 +17,7 @@ fn handler_dirs() -> Vec<PathBuf> {
         .nth(1)
         .expect("crates directory above konnect")
         .join("copperpour-core/src");
-    ["tools", "autorouting"]
+    ["tools", "autorouting", "fab"]
         .into_iter()
         .map(|dir| src.join(dir))
         .collect()

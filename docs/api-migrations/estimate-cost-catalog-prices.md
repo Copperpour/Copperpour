@@ -22,6 +22,9 @@ bought or placed, for JLCPCB and PCBWay: `components_estimate` and
 The response adds:
 - `cost_estimate.extended_parts_fee`, which `total_estimate` and `per_board`
   include. It is `$0.00` for other fab houses.
+- `cost_estimate.approximate`, true when the fab house's PCB and assembly
+  prices have no cited source, as all of them have none today. `notes` then
+  says so.
 - `components`, which lists the parts `priced_from_catalog` and those
   `estimated` at the average, each with a `reason`. A part priced from the
   catalog gives its `order_quantity`, its `unit_price` at that quantity, and
