@@ -8396,16 +8396,22 @@ mod multi_unit_component_tests {
         ),
     ];
 
-    /// The nested fixture's project, with a project table of two libraries
-    /// KiCad 10.0.6 saved: `Device`, holding the stock `Device:R`, and
-    /// `Fields`, whose two-pin `FIELDS_BARE` `create_symbol` made. The project
-    /// table is read first, so the developer's installed libraries cannot
-    /// answer.
+    /// The nested fixture's project, with [`write_fixture_lib_table`]'s
+    /// project table.
     fn nested_pages_project() -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         for (name, content) in NESTED_PAGES {
             std::fs::write(directory.path().join(name), content).unwrap();
         }
+        write_fixture_lib_table(directory.path());
+        directory
+    }
+
+    /// A project table of two libraries KiCad 10.0.6 saved: `Device`, holding
+    /// the stock `Device:R`, and `Fields`, whose two-pin `FIELDS_BARE`
+    /// `create_symbol` made. The project table is read first, so the
+    /// developer's installed libraries cannot answer.
+    fn write_fixture_lib_table(directory: &std::path::Path) {
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let lib = |name: &str, file: &str| {
             format!(
@@ -8416,7 +8422,7 @@ mod multi_unit_component_tests {
             )
         };
         std::fs::write(
-            directory.path().join("sym-lib-table"),
+            directory.join("sym-lib-table"),
             format!(
                 "(sym_lib_table\n  (version 7)\n{}{})\n",
                 lib("Device", "reference_prefix_kicad10/Device.kicad_sym"),
@@ -8424,7 +8430,6 @@ mod multi_unit_component_tests {
             ),
         )
         .unwrap();
-        directory
     }
 
     async fn served_handler() -> crate::mcp::handler::McpHandler {
@@ -10198,6 +10203,47 @@ mod multi_unit_component_tests {
         .unwrap();
         assert!(result.is_error);
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// Parts replaced in turn by one symbol share one embedded copy of it:
+    /// the copy the first replace writes, its name on the line after
+    /// `(symbol`, and the copy eeschema wrote, its name on the same line.
+    #[tokio::test]
+    async fn replace_by_one_symbol_keeps_one_embedded_copy() {
+        const SHEET: &str = include_str!("../../tests/fixtures/trace_point_kicad10.kicad_sch");
+        for new_lib_id in ["Fields:FIELDS_BARE", "Device:R"] {
+            let directory = tempfile::tempdir().unwrap();
+            write_fixture_lib_table(directory.path());
+            let path = directory.path().join("trace.kicad_sch");
+            std::fs::write(&path, SHEET).unwrap();
+            for reference in ["R1", "R2"] {
+                let result = handle_replace_component(
+                    &json!({ "schematic": path, "reference": reference, "new_lib_id": new_lib_id }),
+                    &context(),
+                )
+                .await
+                .unwrap();
+                assert!(!result.is_error, "{new_lib_id} {reference}: {result:?}");
+                let written = std::fs::read_to_string(&path).unwrap();
+                if new_lib_id == "Fields:FIELDS_BARE" && reference == "R1" {
+                    assert!(
+                        !written.contains("(symbol \"Fields:FIELDS_BARE\""),
+                        "premise: the first replace writes the name on its own line"
+                    );
+                }
+                let tree = parse_sexp(&written).unwrap();
+                let copies = tree.find("lib_symbols").map_or(0, |libraries| {
+                    libraries
+                        .find_all("symbol")
+                        .into_iter()
+                        .filter(|symbol| {
+                            symbol.get(1).and_then(|value| value.as_str()) == Some(new_lib_id)
+                        })
+                        .count()
+                });
+                assert_eq!(copies, 1, "{new_lib_id} after replacing {reference}");
+            }
+        }
     }
 
     #[tokio::test]
