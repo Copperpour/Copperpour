@@ -195,8 +195,10 @@ does not lower the evidence requirement.
 estimate_cost(board, quantity?, layers?, fab_house?)
 ```
 
-`estimate_cost` is an indicative heuristic built from fixed assumptions and
-rough average component costs. Use it only for coarse comparisons. It is not a
+`estimate_cost` is an indicative heuristic built from fixed assumptions. For
+JLCPCB, parts with an `LCSC` field are priced from the local catalog, a snapshot
+of the parts feed; other parts, and every PCBWay part, at a rough average. Use
+it only for coarse comparisons. It is not a
 vendor quote and does not know the selected finish, service, complete BOM,
 shipping, taxes, coupons, or current pricing. Budget and purchasing decisions
 require a current quote from the selected fabricator.

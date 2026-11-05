@@ -506,7 +506,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 |------|-------------|
 | `export_manufacturing_package` | Generate Gerbers, drill, fab-house BOM, and pick-and-place. JLCPCB assembly requires the exact board open with IPC enabled: native pad-box midpoints and board exports share a stable live snapshot, then versioned CPL corrections apply. Geometry and correction evidence remain separate; Component Placements preview is required. |
 | `validate_for_manufacturing` | Board pre-flight before ordering: checks outline, design rules, footprints, routing evidence, and complete DRC results. |
-| `estimate_cost` | Estimate total manufacturing cost from board dimensions, layers, and footprint count, with an itemized breakdown. For JLCPCB, parts with an `LCSC` field are priced from the local catalog, plus the fee per unique Extended part, and the response lists which parts were priced from data. |
+| `estimate_cost` | Estimate total manufacturing cost from board dimensions, layers, and the parts the BOM lists, with an itemized breakdown. For JLCPCB, parts with an `LCSC` field are priced from the local catalog at the price break for the order's quantity, plus the fee per unique Extended part, and the response lists which parts were priced from data. |
 
 ---
 
