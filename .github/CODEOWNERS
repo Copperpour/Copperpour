@@ -14,6 +14,7 @@
 /docs/JLCPCB_CPL_CORRECTIONS.md                    @mn89h @pauliuszaleckas
 
 # Mixed files: most of their code is JLCPCB and LCSC (his call), but they also hold
-# Freerouting (integration.rs) and fab-neutral export and checks (manufacturing.rs).
+# the Freerouting tool handlers (integration.rs; the code is in autorouting/freerouting)
+# and fab-neutral export and checks (manufacturing.rs).
 /crates/copperpour-core/src/tools/integration.rs      @mn89h @pauliuszaleckas
 /crates/copperpour-core/src/tools/manufacturing.rs    @mn89h @pauliuszaleckas

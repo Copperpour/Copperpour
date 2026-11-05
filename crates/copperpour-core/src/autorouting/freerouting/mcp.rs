@@ -925,7 +925,7 @@ mod tests {
     #[ignore = "requires Java and FREEROUTING_JAR"]
     async fn native_mcp_routes_the_export_fixture() {
         let jar = PathBuf::from(std::env::var_os("FREEROUTING_JAR").expect("set FREEROUTING_JAR"));
-        let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let source = include_str!("../../../tests/fixtures/specctra_two_resistors.kicad_pcb");
         let temp = tempfile::tempdir().unwrap();
         let board = temp.path().join("board.kicad_pcb");
         let dsn = temp.path().join("board.dsn");
@@ -957,7 +957,7 @@ mod tests {
     #[ignore = "requires Java and FREEROUTING_JAR"]
     async fn overall_timeout_closes_child_and_removes_partial_output() {
         let jar = PathBuf::from(std::env::var_os("FREEROUTING_JAR").expect("set FREEROUTING_JAR"));
-        let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let source = include_str!("../../../tests/fixtures/specctra_two_resistors.kicad_pcb");
         let temp = tempfile::tempdir().unwrap();
         let board = temp.path().join("board.kicad_pcb");
         let dsn = temp.path().join("board.dsn");
@@ -1004,7 +1004,7 @@ mod tests {
     #[ignore = "requires Java and FREEROUTING_JAR"]
     async fn cancelling_route_reaps_the_owned_child() {
         let jar = PathBuf::from(std::env::var_os("FREEROUTING_JAR").expect("set FREEROUTING_JAR"));
-        let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let source = include_str!("../../../tests/fixtures/specctra_two_resistors.kicad_pcb");
         let temp = tempfile::tempdir().unwrap();
         let board = temp.path().join("board.kicad_pcb");
         let dsn = temp.path().join("board.dsn");

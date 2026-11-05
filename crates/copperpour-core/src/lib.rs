@@ -1,7 +1,7 @@
 pub mod app_dirs;
+pub(crate) mod autorouting;
 pub mod config_resolution;
 pub mod design_hash;
-pub(crate) mod freerouting_mcp;
 pub mod gates;
 pub mod guidance;
 pub(crate) mod hex;
