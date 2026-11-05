@@ -875,7 +875,7 @@ async fn handle_search_jlcpcb_parts(
         // unknown stock are counted instead of silently dropped (#63).
         let unknown_stock_sql = format!("{sql} AND Stock IS NULL");
         if in_stock {
-            sql.push_str(" AND Stock > 0");
+            sql.push_str(JLCPCB_IN_STOCK_FILTER);
         }
         // Ranked in-stock first, then as suggest_jlcpcb_alternatives ranks
         // (#90), ending on the LCSC number so a page is the same on every run
@@ -959,7 +959,7 @@ async fn handle_search_jlcpcb_parts(
         }
         let fallback_unknown_stock_sql = format!("{fallback_sql} AND Stock IS NULL");
         if in_stock {
-            fallback_sql.push_str(" AND Stock > 0");
+            fallback_sql.push_str(JLCPCB_IN_STOCK_FILTER);
         }
         fallback_sql.push_str(&jlcpcb_ranking_order_by());
 
@@ -1354,6 +1354,12 @@ fn search_ranking_criteria() -> Vec<&'static str> {
         .chain(jlcpcb_ranking_criteria(true))
         .collect()
 }
+
+/// The search's `in_stock` filter. Most parts are in stock, so
+/// `components_stock_idx` would make it slower than a scan, and the catalog
+/// has no `ANALYZE` statistics to tell SQLite so. The unary `+` keeps SQLite
+/// from using the index here; the `Stock IS NULL` count still uses it.
+const JLCPCB_IN_STOCK_FILTER: &str = " AND +Stock > 0";
 
 /// [`search_ranking_criteria`] as an `ORDER BY`. The import stores an unknown
 /// price as 0, as [`AlternativeCandidate::price_known`] reads it.
@@ -5630,6 +5636,49 @@ mod catalog_unknown_values_tests {
             .iter()
             .find(|part| part["lcsc"] == lcsc)
             .unwrap_or_else(|| panic!("{lcsc} missing: {body}"))
+    }
+
+    /// The in-stock search scans instead of reading most of the catalog
+    /// through `components_stock_idx`, which measured 3× slower on the real
+    /// catalog (#286's review). The import runs no `ANALYZE`, so the planner
+    /// sees the same lack of statistics here as on the real catalog.
+    #[test]
+    fn the_in_stock_search_keeps_off_the_stock_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream_path = dir.path().join("upstream.db");
+        let output_path = dir.path().join("catalog.db");
+        let conn = rusqlite::Connection::open(&upstream_path).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE parts USING fts5 (\"LCSC Part\", \"First Category\", \"Second Category\", \
+             \"MFR.Part\", \"Package\", \"Manufacturer\", \"Library Type\", \"Description\", \"Datasheet\", \
+             \"Price\", \"Stock\");
+             INSERT INTO parts VALUES ('C1', 'R', 'Chip', 'M1', '0402', 'Acme', 'Basic', 'd', '', '0.01', '5000');",
+        )
+        .unwrap();
+        drop(conn);
+        build_konnect_jlcpcb_database(&upstream_path, &output_path).unwrap();
+        let conn = rusqlite::Connection::open(&output_path).unwrap();
+        let plan = |sql: &str| -> String {
+            conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("; ")
+        };
+        let filters = "FROM components WHERE 1=1 AND (Description LIKE '%d%')";
+        for order_by in [jlcpcb_ranking_order_by(), String::new()] {
+            let search = plan(&format!(
+                "SELECT LCSC {filters}{JLCPCB_IN_STOCK_FILTER}{order_by}"
+            ));
+            assert!(!search.contains("components_stock_idx"), "{search}");
+        }
+        let unknown_count = plan(&format!("SELECT COUNT(*) {filters} AND Stock IS NULL"));
+        assert!(
+            unknown_count.contains("components_stock_idx"),
+            "{unknown_count}"
+        );
     }
 
     /// The feed's empty and non-numeric prices and stock survive the import
