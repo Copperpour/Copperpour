@@ -2339,7 +2339,10 @@ pub(crate) mod tests {
         let export = export_dsn(&board_path, source, &rules()).unwrap();
         std::fs::write(&dsn_path, export.dsn).expect("write DSN");
 
-        let output = std::process::Command::new("java")
+        let _env = crate::java_runtime::JAVA_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let output = std::process::Command::new(crate::java_runtime::java_executable())
             .arg("-jar")
             .arg(jar)
             .arg("-de")
@@ -2385,7 +2388,10 @@ pub(crate) mod tests {
         let export = adopt_native_dsn(baseline, native.to_string()).unwrap();
         std::fs::write(&dsn_path, &export.dsn).expect("write native DSN");
 
-        let output = std::process::Command::new("java")
+        let _env = crate::java_runtime::JAVA_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let output = std::process::Command::new(crate::java_runtime::java_executable())
             .arg("-jar")
             .arg(jar)
             .arg("-de")

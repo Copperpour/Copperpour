@@ -378,7 +378,8 @@ pub(crate) async fn check_freerouting(
                      https://github.com/freerouting/freerouting/releases), or pass jar_path."
         }))),
         FreeroutingJar::Found(jar_path) => {
-            let mut java_command = tokio::process::Command::new("java");
+            let java_path = crate::java_runtime::java_executable();
+            let mut java_command = tokio::process::Command::new(&java_path);
             java_command.arg("-version");
             let java = match run_java_command(&mut java_command).await {
                 Ok(output) => output,
@@ -389,6 +390,7 @@ pub(crate) async fn check_freerouting(
                         "native_mcp_available": false,
                         "bridge_available": false,
                         "jar_path": jar_path,
+                        "java_path": java_path,
                         "java_available": false,
                         "note": error
                     })));
@@ -401,13 +403,39 @@ pub(crate) async fn check_freerouting(
                     "native_mcp_available": false,
                     "bridge_available": false,
                     "jar_path": jar_path,
+                    "java_path": java_path,
                     "java_available": false,
                     "java_output": command_output(&java),
                     "note": "Freerouting was found, but Java did not start successfully"
                 })));
             }
 
-            let mut freerouting_command = tokio::process::Command::new("java");
+            // An older Java only fails once the JAR is loaded, with
+            // UnsupportedClassVersionError: say so before anything else runs.
+            let java_release = crate::java_runtime::java_release(&command_output(&java));
+            let required_release = crate::java_runtime::required_java_release(&jar_path);
+            if let (Some(found), Some(required)) = (java_release, required_release) {
+                if found < required {
+                    return Ok(CallToolResult::json(&json!({
+                        "available": false,
+                        "engine_found": true,
+                        "native_mcp_available": false,
+                        "bridge_available": false,
+                        "jar_path": jar_path,
+                        "java_path": java_path,
+                        "java_available": true,
+                        "java_release": found,
+                        "required_java_release": required,
+                        "note": format!(
+                            "This Freerouting JAR needs Java {required} or later, but {} is Java {found}. \
+                             Install a newer JDK, or point JAVA_HOME at one.",
+                            java_path.display()
+                        )
+                    })));
+                }
+            }
+
+            let mut freerouting_command = tokio::process::Command::new(&java_path);
             freerouting_command.args([
                 mcp::JAVA_HEADLESS_ARG,
                 "-jar",
@@ -421,13 +449,25 @@ pub(crate) async fn check_freerouting(
             };
 
             let bridge = mcp::probe_local(&jar_path).await;
-            Ok(CallToolResult::json(&json!({
-                "available": true,
+            // Available means the JAR actually ran here, not merely that a JAR
+            // and some `java` exist.
+            let note = (!version_checked).then(|| {
+                format!(
+                    "Java started, but the Freerouting JAR did not run with {} (`--version` \
+                     failed): see version_output",
+                    java_path.display()
+                )
+            });
+            let mut body = json!({
+                "available": version_checked,
                 "engine_found": true,
                 "native_mcp_available": bridge.native_mcp_available,
                 "bridge_available": bridge.bridge_available,
                 "jar_path": jar_path,
+                "java_path": java_path,
                 "java_available": true,
+                "java_release": java_release,
+                "required_java_release": required_release,
                 "java_output": command_output(&java),
                 "version_checked": version_checked,
                 "version_output": version_output,
@@ -435,7 +475,12 @@ pub(crate) async fn check_freerouting(
                 "native_mcp_tool_count": bridge.tool_count,
                 "native_mcp_diagnostics": bridge.diagnostics,
                 "bridge_error": bridge.error
-            })))
+            });
+            // The key stays absent when the JAR ran, as before this change.
+            if let Some(note) = note {
+                body["note"] = json!(note);
+            }
+            Ok(CallToolResult::json(&body))
         }
     }
 }
@@ -815,6 +860,154 @@ mod freerouting_tests {
             json!(format!("jar_path is not a file: {}", missing.display()))
         );
         assert!(body.get("searched_locations").is_none(), "{body}");
+    }
+
+    /// A JAR whose main class is built for Java 25 (class-file major 69), as
+    /// Freerouting 2.5.0's is.
+    #[cfg(unix)]
+    fn java_25_jar(dir: &Path) -> PathBuf {
+        use std::io::Write;
+        let jar = dir.join("freerouting-2.5.0.jar");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&jar).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("META-INF/MANIFEST.MF", options).unwrap();
+        zip.write_all(b"Manifest-Version: 1.0\r\nMain-Class: app.freerouting.Freerouting\r\n")
+            .unwrap();
+        zip.start_file("app/freerouting/Freerouting.class", options)
+            .unwrap();
+        zip.write_all(&[0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 69])
+            .unwrap();
+        zip.finish().unwrap();
+        jar
+    }
+
+    /// Runs `future` to completion on a runtime of its own, so a test can hold
+    /// the synchronous `JAVA_ENV_LOCK` without keeping it across an await.
+    #[cfg(unix)]
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    /// Served `check_freerouting` with `JAVA_HOME` pointing at a fake `java`
+    /// whose script is `body`. The caller holds `JAVA_ENV_LOCK`.
+    #[cfg(unix)]
+    async fn served_check_with_fake_java(body: &str) -> serde_json::Value {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let jar = java_25_jar(temp.path());
+        let bin = temp.path().join("jdk").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let java = bin.join("java");
+        std::fs::write(&java, body).unwrap();
+        std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let previous = std::env::var_os("JAVA_HOME");
+        std::env::set_var("JAVA_HOME", temp.path().join("jdk"));
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "check_freerouting",
+                    "arguments": { "jar_path": jar.display().to_string() }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        match previous {
+            Some(value) => std::env::set_var("JAVA_HOME", value),
+            None => std::env::remove_var("JAVA_HOME"),
+        }
+        let result = response.result.expect("result");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let body: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["java_path"], json!(java), "{body}");
+        body
+    }
+
+    /// A Java older than the JAR needs is refused up front, with both
+    /// releases named, and `JAVA_HOME` is the `java` that was asked.
+    #[cfg(unix)]
+    #[test]
+    fn served_check_freerouting_refuses_a_java_older_than_the_jar() {
+        let _env = crate::java_runtime::JAVA_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let body = block_on(served_check_with_fake_java(
+            "#!/bin/sh\n\
+             if [ \"$1\" = -version ]; then echo 'openjdk version \"17.0.2\" 2022-01-18' >&2; exit 0; fi\n\
+             exit 1\n",
+        ));
+        assert_eq!(body["available"], false, "{body}");
+        assert_eq!(body["engine_found"], true, "{body}");
+        assert_eq!(body["java_available"], true, "{body}");
+        assert_eq!(body["java_release"], 17, "{body}");
+        assert_eq!(body["required_java_release"], 25, "{body}");
+        assert!(
+            body["note"].as_str().unwrap().contains("needs Java 25"),
+            "{body}"
+        );
+        // Refused before the JAR was run.
+        assert!(body.get("version_checked").is_none(), "{body}");
+    }
+
+    /// A recent enough Java whose JAR does not run is not `available`, and
+    /// the note says why.
+    #[cfg(unix)]
+    #[test]
+    fn served_check_freerouting_is_unavailable_when_the_jar_does_not_run() {
+        let _env = crate::java_runtime::JAVA_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let body = block_on(served_check_with_fake_java(
+            "#!/bin/sh\n\
+             if [ \"$1\" = -version ]; then echo 'openjdk version \"25.0.1\" 2025-10-21' >&2; exit 0; fi\n\
+             echo 'Error: could not start' >&2; exit 1\n",
+        ));
+        assert_eq!(body["available"], false, "{body}");
+        assert_eq!(body["java_available"], true, "{body}");
+        assert_eq!(body["java_release"], 25, "{body}");
+        assert_eq!(body["required_java_release"], 25, "{body}");
+        assert_eq!(body["version_checked"], false, "{body}");
+        assert!(
+            body["note"].as_str().unwrap().contains("did not run"),
+            "{body}"
+        );
+    }
+
+    /// A recent enough Java that runs the JAR is `available`, and the
+    /// response has no `note` key, as before the Java check was added.
+    #[cfg(unix)]
+    #[test]
+    fn served_check_freerouting_is_available_without_a_note_when_the_jar_runs() {
+        let _env = crate::java_runtime::JAVA_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let body = block_on(served_check_with_fake_java(
+            "#!/bin/sh\n\
+             if [ \"$1\" = -version ]; then echo 'openjdk version \"25.0.1\" 2025-10-21' >&2; exit 0; fi\n\
+             echo 'Freerouting 2.5.0'; exit 0\n",
+        ));
+        assert_eq!(body["available"], true, "{body}");
+        assert_eq!(body["version_checked"], true, "{body}");
+        assert!(body.get("note").is_none(), "{body}");
     }
 
     /// A directory reached twice is searched, and reported, once, under the
