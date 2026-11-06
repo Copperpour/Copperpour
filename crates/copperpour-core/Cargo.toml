@@ -43,7 +43,7 @@ default = ["jlcpcb", "freerouting", "native-bridge"]
 # EasyEDA lookups. JLCPCB fabrication and assembly output don't need it.
 jlcpcb = ["dep:rusqlite", "dep:reqwest", "dep:zip"]
 # Freerouting discovery and headless routing: a Java subprocess, no network.
-freerouting = []
+freerouting = ["dep:zip"]
 # The KiCad plugin's native Specctra export bridge: HTTP to localhost only.
 native-bridge = ["dep:reqwest"]
 

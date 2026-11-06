@@ -2326,6 +2326,7 @@ pub(crate) mod tests {
     /// install Java or Freerouting; maintainers can opt in with
     /// `FREEROUTING_JAR=/path/to/freerouting.jar cargo test -p copperpour-core
     /// freerouting_accepts_exported_fixture -- --ignored`.
+    #[cfg(feature = "freerouting")]
     #[test]
     #[ignore = "requires Java and FREEROUTING_JAR"]
     fn freerouting_accepts_exported_fixture() {
@@ -2373,6 +2374,7 @@ pub(crate) mod tests {
 
     /// Real-engine parity for KiCad 10's native exporter identifiers plus the
     /// rewritten revision manifest consumed by the strict SES planner.
+    #[cfg(feature = "freerouting")]
     #[test]
     #[ignore = "requires Java and FREEROUTING_JAR"]
     fn freerouting_round_trips_native_kicad_export() {
