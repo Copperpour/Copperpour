@@ -95,3 +95,11 @@ A sheet from before KiCad 7 has no `(dnp …)`. On a KiCad 6 sheet (format
 `(in_bom yes) (on_board yes) (dnp yes) (fields_autoplaced)`. The BOM then
 listed the part as DNP, and `--exclude-dnp` dropped it. KiCad 10.0.6 then
 re-saved the sheet and kept the attribute, after `(on_board yes)`.
+
+## Exclude from BOM and from board
+
+Every placed unit carries KiCad's own `(in_bom yes)` and `(on_board yes)`,
+which the `in_bom` and `on_board` tests flip and restore (#34). KiCad 10.0.6's
+`kicad-cli sch export bom --fields Reference,Value` on the fixture lists `C1`,
+`R1` and `U1`; with `R1`'s `(in_bom yes)` made `(in_bom no)`, it lists `C1` and
+`U1`.

@@ -4142,6 +4142,70 @@ mod tests {
         assert_eq!(skipped, ["H1"]);
     }
 
+    /// The flags `edit_schematic_component` sets reach the plan through the
+    /// sheet this module reads them from (#34): U1 excluded from the board is
+    /// skipped by flag instead of added, and R1 excluded from the BOM is added
+    /// with its footprint excluded from the BOM. The sheet is KiCad-saved.
+    #[tokio::test]
+    async fn edited_board_and_bom_flags_change_the_plan() {
+        let directory = tempfile::tempdir().unwrap();
+        let schematic = directory.path().join("flags.kicad_sch");
+        std::fs::write(
+            &schematic,
+            include_str!("../../tests/fixtures/dnp_kicad10.kicad_sch"),
+        )
+        .unwrap();
+        let plan = || {
+            let mut design = ExportedDesign {
+                components: vec![resistor("U1", "/u1"), resistor("R1", "/r1")],
+                skipped: Vec::new(),
+                unassigned: Vec::new(),
+            };
+            apply_saved_symbol_flags(std::slice::from_ref(&schematic), &mut design).unwrap();
+            let plan = plan_sync("netlist", &design, &board_with(Vec::new()));
+            (design, plan)
+        };
+
+        let (design, before) = plan();
+        assert_eq!(before.counts.added.planned, 2);
+        assert_eq!(before.counts.skipped_by_flag.planned, 0);
+        assert!(design.components.iter().all(|c| !c.exclude_from_bom));
+
+        let edit = crate::tools::sch_components::tools()
+            .into_iter()
+            .find(|tool| tool.name == "edit_schematic_component")
+            .unwrap();
+        let context = std::sync::Arc::new(crate::tools::ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        ));
+        for (reference, flag) in [("U1", "on_board"), ("R1", "in_bom")] {
+            let args = serde_json::json!({
+                "schematic": schematic.display().to_string(),
+                "reference": reference,
+                flag: false
+            });
+            let result = (edit.handler)(&args, context.clone()).await.unwrap();
+            assert!(!result.is_error, "{:?}", result.content);
+        }
+
+        let (design, after) = plan();
+        let skipped = design
+            .skipped
+            .iter()
+            .map(|component| component.reference.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(skipped, ["U1"]);
+        assert_eq!(after.counts.skipped_by_flag.planned, 1);
+        assert_eq!(after.counts.added.planned, 1);
+        let r1 = design
+            .components
+            .iter()
+            .find(|component| component.reference == "R1")
+            .unwrap();
+        assert!(r1.exclude_from_bom);
+    }
+
     #[test]
     fn a_footprint_carries_its_symbol_s_exclude_from_bom() {
         use copperpour_ipc::gen::kiapi;
