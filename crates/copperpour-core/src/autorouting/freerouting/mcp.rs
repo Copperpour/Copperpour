@@ -391,12 +391,15 @@ async fn run_state_machine(
         poll_count = poll_count.saturating_add(1);
         let state = required_string(&details, &["state", "status"], "job state")?;
         progress.report(&state, &details, started);
-        match state.to_ascii_uppercase().as_str() {
-            "COMPLETED" => break "COMPLETED".to_string(),
-            "FAILED" | "CANCELLED" | "CANCELED" => {
-                bail!("Freerouting job {job_id} ended in state {state}")
-            }
-            _ => {}
+        match JobState::of(&state) {
+            JobState::Completed => break "COMPLETED".to_string(),
+            JobState::Ended => bail!("Freerouting job {job_id} ended in state {state}"),
+            JobState::EndedWithoutOutput => bail!(
+                "Freerouting job {job_id} ended in state {state}, which has no downloadable \
+                 output; to bound the optimizer, use optimize_seconds rather than \
+                 job_timeout_seconds"
+            ),
+            JobState::Running => {}
         }
 
         let optimizing = progress.is_optimizing() || stage_is_optimizing(&details);
@@ -434,6 +437,31 @@ async fn run_state_machine(
         diagnostics_path: None,
         last_activity: progress.activity,
     })
+}
+
+/// What a `get_job_details` state means for the poll loop.
+#[derive(Debug, PartialEq, Eq)]
+enum JobState {
+    Completed,
+    /// Failed or cancelled.
+    Ended,
+    /// Terminal too, and Freerouting refuses the output of these states:
+    /// polling on would only wait for the overall timeout.
+    EndedWithoutOutput,
+    /// Anything else: a job still queued or running, or a state this code does not
+    /// know yet. The overall timeout still bounds it.
+    Running,
+}
+
+impl JobState {
+    fn of(state: &str) -> Self {
+        match state.to_ascii_uppercase().as_str() {
+            "COMPLETED" => Self::Completed,
+            "FAILED" | "CANCELLED" | "CANCELED" => Self::Ended,
+            "TIMED_OUT" | "TERMINATED" | "INVALID" => Self::EndedWithoutOutput,
+            _ => Self::Running,
+        }
+    }
 }
 
 /// `optimize_seconds`, counted from the first poll that sees the optimizer.
@@ -1266,6 +1294,26 @@ mod tests {
                 .as_deref(),
             Some("Freerouting running, pass 7: 9 unrouted, 218 violations (0m00s)")
         );
+    }
+
+    #[test]
+    fn every_terminal_job_state_ends_the_poll_loop() {
+        for (state, expected) in [
+            ("COMPLETED", JobState::Completed),
+            ("completed", JobState::Completed),
+            ("FAILED", JobState::Ended),
+            ("CANCELLED", JobState::Ended),
+            ("CANCELED", JobState::Ended),
+            ("TIMED_OUT", JobState::EndedWithoutOutput),
+            ("TERMINATED", JobState::EndedWithoutOutput),
+            ("INVALID", JobState::EndedWithoutOutput),
+            ("timed_out", JobState::EndedWithoutOutput),
+            ("QUEUED", JobState::Running),
+            ("RUNNING", JobState::Running),
+            ("SOMETHING_NEW", JobState::Running),
+        ] {
+            assert_eq!(JobState::of(state), expected, "{state}");
+        }
     }
 
     #[test]
