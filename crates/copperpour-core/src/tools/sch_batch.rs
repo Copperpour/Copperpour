@@ -17,7 +17,7 @@ use copperpour_sexp::{
     parser::parse_sexp,
     schematic::{
         extract_all_net_labels, extract_buses, extract_labels, extract_symbol_instances,
-        extract_wires, find_lib_symbol, format_net_label, format_wire, parse_at, pin_endpoint,
+        extract_wires, find_lib_symbol, format_net_label, parse_at, pin_endpoint,
         pin_outward_direction, read_schematic, symbol_bounds_for_instance, SymbolBounds,
     },
     writer::{apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit},
@@ -1722,15 +1722,14 @@ async fn handle_connect_passthrough(
     let stub = 2.54_f64;
     let (wire_end_x, wire_end_y) = (x + dir.dx * stub, y + dir.dy * stub);
 
-    let wire_sexp = format_wire(x, y, wire_end_x, wire_end_y);
     let label_sexp = format_net_label(&net_name, wire_end_x, wire_end_y, dir.label_rotation);
 
     let expected = content.clone();
+    // The stub gets the dots a new wire calls for, as one drawn with add_wire does (#137).
+    let with_stub =
+        crate::tools::sch_wiring::insert_wire_with_junctions(content, x, y, wire_end_x, wire_end_y);
     // Wires and labels are element class 2; symbol instances MUST come last.
-    let new_content = crate::tools::sch_wiring::insert_before_close(
-        &content,
-        &format!("{wire_sexp}{label_sexp}"),
-    );
+    let new_content = crate::tools::sch_wiring::insert_before_close(&with_stub, &label_sexp);
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
