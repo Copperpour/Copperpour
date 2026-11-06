@@ -349,7 +349,7 @@ fn write(
         }
     };
     let root = match crate::tools::resolve_schematic_ownership(schematic) {
-        Ok(ownership) => ownership.map(|ownership| ownership.root_schematic),
+        Ok(ownership) => ownership.map(|ownership| ownership.editor_schematic()),
         Err(error) => return Ok(Err(error.into_tool_result())),
     };
     let transition = FileTransition::replace(schematic, before.content.clone(), prepared.clone());

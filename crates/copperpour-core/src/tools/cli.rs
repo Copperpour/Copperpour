@@ -1345,9 +1345,9 @@ fn drc_args<'a>(out_path: &'a str, refill_zones: bool, pcb: &'a str) -> Vec<&'a 
 const PARITY_NOT_RUN: &str = "Failed to fetch schematic netlist for parity tests";
 
 /// The schematic kicad-cli's parity test reads: the root of the board's own
-/// project, which shares the board's file stem — the same project↔root
-/// relation `resolve_schematic_ownership` uses (`<project>.kicad_pro` ↔
-/// `<project>.kicad_sch`). Measured on KiCad 10: the root beside a board is
+/// project, which shares the board's file stem — the schematic eeschema opens
+/// for a project, `SchematicOwnership::editor_schematic` (`<project>.kicad_pro`
+/// ↔ `<project>.kicad_sch`). Measured on KiCad 10: the root beside a board is
 /// read with or without its `.kicad_pro`, and a project of a different name
 /// in the same directory is *not* consulted (KiCad reports
 /// [`PARITY_NOT_RUN`] and writes an empty array). So this names one path and

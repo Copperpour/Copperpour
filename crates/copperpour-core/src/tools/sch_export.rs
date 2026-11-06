@@ -718,6 +718,9 @@ async fn handle_run_erc(
     let sch_path = get_path(args, "schematic")?;
     let min_severity = args["severity"].as_str().unwrap_or("warning");
 
+    if let Some(refusal) = under_another_top_level_sheet(&sch_path) {
+        return Ok(refusal);
+    }
     let owning_root = match owning_project_root(&sch_path) {
         Ok(root) => root,
         Err(error) => return Ok(error.into_tool_result()),
@@ -1637,6 +1640,35 @@ fn owning_project_root(file: &Path) -> Result<Option<PathBuf>, crate::tools::Sch
             (!same_file(&ownership.root_schematic, file)).then_some(ownership.root_schematic)
         }),
     )
+}
+
+/// The refusal for a file under a top-level sheet other than the schematic
+/// named after its project. kicad-cli takes the project from the name of the
+/// file it is handed and, up to 10.0.6, loads that file's hierarchy alone
+/// (`EESCHEMA_HELPERS::LoadSchematic`), so no file it can be handed checks
+/// this one with its project. Ownership errors are left to
+/// [`owning_project_root`].
+fn under_another_top_level_sheet(file: &Path) -> Option<CallToolResult> {
+    let ownership = crate::tools::resolve_schematic_ownership(file).ok()??;
+    let project = ownership.editor_schematic();
+    if same_file(&ownership.root_schematic, &project) {
+        return None;
+    }
+    let reason = format!(
+        "{} is under the top-level sheet {}, not {}; kicad-cli takes the project from the \
+         name of the file it is handed and checks that file's hierarchy, so ERC cannot check \
+         it with its project. Run ERC from eeschema",
+        file.display(),
+        ownership.root_schematic.display(),
+        project.display()
+    );
+    Some(CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::UnsupportedCapability {
+            capability: "erc_of_another_top_level_sheet".to_string(),
+            kicad_version: None,
+        },
+        reason,
+    ))
 }
 
 /// Path equality that survives `.\foo` versus `foo` and case-insensitive
