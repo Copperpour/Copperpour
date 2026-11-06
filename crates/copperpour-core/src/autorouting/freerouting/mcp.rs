@@ -477,8 +477,9 @@ fn stage_is_optimizing(details: &Value) -> bool {
 ///
 /// Freerouting publishes the incumbent board, the best one so far, at the
 /// start and end of every optimizer pass; candidates are worked on copies.
-/// Taken during optimization, the snapshot is therefore a complete routing.
-/// Returns false while no output has been published yet.
+/// Taken during optimization, the snapshot is therefore the best board so
+/// far. It is complete only if the router finished; `last_activity` carries
+/// its unrouted count. Returns false while no output has been published yet.
 async fn download_running_output(
     client: &mut LocalMcpClient,
     job_id: &str,
@@ -1182,6 +1183,105 @@ mod tests {
             "unexpected error: {error:#}"
         );
         client.close().await;
+    }
+
+    /// The tool schemas `validate_tool_contracts` accepts, as `tools/list`
+    /// returns them.
+    fn conforming_tools_list() -> Value {
+        let object = |properties: Value, required: Value| json!({ "type": "object", "properties": properties, "required": required });
+        let file = object(
+            json!({ "jobId": { "type": "string" }, "filePath": { "type": "string" } }),
+            json!(["jobId", "filePath"]),
+        );
+        let by_path = object(
+            json!({ "path": object(json!({ "jobId": { "type": "string" } }), json!(["jobId"])) }),
+            json!(["path"]),
+        );
+        let tool = |name: &str, schema: &Value| json!({ "name": name, "inputSchema": schema });
+        json!({ "tools": [
+            tool("create_session", &object(json!({}), json!([]))),
+            tool(
+                "enqueue_job",
+                &object(
+                    json!({ "body": object(json!({ "session_id": { "type": "string" } }), json!(["session_id"])) }),
+                    json!(["body"]),
+                ),
+            ),
+            tool("upload_job_input_from_local_file", &file),
+            tool("start_job", &by_path),
+            tool("get_job_details", &by_path),
+            tool("cancel_job", &by_path),
+            tool("download_job_output_to_local_file", &file),
+        ] })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_empty_download_during_optimization_is_retried_at_the_next_poll() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        // The job is always optimizing. The first download leaves an empty
+        // file, as Freerouting does before it has published a board; the
+        // second writes the board.
+        let script = temp.path().join("server.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"n=0; downloads=0
+while read -r line; do
+  n=$((n+1))
+  case "$line" in
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *get_job_details*) result='{{"state":"RUNNING","stage":"OPTIMIZATION"}}' ;;
+    *download_job_output_to_local_file*)
+      downloads=$((downloads+1))
+      if [ "$downloads" -eq 1 ]; then : > '{output}'; else printf '(session board)' > '{output}'; fi
+      result='{{}}' ;;
+    *cancel_job*) result='{{}}'; last=1 ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$n" "$result"
+  if [ -n "${{last:-}}" ]; then exit 0; fi
+done
+"#,
+                tools = conforming_tools_list(),
+                output = temporary.display(),
+            ),
+        )
+        .unwrap();
+        // exec: the client's child is the script itself, so close() can reap it.
+        let mut client = scripted_client(&format!("exec sh '{}'", script.display()));
+        let settings = RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: Some(0),
+            poll_interval: Duration::from_millis(10),
+            overall_timeout: Duration::from_secs(30),
+        };
+
+        let evidence = timeout(
+            Duration::from_secs(20),
+            run_state_machine(&mut client, &dsn, &temporary, &settings, Instant::now()),
+        )
+        .await
+        .expect("the scripted job ends")
+        .expect("the board from the second download is kept");
+        client.close().await;
+
+        assert_eq!(evidence.final_state, "OPTIMIZATION_STOPPED");
+        assert_eq!(
+            evidence.poll_count, 2,
+            "the empty first download must not end the job"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&temporary).unwrap(),
+            "(session board)"
+        );
     }
 
     #[test]
