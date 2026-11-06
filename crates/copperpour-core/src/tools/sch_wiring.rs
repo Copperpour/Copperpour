@@ -333,7 +333,8 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "array",
                         "items": {
                             "type": "object",
-                            "properties": { "x": { "type": "number" }, "y": { "type": "number" } }
+                            "properties": { "x": { "type": "number" }, "y": { "type": "number" } },
+                            "required": ["x", "y"]
                         }
                     }
                 },
@@ -3573,6 +3574,19 @@ async fn handle_batch_add_junction(
         Ok(a) => a,
         Err(e) => return Ok(e),
     };
+    // A position missing `x` or `y` used to become a dot at 0 on that axis,
+    // reported as added (#282). Check every one before touching the file, as
+    // `batch_add_wire` does, so a malformed batch changes nothing.
+    for (i, pos) in positions.iter().enumerate() {
+        for key in ["x", "y"] {
+            if pos[key].as_f64().is_none() {
+                return Ok(crate::tools::invalid_arg(
+                    &format!("positions[{i}].{key}"),
+                    "missing or not a number",
+                ));
+            }
+        }
+    }
     let points: Vec<(f64, f64)> = positions
         .iter()
         .map(|pos| {
@@ -7262,6 +7276,72 @@ mod add_junction_tests {
         .await;
         assert_eq!(out, json!({ "added": 0, "already_present": 2 }));
         assert_eq!(mtime(&path), aged(), "file rewritten");
+    }
+
+    /// A position missing `x` or `y` is refused by name at the schema gate
+    /// before anything is written, rather than becoming a dot at 0 on that
+    /// axis (#282).
+    #[tokio::test]
+    async fn batch_add_junction_refuses_a_position_missing_a_coordinate() {
+        let handler = handler().await;
+        for (positions, field, reason) in [
+            (
+                json!([{ "x": 5 }]),
+                "positions[0].y",
+                "\"y\" is a required property",
+            ),
+            (
+                json!([{}]),
+                "positions[0].x",
+                "\"x\" is a required property",
+            ),
+            (
+                json!([{ "x": 190.5, "y": 140.0 }, { "y": 30.0 }]),
+                "positions[1].x",
+                "\"x\" is a required property",
+            ),
+        ] {
+            let (_d, path) = sheet();
+            let result = served_call(
+                &handler,
+                "batch_add_junction",
+                json!({ "schematic": path.display().to_string(), "positions": positions }),
+            )
+            .await;
+            let body: Value = serde_json::from_str(text_of(&result)).unwrap();
+            assert_eq!(body["error"]["kind"], json!("invalid_argument"), "{body}");
+            assert_eq!(body["error"]["field"], json!(field), "{body}");
+            assert_eq!(body["error"]["reason"], json!(reason), "{body}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET, "{field}");
+        }
+    }
+
+    /// The handler refuses the same positions when the schema gate is not in
+    /// front of it, and a non-numeric coordinate as well.
+    #[tokio::test]
+    async fn batch_add_junction_handler_checks_every_position_first() {
+        for (positions, field) in [
+            (
+                json!([{ "x": 190.5, "y": 140.0 }, { "x": 30.0 }]),
+                "positions[1].y",
+            ),
+            (json!([{ "x": "190.5", "y": 140.0 }]), "positions[0].x"),
+        ] {
+            let (_d, path) = sheet();
+            let result = handle_batch_add_junction(
+                &json!({ "schematic": path.display().to_string(), "positions": positions }),
+                &crate::tools::ToolContext::new(
+                    ServerConfig::default(),
+                    std::sync::Arc::new(crate::router::ToolRouter::new()),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{:?}", result.content);
+            let body: Value = serde_json::from_str(text_of(&result)).unwrap();
+            assert_eq!(body["error"]["field"], json!(field), "{body}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET, "{field}");
+        }
     }
 
     /// KiCad holding the sheet refuses even a call that would add nothing,
