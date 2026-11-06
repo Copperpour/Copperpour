@@ -13,6 +13,7 @@ fabrication property or a reference point.
 | `issue_283_u2.ipc.bin` | U2, `Package_DIP:DIP-8_W7.62mm` at (125, 95) mm, 0°, front, likewise |
 | `issue_283_u3.ipc.bin` | U3, the same DIP-8 at (145, 95) mm, 90°, on the back, likewise |
 | `issue_283_enabled_layers.ipc.bin` | KiCad's `BoardEnabledLayersResponse` for the board: 2 copper layers |
+| `issue_320_u1_after_refresh.ipc.bin` | U1 again, as KiCad reported it after refresh had restored its pin-1 triangle ([#320](https://github.com/Copperpour/Copperpour/issues/320)), likewise |
 | `issue_283_dfn14_thermalvias_kicad10.kicad_mod` | KiCad 10.0.8's stock `Package_DFN_QFN.pretty/DFN-14-1EP_3x4.5mm_P0.65mm_EP1.65x4.25mm_ThermalVias.kicad_mod`, unchanged |
 | `issue_283_dip8_kicad10.kicad_mod` | KiCad 10.0.8's stock `Package_DIP.pretty/DIP-8_W7.62mm.kicad_mod`, unchanged |
 
@@ -61,3 +62,13 @@ PCB Editor with the API enabled and save it there. Then send `GetItems` for
 footprints and `GetBoardEnabledLayers` for that board without changing
 anything, and write each footprint item's `Any.value` and the layers
 response's bytes unchanged.
+
+## After refresh (#320)
+
+`issue_320_u1_after_refresh.ipc.bin` was captured the same way, on the same
+board, during #283's live check. The check first moved one vertex of U1's
+pin-1 triangle with `edit_board_footprint_graphic`, then let
+`update_footprints_from_library` restore it. KiCad reports the triangle with
+four nodes in `issue_283_u1.ipc.bin`, the last repeating the first, as the
+library lists them. In this capture it reports three: KiCad drops the repeat
+when the outline comes over the API.
