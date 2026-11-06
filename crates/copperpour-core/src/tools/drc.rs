@@ -134,9 +134,13 @@ pub(crate) async fn run(
             }),
         }
     };
-    let (sync, refill) = match (option("sync_live_board"), option("refill_zones")) {
-        (Ok(sync), Ok(refill)) => (sync, refill),
-        (Err(error), _) | (_, Err(error)) => return Ok(Err(error)),
+    let (sync, refill, skip_creepage) = match (
+        option("sync_live_board"),
+        option("refill_zones"),
+        option("skip_creepage"),
+    ) {
+        (Ok(sync), Ok(refill), Ok(skip)) => (sync, refill, skip),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => return Ok(Err(error)),
     };
     // Refuse obvious publication errors before any live save/refill. Later
     // permission changes or filesystem races still need applied-state recovery.
@@ -184,11 +188,13 @@ pub(crate) async fn run(
     }
     // CLI refill is analysis-only. In synchronized mode the persisted IPC fill
     // is authoritative, so do not refill a second time in a different process.
-    let report = match cli::run_drc(&ctx.config.kicad_cli, board, refill && !sync).await {
-        Ok(report) => report,
-        Err(error) if sync => return Ok(Err(uncertain(board, "drc_after_save", error))),
-        Err(error) => return Err(error),
-    };
+    let report =
+        match cli::run_drc_with(&ctx.config.kicad_cli, board, refill && !sync, skip_creepage).await
+        {
+            Ok(report) => report,
+            Err(error) if sync => return Ok(Err(uncertain(board, "drc_after_save", error))),
+            Err(error) => return Err(error),
+        };
     if let Some(snapshot) = saved_snapshot {
         match tokio::fs::read_to_string(board).await {
             Ok(current) if current == snapshot => {}
@@ -509,6 +515,76 @@ mod tests {
             assert_eq!(result["live_board_synced"], false);
             assert_eq!(result["zones_refilled"], false);
             assert_eq!(std::fs::read_to_string(&board).unwrap(), OLD);
+        }
+    }
+
+    /// `skip_creepage` end to end: the served `run_drc` hands kicad-cli the
+    /// board inside a view whose rules have no creepage, and says so.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn served_skip_creepage_checks_the_view_and_says_so() {
+        const RULES: &str = "(version 1)\n(rule \"mains\"\n\t(constraint clearance (min 8mm))\n\t(constraint creepage (min 8mm)))\n";
+        for skip in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let seen = tempfile::tempdir().unwrap();
+            let board = dir.path().join("clock.kicad_pcb");
+            std::fs::write(&board, OLD).unwrap();
+            std::fs::write(board.with_extension("kicad_dru"), RULES).unwrap();
+            // Records the board it was given and the rules beside it, then
+            // writes an empty report where it was told to.
+            let executable = cli::test_support::write_script(
+                seen.path(),
+                "drc-view-probe",
+                &format!(
+                    "#!/bin/sh\nprev=\nfor a; do [ \"$prev\" = --output ] && out=\"$a\"; prev=\"$a\"; last=\"$a\"; done\n\
+                     printf '%s' \"$last\" > '{seen}/board'\n\
+                     cp \"${{last%.kicad_pcb}}.kicad_dru\" '{seen}/rules'\n\
+                     printf '%s' '{{\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]}}' > \"$out\"\nexit 0\n",
+                    seen = seen.path().display()
+                ),
+                "@exit /b 1\r\n",
+            );
+            let result = call(
+                "run_drc",
+                &board,
+                "",
+                &executable,
+                json!({"skip_creepage": skip}),
+            )
+            .await;
+            assert_eq!(result["isError"], false, "{result}");
+            let checked = std::path::PathBuf::from(
+                std::fs::read_to_string(seen.path().join("board")).unwrap(),
+            );
+            let rules = std::fs::read_to_string(seen.path().join("rules")).unwrap();
+            if skip {
+                assert_eq!(result["creepage_skipped"], true, "{result}");
+                assert_eq!(checked.file_name(), board.file_name());
+                let view = checked.parent().unwrap();
+                assert!(
+                    view.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("copperpour-drc-"),
+                    "kicad-cli must check the board inside the view: {}",
+                    checked.display()
+                );
+                assert!(!view.exists(), "the view is removed after the DRC");
+                assert!(!rules.contains("creepage"), "{rules}");
+                assert!(
+                    rules.contains("(constraint clearance (min 8mm)))"),
+                    "{rules}"
+                );
+            } else {
+                assert_ne!(result["creepage_skipped"], true, "{result}");
+                assert_eq!(checked, board);
+                assert_eq!(rules, RULES);
+            }
+            assert_eq!(
+                std::fs::read_to_string(board.with_extension("kicad_dru")).unwrap(),
+                RULES,
+                "the project's rules are never written"
+            );
         }
     }
 
