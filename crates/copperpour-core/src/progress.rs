@@ -5,9 +5,10 @@
 //! task can [`report`] without threading a handle through every signature.
 //! Without a token, or outside a tool call, `report` does nothing.
 //!
-//! Notifications go to the transport's *immediate* sinks: unlike
-//! `tools/list_changed`, which stdio flushes after the response, progress is
-//! only worth anything while the call is still running.
+//! Notifications go to the call's own channel when its transport gave it one
+//! (HTTP: the SSE response to the POST), else to the transport's *immediate*
+//! sinks (stdio): unlike `tools/list_changed`, which stdio flushes after the
+//! response, progress is only worth anything while the call is still running.
 
 use serde_json::{json, Value};
 use std::sync::Arc;
