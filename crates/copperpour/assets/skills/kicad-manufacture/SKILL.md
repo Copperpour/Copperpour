@@ -175,6 +175,26 @@ Completion criterion: an accepted manifest accounts for every required output,
 every accepted path is fresh and non-empty, and visual/order previews agree with
 the saved design.
 
+### JLCPCB order link
+
+When the user asks to send the board to JLCPCB, rather than for files:
+
+```
+generate_jlcpcb_order_link(board, schematic?, include_assembly?, quantity?, thickness?, color?, surface_finish?, copper_weight?, jlcpcb_cpl_corrections_path?)
+```
+
+It writes the JLCPCB package as above, runs DRC on the exported board, and
+uploads the Gerbers (and, with assembly, the BOM and CPL) to JLCPCB through
+EasyEDA's order endpoint. That sends the design to a third party, so call it
+only on the user's request. It orders and pays nothing. A DRC error refuses the
+upload; pass `skip_drc` only when the user has reviewed and waived the errors.
+The BOM sends each part's `LCSC`, `MPN` and `Manufacturer` fields, so fill them
+first.
+
+Give the user the link in **order_url**. It needs a JLCPCB login, then opens the quote page
+with the board loaded and the BOM and CPL in the PCBA steps. The checks above
+still apply there: the board viewer, and every part in Component Placements.
+
 ## 4. Use manual exports when control is required
 
 Use the individual tools when a package needs explicit layer, BOM, side, unit,

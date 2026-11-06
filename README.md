@@ -240,10 +240,10 @@ cargo build --release -p copperpour --no-default-features
 That build has no outbound HTTP client and no vendor endpoints, and CI checks
 both. It leaves out three features, which a release build has:
 
-- `jlcpcb`: the JLCPCB parts catalog, its download, and the LCSC and EasyEDA
-  lookups. That is the catalog, import and datasheet tools of the `integration`
-  toolset, and `lcsc_id` in `add_schematic_component` and
-  `batch_place_components`.
+- `jlcpcb`: the JLCPCB parts catalog, its download, the LCSC and EasyEDA
+  lookups, and the order upload. That is the catalog, import and datasheet
+  tools of the `integration` toolset, `generate_jlcpcb_order_link`, and
+  `lcsc_id` in `add_schematic_component` and `batch_place_components`.
 - `freerouting`: `check_freerouting` and `route_specctra_dsn`.
 - `native-bridge`: the KiCad plugin's Specctra export bridge, which talks to
   KiCad on localhost. `export_specctra_dsn` then always uses Copperpour's own
