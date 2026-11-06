@@ -181,28 +181,41 @@ impl McpHandler {
     }
 
     /// Progress channel for one `tools/call`, or `None` when the client sent no
-    /// `_meta.progressToken`. Delivery is best effort: `try_send` never blocks
-    /// the tool, and a full channel drops that one update.
+    /// `_meta.progressToken`. A call handled by [`Self::handle_message_with_progress`]
+    /// reports on its own channel only; any other call reports to the immediate
+    /// sinks (stdio). Progress never goes to the GET SSE streams: every client
+    /// shares them, and a client would see tokens it never sent. Delivery is
+    /// best effort: `try_send` never blocks the tool, and a full channel drops
+    /// that one update.
     fn progress_reporter(
         &self,
         params: &CallToolParams,
     ) -> Option<crate::progress::ProgressReporter> {
         let token = params.progress_token()?.clone();
+        if let Ok(own) = REQUEST_PROGRESS.try_with(|tx| tx.clone()) {
+            return Some(crate::progress::ProgressReporter::new(token, move |json| {
+                let _ = own.try_send(json);
+            }));
+        }
         let sinks = self.immediate_sinks.clone();
-        let sse = self.sse_senders.clone();
         Some(crate::progress::ProgressReporter::new(token, move |json| {
             if let Ok(sinks) = sinks.read() {
                 for tx in sinks.iter() {
                     let _ = tx.try_send(json.clone());
                 }
             }
-            if let Ok(senders) = sse.try_read() {
-                let event = Event::default().data(json);
-                for tx in senders.iter() {
-                    let _ = tx.try_send(event.clone());
-                }
-            }
         }))
+    }
+
+    /// Like [`Self::handle_message`], but the progress this call reports goes
+    /// to `progress` and nowhere else. The HTTP transport uses it to answer a
+    /// `tools/call` that carries a progress token with an SSE stream of its own.
+    pub async fn handle_message_with_progress(
+        &self,
+        msg: Value,
+        progress: mpsc::Sender<String>,
+    ) -> Option<JsonRpcResponse> {
+        with_request_progress(progress, self.handle_message(msg)).await
     }
 
     /// Process one JSON-RPC message and return an optional response.
@@ -577,6 +590,19 @@ impl McpHandler {
             sinks.retain(|tx| tx.try_send(json.clone()).is_ok());
         }
     }
+}
+
+tokio::task_local! {
+    /// The progress channel of the request being handled, when its transport
+    /// gave it one (see `McpHandler::handle_message_with_progress`).
+    static REQUEST_PROGRESS: mpsc::Sender<String>;
+}
+
+async fn with_request_progress<F: std::future::Future>(
+    progress: mpsc::Sender<String>,
+    future: F,
+) -> F::Output {
+    REQUEST_PROGRESS.scope(progress, future).await
 }
 
 fn kicad_editor_locked_path(error: &anyhow::Error) -> Option<&std::path::Path> {
@@ -4822,6 +4848,74 @@ mod progress_delivery_tests {
             assert_eq!(message["params"]["progress"], 1.0, "{line}");
             assert_eq!(message["params"]["message"], "x", "{line}");
             assert!(rx.try_recv().is_err(), "one report, one notification");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_call_with_its_own_progress_channel_reports_only_there() {
+        let (handler, mut shared) = handler_with_sink().await;
+        let (sse_tx, mut sse_rx) = mpsc::channel(8);
+        handler.register_sse_sender(sse_tx).await;
+        let (own_tx, mut own) = mpsc::channel(8);
+        let params = params(Some(json!({ "progressToken": "t" })));
+        with_request_progress(own_tx, report_during_call(&handler, &params)).await;
+        let line = own
+            .try_recv()
+            .expect("the call's own channel got the report");
+        let message: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(message["params"]["progressToken"], "t", "{line}");
+        assert!(shared.try_recv().is_err(), "nothing on the immediate sinks");
+        assert!(sse_rx.try_recv().is_err(), "nothing on the GET streams");
+    }
+
+    #[tokio::test]
+    async fn progress_never_goes_to_the_get_streams() {
+        let (handler, _shared) = handler_with_sink().await;
+        let (sse_tx, mut sse_rx) = mpsc::channel(8);
+        handler.register_sse_sender(sse_tx).await;
+        report_during_call(&handler, &params(Some(json!({ "progressToken": "t" })))).await;
+        assert!(sse_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn only_a_tools_call_request_with_a_valid_token_asks_for_a_stream() {
+        let call = |id: Option<Value>, method: &str, meta: Value| {
+            let mut msg = json!({ "jsonrpc": "2.0", "method": method,
+                "params": { "name": "x", "_meta": meta } });
+            if let Some(id) = id {
+                msg["id"] = id;
+            }
+            msg
+        };
+        let token = json!({ "progressToken": "t" });
+        assert_eq!(
+            tools_call_progress_token(&call(Some(json!(1)), "tools/call", token.clone())),
+            Some(&json!("t"))
+        );
+        assert_eq!(
+            tools_call_progress_token(&call(
+                Some(json!(1)),
+                "tools/call",
+                json!({ "progressToken": 3 })
+            )),
+            Some(&json!(3))
+        );
+        for msg in [
+            call(None, "tools/call", token.clone()),
+            call(Some(json!(1)), "tools/list", token.clone()),
+            call(Some(json!(1)), "tools/call", json!({})),
+            call(
+                Some(json!(1)),
+                "tools/call",
+                json!({ "progressToken": true }),
+            ),
+            call(
+                Some(json!(1)),
+                "tools/call",
+                json!({ "progressToken": null }),
+            ),
+        ] {
+            assert_eq!(tools_call_progress_token(&msg), None, "{msg}");
         }
     }
 

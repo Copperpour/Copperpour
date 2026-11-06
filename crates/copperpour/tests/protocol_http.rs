@@ -2,7 +2,8 @@
 //!
 //! Spawns the real binary with `transport = "http"` and asserts the seven
 //! behaviors verified by hand at release time, plus the tools/list_changed
-//! notification arriving on the SSE stream after load_toolset.
+//! notification arriving on the SSE stream after load_toolset, and the SSE
+//! response to a tools/call that carries a progress token.
 //!
 //! Plain std TcpStream HTTP/1.1 — no client dependency needed for requests
 //! this simple.
@@ -264,4 +265,48 @@ fn sse_stream_delivers_tools_list_changed() {
         saw_notification,
         "tools/list_changed never arrived on the SSE stream"
     );
+}
+
+#[test]
+fn a_tools_call_with_a_progress_token_is_answered_on_its_own_sse_stream() {
+    let server = HttpServer::spawn();
+    let _ = server.post_mcp(&initialize_msg());
+    let call = |accept: &str| {
+        let msg = json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "get_active_toolsets", "arguments": {},
+                       "_meta": {"progressToken": "p-3"}}
+        });
+        server
+            .raw_request(
+                "POST",
+                "/mcp",
+                &[("Accept", accept)],
+                Some(&msg.to_string()),
+            )
+            .unwrap()
+    };
+
+    // 8. The client accepts an event stream: the response is the last event
+    //    of a stream of its own (here the only one: this tool reports nothing).
+    let (status, headers, body) = call("application/json, text/event-stream");
+    assert_eq!(status, 200);
+    assert!(
+        headers.to_lowercase().contains("text/event-stream"),
+        "a call with a progress token did not get an SSE stream:\n{headers}"
+    );
+    let data = body
+        .split("data: ")
+        .nth(1)
+        .expect("the stream carries the response");
+    let response: Value = serde_json::from_str(data.trim()).unwrap();
+    assert_eq!(response["id"], 3);
+    assert!(response["result"].is_object(), "{response}");
+
+    // 9. A client that only accepts JSON keeps the JSON response.
+    let (status, headers, body) = call("application/json");
+    assert_eq!(status, 200);
+    assert!(headers.to_lowercase().contains("application/json"));
+    let response: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(response["id"], 3);
 }

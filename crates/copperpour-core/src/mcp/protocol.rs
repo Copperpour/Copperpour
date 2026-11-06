@@ -149,8 +149,27 @@ impl CallToolParams {
         self.meta
             .as_ref()?
             .get("progressToken")
-            .filter(|token| token.is_string() || token.is_number())
+            .filter(|token| is_progress_token(token))
     }
+}
+
+/// MCP progress tokens are strings or integers.
+fn is_progress_token(token: &Value) -> bool {
+    token.is_string() || token.is_number()
+}
+
+/// The `_meta.progressToken` of a raw JSON-RPC `tools/call` request, when it
+/// has an id and a valid token: what a transport checks before it opens a
+/// stream of its own for the call.
+pub fn tools_call_progress_token(msg: &Value) -> Option<&Value> {
+    msg.get("id")?;
+    if msg.get("method")?.as_str()? != "tools/call" {
+        return None;
+    }
+    msg.get("params")?
+        .get("_meta")?
+        .get("progressToken")
+        .filter(|token| is_progress_token(token))
 }
 
 /// tools/call response
