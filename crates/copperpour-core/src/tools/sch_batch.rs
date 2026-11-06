@@ -134,8 +134,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Place multiple symbols from KiCAD libraries in one write with committed-file \
              readback. Preserves every saved hierarchy instance and preflights stale metadata \
              before any placement. Copies each library Value and Footprint unless that entry \
-             explicitly overrides it. Pins that land mid-segment on an existing wire gain the \
-             required junction in the same atomic write; the response reports \
+             explicitly overrides it. Pins that land mid-segment on an existing wire, or \
+             where wire ends meet, gain the required junction in the same atomic write; \
+             the response reports \
              junctions_added_count and junctions_pruned_count. \
              There is no auto-numbering: an omitted reference becomes the library prefix \
              plus '?' (e.g. 'R?', '#FLG?'), like an eeschema-unannotated symbol, same as \
@@ -219,9 +220,11 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "bulk_move_schematic_components",
             "Move multiple components by a uniform dx/dy offset in a single atomic file \
-             write. Junction dots are re-judged where the pins moved: a dot the pins \
-             leave unjustified is removed and a pin landing mid-span on a wire gains \
-             one, reported as junctions_pruned_count and junctions_added_count. A \
+             write. Junction dots are re-judged where the pins moved: a dot left with \
+             fewer than three exits (wires, pins, sheet pins, bus entries) is removed \
+             unless it is what joins wires there, and a pin that makes three, mid-span \
+             on one wire or where wire ends meet, gains one, reported as \
+             junctions_pruned_count and junctions_added_count. A \
              no-connect flag travels with the pin it protects, reported as \
              no_connects_moved; the shift is refused before writing when that pin \
              cannot be followed one-to-one.",

@@ -166,8 +166,10 @@ pub fn tools() -> Vec<ToolDef> {
             "move_schematic_component",
             "Move a component's lowest-numbered unit to a new position and translate every \
              other placed unit by the same delta. Does NOT adjust connected wires. \
-             Junction dots are re-judged where the pins moved: a dot the pins leave \
-             unjustified is removed and a pin landing mid-span on a wire gains one, \
+             Junction dots are re-judged where the pins moved: a dot left with fewer \
+             than three exits (wires, pins, sheet pins, bus entries) is removed unless \
+             it is what joins wires there, and a pin that makes three, mid-span on one \
+             wire or where wire ends meet, gains one, \
              reported as junctions_pruned_count and junctions_added_count. A no-connect \
              flag travels with the pin it protects, reported as no_connects_moved; the \
              move is refused before writing when that pin cannot be followed one-to-one. \

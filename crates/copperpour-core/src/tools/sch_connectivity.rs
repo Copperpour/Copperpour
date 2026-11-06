@@ -35,7 +35,7 @@ use copperpour_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
         extract_bus_entries, extract_junctions, extract_no_connects, extract_sheet_pins,
-        pin_endpoint, Label, LabelKind, LibPin, Wire,
+        pin_endpoint, wire_end_needs_junction, Label, LabelKind, LibPin, Wire,
     },
     SexpNode,
 };
@@ -566,6 +566,8 @@ pub(crate) struct ConnectivityIndex<'a> {
     junction_points: PointIndex,
     no_connect_points: PointIndex,
     placed_pins: Vec<PlacedPin>,
+    /// [`crate::tools::junction_exit_points`], for [`Self::needs_junction`].
+    junction_exits: Vec<(f64, f64)>,
 }
 
 /// The wire-side end of each bus entry on the sheet.
@@ -607,7 +609,17 @@ impl<'a> ConnectivityIndex<'a> {
         labels: &'a [Label],
         tolerance: f64,
     ) -> Self {
-        let placed_pins: Vec<PlacedPin> = crate::tools::placed_pins_by_reference(tree)
+        let by_reference = crate::tools::placed_pins_by_reference(tree);
+        let junctions = extract_junctions(tree);
+        let sheet_pins = extract_sheet_pins(tree);
+        let on_bus = WireIndex::build(buses, tolerance);
+        let bus_entry_wire_points = bus_entry_wire_ends_on(tree, &on_bus);
+        let junction_exits = crate::tools::junction_exits(
+            &by_reference,
+            sheet_pins.iter().copied(),
+            bus_entry_wire_points.iter().copied(),
+        );
+        let placed_pins: Vec<PlacedPin> = by_reference
             .into_iter()
             .flat_map(|(inst, pins)| {
                 pins.into_iter().map(move |(pin, transform)| PlacedPin {
@@ -618,10 +630,6 @@ impl<'a> ConnectivityIndex<'a> {
                 })
             })
             .collect();
-        let junctions = extract_junctions(tree);
-        let sheet_pins = extract_sheet_pins(tree);
-        let on_bus = WireIndex::build(buses, tolerance);
-        let bus_entry_wire_points = bus_entry_wire_ends_on(tree, &on_bus);
 
         ConnectivityIndex {
             wires,
@@ -656,6 +664,7 @@ impl<'a> ConnectivityIndex<'a> {
             junction_points: PointIndex::build(junctions, tolerance),
             no_connect_points: PointIndex::build(extract_no_connects(tree), tolerance),
             placed_pins,
+            junction_exits,
         }
     }
 
@@ -709,6 +718,21 @@ impl<'a> ConnectivityIndex<'a> {
             .iter()
             .filter(|w| point_on_segment(x, y, w.x1, w.y1, w.x2, w.y2, self.on_wire.tolerance()))
             .count()
+    }
+
+    /// Whether a junction dot belongs at `(x, y)`: three or more exits, counted
+    /// as the wire tools count them (#897). A wire passing through counts two
+    /// exits even where nothing ends, so this says yes at a bare crossing; a
+    /// caller adding a dot refuses that case itself, since the dot would join
+    /// two nets.
+    pub(crate) fn needs_junction(&self, x: f64, y: f64) -> bool {
+        wire_end_needs_junction(
+            self.wires,
+            &self.junction_exits,
+            x,
+            y,
+            self.on_wire.tolerance(),
+        )
     }
 
     pub(crate) fn has_label(&self, x: f64, y: f64) -> bool {
