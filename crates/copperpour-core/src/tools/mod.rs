@@ -74,6 +74,7 @@ pub mod sch_components;
 pub(crate) mod sch_connectivity;
 pub mod sch_export;
 pub mod sch_hierarchy;
+mod sch_instance_repair;
 mod sch_label_rename;
 mod sch_texts;
 pub mod sch_wiring;
@@ -2526,42 +2527,7 @@ impl SchematicTargetError {
 pub(crate) fn resolve_schematic_ownership(
     target: &std::path::Path,
 ) -> Result<Option<SchematicOwnership>, SchematicTargetError> {
-    use std::collections::BTreeSet;
-
-    let Some(start) = target.parent() else {
-        return Ok(None);
-    };
-    // A relative path still belongs to the same filesystem hierarchy. Starting
-    // at its lexical parent alone would stop at cwd and miss higher projects.
-    let scan_start = if start.is_absolute() {
-        start.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|error| SchematicTargetError::DiscoveryFailed {
-                directory: start.to_path_buf(),
-                reason: error.to_string(),
-            })?
-            .join(start)
-    };
-    let mut project_files = BTreeSet::new();
-    for directory in scan_start.ancestors() {
-        let discovery_error = |error: std::io::Error| SchematicTargetError::DiscoveryFailed {
-            directory: directory.to_path_buf(),
-            reason: error.to_string(),
-        };
-        let entries = std::fs::read_dir(directory).map_err(discovery_error)?;
-        for entry in entries {
-            let entry = entry.map_err(discovery_error)?;
-            let path = entry.path();
-            if path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pro"))
-            {
-                project_files.insert(path);
-            }
-        }
-    }
+    let project_files = candidate_project_files(target)?;
 
     let roots = project_files
         .iter()
@@ -2605,6 +2571,49 @@ pub(crate) fn resolve_schematic_ownership(
         });
     }
     Ok(owners.pop())
+}
+
+/// Every `.kicad_pro` in `target`'s directory and each directory above it:
+/// the candidate projects `resolve_schematic_ownership` judges ownership
+/// among; empty for a path with no directory.
+pub(crate) fn candidate_project_files(
+    target: &std::path::Path,
+) -> Result<std::collections::BTreeSet<std::path::PathBuf>, SchematicTargetError> {
+    let mut project_files = std::collections::BTreeSet::new();
+    let Some(start) = target.parent() else {
+        return Ok(project_files);
+    };
+    // A relative path still belongs to the same filesystem hierarchy. Starting
+    // at its lexical parent alone would stop at cwd and miss higher projects.
+    let scan_start = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| SchematicTargetError::DiscoveryFailed {
+                directory: start.to_path_buf(),
+                reason: error.to_string(),
+            })?
+            .join(start)
+    };
+    for directory in scan_start.ancestors() {
+        let discovery_error = |error: std::io::Error| SchematicTargetError::DiscoveryFailed {
+            directory: directory.to_path_buf(),
+            reason: error.to_string(),
+        };
+        let entries = std::fs::read_dir(directory).map_err(discovery_error)?;
+        for entry in entries {
+            let entry = entry.map_err(discovery_error)?;
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pro"))
+            {
+                project_files.insert(path);
+            }
+        }
+    }
+    Ok(project_files)
 }
 
 fn collect_sheet_instance_paths(

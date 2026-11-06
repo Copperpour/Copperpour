@@ -306,10 +306,38 @@ impl SchematicCommand {
         paths: &[String],
         label: impl Into<String>,
     ) -> Result<Option<Self>, SexpError> {
+        Self::repair_symbol_instances(source, project_name, paths, &[], label)
+    }
+
+    /// Make every placed symbol record exactly `paths` under `project_name`,
+    /// as [`Self::set_symbol_instance_paths`] does, and remove the instances
+    /// of every project `dropped` names, its whole `(project …)` block. A
+    /// path added that a dropped project records takes that record's
+    /// reference and unit: eeschema reads a record at a symbol's path as its
+    /// instance whatever project it names (`SCH_SYMBOL::GetInstance`) and
+    /// saves it under its own project's name. Any other path takes the
+    /// symbol's Reference and unit. Returns `None` when no symbol changes.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_symbol_instance_paths`], and when `dropped` names
+    /// `project_name`, whose records `paths` alone decides.
+    pub fn repair_symbol_instances(
+        source: &str,
+        project_name: &str,
+        paths: &[String],
+        dropped: &[String],
+        label: impl Into<String>,
+    ) -> Result<Option<Self>, SexpError> {
         if paths.is_empty() {
             return Err(SexpError::InvalidValue(
                 "a symbol instance set needs at least one path".to_owned(),
             ));
+        }
+        if dropped.iter().any(|project| project == project_name) {
+            return Err(SexpError::InvalidValue(format!(
+                "project '{project_name}' keeps exactly its wanted paths; it is not dropped"
+            )));
         }
         let mut wanted = paths.to_vec();
         wanted.sort();
@@ -317,12 +345,42 @@ impl SchematicCommand {
         Self::patch_placed_symbols(source, label, |symbol, node, reference, unit| {
             let mut recorded = symbol_instance_paths(node, project_name);
             recorded.sort();
-            if recorded == wanted {
+            let dropped_projects: Vec<&SexpNode> = node
+                .find("instances")
+                .map(|instances| instances.find_all("project"))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|project| {
+                    project
+                        .get(1)
+                        .and_then(SexpNode::as_str)
+                        .is_some_and(|name| dropped.iter().any(|drop| drop == name))
+                })
+                .collect();
+            if recorded == wanted && dropped_projects.is_empty() {
                 return Ok(None);
             }
+            // Each dropped record's path, reference and unit.
+            let carried: Vec<(&str, &str, u32)> = dropped_projects
+                .iter()
+                .flat_map(|project| project.find_all("path"))
+                .filter_map(|record| {
+                    let path = record.get(1)?.as_str()?;
+                    let reference = record.find("reference")?.get(1)?.as_str()?;
+                    let unit = record.find("unit")?.get(1)?.as_str()?.parse().ok()?;
+                    Some((path, reference, unit))
+                })
+                .collect();
+            let symbol = remove_instance_projects(symbol, dropped)?;
             let (mut replacement, kept) =
-                remove_symbol_instance_paths(symbol, project_name, &wanted)?;
+                remove_symbol_instance_paths(&symbol, project_name, &wanted)?;
             for path in wanted.iter().filter(|path| !kept.contains(path)) {
+                let (reference, unit) = carried
+                    .iter()
+                    .find(|(at, _, _)| at == path)
+                    .map_or((reference, unit), |(_, reference, unit)| {
+                        (*reference, *unit)
+                    });
                 replacement =
                     insert_symbol_instance_path(&replacement, project_name, path, reference, unit)?;
             }
@@ -1047,6 +1105,41 @@ fn remove_symbol_instance_paths(
     Ok((apply_edits(symbol.to_owned(), edits), kept))
 }
 
+/// Remove each `(project …)` block of `symbol`'s instances that `dropped`
+/// names, line and all.
+fn remove_instance_projects(symbol: &str, dropped: &[String]) -> Result<String, SexpError> {
+    if dropped.is_empty() {
+        return Ok(symbol.to_owned());
+    }
+    let Some((instances_start, instances_end)) = find_direct_child_blocks(symbol, "symbol")
+        .into_iter()
+        .find(|(start, end)| {
+            parse_sexp(&symbol[*start..*end]).is_ok_and(|node| node.head() == Some("instances"))
+        })
+    else {
+        return Ok(symbol.to_owned());
+    };
+    let instances = &symbol[instances_start..instances_end];
+    let mut edits = Vec::new();
+    for (project_start, project_end) in find_direct_child_blocks(instances, "instances") {
+        let project = parse_sexp(&instances[project_start..project_end])?;
+        let named = project.head() == Some("project")
+            && project
+                .get(1)
+                .and_then(SexpNode::as_str)
+                .is_some_and(|name| dropped.iter().any(|drop| drop == name));
+        if named {
+            let (start, end) = deletion_span(
+                symbol,
+                instances_start + project_start,
+                instances_start + project_end,
+            );
+            edits.push(SexpEdit::delete(start, end));
+        }
+    }
+    Ok(apply_edits(symbol.to_owned(), edits))
+}
+
 fn symbol_property<'a>(node: &'a SexpNode, name: &str) -> Option<&'a str> {
     node.find_all("property")
         .into_iter()
@@ -1623,6 +1716,81 @@ mod tests {
         .is_none());
         assert!(
             SchematicCommand::set_symbol_instance_paths(source, "demo", &[], "Reconcile").is_err()
+        );
+    }
+
+    /// Eeschema's save of a leaf whose two symbols record `owner` at both
+    /// placements of the sheet, `""` at the leaf's own uuid and `other` from a
+    /// project elsewhere: see `tests/fixtures/instance_repair/README.md`.
+    #[test]
+    fn symbol_instance_repair_drops_the_named_projects_whole() {
+        let source = include_str!("../tests/fixtures/instance_repair/leaf.kicad_sch");
+        let owner = [
+            "/0283ae14-46d1-4035-9465-08c9d058cabd/b0fe0e7a-f8ee-431e-b018-f905325d2651".to_owned(),
+            "/0283ae14-46d1-4035-9465-08c9d058cabd/df588be5-ee17-47a5-bff4-d80bef7e7401".to_owned(),
+        ];
+        let dropped = [String::new(), "other".to_owned()];
+        let command =
+            SchematicCommand::repair_symbol_instances(source, "owner", &owner, &dropped, "Repair")
+                .expect("repair prepares")
+                .expect("the symbols need repairing");
+        let (patched, _) =
+            prepare_command(Path::new("leaf.kicad_sch"), source, &command).expect("applies");
+
+        // The sheet less each dropped project's block, cut out line by line
+        // here: every other byte stays.
+        let mut expected = source.to_owned();
+        for project in ["\"\"", "\"other\""] {
+            let open = format!("\n\t\t\t(project {project}\n");
+            while let Some(start) = expected.find(&open) {
+                let end =
+                    start + expected[start..].find("\n\t\t\t)\n").unwrap() + "\n\t\t\t)".len();
+                expected.replace_range(start..end, "");
+            }
+        }
+        assert_ne!(expected, source, "the fixture records both projects");
+        assert_eq!(patched, expected);
+        assert!(SchematicCommand::repair_symbol_instances(
+            &patched, "owner", &owner, &dropped, "Repair"
+        )
+        .expect("idempotence check succeeds")
+        .is_none());
+        assert!(SchematicCommand::repair_symbol_instances(
+            source,
+            "owner",
+            &owner,
+            &["owner".to_owned()],
+            "Repair"
+        )
+        .is_err());
+    }
+
+    /// Eeschema's save of a leaf placed twice in project `old`, annotated R1
+    /// and R2 at one placement and R3 and R4 at the other, after the project
+    /// was renamed `new` by renaming its files. Each path the repair adds
+    /// takes the dropped record's reference: the result is the leaf as
+    /// eeschema saves it in project `new`, every record renamed and kept.
+    #[test]
+    fn symbol_instance_repair_carries_a_dropped_records_reference() {
+        let source = include_str!("../tests/fixtures/instance_repair/renamed_leaf.kicad_sch");
+        let paths = [
+            "/4e248827-0def-461b-af97-fa182d8a4130/24f983cc-504c-4e18-bfb8-690f4a305c3f".to_owned(),
+            "/4e248827-0def-461b-af97-fa182d8a4130/9b6ba800-6b78-4f4d-9f50-4a619da31709".to_owned(),
+        ];
+        let command = SchematicCommand::repair_symbol_instances(
+            source,
+            "new",
+            &paths,
+            &["old".to_owned()],
+            "Repair",
+        )
+        .expect("repair prepares")
+        .expect("the symbols need repairing");
+        let (patched, _) =
+            prepare_command(Path::new("leaf.kicad_sch"), source, &command).expect("applies");
+        assert_eq!(
+            patched,
+            source.replace("(project \"old\"", "(project \"new\"")
         );
     }
 

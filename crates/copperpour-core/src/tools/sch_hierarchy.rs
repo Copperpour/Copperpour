@@ -237,6 +237,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_renumber_sheet_pages(args, ctx).await }
         ),
+        super::sch_instance_repair::tool(),
         tool!(
             "import_sheet_pins",
             "Scan the child sheet's hierarchical_labels and auto-generate matching pins on \

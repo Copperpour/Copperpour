@@ -62,7 +62,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_hierarchy",
-        description: "Sheet files and hierarchical sheets: create a schematic file and set its page size and title block, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, net label renames, pin/label sync validation",
+        description: "Sheet files and hierarchical sheets: create a schematic file and set its page size and title block, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, stale symbol instance record repair, import/add/edit/delete sheet pins, net label renames, pin/label sync validation",
         category: "schematic",
     },
     ToolsetMeta {
