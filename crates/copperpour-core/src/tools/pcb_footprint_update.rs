@@ -29,6 +29,9 @@ struct LibraryFootprint {
     pads: Vec<copperpour_ipc::IpcPadDefinition>,
     /// Each pad's fabrication property, in the order of `pads`.
     pad_properties: Vec<PadFabricationProperty>,
+    /// Each pad's zone connection and thermal relief clauses, in the order
+    /// of `pads`.
+    pad_zones: Vec<PadZoneSettings>,
     graphics: Vec<copperpour_ipc::IpcGraphicDefinition>,
     points: Vec<LibraryPoint>,
     models: Vec<kiapi::board::types::Footprint3DModel>,
@@ -59,6 +62,124 @@ struct LibraryPoint {
     y: f64,
     size: f64,
     layer: String,
+}
+
+/// A library pad's zone connection and thermal relief clauses, as KiCad's
+/// `parsePAD` reads them. Each is `None` when the pad doesn't set it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct PadZoneSettings {
+    /// `(zone_connect N)`.
+    connection: Option<kiapi::board::types::ZoneConnectionStyle>,
+    /// `(thermal_bridge_width w)`, or the legacy `(thermal_width w)`, in mm.
+    spoke_width: Option<f64>,
+    /// `(thermal_gap g)`, in mm.
+    gap: Option<f64>,
+    /// `(thermal_bridge_angle a)`, in degrees.
+    spoke_angle: Option<f64>,
+}
+
+impl PadZoneSettings {
+    /// Read a library pad's clauses. A clause given twice keeps its last
+    /// value, as in KiCad's parser.
+    fn of_pad(pad: &copperpour_sexp::SexpNode) -> Result<Self> {
+        let mut settings = Self::default();
+        for child in pad.children().unwrap_or_default().iter().skip(4) {
+            let Some(tag) = child.head() else {
+                continue;
+            };
+            if !matches!(
+                tag,
+                "zone_connect"
+                    | "thermal_bridge_width"
+                    | "thermal_width"
+                    | "thermal_gap"
+                    | "thermal_bridge_angle"
+            ) {
+                continue;
+            }
+            let text = match child.children() {
+                Some([_, value]) => value.as_str(),
+                _ => None,
+            }
+            .with_context(|| format!("pad clause '{tag}' must hold exactly one number"))?;
+            if tag == "zone_connect" {
+                settings.connection = Some(zone_connection(text)?);
+                continue;
+            }
+            let value = text
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .with_context(|| format!("pad clause '{tag}' has an invalid value '{text}'"))?;
+            match tag {
+                "thermal_bridge_width" | "thermal_width" => settings.spoke_width = Some(value),
+                "thermal_gap" => settings.gap = Some(value),
+                _ => settings.spoke_angle = Some(value),
+            }
+        }
+        Ok(settings)
+    }
+
+    /// The pad stack's zone settings for a pad of `shape`, as KiCad holds
+    /// them once it has loaded the pad from a file: the pad's connection, or
+    /// inherited, and always a spoke angle, the pad's or the parser's default
+    /// for the shape. KiCad's `PADSTACK::Deserialize` sets the spoke angle
+    /// from any `thermal_spokes` it receives, reading a missing angle as 0°,
+    /// and a pad stack built without `thermal_spokes` keeps its constructor's
+    /// 45°, so the angle is always sent.
+    fn zone_connection_settings(&self, shape: i32) -> kiapi::board::types::ZoneConnectionSettings {
+        kiapi::board::types::ZoneConnectionSettings {
+            zone_connection: self
+                .connection
+                .unwrap_or(kiapi::board::types::ZoneConnectionStyle::ZcsInherited)
+                as i32,
+            thermal_spokes: Some(kiapi::board::types::ThermalSpokeSettings {
+                width: self.spoke_width.map(copperpour_ipc::builders::distance),
+                angle: Some(kiapi::common::types::Angle {
+                    value_degrees: self
+                        .spoke_angle
+                        .unwrap_or_else(|| default_thermal_spoke_angle(shape)),
+                }),
+                gap: self.gap.map(copperpour_ipc::builders::distance),
+            }),
+        }
+    }
+}
+
+/// KiCad's API value for `(zone_connect N)`. KiCad's parser casts N to
+/// `ZONE_CONNECTION` (`pcbnew/zones.h`), mapped as `api_pcb_enums.cpp` maps
+/// it.
+fn zone_connection(text: &str) -> Result<kiapi::board::types::ZoneConnectionStyle> {
+    use kiapi::board::types::ZoneConnectionStyle as Style;
+    Ok(match text.parse::<i64>() {
+        Ok(-1) => Style::ZcsInherited,
+        Ok(0) => Style::ZcsNone,
+        Ok(1) => Style::ZcsThermal,
+        Ok(2) => Style::ZcsFull,
+        Ok(3) => Style::ZcsPthThermal,
+        _ => bail!("pad zone_connect '{text}' is not a zone connection KiCad defines"),
+    })
+}
+
+/// The spoke angle KiCad gives a pad that doesn't set one, as
+/// `PADSTACK::DefaultThermalSpokeAngleForShape` does: 90° for ovals and
+/// rectangles, rounded or chamfered, and 45° for the rest. For the shapes
+/// typed refresh builds, KiCad's parser (`parsePAD`) gives the same.
+fn default_thermal_spoke_angle(shape: i32) -> f64 {
+    use kiapi::board::types::PadStackShape;
+    if [
+        PadStackShape::PssOval,
+        PadStackShape::PssRectangle,
+        PadStackShape::PssRoundrect,
+        PadStackShape::PssChamferedrect,
+    ]
+    .into_iter()
+    .any(|candidate| candidate as i32 == shape)
+    {
+        90.0
+    } else {
+        45.0
+    }
 }
 
 /// KiCad's API value for a pad's fabrication property, as
@@ -972,9 +1093,10 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     let properties = super::library_footprint::properties(&root)?;
     let pads = super::pcb_components::extract_pad_definitions(source)?;
     // `extract_pad_definitions` reads the same `pad` nodes in the same order.
-    let pad_properties = root
-        .find_all("pad")
-        .into_iter()
+    let pad_nodes = root.find_all("pad");
+    let pad_properties = pad_nodes
+        .iter()
+        .copied()
         .map(PadFabricationProperty::of_pad)
         .collect::<Vec<_>>();
     if pad_properties.len() != pads.len() {
@@ -984,6 +1106,12 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
             pads.len()
         );
     }
+    // Read from the same nodes, so there is one per pad.
+    let pad_zones = pad_nodes
+        .iter()
+        .copied()
+        .map(PadZoneSettings::of_pad)
+        .collect::<Result<Vec<_>>>()?;
     let points = root
         .children()
         .unwrap_or_default()
@@ -1016,6 +1144,7 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         properties: properties.custom,
         pads,
         pad_properties,
+        pad_zones,
         graphics,
         points,
         models,
@@ -1356,6 +1485,13 @@ fn validate_pad(pad: &copperpour_sexp::SexpNode) -> Result<()> {
                 // The fabrication property, read as KiCad loads it
                 // (`PadFabricationProperty::of_pad`).
                 | "property"
+                // The zone connection and thermal relief settings
+                // (`PadZoneSettings::of_pad`).
+                | "zone_connect"
+                | "thermal_bridge_width"
+                | "thermal_width"
+                | "thermal_gap"
+                | "thermal_bridge_angle"
         ) {
             bail!("pad clause '{tag}' is not supported by typed library refresh");
         }
@@ -1505,14 +1641,24 @@ fn build_updated_instance(
         ));
     }
     // The builder emits the pads in the library's order.
-    let mut pad_properties = library.pad_properties.iter();
+    let mut pad_properties = library.pad_properties.iter().zip(&library.pad_zones);
     for item in &mut definition.items {
         if item.type_url.ends_with("kiapi.board.types.Pad") {
             let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
-            let property = pad_properties
+            let (property, zone) = pad_properties
                 .next()
                 .context("typed footprint builder returned more pads than the library has")?;
             pad.fab_property = fab_property(*property) as i32;
+            let stack = pad
+                .pad_stack
+                .as_mut()
+                .context("typed footprint builder returned a pad without a pad stack")?;
+            let shape = stack
+                .copper_layers
+                .first()
+                .context("typed footprint builder returned a pad without a copper layer")?
+                .shape;
+            stack.zone_settings = Some(zone.zone_connection_settings(shape));
             pad.net = old_nets
                 .get(&pad.number)
                 .map(|old| kiapi::board::types::Net {
@@ -2141,12 +2287,25 @@ fn normalized_items(
                             layer.custom_anchor_shape = PadStackShape::PssUnknown as i32;
                         }
                     }
-                    if stack.zone_settings.as_ref().is_some_and(|settings| {
-                        settings.zone_connection
-                            == kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32
-                    }) {
-                        stack.zone_settings = None;
+                    // KiCad holds a zone connection and a spoke angle for
+                    // every pad, and reads missing settings as an inherited
+                    // connection and the shape's default angle
+                    // (`PADSTACK::Deserialize`). Compare them that way.
+                    let shape = stack.copper_layers.first().map_or(
+                        kiapi::board::types::PadStackShape::PssUnknown as i32,
+                        |layer| layer.shape,
+                    );
+                    let settings = stack.zone_settings.get_or_insert_with(Default::default);
+                    if settings.zone_connection
+                        == kiapi::board::types::ZoneConnectionStyle::ZcsUnknown as i32
+                    {
+                        settings.zone_connection =
+                            kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32;
                     }
+                    let spokes = settings.thermal_spokes.get_or_insert_with(Default::default);
+                    spokes.angle.get_or_insert(kiapi::common::types::Angle {
+                        value_degrees: default_thermal_spoke_angle(shape),
+                    });
                 }
                 Ok(pad.encode_to_vec())
             } else if suffix == "Field" {
@@ -3364,11 +3523,16 @@ mod tests {
                         ..Default::default()
                     });
                 }
+                // KiCad reports an inherited connection and the shape's
+                // default spoke angle: 45° for the round pad, 90° for the
+                // others (`PADSTACK::DefaultThermalSpokeAngleForShape`).
+                let round = stack.copper_layers[0].shape
+                    == kiapi::board::types::PadStackShape::PssCircle as i32;
                 stack.zone_settings = Some(kiapi::board::types::ZoneConnectionSettings {
                     zone_connection: kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32,
                     thermal_spokes: Some(kiapi::board::types::ThermalSpokeSettings {
                         angle: Some(kiapi::common::types::Angle {
-                            value_degrees: 90.0,
+                            value_degrees: if round { 45.0 } else { 90.0 },
                         }),
                         ..Default::default()
                     }),
@@ -5529,5 +5693,612 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    // ─── #300: pad zone connections and thermal relief settings ─────────────
+
+    /// A pad of the clauses `clauses`, read as typed refresh reads one.
+    fn pad_zone(clauses: &str) -> Result<PadZoneSettings> {
+        let source =
+            format!("(pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\") {clauses})");
+        PadZoneSettings::of_pad(&copperpour_sexp::parse_sexp(&source).unwrap())
+    }
+
+    #[test]
+    fn a_pads_zone_connection_and_thermal_clauses_are_read() {
+        use kiapi::board::types::ZoneConnectionStyle as Style;
+        assert_eq!(pad_zone("").unwrap(), PadZoneSettings::default());
+        assert_eq!(
+            pad_zone(
+                "(zone_connect 2) (thermal_bridge_width 0.5) (thermal_gap 0.3) \
+                 (thermal_bridge_angle 45)"
+            )
+            .unwrap(),
+            PadZoneSettings {
+                connection: Some(Style::ZcsFull),
+                spoke_width: Some(0.5),
+                gap: Some(0.3),
+                spoke_angle: Some(45.0),
+            }
+        );
+        // KiCad still reads the legacy `thermal_width`.
+        assert_eq!(
+            pad_zone("(thermal_width 0.4)").unwrap().spoke_width,
+            Some(0.4)
+        );
+        // A clause given twice keeps its last value, as in KiCad's parser.
+        let twice = pad_zone(
+            "(zone_connect 0) (thermal_bridge_angle 45) (thermal_gap 0.2) \
+             (thermal_bridge_width 0.2) (zone_connect 2) (thermal_bridge_angle 90) \
+             (thermal_gap 0.3) (thermal_width 0.4)",
+        )
+        .unwrap();
+        assert_eq!(
+            twice,
+            PadZoneSettings {
+                connection: Some(Style::ZcsFull),
+                spoke_width: Some(0.4),
+                gap: Some(0.3),
+                spoke_angle: Some(90.0),
+            }
+        );
+        // Refresh reads each clause in a whole footprint.
+        let stock = parse_library_footprint(ISSUE_300_MOUNTING_HOLE_ID, ISSUE_300_MOUNTING_HOLE)
+            .unwrap()
+            .pad_zones;
+        assert_eq!(
+            stock,
+            [PadZoneSettings {
+                connection: Some(Style::ZcsFull),
+                ..Default::default()
+            }]
+        );
+        for clause in [
+            "(thermal_bridge_width 0.4)",
+            "(thermal_width 0.4)",
+            "(thermal_gap 0.4)",
+            "(thermal_bridge_angle 30)",
+        ] {
+            let source = ISSUE_300_MOUNTING_HOLE
+                .replace("(zone_connect 2)", &format!("(zone_connect 2) {clause}"));
+            let library = parse_library_footprint(ISSUE_300_MOUNTING_HOLE_ID, &source)
+                .unwrap_or_else(|error| panic!("{clause}: {error:#}"));
+            assert_ne!(library.pad_zones, stock, "{clause}");
+        }
+    }
+
+    #[test]
+    fn zone_connect_maps_as_kicad_casts_it() {
+        use kiapi::board::types::ZoneConnectionStyle as Style;
+        for (value, style) in [
+            ("-1", Style::ZcsInherited),
+            ("0", Style::ZcsNone),
+            ("1", Style::ZcsThermal),
+            ("2", Style::ZcsFull),
+            ("3", Style::ZcsPthThermal),
+        ] {
+            assert_eq!(
+                pad_zone(&format!("(zone_connect {value})"))
+                    .unwrap()
+                    .connection,
+                Some(style),
+                "{value}"
+            );
+        }
+        for value in ["4", "-2", "2.0", "full"] {
+            assert_eq!(
+                format!(
+                    "{:#}",
+                    pad_zone(&format!("(zone_connect {value})")).unwrap_err()
+                ),
+                format!("pad zone_connect '{value}' is not a zone connection KiCad defines")
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_zone_or_thermal_clause_is_refused() {
+        for (clauses, message) in [
+            (
+                "(zone_connect)",
+                "pad clause 'zone_connect' must hold exactly one number",
+            ),
+            (
+                "(zone_connect 1 2)",
+                "pad clause 'zone_connect' must hold exactly one number",
+            ),
+            (
+                "(thermal_gap x)",
+                "pad clause 'thermal_gap' has an invalid value 'x'",
+            ),
+            (
+                "(thermal_bridge_angle inf)",
+                "pad clause 'thermal_bridge_angle' has an invalid value 'inf'",
+            ),
+            (
+                "(thermal_bridge_width (0.5))",
+                "pad clause 'thermal_bridge_width' must hold exactly one number",
+            ),
+        ] {
+            assert_eq!(
+                format!("{:#}", pad_zone(clauses).unwrap_err()),
+                message,
+                "{clauses}"
+            );
+        }
+        // A whole footprint with one is refused before anything is built.
+        let source = ISSUE_300_MOUNTING_HOLE.replace("(zone_connect 2)", "(zone_connect 7)");
+        assert_ne!(source, ISSUE_300_MOUNTING_HOLE, "the edit must land");
+        let plan = plan_on(&kicad(10, 0, 8), ISSUE_300_MOUNTING_HOLE_ID, &source);
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.prepared_items.is_empty());
+        assert_eq!(plan.diagnostics.len(), 1, "{:?}", plan.diagnostics);
+        assert_eq!(plan.diagnostics[0].code, "unsupported_library_footprint");
+        assert!(
+            plan.diagnostics[0]
+                .message
+                .contains("pad zone_connect '7' is not a zone connection KiCad defines"),
+            "{}",
+            plan.diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn a_built_pad_always_carries_its_spoke_angle() {
+        use kiapi::board::types::{PadStackShape, ZoneConnectionStyle as Style};
+        let settings = |zone: PadZoneSettings, shape: PadStackShape| {
+            let settings = zone.zone_connection_settings(shape as i32);
+            let spokes = settings.thermal_spokes.unwrap();
+            (
+                settings.zone_connection,
+                spokes.angle.map(|angle| angle.value_degrees),
+                spokes.width.map(|width| width.value_nm),
+                spokes.gap.map(|gap| gap.value_nm),
+            )
+        };
+        let inherited = Style::ZcsInherited as i32;
+        // Without clauses: inherited, and the shape's default angle.
+        for (shape, angle) in [
+            (PadStackShape::PssCircle, 45.0),
+            (PadStackShape::PssRectangle, 90.0),
+            (PadStackShape::PssOval, 90.0),
+            (PadStackShape::PssRoundrect, 90.0),
+        ] {
+            assert_eq!(
+                settings(PadZoneSettings::default(), shape),
+                (inherited, Some(angle), None, None),
+                "{shape:?}"
+            );
+        }
+        // A connection alone still sends the default angle: KiCad would
+        // otherwise keep its pad stack constructor's 45°.
+        let full = PadZoneSettings {
+            connection: Some(Style::ZcsFull),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings(full, PadStackShape::PssRectangle),
+            (Style::ZcsFull as i32, Some(90.0), None, None)
+        );
+        let all = PadZoneSettings {
+            connection: Some(Style::ZcsNone),
+            spoke_width: Some(0.5),
+            gap: Some(0.25),
+            spoke_angle: Some(45.0),
+        };
+        assert_eq!(
+            settings(all, PadStackShape::PssRoundrect),
+            (
+                Style::ZcsNone as i32,
+                Some(45.0),
+                Some(500_000),
+                Some(250_000)
+            )
+        );
+    }
+
+    /// KiCad 10.0.8's stock `MountingHole.pretty/
+    /// MountingHole_2.2mm_M2_DIN965_Pad.kicad_mod`, unchanged:
+    /// `(zone_connect 2)` on its one round plated pad.
+    const ISSUE_300_MOUNTING_HOLE: &str =
+        include_str!("../../tests/fixtures/issue_300_mountinghole_m2_pad_kicad10.kicad_mod");
+    const ISSUE_300_MOUNTING_HOLE_ID: &str = "MountingHole:MountingHole_2.2mm_M2_DIN965_Pad";
+    /// KiCad 10.0.8's stock `Package_SON.pretty/
+    /// WSON-6-1EP_2x2mm_P0.65mm_EP1x1.6mm_ThermalVias.kicad_mod`, unchanged:
+    /// `(zone_connect 2)` on its two exposed-pad SMD parts, beside
+    /// `(property pad_prop_heatsink)`.
+    const ISSUE_300_WSON6: &str =
+        include_str!("../../tests/fixtures/issue_300_wson6_thermalvias_kicad10.kicad_mod");
+    /// KiCad 10.0.8's stock `Button_Switch_THT.pretty/
+    /// SW_TH_Tactile_Omron_B3F-100x.kicad_mod`, unchanged:
+    /// `(thermal_bridge_angle 90)` on a round pad, which defaults to 45°.
+    const ISSUE_300_OMRON: &str =
+        include_str!("../../tests/fixtures/issue_300_omron_b3f_100x_kicad10.kicad_mod");
+    /// KiCad 10.0.8's stock `Jumper.pretty/Jumper_Harwin_S1621_P10.9mm.kicad_mod`,
+    /// unchanged: `(thermal_bridge_angle 45)` on its two rounded rectangles,
+    /// which default to 90°.
+    const ISSUE_300_HARWIN: &str =
+        include_str!("../../tests/fixtures/issue_300_harwin_s1621_kicad10.kicad_mod");
+    /// KiCad 10.0.8's stock `Package_DFN_QFN.pretty/
+    /// Texas_RGY_R-PVQFN-N20_EP2.05x3.05mm.kicad_mod`, unchanged:
+    /// `(zone_connect 2)` and `(thermal_bridge_angle 45)` on its exposed pad.
+    const ISSUE_300_TEXAS_RGY: &str =
+        include_str!("../../tests/fixtures/issue_300_texas_rgy_kicad10.kicad_mod");
+
+    /// The footprints refresh reads whole (U1 to U5), then the three it reads
+    /// only pad by pad here (U6 to U8), as (nickname, entry, source).
+    const ISSUE_300_LIBRARIES: [(&str, &str, &str); 8] = [
+        (
+            "MountingHole",
+            "MountingHole_2.2mm_M2_DIN965_Pad",
+            ISSUE_300_MOUNTING_HOLE,
+        ),
+        (
+            "Package_SON",
+            "WSON-6-1EP_2x2mm_P0.65mm_EP1x1.6mm_ThermalVias",
+            ISSUE_300_WSON6,
+        ),
+        (
+            "Button_Switch_THT",
+            "SW_TH_Tactile_Omron_B3F-100x",
+            ISSUE_300_OMRON,
+        ),
+        ("Jumper", "Jumper_Harwin_S1621_P10.9mm", ISSUE_300_HARWIN),
+        (
+            "Package_DFN_QFN",
+            "Texas_RGY_R-PVQFN-N20_EP2.05x3.05mm",
+            ISSUE_300_TEXAS_RGY,
+        ),
+        // `(zone_connect 0)` on rectangles.
+        (
+            "Package_DFN_QFN",
+            "PQFN-8-EP_6x5mm_P1.27mm_Generic",
+            include_str!("../../tests/fixtures/issue_300_pqfn8_kicad10.kicad_mod"),
+        ),
+        // `(zone_connect 0)`, and `(zone_connect 1)` on a round pad.
+        (
+            "Package_DFN_QFN",
+            "Texas_B3QFN-14-1EP_5x5.5mm_P0.65mm_ThermalVia",
+            include_str!("../../tests/fixtures/issue_300_b3qfn14_thermalvia_kicad10.kicad_mod"),
+        ),
+        // `(thermal_bridge_width 0.5)`, the stock library's only one.
+        (
+            "RF_Antenna",
+            "Antenova_SR4G013_GPS",
+            include_str!("../../tests/fixtures/issue_300_antenova_sr4g013_kicad10.kicad_mod"),
+        ),
+    ];
+
+    /// U1 to U8 as KiCad 10.0.8 reported them over IPC (#300), in the order
+    /// of `ISSUE_300_LIBRARIES`. Provenance is in `issue_300_ipc.README.md`.
+    const ISSUE_300_CAPTURES: [(&str, &[u8]); 8] = [
+        (
+            "U1",
+            include_bytes!("../../tests/fixtures/issue_300_u1.ipc.bin"),
+        ),
+        (
+            "U2",
+            include_bytes!("../../tests/fixtures/issue_300_u2.ipc.bin"),
+        ),
+        (
+            "U3",
+            include_bytes!("../../tests/fixtures/issue_300_u3.ipc.bin"),
+        ),
+        (
+            "U4",
+            include_bytes!("../../tests/fixtures/issue_300_u4.ipc.bin"),
+        ),
+        (
+            "U5",
+            include_bytes!("../../tests/fixtures/issue_300_u5.ipc.bin"),
+        ),
+        (
+            "U6",
+            include_bytes!("../../tests/fixtures/issue_300_u6.ipc.bin"),
+        ),
+        (
+            "U7",
+            include_bytes!("../../tests/fixtures/issue_300_u7.ipc.bin"),
+        ),
+        (
+            "U8",
+            include_bytes!("../../tests/fixtures/issue_300_u8.ipc.bin"),
+        ),
+    ];
+
+    fn issue_300_capture(reference: &str) -> kiapi::board::types::FootprintInstance {
+        let (_, bytes) = ISSUE_300_CAPTURES
+            .iter()
+            .find(|(capture, _)| *capture == reference)
+            .unwrap();
+        kiapi::board::types::FootprintInstance::decode(*bytes).unwrap()
+    }
+
+    /// KiCad's report of `reference`, the update `source` builds for it, and
+    /// the domains the plan reports.
+    fn issue_300_refresh(
+        reference: &str,
+        source: &str,
+    ) -> (
+        kiapi::board::types::FootprintInstance,
+        kiapi::board::types::FootprintInstance,
+        BTreeSet<ChangedDomain>,
+    ) {
+        issue_300_refresh_of(issue_300_capture(reference), source)
+    }
+
+    /// `current`, the update `source` builds for it, and the domains the plan
+    /// reports.
+    fn issue_300_refresh_of(
+        current: kiapi::board::types::FootprintInstance,
+        source: &str,
+    ) -> (
+        kiapi::board::types::FootprintInstance,
+        kiapi::board::types::FootprintInstance,
+        BTreeSet<ChangedDomain>,
+    ) {
+        let id = current.definition.as_ref().unwrap().id.as_ref().unwrap();
+        let library_id = format!("{}:{}", id.library_nickname, id.entry_name);
+        let library = parse_library_footprint(&library_id, source).unwrap();
+        let prepared = build_updated_instance(
+            &current,
+            &library,
+            two_layers(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            TextReset::default(),
+        )
+        .unwrap();
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        (current, updated, prepared.changed_domains)
+    }
+
+    /// `instance`'s pads as (number, copper shape, zone settings), in order.
+    fn zone_settings(
+        instance: &kiapi::board::types::FootprintInstance,
+    ) -> Vec<(
+        String,
+        i32,
+        Option<kiapi::board::types::ZoneConnectionSettings>,
+    )> {
+        instance
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
+            .map(|item| {
+                let pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                let stack = pad.pad_stack.unwrap();
+                (
+                    pad.number,
+                    stack.copper_layers[0].shape,
+                    stack.zone_settings,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn kicad_reports_each_pads_zone_settings_as_refresh_builds_them() {
+        use kiapi::board::types::{PadStackShape, ZoneConnectionStyle as Style};
+        let mut seen = BTreeSet::new();
+        for ((nickname, entry, source), (reference, _)) in
+            ISSUE_300_LIBRARIES.iter().zip(ISSUE_300_CAPTURES)
+        {
+            let current = issue_300_capture(reference);
+            let id = current.definition.as_ref().unwrap().id.clone().unwrap();
+            assert_eq!(
+                (id.library_nickname.as_str(), id.entry_name.as_str()),
+                (*nickname, *entry)
+            );
+            let root = copperpour_sexp::parse_sexp(source).unwrap();
+            let library = root
+                .find_all("pad")
+                .into_iter()
+                .map(|pad| {
+                    (
+                        pad.get(1)
+                            .and_then(copperpour_sexp::SexpNode::as_str)
+                            .unwrap(),
+                        PadZoneSettings::of_pad(pad).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let reported = zone_settings(&current);
+            assert_eq!(library.len(), reported.len(), "{reference}");
+            // KiCad reports the pads in the library's order.
+            for ((number, zone), (reported_number, shape, settings)) in
+                library.into_iter().zip(reported)
+            {
+                assert_eq!(number, reported_number, "{reference}");
+                // Refresh refuses custom and trapezoid pads, whose default
+                // angle KiCad's parser and API don't agree on.
+                if [PadStackShape::PssCustom, PadStackShape::PssTrapezoid]
+                    .iter()
+                    .any(|other| *other as i32 == shape)
+                {
+                    continue;
+                }
+                assert_eq!(
+                    Some(zone.zone_connection_settings(shape)),
+                    settings,
+                    "{reference} pad {number}"
+                );
+                let settings = settings.unwrap();
+                let spokes = settings.thermal_spokes.unwrap();
+                seen.insert(format!(
+                    "{:?} {:?} {}{}{}",
+                    Style::try_from(settings.zone_connection).unwrap(),
+                    PadStackShape::try_from(shape).unwrap(),
+                    spokes.angle.unwrap().value_degrees,
+                    if zone.spoke_angle.is_some() {
+                        " set"
+                    } else {
+                        ""
+                    },
+                    if spokes.width.is_some() { " width" } else { "" },
+                ));
+            }
+        }
+        // Between them, the captures cover every connection the stock
+        // library sets, both default angles, both angles set away from the
+        // default, and a spoke width.
+        for expected in [
+            "ZcsFull PssCircle 45",
+            "ZcsNone PssRectangle 90",
+            "ZcsThermal PssCircle 45",
+            "ZcsInherited PssCircle 45",
+            "ZcsInherited PssRoundrect 90",
+            "ZcsInherited PssCircle 90 set",
+            "ZcsInherited PssRoundrect 45 set",
+            "ZcsFull PssRoundrect 45 set",
+            "ZcsInherited PssRoundrect 90 width",
+        ] {
+            assert!(seen.contains(expected), "{expected} not in {seen:?}");
+        }
+    }
+
+    #[test]
+    fn stock_footprints_with_pad_zone_settings_match_their_library() {
+        for ((_, _, source), (reference, _)) in
+            ISSUE_300_LIBRARIES.iter().zip(ISSUE_300_CAPTURES).take(5)
+        {
+            let (current, updated, changed) = issue_300_refresh(reference, source);
+            assert!(changed.is_empty(), "{reference}: {changed:?}");
+            // What the update sends is what KiCad reported, not just equal
+            // after normalizing.
+            assert_eq!(
+                zone_settings(&updated),
+                zone_settings(&current),
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pad_reported_without_zone_settings_compares_as_kicad_reads_one() {
+        // `reference`'s report with the zone settings removed from each pad
+        // whose library settings `strip` picks, and how many it removed.
+        let without = |reference: &str, source: &str, strip: &dyn Fn(&PadZoneSettings) -> bool| {
+            let mut current = issue_300_capture(reference);
+            let root = copperpour_sexp::parse_sexp(source).unwrap();
+            let mut library = root
+                .find_all("pad")
+                .into_iter()
+                .map(|pad| PadZoneSettings::of_pad(pad).unwrap());
+            let mut removed = 0;
+            for item in &mut current.definition.as_mut().unwrap().items {
+                if item.type_url.ends_with("kiapi.board.types.Pad") {
+                    let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                    if strip(&library.next().unwrap()) {
+                        pad.pad_stack.as_mut().unwrap().zone_settings = None;
+                        item.value = pad.encode_to_vec();
+                        removed += 1;
+                    }
+                }
+            }
+            (current, removed)
+        };
+        let unset = |zone: &PadZoneSettings| *zone == PadZoneSettings::default();
+        // KiCad 10 always reports them, but reads a pad without them as
+        // inherited at its shape's default angle (`PADSTACK::Deserialize`):
+        // U2's rounded rectangles at 90°, its round vias and U3's round pads
+        // at 45°.
+        for (reference, source, pads) in [("U2", ISSUE_300_WSON6, 10), ("U3", ISSUE_300_OMRON, 3)] {
+            let (current, removed) = without(reference, source, &unset);
+            assert_eq!(removed, pads, "{reference}");
+            let (_, _, changed) = issue_300_refresh_of(current, source);
+            assert!(changed.is_empty(), "{reference}: {changed:?}");
+        }
+        // U3's pad set to 90° isn't at its default.
+        let (current, removed) = without("U3", ISSUE_300_OMRON, &|_| true);
+        assert_eq!(removed, 4);
+        let (_, _, changed) = issue_300_refresh_of(current, ISSUE_300_OMRON);
+        assert_eq!(changed, BTreeSet::from([ChangedDomain::Pads]));
+    }
+
+    #[test]
+    fn a_changed_zone_connection_plans_pads() {
+        let thermal = ISSUE_300_MOUNTING_HOLE.replace("(zone_connect 2)", "(zone_connect 1)");
+        assert_ne!(thermal, ISSUE_300_MOUNTING_HOLE, "the edit must land");
+        let (_, updated, changed) = issue_300_refresh("U1", &thermal);
+        assert_eq!(changed, BTreeSet::from([ChangedDomain::Pads]));
+        assert_eq!(
+            zone_settings(&updated)[0].2.unwrap().zone_connection,
+            kiapi::board::types::ZoneConnectionStyle::ZcsThermal as i32
+        );
+        let removed = ISSUE_300_MOUNTING_HOLE.replace("(zone_connect 2)", "");
+        let (_, _, changed) = issue_300_refresh("U1", &removed);
+        assert_eq!(changed, BTreeSet::from([ChangedDomain::Pads]));
+    }
+
+    #[test]
+    fn a_changed_thermal_setting_plans_pads() {
+        // U3's round pad set to 90°, back at its default 45°.
+        let default = ISSUE_300_OMRON.replace("(thermal_bridge_angle 90)", "");
+        assert_ne!(default, ISSUE_300_OMRON, "the edit must land");
+        let (_, _, changed) = issue_300_refresh("U3", &default);
+        assert_eq!(changed, BTreeSet::from([ChangedDomain::Pads]));
+        // U4's rounded rectangles set to 45°, at another angle.
+        let turned =
+            ISSUE_300_HARWIN.replace("(thermal_bridge_angle 45)", "(thermal_bridge_angle 30)");
+        let (_, _, changed) = issue_300_refresh("U4", &turned);
+        assert_eq!(changed, BTreeSet::from([ChangedDomain::Pads]));
+        // A spoke width or gap the board copy doesn't have.
+        for clause in ["(thermal_bridge_width 0.4)", "(thermal_gap 0.4)"] {
+            let added = ISSUE_300_MOUNTING_HOLE
+                .replace("(zone_connect 2)", &format!("(zone_connect 2) {clause}"));
+            let (_, _, changed) = issue_300_refresh("U1", &added);
+            assert_eq!(changed, BTreeSet::from([ChangedDomain::Pads]), "{clause}");
+        }
+    }
+
+    /// A dry run of the `references` captures on a KiCad of `version`.
+    async fn issue_300_served_dry_run(
+        version: (u32, u32, u32),
+        references: &[&str],
+    ) -> serde_json::Value {
+        // The mock answers a 2-layer stack, as KiCad did for this board. Its
+        // answer was byte for byte the #283 board's.
+        let enabled_layers = kiapi::board::commands::BoardEnabledLayersResponse::decode(
+            include_bytes!("../../tests/fixtures/issue_283_enabled_layers.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        assert_eq!(enabled_layers.copper_layer_count, 2);
+        let (_temp, board) = libraries_project(&ISSUE_300_LIBRARIES);
+        let footprints = ISSUE_300_CAPTURES
+            .iter()
+            .filter(|(reference, _)| references.contains(reference))
+            .map(|(_, bytes)| prost_types::Any {
+                type_url: "type.googleapis.com/kiapi.board.types.FootprintInstance".to_string(),
+                value: bytes.to_vec(),
+            })
+            .collect();
+        let mock = spawn_planner_mock_on(&board, footprints, false, true, version);
+        let handler = served(mock.kicad.address()).await;
+        let body = result_json(&served_call(&handler, serde_json::json!({ "board": board })).await);
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 0);
+        assert!(capture.update_batches.is_empty());
+        body
+    }
+
+    #[tokio::test]
+    async fn served_dry_run_of_stock_footprints_with_pad_zone_settings_is_noop() {
+        let body = issue_300_served_dry_run((10, 0, 8), &["U1", "U2", "U3", "U4", "U5"]).await;
+        assert_eq!(body["status"], "noop", "{body}");
+        assert_eq!(body["coverage"]["unchanged"]["planned"], 5, "{body}");
+    }
+
+    #[tokio::test]
+    async fn served_dry_run_on_kicad_10_0_6_reads_pad_zone_settings_too() {
+        // No version gate: KiCad 10.0.0's API already carries them. U2 is
+        // left out: its heatsink pads need 10.0.7 (#283).
+        let body = issue_300_served_dry_run((10, 0, 6), &["U1", "U3", "U4", "U5"]).await;
+        assert_eq!(body["status"], "noop", "{body}");
+        assert_eq!(body["coverage"]["unchanged"]["planned"], 4, "{body}");
     }
 }
