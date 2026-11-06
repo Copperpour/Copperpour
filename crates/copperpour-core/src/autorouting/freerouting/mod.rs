@@ -492,6 +492,23 @@ pub(crate) async fn route_specctra_dsn(
 ) -> anyhow::Result<CallToolResult> {
     let dsn = get_path(args, "dsn_path")?;
     let ses_output = get_path(args, "ses_output_path")?;
+    // The schema bounds the threshold to 0..=100 but cannot express this gap,
+    // so it is refused here, before the JAR is even looked up.
+    if let Some(threshold) = args["optimizer_improvement_threshold"]
+        .as_f64()
+        .filter(|threshold| mcp::threshold_read_as_fraction(*threshold))
+    {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "optimizer_improvement_threshold".to_string(),
+                reason: mcp::THRESHOLD_READ_AS_FRACTION.to_string(),
+            },
+            format!(
+                "optimizer_improvement_threshold is {threshold}: a value {}. Nothing was routed.",
+                mcp::THRESHOLD_READ_AS_FRACTION
+            ),
+        ));
+    }
     let jar = match resolve_freerouting_jar(args) {
         FreeroutingJar::Found(jar) => jar,
         FreeroutingJar::SuppliedPathIsNotAFile(path) => {
@@ -1136,6 +1153,52 @@ mod freerouting_tests {
             body["message"],
             json!(format!("jar_path is not a file: {}", missing.display()))
         );
+    }
+
+    /// A threshold Freerouting would multiply by 100 is refused as
+    /// `invalid_argument` before the JAR is looked up, so no JAR is needed here.
+    #[tokio::test]
+    async fn served_route_refuses_a_threshold_freerouting_reads_as_a_fraction() {
+        let temp = tempfile::tempdir().unwrap();
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "route_specctra_dsn",
+                    "arguments": {
+                        "dsn_path": temp.path().join("board.dsn").display().to_string(),
+                        "ses_output_path": temp.path().join("board.ses").display().to_string(),
+                        "jar_path": temp.path().join("missing.jar").display().to_string(),
+                        "optimizer_improvement_threshold": 0.05
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("result");
+        assert_eq!(result["isError"], json!(true), "{result}");
+        let body: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "optimizer_improvement_threshold");
+        assert!(
+            body["message"].as_str().unwrap().contains("as a fraction"),
+            "{body}"
+        );
+        assert!(!temp.path().join("board.ses").exists());
     }
 
     #[test]

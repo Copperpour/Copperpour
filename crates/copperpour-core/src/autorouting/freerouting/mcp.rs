@@ -329,8 +329,26 @@ fn validate_inputs(
     {
         bail!("optimizer_improvement_threshold must be between 0 and 100 (percent)");
     }
+    if settings
+        .optimizer_improvement_threshold
+        .is_some_and(threshold_read_as_fraction)
+    {
+        bail!("optimizer_improvement_threshold {THRESHOLD_READ_AS_FRACTION}");
+    }
     Ok(())
 }
+
+/// Freerouting 2.5's `BatchOptimizer` reads an improvement threshold above 0
+/// and below 0.1 as a fraction and multiplies it by 100, so such a value never
+/// runs as given. 0 runs as given.
+pub(crate) fn threshold_read_as_fraction(percent: f64) -> bool {
+    percent > 0.0 && percent < 0.1
+}
+
+/// Why a threshold for which [`threshold_read_as_fraction`] holds is refused.
+pub(crate) const THRESHOLD_READ_AS_FRACTION: &str =
+    "above 0 and below 0.1 is refused: Freerouting reads such a value as a fraction and \
+     multiplies it by 100, so 0.05 would run as 5%. Pass 0, or a percentage of at least 0.1";
 
 async fn run_state_machine(
     client: &mut LocalMcpClient,
@@ -1569,7 +1587,12 @@ done
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };
-        for (passes, threshold) in [(None, None), (Some(1), Some(0.0)), (Some(100), Some(100.0))] {
+        for (passes, threshold) in [
+            (None, None),
+            (Some(1), Some(0.0)),
+            (None, Some(0.1)),
+            (Some(100), Some(100.0)),
+        ] {
             validate_inputs(&jar, &dsn, &ses, &settings(passes, threshold)).unwrap();
         }
         for (passes, threshold, named) in [
@@ -1578,6 +1601,8 @@ done
             (None, Some(-0.1), "optimizer_improvement_threshold"),
             (None, Some(100.1), "optimizer_improvement_threshold"),
             (None, Some(f64::NAN), "optimizer_improvement_threshold"),
+            (None, Some(0.05), "as a fraction"),
+            (None, Some(0.099), "as a fraction"),
         ] {
             let error = validate_inputs(&jar, &dsn, &ses, &settings(passes, threshold))
                 .unwrap_err()
