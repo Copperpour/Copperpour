@@ -74,6 +74,9 @@ pub(crate) struct RouteEvidence {
     pub ses_bytes: u64,
     pub server_protocol_version: String,
     pub diagnostics_path: Option<String>,
+    /// Last routing activity read from Freerouting's log, e.g.
+    /// "pass 17: 0 unrouted, 218 violations".
+    pub last_activity: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -369,12 +372,14 @@ async fn run_state_machine(
         .await?;
 
     let mut poll_count = 0u32;
+    let mut progress = JobProgress::new(&job_id);
     let final_state = loop {
         let details = client
             .call_tool("get_job_details", json!({ "path": { "jobId": job_id } }))
             .await?;
         poll_count = poll_count.saturating_add(1);
         let state = required_string(&details, &["state", "status"], "job state")?;
+        progress.report(&state, &details, started);
         match state.to_ascii_uppercase().as_str() {
             "COMPLETED" => break "COMPLETED".to_string(),
             "FAILED" | "CANCELLED" | "CANCELED" => {
@@ -399,7 +404,158 @@ async fn run_state_machine(
         ses_bytes: 0,
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
+        last_activity: progress.activity,
     })
+}
+
+/// How often an unchanged job still sends a progress notification, so the
+/// client's idle timeout keeps being reset during long optimizer stretches.
+const PROGRESS_HEARTBEAT: Duration = Duration::from_secs(60);
+/// Only the end of Freerouting's log is read on each poll; the file grows to
+/// tens of megabytes over a day of routing.
+const LOG_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Turns job polls into `notifications/progress` for the current tool call.
+///
+/// `get_job_details` only says which pass is running. How far the routing
+/// actually got (unrouted connections, violations, optimizer stage) is in
+/// Freerouting's own log, where each line of a job carries the first six hex
+/// digits of its id, upper-cased: `[A3AA32] Auto-routing pass #8 ... (4
+/// unrouted and 218 violations)`.
+struct JobProgress {
+    tag: String,
+    log: Option<PathBuf>,
+    activity: Option<String>,
+    last_message: String,
+    last_sent: Option<Instant>,
+    sent: u32,
+}
+
+impl JobProgress {
+    fn new(job_id: &str) -> Self {
+        Self {
+            tag: format!(
+                "[{}]",
+                job_id.get(..6).unwrap_or(job_id).to_ascii_uppercase()
+            ),
+            log: freerouting_log_path(),
+            activity: None,
+            last_message: String::new(),
+            last_sent: None,
+            sent: 0,
+        }
+    }
+
+    fn report(&mut self, state: &str, details: &Value, started: Instant) {
+        if let Some(activity) = self.read_activity() {
+            self.activity = Some(activity);
+        }
+        if let Some(message) = self.next_message(state, details, started, Instant::now()) {
+            crate::progress::report(f64::from(self.sent), None, &message);
+        }
+    }
+
+    /// The notification to send for this poll, or `None` when the job looks
+    /// the same as last time and the heartbeat is not due. `now` is a
+    /// parameter so that deduplication and the heartbeat can be tested.
+    fn next_message(
+        &mut self,
+        state: &str,
+        details: &Value,
+        started: Instant,
+        now: Instant,
+    ) -> Option<String> {
+        let mut message = state.to_ascii_lowercase();
+        match &self.activity {
+            Some(activity) => message = format!("{message}, {activity}"),
+            None => {
+                if let Some(pass) = details.get("current_pass").and_then(Value::as_u64) {
+                    message = format!("{message}, pass {pass}");
+                }
+            }
+        }
+        let due = self
+            .last_sent
+            .is_none_or(|sent| now.duration_since(sent) >= PROGRESS_HEARTBEAT);
+        if message == self.last_message && !due {
+            return None;
+        }
+        self.sent += 1;
+        self.last_sent = Some(now);
+        let elapsed = now.duration_since(started).as_secs();
+        let text = format!(
+            "Freerouting {message} ({}m{:02}s)",
+            elapsed / 60,
+            elapsed % 60
+        );
+        self.last_message = message;
+        Some(text)
+    }
+
+    fn read_activity(&self) -> Option<String> {
+        let tail = read_tail(self.log.as_deref()?, LOG_TAIL_BYTES)?;
+        latest_activity(&tail, &self.tag)
+    }
+}
+
+/// Freerouting's log file: `FREEROUTING_LOG`, else its default under the XDG
+/// state directory (Linux).
+fn freerouting_log_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("FREEROUTING_LOG") {
+        return Some(PathBuf::from(path));
+    }
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+        })?;
+    Some(state.join("freerouting/logs/freerouting.log"))
+}
+
+fn read_tail(path: &Path, bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(bytes))).ok()?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).ok()?;
+    Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// The most recent routing-pass or optimizer line of the job tagged `tag`.
+fn latest_activity(log: &str, tag: &str) -> Option<String> {
+    log.lines()
+        .rev()
+        .filter(|line| line.contains(tag))
+        .find_map(|line| {
+            let text = &line[line.find(tag)? + tag.len()..];
+            if let Some(rest) = text.trim_start().strip_prefix("Auto-routing pass #") {
+                let pass = rest.split_whitespace().next()?;
+                let counts = rest.rsplit_once(" (")?.1;
+                let (unrouted, rest) = counts.split_once(" unrouted and ")?;
+                let violations = rest.split_once(" violations")?.0;
+                Some(format!(
+                    "pass {pass}: {unrouted} unrouted, {violations} violations"
+                ))
+            } else if let Some(rest) = text.trim_start().strip_prefix("Optimizer pass #") {
+                // "Optimizer pass #2: optimizer score 73.70 -> 84.26 (IMPROVED, 14.3%), ..."
+                // The other "Optimizer pass #2 on board ..." line carries no score delta.
+                let (pass, rest) = rest.split_once(": optimizer score ")?;
+                let (scores, rest) = rest.split_once(" (")?;
+                let verdict = rest.split([',', ')']).next()?.to_ascii_lowercase();
+                Some(format!("optimizer pass {pass}: score {scores} ({verdict})"))
+            } else if text.contains("Optimization stage started") {
+                let violations = text
+                    .split_once("clearance violations: ")
+                    .map(|(_, v)| v.trim_end_matches('.'));
+                Some(match violations {
+                    Some(v) => format!("optimizing, {v} violations"),
+                    None => "optimizing".to_string(),
+                })
+            } else {
+                None
+            }
+        })
 }
 
 fn validate_tool_contracts(tools: &BTreeMap<String, Value>) -> Result<()> {
@@ -922,6 +1078,98 @@ mod tests {
             "unexpected error: {error:#}"
         );
         client.close().await;
+    }
+
+    #[test]
+    fn routing_activity_is_read_from_the_jobs_own_log_lines() {
+        // Lines as Freerouting 2.5.0 writes them; [B00000] is another job.
+        let log = "\
+2026-10-29 17:52:37.907 INFO   [A3AA32] Auto-routing pass #7 on board '7c06' was completed in 17.53 seconds with score 944.89 (9 unrouted and 218 violations), using 194.58 CPU seconds and the job allocated 188.63 GB of memory so far.
+2026-10-29 17:52:38.001 DEBUG  [A3AA32]   Net 'SCK2' has 4 incomplete(s)
+2026-10-29 17:52:39.000 INFO   [B00000] Auto-routing pass #2 on board 'ffff' was completed in 1.00 seconds with score 1.00 (50 unrouted and 3 violations), using 1.00 CPU seconds.
+";
+        assert_eq!(
+            latest_activity(log, "[A3AA32]").as_deref(),
+            Some("pass 7: 9 unrouted, 218 violations")
+        );
+        let optimizing = format!(
+            "{log}2026-10-29 17:54:26.961 INFO   [A3AA32] Optimization stage started on board 'ce32'. Baseline router score: 980.71, optimizer score: 71.70, incomplete connections: 0, clearance violations: 218.\n"
+        );
+        assert_eq!(
+            latest_activity(&optimizing, "[A3AA32]").as_deref(),
+            Some("optimizing, 218 violations")
+        );
+        let optimizer_pass = format!(
+            "{optimizing}2026-10-29 17:58:00.204 INFO   [A3AA32] Optimizer pass #2 on board '008e' was completed in 152.08 seconds with the score of 84.26 (0 unrouted and 218 violations).
+2026-10-29 17:58:00.204 INFO   [A3AA32] Optimizer pass #2: optimizer score 73.70 -> 84.26 (IMPROVED, 14.3278%), router score: 980.71, incomplete connections: 0, clearance violations: 218.\n"
+        );
+        assert_eq!(
+            latest_activity(&optimizer_pass, "[A3AA32]").as_deref(),
+            Some("optimizer pass 2: score 73.70 -> 84.26 (improved)")
+        );
+        assert_eq!(latest_activity(log, "[C11111]"), None);
+    }
+
+    #[test]
+    fn an_unchanged_job_is_reported_once_then_at_each_heartbeat() {
+        let mut progress = JobProgress::new("a3aa32eb");
+        progress.log = None;
+        let details = json!({ "current_pass": 3 });
+        let started = Instant::now();
+        let at = |seconds| started + Duration::from_secs(seconds);
+
+        assert_eq!(
+            progress
+                .next_message("RUNNING", &details, started, at(5))
+                .as_deref(),
+            Some("Freerouting running, pass 3 (0m05s)")
+        );
+        // Same state, inside the heartbeat: nothing new to say.
+        assert_eq!(
+            progress.next_message("RUNNING", &details, started, at(10)),
+            None
+        );
+        assert_eq!(
+            progress.next_message("RUNNING", &details, started, at(64)),
+            None
+        );
+        // Still the same, but a minute after the last report: the heartbeat.
+        assert_eq!(
+            progress
+                .next_message("RUNNING", &details, started, at(65))
+                .as_deref(),
+            Some("Freerouting running, pass 3 (1m05s)")
+        );
+        // A change is reported at once, and progress keeps increasing.
+        assert_eq!(
+            progress
+                .next_message("RUNNING", &json!({ "current_pass": 4 }), started, at(66))
+                .as_deref(),
+            Some("Freerouting running, pass 4 (1m06s)")
+        );
+        assert_eq!(progress.sent, 3);
+    }
+
+    #[test]
+    fn the_log_activity_replaces_the_pass_number() {
+        let mut progress = JobProgress::new("a3aa32eb");
+        progress.log = None;
+        progress.activity = Some("pass 7: 9 unrouted, 218 violations".to_string());
+        let started = Instant::now();
+        assert_eq!(
+            progress
+                .next_message("RUNNING", &json!({ "current_pass": 3 }), started, started)
+                .as_deref(),
+            Some("Freerouting running, pass 7: 9 unrouted, 218 violations (0m00s)")
+        );
+    }
+
+    #[test]
+    fn job_tag_is_the_upper_cased_id_prefix() {
+        assert_eq!(
+            JobProgress::new("a3aa32eb-5b14-4a2b-8742-6b44c34d63bb").tag,
+            "[A3AA32]"
+        );
     }
 
     #[test]

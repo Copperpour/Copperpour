@@ -139,6 +139,18 @@ pub struct CallToolParams {
     pub name: String,
     #[serde(default)]
     pub arguments: Option<Value>,
+    /// `_meta.progressToken` asks for `notifications/progress` during the call.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+impl CallToolParams {
+    pub fn progress_token(&self) -> Option<&Value> {
+        self.meta
+            .as_ref()?
+            .get("progressToken")
+            .filter(|token| token.is_string() || token.is_number())
+    }
 }
 
 /// tools/call response

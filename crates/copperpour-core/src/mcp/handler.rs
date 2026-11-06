@@ -30,6 +30,11 @@ pub struct McpHandler {
     /// to receive the same notifications. Without this, notifications are
     /// silently dropped on stdio — the cause of issue #19.
     notif_sinks: Arc<RwLock<Vec<mpsc::Sender<String>>>>,
+    /// Sinks the transport writes as soon as they arrive, while a call is still
+    /// running (`notifications/progress`). `notif_sinks` is flushed by stdio
+    /// only after the response, which is right for tools/list_changed and
+    /// useless for progress.
+    immediate_sinks: Arc<std::sync::RwLock<Vec<mpsc::Sender<String>>>>,
     observer: CallObserver,
     /// Meta-tools bypass the domain router, so their advertised schemas are
     /// compiled here once and enforced at the same dispatch boundary.
@@ -109,6 +114,7 @@ impl McpHandler {
             reload: meta_tools::ReloadControl::default(),
             sse_senders: Arc::new(RwLock::new(Vec::new())),
             notif_sinks: Arc::new(RwLock::new(Vec::new())),
+            immediate_sinks: Arc::new(std::sync::RwLock::new(Vec::new())),
             observer,
             meta_input_validators: Arc::new(meta_input_validators),
         })
@@ -149,6 +155,54 @@ impl McpHandler {
     /// JSON-RPC string, which the transport writes to its output stream.
     pub async fn register_notification_sink(&self, tx: mpsc::Sender<String>) {
         self.notif_sinks.write().await.push(tx);
+    }
+
+    /// Register a sink for notifications that must be written while the call
+    /// that emits them is still running (`notifications/progress`).
+    pub fn register_immediate_sink(&self, tx: mpsc::Sender<String>) {
+        if let Ok(mut sinks) = self.immediate_sinks.write() {
+            sinks.push(tx);
+        }
+    }
+
+    /// Run `call` inside the progress scope of `params`: with a valid
+    /// `_meta.progressToken`, what the tool reports reaches the immediate
+    /// sinks; without one, reports do nothing.
+    async fn in_progress_scope<F: std::future::Future>(
+        &self,
+        params: &CallToolParams,
+        call: F,
+    ) -> F::Output {
+        let reporter = self.progress_reporter(params);
+        if reporter.is_some() {
+            info!(tool = %params.name, "tool_call_progress_token");
+        }
+        crate::progress::scope(reporter, call).await
+    }
+
+    /// Progress channel for one `tools/call`, or `None` when the client sent no
+    /// `_meta.progressToken`. Delivery is best effort: `try_send` never blocks
+    /// the tool, and a full channel drops that one update.
+    fn progress_reporter(
+        &self,
+        params: &CallToolParams,
+    ) -> Option<crate::progress::ProgressReporter> {
+        let token = params.progress_token()?.clone();
+        let sinks = self.immediate_sinks.clone();
+        let sse = self.sse_senders.clone();
+        Some(crate::progress::ProgressReporter::new(token, move |json| {
+            if let Ok(sinks) = sinks.read() {
+                for tx in sinks.iter() {
+                    let _ = tx.try_send(json.clone());
+                }
+            }
+            if let Ok(senders) = sse.try_read() {
+                let event = Event::default().data(json);
+                for tx in senders.iter() {
+                    let _ = tx.try_send(event.clone());
+                }
+            }
+        }))
     }
 
     /// Process one JSON-RPC message and return an optional response.
@@ -252,7 +306,9 @@ impl McpHandler {
                 let params: CallToolParams =
                     serde_json::from_value(req.params.clone().unwrap_or(Value::Null))?;
 
-                let call_result = self.execute_tool(&params).await;
+                let call_result = self
+                    .in_progress_scope(&params, self.execute_tool(&params))
+                    .await;
                 Ok(Some(serde_json::to_value(call_result)?))
             }
 
@@ -4711,5 +4767,77 @@ mod zone_deletion_dispatch_tests {
         assert!(outcome["deleted"].is_null());
         assert_eq!(outcome["readback_verified"], false);
         assert_eq!(outcome["refill_request_accepted"], false);
+    }
+}
+
+#[cfg(test)]
+mod progress_delivery_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    /// A handler with one immediate sink registered, as stdio does at startup.
+    async fn handler_with_sink() -> (McpHandler, mpsc::Receiver<String>) {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: false,
+        })
+        .await
+        .expect("handler builds");
+        let (tx, rx) = mpsc::channel(8);
+        handler.register_immediate_sink(tx);
+        (handler, rx)
+    }
+
+    fn params(meta: Option<Value>) -> CallToolParams {
+        CallToolParams {
+            name: "route_specctra_dsn".to_string(),
+            arguments: None,
+            meta,
+        }
+    }
+
+    /// A `tools/call` as `handle_message` runs it, with a tool that reports.
+    async fn report_during_call(handler: &McpHandler, params: &CallToolParams) {
+        handler
+            .in_progress_scope(params, async {
+                crate::progress::report(1.0, None, "x");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_string_or_number_token_gets_notifications_progress_on_the_sink() {
+        for token in [json!("t"), json!(7)] {
+            let (handler, mut rx) = handler_with_sink().await;
+            report_during_call(&handler, &params(Some(json!({ "progressToken": token })))).await;
+            let line = rx.try_recv().expect("a notification reached the sink");
+            let message: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(message["method"], "notifications/progress", "{line}");
+            assert_eq!(message["params"]["progressToken"], token, "{line}");
+            assert_eq!(message["params"]["progress"], 1.0, "{line}");
+            assert_eq!(message["params"]["message"], "x", "{line}");
+            assert!(rx.try_recv().is_err(), "one report, one notification");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_token_or_one_of_another_type_sends_nothing() {
+        for meta in [
+            None,
+            Some(json!({})),
+            Some(json!({ "progressToken": null })),
+            Some(json!({ "progressToken": true })),
+            Some(json!({ "progressToken": { "id": "t" } })),
+            Some(json!({ "progressToken": ["t"] })),
+        ] {
+            let (handler, mut rx) = handler_with_sink().await;
+            report_during_call(&handler, &params(meta.clone())).await;
+            assert!(rx.try_recv().is_err(), "{meta:?}");
+        }
     }
 }

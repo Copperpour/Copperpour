@@ -553,7 +553,8 @@ pub(crate) async fn route_specctra_dsn(
         "final_state": evidence.final_state,
         "poll_count": evidence.poll_count,
         "elapsed_seconds": evidence.elapsed_seconds,
-        "ses_bytes": evidence.ses_bytes
+        "ses_bytes": evidence.ses_bytes,
+        "last_activity": evidence.last_activity
     })))
 }
 
