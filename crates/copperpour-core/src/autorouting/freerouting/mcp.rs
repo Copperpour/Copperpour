@@ -227,11 +227,15 @@ pub(crate) async fn route_local(
     })
 }
 
+fn diagnostics_path(ses_output: &Path) -> PathBuf {
+    ses_output.with_extension("freerouting.log")
+}
+
 async fn write_diagnostics(output: &Path, diagnostics: &str) -> Result<Option<String>> {
     if diagnostics.is_empty() {
         return Ok(None);
     }
-    let path = output.with_extension("freerouting.log");
+    let path = diagnostics_path(output);
     if path.exists() {
         bail!(
             "Freerouting diagnostics output already exists: {}",
@@ -260,6 +264,15 @@ fn validate_inputs(
     }
     if ses_output.exists() {
         bail!("SES output already exists: {}", ses_output.display());
+    }
+    // write_diagnostics refuses to replace this file, but only once routing is
+    // over: refuse now rather than after a run that can take many minutes.
+    let diagnostics = diagnostics_path(ses_output);
+    if diagnostics.exists() {
+        bail!(
+            "Freerouting diagnostics output already exists: {}",
+            diagnostics.display()
+        );
     }
     if let Some(max_passes) = settings.max_passes {
         if !(1..=100).contains(&max_passes) {
@@ -1041,6 +1054,33 @@ mod tests {
         assert!(
             wait_for_process_exit(pid).await,
             "Freerouting child {pid} survived cancellation"
+        );
+    }
+
+    #[test]
+    fn existing_diagnostics_are_refused_before_routing() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        std::fs::write(&jar, "").unwrap();
+        std::fs::write(&dsn, "").unwrap();
+        let settings = RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(900),
+        };
+        validate_inputs(&jar, &dsn, &ses, &settings).unwrap();
+
+        std::fs::write(diagnostics_path(&ses), "previous run").unwrap();
+        let error = validate_inputs(&jar, &dsn, &ses, &settings)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("diagnostics output already exists"),
+            "{error}"
         );
     }
 }
