@@ -1204,6 +1204,8 @@ fn creepage_free_view(pcb: &Path) -> Result<Option<(tempfile::TempDir, PathBuf)>
 /// any `(rule …)` left without a constraint. `None` when there is none. The
 /// scan honours quoted strings and `#` comments, so parentheses inside a
 /// condition or a comment do not count; everything else is kept byte for byte.
+/// As in KiCad's lexer, `#` opens a comment only as a line's first non-blank
+/// character; anywhere else it is text.
 pub(crate) fn strip_creepage_constraints(dru: &str) -> Option<String> {
     // Spans [start, end) of every parenthesised expression, with its depth
     // and head atoms.
@@ -1229,7 +1231,12 @@ pub(crate) fn strip_creepage_constraints(dru: &str) -> Option<String> {
                     i += 1;
                 }
             }
-            b'#' => {
+            b'#' if bytes[..i]
+                .iter()
+                .rev()
+                .take_while(|byte| **byte != b'\n')
+                .all(u8::is_ascii_whitespace) =>
+            {
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
@@ -4236,6 +4243,25 @@ mod creepage_view_tests {
         assert!(!out.contains("creepage"), "{out}");
         assert!(out.contains("# a lone ( here\n"), "{out}");
         assert!(out.contains("(constraint clearance (min 1mm)))"), "{out}");
+    }
+
+    #[test]
+    fn a_hash_opens_a_comment_only_at_the_start_of_a_line() {
+        // KiCad's lexer (common/dsnlexer.cpp) reads `#` as a comment only as
+        // a line's first non-blank character. Elsewhere it is text, and
+        // skipping the rest of the line would lose the closing parentheses.
+        let mid_line = "(version 1)\n(rule \"e\" #tag (constraint clearance (min 1mm))\n\t(constraint creepage (min 2mm)))\n";
+        let out = strip_creepage_constraints(mid_line).expect("strips despite the mid-line #");
+        assert!(!out.contains("creepage"), "{out}");
+        assert!(
+            out.contains("(rule \"e\" #tag (constraint clearance (min 1mm))"),
+            "{out}"
+        );
+
+        let indented = "(version 1)\n(rule \"f\"\n\t# a lone ( here\n\t(constraint clearance (min 1mm))\n\t(constraint creepage (min 2mm)))\n";
+        let out = strip_creepage_constraints(indented).expect("an indented # is still a comment");
+        assert!(!out.contains("creepage"), "{out}");
+        assert!(out.contains("\t# a lone ( here\n"), "{out}");
     }
 
     #[test]
