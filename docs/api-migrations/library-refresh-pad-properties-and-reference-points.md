@@ -22,7 +22,8 @@ refuses these footprints as `unsupported_library_footprint`, with a message
 that names KiCad 10.0.7. Footprints with neither clause refresh as before on
 every version.
 
-Many of these footprints have other clauses refresh still refuses, most
-often a pad's `zone_connect`
-([#300](https://github.com/Copperpour/Copperpour/issues/300)). They are still
-refused, and the message names that clause.
+Many of these footprints also set a pad's `zone_connect`, which refresh
+reads as well since
+[#300](https://github.com/Copperpour/Copperpour/issues/300). A footprint with
+a clause refresh still refuses is still refused, and the message names that
+clause.
