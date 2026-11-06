@@ -549,11 +549,30 @@ pub(crate) async fn build_package(
 #[cfg(feature = "jlcpcb")]
 fn order_not_uploaded(reason: impl Into<String>, detail: serde_json::Value) -> CallToolResult {
     let reason = reason.into();
-    let mut body = json!({ "uploaded": false, "reason": reason });
+    let mut body = json!({ "uploaded": false, "upload_outcome": "not_sent", "reason": reason });
     if let serde_json::Value::Object(extra) = detail {
         body.as_object_mut().unwrap().extend(extra);
     }
     CallToolResult::error(body.to_string())
+}
+
+#[cfg(feature = "jlcpcb")]
+fn order_upload_failed(
+    order_id: &str,
+    failure: crate::fab::jlcpcb::order::UploadFailure,
+) -> CallToolResult {
+    CallToolResult::error(
+        json!({
+            "uploaded": failure.uploaded(),
+            "upload_outcome": failure.outcome,
+            "http_status": failure.http_status,
+            "order_url": null,
+            "order_id": order_id,
+            "reason": failure.to_string(),
+            "recovery": failure.recovery(),
+        })
+        .to_string(),
+    )
 }
 
 /// Writes the package as `export_manufacturing_package` does, runs DRC on the
@@ -595,6 +614,21 @@ async fn handle_generate_jlcpcb_order_link(
         Ok(package) => package,
         Err(refusal) => return Ok(refusal),
     };
+    upload_order_package(args, ctx, &board, include_assembly, skip_drc, package).await
+}
+
+/// Shared preflight/upload path, also exercised with prepared packages in
+/// refusal tests so an unrelated export failure cannot mask a missing guard.
+#[cfg(feature = "jlcpcb")]
+async fn upload_order_package(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    board: &std::path::Path,
+    include_assembly: bool,
+    skip_drc: bool,
+    package: PackageBuild,
+) -> anyhow::Result<CallToolResult> {
+    use crate::fab::jlcpcb::order;
     let package_body = package.body();
     if !package.complete {
         return Ok(order_not_uploaded(
@@ -605,12 +639,13 @@ async fn handle_generate_jlcpcb_order_link(
 
     let board_source = match &package.snapshot {
         Some(snapshot) => snapshot.contents.clone(),
-        None => tokio::fs::read_to_string(&board).await?,
+        None => tokio::fs::read_to_string(board).await?,
     };
     let drc = if skip_drc {
         json!({ "skipped": true })
     } else {
-        let drc_board = stage_board_for_drc(&board, &board_source, staging.path()).await?;
+        let drc_staging = tempfile::tempdir()?;
+        let drc_board = stage_board_for_drc(board, &board_source, drc_staging.path()).await?;
         let report = match cli::run_drc(&ctx.config.kicad_cli, &drc_board, false).await {
             Ok(report) => report,
             Err(error) => {
@@ -695,12 +730,7 @@ async fn handle_generate_jlcpcb_order_link(
     info!(board = %board.display(), order_id = %order_id, "Uploading the JLCPCB order");
     let answer = match order::upload(base, &order_id, &boundary, body).await {
         Ok(answer) => answer,
-        Err(error) => {
-            return Ok(order_not_uploaded(
-                format!("{error:#}"),
-                json!({ "order_id": order_id }),
-            ))
-        }
+        Err(error) => return Ok(order_upload_failed(&order_id, error)),
     };
     // The files were sent; a link may still be missing from the answer.
     let link = match order::order_link(&answer) {
@@ -709,6 +739,7 @@ async fn handle_generate_jlcpcb_order_link(
             return Ok(CallToolResult::error(
                 json!({
                     "uploaded": true,
+                    "upload_outcome": "sent",
                     "order_url": null,
                     "reason": format!("{error:#}"),
                     "order_id": order_id,
@@ -720,6 +751,7 @@ async fn handle_generate_jlcpcb_order_link(
     Ok(CallToolResult::text(
         json!({
             "uploaded": true,
+            "upload_outcome": "sent",
             "order_url": link.url,
             "upload_id": link.id,
             "order_id": order_id,
@@ -1280,6 +1312,12 @@ mod order_link_tests {
     /// A local order endpoint: it counts the requests, keeps the last one,
     /// and answers as EasyEDA's does.
     async fn endpoint() -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<u8>>>) {
+        endpoint_with_status(Some("200 OK")).await
+    }
+
+    async fn endpoint_with_status(
+        status: Option<&'static str>,
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<u8>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1311,15 +1349,139 @@ mod order_link_tests {
                     }
                 }
                 *kept.lock().unwrap() = request;
+                let Some(status) = status else {
+                    // The entire request arrived, but the connection closes
+                    // before any response: transmission is now uncertain.
+                    continue;
+                };
                 let answer = r#"{"success":true,"code":0,"result":{"url":"https:\/\/jlcpcb.com\/quote\/eda?eadLink=2&uuid=f0f0&from=eda-pro&edaActivity=null","id":"f0f0"}}"#;
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
                     answer.len()
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
             }
         });
         (base, count, last)
+    }
+
+    const ORDER_BOARD: &str = include_str!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
+
+    fn prepared_package(complete: bool) -> PackageBuild {
+        PackageBuild {
+            body: json!({ "warnings": if complete { vec![] } else { vec!["Gerber export failed"] }, "board_source": "saved_file" }).to_string(),
+            complete,
+            board_files: Vec::new(),
+            bom: None,
+            cpl: None,
+            snapshot: None,
+            _staging: None,
+        }
+    }
+
+    async fn prepared_order(source: &str, complete: bool, base: &str) -> CallToolResult {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("order.kicad_pcb");
+        std::fs::write(&board, source).unwrap();
+        upload_order_package(
+            &json!({ "_order_base_url": base }),
+            &ctx(),
+            &board,
+            false,
+            true,
+            prepared_package(complete),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_package_refuses_before_any_request() {
+        let (base, count, _) = endpoint().await;
+        let result = prepared_order(ORDER_BOARD, false, &base).await;
+        let refusal = body(&result);
+        assert!(result.is_error, "{refusal}");
+        assert_eq!(refusal["uploaded"], false, "{refusal}");
+        assert!(
+            refusal["reason"]
+                .as_str()
+                .unwrap()
+                .contains("package is incomplete"),
+            "{refusal}"
+        );
+        assert_eq!(refusal["warnings"], json!(["Gerber export failed"]));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_zero_size_outline_refuses_before_any_request() {
+        // Collapse the four Edge.Cuts lines of a KiCad-authored fixture;
+        // retain the actual board format and layer declarations.
+        let mut source = ORDER_BOARD.to_owned();
+        for tag in ["start", "end"] {
+            for point in ["80 30", "130 30", "130 70", "80 70"] {
+                source = source.replace(&format!("({tag} {point})"), &format!("({tag} 0 0)"));
+            }
+        }
+        let tree = copperpour_sexp::parse_sexp(&source).unwrap();
+        assert_eq!(board_outline_size(&tree), Some((0.0, 0.0)));
+        let (base, count, _) = endpoint().await;
+        let result = prepared_order(&source, true, &base).await;
+        let refusal = body(&result);
+        assert!(result.is_error, "{refusal}");
+        assert_eq!(refusal["uploaded"], false);
+        assert!(
+            refusal["reason"].as_str().unwrap().contains("outline"),
+            "{refusal}"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_http_error_after_receiving_the_files_reports_sent() {
+        let (base, count, request) = endpoint_with_status(Some("500 Internal Server Error")).await;
+        let result = prepared_order(ORDER_BOARD, true, &base).await;
+        let refusal = body(&result);
+        assert!(result.is_error, "{refusal}");
+        assert_eq!(refusal["uploaded"], true, "{refusal}");
+        assert_eq!(refusal["upload_outcome"], "sent");
+        assert_eq!(refusal["http_status"], 500);
+        assert_eq!(refusal["order_url"], serde_json::Value::Null);
+        assert!(refusal["order_id"]
+            .as_str()
+            .is_some_and(|id| id.len() == 32));
+        assert!(refusal["reason"].as_str().unwrap().contains("500"));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(String::from_utf8_lossy(&request.lock().unwrap()).contains("name=\"gerber\""));
+    }
+
+    #[tokio::test]
+    async fn a_lost_response_after_receiving_the_files_reports_uncertainty() {
+        let (base, count, _) = endpoint_with_status(None).await;
+        let result = prepared_order(ORDER_BOARD, true, &base).await;
+        let refusal = body(&result);
+        assert!(result.is_error, "{refusal}");
+        assert!(refusal.get("uploaded").is_some(), "{refusal}");
+        assert_eq!(refusal["uploaded"], serde_json::Value::Null, "{refusal}");
+        assert_eq!(refusal["upload_outcome"], "uncertain");
+        assert!(refusal["recovery"]
+            .as_str()
+            .unwrap()
+            .contains("Do not retry automatically"));
+        assert!(refusal["order_id"].as_str().is_some());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_endpoint_reports_not_sent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let result = prepared_order(ORDER_BOARD, true, &base).await;
+        let refusal = body(&result);
+        assert!(result.is_error, "{refusal}");
+        assert_eq!(refusal["uploaded"], false, "{refusal}");
+        assert_eq!(refusal["upload_outcome"], "not_sent");
     }
 
     #[tokio::test]

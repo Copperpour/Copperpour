@@ -194,6 +194,16 @@ first.
 Give the user the link in **order_url**. It needs a JLCPCB login, then opens the quote page
 with the board loaded and the BOM and CPL in the PCBA steps. The checks above
 still apply there: the board viewer, and every part in Component Placements.
+When a footprint has no pad numbered `1` (for example `A1`, `+`/`-`, or
+`A`/`K` numbering), the uploaded Pad X/Y falls back to the component midpoint.
+Its pin-1 marker may therefore be at the centre; check these parts explicitly
+in the preview until that fallback has been verified live.
+
+On failure, `uploaded: false` means nothing was sent. `uploaded: true` means
+an HTTP response was received, even if it rejected the request or gave no link.
+`uploaded: null` with `upload_outcome: "uncertain"` means the files may already
+have reached EasyEDA: retain `order_id` and diagnostics and do not retry
+automatically.
 
 ## 4. Use manual exports when control is required
 

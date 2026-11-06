@@ -374,13 +374,82 @@ pub(crate) fn zip_files(files: &[std::path::PathBuf]) -> anyhow::Result<Vec<u8>>
     Ok(writer.finish()?.into_inner())
 }
 
-/// Posts the order and returns the endpoint's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UploadOutcome {
+    NotSent,
+    Sent,
+    Uncertain,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
+pub(crate) struct UploadFailure {
+    pub outcome: UploadOutcome,
+    pub http_status: Option<u16>,
+    reason: String,
+}
+
+impl UploadFailure {
+    fn before_send(error: reqwest::Error) -> Self {
+        Self {
+            outcome: UploadOutcome::NotSent,
+            http_status: None,
+            reason: format!(
+                "could not prepare the order upload: {:#}",
+                anyhow::Error::new(error)
+            ),
+        }
+    }
+
+    fn transport(error: reqwest::Error) -> Self {
+        let outcome = if error.is_connect() || error.is_builder() {
+            UploadOutcome::NotSent
+        } else {
+            UploadOutcome::Uncertain
+        };
+        Self {
+            outcome,
+            http_status: None,
+            reason: format!(
+                "the order upload request failed: {:#}",
+                anyhow::Error::new(error)
+            ),
+        }
+    }
+
+    fn response(status: reqwest::StatusCode, reason: String) -> Self {
+        Self {
+            outcome: UploadOutcome::Sent,
+            http_status: Some(status.as_u16()),
+            reason,
+        }
+    }
+
+    pub fn uploaded(&self) -> Option<bool> {
+        match self.outcome {
+            UploadOutcome::NotSent => Some(false),
+            UploadOutcome::Sent => Some(true),
+            UploadOutcome::Uncertain => None,
+        }
+    }
+
+    pub fn recovery(&self) -> &'static str {
+        match self.outcome {
+            UploadOutcome::NotSent => "Correct the failure before retrying the upload.",
+            UploadOutcome::Sent => "The files were sent. Keep order_id and inspect the response before starting another upload.",
+            UploadOutcome::Uncertain => "The files may already have reached EasyEDA. Do not retry automatically; keep order_id and inspect the previous upload outcome first.",
+        }
+    }
+}
+
+/// Posts the order and preserves what a failure proves about transmission.
 pub(crate) async fn upload(
     base: &str,
     order_id: &str,
     boundary: &str,
     body: Vec<u8>,
-) -> anyhow::Result<String> {
+) -> Result<String, UploadFailure> {
     let client = reqwest::Client::builder()
         .user_agent(concat!(
             "Copperpour/",
@@ -389,8 +458,13 @@ pub(crate) async fn upload(
         ))
         .connect_timeout(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(180))
-        .build()?;
-    let response = client
+        // Observe the first HTTP response. Following a redirect could send
+        // the files again and turn a later connection failure into a false
+        // claim that the original request was never sent.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(UploadFailure::before_send)?;
+    let request = client
         .post(format!("{base}/api/pcb_order/{order_id}/save"))
         .header("Accept", "*/*")
         .header(
@@ -398,13 +472,24 @@ pub(crate) async fn upload(
             format!("multipart/form-data; boundary={boundary}"),
         )
         .body(body)
-        .send()
+        .build()
+        .map_err(UploadFailure::before_send)?;
+    let response = client
+        .execute(request)
         .await
-        .context("the order upload did not reach EasyEDA")?;
+        .map_err(UploadFailure::transport)?;
     let status = response.status();
-    let text = response.text().await.unwrap_or_default();
+    let text = response.text().await.map_err(|error| {
+        UploadFailure::response(
+            status,
+            format!("the order endpoint answered {status}, but its response body could not be read: {:#}", anyhow::Error::new(error)),
+        )
+    })?;
     if !status.is_success() {
-        bail!("the order endpoint answered {status}: {}", excerpt(&text));
+        return Err(UploadFailure::response(
+            status,
+            format!("the order endpoint answered {status}: {}", excerpt(&text)),
+        ));
     }
     Ok(text)
 }
@@ -681,6 +766,50 @@ mod tests {
         assert_eq!(decimal(-0.00001), "0");
     }
 
+    #[tokio::test]
+    async fn an_invalid_request_is_proven_not_sent() {
+        let failure = upload("not a URL", "id", "boundary", vec![])
+            .await
+            .unwrap_err();
+        assert_eq!(failure.outcome, UploadOutcome::NotSent);
+        assert_eq!(failure.uploaded(), Some(false));
+        assert_eq!(failure.http_status, None);
+    }
+
+    #[tokio::test]
+    async fn a_truncated_response_preserves_the_observed_http_status() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0u8; 1024];
+                let n = socket.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&buf[..n]);
+                if request.ends_with(b"payload") {
+                    break;
+                }
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort",
+                )
+                .await
+                .unwrap();
+        });
+        let failure = upload(&base, "id", "boundary", b"payload".to_vec())
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(failure.outcome, UploadOutcome::Sent);
+        assert_eq!(failure.uploaded(), Some(true));
+        assert_eq!(failure.http_status, Some(200));
+        assert!(failure.to_string().contains("response body"));
+    }
+
     /// The upload names Copperpour, posts the form to the order's path, and
     /// returns the answer; a refusal keeps the endpoint's status and words.
     #[tokio::test]
@@ -688,9 +817,16 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect = format!("http://{}/", closed.local_addr().unwrap());
+        drop(closed);
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for status in ["200 OK", "500 Internal Server Error"] {
+            for status in [
+                "200 OK",
+                "500 Internal Server Error",
+                "307 Temporary Redirect",
+            ] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut buf = [0u8; 4096];
@@ -720,8 +856,13 @@ mod tests {
                 } else {
                     "busy"
                 };
+                let location = if status.starts_with("307") {
+                    format!("Location: {redirect}\r\n")
+                } else {
+                    String::new()
+                };
                 let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 socket.write_all(response.as_bytes()).await.unwrap();
@@ -741,6 +882,11 @@ mod tests {
             refused.contains("500") && refused.contains("busy"),
             "{refused}"
         );
+        let redirected = upload(&base, "0123abcd", "bnd", b"--bnd--\r\n".to_vec())
+            .await
+            .unwrap_err();
+        assert_eq!(redirected.outcome, UploadOutcome::Sent);
+        assert_eq!(redirected.http_status, Some(307));
         let requests = server.await.unwrap();
         let first = requests[0].to_ascii_lowercase();
         assert!(

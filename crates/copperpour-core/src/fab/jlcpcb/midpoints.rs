@@ -252,6 +252,34 @@ mod tests {
                         .as_slice(),
                 )
                 .unwrap();
+                if mode == "pad1-last" {
+                    // Reorder native-captured items without changing any
+                    // UUID or geometry: pad 1 must be found by its number.
+                    for item in &mut items.items {
+                        let mut fp =
+                            kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                                .unwrap();
+                        fp.definition.as_mut().unwrap().items.reverse();
+                        item.value = fp.encode_to_vec();
+                    }
+                    let first = kiapi::board::types::FootprintInstance::decode(
+                        items.items[0].value.as_slice(),
+                    )
+                    .unwrap();
+                    let first_pad = first
+                        .definition
+                        .unwrap()
+                        .items
+                        .into_iter()
+                        .find(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
+                        .unwrap();
+                    assert_ne!(
+                        kiapi::board::types::Pad::decode(first_pad.value.as_slice())
+                            .unwrap()
+                            .number,
+                        "1"
+                    );
+                }
                 if mode == "no-pads" {
                     items.items.truncate(1);
                     let mut fp = kiapi::board::types::FootprintInstance::decode(
@@ -365,6 +393,17 @@ mod tests {
                 "{mode}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn pad_one_is_selected_by_number_when_another_pad_comes_first() {
+        let board = std::path::Path::new("midpoints.kicad_pcb");
+        let document =
+            crate::tools::pcb_board::board_mock::board_document(&board.to_string_lossy());
+        let mock = fixture_server(board, "pad1-last");
+        let snapshot = capture(&KiCadIpcClient::new(mock.address()), document).unwrap();
+        assert_eq!(snapshot.midpoints["R1"].pin1_mm, Some((79.0875, 20.0)));
+        assert_eq!(snapshot.midpoints["JF0"].pin1_mm, Some((20.0, 20.0)));
     }
 
     #[test]

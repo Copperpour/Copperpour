@@ -728,6 +728,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "unmatched_footprints",
         // Structured order-link response field, not a callable tool (#208).
         "order_url",
+        "order_id",
+        "upload_outcome",
         // Structured hierarchy-audit response field, not a callable tool.
         "sheet_instance_path",
         // Structured placement-score response field, not a callable tool.
