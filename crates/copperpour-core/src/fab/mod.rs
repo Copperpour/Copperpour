@@ -349,7 +349,7 @@ impl AssemblyFormat {
         match self {
             Self::KicadNative => None,
             Self::Jlcpcb => Some(
-                "Then inspect every component in JLCPCB Component Placements. Correction rules reduce known orientation mismatches; they do not replace the mandatory visual placement preview.",
+                "Then inspect every component in JLCPCB Component Placements, starting with the parts named in `warnings`. Correction rules reduce known orientation mismatches; they do not replace the mandatory visual placement preview.",
             ),
         }
     }

@@ -1,17 +1,42 @@
 {
   "schema_version": 1,
-  "policy_id": "konnect-jlcpcb-cpl-v1",
-  "provenance": "Konnect issue #518: independently observed KiCad 10 export and JLCPCB Component Placements evidence, 2026-09-10",
+  "policy_id": "copperpour-jlcpcb-cpl-v2",
+  "provenance": "Konnect issue #518: independently observed KiCad 10 export and JLCPCB Component Placements evidence, 2026-09-10. v2 withdraws the HRO USB-C correction: two boards disagree under that footprint name (#305).",
+  "rotation_insensitive_prefixes": ["R_", "C_", "L_", "Fuse_", "Fiducial_", "TestPoint_", "MountingHole_"],
+  "rotation_sensitive_prefixes": ["R_Array_"],
   "footprint_rules": [
     {
       "id": "kicad-soic-8-3.9x4.9-p1.27",
       "footprint_prefix": "SOIC-8_3.9x4.9mm_P1.27mm",
-      "rotation_degrees": 270
+      "rotation_degrees": 270,
+      "evidence": [
+        {
+          "board": "Konnect issue #518 blinker, PR #519 preview",
+          "designator": "U1",
+          "footprint": "SOIC-8_3.9x4.9mm_P1.27mm",
+          "kicad_rotation_degrees": 90,
+          "cpl_rotation_degrees": 0,
+          "footprint_pin1": "bottom-left",
+          "jlc_model_pin1": "bottom-left"
+        }
+      ]
     },
     {
       "id": "kicad-hro-type-c-31-m-12",
-      "footprint_prefix": "USB_C_Receptacle_HRO_TYPE-C-31-M-12",
-      "rotation_degrees": 180
+      "footprint_exact": "USB_C_Receptacle_HRO_TYPE-C-31-M-12",
+      "status": "unverified",
+      "note": "Two boards disagree under this footprint name: issue #518 needed +180 degrees, another board with the KiCad 10 library footprint needed none. Check which side the SMD pins land on and pin the rotation with a project component override.",
+      "evidence": [
+        {
+          "board": "Konnect issue #518 blinker, PR #519 preview",
+          "designator": "J1",
+          "footprint": "USB_C_Receptacle_HRO_TYPE-C-31-M-12",
+          "kicad_rotation_degrees": 0,
+          "cpl_rotation_degrees": 180,
+          "footprint_pin1": "bottom-right",
+          "jlc_model_pin1": "bottom-right"
+        }
+      ]
     }
   ],
   "component_overrides": []

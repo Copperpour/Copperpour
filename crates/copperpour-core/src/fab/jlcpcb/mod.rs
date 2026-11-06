@@ -45,6 +45,15 @@ struct JlcpcbCorrectionPolicy {
     schema_version: u64,
     policy_id: String,
     provenance: String,
+    /// Footprint-name prefixes whose rotation does not matter (two-terminal
+    /// unpolarized parts). Unmatched components outside these prefixes are
+    /// reported for review instead of passing silently.
+    #[serde(default)]
+    rotation_insensitive_prefixes: Vec<String>,
+    /// Exceptions to `rotation_insensitive_prefixes`: footprints under one of
+    /// these prefixes always matter, as `R_Array_` does under `R_`.
+    #[serde(default)]
+    rotation_sensitive_prefixes: Vec<String>,
     #[serde(default)]
     footprint_rules: Vec<JlcpcbCorrectionRule>,
     #[serde(default)]
@@ -55,13 +64,122 @@ struct JlcpcbCorrectionPolicy {
 #[serde(deny_unknown_fields)]
 struct JlcpcbCorrectionRule {
     id: String,
-    footprint_prefix: String,
+    #[serde(default)]
+    footprint_prefix: Option<String>,
+    #[serde(default)]
+    footprint_exact: Option<String>,
+    #[serde(default)]
+    status: JlcpcbRuleStatus,
     #[serde(default)]
     rotation_degrees: f64,
     #[serde(default)]
     offset_x_mm: f64,
     #[serde(default)]
     offset_y_mm: f64,
+    #[serde(default)]
+    evidence: Vec<JlcpcbRotationObservation>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+impl JlcpcbCorrectionRule {
+    fn matches(&self, footprint: &str) -> bool {
+        match (&self.footprint_exact, &self.footprint_prefix) {
+            (Some(exact), _) => footprint == exact,
+            (None, Some(prefix)) => footprint.starts_with(prefix.as_str()),
+            (None, None) => false,
+        }
+    }
+}
+
+/// An unverified rule names a footprint family whose JLCPCB orientation has
+/// not been observed: it applies no correction and turns every match into a
+/// review warning.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum JlcpcbRuleStatus {
+    #[default]
+    Verified,
+    Unverified,
+}
+
+/// Direction of pin 1 from the part centre, as seen in JLCPCB Component
+/// Placements (top view, board coordinates: up is +Y).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum PinDirection {
+    Right,
+    TopRight,
+    Top,
+    TopLeft,
+    Left,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+}
+
+impl PinDirection {
+    /// Counter-clockwise angle from +X, the sense of KiCad and CPL rotations.
+    fn degrees(self) -> f64 {
+        match self {
+            Self::Right => 0.0,
+            Self::TopRight => 45.0,
+            Self::Top => 90.0,
+            Self::TopLeft => 135.0,
+            Self::Left => 180.0,
+            Self::BottomLeft => 225.0,
+            Self::Bottom => 270.0,
+            Self::BottomRight => 315.0,
+        }
+    }
+}
+
+/// One look at the JLCPCB placement preview: where pin 1 of the KiCad
+/// footprint and pin 1 of the JLCPCB model landed, for a CPL rotation that
+/// was actually uploaded.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JlcpcbRotationObservation {
+    board: String,
+    designator: String,
+    #[serde(default)]
+    footprint: Option<String>,
+    /// The LCSC part placed: the part, not the footprint, decides which way
+    /// JLCPCB's model faces.
+    #[serde(default)]
+    lcsc: Option<String>,
+    /// Board side of the observed part. Only `top` is accepted: the pin-1
+    /// arithmetic assumes the preview's top view.
+    #[serde(default)]
+    side: ObservationSide,
+    kicad_rotation_degrees: f64,
+    cpl_rotation_degrees: f64,
+    footprint_pin1: PinDirection,
+    jlc_model_pin1: PinDirection,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ObservationSide {
+    #[default]
+    Top,
+    Bottom,
+}
+
+impl JlcpcbRotationObservation {
+    /// The correction this observation proves: the model's pin 1 at CPL
+    /// rotation 0 is `jlc_model_pin1 - cpl`, and it must reach
+    /// `footprint_pin1` at `kicad + correction`.
+    fn implied_rotation_degrees(&self) -> f64 {
+        (self.footprint_pin1.degrees() - self.jlc_model_pin1.degrees() + self.cpl_rotation_degrees
+            - self.kicad_rotation_degrees)
+            .rem_euclid(360.0)
+    }
+}
+
+fn same_angle(a: f64, b: f64) -> bool {
+    let difference = (a - b).rem_euclid(360.0);
+    difference.min(360.0 - difference) < 0.5
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -75,6 +193,10 @@ struct JlcpcbComponentOverride {
     offset_x_mm: f64,
     #[serde(default)]
     offset_y_mm: f64,
+    #[serde(default)]
+    evidence: Vec<JlcpcbRotationObservation>,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 #[derive(Debug)]
@@ -115,7 +237,7 @@ impl JlcpcbCorrectionPolicies {
             if let Some(rule) = project
                 .footprint_rules
                 .iter()
-                .find(|rule| footprint.starts_with(&rule.footprint_prefix))
+                .find(|rule| rule.matches(footprint))
             {
                 return Some(MatchedRule::Footprint {
                     policy: project,
@@ -126,11 +248,22 @@ impl JlcpcbCorrectionPolicies {
         self.built_in
             .footprint_rules
             .iter()
-            .find(|rule| footprint.starts_with(&rule.footprint_prefix))
+            .find(|rule| rule.matches(footprint))
             .map(|rule| MatchedRule::Footprint {
                 policy: &self.built_in,
                 rule,
             })
+    }
+
+    fn rotation_insensitive(&self, footprint: &str) -> bool {
+        let policies = || self.project.iter().chain(std::iter::once(&self.built_in));
+        let listed = |prefixes: fn(&JlcpcbCorrectionPolicy) -> &Vec<String>| {
+            policies()
+                .flat_map(prefixes)
+                .any(|prefix| footprint.starts_with(prefix.as_str()))
+        };
+        listed(|policy| &policy.rotation_insensitive_prefixes)
+            && !listed(|policy| &policy.rotation_sensitive_prefixes)
     }
 }
 
@@ -146,6 +279,22 @@ enum MatchedRule<'a> {
 }
 
 impl MatchedRule<'_> {
+    fn unverified(&self) -> Option<(&str, &str, Option<&str>)> {
+        match self {
+            Self::Footprint { policy, rule } if rule.status == JlcpcbRuleStatus::Unverified => {
+                Some((&policy.policy_id, &rule.id, rule.note.as_deref()))
+            }
+            _ => None,
+        }
+    }
+
+    fn note(&self) -> Option<&str> {
+        match self {
+            Self::Component { rule, .. } => rule.note.as_deref(),
+            Self::Footprint { rule, .. } => rule.note.as_deref(),
+        }
+    }
+
     fn values(&self) -> (&str, &str, &str, f64, f64, f64) {
         match self {
             Self::Component { policy, rule } => (
@@ -183,11 +332,57 @@ fn parse_jlcpcb_correction_policy(
     if policy.policy_id.trim().is_empty() || policy.provenance.trim().is_empty() {
         bail!("JLCPCB correction policy {description} requires policy_id and provenance");
     }
+    for (field, prefixes) in [
+        (
+            "rotation_insensitive_prefixes",
+            &policy.rotation_insensitive_prefixes,
+        ),
+        (
+            "rotation_sensitive_prefixes",
+            &policy.rotation_sensitive_prefixes,
+        ),
+    ] {
+        if prefixes.iter().any(|prefix| prefix.trim().is_empty()) {
+            bail!("JLCPCB correction policy {description} has an empty {field} entry");
+        }
+    }
     let mut ids = BTreeSet::new();
     for rule in &policy.footprint_rules {
-        if rule.id.trim().is_empty() || rule.footprint_prefix.trim().is_empty() {
+        let pattern = match (&rule.footprint_prefix, &rule.footprint_exact) {
+            (Some(pattern), None) | (None, Some(pattern)) => pattern,
+            _ => bail!(
+                "JLCPCB correction rule '{}' in {description} needs exactly one of footprint_prefix or footprint_exact",
+                rule.id
+            ),
+        };
+        if rule.id.trim().is_empty() || pattern.trim().is_empty() {
             bail!(
-                "JLCPCB correction policy {description} has an empty rule id or footprint_prefix"
+                "JLCPCB correction policy {description} has an empty rule id or footprint pattern"
+            );
+        }
+        if rule.status == JlcpcbRuleStatus::Unverified
+            && [rule.rotation_degrees, rule.offset_x_mm, rule.offset_y_mm]
+                .iter()
+                .any(|value| *value != 0.0)
+        {
+            bail!(
+                "JLCPCB correction rule '{}' in {description} is unverified and cannot carry a correction",
+                rule.id
+            );
+        }
+        validate_observation_fields(description, &rule.id, &rule.evidence)?;
+        if rule.status == JlcpcbRuleStatus::Verified {
+            validate_observations(description, &rule.id, rule.rotation_degrees, &rule.evidence)?;
+        }
+        if let Some(footprint) = rule
+            .evidence
+            .iter()
+            .filter_map(|observation| observation.footprint.as_deref())
+            .find(|footprint| !rule.matches(footprint))
+        {
+            bail!(
+                "JLCPCB correction rule '{}' in {description} cites an observation of {footprint}, which it does not match",
+                rule.id
             );
         }
         if !ids.insert(rule.id.as_str()) {
@@ -221,6 +416,8 @@ fn parse_jlcpcb_correction_policy(
                 rule.designator
             );
         }
+        validate_observation_fields(description, &rule.id, &rule.evidence)?;
+        validate_observations(description, &rule.id, rule.rotation_degrees, &rule.evidence)?;
         validate_finite_correction(
             description,
             &rule.id,
@@ -230,6 +427,56 @@ fn parse_jlcpcb_correction_policy(
         )?;
     }
     Ok(policy)
+}
+
+/// Observations the pin-1 arithmetic cannot check are refused: a bottom-side
+/// part (the preview's top view mirrors it), or an empty LCSC part number.
+fn validate_observation_fields(
+    description: &str,
+    id: &str,
+    evidence: &[JlcpcbRotationObservation],
+) -> anyhow::Result<()> {
+    for observation in evidence {
+        if observation.side != ObservationSide::Top {
+            bail!(
+                "JLCPCB correction rule '{id}' in {description} cites a bottom-side observation of {}: only top-side observations can be checked",
+                observation.designator
+            );
+        }
+        if observation
+            .lcsc
+            .as_deref()
+            .is_some_and(|lcsc| lcsc.trim().is_empty())
+        {
+            bail!(
+                "JLCPCB correction rule '{id}' in {description} has an empty lcsc in its observation of {}",
+                observation.designator
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A rule whose own observations contradict its rotation is the failure that
+/// started this check (an HRO USB-C turned 180 degrees from a correct KiCad
+/// rotation): refuse it before it reaches a CPL.
+fn validate_observations(
+    description: &str,
+    id: &str,
+    rotation: f64,
+    evidence: &[JlcpcbRotationObservation],
+) -> anyhow::Result<()> {
+    for observation in evidence {
+        let implied = observation.implied_rotation_degrees();
+        if !same_angle(implied, rotation) {
+            bail!(
+                "JLCPCB correction rule '{id}' in {description} rotates by {rotation} degrees, but its observation of {} on {} implies {implied} degrees",
+                observation.designator,
+                observation.board
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_finite_correction(
@@ -256,7 +503,63 @@ pub(crate) struct JlcpcbOrientationEvidence {
     policies: Vec<JlcpcbPolicyEvidence>,
     applied_corrections: Vec<JlcpcbAppliedCorrection>,
     unmatched_footprints: Vec<JlcpcbUnmatchedFootprint>,
+    unverified_footprints: Vec<JlcpcbUnverifiedFootprint>,
     note: &'static str,
+}
+
+impl JlcpcbOrientationEvidence {
+    /// Components left at KiCad's raw rotation whose orientation matters:
+    /// one warning per unverified rule, one for every polarized or multi-pin
+    /// footprint that no rule covers. An empty result is the only state in
+    /// which the package may say it has no warnings.
+    pub(crate) fn review_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let mut unverified = std::collections::BTreeMap::<(&str, &str, &str), Vec<&str>>::new();
+        for part in &self.unverified_footprints {
+            unverified
+                .entry((
+                    &part.rule_id,
+                    &part.footprint,
+                    part.note.as_deref().unwrap_or(""),
+                ))
+                .or_default()
+                .push(&part.designator);
+        }
+        for ((rule_id, footprint, note), designators) in unverified {
+            let mut warning = format!(
+                "JLCPCB rotation not verified for footprint {footprint} (rule {rule_id}); left at KiCad rotation: {}.",
+                designators.join(", ")
+            );
+            if !note.is_empty() {
+                warning.push(' ');
+                warning.push_str(note);
+            }
+            warnings.push(warning);
+        }
+        let mut uncovered = std::collections::BTreeMap::<&str, Vec<&str>>::new();
+        for part in self
+            .unmatched_footprints
+            .iter()
+            .filter(|part| part.review_required)
+        {
+            uncovered
+                .entry(&part.footprint)
+                .or_default()
+                .push(&part.designator);
+        }
+        if !uncovered.is_empty() {
+            warnings.push(format!(
+                "No JLCPCB rotation rule for {} polarized or multi-pin footprint(s), left at KiCad rotation; check pin 1 in Component Placements: {}.",
+                uncovered.len(),
+                uncovered
+                    .iter()
+                    .map(|(footprint, designators)| format!("{footprint} ({})", designators.join(", ")))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        warnings
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -281,6 +584,8 @@ struct JlcpcbAppliedCorrection {
     x_after_mm: f64,
     y_before_mm: f64,
     y_after_mm: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -288,6 +593,17 @@ struct JlcpcbUnmatchedFootprint {
     designator: String,
     footprint: String,
     side: String,
+    review_required: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct JlcpcbUnverifiedFootprint {
+    designator: String,
+    footprint: String,
+    side: String,
+    policy_id: String,
+    rule_id: String,
+    note: Option<String>,
 }
 
 #[derive(Debug)]
@@ -327,6 +643,7 @@ fn jlcpcb_cpl_from_kicad_csv(
     let mut designators = BTreeSet::new();
     let mut applied_corrections = Vec::new();
     let mut unmatched_footprints = Vec::new();
+    let mut unverified_footprints = Vec::new();
     for row in reader.records() {
         let row = row?;
         let field = |index: usize, name: &str| {
@@ -363,7 +680,19 @@ fn jlcpcb_cpl_from_kicad_csv(
         let before_x = x;
         let before_y = y;
         let matched = policies.matching_rule(designator, footprint);
-        let corrected_angle = if let Some(rule) = matched {
+        let unverified = matched.as_ref().and_then(MatchedRule::unverified);
+        let is_unverified = unverified.is_some();
+        if let Some((policy_id, rule_id, note)) = unverified {
+            unverified_footprints.push(JlcpcbUnverifiedFootprint {
+                designator: designator.to_string(),
+                footprint: footprint.to_string(),
+                side: layer.to_string(),
+                policy_id: policy_id.to_string(),
+                rule_id: rule_id.to_string(),
+                note: note.map(str::to_string),
+            });
+        }
+        let corrected_angle = if let Some(rule) = matched.filter(|_| !is_unverified) {
             let (policy_id, rule_id, match_kind, rotation_delta, offset_x, offset_y) =
                 rule.values();
             x += offset_x;
@@ -386,14 +715,18 @@ fn jlcpcb_cpl_from_kicad_csv(
                 x_after_mm: x,
                 y_before_mm: before_y,
                 y_after_mm: y,
+                note: rule.note().map(str::to_string),
             });
             corrected
         } else {
-            unmatched_footprints.push(JlcpcbUnmatchedFootprint {
-                designator: designator.to_string(),
-                footprint: footprint.to_string(),
-                side: layer.to_string(),
-            });
+            if !is_unverified {
+                unmatched_footprints.push(JlcpcbUnmatchedFootprint {
+                    designator: designator.to_string(),
+                    footprint: footprint.to_string(),
+                    side: layer.to_string(),
+                    review_required: !policies.rotation_insensitive(footprint),
+                });
+            }
             if layer == "bottom" {
                 (180.0 - angle).rem_euclid(360.0)
             } else {
@@ -437,6 +770,7 @@ fn jlcpcb_cpl_from_kicad_csv(
             policies: policy_evidence,
             applied_corrections,
             unmatched_footprints,
+            unverified_footprints,
             note: "Structural export does not prove physical placement orientation. Inspect every component in JLCPCB Component Placements before ordering.",
         },
     })
@@ -636,7 +970,7 @@ mod jlcpcb_assembly_tests {
     }
 
     #[test]
-    fn built_in_rules_correct_soic_usb_c_bottom_and_normalize_angles() {
+    fn built_in_rules_correct_soic_on_both_sides_and_leave_usb_c_for_review() {
         let source = concat!(
             "Ref,Val,Package,PosX,PosY,Rot,Side\n",
             "U1,timer,Package_SO:SOIC-8_3.9x4.9mm_P1.27mm,47,-35,90,top\n",
@@ -647,15 +981,303 @@ mod jlcpcb_assembly_tests {
         let export = jlcpcb_cpl_from_kicad_csv(source, &built_in_policies()).unwrap();
         let rows = csv_rows(&export.bytes);
         assert_eq!(rows[1][4], "0.000000");
-        assert_eq!(rows[2][4], "180.000000");
+        // Same-named HRO footprints disagreed in the preview: KiCad's rotation
+        // passes through untouched and the part is named for review.
+        assert_eq!(rows[2][4], "0.000000");
         assert_eq!(rows[3][4], "90.000000");
         assert_eq!(rows[4][4], "0.000000");
-        assert_eq!(export.orientation_evidence.applied_corrections.len(), 3);
-        assert_eq!(export.orientation_evidence.unmatched_footprints.len(), 1);
+        let evidence = &export.orientation_evidence;
+        assert_eq!(evidence.applied_corrections.len(), 2);
+        assert_eq!(evidence.unverified_footprints.len(), 1);
+        assert_eq!(evidence.unverified_footprints[0].designator, "J1");
+        assert_eq!(evidence.unmatched_footprints.len(), 1);
+        assert_eq!(evidence.unmatched_footprints[0].designator, "R1");
+        assert!(!evidence.unmatched_footprints[0].review_required);
+        let warnings = evidence.review_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with(
+            "JLCPCB rotation not verified for footprint USB_C_Receptacle_HRO_TYPE-C-31-M-12"
+        ));
+        assert!(warnings[0].contains(": J1."));
+    }
+
+    /// The regression bench: every built-in rule must be backed by at least
+    /// one preview observation, and each observation must imply exactly the
+    /// rule's rotation (pin 1 of the KiCad footprint, turned by KiCad, lands
+    /// where pin 1 of the JLCPCB model lands once the CPL rotation is applied).
+    #[test]
+    fn every_built_in_rule_agrees_with_its_jlcpcb_preview_observations() {
+        let policy = built_in_policies().built_in;
+        assert!(!policy.footprint_rules.is_empty());
+        for rule in &policy.footprint_rules {
+            match rule.status {
+                JlcpcbRuleStatus::Verified => {
+                    assert!(
+                        !rule.evidence.is_empty(),
+                        "built-in rule {} has no preview observation",
+                        rule.id
+                    );
+                    for observation in &rule.evidence {
+                        assert!(
+                            same_angle(
+                                observation.implied_rotation_degrees(),
+                                rule.rotation_degrees
+                            ),
+                            "rule {} vs {}",
+                            rule.id,
+                            observation.designator
+                        );
+                        assert!(observation.footprint.is_some(), "rule {}", rule.id);
+                    }
+                }
+                JlcpcbRuleStatus::Unverified => {
+                    assert!(
+                        rule.note.is_some(),
+                        "unverified rule {} has no note",
+                        rule.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn observations_compute_the_correction_from_pin_one_positions() {
+        let observation = |kicad, cpl, footprint_pin1, jlc_model_pin1| JlcpcbRotationObservation {
+            board: "test".into(),
+            designator: "U1".into(),
+            footprint: None,
+            lcsc: None,
+            side: ObservationSide::Top,
+            kicad_rotation_degrees: kicad,
+            cpl_rotation_degrees: cpl,
+            footprint_pin1,
+            jlc_model_pin1,
+        };
+        use PinDirection::*;
+        // Upright KiCad SOIC, JLCPCB model lying down: +270.
         assert_eq!(
-            export.orientation_evidence.unmatched_footprints[0].designator,
-            "R1"
+            observation(0.0, 0.0, TopLeft, BottomLeft).implied_rotation_degrees(),
+            270.0
         );
+        // SOT-23, model pin 1 diagonally opposite: +180.
+        assert_eq!(
+            observation(0.0, 0.0, TopLeft, BottomRight).implied_rotation_degrees(),
+            180.0
+        );
+        // A CPL rotation of 90 pins the sign of the `cpl` term: 0 and 180
+        // read the same whether it is added or subtracted.
+        assert_eq!(
+            observation(0.0, 90.0, TopLeft, BottomLeft).implied_rotation_degrees(),
+            0.0
+        );
+        // Issue #518 after its correction: aligned at CPL 0 for KiCad 90.
+        assert_eq!(
+            observation(90.0, 0.0, BottomLeft, BottomLeft).implied_rotation_degrees(),
+            270.0
+        );
+        // The second HRO USB-C board: KiCad 180 was right, a +180 rule flipped it.
+        assert_eq!(
+            observation(180.0, 0.0, BottomRight, TopLeft).implied_rotation_degrees(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn a_rule_contradicted_by_its_own_observation_is_refused() {
+        // The rule that turned a correctly rotated USB-C connector upside
+        // down, with the observation that caught it.
+        let contradicted = r#"{
+          "schema_version": 1,
+          "policy_id": "old-usb-c",
+          "provenance": "test",
+          "footprint_rules": [{
+            "id": "kicad-hro-type-c-31-m-12",
+            "footprint_prefix": "USB_C_Receptacle_HRO_TYPE-C-31-M-12",
+            "rotation_degrees": 180,
+            "evidence": [{
+              "board": "example-board", "designator": "J1",
+              "kicad_rotation_degrees": 180, "cpl_rotation_degrees": 0,
+              "footprint_pin1": "bottom-right", "jlc_model_pin1": "top-left"
+            }]
+          }]
+        }"#;
+        let error = parse_jlcpcb_correction_policy(contradicted, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("implies 0 degrees"), "{error}");
+    }
+
+    #[test]
+    fn bottom_side_and_empty_lcsc_observations_are_refused() {
+        let policy = |observation_extra: &str| {
+            format!(
+                r#"{{"schema_version": 1, "policy_id": "p", "provenance": "test",
+                  "component_overrides": [{{"id": "u1", "designator": "U1",
+                    "rotation_degrees": 270,
+                    "evidence": [{{"board": "b", "designator": "U1",
+                      "kicad_rotation_degrees": 0, "cpl_rotation_degrees": 0,
+                      "footprint_pin1": "top-left", "jlc_model_pin1": "bottom-left"
+                      {observation_extra}}}]}}]}}"#
+            )
+        };
+        parse_jlcpcb_correction_policy(&policy(r#", "lcsc": "C0000001", "side": "top""#), "test")
+            .expect("a top-side observation naming its part is accepted");
+        let bottom = parse_jlcpcb_correction_policy(&policy(r#", "side": "bottom""#), "test")
+            .unwrap_err()
+            .to_string();
+        assert!(bottom.contains("bottom-side observation of U1"), "{bottom}");
+        let empty = parse_jlcpcb_correction_policy(&policy(r#", "lcsc": " ""#), "test")
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("empty lcsc"), "{empty}");
+        // Unverified rules carry observations too: the same checks apply.
+        let unverified_bottom = r#"{"schema_version": 1, "policy_id": "p", "provenance": "test",
+          "footprint_rules": [{"id": "usb", "footprint_exact": "USB", "status": "unverified",
+            "evidence": [{"board": "b", "designator": "J1", "side": "bottom",
+              "kicad_rotation_degrees": 0, "cpl_rotation_degrees": 0,
+              "footprint_pin1": "top-left", "jlc_model_pin1": "top-left"}]}]}"#;
+        assert!(parse_jlcpcb_correction_policy(unverified_bottom, "test")
+            .unwrap_err()
+            .to_string()
+            .contains("bottom-side observation"));
+    }
+
+    #[test]
+    fn a_rule_citing_a_footprint_it_does_not_match_is_refused() {
+        // An observation of SOT-23-5 proves nothing about a rule for SOT-23.
+        let policy = r#"{
+          "schema_version": 1, "policy_id": "p", "provenance": "test",
+          "footprint_rules": [{
+            "id": "sot-23", "footprint_exact": "SOT-23", "rotation_degrees": 180,
+            "evidence": [{
+              "board": "b", "designator": "U1", "footprint": "SOT-23-5",
+              "kicad_rotation_degrees": 0, "cpl_rotation_degrees": 0,
+              "footprint_pin1": "top-left", "jlc_model_pin1": "bottom-right"
+            }]
+          }]
+        }"#;
+        let error = parse_jlcpcb_correction_policy(policy, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cites an observation of SOT-23-5, which it does not match"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unverified_and_ambiguous_rules_fail_closed() {
+        let unverified_with_rotation = r#"{
+          "schema_version": 1, "policy_id": "p", "provenance": "test",
+          "footprint_rules": [{"id": "msop", "footprint_prefix": "MSOP-",
+            "status": "unverified", "rotation_degrees": 270}]
+        }"#;
+        assert!(
+            parse_jlcpcb_correction_policy(unverified_with_rotation, "test")
+                .unwrap_err()
+                .to_string()
+                .contains("cannot carry a correction")
+        );
+        for both_or_neither in [
+            r#""footprint_prefix": "SOT-23", "footprint_exact": "SOT-23""#,
+            r#""rotation_degrees": 180"#,
+        ] {
+            let policy = format!(
+                r#"{{"schema_version": 1, "policy_id": "p", "provenance": "test",
+                  "footprint_rules": [{{"id": "sot", {both_or_neither}}}]}}"#
+            );
+            assert!(parse_jlcpcb_correction_policy(&policy, "test")
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one of footprint_prefix or footprint_exact"));
+        }
+    }
+
+    #[test]
+    fn footprint_exact_keeps_sot_23_from_its_5_and_6_pin_variants() {
+        let project = parse_jlcpcb_correction_policy(
+            r#"{
+              "schema_version": 1, "policy_id": "p", "provenance": "test",
+              "footprint_rules": [
+                {"id": "sot-23", "footprint_exact": "SOT-23", "rotation_degrees": 180},
+                {"id": "sot-23-6", "footprint_exact": "SOT-23-6", "rotation_degrees": 270}
+              ]
+            }"#,
+            "test",
+        )
+        .unwrap();
+        let policies = JlcpcbCorrectionPolicies {
+            built_in: built_in_policies().built_in,
+            project: Some(project),
+        };
+        let source = concat!(
+            "Ref,Val,Package,PosX,PosY,Rot,Side\n",
+            "Q1,npn,Package_TO_SOT_SMD:SOT-23,1,2,0,top\n",
+            "U1,ldo,Package_TO_SOT_SMD:SOT-23-5,1,2,0,top\n",
+            "U2,mux,Package_TO_SOT_SMD:SOT-23-6,1,2,0,top\n",
+        );
+        let export = jlcpcb_cpl_from_kicad_csv(source, &policies).unwrap();
+        let rows = csv_rows(&export.bytes);
+        // Three packages, three JLCPCB models: SOT-23's +180 reaches neither
+        // the 5-pin variant, left for review, nor the 6-pin one.
+        assert_eq!(rows[1][4], "180.000000");
+        assert_eq!(rows[2][4], "0.000000");
+        assert_eq!(rows[3][4], "270.000000");
+        let evidence = &export.orientation_evidence;
+        assert_eq!(evidence.applied_corrections[1].rule_id, "sot-23-6");
+        assert_eq!(evidence.unmatched_footprints[0].designator, "U1");
+        assert!(evidence.unmatched_footprints[0].review_required);
+    }
+
+    #[test]
+    fn uncovered_polarized_parts_are_listed_and_passives_are_not() {
+        let source = concat!(
+            "Ref,Val,Package,PosX,PosY,Rot,Side\n",
+            "R1,10k,Resistor_SMD:R_0402_1005Metric,1,2,0,top\n",
+            "C1,1u,Capacitor_SMD:C_0603_1608Metric,1,2,0,top\n",
+            "U1,ldo,Package_TO_SOT_SMD:SOT-223-3_TabPin2,1,2,0,top\n",
+            "U2,ldo,Package_TO_SOT_SMD:SOT-223-3_TabPin2,1,2,90,top\n",
+            "K1,relay,Relay_THT:Relay_SPDT_Finder_36.11,1,2,0,top\n",
+            "RN1,4x10k,Resistor_SMD:R_Array_Convex_4x0603,1,2,0,top\n",
+        );
+        let export = jlcpcb_cpl_from_kicad_csv(source, &built_in_policies()).unwrap();
+        let warnings = export.orientation_evidence.review_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("for 3 polarized or multi-pin footprint(s)"));
+        assert!(warnings[0].contains("SOT-223-3_TabPin2 (U1, U2)"));
+        assert!(warnings[0].contains("Relay_SPDT_Finder_36.11 (K1)"));
+        // Under `R_`, but pin 1 of a resistor array matters.
+        assert!(warnings[0].contains("R_Array_Convex_4x0603 (RN1)"));
+        assert!(!warnings[0].contains("R1"));
+
+        let passives_only =
+            "Ref,Val,Package,PosX,PosY,Rot,Side\nR1,10k,R_0402_1005Metric,1,2,0,top\n";
+        let export = jlcpcb_cpl_from_kicad_csv(passives_only, &built_in_policies()).unwrap();
+        assert!(export.orientation_evidence.review_warnings().is_empty());
+    }
+
+    #[test]
+    fn documented_project_policy_example_pins_designators() {
+        let project = parse_jlcpcb_correction_policy(
+            include_str!("../../../../../examples/jlcpcb_cpl_corrections.example.json"),
+            "example",
+        )
+        .unwrap();
+        let policies = JlcpcbCorrectionPolicies {
+            built_in: built_in_policies().built_in,
+            project: Some(project),
+        };
+        let source = concat!(
+            "Ref,Val,Package,PosX,PosY,Rot,Side\n",
+            "J1,usb,Connector_USB:USB_C_Receptacle_HRO_TYPE-C-31-M-12,1,2,180,top\n",
+            "U3,amp,Package_SO:TSSOP-8_4.4x3mm_P0.65mm,1,2,0,top\n",
+        );
+        let export = jlcpcb_cpl_from_kicad_csv(source, &policies).unwrap();
+        let rows = csv_rows(&export.bytes);
+        assert_eq!(rows[1][4], "180.000000");
+        assert_eq!(rows[2][4], "270.000000");
+        assert!(export.orientation_evidence.review_warnings().is_empty());
     }
 
     #[test]
@@ -741,7 +1363,8 @@ mod jlcpcb_assembly_tests {
         let j1 = rows.iter().find(|row| row[0] == "J1").unwrap();
         let r1 = rows.iter().find(|row| row[0] == "R1").unwrap();
         assert_eq!(u1, &["U1", "47.000000", "-35.000000", "top", "0.000000"]);
-        assert_eq!(j1, &["J1", "30.000000", "-26.500000", "top", "180.000000"]);
+        // The #518 J1 correction is no longer built in (see the HRO rule).
+        assert_eq!(j1, &["J1", "30.000000", "-26.500000", "top", "0.000000"]);
         assert_eq!(r1, &["R1", "38.000000", "-24.000000", "top", "90.000000"]);
         assert_eq!(export.designators.len(), 12);
     }
