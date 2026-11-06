@@ -72,6 +72,7 @@ pub(crate) mod sch_connectivity;
 pub mod sch_export;
 pub mod sch_hierarchy;
 mod sch_label_rename;
+mod sch_texts;
 pub mod sch_wiring;
 pub mod schematic_builder;
 #[cfg(test)]

@@ -357,6 +357,9 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_add_schematic_text(args, ctx).await }
         ),
+        super::sch_texts::list_tool(),
+        super::sch_texts::edit_tool(),
+        super::sch_texts::delete_tool(),
         tool!(
             "get_schematic_layout",
             "Return a compact spatial summary of the schematic: component positions, \
@@ -1909,17 +1912,7 @@ async fn handle_add_schematic_text(
         Err(e) => return Ok(CallToolResult::error(e)),
     };
     let uuid = new_uuid();
-
-    // Escape for a KiCad quoted string. Newlines and tabs must become their
-    // two-character escapes: KiCad's reader rejects a literal newline inside
-    // quotes, and it fails at the *file* level — a multi-line annotation makes
-    // the whole schematic unloadable with only "Failed to load schematic".
-    let escaped = text
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\r', "")
-        .replace('\n', "\\n")
-        .replace('\t', "\\t");
+    let escaped = escaped_text(&text);
 
     // Rounded to the six decimals KiCad writes: a caller passing back a
     // coordinate an older response reported (54.60999999999999, #747) would
@@ -1966,6 +1959,20 @@ async fn handle_add_schematic_text(
         "font": font_sexp,
         "uuid": uuid
     })))
+}
+
+/// `text` escaped for a KiCad quoted string, without the quotes, as
+/// `add_schematic_text` and `edit_schematic_text` write it. A newline must
+/// become `\n`: KiCad's reader rejects a literal newline inside quotes, and it
+/// fails at the *file* level — a multi-line annotation makes the whole
+/// schematic unloadable with only "Failed to load schematic". A tab is written
+/// `\t`, which KiCad's lexer reads back as a tab.
+pub(super) fn escaped_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
 }
 
 /// Confirm `content` holds the text `uuid` at its own `(at x y rotation)`, or
