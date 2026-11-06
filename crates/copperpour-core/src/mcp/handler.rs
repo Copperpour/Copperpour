@@ -2176,6 +2176,27 @@ mod schema_validation_dispatch_tests {
         assert_eq!(body["error"]["field"], "unit");
     }
 
+    /// The schema bound is the guard a caller meets first. The DSN does not
+    /// exist, so a call that got past the schema would be refused on another
+    /// field.
+    #[cfg(feature = "freerouting")]
+    #[tokio::test]
+    async fn optimize_seconds_above_a_day_is_refused_by_the_schema() {
+        let handler = handler().await;
+        let body = assert_invalid_field(
+            &handler,
+            "route_specctra_dsn",
+            json!({
+                "dsn_path": "does-not-exist.dsn",
+                "ses_output_path": "does-not-exist.ses",
+                "optimize_seconds": 86_401
+            }),
+            "optimize_seconds",
+        )
+        .await;
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+    }
+
     #[tokio::test]
     async fn wrong_typed_and_fractional_integer_options_are_refused_by_field() {
         let handler = handler().await;
