@@ -172,15 +172,7 @@ async fn main() -> Result<()> {
     // below: it holds the lock that proves this process is still alive.
     let _run_record = run_registry::sweep_and_register(&config.transport);
 
-    let server_config = copperpour_core::tools::ServerConfig {
-        kicad_cli: config.kicad_cli.clone(),
-        kicad_binary: config.kicad_binary.clone(),
-        ipc_address: config.ipc_address.clone(),
-        project_dir: config.project_dir.clone(),
-        jlcpcb_db_path: config.jlcpcb_db_path.clone(),
-        auto_load_toolsets: config.auto_load_toolsets,
-        eager_toolsets: config.eager_toolsets,
-    };
+    let server_config = config.apply_to_process();
     let handler = McpHandler::new_with_config_resolution(server_config, config_resolution).await?;
     match install::InstalledGuidanceProbe::for_current_user() {
         Ok(probe) => handler.set_guidance_probe(std::sync::Arc::new(probe)),

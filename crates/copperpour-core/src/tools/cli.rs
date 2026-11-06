@@ -14,13 +14,30 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-/// Extended timeout for long operations (export, ERC, DRC).
-const LONG_TIMEOUT: Duration = Duration::from_secs(600);
+/// Default timeout for long operations (export, ERC, DRC), in seconds.
+pub const DEFAULT_LONG_TIMEOUT_SECS: u64 = 600;
+
+/// Timeout for long operations, set once at startup from the `kicad_cli_timeout_seconds`
+/// setting. A full DRC of a large board with creepage rules can need more than the default,
+/// all the more on a loaded machine.
+static LONG_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(DEFAULT_LONG_TIMEOUT_SECS);
+
+/// Set the timeout of long kicad-cli operations. Zero is read as one second: zero would fail
+/// every call before kicad-cli could answer.
+pub fn set_long_timeout(seconds: u64) {
+    LONG_TIMEOUT_SECS.store(seconds.max(1), Ordering::Relaxed);
+}
+
+/// The timeout of long kicad-cli operations currently in force.
+pub fn long_timeout() -> Duration {
+    Duration::from_secs(LONG_TIMEOUT_SECS.load(Ordering::Relaxed))
+}
 
 fn cli_failure_diagnostics(stdout: &[u8], stderr: &[u8]) -> String {
     let stdout = String::from_utf8_lossy(stdout);
@@ -402,6 +419,9 @@ async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Re
     let exe = resolve_cli_executable(cli);
     let mut cmd = Command::new(&exe);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // A timed-out call drops the child: kill it then, or kicad-cli keeps running, on every
+    // core for a DRC, for a result nobody reads.
+    cmd.kill_on_drop(true);
 
     #[cfg(test)]
     let child = test_support::spawn_cli(&mut cmd)
@@ -711,6 +731,65 @@ pub(crate) mod test_support {
 
         assert_eq!(output, "ready");
     }
+
+    /// The state `ps` reports for `pid`, or `None` once the process is gone.
+    #[cfg(unix)]
+    fn process_state(pid: &str) -> Option<String> {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !state.is_empty()).then_some(state)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_cli_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        // `exec` so the PID written is the process left running, not a shell around it.
+        let cli = write_script(
+            dir.path(),
+            "hung-kicad-cli",
+            "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 30\n",
+            "",
+        );
+
+        let error = run_cli_captured(
+            cli.to_str().unwrap(),
+            &[pid_file.to_str().unwrap()],
+            Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .expect("a CLI that outlives the timeout must fail the call");
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "unexpected error: {error:#}"
+        );
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_string();
+        // SIGKILL is sent when the timed-out future drops the child; the process may stay a
+        // zombie until tokio reaps it, which no longer runs anything.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut state = process_state(&pid);
+        while state.as_deref().is_some_and(|s| !s.starts_with('Z'))
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            state = process_state(&pid);
+        }
+        if state.as_deref().is_some_and(|s| !s.starts_with('Z')) {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid])
+                .status();
+            panic!("kicad-cli {pid} is still running after the timeout (state {state:?})");
+        }
+    }
 }
 
 // ─── ERC ─────────────────────────────────────────────────────────────────────
@@ -766,7 +845,7 @@ async fn run_erc_with_temp_root(
             "mm",
             schematic.to_str().context("schematic path is not UTF-8")?,
         ];
-        run_cli(cli, &args, LONG_TIMEOUT).await?;
+        run_cli(cli, &args, long_timeout()).await?;
 
         let json_str = tokio::fs::read_to_string(&out_path)
             .await
@@ -1040,7 +1119,7 @@ pub async fn run_drc_with(
         refill_zones,
         checked_pcb.to_str().unwrap(),
     );
-    let output = run_cli_captured(cli, &args, LONG_TIMEOUT).await?;
+    let output = run_cli_captured(cli, &args, long_timeout()).await?;
 
     let json_str = tokio::fs::read_to_string(&out_path)
         .await
@@ -1414,7 +1493,7 @@ pub async fn export_schematic_svg(
         schematic.to_str().unwrap(),
         options,
     );
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
     let stem = schematic.file_stem().unwrap_or_default().to_string_lossy();
     let staged_root = staging.path().join(format!("{}.svg", stem));
 
@@ -1482,7 +1561,7 @@ pub async fn export_schematic_pdf(
         schematic.to_str().unwrap(),
         options,
     );
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
     publish_verified_file(&staged, output, "schematic PDF").await?;
     Ok(())
 }
@@ -1591,7 +1670,7 @@ async fn export_bom_with_options(
         options,
         ref_range_delimiter,
     );
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
     publish_verified_file(&staged, output, "BOM").await?;
     Ok(())
 }
@@ -1626,7 +1705,7 @@ pub async fn export_netlist(
         v10_format,
         schematic.to_str().unwrap(),
     ];
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
     Ok(())
 }
 
@@ -1659,7 +1738,7 @@ pub async fn export_gerber(
         pcb.to_str().unwrap_or(""),
         &layers_csv,
     );
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
 
     let board_stem = pcb.file_stem().unwrap_or_default().to_string_lossy();
     let mut files = Vec::new();
@@ -1754,7 +1833,7 @@ pub async fn export_drill(cli: &str, pcb: &Path, output_dir: &Path) -> Result<Ve
     let staging = export_staging_dir(output_dir)?;
     let dir_arg = drill_output_dir_arg(staging.path().to_str().unwrap_or(""));
     let args = drill_args(&dir_arg, pcb.to_str().unwrap_or(""));
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
     let files = drill_files_in(staging.path()).await;
     if files.is_empty() {
         anyhow::bail!(
@@ -1820,7 +1899,7 @@ pub async fn export_pdf(
         pcb.to_str().unwrap(),
     )?;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
     publish_verified_file(&staged, output, "PCB PDF").await?;
     Ok(())
 }
@@ -1842,7 +1921,7 @@ pub async fn export_svg_pcb(
         pcb.to_str().unwrap(),
     )?;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
     Ok(())
 }
 
@@ -1891,7 +1970,7 @@ pub async fn export_3d(
         format,
         include_unspecified,
     )?;
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
     Ok(())
 }
 
@@ -1975,7 +2054,7 @@ async fn export_position_file_with_options(
         side,
         exclude_dnp,
     );
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
     publish_verified_file(&staged, output, "position file").await?;
     Ok(())
 }
@@ -1990,7 +2069,7 @@ pub async fn export_ipcd356(cli: &str, pcb: &Path, output: &Path) -> Result<()> 
         output.to_str().unwrap(),
         pcb.to_str().unwrap(),
     ];
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
     Ok(())
 }
 
@@ -2067,7 +2146,7 @@ pub(crate) async fn upgrade_legacy_footprint(
 /// (`PCBNEW_JOBS_HANDLER::JobUpgrade`).
 pub(crate) async fn resave_board(cli: &str, board: &Path) -> Result<()> {
     let board = board.to_str().context("board path is not UTF-8")?;
-    run_cli(cli, &["pcb", "upgrade", "--force", board], LONG_TIMEOUT).await?;
+    run_cli(cli, &["pcb", "upgrade", "--force", board], long_timeout()).await?;
     Ok(())
 }
 
@@ -2090,7 +2169,7 @@ pub async fn export_dxf(cli: &str, pcb: &Path, output_dir: &Path, layers: &[&str
     args.push("--mode-multi");
     args.push(pcb_str);
 
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
     Ok(())
 }
 
@@ -2104,7 +2183,7 @@ pub async fn export_gencad(cli: &str, pcb: &Path, output: &Path) -> Result<()> {
         output.to_str().unwrap(),
         pcb.to_str().unwrap(),
     ];
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
     Ok(())
 }
 
@@ -2127,7 +2206,7 @@ pub async fn export_ipc2581(
     }
     args.push(pcb_str);
 
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
     Ok(())
 }
 
@@ -2152,7 +2231,7 @@ pub async fn export_odb(
         compression,
         pcb.to_str().unwrap(),
     ];
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
     Ok(())
 }
 
@@ -2192,7 +2271,7 @@ pub async fn render_pcb_png(
         &height_str,
         pcb.to_str().unwrap(),
     ];
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_cli(cli, &args, long_timeout()).await?;
     Ok(())
 }
 
