@@ -2806,11 +2806,16 @@ async fn handle_route_diff_pair(
 #[cfg(test)]
 mod specctra_live_undo_test {
     use super::*;
-    use crate::router::ToolRouter;
-    use crate::tools::ServerConfig;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    // The live undo test routes through Freerouting (#210).
+    #[cfg(feature = "freerouting")]
+    use {
+        crate::router::ToolRouter,
+        crate::tools::ServerConfig,
+        std::sync::Arc,
+        std::time::{Duration, Instant},
+    };
 
+    #[cfg(feature = "freerouting")]
     fn response_json(result: &CallToolResult) -> serde_json::Value {
         match &result.content[0] {
             crate::mcp::protocol::ToolContent::Text { text } => {
@@ -2855,6 +2860,7 @@ mod specctra_live_undo_test {
 
     #[tokio::test]
     #[ignore = "requires a disposable locked fixture open in KiCad and one manual Ctrl+Z"]
+    #[cfg(feature = "freerouting")]
     async fn one_undo_restores_the_exact_pre_import_board_snapshot() {
         let board = std::path::PathBuf::from(
             crate::app_dirs::env_var("LIVE_SPECCTRA_BOARD")

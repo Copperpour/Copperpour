@@ -26,6 +26,7 @@ pub mod design_review;
 #[cfg(test)]
 mod design_rules_tests;
 pub(crate) mod drc;
+#[cfg(feature = "jlcpcb")]
 pub mod easyeda;
 pub mod editor_navigation;
 mod erc_severity;
@@ -33,10 +34,12 @@ mod footprint_fields;
 mod footprint_graphics;
 mod footprint_metadata;
 mod footprint_models;
+#[cfg(any(feature = "jlcpcb", feature = "freerouting"))]
 pub mod integration;
 #[cfg(test)]
 mod kicad10_schematic_identity_tests;
 pub(crate) mod launch;
+#[cfg(feature = "jlcpcb")]
 pub(crate) mod lcsc_packages;
 pub mod library;
 mod library_footprint;
@@ -553,6 +556,29 @@ macro_rules! tool {
         });
         $crate::tools::ToolDef::new($name, $desc, $schema, h)
     }};
+}
+
+/// A placement tool's schema as this build offers it. Without the JLCPCB
+/// catalog (#210) nothing fills a symbol's fields from an LCSC number, so
+/// `lcsc_id` isn't offered; the `LCSC` field can still be set with `fields`.
+pub(crate) fn placement_schema(schema: Value) -> Value {
+    #[cfg(not(feature = "jlcpcb"))]
+    let schema = {
+        fn drop_lcsc_id(node: &mut Value) {
+            if let Some(properties) = node.get_mut("properties").and_then(Value::as_object_mut) {
+                properties.remove("lcsc_id");
+            }
+            match node {
+                Value::Object(map) => map.values_mut().for_each(drop_lcsc_id),
+                Value::Array(items) => items.iter_mut().for_each(drop_lcsc_id),
+                _ => {}
+            }
+        }
+        let mut schema = schema;
+        drop_lcsc_id(&mut schema);
+        schema
+    };
+    schema
 }
 
 pub(crate) fn compile_input_validator(

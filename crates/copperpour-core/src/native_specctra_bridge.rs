@@ -4,17 +4,33 @@
 //! board into its own private temporary directory; it cannot execute arbitrary
 //! Python or write a caller-selected path. KiCad 11 and installations without
 //! the legacy plugin continue through Copperpour's Rust exporter.
+//!
+//! The bridge comes with the `native-bridge` feature (#210). Without it,
+//! [`try_export`] finds no bridge and says why, so `native_bridge_mode:
+//! "prefer"` uses the Rust exporter and `"require"` refuses.
 
-use anyhow::{bail, Context, Result};
-use reqwest::Url;
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::Path;
+#[cfg(feature = "native-bridge")]
+use {
+    anyhow::{bail, Context, Result},
+    reqwest::Url,
+    serde::{Deserialize, Serialize},
+    std::path::PathBuf,
+    std::time::Duration,
+};
 
+#[cfg(feature = "native-bridge")]
 const PROTOCOL_VERSION: u32 = 1;
+#[cfg(feature = "native-bridge")]
 const MAX_DSN_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Why no bridge is tried in a build without the `native-bridge` feature.
+#[cfg(not(feature = "native-bridge"))]
+pub(crate) const NOT_IN_THIS_BUILD: &str =
+    "this build of Copperpour has no native Specctra bridge (built without the 'native-bridge' feature)";
+
 #[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "native-bridge"), allow(dead_code))]
 pub(crate) struct NativeExport {
     pub dsn: String,
     pub plugin_pid: u32,
@@ -27,6 +43,7 @@ pub(crate) struct NativeExportAttempt {
     pub diagnostics: Vec<String>,
 }
 
+#[cfg(feature = "native-bridge")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Registration {
@@ -37,6 +54,7 @@ struct Registration {
     started_at_unix: f64,
 }
 
+#[cfg(feature = "native-bridge")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StatusResponse {
@@ -46,11 +64,13 @@ struct StatusResponse {
     native_specctra_export: bool,
 }
 
+#[cfg(feature = "native-bridge")]
 #[derive(Debug, Serialize)]
 struct ExportRequest<'a> {
     expected_board: &'a str,
 }
 
+#[cfg(feature = "native-bridge")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExportResponse {
@@ -62,6 +82,15 @@ struct ExportResponse {
     dsn_bytes: u64,
 }
 
+#[cfg(not(feature = "native-bridge"))]
+pub(crate) async fn try_export(_board: &Path) -> NativeExportAttempt {
+    NativeExportAttempt {
+        export: None,
+        diagnostics: vec![NOT_IN_THIS_BUILD.to_owned()],
+    }
+}
+
+#[cfg(feature = "native-bridge")]
 pub(crate) async fn try_export(board: &Path) -> NativeExportAttempt {
     let mut attempt = NativeExportAttempt::default();
     let Some(root) = registration_root() else {
@@ -117,6 +146,7 @@ pub(crate) async fn try_export(board: &Path) -> NativeExportAttempt {
     attempt
 }
 
+#[cfg(feature = "native-bridge")]
 pub(crate) fn registration_root() -> Option<PathBuf> {
     if let Some(path) = crate::app_dirs::env_var("BRIDGE_DIR") {
         // Relative would mean this process's working directory, not KiCad's (#181).
@@ -127,6 +157,7 @@ pub(crate) fn registration_root() -> Option<PathBuf> {
         .map(|path| path.join(crate::app_dirs::APP_NAME).join("native-bridge"))
 }
 
+#[cfg(feature = "native-bridge")]
 fn registrations(root: &Path) -> Result<Vec<PathBuf>> {
     if !root.is_dir() {
         return Ok(Vec::new());
@@ -144,6 +175,7 @@ fn registrations(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(entries)
 }
 
+#[cfg(feature = "native-bridge")]
 async fn try_registration(
     root: &Path,
     registration_path: &Path,
@@ -230,6 +262,7 @@ async fn try_registration(
     })
 }
 
+#[cfg(feature = "native-bridge")]
 fn validate_registration(registration: &Registration) -> Result<()> {
     if registration.protocol_version != PROTOCOL_VERSION
         || registration.pid == 0
@@ -254,6 +287,7 @@ fn validate_registration(registration: &Registration) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "native-bridge")]
 fn validate_response(
     registration: &Registration,
     response: &ExportResponse,
@@ -285,7 +319,21 @@ fn validate_response(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "native-bridge")))]
+mod not_in_this_build_tests {
+    use super::*;
+
+    /// Without the bridge nothing is tried, and the diagnostic says why, so
+    /// `require` refuses with that reason and `prefer` falls back (#210).
+    #[tokio::test]
+    async fn no_bridge_is_tried_and_the_diagnostic_says_why() {
+        let attempt = try_export(Path::new("board.kicad_pcb")).await;
+        assert!(attempt.export.is_none());
+        assert_eq!(attempt.diagnostics, [NOT_IN_THIS_BUILD]);
+    }
+}
+
+#[cfg(all(test, feature = "native-bridge"))]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

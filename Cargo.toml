@@ -98,7 +98,8 @@ gix = { version = "0.88", features = ["status", "worktree-mutation"] }
 # Internal crates
 copperpour-sexp = { path = "crates/copperpour-sexp" }
 copperpour-ipc = { path = "crates/copperpour-ipc" }
-copperpour-core = { path = "crates/copperpour-core" }
+# Members choose its features: see crates/copperpour/Cargo.toml (#210).
+copperpour-core = { path = "crates/copperpour-core", default-features = false }
 copperpour-schematic-editor = { path = "crates/copperpour-schematic-editor" }
 copperpour-render = { path = "crates/copperpour-render" }
 copperpour-vcs = { path = "crates/copperpour-vcs" }

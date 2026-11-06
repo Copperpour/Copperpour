@@ -53,6 +53,13 @@ file and calls into them:
   `LcscCatalog` is the one way a tool reads the local catalog, so every tool
   finds it in the same place and reports a missing or unreadable one alike.
 
+`sourcing/catalog`, `sourcing/lcsc_api` and `sourcing/easyeda` need the
+`jlcpcb` Cargo feature, and `autorouting` needs `freerouting`.
+`native_specctra_bridge.rs` reaches the KiCad plugin only with `native-bridge`
+(#210). All three features are on by default. `fab` and `sourcing`'s
+`LcscCatalog` are in every build: fabrication and assembly output need no
+network. See DEV.md's Build Features.
+
 ### KiCad data layers
 
 `crates/copperpour-sexp` owns low-level KiCad S-expression parsing, edits, geometry,

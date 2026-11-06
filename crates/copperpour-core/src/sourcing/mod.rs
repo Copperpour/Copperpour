@@ -4,14 +4,29 @@
 //!
 //! [`LcscCatalog`] is the one way the tools read the local catalog, so they
 //! agree on where it is and on how a missing or unreadable one is reported.
+//!
+//! The catalog, the LCSC API and EasyEDA come with the `jlcpcb` feature
+//! (#210). Without it [`LcscCatalog`] stays, and reports every catalog as
+//! missing from the build, so placement and `estimate_cost` work unchanged.
 
+#[cfg(feature = "jlcpcb")]
 pub(crate) mod catalog;
+#[cfg(feature = "jlcpcb")]
 pub(crate) mod easyeda;
+#[cfg(feature = "jlcpcb")]
 pub(crate) mod lcsc_api;
+mod parts;
+
+pub(crate) use parts::{CatalogPrices, JlcpchPartInfo};
 
 use crate::tools::ToolContext;
 use serde_json::json;
 use std::path::{Path, PathBuf};
+
+/// Why no catalog is read in a build without the `jlcpcb` feature.
+#[cfg(not(feature = "jlcpcb"))]
+pub(crate) const NOT_IN_THIS_BUILD: &str =
+    "this build of Copperpour has no JLCPCB parts catalog (built without the 'jlcpcb' feature)";
 
 /// The local catalog a tool call reads: the `db_path` argument, else the
 /// `jlcpcb_db_path` setting, else the default path.
@@ -19,11 +34,14 @@ use std::path::{Path, PathBuf};
 pub(crate) struct LcscCatalog {
     path: Option<PathBuf>,
     /// The caller named the path with `db_path`.
+    #[cfg(feature = "jlcpcb")]
     explicit: bool,
 }
 
 /// What reading the local catalog gave.
 #[derive(Debug)]
+// Without the catalog every lookup is `Missing` (#210).
+#[cfg_attr(not(feature = "jlcpcb"), allow(dead_code))]
 pub(crate) enum Lookup<T> {
     Read(T),
     /// No catalog to read: no path, or no file at it. The catalog is
@@ -35,8 +53,16 @@ pub(crate) enum Lookup<T> {
 
 impl LcscCatalog {
     pub(crate) fn resolve(args: &serde_json::Value, ctx: &ToolContext) -> Self {
+        #[cfg(feature = "jlcpcb")]
+        let path = catalog::resolve_db_path(args, ctx);
+        #[cfg(not(feature = "jlcpcb"))]
+        let path = {
+            let _ = (args, ctx);
+            None
+        };
         Self {
-            path: catalog::resolve_db_path(args, ctx),
+            path,
+            #[cfg(feature = "jlcpcb")]
             explicit: args["db_path"].as_str().is_some(),
         }
     }
@@ -48,15 +74,18 @@ impl LcscCatalog {
     /// Whether the caller named the catalog with `db_path`. A tool may refuse
     /// a missing or unreadable catalog the caller named, rather than carry on
     /// without it.
+    #[cfg(feature = "jlcpcb")]
     pub(crate) fn is_explicit(&self) -> bool {
         self.explicit
     }
 
     /// The catalog's path when there is a file at it, or why there isn't.
+    #[cfg(feature = "jlcpcb")]
     pub(crate) fn available_path(&self) -> Result<PathBuf, String> {
         self.available().map(Path::to_path_buf)
     }
 
+    #[cfg(feature = "jlcpcb")]
     fn available(&self) -> Result<&Path, String> {
         match &self.path {
             None => Err(
@@ -71,12 +100,14 @@ impl LcscCatalog {
         }
     }
 
+    #[cfg(feature = "jlcpcb")]
     fn unreadable(&self, error: anyhow::Error) -> String {
         let path = self.path.as_deref().unwrap_or(Path::new(""));
         format!("cannot read the catalog at {}: {error:#}", path.display())
     }
 
     /// Runs `query` against the catalog, here.
+    #[cfg(feature = "jlcpcb")]
     pub(crate) fn read_blocking<T>(
         &self,
         query: impl FnOnce(&Path) -> anyhow::Result<T>,
@@ -91,6 +122,7 @@ impl LcscCatalog {
     }
 
     /// Runs `query` against the catalog, on a blocking thread.
+    #[cfg(feature = "jlcpcb")]
     pub(crate) async fn read<T: Send + 'static>(
         &self,
         query: impl FnOnce(&Path) -> anyhow::Result<T> + Send + 'static,
@@ -110,11 +142,18 @@ impl LcscCatalog {
     }
 
     /// The part with this LCSC number, for filling a placed symbol's fields.
-    pub(crate) fn part_info(&self, lcsc_id: &str) -> Lookup<Option<catalog::JlcpchPartInfo>> {
-        self.read_blocking(|path| catalog::query_part_info(path, lcsc_id))
+    pub(crate) fn part_info(&self, lcsc_id: &str) -> Lookup<Option<JlcpchPartInfo>> {
+        #[cfg(feature = "jlcpcb")]
+        return self.read_blocking(|path| catalog::query_part_info(path, lcsc_id));
+        #[cfg(not(feature = "jlcpcb"))]
+        {
+            let _ = lcsc_id;
+            Lookup::Missing(NOT_IN_THIS_BUILD.to_owned())
+        }
     }
 
     /// One part's datasheet, by LCSC number or else MPN.
+    #[cfg(feature = "jlcpcb")]
     pub(crate) async fn datasheet(
         &self,
         lcsc_id: Option<&str>,
@@ -126,6 +165,7 @@ impl LcscCatalog {
     }
 
     /// Datasheets of several parts, by LCSC number.
+    #[cfg(feature = "jlcpcb")]
     pub(crate) async fn datasheets(&self, lcsc_ids: &[String]) -> Lookup<catalog::CatalogRead> {
         let ids = lcsc_ids.to_vec();
         self.read(move |path| catalog::query_catalog_datasheets(path, &ids))
@@ -133,10 +173,18 @@ impl LcscCatalog {
     }
 
     /// Prices, price breaks and library types of several parts.
-    pub(crate) async fn prices(&self, lcsc_ids: &[String]) -> Lookup<catalog::CatalogPrices> {
-        let ids = lcsc_ids.to_vec();
-        self.read(move |path| catalog::query_catalog_prices(path, &ids))
-            .await
+    pub(crate) async fn prices(&self, lcsc_ids: &[String]) -> Lookup<CatalogPrices> {
+        #[cfg(feature = "jlcpcb")]
+        {
+            let ids = lcsc_ids.to_vec();
+            self.read(move |path| catalog::query_catalog_prices(path, &ids))
+                .await
+        }
+        #[cfg(not(feature = "jlcpcb"))]
+        {
+            let _ = lcsc_ids;
+            Lookup::Missing(NOT_IN_THIS_BUILD.to_owned())
+        }
     }
 }
 
@@ -163,7 +211,31 @@ impl<T> Lookup<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "jlcpcb")))]
+mod not_in_this_build_tests {
+    use super::*;
+
+    /// Without the catalog, placement and pricing still get a report, saying
+    /// why no catalog was read, and no path: none is looked for.
+    #[tokio::test]
+    async fn every_catalog_is_missing_from_the_build() {
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let catalog = LcscCatalog::resolve(&json!({}), &ctx);
+        let lookup = catalog.part_info("C1");
+        assert!(matches!(&lookup, Lookup::Missing(reason) if reason == NOT_IN_THIS_BUILD));
+        assert_eq!(
+            lookup.report(&catalog),
+            json!({ "read": false, "reason": NOT_IN_THIS_BUILD })
+        );
+        let prices = catalog.prices(&["C1".to_owned()]).await;
+        assert_eq!(prices.reason(), Some(NOT_IN_THIS_BUILD));
+    }
+}
+
+#[cfg(all(test, feature = "jlcpcb"))]
 mod tests {
     use super::*;
 

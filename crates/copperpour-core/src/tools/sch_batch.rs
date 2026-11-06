@@ -140,7 +140,7 @@ pub fn tools() -> Vec<ToolDef> {
              There is no auto-numbering: an omitted reference becomes the library prefix \
              plus '?' (e.g. 'R?', '#FLG?'), like an eeschema-unannotated symbol, same as \
              add_schematic_component; annotate_schematic numbers it.",
-            json!({
+            super::placement_schema(json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
@@ -165,7 +165,7 @@ pub fn tools() -> Vec<ToolDef> {
                     }
                 },
                 "required": ["schematic", "components"]
-            }),
+            })),
             |args, ctx| async move { handle_batch_place_components(args, ctx).await }
         ),
         tool!(
@@ -2606,6 +2606,7 @@ mod batch_place_and_connect_tests {
 
     /// A context whose `jlcpcb_db_path` setting names `db_path`, as a caller
     /// configures the catalog: the placement tools take no path argument.
+    #[cfg(feature = "jlcpcb")]
     fn ctx_with_catalog(db_path: &std::path::Path) -> ToolContext {
         ToolContext::new(
             ServerConfig {
@@ -2717,6 +2718,7 @@ mod batch_place_and_connect_tests {
     /// Each placed entry with an LCSC number carries the catalog's report;
     /// one without has none (#209).
     #[tokio::test]
+    #[cfg(feature = "jlcpcb")]
     async fn batch_place_components_reports_the_catalog_per_entry() {
         let (dir, path) = seeded_schematic();
         let db_path = dir.path().join("jlcpcb.db");

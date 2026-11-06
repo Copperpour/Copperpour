@@ -39,6 +39,13 @@ toml.workspace = true
 dirs.workspace = true
 fs4.workspace = true
 
+[features]
+# Forwards copperpour-core's integrations; see its Cargo.toml (#210).
+default = ["jlcpcb", "freerouting", "native-bridge"]
+jlcpcb = ["copperpour-core/jlcpcb"]
+freerouting = ["copperpour-core/freerouting"]
+native-bridge = ["copperpour-core/native-bridge"]
+
 [build-dependencies]
 
 [dev-dependencies]

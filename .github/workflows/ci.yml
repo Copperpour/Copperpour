@@ -121,6 +121,48 @@ jobs:
       # of a transform assertion unwritten, and a handful of style lints (#121).
       - run: cargo clippy --workspace --locked --all-targets -- -D warnings
 
+  # The offline build (#210). `--no-default-features` leaves out the JLCPCB
+  # catalog, Freerouting and the native Specctra bridge. Cargo features only
+  # add code, so this job is what keeps that build free of an outbound HTTP
+  # client and of vendor hosts, and each integration buildable on its own.
+  # Release, PCM and Nix builds keep the default features.
+  offline:
+    name: Offline build (no default features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc@3.23.4
+          fallback: none
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build -p copperpour --locked --no-default-features
+      - name: Clippy
+        run: cargo clippy -p copperpour-core -p copperpour --locked --no-default-features --all-targets -- -D warnings
+      - name: Test (unit + integration)
+        run: cargo test -p copperpour-core -p copperpour --locked --no-default-features --lib --tests
+      # hyper stays: axum serves the HTTP transport with it, inbound only.
+      - name: No HTTP client, catalog or archive crate in the dependency tree
+        run: |
+          found=$(cargo tree -p copperpour --locked --no-default-features -e normal --prefix none --format '{p}' \
+            | grep -E '^(reqwest|rusqlite|libsqlite3-sys|zip|rustls|hyper-rustls|hyper-tls|native-tls|openssl) ' | sort -u || true)
+          if [ -n "$found" ]; then echo "$found"; exit 1; fi
+      - name: No vendor hosts in the binaries
+        run: |
+          found=$(grep -a -o -i -h -E '[a-z0-9.-]*(lcsc|jlcpcb|easyeda|lceda)\.(com|cn)' \
+            target/debug/copperpour target/debug/konnect target/debug/libcopperpour_plugin.so | sort -u || true)
+          if [ -n "$found" ]; then echo "$found"; exit 1; fi
+      - name: Each integration builds on its own
+        run: |
+          for feature in jlcpcb freerouting native-bridge; do
+            cargo check -p copperpour --locked --no-default-features --features "$feature"
+          done
+
   # Dependency license gate (deny.toml). Every dependency must be
   # AGPL-compatible; this job stops an incompatible license entering via an
   # innocuous-looking dependency bump.

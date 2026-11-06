@@ -938,6 +938,7 @@ fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
 /// environment. The environment is redirected so a Freerouting installed on
 /// the machine running the test cannot be found.
 #[test]
+#[cfg(feature = "freerouting")]
 fn check_freerouting_reports_every_location_it_searched_over_stdio() {
     let tmp = tempfile::tempdir().unwrap();
     let bin = tmp.path().join("bin");
@@ -1012,6 +1013,7 @@ fn check_freerouting_reports_every_location_it_searched_over_stdio() {
 /// server must create nothing beside them.
 /// Unix only: Windows reads `APPDATA`, and falls back to the real profile.
 #[cfg(unix)]
+#[cfg(feature = "jlcpcb")]
 #[test]
 fn a_relative_home_never_reaches_the_working_directory() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1170,6 +1172,7 @@ fn a_relative_home_never_reaches_the_working_directory() {
     }
 }
 
+#[cfg(all(unix, feature = "jlcpcb"))]
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap().flatten() {

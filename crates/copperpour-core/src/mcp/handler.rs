@@ -761,6 +761,33 @@ mod required_argument_dispatch_tests {
         .expect("handler builds")
     }
 
+    /// A build without an integration doesn't register its tools (#210): a
+    /// call to one is refused as `unknown_tool`, as a misspelt name is, and
+    /// `list_toolboxes` leaves out a toolset with no tools left.
+    #[tokio::test]
+    async fn a_compiled_out_tool_is_unknown_and_an_empty_toolset_unlisted() {
+        let handler = handler().await;
+        for (tool, compiled_in) in [
+            ("search_jlcpcb_parts", cfg!(feature = "jlcpcb")),
+            ("download_jlcpcb_database", cfg!(feature = "jlcpcb")),
+            ("check_freerouting", cfg!(feature = "freerouting")),
+        ] {
+            let (_, _, kind) = handler.dispatch_tool(tool, &json!({})).await;
+            assert_eq!(
+                kind.as_deref() == Some("unknown_tool"),
+                !compiled_in,
+                "{tool}"
+            );
+        }
+        let listed = crate::router::registry::ALL_TOOLSETS
+            .iter()
+            .any(|toolset| toolset.name == "integration");
+        assert_eq!(
+            listed,
+            cfg!(any(feature = "jlcpcb", feature = "freerouting"))
+        );
+    }
+
     #[tokio::test]
     async fn a_missing_required_argument_is_refused_by_name() {
         let handler = handler().await;
@@ -773,13 +800,16 @@ mod required_argument_dispatch_tests {
         let cases: Vec<(&str, Value, &str)> = vec![
             ("search_symbols", json!({}), "query"),
             ("search_footprints", json!({}), "query"),
+            #[cfg(feature = "jlcpcb")]
             ("search_jlcpcb_parts", json!({}), "query"),
             ("search_templates", json!({}), "query"),
+            #[cfg(feature = "jlcpcb")]
             (
                 "suggest_jlcpcb_alternatives",
                 json!({ "footprint": "0402" }),
                 "value",
             ),
+            #[cfg(feature = "jlcpcb")]
             (
                 "suggest_jlcpcb_alternatives",
                 json!({ "value": "10k" }),

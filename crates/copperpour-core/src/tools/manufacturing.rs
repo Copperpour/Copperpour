@@ -831,11 +831,17 @@ async fn handle_estimate_cost(
     }
     let components = match &catalog_pricing {
         Some((pricing, average, _, fee_source)) => {
+            #[cfg(feature = "jlcpcb")]
             notes.push(format!(
                 "Parts with an LCSC field are priced from the local JLCPCB catalog, at the price break \
                  for the order's quantity of each; other parts at an average of \
                  ${average:.2}. components lists which is which; search_jlcpcb_parts \
                  finds an LCSC number for a part."
+            ));
+            #[cfg(not(feature = "jlcpcb"))]
+            notes.push(format!(
+                "Every part is priced at an average of ${average:.2}: this build of Copperpour \
+                 has no JLCPCB parts catalog (built without the 'jlcpcb' feature)."
             ));
             notes.push(fee_source.to_string());
             json!({
@@ -1552,15 +1558,18 @@ mod estimate_cost_catalog_tests {
     /// have. C1119's price rounds to $0.000, as 671 parts' do in the
     /// 2026-11-04 feed. C1111 has no price: NULL here, and 0 in a catalog
     /// from before #63.
+    #[cfg(feature = "jlcpcb")]
     fn seed_catalog(dir: &Path) -> PathBuf {
         seed(dir, true)
     }
 
     /// A catalog from before #63: no `Price_Breaks` column, user_version 1.
+    #[cfg(feature = "jlcpcb")]
     fn seed_old_catalog(dir: &Path) -> PathBuf {
         seed(dir, false)
     }
 
+    #[cfg(feature = "jlcpcb")]
     fn seed(dir: &Path, with_price_breaks: bool) -> PathBuf {
         let db_path = dir.join("jlcpcb.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1610,6 +1619,7 @@ mod estimate_cost_catalog_tests {
     }
 
     /// The `priced_from_catalog` entry for `lcsc`.
+    #[cfg(feature = "jlcpcb")]
     fn priced<'a>(report: &'a serde_json::Value, lcsc: &str) -> &'a serde_json::Value {
         report["components"]["priced_from_catalog"]
             .as_array()
@@ -1662,6 +1672,7 @@ mod estimate_cost_catalog_tests {
     /// Parts with catalog prices are priced from them, the rest at the
     /// average, and each unique Extended part adds its fee once.
     #[tokio::test]
+    #[cfg(feature = "jlcpcb")]
     async fn jlcpcb_prices_parts_from_the_catalog_and_adds_extended_fees() {
         let dir = tempfile::tempdir().unwrap();
         let report = estimate("jlcpcb", &seed_catalog(dir.path())).await;
@@ -1760,10 +1771,19 @@ mod estimate_cost_catalog_tests {
         let report = estimate("jlcpcb", &dir.path().join("missing.db")).await;
         let components = &report["components"];
         assert_eq!(components["catalog"]["read"], false, "{report}");
-        assert!(components["catalog"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("download_jlcpcb_database"));
+        let reason = components["catalog"]["reason"].as_str().unwrap();
+        #[cfg(feature = "jlcpcb")]
+        assert!(reason.contains("download_jlcpcb_database"), "{reason}");
+        // A build without the catalog prices the same way, and says why (#210).
+        // Its notes name no catalog tool, and no vendor URL.
+        #[cfg(not(feature = "jlcpcb"))]
+        {
+            assert_eq!(reason, crate::sourcing::NOT_IN_THIS_BUILD);
+            let notes = report["notes"].to_string();
+            assert!(notes.contains("no JLCPCB parts catalog"), "{notes}");
+            assert!(!notes.contains("search_jlcpcb_parts"), "{notes}");
+            assert!(!notes.contains("jlcpcb.com"), "{notes}");
+        }
         assert_eq!(components["priced_from_catalog"], json!([]));
         let estimated = components["estimated"].as_array().unwrap();
         assert!(estimated[1..]
@@ -1777,6 +1797,7 @@ mod estimate_cost_catalog_tests {
     /// A catalog from before #63 has no price breaks: parts are at their
     /// first break's price, and the response says so.
     #[tokio::test]
+    #[cfg(feature = "jlcpcb")]
     async fn an_old_catalog_prices_at_the_first_break_and_says_so() {
         let dir = tempfile::tempdir().unwrap();
         let report = estimate("jlcpcb", &seed_old_catalog(dir.path())).await;
@@ -1813,6 +1834,7 @@ mod estimate_cost_catalog_tests {
     /// Through served dispatch, with the catalog from the setting: the
     /// schema accepts the call, and a part is priced at its quantity break.
     #[tokio::test]
+    #[cfg(feature = "jlcpcb")]
     async fn served_estimate_prices_at_the_quantity_break() {
         let dir = tempfile::tempdir().unwrap();
         let handler = crate::mcp::handler::McpHandler::new(config(&seed_catalog(dir.path())))
@@ -1852,6 +1874,7 @@ mod estimate_cost_catalog_tests {
     /// A quantity so large that count x boards overflows saturates instead
     /// of panicking or wrapping to a small order.
     #[tokio::test]
+    #[cfg(feature = "jlcpcb")]
     async fn a_huge_quantity_saturates_the_order_quantity() {
         let dir = tempfile::tempdir().unwrap();
         let args = json!({
@@ -1876,6 +1899,7 @@ mod estimate_cost_catalog_tests {
 
     /// PCBWay keeps its per-part average and does not read the catalog.
     #[tokio::test]
+    #[cfg(feature = "jlcpcb")]
     async fn pcbway_keeps_its_average() {
         let dir = tempfile::tempdir().unwrap();
         let report = estimate("pcbway", &seed_catalog(dir.path())).await;

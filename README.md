@@ -231,6 +231,29 @@ cargo build --release -p copperpour
 The program is at `target/release/copperpour`. The schematic viewer is built
 separately; see [DEV.md](DEV.md).
 
+For a build that makes no outbound connections, leave out the integrations:
+
+```bash
+cargo build --release -p copperpour --no-default-features
+```
+
+That build has no outbound HTTP client and no vendor endpoints, and CI checks
+both. It leaves out three features, which a release build has:
+
+- `jlcpcb`: the JLCPCB parts catalog, its download, and the LCSC and EasyEDA
+  lookups. That is the catalog, import and datasheet tools of the `integration`
+  toolset, and `lcsc_id` in `add_schematic_component` and
+  `batch_place_components`.
+- `freerouting`: `check_freerouting` and `route_specctra_dsn`.
+- `native-bridge`: the KiCad plugin's Specctra export bridge, which talks to
+  KiCad on localhost. `export_specctra_dsn` then always uses Copperpour's own
+  exporter, and refuses `native_bridge_mode: "require"`.
+
+Fabrication and assembly output work for every fab house. Without the catalog,
+`estimate_cost` prices JLCPCB parts at its average. Add a feature back with
+`--features jlcpcb`, for example. The tool counts in these docs are for the
+default build.
+
 </details>
 
 <details>

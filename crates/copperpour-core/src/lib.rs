@@ -1,4 +1,5 @@
 pub mod app_dirs;
+#[cfg(feature = "freerouting")]
 pub(crate) mod autorouting;
 pub mod config_resolution;
 pub mod design_hash;
@@ -6,6 +7,7 @@ pub(crate) mod fab;
 pub mod gates;
 pub mod guidance;
 pub(crate) mod hex;
+#[cfg(feature = "freerouting")]
 pub(crate) mod java_runtime;
 pub mod kicad_install;
 pub mod mcp;

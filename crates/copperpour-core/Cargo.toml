@@ -27,12 +27,25 @@ tracing.workspace = true
 uuid.workspace = true
 base64.workspace = true
 sha2.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, optional = true }
 dirs.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, optional = true }
 usvg.workspace = true
-zip.workspace = true
+zip = { workspace = true, optional = true }
 tempfile = "3"
+
+[features]
+# Release builds ship everything. `--no-default-features` is the offline build:
+# no outbound HTTP client and no vendor endpoints (#210). Cargo features only
+# add code, so each integration adds itself; there is no `offline` feature.
+default = ["jlcpcb", "freerouting", "native-bridge"]
+# JLCPCB / LCSC parts catalog: the local cache, its download, and the LCSC and
+# EasyEDA lookups. JLCPCB fabrication and assembly output don't need it.
+jlcpcb = ["dep:rusqlite", "dep:reqwest", "dep:zip"]
+# Freerouting discovery and headless routing: a Java subprocess, no network.
+freerouting = ["dep:zip"]
+# The KiCad plugin's native Specctra export bridge: HTTP to localhost only.
+native-bridge = ["dep:reqwest"]
 
 [target.'cfg(windows)'.dependencies]
 winreg.workspace = true

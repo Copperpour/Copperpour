@@ -383,10 +383,9 @@ mod tests {
             );
             return;
         }
-        let found = share_roots()
-            .into_iter()
-            .chain(cli_candidates())
-            .chain(crate::native_specctra_bridge::registration_root());
+        let found = share_roots().into_iter().chain(cli_candidates());
+        #[cfg(feature = "native-bridge")]
+        let found = found.chain(crate::native_specctra_bridge::registration_root());
         for path in found {
             assert!(path.is_absolute(), "{path:?}");
         }

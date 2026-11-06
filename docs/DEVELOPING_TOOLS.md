@@ -91,6 +91,21 @@ board, reachable IPC rejection, stale file revision, unsupported geometry, or
 missing evidence. For IPC behavior that mocks cannot prove, add an ignored live
 test and record the live validation command in the PR.
 
+## Adding A Vendor Integration
+
+Code that reaches a vendor's service, or a program outside Copperpour, goes
+behind a Cargo feature of its own in `crates/copperpour-core/Cargo.toml`. It is
+on by default and forwarded by `crates/copperpour/Cargo.toml` (#210). Mark its
+dependencies `optional` and enable them from the feature. Gate its module and
+its `tool!` entries with `#[cfg(feature = "...")]`, and gate tests that call its
+tools. Without it, its tools aren't registered. Code that runs in every build
+reads the integration through a seam that reports it missing, as
+`sourcing::LcscCatalog` does, rather than through `cfg` at each call site.
+
+CI's `offline` job builds, lints and tests with `--no-default-features`. It also
+checks each feature alone. Add the new feature to that loop. If it brings an
+HTTP client or names a vendor host, it can't be in the offline build.
+
 ## Adding A Fab House
 
 A fab house that differs only in limits or prices is one `FabProfile` in
