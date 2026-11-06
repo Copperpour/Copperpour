@@ -2281,7 +2281,15 @@ fn normalize_polyset(polyset: &mut kiapi::common::types::PolySet) {
 }
 
 fn normalize_polyline(polyline: &mut kiapi::common::types::PolyLine) {
-    if !polyline.closed || polyline.nodes.len() < 2 {
+    if !polyline.closed {
+        return;
+    }
+    // A closed outline whose last node repeats its first keeps it when KiCad
+    // loads it from a file, but loses it when KiCad stores it from the API.
+    if polyline.nodes.len() > 1 && polyline.nodes.first() == polyline.nodes.last() {
+        polyline.nodes.pop();
+    }
+    if polyline.nodes.len() < 2 {
         return;
     }
     let candidates = [
@@ -5321,6 +5329,65 @@ mod tests {
         let updated =
             kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
         (current, updated, prepared.changed_domains)
+    }
+
+    /// U1 as KiCad 10.0.8 reported it after refresh applied it (#320).
+    /// Provenance is in `issue_283_ipc.README.md`.
+    const ISSUE_320_U1_AFTER_REFRESH: &[u8] =
+        include_bytes!("../../tests/fixtures/issue_320_u1_after_refresh.ipc.bin");
+
+    /// The node count of each polygon outline in `instance`.
+    fn outline_node_counts(instance: &kiapi::board::types::FootprintInstance) -> Vec<usize> {
+        instance
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| {
+                item.type_url
+                    .ends_with("kiapi.board.types.BoardGraphicShape")
+            })
+            .filter_map(|item| {
+                let shape =
+                    kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).unwrap();
+                match shape.shape?.geometry? {
+                    kiapi::common::types::graphic_shape::Geometry::Polygon(polyset) => {
+                        Some(polyset.polygons[0].outline.as_ref().unwrap().nodes.len())
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_closed_outline_without_its_repeated_vertex_matches_the_library() {
+        // The library's pin-1 triangle lists four points, the last equal to
+        // the first. KiCad reports all four for the footprint loaded from the
+        // file, and three once it has stored refresh's update.
+        let loaded = issue_283_capture("U1");
+        let applied =
+            kiapi::board::types::FootprintInstance::decode(ISSUE_320_U1_AFTER_REFRESH).unwrap();
+        assert_eq!(outline_node_counts(&loaded), [4]);
+        assert_eq!(outline_node_counts(&applied), [3]);
+        let library = parse_library_footprint(ISSUE_283_DFN14_ID, ISSUE_283_DFN14).unwrap();
+        for current in [&loaded, &applied] {
+            let prepared = build_updated_instance(
+                current,
+                &library,
+                two_layers(),
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                TextReset::default(),
+            )
+            .unwrap();
+            assert!(
+                prepared.changed_domains.is_empty(),
+                "{:?}",
+                prepared.changed_domains
+            );
+        }
     }
 
     fn fab_properties(instance: &kiapi::board::types::FootprintInstance) -> Vec<(String, i32)> {
