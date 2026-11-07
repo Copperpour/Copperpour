@@ -1191,8 +1191,6 @@ mod freerouting_tests {
         );
     }
 
-    /// A threshold Freerouting would multiply by 100 is refused as
-    /// `invalid_argument` before the JAR is looked up, so no JAR is needed here.
     #[tokio::test]
     async fn served_route_refuses_an_overall_timeout_within_the_optimizer_window() {
         // Explicit: the caller's overall_timeout_seconds is the value named.
@@ -1244,6 +1242,8 @@ mod freerouting_tests {
         }
     }
 
+    /// A threshold Freerouting would multiply by 100 is refused as
+    /// `invalid_argument` before the JAR is looked up, so no JAR is needed here.
     #[tokio::test]
     async fn served_route_refuses_a_threshold_freerouting_reads_as_a_fraction() {
         for (threshold_args, field) in [
