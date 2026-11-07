@@ -492,32 +492,19 @@ pub(crate) async fn route_specctra_dsn(
 ) -> anyhow::Result<CallToolResult> {
     let dsn = get_path(args, "dsn_path")?;
     let ses_output = get_path(args, "ses_output_path")?;
-    let explicit_overall_timeout = args["overall_timeout_seconds"].as_u64();
-    let overall_timeout_seconds = explicit_overall_timeout
+    let overall_timeout_seconds = args["overall_timeout_seconds"]
+        .as_u64()
         .unwrap_or_else(|| mcp::default_overall_timeout_seconds(args["optimize_seconds"].as_u64()));
     // Refused before the JAR lookup, as the threshold below is: the optimizer window opens only once
     // routing is done, so an overall timeout within it kills the run and keeps
-    // nothing.
+    // nothing. Only an explicit overall_timeout_seconds can fall within it:
+    // optimize_seconds is at most 86399, and the default, at most 86400,
+    // exceeds it.
     if let Some(optimize) = args["optimize_seconds"].as_u64() {
         if let Some(reason) = mcp::overall_timeout_too_short(overall_timeout_seconds, optimize) {
-            // Without overall_timeout_seconds, the default reached its limit:
-            // optimize_seconds is the value to lower.
-            let (field, reason) = match explicit_overall_timeout {
-                Some(_) => ("overall_timeout_seconds", reason),
-                None => (
-                    "optimize_seconds",
-                    format!(
-                        "optimize_seconds ({optimize}) leaves no time for routing: \
-                         overall_timeout_seconds defaults to {} plus optimize_seconds, at most \
-                         {}",
-                        mcp::DEFAULT_OVERALL_TIMEOUT_SECONDS,
-                        mcp::MAX_OVERALL_TIMEOUT_SECONDS
-                    ),
-                ),
-            };
             return Ok(CallToolResult::error_kind(
                 ToolErrorKind::InvalidArgument {
-                    field: field.to_string(),
+                    field: "overall_timeout_seconds".to_string(),
                     reason: reason.clone(),
                 },
                 format!("{reason}. Nothing was routed."),
@@ -1225,36 +1212,32 @@ mod freerouting_tests {
         );
         assert!(!temp.path().join("board.ses").exists());
 
-        // By default: no room is left below the limit, so optimize_seconds is
-        // the value named.
-        let (_temp, body) = served_route(json!({ "optimize_seconds": 86_400 })).await;
-        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
-        assert_eq!(body["error"]["field"], "optimize_seconds", "{body}");
-        assert!(
-            body["error"]["reason"]
-                .as_str()
-                .unwrap()
-                .starts_with("optimize_seconds (86400) leaves no time for routing"),
-            "{body}"
-        );
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap()
-                .contains("optimize_seconds (86400) leaves no time for routing"),
-            "{body}"
-        );
+        // 86400 never runs: the longest overall timeout, 86400, would have
+        // to exceed it. The schema refuses it, by default or not.
+        for extra in [
+            json!({ "optimize_seconds": 86_400 }),
+            json!({ "optimize_seconds": 86_400, "overall_timeout_seconds": 86_400 }),
+        ] {
+            let (_temp, body) = served_route(extra.clone()).await;
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{extra}: {body}");
+            assert_eq!(
+                body["error"]["field"], "optimize_seconds",
+                "{extra}: {body}"
+            );
+        }
     }
 
     #[tokio::test]
     async fn served_route_sizes_the_default_overall_timeout_for_the_optimizer() {
         // A flat 900 s default would be refused here; 900 + 1100 lets the
         // call go on to look up the (missing) JAR. So does an explicit value
-        // above optimize_seconds, and 86399, whose default is the limit.
+        // above optimize_seconds, and 86399, the largest accepted, whose default
+        // and longest explicit overall timeout are both 86400.
         for extra in [
             json!({ "optimize_seconds": 1100 }),
             json!({ "optimize_seconds": 1100, "overall_timeout_seconds": 1101 }),
             json!({ "optimize_seconds": 86_399 }),
+            json!({ "optimize_seconds": 86_399, "overall_timeout_seconds": 86_400 }),
         ] {
             let (_temp, body) = served_route(extra.clone()).await;
             assert_eq!(body["error"]["kind"], "file_not_found", "{extra}: {body}");

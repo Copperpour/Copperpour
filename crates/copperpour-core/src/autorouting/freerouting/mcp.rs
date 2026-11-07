@@ -333,9 +333,9 @@ fn validate_inputs(
     }
     if settings
         .optimize_seconds
-        .is_some_and(|seconds| seconds > 86_400)
+        .is_some_and(|seconds| seconds > MAX_OPTIMIZE_SECONDS)
     {
-        bail!("optimize_seconds must be between 0 and 86400");
+        bail!("optimize_seconds must be between 0 and {MAX_OPTIMIZE_SECONDS}");
     }
     if let Some(message) = settings.optimize_seconds.and_then(|optimize| {
         overall_timeout_too_short(settings.overall_timeout.as_secs(), optimize)
@@ -401,6 +401,9 @@ pub(crate) const THRESHOLD_READ_AS_FRACTION: &str =
 pub(crate) const DEFAULT_OVERALL_TIMEOUT_SECONDS: u64 = 900;
 /// The longest overall timeout, explicit or by default.
 pub(crate) const MAX_OVERALL_TIMEOUT_SECONDS: u64 = 86_400;
+/// The longest optimizer window: the overall timeout is at most
+/// [`MAX_OVERALL_TIMEOUT_SECONDS`] and must exceed it. The schema's maximum.
+pub(crate) const MAX_OPTIMIZE_SECONDS: u64 = MAX_OVERALL_TIMEOUT_SECONDS - 1;
 
 /// The overall timeout of a call without `overall_timeout_seconds`: 900 s for
 /// routing, then the optimizer window, which opens only once routing is done.
@@ -1845,14 +1848,24 @@ done
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(default_overall_timeout_seconds(optimize_seconds)),
         };
-        // 86400 leaves no room for routing within the longest overall timeout.
+        // 86400 leaves no room for routing within the longest overall
+        // timeout: 86399 is the largest window accepted, by default or with
+        // the longest explicit overall timeout.
+        assert_eq!(MAX_OPTIMIZE_SECONDS, 86_399);
         for accepted in [None, Some(0), Some(86_399)] {
             validate_inputs(&jar, &dsn, &ses, &settings(accepted)).unwrap();
         }
-        let error = validate_inputs(&jar, &dsn, &ses, &settings(Some(86_401)))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("optimize_seconds"), "{error}");
+        let longest = RouteSettings {
+            overall_timeout: Duration::from_secs(MAX_OVERALL_TIMEOUT_SECONDS),
+            ..settings(Some(86_399))
+        };
+        validate_inputs(&jar, &dsn, &ses, &longest).unwrap();
+        for refused in [86_400, 86_401] {
+            let error = validate_inputs(&jar, &dsn, &ses, &settings(Some(refused)))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "optimize_seconds must be between 0 and 86399");
+        }
     }
 
     #[test]

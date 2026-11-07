@@ -2177,24 +2177,37 @@ mod schema_validation_dispatch_tests {
     }
 
     /// The schema bound is the guard a caller meets first. The DSN does not
-    /// exist, so a call that got past the schema would be refused on another
-    /// field.
+    /// exist, so a call that got past the schema is refused for another
+    /// reason, which does not name optimize_seconds. 86399 is the largest window: the overall timeout is at most
+    /// 86400 and must exceed it.
     #[cfg(feature = "freerouting")]
     #[tokio::test]
-    async fn optimize_seconds_above_a_day_is_refused_by_the_schema() {
+    async fn optimize_seconds_above_86399_is_refused_by_the_schema() {
         let handler = handler().await;
-        let body = assert_invalid_field(
-            &handler,
-            "route_specctra_dsn",
+        let args = |optimize_seconds: u64| {
             json!({
                 "dsn_path": "does-not-exist.dsn",
                 "ses_output_path": "does-not-exist.ses",
-                "optimize_seconds": 86_401
-            }),
+                "optimize_seconds": optimize_seconds
+            })
+        };
+        let body = assert_invalid_field(
+            &handler,
+            "route_specctra_dsn",
+            args(86_400),
             "optimize_seconds",
         )
         .await;
         assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+
+        let (result, _, _) = handler
+            .dispatch_tool("route_specctra_dsn", &args(86_399))
+            .await;
+        let text = match result.content.first() {
+            Some(ToolContent::Text { text }) => text,
+            other => panic!("expected a text error, got {other:?}"),
+        };
+        assert!(!text.contains("optimize_seconds"), "{text}");
     }
 
     #[tokio::test]

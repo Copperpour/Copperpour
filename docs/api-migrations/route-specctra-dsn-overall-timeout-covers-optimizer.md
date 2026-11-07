@@ -13,9 +13,11 @@ does not exceed it now fails with `invalid_argument` and `field`
 starts and no SES is written. Raise `overall_timeout_seconds` above the
 routing time plus `optimize_seconds`, or drop it to take the default.
 
-`optimize_seconds` 86400 without `overall_timeout_seconds` leaves no time for
-routing under the 86400 limit and fails the same way, with `field`
-`optimize_seconds`: lower it.
+The largest `optimize_seconds` is now 86399, in the schema and in the
+tool's own check: `overall_timeout_seconds` is at most 86400 and must exceed
+it, so a window of 86400 could never run. A call with `optimize_seconds`
+86400 now fails at the schema with `invalid_argument` and `field`
+`optimize_seconds`: lower it to 86399 at most.
 
 The `overall_timeout_seconds` schema no longer carries `"default": 900`; its
 description states the default.
