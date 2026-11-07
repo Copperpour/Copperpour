@@ -210,16 +210,8 @@ pub(crate) async fn route_local(
     let diagnostics = client.close().await;
     let diagnostics_path = write_diagnostics(ses_output, &diagnostics).await?;
 
-    let result = match route_result {
-        Ok(evidence) => Ok(evidence),
-        Err(error) => {
-            if diagnostics.is_empty() {
-                Err(error)
-            } else {
-                Err(error).context(format!("Freerouting stderr: {diagnostics}"))
-            }
-        }
-    };
+    let result = route_result
+        .map_err(|error| with_stderr_tail(error, &diagnostics, diagnostics_path.as_deref()));
     let evidence = match result {
         Ok(evidence) => evidence,
         Err(error) => {
@@ -256,6 +248,34 @@ pub(crate) async fn route_local(
         diagnostics_path,
         ..evidence
     })
+}
+
+/// `error` first, then the end of Freerouting's stderr: its banner and
+/// warnings run to thousands of characters, with the cause at the end. `full`
+/// names the file that holds all of it.
+fn with_stderr_tail(error: anyhow::Error, diagnostics: &str, full: Option<&str>) -> anyhow::Error {
+    if diagnostics.is_empty() {
+        return error;
+    }
+    let full = full
+        .map(|path| format!(", all of it in {path}"))
+        .unwrap_or_default();
+    anyhow::anyhow!(
+        "{error:#}\nFreerouting stderr, last lines{full}:\n{}",
+        stderr_tail(diagnostics)
+    )
+}
+
+/// The last 12 lines of `diagnostics`, cut to their last 2000 characters.
+fn stderr_tail(diagnostics: &str) -> String {
+    const LINES: usize = 12;
+    const CHARS: usize = 2000;
+    let lines: Vec<&str> = diagnostics.lines().collect();
+    let tail = lines[lines.len().saturating_sub(LINES)..].join("\n");
+    match tail.char_indices().rev().nth(CHARS - 1) {
+        Some((start, _)) => format!("...{}", &tail[start..]),
+        None => tail,
+    }
 }
 
 fn diagnostics_path(ses_output: &Path) -> PathBuf {
@@ -856,11 +876,7 @@ impl LocalMcpClient {
         let mut client = Self::spawn(jar)?;
         if let Err(error) = client.initialize().await {
             let diagnostics = client.close().await;
-            return if diagnostics.is_empty() {
-                Err(error)
-            } else {
-                Err(error).context(format!("Freerouting stderr: {diagnostics}"))
-            };
+            return Err(with_stderr_tail(error, &diagnostics, None));
         }
         Ok(client)
     }
@@ -2144,6 +2160,179 @@ done
             std::fs::read_to_string(path).unwrap(),
             "router failed at pass 3"
         );
+    }
+
+    #[test]
+    fn stderr_in_errors_is_cut_to_its_last_lines() {
+        let long: String = (1..=40)
+            .map(|n| format!("2026-10-29 INFO line {n}\n"))
+            .collect();
+        let tail = stderr_tail(&long);
+        assert!(tail.starts_with("2026-10-29 INFO line 29"), "{tail}");
+        assert!(tail.ends_with("line 40"), "{tail}");
+        let wide = "é".repeat(5000);
+        let cut = stderr_tail(&wide);
+        assert_eq!(cut.chars().count(), 2003);
+        assert!(cut.starts_with("..."), "{cut}");
+        assert_eq!(stderr_tail("short"), "short");
+    }
+
+    /// The cause comes first, the banner's start is left out, and the file
+    /// holding all of stderr is named.
+    #[test]
+    fn an_error_puts_its_cause_before_the_end_of_stderr() {
+        let stderr: String = (1..=40)
+            .map(|n| format!("banner line {n}\n"))
+            .chain(["java.lang.OutOfMemoryError: Java heap space\n".to_string()])
+            .collect();
+        let error = with_stderr_tail(
+            anyhow::anyhow!("job ended").context("Freerouting job abc ended in state FAILED"),
+            &stderr,
+            Some("/work/board.freerouting.log"),
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("Freerouting job abc ended in state FAILED: job ended\n"),
+            "{message}"
+        );
+        assert!(
+            message.contains("all of it in /work/board.freerouting.log"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("java.lang.OutOfMemoryError: Java heap space"),
+            "{message}"
+        );
+        assert!(!message.contains("banner line 29\n"), "{message}");
+        assert!(message.contains("banner line 30"), "{message}");
+
+        let bare = with_stderr_tail(anyhow::anyhow!("no answer"), "", None);
+        assert_eq!(format!("{bare:#}"), "no answer");
+    }
+
+    /// Runs `run` with `JAVA_HOME` pointing at a fake `java` that writes 40
+    /// banner lines and a last line to stderr, then runs `server` (sh).
+    #[cfg(unix)]
+    fn with_fake_java<T>(
+        temp: &Path,
+        server: &str,
+        run: impl std::future::Future<Output = T>,
+    ) -> T {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = temp.join("jdk").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let java = bin.join("java");
+        std::fs::write(
+            &java,
+            format!(
+                "#!/bin/sh\n\
+                 i=1; while [ $i -le 40 ]; do echo \"banner line $i\" >&2; i=$((i+1)); done\n\
+                 echo 'last stderr line' >&2\n\
+                 {server}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _env = crate::java_runtime::JAVA_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("JAVA_HOME");
+        std::env::set_var("JAVA_HOME", temp.join("jdk"));
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run);
+        match previous {
+            Some(value) => std::env::set_var("JAVA_HOME", value),
+            None => std::env::remove_var("JAVA_HOME"),
+        }
+        result
+    }
+
+    /// The error of a job that failed starts with its cause and ends with the
+    /// last lines of stderr, and names the log that holds all of it.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_job_reports_its_cause_before_the_end_of_stderr() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        std::fs::write(&jar, "not a jar").unwrap();
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let tools = conforming_tools_list();
+        let server = format!(
+            r#"while read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  [ -n "$id" ] || continue
+  case "$line" in
+    *'"initialize"'*) result='{{"protocolVersion":"2025-06-18"}}' ;;
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *get_job_details*) result='{{"state":"FAILED"}}' ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$id" "$result"
+done"#
+        );
+        let settings = RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
+            // The least route_local accepts; FAILED comes on the first poll.
+            poll_interval: Duration::from_secs(2),
+            overall_timeout: Duration::from_secs(30),
+        };
+        let error = with_fake_java(
+            temp.path(),
+            &server,
+            route_local(&jar, &dsn, &ses, &settings),
+        )
+        .expect_err("a FAILED job is an error");
+
+        let message = format!("{error:#}");
+        let log = diagnostics_path(&ses);
+        assert!(
+            message.starts_with("Freerouting job job123 ended in state FAILED\n"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("all of it in {}", log.display())),
+            "{message}"
+        );
+        assert!(message.ends_with("last stderr line"), "{message}");
+        assert!(message.contains("banner line 30\n"), "{message}");
+        assert!(!message.contains("banner line 29\n"), "{message}");
+        let full = std::fs::read_to_string(&log).unwrap();
+        assert!(full.contains("banner line 1\n"), "{full}");
+    }
+
+    /// A server that dies before answering `initialize`: the cause first,
+    /// then the end of stderr.
+    #[cfg(unix)]
+    #[test]
+    fn a_server_that_does_not_start_reports_its_cause_before_the_end_of_stderr() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        std::fs::write(&jar, "not a jar").unwrap();
+        let probe = with_fake_java(temp.path(), "exit 1", probe_local(&jar));
+
+        let message = probe.error.expect("the start failed");
+        assert!(!message.starts_with("Freerouting stderr"), "{message}");
+        assert!(
+            message.contains("\nFreerouting stderr, last lines:\n"),
+            "{message}"
+        );
+        assert!(message.ends_with("last stderr line"), "{message}");
+        assert!(!message.contains("banner line 29\n"), "{message}");
     }
 
     /// Optional local parity check for Freerouting's actual stdio MCP state
