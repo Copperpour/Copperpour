@@ -6,7 +6,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Map, Number, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -364,7 +364,72 @@ fn validate_inputs(
     {
         bail!("{ROUTER_SETTINGS_THRESHOLD} {THRESHOLD_READ_AS_FRACTION}");
     }
+    let negative = negative_settings_sent(settings);
+    if !negative.is_empty() {
+        bail!("{}", negative_settings_message(&negative));
+    }
     Ok(())
+}
+
+/// Why a negative `router_settings` number is refused.
+pub(crate) const NEGATIVE_SETTING: &str =
+    "must not be negative: Freerouting takes a negative cost, count or distance without a \
+     warning and routes with it, and none of its settings has a meaning below zero";
+
+/// Every number below zero that `router_settings` would send, as its path
+/// (`router_settings.scoring.via_costs`) and value. A value that a named
+/// argument replaces is not sent, so it is not reported.
+pub(crate) fn negative_settings_sent(settings: &RouteSettings) -> Vec<(String, Number)> {
+    // Mirrors merge_into: an object over an object merges key by key, and
+    // anything else in the named settings replaces the whole router_settings
+    // value at that path.
+    fn walk(value: &Value, named: Option<&Value>, path: &str, out: &mut Vec<(String, Number)>) {
+        if let Some(named) = named {
+            if !(named.is_object() && value.is_object()) {
+                return;
+            }
+        }
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    let named = named.and_then(|named| named.get(key));
+                    walk(value, named, &format!("{path}.{key}"), out);
+                }
+            }
+            Value::Array(items) => {
+                for (index, value) in items.iter().enumerate() {
+                    walk(value, None, &format!("{path}[{index}]"), out);
+                }
+            }
+            Value::Number(number) if number.as_f64().is_some_and(|n| n < 0.0) => {
+                out.push((path.to_string(), number.clone()))
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(router_settings) = &settings.router_settings {
+        let named = Value::Object(named_settings(settings));
+        walk(
+            &Value::Object(router_settings.clone()),
+            Some(&named),
+            "router_settings",
+            &mut out,
+        );
+    }
+    out
+}
+
+/// The refusal for what [`negative_settings_sent`] found, naming each path.
+pub(crate) fn negative_settings_message(negative: &[(String, Number)]) -> String {
+    let listed: Vec<String> = negative
+        .iter()
+        .map(|(path, value)| format!("{path} is {value}"))
+        .collect();
+    format!(
+        "{}. A router setting {NEGATIVE_SETTING}. Nothing was routed.",
+        listed.join("; ")
+    )
 }
 
 /// Where `router_settings` carries the optimizer's improvement threshold.
@@ -1917,6 +1982,100 @@ done
         for (named, routed) in [(None, 0.0), (None, 0.1), (Some(2.5), 0.05)] {
             validate_inputs(&jar, &dsn, &ses, &with_router_threshold(named, routed)).unwrap();
         }
+    }
+
+    fn with_router_settings(router_settings: Value) -> RouteSettings {
+        RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: router_settings.as_object().cloned(),
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(900),
+        }
+    }
+
+    #[test]
+    fn negative_router_settings_are_named_by_path() {
+        let settings = with_router_settings(json!({
+            "scoring": { "via_costs": -5, "plane_via_costs": 5 },
+            "layers": [{ "bend_cost": 0.0 }, { "bend_cost": -0.5 }],
+            "plane_nets": ["GND"],
+            "fanout": { "min_escape_length_mm": 2.5 },
+            "neck_width_um": -0.0
+        }));
+        let negative: Vec<String> = negative_settings_sent(&settings)
+            .iter()
+            .map(|(path, value)| format!("{path} is {value}"))
+            .collect();
+        assert_eq!(
+            negative,
+            [
+                "router_settings.layers[1].bend_cost is -0.5",
+                "router_settings.scoring.via_costs is -5"
+            ]
+        );
+    }
+
+    #[test]
+    fn negative_router_settings_a_named_argument_replaces_are_not_sent() {
+        let settings = RouteSettings {
+            max_passes: Some(4),
+            optimizer_improvement_threshold: Some(1.0),
+            plane_nets: Some(vec!["GND".to_string()]),
+            ..with_router_settings(json!({
+                "autorouter": { "max_passes": -1, "max_threads": -2 },
+                "optimizer": { "improvement_threshold": -3 },
+                "plane_nets": [-4]
+            }))
+        };
+        let negative = negative_settings_sent(&settings);
+        assert_eq!(
+            negative,
+            [(
+                "router_settings.autorouter.max_threads".to_string(),
+                Number::from(-2)
+            )]
+        );
+        // What is reported is what job_settings_body really sends.
+        let sent = job_settings_body(&settings);
+        assert_eq!(sent["autorouter"]["max_threads"], json!(-2));
+        assert_eq!(sent["autorouter"]["max_passes"], json!(4));
+        assert_eq!(sent["optimizer"]["improvement_threshold"], json!(1.0));
+        assert_eq!(sent["plane_nets"], json!(["GND"]));
+    }
+
+    #[test]
+    fn negative_router_settings_are_refused_before_java() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        std::fs::write(&jar, "").unwrap();
+        std::fs::write(&dsn, "").unwrap();
+        let refused = with_router_settings(json!({
+            "scoring": { "via_costs": -5 },
+            "optimizer": { "improvement_threshold": -1 }
+        }));
+        let error = validate_inputs(&jar, &dsn, &ses, &refused)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("router_settings.optimizer.improvement_threshold is -1"),
+            "{error}"
+        );
+        assert!(
+            error.contains("router_settings.scoring.via_costs is -5"),
+            "{error}"
+        );
+        assert!(error.contains("must not be negative"), "{error}");
+        let accepted = with_router_settings(json!({ "scoring": { "via_costs": 0 } }));
+        validate_inputs(&jar, &dsn, &ses, &accepted).unwrap();
     }
 
     #[test]

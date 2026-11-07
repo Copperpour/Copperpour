@@ -516,24 +516,6 @@ pub(crate) async fn route_specctra_dsn(
             ),
         ));
     }
-    let jar = match resolve_freerouting_jar(args) {
-        FreeroutingJar::Found(jar) => jar,
-        FreeroutingJar::SuppliedPathIsNotAFile(path) => {
-            return Ok(CallToolResult::error_kind(
-                ToolErrorKind::FileNotFound {
-                    path: path.display().to_string(),
-                },
-                format!("jar_path is not a file: {}", path.display()),
-            ));
-        }
-        FreeroutingJar::NotFound(roots) => {
-            return Ok(CallToolResult::error(format!(
-                "Freerouting JAR not found in {} searched locations; install Freerouting or \
-                 pass jar_path. check_freerouting lists every location searched.",
-                roots.len()
-            )));
-        }
-    };
     let max_passes = args["max_passes"]
         .as_u64()
         .map(u32::try_from)
@@ -562,6 +544,37 @@ pub(crate) async fn route_specctra_dsn(
         router_settings: args["router_settings"].as_object().cloned(),
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
+    };
+    // Like the threshold above, refused before the JAR lookup; the values
+    // checked are the ones sent, so a named argument that replaces a negative
+    // router_settings value clears it.
+    let negative = mcp::negative_settings_sent(&settings);
+    if let Some((field, _)) = negative.first() {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: field.clone(),
+                reason: mcp::NEGATIVE_SETTING.to_string(),
+            },
+            mcp::negative_settings_message(&negative),
+        ));
+    }
+    let jar = match resolve_freerouting_jar(args) {
+        FreeroutingJar::Found(jar) => jar,
+        FreeroutingJar::SuppliedPathIsNotAFile(path) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::FileNotFound {
+                    path: path.display().to_string(),
+                },
+                format!("jar_path is not a file: {}", path.display()),
+            ));
+        }
+        FreeroutingJar::NotFound(roots) => {
+            return Ok(CallToolResult::error(format!(
+                "Freerouting JAR not found in {} searched locations; install Freerouting or \
+                 pass jar_path. check_freerouting lists every location searched.",
+                roots.len()
+            )));
+        }
     };
     let evidence = mcp::route_local(&jar, &dsn, &ses_output, &settings)
         .await
@@ -1205,6 +1218,47 @@ mod freerouting_tests {
         let (_temp, body) = served_route(json!({
             "optimizer_improvement_threshold": 1.0,
             "router_settings": { "optimizer": { "improvement_threshold": 0.05 } }
+        }))
+        .await;
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+    }
+
+    #[tokio::test]
+    async fn served_route_refuses_negative_router_settings_before_the_jar_lookup() {
+        // The JAR path does not exist: an invalid_argument rather than
+        // file_not_found shows the refusal comes before the JAR is looked up.
+        let (temp, body) = served_route(json!({
+            "router_settings": {
+                "scoring": { "via_costs": -5, "plane_via_costs": 5 },
+                "fanout": { "min_escape_length_mm": -0.5 }
+            }
+        }))
+        .await;
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(
+            body["error"]["field"], "router_settings.fanout.min_escape_length_mm",
+            "{body}"
+        );
+        let message = body["message"].as_str().unwrap();
+        assert!(
+            message.contains("router_settings.fanout.min_escape_length_mm is -0.5"),
+            "{body}"
+        );
+        assert!(
+            message.contains("router_settings.scoring.via_costs is -5"),
+            "{body}"
+        );
+        assert!(!message.contains("plane_via_costs"), "{body}");
+        assert!(!temp.path().join("board.ses").exists());
+    }
+
+    #[tokio::test]
+    async fn served_route_checks_the_negative_values_it_sends() {
+        // max_passes replaces autorouter.max_passes, so -1 is never sent and
+        // the call goes on to look up the (missing) JAR.
+        let (_temp, body) = served_route(json!({
+            "max_passes": 3,
+            "router_settings": { "autorouter": { "max_passes": -1 } }
         }))
         .await;
         assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
