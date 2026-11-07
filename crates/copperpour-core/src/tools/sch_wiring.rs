@@ -6533,6 +6533,9 @@ mod wire_end_junction_tests {
     type Segment = ((f64, f64), (f64, f64));
     /// A case's name, its wires, and the dots KiCad would draw.
     type Case = (&'static str, Vec<Segment>, Vec<(f64, f64)>);
+    /// A `connect_passthrough` case: its name, the wires drawn first, the
+    /// stub's direction from `T`, and the dots KiCad would draw.
+    type StubCase = (&'static str, Vec<Segment>, &'static str, Vec<(f64, f64)>);
 
     fn cases() -> Vec<Case> {
         vec![
@@ -6660,6 +6663,78 @@ mod wire_end_junction_tests {
             let result = response.result.expect("successful JSON-RPC response");
             assert_ne!(result["isError"], json!(true), "{case}: {result}");
             assert_dots(case, &std::fs::read_to_string(&path).unwrap(), &expected);
+        }
+    }
+
+    /// `connect_passthrough`'s stub from a point where wires already are,
+    /// through the served `tools/call` boundary (#137).
+    #[tokio::test]
+    async fn connect_passthrough_dots_its_stub_through_the_served_dispatch() {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+        let cases: [StubCase; 4] = [
+            (
+                "a stub from a corner",
+                vec![((101.6, 101.6), T), (T, (114.3, 88.9))],
+                "right",
+                vec![T],
+            ),
+            (
+                "a stub from mid-span",
+                vec![((101.6, 101.6), (127.0, 101.6))],
+                "up",
+                vec![T],
+            ),
+            (
+                "a stub from a T already dotted keeps one dot",
+                vec![((101.6, 101.6), T), (T, (127.0, 101.6)), (T, (114.3, 88.9))],
+                "down",
+                vec![T],
+            ),
+            (
+                "a stub straight on from one wire end (control)",
+                vec![((101.6, 101.6), T)],
+                "right",
+                vec![],
+            ),
+        ];
+        for (case, wires, direction, expected) in cases {
+            let (_dir, path) = sheet();
+            let schematic = path.display().to_string();
+            let wires: Vec<_> = wires.into_iter().map(wire_json).collect();
+            let stub = json!({
+                "schematic": schematic,
+                "net_name": "SIG",
+                "x": T.0,
+                "y": T.1,
+                "direction": direction
+            });
+            for (name, arguments) in [
+                (
+                    "batch_add_wire",
+                    json!({ "schematic": schematic, "wires": wires }),
+                ),
+                ("connect_passthrough", stub),
+            ] {
+                let response = handler
+                    .handle_message(json!({
+                        "jsonrpc": "2.0",
+                        "id": 137,
+                        "method": "tools/call",
+                        "params": { "name": name, "arguments": arguments }
+                    }))
+                    .await
+                    .expect("tools/call receives a response");
+                let result = response.result.expect("successful JSON-RPC response");
+                assert_ne!(result["isError"], json!(true), "{case}, {name}: {result}");
+            }
+            let written = std::fs::read_to_string(&path).unwrap();
+            assert_dots(case, &written, &expected);
+            assert!(written.contains("(label \"SIG\""), "{case}: no label");
         }
     }
 
