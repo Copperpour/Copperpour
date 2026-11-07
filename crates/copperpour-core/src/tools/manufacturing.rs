@@ -128,6 +128,37 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_estimate_cost(args, ctx).await }
         ),
+        #[cfg(feature = "jlcpcb")]
+        tool!(
+            "generate_jlcpcb_order_link",
+            "Upload the board's Gerbers and drill files, and for assembly its BOM and CPL, to \
+             JLCPCB through EasyEDA's order endpoint, and return a JLCPCB quote link that opens \
+             with them loaded. This sends the design files to JLCPCB; it places no order and pays \
+             nothing. DRC runs first on the exported board and any error refuses the upload \
+             (skip_drc bypasses it). The files are export_manufacturing_package's for JLCPCB: \
+             assembly needs the exact board open in KiCad with IPC enabled, and the schematic \
+             for the BOM, whose LCSC, MPN and Manufacturer fields are sent.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "schematic": { "type": "string", "description": "Path to the root .kicad_sch file, for the BOM. Required when include_assembly is true" },
+                    "include_assembly": { "type": "boolean", "description": "Upload the BOM and CPL for JLCPCB SMT assembly with the Gerbers", "default": true },
+                    "skip_drc": { "type": "boolean", "description": "Upload without running DRC first. Only when DRC's errors were reviewed and waived", "default": false },
+                    "quantity": { "type": "integer", "minimum": 1, "maximum": 100000, "description": "Number of boards", "default": 5 },
+                    "thickness": { "type": "number", "enum": [0.4, 0.6, 0.8, 1.0, 1.2, 1.6, 2.0], "description": "Board thickness in mm", "default": 1.6 },
+                    "color": { "type": "string", "enum": ["Green", "Red", "Yellow", "Blue", "White", "Black", "Purple"], "description": "Solder mask colour", "default": "Green" },
+                    "surface_finish": { "type": "string", "enum": ["HASL(with lead)", "LeadFree HASL", "ENIG"], "description": "Surface finish", "default": "HASL(with lead)" },
+                    "copper_weight": { "type": "string", "enum": ["1", "2"], "description": "Outer copper weight in oz", "default": "1" },
+                    "jlcpcb_cpl_corrections_path": {
+                        "type": "string",
+                        "description": "Optional path to a versioned JLCPCB CPL correction-policy JSON file, as export_manufacturing_package takes it"
+                    }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_generate_jlcpcb_order_link(args, ctx).await }
+        ),
     ]
 }
 
@@ -137,6 +168,48 @@ async fn handle_export_manufacturing_package(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    Ok(match build_package(args, ctx).await? {
+        Ok(package) => package.into_result(),
+        Err(refusal) => refusal,
+    })
+}
+
+/// A package `build_package` wrote, and what an order link uploads from it
+/// (#208): the board files, the BOM, the JLCPCB CPL and the live snapshot.
+#[cfg_attr(not(feature = "jlcpcb"), allow(dead_code))]
+pub(crate) struct PackageBuild {
+    body: String,
+    pub(crate) complete: bool,
+    /// The Gerber and drill files written.
+    pub(crate) board_files: Vec<PathBuf>,
+    pub(crate) bom: Option<PathBuf>,
+    pub(crate) cpl: Option<crate::fab::jlcpcb::JlcpcbCplExport>,
+    pub(crate) snapshot: Option<crate::fab::jlcpcb::midpoints::Snapshot>,
+    /// Keeps the staged copy alive.
+    _staging: Option<tempfile::TempDir>,
+}
+
+impl PackageBuild {
+    /// The package's response, as `export_manufacturing_package` gives it.
+    #[cfg_attr(not(feature = "jlcpcb"), allow(dead_code))]
+    pub(crate) fn body(&self) -> serde_json::Value {
+        serde_json::from_str(&self.body).unwrap_or_default()
+    }
+
+    fn into_result(self) -> CallToolResult {
+        if self.complete {
+            CallToolResult::text(self.body)
+        } else {
+            CallToolResult::error(self.body)
+        }
+    }
+}
+
+/// Writes the package `args` ask for: the body of `export_manufacturing_package`.
+pub(crate) async fn build_package(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<Result<PackageBuild, CallToolResult>> {
     let board = get_path(args, "board")?;
     let output_dir = get_path(args, "output_dir")?;
     let fab_house = args["fab_house"].as_str().unwrap_or("jlcpcb");
@@ -145,7 +218,7 @@ async fn handle_export_manufacturing_package(
     let schematic = args["schematic"].as_str().map(PathBuf::from);
     let requested_gerber_layers = match pcb_export::optional_string_array(args, "gerber_layers") {
         Ok(layers) => layers,
-        Err(error) => return Ok(error),
+        Err(error) => return Ok(Err(error)),
     };
     let position_side = args["position_side"].as_str().unwrap_or("both");
     let position_units = args["position_units"].as_str().unwrap_or("mm");
@@ -162,21 +235,21 @@ async fn handle_export_manufacturing_package(
             "units" => "position_units",
             other => other,
         };
-        return Ok(invalid_manufacturing_argument(public_field, reason));
+        return Ok(Err(invalid_manufacturing_argument(public_field, reason)));
     }
     if let Err((field, reason)) = assembly.check_arguments(
         include_assembly,
         position_units,
         jlcpcb_cpl_corrections_path.is_some(),
     ) {
-        return Ok(invalid_manufacturing_argument(field, reason));
+        return Ok(Err(invalid_manufacturing_argument(field, reason)));
     }
 
     // Establish native geometry before creating/publishing any output. Keep the
     // staging owner alive for every CLI board export, not just CPL.
     let snapshot = match assembly.capture(ctx, &board, include_assembly).await? {
         Ok(snapshot) => snapshot,
-        Err(error) => return Ok(midpoint_failure(error)),
+        Err(error) => return Ok(Err(midpoint_failure(error))),
     };
     let gerber_layers = if requested_gerber_layers.is_empty() {
         let board_source = match &snapshot {
@@ -223,13 +296,17 @@ async fn handle_export_manufacturing_package(
     let mut cpl_designators = None;
     let mut bom_designators = None;
     let mut cpl_orientation_evidence = None;
+    let mut cpl_export = None;
+    let mut bom_written = None;
 
     // 1. Export Gerbers
     let gerber_dir = output_dir.join("gerbers");
     tokio::fs::create_dir_all(&gerber_dir).await?;
     let gerber_layer_refs = gerber_layers.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut board_files = Vec::new();
     match cli::export_gerber(cli_path, &export_board, &gerber_dir, &gerber_layer_refs).await {
         Ok(gerber_files) => {
+            board_files.extend(gerber_files.iter().cloned());
             info!(files = gerber_files.len(), "[BETA] Gerber export succeeded");
             verified_paths.extend(gerber_files.iter().cloned());
             files_generated.push(json!({
@@ -254,6 +331,7 @@ async fn handle_export_manufacturing_package(
     match cli::export_drill(cli_path, &export_board, &gerber_dir).await {
         Ok(drill_files) => {
             info!(files = drill_files.len(), "[BETA] Drill export succeeded");
+            board_files.extend(drill_files.iter().cloned());
             verified_paths.extend(drill_files.iter().cloned());
             for file in &drill_files {
                 files_generated.push(json!({
@@ -294,8 +372,9 @@ async fn handle_export_manufacturing_package(
             Ok(export) => {
                 info!("[BETA] Position file export succeeded");
                 if let Some(export) = export {
-                    cpl_designators = Some(export.designators);
+                    cpl_designators = Some(export.designators.clone());
                     cpl_orientation_evidence = Some(export.orientation_evidence.clone());
+                    cpl_export = Some(export);
                 }
                 verified_paths.push(pos_path.clone());
                 let mut generated = json!({
@@ -340,6 +419,7 @@ async fn handle_export_manufacturing_package(
                         Ok(designators) => {
                             info!("[BETA] BOM export succeeded");
                             bom_designators = designators;
+                            bom_written = Some(bom_path.clone());
                             verified_paths.push(bom_path.clone());
                             files_generated.push(json!({
                                 "type": "bom",
@@ -454,11 +534,307 @@ async fn handle_export_manufacturing_package(
         "next_steps": next_steps
     }))
     .unwrap();
-    Ok(if complete {
-        CallToolResult::text(body)
+    Ok(Ok(PackageBuild {
+        body,
+        complete,
+        board_files,
+        bom: bom_written,
+        cpl: cpl_export,
+        snapshot,
+        _staging: snapshot_directory,
+    }))
+}
+
+/// A refusal of the order link: nothing was uploaded, and why.
+#[cfg(feature = "jlcpcb")]
+fn order_not_uploaded(reason: impl Into<String>, detail: serde_json::Value) -> CallToolResult {
+    let reason = reason.into();
+    let mut body = json!({ "uploaded": false, "upload_outcome": "not_sent", "reason": reason });
+    if let serde_json::Value::Object(extra) = detail {
+        body.as_object_mut().unwrap().extend(extra);
+    }
+    CallToolResult::error(body.to_string())
+}
+
+#[cfg(feature = "jlcpcb")]
+fn order_upload_failed(
+    order_id: &str,
+    failure: crate::fab::jlcpcb::order::UploadFailure,
+) -> CallToolResult {
+    CallToolResult::error(
+        json!({
+            "uploaded": failure.uploaded(),
+            "upload_outcome": failure.outcome,
+            "http_status": failure.http_status,
+            "order_url": null,
+            "order_id": order_id,
+            "reason": failure.to_string(),
+            "recovery": failure.recovery(),
+        })
+        .to_string(),
+    )
+}
+
+/// Writes the package as `export_manufacturing_package` does, runs DRC on the
+/// board it was exported from, and uploads it as EasyEDA Pro's "Order PCB"
+/// does (#208). Every check runs before the one network request.
+#[cfg(feature = "jlcpcb")]
+async fn handle_generate_jlcpcb_order_link(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use crate::fab::jlcpcb::order;
+    let board = get_path(args, "board")?;
+    let include_assembly = args["include_assembly"].as_bool().unwrap_or(true);
+    let skip_drc = args["skip_drc"].as_bool().unwrap_or(false);
+    let schematic = args["schematic"].as_str().map(PathBuf::from);
+    if include_assembly && schematic.is_none() {
+        return Ok(invalid_manufacturing_argument(
+            "schematic",
+            "assembly needs the schematic for its BOM; pass it, or include_assembly: false for a PCB-only order",
+        ));
+    }
+    let staging = tempfile::tempdir()?;
+    let mut package_args = json!({
+        "board": board,
+        "output_dir": staging.path().join("package"),
+        "fab_house": "jlcpcb",
+        "include_assembly": include_assembly,
+        "bom_fields": order::BOM_FIELDS,
+        "bom_labels": order::BOM_LABELS,
+        "bom_group_by": order::BOM_GROUP_BY,
+    });
+    if let Some(schematic) = &schematic {
+        package_args["schematic"] = json!(schematic);
+    }
+    if let Some(path) = args.get("jlcpcb_cpl_corrections_path") {
+        package_args["jlcpcb_cpl_corrections_path"] = path.clone();
+    }
+    let package = match build_package(&package_args, ctx).await? {
+        Ok(package) => package,
+        Err(refusal) => return Ok(refusal),
+    };
+    upload_order_package(args, ctx, &board, include_assembly, skip_drc, package).await
+}
+
+/// Shared preflight/upload path, also exercised with prepared packages in
+/// refusal tests so an unrelated export failure cannot mask a missing guard.
+#[cfg(feature = "jlcpcb")]
+async fn upload_order_package(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    board: &std::path::Path,
+    include_assembly: bool,
+    skip_drc: bool,
+    package: PackageBuild,
+) -> anyhow::Result<CallToolResult> {
+    use crate::fab::jlcpcb::order;
+    let package_body = package.body();
+    if !package.complete {
+        return Ok(order_not_uploaded(
+            "the package is incomplete: resolve its warnings and retry",
+            json!({ "warnings": package_body["warnings"] }),
+        ));
+    }
+
+    let board_source = match &package.snapshot {
+        Some(snapshot) => snapshot.contents.clone(),
+        None => tokio::fs::read_to_string(board).await?,
+    };
+    let drc = if skip_drc {
+        json!({ "skipped": true })
     } else {
-        CallToolResult::error(body)
-    })
+        let drc_staging = tempfile::tempdir()?;
+        let drc_board = stage_board_for_drc(board, &board_source, drc_staging.path()).await?;
+        let report = match cli::run_drc(&ctx.config.kicad_cli, &drc_board, false).await {
+            Ok(report) => report,
+            Err(error) => {
+                return Ok(order_not_uploaded(
+                    format!("DRC could not run: {error:#}. Fix the kicad-cli path, or pass skip_drc: true after checking the board yourself"),
+                    json!({}),
+                ))
+            }
+        };
+        if let Some(refusal) = drc_refusal(&report) {
+            return Ok(refusal);
+        }
+        json!({
+            "errors": 0,
+            "warnings": report.all().filter(|violation| violation.severity == "warning").count(),
+            "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
+            "board": "the board the files were exported from",
+            "schematic_parity": "not checked: validate_for_manufacturing compares the board with its schematic",
+        })
+    };
+
+    let tree = copperpour_sexp::parser::parse_sexp(&board_source)?;
+    let layers = copperpour_sexp::layers::copper_layer_count(&tree);
+    let Some((width_mm, length_mm)) =
+        board_outline_size(&tree).filter(|(w, l)| *w > 0.0 && *l > 0.0)
+    else {
+        return Ok(order_not_uploaded(
+            "the board has no Edge.Cuts outline to measure, and the quote needs its size",
+            json!({}),
+        ));
+    };
+
+    let gerber_zip = order::zip_files(&package.board_files)?;
+    let assembly = if include_assembly {
+        let cpl = package
+            .cpl
+            .as_ref()
+            .context("the package has no JLCPCB CPL")?;
+        let snapshot = package
+            .snapshot
+            .as_ref()
+            .context("the package has no live snapshot")?;
+        let bom = package.bom.as_ref().context("the package has no BOM")?;
+        let bom_lines = order::bom_lines(&tokio::fs::read_to_string(bom).await?)?;
+        let cpl_lines = order::cpl_lines(&cpl.bytes, &cpl.kicad_positions, &snapshot.midpoints)?;
+        Some((
+            order::utf16le_with_bom(&order::easyeda_bom(&bom_lines)),
+            order::utf16le_with_bom(&order::easyeda_cpl(&cpl_lines)),
+        ))
+    } else {
+        None
+    };
+    let project = board
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("board");
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let options = order::OrderOptions {
+        gerber_name: format!("{project}_{seconds}.zip"),
+        layers,
+        width_mm,
+        length_mm,
+        quantity: args["quantity"].as_u64().unwrap_or(5),
+        thickness_mm: args["thickness"].as_f64().unwrap_or(1.6),
+        color: args["color"].as_str().unwrap_or("Green").to_owned(),
+        surface_finish: args["surface_finish"]
+            .as_str()
+            .unwrap_or("HASL(with lead)")
+            .to_owned(),
+        copper_weight: args["copper_weight"].as_str().unwrap_or("1").to_owned(),
+    };
+    let files = order::OrderFiles {
+        gerber_zip,
+        assembly,
+    };
+    let order_id = uuid::Uuid::new_v4().simple().to_string();
+    let boundary = format!("----CopperpourOrder{}", uuid::Uuid::new_v4().simple());
+    let body = order::multipart_body(&files, &options, &boundary);
+    let base = order::order_base(args);
+    info!(board = %board.display(), order_id = %order_id, "Uploading the JLCPCB order");
+    let answer = match order::upload(base, &order_id, &boundary, body).await {
+        Ok(answer) => answer,
+        Err(error) => return Ok(order_upload_failed(&order_id, error)),
+    };
+    // The files were sent; a link may still be missing from the answer.
+    let link = match order::order_link(&answer) {
+        Ok(link) => link,
+        Err(error) => {
+            return Ok(CallToolResult::error(
+                json!({
+                    "uploaded": true,
+                    "upload_outcome": "sent",
+                    "order_url": null,
+                    "reason": format!("{error:#}"),
+                    "order_id": order_id,
+                })
+                .to_string(),
+            ))
+        }
+    };
+    Ok(CallToolResult::text(
+        json!({
+            "uploaded": true,
+            "upload_outcome": "sent",
+            "order_url": link.url,
+            "upload_id": link.id,
+            "order_id": order_id,
+            "sent_to": format!("{base}/api/pcb_order/{order_id}/save"),
+            "sent": {
+                "gerber_files": package.board_files.len(),
+                "bom": include_assembly,
+                "cpl": include_assembly,
+            },
+            "board": { "width_mm": width_mm, "length_mm": length_mm, "copper_layers": layers },
+            "order": {
+                "quantity": options.quantity,
+                "thickness_mm": options.thickness_mm,
+                "color": options.color,
+                "surface_finish": options.surface_finish,
+                "copper_weight_oz": options.copper_weight,
+            },
+            "drc": drc,
+            "board_source": package_body["board_source"],
+            "placement_orientation": package_body["placement_orientation"],
+            "next_steps": "Open order_url and sign in to JLCPCB. Check the board in JLCPCB's viewer and its size, layers and options; with assembly, check every part in the PCBA step's Component Placements before ordering. Nothing has been ordered or paid.",
+        })
+        .to_string(),
+    ))
+}
+
+/// A copy of the exported board, with the project's settings and custom
+/// rules beside it, for DRC to check what is uploaded without writing a
+/// report into the project.
+#[cfg(feature = "jlcpcb")]
+async fn stage_board_for_drc(
+    board: &std::path::Path,
+    contents: &str,
+    staging: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    let dir = staging.join("drc");
+    tokio::fs::create_dir_all(&dir).await?;
+    let staged = dir.join(board.file_name().context("the board path names no file")?);
+    tokio::fs::write(&staged, contents).await?;
+    for extension in ["kicad_pro", "kicad_dru"] {
+        let beside = board.with_extension(extension);
+        if beside.try_exists()? {
+            tokio::fs::copy(&beside, staged.with_extension(extension)).await?;
+        }
+    }
+    Ok(staged)
+}
+
+/// The refusal DRC's report gives an upload: any error, or a report that
+/// leaves out the unconnected items, which are what an unrouted board shows.
+#[cfg(feature = "jlcpcb")]
+fn drc_refusal(report: &cli::DrcReport) -> Option<CallToolResult> {
+    if report.unconnected_items.is_none() {
+        return Some(order_not_uploaded(
+            "kicad-cli did not report DRC's unconnected items, so an unrouted board can't be told from a routed one; update kicad-cli, or pass skip_drc: true",
+            json!({}),
+        ));
+    }
+    let errors: Vec<_> = report
+        .all()
+        .filter(|violation| violation.severity == "error")
+        .collect();
+    if errors.is_empty() {
+        return None;
+    }
+    let shown: Vec<_> = errors
+        .iter()
+        .take(25)
+        .map(|violation| {
+            json!({
+                "rule": violation.rule,
+                "description": violation.description,
+                "pos": violation.pos,
+            })
+        })
+        .collect();
+    Some(order_not_uploaded(
+        format!(
+            "DRC reports {} error(s) on the exported board. Fix them, or pass skip_drc: true once they are reviewed and waived",
+            errors.len()
+        ),
+        json!({ "drc_errors": shown, "drc_error_count": errors.len() }),
+    ))
 }
 
 fn midpoint_failure(error: copperpour_ipc::IpcFailure) -> CallToolResult {
@@ -904,6 +1280,415 @@ async fn handle_estimate_cost(
         }))
         .unwrap(),
     ))
+}
+
+#[cfg(all(test, feature = "jlcpcb"))]
+mod order_link_tests {
+    //! #208: the order link's checks run before its one request.
+
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".into()),
+                ..Default::default()
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap_or_else(|_| json!({ "text": text }))
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    /// A local order endpoint: it counts the requests, keeps the last one,
+    /// and answers as EasyEDA's does.
+    async fn endpoint() -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<u8>>>) {
+        endpoint_with_status(Some("200 OK")).await
+    }
+
+    async fn endpoint_with_status(
+        status: Option<&'static str>,
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<u8>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let count = Arc::new(AtomicUsize::new(0));
+        let last = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (counted, kept) = (count.clone(), last.clone());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut request = Vec::new();
+                let mut buf = [0u8; 65536];
+                loop {
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request).into_owned();
+                    let done = text.split_once("\r\n\r\n").is_some_and(|(head, _)| {
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        request.len() >= head.len() + 4 + length
+                    });
+                    if done || n == 0 {
+                        break;
+                    }
+                }
+                *kept.lock().unwrap() = request;
+                let Some(status) = status else {
+                    // The entire request arrived, but the connection closes
+                    // before any response: transmission is now uncertain.
+                    continue;
+                };
+                let answer = r#"{"success":true,"code":0,"result":{"url":"https:\/\/jlcpcb.com\/quote\/eda?eadLink=2&uuid=f0f0&from=eda-pro&edaActivity=null","id":"f0f0"}}"#;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (base, count, last)
+    }
+
+    const ORDER_BOARD: &str = include_str!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
+
+    fn prepared_package(complete: bool) -> PackageBuild {
+        PackageBuild {
+            body: json!({ "warnings": if complete { vec![] } else { vec!["Gerber export failed"] }, "board_source": "saved_file" }).to_string(),
+            complete,
+            board_files: Vec::new(),
+            bom: None,
+            cpl: None,
+            snapshot: None,
+            _staging: None,
+        }
+    }
+
+    async fn prepared_order(source: &str, complete: bool, base: &str) -> CallToolResult {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("order.kicad_pcb");
+        std::fs::write(&board, source).unwrap();
+        upload_order_package(
+            &json!({ "_order_base_url": base }),
+            &ctx(),
+            &board,
+            false,
+            true,
+            prepared_package(complete),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_package_refuses_before_any_request() {
+        let (base, count, _) = endpoint().await;
+        let result = prepared_order(ORDER_BOARD, false, &base).await;
+        let refusal = body(&result);
+        assert!(result.is_error, "{refusal}");
+        assert_eq!(refusal["uploaded"], false, "{refusal}");
+        assert!(
+            refusal["reason"]
+                .as_str()
+                .unwrap()
+                .contains("package is incomplete"),
+            "{refusal}"
+        );
+        assert_eq!(refusal["warnings"], json!(["Gerber export failed"]));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_zero_size_outline_refuses_before_any_request() {
+        // Collapse the four Edge.Cuts lines of a KiCad-authored fixture;
+        // retain the actual board format and layer declarations.
+        let mut source = ORDER_BOARD.to_owned();
+        for tag in ["start", "end"] {
+            for point in ["80 30", "130 30", "130 70", "80 70"] {
+                source = source.replace(&format!("({tag} {point})"), &format!("({tag} 0 0)"));
+            }
+        }
+        let tree = copperpour_sexp::parse_sexp(&source).unwrap();
+        assert_eq!(board_outline_size(&tree), Some((0.0, 0.0)));
+        let (base, count, _) = endpoint().await;
+        let result = prepared_order(&source, true, &base).await;
+        let refusal = body(&result);
+        assert!(result.is_error, "{refusal}");
+        assert_eq!(refusal["uploaded"], false);
+        assert!(
+            refusal["reason"].as_str().unwrap().contains("outline"),
+            "{refusal}"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_http_error_after_receiving_the_files_reports_sent() {
+        let (base, count, request) = endpoint_with_status(Some("500 Internal Server Error")).await;
+        let result = prepared_order(ORDER_BOARD, true, &base).await;
+        let refusal = body(&result);
+        assert!(result.is_error, "{refusal}");
+        assert_eq!(refusal["uploaded"], true, "{refusal}");
+        assert_eq!(refusal["upload_outcome"], "sent");
+        assert_eq!(refusal["http_status"], 500);
+        assert_eq!(refusal["order_url"], serde_json::Value::Null);
+        assert!(refusal["order_id"]
+            .as_str()
+            .is_some_and(|id| id.len() == 32));
+        assert!(refusal["reason"].as_str().unwrap().contains("500"));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(String::from_utf8_lossy(&request.lock().unwrap()).contains("name=\"gerber\""));
+    }
+
+    #[tokio::test]
+    async fn a_lost_response_after_receiving_the_files_reports_uncertainty() {
+        let (base, count, _) = endpoint_with_status(None).await;
+        let result = prepared_order(ORDER_BOARD, true, &base).await;
+        let refusal = body(&result);
+        assert!(result.is_error, "{refusal}");
+        assert!(refusal.get("uploaded").is_some(), "{refusal}");
+        assert_eq!(refusal["uploaded"], serde_json::Value::Null, "{refusal}");
+        assert_eq!(refusal["upload_outcome"], "uncertain");
+        assert!(refusal["recovery"]
+            .as_str()
+            .unwrap()
+            .contains("Do not retry automatically"));
+        assert!(refusal["order_id"].as_str().is_some());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_endpoint_reports_not_sent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let result = prepared_order(ORDER_BOARD, true, &base).await;
+        let refusal = body(&result);
+        assert!(result.is_error, "{refusal}");
+        assert_eq!(refusal["uploaded"], false, "{refusal}");
+        assert_eq!(refusal["upload_outcome"], "not_sent");
+    }
+
+    #[tokio::test]
+    async fn an_assembly_order_needs_the_schematic() {
+        let result =
+            handle_generate_jlcpcb_order_link(&json!({ "board": "/no/board.kicad_pcb" }), &ctx())
+                .await
+                .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            body(&result)["error"]["field"],
+            "schematic",
+            "{:?}",
+            body(&result)
+        );
+    }
+
+    fn report(violations: serde_json::Value, unconnected: serde_json::Value) -> cli::DrcReport {
+        serde_json::from_value(json!({
+            "violations": violations,
+            "unconnected_items": unconnected,
+            "schematic_parity": null,
+        }))
+        .unwrap()
+    }
+
+    fn violation(severity: &str, rule: &str) -> serde_json::Value {
+        json!({ "severity": severity, "description": rule, "rule": rule, "pos": null, "items": [] })
+    }
+
+    /// Errors refuse, warnings don't, and a report without unconnected items
+    /// can't tell an unrouted board from a routed one.
+    #[test]
+    fn drc_errors_or_no_unconnected_report_refuse_the_upload() {
+        assert!(drc_refusal(&report(
+            json!([violation("warning", "silk_overlap")]),
+            json!([])
+        ))
+        .is_none());
+        let refused = drc_refusal(&report(
+            json!([
+                violation("error", "clearance"),
+                violation("warning", "silk_overlap")
+            ]),
+            json!([violation("error", "unconnected_items")]),
+        ))
+        .unwrap();
+        let refusal = body(&refused);
+        assert_eq!(refusal["uploaded"], false, "{refusal}");
+        assert_eq!(refusal["drc_error_count"], 2, "{refusal}");
+        assert_eq!(refusal["drc_errors"][0]["rule"], "clearance", "{refusal}");
+        let unreported = body(&drc_refusal(&report(json!([]), json!(null))).unwrap());
+        assert!(
+            unreported["reason"]
+                .as_str()
+                .unwrap()
+                .contains("unconnected items"),
+            "{unreported}"
+        );
+    }
+
+    /// DRC checks the board that was exported, the live snapshot with its
+    /// unsaved edits, with the project's settings and custom rules beside it.
+    #[tokio::test]
+    async fn drc_checks_the_exported_board_with_the_projects_rules() {
+        let project = tempfile::tempdir().unwrap();
+        let board = project.path().join("b.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb saved)").unwrap();
+        std::fs::write(project.path().join("b.kicad_dru"), "(version 1)").unwrap();
+        std::fs::write(project.path().join("b.kicad_pro"), "{}").unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let staged = stage_board_for_drc(&board, "(kicad_pcb live)", staging.path())
+            .await
+            .unwrap();
+        assert!(staged.starts_with(staging.path()), "{}", staged.display());
+        assert_eq!(
+            std::fs::read_to_string(&staged).unwrap(),
+            "(kicad_pcb live)"
+        );
+        for (extension, contents) in [("kicad_dru", "(version 1)"), ("kicad_pro", "{}")] {
+            let beside = staged.with_extension(extension);
+            assert_eq!(std::fs::read_to_string(beside).unwrap(), contents);
+        }
+    }
+
+    const CLEAN_BOARD: &str = "(kicad_pcb (version 20240108) (generator \"pcbnew\")\n\
+        (general (thickness 1.6))\n(paper \"A4\")\n\
+        (layers (0 \"F.Cu\" signal) (31 \"B.Cu\" signal) (36 \"B.SilkS\" user \"B.Silkscreen\")\n\
+        (37 \"F.SilkS\" user \"F.Silkscreen\") (38 \"B.Mask\" user) (39 \"F.Mask\" user) (44 \"Edge.Cuts\" user))\n\
+        (setup (pad_to_mask_clearance 0))\n(net 0 \"\")\n\
+        (gr_rect (start 100 100) (end 150 140) (stroke (width 0.1) (type default)) (fill none) (layer \"Edge.Cuts\"))\n)\n";
+
+    /// A PCB-only order of a clean board: DRC passes, and the one request
+    /// carries the zipped Gerbers and the board's size and layers.
+    #[tokio::test]
+    #[ignore = "needs a real kicad-cli: KICAD_CLI=/path/to/kicad-cli"]
+    async fn a_clean_board_uploads_once_and_gets_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("clean.kicad_pcb");
+        std::fs::write(&board, CLEAN_BOARD).unwrap();
+        let (base, count, last) = endpoint().await;
+        let result = handle_generate_jlcpcb_order_link(
+            &json!({ "board": board, "include_assembly": false, "quantity": 10, "_order_base_url": base }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        let answer = body(&result);
+        assert!(!result.is_error, "{answer}");
+        assert_eq!(
+            answer["order_url"],
+            "https://jlcpcb.com/quote/eda?eadLink=2&uuid=f0f0&from=eda-pro&edaActivity=null"
+        );
+        assert_eq!(answer["upload_id"], "f0f0");
+        assert_eq!(answer["drc"]["errors"], 0, "{answer}");
+        assert_eq!(
+            answer["board"],
+            json!({ "width_mm": 50.0, "length_mm": 40.0, "copper_layers": 2 })
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let request = String::from_utf8_lossy(&last.lock().unwrap()).into_owned();
+        assert!(
+            request.contains("name=\"gerber\"; filename=\"blob\"\r\nContent-Type: application/zip")
+        );
+        assert!(!request.contains("name=\"bom\""));
+        for (field, value) in [
+            ("layer", "2"),
+            ("width", "50"),
+            ("length", "40"),
+            ("qty", "10"),
+        ] {
+            assert!(
+                request.contains(&format!("name=\"{field}\"\r\n\r\n{value}\r\n")),
+                "{field}"
+            );
+        }
+    }
+
+    /// The whole order against a board open in KiCad. Set
+    /// `COPPERPOUR_LIVE_ORDER_BOARD` and `COPPERPOUR_LIVE_ORDER_SCHEMATIC`,
+    /// `KICAD_API_SOCKET` and `KICAD_CLI`. It posts to a local endpoint
+    /// unless `COPPERPOUR_LIVE_ORDER_UPLOAD=1`, which uploads the board to
+    /// EasyEDA and JLCPCB for real; `COPPERPOUR_LIVE_ORDER_SKIP_DRC=1` skips
+    /// DRC. Nothing is ordered either way.
+    #[tokio::test]
+    #[ignore = "needs a board open in KiCad; see the comment"]
+    async fn live_order_of_the_open_board() {
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: var("KICAD_CLI"),
+                ipc_address: var("KICAD_API_SOCKET"),
+                ..Default::default()
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let mut args = json!({
+            "board": var("COPPERPOUR_LIVE_ORDER_BOARD"),
+            "schematic": var("COPPERPOUR_LIVE_ORDER_SCHEMATIC"),
+            "skip_drc": std::env::var("COPPERPOUR_LIVE_ORDER_SKIP_DRC").is_ok_and(|value| value == "1"),
+        });
+        let local =
+            std::env::var("COPPERPOUR_LIVE_ORDER_UPLOAD").map_or(true, |value| value != "1");
+        let mut last = None;
+        if local {
+            let (base, _, request) = endpoint().await;
+            args["_order_base_url"] = json!(base);
+            last = Some(request);
+        }
+        let result = handle_generate_jlcpcb_order_link(&args, &ctx)
+            .await
+            .unwrap();
+        eprintln!("{}", serde_json::to_string_pretty(&body(&result)).unwrap());
+        if let Some(request) = last {
+            let request = request.lock().unwrap().clone();
+            if let Some(at) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let out = std::env::temp_dir().join("copperpour-live-order-request.bin");
+                std::fs::write(&out, &request[at + 4..]).unwrap();
+                eprintln!("request body written to {}", out.display());
+            }
+        }
+    }
+
+    /// DRC's errors refuse the upload: no request is made.
+    #[tokio::test]
+    #[ignore = "needs a real kicad-cli: KICAD_CLI=/path/to/kicad-cli"]
+    async fn drc_errors_refuse_before_any_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("drc_ownership_j1.kicad_pcb");
+        std::fs::write(
+            &board,
+            include_str!("../../tests/fixtures/drc_ownership_j1.kicad_pcb"),
+        )
+        .unwrap();
+        let (base, count, _) = endpoint().await;
+        let result = handle_generate_jlcpcb_order_link(
+            &json!({ "board": board, "include_assembly": false, "_order_base_url": base }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        let refusal = body(&result);
+        assert!(result.is_error, "{refusal}");
+        assert_eq!(refusal["uploaded"], false, "{refusal}");
+        assert_eq!(refusal["drc_error_count"], 4, "{refusal}");
+        assert_eq!(count.load(Ordering::SeqCst), 0, "no request may be made");
+    }
 }
 
 #[cfg(test)]

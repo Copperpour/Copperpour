@@ -5,6 +5,10 @@
 //! [`super::AssemblyFormat::Jlcpcb`].
 
 pub(crate) mod midpoints;
+// The order link uploads to EasyEDA (#208), so it comes with the catalog's
+// network feature.
+#[cfg(feature = "jlcpcb")]
+pub(crate) mod order;
 pub(crate) mod pricing;
 
 use crate::tools::cli;
@@ -33,6 +37,7 @@ pub(crate) async fn export_jlcpcb_cpl(
     let (source, geometry) = midpoints::convert_positions(&source, midpoints)?;
     let mut export = jlcpcb_cpl_from_kicad_csv(&source, &policies)?;
     export.orientation_evidence.geometry = geometry;
+    export.kicad_positions = source;
     cli::publish_verified_bytes(output, &export.bytes, "JLCPCB CPL").await?;
     Ok(export)
 }
@@ -609,6 +614,9 @@ struct JlcpcbUnverifiedFootprint {
 #[derive(Debug)]
 pub(crate) struct JlcpcbCplExport {
     pub(crate) bytes: Vec<u8>,
+    /// KiCad's position file after the midpoint conversion: the order link's
+    /// CPL takes each part's value and footprint from it (#208).
+    pub(crate) kicad_positions: String,
     pub(crate) designators: BTreeSet<String>,
     pub(crate) orientation_evidence: JlcpcbOrientationEvidence,
 }
@@ -761,6 +769,7 @@ fn jlcpcb_cpl_from_kicad_csv(
         precedence: "built-in footprint first-match after project policy",
     });
     Ok(JlcpcbCplExport {
+        kicad_positions: String::new(),
         bytes: writer.into_inner()?,
         designators,
         orientation_evidence: JlcpcbOrientationEvidence {
@@ -956,6 +965,9 @@ mod jlcpcb_assembly_tests {
                 midpoint_x_mm: 16.25,
                 midpoint_y_mm: 6.0,
                 algorithm: "kicad_native_board_pad_boxes_union_center",
+                pad_count: 2,
+                pin1_mm: None,
+                smd: true,
             },
         )]);
         let source = "Ref,Val,Package,PosX,PosY,Rot,Side\nJ1,X,JST,15,-6,0,top\n";

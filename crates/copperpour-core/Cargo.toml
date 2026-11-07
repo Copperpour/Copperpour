@@ -39,8 +39,9 @@ tempfile = "3"
 # no outbound HTTP client and no vendor endpoints (#210). Cargo features only
 # add code, so each integration adds itself; there is no `offline` feature.
 default = ["jlcpcb", "freerouting", "native-bridge"]
-# JLCPCB / LCSC parts catalog: the local cache, its download, and the LCSC and
-# EasyEDA lookups. JLCPCB fabrication and assembly output don't need it.
+# JLCPCB / LCSC parts catalog: the local cache, its download, the LCSC and
+# EasyEDA lookups, and the order upload (#208). JLCPCB fabrication and assembly
+# output don't need it.
 jlcpcb = ["dep:rusqlite", "dep:reqwest", "dep:zip"]
 # Freerouting discovery and headless routing: a Java subprocess, no network.
 freerouting = ["dep:zip"]
