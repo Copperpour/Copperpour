@@ -594,6 +594,7 @@ pub(crate) async fn route_specctra_dsn(
         "elapsed_seconds": evidence.elapsed_seconds,
         "ses_bytes": evidence.ses_bytes,
         "last_activity": evidence.last_activity,
+        "settings_checked": evidence.settings_checked,
         "settings_not_applied": evidence.settings_not_applied,
         "settings_warnings": evidence.settings_warnings
     })))

@@ -96,6 +96,10 @@ pub(crate) struct RouteEvidence {
     /// Last routing activity read from Freerouting's log, e.g.
     /// "pass 17: 0 unrouted, 218 violations".
     pub last_activity: Option<String>,
+    /// Whether the sent settings were read back from
+    /// `get_effective_settings`. When false, `settings_not_applied` is empty
+    /// because nothing was compared, not because everything took.
+    pub settings_checked: bool,
     /// Settings sent but not found with the same value among the job's
     /// effective settings: unknown key, typo, or a value Freerouting replaced.
     pub settings_not_applied: Vec<String>,
@@ -426,6 +430,7 @@ async fn run_state_machine(
         .await?;
 
     let job_settings = job_settings_body(settings);
+    let mut settings_checked = false;
     let mut settings_not_applied = Vec::new();
     let mut settings_warnings = Vec::new();
     if !job_settings.is_empty() {
@@ -448,6 +453,7 @@ async fn run_state_machine(
                 )
                 .await?;
             if let Some(effective) = effective_settings(&effective) {
+                settings_checked = true;
                 settings_not_applied = settings_mismatches(&job_settings, effective);
                 settings_warnings = effective
                     .get("validation_warnings")
@@ -517,6 +523,7 @@ async fn run_state_machine(
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
         last_activity: progress.activity,
+        settings_checked,
         settings_not_applied,
         settings_warnings,
     })
@@ -1233,33 +1240,51 @@ fn effective_settings(result: &Value) -> Option<&Map<String, Value>> {
 
 /// Every leaf of `sent` whose value is not found at the same path in
 /// `effective`, as "path: sent X, effective Y" (or "not a setting").
+///
+/// Objects and arrays are walked, arrays element by element (`layers[0]`):
+/// Freerouting fills in what an element leaves out with its defaults, and
+/// keeps elements nobody sent (the other layers), so neither is a mismatch.
+/// A sent element with no counterpart in the effective array is one.
 fn settings_mismatches(sent: &Map<String, Value>, effective: &Map<String, Value>) -> Vec<String> {
-    fn walk(
-        sent: &Map<String, Value>,
-        effective: &Map<String, Value>,
-        path: &str,
-        out: &mut Vec<String>,
-    ) {
-        for (key, value) in sent {
-            let here = if path.is_empty() {
-                key.clone()
-            } else {
-                format!("{path}.{key}")
-            };
-            match (value, effective.get(key)) {
-                (_, None) => out.push(format!("{here}: not a Freerouting setting")),
-                (Value::Object(sent), Some(Value::Object(effective))) => {
-                    walk(sent, effective, &here, out)
+    fn walk(sent: &Value, effective: &Value, path: &str, out: &mut Vec<String>) {
+        match (sent, effective) {
+            (Value::Object(sent), Value::Object(effective)) => {
+                for (key, value) in sent {
+                    let here = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    match effective.get(key) {
+                        None => out.push(format!("{here}: not a Freerouting setting")),
+                        Some(effective) => walk(value, effective, &here, out),
+                    }
                 }
-                (sent, Some(effective)) if !same_value(sent, effective) => {
-                    out.push(format!("{here}: sent {sent}, effective {effective}"))
-                }
-                _ => {}
             }
+            (Value::Array(sent), Value::Array(effective)) => {
+                for (index, value) in sent.iter().enumerate() {
+                    let here = format!("{path}[{index}]");
+                    match effective.get(index) {
+                        None => out.push(format!(
+                            "{here}: sent {value}, not in the effective settings"
+                        )),
+                        Some(effective) => walk(value, effective, &here, out),
+                    }
+                }
+            }
+            (sent, effective) if !same_value(sent, effective) => {
+                out.push(format!("{path}: sent {sent}, effective {effective}"))
+            }
+            _ => {}
         }
     }
     let mut out = Vec::new();
-    walk(sent, effective, "", &mut out);
+    walk(
+        &Value::Object(sent.clone()),
+        &Value::Object(effective.clone()),
+        "",
+        &mut out,
+    );
     out
 }
 
@@ -1513,6 +1538,15 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn router_settings_are_sent_merged_and_what_did_not_take_is_reported() {
+        // Without get_effective_settings nothing is compared, and the
+        // evidence says so instead of an empty list that reads as "all took".
+        for read_back in [true, false] {
+            router_settings_round_trip(read_back).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn router_settings_round_trip(read_back: bool) {
         let temp = tempfile::tempdir().unwrap();
         let dsn = temp.path().join("board.dsn");
         let temporary = temp.path().join("board.ses.tmp");
@@ -1520,7 +1554,12 @@ done
         std::fs::write(&dsn, "(pcb board)").unwrap();
         let mut tools = conforming_tools_list();
         let by_path = tools["tools"][3]["inputSchema"].clone();
-        for name in ["update_job_settings", "get_effective_settings"] {
+        let names: &[&str] = if read_back {
+            &["update_job_settings", "get_effective_settings"]
+        } else {
+            &["update_job_settings"]
+        };
+        for name in names {
             tools["tools"]
                 .as_array_mut()
                 .unwrap()
@@ -1602,6 +1641,12 @@ done
             })
         );
         assert_eq!(evidence.final_state, "COMPLETED");
+        assert_eq!(evidence.settings_checked, read_back);
+        if !read_back {
+            assert!(evidence.settings_not_applied.is_empty());
+            assert!(evidence.settings_warnings.is_empty());
+            return;
+        }
         assert_eq!(
             evidence.settings_not_applied,
             [
@@ -1939,6 +1984,45 @@ done
                 "no_such_setting: not a Freerouting setting",
             ]
         );
+
+        // Freerouting 2.5.0 fills in what a layer leaves out and keeps the
+        // layers nobody sent: a partial layers array that took is no mismatch.
+        let effective = json!({
+            "layers": [
+                { "bend_cost": 0.5, "preferred_direction_horizontal": true },
+                { "bend_cost": 0.0, "preferred_direction_horizontal": false }
+            ]
+        });
+        let effective = effective.as_object().unwrap();
+        for (sent, expected) in [
+            (json!({ "layers": [{ "bend_cost": 0.5 }] }), vec![]),
+            (
+                json!({ "layers": [{ "bend_cost": 0.5 }, { "bend_cost": 2.0 }] }),
+                vec!["layers[1].bend_cost: sent 2.0, effective 0.0"],
+            ),
+            (
+                json!({ "layers": [{ "bend_kost": 1.0 }] }),
+                vec!["layers[0].bend_kost: not a Freerouting setting"],
+            ),
+            (
+                json!({ "layers": [{}, {}, { "bend_cost": 1.0 }] }),
+                vec![r#"layers[2]: sent {"bend_cost":1.0}, not in the effective settings"#],
+            ),
+            (
+                json!({ "layers": { "bend_cost": 0.5 } }),
+                vec![concat!(
+                    r#"layers: sent {"bend_cost":0.5}, effective "#,
+                    r#"[{"bend_cost":0.5,"preferred_direction_horizontal":true},"#,
+                    r#"{"bend_cost":0.0,"preferred_direction_horizontal":false}]"#
+                )],
+            ),
+        ] {
+            assert_eq!(
+                settings_mismatches(sent.as_object().unwrap(), effective),
+                expected,
+                "{sent}"
+            );
+        }
     }
 
     #[test]

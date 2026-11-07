@@ -11,15 +11,22 @@ below 0.1 like `optimizer_improvement_threshold`, when no
 
 Freerouting accepts keys it does not know and drops them without a word. After
 the job settings are sent, they are read back from `get_effective_settings`,
-and the result has two new keys:
+and the result has three new keys:
 
+- `settings_checked` (boolean): `true` when the settings sent were read back
+  and compared. `false` when nothing was sent, or when the Freerouting server
+  has no `get_effective_settings` or its answer could not be read: then
+  `settings_not_applied` is empty because nothing was compared.
 - `settings_not_applied` (array of strings): each setting sent that Freerouting
   does not have, or holds with another value, as `"path: not a Freerouting
-  setting"` or `"path: sent X, effective Y"`. Empty when everything took, when
-  nothing was sent, or when the Freerouting server has no
-  `get_effective_settings` to read them back from.
+  setting"` or `"path: sent X, effective Y"`. Arrays are compared element by
+  element, with the index in the path (`layers[0].bend_cost`): what an element
+  leaves out, and elements that were not sent, are Freerouting's defaults and
+  not reported, while a sent element missing from the effective array is
+  reported as `"path[i]: sent X, not in the effective settings"`. Empty when
+  everything took, or when `settings_checked` is `false`.
 - `settings_warnings` (array): Freerouting's own `validation_warnings` for the
   effective settings.
 
 The routing still runs when a setting did not take. Calls without
-`router_settings` behave as before, apart from the two new keys in the result.
+`router_settings` behave as before, apart from the three new keys in the result.
