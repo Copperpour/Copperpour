@@ -103,6 +103,9 @@ pub(crate) struct RouteEvidence {
     /// Connections still unrouted when the job ended, from the last count in
     /// Freerouting's log; None when the log could not be read.
     pub unrouted: Option<u64>,
+    /// Freerouting's log file the count was looked for in; None when no
+    /// location could be worked out.
+    pub freerouting_log: Option<String>,
     /// Settings sent but not found with the same value among the job's
     /// effective settings: unknown key, typo, or a value Freerouting replaced.
     pub settings_not_applied: Vec<String>,
@@ -526,6 +529,7 @@ async fn run_state_machine(
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
         unrouted: progress.read_unrouted(),
+        freerouting_log: progress.log.as_deref().map(|log| log.display().to_string()),
         last_activity: progress.activity,
         settings_checked,
         settings_not_applied,
@@ -1767,6 +1771,11 @@ done
 
         assert_eq!(evidence.final_state, "COMPLETED");
         assert_eq!(evidence.unrouted, Some(3), "the last count of the job");
+        assert_eq!(
+            evidence.freerouting_log.as_deref(),
+            Some(log.to_str().unwrap()),
+            "the log the count was read from"
+        );
     }
 
     #[test]

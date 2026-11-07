@@ -580,7 +580,8 @@ pub(crate) async fn route_specctra_dsn(
 /// Freerouting ends the job COMPLETED (max_passes reached, or no progress):
 /// `success` is false, `message` says how many are left, and the SES is still
 /// written, for inspection. An unknown count (log not readable) is not turned
-/// into a failure.
+/// into a failure, but `message` says it was not checked: "routed" and "not
+/// counted" must not give the same answer.
 fn route_response(
     evidence: &mcp::RouteEvidence,
     jar: &Path,
@@ -588,13 +589,19 @@ fn route_response(
     ses_output: &Path,
 ) -> serde_json::Value {
     let fully_routed = evidence.unrouted.is_none_or(|unrouted| unrouted == 0);
-    let message = (!fully_routed).then(|| {
-        format!(
-            "Freerouting left {} connection(s) unrouted; the SES at {} is incomplete",
-            evidence.unrouted.unwrap_or_default(),
+    let message = match evidence.unrouted {
+        Some(0) => None,
+        Some(unrouted) => Some(format!(
+            "Freerouting left {unrouted} connection(s) unrouted; the SES at {} is incomplete",
             ses_output.display()
-        )
-    });
+        )),
+        None => Some(format!(
+            "the unrouted count could not be read from Freerouting's log ({}); the SES at {} \
+             was not checked for completeness",
+            evidence.freerouting_log.as_deref().unwrap_or("no log"),
+            ses_output.display()
+        )),
+    };
     json!({
         "success": fully_routed,
         "message": message,
@@ -653,6 +660,7 @@ mod freerouting_tests {
             diagnostics_path: None,
             last_activity: Some("pass 30: 3 unrouted, 218 violations".into()),
             unrouted,
+            freerouting_log: Some("/state/freerouting/logs/freerouting.log".into()),
             settings_checked: false,
             settings_not_applied: Vec::new(),
             settings_warnings: Vec::new(),
@@ -727,13 +735,33 @@ mod freerouting_tests {
         );
     }
 
-    /// A count that could not be read from the log is unknown, not a failure.
+    /// A count that could not be read from the log is unknown, not a failure,
+    /// and the message says so: "routed" and "not counted" differ.
     #[test]
     fn an_unknown_unrouted_count_leaves_success_true() {
         let body = respond(None);
         assert_eq!(body["success"], true, "{body}");
         assert!(body["unrouted_connections"].is_null(), "{body}");
-        assert!(body["message"].is_null(), "{body}");
+        let message = body["message"]
+            .as_str()
+            .expect("a message says it was not counted");
+        assert!(message.contains("could not be read"), "{message}");
+        assert!(
+            message.contains("/state/freerouting/logs/freerouting.log"),
+            "{message}"
+        );
+        assert!(message.contains("/work/board.ses"), "{message}");
+
+        let mut evidence = completed_job(None);
+        evidence.freerouting_log = None;
+        let body = route_response(
+            &evidence,
+            Path::new("/opt/freerouting.jar"),
+            Path::new("/work/board.dsn"),
+            Path::new("/work/board.ses"),
+        );
+        let message = body["message"].as_str().expect("a message without a log");
+        assert!(message.contains("(no log)"), "{message}");
     }
 
     fn test_ctx() -> ToolContext {
