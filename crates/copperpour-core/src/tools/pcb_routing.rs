@@ -2901,6 +2901,8 @@ mod specctra_live_undo_test {
                 optimizer_enabled: Some(false),
                 job_timeout_seconds: Some(120),
                 optimize_seconds: None,
+                optimizer_max_passes: None,
+                optimizer_improvement_threshold: None,
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(180),
             },
