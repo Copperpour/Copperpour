@@ -1724,7 +1724,11 @@ pub(crate) fn annotate_hierarchy(path: &Path, options: AnnotateOptions) -> CallT
 /// Whether `root` is its project's only top-level sheet, as eeschema 10 reads
 /// `schematic.top_level_sheets`: none listed means the project's own
 /// schematic, and an entry's uuid, unless nil, replaces the sheet's own.
-fn sole_top_level_sheet(project_file: &Path, root: &Path, root_uuid: &str) -> Result<(), String> {
+pub(crate) fn sole_top_level_sheet(
+    project_file: &Path,
+    root: &Path,
+    root_uuid: &str,
+) -> Result<(), String> {
     const NIL: &str = "00000000-0000-0000-0000-000000000000";
     let shown = project_file.display();
     let settings: Value = std::fs::read_to_string(project_file)

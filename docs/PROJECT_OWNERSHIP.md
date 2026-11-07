@@ -87,6 +87,14 @@ unreadable project schematics, or move a genuinely independent document out of
 the unrelated project. An explicit library table beside a schematic still
 selects its library context.
 
+## Repairing stale instance records
+
+`repair_instance_metadata` drops a sheet's symbol instance records of
+projects no candidate defines, and paths of the owning project its sheet tree
+no longer gives the file, and adds the owning project's missing paths. A sheet
+carrying a record of another candidate project is not repaired, and stays
+refused.
+
 ## Evidence and limits
 
 The `project_ownership` test fixture is copied from KiCad's complex-hierarchy
