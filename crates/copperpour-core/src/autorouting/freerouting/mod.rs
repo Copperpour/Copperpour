@@ -633,7 +633,9 @@ fn route_response(
         "ses_bytes": evidence.ses_bytes,
         "last_activity": evidence.last_activity,
         "settings_checked": evidence.settings_checked,
-        "settings_not_applied": evidence.settings_not_applied,
+        // Kept for callers that read it: a setting Freerouting did not apply
+        // now fails the call before routing, so a routed board has none.
+        "settings_not_applied": [],
         "settings_warnings": evidence.settings_warnings
     })
 }
@@ -662,7 +664,6 @@ mod freerouting_tests {
             unrouted,
             freerouting_log: Some("/state/freerouting/logs/freerouting.log".into()),
             settings_checked: false,
-            settings_not_applied: Vec::new(),
             settings_warnings: Vec::new(),
         }
     }
@@ -700,37 +701,28 @@ mod freerouting_tests {
         assert!(body["message"].is_null(), "{body}");
     }
 
-    /// The read-back of the settings reaches the caller as RouteEvidence
-    /// holds it, checked or not.
+    /// Settings Freerouting did not apply fail the call before routing, so a
+    /// routed board has none; the key stays for callers that read it.
+    /// Whether they were read back at all reaches the caller as is.
     #[test]
-    fn the_settings_read_back_is_in_the_result() {
+    fn a_routed_board_keeps_an_empty_settings_not_applied() {
+        let body = respond(Some(0));
+        assert_eq!(body["settings_not_applied"], json!([]), "{body}");
+        assert_eq!(body["settings_checked"], false, "{body}");
         let mut evidence = completed_job(Some(0));
         evidence.settings_checked = true;
-        evidence.settings_not_applied =
-            vec!["autorouter.max_pases: not a Freerouting setting".into()];
-        evidence.settings_warnings = vec![serde_json::json!("max_threads above the CPU count")];
-        let paths = (
+        evidence.settings_warnings = vec![json!("max_threads above the CPU count")];
+        let body = route_response(
+            &evidence,
             Path::new("/opt/freerouting.jar"),
             Path::new("/work/board.dsn"),
             Path::new("/work/board.ses"),
         );
-        let body = route_response(&evidence, paths.0, paths.1, paths.2);
         assert_eq!(body["settings_checked"], true, "{body}");
-        assert_eq!(
-            body["settings_not_applied"],
-            serde_json::json!(["autorouter.max_pases: not a Freerouting setting"]),
-            "{body}"
-        );
+        assert_eq!(body["settings_not_applied"], json!([]), "{body}");
         assert_eq!(
             body["settings_warnings"],
-            serde_json::json!(["max_threads above the CPU count"]),
-            "{body}"
-        );
-        let body = respond(Some(0));
-        assert_eq!(body["settings_checked"], false, "{body}");
-        assert_eq!(
-            body["settings_not_applied"],
-            serde_json::json!([]),
+            json!(["max_threads above the CPU count"]),
             "{body}"
         );
     }
