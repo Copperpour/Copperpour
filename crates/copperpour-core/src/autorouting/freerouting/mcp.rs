@@ -658,12 +658,36 @@ fn freerouting_log_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("FREEROUTING_LOG") {
         return Some(PathBuf::from(path));
     }
+    Some(freerouting_state_dir()?.join("logs/freerouting.log"))
+}
+
+/// `$XDG_STATE_HOME/freerouting`, else `~/.local/state/freerouting`: where
+/// Freerouting already keeps its logs.
+fn freerouting_state_dir() -> Option<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
         })?;
-    Some(state.join("freerouting/logs/freerouting.log"))
+    Some(state.join("freerouting"))
+}
+
+/// HotSpot writes a crash report (`hs_err_pid*.log`) and possibly a core dump
+/// into its working directory, which it inherits from Copperpour and is
+/// usually the KiCad project: a G1 crash once left its report at the root of a
+/// project repository. Send the report next to Freerouting's logs (the
+/// temporary directory when there is no usable state directory) and never dump
+/// core. A relative state directory would resolve against that same working
+/// directory, so it is not used.
+fn jvm_crash_arguments(state_dir: Option<&Path>) -> Vec<std::ffi::OsString> {
+    let directory = state_dir
+        .filter(|directory| directory.is_absolute())
+        .filter(|directory| std::fs::create_dir_all(directory).is_ok())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let mut error_file = std::ffi::OsString::from("-XX:ErrorFile=");
+    error_file.push(directory.join("hs_err_pid%p.log"));
+    vec![error_file, "-XX:-CreateCoredumpOnCrash".into()]
 }
 
 fn read_tail(path: &Path, bytes: u64) -> Option<String> {
@@ -808,6 +832,7 @@ impl LocalMcpClient {
     fn server_command(jar: &Path) -> Command {
         let mut command = Command::new(crate::java_runtime::java_executable());
         command
+            .args(jvm_crash_arguments(freerouting_state_dir().as_deref()))
             .arg(JAVA_HEADLESS_ARG)
             .arg("-jar")
             .arg(jar)
@@ -1684,9 +1709,53 @@ done
     fn server_command_passes_headless_as_a_jvm_option_before_jar() {
         let command = LocalMcpClient::server_command(Path::new("freerouting.jar"));
         let arguments: Vec<_> = command.as_std().get_args().collect();
-        assert_eq!(arguments[0], "-Djava.awt.headless=true");
-        assert_eq!(arguments[1], "-jar");
-        assert_eq!(arguments[2], "freerouting.jar");
+        let jar = arguments.iter().position(|a| *a == "-jar").unwrap();
+        assert!(arguments[..jar].contains(&std::ffi::OsStr::new("-Djava.awt.headless=true")));
+        assert_eq!(arguments[jar + 1], "freerouting.jar");
+    }
+
+    #[test]
+    fn jvm_crash_reports_stay_out_of_the_project_directory() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("freerouting");
+        let arguments = jvm_crash_arguments(Some(&directory));
+        let mut expected = std::ffi::OsString::from("-XX:ErrorFile=");
+        expected.push(directory.join("hs_err_pid%p.log"));
+        assert_eq!(arguments, [expected, "-XX:-CreateCoredumpOnCrash".into()]);
+        assert!(directory.is_dir());
+
+        let blocked = state.path().join("file");
+        std::fs::write(&blocked, "").unwrap();
+        let fallback = jvm_crash_arguments(Some(&blocked.join("freerouting")));
+        let mut expected = std::ffi::OsString::from("-XX:ErrorFile=");
+        expected.push(std::env::temp_dir().join("hs_err_pid%p.log"));
+        assert_eq!(fallback[0], expected);
+    }
+
+    #[test]
+    fn jvm_crash_reports_go_to_the_temporary_directory_without_an_absolute_state_directory() {
+        let mut expected = std::ffi::OsString::from("-XX:ErrorFile=");
+        expected.push(std::env::temp_dir().join("hs_err_pid%p.log"));
+        assert_eq!(jvm_crash_arguments(None)[0], expected);
+
+        let relative = Path::new("relative-state-for-crash-reports/freerouting");
+        assert_eq!(jvm_crash_arguments(Some(relative))[0], expected);
+        assert!(!Path::new("relative-state-for-crash-reports").exists());
+    }
+
+    #[test]
+    fn server_command_passes_the_crash_report_options_before_jar() {
+        let command = LocalMcpClient::server_command(Path::new("freerouting.jar"));
+        let arguments: Vec<_> = command.as_std().get_args().collect();
+        let jar = arguments.iter().position(|a| *a == "-jar").unwrap();
+        let error_file = arguments
+            .iter()
+            .position(|a| a.to_string_lossy().starts_with("-XX:ErrorFile="))
+            .expect("server command sets -XX:ErrorFile");
+        assert!(error_file < jar);
+        assert!(arguments[..jar].contains(&std::ffi::OsStr::new("-XX:-CreateCoredumpOnCrash")));
+        let report = arguments[error_file].to_string_lossy();
+        assert!(Path::new(&report["-XX:ErrorFile=".len()..]).is_absolute());
     }
 
     #[test]
