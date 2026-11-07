@@ -2915,6 +2915,7 @@ mod specctra_live_undo_test {
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(180),
             },
+            &serde_json::Map::new(),
         )
         .await
         .expect("route deterministic DSN through local Freerouting MCP");

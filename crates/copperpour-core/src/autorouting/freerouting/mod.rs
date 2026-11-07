@@ -485,12 +485,168 @@ pub(crate) async fn check_freerouting(
     }
 }
 
+/// The KiCad project whose design rules `route_specctra_dsn` sends, and why
+/// it is that one, or why there is none.
+#[derive(Debug, PartialEq, Eq)]
+enum RouteProject {
+    /// `project_path`, as given.
+    Given(PathBuf),
+    /// The only `.kicad_pro` in the DSN's folder, else in its parent.
+    Found(PathBuf),
+    /// No `.kicad_pro` in either folder.
+    NoneFound,
+    /// Several `.kicad_pro` in this folder: none is guessed.
+    Several(PathBuf),
+}
+
+/// The `.kicad_pro` files directly in `dir`.
+fn kicad_projects_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut projects: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_file() && extension_is(path, "kicad_pro"))
+        .collect();
+    projects.sort();
+    projects
+}
+
+fn extension_is(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+}
+
+/// Which project's rules apply to `dsn`: `project_path` when given, else the
+/// only `.kicad_pro` in the DSN's folder, else the only one in its parent (a
+/// `route/` subfolder is common). Several in the first folder that has any:
+/// none is guessed, and the parent is not searched.
+fn route_project(project_path: Option<PathBuf>, dsn: &Path) -> RouteProject {
+    if let Some(project) = project_path {
+        return RouteProject::Given(project);
+    }
+    let folder = match dsn.parent() {
+        Some(folder) if !folder.as_os_str().is_empty() => folder,
+        _ => Path::new("."),
+    };
+    for dir in [Some(folder), folder.parent()].into_iter().flatten() {
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        let mut projects = kicad_projects_in(dir);
+        match projects.len() {
+            0 => continue,
+            1 => return RouteProject::Found(projects.remove(0)),
+            _ => return RouteProject::Several(dir.to_path_buf()),
+        }
+    }
+    RouteProject::NoneFound
+}
+
+/// What `route_specctra_dsn` read from the KiCad project, reported under
+/// `project_rules` in its answer.
+#[derive(Debug, Default)]
+struct ProjectRules {
+    project_path: Option<PathBuf>,
+    /// The Freerouting settings read from it, before the caller's own.
+    sent: serde_json::Map<String, serde_json::Value>,
+    /// Why no project rules were sent, when none were.
+    note: Option<String>,
+}
+
+/// Read the design rules of `project`. A project that is named or found but
+/// cannot be read is refused: routing without its rules is what this call
+/// would otherwise do in silence.
+fn read_project_rules(project: RouteProject) -> Result<ProjectRules, CallToolResult> {
+    let (path, how) = match project {
+        RouteProject::Given(path) => (path, "project_path"),
+        RouteProject::Found(path) => (path, "found next to the DSN"),
+        RouteProject::NoneFound => {
+            return Ok(ProjectRules {
+                note: Some(
+                    "no .kicad_pro next to the DSN or in its parent folder: no project rules \
+                     sent; pass project_path to send them"
+                        .to_string(),
+                ),
+                ..ProjectRules::default()
+            })
+        }
+        RouteProject::Several(dir) => {
+            return Ok(ProjectRules {
+                note: Some(format!(
+                    "several .kicad_pro in {}: no project rules sent; pass project_path to \
+                     choose one",
+                    dir.display()
+                )),
+                ..ProjectRules::default()
+            })
+        }
+    };
+    if !path.is_file() {
+        return Err(CallToolResult::error_kind(
+            ToolErrorKind::FileNotFound {
+                path: path.display().to_string(),
+            },
+            format!(
+                "project_path is not a file: {}. Nothing was routed.",
+                path.display()
+            ),
+        ));
+    }
+    let refuse = |reason: String| {
+        Err(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "project_path".to_string(),
+                reason: reason.clone(),
+            },
+            format!("{reason}. Nothing was routed."),
+        ))
+    };
+    if !extension_is(&path, "kicad_pro") {
+        return refuse(format!(
+            "project_path must be a KiCad .kicad_pro file: {}",
+            path.display()
+        ));
+    }
+    let parsed = std::fs::read_to_string(&path)
+        .map_err(|error| error.to_string())
+        .and_then(|content| {
+            serde_json::from_str::<serde_json::Value>(&content).map_err(|error| error.to_string())
+        });
+    match parsed {
+        Ok(project) => Ok(ProjectRules {
+            sent: mcp::project_route_rules(&project),
+            project_path: Some(path),
+            note: None,
+        }),
+        Err(error) => refuse(format!(
+            "cannot read the KiCad project {} ({how}): {error}; pass project_path to name \
+             a readable one",
+            path.display()
+        )),
+    }
+}
+
 /// The `route_specctra_dsn` tool, which `integration`'s handler delegates to.
 pub(crate) async fn route_specctra_dsn(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let dsn = get_path(args, "dsn_path")?;
+    // Freerouting does not find these rules in the DSN. The project is found
+    // from the DSN's folder, so it is read as soon as the DSN is known: a
+    // project that cannot be read is refused before any other check, and
+    // before Java starts.
+    let project_path = match args.get("project_path") {
+        Some(value) if !value.is_null() => Some(get_path(args, "project_path")?),
+        _ => None,
+    };
+    let project = match read_project_rules(route_project(project_path, &dsn)) {
+        Ok(project) => project,
+        Err(refusal) => return Ok(refusal),
+    };
     let ses_output = get_path(args, "ses_output_path")?;
     let overall_timeout_seconds = args["overall_timeout_seconds"]
         .as_u64()
@@ -594,9 +750,10 @@ pub(crate) async fn route_specctra_dsn(
             )));
         }
     };
-    match mcp::route_local(&jar, &dsn, &ses_output, &settings).await {
+    match mcp::route_local(&jar, &dsn, &ses_output, &settings, &project.sent).await {
         Ok(evidence) => Ok(CallToolResult::json(&route_response(
             &evidence,
+            &project,
             &jar,
             &dsn,
             &ses_output,
@@ -634,6 +791,7 @@ fn routing_failed(error: anyhow::Error) -> anyhow::Result<CallToolResult> {
 /// counted" must not give the same answer.
 fn route_response(
     evidence: &mcp::RouteEvidence,
+    project: &ProjectRules,
     jar: &Path,
     dsn: &Path,
     ses_output: &Path,
@@ -686,7 +844,13 @@ fn route_response(
         // Kept for callers that read it: a setting Freerouting did not apply
         // now fails the call before routing, so a routed board has none.
         "settings_not_applied": [],
-        "settings_warnings": evidence.settings_warnings
+        "settings_warnings": evidence.settings_warnings,
+        "project_rules": {
+            "project_path": project.project_path,
+            "sent": project.sent,
+            "not_applied": evidence.project_rules_not_applied,
+            "note": project.note
+        }
     })
 }
 
@@ -714,6 +878,7 @@ mod freerouting_tests {
             unrouted,
             freerouting_log: Some("/state/freerouting/logs/freerouting.log".into()),
             settings_checked: false,
+            project_rules_not_applied: Vec::new(),
             settings_warnings: Vec::new(),
         }
     }
@@ -721,6 +886,7 @@ mod freerouting_tests {
     fn respond(unrouted: Option<u64>) -> serde_json::Value {
         route_response(
             &completed_job(unrouted),
+            &ProjectRules::default(),
             Path::new("/opt/freerouting.jar"),
             Path::new("/work/board.dsn"),
             Path::new("/work/board.ses"),
@@ -764,6 +930,7 @@ mod freerouting_tests {
         evidence.settings_warnings = vec![json!("max_threads above the CPU count")];
         let body = route_response(
             &evidence,
+            &ProjectRules::default(),
             Path::new("/opt/freerouting.jar"),
             Path::new("/work/board.dsn"),
             Path::new("/work/board.ses"),
@@ -798,6 +965,7 @@ mod freerouting_tests {
         evidence.freerouting_log = None;
         let body = route_response(
             &evidence,
+            &ProjectRules::default(),
             Path::new("/opt/freerouting.jar"),
             Path::new("/work/board.dsn"),
             Path::new("/work/board.ses"),
@@ -1443,7 +1611,7 @@ mod freerouting_tests {
                 body["message"].as_str().unwrap().contains("as a fraction"),
                 "{body}"
             );
-            assert!(!temp.path().join("board.ses").exists());
+            assert!(!temp.path().join("route/board.ses").exists());
         }
     }
 
@@ -1504,6 +1672,15 @@ mod freerouting_tests {
     /// does not exist, and returns the structured error body.
     async fn served_route(extra: serde_json::Value) -> (tempfile::TempDir, serde_json::Value) {
         let temp = tempfile::tempdir().unwrap();
+        let body = served_route_in(temp.path(), extra).await;
+        (temp, body)
+    }
+
+    /// [`served_route`] with the DSN in `dir/route/`: the project search
+    /// stops at `dir`, whatever the system's temporary folder holds.
+    async fn served_route_in(dir: &Path, extra: serde_json::Value) -> serde_json::Value {
+        let route = dir.join("route");
+        std::fs::create_dir_all(&route).unwrap();
         let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
             kicad_cli: String::new(),
             kicad_binary: String::new(),
@@ -1516,9 +1693,9 @@ mod freerouting_tests {
         .await
         .expect("handler builds");
         let mut arguments = json!({
-            "dsn_path": temp.path().join("board.dsn").display().to_string(),
-            "ses_output_path": temp.path().join("board.ses").display().to_string(),
-            "jar_path": temp.path().join("missing.jar").display().to_string(),
+            "dsn_path": route.join("board.dsn").display().to_string(),
+            "ses_output_path": route.join("board.ses").display().to_string(),
+            "jar_path": dir.join("missing.jar").display().to_string(),
         });
         arguments
             .as_object_mut()
@@ -1535,8 +1712,185 @@ mod freerouting_tests {
             .expect("tools/call receives a response");
         let result = response.result.expect("result");
         assert_eq!(result["isError"], json!(true), "{result}");
-        let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        (temp, body)
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    /// A `.kicad_pro` whose rules are `rules`, at `path`.
+    fn write_project(path: &Path, rules: serde_json::Value) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            json!({ "board": { "design_settings": { "rules": rules } } }).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_project_is_the_only_kicad_pro_next_to_the_dsn_else_in_its_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board/route/board.dsn");
+        std::fs::create_dir_all(dsn.parent().unwrap()).unwrap();
+        let parent = temp.path().join("board/board.kicad_pro");
+        write_project(&parent, json!({}));
+        // A folder named like a project is not one.
+        std::fs::create_dir(temp.path().join("board/route/old.kicad_pro")).unwrap();
+        assert_eq!(
+            route_project(None, &dsn),
+            RouteProject::Found(parent.clone())
+        );
+
+        let beside = temp.path().join("board/route/board.kicad_pro");
+        write_project(&beside, json!({}));
+        assert_eq!(route_project(None, &dsn), RouteProject::Found(beside));
+
+        // Two beside the DSN: none is guessed, and the parent's single one is
+        // not taken instead.
+        write_project(&temp.path().join("board/route/copy.kicad_pro"), json!({}));
+        assert_eq!(
+            route_project(None, &dsn),
+            RouteProject::Several(temp.path().join("board/route"))
+        );
+
+        // project_path wins over the search.
+        assert_eq!(
+            route_project(Some(parent.clone()), &dsn),
+            RouteProject::Given(parent)
+        );
+
+        let alone = temp.path().join("alone/route/board.dsn");
+        std::fs::create_dir_all(alone.parent().unwrap()).unwrap();
+        assert_eq!(route_project(None, &alone), RouteProject::NoneFound);
+    }
+
+    #[test]
+    fn without_a_single_project_no_rules_are_sent_and_the_answer_says_why() {
+        let none = read_project_rules(RouteProject::NoneFound).unwrap();
+        assert!(none.sent.is_empty());
+        assert_eq!(
+            none.note.as_deref(),
+            Some(
+                "no .kicad_pro next to the DSN or in its parent folder: no project rules sent; \
+                 pass project_path to send them"
+            )
+        );
+        let several = read_project_rules(RouteProject::Several(PathBuf::from("/work"))).unwrap();
+        assert!(several.sent.is_empty());
+        assert_eq!(
+            several.note.as_deref(),
+            Some("several .kicad_pro in /work: no project rules sent; pass project_path to choose one")
+        );
+    }
+
+    #[test]
+    fn the_answer_reports_the_project_rules_sent_and_not_applied() {
+        let mut evidence = completed_job(Some(0));
+        evidence.project_rules_not_applied =
+            vec!["hole_to_hole_um: not a Freerouting setting".into()];
+        let project = ProjectRules {
+            project_path: Some(PathBuf::from("/work/board.kicad_pro")),
+            sent: json!({ "copper_to_edge_clearance_um": 500.0, "hole_to_hole_um": 250.0 })
+                .as_object()
+                .unwrap()
+                .clone(),
+            note: None,
+        };
+        let body = route_response(
+            &evidence,
+            &project,
+            Path::new("/opt/freerouting.jar"),
+            Path::new("/work/board.dsn"),
+            Path::new("/work/board.ses"),
+        );
+        assert_eq!(
+            body["project_rules"],
+            json!({
+                "project_path": "/work/board.kicad_pro",
+                "sent": { "copper_to_edge_clearance_um": 500.0, "hole_to_hole_um": 250.0 },
+                "not_applied": ["hole_to_hole_um: not a Freerouting setting"],
+                "note": null
+            })
+        );
+        // A rule the JAR skipped does not fail a routed board.
+        assert_eq!(body["success"], true, "{body}");
+    }
+
+    #[tokio::test]
+    async fn served_route_refuses_a_project_path_that_is_not_a_file_before_the_jar_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("gone.kicad_pro");
+        let body = served_route_in(
+            temp.path(),
+            json!({ "project_path": missing.display().to_string() }),
+        )
+        .await;
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert_eq!(
+            body["error"]["path"],
+            json!(missing.display().to_string()),
+            "{body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("project_path is not a file"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn served_route_refuses_a_project_path_that_is_not_a_kicad_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        let body = served_route_in(
+            temp.path(),
+            json!({ "project_path": board.display().to_string() }),
+        )
+        .await;
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "project_path", "{body}");
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("project_path must be a KiCad .kicad_pro file"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn served_route_refuses_a_found_project_it_cannot_read() {
+        // Found next to the DSN, not named: routing without its rules would
+        // be the silent fallback this refuses. The missing JAR is not reached.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("route")).unwrap();
+        std::fs::write(temp.path().join("route/board.kicad_pro"), "{ not json").unwrap();
+        let body = served_route_in(temp.path(), json!({})).await;
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "project_path", "{body}");
+        let reason = body["error"]["reason"].as_str().unwrap();
+        assert!(reason.contains("(found next to the DSN)"), "{body}");
+        assert!(
+            reason.ends_with("; pass project_path to name a readable one"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn served_route_goes_on_to_the_jar_with_a_readable_project() {
+        // A readable project, named or found, lets the call reach the
+        // (missing) JAR.
+        let temp = tempfile::tempdir().unwrap();
+        write_project(
+            &temp.path().join("board.kicad_pro"),
+            json!({ "min_copper_edge_clearance": 0.5 }),
+        );
+        let body = served_route_in(temp.path(), json!({})).await;
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        let project = temp.path().join("board.kicad_pro").display().to_string();
+        let body = served_route_in(temp.path(), json!({ "project_path": project })).await;
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
     }
 
     #[test]
