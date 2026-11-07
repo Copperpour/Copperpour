@@ -75,6 +75,10 @@ pub(crate) struct RouteSettings {
     /// Freerouting's `plane_as_obstacle`: whether copper pours block foreign
     /// traces (its default is false).
     pub plane_as_obstacle: Option<bool>,
+    /// Any of Freerouting's router settings, in its JSON shape
+    /// (`get_effective_settings`), passed through as given. The named fields
+    /// above are merged on top and win.
+    pub router_settings: Option<Map<String, Value>>,
     pub poll_interval: Duration,
     pub overall_timeout: Duration,
 }
@@ -92,6 +96,11 @@ pub(crate) struct RouteEvidence {
     /// Last routing activity read from Freerouting's log, e.g.
     /// "pass 17: 0 unrouted, 218 violations".
     pub last_activity: Option<String>,
+    /// Settings sent but not found with the same value among the job's
+    /// effective settings: unknown key, typo, or a value Freerouting replaced.
+    pub settings_not_applied: Vec<String>,
+    /// Freerouting's own `validation_warnings` for the effective settings.
+    pub settings_warnings: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -342,7 +351,29 @@ fn validate_inputs(
     {
         bail!("optimizer_improvement_threshold {THRESHOLD_READ_AS_FRACTION}");
     }
+    if settings.optimizer_improvement_threshold.is_none()
+        && settings
+            .router_settings
+            .as_ref()
+            .and_then(router_settings_threshold)
+            .is_some_and(threshold_read_as_fraction)
+    {
+        bail!("{ROUTER_SETTINGS_THRESHOLD} {THRESHOLD_READ_AS_FRACTION}");
+    }
     Ok(())
+}
+
+/// Where `router_settings` carries the optimizer's improvement threshold.
+pub(crate) const ROUTER_SETTINGS_THRESHOLD: &str =
+    "router_settings.optimizer.improvement_threshold";
+
+/// The improvement threshold `router_settings` would send, if it sets one.
+/// It is sent only when `optimizer_improvement_threshold` is not given.
+pub(crate) fn router_settings_threshold(router_settings: &Map<String, Value>) -> Option<f64> {
+    router_settings
+        .get("optimizer")?
+        .get("improvement_threshold")?
+        .as_f64()
 }
 
 /// Freerouting 2.5's `BatchOptimizer` reads an improvement threshold above 0
@@ -395,6 +426,8 @@ async fn run_state_machine(
         .await?;
 
     let job_settings = job_settings_body(settings);
+    let mut settings_not_applied = Vec::new();
+    let mut settings_warnings = Vec::new();
     if !job_settings.is_empty() {
         if !tools.contains_key("update_job_settings") {
             bail!("Freerouting MCP does not expose update_job_settings");
@@ -405,6 +438,24 @@ async fn run_state_machine(
                 json!({ "path": { "jobId": job_id }, "body": job_settings }),
             )
             .await?;
+        // Freerouting accepts unknown keys and drops them without a word:
+        // read the settings back so a setting that did not take is reported.
+        if tools.contains_key("get_effective_settings") {
+            let effective = client
+                .call_tool(
+                    "get_effective_settings",
+                    json!({ "path": { "jobId": job_id } }),
+                )
+                .await?;
+            if let Some(effective) = effective_settings(&effective) {
+                settings_not_applied = settings_mismatches(&job_settings, effective);
+                settings_warnings = effective
+                    .get("validation_warnings")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
     }
     client
         .call_tool("start_job", json!({ "path": { "jobId": job_id } }))
@@ -466,6 +517,8 @@ async fn run_state_machine(
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
         last_activity: progress.activity,
+        settings_not_applied,
+        settings_warnings,
     })
 }
 
@@ -1114,6 +1167,13 @@ fn temporary_output_path(output: &Path) -> Result<PathBuf> {
 /// sent before were accepted and silently ignored: routing passes stayed
 /// unlimited and the job limit at 12 hours.
 fn job_settings_body(settings: &RouteSettings) -> Map<String, Value> {
+    let mut body = settings.router_settings.clone().unwrap_or_default();
+    merge_into(&mut body, named_settings(settings));
+    body
+}
+
+/// The settings that have their own route_specctra_dsn argument.
+fn named_settings(settings: &RouteSettings) -> Map<String, Value> {
     let mut body = Map::new();
     if let Some(max_passes) = settings.max_passes {
         body.insert(
@@ -1147,6 +1207,68 @@ fn job_settings_body(settings: &RouteSettings) -> Map<String, Value> {
         );
     }
     body
+}
+
+/// Deep-merge `overlay` into `base`: objects merge key by key, anything else
+/// in `overlay` replaces what `base` had.
+fn merge_into(base: &mut Map<String, Value>, overlay: Map<String, Value>) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(Value::Object(existing)), Value::Object(incoming)) => {
+                merge_into(existing, incoming)
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+/// The settings object inside a `get_effective_settings` result, which wraps
+/// it as `{status, contentType, body}` in its text content.
+fn effective_settings(result: &Value) -> Option<&Map<String, Value>> {
+    let parsed = result.get("parsedTextContent")?.as_array()?.first()?;
+    parsed.get("body").unwrap_or(parsed).as_object()
+}
+
+/// Every leaf of `sent` whose value is not found at the same path in
+/// `effective`, as "path: sent X, effective Y" (or "not a setting").
+fn settings_mismatches(sent: &Map<String, Value>, effective: &Map<String, Value>) -> Vec<String> {
+    fn walk(
+        sent: &Map<String, Value>,
+        effective: &Map<String, Value>,
+        path: &str,
+        out: &mut Vec<String>,
+    ) {
+        for (key, value) in sent {
+            let here = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            match (value, effective.get(key)) {
+                (_, None) => out.push(format!("{here}: not a Freerouting setting")),
+                (Value::Object(sent), Some(Value::Object(effective))) => {
+                    walk(sent, effective, &here, out)
+                }
+                (sent, Some(effective)) if !same_value(sent, effective) => {
+                    out.push(format!("{here}: sent {sent}, effective {effective}"))
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(sent, effective, "", &mut out);
+    out
+}
+
+/// Equality that lets 3 match 3.0: Freerouting echoes some integers as floats.
+fn same_value(a: &Value, b: &Value) -> bool {
+    match (a.as_f64(), b.as_f64()) {
+        (Some(x), Some(y)) => (x - y).abs() <= 1e-9 * x.abs().max(1.0),
+        _ => a == b,
+    }
 }
 
 fn duration_string(seconds: u64) -> String {
@@ -1363,6 +1485,7 @@ done
             optimizer_improvement_threshold: None,
             plane_nets: None,
             plane_as_obstacle: None,
+            router_settings: None,
             poll_interval: Duration::from_millis(10),
             overall_timeout: Duration::from_secs(30),
         };
@@ -1384,6 +1507,111 @@ done
         assert_eq!(
             std::fs::read_to_string(&temporary).unwrap(),
             "(session board)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn router_settings_are_sent_merged_and_what_did_not_take_is_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        let sent = temp.path().join("sent.json");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let mut tools = conforming_tools_list();
+        let by_path = tools["tools"][3]["inputSchema"].clone();
+        for name in ["update_job_settings", "get_effective_settings"] {
+            tools["tools"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({ "name": name, "inputSchema": by_path }));
+        }
+        // Freerouting 2.5.0 answers get_effective_settings with the settings
+        // as JSON text: it kept max_passes and dropped the misspelt key.
+        let effective = json!({ "content": [{ "type": "text", "text": json!({
+            "status": 200,
+            "contentType": "application/json",
+            "body": {
+                "autorouter": { "max_passes": 7, "max_threads": 4 },
+                "scoring": { "via_costs": 50 },
+                "validation_warnings": ["max_threads above the CPU count"]
+            }
+        }).to_string() }] });
+        let script = temp.path().join("server.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"n=0
+while read -r line; do
+  n=$((n+1))
+  case "$line" in
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *update_job_settings*) printf '%s\n' "$line" > '{sent}'; result='{{}}' ;;
+    *get_effective_settings*) result='{effective}' ;;
+    *get_job_details*) result='{{"state":"COMPLETED"}}' ;;
+    *download_job_output_to_local_file*) printf '(session board)' > '{output}'; result='{{}}'; last=1 ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$n" "$result"
+  if [ -n "${{last:-}}" ]; then exit 0; fi
+done
+"#,
+                sent = sent.display(),
+                output = temporary.display(),
+            ),
+        )
+        .unwrap();
+        let mut client = scripted_client(&format!("exec sh '{}'", script.display()));
+        let settings = RouteSettings {
+            max_passes: Some(7),
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: json!({
+                "autorouter": { "max_passes": 99, "max_threads": 4, "max_pases": 3 },
+                "scoring": { "via_costs": 80 }
+            })
+            .as_object()
+            .cloned(),
+            poll_interval: Duration::from_millis(10),
+            overall_timeout: Duration::from_secs(30),
+        };
+
+        let evidence = timeout(
+            Duration::from_secs(20),
+            run_state_machine(&mut client, &dsn, &temporary, &settings, Instant::now()),
+        )
+        .await
+        .expect("the scripted job ends")
+        .expect("the routed board is kept");
+        client.close().await;
+
+        let request: Value =
+            serde_json::from_str(&std::fs::read_to_string(&sent).unwrap()).unwrap();
+        assert_eq!(
+            request["params"]["arguments"]["body"],
+            json!({
+                "autorouter": { "max_passes": 7, "max_threads": 4, "max_pases": 3 },
+                "scoring": { "via_costs": 80 }
+            })
+        );
+        assert_eq!(evidence.final_state, "COMPLETED");
+        assert_eq!(
+            evidence.settings_not_applied,
+            [
+                "autorouter.max_pases: not a Freerouting setting",
+                "scoring.via_costs: sent 80, effective 50",
+            ]
+        );
+        assert_eq!(
+            evidence.settings_warnings,
+            [json!("max_threads above the CPU count")]
         );
     }
 
@@ -1536,6 +1764,7 @@ done
             optimizer_improvement_threshold: None,
             plane_nets: None,
             plane_as_obstacle: None,
+            router_settings: None,
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };
@@ -1603,6 +1832,7 @@ done
             optimizer_improvement_threshold: threshold,
             plane_nets: None,
             plane_as_obstacle: None,
+            router_settings: None,
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };
@@ -1628,6 +1858,87 @@ done
                 .to_string();
             assert!(error.contains(named), "{passes:?} {threshold:?}: {error}");
         }
+        let with_router_threshold = |named, routed: f64| RouteSettings {
+            router_settings: json!({ "optimizer": { "improvement_threshold": routed } })
+                .as_object()
+                .cloned(),
+            ..settings(None, named)
+        };
+        let error = validate_inputs(&jar, &dsn, &ses, &with_router_threshold(None, 0.05))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(ROUTER_SETTINGS_THRESHOLD), "{error}");
+        assert!(error.contains("as a fraction"), "{error}");
+        for (named, routed) in [(None, 0.0), (None, 0.1), (Some(2.5), 0.05)] {
+            validate_inputs(&jar, &dsn, &ses, &with_router_threshold(named, routed)).unwrap();
+        }
+    }
+
+    #[test]
+    fn router_settings_pass_through_and_named_arguments_win() {
+        let settings = RouteSettings {
+            max_passes: Some(7),
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: Some(
+                json!({
+                    "autorouter": { "max_passes": 99, "max_threads": 4 },
+                    "scoring": { "via_costs": 80 },
+                    "hole_clearance_um": 200.0
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(900),
+        };
+        assert_eq!(
+            Value::Object(job_settings_body(&settings)),
+            json!({
+                "autorouter": { "max_passes": 7, "max_threads": 4 },
+                "scoring": { "via_costs": 80 },
+                "hole_clearance_um": 200.0
+            })
+        );
+    }
+
+    #[test]
+    fn settings_that_did_not_take_are_reported() {
+        let sent = json!({
+            "autorouter": { "max_passes": 7, "max_pases": 3 },
+            "optimizer": { "improvement_threshold": 1 },
+            "hole_clearance_um": 200.0,
+            "plane_nets": ["GND"],
+            "no_such_setting": true
+        });
+        // Freerouting 2.5.0 wraps the effective settings like this.
+        let result = json!({
+            "parsedTextContent": [{
+                "status": 200,
+                "contentType": "application/json",
+                "body": {
+                    "autorouter": { "max_passes": 7, "max_threads": 15 },
+                    "optimizer": { "improvement_threshold": 1.0 },
+                    "hole_clearance_um": 0.0,
+                    "plane_nets": ["GND"]
+                }
+            }]
+        });
+        let effective = effective_settings(&result).unwrap();
+        assert_eq!(
+            settings_mismatches(sent.as_object().unwrap(), effective),
+            [
+                "autorouter.max_pases: not a Freerouting setting",
+                "hole_clearance_um: sent 200.0, effective 0.0",
+                "no_such_setting: not a Freerouting setting",
+            ]
+        );
     }
 
     #[test]
@@ -1641,6 +1952,7 @@ done
             optimizer_improvement_threshold: Some(0.5),
             plane_nets: Some(vec!["GND".into(), "+3V3".into()]),
             plane_as_obstacle: Some(false),
+            router_settings: None,
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };
@@ -1663,6 +1975,7 @@ done
             optimizer_improvement_threshold: None,
             plane_nets: None,
             plane_as_obstacle: None,
+            router_settings: None,
             ..settings
         };
         assert!(job_settings_body(&nothing).is_empty());
@@ -1777,6 +2090,7 @@ done
                 optimizer_improvement_threshold: None,
                 plane_nets: None,
                 plane_as_obstacle: None,
+                router_settings: None,
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(300),
             },
@@ -1816,6 +2130,7 @@ done
                     optimizer_improvement_threshold: None,
                     plane_nets: None,
                     plane_as_obstacle: None,
+                    router_settings: None,
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_millis(100),
                 },
@@ -1868,6 +2183,7 @@ done
                     optimizer_improvement_threshold: None,
                     plane_nets: None,
                     plane_as_obstacle: None,
+                    router_settings: None,
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_secs(300),
                 },
@@ -1906,6 +2222,7 @@ done
             optimizer_improvement_threshold: None,
             plane_nets: None,
             plane_as_obstacle: None,
+            router_settings: None,
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };

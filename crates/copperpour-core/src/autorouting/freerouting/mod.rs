@@ -493,18 +493,25 @@ pub(crate) async fn route_specctra_dsn(
     let dsn = get_path(args, "dsn_path")?;
     let ses_output = get_path(args, "ses_output_path")?;
     // The schema bounds the threshold to 0..=100 but cannot express this gap,
-    // so it is refused here, before the JAR is even looked up.
-    if let Some(threshold) = args["optimizer_improvement_threshold"]
-        .as_f64()
-        .filter(|threshold| mcp::threshold_read_as_fraction(*threshold))
+    // so it is refused here, before the JAR is even looked up. The threshold
+    // checked is the one sent: the named argument wins over router_settings.
+    let threshold_sent = match args["optimizer_improvement_threshold"].as_f64() {
+        Some(threshold) => Some(("optimizer_improvement_threshold", threshold)),
+        None => args["router_settings"]
+            .as_object()
+            .and_then(mcp::router_settings_threshold)
+            .map(|threshold| (mcp::ROUTER_SETTINGS_THRESHOLD, threshold)),
+    };
+    if let Some((field, threshold)) =
+        threshold_sent.filter(|(_, threshold)| mcp::threshold_read_as_fraction(*threshold))
     {
         return Ok(CallToolResult::error_kind(
             ToolErrorKind::InvalidArgument {
-                field: "optimizer_improvement_threshold".to_string(),
+                field: field.to_string(),
                 reason: mcp::THRESHOLD_READ_AS_FRACTION.to_string(),
             },
             format!(
-                "optimizer_improvement_threshold is {threshold}: a value {}. Nothing was routed.",
+                "{field} is {threshold}: a value {}. Nothing was routed.",
                 mcp::THRESHOLD_READ_AS_FRACTION
             ),
         ));
@@ -552,6 +559,7 @@ pub(crate) async fn route_specctra_dsn(
                 .collect()
         }),
         plane_as_obstacle: args["plane_as_obstacle"].as_bool(),
+        router_settings: args["router_settings"].as_object().cloned(),
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
     };
@@ -585,7 +593,9 @@ pub(crate) async fn route_specctra_dsn(
         "poll_count": evidence.poll_count,
         "elapsed_seconds": evidence.elapsed_seconds,
         "ses_bytes": evidence.ses_bytes,
-        "last_activity": evidence.last_activity
+        "last_activity": evidence.last_activity,
+        "settings_not_applied": evidence.settings_not_applied,
+        "settings_warnings": evidence.settings_warnings
     })))
 }
 
@@ -1166,6 +1176,42 @@ mod freerouting_tests {
     /// `invalid_argument` before the JAR is looked up, so no JAR is needed here.
     #[tokio::test]
     async fn served_route_refuses_a_threshold_freerouting_reads_as_a_fraction() {
+        for (threshold_args, field) in [
+            (
+                json!({ "optimizer_improvement_threshold": 0.05 }),
+                "optimizer_improvement_threshold",
+            ),
+            (
+                json!({ "router_settings": { "optimizer": { "improvement_threshold": 0.05 } } }),
+                mcp::ROUTER_SETTINGS_THRESHOLD,
+            ),
+        ] {
+            let (temp, body) = served_route(threshold_args).await;
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], field, "{body}");
+            assert!(
+                body["message"].as_str().unwrap().contains("as a fraction"),
+                "{body}"
+            );
+            assert!(!temp.path().join("board.ses").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn served_route_checks_the_threshold_it_sends() {
+        // The named argument wins over router_settings, so only its value is
+        // sent and checked: the call goes on to look up the (missing) JAR.
+        let (_temp, body) = served_route(json!({
+            "optimizer_improvement_threshold": 1.0,
+            "router_settings": { "optimizer": { "improvement_threshold": 0.05 } }
+        }))
+        .await;
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+    }
+
+    /// Calls route_specctra_dsn through the MCP handler, with a JAR path that
+    /// does not exist, and returns the structured error body.
+    async fn served_route(extra: serde_json::Value) -> (tempfile::TempDir, serde_json::Value) {
         let temp = tempfile::tempdir().unwrap();
         let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
             kicad_cli: String::new(),
@@ -1178,34 +1224,28 @@ mod freerouting_tests {
         })
         .await
         .expect("handler builds");
+        let mut arguments = json!({
+            "dsn_path": temp.path().join("board.dsn").display().to_string(),
+            "ses_output_path": temp.path().join("board.ses").display().to_string(),
+            "jar_path": temp.path().join("missing.jar").display().to_string(),
+        });
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
         let response = handler
             .handle_message(json!({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "tools/call",
-                "params": {
-                    "name": "route_specctra_dsn",
-                    "arguments": {
-                        "dsn_path": temp.path().join("board.dsn").display().to_string(),
-                        "ses_output_path": temp.path().join("board.ses").display().to_string(),
-                        "jar_path": temp.path().join("missing.jar").display().to_string(),
-                        "optimizer_improvement_threshold": 0.05
-                    }
-                }
+                "params": { "name": "route_specctra_dsn", "arguments": arguments }
             }))
             .await
             .expect("tools/call receives a response");
         let result = response.result.expect("result");
         assert_eq!(result["isError"], json!(true), "{result}");
-        let body: serde_json::Value =
-            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
-        assert_eq!(body["error"]["field"], "optimizer_improvement_threshold");
-        assert!(
-            body["message"].as_str().unwrap().contains("as a fraction"),
-            "{body}"
-        );
-        assert!(!temp.path().join("board.ses").exists());
+        let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        (temp, body)
     }
 
     #[test]
