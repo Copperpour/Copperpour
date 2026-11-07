@@ -113,11 +113,11 @@ pub fn tools() -> Vec<ToolDef> {
              .kicad_sch file. Creates the child file (blank) if it doesn't exist yet, or \
              links to it as-is if it does — reusing an existing file places the *same* \
              sub-circuit at a second location (KiCAD's multi-instance sheet pattern) rather \
-             than duplicating it. If the linked file already has symbols in it, their \
-             hierarchical instance paths are patched immediately so ERC resolves them, and \
-             paths naming a sheet that no longer exists are dropped. A sheet added inside a \
-             child sheet is keyed from the project root through that sheet; a child sheet \
-             placed more than once cannot take a new sheet.",
+             than duplicating it. If the linked file, or any file below it, already has \
+             symbols, their hierarchical instance paths are patched immediately so ERC \
+             resolves them, and paths naming a sheet that no longer exists are dropped. A \
+             sheet added inside a child sheet is keyed from the project root through that \
+             sheet; a child sheet placed more than once cannot take a new sheet.",
             json!({
                 "type": "object",
                 "properties": {
@@ -172,9 +172,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "delete_sheet",
             "Remove a sheet reference from the parent schematic. Does NOT delete the child \
-             .kicad_sch file on disk. When other sheets still place that file, its symbols \
-             drop the deleted sheet's instance path. Remaining sheets' page numbers may now \
-             have a gap — call renumber_sheet_pages afterward if that matters.",
+             .kicad_sch file on disk. When other sheets still place that file, or a file \
+             below it, its symbols drop the deleted sheet's instance paths. Remaining sheets' \
+             page numbers may now have a gap — call renumber_sheet_pages afterward if that \
+             matters.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1359,15 +1360,16 @@ fn apply_hierarchy_prospective_fault(source: String) -> String {
     })
 }
 
-/// Commit `command`, together with `child` when given, after validating the
-/// exact prospective text, then independently verify the saved document.
+/// Commit `command`, together with the `children` transitions, after
+/// validating the exact prospective text, then independently verify the saved
+/// document.
 fn commit_verified_sheet_mutation(
     path: &Path,
     before: &str,
     command: &SchematicCommand,
     intent: &SheetMutationIntent,
     operation: &str,
-    child: Option<FileTransition>,
+    children: Vec<FileTransition>,
 ) -> anyhow::Result<Option<CallToolResult>> {
     let (prepared, _) = prepare_command(path, before, command)?;
     let prospective_source = prepared.clone();
@@ -1386,19 +1388,12 @@ fn commit_verified_sheet_mutation(
         return Ok(Some(sheet_precommit_refusal(path, reason)));
     }
 
-    match child {
-        None => {
-            commit_command(path, command)?;
-        }
-        Some(child) => {
-            commit_file_transaction(
-                parent_dir(path),
-                vec![
-                    FileTransition::replace(path, before.to_owned(), prepared),
-                    child,
-                ],
-            )?;
-        }
+    if children.is_empty() {
+        commit_command(path, command)?;
+    } else {
+        let mut transitions = vec![FileTransition::replace(path, before.to_owned(), prepared)];
+        transitions.extend(children);
+        commit_file_transaction(parent_dir(path), transitions)?;
     }
     let committed = match cse::Schematic::load(path) {
         Ok(schematic) => schematic,
@@ -1441,7 +1436,7 @@ fn commit_edited_sheet_item(
         uuid: uuid.to_owned(),
         expected: intended.to_sexp(),
     };
-    commit_verified_sheet_mutation(path, before, &command, &intent, label, None)
+    commit_verified_sheet_mutation(path, before, &command, &intent, label, Vec::new())
 }
 
 /// Read one sheet pin back off the file a write has just committed, so a
@@ -1561,14 +1556,14 @@ fn locate_sheet_parent(
     })
 }
 
-/// What a child file's symbols must record for one project once a sheet
-/// naming it is added or removed.
+/// What a file's symbols must record for one project once a sheet naming it,
+/// or one above it, is added or removed.
 enum ChildLink {
     /// Exactly these paths: the hierarchy was read in full, so any other path
     /// names a sheet that is gone.
     Exact(Vec<String>),
-    /// This path besides the recorded ones, which cannot be proven stale.
-    Added(String),
+    /// These paths besides the recorded ones, which cannot be proven stale.
+    Added(Vec<String>),
 }
 
 impl ChildLink {
@@ -1582,8 +1577,8 @@ impl ChildLink {
             Self::Exact(paths) => {
                 SchematicCommand::set_symbol_instance_paths(source, project_name, paths, label)
             }
-            Self::Added(path) => {
-                SchematicCommand::ensure_symbol_instance_path(source, project_name, path, label)
+            Self::Added(paths) => {
+                SchematicCommand::ensure_symbol_instance_paths(source, project_name, paths, label)
             }
         }
     }
@@ -1646,58 +1641,146 @@ impl ChildLink {
     }
 }
 
-/// The edit that drops a deleted sheet's path from its file's symbols.
+/// What `files_below` found under a sheet's file.
+struct FilesBelow {
+    /// Each file reached, that file first, with the hierarchy paths from the
+    /// file down to it: `""` for the file itself, `/<sheet uuid>` for a sheet
+    /// placed in it, and so on, one per placement.
+    found: Vec<(PathBuf, Vec<String>)>,
+    /// Each file the walk could not take in, with why: one that cannot be
+    /// read, or one deeper than [`MAX_HIERARCHY_DEPTH`] sheets below.
+    left_out: Vec<(PathBuf, String)>,
+}
+
+/// The files a sheet's file places below it. A file not yet on disk is left
+/// out, as is a file already on the way down to it; what a file in `left_out`
+/// places is not reached.
+fn files_below(file: &Path) -> FilesBelow {
+    fn collect(
+        file: &Path,
+        suffix: String,
+        stack: &mut HashSet<PathBuf>,
+        depth: usize,
+        found: &mut Vec<(PathBuf, Vec<String>)>,
+        left_out: &mut Vec<(PathBuf, String)>,
+    ) {
+        let canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+        if !file.is_file() || stack.contains(&canonical) {
+            return;
+        }
+        if depth > MAX_HIERARCHY_DEPTH {
+            left_out.push((
+                file.to_path_buf(),
+                format!("lies deeper than {MAX_HIERARCHY_DEPTH} sheets below the placed file"),
+            ));
+            return;
+        }
+        let schematic = match cse::Schematic::load(file) {
+            Ok(schematic) => schematic,
+            Err(error) => {
+                left_out.push((file.to_path_buf(), format!("could not be read: {error}")));
+                return;
+            }
+        };
+        match found
+            .iter_mut()
+            .find(|(known, _)| super::same_schematic_document(known, file))
+        {
+            Some((_, suffixes)) => suffixes.push(suffix.clone()),
+            None => found.push((file.to_path_buf(), vec![suffix.clone()])),
+        }
+        stack.insert(canonical.clone());
+        let dir = parent_dir(file);
+        for sheet in schematic.sheets.iter() {
+            collect(
+                &dir.join(sheet.file()),
+                format!("{suffix}/{}", sheet.uuid),
+                stack,
+                depth + 1,
+                found,
+                left_out,
+            );
+        }
+        stack.remove(&canonical);
+    }
+    let (mut found, mut left_out) = (Vec::new(), Vec::new());
+    collect(
+        file,
+        String::new(),
+        &mut HashSet::new(),
+        0,
+        &mut found,
+        &mut left_out,
+    );
+    FilesBelow { found, left_out }
+}
+
+/// The edit that drops a deleted sheet's paths from the symbols of one file
+/// below it.
 struct ChildUnlink {
+    file: PathBuf,
     project_name: String,
     link: ChildLink,
     transition: FileTransition,
     changed: usize,
 }
 
-/// Unlink a deleted sheet's file when other sheets still place it. `None`
-/// when nothing changes, nothing else places the file, the hierarchy cannot
-/// be read in full to prove which of its paths are gone, or the file cannot
-/// be patched; none of these stops the sheet itself being deleted. An
-/// unplaced file keeps its paths, so adding the sheet back reconciles them.
-fn remaining_child_link(
+/// Unlink a deleted sheet's file, and every file below it, where other sheets
+/// still place them. A file is left out when nothing changes, nothing else
+/// places it, the hierarchy cannot be read in full to prove which of its paths
+/// are gone, it cannot be read or patched, or it lies past the depth limit;
+/// none of these stops the sheet itself being deleted. An unplaced file keeps
+/// its paths, so adding the sheet back reconciles them.
+fn remaining_child_links(
     parent_path: &Path,
     parent_uuid: &str,
     child_path: &Path,
     sheet_uuid: &str,
-) -> Option<ChildUnlink> {
-    if !child_path.is_file() {
-        return None;
-    }
-    let located = locate_sheet_parent(parent_path, parent_uuid, None).ok()?;
-    let live = located.live_paths_of(child_path)?;
+) -> Vec<ChildUnlink> {
+    let Ok(located) = locate_sheet_parent(parent_path, parent_uuid, None) else {
+        return Vec::new();
+    };
     let deleted: Vec<String> = located
         .instance_paths
         .iter()
         .map(|path| format!("{path}/{sheet_uuid}"))
         .collect();
-    let remaining: Vec<String> = live
+    let below_deleted = |path: &String| {
+        deleted
+            .iter()
+            .any(|gone| path == gone || path.starts_with(&format!("{gone}/")))
+    };
+    files_below(child_path)
+        .found
         .into_iter()
-        .filter(|path| !deleted.contains(path))
-        .collect();
-    if remaining.is_empty() {
-        return None;
-    }
-    let link = ChildLink::Exact(remaining);
-    let child_before = read_consistent(child_path).ok()?;
-    let (child_after, changed) = link
-        .prepare(
-            child_path,
-            &child_before,
-            &located.project_name,
-            "Unlink deleted sheet's symbols",
-        )
-        .ok()??;
-    Some(ChildUnlink {
-        project_name: located.project_name,
-        link,
-        transition: FileTransition::replace(child_path, child_before, child_after),
-        changed,
-    })
+        .filter_map(|(file, _)| {
+            let remaining: Vec<String> = located
+                .live_paths_of(&file)?
+                .into_iter()
+                .filter(|path| !below_deleted(path))
+                .collect();
+            if remaining.is_empty() {
+                return None;
+            }
+            let link = ChildLink::Exact(remaining);
+            let before = read_consistent(&file).ok()?;
+            let (after, changed) = link
+                .prepare(
+                    &file,
+                    &before,
+                    &located.project_name,
+                    "Unlink deleted sheet's symbols",
+                )
+                .ok()??;
+            Some(ChildUnlink {
+                transition: FileTransition::replace(&file, before, after),
+                file,
+                project_name: located.project_name.clone(),
+                link,
+                changed,
+            })
+        })
+        .collect()
 }
 
 // ─── Saved hierarchy, in eeschema's order ─────────────────────────────────────
@@ -2181,32 +2264,61 @@ async fn handle_add_hierarchical_sheet(
         parent_after,
     )];
     let mut patched = 0usize;
-    let mut child_link = None;
+    let mut links = Vec::new();
     if let Some(child_before) = child_before {
-        // The child keeps the paths its other sheets still give it and gains
-        // the new one. Paths naming a deleted sheet are dropped, but only when
+        // The child, and every file the sheets in it place, keeps the paths
+        // other sheets still give it and gains the new ones, one per placement
+        // below the new sheet, since the sheets inside a file keep their own
+        // paths (#126). Paths naming a deleted sheet are dropped, but only when
         // the whole hierarchy could be read to prove they are gone.
-        let hierarchy_path = format!("{parent_instance_path}/{sheet_uuid}");
-        let link = match located.live_paths_of(&child_path) {
-            Some(mut live) => {
-                live.push(hierarchy_path);
-                ChildLink::Exact(live)
+        let FilesBelow {
+            found: below,
+            left_out,
+        } = files_below(&child_path);
+        if let Some((file, why)) = left_out.first() {
+            return Ok(CallToolResult::error(format!(
+                "'{}' {why}, so the files below '{sheet_file}' cannot be relinked; nothing \
+                 was written.",
+                file.display()
+            )));
+        }
+        if below
+            .iter()
+            .any(|(file, _)| super::same_schematic_document(file, &parent_path))
+        {
+            return Ok(CallToolResult::error(format!(
+                "'{sheet_file}' places '{}' through its sheets, so the new sheet would place \
+                 its own parent; nothing was written.",
+                parent_path.display()
+            )));
+        }
+        for (file, suffixes) in below {
+            let added: Vec<String> = suffixes
+                .iter()
+                .map(|suffix| format!("{parent_instance_path}/{sheet_uuid}{suffix}"))
+                .collect();
+            let link = match located.live_paths_of(&file) {
+                Some(mut live) => {
+                    live.extend(added);
+                    ChildLink::Exact(live)
+                }
+                None => ChildLink::Added(added),
+            };
+            let before = if super::same_schematic_document(&file, &child_path) {
+                child_before.clone()
+            } else {
+                read_consistent(&file)?
+            };
+            if let Some((after, changed)) = link.prepare(
+                &file,
+                &before,
+                &project_name,
+                "Link hierarchical child symbols",
+            )? {
+                patched += changed;
+                transitions.push(FileTransition::replace(&file, before, after));
+                links.push((file, link));
             }
-            None => ChildLink::Added(hierarchy_path),
-        };
-        if let Some((child_after, changed)) = link.prepare(
-            &child_path,
-            &child_before,
-            &project_name,
-            "Link hierarchical child symbols",
-        )? {
-            patched = changed;
-            transitions.push(FileTransition::replace(
-                &child_path,
-                child_before,
-                child_after,
-            ));
-            child_link = Some(link);
         }
     } else {
         transitions.push(FileTransition::create(
@@ -2216,10 +2328,10 @@ async fn handle_add_hierarchical_sheet(
     }
     commit_file_transaction(&dir, transitions)?;
 
-    if let Some(error) = child_link
-        .and_then(|link| link.verify(&child_path, &project_name, "add_hierarchical_sheet"))
-    {
-        return Ok(error);
+    for (file, link) in &links {
+        if let Some(error) = link.verify(file, &project_name, "add_hierarchical_sheet") {
+            return Ok(error);
+        }
     }
     let committed = cse::Schematic::load(&parent_path)?;
     let sheet_ref = committed
@@ -2383,34 +2495,39 @@ async fn handle_delete_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result
                 SchematicCommand::delete_item(&before, ItemId::new(uuid.clone())?, "Delete sheet")?;
             let intent = SheetMutationIntent::Absent { uuid: uuid.clone() };
             let child_path = parent_dir(&sch_path).join(&child_file);
-            let unlink = sch.uuid.as_deref().and_then(|parent_uuid| {
-                remaining_child_link(&sch_path, parent_uuid, &child_path, &uuid)
+            let unlinks = sch.uuid.as_deref().map_or_else(Vec::new, |parent_uuid| {
+                remaining_child_links(&sch_path, parent_uuid, &child_path, &uuid)
             });
-            let (transition, unlinked) = match unlink {
-                Some(ChildUnlink {
-                    project_name,
-                    link,
-                    transition,
-                    changed,
-                }) => (Some(transition), Some((link, project_name, changed))),
-                None => (None, None),
-            };
+            let (transitions, unlinked): (Vec<_>, Vec<_>) = unlinks
+                .into_iter()
+                .map(|unlink| {
+                    (
+                        unlink.transition,
+                        (
+                            unlink.file,
+                            unlink.link,
+                            unlink.project_name,
+                            unlink.changed,
+                        ),
+                    )
+                })
+                .unzip();
             if let Some(error) = commit_verified_sheet_mutation(
                 &sch_path,
                 &before,
                 &command,
                 &intent,
                 "delete_sheet",
-                transition,
+                transitions,
             )? {
                 return Ok(error);
             }
-            if let Some(error) = unlinked.as_ref().and_then(|(link, project_name, _)| {
-                link.verify(&child_path, project_name, "delete_sheet")
-            }) {
-                return Ok(error);
+            for (file, link, project_name, _) in &unlinked {
+                if let Some(error) = link.verify(file, project_name, "delete_sheet") {
+                    return Ok(error);
+                }
             }
-            let unlinked = unlinked.map_or(0, |(_, _, changed)| changed);
+            let unlinked: usize = unlinked.iter().map(|(_, _, _, changed)| changed).sum();
             Ok(CallToolResult::json(&json!({
                 "deleted": sheet_name,
                 "child_file_preserved": child_file,
@@ -6129,7 +6246,10 @@ mod page_tests {
 mod instance_path_lifecycle_tests {
     use crate::tools::{sheet_instance_context, validate_sheet_instance_state, ServerConfig};
     use copperpour_schematic_editor as cse;
-    use copperpour_sexp::{parse_sexp, SexpNode};
+    use copperpour_sexp::schematic::{format_hierarchical_sheet, HierarchicalSheetSpec};
+    use copperpour_sexp::{
+        commit_command, parse_sexp, ItemAnchor, ItemId, SchematicCommand, SexpNode,
+    };
     use serde_json::{json, Value};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -6273,8 +6393,8 @@ mod instance_path_lifecycle_tests {
         // The file does not record exactly the live set.
         let error = verify(super::ChildLink::Exact(vec![live.clone()])).unwrap();
         assert!(error.contains("do not record the expected"), "{error}");
-        // An added path only has to be present.
-        assert!(verify(super::ChildLink::Added(live)).is_none());
+        // Added paths only have to be present.
+        assert!(verify(super::ChildLink::Added(vec![live])).is_none());
     }
 
     #[tokio::test]
@@ -6547,6 +6667,312 @@ mod instance_path_lifecycle_tests {
         let live = format!("/{ROOT}/{}", sheet_uuid(&root, "Copy"));
         assert_eq!(recorded(&copy), vec![("R1".to_owned(), demo(&[live]))]);
         writable(&copy).unwrap();
+    }
+
+    // ─── The files below a placed or deleted sheet (#126) ──────────────────
+
+    /// The nested fixture (`tests/fixtures/annotate_nested_hierarchy/README.md`):
+    /// the root places `bank.kicad_sch` as north and south, and that file
+    /// places `cell.kicad_sch` as east and west, so each bank symbol records
+    /// two paths and each cell symbol four, under the project `nested_pages`.
+    fn nested_project() -> (TempDir, PathBuf, PathBuf, PathBuf) {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/annotate_nested_hierarchy");
+        let tmp = TempDir::new().unwrap();
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.to_string_lossy().ends_with(".md") {
+                continue;
+            }
+            std::fs::copy(entry.path(), tmp.path().join(name)).unwrap();
+        }
+        let root = tmp.path().join("nested_pages.kicad_sch");
+        let bank = tmp.path().join("bank.kicad_sch");
+        let cell = tmp.path().join("cell.kicad_sch");
+        (tmp, root, bank, cell)
+    }
+
+    const NESTED_ROOT: &str = "/970f1adb-65bd-4ca9-bbaf-b939cab8549c";
+    const NORTH: &str = "8cca053b-d9dc-44e3-a2d7-e24a663aa548";
+    const SOUTH: &str = "ed5b7508-65bd-450d-b053-99de75ca07ff";
+    const EAST: &str = "380650f1-fcab-4acf-8bbe-d7c7771fd834";
+    const WEST: &str = "69a89bb1-464e-4f4e-948b-24cc8540975b";
+    const BANK_SYMBOLS: usize = 7;
+    const CELL_SYMBOLS: usize = 8;
+
+    fn text_of(file: &Path) -> String {
+        std::fs::read_to_string(file).unwrap()
+    }
+
+    /// Every `placement/leaf`.
+    fn under(placements: &[String], leaves: &[&str]) -> Vec<String> {
+        placements
+            .iter()
+            .flat_map(|placement| leaves.iter().map(move |leaf| format!("{placement}/{leaf}")))
+            .collect()
+    }
+
+    /// Each of `file`'s `count` symbols records exactly `paths` under the
+    /// nested project.
+    fn each_records(file: &Path, count: usize, paths: &[String]) {
+        let mut wanted: Vec<_> = paths
+            .iter()
+            .map(|path| ("nested_pages".to_owned(), path.clone()))
+            .collect();
+        wanted.sort();
+        let recorded = recorded(file);
+        assert_eq!(recorded.len(), count, "{}", file.display());
+        for (reference, paths) in recorded {
+            assert_eq!(paths, wanted, "{reference} in {}", file.display());
+        }
+    }
+
+    /// Place `bank.kicad_sch` once more on the root, as `name`.
+    async fn place_bank(root: &Path, name: &str) -> (bool, Value) {
+        served(
+            "add_hierarchical_sheet",
+            json!({"schematic": root.display().to_string(), "sheet_file": "bank.kicad_sch",
+                   "sheet_name": name, "x": 100.0, "y": 100.0}),
+        )
+        .await
+    }
+
+    /// `junk.kicad_sch` in `tmp`: a file cut off after its first line, which
+    /// KiCad never writes, so no fixture can hold one.
+    fn junk_file(tmp: &Path) -> &'static str {
+        std::fs::write(tmp.join("junk.kicad_sch"), "(kicad_sch (version 20260306)").unwrap();
+        "junk.kicad_sch"
+    }
+
+    /// Point bank's east at the junk file; west still places cell. Returns
+    /// bank's text.
+    fn break_east(tmp: &Path, bank: &Path) -> String {
+        let junk = junk_file(tmp);
+        let text = text_of(bank).replacen("\"cell.kicad_sch\"", &format!("\"{junk}\""), 1);
+        std::fs::write(bank, &text).unwrap();
+        text
+    }
+
+    #[tokio::test]
+    async fn placing_a_file_that_holds_sheets_records_every_file_below_it() {
+        let (_tmp, root, bank, cell) = nested_project();
+        let (failed, body) = place_bank(&root, "middle").await;
+        assert!(!failed, "{body}");
+        assert_eq!(
+            body["patched_symbol_instances"],
+            BANK_SYMBOLS + CELL_SYMBOLS,
+            "{body}"
+        );
+        let placements = [
+            format!("{NESTED_ROOT}/{NORTH}"),
+            format!("{NESTED_ROOT}/{SOUTH}"),
+            format!("{NESTED_ROOT}/{}", sheet_uuid(&root, "middle")),
+        ];
+        each_records(&bank, BANK_SYMBOLS, &placements);
+        each_records(&cell, CELL_SYMBOLS, &under(&placements, &[EAST, WEST]));
+        writable(&bank).unwrap();
+        writable(&cell).unwrap();
+    }
+
+    #[tokio::test]
+    async fn re_adding_a_sheet_keys_every_file_below_it_to_the_new_sheet() {
+        let (_tmp, root, bank, cell) = nested_project();
+        // south removed from the root alone, as an editor that knows nothing
+        // of the records removes it: bank's and cell's symbols keep its paths.
+        let command = SchematicCommand::delete_item(
+            &text_of(&root),
+            ItemId::new(SOUTH).unwrap(),
+            "Delete south",
+        )
+        .unwrap();
+        commit_command(&root, &command).unwrap();
+        assert!(
+            recorded(&cell)
+                .iter()
+                .all(|(_, paths)| paths.iter().any(|(_, path)| path.contains(SOUTH))),
+            "the stale paths the add has to drop"
+        );
+
+        let (failed, body) = place_bank(&root, "south").await;
+        assert!(!failed, "{body}");
+        let south = sheet_uuid(&root, "south");
+        assert_ne!(south, SOUTH, "a re-added sheet has a uuid of its own");
+        let placements = [
+            format!("{NESTED_ROOT}/{NORTH}"),
+            format!("{NESTED_ROOT}/{south}"),
+        ];
+        each_records(&bank, BANK_SYMBOLS, &placements);
+        each_records(&cell, CELL_SYMBOLS, &under(&placements, &[EAST, WEST]));
+        writable(&bank).unwrap();
+        writable(&cell).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_a_sheet_unlinks_every_file_below_it() {
+        let (_tmp, root, bank, cell) = nested_project();
+        // north, not south: each Reference property shows south's designator,
+        // eeschema's first instance in page order, and a record has to keep
+        // naming it for the file to stay writable.
+        let (failed, body) = served(
+            "delete_sheet",
+            json!({"schematic": root.display().to_string(), "sheet_name": "north"}),
+        )
+        .await;
+        assert!(!failed, "{body}");
+        assert_eq!(
+            body["unlinked_symbol_instances"],
+            BANK_SYMBOLS + CELL_SYMBOLS,
+            "{body}"
+        );
+        let placements = [format!("{NESTED_ROOT}/{SOUTH}")];
+        each_records(&bank, BANK_SYMBOLS, &placements);
+        each_records(&cell, CELL_SYMBOLS, &under(&placements, &[EAST, WEST]));
+        writable(&bank).unwrap();
+        writable(&cell).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_file_below_the_placed_sheet_that_cannot_be_read_refuses_the_placement() {
+        let (tmp, root, bank, cell) = nested_project();
+        let bank_text = break_east(tmp.path(), &bank);
+        let (root_before, cell_before) = (text_of(&root), text_of(&cell));
+
+        let (failed, body) = place_bank(&root, "middle").await;
+        assert!(failed, "{body}");
+        assert!(body.to_string().contains("junk.kicad_sch"), "{body}");
+        assert_eq!(text_of(&root), root_before, "nothing was written");
+        assert_eq!(text_of(&bank), bank_text);
+        assert_eq!(text_of(&cell), cell_before);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_sheet_unlinks_the_files_below_it_that_can_be_read() {
+        let (tmp, root, bank, cell) = nested_project();
+        break_east(tmp.path(), &bank);
+        let cell_before = text_of(&cell);
+
+        let (failed, body) = served(
+            "delete_sheet",
+            json!({"schematic": root.display().to_string(), "sheet_name": "south"}),
+        )
+        .await;
+        assert!(!failed, "{body}");
+        // bank's live paths are known, since the root's walk stops at bank;
+        // cell's are not, since that walk meets the unreadable file, so cell
+        // keeps its paths, as any file whose hierarchy cannot be read in full.
+        assert_eq!(body["unlinked_symbol_instances"], BANK_SYMBOLS, "{body}");
+        each_records(&bank, BANK_SYMBOLS, &[format!("{NESTED_ROOT}/{NORTH}")]);
+        assert_eq!(text_of(&cell), cell_before);
+    }
+
+    #[tokio::test]
+    async fn a_sheet_that_would_place_its_parent_is_refused() {
+        let (tmp, root) = project();
+        let mid = tmp.path().join("mid.kicad_sch");
+        let (root_before, mid_before) = (text_of(&root), text_of(&mid));
+
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({"schematic": mid.display().to_string(), "sheet_file": "demo.kicad_sch",
+                   "sheet_name": "Loop"}),
+        )
+        .await;
+        assert!(failed, "{body}");
+        assert!(body.to_string().contains("its own parent"), "{body}");
+        assert_eq!(text_of(&root), root_before);
+        assert_eq!(text_of(&mid), mid_before);
+    }
+
+    /// No tool builds a chain this deep, since `add_hierarchical_sheet`
+    /// refuses a parent past the limit; the files are the blank template with
+    /// the sheet block the tool writes, from `format_hierarchical_sheet`.
+    #[tokio::test]
+    async fn a_hierarchy_past_the_depth_limit_below_the_placed_sheet_is_refused() {
+        let (tmp, root) = project();
+        let last = super::MAX_HIERARCHY_DEPTH + 1;
+        for index in 0..=last {
+            let mut text = crate::tools::blank_schematic_template();
+            if index < last {
+                let block = format_hierarchical_sheet(HierarchicalSheetSpec {
+                    name: "next",
+                    file: &format!("chain{}.kicad_sch", index + 1),
+                    x: 50.0,
+                    y: 50.0,
+                    width: 80.0,
+                    height: 50.0,
+                    project_name: "demo",
+                    parent_instance_path: "/",
+                    page: "2",
+                });
+                let closing = text.rfind("\n)").unwrap();
+                text.insert_str(closing, &format!("\n{block}"));
+            }
+            std::fs::write(tmp.path().join(format!("chain{index}.kicad_sch")), text).unwrap();
+        }
+        let root_before = text_of(&root);
+
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({"schematic": root.display().to_string(), "sheet_file": "chain0.kicad_sch",
+                   "sheet_name": "Chain"}),
+        )
+        .await;
+        assert!(failed, "{body}");
+        assert!(body.to_string().contains("deeper"), "{body}");
+        assert_eq!(text_of(&root), root_before);
+    }
+
+    /// Where the root's walk cannot read the whole hierarchy, nothing proves a
+    /// path stale, so each file below keeps what it records and gains the new
+    /// paths, one per placement below the new sheet.
+    #[tokio::test]
+    async fn placing_a_file_adds_paths_where_the_hierarchy_cannot_be_read_in_full() {
+        let (tmp, root, bank, cell) = nested_project();
+        // south removed from the root alone, so bank and cell keep its paths;
+        // then a sheet on the root naming the junk file, which the root's walk
+        // cannot read.
+        let without_south = SchematicCommand::delete_item(
+            &text_of(&root),
+            ItemId::new(SOUTH).unwrap(),
+            "Delete south",
+        )
+        .unwrap();
+        commit_command(&root, &without_south).unwrap();
+        let junk = format_hierarchical_sheet(HierarchicalSheetSpec {
+            name: "junk",
+            file: junk_file(tmp.path()),
+            x: 150.0,
+            y: 150.0,
+            width: 80.0,
+            height: 50.0,
+            project_name: "nested_pages",
+            parent_instance_path: NESTED_ROOT,
+            page: "9",
+        });
+        let with_junk =
+            SchematicCommand::insert_item(&text_of(&root), junk, ItemAnchor::BeforeFooter, "Junk")
+                .unwrap();
+        commit_command(&root, &with_junk).unwrap();
+
+        let (failed, body) = place_bank(&root, "middle").await;
+        assert!(!failed, "{body}");
+        assert_eq!(
+            body["patched_symbol_instances"],
+            BANK_SYMBOLS + CELL_SYMBOLS,
+            "{body}"
+        );
+        let middle = [format!("{NESTED_ROOT}/{}", sheet_uuid(&root, "middle"))];
+        let kept = [
+            format!("{NESTED_ROOT}/{NORTH}"),
+            format!("{NESTED_ROOT}/{SOUTH}"),
+        ];
+        each_records(&bank, BANK_SYMBOLS, &[kept.as_slice(), &middle].concat());
+        each_records(
+            &cell,
+            CELL_SYMBOLS,
+            &[under(&kept, &[EAST, WEST]), under(&middle, &[EAST, WEST])].concat(),
+        );
     }
 }
 

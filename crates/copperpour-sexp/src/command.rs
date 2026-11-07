@@ -279,14 +279,47 @@ impl SchematicCommand {
         path: &str,
         label: impl Into<String>,
     ) -> Result<Option<Self>, SexpError> {
+        Self::ensure_symbol_instance_paths(source, project_name, &[path.to_owned()], label)
+    }
+
+    /// Ensure every placed symbol carries each of `paths` under `project_name`.
+    ///
+    /// The paths a symbol records already, and every other project's
+    /// instances, are left as they are. Returns `None` when every symbol
+    /// already records them all.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `paths` is empty, a placed symbol lacks a UUID or has
+    /// malformed instance data, or the replacements fail command validation.
+    pub fn ensure_symbol_instance_paths(
+        source: &str,
+        project_name: &str,
+        paths: &[String],
+        label: impl Into<String>,
+    ) -> Result<Option<Self>, SexpError> {
+        if paths.is_empty() {
+            return Err(SexpError::InvalidValue(
+                "a symbol instance set needs at least one path".to_owned(),
+            ));
+        }
+        let mut wanted = paths.to_vec();
+        wanted.sort();
+        wanted.dedup();
         Self::patch_placed_symbols(source, label, |symbol, node, reference, unit| {
-            if symbol_instance_paths(node, project_name)
-                .iter()
-                .any(|p| p == path)
-            {
-                return Ok(None);
+            let recorded = symbol_instance_paths(node, project_name);
+            let mut replacement: Option<String> = None;
+            for path in wanted.iter().filter(|path| !recorded.contains(path)) {
+                let current = replacement.as_deref().unwrap_or(symbol);
+                replacement = Some(insert_symbol_instance_path(
+                    current,
+                    project_name,
+                    path,
+                    reference,
+                    unit,
+                )?);
             }
-            insert_symbol_instance_path(symbol, project_name, path, reference, unit).map(Some)
+            Ok(replacement)
         })
     }
 
@@ -1558,6 +1591,16 @@ mod tests {
         )
         .expect("idempotence check succeeds")
         .is_none());
+    }
+
+    /// The plural form's edits are covered by the sheet tools' tests on the
+    /// eeschema-saved nested fixture; this is its one guard, which fires
+    /// before any text is read.
+    #[test]
+    fn an_empty_symbol_instance_set_is_refused_before_reading() {
+        let error = SchematicCommand::ensure_symbol_instance_paths("", "demo", &[], "Link")
+            .expect_err("an empty set is refused");
+        assert!(matches!(error, SexpError::InvalidValue(_)), "{error}");
     }
 
     #[test]
