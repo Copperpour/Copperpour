@@ -226,7 +226,8 @@ pub fn tools() -> Vec<ToolDef> {
             "renumber_sheet_pages",
             "Walk the whole sheet tree from a root schematic and reassign sequential page \
              numbers (2, 3, 4, ... — page 1 is always the root and is left untouched) in \
-             depth-first order. Fixes gaps left by delete_sheet/duplicate_sheet. Only \
+             depth-first order; the sheets inside a sheet file placed more than once get a \
+             page per placement. Fixes gaps left by delete_sheet/duplicate_sheet. Only \
              touches files whose page numbers actually changed.",
             json!({
                 "type": "object",
@@ -2805,18 +2806,24 @@ async fn handle_renumber_sheet_pages(
 
     let mut next_page = 2u32; // page 1 is always the root, left untouched
     let mut renumbered = Vec::new();
-    let mut visited = HashSet::new();
-    let mut transitions = Vec::new();
-    collect_renumber_transitions(
+    let mut files = Vec::new();
+    collect_renumbered_pages(
         &root_path,
         &root_prefix,
-        &project_name,
         &mut next_page,
         &mut renumbered,
-        &mut visited,
-        Some((&root_before, &root_base, &root_uuid)),
-        &mut transitions,
+        &mut HashSet::new(),
+        &mut files,
     )?;
+    // One transition per file. A file placed more than once is walked once
+    // per placement and takes every placement's page in one write; a second
+    // transition on the same file would be refused as a duplicate target.
+    let mut transitions = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        let root =
+            (index == 0).then_some((root_before.as_str(), root_base.as_str(), root_uuid.as_str()));
+        transitions.extend(renumber_file_transition(file, &project_name, root)?);
+    }
     if !transitions.is_empty() {
         commit_file_transaction(parent_dir(&root_path), transitions)?;
     }
@@ -2827,66 +2834,105 @@ async fn handle_renumber_sheet_pages(
     })))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_renumber_transitions(
+/// The pages a renumbering gives the sheets of one file: one per placement of
+/// the file, each at the instance path of that placement.
+struct RenumberedPages {
+    path: PathBuf,
+    canonical: PathBuf,
+    /// The sheet's uuid, the file's instance path, the page.
+    pages: Vec<(String, String, String)>,
+}
+
+/// Walk the hierarchy depth-first in file order, numbering every sheet
+/// instance from `next_page`, and gather each file's pages. A file placed
+/// more than once is walked once per placement, so each placement's sheets
+/// get pages of their own.
+fn collect_renumbered_pages(
     path: &Path,
     hier_prefix: &str,
-    project_name: &str,
     next_page: &mut u32,
     renumbered: &mut Vec<Value>,
     visited: &mut HashSet<PathBuf>,
-    source_override: Option<(&str, &str, &str)>,
-    transitions: &mut Vec<FileTransition>,
+    files: &mut Vec<RenumberedPages>,
 ) -> anyhow::Result<()> {
     let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if !visited.insert(canon.clone()) {
         return Ok(()); // cycle guard — already on this DFS path, skip
     }
-
-    let loaded_before = source_override
-        .map(|(before, _, _)| before.to_owned())
-        .unwrap_or(read_consistent(path)?);
-    let command_source = source_override
-        .map(|(_, base, _)| base)
-        .unwrap_or(loaded_before.as_str());
-    let mut sch = cse::Schematic::load(path)?;
-    if let Some((_, _, root_uuid)) = source_override {
-        sch.uuid = Some(root_uuid.to_owned());
-    }
+    let sch = cse::Schematic::load(path)?;
     let dir = parent_dir(path);
-    let mut changed_ids = Vec::new();
+    let index = match files.iter().position(|file| file.canonical == canon) {
+        Some(index) => index,
+        None => {
+            files.push(RenumberedPages {
+                path: path.to_path_buf(),
+                canonical: canon.clone(),
+                pages: Vec::new(),
+            });
+            files.len() - 1
+        }
+    };
 
-    // Snapshot the sheet order first: recursing below needs `sch` unborrowed.
-    let sheet_order: Vec<(String, String, String)> = sch
-        .sheets
-        .iter()
-        .map(|s| (s.name().to_string(), s.file().to_string(), s.uuid.clone()))
-        .collect();
-
-    for (name, file, sheet_uuid) in &sheet_order {
+    for sheet in sch.sheets.iter() {
         let page = next_page.to_string();
         *next_page += 1;
-        if let Some(sheet) = sch.sheets.by_name_mut(name) {
-            if sheet.page(project_name) != Some(page.as_str()) {
-                sheet.set_page(project_name, hier_prefix, &page);
-                changed_ids.push(ItemId::new(sheet.uuid.clone())?);
-            }
-        }
-        renumbered.push(json!({ "sheet_name": name, "file": file, "page": page }));
+        let child_prefix = format!("{}/{}", hier_prefix, sheet.uuid);
+        files[index]
+            .pages
+            .push((sheet.uuid.clone(), hier_prefix.to_owned(), page.clone()));
+        renumbered.push(json!({
+            "sheet_name": sheet.name(),
+            "file": sheet.file(),
+            "path": child_prefix,
+            "page": page
+        }));
 
-        let child_path = dir.join(file);
+        let child_path = dir.join(sheet.file());
         if child_path.exists() {
-            let child_prefix = format!("{}/{}", hier_prefix, sheet_uuid);
-            collect_renumber_transitions(
+            collect_renumbered_pages(
                 &child_path,
                 &child_prefix,
-                project_name,
                 next_page,
                 renumbered,
                 visited,
-                None,
-                transitions,
+                files,
             )?;
+        }
+    }
+    visited.remove(&canon);
+    Ok(())
+}
+
+/// The transition that writes `file`'s pages, or `None` when every sheet in
+/// it records them already. The root's `source_override` is the text read
+/// before the walk, that text with its uuid ensured, and the uuid.
+fn renumber_file_transition(
+    file: &RenumberedPages,
+    project_name: &str,
+    source_override: Option<(&str, &str, &str)>,
+) -> anyhow::Result<Option<FileTransition>> {
+    let loaded_before = source_override
+        .map(|(before, _, _)| before.to_owned())
+        .unwrap_or(read_consistent(&file.path)?);
+    let command_source = source_override
+        .map(|(_, base, _)| base)
+        .unwrap_or(loaded_before.as_str());
+    let mut sch = cse::Schematic::load(&file.path)?;
+    if let Some((_, _, root_uuid)) = source_override {
+        sch.uuid = Some(root_uuid.to_owned());
+    }
+    let mut changed_ids = Vec::new();
+    for (sheet_uuid, hier_prefix, page) in &file.pages {
+        let Some(sheet) = sch.sheets.by_uuid_mut(sheet_uuid) else {
+            continue;
+        };
+        if sheet.page_at(project_name, hier_prefix) == Some(page.as_str()) {
+            continue;
+        }
+        sheet.set_page(project_name, hier_prefix, page);
+        let id = ItemId::new(sheet_uuid.clone())?;
+        if !changed_ids.contains(&id) {
+            changed_ids.push(id);
         }
     }
 
@@ -2899,13 +2945,10 @@ fn collect_renumber_transitions(
             changed_ids,
             "Renumber hierarchical sheets",
         )?;
-        prepare_command(path, command_source, &command)?.0
+        prepare_command(&file.path, command_source, &command)?.0
     };
-    if replacement != loaded_before {
-        transitions.push(FileTransition::replace(path, loaded_before, replacement));
-    }
-    visited.remove(&canon);
-    Ok(())
+    Ok((replacement != loaded_before)
+        .then(|| FileTransition::replace(&file.path, loaded_before, replacement)))
 }
 
 async fn handle_import_sheet_pins(
@@ -4368,6 +4411,189 @@ mod tests {
         let parent = cse::Schematic::load(&root).unwrap();
         assert_eq!(parent.sheets.by_name("A").unwrap().page("root"), Some("2"));
         assert_eq!(parent.sheets.by_name("C").unwrap().page("root"), Some("3"));
+    }
+
+    /// The eeschema-saved nested fixture in a directory of its own: the root
+    /// places `bank.kicad_sch` as `north` and `south`, and that file places
+    /// `cell.kicad_sch` as `east` and `west`; see its README for the pages.
+    fn nested_hierarchy_copy() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        for (name, content) in [
+            (
+                "nested_pages.kicad_pro",
+                include_str!(
+                    "../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_pro"
+                ),
+            ),
+            (
+                "nested_pages.kicad_sch",
+                include_str!(
+                    "../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_sch"
+                ),
+            ),
+            (
+                "bank.kicad_sch",
+                include_str!("../../tests/fixtures/annotate_nested_hierarchy/bank.kicad_sch"),
+            ),
+            (
+                "cell.kicad_sch",
+                include_str!("../../tests/fixtures/annotate_nested_hierarchy/cell.kicad_sch"),
+            ),
+        ] {
+            std::fs::write(tmp.path().join(name), content).unwrap();
+        }
+        tmp
+    }
+
+    #[tokio::test]
+    async fn renumber_sheet_pages_gives_each_placement_of_a_reused_sheet_its_own_page() {
+        let tmp = nested_hierarchy_copy();
+        let root = tmp.path().join("nested_pages.kicad_sch");
+        let bank = tmp.path().join("bank.kicad_sch");
+        let cell = tmp.path().join("cell.kicad_sch");
+        let symbol_records = |path: &Path| -> Vec<Vec<(String, String)>> {
+            cse::Schematic::load(path)
+                .unwrap()
+                .symbols
+                .iter()
+                .map(|symbol| symbol.instance_paths())
+                .collect()
+        };
+        let bank_symbols_before = symbol_records(&bank);
+        let cell_before = std::fs::read_to_string(&cell).unwrap();
+        let ctx = test_ctx();
+
+        let result =
+            handle_renumber_sheet_pages(&json!({ "schematic": root.display().to_string() }), &ctx)
+                .await
+                .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = result_json(&result);
+        assert_eq!(body["renumbered_count"], 6, "{body}");
+
+        // Depth-first in file order: north is first in the root's file and
+        // east first in bank's, so eeschema's 10, 12, 11, 2, 3, 4 become 2..7,
+        // each placement of bank numbering its two sheets again.
+        let root_path = "/970f1adb-65bd-4ca9-bbaf-b939cab8549c";
+        let north = format!("{root_path}/8cca053b-d9dc-44e3-a2d7-e24a663aa548");
+        let south = format!("{root_path}/ed5b7508-65bd-450d-b053-99de75ca07ff");
+        let east = "380650f1-fcab-4acf-8bbe-d7c7771fd834";
+        let west = "69a89bb1-464e-4f4e-948b-24cc8540975b";
+        let pages: Vec<(String, String, String, String)> = body["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|page| {
+                let field = |name: &str| page[name].as_str().unwrap().to_owned();
+                (
+                    field("sheet_name"),
+                    field("file"),
+                    field("path"),
+                    field("page"),
+                )
+            })
+            .collect();
+        let entry = |name: &str, file: &str, path: String, page: &str| {
+            (name.to_owned(), file.to_owned(), path, page.to_owned())
+        };
+        assert_eq!(
+            pages,
+            [
+                entry("north", "bank.kicad_sch", north.clone(), "2"),
+                entry("east", "cell.kicad_sch", format!("{north}/{east}"), "3"),
+                entry("west", "cell.kicad_sch", format!("{north}/{west}"), "4"),
+                entry("south", "bank.kicad_sch", south.clone(), "5"),
+                entry("east", "cell.kicad_sch", format!("{south}/{east}"), "6"),
+                entry("west", "cell.kicad_sch", format!("{south}/{west}"), "7"),
+            ]
+        );
+
+        let saved_root = cse::Schematic::load(&root).unwrap();
+        let page_at = |sheets: &cse::Schematic, name: &str, path: &str| {
+            sheets
+                .sheets
+                .by_name(name)
+                .unwrap()
+                .page_at("nested_pages", path)
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            page_at(&saved_root, "north", root_path).as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            page_at(&saved_root, "south", root_path).as_deref(),
+            Some("5")
+        );
+        let saved_bank = cse::Schematic::load(&bank).unwrap();
+        assert_eq!(page_at(&saved_bank, "east", &north).as_deref(), Some("3"));
+        assert_eq!(page_at(&saved_bank, "east", &south).as_deref(), Some("6"));
+        assert_eq!(page_at(&saved_bank, "west", &north).as_deref(), Some("4"));
+        assert_eq!(page_at(&saved_bank, "west", &south).as_deref(), Some("7"));
+        for name in ["east", "west"] {
+            assert_eq!(
+                saved_bank.sheets.by_name(name).unwrap().instances.len(),
+                2,
+                "one record per placement of bank, nothing else"
+            );
+        }
+        // Only the pages moved: the symbols' records are as eeschema wrote
+        // them, and cell.kicad_sch, which places no sheet, is untouched.
+        assert_eq!(symbol_records(&bank), bank_symbols_before);
+        assert_eq!(std::fs::read_to_string(&cell).unwrap(), cell_before);
+
+        // Numbered already, so a second call reports the pages and writes nothing.
+        let root_after = std::fs::read_to_string(&root).unwrap();
+        let bank_after = std::fs::read_to_string(&bank).unwrap();
+        let again =
+            handle_renumber_sheet_pages(&json!({ "schematic": root.display().to_string() }), &ctx)
+                .await
+                .unwrap();
+        assert!(!again.is_error, "{:?}", again.content);
+        assert_eq!(result_json(&again)["renumbered_count"], 6);
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), root_after);
+        assert_eq!(std::fs::read_to_string(&bank).unwrap(), bank_after);
+    }
+
+    #[tokio::test]
+    async fn renumber_sheet_pages_judges_each_record_by_its_path() {
+        let tmp = nested_hierarchy_copy();
+        let root = tmp.path().join("nested_pages.kicad_sch");
+        let bank = tmp.path().join("bank.kicad_sch");
+        // east's two records swapped in eeschema's text, so south's page 3 is
+        // listed before north's 12. The walk gives north's instance page 3: a
+        // reader of the first record would take it as numbered already and
+        // leave north at 12.
+        let north_record = "\t\t\t\t(path \"/970f1adb-65bd-4ca9-bbaf-b939cab8549c/8cca053b-d9dc-44e3-a2d7-e24a663aa548\"\n\t\t\t\t\t(page \"12\")\n\t\t\t\t)\n";
+        let south_record = "\t\t\t\t(path \"/970f1adb-65bd-4ca9-bbaf-b939cab8549c/ed5b7508-65bd-450d-b053-99de75ca07ff\"\n\t\t\t\t\t(page \"3\")\n\t\t\t\t)\n";
+        let saved = std::fs::read_to_string(&bank).unwrap();
+        let pair = format!("{north_record}{south_record}");
+        assert_eq!(saved.matches(&pair).count(), 1, "east's two records");
+        std::fs::write(
+            &bank,
+            saved.replacen(&pair, &format!("{south_record}{north_record}"), 1),
+        )
+        .unwrap();
+        let north = "/970f1adb-65bd-4ca9-bbaf-b939cab8549c/8cca053b-d9dc-44e3-a2d7-e24a663aa548";
+        let south = "/970f1adb-65bd-4ca9-bbaf-b939cab8549c/ed5b7508-65bd-450d-b053-99de75ca07ff";
+        let east = cse::Schematic::load(&bank).unwrap();
+        let east = east.sheets.by_name("east").unwrap();
+        assert_eq!(east.page("nested_pages"), Some("3"), "south's record first");
+        assert_eq!(east.page_at("nested_pages", north), Some("12"));
+
+        let result = handle_renumber_sheet_pages(
+            &json!({ "schematic": root.display().to_string() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let saved = cse::Schematic::load(&bank).unwrap();
+        let east = saved.sheets.by_name("east").unwrap();
+        assert_eq!(east.page_at("nested_pages", north), Some("3"));
+        assert_eq!(east.page_at("nested_pages", south), Some("6"));
+        assert_eq!(east.instances.len(), 2);
     }
 
     #[tokio::test]

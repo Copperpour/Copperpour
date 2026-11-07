@@ -410,6 +410,16 @@ impl Sheet {
             .map(|i| i.page.as_str())
     }
 
+    /// The page of this sheet under the parent instance at `path`, the
+    /// record `set_page` writes. A parent placed more than once gives the
+    /// sheet one record per placement.
+    pub fn page_at(&self, project_name: &str, path: &str) -> Option<&str> {
+        self.instances
+            .iter()
+            .find(|i| i.project_name == project_name && i.path == path)
+            .map(|i| i.page.as_str())
+    }
+
     pub fn set_page(&mut self, project_name: &str, path: &str, page: &str) {
         if let Some(inst) = self
             .instances
@@ -751,6 +761,9 @@ mod tests {
         sheet.set_page("", "/", "2");
         sheet.set_page("", "/amp1-uuid/", "3");
         assert_eq!(sheet.instances.len(), 2);
+        assert_eq!(sheet.page_at("", "/"), Some("2"));
+        assert_eq!(sheet.page_at("", "/amp1-uuid/"), Some("3"));
+        assert_eq!(sheet.page_at("", "/amp2-uuid/"), None);
         let out = sheet.to_sexp();
         let reparsed = Sheet::from_sexp(&out).unwrap();
         assert_eq!(reparsed.instances.len(), 2);
