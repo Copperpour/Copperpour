@@ -485,12 +485,234 @@ pub(crate) async fn check_freerouting(
     }
 }
 
+/// The KiCad project whose design rules `route_specctra_dsn` sends, and why
+/// it is that one, or why there is none.
+#[derive(Debug, PartialEq, Eq)]
+enum RouteProject {
+    /// `project_path`, as given.
+    Given(PathBuf),
+    /// The only `.kicad_pro` in the DSN's folder, else in its parent.
+    Found(PathBuf),
+    /// No `.kicad_pro` in either folder.
+    NoneFound,
+    /// Several `.kicad_pro` in this folder: none is guessed.
+    Several(PathBuf),
+}
+
+/// The `.kicad_pro` files directly in `dir`.
+fn kicad_projects_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut projects: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_file() && extension_is(path, "kicad_pro"))
+        .collect();
+    projects.sort();
+    projects
+}
+
+fn extension_is(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+}
+
+/// Which project's rules apply to `dsn`: `project_path` when given, else the
+/// only `.kicad_pro` in the DSN's folder, else the only one in its parent (a
+/// `route/` subfolder is common). Several in the first folder that has any:
+/// none is guessed, and the parent is not searched.
+fn route_project(project_path: Option<PathBuf>, dsn: &Path) -> RouteProject {
+    if let Some(project) = project_path {
+        return RouteProject::Given(project);
+    }
+    let folder = match dsn.parent() {
+        Some(folder) if !folder.as_os_str().is_empty() => folder,
+        _ => Path::new("."),
+    };
+    for dir in [Some(folder), folder.parent()].into_iter().flatten() {
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        let mut projects = kicad_projects_in(dir);
+        match projects.len() {
+            0 => continue,
+            1 => return RouteProject::Found(projects.remove(0)),
+            _ => return RouteProject::Several(dir.to_path_buf()),
+        }
+    }
+    RouteProject::NoneFound
+}
+
+/// What `route_specctra_dsn` read from the KiCad project, reported under
+/// `project_rules` in its answer.
+#[derive(Debug, Default)]
+struct ProjectRules {
+    project_path: Option<PathBuf>,
+    /// The Freerouting settings read from it, before the caller's own.
+    sent: serde_json::Map<String, serde_json::Value>,
+    /// Why no project rules were sent, when none were.
+    note: Option<String>,
+    /// The project's `min_track_width`, in um, read whether or not it is sent.
+    min_track_width_um: Option<f64>,
+    /// `neck_width_um` sent from `min_track_width`, at the caller's request
+    /// (`neck_to_min_track_width`).
+    neck_width_um: Option<f64>,
+}
+
+/// With `neck_to_min_track_width`, the `neck_width_um` to send: the project's
+/// `min_track_width`. An explicit `router_settings.neck_width_um` wins, and
+/// then nothing is taken from the project. Asked for without a project, or
+/// with a project that has no `min_track_width` above 0, the call is refused:
+/// routing at the class widths only is what the caller asked to avoid.
+fn neck_from_project(
+    requested: bool,
+    router_settings: Option<&serde_json::Map<String, serde_json::Value>>,
+    project: &ProjectRules,
+) -> Result<Option<f64>, CallToolResult> {
+    if !requested || router_settings.is_some_and(|settings| settings.contains_key("neck_width_um"))
+    {
+        return Ok(None);
+    }
+    if let Some(um) = project.min_track_width_um {
+        return Ok(Some(um));
+    }
+    let reason = match &project.project_path {
+        Some(path) => format!(
+            "neck_to_min_track_width needs a min_track_width above 0, and the KiCad project \
+             {} has none",
+            path.display()
+        ),
+        None => format!(
+            "neck_to_min_track_width needs the KiCad project's min_track_width: {}",
+            project.note.as_deref().unwrap_or("no project read")
+        ),
+    };
+    Err(CallToolResult::error_kind(
+        ToolErrorKind::InvalidArgument {
+            field: "neck_to_min_track_width".to_string(),
+            reason: reason.clone(),
+        },
+        format!("{reason}. Nothing was routed."),
+    ))
+}
+
+/// Read the design rules of `project`. A project that is named or found but
+/// cannot be read is refused: routing without its rules is what this call
+/// would otherwise do in silence.
+fn read_project_rules(project: RouteProject) -> Result<ProjectRules, CallToolResult> {
+    let (path, how) = match project {
+        RouteProject::Given(path) => (path, "project_path"),
+        RouteProject::Found(path) => (path, "found next to the DSN"),
+        RouteProject::NoneFound => {
+            return Ok(ProjectRules {
+                note: Some(
+                    "no .kicad_pro next to the DSN or in its parent folder: no project rules \
+                     sent; pass project_path to send them"
+                        .to_string(),
+                ),
+                ..ProjectRules::default()
+            })
+        }
+        RouteProject::Several(dir) => {
+            return Ok(ProjectRules {
+                note: Some(format!(
+                    "several .kicad_pro in {}: no project rules sent; pass project_path to \
+                     choose one",
+                    dir.display()
+                )),
+                ..ProjectRules::default()
+            })
+        }
+    };
+    if !path.is_file() {
+        return Err(CallToolResult::error_kind(
+            ToolErrorKind::FileNotFound {
+                path: path.display().to_string(),
+            },
+            format!(
+                "project_path is not a file: {}. Nothing was routed.",
+                path.display()
+            ),
+        ));
+    }
+    let refuse = |reason: String| {
+        Err(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "project_path".to_string(),
+                reason: reason.clone(),
+            },
+            format!("{reason}. Nothing was routed."),
+        ))
+    };
+    if !extension_is(&path, "kicad_pro") {
+        return refuse(format!(
+            "project_path must be a KiCad .kicad_pro file: {}",
+            path.display()
+        ));
+    }
+    let parsed = std::fs::read_to_string(&path)
+        .map_err(|error| error.to_string())
+        .and_then(|content| {
+            serde_json::from_str::<serde_json::Value>(&content).map_err(|error| error.to_string())
+        });
+    match parsed {
+        Ok(project) => Ok(ProjectRules {
+            sent: mcp::project_route_rules(&project),
+            min_track_width_um: mcp::project_min_track_width_um(&project),
+            project_path: Some(path),
+            ..ProjectRules::default()
+        }),
+        Err(error) => refuse(format!(
+            "cannot read the KiCad project {} ({how}): {error}; pass project_path to name \
+             a readable one",
+            path.display()
+        )),
+    }
+}
+
+/// `router_settings` with the `neck_width_um` taken from the project, sent
+/// as if the caller had set it: it asked for it, so Freerouting not applying
+/// it refuses the run, unlike a project rule.
+fn router_settings_with_neck(
+    router_settings: Option<serde_json::Map<String, serde_json::Value>>,
+    neck_width_um: Option<f64>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let Some(neck) = neck_width_um else {
+        return router_settings;
+    };
+    let mut settings = router_settings.unwrap_or_default();
+    settings.insert("neck_width_um".to_string(), json!(neck));
+    Some(settings)
+}
+
 /// The `route_specctra_dsn` tool, which `integration`'s handler delegates to.
 pub(crate) async fn route_specctra_dsn(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let dsn = get_path(args, "dsn_path")?;
+    // Freerouting does not find these rules in the DSN. The project is found
+    // from the DSN's folder, so it is read as soon as the DSN is known: a
+    // project that cannot be read is refused before any other check, and
+    // before Java starts.
+    let project_path = match args.get("project_path") {
+        Some(value) if !value.is_null() => Some(get_path(args, "project_path")?),
+        _ => None,
+    };
+    let mut project = match read_project_rules(route_project(project_path, &dsn)) {
+        Ok(project) => project,
+        Err(refusal) => return Ok(refusal),
+    };
+    project.neck_width_um = match neck_from_project(
+        args["neck_to_min_track_width"].as_bool().unwrap_or(false),
+        args["router_settings"].as_object(),
+        &project,
+    ) {
+        Ok(neck) => neck,
+        Err(refusal) => return Ok(refusal),
+    };
     let ses_output = get_path(args, "ses_output_path")?;
     // The schema bounds the threshold to 0..=100 but cannot express this gap,
     // so it is refused here, before the JAR is even looked up. The threshold
@@ -541,7 +763,11 @@ pub(crate) async fn route_specctra_dsn(
                 .collect()
         }),
         plane_as_obstacle: args["plane_as_obstacle"].as_bool(),
-        router_settings: args["router_settings"].as_object().cloned(),
+        router_settings: router_settings_with_neck(
+            args["router_settings"].as_object().cloned(),
+            project.neck_width_um,
+        ),
+        project_rules: project.sent.clone(),
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
     };
@@ -579,8 +805,48 @@ pub(crate) async fn route_specctra_dsn(
     let evidence = mcp::route_local(&jar, &dsn, &ses_output, &settings)
         .await
         .map_err(|error| anyhow::anyhow!("Freerouting MCP routing failed: {error:#}"))?;
-    Ok(CallToolResult::json(&json!({
-        "success": true,
+    Ok(CallToolResult::json(&route_response(
+        &evidence,
+        &project,
+        &jar,
+        &dsn,
+        &ses_output,
+    )))
+}
+
+/// The `route_specctra_dsn` answer for a finished job.
+///
+/// A board with unrouted connections is not a routed board, even though
+/// Freerouting ends the job COMPLETED (max_passes reached, or no progress):
+/// `success` is false, `message` says how many are left, and the SES is still
+/// written, for inspection. An unknown count (log not readable) is not turned
+/// into a failure, but `message` says it was not checked: "routed" and "not
+/// counted" must not give the same answer.
+fn route_response(
+    evidence: &mcp::RouteEvidence,
+    project: &ProjectRules,
+    jar: &Path,
+    dsn: &Path,
+    ses_output: &Path,
+) -> serde_json::Value {
+    let fully_routed = evidence.unrouted.is_none_or(|unrouted| unrouted == 0);
+    let message = match evidence.unrouted {
+        Some(0) => None,
+        Some(unrouted) => Some(format!(
+            "Freerouting left {unrouted} connection(s) unrouted; the SES at {} is incomplete",
+            ses_output.display()
+        )),
+        None => Some(format!(
+            "the unrouted count could not be read from Freerouting's log ({}); the SES at {} \
+             was not checked for completeness",
+            evidence.freerouting_log.as_deref().unwrap_or("no log"),
+            ses_output.display()
+        )),
+    };
+    json!({
+        "success": fully_routed,
+        "message": message,
+        "unrouted_connections": evidence.unrouted,
         "method": "local_freerouting_native_mcp",
         "engine": {
             "name": "Freerouting",
@@ -608,9 +874,18 @@ pub(crate) async fn route_specctra_dsn(
         "ses_bytes": evidence.ses_bytes,
         "last_activity": evidence.last_activity,
         "settings_checked": evidence.settings_checked,
-        "settings_not_applied": evidence.settings_not_applied,
-        "settings_warnings": evidence.settings_warnings
-    })))
+        // Kept for callers that read it: a setting Freerouting did not apply
+        // now fails the call before routing, so a routed board has none.
+        "settings_not_applied": [],
+        "settings_warnings": evidence.settings_warnings,
+        "project_rules": {
+            "project_path": project.project_path,
+            "sent": project.sent,
+            "not_applied": evidence.project_rules_not_applied,
+            "note": project.note,
+            "neck_width_um": project.neck_width_um
+        }
+    })
 }
 
 #[cfg(test)]
@@ -620,6 +895,118 @@ mod freerouting_tests {
     use crate::tools::ServerConfig;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// What `route_local` hands back for a job that ended COMPLETED, with
+    /// `unrouted` connections left according to Freerouting's log.
+    fn completed_job(unrouted: Option<u64>) -> mcp::RouteEvidence {
+        mcp::RouteEvidence {
+            session_id: "session".into(),
+            job_id: "a3aa32d0".into(),
+            final_state: "COMPLETED".into(),
+            poll_count: 12,
+            elapsed_seconds: 300.0,
+            ses_bytes: 4096,
+            server_protocol_version: "2025-06-18".into(),
+            diagnostics_path: None,
+            last_activity: Some("pass 30: 3 unrouted, 218 violations".into()),
+            unrouted,
+            freerouting_log: Some("/state/freerouting/logs/freerouting.log".into()),
+            settings_checked: false,
+            project_rules_not_applied: Vec::new(),
+            settings_warnings: Vec::new(),
+        }
+    }
+
+    fn respond(unrouted: Option<u64>) -> serde_json::Value {
+        route_response(
+            &completed_job(unrouted),
+            &ProjectRules::default(),
+            Path::new("/opt/freerouting.jar"),
+            Path::new("/work/board.dsn"),
+            Path::new("/work/board.ses"),
+        )
+    }
+
+    /// Freerouting ends a job COMPLETED when max_passes runs out or no pass
+    /// makes progress, whatever is left unrouted: that is not success.
+    #[test]
+    fn a_completed_job_with_unrouted_connections_is_not_a_success() {
+        let body = respond(Some(3));
+        assert_eq!(body["success"], false, "{body}");
+        assert_eq!(body["final_state"], "COMPLETED", "{body}");
+        assert_eq!(body["unrouted_connections"], 3, "{body}");
+        let message = body["message"].as_str().expect("a message says why");
+        assert!(message.contains("3 connection(s) unrouted"), "{message}");
+        assert!(message.contains("/work/board.ses"), "{message}");
+        // The SES is still reported, for inspection.
+        assert_eq!(body["artifacts"]["ses_output_path"], "/work/board.ses");
+        assert_eq!(body["ses_bytes"], 4096);
+    }
+
+    #[test]
+    fn a_completed_job_with_every_connection_routed_is_a_success() {
+        let body = respond(Some(0));
+        assert_eq!(body["success"], true, "{body}");
+        assert_eq!(body["unrouted_connections"], 0, "{body}");
+        assert!(body["message"].is_null(), "{body}");
+    }
+
+    /// Settings Freerouting did not apply fail the call before routing, so a
+    /// routed board has none; the key stays for callers that read it.
+    /// Whether they were read back at all reaches the caller as is.
+    #[test]
+    fn a_routed_board_keeps_an_empty_settings_not_applied() {
+        let body = respond(Some(0));
+        assert_eq!(body["settings_not_applied"], json!([]), "{body}");
+        assert_eq!(body["settings_checked"], false, "{body}");
+        let mut evidence = completed_job(Some(0));
+        evidence.settings_checked = true;
+        evidence.settings_warnings = vec![json!("max_threads above the CPU count")];
+        let body = route_response(
+            &evidence,
+            &ProjectRules::default(),
+            Path::new("/opt/freerouting.jar"),
+            Path::new("/work/board.dsn"),
+            Path::new("/work/board.ses"),
+        );
+        assert_eq!(body["settings_checked"], true, "{body}");
+        assert_eq!(body["settings_not_applied"], json!([]), "{body}");
+        assert_eq!(
+            body["settings_warnings"],
+            json!(["max_threads above the CPU count"]),
+            "{body}"
+        );
+    }
+
+    /// A count that could not be read from the log is unknown, not a failure,
+    /// and the message says so: "routed" and "not counted" differ.
+    #[test]
+    fn an_unknown_unrouted_count_leaves_success_true() {
+        let body = respond(None);
+        assert_eq!(body["success"], true, "{body}");
+        assert!(body["unrouted_connections"].is_null(), "{body}");
+        let message = body["message"]
+            .as_str()
+            .expect("a message says it was not counted");
+        assert!(message.contains("could not be read"), "{message}");
+        assert!(
+            message.contains("/state/freerouting/logs/freerouting.log"),
+            "{message}"
+        );
+        assert!(message.contains("/work/board.ses"), "{message}");
+
+        let mut evidence = completed_job(None);
+        evidence.freerouting_log = None;
+        let body = route_response(
+            &evidence,
+            &ProjectRules::default(),
+            Path::new("/opt/freerouting.jar"),
+            Path::new("/work/board.dsn"),
+            Path::new("/work/board.ses"),
+        );
+        let message = body["message"].as_str().expect("a message without a log");
+        assert!(message.contains("(no log)"), "{message}");
+    }
 
     fn test_ctx() -> ToolContext {
         ToolContext::new(
@@ -1207,7 +1594,7 @@ mod freerouting_tests {
                 body["message"].as_str().unwrap().contains("as a fraction"),
                 "{body}"
             );
-            assert!(!temp.path().join("board.ses").exists());
+            assert!(!temp.path().join("route/board.ses").exists());
         }
     }
 
@@ -1268,6 +1655,15 @@ mod freerouting_tests {
     /// does not exist, and returns the structured error body.
     async fn served_route(extra: serde_json::Value) -> (tempfile::TempDir, serde_json::Value) {
         let temp = tempfile::tempdir().unwrap();
+        let body = served_route_in(temp.path(), extra).await;
+        (temp, body)
+    }
+
+    /// [`served_route`] with the DSN in `dir/route/`: the project search
+    /// stops at `dir`, whatever the system's temporary folder holds.
+    async fn served_route_in(dir: &Path, extra: serde_json::Value) -> serde_json::Value {
+        let route = dir.join("route");
+        std::fs::create_dir_all(&route).unwrap();
         let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
             kicad_cli: String::new(),
             kicad_binary: String::new(),
@@ -1280,9 +1676,9 @@ mod freerouting_tests {
         .await
         .expect("handler builds");
         let mut arguments = json!({
-            "dsn_path": temp.path().join("board.dsn").display().to_string(),
-            "ses_output_path": temp.path().join("board.ses").display().to_string(),
-            "jar_path": temp.path().join("missing.jar").display().to_string(),
+            "dsn_path": route.join("board.dsn").display().to_string(),
+            "ses_output_path": route.join("board.ses").display().to_string(),
+            "jar_path": dir.join("missing.jar").display().to_string(),
         });
         arguments
             .as_object_mut()
@@ -1299,8 +1695,309 @@ mod freerouting_tests {
             .expect("tools/call receives a response");
         let result = response.result.expect("result");
         assert_eq!(result["isError"], json!(true), "{result}");
-        let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        (temp, body)
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    /// A `.kicad_pro` whose rules are `rules`, at `path`.
+    fn write_project(path: &Path, rules: serde_json::Value) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            json!({ "board": { "design_settings": { "rules": rules } } }).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_project_is_the_only_kicad_pro_next_to_the_dsn_else_in_its_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board/route/board.dsn");
+        std::fs::create_dir_all(dsn.parent().unwrap()).unwrap();
+        let parent = temp.path().join("board/board.kicad_pro");
+        write_project(&parent, json!({}));
+        // A folder named like a project is not one.
+        std::fs::create_dir(temp.path().join("board/route/old.kicad_pro")).unwrap();
+        assert_eq!(
+            route_project(None, &dsn),
+            RouteProject::Found(parent.clone())
+        );
+
+        let beside = temp.path().join("board/route/board.kicad_pro");
+        write_project(&beside, json!({}));
+        assert_eq!(route_project(None, &dsn), RouteProject::Found(beside));
+
+        // Two beside the DSN: none is guessed, and the parent's single one is
+        // not taken instead.
+        write_project(&temp.path().join("board/route/copy.kicad_pro"), json!({}));
+        assert_eq!(
+            route_project(None, &dsn),
+            RouteProject::Several(temp.path().join("board/route"))
+        );
+
+        // project_path wins over the search.
+        assert_eq!(
+            route_project(Some(parent.clone()), &dsn),
+            RouteProject::Given(parent)
+        );
+
+        let alone = temp.path().join("alone/route/board.dsn");
+        std::fs::create_dir_all(alone.parent().unwrap()).unwrap();
+        assert_eq!(route_project(None, &alone), RouteProject::NoneFound);
+    }
+
+    #[test]
+    fn without_a_single_project_no_rules_are_sent_and_the_answer_says_why() {
+        let none = read_project_rules(RouteProject::NoneFound).unwrap();
+        assert!(none.sent.is_empty());
+        assert_eq!(
+            none.note.as_deref(),
+            Some(
+                "no .kicad_pro next to the DSN or in its parent folder: no project rules sent; \
+                 pass project_path to send them"
+            )
+        );
+        let several = read_project_rules(RouteProject::Several(PathBuf::from("/work"))).unwrap();
+        assert!(several.sent.is_empty());
+        assert_eq!(
+            several.note.as_deref(),
+            Some("several .kicad_pro in /work: no project rules sent; pass project_path to choose one")
+        );
+    }
+
+    #[test]
+    fn the_answer_reports_the_project_rules_sent_and_not_applied() {
+        let mut evidence = completed_job(Some(0));
+        evidence.project_rules_not_applied =
+            vec!["hole_to_hole_um: not a Freerouting setting".into()];
+        let project = ProjectRules {
+            project_path: Some(PathBuf::from("/work/board.kicad_pro")),
+            sent: json!({ "copper_to_edge_clearance_um": 500.0, "hole_to_hole_um": 250.0 })
+                .as_object()
+                .unwrap()
+                .clone(),
+            min_track_width_um: Some(150.0),
+            neck_width_um: Some(150.0),
+            ..ProjectRules::default()
+        };
+        let body = route_response(
+            &evidence,
+            &project,
+            Path::new("/opt/freerouting.jar"),
+            Path::new("/work/board.dsn"),
+            Path::new("/work/board.ses"),
+        );
+        assert_eq!(
+            body["project_rules"],
+            json!({
+                "project_path": "/work/board.kicad_pro",
+                "sent": { "copper_to_edge_clearance_um": 500.0, "hole_to_hole_um": 250.0 },
+                "not_applied": ["hole_to_hole_um: not a Freerouting setting"],
+                "note": null,
+                "neck_width_um": 150.0
+            })
+        );
+        // A rule the JAR skipped does not fail a routed board.
+        assert_eq!(body["success"], true, "{body}");
+    }
+
+    #[tokio::test]
+    async fn served_route_refuses_a_project_path_that_is_not_a_file_before_the_jar_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("gone.kicad_pro");
+        let body = served_route_in(
+            temp.path(),
+            json!({ "project_path": missing.display().to_string() }),
+        )
+        .await;
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert_eq!(
+            body["error"]["path"],
+            json!(missing.display().to_string()),
+            "{body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("project_path is not a file"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn served_route_refuses_a_project_path_that_is_not_a_kicad_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        let body = served_route_in(
+            temp.path(),
+            json!({ "project_path": board.display().to_string() }),
+        )
+        .await;
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "project_path", "{body}");
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("project_path must be a KiCad .kicad_pro file"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn served_route_refuses_a_found_project_it_cannot_read() {
+        // Found next to the DSN, not named: routing without its rules would
+        // be the silent fallback this refuses. The missing JAR is not reached.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("route")).unwrap();
+        std::fs::write(temp.path().join("route/board.kicad_pro"), "{ not json").unwrap();
+        let body = served_route_in(temp.path(), json!({})).await;
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "project_path", "{body}");
+        let reason = body["error"]["reason"].as_str().unwrap();
+        assert!(reason.contains("(found next to the DSN)"), "{body}");
+        assert!(
+            reason.ends_with("; pass project_path to name a readable one"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn served_route_goes_on_to_the_jar_with_a_readable_project() {
+        // A readable project, named or found, lets the call reach the
+        // (missing) JAR.
+        let temp = tempfile::tempdir().unwrap();
+        write_project(
+            &temp.path().join("board.kicad_pro"),
+            json!({ "min_copper_edge_clearance": 0.5 }),
+        );
+        let body = served_route_in(temp.path(), json!({})).await;
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        let project = temp.path().join("board.kicad_pro").display().to_string();
+        let body = served_route_in(temp.path(), json!({ "project_path": project })).await;
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+    }
+
+    /// A project read from `path`, with `min_track_width_um`.
+    fn project_read(min_track_width_um: Option<f64>) -> ProjectRules {
+        ProjectRules {
+            project_path: Some(PathBuf::from("/work/board.kicad_pro")),
+            min_track_width_um,
+            ..ProjectRules::default()
+        }
+    }
+
+    #[test]
+    fn the_neck_width_comes_from_the_project_only_when_asked_for() {
+        let project = project_read(Some(150.0));
+        assert_eq!(neck_from_project(false, None, &project).ok(), Some(None));
+        assert_eq!(
+            neck_from_project(true, None, &project).ok(),
+            Some(Some(150.0))
+        );
+        // Other router_settings do not stop it; an explicit neck_width_um
+        // wins, even with no project to read it from.
+        let other = json!({ "hole_clearance_um": 200 });
+        assert_eq!(
+            neck_from_project(true, other.as_object(), &project).ok(),
+            Some(Some(150.0))
+        );
+        let explicit = json!({ "neck_width_um": 120 });
+        assert_eq!(
+            neck_from_project(true, explicit.as_object(), &ProjectRules::default()).ok(),
+            Some(None)
+        );
+    }
+
+    /// The `error` of a refused call; an accepted one fails the assertion.
+    fn refusal_error(result: Result<Option<f64>, CallToolResult>) -> serde_json::Value {
+        assert!(result.is_err(), "not refused: {:?}", result.ok());
+        response_json(&result.unwrap_err())["error"].clone()
+    }
+
+    #[test]
+    fn a_neck_width_asked_for_without_a_min_track_width_is_refused() {
+        let error = refusal_error(neck_from_project(true, None, &project_read(None)));
+        assert_eq!(error["kind"], "invalid_argument", "{error}");
+        assert_eq!(error["field"], "neck_to_min_track_width", "{error}");
+        assert_eq!(
+            error["reason"],
+            "neck_to_min_track_width needs a min_track_width above 0, and the KiCad project \
+             /work/board.kicad_pro has none"
+        );
+        // No project read: the reason says why there is none.
+        let none = read_project_rules(RouteProject::NoneFound).unwrap();
+        let error = refusal_error(neck_from_project(true, None, &none));
+        assert_eq!(error["field"], "neck_to_min_track_width", "{error}");
+        assert_eq!(
+            error["reason"],
+            format!(
+                "neck_to_min_track_width needs the KiCad project's min_track_width: {}",
+                none.note.unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn the_neck_width_goes_out_with_what_the_caller_asked_for() {
+        assert_eq!(router_settings_with_neck(None, None), None);
+        assert_eq!(
+            router_settings_with_neck(None, Some(150.0)).map(serde_json::Value::Object),
+            Some(json!({ "neck_width_um": 150.0 }))
+        );
+        let asked = json!({ "hole_clearance_um": 200 }).as_object().cloned();
+        assert_eq!(
+            router_settings_with_neck(asked, Some(150.0)).map(serde_json::Value::Object),
+            Some(json!({ "hole_clearance_um": 200, "neck_width_um": 150.0 }))
+        );
+    }
+
+    #[test]
+    fn a_project_read_keeps_its_min_track_width() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("board.kicad_pro");
+        write_project(&path, json!({ "min_track_width": 0.15 }));
+        let project = read_project_rules(RouteProject::Given(path)).unwrap();
+        assert_eq!(project.min_track_width_um, Some(150.0));
+        // Read, not sent: only neck_to_min_track_width sends it.
+        assert!(project.sent.is_empty(), "{:?}", project.sent);
+        assert_eq!(project.neck_width_um, None);
+    }
+
+    #[tokio::test]
+    async fn served_route_refuses_a_neck_width_it_cannot_send_before_the_jar_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        write_project(
+            &temp.path().join("board.kicad_pro"),
+            json!({ "min_copper_edge_clearance": 0.5 }),
+        );
+        let body = served_route_in(temp.path(), json!({ "neck_to_min_track_width": true })).await;
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "neck_to_min_track_width", "{body}");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .ends_with(". Nothing was routed."));
+
+        // With a min_track_width, or an explicit neck_width_um, the call
+        // reaches the (missing) JAR.
+        write_project(
+            &temp.path().join("board.kicad_pro"),
+            json!({ "min_track_width": 0.15 }),
+        );
+        let body = served_route_in(temp.path(), json!({ "neck_to_min_track_width": true })).await;
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        let alone = tempfile::tempdir().unwrap();
+        let body = served_route_in(
+            alone.path(),
+            json!({
+                "neck_to_min_track_width": true,
+                "router_settings": { "neck_width_um": 120 }
+            }),
+        )
+        .await;
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
     }
 
     #[test]
