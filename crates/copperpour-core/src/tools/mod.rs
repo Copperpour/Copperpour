@@ -1514,19 +1514,34 @@ pub(crate) fn all_pin_endpoints(tree: &copperpour_sexp::SexpNode) -> Vec<(f64, f
 /// pins one symbol stacks on a tip counted once, each sheet pin, and each bus
 /// entry's wire end.
 pub(crate) fn junction_exit_points(tree: &copperpour_sexp::SexpNode) -> Vec<(f64, f64)> {
+    junction_exits(
+        &placed_pins_by_reference(tree),
+        copperpour_sexp::schematic::extract_sheet_pins(tree),
+        sch_connectivity::bus_entry_wire_ends(
+            tree,
+            &copperpour_sexp::schematic::extract_buses(tree),
+            sch_connectivity::COINCIDENT_TOLERANCE,
+        ),
+    )
+}
+
+/// [`junction_exit_points`] from pieces a caller already holds, so the
+/// [`sch_connectivity::ConnectivityIndex`] counts what the wire tools count
+/// without resolving the pins twice.
+pub(crate) fn junction_exits(
+    by_reference: &PlacedPinsByReference,
+    sheet_pins: impl IntoIterator<Item = (f64, f64)>,
+    bus_entry_wire_ends: impl IntoIterator<Item = (f64, f64)>,
+) -> Vec<(f64, f64)> {
     let mut points = Vec::new();
-    for (_, pins) in placed_pins_by_reference(tree) {
+    for (_, pins) in by_reference {
         points
-            .extend(dedup_points(pins.into_iter().map(|(pin, t)| {
-                copperpour_sexp::schematic::pin_endpoint(&pin, t)
+            .extend(dedup_points(pins.iter().map(|(pin, t)| {
+                copperpour_sexp::schematic::pin_endpoint(pin, *t)
             })));
     }
-    points.extend(copperpour_sexp::schematic::extract_sheet_pins(tree));
-    points.extend(sch_connectivity::bus_entry_wire_ends(
-        tree,
-        &copperpour_sexp::schematic::extract_buses(tree),
-        sch_connectivity::COINCIDENT_TOLERANCE,
-    ));
+    points.extend(sheet_pins);
+    points.extend(bus_entry_wire_ends);
     points
 }
 
