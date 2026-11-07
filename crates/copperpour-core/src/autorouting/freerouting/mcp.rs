@@ -97,6 +97,10 @@ pub(crate) struct RouteEvidence {
     pub ses_bytes: u64,
     pub server_protocol_version: String,
     pub diagnostics_path: Option<String>,
+    /// Why Freerouting's stderr could not be saved at `diagnostics_path`,
+    /// e.g. a file of that name appeared during the run. The routed board is
+    /// delivered all the same.
+    pub diagnostics_error: Option<String>,
     /// Last routing activity read from Freerouting's log, e.g.
     /// "pass 17: 0 unrouted, 218 violations".
     pub last_activity: Option<String>,
@@ -230,18 +234,28 @@ pub(crate) async fn route_local(
         )),
     };
     let diagnostics = client.close().await;
-    let diagnostics_path = write_diagnostics(ses_output, &diagnostics).await?;
+    // The routing decides the call, not the log: a log that appeared during
+    // the run is reported, and the board is still delivered (or, on a failed
+    // run, the temporary SES still removed).
+    let (diagnostics_path, diagnostics_error) =
+        match write_diagnostics(ses_output, &diagnostics).await {
+            Ok(path) => (path, None),
+            Err(error) => (None, Some(format!("{error:#}"))),
+        };
 
     // with_stderr_tail rebuilds the error as text. A refusal of the caller's
     // settings keeps its type for the handler, which answers it as
-    // invalid_argument; Freerouting's stderr has nothing to add to it and
-    // still goes to the log.
+    // invalid_argument; Freerouting's stderr, or why it was not saved, has
+    // nothing to add to it.
     let result = route_result.map_err(|error| {
         if SettingsNotApplied::in_error(&error).is_some() {
-            error
-        } else {
-            with_stderr_tail(error, &diagnostics, diagnostics_path.as_deref())
+            return error;
         }
+        let error = match &diagnostics_error {
+            Some(reason) => anyhow::anyhow!("{error:#} (Freerouting stderr not saved: {reason})"),
+            None => error,
+        };
+        with_stderr_tail(error, &diagnostics, diagnostics_path.as_deref())
     });
     let evidence = match result {
         Ok(evidence) => evidence,
@@ -277,6 +291,7 @@ pub(crate) async fn route_local(
     Ok(RouteEvidence {
         ses_bytes: metadata.len(),
         diagnostics_path,
+        diagnostics_error,
         ..evidence
     })
 }
@@ -730,6 +745,7 @@ async fn run_state_machine(
         ses_bytes: 0,
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
+        diagnostics_error: None,
         unrouted: progress.read_unrouted(),
         freerouting_log: progress.log.as_deref().map(|log| log.display().to_string()),
         last_activity: progress.activity,
@@ -3727,6 +3743,132 @@ done
             error.contains("start_job") && error.contains("path.jobId"),
             "{error}"
         );
+    }
+
+    /// A server scripted in sh, run behind [`with_fake_java`], whose job ends
+    /// in `state` on the first poll. On download it writes a board to the
+    /// path it is given and, like another process during the run, `log`.
+    #[cfg(unix)]
+    fn log_appears_during_the_run(state: &str, log: &Path) -> String {
+        format!(
+            r#"while read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  [ -n "$id" ] || continue
+  case "$line" in
+    *'"initialize"'*) result='{{"protocolVersion":"2025-06-18"}}' ;;
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *get_job_details*) printf 'another run' > '{log}'; result='{{"state":"{state}"}}' ;;
+    *download_job_output_to_local_file*)
+      file=$(printf '%s' "$line" | sed -n 's/.*"filePath":"\([^"]*\)".*/\1/p')
+      printf '(session board)' > "$file"; result='{{}}' ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$id" "$result"
+done"#,
+            tools = conforming_tools_list(),
+            log = log.display(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn one_poll_settings() -> RouteSettings {
+        RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
+            // The least route_local accepts; the job ends on the first poll.
+            poll_interval: Duration::from_secs(2),
+            overall_timeout: Duration::from_secs(30),
+        }
+    }
+
+    /// Names in `dir` that look like a temporary SES.
+    #[cfg(unix)]
+    fn temporary_ses_left(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp.ses"))
+            .collect()
+    }
+
+    /// A diagnostics log that appears during a run that routes: the board
+    /// is delivered at the requested path, no temporary SES is left behind,
+    /// the log is not replaced, and the reason it was not written is reported.
+    #[cfg(unix)]
+    #[test]
+    fn a_log_that_appears_during_the_run_does_not_cost_the_routed_board() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        let log = diagnostics_path(&ses);
+        std::fs::write(&jar, "not a jar").unwrap();
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+
+        let evidence = with_fake_java(
+            temp.path(),
+            &log_appears_during_the_run("COMPLETED", &log),
+            route_local(&jar, &dsn, &ses, &one_poll_settings()),
+        )
+        .expect("the log does not fail a routed job");
+
+        assert_eq!(std::fs::read_to_string(&ses).unwrap(), "(session board)");
+        assert_eq!(evidence.ses_bytes, "(session board)".len() as u64);
+        assert_eq!(temporary_ses_left(temp.path()), Vec::<String>::new());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "another run");
+        assert_eq!(evidence.diagnostics_path, None);
+        let reason = evidence.diagnostics_error.expect("the reason is reported");
+        assert!(
+            reason.contains("diagnostics output already exists"),
+            "{reason}"
+        );
+    }
+
+    /// The same log during a run that fails: the error still starts with the
+    /// job's cause, says why stderr was not saved, ends with the end of
+    /// stderr, and no temporary SES is left behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_log_that_appears_during_a_failed_run_does_not_hide_its_cause() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        let log = diagnostics_path(&ses);
+        std::fs::write(&jar, "not a jar").unwrap();
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+
+        let error = with_fake_java(
+            temp.path(),
+            &log_appears_during_the_run("FAILED", &log),
+            route_local(&jar, &dsn, &ses, &one_poll_settings()),
+        )
+        .expect_err("a FAILED job is an error");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("Freerouting job job123 ended in state FAILED"),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "Freerouting stderr not saved: Freerouting diagnostics output already exists"
+            ),
+            "{message}"
+        );
+        assert!(message.ends_with("last stderr line"), "{message}");
+        assert!(!ses.exists());
+        assert_eq!(temporary_ses_left(temp.path()), Vec::<String>::new());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "another run");
     }
 
     #[tokio::test]
