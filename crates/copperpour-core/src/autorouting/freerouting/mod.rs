@@ -782,7 +782,8 @@ fn route_response(
         "artifacts": {
             "dsn_path": dsn,
             "ses_output_path": ses_output,
-            "diagnostics_path": evidence.diagnostics_path
+            "diagnostics_path": evidence.diagnostics_path,
+            "diagnostics_error": evidence.diagnostics_error
         },
         "session_id": evidence.session_id,
         "job_id": evidence.job_id,
@@ -825,6 +826,7 @@ mod freerouting_tests {
             ses_bytes: 4096,
             server_protocol_version: "2025-06-18".into(),
             diagnostics_path: None,
+            diagnostics_error: None,
             last_activity: Some("pass 30: 3 unrouted, 218 violations".into()),
             unrouted,
             freerouting_log: Some("/state/freerouting/logs/freerouting.log".into()),
@@ -893,6 +895,28 @@ mod freerouting_tests {
             json!(["max_threads above the CPU count"]),
             "{body}"
         );
+    }
+
+    /// A routed board whose stderr could not be saved is still a success,
+    /// and the response says why the log is missing.
+    #[test]
+    fn a_routed_board_reports_why_its_diagnostics_were_not_saved() {
+        let reason = "Freerouting diagnostics output already exists: /work/board.freerouting.log";
+        let evidence = mcp::RouteEvidence {
+            diagnostics_error: Some(reason.into()),
+            ..completed_job(Some(0))
+        };
+        let body = route_response(
+            &evidence,
+            &ProjectRules::default(),
+            Path::new("/opt/freerouting.jar"),
+            Path::new("/work/board.dsn"),
+            Path::new("/work/board.ses"),
+        );
+        assert_eq!(body["success"], true, "{body}");
+        assert!(body["artifacts"]["diagnostics_path"].is_null(), "{body}");
+        assert_eq!(body["artifacts"]["diagnostics_error"], reason, "{body}");
+        assert_eq!(body["artifacts"]["ses_output_path"], "/work/board.ses");
     }
 
     /// A count that could not be read from the log is unknown, not a failure,
