@@ -1202,6 +1202,8 @@ struct Written {
 struct Design {
     root: PathBuf,
     project: Option<PathBuf>,
+    /// The schematic whose editor lock guards the design.
+    editor: PathBuf,
     hierarchy: SavedHierarchy,
     contents: Vec<SheetContents>,
     instances: Vec<Instance>,
@@ -1213,9 +1215,21 @@ impl Design {
     fn load(schematic: &Path) -> Result<(Design, usize), CallToolResult> {
         let ownership = crate::tools::resolve_schematic_ownership(schematic)
             .map_err(|error| error.into_tool_result())?;
-        let (root, project) = match ownership {
-            Some(o) => (o.root_schematic, Some(o.project_file)),
-            None => (schematic.to_path_buf(), None),
+        let (root, project, editor) = match ownership {
+            Some(o) => {
+                o.single_top_level_sheet().map_err(|reason| {
+                    CallToolResult::error_kind(
+                        ToolErrorKind::InvalidArgument {
+                            field: "schematic".to_string(),
+                            reason: reason.clone(),
+                        },
+                        reason,
+                    )
+                })?;
+                let editor = o.editor_schematic();
+                (o.root_schematic, Some(o.project_file), editor)
+            }
+            None => (schematic.to_path_buf(), None, schematic.to_path_buf()),
         };
         let hierarchy = load_saved_hierarchy(&root).map_err(|error| error.into_tool_result())?;
         let canonical = schematic.canonicalize().map_err(|error| {
@@ -1246,6 +1260,7 @@ impl Design {
             Design {
                 root,
                 project,
+                editor,
                 hierarchy,
                 contents,
                 instances,
@@ -1494,7 +1509,7 @@ impl Design {
             }
         }
         let paths: Vec<&Path> = written.iter().map(|(path, _)| *path).collect();
-        if let Err(refusal) = commit_sheets(&self.root, &paths, transitions)? {
+        if let Err(refusal) = commit_sheets(&self.editor, &paths, transitions)? {
             return Ok(Err(refusal));
         }
 
