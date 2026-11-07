@@ -100,6 +100,12 @@ pub(crate) struct RouteEvidence {
     /// `get_effective_settings`. When false, `settings_not_applied` is empty
     /// because nothing was compared, not because everything took.
     pub settings_checked: bool,
+    /// Connections still unrouted when the job ended, from the last count in
+    /// Freerouting's log; None when the log could not be read.
+    pub unrouted: Option<u64>,
+    /// Freerouting's log file the count was looked for in; None when no
+    /// location could be worked out.
+    pub freerouting_log: Option<String>,
     /// Settings sent but not found with the same value among the job's
     /// effective settings: unknown key, typo, or a value Freerouting replaced.
     pub settings_not_applied: Vec<String>,
@@ -542,6 +548,8 @@ async fn run_state_machine(
         ses_bytes: 0,
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
+        unrouted: progress.read_unrouted(),
+        freerouting_log: progress.log.as_deref().map(|log| log.display().to_string()),
         last_activity: progress.activity,
         settings_checked,
         settings_not_applied,
@@ -730,6 +738,11 @@ impl JobProgress {
         let tail = read_tail(self.log.as_deref()?, LOG_TAIL_BYTES)?;
         latest_activity(&tail, &self.tag)
     }
+
+    fn read_unrouted(&self) -> Option<u64> {
+        let tail = read_tail(self.log.as_deref()?, LOG_TAIL_BYTES)?;
+        latest_unrouted(&tail, &self.tag)
+    }
 }
 
 /// Freerouting's log file: `FREEROUTING_LOG`, else its default under the XDG
@@ -778,6 +791,27 @@ fn read_tail(path: &Path, bytes: u64) -> Option<String> {
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).ok()?;
     Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// The last unrouted-connection count logged for the job tagged `tag`: a pass
+/// line's "(N unrouted and ...)" or an optimizer line's "incomplete
+/// connections: N".
+fn latest_unrouted(log: &str, tag: &str) -> Option<u64> {
+    log.lines()
+        .rev()
+        .filter(|line| line.contains(tag))
+        .find_map(|line| {
+            let count = |marker: &str, before: bool| -> Option<u64> {
+                if before {
+                    let head = line.split_once(marker)?.0;
+                    head.rsplit(['(', ' ']).next()?.parse().ok()
+                } else {
+                    let tail = line.split_once(marker)?.1;
+                    tail.split([',', '.', ' ']).next()?.parse().ok()
+                }
+            };
+            count(" unrouted and ", true).or_else(|| count("incomplete connections: ", false))
+        })
 }
 
 /// The most recent routing-pass or optimizer line of the job tagged `tag`.
@@ -1701,6 +1735,90 @@ done
         );
     }
 
+    /// The count `route_response` decides on comes from the job's own lines
+    /// in Freerouting's log, read when the job ends.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_completed_job_reports_the_unrouted_count_from_its_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        let log = temp.path().join("freerouting.log");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        // A job id no other test uses: FREEROUTING_LOG is process-wide, and
+        // the other scripted jobs' tags find no line of theirs here.
+        std::fs::write(
+            &log,
+            "\
+2026-10-29 17:52:37.907 INFO   [BEEF01] Auto-routing pass #29 on board 'a' was completed in 17.53 seconds with score 944.89 (5 unrouted and 0 violations), using 1.00 CPU seconds.
+2026-10-29 17:52:39.000 INFO   [BEEF01] Auto-routing pass #30 on board 'a' was completed in 17.53 seconds with score 950.12 (3 unrouted and 0 violations), using 1.00 CPU seconds.
+",
+        )
+        .unwrap();
+        let script = temp.path().join("server.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"n=0
+while read -r line; do
+  n=$((n+1))
+  case "$line" in
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *enqueue_job*) result='{{"jobId":"beef01aa"}}' ;;
+    *get_job_details*) result='{{"state":"COMPLETED"}}' ;;
+    *download_job_output_to_local_file*) printf '(session board)' > '{output}'; result='{{}}'; last=1 ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$n" "$result"
+  if [ -n "${{last:-}}" ]; then exit 0; fi
+done
+"#,
+                tools = conforming_tools_list(),
+                output = temporary.display(),
+            ),
+        )
+        .unwrap();
+        let mut client = scripted_client(&format!("exec sh '{}'", script.display()));
+        let settings = RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
+            poll_interval: Duration::from_millis(10),
+            overall_timeout: Duration::from_secs(30),
+        };
+
+        let previous = std::env::var_os("FREEROUTING_LOG");
+        std::env::set_var("FREEROUTING_LOG", &log);
+        let evidence = timeout(
+            Duration::from_secs(20),
+            run_state_machine(&mut client, &dsn, &temporary, &settings, Instant::now()),
+        )
+        .await;
+        match previous {
+            Some(value) => std::env::set_var("FREEROUTING_LOG", value),
+            None => std::env::remove_var("FREEROUTING_LOG"),
+        }
+        let evidence = evidence
+            .expect("the scripted job ends")
+            .expect("the routed board is kept");
+        client.close().await;
+
+        assert_eq!(evidence.final_state, "COMPLETED");
+        assert_eq!(evidence.unrouted, Some(3), "the last count of the job");
+        assert_eq!(
+            evidence.freerouting_log.as_deref(),
+            Some(log.to_str().unwrap()),
+            "the log the count was read from"
+        );
+    }
+
     #[test]
     fn routing_activity_is_read_from_the_jobs_own_log_lines() {
         // Lines as Freerouting 2.5.0 writes them; [B00000] is another job.
@@ -1877,6 +1995,21 @@ done
         assert!(stage_is_optimizing(&json!({ "stage": "OPTIMIZATION" })));
         assert!(!stage_is_optimizing(&json!({ "stage": "ROUTING" })));
         assert!(!stage_is_optimizing(&json!({})));
+    }
+
+    #[test]
+    fn the_last_unrouted_count_of_the_job_is_found() {
+        let routing = "\
+2026-10-29 17:52:54.000 INFO   [A3AA32] Auto-routing pass #8 on board 'a' was completed in 16.00 seconds with score 964.79 (4 unrouted and 218 violations), using 1.00 CPU seconds.
+2026-10-29 17:52:55.000 DEBUG  [A3AA32]   Net 'SCK2' has 4 incomplete(s)
+2026-10-29 17:52:56.000 INFO   [B00000] Auto-routing pass #2 on board 'b' was completed in 1.00 seconds with score 1.00 (50 unrouted and 3 violations), using 1.00 CPU seconds.
+";
+        assert_eq!(latest_unrouted(routing, "[A3AA32]"), Some(4));
+        let optimizing = format!(
+            "{routing}2026-10-29 17:54:26.961 INFO   [A3AA32] Optimization stage started on board 'c'. Baseline router score: 980.71, optimizer score: 71.70, incomplete connections: 0, clearance violations: 218.\n"
+        );
+        assert_eq!(latest_unrouted(&optimizing, "[A3AA32]"), Some(0));
+        assert_eq!(latest_unrouted(routing, "[C11111]"), None);
     }
 
     #[test]
