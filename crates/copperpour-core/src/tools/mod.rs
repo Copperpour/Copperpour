@@ -1265,6 +1265,17 @@ pub fn opt_positive_f64(args: &Value, key: &str) -> Result<Option<f64>, CallTool
     }
 }
 
+/// Extract an optional boolean. Unlike `sch_annotate`'s `opt_bool`, omission
+/// is kept apart from `false`, and a present value that is not a boolean is
+/// refused rather than treated as omission.
+pub fn opt_bool_flag(args: &Value, key: &str) -> Result<Option<bool>, CallToolResult> {
+    match &args[key] {
+        Value::Null => Ok(None),
+        Value::Bool(value) => Ok(Some(*value)),
+        _ => Err(invalid_arg(key, "must be a boolean")),
+    }
+}
+
 /// Extract an optional u32 while accepting either JSON spelling of an integer
 /// (`2` and `2.0`). Fractions, negative values, and overflow are refused
 /// instead of being silently narrowed by `as u32`. Domain-specific lower

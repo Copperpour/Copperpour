@@ -325,6 +325,24 @@ impl Sheet {
     pub fn file(&self) -> &str {
         self.property("Sheetfile").unwrap_or("")
     }
+    /// Whether a sheet field, `Sheetname` or `Sheetfile`, is hidden; `None`
+    /// when the sheet has no such field.
+    pub fn property_hidden(&self, name: &str) -> Option<bool> {
+        self.properties
+            .iter()
+            .find(|p| p.name == name)
+            .map(Property::is_hidden)
+    }
+    /// Hide or show a sheet field's text. Returns whether it changed, or
+    /// `None` when the sheet has no such field.
+    pub fn set_property_hidden(&mut self, name: &str, hidden: bool) -> Option<bool> {
+        let property = self.properties.iter_mut().find(|p| p.name == name)?;
+        let changed = property.is_hidden() != hidden;
+        if changed {
+            property.set_hidden(hidden);
+        }
+        Some(changed)
+    }
     pub fn set_name(&mut self, v: &str) {
         self.set_property("Sheetname", v);
     }
@@ -753,6 +771,22 @@ mod tests {
             "old caption position survived: {out}"
         );
         assert!(out.contains("89.2"), "new caption position missing: {out}");
+    }
+
+    #[test]
+    fn a_sheet_field_is_hidden_and_shown_by_name() {
+        let mut sheet = Sheet::new("Amp", "amp.kicad_sch", 0.0, 0.0, 10.0, 10.0);
+        assert_eq!(sheet.property_hidden("Sheetfile"), Some(false));
+        assert_eq!(sheet.set_property_hidden("Sheetfile", true), Some(true));
+        assert_eq!(sheet.set_property_hidden("Sheetfile", true), Some(false));
+        assert_eq!(sheet.property_hidden("Sheetfile"), Some(true));
+        assert_eq!(sheet.property_hidden("Sheetname"), Some(false));
+        let reparsed = Sheet::from_sexp(&sheet.to_sexp()).unwrap();
+        assert_eq!(reparsed.property_hidden("Sheetfile"), Some(true));
+        assert_eq!(sheet.set_property_hidden("Sheetfile", false), Some(true));
+        assert_eq!(sheet.property_hidden("Sheetfile"), Some(false));
+        assert_eq!(sheet.property_hidden("Nope"), None);
+        assert_eq!(sheet.set_property_hidden("Nope", true), None);
     }
 
     #[test]

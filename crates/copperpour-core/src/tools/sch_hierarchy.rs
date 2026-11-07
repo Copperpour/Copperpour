@@ -12,8 +12,8 @@ use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::title_block_args::{self, TitleBlockUpdate};
 use crate::tools::{
-    get_path, invalid_arg, opt_f64, opt_positive_f64, opt_str, project_name_for, require_f64,
-    require_str, ToolContext, ToolDef,
+    get_path, invalid_arg, opt_bool_flag, opt_f64, opt_positive_f64, opt_str, project_name_for,
+    require_f64, require_str, ToolContext, ToolDef,
 };
 use copperpour_schematic_editor as cse;
 use copperpour_sexp::schematic::{format_hierarchical_sheet, sheet_files, HierarchicalSheetSpec};
@@ -136,10 +136,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_sheet",
-            "Rename, resize, reposition, or repoint (Sheetfile) an existing sheet. Provide \
-             at least one of: new_name, new_file, or both x+y, or both width+height. Does \
-             NOT rename the child file on disk when new_file is given — it only repoints \
-             the reference; the file itself must already exist at that path.",
+            "Rename, resize, reposition, repoint (Sheetfile), or show or hide the name and \
+             file fields of an existing sheet. Provide at least one of: new_name, new_file, \
+             hide_name, hide_file, or both x+y, or both width+height. Does NOT rename the \
+             child file on disk when new_file is given — it only repoints the reference; \
+             the file itself must already exist at that path.",
             json!({
                 "type": "object",
                 "properties": {
@@ -147,6 +148,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "sheet_name": { "type": "string", "description": "Current Sheetname to look up" },
                     "new_name": { "type": "string" },
                     "new_file": { "type": "string" },
+                    "hide_name": { "type": "boolean", "description": "true hides the sheet's name text on the sheet; false shows it. Omit to leave it as it is." },
+                    "hide_file": { "type": "boolean", "description": "true hides the sheet's file name text on the sheet; false shows it. Omit to leave it as it is." },
                     "x": { "type": "number" }, "y": { "type": "number" },
                     "width": { "type": "number", "exclusiveMinimum": 0 }, "height": { "type": "number", "exclusiveMinimum": 0 },
                     "project_name": { "type": "string", "description": PROJECT_NAME_DESC }
@@ -1060,6 +1063,8 @@ fn sheet_json(sheet: &cse::Sheet, project_name: &str) -> Value {
         "width": sheet.width,
         "height": sheet.height,
         "page": sheet.page(project_name),
+        "hide_name": sheet.property_hidden("Sheetname"),
+        "hide_file": sheet.property_hidden("Sheetfile"),
         "pins": sheet.pins.iter().map(|p| {
             let (px, py) = p.position();
             json!({ "name": p.name, "pin_type": p.pin_type, "x": px, "y": py })
@@ -2366,6 +2371,15 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         Err(error) => return Ok(error),
     };
 
+    let hide_name = match opt_bool_flag(args, "hide_name") {
+        Ok(hide) => hide,
+        Err(error) => return Ok(error),
+    };
+    let hide_file = match opt_bool_flag(args, "hide_file") {
+        Ok(hide) => hide,
+        Err(error) => return Ok(error),
+    };
+
     let before = read_consistent(&sch_path)?;
     let mut sch = cse::Schematic::load(&sch_path)?;
     let sheet = match sch.sheets.by_name_mut(&sheet_name) {
@@ -2412,10 +2426,27 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
             changed.push("size");
         }
     }
+    for (hide, field, label) in [
+        (hide_name, "Sheetname", "hide_name"),
+        (hide_file, "Sheetfile", "hide_file"),
+    ] {
+        let Some(hide) = hide else { continue };
+        requested.push(label);
+        match sheet.set_property_hidden(field, hide) {
+            Some(true) => changed.push(label),
+            Some(false) => {}
+            None => {
+                return Ok(CallToolResult::error(format!(
+                    "Sheet '{sheet_name}' has no {field} field"
+                )))
+            }
+        }
+    }
 
     if requested.is_empty() {
         return Ok(CallToolResult::error(
-            "No fields to change — provide at least one of: new_name, new_file, x+y, width+height",
+            "No fields to change — provide at least one of: new_name, new_file, hide_name, \
+             hide_file, x+y, width+height",
         ));
     }
 
@@ -3825,6 +3856,223 @@ mod tests {
         assert_eq!(body["error"]["field"], "width");
         assert_eq!(std::fs::read_to_string(&root).unwrap(), before);
         assert!(!child.exists());
+    }
+
+    /// `tests/fixtures/sheet_fields_kicad10`: one sheet file placed four
+    /// times, as KiCad's multichannel pattern places it. `CH1` hides its file
+    /// field, `CH2` both fields, `CH3` and `CH4` hide none. Copied beside no
+    /// project file.
+    fn fields_fixture(tmp: &TempDir) -> (PathBuf, String) {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sheet_fields_kicad10");
+        for name in ["sheet_fields.kicad_sch", "channel.kicad_sch"] {
+            std::fs::copy(dir.join(name), tmp.path().join(name)).unwrap();
+        }
+        let root = tmp.path().join("sheet_fields.kicad_sch");
+        let text = std::fs::read_to_string(&root).unwrap();
+        (root, text)
+    }
+
+    /// The lines KiCad writes for a field it hides, between its `(at …)` and
+    /// its `(show_name …)`.
+    const HIDDEN_FILE_FIELD: &str = "(at 150 55.635 0)\n\t\t\t(hide yes)\n\t\t\t(show_name no)";
+
+    /// The text of each `(sheet …)` block of a root sheet, with the file's
+    /// head first and the tail on the last.
+    fn blocks(text: &str) -> Vec<&str> {
+        text.split("\n\t(sheet\n").collect()
+    }
+
+    /// The sheet named `sheet`'s block of `after`, once every other block of it
+    /// is found to be as it was in `before`. `edit_sheet` writes back the one
+    /// sheet it edits, so that block alone may differ.
+    fn only_block_changed<'a>(before: &str, after: &'a str, sheet: &str) -> &'a str {
+        let marker = format!("(property \"Sheetname\" \"{sheet}\"");
+        let (before, after_blocks) = (blocks(before), blocks(after));
+        assert_eq!(before.len(), after_blocks.len());
+        let mut edited = None;
+        for (was, now) in before.iter().zip(&after_blocks) {
+            if now.contains(&marker) {
+                edited = Some(*now);
+            } else {
+                assert_eq!(was, now, "a block other than {sheet}'s changed");
+            }
+        }
+        edited.expect("the edited sheet is still in the file")
+    }
+
+    async fn edit_fields(root: &Path, sheet: &str, extra: Value) -> CallToolResult {
+        let mut args = json!({
+            "schematic": root.display().to_string(),
+            "sheet_name": sheet,
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        handle_edit_sheet(&args, &test_ctx()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_hides_a_field_and_no_other_sheet_changes() {
+        let tmp = TempDir::new().unwrap();
+        let (root, fixture) = fields_fixture(&tmp);
+
+        let result = edit_fields(&root, "CH3", json!({ "hide_file": true })).await;
+
+        assert!(!result.is_error, "{:?}", result_json(&result));
+        let body = result_json(&result);
+        assert_eq!(body["changed"], json!(true));
+        assert_eq!(body["changed_fields"], json!(["hide_file"]));
+        assert_eq!(body["requested_fields"], json!(["hide_file"]));
+        assert_eq!(body["sheet"]["hide_file"], json!(true));
+        assert_eq!(body["sheet"]["hide_name"], json!(false));
+        let saved = std::fs::read_to_string(&root).unwrap();
+        let edited = only_block_changed(&fixture, &saved, "CH3");
+        assert!(edited.contains(HIDDEN_FILE_FIELD), "{edited}");
+        assert_eq!(edited.matches("(hide yes)").count(), 1, "{edited}");
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_shows_a_hidden_field() {
+        let tmp = TempDir::new().unwrap();
+        let (root, fixture) = fields_fixture(&tmp);
+
+        let result = edit_fields(
+            &root,
+            "CH2",
+            json!({ "hide_name": false, "hide_file": false }),
+        )
+        .await;
+
+        assert!(!result.is_error, "{:?}", result_json(&result));
+        let body = result_json(&result);
+        assert_eq!(body["changed_fields"], json!(["hide_name", "hide_file"]));
+        assert_eq!(body["sheet"]["hide_name"], json!(false));
+        assert_eq!(body["sheet"]["hide_file"], json!(false));
+        let saved = std::fs::read_to_string(&root).unwrap();
+        let edited = only_block_changed(&fixture, &saved, "CH2");
+        assert!(!edited.contains("hide"), "{edited}");
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_leaves_the_placements_that_share_a_file_as_they_are() {
+        let tmp = TempDir::new().unwrap();
+        let (root, fixture) = fields_fixture(&tmp);
+
+        let result = edit_fields(
+            &root,
+            "CH4",
+            json!({ "hide_name": true, "hide_file": true }),
+        )
+        .await;
+
+        let body = result_json(&result);
+        assert_eq!(body["sheet"]["hide_name"], json!(true));
+        assert_eq!(body["sheet"]["hide_file"], json!(true));
+        let saved = cse::Schematic::load(&root).unwrap();
+        let hidden = |name: &str| {
+            let sheet = saved.sheets.by_name(name).unwrap();
+            (
+                sheet.property_hidden("Sheetname").unwrap(),
+                sheet.property_hidden("Sheetfile").unwrap(),
+            )
+        };
+        assert_eq!(hidden("CH1"), (false, true));
+        assert_eq!(hidden("CH2"), (true, true));
+        assert_eq!(hidden("CH3"), (false, false));
+        assert_eq!(hidden("CH4"), (true, true));
+        // The other placements, read as bytes rather than through the flag.
+        only_block_changed(&fixture, &std::fs::read_to_string(&root).unwrap(), "CH4");
+    }
+
+    /// Through the served dispatch: the arguments as the schema declares them,
+    /// and an explicit `null`, which the schema check refuses before the
+    /// handler runs.
+    #[tokio::test]
+    async fn served_edit_sheet_hides_a_field_and_refuses_a_null() {
+        let tmp = TempDir::new().unwrap();
+        let (root, fixture) = fields_fixture(&tmp);
+        let call = |extra: Value| {
+            let mut args = json!({ "schematic": root.display().to_string(), "sheet_name": "CH3" });
+            for (key, value) in extra.as_object().unwrap() {
+                args[key] = value.clone();
+            }
+            super::instance_path_lifecycle_tests::served("edit_sheet", args)
+        };
+
+        let (refused, body) = call(json!({ "hide_file": null })).await;
+        assert!(refused, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), fixture);
+
+        let (refused, body) = call(json!({ "hide_file": true })).await;
+        assert!(!refused, "{body}");
+        assert_eq!(body["changed_fields"], json!(["hide_file"]));
+        assert_eq!(body["sheet"]["hide_file"], json!(true));
+        let saved = std::fs::read_to_string(&root).unwrap();
+        assert!(only_block_changed(&fixture, &saved, "CH3").contains(HIDDEN_FILE_FIELD));
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_restating_a_field_visibility_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let (root, fixture) = fields_fixture(&tmp);
+
+        let hidden = edit_fields(&root, "CH1", json!({ "hide_file": true })).await;
+        let shown = edit_fields(&root, "CH1", json!({ "hide_name": false })).await;
+
+        for result in [&hidden, &shown] {
+            assert!(!result.is_error);
+            let body = result_json(result);
+            assert_eq!(body["changed"], json!(false));
+            assert_eq!(body["changed_fields"], json!([]));
+        }
+        assert_eq!(
+            result_json(&hidden)["requested_fields"],
+            json!(["hide_file"])
+        );
+        assert_eq!(
+            result_json(&shown)["requested_fields"],
+            json!(["hide_name"])
+        );
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), fixture);
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_refuses_a_visibility_that_is_not_a_boolean() {
+        let tmp = TempDir::new().unwrap();
+        let (root, fixture) = fields_fixture(&tmp);
+
+        for (field, value) in [("hide_name", json!("yes")), ("hide_file", json!(1))] {
+            let result = edit_fields(&root, "CH3", json!({ field: value })).await;
+            assert!(result.is_error);
+            let body = result_json(&result);
+            assert_eq!(body["error"]["kind"], "invalid_argument");
+            assert_eq!(body["error"]["field"], field);
+        }
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), fixture);
+    }
+
+    /// KiCad never writes a sheet without its `Sheetfile` field, so this sheet
+    /// is the fixture's with that one property cut out.
+    #[tokio::test]
+    async fn edit_sheet_refuses_to_hide_a_field_the_sheet_lacks() {
+        let tmp = TempDir::new().unwrap();
+        let (root, fixture) = fields_fixture(&tmp);
+        let start = fixture.find("\t\t(property \"Sheetfile\"").unwrap();
+        let end = start + fixture[start..].find("\t\t(instances").unwrap();
+        let cut = format!("{}{}", &fixture[..start], &fixture[end..]);
+        std::fs::write(&root, &cut).unwrap();
+
+        // The first sheet left without its file field is `CH3`.
+        let result = edit_fields(&root, "CH3", json!({ "hide_file": true })).await;
+
+        assert!(result.is_error);
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert_eq!(text, "Sheet 'CH3' has no Sheetfile field");
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), cut);
     }
 
     #[tokio::test]
@@ -6504,7 +6752,7 @@ mod instance_path_lifecycle_tests {
         (tmp, root)
     }
 
-    async fn served(tool: &str, arguments: Value) -> (bool, Value) {
+    pub(super) async fn served(tool: &str, arguments: Value) -> (bool, Value) {
         let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
             kicad_cli: String::new(),
             kicad_binary: String::new(),

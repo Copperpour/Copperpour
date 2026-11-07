@@ -102,6 +102,53 @@ impl Property {
         translate_field_ats(&mut self.sub_nodes, dx, dy);
     }
 
+    /// Whether the field's text is hidden, as KiCad 10's reader takes it: on
+    /// the property, where KiCad 10 writes it, `(hide yes)` (`parseSchField`
+    /// reads a yes or a no); inside its `(effects …)` also `(hide)` and a bare
+    /// `hide`, as older files have it (`parseEDA_TEXT`, `parseMaybeAbsentBool`).
+    pub fn is_hidden(&self) -> bool {
+        fn hides_in_effects(node: &SexpNode) -> bool {
+            match node {
+                SexpNode::Atom(token) => token == "hide",
+                _ => node.tag() == Some("hide") && node.value() != Some("no"),
+            }
+        }
+        self.sub_nodes.iter().any(|node| {
+            (node.tag() == Some("hide") && node.value() == Some("yes"))
+                || (node.tag() == Some("effects") && node.args().iter().any(hides_in_effects))
+        })
+    }
+
+    /// Hide or show the field's text. A hidden field gets `(hide yes)` right
+    /// after its `(at …)`, as KiCad writes it; showing it removes the flag
+    /// wherever it stands. Nothing else about the field changes.
+    pub fn set_hidden(&mut self, hidden: bool) {
+        fn hides(node: &SexpNode) -> bool {
+            match node {
+                SexpNode::Atom(token) => token == "hide",
+                _ => node.tag() == Some("hide"),
+            }
+        }
+        for node in &mut self.sub_nodes {
+            if node.tag() != Some("effects") {
+                continue;
+            }
+            if let SexpNode::List(children) = node {
+                children.retain(|child| !hides(child));
+            }
+        }
+        self.sub_nodes.retain(|node| node.tag() != Some("hide"));
+        if hidden {
+            let after_at = self
+                .sub_nodes
+                .iter()
+                .position(|node| node.tag() == Some("at"))
+                .map_or(0, |i| i + 1);
+            self.sub_nodes
+                .insert(after_at, tagged("hide", vec![atom("yes")]));
+        }
+    }
+
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
         Property {
             private: false,
@@ -260,5 +307,94 @@ mod private_property_tests {
         let words: Vec<&str> = written.split_whitespace().collect();
         assert_eq!(&words[..2], ["(property", "\"private\""], "{written}");
         assert!(!parse_prop(&written).private, "{written}");
+    }
+}
+
+#[cfg(test)]
+mod hidden_property_tests {
+    use super::*;
+    use crate::sexp::parser::parse;
+    use crate::sexp::writer::write;
+
+    fn parse_prop(source: &str) -> Property {
+        Property::from_sexp(&parse(source).unwrap()).unwrap()
+    }
+
+    fn words(property: &Property) -> String {
+        write(&property.to_sexp()).split_whitespace().collect()
+    }
+
+    /// KiCad 10 writes only `(hide yes)` on the property. The other forms
+    /// are written here: those inside `(effects …)` are what its reader takes
+    /// from older files, and a bare `hide` or `(hide)` on the property is one
+    /// it refuses, which therefore hides nothing.
+    #[test]
+    fn a_field_is_hidden_where_kicad_writes_the_flag_and_where_it_reads_it() {
+        let hidden = [
+            "(property \"F\" \"v\" (at 1 2 0) (hide yes) (show_name no))",
+            "(property \"F\" \"v\" (at 1 2 0) (effects (font (size 1 1)) (hide yes)))",
+            "(property \"F\" \"v\" (at 1 2 0) (effects (font (size 1 1)) (hide)))",
+            "(property \"F\" \"v\" (at 1 2 0) (effects (font (size 1 1)) hide))",
+        ];
+        for source in hidden {
+            assert!(parse_prop(source).is_hidden(), "{source}");
+        }
+        let shown = [
+            "(property \"F\" \"v\" (at 1 2 0))",
+            "(property \"F\" \"v\" (at 1 2 0) (hide no))",
+            "(property \"F\" \"v\" (at 1 2 0) (hide))",
+            "(property \"F\" \"v\" (at 1 2 0) hide)",
+            "(property \"F\" \"v\" (at 1 2 0) (effects (font (size 1 1)) (hide no)))",
+        ];
+        for source in shown {
+            assert!(!parse_prop(source).is_hidden(), "{source}");
+        }
+    }
+
+    #[test]
+    fn hiding_puts_the_flag_right_after_the_position_and_nothing_else_moves() {
+        let mut property = parse_prop(
+            "(property \"F\" \"v\" (at 1 2 0) (show_name no) (effects (font (size 1 1))))",
+        );
+        property.set_hidden(true);
+        assert!(property.is_hidden());
+        assert_eq!(
+            words(&property),
+            "(property\"F\"\"v\"(at120)(hideyes)(show_nameno)(effects(font(size11))))"
+        );
+    }
+
+    #[test]
+    fn showing_takes_the_flag_out_wherever_it_stands() {
+        let mut property = parse_prop(
+            "(property \"F\" \"v\" (at 1 2 0) (hide yes) (effects (font (size 1 1)) (hide yes)))",
+        );
+        property.set_hidden(false);
+        assert!(!property.is_hidden());
+        assert_eq!(
+            words(&property),
+            "(property\"F\"\"v\"(at120)(effects(font(size11))))"
+        );
+    }
+
+    #[test]
+    fn showing_takes_out_the_bare_hide_of_an_older_file() {
+        let mut property =
+            parse_prop("(property \"F\" \"v\" (at 1 2 0) (effects (font (size 1 1)) hide))");
+        assert!(property.is_hidden());
+        property.set_hidden(false);
+        assert!(!property.is_hidden());
+        assert_eq!(
+            words(&property),
+            "(property\"F\"\"v\"(at120)(effects(font(size11))))"
+        );
+    }
+
+    #[test]
+    fn hiding_twice_writes_one_flag() {
+        let mut property = parse_prop("(property \"F\" \"v\" (at 1 2 0))");
+        property.set_hidden(true);
+        property.set_hidden(true);
+        assert_eq!(write(&property.to_sexp()).matches("hide").count(), 1);
     }
 }
