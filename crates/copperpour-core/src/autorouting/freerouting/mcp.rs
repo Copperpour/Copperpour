@@ -1767,8 +1767,8 @@ done
 
     /// A server scripted in sh whose `get_job_details` answers follow
     /// `polls`, one word per poll: `miss` leaves the poll unanswered, `late`
-    /// answers it after the client has given up on it, any other word is the
-    /// job state returned. Each poll it receives is appended to `poll_log`.
+    /// answers it after the client has given up on it, `error` answers it
+    /// with a JSON-RPC error, any other word is the job state returned. Each poll it receives is appended to `poll_log`.
     #[cfg(unix)]
     fn polled_server(
         temp: &Path,
@@ -1793,6 +1793,7 @@ while read -r line; do
       case "$answer" in
         miss) continue ;;
         late) sleep 0.3; result='{{"state":"RUNNING"}}' ;;
+        error) printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32000,"message":"boom"}}}}\n' "$n"; continue ;;
         *) result="{{\"state\":\"$answer\"}}" ;;
       esac ;;
     *download_job_output_to_local_file*) printf '(session board)' > '{output}'; result='{{}}'; last=1 ;;
@@ -1900,6 +1901,42 @@ done
             std::fs::read_to_string(&poll_log).unwrap().lines().count(),
             MAX_MISSED_POLLS as usize + 1,
             "the poll after the last one allowed to go unanswered fails the job"
+        );
+    }
+
+    /// Only a timed-out poll is retried: any other error on a poll fails the
+    /// job at once, with its own message.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_poll_answered_with_an_error_fails_the_job_at_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        let poll_log = temp.path().join("polls.log");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let mut client = polled_server(temp.path(), &["error", "COMPLETED"], &temporary, &poll_log);
+
+        let error = timeout(
+            Duration::from_secs(20),
+            run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &quick_poll_settings(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the job is given up")
+        .expect_err("an error on a poll fails the job");
+        client.close().await;
+
+        assert!(!is_request_timeout(&error), "unexpected error: {error:#}");
+        assert!(format!("{error:#}").contains("boom"), "{error:#}");
+        assert_eq!(
+            std::fs::read_to_string(&poll_log).unwrap().lines().count(),
+            1,
+            "the error is not retried"
         );
     }
 
