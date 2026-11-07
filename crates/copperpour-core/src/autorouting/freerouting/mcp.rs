@@ -68,6 +68,13 @@ pub(crate) struct RouteSettings {
     /// Freerouting's `optimizer.improvement_threshold`, in percent: the
     /// optimizer stops after a pass that improves less (its default is 2.5).
     pub optimizer_improvement_threshold: Option<f64>,
+    /// Freerouting's `plane_nets`: nets to mark as power-plane nets (plane
+    /// routing mode, cheaper vias to the plane). A `(plane ...)` declared in
+    /// the DSN already sets the same flag on its net.
+    pub plane_nets: Option<Vec<String>>,
+    /// Freerouting's `plane_as_obstacle`: whether copper pours block foreign
+    /// traces (its default is false).
+    pub plane_as_obstacle: Option<bool>,
     pub poll_interval: Duration,
     pub overall_timeout: Duration,
 }
@@ -1127,6 +1134,12 @@ fn job_settings_body(settings: &RouteSettings) -> Map<String, Value> {
     if !optimizer.is_empty() {
         body.insert("optimizer".to_string(), Value::Object(optimizer));
     }
+    if let Some(nets) = &settings.plane_nets {
+        body.insert("plane_nets".to_string(), json!(nets));
+    }
+    if let Some(obstacle) = settings.plane_as_obstacle {
+        body.insert("plane_as_obstacle".to_string(), json!(obstacle));
+    }
     if let Some(seconds) = settings.job_timeout_seconds {
         body.insert(
             "job_timeout".to_string(),
@@ -1348,6 +1361,8 @@ done
             optimize_seconds: Some(0),
             optimizer_max_passes: None,
             optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
             poll_interval: Duration::from_millis(10),
             overall_timeout: Duration::from_secs(30),
         };
@@ -1519,6 +1534,8 @@ done
             optimize_seconds,
             optimizer_max_passes: None,
             optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };
@@ -1584,6 +1601,8 @@ done
             optimize_seconds: None,
             optimizer_max_passes: passes,
             optimizer_improvement_threshold: threshold,
+            plane_nets: None,
+            plane_as_obstacle: None,
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };
@@ -1620,6 +1639,8 @@ done
             optimize_seconds: None,
             optimizer_max_passes: Some(3),
             optimizer_improvement_threshold: Some(0.5),
+            plane_nets: Some(vec!["GND".into(), "+3V3".into()]),
+            plane_as_obstacle: Some(false),
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };
@@ -1629,6 +1650,8 @@ done
             json!({
                 "autorouter": { "max_passes": 7 },
                 "optimizer": { "enabled": true, "max_passes": 3, "improvement_threshold": 0.5 },
+                "plane_nets": ["GND", "+3V3"],
+                "plane_as_obstacle": false,
                 "job_timeout": "00:05:00"
             })
         );
@@ -1638,6 +1661,8 @@ done
             job_timeout_seconds: None,
             optimizer_max_passes: None,
             optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
             ..settings
         };
         assert!(job_settings_body(&nothing).is_empty());
@@ -1750,6 +1775,8 @@ done
                 optimize_seconds: None,
                 optimizer_max_passes: None,
                 optimizer_improvement_threshold: None,
+                plane_nets: None,
+                plane_as_obstacle: None,
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(300),
             },
@@ -1787,6 +1814,8 @@ done
                     optimize_seconds: None,
                     optimizer_max_passes: None,
                     optimizer_improvement_threshold: None,
+                    plane_nets: None,
+                    plane_as_obstacle: None,
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_millis(100),
                 },
@@ -1837,6 +1866,8 @@ done
                     optimize_seconds: None,
                     optimizer_max_passes: None,
                     optimizer_improvement_threshold: None,
+                    plane_nets: None,
+                    plane_as_obstacle: None,
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_secs(300),
                 },
@@ -1873,6 +1904,8 @@ done
             optimize_seconds: None,
             optimizer_max_passes: None,
             optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };
