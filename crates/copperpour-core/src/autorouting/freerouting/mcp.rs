@@ -26,6 +26,10 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Polls in a row that may go unanswered before the job is given up. A busy
+/// JVM (garbage collection, a starved CPU) can stop answering for minutes in
+/// the middle of a long route; the overall timeout still bounds the wait.
+const MAX_MISSED_POLLS: u32 = 10;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SES_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -471,10 +475,22 @@ async fn run_state_machine(
     let mut progress = JobProgress::new(&job_id);
     let mut optimizer_bound = OptimizerBound::new(settings.optimize_seconds);
     let mut output_downloaded = false;
+    let mut missed_polls = 0u32;
     let final_state = loop {
-        let details = client
+        let details = match client
             .call_tool("get_job_details", json!({ "path": { "jobId": job_id } }))
-            .await?;
+            .await
+        {
+            Ok(details) => details,
+            // The request already waited its own timeout: poll again at once.
+            Err(error) if is_request_timeout(&error) && missed_polls < MAX_MISSED_POLLS => {
+                missed_polls += 1;
+                progress.report_missed_poll(missed_polls, started);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        missed_polls = 0;
         poll_count = poll_count.saturating_add(1);
         let state = required_string(&details, &["state", "status"], "job state")?;
         progress.report(&state, &details, started);
@@ -660,6 +676,27 @@ impl JobProgress {
         if let Some(message) = self.next_message(state, details, started, Instant::now()) {
             crate::progress::report(f64::from(self.sent), None, &message);
         }
+    }
+
+    /// A poll Freerouting left unanswered: always said, since the silence is
+    /// what the caller needs to see.
+    fn report_missed_poll(&mut self, missed: u32, started: Instant) {
+        let message = self.missed_poll_message(missed, started, Instant::now());
+        crate::progress::report(f64::from(self.sent), None, &message);
+    }
+
+    fn missed_poll_message(&mut self, missed: u32, started: Instant, now: Instant) -> String {
+        self.sent += 1;
+        self.last_sent = Some(now);
+        // The next answered poll is reported even if the job looks the same.
+        self.last_message.clear();
+        let elapsed = now.duration_since(started).as_secs();
+        format!(
+            "Freerouting not answering, {missed}/{MAX_MISSED_POLLS} polls missed in a row \
+             ({}m{:02}s)",
+            elapsed / 60,
+            elapsed % 60
+        )
     }
 
     /// The notification to send for this poll, or `None` when the job looks
@@ -849,6 +886,9 @@ struct LocalMcpClient {
     stderr_task: Option<JoinHandle<String>>,
     next_id: u64,
     server_protocol_version: String,
+    /// How long `call_tool` waits for each answer: `REQUEST_TIMEOUT`, shorter
+    /// in tests.
+    request_timeout: Duration,
 }
 
 impl LocalMcpClient {
@@ -919,6 +959,7 @@ impl LocalMcpClient {
             stderr_task: Some(stderr_task),
             next_id: 1,
             server_protocol_version: String::new(),
+            request_timeout: REQUEST_TIMEOUT,
         })
     }
 
@@ -973,7 +1014,7 @@ impl LocalMcpClient {
             .request(
                 "tools/call",
                 json!({ "name": name, "arguments": arguments }),
-                REQUEST_TIMEOUT,
+                self.request_timeout,
             )
             .await
             .with_context(|| format!("call Freerouting MCP tool '{name}'"))?;
@@ -997,14 +1038,17 @@ impl LocalMcpClient {
         }))
         .await?;
         let deadline = Instant::now() + limit;
+        let timed_out = || RequestTimedOut {
+            method: method.to_string(),
+        };
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                bail!("Freerouting MCP request '{method}' timed out");
+                return Err(timed_out().into());
             }
             let line = timeout(remaining, self.stdout.next_line())
                 .await
-                .map_err(|_| anyhow::anyhow!("Freerouting MCP request '{method}' timed out"))??
+                .map_err(|_| timed_out())??
                 .context("Freerouting MCP closed stdout before responding")?;
             let Some(response) = json_rpc_message(&line) else {
                 if !line.trim().is_empty() {
@@ -1017,7 +1061,9 @@ impl LocalMcpClient {
                 continue;
             };
             if response.get("id") != Some(&json!(id)) {
-                if response.get("method").is_some() {
+                // A notification, or the late answer to a request that timed
+                // out and was given up.
+                if response.get("method").is_some() || is_stale_response(&response, id) {
                     continue;
                 }
                 bail!("Freerouting MCP returned an unexpected response id");
@@ -1294,6 +1340,35 @@ fn same_value(a: &Value, b: &Value) -> bool {
         (Some(x), Some(y)) => (x - y).abs() <= 1e-9 * x.abs().max(1.0),
         _ => a == b,
     }
+}
+
+/// A request Freerouting did not answer in time, told apart from other errors
+/// so a missed poll can be retried.
+#[derive(Debug)]
+struct RequestTimedOut {
+    method: String,
+}
+
+impl std::fmt::Display for RequestTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Freerouting MCP request '{}' timed out", self.method)
+    }
+}
+
+impl std::error::Error for RequestTimedOut {}
+
+fn is_request_timeout(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<RequestTimedOut>().is_some())
+}
+
+/// Whether `response` answers a request sent before the one awaited as `id`.
+fn is_stale_response(response: &Value, id: u64) -> bool {
+    response
+        .get("id")
+        .and_then(Value::as_u64)
+        .is_some_and(|earlier| earlier < id)
 }
 
 fn duration_string(seconds: u64) -> String {
@@ -1688,6 +1763,199 @@ done
             Some("optimizer pass 2: score 73.70 -> 84.26 (improved)")
         );
         assert_eq!(latest_activity(log, "[C11111]"), None);
+    }
+
+    /// A server scripted in sh whose `get_job_details` answers follow
+    /// `polls`, one word per poll: `miss` leaves the poll unanswered, `late`
+    /// answers it after the client has given up on it, any other word is the
+    /// job state returned. Each poll it receives is appended to `poll_log`.
+    #[cfg(unix)]
+    fn polled_server(
+        temp: &Path,
+        polls: &[&str],
+        temporary: &Path,
+        poll_log: &Path,
+    ) -> LocalMcpClient {
+        let script = temp.join("server.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"n=0; set -- {polls}
+while read -r line; do
+  n=$((n+1))
+  case "$line" in
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *get_job_details*)
+      echo poll >> '{poll_log}'
+      answer=${{1:-miss}}; [ $# -gt 0 ] && shift
+      case "$answer" in
+        miss) continue ;;
+        late) sleep 0.3; result='{{"state":"RUNNING"}}' ;;
+        *) result="{{\"state\":\"$answer\"}}" ;;
+      esac ;;
+    *download_job_output_to_local_file*) printf '(session board)' > '{output}'; result='{{}}'; last=1 ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$n" "$result"
+  if [ -n "${{last:-}}" ]; then exit 0; fi
+done
+"#,
+                polls = polls.join(" "),
+                tools = conforming_tools_list(),
+                output = temporary.display(),
+                poll_log = poll_log.display(),
+            ),
+        )
+        .unwrap();
+        let mut client = scripted_client(&format!("exec sh '{}'", script.display()));
+        client.request_timeout = Duration::from_millis(100);
+        client
+    }
+
+    #[cfg(unix)]
+    fn quick_poll_settings() -> RouteSettings {
+        RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
+            poll_interval: Duration::from_millis(10),
+            overall_timeout: Duration::from_secs(30),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unanswered_polls_are_survived_and_late_answers_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        let poll_log = temp.path().join("polls.log");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        // Ten polls in a row unanswered, the first of them answered too late;
+        // then one answer, which starts the count again: one more miss is
+        // survived before the job completes.
+        let mut polls = vec!["late"];
+        polls.extend(["miss"; 9]);
+        polls.extend(["RUNNING", "miss", "COMPLETED"]);
+        let mut client = polled_server(temp.path(), &polls, &temporary, &poll_log);
+
+        let evidence = timeout(
+            Duration::from_secs(20),
+            run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &quick_poll_settings(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the scripted job ends")
+        .expect("unanswered polls do not end the job");
+        client.close().await;
+
+        assert_eq!(evidence.final_state, "COMPLETED");
+        assert_eq!(evidence.poll_count, 2, "only answered polls are counted");
+        assert_eq!(
+            std::fs::read_to_string(&poll_log).unwrap().lines().count(),
+            13
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_job_is_given_up_after_ten_unanswered_polls_in_a_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        let poll_log = temp.path().join("polls.log");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let mut client = polled_server(temp.path(), &[], &temporary, &poll_log);
+
+        let error = timeout(
+            Duration::from_secs(20),
+            run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &quick_poll_settings(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the job is given up")
+        .expect_err("a server that never answers fails the job");
+        client.close().await;
+
+        assert!(is_request_timeout(&error), "unexpected error: {error:#}");
+        assert_eq!(
+            std::fs::read_to_string(&poll_log).unwrap().lines().count(),
+            MAX_MISSED_POLLS as usize + 1,
+            "the poll after the last one allowed to go unanswered fails the job"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_poll_is_told_apart_from_other_errors() {
+        let timed_out = anyhow::Error::from(RequestTimedOut {
+            method: "tools/call".into(),
+        })
+        .context("call Freerouting MCP tool 'get_job_details'");
+        assert!(is_request_timeout(&timed_out));
+        assert_eq!(
+            format!("{timed_out:#}"),
+            "call Freerouting MCP tool 'get_job_details': \
+             Freerouting MCP request 'tools/call' timed out"
+        );
+        assert!(!is_request_timeout(&anyhow::anyhow!(
+            "Freerouting MCP closed stdout before responding"
+        )));
+    }
+
+    #[test]
+    fn only_answers_to_earlier_requests_are_stale() {
+        assert!(is_stale_response(&json!({ "id": 4, "result": {} }), 5));
+        assert!(!is_stale_response(&json!({ "id": 5, "result": {} }), 5));
+        assert!(!is_stale_response(&json!({ "id": 6, "result": {} }), 5));
+        assert!(!is_stale_response(&json!({ "id": "4", "result": {} }), 5));
+    }
+
+    #[test]
+    fn a_missed_poll_is_always_reported_and_so_is_the_next_answer() {
+        let mut progress = JobProgress::new("a3aa32eb");
+        progress.log = None;
+        let details = json!({ "current_pass": 3 });
+        let started = Instant::now();
+        let at = |seconds| started + Duration::from_secs(seconds);
+
+        assert!(progress
+            .next_message("RUNNING", &details, started, at(5))
+            .is_some());
+        assert_eq!(
+            progress.missed_poll_message(1, started, at(35)),
+            "Freerouting not answering, 1/10 polls missed in a row (0m35s)"
+        );
+        assert_eq!(
+            progress.missed_poll_message(2, started, at(65)),
+            "Freerouting not answering, 2/10 polls missed in a row (1m05s)"
+        );
+        // The job answers again, unchanged and inside the heartbeat: the
+        // caller still learns that it is back.
+        assert_eq!(
+            progress
+                .next_message("RUNNING", &details, started, at(66))
+                .as_deref(),
+            Some("Freerouting running, pass 3 (1m06s)")
+        );
+        assert_eq!(progress.sent, 4);
     }
 
     #[test]
