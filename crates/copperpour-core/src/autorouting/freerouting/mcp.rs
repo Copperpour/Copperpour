@@ -353,9 +353,14 @@ fn validate_inputs(
     }
     if settings
         .optimize_seconds
-        .is_some_and(|seconds| seconds > 86_400)
+        .is_some_and(|seconds| seconds > MAX_OPTIMIZE_SECONDS)
     {
-        bail!("optimize_seconds must be between 0 and 86400");
+        bail!("optimize_seconds must be between 0 and {MAX_OPTIMIZE_SECONDS}");
+    }
+    if let Some(message) = settings.optimize_seconds.and_then(|optimize| {
+        overall_timeout_too_short(settings.overall_timeout.as_secs(), optimize)
+    }) {
+        bail!("{message}");
     }
     if settings
         .optimizer_max_passes
@@ -476,6 +481,36 @@ pub(crate) fn threshold_read_as_fraction(percent: f64) -> bool {
 pub(crate) const THRESHOLD_READ_AS_FRACTION: &str =
     "above 0 and below 0.1 is refused: Freerouting reads such a value as a fraction and \
      multiplies it by 100, so 0.05 would run as 5%. Pass 0, or a percentage of at least 0.1";
+
+/// The overall timeout for routing alone, when `optimize_seconds` is not given.
+pub(crate) const DEFAULT_OVERALL_TIMEOUT_SECONDS: u64 = 900;
+/// The longest overall timeout, explicit or by default.
+pub(crate) const MAX_OVERALL_TIMEOUT_SECONDS: u64 = 86_400;
+/// The longest optimizer window: the overall timeout is at most
+/// [`MAX_OVERALL_TIMEOUT_SECONDS`] and must exceed it. The schema's maximum.
+pub(crate) const MAX_OPTIMIZE_SECONDS: u64 = MAX_OVERALL_TIMEOUT_SECONDS - 1;
+
+/// The overall timeout of a call without `overall_timeout_seconds`: 900 s for
+/// routing, then the optimizer window, which opens only once routing is done.
+/// A flat 900 s killed a run whose optimizer was still inside the
+/// `optimize_seconds` it had been given.
+pub(crate) fn default_overall_timeout_seconds(optimize_seconds: Option<u64>) -> u64 {
+    DEFAULT_OVERALL_TIMEOUT_SECONDS
+        .saturating_add(optimize_seconds.unwrap_or(0))
+        .min(MAX_OVERALL_TIMEOUT_SECONDS)
+}
+
+/// Why an overall timeout of `overall` seconds leaves no room for the
+/// optimizer window of `optimize` seconds, or `None` when it does.
+pub(crate) fn overall_timeout_too_short(overall: u64, optimize: u64) -> Option<String> {
+    (overall <= optimize).then(|| {
+        format!(
+            "overall_timeout_seconds ({overall}) must exceed optimize_seconds ({optimize}): \
+             routing comes first, the optimizer window opens only once it is done, and the \
+             overall timeout keeps no board"
+        )
+    })
+}
 
 async fn run_state_machine(
     client: &mut LocalMcpClient,
@@ -1917,15 +1952,73 @@ done
             plane_as_obstacle: None,
             router_settings: None,
             poll_interval: Duration::from_secs(3),
-            overall_timeout: Duration::from_secs(900),
+            overall_timeout: Duration::from_secs(default_overall_timeout_seconds(optimize_seconds)),
         };
-        for accepted in [None, Some(0), Some(86_400)] {
+        // 86400 leaves no room for routing within the longest overall
+        // timeout: 86399 is the largest window accepted, by default or with
+        // the longest explicit overall timeout.
+        assert_eq!(MAX_OPTIMIZE_SECONDS, 86_399);
+        for accepted in [None, Some(0), Some(86_399)] {
             validate_inputs(&jar, &dsn, &ses, &settings(accepted)).unwrap();
         }
-        let error = validate_inputs(&jar, &dsn, &ses, &settings(Some(86_401)))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("optimize_seconds"), "{error}");
+        let longest = RouteSettings {
+            overall_timeout: Duration::from_secs(MAX_OVERALL_TIMEOUT_SECONDS),
+            ..settings(Some(86_399))
+        };
+        validate_inputs(&jar, &dsn, &ses, &longest).unwrap();
+        for refused in [86_400, 86_401] {
+            let error = validate_inputs(&jar, &dsn, &ses, &settings(Some(refused)))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "optimize_seconds must be between 0 and 86399");
+        }
+    }
+
+    #[test]
+    fn the_default_overall_timeout_adds_the_optimizer_window_up_to_a_day() {
+        assert_eq!(default_overall_timeout_seconds(None), 900);
+        assert_eq!(default_overall_timeout_seconds(Some(0)), 900);
+        assert_eq!(default_overall_timeout_seconds(Some(1100)), 2000);
+        assert_eq!(default_overall_timeout_seconds(Some(86_000)), 86_400);
+        assert_eq!(default_overall_timeout_seconds(Some(u64::MAX)), 86_400);
+    }
+
+    #[test]
+    fn an_overall_timeout_within_the_optimizer_window_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        std::fs::write(&jar, "").unwrap();
+        std::fs::write(&dsn, "").unwrap();
+        let settings = |optimize_seconds, overall| RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(overall),
+        };
+        // The 900 s default with optimize_seconds 1100 killed a run whose
+        // optimizer was still within its window.
+        for (optimize, overall) in [(1100, 900), (1100, 1100)] {
+            let error = validate_inputs(&jar, &dsn, &ses, &settings(Some(optimize), overall))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "overall_timeout_seconds ({overall}) must exceed optimize_seconds ({optimize})"
+                )),
+                "{error}"
+            );
+        }
+        validate_inputs(&jar, &dsn, &ses, &settings(Some(1100), 1101)).unwrap();
+        validate_inputs(&jar, &dsn, &ses, &settings(None, 900)).unwrap();
     }
 
     #[test]

@@ -492,6 +492,25 @@ pub(crate) async fn route_specctra_dsn(
 ) -> anyhow::Result<CallToolResult> {
     let dsn = get_path(args, "dsn_path")?;
     let ses_output = get_path(args, "ses_output_path")?;
+    let overall_timeout_seconds = args["overall_timeout_seconds"]
+        .as_u64()
+        .unwrap_or_else(|| mcp::default_overall_timeout_seconds(args["optimize_seconds"].as_u64()));
+    // Refused before the JAR lookup, as the threshold below is: the optimizer window opens only once
+    // routing is done, so an overall timeout within it kills the run and keeps
+    // nothing. Only an explicit overall_timeout_seconds can fall within it:
+    // optimize_seconds is at most 86399, and the default, at most 86400,
+    // exceeds it.
+    if let Some(optimize) = args["optimize_seconds"].as_u64() {
+        if let Some(reason) = mcp::overall_timeout_too_short(overall_timeout_seconds, optimize) {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "overall_timeout_seconds".to_string(),
+                    reason: reason.clone(),
+                },
+                format!("{reason}. Nothing was routed."),
+            ));
+        }
+    }
     // The schema bounds the threshold to 0..=100 but cannot express this gap,
     // so it is refused here, before the JAR is even looked up. The threshold
     // checked is the one sent: the named argument wins over router_settings.
@@ -522,7 +541,6 @@ pub(crate) async fn route_specctra_dsn(
         .transpose()
         .map_err(|_| anyhow::anyhow!("max_passes is too large"))?;
     let job_timeout_seconds = args["job_timeout_seconds"].as_u64();
-    let overall_timeout_seconds = args["overall_timeout_seconds"].as_u64().unwrap_or(900);
     let settings = mcp::RouteSettings {
         max_passes,
         optimizer_enabled: args["optimizer_enabled"].as_bool(),
@@ -1184,6 +1202,57 @@ mod freerouting_tests {
             body["message"],
             json!(format!("jar_path is not a file: {}", missing.display()))
         );
+    }
+
+    #[tokio::test]
+    async fn served_route_refuses_an_overall_timeout_within_the_optimizer_window() {
+        // Explicit: the caller's overall_timeout_seconds is the value named.
+        let (temp, body) = served_route(json!({
+            "optimize_seconds": 1100,
+            "overall_timeout_seconds": 1100
+        }))
+        .await;
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "overall_timeout_seconds", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("overall_timeout_seconds (1100) must exceed optimize_seconds (1100)"),
+            "{body}"
+        );
+        assert!(!temp.path().join("board.ses").exists());
+
+        // 86400 never runs: the longest overall timeout, 86400, would have
+        // to exceed it. The schema refuses it, by default or not.
+        for extra in [
+            json!({ "optimize_seconds": 86_400 }),
+            json!({ "optimize_seconds": 86_400, "overall_timeout_seconds": 86_400 }),
+        ] {
+            let (_temp, body) = served_route(extra.clone()).await;
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{extra}: {body}");
+            assert_eq!(
+                body["error"]["field"], "optimize_seconds",
+                "{extra}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn served_route_sizes_the_default_overall_timeout_for_the_optimizer() {
+        // A flat 900 s default would be refused here; 900 + 1100 lets the
+        // call go on to look up the (missing) JAR. So does an explicit value
+        // above optimize_seconds, and 86399, the largest accepted, whose default
+        // and longest explicit overall timeout are both 86400.
+        for extra in [
+            json!({ "optimize_seconds": 1100 }),
+            json!({ "optimize_seconds": 1100, "overall_timeout_seconds": 1101 }),
+            json!({ "optimize_seconds": 86_399 }),
+            json!({ "optimize_seconds": 86_399, "overall_timeout_seconds": 86_400 }),
+        ] {
+            let (_temp, body) = served_route(extra.clone()).await;
+            assert_eq!(body["error"]["kind"], "file_not_found", "{extra}: {body}");
+        }
     }
 
     /// A threshold Freerouting would multiply by 100 is refused as
