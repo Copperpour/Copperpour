@@ -61,7 +61,7 @@ python3 -I corpus.py <kicad-10.0>/demos
 The keys are (distinct wire-end exits, has a dot). The scan parses `(wire (pts
 ...))` and `(junction (at ...))`, keys points at 0.01 mm, takes each wire end's
 exit angle toward the wire's other end, and skips any point that lies mid-span on
-another wire, since `find_t_junctions` already handles those.
+another wire, since the wire tools' T check already handles those.
 
 `corpus.py`:
 
@@ -124,3 +124,31 @@ Copperpour dotted
 both, because `find_t_junctions` saw a wire end landing mid-span. The gate row
 gives one wire exit plus one symbol. Counting pins rather than symbols makes it
 three, because Copperpour's pin list carries pin 3 once per body style.
+
+## Moves and wire deletes
+
+The #136 tests draw wires the same way, then move `R1` or delete a wire through
+the served tools. `move_schematic_component` to `(114.3, 105.41)` puts `R1`'s
+pin 1 on `(114.3, 101.6)`.
+
+| Case | Wires | Then | Dots |
+|---|---|---|---|
+| a pin moved onto a corner | `(101.6,101.6)→(114.3,101.6)`, `(114.3,101.6)→(114.3,88.9)` | move `R1` there | `(114.3, 101.6)` |
+| the same pin moved back | as above | move `R1` to `(152.4, 101.6)` | none |
+| a pin moved onto a bare crossing | `(101.6,101.6)→(127,101.6)`, `(114.3,88.9)→(114.3,106.68)` | move `R1` there | none |
+| a T's branch deleted | the three-end T above | delete `(114.3,101.6)→(114.3,88.9)` | none |
+| one arm of a cross deleted | the four-end cross above | delete `(114.3,114.3)→(114.3,101.6)` | `(114.3, 101.6)` |
+| one of two wires at a pin tip deleted | the pin-tip pair above | delete `(152.4,97.79)→(152.4,88.9)` | none |
+| a T with its dot taken out, no pin | the three-end T above | reconcile `(114.3, 101.6)` | none |
+| a dot on a collinear overlap | `(101.6,101.6)→(127,101.6)`, `(114.3,101.6)→(139.7,101.6)`, `add_junction` at `(114.3, 101.6)` | move `R1` there and back | `(114.3, 101.6)` |
+| a pin moved onto a T with its dot taken out | `(101.6,101.6)→(127,101.6)`, `(114.3,101.6)→(114.3,88.9)` | move `R1` there | none |
+| a branch deleted at a sheet pin mid-span | `(68.58,147.32)→(93.98,147.32)`, `(81.28,147.32)→(81.28,134.62)` | delete the branch | `(81.28, 147.32)` |
+| a branch deleted at a bus entry mid-span | `(200.66,147.32)→(226.06,147.32)`, `(213.36,147.32)→(213.36,134.62)` | delete the branch | `(213.36, 147.32)` |
+
+The corner and the pin tip are KiCad's count of three exits: two wire ends and
+a symbol. eeschema joins items at shared connection points, and a wire passing
+mid-span only through a junction there, or a label over two or more wires
+(`CONNECTION_GRAPH::updateItemConnectivity`, `eeschema/connection_graph.cpp`).
+So at the crossing, the overlap and the T
+without its dot, a dot is what joins the wires, and moving a pin there or away
+neither adds nor removes one.

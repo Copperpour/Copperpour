@@ -308,7 +308,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "library_path": { "type": "string", "description": "Path to .kicad_sym library file" },
-                    "name": { "type": "string", "description": "Symbol name" },
+                    "name": { "type": "string", "description": "Symbol name; refused if the library already defines it" },
                     "reference_prefix": { "type": "string", "description": "Default reference prefix (e.g. 'U')" },
                     "value": { "type": "string", "description": "Default value string" },
                     "datasheet": { "type": "string", "description": "Datasheet URL or path (default empty). A '~' is written as an empty string — carrying it fails ERC's library-match check." },
@@ -4567,8 +4567,7 @@ pub(crate) async fn handle_create_symbol(
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
     // Schema-required. Defaulting them appended `(symbol "Symbol" …)` with
-    // reference `U` to the library — and there is no duplicate-name guard, so
-    // repeated calls stacked identically-named entries in one file (#218).
+    // reference `U` to the library (#218).
     let name = match require_str(args, "name") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -4886,23 +4885,39 @@ pub(crate) async fn handle_create_symbol(
         units_sexp
     );
 
-    // If file doesn't exist, create scaffold
-    let content = if lib_path.exists() {
-        let mut content = tokio::fs::read_to_string(&lib_path).await?;
-        content = content.replace("(version 20240108)", "(version 20251024)");
-        if !content.contains("(generator_version ") {
-            if let Some(position) = content.find("(generator \"") {
-                if let Some(end) = content[position..].find(')') {
-                    let insert_at = position + end + 1;
-                    content.insert_str(insert_at, "\n  (generator_version \"10.0\")");
+    let read = if lib_path.exists() {
+        Some(read_consistent(&lib_path)?)
+    } else {
+        None
+    };
+    let content = match &read {
+        Some(source) => {
+            // KiCad keeps one of two same-named symbols on its next save,
+            // without saying which (#123).
+            if top_level_symbol_names(source)?.iter().any(|n| n == name) {
+                return Ok(super::invalid_arg(
+                    "name",
+                    &format!(
+                        "'{}' already defines symbol '{name}'; pick another name or \
+                         delete_symbol it first",
+                        lib_path.display()
+                    ),
+                ));
+            }
+            let mut content = source.replace("(version 20240108)", "(version 20251024)");
+            if !content.contains("(generator_version ") {
+                if let Some(position) = content.find("(generator \"") {
+                    if let Some(end) = content[position..].find(')') {
+                        let insert_at = position + end + 1;
+                        content.insert_str(insert_at, "\n  (generator_version \"10.0\")");
+                    }
                 }
             }
+            content
         }
-        content
-    } else {
-        "(kicad_symbol_lib\n  (version 20251024)\n  (generator \"copperpour\")\n  \
-         (generator_version \"10.0\")\n)\n"
-            .to_string()
+        None => "(kicad_symbol_lib\n  (version 20251024)\n  (generator \"copperpour\")\n  \
+                 (generator_version \"10.0\")\n)\n"
+            .to_string(),
     };
 
     // Insert before closing paren of root expression
@@ -4912,7 +4927,15 @@ pub(crate) async fn handle_create_symbol(
     if let Some(parent) = lib_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    write_atomic(&lib_path, &new_content)?;
+    if let Some(refusal) = super::write_if_unchanged(
+        &lib_path,
+        "symbol library",
+        "create_symbol",
+        read.as_deref(),
+        new_content,
+    )? {
+        return Ok(refusal);
+    }
 
     let mut result = json!({
         "success": true,

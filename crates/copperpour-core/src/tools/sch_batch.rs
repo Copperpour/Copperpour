@@ -17,7 +17,7 @@ use copperpour_sexp::{
     parser::parse_sexp,
     schematic::{
         extract_all_net_labels, extract_buses, extract_labels, extract_symbol_instances,
-        extract_wires, find_lib_symbol, format_net_label, format_wire, parse_at, pin_endpoint,
+        extract_wires, find_lib_symbol, format_net_label, parse_at, pin_endpoint,
         pin_outward_direction, read_schematic, symbol_bounds_for_instance, SymbolBounds,
     },
     writer::{apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit},
@@ -34,7 +34,8 @@ use super::sch_components::{
     set_dnp_attribute, set_property_value, ComponentDeleteTargetError,
 };
 use super::sch_wiring::{
-    add_stub_label, add_stub_wire, resolve_pin_endpoint, resolve_placed_pin, route_between,
+    add_stub_label, add_stub_wire, clear_stub_direction, resolve_pin_endpoint, resolve_placed_pin,
+    route_between,
 };
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -61,7 +62,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "direction": {
                         "type": "string",
                         "description": "Direction of each pin's stub, and of its label text. 'auto' (default) \
-                                        points away from the symbol body.",
+                                        points away from the symbol body, and turns across when that stub \
+                                        would join another net. A pin whose stub would join one either way \
+                                        is skipped and reported in errors.",
                         "enum": ["auto", "right", "left", "up", "down"],
                         "default": "auto"
                     },
@@ -134,8 +137,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Place multiple symbols from KiCAD libraries in one write with committed-file \
              readback. Preserves every saved hierarchy instance and preflights stale metadata \
              before any placement. Copies each library Value and Footprint unless that entry \
-             explicitly overrides it. Pins that land mid-segment on an existing wire gain the \
-             required junction in the same atomic write; the response reports \
+             explicitly overrides it. Pins that land mid-segment on an existing wire, or \
+             where wire ends meet, gain the required junction in the same atomic write; \
+             the response reports \
              junctions_added_count and junctions_pruned_count. \
              There is no auto-numbering: an omitted reference becomes the library prefix \
              plus '?' (e.g. 'R?', '#FLG?'), like an eeschema-unannotated symbol, same as \
@@ -219,9 +223,11 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "bulk_move_schematic_components",
             "Move multiple components by a uniform dx/dy offset in a single atomic file \
-             write. Junction dots are re-judged where the pins moved: a dot the pins \
-             leave unjustified is removed and a pin landing mid-span on a wire gains \
-             one, reported as junctions_pruned_count and junctions_added_count. A \
+             write. Junction dots are re-judged where the pins moved: a dot left with \
+             fewer than three exits (wires, pins, sheet pins, bus entries) is removed \
+             unless it is what joins wires there, and a pin that makes three, mid-span \
+             on one wire or where wire ends meet, gains one, reported as \
+             junctions_pruned_count and junctions_added_count. A \
              no-connect flag travels with the pin it protects, reported as \
              no_connects_moved; the shift is refused before writing when that pin \
              cannot be followed one-to-one.",
@@ -517,6 +523,16 @@ async fn handle_batch_connect_to_net(
     } else {
         Vec::new()
     };
+    // Every pin the call names joins the net, so a stub may end on another (#117).
+    let requested: Vec<(f64, f64)> = pins
+        .iter()
+        .filter(|_| stub_length > 0.0)
+        .filter_map(|spec| {
+            let reference = spec["reference"].as_str()?;
+            let pin_number = spec["pin_number"].as_str()?;
+            resolve_pin_endpoint(&instances, &lib_syms, reference, pin_number).ok()
+        })
+        .collect();
     let mut is_changed = false;
 
     let mut inserts = String::new();
@@ -556,7 +572,31 @@ async fn handle_batch_connect_to_net(
         let (px, py) = pin_endpoint(&pin, t);
         // `auto` is pin_label_rotation's direction, so the default rotation
         // is unchanged.
-        let dir = crate::tools::stub_direction(direction, Some(pin_outward_direction(&pin, t)));
+        let outward = Some(pin_outward_direction(&pin, t));
+        let dir = match sch.as_ref() {
+            Some(sch) if stub_length > 0.0 => {
+                // ponytail: re-parses the sheet and rebuilds net graphs per pin and
+                // direction, as batch_connect_pins does per wire.
+                let dirs = crate::tools::stub_directions(direction, outward);
+                match clear_stub_direction(
+                    sch,
+                    &exit_points,
+                    (px, py),
+                    &dirs,
+                    stub_length,
+                    label_type,
+                    &net_name,
+                    &requested,
+                )? {
+                    Ok(dir) => dir,
+                    Err(reasons) => {
+                        errors.push(format!("{reference}.{pin_number}: {}", reasons.join("; ")));
+                        continue;
+                    }
+                }
+            }
+            _ => crate::tools::stub_direction(direction, outward),
+        };
         let (lx, ly) = dir.end((px, py), stub_length);
         let rotation = dir.label_rotation;
 
@@ -631,7 +671,10 @@ async fn handle_batch_connect_to_net(
         body["stub_length"] = json!(stub_length);
         body["label_type"] = json!(label_type);
     }
-    Ok(CallToolResult::json(&body))
+    let mut result = CallToolResult::json(&body);
+    // As batch_connect_pins: a call that connected nothing failed (#117).
+    result.is_error = added.is_empty() && !errors.is_empty();
+    Ok(result)
 }
 
 /// Whether `sch` already has a wire between `a` and `b`, either way round.
@@ -1716,21 +1759,20 @@ async fn handle_connect_passthrough(
     let direction = opt_str(args, "direction").unwrap_or("auto");
 
     let (content, tree) = read_schematic(&sch_path)?;
-    let dir = crate::tools::resolve_stub_direction(direction, (x, y), &tree);
+    let dir = crate::tools::stub_direction(direction, crate::tools::pin_outward_at(&tree, x, y));
 
     // Stub is 2.54mm (2×1.27 grid units)
     let stub = 2.54_f64;
     let (wire_end_x, wire_end_y) = (x + dir.dx * stub, y + dir.dy * stub);
 
-    let wire_sexp = format_wire(x, y, wire_end_x, wire_end_y);
     let label_sexp = format_net_label(&net_name, wire_end_x, wire_end_y, dir.label_rotation);
 
     let expected = content.clone();
+    // The stub gets the dots a new wire calls for, as one drawn with add_wire does (#137).
+    let with_stub =
+        crate::tools::sch_wiring::insert_wire_with_junctions(content, x, y, wire_end_x, wire_end_y);
     // Wires and labels are element class 2; symbol instances MUST come last.
-    let new_content = crate::tools::sch_wiring::insert_before_close(
-        &content,
-        &format!("{wire_sexp}{label_sexp}"),
-    );
+    let new_content = crate::tools::sch_wiring::insert_before_close(&with_stub, &label_sexp);
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({

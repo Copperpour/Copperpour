@@ -122,6 +122,25 @@ documented paths as public API. Preserve compatibility or provide an explicit
 migration. Keep generated artifacts, personal settings, downloaded catalogs, build
 output, and unrelated cleanup out of the diff.
 
+## Negative controls
+
+Reviewers check each guard your change adds: break it, and see which tests fail.
+A guard whose removal fails nothing is not pinned by any test, and the review will
+ask for one. `scripts/control.sh` runs one such control the way reviews do. Commit
+first, then pass a label and the command that breaks the guard:
+
+```bash
+CONTROL_TESTS="the_log_is_read_incrementally" scripts/control.sh "fixed log tail" \
+  perl -pi -e 's/Some\(offset\) if offset <= len/Some(offset) if false \&\& offset <= len/' \
+  crates/copperpour-core/src/autorouting/freerouting/mcp.rs
+```
+
+It prints `== <label>: N failed` and the failing tests, then restores the tree. It
+tests the edited crates and every crate that depends on them, with `--no-fail-fast`.
+`CONTROL_TESTS` limits the run to your new tests, and the full set runs only when
+they fail nothing. The script's header lists its options. A table of controls in
+the PR body is welcome but not required: reviewers run their own.
+
 ## Pull request checklist
 
 These are exactly the commands CI runs — if they pass locally, CI should be green:

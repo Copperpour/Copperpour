@@ -6,7 +6,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Map, Number, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -26,6 +26,10 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Polls in a row that may go unanswered before the job is given up. A busy
+/// JVM (garbage collection, a starved CPU) can stop answering for minutes in
+/// the middle of a long route; the overall timeout still bounds the wait.
+const MAX_MISSED_POLLS: u32 = 10;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SES_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -63,6 +67,22 @@ pub(crate) struct RouteSettings {
     /// Once routing is complete and the optimizer has started, how long to let
     /// it run before taking the best board so far and stopping the job.
     pub optimize_seconds: Option<u64>,
+    /// Freerouting's `optimizer.max_passes` (its default is 100).
+    pub optimizer_max_passes: Option<u32>,
+    /// Freerouting's `optimizer.improvement_threshold`, in percent: the
+    /// optimizer stops after a pass that improves less (its default is 2.5).
+    pub optimizer_improvement_threshold: Option<f64>,
+    /// Freerouting's `plane_nets`: nets to mark as power-plane nets (plane
+    /// routing mode, cheaper vias to the plane). A `(plane ...)` declared in
+    /// the DSN already sets the same flag on its net.
+    pub plane_nets: Option<Vec<String>>,
+    /// Freerouting's `plane_as_obstacle`: whether copper pours block foreign
+    /// traces (its default is false).
+    pub plane_as_obstacle: Option<bool>,
+    /// Any of Freerouting's router settings, in its JSON shape
+    /// (`get_effective_settings`), passed through as given. The named fields
+    /// above are merged on top and win.
+    pub router_settings: Option<Map<String, Value>>,
     pub poll_interval: Duration,
     pub overall_timeout: Duration,
 }
@@ -80,6 +100,21 @@ pub(crate) struct RouteEvidence {
     /// Last routing activity read from Freerouting's log, e.g.
     /// "pass 17: 0 unrouted, 218 violations".
     pub last_activity: Option<String>,
+    /// Whether the sent settings were read back from
+    /// `get_effective_settings`. When false, nothing was compared, so a
+    /// setting that did not take went unnoticed.
+    pub settings_checked: bool,
+    /// Connections still unrouted when the job ended, from the last count in
+    /// Freerouting's log; None when the log could not be read.
+    pub unrouted: Option<u64>,
+    /// Freerouting's log file the count was looked for in; None when no
+    /// location could be worked out.
+    pub freerouting_log: Option<String>,
+    /// Project design rules sent but not applied, e.g. a key an older JAR
+    /// does not have (`hole_to_hole_um` in 2.5.0), as "path: reason".
+    pub project_rules_not_applied: Vec<String>,
+    /// Freerouting's own `validation_warnings` for the effective settings.
+    pub settings_warnings: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -145,11 +180,16 @@ pub(crate) async fn probe_local(jar: &Path) -> BridgeProbe {
     }
 }
 
+/// Route `dsn` with the caller's `settings`. `project_rules` are the
+/// Freerouting settings read from the KiCad project's design rules
+/// ([`project_route_rules`]), sent under `settings`. A project rule the JAR
+/// does not apply is reported, not refused: the caller did not ask for it.
 pub(crate) async fn route_local(
     jar: &Path,
     dsn: &Path,
     ses_output: &Path,
     settings: &RouteSettings,
+    project_rules: &Map<String, Value>,
 ) -> Result<RouteEvidence> {
     validate_inputs(jar, dsn, ses_output, settings)?;
     if let Some(parent) = ses_output
@@ -172,7 +212,14 @@ pub(crate) async fn route_local(
     let started = Instant::now();
     let route_result = match timeout(
         settings.overall_timeout,
-        run_state_machine(&mut client, dsn, &temporary, settings, started),
+        run_state_machine(
+            &mut client,
+            dsn,
+            &temporary,
+            settings,
+            project_rules,
+            started,
+        ),
     )
     .await
     {
@@ -185,16 +232,17 @@ pub(crate) async fn route_local(
     let diagnostics = client.close().await;
     let diagnostics_path = write_diagnostics(ses_output, &diagnostics).await?;
 
-    let result = match route_result {
-        Ok(evidence) => Ok(evidence),
-        Err(error) => {
-            if diagnostics.is_empty() {
-                Err(error)
-            } else {
-                Err(error).context(format!("Freerouting stderr: {diagnostics}"))
-            }
+    // with_stderr_tail rebuilds the error as text. A refusal of the caller's
+    // settings keeps its type for the handler, which answers it as
+    // invalid_argument; Freerouting's stderr has nothing to add to it and
+    // still goes to the log.
+    let result = route_result.map_err(|error| {
+        if SettingsNotApplied::in_error(&error).is_some() {
+            error
+        } else {
+            with_stderr_tail(error, &diagnostics, diagnostics_path.as_deref())
         }
-    };
+    });
     let evidence = match result {
         Ok(evidence) => evidence,
         Err(error) => {
@@ -231,6 +279,34 @@ pub(crate) async fn route_local(
         diagnostics_path,
         ..evidence
     })
+}
+
+/// `error` first, then the end of Freerouting's stderr: its banner and
+/// warnings run to thousands of characters, with the cause at the end. `full`
+/// names the file that holds all of it.
+fn with_stderr_tail(error: anyhow::Error, diagnostics: &str, full: Option<&str>) -> anyhow::Error {
+    if diagnostics.is_empty() {
+        return error;
+    }
+    let full = full
+        .map(|path| format!(", all of it in {path}"))
+        .unwrap_or_default();
+    anyhow::anyhow!(
+        "{error:#}\nFreerouting stderr, last lines{full}:\n{}",
+        stderr_tail(diagnostics)
+    )
+}
+
+/// The last 12 lines of `diagnostics`, cut to their last 2000 characters.
+fn stderr_tail(diagnostics: &str) -> String {
+    const LINES: usize = 12;
+    const CHARS: usize = 2000;
+    let lines: Vec<&str> = diagnostics.lines().collect();
+    let tail = lines[lines.len().saturating_sub(LINES)..].join("\n");
+    match tail.char_indices().rev().nth(CHARS - 1) {
+        Some((start, _)) => format!("...{}", &tail[start..]),
+        None => tail,
+    }
 }
 
 fn diagnostics_path(ses_output: &Path) -> PathBuf {
@@ -308,11 +384,189 @@ fn validate_inputs(
     }
     if settings
         .optimize_seconds
-        .is_some_and(|seconds| seconds > 86_400)
+        .is_some_and(|seconds| seconds > MAX_OPTIMIZE_SECONDS)
     {
-        bail!("optimize_seconds must be between 0 and 86400");
+        bail!("optimize_seconds must be between 0 and {MAX_OPTIMIZE_SECONDS}");
+    }
+    if let Some(message) = settings.optimize_seconds.and_then(|optimize| {
+        overall_timeout_too_short(settings.overall_timeout.as_secs(), optimize)
+    }) {
+        bail!("{message}");
+    }
+    if settings
+        .optimizer_max_passes
+        .is_some_and(|passes| !(1..=100).contains(&passes))
+    {
+        bail!("optimizer_max_passes must be between 1 and 100");
+    }
+    if settings
+        .optimizer_improvement_threshold
+        .is_some_and(|percent| !(0.0..=100.0).contains(&percent))
+    {
+        bail!("optimizer_improvement_threshold must be between 0 and 100 (percent)");
+    }
+    if settings
+        .optimizer_improvement_threshold
+        .is_some_and(threshold_read_as_fraction)
+    {
+        bail!("optimizer_improvement_threshold {THRESHOLD_READ_AS_FRACTION}");
+    }
+    if settings.optimizer_improvement_threshold.is_none()
+        && settings
+            .router_settings
+            .as_ref()
+            .and_then(router_settings_threshold)
+            .is_some_and(threshold_read_as_fraction)
+    {
+        bail!("{ROUTER_SETTINGS_THRESHOLD} {THRESHOLD_READ_AS_FRACTION}");
+    }
+    let negative = negative_settings_sent(settings);
+    if !negative.is_empty() {
+        bail!("{}", negative_settings_message(&negative));
     }
     Ok(())
+}
+
+/// Why a negative `router_settings` number is refused.
+pub(crate) const NEGATIVE_SETTING: &str =
+    "must not be negative: Freerouting takes a negative cost, count or distance without a \
+     warning and routes with it, and none of its settings has a meaning below zero";
+
+/// Every number below zero that `router_settings` would send, as its path
+/// (`router_settings.scoring.via_costs`) and value. A value that a named
+/// argument replaces is not sent, so it is not reported.
+pub(crate) fn negative_settings_sent(settings: &RouteSettings) -> Vec<(String, Number)> {
+    // Mirrors merge_into: an object over an object merges key by key, and
+    // anything else in the named settings replaces the whole router_settings
+    // value at that path.
+    fn walk(value: &Value, named: Option<&Value>, path: &str, out: &mut Vec<(String, Number)>) {
+        if let Some(named) = named {
+            if !(named.is_object() && value.is_object()) {
+                return;
+            }
+        }
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    let named = named.and_then(|named| named.get(key));
+                    walk(value, named, &format!("{path}.{key}"), out);
+                }
+            }
+            Value::Array(items) => {
+                for (index, value) in items.iter().enumerate() {
+                    walk(value, None, &format!("{path}[{index}]"), out);
+                }
+            }
+            Value::Number(number) if number.as_f64().is_some_and(|n| n < 0.0) => {
+                out.push((path.to_string(), number.clone()))
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(router_settings) = &settings.router_settings {
+        let named = Value::Object(named_settings(settings));
+        walk(
+            &Value::Object(router_settings.clone()),
+            Some(&named),
+            "router_settings",
+            &mut out,
+        );
+    }
+    out
+}
+
+/// The refusal for what [`negative_settings_sent`] found, naming each path.
+pub(crate) fn negative_settings_message(negative: &[(String, Number)]) -> String {
+    let listed: Vec<String> = negative
+        .iter()
+        .map(|(path, value)| format!("{path} is {value}"))
+        .collect();
+    format!(
+        "{}. A router setting {NEGATIVE_SETTING}. Nothing was routed.",
+        listed.join("; ")
+    )
+}
+
+/// Where `router_settings` carries the optimizer's improvement threshold.
+pub(crate) const ROUTER_SETTINGS_THRESHOLD: &str =
+    "router_settings.optimizer.improvement_threshold";
+
+/// The improvement threshold `router_settings` would send, if it sets one.
+/// It is sent only when `optimizer_improvement_threshold` is not given.
+pub(crate) fn router_settings_threshold(router_settings: &Map<String, Value>) -> Option<f64> {
+    router_settings
+        .get("optimizer")?
+        .get("improvement_threshold")?
+        .as_f64()
+}
+
+/// The settings Freerouting did not apply, each as `"path: not a Freerouting
+/// setting"` or `"path: sent X, effective Y"`. Carried in the error of a run
+/// refused before `start_job`, so the handler can report `invalid_argument`
+/// on `router_settings` by downcasting rather than by reading the message.
+#[derive(Debug)]
+pub(crate) struct SettingsNotApplied(pub(crate) Vec<String>);
+
+impl std::fmt::Display for SettingsNotApplied {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Freerouting did not apply these settings, nothing was routed: {}",
+            self.0.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for SettingsNotApplied {}
+
+impl SettingsNotApplied {
+    /// The [`SettingsNotApplied`] `error` carries, context added or not.
+    pub(crate) fn in_error(error: &anyhow::Error) -> Option<&Self> {
+        error.downcast_ref::<Self>()
+    }
+}
+
+/// Freerouting 2.5's `BatchOptimizer` reads an improvement threshold above 0
+/// and below 0.1 as a fraction and multiplies it by 100, so such a value never
+/// runs as given. 0 runs as given.
+pub(crate) fn threshold_read_as_fraction(percent: f64) -> bool {
+    percent > 0.0 && percent < 0.1
+}
+
+/// Why a threshold for which [`threshold_read_as_fraction`] holds is refused.
+pub(crate) const THRESHOLD_READ_AS_FRACTION: &str =
+    "above 0 and below 0.1 is refused: Freerouting reads such a value as a fraction and \
+     multiplies it by 100, so 0.05 would run as 5%. Pass 0, or a percentage of at least 0.1";
+
+/// The overall timeout for routing alone, when `optimize_seconds` is not given.
+pub(crate) const DEFAULT_OVERALL_TIMEOUT_SECONDS: u64 = 900;
+/// The longest overall timeout, explicit or by default.
+pub(crate) const MAX_OVERALL_TIMEOUT_SECONDS: u64 = 86_400;
+/// The longest optimizer window: the overall timeout is at most
+/// [`MAX_OVERALL_TIMEOUT_SECONDS`] and must exceed it. The schema's maximum.
+pub(crate) const MAX_OPTIMIZE_SECONDS: u64 = MAX_OVERALL_TIMEOUT_SECONDS - 1;
+
+/// The overall timeout of a call without `overall_timeout_seconds`: 900 s for
+/// routing, then the optimizer window, which opens only once routing is done.
+/// A flat 900 s killed a run whose optimizer was still inside the
+/// `optimize_seconds` it had been given.
+pub(crate) fn default_overall_timeout_seconds(optimize_seconds: Option<u64>) -> u64 {
+    DEFAULT_OVERALL_TIMEOUT_SECONDS
+        .saturating_add(optimize_seconds.unwrap_or(0))
+        .min(MAX_OVERALL_TIMEOUT_SECONDS)
+}
+
+/// Why an overall timeout of `overall` seconds leaves no room for the
+/// optimizer window of `optimize` seconds, or `None` when it does.
+pub(crate) fn overall_timeout_too_short(overall: u64, optimize: u64) -> Option<String> {
+    (overall <= optimize).then(|| {
+        format!(
+            "overall_timeout_seconds ({overall}) must exceed optimize_seconds ({optimize}): \
+             routing comes first, the optimizer window opens only once it is done, and the \
+             overall timeout keeps no board"
+        )
+    })
 }
 
 async fn run_state_machine(
@@ -320,6 +574,7 @@ async fn run_state_machine(
     dsn: &Path,
     temporary: &Path,
     settings: &RouteSettings,
+    project_rules: &Map<String, Value>,
     started: Instant,
 ) -> Result<RouteEvidence> {
     let tools = client.list_tools().await?;
@@ -352,29 +607,57 @@ async fn run_state_machine(
         )
         .await?;
 
-    let mut job_settings = Map::new();
-    if let Some(max_passes) = settings.max_passes {
-        job_settings.insert("maxPasses".to_string(), json!(max_passes));
-    }
-    if let Some(enabled) = settings.optimizer_enabled {
-        job_settings.insert("optimizer".to_string(), json!({ "enabled": enabled }));
-    }
-    if let Some(seconds) = settings.job_timeout_seconds {
-        job_settings.insert(
-            "jobTimeoutString".to_string(),
-            Value::String(duration_string(seconds)),
-        );
-    }
-    if !job_settings.is_empty() {
-        if !tools.contains_key("update_job_settings") {
+    // The project rules go under what the caller asked for, which wins.
+    let requested = job_settings_body(settings);
+    let project_only = project_only_settings(project_rules, &requested);
+    let mut job_settings = project_only.clone();
+    job_settings.extend(requested.clone());
+    let mut settings_checked = false;
+    let mut settings_warnings = Vec::new();
+    let mut project_rules_not_applied = Vec::new();
+    if !job_settings.is_empty() && !tools.contains_key("update_job_settings") {
+        if !requested.is_empty() {
             bail!("Freerouting MCP does not expose update_job_settings");
         }
+        // Only project rules to send: a JAR that cannot take them still
+        // routes, as it did before they were sent, and says what it skipped.
+        project_rules_not_applied = project_only
+            .keys()
+            .map(|key| format!("{key}: not sent, this Freerouting has no update_job_settings"))
+            .collect();
+    } else if !job_settings.is_empty() {
         client
             .call_tool(
                 "update_job_settings",
                 json!({ "path": { "jobId": job_id }, "body": job_settings }),
             )
             .await?;
+        // Freerouting accepts unknown keys and drops them without a word:
+        // read the settings back, and refuse before start_job a run that
+        // would ignore part of what was asked.
+        if tools.contains_key("get_effective_settings") {
+            let effective = client
+                .call_tool(
+                    "get_effective_settings",
+                    json!({ "path": { "jobId": job_id } }),
+                )
+                .await?;
+            if let Some(effective) = effective_settings(&effective) {
+                settings_checked = true;
+                // What the caller asked for is checked strictly; a project
+                // rule it did not override is only reported.
+                project_rules_not_applied = settings_mismatches(&project_only, effective);
+                let not_applied = settings_mismatches(&requested, effective);
+                if !not_applied.is_empty() {
+                    return Err(anyhow::Error::new(SettingsNotApplied(not_applied)));
+                }
+                settings_warnings = effective
+                    .get("validation_warnings")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
     }
     client
         .call_tool("start_job", json!({ "path": { "jobId": job_id } }))
@@ -384,10 +667,22 @@ async fn run_state_machine(
     let mut progress = JobProgress::new(&job_id);
     let mut optimizer_bound = OptimizerBound::new(settings.optimize_seconds);
     let mut output_downloaded = false;
+    let mut missed_polls = 0u32;
     let final_state = loop {
-        let details = client
+        let details = match client
             .call_tool("get_job_details", json!({ "path": { "jobId": job_id } }))
-            .await?;
+            .await
+        {
+            Ok(details) => details,
+            // The request already waited its own timeout: poll again at once.
+            Err(error) if is_request_timeout(&error) && missed_polls < MAX_MISSED_POLLS => {
+                missed_polls += 1;
+                progress.report_missed_poll(missed_polls, started);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        missed_polls = 0;
         poll_count = poll_count.saturating_add(1);
         let state = required_string(&details, &["state", "status"], "job state")?;
         progress.report(&state, &details, started);
@@ -435,7 +730,12 @@ async fn run_state_machine(
         ses_bytes: 0,
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
+        unrouted: progress.read_unrouted(),
+        freerouting_log: progress.log.as_deref().map(|log| log.display().to_string()),
         last_activity: progress.activity,
+        settings_checked,
+        project_rules_not_applied,
+        settings_warnings,
     })
 }
 
@@ -528,8 +828,9 @@ async fn download_running_output(
 /// How often an unchanged job still sends a progress notification, so the
 /// client's idle timeout keeps being reset during long optimizer stretches.
 const PROGRESS_HEARTBEAT: Duration = Duration::from_secs(60);
-/// Only the end of Freerouting's log is read on each poll; the file grows to
-/// tens of megabytes over a day of routing.
+/// The first read of Freerouting's log starts this far from its end: the file
+/// grows to tens of megabytes over a day of routing, and the job has only just
+/// started. Later reads take what the log gained since.
 const LOG_TAIL_BYTES: u64 = 256 * 1024;
 
 /// Turns job polls into `notifications/progress` for the current tool call.
@@ -539,10 +840,20 @@ const LOG_TAIL_BYTES: u64 = 256 * 1024;
 /// Freerouting's own log, where each line of a job carries the first six hex
 /// digits of its id, upper-cased: `[A3AA32] Auto-routing pass #8 ... (4
 /// unrouted and 218 violations)`.
+///
+/// The log is read incrementally: an optimizer pass writes over a megabyte of
+/// DEBUG lines between two of the lines that matter, so any fixed tail of the
+/// file can hold none of them.
 struct JobProgress {
     tag: String,
     log: Option<PathBuf>,
+    /// How far the log has been read; `None` before the first read.
+    offset: Option<u64>,
+    /// The bytes after the last newline read: a line cut by the read, kept
+    /// until it is complete.
+    partial: Vec<u8>,
     activity: Option<String>,
+    unrouted: Option<u64>,
     last_message: String,
     last_sent: Option<Instant>,
     sent: u32,
@@ -556,7 +867,10 @@ impl JobProgress {
                 job_id.get(..6).unwrap_or(job_id).to_ascii_uppercase()
             ),
             log: freerouting_log_path(),
+            offset: None,
+            partial: Vec::new(),
             activity: None,
+            unrouted: None,
             last_message: String::new(),
             last_sent: None,
             sent: 0,
@@ -564,12 +878,31 @@ impl JobProgress {
     }
 
     fn report(&mut self, state: &str, details: &Value, started: Instant) {
-        if let Some(activity) = self.read_activity() {
-            self.activity = Some(activity);
-        }
+        self.read_log();
         if let Some(message) = self.next_message(state, details, started, Instant::now()) {
             crate::progress::report(f64::from(self.sent), None, &message);
         }
+    }
+
+    /// A poll Freerouting left unanswered: always said, since the silence is
+    /// what the caller needs to see.
+    fn report_missed_poll(&mut self, missed: u32, started: Instant) {
+        let message = self.missed_poll_message(missed, started, Instant::now());
+        crate::progress::report(f64::from(self.sent), None, &message);
+    }
+
+    fn missed_poll_message(&mut self, missed: u32, started: Instant, now: Instant) -> String {
+        self.sent += 1;
+        self.last_sent = Some(now);
+        // The next answered poll is reported even if the job looks the same.
+        self.last_message.clear();
+        let elapsed = now.duration_since(started).as_secs();
+        format!(
+            "Freerouting not answering, {missed}/{MAX_MISSED_POLLS} polls missed in a row \
+             ({}m{:02}s)",
+            elapsed / 60,
+            elapsed % 60
+        )
     }
 
     /// The notification to send for this poll, or `None` when the job looks
@@ -616,9 +949,58 @@ impl JobProgress {
             .is_some_and(|activity| activity.starts_with("optimiz"))
     }
 
-    fn read_activity(&self) -> Option<String> {
-        let tail = read_tail(self.log.as_deref()?, LOG_TAIL_BYTES)?;
-        latest_activity(&tail, &self.tag)
+    /// The last unrouted count of the job, after reading what the log gained.
+    fn read_unrouted(&mut self) -> Option<u64> {
+        self.read_log();
+        self.unrouted
+    }
+
+    /// Reads the lines the log gained since the last call and keeps the latest
+    /// activity and unrouted count found in them; a read that finds neither
+    /// leaves the previous ones in place.
+    fn read_log(&mut self) {
+        use std::io::{Read, Seek, SeekFrom};
+        let Some(path) = self.log.as_deref() else {
+            return;
+        };
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return;
+        };
+        let Ok(len) = file.metadata().map(|metadata| metadata.len()) else {
+            return;
+        };
+        let start = match self.offset {
+            Some(offset) if offset <= len => offset,
+            // First read, or the log is shorter than what was read: it was
+            // replaced or truncated, so what was kept belongs to another file.
+            _ => {
+                self.partial.clear();
+                len.saturating_sub(LOG_TAIL_BYTES)
+            }
+        };
+        let mut gained = Vec::new();
+        if file.seek(SeekFrom::Start(start)).is_err()
+            || file.take(len - start).read_to_end(&mut gained).is_err()
+        {
+            return;
+        }
+        self.offset = Some(len);
+        let mut buffer = std::mem::take(&mut self.partial);
+        buffer.append(&mut gained);
+        // A newline byte is never inside a UTF-8 character, so cutting there
+        // keeps every complete line intact.
+        let Some(end) = buffer.iter().rposition(|&byte| byte == b'\n') else {
+            self.partial = buffer;
+            return;
+        };
+        self.partial = buffer.split_off(end + 1);
+        let complete = String::from_utf8_lossy(&buffer);
+        if let Some(activity) = latest_activity(&complete, &self.tag) {
+            self.activity = Some(activity);
+        }
+        if let Some(unrouted) = latest_unrouted(&complete, &self.tag) {
+            self.unrouted = Some(unrouted);
+        }
     }
 }
 
@@ -628,22 +1010,57 @@ fn freerouting_log_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("FREEROUTING_LOG") {
         return Some(PathBuf::from(path));
     }
+    Some(freerouting_state_dir()?.join("logs/freerouting.log"))
+}
+
+/// `$XDG_STATE_HOME/freerouting`, else `~/.local/state/freerouting`: where
+/// Freerouting already keeps its logs.
+fn freerouting_state_dir() -> Option<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
         })?;
-    Some(state.join("freerouting/logs/freerouting.log"))
+    Some(state.join("freerouting"))
 }
 
-fn read_tail(path: &Path, bytes: u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(len.saturating_sub(bytes))).ok()?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer).ok()?;
-    Some(String::from_utf8_lossy(&buffer).into_owned())
+/// HotSpot writes a crash report (`hs_err_pid*.log`) and possibly a core dump
+/// into its working directory, which it inherits from Copperpour and is
+/// usually the KiCad project: a G1 crash once left its report at the root of a
+/// project repository. Send the report next to Freerouting's logs (the
+/// temporary directory when there is no usable state directory) and never dump
+/// core. A relative state directory would resolve against that same working
+/// directory, so it is not used.
+fn jvm_crash_arguments(state_dir: Option<&Path>) -> Vec<std::ffi::OsString> {
+    let directory = state_dir
+        .filter(|directory| directory.is_absolute())
+        .filter(|directory| std::fs::create_dir_all(directory).is_ok())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let mut error_file = std::ffi::OsString::from("-XX:ErrorFile=");
+    error_file.push(directory.join("hs_err_pid%p.log"));
+    vec![error_file, "-XX:-CreateCoredumpOnCrash".into()]
+}
+
+/// The last unrouted-connection count logged for the job tagged `tag`: a pass
+/// line's "(N unrouted and ...)" or an optimizer line's "incomplete
+/// connections: N".
+fn latest_unrouted(log: &str, tag: &str) -> Option<u64> {
+    log.lines()
+        .rev()
+        .filter(|line| line.contains(tag))
+        .find_map(|line| {
+            let count = |marker: &str, before: bool| -> Option<u64> {
+                if before {
+                    let head = line.split_once(marker)?.0;
+                    head.rsplit(['(', ' ']).next()?.parse().ok()
+                } else {
+                    let tail = line.split_once(marker)?.1;
+                    tail.split([',', '.', ' ']).next()?.parse().ok()
+                }
+            };
+            count(" unrouted and ", true).or_else(|| count("incomplete connections: ", false))
+        })
 }
 
 /// The most recent routing-pass or optimizer line of the job tagged `tag`.
@@ -759,6 +1176,9 @@ struct LocalMcpClient {
     stderr_task: Option<JoinHandle<String>>,
     next_id: u64,
     server_protocol_version: String,
+    /// How long `call_tool` waits for each answer: `REQUEST_TIMEOUT`, shorter
+    /// in tests.
+    request_timeout: Duration,
 }
 
 impl LocalMcpClient {
@@ -766,11 +1186,7 @@ impl LocalMcpClient {
         let mut client = Self::spawn(jar)?;
         if let Err(error) = client.initialize().await {
             let diagnostics = client.close().await;
-            return if diagnostics.is_empty() {
-                Err(error)
-            } else {
-                Err(error).context(format!("Freerouting stderr: {diagnostics}"))
-            };
+            return Err(with_stderr_tail(error, &diagnostics, None));
         }
         Ok(client)
     }
@@ -778,6 +1194,7 @@ impl LocalMcpClient {
     fn server_command(jar: &Path) -> Command {
         let mut command = Command::new(crate::java_runtime::java_executable());
         command
+            .args(jvm_crash_arguments(freerouting_state_dir().as_deref()))
             .arg(JAVA_HEADLESS_ARG)
             .arg("-jar")
             .arg(jar)
@@ -829,6 +1246,7 @@ impl LocalMcpClient {
             stderr_task: Some(stderr_task),
             next_id: 1,
             server_protocol_version: String::new(),
+            request_timeout: REQUEST_TIMEOUT,
         })
     }
 
@@ -883,7 +1301,7 @@ impl LocalMcpClient {
             .request(
                 "tools/call",
                 json!({ "name": name, "arguments": arguments }),
-                REQUEST_TIMEOUT,
+                self.request_timeout,
             )
             .await
             .with_context(|| format!("call Freerouting MCP tool '{name}'"))?;
@@ -907,14 +1325,17 @@ impl LocalMcpClient {
         }))
         .await?;
         let deadline = Instant::now() + limit;
+        let timed_out = || RequestTimedOut {
+            method: method.to_string(),
+        };
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                bail!("Freerouting MCP request '{method}' timed out");
+                return Err(timed_out().into());
             }
             let line = timeout(remaining, self.stdout.next_line())
                 .await
-                .map_err(|_| anyhow::anyhow!("Freerouting MCP request '{method}' timed out"))??
+                .map_err(|_| timed_out())??
                 .context("Freerouting MCP closed stdout before responding")?;
             let Some(response) = json_rpc_message(&line) else {
                 if !line.trim().is_empty() {
@@ -927,7 +1348,9 @@ impl LocalMcpClient {
                 continue;
             };
             if response.get("id") != Some(&json!(id)) {
-                if response.get("method").is_some() {
+                // A notification, or the late answer to a request that timed
+                // out and was given up.
+                if response.get("method").is_some() || is_stale_response(&response, id) {
                     continue;
                 }
                 bail!("Freerouting MCP returned an unexpected response id");
@@ -1076,6 +1499,201 @@ fn temporary_output_path(output: &Path) -> Result<PathBuf> {
         ".{name}.copperpour-{}.tmp.ses",
         uuid::Uuid::new_v4()
     )))
+}
+
+/// The `update_job_settings` body, in the keys Freerouting 2.5 deserializes
+/// (its `RouterSettings` JSON names, read back through
+/// `get_effective_settings`). The camelCase `maxPasses` and `jobTimeoutString`
+/// sent before were accepted and silently ignored: routing passes stayed
+/// unlimited and the job limit at 12 hours.
+fn job_settings_body(settings: &RouteSettings) -> Map<String, Value> {
+    let mut body = settings.router_settings.clone().unwrap_or_default();
+    merge_into(&mut body, named_settings(settings));
+    body
+}
+
+/// The project rules the caller did not override, so the ones sent as read
+/// from the project. Project rules are top-level numbers, so a top-level key
+/// in `requested` overrides one.
+fn project_only_settings(
+    project_rules: &Map<String, Value>,
+    requested: &Map<String, Value>,
+) -> Map<String, Value> {
+    project_rules
+        .iter()
+        .filter(|(key, _)| !requested.contains_key(*key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// KiCad design rules (`board.design_settings.rules` in a `.kicad_pro`, in
+/// mm) and the Freerouting setting (in um) each one is sent as.
+pub(crate) const PROJECT_RULES: [(&str, &str); 3] = [
+    ("min_copper_edge_clearance", "copper_to_edge_clearance_um"),
+    ("min_hole_to_hole", "hole_to_hole_um"),
+    ("min_hole_clearance", "hole_clearance_um"),
+];
+
+/// Freerouting settings from a KiCad project's design rules. Freerouting does
+/// not get these from the DSN: KiCad leaves the board edge clearance out of
+/// it, and the hole rules have no Specctra form. Without them, its job API
+/// routes with none at all. A rule that is absent, not a number, or not above
+/// 0 is not sent, so Freerouting keeps its own default for it.
+pub(crate) fn project_route_rules(project: &Value) -> Map<String, Value> {
+    let rules = &project["board"]["design_settings"]["rules"];
+    PROJECT_RULES
+        .iter()
+        .filter_map(|(kicad, freerouting)| {
+            let mm = rules[*kicad].as_f64().filter(|mm| *mm > 0.0)?;
+            Some((freerouting.to_string(), json!((mm * 1000.0).round())))
+        })
+        .collect()
+}
+
+/// The settings that have their own route_specctra_dsn argument.
+fn named_settings(settings: &RouteSettings) -> Map<String, Value> {
+    let mut body = Map::new();
+    if let Some(max_passes) = settings.max_passes {
+        body.insert(
+            "autorouter".to_string(),
+            json!({ "max_passes": max_passes }),
+        );
+    }
+    let mut optimizer = Map::new();
+    if let Some(enabled) = settings.optimizer_enabled {
+        optimizer.insert("enabled".to_string(), json!(enabled));
+    }
+    if let Some(passes) = settings.optimizer_max_passes {
+        optimizer.insert("max_passes".to_string(), json!(passes));
+    }
+    if let Some(percent) = settings.optimizer_improvement_threshold {
+        optimizer.insert("improvement_threshold".to_string(), json!(percent));
+    }
+    if !optimizer.is_empty() {
+        body.insert("optimizer".to_string(), Value::Object(optimizer));
+    }
+    if let Some(nets) = &settings.plane_nets {
+        body.insert("plane_nets".to_string(), json!(nets));
+    }
+    if let Some(obstacle) = settings.plane_as_obstacle {
+        body.insert("plane_as_obstacle".to_string(), json!(obstacle));
+    }
+    if let Some(seconds) = settings.job_timeout_seconds {
+        body.insert(
+            "job_timeout".to_string(),
+            Value::String(duration_string(seconds)),
+        );
+    }
+    body
+}
+
+/// Deep-merge `overlay` into `base`: objects merge key by key, anything else
+/// in `overlay` replaces what `base` had.
+fn merge_into(base: &mut Map<String, Value>, overlay: Map<String, Value>) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(Value::Object(existing)), Value::Object(incoming)) => {
+                merge_into(existing, incoming)
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+/// The settings object inside a `get_effective_settings` result, which wraps
+/// it as `{status, contentType, body}` in its text content.
+fn effective_settings(result: &Value) -> Option<&Map<String, Value>> {
+    let parsed = result.get("parsedTextContent")?.as_array()?.first()?;
+    parsed.get("body").unwrap_or(parsed).as_object()
+}
+
+/// Every leaf of `sent` whose value is not found at the same path in
+/// `effective`, as "path: sent X, effective Y" (or "not a setting").
+///
+/// Objects and arrays are walked, arrays element by element (`layers[0]`):
+/// Freerouting fills in what an element leaves out with its defaults, and
+/// keeps elements nobody sent (the other layers), so neither is a mismatch.
+/// A sent element with no counterpart in the effective array is one.
+fn settings_mismatches(sent: &Map<String, Value>, effective: &Map<String, Value>) -> Vec<String> {
+    fn walk(sent: &Value, effective: &Value, path: &str, out: &mut Vec<String>) {
+        match (sent, effective) {
+            (Value::Object(sent), Value::Object(effective)) => {
+                for (key, value) in sent {
+                    let here = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    match effective.get(key) {
+                        None => out.push(format!("{here}: not a Freerouting setting")),
+                        Some(effective) => walk(value, effective, &here, out),
+                    }
+                }
+            }
+            (Value::Array(sent), Value::Array(effective)) => {
+                for (index, value) in sent.iter().enumerate() {
+                    let here = format!("{path}[{index}]");
+                    match effective.get(index) {
+                        None => out.push(format!(
+                            "{here}: sent {value}, not in the effective settings"
+                        )),
+                        Some(effective) => walk(value, effective, &here, out),
+                    }
+                }
+            }
+            (sent, effective) if !same_value(sent, effective) => {
+                out.push(format!("{path}: sent {sent}, effective {effective}"))
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(
+        &Value::Object(sent.clone()),
+        &Value::Object(effective.clone()),
+        "",
+        &mut out,
+    );
+    out
+}
+
+/// Equality that lets 3 match 3.0: Freerouting echoes some integers as floats.
+fn same_value(a: &Value, b: &Value) -> bool {
+    match (a.as_f64(), b.as_f64()) {
+        (Some(x), Some(y)) => (x - y).abs() <= 1e-9 * x.abs().max(1.0),
+        _ => a == b,
+    }
+}
+
+/// A request Freerouting did not answer in time, told apart from other errors
+/// so a missed poll can be retried.
+#[derive(Debug)]
+struct RequestTimedOut {
+    method: String,
+}
+
+impl std::fmt::Display for RequestTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Freerouting MCP request '{}' timed out", self.method)
+    }
+}
+
+impl std::error::Error for RequestTimedOut {}
+
+fn is_request_timeout(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<RequestTimedOut>().is_some())
+}
+
+/// Whether `response` answers a request sent before the one awaited as `id`.
+fn is_stale_response(response: &Value, id: u64) -> bool {
+    response
+        .get("id")
+        .and_then(Value::as_u64)
+        .is_some_and(|earlier| earlier < id)
 }
 
 fn duration_string(seconds: u64) -> String {
@@ -1288,6 +1906,11 @@ done
             optimizer_enabled: None,
             job_timeout_seconds: None,
             optimize_seconds: Some(0),
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
             poll_interval: Duration::from_millis(10),
             overall_timeout: Duration::from_secs(30),
         };
@@ -1309,6 +1932,790 @@ done
         assert_eq!(
             std::fs::read_to_string(&temporary).unwrap(),
             "(session board)"
+        );
+    }
+
+    /// A Freerouting server scripted in sh that takes the job settings,
+    /// answers `get_effective_settings` with `effective`, and logs the name of
+    /// each tool called to `calls`, the `update_job_settings` request to `sent`.
+    #[cfg(unix)]
+    fn settings_server(temp: &Path, effective: Value) -> (LocalMcpClient, PathBuf, PathBuf) {
+        settings_server_reading_back(temp, Some(effective))
+    }
+
+    /// [`settings_server`], without `get_effective_settings` when `effective`
+    /// is None.
+    #[cfg(unix)]
+    fn settings_server_reading_back(
+        temp: &Path,
+        effective: Option<Value>,
+    ) -> (LocalMcpClient, PathBuf, PathBuf) {
+        let read_back = effective.is_some();
+        let temporary = temp.join("board.ses.tmp");
+        let sent = temp.join("sent.json");
+        let calls = temp.join("calls.log");
+        let mut tools = conforming_tools_list();
+        let by_path = tools["tools"][3]["inputSchema"].clone();
+        let names: &[&str] = if read_back {
+            &["update_job_settings", "get_effective_settings"]
+        } else {
+            &["update_job_settings"]
+        };
+        for name in names {
+            tools["tools"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({ "name": name, "inputSchema": by_path }));
+        }
+        // Freerouting 2.5.0 answers get_effective_settings with the settings
+        // as JSON text.
+        let effective = json!({ "content": [{ "type": "text", "text": json!({
+            "status": 200,
+            "contentType": "application/json",
+            "body": effective.unwrap_or_default()
+        }).to_string() }] });
+        let script = temp.join("server.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"n=0
+while read -r line; do
+  n=$((n+1))
+  tool=$(printf '%s' "$line" | sed -n 's/.*"name":"\([a-z_]*\)".*/\1/p')
+  printf '%s\n' "${{tool:-tools/list}}" >> '{calls}'
+  case "$line" in
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *update_job_settings*) printf '%s\n' "$line" > '{sent}'; result='{{}}' ;;
+    *get_effective_settings*) result='{effective}' ;;
+    *get_job_details*) result='{{"state":"COMPLETED"}}' ;;
+    *download_job_output_to_local_file*) printf '(session board)' > '{output}'; result='{{}}'; last=1 ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$n" "$result"
+  if [ -n "${{last:-}}" ]; then exit 0; fi
+done
+"#,
+                sent = sent.display(),
+                calls = calls.display(),
+                output = temporary.display(),
+            ),
+        )
+        .unwrap();
+        let client = scripted_client(&format!("exec sh '{}'", script.display()));
+        (client, sent, calls)
+    }
+
+    /// `max_passes` named on top of a `router_settings` that also sets it,
+    /// a misspelt key and a scoring value.
+    #[cfg(unix)]
+    fn merged_settings() -> RouteSettings {
+        RouteSettings {
+            max_passes: Some(7),
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: json!({
+                "autorouter": { "max_passes": 99, "max_threads": 4, "max_pases": 3 },
+                "scoring": { "via_costs": 80 }
+            })
+            .as_object()
+            .cloned(),
+            poll_interval: Duration::from_millis(10),
+            overall_timeout: Duration::from_secs(30),
+        }
+    }
+
+    /// Freerouting kept max_passes but dropped the misspelt key and replaced
+    /// via_costs: the call fails naming both, and the job is never started.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settings_freerouting_did_not_apply_are_refused_before_start_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let (mut client, sent, calls) = settings_server(
+            temp.path(),
+            json!({
+                "autorouter": { "max_passes": 7, "max_threads": 4 },
+                "scoring": { "via_costs": 50 }
+            }),
+        );
+
+        let error = timeout(
+            Duration::from_secs(20),
+            run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &merged_settings(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the refusal comes before any poll")
+        .expect_err("settings that did not take are refused");
+        client.close().await;
+
+        let message = format!("{error:#}");
+        assert!(message.contains("nothing was routed"), "{message}");
+        assert!(
+            message.contains("autorouter.max_pases: not a Freerouting setting"),
+            "{message}"
+        );
+        assert!(
+            message.contains("scoring.via_costs: sent 80, effective 50"),
+            "{message}"
+        );
+        assert!(!message.contains("max_threads"), "{message}");
+        // With context added on top, the type is still found.
+        let refusal = super::super::routing_failed(error.context("Freerouting stderr: noise"))
+            .expect("a refusal the caller can fix, not a handler error");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&refusal).as_deref(),
+            Some("invalid_argument")
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &refusal.content[0] else {
+            panic!("structured error must be text JSON");
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["field"], "router_settings", "{body}");
+        assert_eq!(
+            body["error"]["reason"],
+            "autorouter.max_pases: not a Freerouting setting; scoring.via_costs: sent 80, effective 50",
+            "{body}"
+        );
+        let request: Value =
+            serde_json::from_str(&std::fs::read_to_string(&sent).unwrap()).unwrap();
+        assert_eq!(
+            request["params"]["arguments"]["body"],
+            json!({
+                "autorouter": { "max_passes": 7, "max_threads": 4, "max_pases": 3 },
+                "scoring": { "via_costs": 80 }
+            })
+        );
+        let calls = std::fs::read_to_string(&calls).unwrap();
+        assert!(calls.contains("get_effective_settings"), "{calls}");
+        assert!(!calls.contains("start_job"), "{calls}");
+        assert!(!temporary.exists());
+    }
+
+    /// Every setting sent found with its value among the effective ones (3
+    /// echoed as 3.0 included): the job runs, with Freerouting's warnings.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn router_settings_that_took_are_sent_merged_and_routed() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let (mut client, sent, calls) = settings_server(
+            temp.path(),
+            json!({
+                "autorouter": { "max_passes": 7, "max_threads": 4, "max_pases": 3.0 },
+                "scoring": { "via_costs": 80, "bend_penalty": 2 },
+                "validation_warnings": ["max_threads above the CPU count"]
+            }),
+        );
+
+        let evidence = timeout(
+            Duration::from_secs(20),
+            run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &merged_settings(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the scripted job ends")
+        .expect("the routed board is kept");
+        client.close().await;
+
+        let request: Value =
+            serde_json::from_str(&std::fs::read_to_string(&sent).unwrap()).unwrap();
+        assert_eq!(
+            request["params"]["arguments"]["body"],
+            json!({
+                "autorouter": { "max_passes": 7, "max_threads": 4, "max_pases": 3 },
+                "scoring": { "via_costs": 80 }
+            })
+        );
+        assert!(std::fs::read_to_string(&calls)
+            .unwrap()
+            .contains("start_job"));
+        assert_eq!(evidence.final_state, "COMPLETED");
+        assert!(evidence.settings_checked);
+        assert_eq!(
+            evidence.settings_warnings,
+            [json!("max_threads above the CPU count")]
+        );
+    }
+
+    /// A server without get_effective_settings cannot say what took: the job
+    /// runs, misspelt key included, and the evidence says it was not checked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settings_that_cannot_be_read_back_are_routed_unchecked() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let (mut client, _sent, calls) = settings_server_reading_back(temp.path(), None);
+
+        let evidence = timeout(
+            Duration::from_secs(20),
+            run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &merged_settings(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the scripted job ends")
+        .expect("the routed board is kept");
+        client.close().await;
+
+        let calls = std::fs::read_to_string(&calls).unwrap();
+        assert!(!calls.contains("get_effective_settings"), "{calls}");
+        assert!(calls.contains("start_job"), "{calls}");
+        assert_eq!(evidence.final_state, "COMPLETED");
+        assert!(!evidence.settings_checked);
+        assert!(evidence.settings_warnings.is_empty());
+    }
+
+    /// Through `route_local`, behind a `java` that writes its banner to
+    /// stderr as Freerouting does: the refusal keeps its type, so the tool
+    /// answers `invalid_argument` and not a handler error.
+    #[cfg(unix)]
+    #[test]
+    fn a_settings_refusal_after_freerouting_wrote_to_stderr_is_still_invalid_argument() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        std::fs::write(&jar, "not a jar").unwrap();
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let mut tools = conforming_tools_list();
+        let by_path = tools["tools"][3]["inputSchema"].clone();
+        for name in ["update_job_settings", "get_effective_settings"] {
+            tools["tools"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({ "name": name, "inputSchema": by_path }));
+        }
+        let effective = json!({ "content": [{ "type": "text", "text": json!({
+            "status": 200,
+            "contentType": "application/json",
+            "body": { "autorouter": { "max_passes": 7, "max_threads": 4 }, "scoring": { "via_costs": 50 } }
+        }).to_string() }] });
+        let server = format!(
+            r#"while read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  [ -n "$id" ] || continue
+  case "$line" in
+    *'"initialize"'*) result='{{"protocolVersion":"2025-06-18"}}' ;;
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *get_effective_settings*) result='{effective}' ;;
+    *start_job*) printf 'started' > '{started}'; result='{{}}' ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$id" "$result"
+done"#,
+            started = temp.path().join("started").display(),
+        );
+        let settings = RouteSettings {
+            // The least route_local accepts; the refusal comes before any poll.
+            poll_interval: Duration::from_secs(2),
+            ..merged_settings()
+        };
+
+        let error = with_fake_java(
+            temp.path(),
+            &server,
+            route_local(&jar, &dsn, &ses, &settings),
+        )
+        .expect_err("settings that did not take are refused");
+
+        assert!(!temp.path().join("started").exists());
+        let refusal = super::super::routing_failed(error)
+            .expect("a refusal the caller can fix, not a handler error");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&refusal).as_deref(),
+            Some("invalid_argument")
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &refusal.content[0] else {
+            panic!("structured error must be text JSON");
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["field"], "router_settings", "{body}");
+        assert_eq!(
+            body["error"]["reason"],
+            "autorouter.max_pases: not a Freerouting setting; scoring.via_costs: sent 80, effective 50",
+            "{body}"
+        );
+    }
+
+    /// [`super::route_local`] without project rules, as most tests route.
+    /// It shadows the glob import, so these tests keep their shape.
+    async fn route_local(
+        jar: &Path,
+        dsn: &Path,
+        ses_output: &Path,
+        settings: &RouteSettings,
+    ) -> Result<RouteEvidence> {
+        super::route_local(jar, dsn, ses_output, settings, &Map::new()).await
+    }
+
+    /// [`super::run_state_machine`] without project rules, as most tests run
+    /// it. It shadows the glob import, like [`route_local`] above.
+    async fn run_state_machine(
+        client: &mut LocalMcpClient,
+        dsn: &Path,
+        temporary: &Path,
+        settings: &RouteSettings,
+        started: Instant,
+    ) -> Result<RouteEvidence> {
+        super::run_state_machine(client, dsn, temporary, settings, &Map::new(), started).await
+    }
+
+    /// Only `router_settings`, if any.
+    fn asking_for(router_settings: Option<Value>) -> RouteSettings {
+        RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: router_settings.and_then(|value| value.as_object().cloned()),
+            poll_interval: Duration::from_millis(10),
+            overall_timeout: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn project_design_rules_become_freerouting_settings_in_um() {
+        let project = json!({ "board": { "design_settings": { "rules": {
+            "min_copper_edge_clearance": 0.5,
+            "min_hole_to_hole": 0.25,
+            "min_hole_clearance": 0.0,
+            "min_clearance": 0.2
+        } } } });
+        assert_eq!(
+            Value::Object(project_route_rules(&project)),
+            json!({ "copper_to_edge_clearance_um": 500.0, "hole_to_hole_um": 250.0 })
+        );
+        // Below zero, not a number, or absent: Freerouting keeps its default.
+        let unusable = json!({ "board": { "design_settings": { "rules": {
+            "min_copper_edge_clearance": -0.5,
+            "min_hole_to_hole": "0.25"
+        } } } });
+        assert!(project_route_rules(&unusable).is_empty());
+        assert!(project_route_rules(&json!({})).is_empty());
+        // Rounded to the micrometre Freerouting takes.
+        let fine = json!({ "board": { "design_settings": { "rules": {
+            "min_hole_clearance": 0.2504
+        } } } });
+        assert_eq!(
+            Value::Object(project_route_rules(&fine)),
+            json!({ "hole_clearance_um": 250.0 })
+        );
+    }
+
+    #[test]
+    fn project_rules_go_under_what_the_caller_asked_for() {
+        let project = json!({ "copper_to_edge_clearance_um": 500.0, "hole_to_hole_um": 500.0 });
+        let requested = job_settings_body(&asking_for(Some(
+            json!({ "copper_to_edge_clearance_um": 300.0 }),
+        )));
+        // Only the rule the caller left alone is sent from the project, and
+        // checked leniently.
+        assert_eq!(
+            Value::Object(project_only_settings(
+                project.as_object().unwrap(),
+                &requested
+            )),
+            json!({ "hole_to_hole_um": 500.0 })
+        );
+    }
+
+    /// The JAR does not know `hole_to_hole_um` (Freerouting 2.5.0): the run
+    /// goes on and says so, and the caller's `hole_clearance_um` replaces the
+    /// project's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_project_rule_freerouting_did_not_apply_is_reported_not_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let (mut client, sent, calls) = settings_server(
+            temp.path(),
+            json!({ "copper_to_edge_clearance_um": 500.0, "hole_clearance_um": 200 }),
+        );
+        let project = json!({
+            "copper_to_edge_clearance_um": 500.0,
+            "hole_to_hole_um": 250.0,
+            "hole_clearance_um": 300.0
+        });
+
+        let evidence = timeout(
+            Duration::from_secs(20),
+            super::run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &asking_for(Some(json!({ "hole_clearance_um": 200 }))),
+                project.as_object().unwrap(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the scripted job ends")
+        .expect("a project rule the JAR skipped does not refuse the run");
+        client.close().await;
+
+        let request: Value =
+            serde_json::from_str(&std::fs::read_to_string(&sent).unwrap()).unwrap();
+        assert_eq!(
+            request["params"]["arguments"]["body"],
+            json!({
+                "copper_to_edge_clearance_um": 500.0,
+                "hole_to_hole_um": 250.0,
+                "hole_clearance_um": 200
+            })
+        );
+        assert_eq!(
+            evidence.project_rules_not_applied,
+            ["hole_to_hole_um: not a Freerouting setting"]
+        );
+        assert!(std::fs::read_to_string(&calls)
+            .unwrap()
+            .contains("start_job"));
+    }
+
+    /// The project has the same rule: what the caller asked for is still
+    /// checked strictly, and refused when Freerouting did not apply it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_requested_setting_over_a_project_rule_is_still_refused_when_not_applied() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let (mut client, _sent, calls) =
+            settings_server(temp.path(), json!({ "copper_to_edge_clearance_um": 250.0 }));
+        let project = json!({ "copper_to_edge_clearance_um": 500.0 });
+
+        let error = timeout(
+            Duration::from_secs(20),
+            super::run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &asking_for(Some(json!({ "copper_to_edge_clearance_um": 300.0 }))),
+                project.as_object().unwrap(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the refusal comes before any poll")
+        .expect_err("the caller's setting did not take");
+        client.close().await;
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("copper_to_edge_clearance_um: sent 300.0, effective 250.0"),
+            "{message}"
+        );
+        assert!(!std::fs::read_to_string(&calls)
+            .unwrap()
+            .contains("start_job"));
+    }
+
+    /// A JAR without `update_job_settings` routes as it did before project
+    /// rules were sent, and lists each one as not sent. Asked-for settings
+    /// are still refused there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_rules_alone_do_not_need_update_job_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let script = temp.path().join("server.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"n=0
+while read -r line; do
+  n=$((n+1))
+  case "$line" in
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *get_job_details*) result='{{"state":"COMPLETED"}}' ;;
+    *download_job_output_to_local_file*) printf '(session board)' > '{output}'; result='{{}}'; last=1 ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$n" "$result"
+  if [ -n "${{last:-}}" ]; then exit 0; fi
+done
+"#,
+                tools = conforming_tools_list(),
+                output = temporary.display(),
+            ),
+        )
+        .unwrap();
+        let project = json!({ "copper_to_edge_clearance_um": 500.0 });
+
+        let mut client = scripted_client(&format!("exec sh '{}'", script.display()));
+        let evidence = timeout(
+            Duration::from_secs(20),
+            super::run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &asking_for(None),
+                project.as_object().unwrap(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the scripted job ends")
+        .expect("project rules alone do not fail the run");
+        client.close().await;
+        assert_eq!(evidence.final_state, "COMPLETED");
+        assert_eq!(
+            evidence.project_rules_not_applied,
+            ["copper_to_edge_clearance_um: not sent, this Freerouting has no update_job_settings"]
+        );
+
+        std::fs::remove_file(&temporary).unwrap();
+        let mut client = scripted_client(&format!("exec sh '{}'", script.display()));
+        let error = timeout(
+            Duration::from_secs(20),
+            super::run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &asking_for(Some(json!({ "hole_clearance_um": 200 }))),
+                project.as_object().unwrap(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the refusal comes before any poll")
+        .expect_err("asked-for settings need update_job_settings");
+        client.close().await;
+        assert!(
+            format!("{error:#}").contains("does not expose update_job_settings"),
+            "{error:#}"
+        );
+    }
+
+    /// Calls `route_specctra_dsn` with `args` (`jar_path`, `dsn_path` and
+    /// `ses_output_path` in `temp` added) behind [`with_fake_java`], against
+    /// a server that takes `update_job_settings` but cannot read settings
+    /// back. Returns the tool's answer and the settings body it sent.
+    #[cfg(unix)]
+    fn route_through_the_tool(temp: &Path, mut args: Value) -> (Value, Value) {
+        let jar = temp.join("freerouting.jar");
+        let dsn = temp.join("board.dsn");
+        let sent = temp.join("sent.json");
+        std::fs::write(&jar, "not a jar").unwrap();
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let mut tools = conforming_tools_list();
+        let by_path = tools["tools"][3]["inputSchema"].clone();
+        tools["tools"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "name": "update_job_settings", "inputSchema": by_path }));
+        let server = format!(
+            r#"while read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  [ -n "$id" ] || continue
+  case "$line" in
+    *'"initialize"'*) result='{{"protocolVersion":"2025-06-18"}}' ;;
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *update_job_settings*) printf '%s' "$line" > '{sent}'; result='{{}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *get_job_details*) result='{{"state":"COMPLETED"}}' ;;
+    *download_job_output_to_local_file*)
+      file=$(printf '%s' "$line" | sed -n 's/.*"filePath":"\([^"]*\)".*/\1/p')
+      printf '(session board)' > "$file"; result='{{}}' ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$id" "$result"
+done"#,
+            sent = sent.display(),
+        );
+        let paths = args.as_object_mut().unwrap();
+        paths.insert("jar_path".into(), json!(jar.display().to_string()));
+        paths.insert("dsn_path".into(), json!(dsn.display().to_string()));
+        paths.insert(
+            "ses_output_path".into(),
+            json!(temp.join("board.ses").display().to_string()),
+        );
+        let context = crate::tools::ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = with_fake_java(
+            temp,
+            &server,
+            super::super::route_specctra_dsn(&args, &context),
+        )
+        .expect("the tool answers");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("the answer is text JSON");
+        };
+        let answer: Value = serde_json::from_str(text).unwrap();
+        let request: Value = serde_json::from_str(
+            &std::fs::read_to_string(&sent).expect("update_job_settings was called"),
+        )
+        .unwrap();
+        (answer, request["params"]["arguments"]["body"].clone())
+    }
+
+    /// The tool reads the project next to the DSN and sends its rules to
+    /// Freerouting, under the caller's own settings, which win.
+    #[cfg(unix)]
+    #[test]
+    fn route_specctra_dsn_sends_the_project_rules_to_freerouting() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("board.kicad_pro"),
+            json!({ "board": { "design_settings": { "rules": {
+                "min_copper_edge_clearance": 0.5,
+                "min_hole_clearance": 0.25
+            } } } })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (answer, sent) = route_through_the_tool(
+            temp.path(),
+            json!({ "router_settings": { "hole_clearance_um": 200 } }),
+        );
+
+        assert_eq!(
+            sent,
+            json!({ "copper_to_edge_clearance_um": 500.0, "hole_clearance_um": 200 }),
+            "{answer}"
+        );
+        assert_eq!(answer["success"], true, "{answer}");
+        assert_eq!(
+            answer["project_rules"]["sent"],
+            json!({ "copper_to_edge_clearance_um": 500.0, "hole_clearance_um": 250.0 }),
+            "{answer}"
+        );
+    }
+
+    /// The count `route_response` decides on comes from the job's own lines
+    /// in Freerouting's log, read when the job ends.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_completed_job_reports_the_unrouted_count_from_its_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        let log = temp.path().join("freerouting.log");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        // A job id no other test uses: FREEROUTING_LOG is process-wide, and
+        // the other scripted jobs' tags find no line of theirs here.
+        std::fs::write(
+            &log,
+            "\
+2026-10-29 17:52:37.907 INFO   [BEEF01] Auto-routing pass #29 on board 'a' was completed in 17.53 seconds with score 944.89 (5 unrouted and 0 violations), using 1.00 CPU seconds.
+2026-10-29 17:52:39.000 INFO   [BEEF01] Auto-routing pass #30 on board 'a' was completed in 17.53 seconds with score 950.12 (3 unrouted and 0 violations), using 1.00 CPU seconds.
+",
+        )
+        .unwrap();
+        let script = temp.path().join("server.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"n=0
+while read -r line; do
+  n=$((n+1))
+  case "$line" in
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *enqueue_job*) result='{{"jobId":"beef01aa"}}' ;;
+    *get_job_details*) result='{{"state":"COMPLETED"}}' ;;
+    *download_job_output_to_local_file*) printf '(session board)' > '{output}'; result='{{}}'; last=1 ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$n" "$result"
+  if [ -n "${{last:-}}" ]; then exit 0; fi
+done
+"#,
+                tools = conforming_tools_list(),
+                output = temporary.display(),
+            ),
+        )
+        .unwrap();
+        let mut client = scripted_client(&format!("exec sh '{}'", script.display()));
+        let settings = RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
+            poll_interval: Duration::from_millis(10),
+            overall_timeout: Duration::from_secs(30),
+        };
+
+        let previous = std::env::var_os("FREEROUTING_LOG");
+        std::env::set_var("FREEROUTING_LOG", &log);
+        let evidence = timeout(
+            Duration::from_secs(20),
+            run_state_machine(&mut client, &dsn, &temporary, &settings, Instant::now()),
+        )
+        .await;
+        match previous {
+            Some(value) => std::env::set_var("FREEROUTING_LOG", value),
+            None => std::env::remove_var("FREEROUTING_LOG"),
+        }
+        let evidence = evidence
+            .expect("the scripted job ends")
+            .expect("the routed board is kept");
+        client.close().await;
+
+        assert_eq!(evidence.final_state, "COMPLETED");
+        assert_eq!(evidence.unrouted, Some(3), "the last count of the job");
+        assert_eq!(
+            evidence.freerouting_log.as_deref(),
+            Some(log.to_str().unwrap()),
+            "the log the count was read from"
         );
     }
 
@@ -1340,6 +2747,236 @@ done
             Some("optimizer pass 2: score 73.70 -> 84.26 (improved)")
         );
         assert_eq!(latest_activity(log, "[C11111]"), None);
+    }
+
+    /// A server scripted in sh whose `get_job_details` answers follow
+    /// `polls`, one word per poll: `miss` leaves the poll unanswered, `late`
+    /// answers it after the client has given up on it, `error` answers it
+    /// with a JSON-RPC error, any other word is the job state returned. Each poll it receives is appended to `poll_log`.
+    #[cfg(unix)]
+    fn polled_server(
+        temp: &Path,
+        polls: &[&str],
+        temporary: &Path,
+        poll_log: &Path,
+    ) -> LocalMcpClient {
+        let script = temp.join("server.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"n=0; set -- {polls}
+while read -r line; do
+  n=$((n+1))
+  case "$line" in
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *get_job_details*)
+      echo poll >> '{poll_log}'
+      answer=${{1:-miss}}; [ $# -gt 0 ] && shift
+      case "$answer" in
+        miss) continue ;;
+        late) sleep 0.3; result='{{"state":"RUNNING"}}' ;;
+        error) printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32000,"message":"boom"}}}}\n' "$n"; continue ;;
+        *) result="{{\"state\":\"$answer\"}}" ;;
+      esac ;;
+    *download_job_output_to_local_file*) printf '(session board)' > '{output}'; result='{{}}'; last=1 ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$n" "$result"
+  if [ -n "${{last:-}}" ]; then exit 0; fi
+done
+"#,
+                polls = polls.join(" "),
+                tools = conforming_tools_list(),
+                output = temporary.display(),
+                poll_log = poll_log.display(),
+            ),
+        )
+        .unwrap();
+        let mut client = scripted_client(&format!("exec sh '{}'", script.display()));
+        client.request_timeout = Duration::from_millis(100);
+        client
+    }
+
+    #[cfg(unix)]
+    fn quick_poll_settings() -> RouteSettings {
+        RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
+            poll_interval: Duration::from_millis(10),
+            overall_timeout: Duration::from_secs(30),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unanswered_polls_are_survived_and_late_answers_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        let poll_log = temp.path().join("polls.log");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        // Ten polls in a row unanswered, the first of them answered too late;
+        // then one answer, which starts the count again: one more miss is
+        // survived before the job completes.
+        let mut polls = vec!["late"];
+        polls.extend(["miss"; 9]);
+        polls.extend(["RUNNING", "miss", "COMPLETED"]);
+        let mut client = polled_server(temp.path(), &polls, &temporary, &poll_log);
+
+        let evidence = timeout(
+            Duration::from_secs(20),
+            run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &quick_poll_settings(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the scripted job ends")
+        .expect("unanswered polls do not end the job");
+        client.close().await;
+
+        assert_eq!(evidence.final_state, "COMPLETED");
+        assert_eq!(evidence.poll_count, 2, "only answered polls are counted");
+        assert_eq!(
+            std::fs::read_to_string(&poll_log).unwrap().lines().count(),
+            13
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_job_is_given_up_after_ten_unanswered_polls_in_a_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        let poll_log = temp.path().join("polls.log");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let mut client = polled_server(temp.path(), &[], &temporary, &poll_log);
+
+        let error = timeout(
+            Duration::from_secs(20),
+            run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &quick_poll_settings(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the job is given up")
+        .expect_err("a server that never answers fails the job");
+        client.close().await;
+
+        assert!(is_request_timeout(&error), "unexpected error: {error:#}");
+        assert_eq!(
+            std::fs::read_to_string(&poll_log).unwrap().lines().count(),
+            MAX_MISSED_POLLS as usize + 1,
+            "the poll after the last one allowed to go unanswered fails the job"
+        );
+    }
+
+    /// Only a timed-out poll is retried: any other error on a poll fails the
+    /// job at once, with its own message.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_poll_answered_with_an_error_fails_the_job_at_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        let poll_log = temp.path().join("polls.log");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let mut client = polled_server(temp.path(), &["error", "COMPLETED"], &temporary, &poll_log);
+
+        let error = timeout(
+            Duration::from_secs(20),
+            run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &quick_poll_settings(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the job is given up")
+        .expect_err("an error on a poll fails the job");
+        client.close().await;
+
+        assert!(!is_request_timeout(&error), "unexpected error: {error:#}");
+        assert!(format!("{error:#}").contains("boom"), "{error:#}");
+        assert_eq!(
+            std::fs::read_to_string(&poll_log).unwrap().lines().count(),
+            1,
+            "the error is not retried"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_poll_is_told_apart_from_other_errors() {
+        let timed_out = anyhow::Error::from(RequestTimedOut {
+            method: "tools/call".into(),
+        })
+        .context("call Freerouting MCP tool 'get_job_details'");
+        assert!(is_request_timeout(&timed_out));
+        assert_eq!(
+            format!("{timed_out:#}"),
+            "call Freerouting MCP tool 'get_job_details': \
+             Freerouting MCP request 'tools/call' timed out"
+        );
+        assert!(!is_request_timeout(&anyhow::anyhow!(
+            "Freerouting MCP closed stdout before responding"
+        )));
+    }
+
+    #[test]
+    fn only_answers_to_earlier_requests_are_stale() {
+        assert!(is_stale_response(&json!({ "id": 4, "result": {} }), 5));
+        assert!(!is_stale_response(&json!({ "id": 5, "result": {} }), 5));
+        assert!(!is_stale_response(&json!({ "id": 6, "result": {} }), 5));
+        assert!(!is_stale_response(&json!({ "id": "4", "result": {} }), 5));
+    }
+
+    #[test]
+    fn a_missed_poll_is_always_reported_and_so_is_the_next_answer() {
+        let mut progress = JobProgress::new("a3aa32eb");
+        progress.log = None;
+        let details = json!({ "current_pass": 3 });
+        let started = Instant::now();
+        let at = |seconds| started + Duration::from_secs(seconds);
+
+        assert!(progress
+            .next_message("RUNNING", &details, started, at(5))
+            .is_some());
+        assert_eq!(
+            progress.missed_poll_message(1, started, at(35)),
+            "Freerouting not answering, 1/10 polls missed in a row (0m35s)"
+        );
+        assert_eq!(
+            progress.missed_poll_message(2, started, at(65)),
+            "Freerouting not answering, 2/10 polls missed in a row (1m05s)"
+        );
+        // The job answers again, unchanged and inside the heartbeat: the
+        // caller still learns that it is back.
+        assert_eq!(
+            progress
+                .next_message("RUNNING", &details, started, at(66))
+                .as_deref(),
+            Some("Freerouting running, pass 3 (1m06s)")
+        );
+        assert_eq!(progress.sent, 4);
     }
 
     #[test]
@@ -1457,16 +3094,79 @@ done
             optimizer_enabled: None,
             job_timeout_seconds: None,
             optimize_seconds,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
             poll_interval: Duration::from_secs(3),
-            overall_timeout: Duration::from_secs(900),
+            overall_timeout: Duration::from_secs(default_overall_timeout_seconds(optimize_seconds)),
         };
-        for accepted in [None, Some(0), Some(86_400)] {
+        // 86400 leaves no room for routing within the longest overall
+        // timeout: 86399 is the largest window accepted, by default or with
+        // the longest explicit overall timeout.
+        assert_eq!(MAX_OPTIMIZE_SECONDS, 86_399);
+        for accepted in [None, Some(0), Some(86_399)] {
             validate_inputs(&jar, &dsn, &ses, &settings(accepted)).unwrap();
         }
-        let error = validate_inputs(&jar, &dsn, &ses, &settings(Some(86_401)))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("optimize_seconds"), "{error}");
+        let longest = RouteSettings {
+            overall_timeout: Duration::from_secs(MAX_OVERALL_TIMEOUT_SECONDS),
+            ..settings(Some(86_399))
+        };
+        validate_inputs(&jar, &dsn, &ses, &longest).unwrap();
+        for refused in [86_400, 86_401] {
+            let error = validate_inputs(&jar, &dsn, &ses, &settings(Some(refused)))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "optimize_seconds must be between 0 and 86399");
+        }
+    }
+
+    #[test]
+    fn the_default_overall_timeout_adds_the_optimizer_window_up_to_a_day() {
+        assert_eq!(default_overall_timeout_seconds(None), 900);
+        assert_eq!(default_overall_timeout_seconds(Some(0)), 900);
+        assert_eq!(default_overall_timeout_seconds(Some(1100)), 2000);
+        assert_eq!(default_overall_timeout_seconds(Some(86_000)), 86_400);
+        assert_eq!(default_overall_timeout_seconds(Some(u64::MAX)), 86_400);
+    }
+
+    #[test]
+    fn an_overall_timeout_within_the_optimizer_window_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        std::fs::write(&jar, "").unwrap();
+        std::fs::write(&dsn, "").unwrap();
+        let settings = |optimize_seconds, overall| RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(overall),
+        };
+        // The 900 s default with optimize_seconds 1100 killed a run whose
+        // optimizer was still within its window.
+        for (optimize, overall) in [(1100, 900), (1100, 1100)] {
+            let error = validate_inputs(&jar, &dsn, &ses, &settings(Some(optimize), overall))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "overall_timeout_seconds ({overall}) must exceed optimize_seconds ({optimize})"
+                )),
+                "{error}"
+            );
+        }
+        validate_inputs(&jar, &dsn, &ses, &settings(Some(1100), 1101)).unwrap();
+        validate_inputs(&jar, &dsn, &ses, &settings(None, 900)).unwrap();
     }
 
     #[test]
@@ -1483,6 +3183,118 @@ done
         assert!(stage_is_optimizing(&json!({ "stage": "OPTIMIZATION" })));
         assert!(!stage_is_optimizing(&json!({ "stage": "ROUTING" })));
         assert!(!stage_is_optimizing(&json!({})));
+    }
+
+    /// Appends `text` to the log at `path`, as Freerouting does.
+    fn append_to_log(path: &Path, text: &str) {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+
+    #[test]
+    fn the_log_is_read_incrementally_through_a_flood_of_debug_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("freerouting.log");
+        let mut progress = JobProgress::new("933480eb");
+        progress.log = Some(path.clone());
+
+        append_to_log(&path, "2026-10-30 00:41:02.000 INFO   [933480] Auto-routing pass #8 on board 'a' was completed in 16.00 seconds with score 964.79 (4 unrouted and 218 violations), using 1.00 CPU seconds.\n");
+        progress.read_log();
+        assert_eq!(progress.unrouted, Some(4));
+
+        // The optimizer completes the board, then one of its passes writes
+        // 1.3 MB of DEBUG lines before the next poll: more than any fixed tail.
+        append_to_log(&path, "2026-10-30 00:56:24.082 INFO   [933480] Optimizer pass #3: optimizer score 119.14 -> 116.76 (REGRESSED, -1.9974%), router score: 979.51, incomplete connections: 0, clearance violations: 220.\n");
+        let debug = "2026-10-30 00:58:00.000 DEBUG  [933480]   Net 'SCK2' has 4 incomplete(s)\n";
+        append_to_log(
+            &path,
+            &debug.repeat(LOG_TAIL_BYTES as usize / debug.len() * 5),
+        );
+        progress.read_log();
+        assert_eq!(progress.unrouted, Some(0));
+        assert_eq!(
+            progress.activity.as_deref(),
+            Some("optimizer pass 3: score 119.14 -> 116.76 (regressed)")
+        );
+
+        // A read that finds neither keeps what the previous ones found.
+        append_to_log(&path, debug);
+        progress.read_log();
+        assert_eq!(progress.unrouted, Some(0));
+        assert_eq!(
+            progress.activity.as_deref(),
+            Some("optimizer pass 3: score 119.14 -> 116.76 (regressed)")
+        );
+    }
+
+    #[test]
+    fn a_line_cut_by_a_read_is_taken_once_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("freerouting.log");
+        let mut progress = JobProgress::new("933480eb");
+        progress.log = Some(path.clone());
+
+        append_to_log(&path, "2026-10-30 00:56:24.082 INFO   [933480] Optimizer pass #3: optimizer score 119.14 -> 116.76 (REGRESSED, -1.9974%), router score: 979.51, incomplete connections: 0, clearance violations: 220.\n");
+        append_to_log(&path, "2026-10-30 01:01:05.787 INFO   [933480] Optimizer pass #4: optimizer score 119.14 -> 119.14 (UNCHANGED, 0.0000%), router score: 979.51, incomplete ");
+        progress.read_log();
+        assert_eq!(
+            progress.activity.as_deref(),
+            Some("optimizer pass 3: score 119.14 -> 116.76 (regressed)")
+        );
+        append_to_log(&path, "connections: 0, clearance violations: 220.\n");
+        assert_eq!(progress.read_unrouted(), Some(0));
+        assert_eq!(
+            progress.activity.as_deref(),
+            Some("optimizer pass 4: score 119.14 -> 119.14 (unchanged)")
+        );
+    }
+
+    #[test]
+    fn a_log_replaced_by_a_shorter_one_is_read_again_from_its_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("freerouting.log");
+        let mut progress = JobProgress::new("933480eb");
+        progress.log = Some(path.clone());
+
+        let debug = "2026-10-30 00:40:00.000 DEBUG  [933480]   Net 'SCK2' has 4 incomplete(s)\n";
+        append_to_log(&path, &debug.repeat(100));
+        append_to_log(&path, "2026-10-30 00:41:02.000 INFO   [933480] Auto-routing pass #8 on board 'a' was completed in 16.00 seconds with score 964.79 (4 unrouted and 218 violations), using 1.00 CPU seconds.\n");
+        // Ends inside a line: what is kept of it belongs to this file only.
+        append_to_log(
+            &path,
+            "2026-10-30 00:41:20.000 INFO   [933480] Optimizer pass #9: optimizer score 1.00 -> 2.",
+        );
+        progress.read_log();
+        assert_eq!(progress.unrouted, Some(4));
+
+        std::fs::write(&path, "2026-10-30 01:00:00.000 INFO   [933480] Auto-routing pass #2 on board 'b' was completed in 1.00 seconds with score 1.00 (50 unrouted and 3 violations), using 1.00 CPU seconds.\n").unwrap();
+        progress.read_log();
+        assert_eq!(progress.unrouted, Some(50));
+        assert_eq!(
+            progress.activity.as_deref(),
+            Some("pass 2: 50 unrouted, 3 violations")
+        );
+    }
+
+    #[test]
+    fn the_last_unrouted_count_of_the_job_is_found() {
+        let routing = "\
+2026-10-29 17:52:54.000 INFO   [A3AA32] Auto-routing pass #8 on board 'a' was completed in 16.00 seconds with score 964.79 (4 unrouted and 218 violations), using 1.00 CPU seconds.
+2026-10-29 17:52:55.000 DEBUG  [A3AA32]   Net 'SCK2' has 4 incomplete(s)
+2026-10-29 17:52:56.000 INFO   [B00000] Auto-routing pass #2 on board 'b' was completed in 1.00 seconds with score 1.00 (50 unrouted and 3 violations), using 1.00 CPU seconds.
+";
+        assert_eq!(latest_unrouted(routing, "[A3AA32]"), Some(4));
+        let optimizing = format!(
+            "{routing}2026-10-29 17:54:26.961 INFO   [A3AA32] Optimization stage started on board 'c'. Baseline router score: 980.71, optimizer score: 71.70, incomplete connections: 0, clearance violations: 218.\n"
+        );
+        assert_eq!(latest_unrouted(&optimizing, "[A3AA32]"), Some(0));
+        assert_eq!(latest_unrouted(routing, "[C11111]"), None);
     }
 
     #[test]
@@ -1508,6 +3320,305 @@ done
     }
 
     #[test]
+    fn optimizer_settings_out_of_range_are_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        std::fs::write(&jar, "").unwrap();
+        std::fs::write(&dsn, "").unwrap();
+        let settings = |passes, threshold| RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: passes,
+            optimizer_improvement_threshold: threshold,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(900),
+        };
+        for (passes, threshold) in [
+            (None, None),
+            (Some(1), Some(0.0)),
+            (None, Some(0.1)),
+            (Some(100), Some(100.0)),
+        ] {
+            validate_inputs(&jar, &dsn, &ses, &settings(passes, threshold)).unwrap();
+        }
+        for (passes, threshold, named) in [
+            (Some(0), None, "optimizer_max_passes"),
+            (Some(101), None, "optimizer_max_passes"),
+            (None, Some(-0.1), "optimizer_improvement_threshold"),
+            (None, Some(100.1), "optimizer_improvement_threshold"),
+            (None, Some(f64::NAN), "optimizer_improvement_threshold"),
+            (None, Some(0.05), "as a fraction"),
+            (None, Some(0.099), "as a fraction"),
+        ] {
+            let error = validate_inputs(&jar, &dsn, &ses, &settings(passes, threshold))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(named), "{passes:?} {threshold:?}: {error}");
+        }
+        let with_router_threshold = |named, routed: f64| RouteSettings {
+            router_settings: json!({ "optimizer": { "improvement_threshold": routed } })
+                .as_object()
+                .cloned(),
+            ..settings(None, named)
+        };
+        let error = validate_inputs(&jar, &dsn, &ses, &with_router_threshold(None, 0.05))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(ROUTER_SETTINGS_THRESHOLD), "{error}");
+        assert!(error.contains("as a fraction"), "{error}");
+        for (named, routed) in [(None, 0.0), (None, 0.1), (Some(2.5), 0.05)] {
+            validate_inputs(&jar, &dsn, &ses, &with_router_threshold(named, routed)).unwrap();
+        }
+    }
+
+    fn with_router_settings(router_settings: Value) -> RouteSettings {
+        RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: router_settings.as_object().cloned(),
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(900),
+        }
+    }
+
+    #[test]
+    fn negative_router_settings_are_named_by_path() {
+        let settings = with_router_settings(json!({
+            "scoring": { "via_costs": -5, "plane_via_costs": 5 },
+            "layers": [{ "bend_cost": 0.0 }, { "bend_cost": -0.5 }],
+            "plane_nets": ["GND"],
+            "fanout": { "min_escape_length_mm": 2.5 },
+            "neck_width_um": -0.0
+        }));
+        let negative: Vec<String> = negative_settings_sent(&settings)
+            .iter()
+            .map(|(path, value)| format!("{path} is {value}"))
+            .collect();
+        assert_eq!(
+            negative,
+            [
+                "router_settings.layers[1].bend_cost is -0.5",
+                "router_settings.scoring.via_costs is -5"
+            ]
+        );
+    }
+
+    #[test]
+    fn negative_router_settings_a_named_argument_replaces_are_not_sent() {
+        let settings = RouteSettings {
+            max_passes: Some(4),
+            optimizer_improvement_threshold: Some(1.0),
+            plane_nets: Some(vec!["GND".to_string()]),
+            ..with_router_settings(json!({
+                "autorouter": { "max_passes": -1, "max_threads": -2 },
+                "optimizer": { "improvement_threshold": -3 },
+                "plane_nets": [-4]
+            }))
+        };
+        let negative = negative_settings_sent(&settings);
+        assert_eq!(
+            negative,
+            [(
+                "router_settings.autorouter.max_threads".to_string(),
+                Number::from(-2)
+            )]
+        );
+        // What is reported is what job_settings_body really sends.
+        let sent = job_settings_body(&settings);
+        assert_eq!(sent["autorouter"]["max_threads"], json!(-2));
+        assert_eq!(sent["autorouter"]["max_passes"], json!(4));
+        assert_eq!(sent["optimizer"]["improvement_threshold"], json!(1.0));
+        assert_eq!(sent["plane_nets"], json!(["GND"]));
+    }
+
+    #[test]
+    fn negative_router_settings_are_refused_before_java() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        std::fs::write(&jar, "").unwrap();
+        std::fs::write(&dsn, "").unwrap();
+        let refused = with_router_settings(json!({
+            "scoring": { "via_costs": -5 },
+            "optimizer": { "improvement_threshold": -1 }
+        }));
+        let error = validate_inputs(&jar, &dsn, &ses, &refused)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("router_settings.optimizer.improvement_threshold is -1"),
+            "{error}"
+        );
+        assert!(
+            error.contains("router_settings.scoring.via_costs is -5"),
+            "{error}"
+        );
+        assert!(error.contains("must not be negative"), "{error}");
+        let accepted = with_router_settings(json!({ "scoring": { "via_costs": 0 } }));
+        validate_inputs(&jar, &dsn, &ses, &accepted).unwrap();
+    }
+
+    #[test]
+    fn router_settings_pass_through_and_named_arguments_win() {
+        let settings = RouteSettings {
+            max_passes: Some(7),
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: Some(
+                json!({
+                    "autorouter": { "max_passes": 99, "max_threads": 4 },
+                    "scoring": { "via_costs": 80 },
+                    "hole_clearance_um": 200.0
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(900),
+        };
+        assert_eq!(
+            Value::Object(job_settings_body(&settings)),
+            json!({
+                "autorouter": { "max_passes": 7, "max_threads": 4 },
+                "scoring": { "via_costs": 80 },
+                "hole_clearance_um": 200.0
+            })
+        );
+    }
+
+    #[test]
+    fn settings_that_did_not_take_are_reported() {
+        let sent = json!({
+            "autorouter": { "max_passes": 7, "max_pases": 3 },
+            "optimizer": { "improvement_threshold": 1 },
+            "hole_clearance_um": 200.0,
+            "plane_nets": ["GND"],
+            "no_such_setting": true
+        });
+        // Freerouting 2.5.0 wraps the effective settings like this.
+        let result = json!({
+            "parsedTextContent": [{
+                "status": 200,
+                "contentType": "application/json",
+                "body": {
+                    "autorouter": { "max_passes": 7, "max_threads": 15 },
+                    "optimizer": { "improvement_threshold": 1.0 },
+                    "hole_clearance_um": 0.0,
+                    "plane_nets": ["GND"]
+                }
+            }]
+        });
+        let effective = effective_settings(&result).unwrap();
+        assert_eq!(
+            settings_mismatches(sent.as_object().unwrap(), effective),
+            [
+                "autorouter.max_pases: not a Freerouting setting",
+                "hole_clearance_um: sent 200.0, effective 0.0",
+                "no_such_setting: not a Freerouting setting",
+            ]
+        );
+
+        // Freerouting 2.5.0 fills in what a layer leaves out and keeps the
+        // layers nobody sent: a partial layers array that took is no mismatch.
+        let effective = json!({
+            "layers": [
+                { "bend_cost": 0.5, "preferred_direction_horizontal": true },
+                { "bend_cost": 0.0, "preferred_direction_horizontal": false }
+            ]
+        });
+        let effective = effective.as_object().unwrap();
+        for (sent, expected) in [
+            (json!({ "layers": [{ "bend_cost": 0.5 }] }), vec![]),
+            (
+                json!({ "layers": [{ "bend_cost": 0.5 }, { "bend_cost": 2.0 }] }),
+                vec!["layers[1].bend_cost: sent 2.0, effective 0.0"],
+            ),
+            (
+                json!({ "layers": [{ "bend_kost": 1.0 }] }),
+                vec!["layers[0].bend_kost: not a Freerouting setting"],
+            ),
+            (
+                json!({ "layers": [{}, {}, { "bend_cost": 1.0 }] }),
+                vec![r#"layers[2]: sent {"bend_cost":1.0}, not in the effective settings"#],
+            ),
+            (
+                json!({ "layers": { "bend_cost": 0.5 } }),
+                vec![concat!(
+                    r#"layers: sent {"bend_cost":0.5}, effective "#,
+                    r#"[{"bend_cost":0.5,"preferred_direction_horizontal":true},"#,
+                    r#"{"bend_cost":0.0,"preferred_direction_horizontal":false}]"#
+                )],
+            ),
+        ] {
+            assert_eq!(
+                settings_mismatches(sent.as_object().unwrap(), effective),
+                expected,
+                "{sent}"
+            );
+        }
+    }
+
+    #[test]
+    fn job_settings_use_the_keys_freerouting_reads() {
+        let settings = RouteSettings {
+            max_passes: Some(7),
+            optimizer_enabled: Some(true),
+            job_timeout_seconds: Some(300),
+            optimize_seconds: None,
+            optimizer_max_passes: Some(3),
+            optimizer_improvement_threshold: Some(0.5),
+            plane_nets: Some(vec!["GND".into(), "+3V3".into()]),
+            plane_as_obstacle: Some(false),
+            router_settings: None,
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(900),
+        };
+        // The shape get_effective_settings echoed back from Freerouting 2.5.0.
+        assert_eq!(
+            Value::Object(job_settings_body(&settings)),
+            json!({
+                "autorouter": { "max_passes": 7 },
+                "optimizer": { "enabled": true, "max_passes": 3, "improvement_threshold": 0.5 },
+                "plane_nets": ["GND", "+3V3"],
+                "plane_as_obstacle": false,
+                "job_timeout": "00:05:00"
+            })
+        );
+        let nothing = RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
+            ..settings
+        };
+        assert!(job_settings_body(&nothing).is_empty());
+    }
+
+    #[test]
     fn output_path_is_unique_and_stays_beside_destination() {
         let output = Path::new("build/board.ses");
         let first = temporary_output_path(output).unwrap();
@@ -1523,9 +3634,53 @@ done
     fn server_command_passes_headless_as_a_jvm_option_before_jar() {
         let command = LocalMcpClient::server_command(Path::new("freerouting.jar"));
         let arguments: Vec<_> = command.as_std().get_args().collect();
-        assert_eq!(arguments[0], "-Djava.awt.headless=true");
-        assert_eq!(arguments[1], "-jar");
-        assert_eq!(arguments[2], "freerouting.jar");
+        let jar = arguments.iter().position(|a| *a == "-jar").unwrap();
+        assert!(arguments[..jar].contains(&std::ffi::OsStr::new("-Djava.awt.headless=true")));
+        assert_eq!(arguments[jar + 1], "freerouting.jar");
+    }
+
+    #[test]
+    fn jvm_crash_reports_stay_out_of_the_project_directory() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("freerouting");
+        let arguments = jvm_crash_arguments(Some(&directory));
+        let mut expected = std::ffi::OsString::from("-XX:ErrorFile=");
+        expected.push(directory.join("hs_err_pid%p.log"));
+        assert_eq!(arguments, [expected, "-XX:-CreateCoredumpOnCrash".into()]);
+        assert!(directory.is_dir());
+
+        let blocked = state.path().join("file");
+        std::fs::write(&blocked, "").unwrap();
+        let fallback = jvm_crash_arguments(Some(&blocked.join("freerouting")));
+        let mut expected = std::ffi::OsString::from("-XX:ErrorFile=");
+        expected.push(std::env::temp_dir().join("hs_err_pid%p.log"));
+        assert_eq!(fallback[0], expected);
+    }
+
+    #[test]
+    fn jvm_crash_reports_go_to_the_temporary_directory_without_an_absolute_state_directory() {
+        let mut expected = std::ffi::OsString::from("-XX:ErrorFile=");
+        expected.push(std::env::temp_dir().join("hs_err_pid%p.log"));
+        assert_eq!(jvm_crash_arguments(None)[0], expected);
+
+        let relative = Path::new("relative-state-for-crash-reports/freerouting");
+        assert_eq!(jvm_crash_arguments(Some(relative))[0], expected);
+        assert!(!Path::new("relative-state-for-crash-reports").exists());
+    }
+
+    #[test]
+    fn server_command_passes_the_crash_report_options_before_jar() {
+        let command = LocalMcpClient::server_command(Path::new("freerouting.jar"));
+        let arguments: Vec<_> = command.as_std().get_args().collect();
+        let jar = arguments.iter().position(|a| *a == "-jar").unwrap();
+        let error_file = arguments
+            .iter()
+            .position(|a| a.to_string_lossy().starts_with("-XX:ErrorFile="))
+            .expect("server command sets -XX:ErrorFile");
+        assert!(error_file < jar);
+        assert!(arguments[..jar].contains(&std::ffi::OsStr::new("-XX:-CreateCoredumpOnCrash")));
+        let report = arguments[error_file].to_string_lossy();
+        assert!(Path::new(&report["-XX:ErrorFile=".len()..]).is_absolute());
     }
 
     #[test]
@@ -1588,6 +3743,179 @@ done
         );
     }
 
+    #[test]
+    fn stderr_in_errors_is_cut_to_its_last_lines() {
+        let long: String = (1..=40)
+            .map(|n| format!("2026-10-29 INFO line {n}\n"))
+            .collect();
+        let tail = stderr_tail(&long);
+        assert!(tail.starts_with("2026-10-29 INFO line 29"), "{tail}");
+        assert!(tail.ends_with("line 40"), "{tail}");
+        let wide = "é".repeat(5000);
+        let cut = stderr_tail(&wide);
+        assert_eq!(cut.chars().count(), 2003);
+        assert!(cut.starts_with("..."), "{cut}");
+        assert_eq!(stderr_tail("short"), "short");
+    }
+
+    /// The cause comes first, the banner's start is left out, and the file
+    /// holding all of stderr is named.
+    #[test]
+    fn an_error_puts_its_cause_before_the_end_of_stderr() {
+        let stderr: String = (1..=40)
+            .map(|n| format!("banner line {n}\n"))
+            .chain(["java.lang.OutOfMemoryError: Java heap space\n".to_string()])
+            .collect();
+        let error = with_stderr_tail(
+            anyhow::anyhow!("job ended").context("Freerouting job abc ended in state FAILED"),
+            &stderr,
+            Some("/work/board.freerouting.log"),
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("Freerouting job abc ended in state FAILED: job ended\n"),
+            "{message}"
+        );
+        assert!(
+            message.contains("all of it in /work/board.freerouting.log"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("java.lang.OutOfMemoryError: Java heap space"),
+            "{message}"
+        );
+        assert!(!message.contains("banner line 29\n"), "{message}");
+        assert!(message.contains("banner line 30"), "{message}");
+
+        let bare = with_stderr_tail(anyhow::anyhow!("no answer"), "", None);
+        assert_eq!(format!("{bare:#}"), "no answer");
+    }
+
+    /// Runs `run` with `JAVA_HOME` pointing at a fake `java` that writes 40
+    /// banner lines and a last line to stderr, then runs `server` (sh).
+    #[cfg(unix)]
+    fn with_fake_java<T>(
+        temp: &Path,
+        server: &str,
+        run: impl std::future::Future<Output = T>,
+    ) -> T {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = temp.join("jdk").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let java = bin.join("java");
+        std::fs::write(
+            &java,
+            format!(
+                "#!/bin/sh\n\
+                 i=1; while [ $i -le 40 ]; do echo \"banner line $i\" >&2; i=$((i+1)); done\n\
+                 echo 'last stderr line' >&2\n\
+                 {server}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _env = crate::java_runtime::JAVA_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("JAVA_HOME");
+        std::env::set_var("JAVA_HOME", temp.join("jdk"));
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run);
+        match previous {
+            Some(value) => std::env::set_var("JAVA_HOME", value),
+            None => std::env::remove_var("JAVA_HOME"),
+        }
+        result
+    }
+
+    /// The error of a job that failed starts with its cause and ends with the
+    /// last lines of stderr, and names the log that holds all of it.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_job_reports_its_cause_before_the_end_of_stderr() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        std::fs::write(&jar, "not a jar").unwrap();
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let tools = conforming_tools_list();
+        let server = format!(
+            r#"while read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  [ -n "$id" ] || continue
+  case "$line" in
+    *'"initialize"'*) result='{{"protocolVersion":"2025-06-18"}}' ;;
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *get_job_details*) result='{{"state":"FAILED"}}' ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$id" "$result"
+done"#
+        );
+        let settings = RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
+            // The least route_local accepts; FAILED comes on the first poll.
+            poll_interval: Duration::from_secs(2),
+            overall_timeout: Duration::from_secs(30),
+        };
+        let error = with_fake_java(
+            temp.path(),
+            &server,
+            route_local(&jar, &dsn, &ses, &settings),
+        )
+        .expect_err("a FAILED job is an error");
+
+        let message = format!("{error:#}");
+        let log = diagnostics_path(&ses);
+        assert!(
+            message.starts_with("Freerouting job job123 ended in state FAILED\n"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("all of it in {}", log.display())),
+            "{message}"
+        );
+        assert!(message.ends_with("last stderr line"), "{message}");
+        assert!(message.contains("banner line 30\n"), "{message}");
+        assert!(!message.contains("banner line 29\n"), "{message}");
+        let full = std::fs::read_to_string(&log).unwrap();
+        assert!(full.contains("banner line 1\n"), "{full}");
+    }
+
+    /// A server that dies before answering `initialize`: the cause first,
+    /// then the end of stderr.
+    #[cfg(unix)]
+    #[test]
+    fn a_server_that_does_not_start_reports_its_cause_before_the_end_of_stderr() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        std::fs::write(&jar, "not a jar").unwrap();
+        let probe = with_fake_java(temp.path(), "exit 1", probe_local(&jar));
+
+        let message = probe.error.expect("the start failed");
+        assert!(!message.starts_with("Freerouting stderr"), "{message}");
+        assert!(
+            message.contains("\nFreerouting stderr, last lines:\n"),
+            "{message}"
+        );
+        assert!(message.ends_with("last stderr line"), "{message}");
+        assert!(!message.contains("banner line 29\n"), "{message}");
+    }
+
     /// Optional local parity check for Freerouting's actual stdio MCP state
     /// machine. CI does not install Java or Freerouting.
     #[tokio::test]
@@ -1612,6 +3940,11 @@ done
                 optimizer_enabled: Some(false),
                 job_timeout_seconds: Some(300),
                 optimize_seconds: None,
+                optimizer_max_passes: None,
+                optimizer_improvement_threshold: None,
+                plane_nets: None,
+                plane_as_obstacle: None,
+                router_settings: None,
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(300),
             },
@@ -1647,6 +3980,11 @@ done
                     optimizer_enabled: Some(true),
                     job_timeout_seconds: Some(300),
                     optimize_seconds: None,
+                    optimizer_max_passes: None,
+                    optimizer_improvement_threshold: None,
+                    plane_nets: None,
+                    plane_as_obstacle: None,
+                    router_settings: None,
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_millis(100),
                 },
@@ -1695,6 +4033,11 @@ done
                     optimizer_enabled: Some(true),
                     job_timeout_seconds: Some(300),
                     optimize_seconds: None,
+                    optimizer_max_passes: None,
+                    optimizer_improvement_threshold: None,
+                    plane_nets: None,
+                    plane_as_obstacle: None,
+                    router_settings: None,
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_secs(300),
                 },
@@ -1729,6 +4072,11 @@ done
             optimizer_enabled: None,
             job_timeout_seconds: None,
             optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };

@@ -1738,7 +1738,11 @@ pub(crate) fn annotate_hierarchy(path: &Path, options: AnnotateOptions) -> CallT
 /// Whether `root` is its project's only top-level sheet, keyed by its own
 /// uuid, as [`crate::tools::listed_top_level_sheets`] reads the list: an
 /// entry's uuid, unless nil, replaces the sheet's own.
-fn sole_top_level_sheet(project_file: &Path, root: &Path, root_uuid: &str) -> Result<(), String> {
+pub(crate) fn sole_top_level_sheet(
+    project_file: &Path,
+    root: &Path,
+    root_uuid: &str,
+) -> Result<(), String> {
     let shown = project_file.display();
     match crate::tools::listed_top_level_sheets(project_file).as_slice() {
         [(sheet, uuid)] if crate::tools::same_schematic_document(sheet, root) => match uuid {

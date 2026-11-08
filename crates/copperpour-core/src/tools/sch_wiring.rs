@@ -1,8 +1,9 @@
 //! `sch_wiring` toolset — wires, net labels, power symbols, junctions, no-connects.
 //!
-//! Key rule: Every wire add operation must auto-detect T-junctions and insert
-//! junction dots. This uses `copperpour_sexp::schematic::find_t_junctions` and
-//! `wire_end_needs_junction`.
+//! Key rule: Every wire add operation must dot the T-junctions its own wire
+//! forms, and no others: a dot-less T is two nets to KiCad. Most go through
+//! `new_wire_junctions`, which uses
+//! `copperpour_sexp::schematic::wire_end_needs_junction`.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -33,7 +34,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "add_wire",
             "Add a wire segment between two points. The wire must be horizontal or vertical. \
-             T-junctions are automatically detected and junction dots inserted.",
+             Junction dots are added where this wire forms a T or meets three or more \
+             wire ends and pins; a dot-less T elsewhere on the sheet is left alone.",
             json!({
                 "type": "object",
                 "properties": {
@@ -363,7 +365,10 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Direction to route the wire stub. 'auto' (default) points it \
                                         away from the symbol body so the label text does not run back \
-                                        across the pin names; it falls back to 'right' on a bare point.",
+                                        across the pin names; it falls back to 'right' on a bare point. \
+                                        An 'auto' stub that would join another net turns across instead; \
+                                        when every direction, or the one named, would, the call refuses \
+                                        with plan_blocked.",
                         "enum": ["auto", "right", "left", "up", "down"],
                         "default": "auto"
                     },
@@ -499,18 +504,23 @@ fn pins_mid_segment(exits: &[(f64, f64)], x1: f64, y1: f64, x2: f64, y2: f64) ->
 /// already hold the new wire, and `exits` comes from
 /// [`crate::tools::junction_exit_points`].
 ///
-/// The candidates are every T on the sheet, each exit the wire passes over,
-/// and the wire's two ends. Each is kept only where three or more exits meet
-/// (#897).
+/// The candidates are only points on the new wire: each wire end or exit it
+/// passes over, and its two ends. Each is kept only where three or more exits
+/// meet (mixelpixx/Konnect#897). A dot-less T elsewhere is two nets to KiCad,
+/// and dotting it would join them (mixelpixx/Konnect#887, Copperpour#118).
 fn new_wire_junctions(
     wires: &[Wire],
     exits: &[(f64, f64)],
     (x1, y1): (f64, f64),
     (x2, y2): (f64, f64),
 ) -> Vec<(f64, f64)> {
-    let candidates = find_t_junctions(wires, 0.01)
+    let ends_and_exits: Vec<(f64, f64)> = wires
+        .iter()
+        .flat_map(|w| [(w.x1, w.y1), (w.x2, w.y2)])
+        .chain(exits.iter().copied())
+        .collect();
+    let candidates = pins_mid_segment(&ends_and_exits, x1, y1, x2, y2)
         .into_iter()
-        .chain(pins_mid_segment(exits, x1, y1, x2, y2))
         .chain([(x1, y1), (x2, y2)]);
     crate::tools::dedup_points(
         candidates.filter(|&(px, py)| wire_end_needs_junction(wires, exits, px, py, 0.01)),
@@ -519,10 +529,9 @@ fn new_wire_junctions(
 
 /// Add a junction dot at each position that does not already carry one.
 ///
-/// `find_t_junctions` reports every T on the sheet, not only the ones the new
-/// wire made, so an unguarded loop re-emits a dot at every existing T on every
-/// call — quadratic in a batch. `insert_wire_with_junctions` guards the same
-/// way on the string path. Returns how many it added.
+/// A T on the new wire may already carry one, so an unguarded loop re-emits
+/// it. `insert_wire_with_junctions` guards the same way on the string path.
+/// Returns how many it added.
 fn add_missing_junctions(sch: &mut cse::Schematic, positions: &[(f64, f64)]) -> usize {
     let before = sch.junctions.len();
     for &(x, y) in positions {
@@ -624,19 +633,11 @@ pub(crate) fn insert_wire_with_junctions(
     };
     existing_wires.push(new_wire);
 
-    // Only the T's and 3-way exits this wire forms. A dot-less T elsewhere on
-    // the sheet is two nets to KiCad, and dotting it would join them unasked (#887).
     let exits = tree
         .as_ref()
         .map(crate::tools::junction_exit_points)
         .unwrap_or_default();
-    let junctions: Vec<(f64, f64)> =
-        new_wire_junctions(&existing_wires, &exits, (x1, y1), (x2, y2))
-            .into_iter()
-            .filter(|&(jx, jy)| {
-                copperpour_sexp::geometry::point_on_segment(jx, jy, x1, y1, x2, y2, 0.01)
-            })
-            .collect();
+    let junctions = new_wire_junctions(&existing_wires, &exits, (x1, y1), (x2, y2));
 
     let mut c = content;
     c = insert_before_close(&c, &format_wire(x1, y1, x2, y2));
@@ -674,7 +675,7 @@ pub(crate) fn route_between(
     y2: f64,
 ) -> anyhow::Result<Result<Routed, Vec<String>>> {
     let before = parse_sexp(content)?;
-    let Some(guard) = RouteGuard::new(&before, (x1, y1), (x2, y2)) else {
+    let Some(guard) = RouteGuard::new(&before, (x1, y1), &[(x2, y2)]) else {
         return Ok(Err(vec![format!(
             "cannot check what the route would join: {}",
             crate::tools::UNRESOLVED_PIN_GEOMETRY
@@ -693,14 +694,15 @@ pub(crate) fn route_between(
         let routed = points.windows(2).fold(content.to_owned(), |c, leg| {
             insert_wire_with_junctions(c, leg[0].0, leg[0].1, leg[1].0, leg[1].1)
         });
-        let joined = guard.foreign_joins(&parse_sexp(&routed)?);
-        if joined.is_empty() {
-            return Ok(Ok(Routed {
-                content: routed,
-                path: points.to_vec(),
-            }));
+        match guard.refusal(&format!("{bend} route"), &routed)? {
+            Some(reason) => refused.push(reason),
+            None => {
+                return Ok(Ok(Routed {
+                    content: routed,
+                    path: points.to_vec(),
+                }))
+            }
         }
-        refused.push(format!("the {bend} route would join {}", joined.join(", ")));
     }
     Ok(Err(refused))
 }
@@ -720,11 +722,11 @@ pub(crate) fn route_blocked(operation: &str, reasons: Vec<String>) -> CallToolRe
     )
 }
 
-/// What a sheet held before a route from `a` to `b`, built once for every bend
-/// tried. Wire ends are not terminals: a net is joined through what it carries,
-/// and a net of bare wires has nothing to short.
+/// What a sheet held before a wire from `from`, built once for every bend or
+/// direction tried. Wire ends are not terminals: a net is joined through what it
+/// carries, and a net of bare wires has nothing to short.
 struct RouteGuard {
-    /// The endpoints' nets, and those of any wire an endpoint lies on: a route
+    /// The nets at `from` and `also`, and those of any wire one lies on: a route
     /// ending mid-span is dotted there, so tapping a wire is the caller's ask.
     allowed: Vec<crate::tools::sch_connectivity::NetRoot>,
     a: (f64, f64),
@@ -743,7 +745,11 @@ struct Terminal {
 impl RouteGuard {
     /// `None` when a placed symbol's pins cannot be resolved: the guard would
     /// not see them, and a route over them would join them unchecked.
-    fn new(before: &copperpour_sexp::SexpNode, a: (f64, f64), b: (f64, f64)) -> Option<Self> {
+    fn new(
+        before: &copperpour_sexp::SexpNode,
+        from: (f64, f64),
+        also: &[(f64, f64)],
+    ) -> Option<Self> {
         use crate::tools::sch_connectivity::pt_key;
         use copperpour_sexp::geometry::point_on_segment;
         use copperpour_sexp::schematic::{extract_sheet_pins, LabelKind};
@@ -791,9 +797,10 @@ impl RouteGuard {
             push(at, "a sheet pin".into());
         }
 
-        let mut allowed = vec![graph.root_at(a.0, a.1), graph.root_at(b.0, b.1)];
+        let ends: Vec<_> = std::iter::once(from).chain(also.iter().copied()).collect();
+        let mut allowed: Vec<_> = ends.iter().map(|p| graph.root_at(p.0, p.1)).collect();
         for w in &wires {
-            if [a, b]
+            if ends
                 .iter()
                 .any(|p| point_on_segment(p.0, p.1, w.x1, w.y1, w.x2, w.y2, 0.01))
             {
@@ -802,9 +809,17 @@ impl RouteGuard {
         }
         Some(RouteGuard {
             allowed,
-            a,
+            a: from,
             terminals,
         })
+    }
+
+    /// Why the `candidate` sheet in `after` is refused, or `None` when it joins
+    /// nothing [`Self::foreign_joins`] reports.
+    fn refusal(&self, candidate: &str, after: &str) -> anyhow::Result<Option<String>> {
+        let joined = self.foreign_joins(&parse_sexp(after)?);
+        Ok((!joined.is_empty())
+            .then(|| format!("the {candidate} would join {}", joined.join(", "))))
     }
 
     /// Each point whose items `after` puts on `a`'s net although they were on
@@ -1579,18 +1594,19 @@ pub(crate) fn reconcile_junctions_for_placement(
 ///
 /// All connectivity answers come from the shared [`ConnectivityIndex`] — this
 /// must not become a fifth private definition of "what is attached here"
-/// (#323). A dot is kept when anything still justifies it:
+/// (#323). Whether a dot belongs is [`ConnectivityIndex::needs_junction`], the
+/// count of exits the wire tools write dots by: eeschema's
+/// `JUNCTION_HELPERS::AnalyzePoint`, which its move and delete judge dots by
+/// (#136). A dot is kept at three or more exits, and pruned below, except
+/// where a wire passes mid-span and another wire is at the point: only the dot
+/// (or a label over them) joins those, as at a collinear overlap, so it stays. Pins unresolvable
+/// (`lib_symbols` lookup failed) are not "no pin here", so then only the
+/// unambiguous zero-wire case prunes.
 ///
-/// * two or more wires under the point — a T, a crossing joined on purpose, or
-///   wire ends meeting: never touched;
-/// * a pin or a hierarchical sheet pin still at the point;
-/// * pins unresolvable (`lib_symbols` lookup failed) — that is not the same as
-///   "no pin here", so only the unambiguous zero-wire case prunes then.
-///
-/// A dot is added only where a pin has landed mid-span on **exactly one** wire
-/// and no no-connect flag sits there. One wire is the unambiguous case: with
-/// two, wires that merely cross are separate nets until a junction says
-/// otherwise, and adding the dot would merge them — the same silent
+/// A dot is added only where a pin sits and makes three or more exits, with
+/// two refusals. Where a wire passes mid-span and another wire is at the
+/// point, as where wires cross, the wires are separate nets until a junction
+/// says otherwise, and adding the dot would merge them — the same silent
 /// connectivity change this pass exists to stop. A no-connect is the user
 /// saying "this pin stays unconnected", which a move must not override.
 ///
@@ -1655,20 +1671,23 @@ pub(crate) fn reconcile_junctions_at(
             .iter()
             .filter(|d| copperpour_sexp::geometry::points_coincident(px, py, d.at.0, d.at.1, TOL))
             .collect();
-        let attached = idx.has_pin(px, py) || idx.has_sheet_pin(px, py);
+        // eeschema joins a wire passing mid-span to the others at the point
+        // only through a dot there, or a label over two or more wires, so
+        // this pass neither adds nor removes one.
+        let dot_joins_wires = idx.wires_at(px, py) >= 2 && idx.on_wire_interior(px, py);
         if here.is_empty() {
-            if idx.wires_at(px, py) == 1
-                && idx.on_wire_interior(px, py)
-                && idx.has_pin(px, py)
+            if idx.has_pin(px, py)
+                && idx.needs_junction(px, py)
+                && !dot_joins_wires
                 && !idx.has_no_connect(px, py)
             {
                 to_add.push((px, py));
             }
         } else {
-            let keep = match idx.wires_at(px, py) {
-                0 => false,
-                1 => !pins_known || attached,
-                _ => true,
+            let keep = if pins_known {
+                dot_joins_wires || idx.needs_junction(px, py)
+            } else {
+                idx.wires_at(px, py) > 0
             };
             if !keep {
                 ranges.extend(here.iter().map(|d| d.range));
@@ -1709,30 +1728,17 @@ pub(crate) fn reconcile_junctions_at(
 ///
 /// Deleting a wire used to leave its dots behind, so relocating a block — delete
 /// its wires, re-add them elsewhere — stranded junctions at the old coordinates.
-/// A dot needs two wires to mean anything, with one exception: one wire plus a
-/// pin landing mid-segment, which is exactly what `pins_mid_segment` creates.
-/// So a junction is pruned when no wire is left through it, or one is and no pin
-/// sits there. Junctions no removed wire touched are left alone, and moves that
-/// strand a dot without deleting a wire are #120's half of the problem.
+/// Each dot a removed wire ran through is judged again by
+/// [`reconcile_junctions_at`], the rule a component move is judged by, so a T
+/// whose branch is deleted loses its dot at the corner left (#136). Junctions
+/// no removed wire touched are left alone.
 fn prune_orphaned_junctions(content: String, removed: &[Wire]) -> (String, usize) {
     const TOL: f64 = 0.01;
-    // Two is as high as this needs to count, so it stops there.
-    let wires_through = |wires: &[Wire], jx: f64, jy: f64| {
-        wires
-            .iter()
-            .filter(|w| {
-                copperpour_sexp::geometry::point_on_segment(jx, jy, w.x1, w.y1, w.x2, w.y2, TOL)
-            })
-            .take(2)
-            .count()
-    };
-
-    // The dots the removed wires ran through, with the block to delete. Most
-    // deletions find none, and the document parse below is only for those.
-    let mut candidates: Vec<((usize, usize), (f64, f64))> = Vec::new();
+    // The dots the removed wires ran through. Most deletions find none, and
+    // the reconcile's document parse is only for those.
+    let mut points: Vec<(f64, f64)> = Vec::new();
     for start in find_block_starts(&content, "junction") {
-        let Some((ws_start, block_end)) = find_block_with_leading_whitespace(&content, start)
-        else {
+        let Some((_, block_end)) = find_block_with_leading_whitespace(&content, start) else {
             continue;
         };
         let Ok(node) = parse_sexp(&content[start..block_end]) else {
@@ -1741,54 +1747,15 @@ fn prune_orphaned_junctions(content: String, removed: &[Wire]) -> (String, usize
         let Some((jx, jy, _)) = parse_at(&node) else {
             continue;
         };
-        if wires_through(removed, jx, jy) > 0 {
-            candidates.push(((ws_start, block_end), (jx, jy)));
+        if removed.iter().any(|w| {
+            copperpour_sexp::geometry::point_on_segment(jx, jy, w.x1, w.y1, w.x2, w.y2, TOL)
+        }) {
+            points.push((jx, jy));
         }
     }
-    if candidates.is_empty() {
-        return (content, 0);
-    }
-
-    let Ok(tree) = parse_sexp(&content) else {
-        return (content, 0);
-    };
-    let remaining = extract_wires(&tree);
-    // Resolving pins walks every symbol against `lib_symbols`, so it waits
-    // until a dot is down to its last wire and the answer decides the case.
-    let mut pins: Option<(Vec<(f64, f64)>, bool)> = None;
-
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for (range, (jx, jy)) in candidates {
-        let orphaned = match wires_through(&remaining, jx, jy) {
-            0 => true,
-            1 => {
-                let (pins, pins_known) = pins.get_or_insert_with(|| {
-                    let pins = crate::tools::all_pin_endpoints(&tree);
-                    // A sheet with symbols but no resolvable pin means the
-                    // `lib_symbols` lookup failed, not that nothing is
-                    // connected. Only the unambiguous zero-wire case prunes
-                    // then, rather than guess a pin isn't there.
-                    let known = !pins.is_empty() || extract_symbol_instances(&tree).is_empty();
-                    (pins, known)
-                });
-                *pins_known
-                    && !pins.iter().any(|&(px, py)| {
-                        copperpour_sexp::geometry::points_coincident(px, py, jx, jy, TOL)
-                    })
-            }
-            _ => false,
-        };
-        if orphaned {
-            ranges.push(range);
-        }
-    }
-
-    let pruned = ranges.len();
-    let edits = ranges
-        .into_iter()
-        .map(|(s, e)| SexpEdit::delete(s, e))
-        .collect();
-    (apply_edits(content, edits), pruned)
+    // Every point carries a dot, so the reconcile only prunes.
+    let (content, _, pruned) = reconcile_junctions_at(content, &points);
+    (content, pruned)
 }
 
 async fn handle_batch_delete_wire(
@@ -3678,12 +3645,28 @@ async fn handle_connect_to_net(
 
     // Where the stub goes, and how the label at its end must read: text
     // running back over the symbol covers its pin names (pin_label_rotation).
-    let dir = match outward {
-        Some(d) => crate::tools::stub_direction(direction, Some(d)),
-        None => crate::tools::resolve_stub_direction(direction, (pin_x, pin_y), &tree),
-    };
+    let outward = outward.or_else(|| crate::tools::pin_outward_at(&tree, pin_x, pin_y));
+    let dirs = crate::tools::stub_directions(direction, outward);
     let mut sch = cse::Schematic::load(&sch_path)?;
     let exits = crate::tools::junction_exit_points(&tree);
+    // A zero-length stub is a label on the pin, which joins only the net asked for.
+    let dir = if stub_length > 0.0 {
+        match clear_stub_direction(
+            &sch,
+            &exits,
+            (pin_x, pin_y),
+            &dirs,
+            stub_length,
+            label_type,
+            &net,
+            &[],
+        )? {
+            Ok(dir) => dir,
+            Err(reasons) => return Ok(route_blocked("connect_to_net", reasons)),
+        }
+    } else {
+        crate::tools::stub_direction(direction, outward)
+    };
     let (label_x, label_y, label_rot) = add_net_stub(
         &mut sch,
         &exits,
@@ -3727,6 +3710,46 @@ pub(crate) fn add_net_stub(
     }
     add_stub_label(sch, label_type, net, end, dir.label_rotation);
     (end.0, end.1, dir.label_rotation)
+}
+
+/// The first of `dirs` along which [`add_net_stub`] from `pin` joins nothing
+/// beyond the net the caller asked for (#117): what a label named `net` on
+/// `pin` would join, and the nets at `requested`. A stub ending on or running
+/// over another pin dots it, and joins it to that net.
+///
+/// The inner `Err` holds one reason per direction tried, or why none could be
+/// checked.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn clear_stub_direction(
+    sch: &cse::Schematic,
+    exits: &[(f64, f64)],
+    pin: (f64, f64),
+    dirs: &[crate::tools::StubDirection],
+    stub_length: f64,
+    label_type: &str,
+    net: &str,
+    requested: &[(f64, f64)],
+) -> anyhow::Result<Result<crate::tools::StubDirection, Vec<String>>> {
+    let source = sch.to_source();
+    let scratch = || cse::Schematic::from_source(sch.filepath(), source.as_str());
+    let mut asked = scratch()?;
+    add_stub_label(&mut asked, label_type, net, pin, 0.0);
+    let Some(guard) = RouteGuard::new(&parse_sexp(&asked.to_source())?, pin, requested) else {
+        return Ok(Err(vec![format!(
+            "cannot check what the stub would join: {}",
+            crate::tools::UNRESOLVED_PIN_GEOMETRY
+        )]));
+    };
+    let mut refused = Vec::new();
+    for dir in dirs {
+        let mut stubbed = scratch()?;
+        add_net_stub(&mut stubbed, exits, pin, dir, stub_length, label_type, net);
+        match guard.refusal(&format!("{} stub", dir.name), &stubbed.to_source())? {
+            Some(reason) => refused.push(reason),
+            None => return Ok(Ok(*dir)),
+        }
+    }
+    Ok(Err(refused))
 }
 
 /// The wire half of [`add_net_stub`]: the wire, plus the junction dots
@@ -4177,9 +4200,8 @@ mod unit_aware_wiring_tests {
             .count()
     }
 
-    /// `find_t_junctions` reports every T on the sheet, so each call used to
-    /// re-emit a dot at every T already there — five wires left five dots
-    /// stacked on one point.
+    /// Each call used to re-emit a dot at every T already on the sheet — five
+    /// wires left five dots stacked on one point.
     #[tokio::test]
     async fn repeated_add_wire_leaves_one_junction_per_t() {
         let (_d, path) = bare_schematic();
@@ -4265,8 +4287,8 @@ mod unit_aware_wiring_tests {
     }
 
     /// A hierarchical sheet pin justifies a dot exactly as a symbol pin does —
-    /// the `|| idx.has_sheet_pin(..)` half of the keep rule, which nothing else
-    /// reaches. Candidate points come from moved *symbol* pins, so the branch
+    /// it is one of the exits the keep rule counts, and nothing else here
+    /// reaches that. Candidate points come from moved *symbol* pins, so the branch
     /// only decides anything when a symbol pin vacates a point a sheet pin also
     /// holds: in this fixture R1's pin, `test`'s SHPIN and the dot all sit at
     /// (139.7, 190.5) on a wire's interior. Ask about it with R1 gone — the
@@ -4451,6 +4473,24 @@ mod unit_aware_wiring_tests {
             .filter(|(x, y)| x == "120.65" && y == "139.7")
             .count();
         assert_eq!(dots_there, 1, "exactly one junction block written");
+    }
+
+    /// A sheet whose pins cannot be resolved is not a sheet with no pins. R1's
+    /// dot on its lone wire stays, though the count cannot see the pin.
+    #[test]
+    fn reconcile_keeps_a_dot_on_a_wire_when_the_pins_cannot_be_resolved() {
+        let unresolved = RECONCILE_SCH.replacen(
+            r#"(symbol "Device:R""#,
+            r#"(symbol "Device:R_unresolved""#,
+            1,
+        );
+        assert!(
+            crate::tools::all_pin_endpoints(&parse_sexp(&unresolved).unwrap()).is_empty(),
+            "no pin resolves"
+        );
+        let (out, added, pruned) = reconcile_junctions_at(unresolved, &[(120.65, 139.7)]);
+        assert_eq!((added, pruned), (0, 0), "the pin may still be there");
+        assert!(has_dot(&out, "120.65", "139.7"));
     }
 
     /// A dot on a bus tee is a BUS junction — it joins bus segments, which no
@@ -6514,7 +6554,8 @@ mod batch_no_connect_tests {
 mod wire_end_junction_tests {
     //! #897: a dot where three or more wire exits meet at a wire end. The
     //! expected dots are KiCad's rule (`JUNCTION_HELPERS::AnalyzePoint`),
-    //! corroborated by its demo corpus; see the fixture README.
+    //! corroborated by its demo corpus; see the fixture README. #136: a move
+    //! and a wire delete judge their dots by the same count.
     use super::*;
     use crate::router::ToolRouter;
     use crate::tools::ServerConfig;
@@ -6533,6 +6574,9 @@ mod wire_end_junction_tests {
     type Segment = ((f64, f64), (f64, f64));
     /// A case's name, its wires, and the dots KiCad would draw.
     type Case = (&'static str, Vec<Segment>, Vec<(f64, f64)>);
+    /// A `connect_passthrough` case: its name, the wires drawn first, the
+    /// stub's direction from `T`, and the dots KiCad would draw.
+    type StubCase = (&'static str, Vec<Segment>, &'static str, Vec<(f64, f64)>);
 
     fn cases() -> Vec<Case> {
         vec![
@@ -6663,6 +6707,78 @@ mod wire_end_junction_tests {
         }
     }
 
+    /// `connect_passthrough`'s stub from a point where wires already are,
+    /// through the served `tools/call` boundary (#137).
+    #[tokio::test]
+    async fn connect_passthrough_dots_its_stub_through_the_served_dispatch() {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+        let cases: [StubCase; 4] = [
+            (
+                "a stub from a corner",
+                vec![((101.6, 101.6), T), (T, (114.3, 88.9))],
+                "right",
+                vec![T],
+            ),
+            (
+                "a stub from mid-span",
+                vec![((101.6, 101.6), (127.0, 101.6))],
+                "up",
+                vec![T],
+            ),
+            (
+                "a stub from a T already dotted keeps one dot",
+                vec![((101.6, 101.6), T), (T, (127.0, 101.6)), (T, (114.3, 88.9))],
+                "down",
+                vec![T],
+            ),
+            (
+                "a stub straight on from one wire end (control)",
+                vec![((101.6, 101.6), T)],
+                "right",
+                vec![],
+            ),
+        ];
+        for (case, wires, direction, expected) in cases {
+            let (_dir, path) = sheet();
+            let schematic = path.display().to_string();
+            let wires: Vec<_> = wires.into_iter().map(wire_json).collect();
+            let stub = json!({
+                "schematic": schematic,
+                "net_name": "SIG",
+                "x": T.0,
+                "y": T.1,
+                "direction": direction
+            });
+            for (name, arguments) in [
+                (
+                    "batch_add_wire",
+                    json!({ "schematic": schematic, "wires": wires }),
+                ),
+                ("connect_passthrough", stub),
+            ] {
+                let response = handler
+                    .handle_message(json!({
+                        "jsonrpc": "2.0",
+                        "id": 137,
+                        "method": "tools/call",
+                        "params": { "name": name, "arguments": arguments }
+                    }))
+                    .await
+                    .expect("tools/call receives a response");
+                let result = response.result.expect("successful JSON-RPC response");
+                assert_ne!(result["isError"], json!(true), "{case}, {name}: {result}");
+            }
+            let written = std::fs::read_to_string(&path).unwrap();
+            assert_dots(case, &written, &expected);
+            assert!(written.contains("(label \"SIG\""), "{case}: no label");
+        }
+    }
+
     /// `add_wire`, one wire per call.
     #[tokio::test]
     async fn add_wire_dots_three_exits() {
@@ -6704,6 +6820,289 @@ mod wire_end_junction_tests {
             }
             sch.overwrite().unwrap();
             assert_dots(case, &std::fs::read_to_string(&path).unwrap(), &expected);
+        }
+    }
+
+    // #136: a move and a wire delete judge the dot at each point they touch
+    // by the same count.
+
+    async fn served() -> crate::mcp::handler::McpHandler {
+        crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    /// One `tools/call`, which must succeed, and its first text.
+    async fn call(
+        handler: &crate::mcp::handler::McpHandler,
+        tool: &str,
+        path: &std::path::Path,
+        mut arguments: serde_json::Value,
+    ) -> String {
+        arguments["schematic"] = json!(path.display().to_string());
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 136,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{tool}: {result}");
+        result["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    async fn draw(
+        handler: &crate::mcp::handler::McpHandler,
+        path: &std::path::Path,
+        wires: &[Segment],
+    ) {
+        let wires: Vec<_> = wires.iter().copied().map(wire_json).collect();
+        call(handler, "batch_add_wire", path, json!({ "wires": wires })).await;
+    }
+
+    /// Moves `R1` to `(x, y)`, which puts its pin 1 at `(x, y - 3.81)`, and
+    /// returns (added, pruned).
+    async fn move_r1(
+        handler: &crate::mcp::handler::McpHandler,
+        path: &std::path::Path,
+        (x, y): (f64, f64),
+    ) -> (serde_json::Value, serde_json::Value) {
+        let text = call(
+            handler,
+            "move_schematic_component",
+            path,
+            json!({ "reference": "R1", "x": x, "y": y }),
+        )
+        .await;
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        (
+            body["junctions_added_count"].clone(),
+            body["junctions_pruned_count"].clone(),
+        )
+    }
+
+    fn file(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// The issue's reproduction: pin 1 moved onto a corner makes three exits
+    /// and gets a dot. Moved off again, it leaves two, and the dot goes.
+    #[tokio::test]
+    async fn a_pin_moved_onto_a_corner_gets_a_dot_and_takes_it_away() {
+        let handler = served().await;
+        let (_dir, path) = sheet();
+        draw(&handler, &path, &[((101.6, 101.6), T), (T, (114.3, 88.9))]).await;
+        assert_dots("the corner alone", &file(&path), &[]);
+
+        let counts = move_r1(&handler, &path, (114.3, 105.41)).await;
+        assert_eq!(counts, (json!(1), json!(0)), "moved onto the corner");
+        assert_dots("pin 1 on the corner", &file(&path), &[T]);
+
+        let counts = move_r1(&handler, &path, (152.4, 101.6)).await;
+        assert_eq!(counts, (json!(0), json!(1)), "moved back");
+        assert_dots("pin 1 off the corner", &file(&path), &[]);
+    }
+
+    /// Two wires crossing with nothing ending there are two nets. A pin
+    /// landing on the crossing gets no dot, which would join them.
+    #[tokio::test]
+    async fn a_pin_moved_onto_a_bare_crossing_gets_no_dot() {
+        let handler = served().await;
+        let (_dir, path) = sheet();
+        let crossing = [
+            ((101.6, 101.6), (127.0, 101.6)),
+            ((114.3, 88.9), (114.3, 106.68)),
+        ];
+        draw(&handler, &path, &crossing).await;
+
+        let counts = move_r1(&handler, &path, (114.3, 105.41)).await;
+        assert_eq!(counts, (json!(0), json!(0)));
+        assert_dots("pin 1 on the crossing", &file(&path), &[]);
+    }
+
+    /// The comment on #136: deleting a T's branch leaves a corner, two exits.
+    #[tokio::test]
+    async fn deleting_a_tees_branch_prunes_its_dot() {
+        let handler = served().await;
+        let (_dir, path) = sheet();
+        draw(
+            &handler,
+            &path,
+            &[((101.6, 101.6), T), (T, (127.0, 101.6)), (T, (114.3, 88.9))],
+        )
+        .await;
+        assert_dots("the T", &file(&path), &[T]);
+
+        let text = call(
+            &handler,
+            "delete_schematic_wire",
+            &path,
+            json!({ "x1": 114.3, "y1": 101.6, "x2": 114.3, "y2": 88.9 }),
+        )
+        .await;
+        assert_eq!(text, "Wire deleted. Removed 1 orphaned junction(s).");
+        assert_dots("the corner left", &file(&path), &[]);
+    }
+
+    /// One arm off a cross leaves a T, three exits, and the dot stays.
+    #[tokio::test]
+    async fn deleting_an_arm_of_a_cross_keeps_its_dot() {
+        let handler = served().await;
+        let (_dir, path) = sheet();
+        draw(
+            &handler,
+            &path,
+            &[
+                ((101.6, 101.6), T),
+                (T, (127.0, 101.6)),
+                (T, (114.3, 88.9)),
+                ((114.3, 114.3), T),
+            ],
+        )
+        .await;
+
+        let text = call(
+            &handler,
+            "delete_schematic_wire",
+            &path,
+            json!({ "x1": 114.3, "y1": 114.3, "x2": 114.3, "y2": 101.6 }),
+        )
+        .await;
+        assert_eq!(text, "Wire deleted.");
+        assert_dots("the T left", &file(&path), &[T]);
+    }
+
+    /// Two wire ends at a pin tip are three exits. Deleting one leaves a wire
+    /// ending on the pin, two exits, and the dot goes.
+    #[tokio::test]
+    async fn deleting_one_of_two_wires_at_a_pin_tip_prunes_its_dot() {
+        let handler = served().await;
+        let (_dir, path) = sheet();
+        draw(
+            &handler,
+            &path,
+            &[((139.7, 97.79), PIN_1), (PIN_1, (152.4, 88.9))],
+        )
+        .await;
+        assert_dots("two wire ends at the pin", &file(&path), &[PIN_1]);
+
+        let text = call(
+            &handler,
+            "delete_schematic_wire",
+            &path,
+            json!({ "x1": 152.4, "y1": 97.79, "x2": 152.4, "y2": 88.9 }),
+        )
+        .await;
+        assert_eq!(text, "Wire deleted. Removed 1 orphaned junction(s).");
+        assert_dots("one wire end at the pin", &file(&path), &[]);
+    }
+
+    /// A point a pin leaves is judged too, but only a pin earns a new dot.
+    /// Three wire ends with no dot and no pin, as a sheet drawn before #897
+    /// can hold them, are left as they are.
+    #[test]
+    fn a_tee_with_no_pin_gets_no_dot_from_the_reconcile() {
+        let mut src = SHEET.to_string();
+        for ((x1, y1), (x2, y2)) in [((101.6, 101.6), T), (T, (127.0, 101.6)), (T, (114.3, 88.9))] {
+            src = insert_wire_with_junctions(src, x1, y1, x2, y2);
+        }
+        let start = find_block_starts(&src, "junction")[0];
+        let (from, to) = find_block_with_leading_whitespace(&src, start).unwrap();
+        let undotted = format!("{}{}", &src[..from], &src[to..]);
+        assert_dots("the T, its dot taken out", &undotted, &[]);
+
+        let (out, added, pruned) = reconcile_junctions_at(undotted, &[T]);
+        assert_eq!((added, pruned), (0, 0));
+        assert_dots("after the reconcile", &out, &[]);
+    }
+
+    /// The first dot in `path`'s file taken out, as a sheet drawn before #897
+    /// can lack it.
+    fn take_out_the_dot(path: &std::path::Path) {
+        let src = file(path);
+        let start = find_block_starts(&src, "junction")[0];
+        let (from, to) = find_block_with_leading_whitespace(&src, start).unwrap();
+        std::fs::write(path, format!("{}{}", &src[..from], &src[to..])).unwrap();
+        assert_dots("the dot taken out", &file(path), &[]);
+    }
+
+    /// Two wires in line, one ending mid-span on the other, are two exits, but
+    /// eeschema joins them there only through the dot. A pin leaving it leaves
+    /// it as it is.
+    #[tokio::test]
+    async fn a_dot_joining_a_collinear_overlap_stays_when_a_pin_leaves() {
+        let handler = served().await;
+        let (_dir, path) = sheet();
+        draw(
+            &handler,
+            &path,
+            &[((101.6, 101.6), (127.0, 101.6)), (T, (139.7, 101.6))],
+        )
+        .await;
+        call(
+            &handler,
+            "add_junction",
+            &path,
+            json!({ "x": T.0, "y": T.1 }),
+        )
+        .await;
+
+        let counts = move_r1(&handler, &path, (114.3, 105.41)).await;
+        assert_eq!(counts, (json!(0), json!(0)), "moved onto the overlap");
+        let counts = move_r1(&handler, &path, (152.4, 101.6)).await;
+        assert_eq!(counts, (json!(0), json!(0)), "moved off it");
+        assert_dots("the overlap", &file(&path), &[T]);
+    }
+
+    /// A branch ending mid-span on a wire with no dot is not joined to it, so
+    /// a pin landing there gets no dot, which would join them.
+    #[tokio::test]
+    async fn a_pin_moved_onto_an_undotted_tee_gets_no_dot() {
+        let handler = served().await;
+        let (_dir, path) = sheet();
+        draw(
+            &handler,
+            &path,
+            &[((101.6, 101.6), (127.0, 101.6)), (T, (114.3, 88.9))],
+        )
+        .await;
+        take_out_the_dot(&path);
+
+        let counts = move_r1(&handler, &path, (114.3, 105.41)).await;
+        assert_eq!(counts, (json!(0), json!(0)));
+        assert_dots("pin 1 on the T", &file(&path), &[]);
+    }
+
+    /// A sheet pin or a bus entry's wire end mid-span on the wire left is
+    /// three exits, so deleting the branch keeps the dot.
+    #[tokio::test]
+    async fn deleting_a_branch_keeps_a_dot_at_a_sheet_pin_or_bus_entry_mid_span() {
+        let handler = served().await;
+        for (case, (x, y)) in [("sheet pin", SHEET_PIN), ("bus entry", BUS_ENTRY)] {
+            let (_dir, path) = sheet();
+            draw(
+                &handler,
+                &path,
+                &[((x - 12.7, y), (x + 12.7, y)), ((x, y), (x, y - 12.7))],
+            )
+            .await;
+            assert_dots(case, &file(&path), &[(x, y)]);
+
+            let text = call(
+                &handler,
+                "delete_schematic_wire",
+                &path,
+                json!({ "x1": x, "y1": y, "x2": x, "y2": y - 12.7 }),
+            )
+            .await;
+            assert_eq!(text, "Wire deleted.", "{case}");
+            assert_dots(case, &file(&path), &[(x, y)]);
         }
     }
 }

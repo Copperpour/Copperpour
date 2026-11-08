@@ -3170,10 +3170,7 @@ fn board_layer_arg(
     args: &serde_json::Value,
     default: Option<&str>,
 ) -> Result<String, CallToolResult> {
-    let layer = match default {
-        Some(default) if args["layer"].is_null() => default,
-        _ => require_str(args, "layer")?,
-    };
+    let layer = layer_arg(args, default)?;
     match builders::layer_name(builders::layer_from_name(layer)) {
         // Only the fixed layers have display names; a numbered one must be
         // spelled exactly.
@@ -3190,6 +3187,37 @@ fn board_layer_arg(
                  In1.Cu..In30.Cu, F.SilkS, B.SilkS, Edge.Cuts or User.1..User.45"
             ),
         )),
+    }
+}
+
+/// `layer`, or `default` when it is absent; required when there is none.
+fn layer_arg<'a>(
+    args: &'a serde_json::Value,
+    default: Option<&'a str>,
+) -> Result<&'a str, CallToolResult> {
+    match default {
+        Some(default) if args["layer"].is_null() => Ok(default),
+        _ => require_str(args, "layer"),
+    }
+}
+
+/// As [`board_layer_arg`], for a track: only copper, spelled as KiCad writes
+/// it (#205). Copper has no display names, so `In01.Cu` is refused, and the
+/// refusal names the layer the caller sent.
+pub(super) fn copper_layer_arg(
+    args: &serde_json::Value,
+    default: Option<&str>,
+) -> Result<String, CallToolResult> {
+    let layer = layer_arg(args, default)?;
+    if copperpour_sexp::layers::is_copper_name(layer)
+        && builders::layer_name(builders::layer_from_name(layer)) == Some(layer)
+    {
+        Ok(layer.to_string())
+    } else {
+        Err(invalid_arg(
+            "layer",
+            &format!("'{layer}' is not a KiCad copper layer; use F.Cu, B.Cu or In1.Cu..In30.Cu"),
+        ))
     }
 }
 
