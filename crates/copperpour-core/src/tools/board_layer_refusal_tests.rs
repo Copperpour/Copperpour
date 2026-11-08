@@ -6,6 +6,9 @@
 //! Each case runs through served `tools/call`, once against a KiCad double
 //! holding the board and once with no KiCad, on a board KiCad 10 saved (see
 //! `tests/fixtures/six_layer_power_planes_kicad10.README.md` for the oracle).
+//!
+//! The routing tools sent theirs to KiCad as a `BL_UNDEFINED` track (#205), and
+//! refuse any layer that is not copper.
 
 use crate::mcp::handler::McpHandler;
 use crate::mcp::protocol::CallToolResult;
@@ -83,6 +86,21 @@ impl Scene {
             "import_svg_logo" => json!({
                 "board": board, "svg": self.svg.to_string_lossy(), "width_mm": 4.0
             }),
+            "route_trace" => json!({
+                "board": board, "net_name": "GND", "x1": 0.0, "y1": 0.0, "x2": 5.0, "y2": 0.0
+            }),
+            "route_pad_to_pad" => json!({
+                "board": board, "net_name": "GND",
+                "ref1": "R1", "pad1": "1", "ref2": "R2", "pad2": "1"
+            }),
+            "modify_trace" => json!({
+                "board": board, "uuid": "00000000-0000-0000-0000-000000000205",
+                "net_name": "GND", "x1": 0.0, "y1": 0.0, "x2": 5.0, "y2": 0.0
+            }),
+            "route_differential_pair" => json!({
+                "board": board, "net_pos": "GND", "net_neg": "GND",
+                "x1": 0.0, "y1": 0.0, "x2": 5.0, "y2": 0.0
+            }),
             _ => json!({
                 "board": board, "net_name": "GND",
                 "points": [{ "x": 0.0, "y": 0.0 }, { "x": 10.0, "y": 0.0 }, { "x": 10.0, "y": 10.0 }]
@@ -115,16 +133,25 @@ fn kicad_recording(board: &Path, received: Received) -> MockIpcServer {
     spawn_kicad_holding_board(board, move |command| {
         let name = command.type_url.rsplit('.').next().unwrap().to_string();
         if name != "CreateItems" {
-            let nets = name == "GetNets";
-            received.lock().unwrap().push((name, Vec::new()));
-            return nets.then(|| {
-                copperpour_ipc::builders::pack_any(
+            received.lock().unwrap().push((name.clone(), Vec::new()));
+            return match name.as_str() {
+                "GetNets" => Some(copperpour_ipc::builders::pack_any(
                     &kiapi::board::commands::NetsResponse {
                         nets: vec![copperpour_ipc::builders::net("GND", 1)],
                     },
                     "kiapi.board.commands.NetsResponse",
-                )
-            });
+                )),
+                // `modify_trace` deletes the old track first.
+                "DeleteItems" => Some(copperpour_ipc::builders::pack_any(
+                    &kiapi::common::commands::DeleteItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        deleted_items: Vec::new(),
+                    },
+                    "kiapi.common.commands.DeleteItemsResponse",
+                )),
+                _ => None,
+            };
         }
         let request =
             kiapi::common::commands::CreateItems::decode(command.value.as_slice()).unwrap();
@@ -161,6 +188,8 @@ fn item_layers(item: &prost_types::Any) -> Vec<i32> {
                 .unwrap()
                 .layer,
         ]
+    } else if item.type_url.ends_with("Track") {
+        vec![kiapi::board::types::Track::decode(bytes).unwrap().layer]
     } else if item.type_url.ends_with("Zone") {
         kiapi::board::types::Zone::decode(bytes).unwrap().layers
     } else {
@@ -181,13 +210,26 @@ fn body(result: &CallToolResult) -> Value {
 /// never writes (#99).
 const UNKNOWN_LAYERS: [&str; 5] = ["F.Silk", "Not.A.Layer", "In01.Cu", "In+1.Cu", "User.01"];
 
+/// Board layers a track cannot go on, beside [`UNKNOWN_LAYERS`]: KiCad
+/// numbers its inner copper `In1.Cu`..`In30.Cu`.
+const NOT_COPPER_LAYERS: [&str; 5] = ["F.SilkS", "F.Silkscreen", "Edge.Cuts", "In0.Cu", "In31.Cu"];
+
 /// `tool` refuses each unknown layer as `invalid_argument` naming `layer`, with
 /// KiCad live and without, sending KiCad nothing and leaving the board alone.
 async fn assert_refuses_unknown_layers(tool: &str) {
+    assert_refuses_layers(tool, &UNKNOWN_LAYERS).await;
+}
+
+/// As [`assert_refuses_unknown_layers`], for a tool that only lays copper.
+async fn assert_refuses_non_copper_layers(tool: &str) {
+    assert_refuses_layers(tool, &[UNKNOWN_LAYERS, NOT_COPPER_LAYERS].concat()).await;
+}
+
+async fn assert_refuses_layers(tool: &str, layers: &[&str]) {
     for live in [true, false] {
         let scene = Scene::new(live).await;
         let before = std::fs::read(&scene.board).unwrap();
-        for layer in UNKNOWN_LAYERS {
+        for &layer in layers {
             let result = scene.call(tool, Some(layer)).await;
 
             let case = format!("{tool} {layer} live={live}");
@@ -227,6 +269,59 @@ async fn add_zone_refuses_an_unknown_layer() {
 #[tokio::test]
 async fn add_copper_pour_refuses_an_unknown_layer() {
     assert_refuses_unknown_layers("add_copper_pour").await;
+}
+
+#[tokio::test]
+async fn route_trace_refuses_a_layer_that_is_not_copper() {
+    assert_refuses_non_copper_layers("route_trace").await;
+}
+
+#[tokio::test]
+async fn route_pad_to_pad_refuses_a_layer_that_is_not_copper() {
+    assert_refuses_non_copper_layers("route_pad_to_pad").await;
+}
+
+#[tokio::test]
+async fn modify_trace_refuses_a_layer_that_is_not_copper() {
+    assert_refuses_non_copper_layers("modify_trace").await;
+}
+
+#[tokio::test]
+async fn route_differential_pair_refuses_a_layer_that_is_not_copper() {
+    assert_refuses_non_copper_layers("route_differential_pair").await;
+}
+
+/// A copper layer still reaches KiCad as that layer, in every track a routing
+/// tool creates; `route_differential_pair` defaults to `F.Cu`.
+#[tokio::test]
+async fn a_copper_layer_still_reaches_kicad_on_every_track() {
+    let cases = [
+        ("route_trace", Some("In1.Cu"), BoardLayer::BlIn1Cu),
+        ("route_trace", Some("B.Cu"), BoardLayer::BlBCu),
+        ("modify_trace", Some("In4.Cu"), BoardLayer::BlIn4Cu),
+        ("route_differential_pair", None, BoardLayer::BlFCu),
+        ("route_differential_pair", Some("B.Cu"), BoardLayer::BlBCu),
+    ];
+    let scene = Scene::new(true).await;
+    for (tool, layer, expected) in cases {
+        let result = scene.call(tool, layer).await;
+        let tracks = if tool == "route_differential_pair" {
+            2
+        } else {
+            1
+        };
+
+        let case = format!("{tool} {layer:?}");
+        assert!(!result.is_error, "{case}: {:?}", result.content);
+        assert_eq!(body(&result)["layer"], layer.unwrap_or("F.Cu"), "{case}");
+        let created: Vec<i32> = scene
+            .take_received()
+            .into_iter()
+            .filter(|(name, _)| name == "CreateItems")
+            .flat_map(|(_, layers)| layers)
+            .collect();
+        assert_eq!(created, vec![expected as i32; tracks], "{case}");
+    }
 }
 
 /// How many board items name `layer`; a KiCad 10 zone uses `(layers …)`.
