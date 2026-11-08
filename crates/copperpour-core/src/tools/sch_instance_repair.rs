@@ -87,8 +87,8 @@ impl Owner {
                 root: path.to_path_buf(),
             }),
             Ok(Some(owner)) => {
-                // Eeschema keys a root listed with another uuid, or a second
-                // top-level sheet, by paths this project's walk does not give.
+                // Eeschema keys a second top-level sheet's files by paths
+                // this project's walk does not give.
                 crate::tools::sch_annotate::sole_top_level_sheet(
                     &owner.project_file,
                     &owner.root_schematic,
@@ -829,34 +829,60 @@ mod tests {
         assert_eq!(refusal(&leaf), None);
     }
 
-    /// KiCad 10 keys a second top-level sheet, or a root the project file
-    /// gives another uuid, by paths the project's walk does not give. No tool
-    /// here lists a second top-level sheet, so the entry is written into the
-    /// project file `create_project` wrote, as `sch_annotate`'s test does.
+    /// `owner.kicad_pro` listing `sheets` as its top-level sheets. No tool
+    /// lists them, so the entry is written into the project file
+    /// `create_project` wrote, as `sch_annotate`'s test does.
+    fn list_top_level_sheets(dir: &Path, sheets: Value) {
+        let mut settings: Value =
+            serde_json::from_str(&fixture("dead", "owner.kicad_pro")).unwrap();
+        settings["schematic"]["top_level_sheets"] = sheets;
+        std::fs::write(dir.join("owner.kicad_pro"), settings.to_string()).unwrap();
+    }
+
+    /// KiCad 10 keys a second top-level sheet's files by paths the project's
+    /// walk does not give, so the repair refuses.
     #[tokio::test]
     async fn a_project_with_another_top_level_sheet_is_refused() {
         const NIL: &str = "00000000-0000-0000-0000-000000000000";
-        let root =
-            |uuid: &str| json!({ "uuid": uuid, "name": "owner", "filename": "owner.kicad_sch" });
-        let second = json!({ "uuid": "11111111-1111-1111-1111-111111111111", "name": "second",
-            "filename": "second.kicad_sch" });
-        for (sheets, refusal) in [
-            (json!([root(NIL), second]), "top-level sheets"),
-            (
-                json!([root("22222222-2222-2222-2222-222222222222")]),
-                "gives the root the uuid",
-            ),
-        ] {
-            let (dir, leaf) = case("dead");
-            let before = read(&leaf);
-            let mut settings: Value =
-                serde_json::from_str(&fixture("dead", "owner.kicad_pro")).unwrap();
-            settings["schematic"]["top_level_sheets"] = sheets;
-            std::fs::write(dir.path().join("owner.kicad_pro"), settings.to_string()).unwrap();
-            let message = refused(&repair(&leaf, json!({})).await, "invalid_argument");
-            assert!(message.contains(refusal), "{message}");
-            assert_eq!(read(&leaf), before);
+        let (dir, leaf) = case("dead");
+        let before = read(&leaf);
+        list_top_level_sheets(
+            dir.path(),
+            json!([
+                { "uuid": NIL, "name": "owner", "filename": "owner.kicad_sch" },
+                { "uuid": "11111111-1111-1111-1111-111111111111", "name": "second",
+                  "filename": "second.kicad_sch" }
+            ]),
+        );
+        let message = refused(&repair(&leaf, json!({})).await, "invalid_argument");
+        assert!(message.contains("top-level sheets"), "{message}");
+        assert_eq!(read(&leaf), before);
+    }
+
+    /// A root the project file gives another uuid is keyed by that uuid, as
+    /// eeschema keys it (#125), so the plan's paths start at it.
+    #[tokio::test]
+    async fn a_root_listed_with_another_uuid_keys_the_plan_to_it() {
+        const LISTED: &str = "22222222-2222-2222-2222-222222222222";
+        let (dir, leaf) = case("dead");
+        let before = read(&leaf);
+        list_top_level_sheets(
+            dir.path(),
+            json!([{ "uuid": LISTED, "name": "owner", "filename": "owner.kicad_sch" }]),
+        );
+        let plan = dry_run(&leaf).await;
+        let paths = plan["instance_paths"].as_array().unwrap();
+        assert!(!paths.is_empty(), "{plan}");
+        for path in paths
+            .iter()
+            .chain(plan["add"].as_array().unwrap().iter().map(|a| &a["path"]))
+        {
+            assert!(
+                path.as_str().unwrap().starts_with(&format!("/{LISTED}/")),
+                "{plan}"
+            );
         }
+        assert_eq!(read(&leaf), before);
     }
 
     const LOCK: &str = r#"{"username":"copperpour-test","hostname":"test-host"}"#;
