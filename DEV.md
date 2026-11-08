@@ -326,7 +326,7 @@ and release, PCM and Nix builds use the defaults:
 
 | Feature | Adds | Dependencies |
 | --- | --- | --- |
-| `jlcpcb` | JLCPCB parts catalog, its download, LCSC and EasyEDA lookups | `rusqlite`, `reqwest`, `zip` |
+| `jlcpcb` | JLCPCB parts catalog, its download, LCSC and EasyEDA lookups, the order upload | `rusqlite`, `reqwest`, `zip` |
 | `freerouting` | Freerouting discovery and headless routing (a Java subprocess) | `zip` (JAR manifest checks) |
 | `native-bridge` | KiCad plugin's Specctra export bridge (HTTP to localhost) | `reqwest` |
 

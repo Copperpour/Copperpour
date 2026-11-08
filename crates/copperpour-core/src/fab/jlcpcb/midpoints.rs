@@ -14,6 +14,18 @@ pub(crate) struct Midpoint {
     pub midpoint_x_mm: f64,
     pub midpoint_y_mm: f64,
     pub algorithm: &'static str,
+    /// The pads KiCad reports, the centre of pad 1's board-space box, and
+    /// whether the footprint is SMD: the EasyEDA CPL of an order link takes
+    /// them (#208). Kept out of the export's geometry evidence.
+    #[serde(skip)]
+    #[cfg_attr(not(feature = "jlcpcb"), allow(dead_code))]
+    pub pad_count: usize,
+    #[serde(skip)]
+    #[cfg_attr(not(feature = "jlcpcb"), allow(dead_code))]
+    pub pin1_mm: Option<(f64, f64)>,
+    #[serde(skip)]
+    #[cfg_attr(not(feature = "jlcpcb"), allow(dead_code))]
+    pub smd: bool,
 }
 
 pub(crate) struct Snapshot {
@@ -52,15 +64,33 @@ pub(crate) fn capture(
         let anchor = fp.position.context("footprint missing anchor")?;
         let definition = fp.definition.context("footprint missing definition")?;
         let mut ids = Vec::new();
+        let mut pin1_id = None;
+        let mut all_pads_smd = true;
         for item in definition.items {
             if item.type_url.ends_with("kiapi.board.types.Pad") {
                 let pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
                 let id = pad.id.context("pad missing UUID")?.value;
                 anyhow::ensure!(!id.is_empty(), "pad has empty UUID");
+                all_pads_smd &= pad.r#type == kiapi::board::types::PadType::PtSmd as i32;
+                if pin1_id.is_none() && pad.number == "1" {
+                    pin1_id = Some(id.clone());
+                }
                 ids.push(id);
             }
         }
         let boxes = client.get_item_boxes_in(document.clone(), &ids)?;
+        let pin1_mm = pin1_id
+            .and_then(|id| boxes.get(&id))
+            .map(|bounds| union_center(std::iter::once(bounds)))
+            .transpose()?;
+        // The footprint's mounting style when it has one; otherwise its pads
+        // decide, as an `(attr)`-less footprint of SMD pads is still SMD.
+        use kiapi::board::types::FootprintMountingStyle as Style;
+        let smd = match fp.attributes.as_ref().map(|attrs| attrs.mounting_style) {
+            Some(style) if style == Style::FmsSmd as i32 => true,
+            Some(style) if style == Style::FmsThroughHole as i32 => false,
+            _ => !ids.is_empty() && all_pads_smd,
+        };
         let (x, y) = if boxes.is_empty() {
             (anchor.x_nm as f64 / 1e6, anchor.y_nm as f64 / 1e6)
         } else {
@@ -77,6 +107,9 @@ pub(crate) fn capture(
             } else {
                 "kicad_native_board_pad_boxes_union_center"
             },
+            pad_count: ids.len(),
+            pin1_mm,
+            smd,
         };
         anyhow::ensure!(
             midpoints.insert(reference, midpoint).is_none(),
@@ -219,6 +252,34 @@ mod tests {
                         .as_slice(),
                 )
                 .unwrap();
+                if mode == "pad1-last" {
+                    // Reorder native-captured items without changing any
+                    // UUID or geometry: pad 1 must be found by its number.
+                    for item in &mut items.items {
+                        let mut fp =
+                            kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                                .unwrap();
+                        fp.definition.as_mut().unwrap().items.reverse();
+                        item.value = fp.encode_to_vec();
+                    }
+                    let first = kiapi::board::types::FootprintInstance::decode(
+                        items.items[0].value.as_slice(),
+                    )
+                    .unwrap();
+                    let first_pad = first
+                        .definition
+                        .unwrap()
+                        .items
+                        .into_iter()
+                        .find(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
+                        .unwrap();
+                    assert_ne!(
+                        kiapi::board::types::Pad::decode(first_pad.value.as_slice())
+                            .unwrap()
+                            .number,
+                        "1"
+                    );
+                }
                 if mode == "no-pads" {
                     items.items.truncate(1);
                     let mut fp = kiapi::board::types::FootprintInstance::decode(
@@ -335,6 +396,17 @@ mod tests {
     }
 
     #[test]
+    fn pad_one_is_selected_by_number_when_another_pad_comes_first() {
+        let board = std::path::Path::new("midpoints.kicad_pcb");
+        let document =
+            crate::tools::pcb_board::board_mock::board_document(&board.to_string_lossy());
+        let mock = fixture_server(board, "pad1-last");
+        let snapshot = capture(&KiCadIpcClient::new(mock.address()), document).unwrap();
+        assert_eq!(snapshot.midpoints["R1"].pin1_mm, Some((79.0875, 20.0)));
+        assert_eq!(snapshot.midpoints["JF0"].pin1_mm, Some((20.0, 20.0)));
+    }
+
+    #[test]
     fn captured_native_geometry_matches_literal_board_space_oracle() {
         let board = std::path::Path::new("midpoints.kicad_pcb");
         let document =
@@ -348,6 +420,19 @@ mod tests {
             (48.73, 20.0),
             (60.721984, 20.721984),
         ];
+        // What an order link's EasyEDA CPL takes (#208): the pad count, pad
+        // 1's box centre in board space, and SMD from the pads when the
+        // footprint states no mounting style, as these don't.
+        let r1 = &snapshot.midpoints["R1"];
+        assert_eq!(
+            (r1.pad_count, r1.pin1_mm, r1.smd),
+            (2, Some((79.0875, 20.0)), true)
+        );
+        let jf0 = &snapshot.midpoints["JF0"];
+        assert_eq!(
+            (jf0.pad_count, jf0.pin1_mm, jf0.smd),
+            (2, Some((20.0, 20.0)), false)
+        );
         assert_eq!(snapshot.midpoints.len(), 11);
         let centered = &snapshot.midpoints["R1"];
         assert_eq!(
@@ -438,6 +523,9 @@ mod tests {
             midpoint_x_mm: 16.25,
             midpoint_y_mm: 6.0,
             algorithm: "kicad_native_board_pad_boxes_union_center",
+            pad_count: 2,
+            pin1_mm: None,
+            smd: true,
         };
         let mut points = BTreeMap::from([("J1".into(), midpoint.clone())]);
         let source = "Ref,Val,Package,PosX,PosY,Rot,Side\nJ1,X,JST,15.000000,-6.000000,0,top\n";
