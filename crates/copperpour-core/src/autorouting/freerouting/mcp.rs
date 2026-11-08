@@ -762,8 +762,9 @@ async fn download_running_output(
 /// How often an unchanged job still sends a progress notification, so the
 /// client's idle timeout keeps being reset during long optimizer stretches.
 const PROGRESS_HEARTBEAT: Duration = Duration::from_secs(60);
-/// Only the end of Freerouting's log is read on each poll; the file grows to
-/// tens of megabytes over a day of routing.
+/// The first read of Freerouting's log starts this far from its end: the file
+/// grows to tens of megabytes over a day of routing, and the job has only just
+/// started. Later reads take what the log gained since.
 const LOG_TAIL_BYTES: u64 = 256 * 1024;
 
 /// Turns job polls into `notifications/progress` for the current tool call.
@@ -773,10 +774,20 @@ const LOG_TAIL_BYTES: u64 = 256 * 1024;
 /// Freerouting's own log, where each line of a job carries the first six hex
 /// digits of its id, upper-cased: `[A3AA32] Auto-routing pass #8 ... (4
 /// unrouted and 218 violations)`.
+///
+/// The log is read incrementally: an optimizer pass writes over a megabyte of
+/// DEBUG lines between two of the lines that matter, so any fixed tail of the
+/// file can hold none of them.
 struct JobProgress {
     tag: String,
     log: Option<PathBuf>,
+    /// How far the log has been read; `None` before the first read.
+    offset: Option<u64>,
+    /// The bytes after the last newline read: a line cut by the read, kept
+    /// until it is complete.
+    partial: Vec<u8>,
     activity: Option<String>,
+    unrouted: Option<u64>,
     last_message: String,
     last_sent: Option<Instant>,
     sent: u32,
@@ -790,7 +801,10 @@ impl JobProgress {
                 job_id.get(..6).unwrap_or(job_id).to_ascii_uppercase()
             ),
             log: freerouting_log_path(),
+            offset: None,
+            partial: Vec::new(),
             activity: None,
+            unrouted: None,
             last_message: String::new(),
             last_sent: None,
             sent: 0,
@@ -798,9 +812,7 @@ impl JobProgress {
     }
 
     fn report(&mut self, state: &str, details: &Value, started: Instant) {
-        if let Some(activity) = self.read_activity() {
-            self.activity = Some(activity);
-        }
+        self.read_log();
         if let Some(message) = self.next_message(state, details, started, Instant::now()) {
             crate::progress::report(f64::from(self.sent), None, &message);
         }
@@ -871,14 +883,58 @@ impl JobProgress {
             .is_some_and(|activity| activity.starts_with("optimiz"))
     }
 
-    fn read_activity(&self) -> Option<String> {
-        let tail = read_tail(self.log.as_deref()?, LOG_TAIL_BYTES)?;
-        latest_activity(&tail, &self.tag)
+    /// The last unrouted count of the job, after reading what the log gained.
+    fn read_unrouted(&mut self) -> Option<u64> {
+        self.read_log();
+        self.unrouted
     }
 
-    fn read_unrouted(&self) -> Option<u64> {
-        let tail = read_tail(self.log.as_deref()?, LOG_TAIL_BYTES)?;
-        latest_unrouted(&tail, &self.tag)
+    /// Reads the lines the log gained since the last call and keeps the latest
+    /// activity and unrouted count found in them; a read that finds neither
+    /// leaves the previous ones in place.
+    fn read_log(&mut self) {
+        use std::io::{Read, Seek, SeekFrom};
+        let Some(path) = self.log.as_deref() else {
+            return;
+        };
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return;
+        };
+        let Ok(len) = file.metadata().map(|metadata| metadata.len()) else {
+            return;
+        };
+        let start = match self.offset {
+            Some(offset) if offset <= len => offset,
+            // First read, or the log is shorter than what was read: it was
+            // replaced or truncated, so what was kept belongs to another file.
+            _ => {
+                self.partial.clear();
+                len.saturating_sub(LOG_TAIL_BYTES)
+            }
+        };
+        let mut gained = Vec::new();
+        if file.seek(SeekFrom::Start(start)).is_err()
+            || file.take(len - start).read_to_end(&mut gained).is_err()
+        {
+            return;
+        }
+        self.offset = Some(len);
+        let mut buffer = std::mem::take(&mut self.partial);
+        buffer.append(&mut gained);
+        // A newline byte is never inside a UTF-8 character, so cutting there
+        // keeps every complete line intact.
+        let Some(end) = buffer.iter().rposition(|&byte| byte == b'\n') else {
+            self.partial = buffer;
+            return;
+        };
+        self.partial = buffer.split_off(end + 1);
+        let complete = String::from_utf8_lossy(&buffer);
+        if let Some(activity) = latest_activity(&complete, &self.tag) {
+            self.activity = Some(activity);
+        }
+        if let Some(unrouted) = latest_unrouted(&complete, &self.tag) {
+            self.unrouted = Some(unrouted);
+        }
     }
 }
 
@@ -918,16 +974,6 @@ fn jvm_crash_arguments(state_dir: Option<&Path>) -> Vec<std::ffi::OsString> {
     let mut error_file = std::ffi::OsString::from("-XX:ErrorFile=");
     error_file.push(directory.join("hs_err_pid%p.log"));
     vec![error_file, "-XX:-CreateCoredumpOnCrash".into()]
-}
-
-fn read_tail(path: &Path, bytes: u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(len.saturating_sub(bytes))).ok()?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer).ok()?;
-    Some(String::from_utf8_lossy(&buffer).into_owned())
 }
 
 /// The last unrouted-connection count logged for the job tagged `tag`: a pass
@@ -2458,6 +2504,103 @@ done
         assert!(stage_is_optimizing(&json!({ "stage": "OPTIMIZATION" })));
         assert!(!stage_is_optimizing(&json!({ "stage": "ROUTING" })));
         assert!(!stage_is_optimizing(&json!({})));
+    }
+
+    /// Appends `text` to the log at `path`, as Freerouting does.
+    fn append_to_log(path: &Path, text: &str) {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+
+    #[test]
+    fn the_log_is_read_incrementally_through_a_flood_of_debug_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("freerouting.log");
+        let mut progress = JobProgress::new("933480eb");
+        progress.log = Some(path.clone());
+
+        append_to_log(&path, "2026-10-30 00:41:02.000 INFO   [933480] Auto-routing pass #8 on board 'a' was completed in 16.00 seconds with score 964.79 (4 unrouted and 218 violations), using 1.00 CPU seconds.\n");
+        progress.read_log();
+        assert_eq!(progress.unrouted, Some(4));
+
+        // The optimizer completes the board, then one of its passes writes
+        // 1.3 MB of DEBUG lines before the next poll: more than any fixed tail.
+        append_to_log(&path, "2026-10-30 00:56:24.082 INFO   [933480] Optimizer pass #3: optimizer score 119.14 -> 116.76 (REGRESSED, -1.9974%), router score: 979.51, incomplete connections: 0, clearance violations: 220.\n");
+        let debug = "2026-10-30 00:58:00.000 DEBUG  [933480]   Net 'SCK2' has 4 incomplete(s)\n";
+        append_to_log(
+            &path,
+            &debug.repeat(LOG_TAIL_BYTES as usize / debug.len() * 5),
+        );
+        progress.read_log();
+        assert_eq!(progress.unrouted, Some(0));
+        assert_eq!(
+            progress.activity.as_deref(),
+            Some("optimizer pass 3: score 119.14 -> 116.76 (regressed)")
+        );
+
+        // A read that finds neither keeps what the previous ones found.
+        append_to_log(&path, debug);
+        progress.read_log();
+        assert_eq!(progress.unrouted, Some(0));
+        assert_eq!(
+            progress.activity.as_deref(),
+            Some("optimizer pass 3: score 119.14 -> 116.76 (regressed)")
+        );
+    }
+
+    #[test]
+    fn a_line_cut_by_a_read_is_taken_once_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("freerouting.log");
+        let mut progress = JobProgress::new("933480eb");
+        progress.log = Some(path.clone());
+
+        append_to_log(&path, "2026-10-30 00:56:24.082 INFO   [933480] Optimizer pass #3: optimizer score 119.14 -> 116.76 (REGRESSED, -1.9974%), router score: 979.51, incomplete connections: 0, clearance violations: 220.\n");
+        append_to_log(&path, "2026-10-30 01:01:05.787 INFO   [933480] Optimizer pass #4: optimizer score 119.14 -> 119.14 (UNCHANGED, 0.0000%), router score: 979.51, incomplete ");
+        progress.read_log();
+        assert_eq!(
+            progress.activity.as_deref(),
+            Some("optimizer pass 3: score 119.14 -> 116.76 (regressed)")
+        );
+        append_to_log(&path, "connections: 0, clearance violations: 220.\n");
+        assert_eq!(progress.read_unrouted(), Some(0));
+        assert_eq!(
+            progress.activity.as_deref(),
+            Some("optimizer pass 4: score 119.14 -> 119.14 (unchanged)")
+        );
+    }
+
+    #[test]
+    fn a_log_replaced_by_a_shorter_one_is_read_again_from_its_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("freerouting.log");
+        let mut progress = JobProgress::new("933480eb");
+        progress.log = Some(path.clone());
+
+        let debug = "2026-10-30 00:40:00.000 DEBUG  [933480]   Net 'SCK2' has 4 incomplete(s)\n";
+        append_to_log(&path, &debug.repeat(100));
+        append_to_log(&path, "2026-10-30 00:41:02.000 INFO   [933480] Auto-routing pass #8 on board 'a' was completed in 16.00 seconds with score 964.79 (4 unrouted and 218 violations), using 1.00 CPU seconds.\n");
+        // Ends inside a line: what is kept of it belongs to this file only.
+        append_to_log(
+            &path,
+            "2026-10-30 00:41:20.000 INFO   [933480] Optimizer pass #9: optimizer score 1.00 -> 2.",
+        );
+        progress.read_log();
+        assert_eq!(progress.unrouted, Some(4));
+
+        std::fs::write(&path, "2026-10-30 01:00:00.000 INFO   [933480] Auto-routing pass #2 on board 'b' was completed in 1.00 seconds with score 1.00 (50 unrouted and 3 violations), using 1.00 CPU seconds.\n").unwrap();
+        progress.read_log();
+        assert_eq!(progress.unrouted, Some(50));
+        assert_eq!(
+            progress.activity.as_deref(),
+            Some("pass 2: 50 unrouted, 3 violations")
+        );
     }
 
     #[test]
