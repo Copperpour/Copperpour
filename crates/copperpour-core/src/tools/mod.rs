@@ -74,6 +74,7 @@ pub mod sch_components;
 pub(crate) mod sch_connectivity;
 pub mod sch_export;
 pub mod sch_hierarchy;
+mod sch_instance_repair;
 mod sch_label_rename;
 mod sch_texts;
 pub mod sch_wiring;
@@ -1265,6 +1266,17 @@ pub fn opt_positive_f64(args: &Value, key: &str) -> Result<Option<f64>, CallTool
     }
 }
 
+/// Extract an optional boolean. Unlike `sch_annotate`'s `opt_bool`, omission
+/// is kept apart from `false`, and a present value that is not a boolean is
+/// refused rather than treated as omission.
+pub fn opt_bool_flag(args: &Value, key: &str) -> Result<Option<bool>, CallToolResult> {
+    match &args[key] {
+        Value::Null => Ok(None),
+        Value::Bool(value) => Ok(Some(*value)),
+        _ => Err(invalid_arg(key, "must be a boolean")),
+    }
+}
+
 /// Extract an optional u32 while accepting either JSON spelling of an integer
 /// (`2` and `2.0`). Fractions, negative values, and overflow are refused
 /// instead of being silently narrowed by `as u32`. Domain-specific lower
@@ -1514,19 +1526,34 @@ pub(crate) fn all_pin_endpoints(tree: &copperpour_sexp::SexpNode) -> Vec<(f64, f
 /// pins one symbol stacks on a tip counted once, each sheet pin, and each bus
 /// entry's wire end.
 pub(crate) fn junction_exit_points(tree: &copperpour_sexp::SexpNode) -> Vec<(f64, f64)> {
+    junction_exits(
+        &placed_pins_by_reference(tree),
+        copperpour_sexp::schematic::extract_sheet_pins(tree),
+        sch_connectivity::bus_entry_wire_ends(
+            tree,
+            &copperpour_sexp::schematic::extract_buses(tree),
+            sch_connectivity::COINCIDENT_TOLERANCE,
+        ),
+    )
+}
+
+/// [`junction_exit_points`] from pieces a caller already holds, so the
+/// [`sch_connectivity::ConnectivityIndex`] counts what the wire tools count
+/// without resolving the pins twice.
+pub(crate) fn junction_exits(
+    by_reference: &PlacedPinsByReference,
+    sheet_pins: impl IntoIterator<Item = (f64, f64)>,
+    bus_entry_wire_ends: impl IntoIterator<Item = (f64, f64)>,
+) -> Vec<(f64, f64)> {
     let mut points = Vec::new();
-    for (_, pins) in placed_pins_by_reference(tree) {
+    for (_, pins) in by_reference {
         points
-            .extend(dedup_points(pins.into_iter().map(|(pin, t)| {
-                copperpour_sexp::schematic::pin_endpoint(&pin, t)
+            .extend(dedup_points(pins.iter().map(|(pin, t)| {
+                copperpour_sexp::schematic::pin_endpoint(pin, *t)
             })));
     }
-    points.extend(copperpour_sexp::schematic::extract_sheet_pins(tree));
-    points.extend(sch_connectivity::bus_entry_wire_ends(
-        tree,
-        &copperpour_sexp::schematic::extract_buses(tree),
-        sch_connectivity::COINCIDENT_TOLERANCE,
-    ));
+    points.extend(sheet_pins);
+    points.extend(bus_entry_wire_ends);
     points
 }
 
@@ -2526,42 +2553,7 @@ impl SchematicTargetError {
 pub(crate) fn resolve_schematic_ownership(
     target: &std::path::Path,
 ) -> Result<Option<SchematicOwnership>, SchematicTargetError> {
-    use std::collections::BTreeSet;
-
-    let Some(start) = target.parent() else {
-        return Ok(None);
-    };
-    // A relative path still belongs to the same filesystem hierarchy. Starting
-    // at its lexical parent alone would stop at cwd and miss higher projects.
-    let scan_start = if start.is_absolute() {
-        start.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|error| SchematicTargetError::DiscoveryFailed {
-                directory: start.to_path_buf(),
-                reason: error.to_string(),
-            })?
-            .join(start)
-    };
-    let mut project_files = BTreeSet::new();
-    for directory in scan_start.ancestors() {
-        let discovery_error = |error: std::io::Error| SchematicTargetError::DiscoveryFailed {
-            directory: directory.to_path_buf(),
-            reason: error.to_string(),
-        };
-        let entries = std::fs::read_dir(directory).map_err(discovery_error)?;
-        for entry in entries {
-            let entry = entry.map_err(discovery_error)?;
-            let path = entry.path();
-            if path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pro"))
-            {
-                project_files.insert(path);
-            }
-        }
-    }
+    let project_files = candidate_project_files(target)?;
 
     let roots = project_files
         .iter()
@@ -2605,6 +2597,49 @@ pub(crate) fn resolve_schematic_ownership(
         });
     }
     Ok(owners.pop())
+}
+
+/// Every `.kicad_pro` in `target`'s directory and each directory above it:
+/// the candidate projects `resolve_schematic_ownership` judges ownership
+/// among; empty for a path with no directory.
+pub(crate) fn candidate_project_files(
+    target: &std::path::Path,
+) -> Result<std::collections::BTreeSet<std::path::PathBuf>, SchematicTargetError> {
+    let mut project_files = std::collections::BTreeSet::new();
+    let Some(start) = target.parent() else {
+        return Ok(project_files);
+    };
+    // A relative path still belongs to the same filesystem hierarchy. Starting
+    // at its lexical parent alone would stop at cwd and miss higher projects.
+    let scan_start = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| SchematicTargetError::DiscoveryFailed {
+                directory: start.to_path_buf(),
+                reason: error.to_string(),
+            })?
+            .join(start)
+    };
+    for directory in scan_start.ancestors() {
+        let discovery_error = |error: std::io::Error| SchematicTargetError::DiscoveryFailed {
+            directory: directory.to_path_buf(),
+            reason: error.to_string(),
+        };
+        let entries = std::fs::read_dir(directory).map_err(discovery_error)?;
+        for entry in entries {
+            let entry = entry.map_err(discovery_error)?;
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pro"))
+            {
+                project_files.insert(path);
+            }
+        }
+    }
+    Ok(project_files)
 }
 
 fn collect_sheet_instance_paths(

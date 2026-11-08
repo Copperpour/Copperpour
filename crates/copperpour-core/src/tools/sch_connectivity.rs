@@ -35,7 +35,7 @@ use copperpour_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
         extract_bus_entries, extract_junctions, extract_no_connects, extract_sheet_pins,
-        pin_endpoint, Label, LabelKind, LibPin, Wire,
+        pin_endpoint, wire_end_needs_junction, Label, LabelKind, LibPin, Wire,
     },
     SexpNode,
 };
@@ -168,8 +168,8 @@ impl<'a> WireIndex<'a> {
         self.hits(x, y).next().is_some()
     }
 
-    /// Lies on the interior of a wire — a T-junction, which KiCAD connects
-    /// without splitting the crossed wire.
+    /// Lies on the interior of a wire, where eeschema joins it only through a
+    /// junction or a label.
     fn covers_interior(&self, x: f64, y: f64) -> bool {
         self.hits(x, y).any(|wire| {
             !points_coincident(x, y, wire.x1, wire.y1, self.tol)
@@ -566,6 +566,8 @@ pub(crate) struct ConnectivityIndex<'a> {
     junction_points: PointIndex,
     no_connect_points: PointIndex,
     placed_pins: Vec<PlacedPin>,
+    /// [`crate::tools::junction_exit_points`], for [`Self::needs_junction`].
+    junction_exits: Vec<(f64, f64)>,
 }
 
 /// The wire-side end of each bus entry on the sheet.
@@ -607,7 +609,17 @@ impl<'a> ConnectivityIndex<'a> {
         labels: &'a [Label],
         tolerance: f64,
     ) -> Self {
-        let placed_pins: Vec<PlacedPin> = crate::tools::placed_pins_by_reference(tree)
+        let by_reference = crate::tools::placed_pins_by_reference(tree);
+        let junctions = extract_junctions(tree);
+        let sheet_pins = extract_sheet_pins(tree);
+        let on_bus = WireIndex::build(buses, tolerance);
+        let bus_entry_wire_points = bus_entry_wire_ends_on(tree, &on_bus);
+        let junction_exits = crate::tools::junction_exits(
+            &by_reference,
+            sheet_pins.iter().copied(),
+            bus_entry_wire_points.iter().copied(),
+        );
+        let placed_pins: Vec<PlacedPin> = by_reference
             .into_iter()
             .flat_map(|(inst, pins)| {
                 pins.into_iter().map(move |(pin, transform)| PlacedPin {
@@ -618,10 +630,6 @@ impl<'a> ConnectivityIndex<'a> {
                 })
             })
             .collect();
-        let junctions = extract_junctions(tree);
-        let sheet_pins = extract_sheet_pins(tree);
-        let on_bus = WireIndex::build(buses, tolerance);
-        let bus_entry_wire_points = bus_entry_wire_ends_on(tree, &on_bus);
 
         ConnectivityIndex {
             wires,
@@ -656,6 +664,7 @@ impl<'a> ConnectivityIndex<'a> {
             junction_points: PointIndex::build(junctions, tolerance),
             no_connect_points: PointIndex::build(extract_no_connects(tree), tolerance),
             placed_pins,
+            junction_exits,
         }
     }
 
@@ -682,8 +691,8 @@ impl<'a> ConnectivityIndex<'a> {
         self.on_wire.covers(x, y)
     }
 
-    /// Lies on a wire's interior — a T-junction KiCAD connects without
-    /// splitting the crossed wire.
+    /// Lies on a wire's interior. eeschema joins a wire there only through a
+    /// junction dot or a label, so a T without either is two nets.
     pub(crate) fn on_wire_interior(&self, x: f64, y: f64) -> bool {
         self.on_wire.covers_interior(x, y)
     }
@@ -709,6 +718,21 @@ impl<'a> ConnectivityIndex<'a> {
             .iter()
             .filter(|w| point_on_segment(x, y, w.x1, w.y1, w.x2, w.y2, self.on_wire.tolerance()))
             .count()
+    }
+
+    /// Whether a junction dot belongs at `(x, y)`: three or more exits, counted
+    /// as the wire tools count them (#897). A wire passing through counts two
+    /// exits even where nothing ends, so this says yes at a bare crossing; a
+    /// caller adding a dot refuses that case itself, since the dot would join
+    /// two nets.
+    pub(crate) fn needs_junction(&self, x: f64, y: f64) -> bool {
+        wire_end_needs_junction(
+            self.wires,
+            &self.junction_exits,
+            x,
+            y,
+            self.on_wire.tolerance(),
+        )
     }
 
     pub(crate) fn has_label(&self, x: f64, y: f64) -> bool {
@@ -768,8 +792,9 @@ impl<'a> ConnectivityIndex<'a> {
 
     /// Whether a wire endpoint at `(x, y)` is terminated. Everything but the
     /// endpoint itself terminates it: a pin, a label, a hierarchical sheet pin,
-    /// a junction dot, a no-connect flag, another wire's endpoint, or the
-    /// interior of a wire it lands mid-span on.
+    /// a junction dot, a no-connect flag, or another wire's endpoint. A wire it
+    /// lands mid-span on does not: eeschema joins that wire only through a
+    /// junction or a label there, and its ERC reports the end as unconnected.
     pub(crate) fn terminates_wire_end(&self, x: f64, y: f64) -> bool {
         self.has_pin(x, y)
             || self.has_label(x, y)
@@ -778,7 +803,6 @@ impl<'a> ConnectivityIndex<'a> {
             || self.has_no_connect(x, y)
             || self.has_bus_entry_wire_end(x, y)
             || self.wire_ends_at(x, y) >= 2
-            || self.on_wire_interior(x, y)
     }
 
     /// Whether a pin at `(x, y)` is attached to anything. A wire ending on it,
@@ -952,6 +976,119 @@ mod agreement_tests {
         let components = call("validate_component_connections", &sch, json!({})).await;
         assert_eq!(components["unconnected_count"], 1, "{components}");
         assert_eq!(components["unconnected_pins"][0]["reference"], "U1");
+    }
+
+    /// The points of `items` whose `type` is `kind`, or of all of them.
+    fn points_of(items: &serde_json::Value, kind: Option<&str>) -> Vec<(f64, f64)> {
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| kind.is_none_or(|kind| item["type"] == kind))
+            .map(|item| (item["x"].as_f64().unwrap(), item["y"].as_f64().unwrap()))
+            .collect()
+    }
+
+    /// A wire ending mid-span on another wire with no junction there is not
+    /// joined to it: eeschema joins a wire's interior only through a junction
+    /// or a label, and its ERC reports the end as `unconnected_wire_endpoint`.
+    /// The `tee` group of `route_obstacles_kicad10.kicad_sch`, as KiCad saved
+    /// it, is that shape: R53's wire ends at (190.5, 156.21) on R51's. See the
+    /// README.
+    #[tokio::test]
+    async fn a_wire_ending_mid_span_without_a_junction_floats_for_every_tool() {
+        let sch = include_str!("../../tests/fixtures/route_obstacles_kicad10.kicad_sch");
+
+        let wires = call("validate_wire_connections", sch, json!({})).await;
+        assert_eq!(
+            points_of(&wires["floating_endpoints"], None),
+            [(190.5, 156.21)],
+            "{wires}"
+        );
+
+        let orphans = call("find_orphan_items", sch, json!({})).await;
+        assert_eq!(
+            points_of(&orphans["orphans"], Some("dangling_wire_end")),
+            [(190.5, 156.21)],
+            "{orphans}"
+        );
+    }
+
+    async fn served(
+        handler: &crate::mcp::handler::McpHandler,
+        tool: &str,
+        path: &std::path::Path,
+        mut arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        arguments["schematic"] = json!(path.display().to_string());
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{tool}: {result}");
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    /// The same shape made through Copperpour's own tools. `batch_add_wire`
+    /// dots R1's branch where it lands mid-span, so both tools pass the sheet;
+    /// `batch_delete` removing that dot leaves the branch end unjoined, as
+    /// KiCad's netlist and ERC then say, and both tools must report it.
+    #[tokio::test]
+    async fn a_tee_whose_dot_is_deleted_floats_for_every_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wire_end_junctions_kicad10.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/wire_end_junctions_kicad10.kicad_sch"),
+        )
+        .unwrap();
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+        // R1 pin 1 at (152.4, 97.79) up to a wire that runs to U1's output,
+        // whose open end a label names.
+        let wires = json!([
+            { "x1": 127.0, "y1": 88.9, "x2": 198.12, "y2": 88.9 },
+            { "x1": 198.12, "y1": 88.9, "x2": 198.12, "y2": 101.6 },
+            { "x1": 152.4, "y1": 97.79, "x2": 152.4, "y2": 88.9 }
+        ]);
+        served(&handler, "batch_add_wire", &path, json!({ "wires": wires })).await;
+        let label = json!({ "net": "N", "x": 127.0, "y": 88.9 });
+        served(&handler, "add_schematic_net_label", &path, label).await;
+
+        let wires = served(&handler, "validate_wire_connections", &path, json!({})).await;
+        assert_eq!(wires["floating_count"], 0, "{wires}");
+        let orphans = served(&handler, "find_orphan_items", &path, json!({})).await;
+        let dangling = points_of(&orphans["orphans"], Some("dangling_wire_end"));
+        assert!(dangling.is_empty(), "{orphans}");
+
+        let tree = copperpour_sexp::parse_sexp(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let dots = tree.find_all("junction");
+        assert_eq!(dots.len(), 1, "batch_add_wire dots the T alone");
+        let dot = dots[0].find_str("uuid").unwrap().to_string();
+        served(&handler, "batch_delete", &path, json!({ "uuids": [dot] })).await;
+
+        let wires = served(&handler, "validate_wire_connections", &path, json!({})).await;
+        assert_eq!(
+            points_of(&wires["floating_endpoints"], None),
+            [(152.4, 88.9)],
+            "{wires}"
+        );
+        let orphans = served(&handler, "find_orphan_items", &path, json!({})).await;
+        assert_eq!(
+            points_of(&orphans["orphans"], Some("dangling_wire_end")),
+            [(152.4, 88.9)],
+            "{orphans}"
+        );
     }
 
     fn bus(x1: f64, y1: f64, x2: f64, y2: f64, uuid: &str) -> String {

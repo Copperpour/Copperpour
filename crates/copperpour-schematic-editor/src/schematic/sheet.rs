@@ -325,6 +325,24 @@ impl Sheet {
     pub fn file(&self) -> &str {
         self.property("Sheetfile").unwrap_or("")
     }
+    /// Whether a sheet field, `Sheetname` or `Sheetfile`, is hidden; `None`
+    /// when the sheet has no such field.
+    pub fn property_hidden(&self, name: &str) -> Option<bool> {
+        self.properties
+            .iter()
+            .find(|p| p.name == name)
+            .map(Property::is_hidden)
+    }
+    /// Hide or show a sheet field's text. Returns whether it changed, or
+    /// `None` when the sheet has no such field.
+    pub fn set_property_hidden(&mut self, name: &str, hidden: bool) -> Option<bool> {
+        let property = self.properties.iter_mut().find(|p| p.name == name)?;
+        let changed = property.is_hidden() != hidden;
+        if changed {
+            property.set_hidden(hidden);
+        }
+        Some(changed)
+    }
     pub fn set_name(&mut self, v: &str) {
         self.set_property("Sheetname", v);
     }
@@ -407,6 +425,16 @@ impl Sheet {
         self.instances
             .iter()
             .find(|i| i.project_name == project_name)
+            .map(|i| i.page.as_str())
+    }
+
+    /// The page of this sheet under the parent instance at `path`, the
+    /// record `set_page` writes. A parent placed more than once gives the
+    /// sheet one record per placement.
+    pub fn page_at(&self, project_name: &str, path: &str) -> Option<&str> {
+        self.instances
+            .iter()
+            .find(|i| i.project_name == project_name && i.path == path)
             .map(|i| i.page.as_str())
     }
 
@@ -746,11 +774,30 @@ mod tests {
     }
 
     #[test]
+    fn a_sheet_field_is_hidden_and_shown_by_name() {
+        let mut sheet = Sheet::new("Amp", "amp.kicad_sch", 0.0, 0.0, 10.0, 10.0);
+        assert_eq!(sheet.property_hidden("Sheetfile"), Some(false));
+        assert_eq!(sheet.set_property_hidden("Sheetfile", true), Some(true));
+        assert_eq!(sheet.set_property_hidden("Sheetfile", true), Some(false));
+        assert_eq!(sheet.property_hidden("Sheetfile"), Some(true));
+        assert_eq!(sheet.property_hidden("Sheetname"), Some(false));
+        let reparsed = Sheet::from_sexp(&sheet.to_sexp()).unwrap();
+        assert_eq!(reparsed.property_hidden("Sheetfile"), Some(true));
+        assert_eq!(sheet.set_property_hidden("Sheetfile", false), Some(true));
+        assert_eq!(sheet.property_hidden("Sheetfile"), Some(false));
+        assert_eq!(sheet.property_hidden("Nope"), None);
+        assert_eq!(sheet.set_property_hidden("Nope", true), None);
+    }
+
+    #[test]
     fn multi_instance_sheet_keeps_separate_pages_per_path() {
         let mut sheet = Sheet::new("Amp Stage", "amp.kicad_sch", 0.0, 0.0, 10.0, 10.0);
         sheet.set_page("", "/", "2");
         sheet.set_page("", "/amp1-uuid/", "3");
         assert_eq!(sheet.instances.len(), 2);
+        assert_eq!(sheet.page_at("", "/"), Some("2"));
+        assert_eq!(sheet.page_at("", "/amp1-uuid/"), Some("3"));
+        assert_eq!(sheet.page_at("", "/amp2-uuid/"), None);
         let out = sheet.to_sexp();
         let reparsed = Sheet::from_sexp(&out).unwrap();
         assert_eq!(reparsed.instances.len(), 2);

@@ -1720,6 +1720,81 @@ mod hierarchy_dispatch_tests {
         assert!(source.contains("(exclude_from_sim no)"));
         assert!(source.contains("(do_not_autoplace no)"));
     }
+
+    /// A sheet file placed twice is written once, with a page for each
+    /// placement: through the served `tools/call`, on the eeschema-saved
+    /// nested fixture, whose `bank.kicad_sch` the root places as north and
+    /// south.
+    #[tokio::test]
+    async fn renumber_sheet_pages_numbers_each_placement_through_dispatch() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content) in [
+            (
+                "nested_pages.kicad_pro",
+                include_str!(
+                    "../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_pro"
+                ),
+            ),
+            (
+                "nested_pages.kicad_sch",
+                include_str!(
+                    "../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_sch"
+                ),
+            ),
+            (
+                "bank.kicad_sch",
+                include_str!("../../tests/fixtures/annotate_nested_hierarchy/bank.kicad_sch"),
+            ),
+            (
+                "cell.kicad_sch",
+                include_str!("../../tests/fixtures/annotate_nested_hierarchy/cell.kicad_sch"),
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), content).unwrap();
+        }
+        let root = dir.path().join("nested_pages.kicad_sch");
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "renumber_sheet_pages",
+                    "arguments": { "schematic": root.display().to_string() }
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        let body: Value = serde_json::from_str(text).expect("tool body is JSON");
+        assert_eq!(body["renumbered_count"], 6, "{body}");
+        assert_eq!(body["pages"][1]["sheet_name"], "east", "{body}");
+        assert_eq!(body["pages"][4]["sheet_name"], "east", "{body}");
+        assert_ne!(body["pages"][1]["path"], body["pages"][4]["path"], "{body}");
+
+        // east: page 3 under north, 6 under south; eeschema's 12 and 3 are gone.
+        let bank = std::fs::read_to_string(dir.path().join("bank.kicad_sch")).unwrap();
+        for page in ["3", "4", "6", "7"] {
+            assert!(bank.contains(&format!("(page \"{page}\")")), "{bank}");
+        }
+        assert!(!bank.contains("(page \"12\")"), "{bank}");
+    }
 }
 
 #[cfg(test)]
@@ -2177,24 +2252,37 @@ mod schema_validation_dispatch_tests {
     }
 
     /// The schema bound is the guard a caller meets first. The DSN does not
-    /// exist, so a call that got past the schema would be refused on another
-    /// field.
+    /// exist, so a call that got past the schema is refused for another
+    /// reason, which does not name optimize_seconds. 86399 is the largest window: the overall timeout is at most
+    /// 86400 and must exceed it.
     #[cfg(feature = "freerouting")]
     #[tokio::test]
-    async fn optimize_seconds_above_a_day_is_refused_by_the_schema() {
+    async fn optimize_seconds_above_86399_is_refused_by_the_schema() {
         let handler = handler().await;
-        let body = assert_invalid_field(
-            &handler,
-            "route_specctra_dsn",
+        let args = |optimize_seconds: u64| {
             json!({
                 "dsn_path": "does-not-exist.dsn",
                 "ses_output_path": "does-not-exist.ses",
-                "optimize_seconds": 86_401
-            }),
+                "optimize_seconds": optimize_seconds
+            })
+        };
+        let body = assert_invalid_field(
+            &handler,
+            "route_specctra_dsn",
+            args(86_400),
             "optimize_seconds",
         )
         .await;
         assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+
+        let (result, _, _) = handler
+            .dispatch_tool("route_specctra_dsn", &args(86_399))
+            .await;
+        let text = match result.content.first() {
+            Some(ToolContent::Text { text }) => text,
+            other => panic!("expected a text error, got {other:?}"),
+        };
+        assert!(!text.contains("optimize_seconds"), "{text}");
     }
 
     #[tokio::test]

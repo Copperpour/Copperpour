@@ -17,7 +17,7 @@ use copperpour_sexp::{
     parser::parse_sexp,
     schematic::{
         extract_all_net_labels, extract_buses, extract_labels, extract_symbol_instances,
-        extract_wires, find_lib_symbol, format_net_label, format_wire, parse_at, pin_endpoint,
+        extract_wires, find_lib_symbol, format_net_label, parse_at, pin_endpoint,
         pin_outward_direction, read_schematic, symbol_bounds_for_instance, SymbolBounds,
     },
     writer::{apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit},
@@ -134,8 +134,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Place multiple symbols from KiCAD libraries in one write with committed-file \
              readback. Preserves every saved hierarchy instance and preflights stale metadata \
              before any placement. Copies each library Value and Footprint unless that entry \
-             explicitly overrides it. Pins that land mid-segment on an existing wire gain the \
-             required junction in the same atomic write; the response reports \
+             explicitly overrides it. Pins that land mid-segment on an existing wire, or \
+             where wire ends meet, gain the required junction in the same atomic write; \
+             the response reports \
              junctions_added_count and junctions_pruned_count. \
              There is no auto-numbering: an omitted reference becomes the library prefix \
              plus '?' (e.g. 'R?', '#FLG?'), like an eeschema-unannotated symbol, same as \
@@ -219,9 +220,11 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "bulk_move_schematic_components",
             "Move multiple components by a uniform dx/dy offset in a single atomic file \
-             write. Junction dots are re-judged where the pins moved: a dot the pins \
-             leave unjustified is removed and a pin landing mid-span on a wire gains \
-             one, reported as junctions_pruned_count and junctions_added_count. A \
+             write. Junction dots are re-judged where the pins moved: a dot left with \
+             fewer than three exits (wires, pins, sheet pins, bus entries) is removed \
+             unless it is what joins wires there, and a pin that makes three, mid-span \
+             on one wire or where wire ends meet, gains one, reported as \
+             junctions_pruned_count and junctions_added_count. A \
              no-connect flag travels with the pin it protects, reported as \
              no_connects_moved; the shift is refused before writing when that pin \
              cannot be followed one-to-one.",
@@ -1722,15 +1725,14 @@ async fn handle_connect_passthrough(
     let stub = 2.54_f64;
     let (wire_end_x, wire_end_y) = (x + dir.dx * stub, y + dir.dy * stub);
 
-    let wire_sexp = format_wire(x, y, wire_end_x, wire_end_y);
     let label_sexp = format_net_label(&net_name, wire_end_x, wire_end_y, dir.label_rotation);
 
     let expected = content.clone();
+    // The stub gets the dots a new wire calls for, as one drawn with add_wire does (#137).
+    let with_stub =
+        crate::tools::sch_wiring::insert_wire_with_junctions(content, x, y, wire_end_x, wire_end_y);
     // Wires and labels are element class 2; symbol instances MUST come last.
-    let new_content = crate::tools::sch_wiring::insert_before_close(
-        &content,
-        &format!("{wire_sexp}{label_sexp}"),
-    );
+    let new_content = crate::tools::sch_wiring::insert_before_close(&with_stub, &label_sexp);
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
