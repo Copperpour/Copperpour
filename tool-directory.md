@@ -119,7 +119,7 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `add_wire` | Add a wire segment (H or V) between two points. T-junctions are auto-detected and junction dots inserted. |
+| `add_wire` | Add a wire segment (H or V) between two points. Dots the T-junctions this wire forms, and no others. |
 | `batch_add_wire` | Add multiple wire segments in a single file read/write cycle. |
 | `delete_schematic_wire` | Delete a wire segment by UUID or by matching start/end coordinates, pruning the junction dots it leaves unjustified. |
 | `batch_delete_schematic_wire` | Delete multiple wire segments in a single file read/write cycle, pruning the junction dots they leave unjustified. |

@@ -1,8 +1,9 @@
 //! `sch_wiring` toolset — wires, net labels, power symbols, junctions, no-connects.
 //!
-//! Key rule: Every wire add operation must auto-detect T-junctions and insert
-//! junction dots. This uses `copperpour_sexp::schematic::find_t_junctions` and
-//! `wire_end_needs_junction`.
+//! Key rule: Every wire add operation must dot the T-junctions its own wire
+//! forms, and no others: a dot-less T is two nets to KiCad. Most go through
+//! `new_wire_junctions`, which uses
+//! `copperpour_sexp::schematic::wire_end_needs_junction`.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -33,7 +34,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "add_wire",
             "Add a wire segment between two points. The wire must be horizontal or vertical. \
-             T-junctions are automatically detected and junction dots inserted.",
+             Junction dots are added where this wire forms a T or meets three or more \
+             wire ends and pins; a dot-less T elsewhere on the sheet is left alone.",
             json!({
                 "type": "object",
                 "properties": {
@@ -502,18 +504,23 @@ fn pins_mid_segment(exits: &[(f64, f64)], x1: f64, y1: f64, x2: f64, y2: f64) ->
 /// already hold the new wire, and `exits` comes from
 /// [`crate::tools::junction_exit_points`].
 ///
-/// The candidates are every T on the sheet, each exit the wire passes over,
-/// and the wire's two ends. Each is kept only where three or more exits meet
-/// (#897).
+/// The candidates are only points on the new wire: each wire end or exit it
+/// passes over, and its two ends. Each is kept only where three or more exits
+/// meet (mixelpixx/Konnect#897). A dot-less T elsewhere is two nets to KiCad,
+/// and dotting it would join them (mixelpixx/Konnect#887, Copperpour#118).
 fn new_wire_junctions(
     wires: &[Wire],
     exits: &[(f64, f64)],
     (x1, y1): (f64, f64),
     (x2, y2): (f64, f64),
 ) -> Vec<(f64, f64)> {
-    let candidates = find_t_junctions(wires, 0.01)
+    let ends_and_exits: Vec<(f64, f64)> = wires
+        .iter()
+        .flat_map(|w| [(w.x1, w.y1), (w.x2, w.y2)])
+        .chain(exits.iter().copied())
+        .collect();
+    let candidates = pins_mid_segment(&ends_and_exits, x1, y1, x2, y2)
         .into_iter()
-        .chain(pins_mid_segment(exits, x1, y1, x2, y2))
         .chain([(x1, y1), (x2, y2)]);
     crate::tools::dedup_points(
         candidates.filter(|&(px, py)| wire_end_needs_junction(wires, exits, px, py, 0.01)),
@@ -522,10 +529,9 @@ fn new_wire_junctions(
 
 /// Add a junction dot at each position that does not already carry one.
 ///
-/// `find_t_junctions` reports every T on the sheet, not only the ones the new
-/// wire made, so an unguarded loop re-emits a dot at every existing T on every
-/// call — quadratic in a batch. `insert_wire_with_junctions` guards the same
-/// way on the string path. Returns how many it added.
+/// A T on the new wire may already carry one, so an unguarded loop re-emits
+/// it. `insert_wire_with_junctions` guards the same way on the string path.
+/// Returns how many it added.
 fn add_missing_junctions(sch: &mut cse::Schematic, positions: &[(f64, f64)]) -> usize {
     let before = sch.junctions.len();
     for &(x, y) in positions {
@@ -627,19 +633,11 @@ pub(crate) fn insert_wire_with_junctions(
     };
     existing_wires.push(new_wire);
 
-    // Only the T's and 3-way exits this wire forms. A dot-less T elsewhere on
-    // the sheet is two nets to KiCad, and dotting it would join them unasked (#887).
     let exits = tree
         .as_ref()
         .map(crate::tools::junction_exit_points)
         .unwrap_or_default();
-    let junctions: Vec<(f64, f64)> =
-        new_wire_junctions(&existing_wires, &exits, (x1, y1), (x2, y2))
-            .into_iter()
-            .filter(|&(jx, jy)| {
-                copperpour_sexp::geometry::point_on_segment(jx, jy, x1, y1, x2, y2, 0.01)
-            })
-            .collect();
+    let junctions = new_wire_junctions(&existing_wires, &exits, (x1, y1), (x2, y2));
 
     let mut c = content;
     c = insert_before_close(&c, &format_wire(x1, y1, x2, y2));
@@ -4202,9 +4200,8 @@ mod unit_aware_wiring_tests {
             .count()
     }
 
-    /// `find_t_junctions` reports every T on the sheet, so each call used to
-    /// re-emit a dot at every T already there — five wires left five dots
-    /// stacked on one point.
+    /// Each call used to re-emit a dot at every T already on the sheet — five
+    /// wires left five dots stacked on one point.
     #[tokio::test]
     async fn repeated_add_wire_leaves_one_junction_per_t() {
         let (_d, path) = bare_schematic();

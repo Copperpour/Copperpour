@@ -61,7 +61,7 @@ python3 -I corpus.py <kicad-10.0>/demos
 The keys are (distinct wire-end exits, has a dot). The scan parses `(wire (pts
 ...))` and `(junction (at ...))`, keys points at 0.01 mm, takes each wire end's
 exit angle toward the wire's other end, and skips any point that lies mid-span on
-another wire, since `find_t_junctions` already handles those.
+another wire, since the wire tools' T check already handles those.
 
 `corpus.py`:
 
