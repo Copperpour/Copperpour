@@ -163,9 +163,10 @@ checks that the native DSN has the same components, pads, nets, layers, and
 routing rules, and writes the revision-bound reverse manifest. The temporary
 file is consumed and deleted.
 
-The `native_bridge_mode` tool argument controls selection: `prefer` (the default)
-uses a running bridge and otherwise falls back to the Rust DSN exporter,
-`require` fails if native export cannot be used, and `disable` uses Rust only.
+The `native_bridge_mode` tool argument controls selection: `disable` (the
+default) uses the Rust DSN exporter only, `prefer` uses a running bridge and
+otherwise falls back to the Rust exporter, and `require` fails if native export
+cannot be used.
 Native export is disabled in the plugin settings by default. This bridge is a
 KiCad 10 compatibility path, not a substitute for the executable IPC plugin or
 the KiCad 11 architecture; strict SES planning and atomic IPC apply never pass
