@@ -2670,6 +2670,30 @@ done"#,
         );
     }
 
+    /// With `neck_to_min_track_width`, the tool sends the project's
+    /// `min_track_width` as `neck_width_um`, among the caller's settings, and
+    /// reports it.
+    #[cfg(unix)]
+    #[test]
+    fn route_specctra_dsn_sends_the_min_track_width_as_neck_width_when_asked() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("board.kicad_pro"),
+            json!({ "board": { "design_settings": { "rules": {
+                "min_track_width": 0.15
+            } } } })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (answer, sent) =
+            route_through_the_tool(temp.path(), json!({ "neck_to_min_track_width": true }));
+
+        assert_eq!(sent, json!({ "neck_width_um": 150.0 }), "{answer}");
+        assert_eq!(answer["success"], true, "{answer}");
+        assert_eq!(answer["project_rules"]["neck_width_um"], 150.0, "{answer}");
+    }
+
     /// The count `route_response` decides on comes from the job's own lines
     /// in Freerouting's log, read when the job ends.
     #[cfg(unix)]
