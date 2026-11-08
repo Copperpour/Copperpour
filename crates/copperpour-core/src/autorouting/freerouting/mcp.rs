@@ -383,6 +383,32 @@ pub(crate) fn router_settings_threshold(router_settings: &Map<String, Value>) ->
         .as_f64()
 }
 
+/// The settings Freerouting did not apply, each as `"path: not a Freerouting
+/// setting"` or `"path: sent X, effective Y"`. Carried in the error of a run
+/// refused before `start_job`, so the handler can report `invalid_argument`
+/// on `router_settings` by downcasting rather than by reading the message.
+#[derive(Debug)]
+pub(crate) struct SettingsNotApplied(pub(crate) Vec<String>);
+
+impl std::fmt::Display for SettingsNotApplied {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Freerouting did not apply these settings, nothing was routed: {}",
+            self.0.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for SettingsNotApplied {}
+
+impl SettingsNotApplied {
+    /// The first [`SettingsNotApplied`] in `error`'s chain.
+    pub(crate) fn in_error(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+}
+
 /// Freerouting 2.5's `BatchOptimizer` reads an improvement threshold above 0
 /// and below 0.1 as a fraction and multiplies it by 100, so such a value never
 /// runs as given. 0 runs as given.
@@ -459,10 +485,7 @@ async fn run_state_machine(
                 settings_checked = true;
                 let not_applied = settings_mismatches(&job_settings, effective);
                 if !not_applied.is_empty() {
-                    bail!(
-                        "Freerouting did not apply these settings, nothing was routed: {}",
-                        not_applied.join("; ")
-                    );
+                    return Err(anyhow::Error::new(SettingsNotApplied(not_applied)));
                 }
                 settings_warnings = effective
                     .get("validation_warnings")
@@ -1710,6 +1733,23 @@ done
             "{message}"
         );
         assert!(!message.contains("max_threads"), "{message}");
+        // As route_local hands it to the handler: wrapped in the stderr.
+        let refusal = super::super::routing_failed(error.context("Freerouting stderr: noise"))
+            .expect("a refusal the caller can fix, not a handler error");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&refusal).as_deref(),
+            Some("invalid_argument")
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &refusal.content[0] else {
+            panic!("structured error must be text JSON");
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["field"], "router_settings", "{body}");
+        assert_eq!(
+            body["error"]["reason"],
+            "autorouter.max_pases: not a Freerouting setting; scoring.via_costs: sent 80, effective 50",
+            "{body}"
+        );
         let request: Value =
             serde_json::from_str(&std::fs::read_to_string(&sent).unwrap()).unwrap();
         assert_eq!(

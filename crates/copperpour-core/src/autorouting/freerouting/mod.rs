@@ -563,15 +563,34 @@ pub(crate) async fn route_specctra_dsn(
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
     };
-    let evidence = mcp::route_local(&jar, &dsn, &ses_output, &settings)
-        .await
-        .map_err(|error| anyhow::anyhow!("Freerouting MCP routing failed: {error:#}"))?;
-    Ok(CallToolResult::json(&route_response(
-        &evidence,
-        &jar,
-        &dsn,
-        &ses_output,
-    )))
+    match mcp::route_local(&jar, &dsn, &ses_output, &settings).await {
+        Ok(evidence) => Ok(CallToolResult::json(&route_response(
+            &evidence,
+            &jar,
+            &dsn,
+            &ses_output,
+        ))),
+        Err(error) => routing_failed(error),
+    }
+}
+
+/// The `route_specctra_dsn` answer for a run that failed.
+///
+/// Settings Freerouting did not apply are the caller's to fix, so they come
+/// back as `invalid_argument` on `router_settings`, found by downcasting.
+/// Every other failure (a crash, a timeout, a missing tool) stays a handler
+/// error.
+fn routing_failed(error: anyhow::Error) -> anyhow::Result<CallToolResult> {
+    if let Some(not_applied) = mcp::SettingsNotApplied::in_error(&error) {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "router_settings".to_string(),
+                reason: not_applied.0.join("; "),
+            },
+            format!("router_settings: {not_applied}. Fix them and call again."),
+        ));
+    }
+    Err(anyhow::anyhow!("Freerouting MCP routing failed: {error:#}"))
 }
 
 /// The `route_specctra_dsn` answer for a finished job.
