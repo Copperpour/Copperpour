@@ -217,8 +217,17 @@ pub(crate) async fn route_local(
     let diagnostics = client.close().await;
     let diagnostics_path = write_diagnostics(ses_output, &diagnostics).await?;
 
-    let result = route_result
-        .map_err(|error| with_stderr_tail(error, &diagnostics, diagnostics_path.as_deref()));
+    // with_stderr_tail rebuilds the error as text. A refusal of the caller's
+    // settings keeps its type for the handler, which answers it as
+    // invalid_argument; Freerouting's stderr has nothing to add to it and
+    // still goes to the log.
+    let result = route_result.map_err(|error| {
+        if SettingsNotApplied::in_error(&error).is_some() {
+            error
+        } else {
+            with_stderr_tail(error, &diagnostics, diagnostics_path.as_deref())
+        }
+    });
     let evidence = match result {
         Ok(evidence) => evidence,
         Err(error) => {
@@ -497,9 +506,9 @@ impl std::fmt::Display for SettingsNotApplied {
 impl std::error::Error for SettingsNotApplied {}
 
 impl SettingsNotApplied {
-    /// The first [`SettingsNotApplied`] in `error`'s chain.
+    /// The [`SettingsNotApplied`] `error` carries, context added or not.
     pub(crate) fn in_error(error: &anyhow::Error) -> Option<&Self> {
-        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+        error.downcast_ref::<Self>()
     }
 }
 
@@ -1995,7 +2004,7 @@ done
             "{message}"
         );
         assert!(!message.contains("max_threads"), "{message}");
-        // As route_local hands it to the handler: wrapped in the stderr.
+        // With context added on top, the type is still found.
         let refusal = super::super::routing_failed(error.context("Freerouting stderr: noise"))
             .expect("a refusal the caller can fix, not a handler error");
         assert_eq!(
@@ -2112,6 +2121,80 @@ done
         assert_eq!(evidence.final_state, "COMPLETED");
         assert!(!evidence.settings_checked);
         assert!(evidence.settings_warnings.is_empty());
+    }
+
+    /// Through `route_local`, behind a `java` that writes its banner to
+    /// stderr as Freerouting does: the refusal keeps its type, so the tool
+    /// answers `invalid_argument` and not a handler error.
+    #[cfg(unix)]
+    #[test]
+    fn a_settings_refusal_after_freerouting_wrote_to_stderr_is_still_invalid_argument() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        std::fs::write(&jar, "not a jar").unwrap();
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let mut tools = conforming_tools_list();
+        let by_path = tools["tools"][3]["inputSchema"].clone();
+        for name in ["update_job_settings", "get_effective_settings"] {
+            tools["tools"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({ "name": name, "inputSchema": by_path }));
+        }
+        let effective = json!({ "content": [{ "type": "text", "text": json!({
+            "status": 200,
+            "contentType": "application/json",
+            "body": { "autorouter": { "max_passes": 7, "max_threads": 4 }, "scoring": { "via_costs": 50 } }
+        }).to_string() }] });
+        let server = format!(
+            r#"while read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  [ -n "$id" ] || continue
+  case "$line" in
+    *'"initialize"'*) result='{{"protocolVersion":"2025-06-18"}}' ;;
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *get_effective_settings*) result='{effective}' ;;
+    *start_job*) printf 'started' > '{started}'; result='{{}}' ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$id" "$result"
+done"#,
+            started = temp.path().join("started").display(),
+        );
+        let settings = RouteSettings {
+            // The least route_local accepts; the refusal comes before any poll.
+            poll_interval: Duration::from_secs(2),
+            ..merged_settings()
+        };
+
+        let error = with_fake_java(
+            temp.path(),
+            &server,
+            route_local(&jar, &dsn, &ses, &settings),
+        )
+        .expect_err("settings that did not take are refused");
+
+        assert!(!temp.path().join("started").exists());
+        let refusal = super::super::routing_failed(error)
+            .expect("a refusal the caller can fix, not a handler error");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&refusal).as_deref(),
+            Some("invalid_argument")
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &refusal.content[0] else {
+            panic!("structured error must be text JSON");
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["field"], "router_settings", "{body}");
+        assert_eq!(
+            body["error"]["reason"],
+            "autorouter.max_pases: not a Freerouting setting; scoring.via_costs: sent 80, effective 50",
+            "{body}"
+        );
     }
 
     /// The count `route_response` decides on comes from the job's own lines
