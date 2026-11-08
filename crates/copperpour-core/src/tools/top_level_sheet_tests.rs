@@ -400,6 +400,54 @@ async fn a_file_placed_under_both_top_level_sheets_keeps_both_paths() {
     );
 }
 
+/// A sheet below the second top-level sheet that cannot be read may place the
+/// target too, so its paths are unknown: the write is refused, even though the
+/// first top-level sheet alone places the target once.
+#[tokio::test]
+async fn an_unreadable_sheet_under_a_second_top_level_sheet_refuses_the_write() {
+    let project = Project::new(Some(both(NIL, NIL)));
+    let (refused, body) = add_sheet(
+        &project.file("second.kicad_sch"),
+        "broken.kicad_sch",
+        "Broken",
+    )
+    .await;
+    assert!(!refused, "{body}");
+    // Malformed S-expression: a file that parses as no schematic still loads.
+    std::fs::write(
+        project.file("broken.kicad_sch"),
+        "(kicad_sch (version 20260306",
+    )
+    .unwrap();
+    let before = project.saved();
+
+    let child = project.file("child.kicad_sch");
+    let (refused, body) = add_sheet(&child, "sub.kicad_sch", "Sub").await;
+    assert!(refused, "{body}");
+    assert_eq!(kind(&body), "conflict", "{body}");
+    let (refused, body) = place(&child, "R10").await;
+    assert!(refused, "{body}");
+    assert_eq!(kind(&body), "conflict", "{body}");
+    assert_eq!(project.saved(), before);
+}
+
+/// A file listed twice is two top-level sheets; both under nil uuids, they key
+/// to the same uuid, and a write records each path once.
+#[tokio::test]
+async fn a_sheet_listed_twice_records_each_path_once() {
+    let project = Project::new(Some(json!([
+        {"filename": "toplevel.kicad_sch", "name": "toplevel", "uuid": NIL},
+        {"filename": "toplevel.kicad_sch", "name": "again", "uuid": NIL}
+    ])));
+    let child = project.file("child.kicad_sch");
+    let (refused, body) = place(&child, "R10").await;
+    assert!(!refused, "{body}");
+    assert_eq!(
+        recorded(&child, "R10"),
+        toplevel(&[format!("/{TOPLEVEL}/{CHILD_SHEET}")])
+    );
+}
+
 /// eeschema connects and numbers every top-level sheet as one design; a tool
 /// that reads one sheet's hierarchy as the whole refuses and writes nothing.
 #[tokio::test]
