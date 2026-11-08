@@ -83,6 +83,8 @@ pub mod schematic_builder;
 mod schematic_placement_tests;
 #[cfg(test)]
 mod schematic_title_block_tests;
+#[cfg(test)]
+mod stub_obstacle_tests;
 pub mod svg_import;
 mod symbol_fields;
 mod symbol_pins;
@@ -1602,6 +1604,7 @@ const STUB_DIRECTIONS: [(&str, f64, f64, f64); 4] = [
 
 /// A resolved stub direction: which way the wire leaves the anchor, and how to
 /// orient the label at its far end.
+#[derive(Clone, Copy)]
 pub(crate) struct StubDirection {
     pub name: &'static str,
     /// Unit offset in schematic space (Y grows downward).
@@ -1667,14 +1670,28 @@ pub(crate) fn stub_direction(direction: &str, outward: Option<f64>) -> StubDirec
     }
 }
 
-/// [`stub_direction`] for a caller holding only a coordinate. Naming a pin is
-/// exact; matching one by position gives up when stacked pins there disagree.
-pub(crate) fn resolve_stub_direction(
-    direction: &str,
-    anchor: (f64, f64),
-    tree: &copperpour_sexp::SexpNode,
-) -> StubDirection {
-    stub_direction(direction, pin_outward_at(tree, anchor.0, anchor.1))
+/// The directions a stub may take, best first (#117): the one named, or with
+/// `auto` the outward one and then the two across it, never back over the
+/// symbol. With no outward direction known, all four are tried. A stub turned
+/// up or down keeps the outward label rotation, so its text still runs away
+/// from the symbol.
+pub(crate) fn stub_directions(direction: &str, outward: Option<f64>) -> Vec<StubDirection> {
+    let first = stub_direction(direction, outward);
+    if direction != "auto" {
+        return vec![first];
+    }
+    let back = outward.map(|d| (d + 180.0) % 360.0);
+    let rest = STUB_DIRECTIONS
+        .iter()
+        .filter(|r| r.0 != first.name && Some(r.3) != back)
+        .map(|r| {
+            let mut dir = stub_direction(r.0, outward);
+            if let (Some(d), true) = (outward, r.1 == 0.0) {
+                dir.label_rotation = copperpour_sexp::schematic::horizontal_label_rotation(d);
+            }
+            dir
+        });
+    std::iter::once(first).chain(rest).collect()
 }
 
 /// Add junction dots for pins of `reference` that land mid-segment on a wire.
