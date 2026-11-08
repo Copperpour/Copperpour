@@ -110,6 +110,9 @@ pub(crate) struct RouteEvidence {
     /// Freerouting's log file the count was looked for in; None when no
     /// location could be worked out.
     pub freerouting_log: Option<String>,
+    /// Project design rules sent but not applied, e.g. a key an older JAR
+    /// does not have (`hole_to_hole_um` in 2.5.0), as "path: reason".
+    pub project_rules_not_applied: Vec<String>,
     /// Freerouting's own `validation_warnings` for the effective settings.
     pub settings_warnings: Vec<Value>,
 }
@@ -177,11 +180,16 @@ pub(crate) async fn probe_local(jar: &Path) -> BridgeProbe {
     }
 }
 
+/// Route `dsn` with the caller's `settings`. `project_rules` are the
+/// Freerouting settings read from the KiCad project's design rules
+/// ([`project_route_rules`]), sent under `settings`. A project rule the JAR
+/// does not apply is reported, not refused: the caller did not ask for it.
 pub(crate) async fn route_local(
     jar: &Path,
     dsn: &Path,
     ses_output: &Path,
     settings: &RouteSettings,
+    project_rules: &Map<String, Value>,
 ) -> Result<RouteEvidence> {
     validate_inputs(jar, dsn, ses_output, settings)?;
     if let Some(parent) = ses_output
@@ -204,7 +212,14 @@ pub(crate) async fn route_local(
     let started = Instant::now();
     let route_result = match timeout(
         settings.overall_timeout,
-        run_state_machine(&mut client, dsn, &temporary, settings, started),
+        run_state_machine(
+            &mut client,
+            dsn,
+            &temporary,
+            settings,
+            project_rules,
+            started,
+        ),
     )
     .await
     {
@@ -217,8 +232,17 @@ pub(crate) async fn route_local(
     let diagnostics = client.close().await;
     let diagnostics_path = write_diagnostics(ses_output, &diagnostics).await?;
 
-    let result = route_result
-        .map_err(|error| with_stderr_tail(error, &diagnostics, diagnostics_path.as_deref()));
+    // with_stderr_tail rebuilds the error as text. A refusal of the caller's
+    // settings keeps its type for the handler, which answers it as
+    // invalid_argument; Freerouting's stderr has nothing to add to it and
+    // still goes to the log.
+    let result = route_result.map_err(|error| {
+        if SettingsNotApplied::in_error(&error).is_some() {
+            error
+        } else {
+            with_stderr_tail(error, &diagnostics, diagnostics_path.as_deref())
+        }
+    });
     let evidence = match result {
         Ok(evidence) => evidence,
         Err(error) => {
@@ -497,9 +521,9 @@ impl std::fmt::Display for SettingsNotApplied {
 impl std::error::Error for SettingsNotApplied {}
 
 impl SettingsNotApplied {
-    /// The first [`SettingsNotApplied`] in `error`'s chain.
+    /// The [`SettingsNotApplied`] `error` carries, context added or not.
     pub(crate) fn in_error(error: &anyhow::Error) -> Option<&Self> {
-        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+        error.downcast_ref::<Self>()
     }
 }
 
@@ -550,6 +574,7 @@ async fn run_state_machine(
     dsn: &Path,
     temporary: &Path,
     settings: &RouteSettings,
+    project_rules: &Map<String, Value>,
     started: Instant,
 ) -> Result<RouteEvidence> {
     let tools = client.list_tools().await?;
@@ -582,13 +607,25 @@ async fn run_state_machine(
         )
         .await?;
 
-    let job_settings = job_settings_body(settings);
+    // The project rules go under what the caller asked for, which wins.
+    let requested = job_settings_body(settings);
+    let project_only = project_only_settings(project_rules, &requested);
+    let mut job_settings = project_only.clone();
+    job_settings.extend(requested.clone());
     let mut settings_checked = false;
     let mut settings_warnings = Vec::new();
-    if !job_settings.is_empty() {
-        if !tools.contains_key("update_job_settings") {
+    let mut project_rules_not_applied = Vec::new();
+    if !job_settings.is_empty() && !tools.contains_key("update_job_settings") {
+        if !requested.is_empty() {
             bail!("Freerouting MCP does not expose update_job_settings");
         }
+        // Only project rules to send: a JAR that cannot take them still
+        // routes, as it did before they were sent, and says what it skipped.
+        project_rules_not_applied = project_only
+            .keys()
+            .map(|key| format!("{key}: not sent, this Freerouting has no update_job_settings"))
+            .collect();
+    } else if !job_settings.is_empty() {
         client
             .call_tool(
                 "update_job_settings",
@@ -607,7 +644,10 @@ async fn run_state_machine(
                 .await?;
             if let Some(effective) = effective_settings(&effective) {
                 settings_checked = true;
-                let not_applied = settings_mismatches(&job_settings, effective);
+                // What the caller asked for is checked strictly; a project
+                // rule it did not override is only reported.
+                project_rules_not_applied = settings_mismatches(&project_only, effective);
+                let not_applied = settings_mismatches(&requested, effective);
                 if !not_applied.is_empty() {
                     return Err(anyhow::Error::new(SettingsNotApplied(not_applied)));
                 }
@@ -694,6 +734,7 @@ async fn run_state_machine(
         freerouting_log: progress.log.as_deref().map(|log| log.display().to_string()),
         last_activity: progress.activity,
         settings_checked,
+        project_rules_not_applied,
         settings_warnings,
     })
 }
@@ -1471,6 +1512,44 @@ fn job_settings_body(settings: &RouteSettings) -> Map<String, Value> {
     body
 }
 
+/// The project rules the caller did not override, so the ones sent as read
+/// from the project. Project rules are top-level numbers, so a top-level key
+/// in `requested` overrides one.
+fn project_only_settings(
+    project_rules: &Map<String, Value>,
+    requested: &Map<String, Value>,
+) -> Map<String, Value> {
+    project_rules
+        .iter()
+        .filter(|(key, _)| !requested.contains_key(*key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// KiCad design rules (`board.design_settings.rules` in a `.kicad_pro`, in
+/// mm) and the Freerouting setting (in um) each one is sent as.
+pub(crate) const PROJECT_RULES: [(&str, &str); 3] = [
+    ("min_copper_edge_clearance", "copper_to_edge_clearance_um"),
+    ("min_hole_to_hole", "hole_to_hole_um"),
+    ("min_hole_clearance", "hole_clearance_um"),
+];
+
+/// Freerouting settings from a KiCad project's design rules. Freerouting does
+/// not get these from the DSN: KiCad leaves the board edge clearance out of
+/// it, and the hole rules have no Specctra form. Without them, its job API
+/// routes with none at all. A rule that is absent, not a number, or not above
+/// 0 is not sent, so Freerouting keeps its own default for it.
+pub(crate) fn project_route_rules(project: &Value) -> Map<String, Value> {
+    let rules = &project["board"]["design_settings"]["rules"];
+    PROJECT_RULES
+        .iter()
+        .filter_map(|(kicad, freerouting)| {
+            let mm = rules[*kicad].as_f64().filter(|mm| *mm > 0.0)?;
+            Some((freerouting.to_string(), json!((mm * 1000.0).round())))
+        })
+        .collect()
+}
+
 /// The settings that have their own route_specctra_dsn argument.
 fn named_settings(settings: &RouteSettings) -> Map<String, Value> {
     let mut body = Map::new();
@@ -1995,7 +2074,7 @@ done
             "{message}"
         );
         assert!(!message.contains("max_threads"), "{message}");
-        // As route_local hands it to the handler: wrapped in the stderr.
+        // With context added on top, the type is still found.
         let refusal = super::super::routing_failed(error.context("Freerouting stderr: noise"))
             .expect("a refusal the caller can fix, not a handler error");
         assert_eq!(
@@ -2112,6 +2191,448 @@ done
         assert_eq!(evidence.final_state, "COMPLETED");
         assert!(!evidence.settings_checked);
         assert!(evidence.settings_warnings.is_empty());
+    }
+
+    /// Through `route_local`, behind a `java` that writes its banner to
+    /// stderr as Freerouting does: the refusal keeps its type, so the tool
+    /// answers `invalid_argument` and not a handler error.
+    #[cfg(unix)]
+    #[test]
+    fn a_settings_refusal_after_freerouting_wrote_to_stderr_is_still_invalid_argument() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        std::fs::write(&jar, "not a jar").unwrap();
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let mut tools = conforming_tools_list();
+        let by_path = tools["tools"][3]["inputSchema"].clone();
+        for name in ["update_job_settings", "get_effective_settings"] {
+            tools["tools"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({ "name": name, "inputSchema": by_path }));
+        }
+        let effective = json!({ "content": [{ "type": "text", "text": json!({
+            "status": 200,
+            "contentType": "application/json",
+            "body": { "autorouter": { "max_passes": 7, "max_threads": 4 }, "scoring": { "via_costs": 50 } }
+        }).to_string() }] });
+        let server = format!(
+            r#"while read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  [ -n "$id" ] || continue
+  case "$line" in
+    *'"initialize"'*) result='{{"protocolVersion":"2025-06-18"}}' ;;
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *get_effective_settings*) result='{effective}' ;;
+    *start_job*) printf 'started' > '{started}'; result='{{}}' ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$id" "$result"
+done"#,
+            started = temp.path().join("started").display(),
+        );
+        let settings = RouteSettings {
+            // The least route_local accepts; the refusal comes before any poll.
+            poll_interval: Duration::from_secs(2),
+            ..merged_settings()
+        };
+
+        let error = with_fake_java(
+            temp.path(),
+            &server,
+            route_local(&jar, &dsn, &ses, &settings),
+        )
+        .expect_err("settings that did not take are refused");
+
+        assert!(!temp.path().join("started").exists());
+        let refusal = super::super::routing_failed(error)
+            .expect("a refusal the caller can fix, not a handler error");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&refusal).as_deref(),
+            Some("invalid_argument")
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &refusal.content[0] else {
+            panic!("structured error must be text JSON");
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["field"], "router_settings", "{body}");
+        assert_eq!(
+            body["error"]["reason"],
+            "autorouter.max_pases: not a Freerouting setting; scoring.via_costs: sent 80, effective 50",
+            "{body}"
+        );
+    }
+
+    /// [`super::route_local`] without project rules, as most tests route.
+    /// It shadows the glob import, so these tests keep their shape.
+    async fn route_local(
+        jar: &Path,
+        dsn: &Path,
+        ses_output: &Path,
+        settings: &RouteSettings,
+    ) -> Result<RouteEvidence> {
+        super::route_local(jar, dsn, ses_output, settings, &Map::new()).await
+    }
+
+    /// [`super::run_state_machine`] without project rules, as most tests run
+    /// it. It shadows the glob import, like [`route_local`] above.
+    async fn run_state_machine(
+        client: &mut LocalMcpClient,
+        dsn: &Path,
+        temporary: &Path,
+        settings: &RouteSettings,
+        started: Instant,
+    ) -> Result<RouteEvidence> {
+        super::run_state_machine(client, dsn, temporary, settings, &Map::new(), started).await
+    }
+
+    /// Only `router_settings`, if any.
+    fn asking_for(router_settings: Option<Value>) -> RouteSettings {
+        RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: router_settings.and_then(|value| value.as_object().cloned()),
+            poll_interval: Duration::from_millis(10),
+            overall_timeout: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn project_design_rules_become_freerouting_settings_in_um() {
+        let project = json!({ "board": { "design_settings": { "rules": {
+            "min_copper_edge_clearance": 0.5,
+            "min_hole_to_hole": 0.25,
+            "min_hole_clearance": 0.0,
+            "min_clearance": 0.2
+        } } } });
+        assert_eq!(
+            Value::Object(project_route_rules(&project)),
+            json!({ "copper_to_edge_clearance_um": 500.0, "hole_to_hole_um": 250.0 })
+        );
+        // Below zero, not a number, or absent: Freerouting keeps its default.
+        let unusable = json!({ "board": { "design_settings": { "rules": {
+            "min_copper_edge_clearance": -0.5,
+            "min_hole_to_hole": "0.25"
+        } } } });
+        assert!(project_route_rules(&unusable).is_empty());
+        assert!(project_route_rules(&json!({})).is_empty());
+        // Rounded to the micrometre Freerouting takes.
+        let fine = json!({ "board": { "design_settings": { "rules": {
+            "min_hole_clearance": 0.2504
+        } } } });
+        assert_eq!(
+            Value::Object(project_route_rules(&fine)),
+            json!({ "hole_clearance_um": 250.0 })
+        );
+    }
+
+    #[test]
+    fn project_rules_go_under_what_the_caller_asked_for() {
+        let project = json!({ "copper_to_edge_clearance_um": 500.0, "hole_to_hole_um": 500.0 });
+        let requested = job_settings_body(&asking_for(Some(
+            json!({ "copper_to_edge_clearance_um": 300.0 }),
+        )));
+        // Only the rule the caller left alone is sent from the project, and
+        // checked leniently.
+        assert_eq!(
+            Value::Object(project_only_settings(
+                project.as_object().unwrap(),
+                &requested
+            )),
+            json!({ "hole_to_hole_um": 500.0 })
+        );
+    }
+
+    /// The JAR does not know `hole_to_hole_um` (Freerouting 2.5.0): the run
+    /// goes on and says so, and the caller's `hole_clearance_um` replaces the
+    /// project's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_project_rule_freerouting_did_not_apply_is_reported_not_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let (mut client, sent, calls) = settings_server(
+            temp.path(),
+            json!({ "copper_to_edge_clearance_um": 500.0, "hole_clearance_um": 200 }),
+        );
+        let project = json!({
+            "copper_to_edge_clearance_um": 500.0,
+            "hole_to_hole_um": 250.0,
+            "hole_clearance_um": 300.0
+        });
+
+        let evidence = timeout(
+            Duration::from_secs(20),
+            super::run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &asking_for(Some(json!({ "hole_clearance_um": 200 }))),
+                project.as_object().unwrap(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the scripted job ends")
+        .expect("a project rule the JAR skipped does not refuse the run");
+        client.close().await;
+
+        let request: Value =
+            serde_json::from_str(&std::fs::read_to_string(&sent).unwrap()).unwrap();
+        assert_eq!(
+            request["params"]["arguments"]["body"],
+            json!({
+                "copper_to_edge_clearance_um": 500.0,
+                "hole_to_hole_um": 250.0,
+                "hole_clearance_um": 200
+            })
+        );
+        assert_eq!(
+            evidence.project_rules_not_applied,
+            ["hole_to_hole_um: not a Freerouting setting"]
+        );
+        assert!(std::fs::read_to_string(&calls)
+            .unwrap()
+            .contains("start_job"));
+    }
+
+    /// The project has the same rule: what the caller asked for is still
+    /// checked strictly, and refused when Freerouting did not apply it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_requested_setting_over_a_project_rule_is_still_refused_when_not_applied() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let (mut client, _sent, calls) =
+            settings_server(temp.path(), json!({ "copper_to_edge_clearance_um": 250.0 }));
+        let project = json!({ "copper_to_edge_clearance_um": 500.0 });
+
+        let error = timeout(
+            Duration::from_secs(20),
+            super::run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &asking_for(Some(json!({ "copper_to_edge_clearance_um": 300.0 }))),
+                project.as_object().unwrap(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the refusal comes before any poll")
+        .expect_err("the caller's setting did not take");
+        client.close().await;
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("copper_to_edge_clearance_um: sent 300.0, effective 250.0"),
+            "{message}"
+        );
+        assert!(!std::fs::read_to_string(&calls)
+            .unwrap()
+            .contains("start_job"));
+    }
+
+    /// A JAR without `update_job_settings` routes as it did before project
+    /// rules were sent, and lists each one as not sent. Asked-for settings
+    /// are still refused there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_rules_alone_do_not_need_update_job_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let dsn = temp.path().join("board.dsn");
+        let temporary = temp.path().join("board.ses.tmp");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let script = temp.path().join("server.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"n=0
+while read -r line; do
+  n=$((n+1))
+  case "$line" in
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *get_job_details*) result='{{"state":"COMPLETED"}}' ;;
+    *download_job_output_to_local_file*) printf '(session board)' > '{output}'; result='{{}}'; last=1 ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$n" "$result"
+  if [ -n "${{last:-}}" ]; then exit 0; fi
+done
+"#,
+                tools = conforming_tools_list(),
+                output = temporary.display(),
+            ),
+        )
+        .unwrap();
+        let project = json!({ "copper_to_edge_clearance_um": 500.0 });
+
+        let mut client = scripted_client(&format!("exec sh '{}'", script.display()));
+        let evidence = timeout(
+            Duration::from_secs(20),
+            super::run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &asking_for(None),
+                project.as_object().unwrap(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the scripted job ends")
+        .expect("project rules alone do not fail the run");
+        client.close().await;
+        assert_eq!(evidence.final_state, "COMPLETED");
+        assert_eq!(
+            evidence.project_rules_not_applied,
+            ["copper_to_edge_clearance_um: not sent, this Freerouting has no update_job_settings"]
+        );
+
+        std::fs::remove_file(&temporary).unwrap();
+        let mut client = scripted_client(&format!("exec sh '{}'", script.display()));
+        let error = timeout(
+            Duration::from_secs(20),
+            super::run_state_machine(
+                &mut client,
+                &dsn,
+                &temporary,
+                &asking_for(Some(json!({ "hole_clearance_um": 200 }))),
+                project.as_object().unwrap(),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("the refusal comes before any poll")
+        .expect_err("asked-for settings need update_job_settings");
+        client.close().await;
+        assert!(
+            format!("{error:#}").contains("does not expose update_job_settings"),
+            "{error:#}"
+        );
+    }
+
+    /// Calls `route_specctra_dsn` with `args` (`jar_path`, `dsn_path` and
+    /// `ses_output_path` in `temp` added) behind [`with_fake_java`], against
+    /// a server that takes `update_job_settings` but cannot read settings
+    /// back. Returns the tool's answer and the settings body it sent.
+    #[cfg(unix)]
+    fn route_through_the_tool(temp: &Path, mut args: Value) -> (Value, Value) {
+        let jar = temp.join("freerouting.jar");
+        let dsn = temp.join("board.dsn");
+        let sent = temp.join("sent.json");
+        std::fs::write(&jar, "not a jar").unwrap();
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let mut tools = conforming_tools_list();
+        let by_path = tools["tools"][3]["inputSchema"].clone();
+        tools["tools"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "name": "update_job_settings", "inputSchema": by_path }));
+        let server = format!(
+            r#"while read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  [ -n "$id" ] || continue
+  case "$line" in
+    *'"initialize"'*) result='{{"protocolVersion":"2025-06-18"}}' ;;
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *update_job_settings*) printf '%s' "$line" > '{sent}'; result='{{}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *get_job_details*) result='{{"state":"COMPLETED"}}' ;;
+    *download_job_output_to_local_file*)
+      file=$(printf '%s' "$line" | sed -n 's/.*"filePath":"\([^"]*\)".*/\1/p')
+      printf '(session board)' > "$file"; result='{{}}' ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$id" "$result"
+done"#,
+            sent = sent.display(),
+        );
+        let paths = args.as_object_mut().unwrap();
+        paths.insert("jar_path".into(), json!(jar.display().to_string()));
+        paths.insert("dsn_path".into(), json!(dsn.display().to_string()));
+        paths.insert(
+            "ses_output_path".into(),
+            json!(temp.join("board.ses").display().to_string()),
+        );
+        let context = crate::tools::ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = with_fake_java(
+            temp,
+            &server,
+            super::super::route_specctra_dsn(&args, &context),
+        )
+        .expect("the tool answers");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("the answer is text JSON");
+        };
+        let answer: Value = serde_json::from_str(text).unwrap();
+        let request: Value = serde_json::from_str(
+            &std::fs::read_to_string(&sent).expect("update_job_settings was called"),
+        )
+        .unwrap();
+        (answer, request["params"]["arguments"]["body"].clone())
+    }
+
+    /// The tool reads the project next to the DSN and sends its rules to
+    /// Freerouting, under the caller's own settings, which win.
+    #[cfg(unix)]
+    #[test]
+    fn route_specctra_dsn_sends_the_project_rules_to_freerouting() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("board.kicad_pro"),
+            json!({ "board": { "design_settings": { "rules": {
+                "min_copper_edge_clearance": 0.5,
+                "min_hole_clearance": 0.25
+            } } } })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (answer, sent) = route_through_the_tool(
+            temp.path(),
+            json!({ "router_settings": { "hole_clearance_um": 200 } }),
+        );
+
+        assert_eq!(
+            sent,
+            json!({ "copper_to_edge_clearance_um": 500.0, "hole_clearance_um": 200 }),
+            "{answer}"
+        );
+        assert_eq!(answer["success"], true, "{answer}");
+        assert_eq!(
+            answer["project_rules"]["sent"],
+            json!({ "copper_to_edge_clearance_um": 500.0, "hole_clearance_um": 250.0 }),
+            "{answer}"
+        );
     }
 
     /// The count `route_response` decides on comes from the job's own lines
