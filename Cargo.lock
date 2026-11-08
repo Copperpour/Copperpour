@@ -440,7 +440,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "copperpour"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "copperpour-core"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "copperpour-ipc"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "copperpour-sexp",
@@ -519,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "copperpour-render"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "image",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "copperpour-schematic-editor"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "copperpour-sexp",
  "tempfile",
@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "copperpour-sexp"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "copperpour-vcs"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "gix",
