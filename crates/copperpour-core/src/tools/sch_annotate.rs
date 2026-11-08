@@ -1104,6 +1104,20 @@ fn select_project(
             return Err(refuse(format!("project ownership is not proven: {error}")));
         }
     };
+    // The numbers kept free are those of one top-level sheet's hierarchy, so
+    // this refuses as the hierarchy scope does.
+    if let Some(reason) = owner
+        .as_ref()
+        .and_then(|owner| owner.single_top_level_sheet().err())
+    {
+        return Err(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "schematic_scope".to_string(),
+                reason: reason.clone(),
+            },
+            reason,
+        ));
+    }
     let owner_stem = owner.as_ref().map(|owner| {
         owner
             .project_file
@@ -1721,54 +1735,30 @@ pub(crate) fn annotate_hierarchy(path: &Path, options: AnnotateOptions) -> CallT
     })
 }
 
-/// Whether `root` is its project's only top-level sheet, as eeschema 10 reads
-/// `schematic.top_level_sheets`: none listed means the project's own
-/// schematic, and an entry's uuid, unless nil, replaces the sheet's own.
+/// Whether `root` is its project's only top-level sheet, keyed by its own
+/// uuid, as [`crate::tools::listed_top_level_sheets`] reads the list: an
+/// entry's uuid, unless nil, replaces the sheet's own.
 pub(crate) fn sole_top_level_sheet(
     project_file: &Path,
     root: &Path,
     root_uuid: &str,
 ) -> Result<(), String> {
-    const NIL: &str = "00000000-0000-0000-0000-000000000000";
     let shown = project_file.display();
-    let settings: Value = std::fs::read_to_string(project_file)
-        .map_err(|error| format!("{shown} cannot be read: {error}"))
-        .and_then(|text| {
-            serde_json::from_str(&text).map_err(|error| format!("{shown} is not JSON: {error}"))
-        })?;
-    let sheets = match settings.pointer("/schematic/top_level_sheets") {
-        None | Some(Value::Null) => return Ok(()),
-        Some(Value::Array(sheets)) if sheets.is_empty() => return Ok(()),
-        Some(Value::Array(sheets)) => sheets,
-        Some(_) => {
-            return Err(format!(
-                "{shown}'s schematic.top_level_sheets is not a list"
-            ))
-        }
-    };
-    let directory = project_file.parent().unwrap_or_else(|| Path::new(""));
-    let files: Vec<&str> = sheets
-        .iter()
-        .map(|sheet| sheet["filename"].as_str().unwrap_or("?"))
-        .collect();
-    match sheets.as_slice() {
-        [sheet]
-            if sheet["filename"].as_str().is_some_and(|file| {
-                crate::tools::same_schematic_document(&directory.join(file), root)
-            }) =>
-        {
-            match sheet["uuid"].as_str() {
-                None => Ok(()),
-                Some(uuid) if uuid == NIL || uuid == root_uuid => Ok(()),
-                Some(uuid) => Err(format!(
-                    "{shown} gives the root the uuid {uuid}, not its own {root_uuid}, so its \
-                     sheet instances are not the paths its files record; nothing was written"
-                )),
-            }
-        }
-        _ => Err(format!(
-            "{shown} lists the top-level sheets {files:?}; eeschema annotates them as one \
+    match crate::tools::listed_top_level_sheets(project_file).as_slice() {
+        [(sheet, uuid)] if crate::tools::same_schematic_document(sheet, root) => match uuid {
+            Some(uuid) if uuid != root_uuid => Err(format!(
+                "{shown} gives the root the uuid {uuid}, not its own {root_uuid}, so its \
+                 sheet instances are not the paths its files record; nothing was written"
+            )),
+            _ => Ok(()),
+        },
+        sheets => Err(format!(
+            "{shown} lists the top-level sheets {:?}; eeschema annotates them as one \
              hierarchy and this walks only {}, so nothing was written",
+            sheets
+                .iter()
+                .map(|(sheet, _)| sheet.display().to_string())
+                .collect::<Vec<_>>(),
             root.display()
         )),
     }
@@ -1910,10 +1900,23 @@ fn annotate_hierarchy_with_persistence(
     // eeschema locks the root it opened and holds every sheet in memory, so a
     // lock beside any file of the hierarchy refuses the whole call. Anything
     // at the lock path counts, as the writer counts it.
-    let locked: Vec<String> = hierarchy
+    // The file eeschema opened is the project's own, which a project listing
+    // one other top-level sheet does not place.
+    let mut guarded: Vec<std::path::PathBuf> = hierarchy
         .files
         .iter()
-        .filter_map(|file| kicad_editor_lock_path(&file.path))
+        .map(|file| file.path.clone())
+        .collect();
+    let editor = ownership.editor_schematic();
+    if !guarded
+        .iter()
+        .any(|file| crate::tools::same_schematic_document(file, &editor))
+    {
+        guarded.push(editor);
+    }
+    let locked: Vec<String> = guarded
+        .iter()
+        .filter_map(|file| kicad_editor_lock_path(file))
         .filter(|lock| {
             !matches!(std::fs::symlink_metadata(lock),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound)

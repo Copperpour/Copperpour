@@ -12,6 +12,7 @@ walking ancestors, so the same saved hierarchy remains discoverable.
 | --- | --- |
 | Library table beside the target | Library lookup uses that directory before consulting ancestor projects. |
 | Exactly one project hierarchy contains the target, and candidate traversal is complete | Use the proven project's directory and hierarchy paths. |
+| The project lists top-level sheets in `schematic.top_level_sheets` | Each listed sheet is a root, its paths starting at its entry's uuid unless that is nil, and the target's paths are those every top-level sheet places it at. A project that lists none, or whose project file cannot be read or parsed, has `<project>.kicad_sch` alone; a file it does not list is no root. |
 | No ancestor project candidate | Allow the loose schematic and keep its own directory as the library context. |
 | Candidates exist but no hierarchy contains the target | Return the existing structured `conflict`. |
 | A candidate root is missing, unreadable, malformed, or lacks its root UUID | Retain that candidate in the conflict evidence. |
@@ -73,7 +74,7 @@ as eeschema saves it, and carries the project's name or none.
 | The target is the proven root, and the project lists no other top-level sheet | Annotate every sheet instance; commit every changed file in one transaction. |
 | The target is a child sheet, or no project owns it | Return `invalid_argument` naming the root or asking for `schematic_scope: "file"`; never annotate the file alone. |
 | Unproven or ambiguous project ownership | Preserve the ownership `conflict` refusal before writing. |
-| The project lists another top-level sheet, or gives the root another uuid | Return `invalid_argument`: eeschema annotates every top-level sheet as one hierarchy, and keys the root by the uuid listed. |
+| The project lists another top-level sheet, or gives the root another uuid | Return `invalid_argument`: eeschema annotates every top-level sheet as one hierarchy, and keys the root by the uuid listed. File-scope annotation and `rename_schematic_net_label`, which read one top-level sheet's hierarchy as the design, refuse a project that lists another top-level sheet the same way. |
 | A placed symbol lacks a record for a sheet instance of its file, records one twice, records a project path that is not one, records one under another project's name, or records a path under another root under this project's name (eeschema prunes those on load); or two symbols of one file share a uuid | Return `stale_target` before writing; nothing is pruned or created. |
 | Records under another root, under another project's name or none | Leave them untouched. |
 

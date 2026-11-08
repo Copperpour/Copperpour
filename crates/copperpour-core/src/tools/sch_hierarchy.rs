@@ -630,7 +630,7 @@ async fn handle_set_schematic_title_block(
     }
 
     let root = match crate::tools::resolve_schematic_ownership(&schematic) {
-        Ok(ownership) => ownership.map(|ownership| ownership.root_schematic),
+        Ok(ownership) => ownership.map(|ownership| ownership.editor_schematic()),
         Err(error) => return Ok(error.into_tool_result()),
     };
     let targets = match title_block_targets(&schematic, scope == "hierarchy")? {
@@ -1477,8 +1477,8 @@ fn read_back_sheet_pin(
 /// Where a sheet added to, or deleted from, a parent file sits in its project.
 struct SheetParent {
     project_name: String,
-    root_schematic: PathBuf,
-    root_uuid: String,
+    /// The project's top-level sheets, or `None` when one cannot be read.
+    top_level_sheets: Option<Vec<super::TopLevelSheet>>,
     /// The parent's hierarchy paths, which the sheets inside it key to.
     instance_paths: Vec<String>,
     /// Whether the parent is the root, which alone carries `sheet_instances`.
@@ -1503,10 +1503,10 @@ impl SheetParent {
         }
     }
 
-    /// Every hierarchy path at which the root instantiates `file`, or `None`
-    /// when a sheet on the way cannot be read.
+    /// Every hierarchy path at which a top-level sheet instantiates `file`, or
+    /// `None` when a sheet on the way cannot be read.
     fn live_paths_of(&self, file: &Path) -> Option<Vec<String>> {
-        super::sheet_file_instance_paths(&self.root_schematic, &self.root_uuid, file)
+        super::top_level_instance_paths(self.top_level_sheets.as_deref()?, file)
     }
 }
 
@@ -1521,13 +1521,21 @@ fn locate_sheet_parent(
     parent_uuid: &str,
     project_name: Option<&str>,
 ) -> Result<SheetParent, CallToolResult> {
-    let own_root = |project_name: String| SheetParent {
-        project_name,
-        root_schematic: parent_path.to_path_buf(),
-        root_uuid: parent_uuid.to_owned(),
-        instance_paths: vec![format!("/{parent_uuid}")],
-        is_root: true,
+    let alone = || {
+        Some(vec![super::TopLevelSheet {
+            schematic: parent_path.to_path_buf(),
+            uuid: parent_uuid.to_owned(),
+        }])
     };
+    let own_root =
+        |project_name: String,
+         root_uuid: &str,
+         top_level_sheets: Option<Vec<super::TopLevelSheet>>| SheetParent {
+            project_name,
+            top_level_sheets,
+            instance_paths: vec![format!("/{root_uuid}")],
+            is_root: true,
+        };
     let owned_by = |owner_name: String| {
         if project_name.is_some_and(|name| name != owner_name) {
             return Err(invalid_arg(
@@ -1541,9 +1549,21 @@ fn locate_sheet_parent(
         Ok(owner_name)
     };
     // A root needs no hierarchy walk, which would refuse one that predates
-    // root UUIDs before this write could add it.
-    if parent_path.with_extension("kicad_pro").is_file() {
-        return owned_by(project_name_for(parent_path)).map(own_root);
+    // root UUIDs before this write could add it. Its project may key it to
+    // another uuid and list other top-level sheets beside it; a file its
+    // project does not list is no root, and is resolved as any other sheet.
+    let project_file = parent_path.with_extension("kicad_pro");
+    if project_file.is_file() {
+        let listed = super::listed_top_level_sheets(&project_file);
+        let root_uuid = listed
+            .iter()
+            .find(|(sheet, _)| super::same_schematic_document(sheet, parent_path))
+            .map(|(_, uuid)| uuid.clone().unwrap_or_else(|| parent_uuid.to_owned()));
+        if let Some(root_uuid) = root_uuid {
+            let name = owned_by(project_name_for(parent_path))?;
+            let sheets = super::key_top_level_sheets(listed, Some((parent_path, parent_uuid)));
+            return Ok(own_root(name, &root_uuid, sheets));
+        }
     }
     let owner = super::resolve_schematic_ownership(parent_path)
         .map_err(|error| error.into_tool_result())?;
@@ -1552,13 +1572,14 @@ fn locate_sheet_parent(
             project_name
                 .map(str::to_owned)
                 .unwrap_or_else(|| project_name_for(parent_path)),
+            parent_uuid,
+            alone(),
         ));
     };
     Ok(SheetParent {
         project_name: owned_by(project_name_for(&owner.project_file))?,
         is_root: super::same_schematic_document(&owner.root_schematic, parent_path),
-        root_schematic: owner.root_schematic,
-        root_uuid: owner.root_uuid,
+        top_level_sheets: Some(owner.top_level_sheets),
         instance_paths: owner.instance_paths,
     })
 }

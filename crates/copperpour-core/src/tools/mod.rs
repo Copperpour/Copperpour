@@ -90,6 +90,8 @@ mod symbol_fields;
 mod symbol_pins;
 pub mod templates;
 pub(crate) mod title_block_args;
+#[cfg(test)]
+mod top_level_sheet_tests;
 pub mod verification;
 
 use crate::mcp::protocol::{CallToolResult, McpToolDescription};
@@ -2457,17 +2459,177 @@ pub struct SheetInstanceContext {
 /// One structurally proven project owner of a schematic file.
 ///
 /// Ownership is not inferred from directory ancestry alone. A child sheet is
-/// owned only when a candidate project's root schematic reaches it through
-/// parsed `(sheet (property "Sheetfile" ...))` nodes. This is the authority
+/// owned only when one of a candidate project's top-level sheets reaches it
+/// through parsed `(sheet (property "Sheetfile" ...))` nodes. This is the authority
 /// bound for the ancestor walk: it may inspect every ancestor so deeply nested
 /// sheets continue to work, but an unrelated project can never win merely by
 /// being higher in the filesystem (#189).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SchematicOwnership {
     pub project_file: std::path::PathBuf,
+    /// The top-level sheet whose hierarchy reaches the target: the target
+    /// itself when it is one, else the first listed that places it.
     pub root_schematic: std::path::PathBuf,
+    /// The uuid `root_schematic`'s hierarchy paths start at.
     pub root_uuid: String,
+    /// Every path at which any top-level sheet places the target, sorted.
     pub instance_paths: Vec<String>,
+    /// Every top-level sheet of the project, in the order it lists them.
+    pub top_level_sheets: Vec<TopLevelSheet>,
+}
+
+impl SchematicOwnership {
+    /// The schematic eeschema opens for this project, and so the one it
+    /// locks: it takes the project from that file's name (`OpenProjectFiles`).
+    pub(crate) fn editor_schematic(&self) -> std::path::PathBuf {
+        self.project_file.with_extension("kicad_sch")
+    }
+
+    /// For a tool that reads one top-level sheet's hierarchy as the whole
+    /// design: eeschema connects and numbers every top-level sheet as one
+    /// (`SCHEMATIC::BuildSheetListSortedByPageNumbers`), so another is refused.
+    pub(crate) fn single_top_level_sheet(&self) -> Result<(), String> {
+        let [_] = self.top_level_sheets.as_slice() else {
+            return Err(format!(
+                "{} lists the top-level sheets {}; eeschema reads them as one design and \
+                 this reads only {}, so nothing was written",
+                self.project_file.display(),
+                self.top_level_sheets
+                    .iter()
+                    .map(|sheet| sheet.schematic.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.root_schematic.display()
+            ));
+        };
+        Ok(())
+    }
+}
+
+/// A top-level sheet of a project and the uuid its hierarchy paths start at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TopLevelSheet {
+    pub schematic: std::path::PathBuf,
+    pub uuid: String,
+}
+
+/// The files `project_file` lists as top-level sheets, each with the uuid its
+/// entry gives it unless that is nil, read from `schematic.top_level_sheets`
+/// as eeschema 10 reads it. A project file that cannot be read or parsed, or
+/// lists none, has `<project>.kicad_sch` alone; so does one whose list has a
+/// field that is not a string, which drops the whole list (`from_json` throws,
+/// `JSON_SETTINGS::Load` skips the parameter). A listed file that does not
+/// exist is `<project>.kicad_sch` when that exists (`PROJECT_FILE::LoadFromFile`),
+/// and is otherwise left out, as the loader leaves it out; a file listed twice
+/// is two top-level sheets, as the loader loads it twice. One choice is
+/// Copperpour's: an entry without a uuid is read as nil, where eeschema makes
+/// a fresh one that no saved path starts at.
+pub(crate) fn listed_top_level_sheets(
+    project_file: &std::path::Path,
+) -> Vec<(std::path::PathBuf, Option<String>)> {
+    const NIL: &str = "00000000-0000-0000-0000-000000000000";
+    let own = project_file.with_extension("kicad_sch");
+    let directory = project_file
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    let settings: Option<Value> = std::fs::read_to_string(project_file)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
+    let entries = match settings
+        .as_ref()
+        .and_then(|settings| settings.pointer("/schematic/top_level_sheets"))
+    {
+        Some(Value::Array(entries))
+            if !entries.is_empty()
+                && !entries.iter().any(|entry| {
+                    ["uuid", "name", "filename"]
+                        .iter()
+                        .any(|key| entry.get(key).is_some_and(|value| !value.is_string()))
+                }) =>
+        {
+            entries
+        }
+        _ => return vec![(own, None)],
+    };
+    let mut listed: Vec<(std::path::PathBuf, Option<String>)> = Vec::new();
+    for entry in entries {
+        let Some(file) = entry["filename"]
+            .as_str()
+            .map(|file| directory.join(file))
+            .filter(|file| file.is_file())
+            .or_else(|| own.is_file().then(|| own.clone()))
+        else {
+            continue;
+        };
+        let uuid = entry["uuid"]
+            .as_str()
+            .filter(|uuid| *uuid != NIL)
+            .map(str::to_owned);
+        listed.push((file, uuid));
+    }
+    if listed.is_empty() {
+        listed.push((own, None));
+    }
+    listed
+}
+
+/// Key each listed sheet by its entry's uuid, or else its own `(uuid ...)`;
+/// `known` gives one sheet's uuid as a write is about to save it. `None` when
+/// a sheet without a listed uuid cannot be read or has none.
+pub(crate) fn key_top_level_sheets(
+    listed: Vec<(std::path::PathBuf, Option<String>)>,
+    known: Option<(&std::path::Path, &str)>,
+) -> Option<Vec<TopLevelSheet>> {
+    listed
+        .into_iter()
+        .map(|(schematic, uuid)| {
+            let uuid = match (uuid, known) {
+                (Some(uuid), _) => uuid,
+                (None, Some((file, uuid))) if same_schematic_document(file, &schematic) => {
+                    uuid.to_owned()
+                }
+                (None, _) => {
+                    copperpour_schematic_editor::Schematic::load(&schematic)
+                        .ok()?
+                        .uuid?
+                }
+            };
+            Some(TopLevelSheet { schematic, uuid })
+        })
+        .collect()
+}
+
+/// The paths at which each of `sheets` places `target`: the sheet's own
+/// path when it is `target`, `None` where a sheet on the way cannot be read.
+fn paths_under_each(
+    sheets: &[TopLevelSheet],
+    target: &std::path::Path,
+) -> Vec<Option<Vec<String>>> {
+    sheets
+        .iter()
+        .map(|sheet| {
+            if same_schematic_document(&sheet.schematic, target) {
+                Some(vec![format!("/{}", sheet.uuid)])
+            } else {
+                sheet_file_instance_paths(&sheet.schematic, &sheet.uuid, target)
+            }
+        })
+        .collect()
+}
+
+/// Every path at which the top-level `sheets` place `target`, sorted; `None`
+/// when a sheet on the way cannot be read.
+pub(crate) fn top_level_instance_paths(
+    sheets: &[TopLevelSheet],
+    target: &std::path::Path,
+) -> Option<Vec<String>> {
+    let mut paths = Vec::new();
+    for found in paths_under_each(sheets, target) {
+        paths.extend(found?);
+    }
+    paths.sort();
+    paths.dedup();
+    Some(paths)
 }
 
 /// Candidate projects exist, but unique schematic ownership is not proven.
@@ -2562,7 +2724,8 @@ impl SchematicTargetError {
 /// Resolve the unique project whose parsed sheet hierarchy owns `target`.
 ///
 /// Every ancestor `.kicad_pro` is a candidate, independently of whether its
-/// root can be read. Exactly one proven owner resolves normally; no candidates
+/// roots can be read; its roots are the top-level sheets it lists, read by
+/// [`listed_top_level_sheets`]. Exactly one proven owner resolves normally; no candidates
 /// means a loose schematic. Otherwise missing/incomplete hierarchy evidence,
 /// no owner, or multiple owners produce `conflict` with every candidate root.
 /// The walk has no arbitrary filesystem-depth bound: membership is the bound,
@@ -2572,38 +2735,42 @@ pub(crate) fn resolve_schematic_ownership(
 ) -> Result<Option<SchematicOwnership>, SchematicTargetError> {
     let project_files = candidate_project_files(target)?;
 
-    let roots = project_files
-        .iter()
-        .map(|path| path.with_extension("kicad_sch"))
-        .collect::<Vec<_>>();
+    let mut roots = Vec::new();
     let mut owners = Vec::new();
     let mut complete = true;
     for project_file in project_files {
-        let root_schematic = project_file.with_extension("kicad_sch");
-        let Ok(root) = copperpour_schematic_editor::Schematic::load(&root_schematic) else {
-            complete = false;
-            continue;
-        };
-        let Some(root_uuid) = root.uuid.clone() else {
+        let listed = listed_top_level_sheets(&project_file);
+        roots.extend(listed.iter().map(|(schematic, _)| schematic.clone()));
+        let Some(top_level_sheets) = key_top_level_sheets(listed, None) else {
             complete = false;
             continue;
         };
 
-        let instance_paths = if same_schematic_document(&root_schematic, target) {
-            vec![format!("/{root_uuid}")]
-        } else {
-            let found = sheet_file_instance_paths(&root_schematic, &root_uuid, target);
-            complete &= found.is_some();
-            found.unwrap_or_default()
+        let found = paths_under_each(&top_level_sheets, target);
+        complete &= found.iter().all(Option::is_some);
+        let places = |index: &usize| {
+            found[*index]
+                .as_ref()
+                .is_some_and(|paths| !paths.is_empty())
         };
-        if !instance_paths.is_empty() {
-            owners.push(SchematicOwnership {
-                project_file,
-                root_schematic,
-                root_uuid,
-                instance_paths,
-            });
-        }
+        let Some(index) = top_level_sheets
+            .iter()
+            .position(|sheet| same_schematic_document(&sheet.schematic, target))
+            .or_else(|| (0..top_level_sheets.len()).find(places))
+        else {
+            continue;
+        };
+        let root = top_level_sheets[index].clone();
+        let mut instance_paths: Vec<String> = found.into_iter().flatten().flatten().collect();
+        instance_paths.sort();
+        instance_paths.dedup();
+        owners.push(SchematicOwnership {
+            project_file,
+            root_schematic: root.schematic,
+            root_uuid: root.uuid,
+            instance_paths,
+            top_level_sheets,
+        });
     }
 
     owners.sort_by(|left, right| left.root_schematic.cmp(&right.root_schematic));
