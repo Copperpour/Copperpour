@@ -2528,6 +2528,113 @@ done
         );
     }
 
+    /// Calls `route_specctra_dsn` with `args` (`jar_path`, `dsn_path` and
+    /// `ses_output_path` in `temp` added) behind [`with_fake_java`], against
+    /// a server that takes `update_job_settings` but cannot read settings
+    /// back. Returns the tool's answer and the settings body it sent.
+    #[cfg(unix)]
+    fn route_through_the_tool(temp: &Path, mut args: Value) -> (Value, Value) {
+        let jar = temp.join("freerouting.jar");
+        let dsn = temp.join("board.dsn");
+        let sent = temp.join("sent.json");
+        std::fs::write(&jar, "not a jar").unwrap();
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let mut tools = conforming_tools_list();
+        let by_path = tools["tools"][3]["inputSchema"].clone();
+        tools["tools"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "name": "update_job_settings", "inputSchema": by_path }));
+        let server = format!(
+            r#"while read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  [ -n "$id" ] || continue
+  case "$line" in
+    *'"initialize"'*) result='{{"protocolVersion":"2025-06-18"}}' ;;
+    *'"tools/list"'*) result='{tools}' ;;
+    *create_session*) result='{{"sessionId":"s1"}}' ;;
+    *update_job_settings*) printf '%s' "$line" > '{sent}'; result='{{}}' ;;
+    *enqueue_job*) result='{{"jobId":"job123"}}' ;;
+    *get_job_details*) result='{{"state":"COMPLETED"}}' ;;
+    *download_job_output_to_local_file*)
+      file=$(printf '%s' "$line" | sed -n 's/.*"filePath":"\([^"]*\)".*/\1/p')
+      printf '(session board)' > "$file"; result='{{}}' ;;
+    *) result='{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$id" "$result"
+done"#,
+            sent = sent.display(),
+        );
+        let paths = args.as_object_mut().unwrap();
+        paths.insert("jar_path".into(), json!(jar.display().to_string()));
+        paths.insert("dsn_path".into(), json!(dsn.display().to_string()));
+        paths.insert(
+            "ses_output_path".into(),
+            json!(temp.join("board.ses").display().to_string()),
+        );
+        let context = crate::tools::ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = with_fake_java(
+            temp,
+            &server,
+            super::super::route_specctra_dsn(&args, &context),
+        )
+        .expect("the tool answers");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("the answer is text JSON");
+        };
+        let answer: Value = serde_json::from_str(text).unwrap();
+        let request: Value = serde_json::from_str(
+            &std::fs::read_to_string(&sent).expect("update_job_settings was called"),
+        )
+        .unwrap();
+        (answer, request["params"]["arguments"]["body"].clone())
+    }
+
+    /// The tool reads the project next to the DSN and sends its rules to
+    /// Freerouting, under the caller's own settings, which win.
+    #[cfg(unix)]
+    #[test]
+    fn route_specctra_dsn_sends_the_project_rules_to_freerouting() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("board.kicad_pro"),
+            json!({ "board": { "design_settings": { "rules": {
+                "min_copper_edge_clearance": 0.5,
+                "min_hole_clearance": 0.25
+            } } } })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (answer, sent) = route_through_the_tool(
+            temp.path(),
+            json!({ "router_settings": { "hole_clearance_um": 200 } }),
+        );
+
+        assert_eq!(
+            sent,
+            json!({ "copper_to_edge_clearance_um": 500.0, "hole_clearance_um": 200 }),
+            "{answer}"
+        );
+        assert_eq!(answer["success"], true, "{answer}");
+        assert_eq!(
+            answer["project_rules"]["sent"],
+            json!({ "copper_to_edge_clearance_um": 500.0, "hole_clearance_um": 250.0 }),
+            "{answer}"
+        );
+    }
+
     /// The count `route_response` decides on comes from the job's own lines
     /// in Freerouting's log, read when the job ends.
     #[cfg(unix)]
