@@ -597,8 +597,46 @@ pub(crate) async fn route_specctra_dsn(
     let evidence = mcp::route_local(&jar, &dsn, &ses_output, &settings)
         .await
         .map_err(|error| anyhow::anyhow!("Freerouting MCP routing failed: {error:#}"))?;
-    Ok(CallToolResult::json(&json!({
-        "success": true,
+    Ok(CallToolResult::json(&route_response(
+        &evidence,
+        &jar,
+        &dsn,
+        &ses_output,
+    )))
+}
+
+/// The `route_specctra_dsn` answer for a finished job.
+///
+/// A board with unrouted connections is not a routed board, even though
+/// Freerouting ends the job COMPLETED (max_passes reached, or no progress):
+/// `success` is false, `message` says how many are left, and the SES is still
+/// written, for inspection. An unknown count (log not readable) is not turned
+/// into a failure, but `message` says it was not checked: "routed" and "not
+/// counted" must not give the same answer.
+fn route_response(
+    evidence: &mcp::RouteEvidence,
+    jar: &Path,
+    dsn: &Path,
+    ses_output: &Path,
+) -> serde_json::Value {
+    let fully_routed = evidence.unrouted.is_none_or(|unrouted| unrouted == 0);
+    let message = match evidence.unrouted {
+        Some(0) => None,
+        Some(unrouted) => Some(format!(
+            "Freerouting left {unrouted} connection(s) unrouted; the SES at {} is incomplete",
+            ses_output.display()
+        )),
+        None => Some(format!(
+            "the unrouted count could not be read from Freerouting's log ({}); the SES at {} \
+             was not checked for completeness",
+            evidence.freerouting_log.as_deref().unwrap_or("no log"),
+            ses_output.display()
+        )),
+    };
+    json!({
+        "success": fully_routed,
+        "message": message,
+        "unrouted_connections": evidence.unrouted,
         "method": "local_freerouting_native_mcp",
         "engine": {
             "name": "Freerouting",
@@ -628,7 +666,7 @@ pub(crate) async fn route_specctra_dsn(
         "settings_checked": evidence.settings_checked,
         "settings_not_applied": evidence.settings_not_applied,
         "settings_warnings": evidence.settings_warnings
-    })))
+    })
 }
 
 #[cfg(test)]
@@ -638,6 +676,124 @@ mod freerouting_tests {
     use crate::tools::ServerConfig;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// What `route_local` hands back for a job that ended COMPLETED, with
+    /// `unrouted` connections left according to Freerouting's log.
+    fn completed_job(unrouted: Option<u64>) -> mcp::RouteEvidence {
+        mcp::RouteEvidence {
+            session_id: "session".into(),
+            job_id: "a3aa32d0".into(),
+            final_state: "COMPLETED".into(),
+            poll_count: 12,
+            elapsed_seconds: 300.0,
+            ses_bytes: 4096,
+            server_protocol_version: "2025-06-18".into(),
+            diagnostics_path: None,
+            last_activity: Some("pass 30: 3 unrouted, 218 violations".into()),
+            unrouted,
+            freerouting_log: Some("/state/freerouting/logs/freerouting.log".into()),
+            settings_checked: false,
+            settings_not_applied: Vec::new(),
+            settings_warnings: Vec::new(),
+        }
+    }
+
+    fn respond(unrouted: Option<u64>) -> serde_json::Value {
+        route_response(
+            &completed_job(unrouted),
+            Path::new("/opt/freerouting.jar"),
+            Path::new("/work/board.dsn"),
+            Path::new("/work/board.ses"),
+        )
+    }
+
+    /// Freerouting ends a job COMPLETED when max_passes runs out or no pass
+    /// makes progress, whatever is left unrouted: that is not success.
+    #[test]
+    fn a_completed_job_with_unrouted_connections_is_not_a_success() {
+        let body = respond(Some(3));
+        assert_eq!(body["success"], false, "{body}");
+        assert_eq!(body["final_state"], "COMPLETED", "{body}");
+        assert_eq!(body["unrouted_connections"], 3, "{body}");
+        let message = body["message"].as_str().expect("a message says why");
+        assert!(message.contains("3 connection(s) unrouted"), "{message}");
+        assert!(message.contains("/work/board.ses"), "{message}");
+        // The SES is still reported, for inspection.
+        assert_eq!(body["artifacts"]["ses_output_path"], "/work/board.ses");
+        assert_eq!(body["ses_bytes"], 4096);
+    }
+
+    #[test]
+    fn a_completed_job_with_every_connection_routed_is_a_success() {
+        let body = respond(Some(0));
+        assert_eq!(body["success"], true, "{body}");
+        assert_eq!(body["unrouted_connections"], 0, "{body}");
+        assert!(body["message"].is_null(), "{body}");
+    }
+
+    /// The read-back of the settings reaches the caller as RouteEvidence
+    /// holds it, checked or not.
+    #[test]
+    fn the_settings_read_back_is_in_the_result() {
+        let mut evidence = completed_job(Some(0));
+        evidence.settings_checked = true;
+        evidence.settings_not_applied =
+            vec!["autorouter.max_pases: not a Freerouting setting".into()];
+        evidence.settings_warnings = vec![serde_json::json!("max_threads above the CPU count")];
+        let paths = (
+            Path::new("/opt/freerouting.jar"),
+            Path::new("/work/board.dsn"),
+            Path::new("/work/board.ses"),
+        );
+        let body = route_response(&evidence, paths.0, paths.1, paths.2);
+        assert_eq!(body["settings_checked"], true, "{body}");
+        assert_eq!(
+            body["settings_not_applied"],
+            serde_json::json!(["autorouter.max_pases: not a Freerouting setting"]),
+            "{body}"
+        );
+        assert_eq!(
+            body["settings_warnings"],
+            serde_json::json!(["max_threads above the CPU count"]),
+            "{body}"
+        );
+        let body = respond(Some(0));
+        assert_eq!(body["settings_checked"], false, "{body}");
+        assert_eq!(
+            body["settings_not_applied"],
+            serde_json::json!([]),
+            "{body}"
+        );
+    }
+
+    /// A count that could not be read from the log is unknown, not a failure,
+    /// and the message says so: "routed" and "not counted" differ.
+    #[test]
+    fn an_unknown_unrouted_count_leaves_success_true() {
+        let body = respond(None);
+        assert_eq!(body["success"], true, "{body}");
+        assert!(body["unrouted_connections"].is_null(), "{body}");
+        let message = body["message"]
+            .as_str()
+            .expect("a message says it was not counted");
+        assert!(message.contains("could not be read"), "{message}");
+        assert!(
+            message.contains("/state/freerouting/logs/freerouting.log"),
+            "{message}"
+        );
+        assert!(message.contains("/work/board.ses"), "{message}");
+
+        let mut evidence = completed_job(None);
+        evidence.freerouting_log = None;
+        let body = route_response(
+            &evidence,
+            Path::new("/opt/freerouting.jar"),
+            Path::new("/work/board.dsn"),
+            Path::new("/work/board.ses"),
+        );
+        let message = body["message"].as_str().expect("a message without a log");
+        assert!(message.contains("(no log)"), "{message}");
+    }
 
     fn test_ctx() -> ToolContext {
         ToolContext::new(
