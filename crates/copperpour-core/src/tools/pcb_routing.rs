@@ -77,7 +77,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "board":    { "type": "string" },
                     "net_name": { "type": "string" },
-                    "layer":    { "type": "string", "description": "Copper layer (e.g. 'F.Cu')" },
+                    "layer":    { "type": "string", "description": "Copper layer: F.Cu, B.Cu or In1.Cu..In30.Cu" },
                     "x1": { "type": "number" }, "y1": { "type": "number" },
                     "x2": { "type": "number" }, "y2": { "type": "number" },
                     "width": { "type": "number", "default": 0.25 }
@@ -99,7 +99,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "pad1":        { "type": "string", "description": "First pad number" },
                     "ref2":        { "type": "string", "description": "Second component reference" },
                     "pad2":        { "type": "string", "description": "Second pad number" },
-                    "layer":       { "type": "string", "default": "F.Cu" },
+                    "layer":       { "type": "string", "description": "Copper layer: F.Cu, B.Cu or In1.Cu..In30.Cu", "default": "F.Cu" },
                     "width":       { "type": "number", "default": 0.25 }
                 },
                 "required": ["board", "net_name", "ref1", "pad1", "ref2", "pad2"]
@@ -276,7 +276,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "board":     { "type": "string" },
                     "uuid":      { "type": "string" },
                     "net_name":  { "type": "string" },
-                    "layer":     { "type": "string" },
+                    "layer":     { "type": "string", "description": "Copper layer: F.Cu, B.Cu or In1.Cu..In30.Cu" },
                     "x1": { "type": "number" }, "y1": { "type": "number" },
                     "x2": { "type": "number" }, "y2": { "type": "number" },
                     "width":     { "type": "number", "default": 0.25 }
@@ -404,7 +404,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "board":    { "type": "string" },
                     "net_pos":  { "type": "string", "description": "Positive net name" },
                     "net_neg":  { "type": "string", "description": "Negative net name" },
-                    "layer":    { "type": "string", "default": "F.Cu" },
+                    "layer":    { "type": "string", "description": "Copper layer: F.Cu, B.Cu or In1.Cu..In30.Cu", "default": "F.Cu" },
                     "x1": { "type": "number" }, "y1": { "type": "number" },
                     "x2": { "type": "number" }, "y2": { "type": "number" },
                     "width": { "type": "number", "default": 0.1 },
@@ -522,8 +522,8 @@ async fn handle_route_trace(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let layer = match require_str(args, "layer") {
-        Ok(v) => v.to_string(),
+    let layer = match super::pcb_board::copper_layer_arg(args, None) {
+        Ok(v) => v,
         Err(e) => return Ok(e),
     };
     let x1 = match require_f64(args, "x1") {
@@ -578,7 +578,10 @@ async fn handle_route_pad_to_pad(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
+    let layer = match super::pcb_board::copper_layer_arg(args, Some("F.Cu")) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let width = args["width"].as_f64().unwrap_or(0.25);
 
     // Both pads come from the board open in KiCad, the one the tracks are
@@ -1796,8 +1799,8 @@ async fn handle_modify_trace(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let layer = match require_str(args, "layer") {
-        Ok(v) => v.to_string(),
+    let layer = match super::pcb_board::copper_layer_arg(args, None) {
+        Ok(v) => v,
         Err(e) => return Ok(e),
     };
     let x1 = match require_f64(args, "x1") {
@@ -2737,7 +2740,10 @@ async fn handle_route_diff_pair(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
+    let layer = match super::pcb_board::copper_layer_arg(args, Some("F.Cu")) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let x1 = match require_f64(args, "x1") {
         Ok(v) => v,
         Err(e) => return Ok(e),
