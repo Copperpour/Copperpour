@@ -301,8 +301,9 @@ pub fn tools() -> Vec<ToolDef> {
              IPC snapshot and reverse manifest remain authoritative; otherwise the Rust exporter \
              is used. The first \
              supported profile is deliberately narrow: two copper layers, front-side SMD or \
-             through-hole footprints, circle, rectangle and unchamfered rounded-rectangle pads \
-             with one shape on every copper layer (written as polygons that enclose the copper), \
+             through-hole footprints, circle, rectangle, unchamfered rounded-rectangle and oval \
+             pads with one shape on every copper layer (rounded rectangles written as polygons \
+             that enclose the copper, ovals as paths as KiCad writes them), round drills, \
              one straight-line closed outline, \
              and no existing tracks, vias, or zones. Copperpour refuses unsupported geometry or \
              custom DRC rules, or incomplete effective routing rules instead of approximating \
@@ -936,7 +937,7 @@ async fn handle_export_specctra_dsn(
                 "ses_import_available": false,
                 "freerouting_bridge_available": false,
                 "source_revision_bound": true,
-                "supported_profile": "two_layer_front_side_circle_rect_roundrect_no_existing_routing_or_zones"
+                "supported_profile": "two_layer_front_side_circle_rect_roundrect_oval_no_existing_routing_or_zones"
             }
         })
         .to_string(),
@@ -1800,7 +1801,7 @@ mod specctra_roundrect_served_tests {
         assert_eq!(body["pad_count"], 6);
         assert_eq!(
             body["capabilities"]["supported_profile"],
-            "two_layer_front_side_circle_rect_roundrect_no_existing_routing_or_zones"
+            "two_layer_front_side_circle_rect_roundrect_oval_no_existing_routing_or_zones"
         );
         let dsn = std::fs::read_to_string(&output).unwrap();
         assert_eq!(dsn.matches("(polygon F.Cu 0").count(), 3, "{dsn}");

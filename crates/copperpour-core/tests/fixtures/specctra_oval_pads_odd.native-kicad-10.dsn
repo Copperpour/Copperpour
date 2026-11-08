@@ -1,0 +1,153 @@
+(pcb board.dsn
+  (parser
+    (string_quote ")
+    (space_in_quoted_tokens on)
+    (host_cad "KiCad's Pcbnew")
+    (host_version "10.0.7")
+  )
+  (resolution um 10)
+  (unit um)
+  (structure
+    (layer F.Cu
+      (type signal)
+      (property
+        (index 0)
+      )
+    )
+    (layer B.Cu
+      (type signal)
+      (property
+        (index 1)
+      )
+    )
+    (boundary
+      (path pcb 0  130000 -70000  80000 -70000  80000 -30000  130000 -30000
+            130000 -70000)
+    )
+    (via "Via[0-1]_600:300_um")
+    (rule
+      (width 200)
+      (clearance 200)
+      (clearance 50 (type smd_smd))
+    )
+  )
+  (placement
+    (component Resistor_SMD:R_0402
+      (place R1 100000 -50000 front 0 (PN 10k))
+      (place R2 110000 -50000 front 0 (PN 4.7k))
+    )
+    (component Resistor_SMD:R_0402::1
+      (place R4 124000 -60000 front 0 (PN 4.7k))
+    )
+    (component Resistor_SMD:R_0402::2
+      (place R3 116000 -60000 front 0 (PN 4.7k))
+    )
+    (component "Connector_JST:JST_PH_B2B-PH-K_1x02_P2.00mm_Vertical"
+      (place J1 92000 -60000 front 90 (PN "PH 2P"))
+    )
+  )
+  (library
+    (image Resistor_SMD:R_0402
+      (pin Rect[T]Pad_600.000000x500.000000_um 1 -500 0)
+      (pin Rect[T]Pad_600.000000x500.000000_um 2 500 0)
+    )
+    (image Resistor_SMD:R_0402::1
+      (pin Oval[T]Pad_700.000000x700.000000_um 1 -500 0)
+      (pin Oval[T]Pad_700.000000x700.000000_um 2 500 0)
+    )
+    (image Resistor_SMD:R_0402::2
+      (pin Oval[T]Pad_600.000000x901.000000_um 1 -500 0)
+      (pin Oval[T]Pad_900.000000x600.000000_um 2 500 0)
+    )
+    (image "Connector_JST:JST_PH_B2B-PH-K_1x02_P2.00mm_Vertical"
+      (outline (polygon signal 0  -2445 -3295  -2445 2195  4445 2195  4445 -3295))
+      (outline (path signal 120  -1110 2110  -2360 2110))
+      (outline (path signal 120  -2360 2110  -2360 860))
+      (outline (path signal 120  -300 2010  -600 2010))
+      (outline (path signal 120  -600 2010  -600 1810))
+      (outline (path signal 120  -300 1910  -600 1910))
+      (outline (path signal 120  500 1810  500 1200))
+      (outline (path signal 120  -300 1810  -300 2010))
+      (outline (path signal 120  3450 1200  1500 1200))
+      (outline (path signal 120  1500 1200  1500 1810))
+      (outline (path signal 120  500 1200  -1450 1200))
+      (outline (path signal 120  -1450 1200  -1450 -2300))
+      (outline (path signal 120  4060 500  3450 500))
+      (outline (path signal 120  -2060 500  -1450 500))
+      (outline (path signal 120  4060 -800  3450 -800))
+      (outline (path signal 120  -2060 -800  -1450 -800))
+      (outline (path signal 120  1100 -1800  1100 -2300))
+      (outline (path signal 120  900 -1800  1100 -1800))
+      (outline (path signal 120  3450 -2300  3450 1200))
+      (outline (path signal 120  1000 -2300  1000 -1800))
+      (outline (path signal 120  900 -2300  900 -1800))
+      (outline (path signal 120  -1450 -2300  3450 -2300))
+      (outline (path signal 120  -2060 1810  -2060 -2910  4060 -2910  4060 1810  -2060 1810))
+      (outline (path signal 100  -1110 2110  -2360 2110))
+      (outline (path signal 100  -2360 2110  -2360 860))
+      (outline (path signal 100  -1950 1700  -1950 -2800  3950 -2800  3950 1700  -1950 1700))
+      (pin RoundRect[A]Pad_1200.000000x1750.000000_250.951000_um_0.000000_0 1 0 0)
+      (pin Oval[A]Pad_1200.000000x1750.000000_um 2 2000 0)
+    )
+    (padstack Oval[A]Pad_1200.000000x1750.000000_um
+      (shape (path F.Cu 1200  0 -275  0 275))
+      (shape (path B.Cu 1200  0 -275  0 275))
+      (attach off)
+    )
+    (padstack Oval[T]Pad_900.000000x600.000000_um
+      (shape (path F.Cu 600  -150 0  150 0))
+      (attach off)
+    )
+    (padstack Oval[T]Pad_600.000000x901.000000_um
+      (shape (path F.Cu 600  0 -150.5  0 150.5))
+      (attach off)
+    )
+    (padstack Oval[T]Pad_700.000000x700.000000_um
+      (shape (path F.Cu 700  0 0  0 0))
+      (attach off)
+    )
+    (padstack RoundRect[A]Pad_1200.000000x1750.000000_250.951000_um_0.000000_0
+      (shape (polygon F.Cu 0  -600.951 625  -581.848 721.035  -527.449 802.449  -446.035 856.848
+            -349.999 875.95  350 875.951  446.035 856.848  527.449 802.449
+            581.848 721.035  600.95 624.999  600.951 -625  581.848 -721.035
+            527.449 -802.449  446.035 -856.848  349.999 -875.95  -350 -875.951
+            -446.035 -856.848  -527.449 -802.449  -581.848 -721.035  -600.95 -624.999
+            -600.951 625))
+      (shape (polygon B.Cu 0  -600.951 625  -581.848 721.035  -527.449 802.449  -446.035 856.848
+            -349.999 875.95  350 875.951  446.035 856.848  527.449 802.449
+            581.848 721.035  600.95 624.999  600.951 -625  581.848 -721.035
+            527.449 -802.449  446.035 -856.848  349.999 -875.95  -350 -875.951
+            -446.035 -856.848  -527.449 -802.449  -581.848 -721.035  -600.95 -624.999
+            -600.951 625))
+      (attach off)
+    )
+    (padstack Rect[T]Pad_600.000000x500.000000_um
+      (shape (rect F.Cu -300 -250 300 250))
+      (attach off)
+    )
+    (padstack "Via[0-1]_600:300_um"
+      (shape (circle F.Cu 600))
+      (shape (circle B.Cu 600))
+      (attach off)
+    )
+  )
+  (network
+    (net VCC
+      (pins R1-1 R2-2 R4-1 R3-1 J1-1)
+    )
+    (net GND
+      (pins R1-2 R2-1 R4-2 R3-2 J1-2)
+    )
+    (class kicad_default GND VCC
+      (circuit
+        (use_via "Via[0-1]_600:300_um")
+      )
+      (rule
+        (width 200)
+        (clearance 200)
+      )
+    )
+  )
+  (wiring
+  )
+)

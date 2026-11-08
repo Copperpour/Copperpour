@@ -1,0 +1,175 @@
+(session "specctra_oval_pads"
+  (base_design "specctra_oval_pads")
+  (placement
+    (resolution um 10)
+    (component "copperpour_image_J1"
+      (place J1 920000 -600000 front 90)
+    )
+    (component "copperpour_image_R1"
+      (place R1 1000000 -500000 front 0)
+    )
+    (component "copperpour_image_R2"
+      (place R2 1100000 -500000 front 0)
+    )
+    (component "copperpour_image_R3"
+      (place R3 1160000 -600000 front 0)
+    )
+    (component "copperpour_image_R4"
+      (place R4 1240000 -600000 front 0)
+    )
+  )
+  (was_is
+  )
+  (routes 
+    (resolution um 10)
+    (parser
+      (host_cad Copperpour)
+      (host_version "0.15.0")
+    )
+    (library_out 
+      (padstack "copperpour_via_0001"
+        (shape
+          (circle F.Cu 6000 0 0)
+        )
+        (shape
+          (circle B.Cu 6000 0 0)
+        )
+        (attach off)
+      )
+    )
+    (network_out 
+      (net GND
+        (wire
+          (path F.Cu 2500
+            1097040 -608341
+            1068699 -580000
+            920000 -580000
+          )
+        )
+        (wire
+          (path F.Cu 2500
+            1165000 -606267
+            1162926 -608341
+            1097040 -608341
+          )
+        )
+        (wire
+          (path B.Cu 2500
+            1097040 -507807
+            1097040 -608341
+          )
+        )
+        (wire
+          (path F.Cu 2500
+            1165000 -606267
+            1165782 -607049
+            1237951 -607049
+            1245000 -600000
+          )
+        )
+        (wire
+          (path F.Cu 2500
+            1165000 -600000
+            1165000 -605383
+          )
+        )
+        (wire
+          (path F.Cu 2500
+            1165000 -605383
+            1165000 -606267
+          )
+        )
+        (via "copperpour_via_0001" 1097040 -608341
+        )
+        (wire
+          (path F.Cu 2500
+            1097040 -507807
+            1095000 -505767
+          )
+        )
+        (wire
+          (path F.Cu 2500
+            1095000 -500000
+            1095000 -505767
+          )
+        )
+        (via "copperpour_via_0001" 1097040 -507807
+        )
+        (wire
+          (path F.Cu 2500
+            1095000 -500000
+            1005000 -500000
+          )
+        )
+      )
+      (net VCC
+        (wire
+          (path B.Cu 2500
+            996878 -507645
+            996878 -523122
+            920000 -600000
+          )
+        )
+        (wire
+          (path F.Cu 2500
+            1105000 -514180
+            1155000 -564180
+            1155000 -593340
+          )
+        )
+        (wire
+          (path F.Cu 2500
+            1105000 -505767
+            1105000 -514180
+          )
+        )
+        (wire
+          (path F.Cu 2500
+            1105000 -514180
+            1003413 -514180
+            996878 -507645
+          )
+        )
+        (wire
+          (path F.Cu 2500
+            1155000 -593340
+            1221573 -593340
+            1228233 -600000
+          )
+        )
+        (wire
+          (path F.Cu 2500
+            1155000 -593340
+            1155000 -600000
+          )
+        )
+        (wire
+          (path F.Cu 2500
+            1235000 -600000
+            1228233 -600000
+          )
+        )
+        (wire
+          (path F.Cu 2500
+            1105000 -500000
+            1105000 -505767
+          )
+        )
+        (wire
+          (path F.Cu 2500
+            996878 -507645
+            995000 -505767
+          )
+        )
+        (wire
+          (path F.Cu 2500
+            995000 -500000
+            995000 -505767
+          )
+        )
+        (via "copperpour_via_0001" 996878 -507645
+        )
+      )
+    )
+  )
+)
