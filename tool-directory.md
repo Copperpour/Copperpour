@@ -14,7 +14,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 10 categories
-- **245 registered tools** + **7 always-visible meta-tools** = **252 total**
+- **257 registered tools** + **7 always-visible meta-tools** = **264 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<copperpour dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -173,7 +173,7 @@ and Windows servers do not.
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings, pins, and label and field text (excluding free text), with a reported origin fallback when geometry is unavailable. |
 
-### `sch_batch` · 13 tools
+### `sch_batch` · 16 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call; add, list, edit and delete free text items.
 **Source:** [`crates/copperpour-core/src/tools/sch_batch.rs`](crates/copperpour-core/src/tools/sch_batch.rs)
 
@@ -196,7 +196,7 @@ and Windows servers do not.
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in one write with committed-file readback. Copies each library Value and Footprint unless that entry explicitly overrides it, preserves every saved hierarchy instance, and preflights stale metadata before any placement. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
 | `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. A pair whose route would join another net is skipped and listed in `errors`. |
 
-### `sch_export` · 10 tools
+### `sch_export` · 11 tools
 **Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC and set its checks' severities, and synchronize a live PCB.
 **Source:** [`crates/copperpour-core/src/tools/sch_export.rs`](crates/copperpour-core/src/tools/sch_export.rs)
 
@@ -214,7 +214,7 @@ and Windows servers do not.
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. |
 
-### `sch_hierarchy` · 16 tools
+### `sch_hierarchy` · 17 tools
 **Purpose:** Sheet files and hierarchical sheets: create a schematic file and set its page size and title block, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, stale symbol instance record repair, import/add/edit/delete sheet pins, net label renames, pin/label sync validation.
 **Source:** [`crates/copperpour-core/src/tools/sch_hierarchy.rs`](crates/copperpour-core/src/tools/sch_hierarchy.rs)
 
@@ -242,7 +242,7 @@ and Windows servers do not.
 
 ## PCB
 
-### `pcb_board` · 18 tools
+### `pcb_board` · 20 tools
 **Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import, custom fields on placed footprints.
 **Source:** [`crates/copperpour-core/src/tools/pcb_board.rs`](crates/copperpour-core/src/tools/pcb_board.rs)
 
@@ -296,7 +296,7 @@ and Windows servers do not.
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
 
-### `pcb_routing` · 19 tools
+### `pcb_routing` · 20 tools
 **Purpose:** Traces, vias, pad nets, copper pours, net classes, differential pairs, and strict Specctra SES import.
 **Source:** [`crates/copperpour-core/src/tools/pcb_routing.rs`](crates/copperpour-core/src/tools/pcb_routing.rs)
 
@@ -400,7 +400,7 @@ and Windows servers do not.
 
 ## Integration
 
-### `integration` · 10 tools
+### `integration` · 11 tools
 **Purpose:** JLCPCB parts database, local Freerouting MCP routing, datasheet URLs.
 **Source:** [`crates/copperpour-core/src/tools/integration.rs`](crates/copperpour-core/src/tools/integration.rs); the catalog and the LCSC and EasyEDA APIs in [`crates/copperpour-core/src/sourcing/`](crates/copperpour-core/src/sourcing/); the Freerouting code in [`crates/copperpour-core/src/autorouting/freerouting/`](crates/copperpour-core/src/autorouting/freerouting/)
 
@@ -427,7 +427,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ## Verification
 
-### `verification` · 11 tools
+### `verification` · 12 tools
 **Purpose:** DRC, design rules, layer constraints, clearance checks, KiCAD UI control. ERC lives in `sch_export` (`run_erc`), not here.
 **Source:** [`crates/copperpour-core/src/tools/verification.rs`](crates/copperpour-core/src/tools/verification.rs)
 
@@ -503,7 +503,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ## Manufacturing
 
-### `manufacturing` · 3 tools
+### `manufacturing` · 4 tools
 **Purpose:** Design-to-fab pipeline: export Gerber+BOM+positions package, validate for fab house, estimate cost.
 **Source:** [`crates/copperpour-core/src/tools/manufacturing.rs`](crates/copperpour-core/src/tools/manufacturing.rs); fab house profiles and JLCPCB assembly in [`crates/copperpour-core/src/fab/`](crates/copperpour-core/src/fab/)
 

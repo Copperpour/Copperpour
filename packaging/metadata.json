@@ -20,7 +20,7 @@
   "tags": ["ai", "mcp", "pcbnew", "schematic", "routing", "fabrication"],
   "versions": [
     {
-      "version": "0.15.0",
+      "version": "0.16.0",
       "status": "testing",
       "runtime": "ipc",
       "kicad_version": "10.0",
