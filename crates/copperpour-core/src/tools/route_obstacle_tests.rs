@@ -278,7 +278,9 @@ async fn batch_connect_pins_with_every_route_blocked_is_an_error_and_writes_noth
 }
 
 /// Copperpour#118: a wire tool dots only the T's its own wire forms. Each case draws a
-/// wire far from the `tee` group, then R54's tap onto R51's wire.
+/// wire far from the `tee` group, then R54's tap onto R51's wire. A stub that joins
+/// another net is refused (#117), so the stub cases first label R51's wire `TAP`,
+/// the net their tap asks for.
 #[tokio::test]
 async fn wire_tools_dot_only_the_tees_their_wire_forms() {
     let far = [20.32, 20.32, 30.48, 20.32];
@@ -305,6 +307,11 @@ async fn wire_tools_dot_only_the_tees_their_wire_forms() {
     ];
     for (tool, far_args, tap_args) in cases {
         let (_dir, path) = fixture();
+        if tool.ends_with("connect_to_net") {
+            let label = json!({ "net": "TAP", "x": 195.58, "y": 156.21 });
+            let (is_error, body) = call(&path, "add_schematic_net_label", label).await;
+            assert!(!is_error, "{tool}: {body}");
+        }
         let (is_error, body) = call(&path, tool, far_args).await;
         assert!(!is_error, "{tool}: {body}");
         assert_eq!(
