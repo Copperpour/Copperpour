@@ -365,7 +365,10 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Direction to route the wire stub. 'auto' (default) points it \
                                         away from the symbol body so the label text does not run back \
-                                        across the pin names; it falls back to 'right' on a bare point.",
+                                        across the pin names; it falls back to 'right' on a bare point. \
+                                        An 'auto' stub that would join another net turns across instead; \
+                                        when every direction, or the one named, would, the call refuses \
+                                        with plan_blocked.",
                         "enum": ["auto", "right", "left", "up", "down"],
                         "default": "auto"
                     },
@@ -672,7 +675,7 @@ pub(crate) fn route_between(
     y2: f64,
 ) -> anyhow::Result<Result<Routed, Vec<String>>> {
     let before = parse_sexp(content)?;
-    let Some(guard) = RouteGuard::new(&before, (x1, y1), (x2, y2)) else {
+    let Some(guard) = RouteGuard::new(&before, (x1, y1), &[(x2, y2)]) else {
         return Ok(Err(vec![format!(
             "cannot check what the route would join: {}",
             crate::tools::UNRESOLVED_PIN_GEOMETRY
@@ -691,14 +694,15 @@ pub(crate) fn route_between(
         let routed = points.windows(2).fold(content.to_owned(), |c, leg| {
             insert_wire_with_junctions(c, leg[0].0, leg[0].1, leg[1].0, leg[1].1)
         });
-        let joined = guard.foreign_joins(&parse_sexp(&routed)?);
-        if joined.is_empty() {
-            return Ok(Ok(Routed {
-                content: routed,
-                path: points.to_vec(),
-            }));
+        match guard.refusal(&format!("{bend} route"), &routed)? {
+            Some(reason) => refused.push(reason),
+            None => {
+                return Ok(Ok(Routed {
+                    content: routed,
+                    path: points.to_vec(),
+                }))
+            }
         }
-        refused.push(format!("the {bend} route would join {}", joined.join(", ")));
     }
     Ok(Err(refused))
 }
@@ -718,11 +722,11 @@ pub(crate) fn route_blocked(operation: &str, reasons: Vec<String>) -> CallToolRe
     )
 }
 
-/// What a sheet held before a route from `a` to `b`, built once for every bend
-/// tried. Wire ends are not terminals: a net is joined through what it carries,
-/// and a net of bare wires has nothing to short.
+/// What a sheet held before a wire from `from`, built once for every bend or
+/// direction tried. Wire ends are not terminals: a net is joined through what it
+/// carries, and a net of bare wires has nothing to short.
 struct RouteGuard {
-    /// The endpoints' nets, and those of any wire an endpoint lies on: a route
+    /// The nets at `from` and `also`, and those of any wire one lies on: a route
     /// ending mid-span is dotted there, so tapping a wire is the caller's ask.
     allowed: Vec<crate::tools::sch_connectivity::NetRoot>,
     a: (f64, f64),
@@ -741,7 +745,11 @@ struct Terminal {
 impl RouteGuard {
     /// `None` when a placed symbol's pins cannot be resolved: the guard would
     /// not see them, and a route over them would join them unchecked.
-    fn new(before: &copperpour_sexp::SexpNode, a: (f64, f64), b: (f64, f64)) -> Option<Self> {
+    fn new(
+        before: &copperpour_sexp::SexpNode,
+        from: (f64, f64),
+        also: &[(f64, f64)],
+    ) -> Option<Self> {
         use crate::tools::sch_connectivity::pt_key;
         use copperpour_sexp::geometry::point_on_segment;
         use copperpour_sexp::schematic::{extract_sheet_pins, LabelKind};
@@ -789,9 +797,10 @@ impl RouteGuard {
             push(at, "a sheet pin".into());
         }
 
-        let mut allowed = vec![graph.root_at(a.0, a.1), graph.root_at(b.0, b.1)];
+        let ends: Vec<_> = std::iter::once(from).chain(also.iter().copied()).collect();
+        let mut allowed: Vec<_> = ends.iter().map(|p| graph.root_at(p.0, p.1)).collect();
         for w in &wires {
-            if [a, b]
+            if ends
                 .iter()
                 .any(|p| point_on_segment(p.0, p.1, w.x1, w.y1, w.x2, w.y2, 0.01))
             {
@@ -800,9 +809,17 @@ impl RouteGuard {
         }
         Some(RouteGuard {
             allowed,
-            a,
+            a: from,
             terminals,
         })
+    }
+
+    /// Why the `candidate` sheet in `after` is refused, or `None` when it joins
+    /// nothing [`Self::foreign_joins`] reports.
+    fn refusal(&self, candidate: &str, after: &str) -> anyhow::Result<Option<String>> {
+        let joined = self.foreign_joins(&parse_sexp(after)?);
+        Ok((!joined.is_empty())
+            .then(|| format!("the {candidate} would join {}", joined.join(", "))))
     }
 
     /// Each point whose items `after` puts on `a`'s net although they were on
@@ -3628,12 +3645,28 @@ async fn handle_connect_to_net(
 
     // Where the stub goes, and how the label at its end must read: text
     // running back over the symbol covers its pin names (pin_label_rotation).
-    let dir = match outward {
-        Some(d) => crate::tools::stub_direction(direction, Some(d)),
-        None => crate::tools::resolve_stub_direction(direction, (pin_x, pin_y), &tree),
-    };
+    let outward = outward.or_else(|| crate::tools::pin_outward_at(&tree, pin_x, pin_y));
+    let dirs = crate::tools::stub_directions(direction, outward);
     let mut sch = cse::Schematic::load(&sch_path)?;
     let exits = crate::tools::junction_exit_points(&tree);
+    // A zero-length stub is a label on the pin, which joins only the net asked for.
+    let dir = if stub_length > 0.0 {
+        match clear_stub_direction(
+            &sch,
+            &exits,
+            (pin_x, pin_y),
+            &dirs,
+            stub_length,
+            label_type,
+            &net,
+            &[],
+        )? {
+            Ok(dir) => dir,
+            Err(reasons) => return Ok(route_blocked("connect_to_net", reasons)),
+        }
+    } else {
+        crate::tools::stub_direction(direction, outward)
+    };
     let (label_x, label_y, label_rot) = add_net_stub(
         &mut sch,
         &exits,
@@ -3677,6 +3710,46 @@ pub(crate) fn add_net_stub(
     }
     add_stub_label(sch, label_type, net, end, dir.label_rotation);
     (end.0, end.1, dir.label_rotation)
+}
+
+/// The first of `dirs` along which [`add_net_stub`] from `pin` joins nothing
+/// beyond the net the caller asked for (#117): what a label named `net` on
+/// `pin` would join, and the nets at `requested`. A stub ending on or running
+/// over another pin dots it, and joins it to that net.
+///
+/// The inner `Err` holds one reason per direction tried, or why none could be
+/// checked.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn clear_stub_direction(
+    sch: &cse::Schematic,
+    exits: &[(f64, f64)],
+    pin: (f64, f64),
+    dirs: &[crate::tools::StubDirection],
+    stub_length: f64,
+    label_type: &str,
+    net: &str,
+    requested: &[(f64, f64)],
+) -> anyhow::Result<Result<crate::tools::StubDirection, Vec<String>>> {
+    let source = sch.to_source();
+    let scratch = || cse::Schematic::from_source(sch.filepath(), source.as_str());
+    let mut asked = scratch()?;
+    add_stub_label(&mut asked, label_type, net, pin, 0.0);
+    let Some(guard) = RouteGuard::new(&parse_sexp(&asked.to_source())?, pin, requested) else {
+        return Ok(Err(vec![format!(
+            "cannot check what the stub would join: {}",
+            crate::tools::UNRESOLVED_PIN_GEOMETRY
+        )]));
+    };
+    let mut refused = Vec::new();
+    for dir in dirs {
+        let mut stubbed = scratch()?;
+        add_net_stub(&mut stubbed, exits, pin, dir, stub_length, label_type, net);
+        match guard.refusal(&format!("{} stub", dir.name), &stubbed.to_source())? {
+            Some(reason) => refused.push(reason),
+            None => return Ok(Ok(*dir)),
+        }
+    }
+    Ok(Err(refused))
 }
 
 /// The wire half of [`add_net_stub`]: the wire, plus the junction dots

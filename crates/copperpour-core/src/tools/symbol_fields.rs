@@ -993,6 +993,75 @@ pub(super) mod tests {
         })
     }
 
+    fn new_symbol(path: &Path, name: &str) -> serde_json::Value {
+        json!({
+            "library_path": path, "name": name, "reference_prefix": "U",
+            "pins": [{"number": "1", "name": "A", "type": "input"}]
+        })
+    }
+
+    /// #123: a second `FIELDS_BARE` was appended and reported as success, and
+    /// KiCad's resave of that file kept only one of the two.
+    #[tokio::test]
+    async fn create_symbol_refuses_a_name_the_library_already_defines() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        for name in ["FIELDS_FULL", "FIELDS_BARE"] {
+            let body = call(&handler, "create_symbol", new_symbol(&path, name)).await;
+            assert_eq!(body["is_error"], true, "{body}");
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], "name", "{body}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE, "{name}");
+        }
+    }
+
+    /// Only top-level symbols are names in the library: a unit sub-symbol's
+    /// name, or a prefix of a symbol's name, is free.
+    #[tokio::test]
+    async fn create_symbol_accepts_a_name_that_only_a_unit_or_a_longer_name_holds() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        for name in ["FIELDS", "FIELDS_BARE_0_1"] {
+            let body = call(&handler, "create_symbol", new_symbol(&path, name)).await;
+            assert_ne!(body["is_error"], true, "{name}: {body}");
+        }
+    }
+
+    /// A symbol-editor save between the read and the write is kept, not
+    /// overwritten (#123).
+    #[tokio::test]
+    async fn create_symbol_leaves_a_library_saved_after_its_read_as_saved() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        let saved = FIXTURE.replace("\"CH347F\"", "\"CH347T\"");
+        assert_ne!(saved, FIXTURE);
+        crate::tools::write_hook::set(saved.clone());
+        let body = call(&handler, "create_symbol", new_symbol(&path, "NEW")).await;
+        assert!(
+            !crate::tools::write_hook::armed(),
+            "the write was never reached"
+        );
+        assert_eq!(body["error"]["kind"], "conflict", "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+    }
+
+    /// A library created by someone else after the call found none is not
+    /// replaced by a fresh one.
+    #[tokio::test]
+    async fn create_symbol_does_not_replace_a_library_created_after_its_check() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.kicad_sym");
+        crate::tools::write_hook::set(FIXTURE.to_owned());
+        let body = call(&handler, "create_symbol", new_symbol(&path, "NEW")).await;
+        assert!(
+            !crate::tools::write_hook::armed(),
+            "the write was never reached"
+        );
+        assert_eq!(body["error"]["kind"], "conflict", "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE);
+    }
+
     #[tokio::test]
     async fn edits_write_what_kicad_resaves() {
         let handler = handler().await;

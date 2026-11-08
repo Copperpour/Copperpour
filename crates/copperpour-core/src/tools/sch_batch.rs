@@ -34,7 +34,8 @@ use super::sch_components::{
     set_dnp_attribute, set_property_value, ComponentDeleteTargetError,
 };
 use super::sch_wiring::{
-    add_stub_label, add_stub_wire, resolve_pin_endpoint, resolve_placed_pin, route_between,
+    add_stub_label, add_stub_wire, clear_stub_direction, resolve_pin_endpoint, resolve_placed_pin,
+    route_between,
 };
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -61,7 +62,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "direction": {
                         "type": "string",
                         "description": "Direction of each pin's stub, and of its label text. 'auto' (default) \
-                                        points away from the symbol body.",
+                                        points away from the symbol body, and turns across when that stub \
+                                        would join another net. A pin whose stub would join one either way \
+                                        is skipped and reported in errors.",
                         "enum": ["auto", "right", "left", "up", "down"],
                         "default": "auto"
                     },
@@ -520,6 +523,16 @@ async fn handle_batch_connect_to_net(
     } else {
         Vec::new()
     };
+    // Every pin the call names joins the net, so a stub may end on another (#117).
+    let requested: Vec<(f64, f64)> = pins
+        .iter()
+        .filter(|_| stub_length > 0.0)
+        .filter_map(|spec| {
+            let reference = spec["reference"].as_str()?;
+            let pin_number = spec["pin_number"].as_str()?;
+            resolve_pin_endpoint(&instances, &lib_syms, reference, pin_number).ok()
+        })
+        .collect();
     let mut is_changed = false;
 
     let mut inserts = String::new();
@@ -559,7 +572,31 @@ async fn handle_batch_connect_to_net(
         let (px, py) = pin_endpoint(&pin, t);
         // `auto` is pin_label_rotation's direction, so the default rotation
         // is unchanged.
-        let dir = crate::tools::stub_direction(direction, Some(pin_outward_direction(&pin, t)));
+        let outward = Some(pin_outward_direction(&pin, t));
+        let dir = match sch.as_ref() {
+            Some(sch) if stub_length > 0.0 => {
+                // ponytail: re-parses the sheet and rebuilds net graphs per pin and
+                // direction, as batch_connect_pins does per wire.
+                let dirs = crate::tools::stub_directions(direction, outward);
+                match clear_stub_direction(
+                    sch,
+                    &exit_points,
+                    (px, py),
+                    &dirs,
+                    stub_length,
+                    label_type,
+                    &net_name,
+                    &requested,
+                )? {
+                    Ok(dir) => dir,
+                    Err(reasons) => {
+                        errors.push(format!("{reference}.{pin_number}: {}", reasons.join("; ")));
+                        continue;
+                    }
+                }
+            }
+            _ => crate::tools::stub_direction(direction, outward),
+        };
         let (lx, ly) = dir.end((px, py), stub_length);
         let rotation = dir.label_rotation;
 
@@ -634,7 +671,10 @@ async fn handle_batch_connect_to_net(
         body["stub_length"] = json!(stub_length);
         body["label_type"] = json!(label_type);
     }
-    Ok(CallToolResult::json(&body))
+    let mut result = CallToolResult::json(&body);
+    // As batch_connect_pins: a call that connected nothing failed (#117).
+    result.is_error = added.is_empty() && !errors.is_empty();
+    Ok(result)
 }
 
 /// Whether `sch` already has a wire between `a` and `b`, either way round.
@@ -1719,7 +1759,7 @@ async fn handle_connect_passthrough(
     let direction = opt_str(args, "direction").unwrap_or("auto");
 
     let (content, tree) = read_schematic(&sch_path)?;
-    let dir = crate::tools::resolve_stub_direction(direction, (x, y), &tree);
+    let dir = crate::tools::stub_direction(direction, crate::tools::pin_outward_at(&tree, x, y));
 
     // Stub is 2.54mm (2×1.27 grid units)
     let stub = 2.54_f64;
