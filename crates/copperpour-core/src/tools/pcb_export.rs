@@ -1932,6 +1932,109 @@ mod specctra_rotation_served_tests {
         assert_eq!(pin_rotations(&dsn), pin_rotations(ROTATED_NATIVE), "{dsn}");
         assert!(dsn.contains("(place R3 120000 -40000 front 45)"), "{dsn}");
     }
+    /// A connector whose two `MP` pads share their number, served (#338):
+    /// the DSN carries both as pins on GND, and the manifest beside it names
+    /// each one's physical pad.
+    #[tokio::test]
+    async fn served_export_writes_repeated_pad_numbers_as_separate_pins() {
+        const DUPLICATE_MP: &str =
+            include_str!("../../tests/fixtures/specctra_duplicate_mp.kicad_pcb");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let board = root.join("specctra_duplicate_mp.kicad_pcb");
+        std::fs::write(&board, DUPLICATE_MP).unwrap();
+        let output = root.join("board.dsn");
+        let nets = ["GND", "VCC"];
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            let name = command.type_url.rsplit('.').next().unwrap();
+            Some(match name {
+                "SaveDocumentToString" => pack_any(
+                    &kiapi::common::commands::SavedDocumentResponse {
+                        contents: DUPLICATE_MP.to_string(),
+                        document: None,
+                    },
+                    "kiapi.common.commands.SavedDocumentResponse",
+                ),
+                "GetNets" => pack_any(
+                    &kiapi::board::commands::NetsResponse {
+                        nets: (1..)
+                            .zip(nets)
+                            .map(|(code, net)| copperpour_ipc::builders::net(net, code))
+                            .collect(),
+                    },
+                    "kiapi.board.commands.NetsResponse",
+                ),
+                "GetNetClassForNets" => pack_any(
+                    &kiapi::board::commands::NetClassForNetsResponse {
+                        classes: nets
+                            .iter()
+                            .map(|net| (net.to_string(), default_class()))
+                            .collect(),
+                    },
+                    "kiapi.board.commands.NetClassForNetsResponse",
+                ),
+                _ => return None,
+            })
+        });
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: server.address().to_string(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let result = handler
+            .handle_message(json!({"jsonrpc": "2.0", "id": 338, "method": "tools/call",
+                "params": {"name": "export_specctra_dsn",
+                    "arguments": {"board": board, "output": output,
+                        "native_bridge_mode": "disable"}}}))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(result["isError"], false, "{text}");
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["pad_count"], 8, "{text}");
+        let dsn = std::fs::read_to_string(&output).unwrap();
+        assert!(dsn.contains("(pins J1-2 J1-MP J1-MP@1 R1-2 R2-1)"), "{dsn}");
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(body["manifest_output_path"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["schema_version"], 2);
+        let j1 = manifest["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["reference"] == "J1")
+            .unwrap();
+        let mp = j1["pads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|pin| pin["pad_number"] == "MP")
+            .map(|pin| {
+                (
+                    pin["dsn_pin"].as_str().unwrap(),
+                    pin["pad_uuid"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mp,
+            [
+                ("J1-MP", "550c489f-8422-4919-91a6-15d69b43a49a"),
+                ("J1-MP@1", "ce9e8222-11b6-4e53-9716-46236e235ef7"),
+            ]
+        );
+    }
 }
 
 /// `export_specctra_dsn` served against a KiCad holding a board whose pad

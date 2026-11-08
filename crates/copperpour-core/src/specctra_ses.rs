@@ -115,6 +115,9 @@ struct ManifestComponent {
 #[serde(deny_unknown_fields)]
 struct ManifestPin {
     pad_number: String,
+    /// Required from schema 2, absent in schema 1 (#338).
+    #[serde(default)]
+    pad_uuid: Option<String>,
     dsn_pin: String,
     net: Option<String>,
     padstack_name: String,
@@ -216,7 +219,9 @@ pub(crate) fn parse_import_plan(
 }
 
 fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest) -> Result<()> {
-    if manifest.schema_version != 1 {
+    // Schema 1 predates pad UUIDs; it never had a repeated pad number, so its
+    // pins are still checked, by number (#338).
+    if !(1..=crate::specctra::MANIFEST_SCHEMA_VERSION).contains(&manifest.schema_version) {
         bail!(
             "unsupported Specctra manifest schema {}",
             manifest.schema_version
@@ -263,7 +268,59 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
             actual_hash
         );
     }
-    validate_manifest_relations(manifest)
+    validate_manifest_relations(manifest)?;
+    validate_pins_against_board(board_source, manifest)
+}
+
+/// Each manifest pin is one pad of the live board: the same UUID (from
+/// schema 2), number and net, under the DSN name the export gives it. A
+/// stale, missing, ambiguous or edited mapping is refused here, before any
+/// routing is planned (#338).
+fn validate_pins_against_board(board_source: &str, manifest: &Manifest) -> Result<()> {
+    let board = crate::specctra::board_pin_identities(board_source)
+        .context("read the live board's pads")?;
+    let with_uuids = manifest.schema_version >= 2;
+    let key = |pin: &crate::specctra::PinIdentity| {
+        (
+            pin.dsn_pin.clone(),
+            pin.pad_number.clone(),
+            with_uuids.then(|| pin.pad_uuid.clone()),
+            pin.net.clone(),
+        )
+    };
+    if board.len() != manifest.components.len() {
+        bail!("routing manifest pins do not match the live board's footprints");
+    }
+    for component in &manifest.components {
+        let live = board.get(&component.kiid).with_context(|| {
+            format!(
+                "routing manifest component {} is not on the live board",
+                component.reference
+            )
+        })?;
+        let mut expected = live.iter().map(key).collect::<Vec<_>>();
+        let mut recorded = component
+            .pads
+            .iter()
+            .map(|pin| {
+                (
+                    pin.dsn_pin.clone(),
+                    pin.pad_number.clone(),
+                    pin.pad_uuid.clone(),
+                    pin.net.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        expected.sort();
+        recorded.sort();
+        if expected != recorded {
+            bail!(
+                "routing manifest pins of {} do not match its pads on the live board",
+                component.reference
+            );
+        }
+    }
+    Ok(())
 }
 
 fn locked_routing_counts(board_source: &str) -> Result<(usize, usize)> {
@@ -318,7 +375,10 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
     if padstack_names.len() != manifest.padstacks.len() || padstack_names.contains("") {
         bail!("manifest contains an empty or duplicate padstack name");
     }
+    let with_uuids = manifest.schema_version >= 2;
     let mut references = BTreeSet::new();
+    let mut dsn_pins = BTreeSet::new();
+    let mut pad_uuids = BTreeSet::new();
     for component in &manifest.components {
         if component.reference.is_empty()
             || component.kiid.is_empty()
@@ -330,8 +390,27 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
             bail!("manifest contains invalid component placement metadata");
         }
         for pin in &component.pads {
+            let plain = format!("{}-{}", component.reference, pin.pad_number);
+            // From schema 2 a repeated number is `<number>@<k>` (#338).
+            let named = pin.dsn_pin == plain
+                || (with_uuids
+                    && pin
+                        .dsn_pin
+                        .strip_prefix(&plain)
+                        .and_then(|suffix| suffix.strip_prefix('@'))
+                        .is_some_and(|k| {
+                            !k.is_empty()
+                                && !k.starts_with('0')
+                                && k.bytes().all(|b| b.is_ascii_digit())
+                        }));
+            let uuid_ok = match &pin.pad_uuid {
+                Some(uuid) => with_uuids && !uuid.is_empty() && pad_uuids.insert(uuid.as_str()),
+                None => !with_uuids,
+            };
             if pin.pad_number.is_empty()
-                || pin.dsn_pin != format!("{}-{}", component.reference, pin.pad_number)
+                || !named
+                || !uuid_ok
+                || !dsn_pins.insert(pin.dsn_pin.as_str())
                 || !padstack_names.contains(pin.padstack_name.as_str())
                 || pin
                     .net
@@ -903,6 +982,125 @@ mod tests {
         std::fs::write(&board, &source).unwrap();
         let export = export_dsn(&board, &source, &rules()).unwrap();
         (dir, board, source, export.manifest)
+    }
+
+    /// KiCad's stock JST SH `1MP` connector, whose two `MP` pads are on GND
+    /// (#338).
+    const DUPLICATE_MP: &str = include_str!("../tests/fixtures/specctra_duplicate_mp.kicad_pcb");
+
+    fn duplicate_fixture() -> (tempfile::TempDir, std::path::PathBuf, serde_json::Value) {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, DUPLICATE_MP).unwrap();
+        let export = export_dsn(&board, DUPLICATE_MP, &rules()).unwrap();
+        (dir, board, serde_json::from_str(&export.manifest).unwrap())
+    }
+
+    fn check(board: &std::path::Path, manifest: &serde_json::Value) -> String {
+        let manifest: Manifest = serde_json::from_value(manifest.clone()).unwrap();
+        match validate_manifest(board, DUPLICATE_MP, &manifest) {
+            Ok(()) => "ok".to_string(),
+            Err(error) => format!("{error:#}"),
+        }
+    }
+
+    /// J1's manifest pin named `dsn_pin`.
+    fn j1_pin<'a>(manifest: &'a mut serde_json::Value, dsn_pin: &str) -> &'a mut serde_json::Value {
+        manifest["components"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|component| component["reference"] == "J1")
+            .unwrap()["pads"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|pin| pin["dsn_pin"] == dsn_pin)
+            .unwrap()
+    }
+
+    /// Every manifest pin must be the live board's pad with that UUID,
+    /// number and net, under the name the export gives it. A swapped, stale,
+    /// missing or invented mapping is refused before anything is planned.
+    #[test]
+    fn manifest_pins_must_be_the_live_boards_pads() {
+        let (_dir, board, manifest) = duplicate_fixture();
+        assert_eq!(check(&board, &manifest), "ok");
+        let mismatch = "routing manifest pins of J1 do not match its pads on the live board";
+
+        let mut swapped = manifest.clone();
+        let first = j1_pin(&mut swapped, "J1-MP")["pad_uuid"].clone();
+        let second = j1_pin(&mut swapped, "J1-MP@1")["pad_uuid"].clone();
+        j1_pin(&mut swapped, "J1-MP")["pad_uuid"] = second;
+        j1_pin(&mut swapped, "J1-MP@1")["pad_uuid"] = first;
+        assert_eq!(check(&board, &swapped), mismatch);
+
+        let mut stale = manifest.clone();
+        j1_pin(&mut stale, "J1-MP@1")["pad_uuid"] = "00000000-0000-4000-8000-000000000000".into();
+        assert_eq!(check(&board, &stale), mismatch);
+
+        let mut renet = manifest.clone();
+        j1_pin(&mut renet, "J1-MP@1")["net"] = "VCC".into();
+        assert_eq!(check(&board, &renet), mismatch);
+
+        let mut missing = manifest.clone();
+        for component in missing["components"].as_array_mut().unwrap() {
+            if component["reference"] == "J1" {
+                component["pads"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|pin| pin["dsn_pin"] != "J1-MP@1");
+            }
+        }
+        assert_eq!(check(&board, &missing), mismatch);
+    }
+
+    /// The pin records themselves: a schema 2 pin needs its UUID, names are
+    /// `<number>` or `<number>@<k>`, and neither a name nor a UUID repeats.
+    /// Schema 1, written before repeated numbers were exported, can't name one.
+    #[test]
+    fn malformed_pin_records_are_refused() {
+        let (_dir, board, manifest) = duplicate_fixture();
+        let invalid = "manifest contains invalid pin mapping for J1";
+        type Edit = fn(&mut serde_json::Value);
+        let cases: [(&str, Edit); 5] = [
+            ("no uuid", |m| {
+                j1_pin(m, "J1-MP@1")
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("pad_uuid");
+            }),
+            ("padded suffix", |m| {
+                j1_pin(m, "J1-MP@1")["dsn_pin"] = "J1-MP@01".into()
+            }),
+            ("empty suffix", |m| {
+                j1_pin(m, "J1-MP@1")["dsn_pin"] = "J1-MP@".into()
+            }),
+            ("repeated name", |m| {
+                j1_pin(m, "J1-MP@1")["dsn_pin"] = "J1-MP".into()
+            }),
+            ("repeated uuid", |m| {
+                let uuid = j1_pin(m, "J1-MP")["pad_uuid"].clone();
+                j1_pin(m, "J1-MP@1")["pad_uuid"] = uuid;
+            }),
+        ];
+        for (label, edit) in cases {
+            let mut edited = manifest.clone();
+            edit(&mut edited);
+            assert_eq!(check(&board, &edited), invalid, "{label}");
+        }
+
+        let mut schema_1 = manifest.clone();
+        schema_1["schema_version"] = 1.into();
+        for component in schema_1["components"].as_array_mut().unwrap() {
+            for pin in component["pads"].as_array_mut().unwrap() {
+                pin.as_object_mut().unwrap().remove("pad_uuid");
+            }
+        }
+        assert_eq!(check(&board, &schema_1), invalid);
+        let mut schema_3 = manifest.clone();
+        schema_3["schema_version"] = 3.into();
+        assert!(check(&board, &schema_3).contains("unsupported Specctra manifest schema 3"));
     }
 
     #[test]
