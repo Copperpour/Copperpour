@@ -163,14 +163,6 @@ checks that the native DSN has the same components, pads, nets, layers, and
 routing rules, and writes the revision-bound reverse manifest. The temporary
 file is consumed and deleted.
 
-Pads that share a number, such as a connector's two `MP` pads, are separate
-physical pads, and the DSN keeps them apart: the first, by pad UUID, is named
-by its number and the others get `@1`, `@2` (`J1-MP`, `J1-MP@1`), as KiCad's
-own export names them. The reverse manifest records each pin's pad UUID, and
-SES planning checks every pin against the live board's pads before applying
-anything. KiCad names repeated pads by file order instead, so a board with
-them is not adopted from the native bridge (#338).
-
 The `native_bridge_mode` tool argument controls selection: `prefer` (the default)
 uses a running bridge and otherwise falls back to the Rust DSN exporter,
 `require` fails if native export cannot be used, and `disable` uses Rust only.
@@ -178,6 +170,14 @@ Native export is disabled in the plugin settings by default. This bridge is a
 KiCad 10 compatibility path, not a substitute for the executable IPC plugin or
 the KiCad 11 architecture; strict SES planning and atomic IPC apply never pass
 through Python.
+
+Pads that share a number, such as a connector's two `MP` pads, are separate
+physical pads, and the DSN keeps them apart: the first, by pad UUID, is named
+by its number and the others get `@1`, `@2` (`J1-MP`, `J1-MP@1`), as KiCad's
+own export names them. The reverse manifest records each pin's pad UUID, and
+SES planning checks every pin against the live board's pads before applying
+anything. KiCad names repeated pads by file order instead, so a board with
+them is not adopted from the native bridge (#338).
 
 ## Configuration
 
