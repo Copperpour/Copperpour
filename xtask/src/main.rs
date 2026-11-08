@@ -73,12 +73,16 @@ fn text_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Numbers written immediately before `word`, read exactly as the guard reads
-/// them. Returns `(byte offset of the first digit, value)`.
+/// Numbers written immediately before `word`, or before `on-demand word`,
+/// read exactly as the guard reads them. Returns `(byte offset of the first
+/// digit, value)`.
 fn counts_before(line: &str, word: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for (at, _) in line.match_indices(word) {
         let before = line[..at].trim_end();
+        let before = before
+            .strip_suffix("on-demand")
+            .map_or(before, str::trim_end);
         let digits: String = before
             .chars()
             .rev()
@@ -255,4 +259,16 @@ fn rewrite_section_heading(line: &str) -> Option<String> {
         meta.tool_count(),
         &tail[at + needle.len()..]
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::counts_before;
+
+    /// The README's tagline (#388): `fix-doc-counts` left its 21 stale.
+    #[test]
+    fn counts_before_reads_through_on_demand() {
+        let line = "**257 tools across 21 on-demand toolsets.**";
+        assert_eq!(counts_before(line, "toolsets"), vec![(19, 21)]);
+    }
 }

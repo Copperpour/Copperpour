@@ -333,11 +333,15 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Numbers written immediately before `noun` (matching its plural too).
+/// Numbers written immediately before `noun` (matching its plural too), or
+/// before `on-demand noun`, as the README's tagline puts it (#388).
 fn counts_before(line: &str, noun: &str) -> Vec<usize> {
     let mut out = Vec::new();
     for (at, _) in line.match_indices(noun) {
         let before = line[..at].trim_end();
+        let before = before
+            .strip_suffix("on-demand")
+            .map_or(before, str::trim_end);
         let digits: String = before
             .chars()
             .rev()
