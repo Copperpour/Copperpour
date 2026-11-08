@@ -63,3 +63,16 @@ R11.2 -> R12.1: the horizontal-first route would join R13 pin 1 and label OTHER 
 ```
 
 `connect_pins` refuses that pair with `plan_blocked`, one reason per bend.
+
+### The plain wire tools (Copperpour#118)
+
+`add_wire`, `batch_add_wire`, `connect_to_net` and `batch_connect_to_net` each
+ran on a fresh copy, over stdio. Each call drew a wire far from the `tee` group
+first, then the same tap as R54.2's: a plain wire (184.15, 143.51)→(184.15, 156.21),
+or a 12.7 mm stub pointing down with label `TAP` (on R54.2, or on its point
+for `connect_to_net`). The far wire is (20.32, 20.32)→(30.48, 20.32) or a stub
+on R21.1 or R22.2. `main` @ `4759e5d` gave the same result for all four:
+junctions at (190.5, 156.21) and (184.15, 156.21), and R51's net is R51.2 R52.1
+**R53.2** R54.2. With this change, each leaves one junction, at
+(184.15, 156.21), and R51's net is R51.2 R52.1 R54.2. The net is
+`Net-(R51-Pad2)` for the wire tools and `/TAP` for the stub tools.

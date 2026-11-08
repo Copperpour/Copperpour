@@ -27,6 +27,9 @@ const CLEAR_PATH: [(f64, f64); 3] = [(101.6, 156.21), (127.0, 156.21), (127.0, 1
 const SHEET_PATH: [(f64, f64); 3] = [(177.8, 105.41), (177.8, 107.95), (203.2, 107.95)];
 /// Where R53's wire ends mid-span on R51's, with no junction: two nets to KiCad.
 const DOTLESS_TEE: (f64, f64) = (190.5, 156.21);
+/// R54.2's tap onto R51's wire, as a plain wire, and the T it forms there.
+const TAP: [f64; 4] = [184.15, 143.51, 184.15, 156.21];
+const TAP_TEE: (f64, f64) = (184.15, 156.21);
 
 fn fixture() -> (tempfile::TempDir, PathBuf) {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
@@ -59,6 +62,10 @@ async fn call(path: &Path, name: &str, mut arguments: Value) -> (bool, Value) {
     let result = response.result.expect("successful JSON-RPC response");
     let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
     (result["isError"] == json!(true), body)
+}
+
+fn wire_args([x1, y1, x2, y2]: [f64; 4]) -> Value {
+    json!({ "x1": x1, "y1": y1, "x2": x2, "y2": y2 })
 }
 
 fn pair((ref1, pin1, ref2, pin2): (&str, &str, &str, &str)) -> Value {
@@ -162,14 +169,9 @@ async fn connect_pins_leaves_a_dotless_tee_elsewhere_undotted() {
 #[tokio::test]
 async fn add_schematic_connection_taps_a_wire_mid_span() {
     let (_dir, path) = fixture();
-    let args = json!({ "x1": 184.15, "y1": 143.51, "x2": 184.15, "y2": 156.21 });
-    let (is_error, body) = call(&path, "add_schematic_connection", args).await;
+    let (is_error, body) = call(&path, "add_schematic_connection", wire_args(TAP)).await;
     assert!(!is_error, "{body}");
-    assert_eq!(
-        junctions(&path),
-        [(184.15, 156.21)],
-        "R54.2 joins R51's net"
-    );
+    assert_eq!(junctions(&path), [TAP_TEE], "R54.2 joins R51's net");
 }
 
 #[tokio::test]
@@ -273,4 +275,49 @@ async fn batch_connect_pins_with_every_route_blocked_is_an_error_and_writes_noth
     assert!(is_error, "{body}");
     assert_eq!(body["connected_count"], 0, "{body}");
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+/// Copperpour#118: a wire tool dots only the T's its own wire forms. Each case draws a
+/// wire far from the `tee` group, then R54's tap onto R51's wire.
+#[tokio::test]
+async fn wire_tools_dot_only_the_tees_their_wire_forms() {
+    let far = [20.32, 20.32, 30.48, 20.32];
+    let cases: [(&str, Value, Value); 4] = [
+        ("add_wire", wire_args(far), wire_args(TAP)),
+        (
+            "batch_add_wire",
+            json!({ "wires": [wire_args(far)] }),
+            json!({ "wires": [wire_args(TAP)] }),
+        ),
+        (
+            "connect_to_net",
+            json!({ "reference": "R21", "pin_number": "1", "net": "FAR" }),
+            json!({ "pin_x": TAP[0], "pin_y": TAP[1], "net": "TAP",
+                    "direction": "down", "stub_length": 12.7 }),
+        ),
+        (
+            "batch_connect_to_net",
+            json!({ "net": "FAR", "stub_length": 2.54,
+                    "pins": [{ "reference": "R22", "pin_number": "2" }] }),
+            json!({ "net": "TAP", "stub_length": 12.7, "direction": "down",
+                    "pins": [{ "reference": "R54", "pin_number": "2" }] }),
+        ),
+    ];
+    for (tool, far_args, tap_args) in cases {
+        let (_dir, path) = fixture();
+        let (is_error, body) = call(&path, tool, far_args).await;
+        assert!(!is_error, "{tool}: {body}");
+        assert_eq!(
+            junctions(&path),
+            [],
+            "{tool}: a far wire dots nothing; R53.2 stays off R51's net"
+        );
+        let (is_error, body) = call(&path, tool, tap_args).await;
+        assert!(!is_error, "{tool}: {body}");
+        assert_eq!(
+            junctions(&path),
+            [TAP_TEE],
+            "{tool}: the tap's own T is dotted, the dotless one is not"
+        );
+    }
 }
