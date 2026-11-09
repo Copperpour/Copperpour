@@ -9,7 +9,8 @@ Two modes, combinable:
 
   python packaging/validate-pcm.py --zip dist/copperpour-pcm-v0.1.2.zip
       Assert the PCM zip structure (metadata at root, plugin launcher,
-      per-OS entrypoint binary, icons) and validate the embedded metadata.
+      per-OS entrypoint binary, icons, install_size) and validate the embedded
+      metadata.
 
 Exits non-zero on any failure. This is the gate that would have caught the
 v0.1.1 install failures (#4/#8: missing author.contact) and the schema-invalid
@@ -132,7 +133,34 @@ def validate_zip(zip_path: Path) -> list[str]:
                     )
 
         errors += validate_platforms(z, meta, binaries, zip_path.name)
+        errors += validate_install_size(z, meta, zip_path.name)
 
+    return errors
+
+
+def validate_install_size(z, meta: dict, label: str) -> list[str]:
+    """Every version must state the unzipped size of every file, its own included.
+
+    KiCad's addon repository sums the files in the zip and rejects a package
+    whose install_size is more than 1024 bytes off. v0.16.0 was rejected that
+    way: the build scripts summed the files before writing metadata.json (#398).
+    The build writes the exact total, so anything else is a build fault.
+    """
+    actual = sum(info.file_size for info in z.infolist() if not info.is_dir())
+    errors = []
+    for v in meta.get("versions", []):
+        declared = v.get("install_size")
+        if declared is None:
+            errors.append(
+                f"{label}: version {v.get('version')} declares no install_size; "
+                f"the files in the zip total {actual} bytes"
+            )
+        elif declared != actual:
+            errors.append(
+                f"{label}: version {v.get('version')} declares install_size "
+                f"{declared}, but the files in the zip, metadata.json included, "
+                f"total {actual} bytes"
+            )
     return errors
 
 

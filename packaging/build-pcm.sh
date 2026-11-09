@@ -128,12 +128,15 @@ PY
 # OMITTED inside the zip, matching build-pcm.ps1: the schema only requires
 # version/status/kicad_version, and placeholder values are lies that PCM shows
 # to users ("Download Size: 1 B"). The real values (printed below) go into the
-# kicad-addons repository submission. install_size is the staged file total
-# BEFORE metadata.json is written, matching build-pcm.ps1.
-install_size="$(python3 -c 'import os,sys; print(sum(os.path.getsize(os.path.join(d,f)) for d,_,fs in os.walk(sys.argv[1]) for f in fs))' "$staging")"
-python3 - "$repo_root/packaging/metadata.json" "$staging/metadata.json" "$version" "$install_size" "$platform" <<'PY'
-import json, sys
-src, dst, version, install_size, platform = sys.argv[1:6]
+# kicad-addons repository submission.
+#
+# install_size is every file the zip carries, metadata.json included: KiCad's
+# addon repository sums the unzipped files and rejects a package more than
+# 1024 bytes off (#398). metadata.json holds its own size, so it is rewritten
+# until the number it states stops changing its length.
+install_size="$(python3 - "$repo_root/packaging/metadata.json" "$staging/metadata.json" "$version" "$staging" "$platform" <<'PY'
+import json, os, sys
+src, dst, version, staging, platform = sys.argv[1:6]
 m = json.load(open(src))
 # The repo metadata.json may carry one stamped entry per released platform
 # package; the metadata INSIDE a zip must describe only the package being
@@ -141,15 +144,28 @@ m = json.load(open(src))
 v = m["versions"][0]
 m["versions"] = [v]
 v["version"] = version
-v["install_size"] = int(install_size)
 # This package carries one platform's native binary — say so, or PCM offers a
 # macOS build to a Windows user and vice versa.
 v["platforms"] = [platform]
 for field in ("download_sha256", "download_url", "download_size"):
     v.pop(field, None)
-json.dump(m, open(dst, "w"), indent=2)
-open(dst, "a").write("\n")
+others = sum(os.path.getsize(os.path.join(d, f))
+             for d, _, fs in os.walk(staging) for f in fs
+             if os.path.join(d, f) != dst)
+total = others
+for _ in range(8):
+    v["install_size"] = total
+    with open(dst, "w") as out:
+        json.dump(m, out, indent=2)
+        out.write("\n")
+    if others + os.path.getsize(dst) == total:
+        break
+    total = others + os.path.getsize(dst)
+else:
+    sys.exit("install_size did not settle")
+print(total)
 PY
+)"
 
 # Zip it (staged contents at the archive root, matching Compress-Archive)
 mkdir -p "$out_dir"
