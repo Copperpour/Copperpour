@@ -298,26 +298,66 @@ pub(crate) async fn route_local(
 
 /// `error` first, then the end of Freerouting's stderr: its banner and
 /// warnings run to thousands of characters, with the cause at the end. `full`
-/// names the file that holds all of it.
+/// names the file that holds all of it. Without such a file, the header lines
+/// of the last stack trace go in front of the tail when the tail leaves them
+/// out (see [`stderr_header`]).
 fn with_stderr_tail(error: anyhow::Error, diagnostics: &str, full: Option<&str>) -> anyhow::Error {
     if diagnostics.is_empty() {
         return error;
     }
+    let header = match full {
+        Some(_) => String::new(),
+        None => stderr_header(diagnostics)
+            .map(|header| format!("{header}\n...\n"))
+            .unwrap_or_default(),
+    };
     let full = full
         .map(|path| format!(", all of it in {path}"))
         .unwrap_or_default();
     anyhow::anyhow!(
-        "{error:#}\nFreerouting stderr, last lines{full}:\n{}",
+        "{error:#}\nFreerouting stderr, last lines{full}:\n{header}{}",
         stderr_tail(diagnostics)
     )
 }
 
+/// The header of the last stack trace that [`stderr_tail`] leaves out: the
+/// last line before the tail that names an error, with the line just before
+/// it when that one names an error too (Freerouting logs `ERROR  <what>`, then
+/// the exception line). Indented lines (frames, `... N more`) and `Caused by:`
+/// never count.
+/// Each line is cut to 500 characters. `None` when the tail holds every line
+/// or no left-out line names an error.
+fn stderr_header(diagnostics: &str) -> Option<String> {
+    const LINE_CHARS: usize = 500;
+    fn names_error(line: &str) -> bool {
+        !line.starts_with(char::is_whitespace)
+            && !line.starts_with("Caused by:")
+            && (line.contains("ERROR") || line.contains("Exception") || line.contains("Error"))
+    }
+    let lines: Vec<&str> = diagnostics.lines().collect();
+    let dropped = &lines[..lines.len().saturating_sub(STDERR_TAIL_LINES)];
+    let last = dropped.iter().rposition(|line| names_error(line))?;
+    let first = match last.checked_sub(1) {
+        Some(previous) if names_error(dropped[previous]) => previous,
+        _ => last,
+    };
+    Some(
+        dropped[first..=last]
+            .iter()
+            .map(|line| line.chars().take(LINE_CHARS).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// How many lines of Freerouting's stderr an error ends with.
+const STDERR_TAIL_LINES: usize = 12;
+
 /// The last 12 lines of `diagnostics`, cut to their last 2000 characters.
 fn stderr_tail(diagnostics: &str) -> String {
-    const LINES: usize = 12;
     const CHARS: usize = 2000;
     let lines: Vec<&str> = diagnostics.lines().collect();
-    let tail = lines[lines.len().saturating_sub(LINES)..].join("\n");
+    let tail = lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..].join("\n");
     match tail.char_indices().rev().nth(CHARS - 1) {
         Some((start, _)) => format!("...{}", &tail[start..]),
         None => tail,
@@ -3966,6 +4006,111 @@ done"#,
         assert_eq!(stderr_tail("short"), "short");
     }
 
+    /// Freerouting's stderr when its MCP port is taken, shaped like the one in
+    /// the review of #356: the header, 22 frames, a `Caused by:` and its
+    /// frames. The last 12 lines start inside the first trace's frames.
+    fn port_taken_stderr() -> String {
+        let mut lines = vec![
+            "2026-11-09 10:00:00 INFO   Freerouting v2.1.0".to_string(),
+            "2026-11-09 10:00:01 ERROR  Error starting MCP server".to_string(),
+            "java.io.IOException: Failed to bind to /127.0.0.1:37865".to_string(),
+        ];
+        // A frame whose method names an exception is still a frame.
+        lines.push("\tat example.Server.rethrowException(Server.java:9)".to_string());
+        lines.extend((1..=21).map(|n| format!("\tat example.Server.frame{n}(Server.java:{n})")));
+        lines.push("Caused by: java.net.BindException: Address already in use".to_string());
+        lines.extend((1..=6).map(|n| format!("\tat example.Socket.frame{n}(Socket.java:{n})")));
+        lines.push("\t... 16 more".to_string());
+        lines.join("\n")
+    }
+
+    /// Without a log file, the header the 12-line tail drops goes in front of
+    /// it; frames, `Caused by:` and `... N more` are not headers.
+    #[test]
+    fn a_start_error_keeps_the_stderr_header_of_the_last_stack_trace() {
+        let stderr = port_taken_stderr();
+        assert_eq!(
+            stderr_header(&stderr).as_deref(),
+            Some(
+                "2026-11-09 10:00:01 ERROR  Error starting MCP server\n\
+                 java.io.IOException: Failed to bind to /127.0.0.1:37865"
+            )
+        );
+        let message = format!(
+            "{:#}",
+            with_stderr_tail(anyhow::anyhow!("no answer"), &stderr, None)
+        );
+        assert!(
+            message.starts_with(
+                "no answer\nFreerouting stderr, last lines:\n\
+                 2026-11-09 10:00:01 ERROR  Error starting MCP server\n\
+                 java.io.IOException: Failed to bind to /127.0.0.1:37865\n...\n\
+                 \tat example.Server.frame18("
+            ),
+            "{message}"
+        );
+        assert!(message.ends_with("\t... 16 more"), "{message}");
+        assert!(!message.contains("INFO"), "{message}");
+
+        // A log file holds all of stderr: the tail alone, as before.
+        let logged = format!(
+            "{:#}",
+            with_stderr_tail(anyhow::anyhow!("no answer"), &stderr, Some("/w/b.log"))
+        );
+        assert!(!logged.contains("Failed to bind"), "{logged}");
+    }
+
+    #[test]
+    fn a_stderr_header_is_only_what_the_tail_leaves_out() {
+        // The tail holds every line: nothing to add.
+        let short = "ERROR  Error starting MCP server\njava.io.IOException: bind";
+        assert_eq!(stderr_header(short), None);
+        // Left-out lines that name no error: nothing to add.
+        let banner: String = (1..=40).map(|n| format!("INFO banner {n}\n")).collect();
+        assert_eq!(stderr_header(&banner), None);
+        // Only the last header, and only the line right before it.
+        let stderr: String = [
+            "java.lang.IllegalStateException: an older one",
+            "INFO between",
+            "java.lang.OutOfMemoryError: Java heap space",
+        ]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .chain((1..=12).map(|n| format!("INFO after {n}\n")))
+        .collect();
+        assert_eq!(
+            stderr_header(&stderr).as_deref(),
+            Some("java.lang.OutOfMemoryError: Java heap space")
+        );
+        // `Caused by:` is not a header: the exception line above it is.
+        let caused: String = [
+            "java.lang.RuntimeException: outer",
+            "Caused by: java.net.BindException: inner",
+        ]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .chain((1..=12).map(|n| format!("INFO after {n}\n")))
+        .collect();
+        assert_eq!(
+            stderr_header(&caused).as_deref(),
+            Some("java.lang.RuntimeException: outer")
+        );
+        // A log line at level ERROR is a header on its own.
+        let logged: String = std::iter::once("INFO start\n2026-11-09 ERROR  could not start\n")
+            .map(str::to_string)
+            .chain((1..=12).map(|n| format!("INFO after {n}\n")))
+            .collect();
+        assert_eq!(
+            stderr_header(&logged).as_deref(),
+            Some("2026-11-09 ERROR  could not start")
+        );
+        // A header line is cut to 500 characters.
+        let wide: String = std::iter::once(format!("java.lang.Exception: {}\n", "x".repeat(900)))
+            .chain((1..=12).map(|n| format!("INFO after {n}\n")))
+            .collect();
+        assert_eq!(stderr_header(&wide).unwrap().chars().count(), 500);
+    }
+
     /// The cause comes first, the banner's start is left out, and the file
     /// holding all of stderr is named.
     #[test]
@@ -4122,6 +4267,31 @@ done"#
         );
         assert!(message.ends_with("last stderr line"), "{message}");
         assert!(!message.contains("banner line 29\n"), "{message}");
+    }
+
+    /// A server that fails to bind its port: the error keeps the exception
+    /// line the 12-line tail leaves out.
+    #[cfg(unix)]
+    #[test]
+    fn a_server_that_does_not_start_keeps_its_stderr_header() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let trace = temp.path().join("trace.txt");
+        std::fs::write(&jar, "not a jar").unwrap();
+        std::fs::write(&trace, port_taken_stderr()).unwrap();
+        let server = format!("cat '{}' >&2; exit 1", trace.display());
+        let probe = with_fake_java(temp.path(), &server, probe_local(&jar));
+
+        let message = probe.error.expect("the start failed");
+        assert!(
+            message.contains(
+                "\nFreerouting stderr, last lines:\n\
+                 2026-11-09 10:00:01 ERROR  Error starting MCP server\n\
+                 java.io.IOException: Failed to bind to /127.0.0.1:37865\n...\n"
+            ),
+            "{message}"
+        );
+        assert!(message.ends_with("\t... 16 more"), "{message}");
     }
 
     /// Optional local parity check for Freerouting's actual stdio MCP state
