@@ -1652,6 +1652,18 @@ mod freerouting_tests {
         );
         assert!(!temp.path().join("board.ses").exists());
 
+        // The same with the optimizer off, as the schema description says:
+        // the two arguments contradict each other either way.
+        let (temp, body) = served_route(json!({
+            "optimizer_enabled": false,
+            "optimize_seconds": 1100,
+            "overall_timeout_seconds": 1100
+        }))
+        .await;
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "overall_timeout_seconds", "{body}");
+        assert!(!temp.path().join("board.ses").exists());
+
         // 86400 never runs: the longest overall timeout, 86400, would have
         // to exceed it. The schema refuses it, by default or not.
         for extra in [
