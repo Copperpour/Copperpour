@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Write the metadata.json for a KiCAD addon repository submission.
 
-  python packaging/pcm-submission-metadata.py --version 0.16.0 \
-      --base-url https://github.com/Copperpour/Copperpour/releases/download/v0.16.0/ \
-      --out dist/copperpour-pcm-v0.16.0-metadata.json dist/copperpour-pcm-v0.16.0-*.zip
+  python packaging/pcm-submission-metadata.py --version X.Y.Z \
+      --base-url https://github.com/Copperpour/Copperpour/releases/download/vX.Y.Z/ \
+      --out dist/copperpour-pcm-vX.Y.Z-metadata.json dist/copperpour-pcm-vX.Y.Z.zip
 
 KiCAD's official repository (gitlab.com/kicad/addons/metadata) lists a package
 from a metadata.json whose versions carry download_sha256 and download_url. Those
 values exist only once the release zips are built, and they must not appear in
 the metadata inside a zip, so packaging/metadata.json stays a template and this
-script writes one version entry per platform package from the built zips.
+script writes the version entry from the built zip. The repository rejects two
+entries with one version number, so a release submits the one zip merge-pcm.py
+writes, whose entry covers every platform (#398).
 
 The release workflow attaches the result to the GitHub release. A submission
 copies its `versions` entries into packages/<identifier>/metadata.json there.
@@ -25,13 +27,14 @@ import sys
 import zipfile
 from pathlib import Path
 
-PLATFORMS = {"linux", "macos", "windows"}
 
 _spec = importlib.util.spec_from_file_location(
     "validate_pcm", Path(__file__).parent / "validate-pcm.py"
 )
 validate_pcm = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(validate_pcm)
+
+PLATFORMS = sorted(validate_pcm.MULTI_PLATFORM_DIRS)
 
 
 def version_entry(zip_path: Path, template: dict, version: str, base_url: str) -> dict:
@@ -55,15 +58,23 @@ def version_entry(zip_path: Path, template: dict, version: str, base_url: str) -
 
 
 def build(template: dict, zips: list[Path], version: str, base_url: str) -> dict:
-    entries = [version_entry(z, template, version, base_url) for z in zips]
-    platforms = [p for e in entries for p in e.get("platforms", [])]
-    if sorted(platforms) != sorted(PLATFORMS):
+    if len(zips) != 1:
         raise ValueError(
-            f"the zips declare platforms {sorted(platforms)}; a submission needs "
-            f"exactly one package for each of {sorted(PLATFORMS)}"
+            f"got {len(zips)} zips; KiCad's addon repository requires unique "
+            f"version numbers, so submit the one zip merge-pcm.py writes"
+        )
+    entry = version_entry(zips[0], template, version, base_url)
+    if sorted(entry.get("platforms", [])) != PLATFORMS:
+        raise ValueError(
+            f"{zips[0].name} declares platforms {entry.get('platforms')}; a "
+            f"submission needs {PLATFORMS}, the zip merge-pcm.py writes"
         )
     meta = dict(template)
-    meta["versions"] = sorted(entries, key=lambda e: e["platforms"][0])
+    # The repository also checks against the v1 schema, whose license list has
+    # no AGPL. "open-source" is its documented fallback for an OSI-approved
+    # license; the zip's own metadata keeps the real one.
+    meta["license"] = "open-source"
+    meta["versions"] = [entry]
     return meta
 
 
@@ -100,7 +111,7 @@ def main() -> int:
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-    print(f"OK: wrote {args.out} for {len(meta['versions'])} platform packages")
+    print(f"OK: wrote {args.out} for {args.zips[0].name}")
     return 0
 
 

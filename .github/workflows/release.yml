@@ -278,9 +278,10 @@ jobs:
           name: copperpour-pcm-${{ matrix.platform }}
           path: dist/copperpour-pcm-*.zip
 
-  # The metadata for a KiCAD addon repository submission: one version entry
-  # per platform zip, with the download_sha256/size/url only the built zips
-  # can supply. Runs on the dry run too, so a tag cannot be the first test.
+  # The zip and metadata for a KiCad addon repository submission: the three
+  # platform zips merged into one, and its version entry with the
+  # download_sha256/size/url only the built zip can supply. Runs on the dry
+  # run too, so a tag cannot be the first test.
   pcm-submission-metadata:
     name: KiCAD addon repository metadata
     needs: pcm-package
@@ -299,21 +300,31 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Merges the platform zips first: KiCad's addon repository lists one zip
+      # for every platform (#398).
       - name: Write submission metadata
         run: |
           set -euo pipefail
           python -m pip install jsonschema
           version="${RELEASE_VERSION#v}"
+          python packaging/merge-pcm.py --version "$version" --out merged \
+            dist/copperpour-pcm-v"$version"-*.zip
           python packaging/pcm-submission-metadata.py --version "$version" \
             --base-url "https://github.com/${{ github.repository }}/releases/download/v$version/" \
             --out "metadata/copperpour-pcm-v$version-metadata.json" \
-            dist/copperpour-pcm-v"$version"-*.zip
+            "merged/copperpour-pcm-v$version.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: copperpour-pcm-submission-metadata
           path: metadata/*.json
+
+      - name: Upload the merged zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: copperpour-pcm-merged
+          path: merged/*.zip
 
   release:
     name: Create Release
