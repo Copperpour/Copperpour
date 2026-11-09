@@ -234,11 +234,18 @@ fn alias_beside(exe: &str) -> Option<String> {
         .then(|| format!("{}konnect{suffix}", &exe[..exe.len() - name.len()]))
 }
 
-/// Every command an install by `exe` or its alias wrote for `hook_name`,
-/// in the current and the legacy form.
-fn own_hook_commands(exe: &str, hook_name: &str) -> Vec<String> {
+/// `exe`, then the other paths that run it: the `konnect` alias beside it and
+/// the server its PCM launcher runs.
+fn own_executables(exe: &str) -> impl Iterator<Item = String> {
     std::iter::once(exe.to_string())
         .chain(alias_beside(exe))
+        .chain(pcm_server_beside(exe))
+}
+
+/// Every command an install by one of [`own_executables`] wrote for
+/// `hook_name`, in the current and the legacy form.
+fn own_hook_commands(exe: &str, hook_name: &str) -> Vec<String> {
+    own_executables(exe)
         .flat_map(|exe| {
             [
                 hook_command(&exe, "hook", hook_name),
@@ -246,6 +253,52 @@ fn own_hook_commands(exe: &str, hook_name: &str) -> Vec<String> {
             ]
         })
         .collect()
+}
+
+/// This platform's server directory in the multi-platform PCM package, which
+/// runs it through the `bin/copperpour` launcher (#398; `MULTI_PLATFORM_DIRS`
+/// in `packaging/validate-pcm.py`). Windows' server sits in `bin/` itself.
+const PCM_SERVER_DIR: Option<&str> = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    Some("bin-linux-x86_64")
+} else if cfg!(target_os = "macos") {
+    Some("bin-macos")
+} else {
+    None
+};
+
+/// The path `install` registers for this binary: `bin/copperpour` when the PCM
+/// launcher there runs it, since the server directory is a layout detail.
+fn registered_exe() -> Result<String> {
+    let exe = std::env::current_exe()?;
+    let exe = PCM_SERVER_DIR
+        .and_then(|dir| pcm_launcher_for(&exe, dir))
+        .unwrap_or(exe);
+    Ok(exe.to_string_lossy().into_owned())
+}
+
+/// `<plugins>/bin/copperpour` when `exe` is `<plugins>/<server_dir>/copperpour`
+/// and that file is the launcher script.
+fn pcm_launcher_for(exe: &Path, server_dir: &str) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    if exe.file_name()? != "copperpour" || dir.file_name()? != server_dir {
+        return None;
+    }
+    let launcher = dir.parent()?.join("bin").join("copperpour");
+    let mut head = [0; 2];
+    use std::io::Read;
+    fs::File::open(&launcher)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .ok()
+        .filter(|()| head == *b"#!")
+        .map(|()| launcher)
+}
+
+/// The server the PCM launcher at `exe` runs, if `exe` is `<plugins>/bin/copperpour`.
+/// Hooks naming it are this install's own: an install made before #400 wrote them.
+fn pcm_server_beside(exe: &str) -> Option<String> {
+    let server_dir = PCM_SERVER_DIR?;
+    let plugins = exe.strip_suffix("/bin/copperpour")?;
+    Some(format!("{plugins}/{server_dir}/copperpour"))
 }
 
 /// Double-click behavior remains Claude-focused for backward compatibility.
@@ -256,8 +309,7 @@ pub fn run_double_click_install() -> Result<()> {
     println!("===========================================\n");
     run_install(InstallClient::Claude)?;
 
-    let exe = std::env::current_exe()?;
-    let exe_str = exe.to_string_lossy().replace('\\', "\\\\");
+    let exe_str = registered_exe()?.replace('\\', "\\\\");
     println!("\n-------------------------------------------");
     println!("Add this to your Claude MCP config:");
     println!("-------------------------------------------\n");
@@ -344,9 +396,8 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
             }
         }
 
-        let exe = std::env::current_exe()?;
+        let exe_str = registered_exe()?;
         let settings_path = paths.claude_settings_path();
-        let exe_str = exe.to_string_lossy();
         hook_count = if verbose {
             patch_claude_settings(&settings_path, &exe_str)?
         } else {
@@ -495,11 +546,7 @@ fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) 
                 }
             }
         }
-        let exe = std::env::current_exe()?;
-        remove_hooks_from_settings(
-            &paths.claude_settings_path(),
-            exe.to_string_lossy().as_ref(),
-        )?;
+        remove_hooks_from_settings(&paths.claude_settings_path(), &registered_exe()?)?;
         if verbose {
             println!("  [-] Removed hook entries from settings.json");
         }
@@ -515,8 +562,7 @@ fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) 
 }
 
 fn print_status_at(client: InstallClient, paths: &InstallPaths) -> Result<()> {
-    let exe = std::env::current_exe()?;
-    let guidance = inspect_guidance(client, paths, &exe.to_string_lossy());
+    let guidance = inspect_guidance(client, paths, &registered_exe()?);
     print!("{}", StatusText(&guidance, paths));
 
     println!("\nKiCAD:");
@@ -819,9 +865,9 @@ fn read_marker(client: InstallClient, paths: &InstallPaths) -> Option<MarkerInfo
 
 /// Classify each hook by the exact command `init` would write for `exe_str`.
 /// A handler for the same hook in the pre-#358 plain-stdout form, the
-/// current form for the `konnect` alias beside `exe_str`, or either form for
-/// another Konnect executable, is `different`; nothing else is attributed to
-/// us. So is the current command when `init` would still change the hook.
+/// current form for another of [`own_executables`], or either form for another
+/// Konnect executable, is `different`; nothing else is attributed to us. So is
+/// the current command when `init` would still change the hook.
 fn inspect_hooks(settings_path: &Path, exe_str: &str) -> Vec<HookCheck> {
     // `None` when settings.json exists but cannot be read or parsed.
     let settings = match fs::read_to_string(settings_path) {
@@ -900,8 +946,9 @@ fn classify_hook(
         *c == legacy_hook_command(exe_str, hook_name) || is_legacy_konnect_hook(c, hook_name)
     }) {
         (ItemStatus::Different, Some("legacy_handler"))
-    } else if alias_beside(exe_str)
-        .is_some_and(|alias| commands.contains(&hook_command(&alias, "hook", hook_name).as_str()))
+    } else if own_executables(exe_str)
+        .filter(|own| own != exe_str)
+        .any(|alias| commands.contains(&hook_command(&alias, "hook", hook_name).as_str()))
     {
         (ItemStatus::Different, Some("alias_handler"))
     } else if commands.iter().any(|c| is_konnect_hook(c, hook_name)) {
@@ -990,7 +1037,7 @@ impl InstalledGuidanceProbe {
     pub fn for_current_user() -> Result<Self> {
         Ok(Self::at(
             InstallPaths::for_current_user()?,
-            std::env::current_exe()?.to_string_lossy().into_owned(),
+            registered_exe()?,
         ))
     }
 
@@ -2227,6 +2274,98 @@ mod tests {
         patch_claude_settings(&settings_path, &in_bin("/opt/cp/bin", "konnect")).unwrap();
         remove_hooks_from_settings(&settings_path, &in_bin("/opt/cp/bin", "copperpour")).unwrap();
         assert!(handler_commands(&settings_path, HOOK_SKILLS[0].event).is_empty());
+    }
+
+    /// #400: the multi-platform PCM package runs `<plugins>/bin-<platform>/copperpour`
+    /// through the launcher at `<plugins>/bin/copperpour`; only that file
+    /// stands in for the server, and only when it is the script.
+    #[test]
+    fn the_pcm_launcher_is_registered_for_the_server_it_runs() {
+        let temp = TempDir::new().unwrap();
+        let plugins = temp.path();
+        let server = plugins.join("bin-linux-x86_64").join("copperpour");
+        let launcher = plugins.join("bin").join("copperpour");
+        fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        fs::create_dir_all(server.parent().unwrap()).unwrap();
+        let dir = "bin-linux-x86_64";
+        assert_eq!(pcm_launcher_for(&server, dir), None, "no launcher");
+        fs::write(&launcher, b"\x7fELF").unwrap();
+        assert_eq!(pcm_launcher_for(&server, dir), None, "a binary");
+
+        fs::write(&launcher, b"#!/bin/sh\n").unwrap();
+        assert_eq!(pcm_launcher_for(&server, dir), Some(launcher.clone()));
+        for (exe, dir, case) in [
+            (server.clone(), "bin-macos", "other platform"),
+            (server.with_file_name("konnect"), dir, "alias"),
+            (launcher.clone(), dir, "launcher"),
+        ] {
+            assert_eq!(pcm_launcher_for(&exe, dir), None, "{case}");
+        }
+    }
+
+    /// `PCM_SERVER_DIR` is the directory the package puts this platform's
+    /// server in and the launcher execs, so a layout change there fails here.
+    #[test]
+    fn the_pcm_server_dir_matches_the_package_layout() {
+        let Some(dir) = PCM_SERVER_DIR else {
+            return;
+        };
+        let packaging = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging");
+        let validator = fs::read_to_string(packaging.join("validate-pcm.py")).unwrap();
+        let launcher = fs::read_to_string(packaging.join("pcm-launcher.sh")).unwrap();
+        assert!(
+            validator.contains(&format!(": \"plugins/{dir}/\",")),
+            "{dir}"
+        );
+        assert!(
+            launcher.contains(&format!("platform={}", &dir["bin-".len()..])),
+            "{dir}"
+        );
+        assert!(launcher.contains(r#"exec "$plugins/bin-$platform/copperpour" "$@""#));
+    }
+
+    /// #400: an install run by the server inside the PCM package wrote hooks
+    /// naming it. `init` through the launcher replaces them, `status` reads
+    /// them as `alias_handler`, and `uninstall` removes them.
+    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"))]
+    #[test]
+    fn hooks_naming_the_server_behind_the_pcm_launcher_are_ours() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        let settings_path = paths.claude_settings_path();
+        let launcher = "/opt/plugins/bin/copperpour";
+        let server = format!("/opt/plugins/{}/copperpour", PCM_SERVER_DIR.unwrap());
+        assert_eq!(
+            pcm_server_beside(launcher).as_deref(),
+            Some(server.as_str())
+        );
+        assert_eq!(pcm_server_beside("/opt/plugins/bin/konnect"), None);
+
+        patch_claude_settings(&settings_path, &server).unwrap();
+        let guidance = inspect_guidance(InstallClient::Claude, &paths, launcher);
+        for hook in &guidance.hooks {
+            assert_eq!(
+                (hook.status.as_str(), hook.reason),
+                ("different", Some("alias_handler")),
+                "{}",
+                hook.name
+            );
+        }
+
+        patch_claude_settings(&settings_path, launcher).unwrap();
+        let event = HOOK_SKILLS[0].event;
+        let mut expected: Vec<String> = HOOK_SKILLS
+            .iter()
+            .map(|hook| hook_command(launcher, "hook", hook.name))
+            .collect();
+        expected.sort();
+        let mut commands = handler_commands(&settings_path, event);
+        commands.sort();
+        assert_eq!(commands, expected);
+
+        patch_claude_settings(&settings_path, &server).unwrap();
+        remove_hooks_from_settings(&settings_path, launcher).unwrap();
+        assert!(handler_commands(&settings_path, event).is_empty());
     }
 
     #[test]
