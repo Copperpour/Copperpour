@@ -86,8 +86,9 @@ client uses. Each file and hook is compared with that binary's bundle:
 
 A `different` hook carries a reason: `legacy_handler` is the pre-hook-JSON
 `… skill <name>` form, which Claude ignores; `alias_handler` is a hook for the
-`konnect` alias beside this binary, which runs this binary and which `init`
-replaces; `duplicate_handler` is the current hook with another handler of
+`konnect` alias beside this binary, or, in the all-platforms PCM package, for
+the server behind the `bin/copperpour` launcher; both run this binary, and
+`init` replaces them; `duplicate_handler` is the current hook with another handler of
 ours beside it, or a second entry for it, which `init` removes;
 `stale_matcher` is our entry under a tool matcher from an older release,
 which `init` rewrites; `shared_entry` is the current hook only inside an entry
