@@ -38,6 +38,8 @@ enum PadShape {
     Rect,
     #[serde(rename = "roundrect")]
     RoundRect,
+    /// An obround: a stadium whose width is the pad's shorter side (#384).
+    Oval,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -450,6 +452,13 @@ enum DsnShapeIdentity {
         layer: String,
         points: Vec<(OrderedF64, OrderedF64)>,
     },
+    /// An oval pad's spine and width (#384). An odd-micrometre difference
+    /// between its sides puts the ends on a half micrometre.
+    Path {
+        layer: String,
+        width: OrderedF64,
+        points: Vec<(OrderedF64, OrderedF64)>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -550,6 +559,7 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
                         y2: dsn_integer(geometry, 5, "rect y2")?,
                     }),
                     Some("polygon") => dsn_polygon(geometry),
+                    Some("path") => dsn_path(geometry),
                     other => bail!("DSN padstack has unsupported shape {other:?}"),
                 }
             })
@@ -849,6 +859,33 @@ fn dsn_polygon(geometry: &SexpNode) -> Result<DsnShapeIdentity> {
         bail!("DSN pad polygon is not a closed outline");
     }
     Ok(DsnShapeIdentity::Polygon { layer, points })
+}
+
+/// An oval pad's `path`: a positive width and the spine's two ends.
+fn dsn_path(geometry: &SexpNode) -> Result<DsnShapeIdentity> {
+    let layer = dsn_atom(geometry, 1, "path layer")?.to_string();
+    let width = dsn_number(geometry, 2, "path width")?;
+    if width <= 0.0 {
+        bail!("DSN pad path on '{layer}' has no width");
+    }
+    let count = geometry.children().map_or(0, <[SexpNode]>::len);
+    if count != 7 {
+        bail!("DSN pad path on '{layer}' is not one segment");
+    }
+    let points = (3..count)
+        .step_by(2)
+        .map(|index| {
+            Ok((
+                OrderedF64::new(dsn_number(geometry, index, "path x")?)?,
+                OrderedF64::new(dsn_number(geometry, index + 1, "path y")?)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(DsnShapeIdentity::Path {
+        layer,
+        width: OrderedF64::new(width)?,
+        points,
+    })
 }
 
 /// Arc error KiCad allows by default (`max_error`, 0.005 mm). KiCad keeps its
@@ -1246,6 +1283,7 @@ fn footprints(
                 Some("circle") => PadShape::Circle,
                 Some("rect") => PadShape::Rect,
                 Some("roundrect") => PadShape::RoundRect,
+                Some("oval") => PadShape::Oval,
                 Some(other) => bail!(
                     "unsupported first routing profile: pad {reference}-{number} has shape '{other}'"
                 ),
@@ -1763,6 +1801,14 @@ fn padstack(name: &str, key: &PadstackKey) -> dsn::Padstack {
                 x2: key.size_x_um as f64 / 2.0,
                 y2: key.size_y_um as f64 / 2.0,
             }),
+            PadShape::Oval => dsn::Shape::Path(dsn::Path {
+                layer: layer.clone(),
+                width: key.size_x_um.min(key.size_y_um) as f64,
+                coords: oval_spine(key.size_x_um, key.size_y_um)
+                    .into_iter()
+                    .map(|(x, y)| dsn::Point { x, y })
+                    .collect(),
+            }),
             // Specctra has no rounded rectangle, so KiCad writes a polygon too.
             PadShape::RoundRect => dsn::Shape::Polygon(dsn::Polygon {
                 layer: layer.clone(),
@@ -1782,6 +1828,20 @@ fn padstack(name: &str, key: &PadstackKey) -> dsn::Padstack {
         name: name.to_string(),
         shapes,
         attach: Some(false),
+    }
+}
+
+/// An oval pad's spine, as KiCad's Specctra export writes it: the segment a
+/// round pen of the shorter side's width sweeps to cover the pad, along the
+/// longer axis and centred on the pad; zero length for an equal-sided one.
+fn oval_spine(size_x_um: i64, size_y_um: i64) -> [(f64, f64); 2] {
+    let half = (size_x_um - size_y_um).abs() as f64 / 2.0;
+    if size_y_um > size_x_um {
+        [(0.0, -half), (0.0, half)]
+    } else if size_x_um > size_y_um {
+        [(-half, 0.0), (half, 0.0)]
+    } else {
+        [(0.0, 0.0), (0.0, 0.0)]
     }
 }
 
@@ -1929,7 +1989,9 @@ fn build_manifest(
         supported_profile: SupportedProfile {
             copper_layers: 2,
             component_side: "front".to_string(),
-            pad_shapes: ["circle", "rect", "roundrect"].map(String::from).to_vec(),
+            pad_shapes: ["circle", "rect", "roundrect", "oval"]
+                .map(String::from)
+                .to_vec(),
             existing_routing: !locked_routing.tracks.is_empty() || !locked_routing.vias.is_empty(),
             locked_track_count: locked_routing.tracks.len(),
             locked_via_count: locked_routing.vias.len(),
@@ -2149,7 +2211,7 @@ pub(crate) mod tests {
         let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
         assert_eq!(
             manifest["supported_profile"]["pad_shapes"],
-            serde_json::json!(["circle", "rect", "roundrect"])
+            serde_json::json!(["circle", "rect", "roundrect", "oval"])
         );
         assert_eq!(export.pad_count, 6);
         assert!(export.dsn.contains("(polygon F.Cu 0"), "{}", export.dsn);
@@ -2637,6 +2699,208 @@ pub(crate) mod tests {
                     .iter()
                     .any(|end| (end.0 - pad.0).abs() < 1e-6 && (end.1 - pad.1).abs() < 1e-6),
                 "no GND track ends on the MP pad at {pad:?}: {gnd_ends:?}"
+            );
+        }
+    }
+
+    /// KiCad's stock through-hole JST PH as J1, turned 90 degrees, whose pad
+    /// 2 is oval, and R3 and R4 with oval SMD pads: tall, wide and
+    /// equal-sided (#384). See its README.
+    const OVAL_PADS: &str = include_str!("../tests/fixtures/specctra_oval_pads.kicad_pcb");
+    const OVAL_PADS_NATIVE: &str =
+        include_str!("../tests/fixtures/specctra_oval_pads.native-kicad-10.dsn");
+
+    /// An oval pad is the `path` KiCad's own exporter writes: the shorter
+    /// side as its width, along the longer axis, on each copper layer.
+    #[test]
+    fn oval_pads_export_as_kicad_writes_them() {
+        let bundle = export_dsn(Path::new("board.kicad_pcb"), OVAL_PADS, &rules()).unwrap();
+        for (ours, kicad) in [
+            (
+                "(path F.Cu 1200 0 -275 0 275)",
+                "(path F.Cu 1200  0 -275  0 275)",
+            ),
+            (
+                "(path B.Cu 1200 0 -275 0 275)",
+                "(path B.Cu 1200  0 -275  0 275)",
+            ),
+            (
+                "(path F.Cu 600 0 -150 0 150)",
+                "(path F.Cu 600  0 -150  0 150)",
+            ),
+            (
+                "(path F.Cu 600 -150 0 150 0)",
+                "(path F.Cu 600  -150 0  150 0)",
+            ),
+            ("(path F.Cu 700 0 0 0 0)", "(path F.Cu 700  0 0  0 0)"),
+        ] {
+            assert!(
+                OVAL_PADS_NATIVE.contains(kicad),
+                "KiCad's DSN lacks {kicad}"
+            );
+            assert!(
+                bundle.dsn.contains(ours),
+                "{ours} missing from\n{}",
+                bundle.dsn
+            );
+        }
+        let manifest: serde_json::Value = serde_json::from_str(&bundle.manifest).unwrap();
+        let ovals = manifest["padstacks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|padstack| padstack["shape"] == "oval")
+            .map(|padstack| {
+                (
+                    padstack["size_x_um"].as_i64().unwrap(),
+                    padstack["size_y_um"].as_i64().unwrap(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            ovals,
+            BTreeSet::from([(600, 900), (700, 700), (900, 600), (1200, 1750)])
+        );
+        assert!(manifest["supported_profile"]["pad_shapes"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("oval")));
+    }
+
+    #[test]
+    fn an_oval_spine_runs_along_the_longer_side() {
+        assert_eq!(oval_spine(600, 900), [(0.0, -150.0), (0.0, 150.0)]);
+        assert_eq!(oval_spine(900, 600), [(-150.0, 0.0), (150.0, 0.0)]);
+        assert_eq!(oval_spine(700, 700), [(0.0, 0.0), (0.0, 0.0)]);
+    }
+
+    /// An oval pad with an oval drill (a slot) is still refused: Specctra's
+    /// padstacks can't carry the slot.
+    #[test]
+    fn an_oval_drill_is_still_refused() {
+        let at = OVAL_PADS.find("(pad \"2\" thru_hole oval").unwrap();
+        let drill = at + OVAL_PADS[at..].find("(drill 0.75)").unwrap();
+        let slotted = format!(
+            "{}(drill oval 0.75 1.2){}",
+            &OVAL_PADS[..drill],
+            &OVAL_PADS[drill + "(drill 0.75)".len()..]
+        );
+        let error = export_dsn(Path::new("board.kicad_pcb"), &slotted, &rules())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pad J1-2: oval drill"), "{error}");
+    }
+
+    /// KiCad's DSN of the stock JST PH carries its courtyard as an
+    /// `(outline (polygon ...))`, which the parser refuses (#98), so adoption
+    /// fails closed. Without those lines, the oval padstacks map to KiCad's
+    /// own names.
+    #[test]
+    fn native_oval_padstacks_map_to_kicads_names() {
+        let baseline = || {
+            export_dsn(
+                Path::new("board.kicad_pcb"),
+                OVAL_PADS,
+                &native_fixture_rules(),
+            )
+            .unwrap()
+        };
+        let error = adopt_native_dsn(baseline(), OVAL_PADS_NATIVE.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("failed Specctra parser validation"),
+            "{error}"
+        );
+
+        let without_courtyards = OVAL_PADS_NATIVE
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        let adopted = adopt_native_dsn(baseline(), without_courtyards).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        let names = manifest["padstacks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|padstack| padstack["shape"] == "oval")
+            .map(|padstack| padstack["name"].as_str().unwrap().to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "Oval[A]Pad_1200.000000x1750.000000_um".to_string(),
+                "Oval[T]Pad_600.000000x900.000000_um".to_string(),
+                "Oval[T]Pad_700.000000x700.000000_um".to_string(),
+                "Oval[T]Pad_900.000000x600.000000_um".to_string(),
+            ])
+        );
+    }
+
+    /// An oval whose sides differ by an odd number of micrometres has its
+    /// spine's ends on a half micrometre, in KiCad's DSN as in Copperpour's,
+    /// and the two still match.
+    #[test]
+    fn a_half_micrometre_oval_spine_matches_kicads() {
+        let odd = OVAL_PADS.replacen("(size 0.6 0.9)", "(size 0.6 0.901)", 1);
+        assert_ne!(odd, OVAL_PADS);
+        let baseline =
+            export_dsn(Path::new("board.kicad_pcb"), &odd, &native_fixture_rules()).unwrap();
+        assert!(
+            baseline.dsn.contains("(path F.Cu 600 0 -150.5 0 150.5)"),
+            "{}",
+            baseline.dsn
+        );
+        let native = include_str!("../tests/fixtures/specctra_oval_pads_odd.native-kicad-10.dsn")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        assert!(native.contains("(path F.Cu 600  0 -150.5  0 150.5)"));
+        let adopted = adopt_native_dsn(baseline, native).unwrap();
+        assert!(adopted
+            .manifest
+            .contains("Oval[T]Pad_600.000000x901.000000_um"));
+    }
+
+    /// Freerouting 2.3.0 routed the fixture's export, oval pads included, and
+    /// the strict import planner accepts its session: each oval pad has a
+    /// track of its net ending on its centre.
+    #[test]
+    fn freerouting_routes_to_oval_pads_and_the_planner_accepts_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_oval_pads.kicad_pcb");
+        std::fs::write(&board, OVAL_PADS).unwrap();
+        let bundle = export_dsn(&board, OVAL_PADS, &rules()).unwrap();
+        let plan = crate::specctra_ses::parse_import_plan(
+            &board,
+            OVAL_PADS,
+            &bundle.manifest,
+            include_str!("../tests/fixtures/specctra_oval_pads.freerouting-2.3.0.ses"),
+        )
+        .unwrap();
+        let ends = |net: &str| {
+            plan.tracks
+                .iter()
+                .filter(|track| track.net_name == net)
+                .flat_map(|track| [(track.x1_mm, track.y1_mm), (track.x2_mm, track.y2_mm)])
+                .collect::<Vec<_>>()
+        };
+        // J1 at (92, 60) turned 90 degrees puts its pad 2 at (92, 58).
+        for (net, pad) in [
+            ("GND", (92.0, 58.0)),
+            ("VCC", (115.5, 60.0)),
+            ("GND", (116.5, 60.0)),
+            ("VCC", (123.5, 60.0)),
+            ("GND", (124.5, 60.0)),
+        ] {
+            assert!(
+                ends(net)
+                    .iter()
+                    .any(|end| (end.0 - pad.0).abs() < 1e-6 && (end.1 - pad.1).abs() < 1e-6),
+                "no {net} track ends on the oval pad at {pad:?}: {:?}",
+                ends(net)
             );
         }
     }
