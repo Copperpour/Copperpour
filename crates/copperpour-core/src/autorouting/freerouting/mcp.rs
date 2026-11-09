@@ -3240,6 +3240,13 @@ done
                 "{error}"
             );
         }
+        // The optimizer off does not lift the refusal: the two values still
+        // contradict each other.
+        let off = RouteSettings {
+            optimizer_enabled: Some(false),
+            ..settings(Some(1100), 1100)
+        };
+        assert!(validate_inputs(&jar, &dsn, &ses, &off).is_err());
         validate_inputs(&jar, &dsn, &ses, &settings(Some(1100), 1101)).unwrap();
         validate_inputs(&jar, &dsn, &ses, &settings(None, 900)).unwrap();
     }
