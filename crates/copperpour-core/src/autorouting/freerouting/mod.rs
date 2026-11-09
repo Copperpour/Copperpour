@@ -554,6 +554,48 @@ struct ProjectRules {
     sent: serde_json::Map<String, serde_json::Value>,
     /// Why no project rules were sent, when none were.
     note: Option<String>,
+    /// The project's `min_track_width`, in um, read whether or not it is sent.
+    min_track_width_um: Option<f64>,
+    /// `neck_width_um` sent from `min_track_width`, at the caller's request
+    /// (`neck_to_min_track_width`).
+    neck_width_um: Option<f64>,
+}
+
+/// With `neck_to_min_track_width`, the `neck_width_um` to send: the project's
+/// `min_track_width`. An explicit `router_settings.neck_width_um` wins, and
+/// then nothing is taken from the project. Asked for without a project, or
+/// with a project that has no `min_track_width` above 0, the call is refused:
+/// routing at the class widths only is what the caller asked to avoid.
+fn neck_from_project(
+    requested: bool,
+    router_settings: Option<&serde_json::Map<String, serde_json::Value>>,
+    project: &ProjectRules,
+) -> Result<Option<f64>, CallToolResult> {
+    if !requested || router_settings.is_some_and(|settings| settings.contains_key("neck_width_um"))
+    {
+        return Ok(None);
+    }
+    if let Some(um) = project.min_track_width_um {
+        return Ok(Some(um));
+    }
+    let reason = match &project.project_path {
+        Some(path) => format!(
+            "neck_to_min_track_width needs a min_track_width above 0, and the KiCad project \
+             {} has none",
+            path.display()
+        ),
+        None => format!(
+            "neck_to_min_track_width needs the KiCad project's min_track_width: {}",
+            project.note.as_deref().unwrap_or("no project read")
+        ),
+    };
+    Err(CallToolResult::error_kind(
+        ToolErrorKind::InvalidArgument {
+            field: "neck_to_min_track_width".to_string(),
+            reason: reason.clone(),
+        },
+        format!("{reason}. Nothing was routed."),
+    ))
 }
 
 /// Read the design rules of `project`. A project that is named or found but
@@ -618,8 +660,9 @@ fn read_project_rules(project: RouteProject) -> Result<ProjectRules, CallToolRes
     match parsed {
         Ok(project) => Ok(ProjectRules {
             sent: mcp::project_route_rules(&project),
+            min_track_width_um: mcp::project_min_track_width_um(&project),
             project_path: Some(path),
-            note: None,
+            ..ProjectRules::default()
         }),
         Err(error) => refuse(format!(
             "cannot read the KiCad project {} ({how}): {error}; pass project_path to name \
@@ -627,6 +670,21 @@ fn read_project_rules(project: RouteProject) -> Result<ProjectRules, CallToolRes
             path.display()
         )),
     }
+}
+
+/// `router_settings` with the `neck_width_um` taken from the project, sent
+/// as if the caller had set it: it asked for it, so Freerouting not applying
+/// it refuses the run, unlike a project rule.
+fn router_settings_with_neck(
+    router_settings: Option<serde_json::Map<String, serde_json::Value>>,
+    neck_width_um: Option<f64>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let Some(neck) = neck_width_um else {
+        return router_settings;
+    };
+    let mut settings = router_settings.unwrap_or_default();
+    settings.insert("neck_width_um".to_string(), json!(neck));
+    Some(settings)
 }
 
 /// The `route_specctra_dsn` tool, which `integration`'s handler delegates to.
@@ -643,8 +701,16 @@ pub(crate) async fn route_specctra_dsn(
         Some(value) if !value.is_null() => Some(get_path(args, "project_path")?),
         _ => None,
     };
-    let project = match read_project_rules(route_project(project_path, &dsn)) {
+    let mut project = match read_project_rules(route_project(project_path, &dsn)) {
         Ok(project) => project,
+        Err(refusal) => return Ok(refusal),
+    };
+    project.neck_width_um = match neck_from_project(
+        args["neck_to_min_track_width"].as_bool().unwrap_or(false),
+        args["router_settings"].as_object(),
+        &project,
+    ) {
+        Ok(neck) => neck,
         Err(refusal) => return Ok(refusal),
     };
     let ses_output = get_path(args, "ses_output_path")?;
@@ -715,7 +781,10 @@ pub(crate) async fn route_specctra_dsn(
                 .collect()
         }),
         plane_as_obstacle: args["plane_as_obstacle"].as_bool(),
-        router_settings: args["router_settings"].as_object().cloned(),
+        router_settings: router_settings_with_neck(
+            args["router_settings"].as_object().cloned(),
+            project.neck_width_um,
+        ),
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
     };
@@ -849,7 +918,8 @@ fn route_response(
             "project_path": project.project_path,
             "sent": project.sent,
             "not_applied": evidence.project_rules_not_applied,
-            "note": project.note
+            "note": project.note,
+            "neck_width_um": project.neck_width_um
         }
     })
 }
@@ -1792,7 +1862,9 @@ mod freerouting_tests {
                 .as_object()
                 .unwrap()
                 .clone(),
-            note: None,
+            min_track_width_um: Some(150.0),
+            neck_width_um: Some(150.0),
+            ..ProjectRules::default()
         };
         let body = route_response(
             &evidence,
@@ -1807,7 +1879,8 @@ mod freerouting_tests {
                 "project_path": "/work/board.kicad_pro",
                 "sent": { "copper_to_edge_clearance_um": 500.0, "hole_to_hole_um": 250.0 },
                 "not_applied": ["hole_to_hole_um: not a Freerouting setting"],
-                "note": null
+                "note": null,
+                "neck_width_um": 150.0
             })
         );
         // A rule the JAR skipped does not fail a routed board.
@@ -1890,6 +1963,127 @@ mod freerouting_tests {
         assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
         let project = temp.path().join("board.kicad_pro").display().to_string();
         let body = served_route_in(temp.path(), json!({ "project_path": project })).await;
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+    }
+
+    /// A project read from `path`, with `min_track_width_um`.
+    fn project_read(min_track_width_um: Option<f64>) -> ProjectRules {
+        ProjectRules {
+            project_path: Some(PathBuf::from("/work/board.kicad_pro")),
+            min_track_width_um,
+            ..ProjectRules::default()
+        }
+    }
+
+    #[test]
+    fn the_neck_width_comes_from_the_project_only_when_asked_for() {
+        let project = project_read(Some(150.0));
+        assert_eq!(neck_from_project(false, None, &project).ok(), Some(None));
+        assert_eq!(
+            neck_from_project(true, None, &project).ok(),
+            Some(Some(150.0))
+        );
+        // Other router_settings do not stop it; an explicit neck_width_um
+        // wins, even with no project to read it from.
+        let other = json!({ "hole_clearance_um": 200 });
+        assert_eq!(
+            neck_from_project(true, other.as_object(), &project).ok(),
+            Some(Some(150.0))
+        );
+        let explicit = json!({ "neck_width_um": 120 });
+        assert_eq!(
+            neck_from_project(true, explicit.as_object(), &ProjectRules::default()).ok(),
+            Some(None)
+        );
+    }
+
+    /// The `error` of a refused call; an accepted one fails the assertion.
+    fn refusal_error(result: Result<Option<f64>, CallToolResult>) -> serde_json::Value {
+        assert!(result.is_err(), "not refused: {:?}", result.ok());
+        response_json(&result.unwrap_err())["error"].clone()
+    }
+
+    #[test]
+    fn a_neck_width_asked_for_without_a_min_track_width_is_refused() {
+        let error = refusal_error(neck_from_project(true, None, &project_read(None)));
+        assert_eq!(error["kind"], "invalid_argument", "{error}");
+        assert_eq!(error["field"], "neck_to_min_track_width", "{error}");
+        assert_eq!(
+            error["reason"],
+            "neck_to_min_track_width needs a min_track_width above 0, and the KiCad project \
+             /work/board.kicad_pro has none"
+        );
+        // No project read: the reason says why there is none.
+        let none = read_project_rules(RouteProject::NoneFound).unwrap();
+        let error = refusal_error(neck_from_project(true, None, &none));
+        assert_eq!(error["field"], "neck_to_min_track_width", "{error}");
+        assert_eq!(
+            error["reason"],
+            format!(
+                "neck_to_min_track_width needs the KiCad project's min_track_width: {}",
+                none.note.unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn the_neck_width_goes_out_with_what_the_caller_asked_for() {
+        assert_eq!(router_settings_with_neck(None, None), None);
+        assert_eq!(
+            router_settings_with_neck(None, Some(150.0)).map(serde_json::Value::Object),
+            Some(json!({ "neck_width_um": 150.0 }))
+        );
+        let asked = json!({ "hole_clearance_um": 200 }).as_object().cloned();
+        assert_eq!(
+            router_settings_with_neck(asked, Some(150.0)).map(serde_json::Value::Object),
+            Some(json!({ "hole_clearance_um": 200, "neck_width_um": 150.0 }))
+        );
+    }
+
+    #[test]
+    fn a_project_read_keeps_its_min_track_width() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("board.kicad_pro");
+        write_project(&path, json!({ "min_track_width": 0.15 }));
+        let project = read_project_rules(RouteProject::Given(path)).unwrap();
+        assert_eq!(project.min_track_width_um, Some(150.0));
+        // Read, not sent: only neck_to_min_track_width sends it.
+        assert!(project.sent.is_empty(), "{:?}", project.sent);
+        assert_eq!(project.neck_width_um, None);
+    }
+
+    #[tokio::test]
+    async fn served_route_refuses_a_neck_width_it_cannot_send_before_the_jar_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        write_project(
+            &temp.path().join("board.kicad_pro"),
+            json!({ "min_copper_edge_clearance": 0.5 }),
+        );
+        let body = served_route_in(temp.path(), json!({ "neck_to_min_track_width": true })).await;
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "neck_to_min_track_width", "{body}");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .ends_with(". Nothing was routed."));
+
+        // With a min_track_width, or an explicit neck_width_um, the call
+        // reaches the (missing) JAR.
+        write_project(
+            &temp.path().join("board.kicad_pro"),
+            json!({ "min_track_width": 0.15 }),
+        );
+        let body = served_route_in(temp.path(), json!({ "neck_to_min_track_width": true })).await;
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        let alone = tempfile::tempdir().unwrap();
+        let body = served_route_in(
+            alone.path(),
+            json!({
+                "neck_to_min_track_width": true,
+                "router_settings": { "neck_width_um": 120 }
+            }),
+        )
+        .await;
         assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
     }
 

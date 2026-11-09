@@ -1540,14 +1540,30 @@ pub(crate) const PROJECT_RULES: [(&str, &str); 3] = [
 /// routes with none at all. A rule that is absent, not a number, or not above
 /// 0 is not sent, so Freerouting keeps its own default for it.
 pub(crate) fn project_route_rules(project: &Value) -> Map<String, Value> {
-    let rules = &project["board"]["design_settings"]["rules"];
     PROJECT_RULES
         .iter()
         .filter_map(|(kicad, freerouting)| {
-            let mm = rules[*kicad].as_f64().filter(|mm| *mm > 0.0)?;
-            Some((freerouting.to_string(), json!((mm * 1000.0).round())))
+            let um = project_rule_um(project, kicad)?;
+            Some((freerouting.to_string(), json!(um)))
         })
         .collect()
+}
+
+/// The project's `min_track_width`, in um, that `neck_to_min_track_width`
+/// sends as Freerouting's `neck_width_um`. It is not a project rule sent by
+/// default: Freerouting narrows the whole connection, on any net, power nets
+/// included, and KiCad's DRC does not flag a track narrower than its net
+/// class. None when absent, not a number, or not above 0.
+pub(crate) fn project_min_track_width_um(project: &Value) -> Option<f64> {
+    project_rule_um(project, "min_track_width")
+}
+
+/// A KiCad design rule (mm) in whole um, when it is a number above 0.
+fn project_rule_um(project: &Value, kicad: &str) -> Option<f64> {
+    let mm = project["board"]["design_settings"]["rules"][kicad]
+        .as_f64()
+        .filter(|mm| *mm > 0.0)?;
+    Some((mm * 1000.0).round())
 }
 
 /// The settings that have their own route_specctra_dsn argument.
@@ -2308,6 +2324,25 @@ done"#,
     }
 
     #[test]
+    fn min_track_width_is_read_in_um_but_never_sent_as_a_project_rule() {
+        let project = json!({ "board": { "design_settings": { "rules": {
+            "min_copper_edge_clearance": 0.5,
+            "min_track_width": 0.15
+        } } } });
+        assert_eq!(project_min_track_width_um(&project), Some(150.0));
+        assert_eq!(
+            Value::Object(project_route_rules(&project)),
+            json!({ "copper_to_edge_clearance_um": 500.0 })
+        );
+        for unusable in [json!(0.0), json!(-0.1), json!("0.15"), Value::Null] {
+            let project = json!({ "board": { "design_settings": { "rules": {
+                "min_track_width": unusable
+            } } } });
+            assert_eq!(project_min_track_width_um(&project), None, "{unusable}");
+        }
+    }
+
+    #[test]
     fn project_design_rules_become_freerouting_settings_in_um() {
         let project = json!({ "board": { "design_settings": { "rules": {
             "min_copper_edge_clearance": 0.5,
@@ -2633,6 +2668,30 @@ done"#,
             json!({ "copper_to_edge_clearance_um": 500.0, "hole_clearance_um": 250.0 }),
             "{answer}"
         );
+    }
+
+    /// With `neck_to_min_track_width`, the tool sends the project's
+    /// `min_track_width` as `neck_width_um`, among the caller's settings, and
+    /// reports it.
+    #[cfg(unix)]
+    #[test]
+    fn route_specctra_dsn_sends_the_min_track_width_as_neck_width_when_asked() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("board.kicad_pro"),
+            json!({ "board": { "design_settings": { "rules": {
+                "min_track_width": 0.15
+            } } } })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (answer, sent) =
+            route_through_the_tool(temp.path(), json!({ "neck_to_min_track_width": true }));
+
+        assert_eq!(sent, json!({ "neck_width_um": 150.0 }), "{answer}");
+        assert_eq!(answer["success"], true, "{answer}");
+        assert_eq!(answer["project_rules"]["neck_width_um"], 150.0, "{answer}");
     }
 
     /// The count `route_response` decides on comes from the job's own lines
