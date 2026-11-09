@@ -135,7 +135,12 @@ PY
 # addon repository sums the unzipped files and rejects a package more than
 # 1024 bytes off (#398). metadata.json holds its own size, so it is rewritten
 # until the number it states stops changing its length.
-install_size="$(python3 - "$repo_root/packaging/metadata.json" "$staging/metadata.json" "$version" "$staging" "$platform" <<'PY'
+#
+# The heredoc stays out of $( ... ): macOS's bash 3.2 scans a command
+# substitution for quotes, heredoc text included, and an apostrophe there
+# breaks the parse (#408). The size goes through a file beside $staging.
+size_file="$(dirname "$staging")/install_size"
+python3 - "$repo_root/packaging/metadata.json" "$staging/metadata.json" "$version" "$staging" "$platform" > "$size_file" <<'PY'
 import json, os, sys
 src, dst, version, staging, platform = sys.argv[1:6]
 m = json.load(open(src))
@@ -166,7 +171,7 @@ else:
     sys.exit("install_size did not settle")
 print(total)
 PY
-)"
+install_size="$(cat "$size_file")"
 
 # Zip it (staged contents at the archive root, matching Compress-Archive)
 mkdir -p "$out_dir"
