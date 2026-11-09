@@ -1113,6 +1113,61 @@ pub async fn run_drc_with(
     let checked_pcb = view
         .as_ref()
         .map_or_else(|| pcb.to_path_buf(), |(_, path)| path.clone());
+    let mut report = run_drc_checking(cli, pcb, &checked_pcb, pcb, refill_zones).await?;
+    report.creepage_skipped = view.is_some();
+    drop(view);
+    Ok(report)
+}
+
+/// [`run_drc`] on `candidate`, a board written outside its project, under the
+/// rules of `project_board`'s project.
+///
+/// kicad-cli takes the project, and with it the netclasses of `.kicad_pro`
+/// and the custom rules of `.kicad_dru`, from the files named like the board
+/// it checks. A candidate is a new file, usually elsewhere and under another
+/// name, so on its own it is checked against KiCad's defaults (#312). Here
+/// kicad-cli runs on a temporary view of the source project's directory
+/// (symbolic links to every entry) in which the board under the source
+/// board's name is the candidate: the project's netclasses, custom rules and
+/// schematic (for parity) apply, and nothing in the project is written.
+///
+/// The second value says whether the source project's rules applied. It is
+/// `false` only on a platform without symbolic links, where the candidate is
+/// checked on its own as before.
+pub async fn run_drc_as_project(
+    cli: &str,
+    candidate: &Path,
+    project_board: &Path,
+) -> Result<(DrcReport, bool)> {
+    #[cfg(unix)]
+    {
+        let (view, checked) = project_view(project_board, candidate, None)?;
+        let report = run_drc_checking(cli, candidate, &checked, project_board, false).await?;
+        drop(view);
+        Ok((report, true))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = project_board;
+        warn!("checking a candidate under its project's rules needs symbolic links; checking it alone");
+        Ok((
+            run_drc_checking(cli, candidate, candidate, candidate, false).await?,
+            false,
+        ))
+    }
+}
+
+/// Runs kicad-cli's DRC on `checked_pcb`, the path kicad-cli is given, and
+/// reports it for `pcb`, the board whose contents that path holds: ownership
+/// is read from `pcb`. `parity_board` is the board whose project schematic
+/// the parity check reads.
+async fn run_drc_checking(
+    cli: &str,
+    pcb: &Path,
+    checked_pcb: &Path,
+    parity_board: &Path,
+    refill_zones: bool,
+) -> Result<DrcReport> {
     let out_path = checked_pcb.with_extension("drc.json");
     let args = drc_args(
         out_path.to_str().unwrap(),
@@ -1128,9 +1183,7 @@ pub async fn run_drc_with(
     let _ = tokio::fs::remove_file(&out_path).await;
 
     let mut report = parse_drc_report(&raw)?;
-    report.creepage_skipped = view.is_some();
-    drop(view);
-    apply_parity_evidence(&mut report, &output.stderr, pcb);
+    apply_parity_evidence(&mut report, &output.stderr, parity_board);
 
     // Ownership comes from the exact board this DRC ran on, and it is attached
     // here — the one path `run_drc` and `get_drc_violations` share — so the two
@@ -1166,31 +1219,7 @@ fn creepage_free_view(pcb: &Path) -> Result<Option<(tempfile::TempDir, PathBuf)>
     };
     #[cfg(unix)]
     {
-        let dir = pcb
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let dir = dir
-            .canonicalize()
-            .with_context(|| format!("resolve {}", dir.display()))?;
-        let view = tempfile::Builder::new()
-            .prefix("copperpour-drc-")
-            .tempdir()
-            .context("create DRC project view")?;
-        for entry in std::fs::read_dir(&dir).with_context(|| format!("list {}", dir.display()))? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if Path::new(&name) == dru_path.file_name().map(Path::new).unwrap_or(Path::new("")) {
-                continue;
-            }
-            std::os::unix::fs::symlink(entry.path(), view.path().join(&name))
-                .with_context(|| format!("link {}", entry.path().display()))?;
-        }
-        let dru_name = dru_path.file_name().context("rules file name")?;
-        std::fs::write(view.path().join(dru_name), stripped).context("write DRC rules view")?;
-        let board_name = pcb.file_name().context("board file name")?;
-        let board = view.path().join(board_name);
-        Ok(Some((view, board)))
+        Ok(Some(project_view(pcb, pcb, Some(&stripped))?))
     }
     #[cfg(not(unix))]
     {
@@ -1198,6 +1227,52 @@ fn creepage_free_view(pcb: &Path) -> Result<Option<(tempfile::TempDir, PathBuf)>
         warn!("skip_creepage needs symbolic links; running the full DRC");
         Ok(None)
     }
+}
+
+/// A temporary view of `project_board`'s directory: a symbolic link to every
+/// entry, except that the link under `project_board`'s name points to
+/// `checked_board`, and, when `rules` is given, the project's `.kicad_dru` is
+/// replaced by a file holding `rules`. Returns the view, removed on drop, and
+/// the board path inside it. Nothing in the project directory is written.
+#[cfg(unix)]
+fn project_view(
+    project_board: &Path,
+    checked_board: &Path,
+    rules: Option<&str>,
+) -> Result<(tempfile::TempDir, PathBuf)> {
+    let dir = project_board
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let dir = dir
+        .canonicalize()
+        .with_context(|| format!("resolve {}", dir.display()))?;
+    let checked_board = checked_board
+        .canonicalize()
+        .with_context(|| format!("resolve {}", checked_board.display()))?;
+    let board_name = project_board.file_name().context("board file name")?;
+    let dru_path = project_board.with_extension("kicad_dru");
+    let dru_name = dru_path.file_name().context("rules file name")?;
+    let view = tempfile::Builder::new()
+        .prefix("copperpour-drc-")
+        .tempdir()
+        .context("create DRC project view")?;
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("list {}", dir.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == board_name || (rules.is_some() && name == dru_name) {
+            continue;
+        }
+        std::os::unix::fs::symlink(entry.path(), view.path().join(&name))
+            .with_context(|| format!("link {}", entry.path().display()))?;
+    }
+    if let Some(rules) = rules {
+        std::fs::write(view.path().join(dru_name), rules).context("write DRC rules view")?;
+    }
+    let board = view.path().join(board_name);
+    std::os::unix::fs::symlink(&checked_board, &board)
+        .with_context(|| format!("link {}", checked_board.display()))?;
+    Ok((view, board))
 }
 
 /// Removes every `(constraint creepage …)` from a KiCad custom rules file, and
@@ -4305,6 +4380,88 @@ mod creepage_view_tests {
         let view_path = view.path().to_path_buf();
         drop(view);
         assert!(!view_path.exists(), "the view is removed after use");
+    }
+
+    /// #312: a candidate written elsewhere, under another name, is checked
+    /// by kicad-cli as the source board of the source project, with that
+    /// project's rules and netclasses beside it; the project is not written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn candidate_is_checked_under_the_source_projects_rules() {
+        const RULES: &str = "(version 1)\n(rule \"mains\"\n\t(constraint clearance (min 40mm)))\n";
+        let project = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let seen = tempfile::tempdir().unwrap();
+        let board = project.path().join("b.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb source)").unwrap();
+        std::fs::write(project.path().join("b.kicad_pro"), "{\"netclasses\":1}").unwrap();
+        std::fs::write(project.path().join("b.kicad_dru"), RULES).unwrap();
+        let candidate = elsewhere.path().join("routed.kicad_pcb");
+        std::fs::write(&candidate, "(kicad_pcb candidate)").unwrap();
+        let listing = |dir: &Path| {
+            let mut names: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let project_before = listing(project.path());
+        // Records the board path it was given, that board's contents and the
+        // project files beside it, then writes an empty report.
+        let cli = test_support::write_script(
+            seen.path(),
+            "drc-project-probe",
+            &format!(
+                "#!/bin/sh\nprev=\nfor a; do [ \"$prev\" = --output ] && out=\"$a\"; prev=\"$a\"; last=\"$a\"; done\n\
+                 printf '%s' \"$last\" > '{seen}/board'\n\
+                 cp \"$last\" '{seen}/contents'\n\
+                 cp \"${{last%.kicad_pcb}}.kicad_dru\" '{seen}/rules'\n\
+                 cp \"${{last%.kicad_pcb}}.kicad_pro\" '{seen}/project'\n\
+                 echo 'Failed to fetch schematic netlist for parity tests' >&2\n\
+                 printf '%s' '{{\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]}}' > \"$out\"\nexit 0\n",
+                seen = seen.path().display()
+            ),
+            "@exit /b 1\r\n",
+        );
+        let (report, applied) = run_drc_as_project(cli.to_str().unwrap(), &candidate, &board)
+            .await
+            .unwrap();
+        assert!(applied);
+        // Parity reads the source project's schematic, so an unchecked
+        // parity names that schematic, not one beside the candidate.
+        let diagnostic = report.schematic_parity_diagnostic.expect("parity not run");
+        assert!(
+            diagnostic.contains(&project.path().join("b.kicad_sch").display().to_string()),
+            "{diagnostic}"
+        );
+        let read = |name: &str| std::fs::read_to_string(seen.path().join(name)).unwrap();
+        let checked = PathBuf::from(read("board"));
+        assert_eq!(checked.file_name(), board.file_name());
+        let view = checked.parent().unwrap();
+        assert!(
+            view.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("copperpour-drc-"),
+            "kicad-cli must check the board inside the view: {}",
+            checked.display()
+        );
+        assert!(!view.exists(), "the view is removed after the DRC");
+        assert_eq!(read("contents"), "(kicad_pcb candidate)");
+        assert_eq!(read("rules"), RULES);
+        assert_eq!(read("project"), "{\"netclasses\":1}");
+        assert_eq!(listing(project.path()), project_before);
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            "(kicad_pcb source)",
+            "the source board is never written"
+        );
+        assert_eq!(
+            listing(elsewhere.path()),
+            vec![std::ffi::OsString::from("routed.kicad_pcb")],
+            "no report is left beside the candidate"
+        );
     }
 
     #[test]

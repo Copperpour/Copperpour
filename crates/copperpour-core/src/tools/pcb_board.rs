@@ -3943,6 +3943,10 @@ pub(crate) mod board_mock {
                 let mut via = board::Via::decode(item.value.as_slice()).unwrap();
                 via.id = kiid;
                 *item = pack_any(&via, "kiapi.board.types.Via");
+            } else if any_is(item, "kiapi.board.types.Track") {
+                let mut track = board::Track::decode(item.value.as_slice()).unwrap();
+                track.id = kiid;
+                *item = pack_any(&track, "kiapi.board.types.Track");
             } else if any_is(item, "kiapi.board.types.FootprintInstance") {
                 let mut fp = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
                 fp.id = kiid;
