@@ -87,7 +87,8 @@ crates/
         incremental kicad-cli SVG render) · frontend/index.html (pan/zoom, sheets)
 plugin/      Python launcher inside KiCad: __init__.py (PCB-editor ActionPlugin settings
              dialog) · settings_dialog.py · native_bridge.py (see Plugin) · plugin.json
-packaging/   build-pcm.{ps1,sh} · metadata.json · validate-pcm.py · schema/ · resources/
+packaging/   build-pcm.{ps1,sh} (one platform) · merge-pcm.py + pcm-launcher.sh (all
+             platforms, #398) · metadata.json · validate-pcm.py · schema/ · resources/
 .github/workflows/  disabled on GitHub; local CI runs their jobs (GOVERNANCE.md)
     ci.yml        check+test (Linux, Windows), clippy, fmt, viewer, Python plugin,
                   Nix, PCM validation, licenses, offline build — per PR

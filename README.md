@@ -84,11 +84,13 @@ Requires **KiCad 10** on Windows, macOS or Linux.
 
 ### Step 1: Install the plugin into KiCad
 
-1. Download the PCM package for your OS from
+1. Download the PCM package from
    [Releases](https://github.com/Copperpour/Copperpour/releases):
-   `copperpour-pcm-v<version>-{windows,macos,linux}.zip`. The macOS package is a
-   universal build (Apple Silicon and Intel). The other release archives are
-   standalone server binaries; see [Advanced installation](#advanced-installation).
+   `copperpour-pcm-v<version>.zip` carries Windows, macOS and Linux x86_64. The
+   smaller `copperpour-pcm-v<version>-{windows,macos,linux}.zip` carry one OS each.
+   The macOS build is universal (Apple Silicon and Intel). The other release
+   archives are standalone server binaries; see
+   [Advanced installation](#advanced-installation).
 2. In KiCad: **Plugin and Content Manager → Install from File**, select the zip,
    restart KiCad.
 3. Enable the IPC API: **Preferences → Plugins → Enable KiCad API**. Most PCB tools
@@ -121,6 +123,9 @@ The PCM install puts the server binary at:
 | Windows | `C:\Users\<YOU>\Documents\KiCad\10.0\3rdparty\plugins\com_github_copperpour_copperpour\bin\copperpour.exe` |
 | macOS | `~/Documents/KiCad/10.0/3rdparty/plugins/com_github_copperpour_copperpour/bin/copperpour` |
 | Linux | `~/.local/share/kicad/10.0/3rdparty/plugins/com_github_copperpour_copperpour/bin/copperpour` |
+
+In the all-platforms package, `bin/copperpour` is a small `sh` launcher that runs
+the macOS or Linux server beside it, so the path is the same in both packages.
 
 <a id="setup-with-claude-desktop"></a>
 **Claude Desktop**: add to `claude_desktop_config.json`

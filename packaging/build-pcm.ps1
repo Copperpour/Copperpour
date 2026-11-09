@@ -16,8 +16,9 @@
 #     icon.png               icon shown in the PCM dialog
 #
 # The package declares the platform it carries binaries for, so KiCAD's PCM only
-# offers it to machines that can run it. A package bundles one native binary, so
-# it is never valid for "all platforms".
+# offers it to machines that can run it. This package bundles one platform's
+# binaries; merge-pcm.py combines the three into the package that declares them
+# all.
 #
 # Usage:
 #   ./packaging/build-pcm.ps1 -Version 0.1.0 -BinaryPath target/release/copperpour.exe `
@@ -78,8 +79,6 @@ $metadata = Get-Content "$repoRoot/packaging/metadata.json" -Raw | ConvertFrom-J
 # built, so keep just the first entry as the template.
 $metadata.versions = @($metadata.versions[0])
 $metadata.versions[0].version = $Version
-$installSize = (Get-ChildItem $staging -Recurse -File | Measure-Object Length -Sum).Sum
-$metadata.versions[0] | Add-Member -NotePropertyName install_size -NotePropertyValue ([long]$installSize) -Force
 # This package carries one platform's native binary — say so, or PCM offers a
 # Windows build to a macOS user and vice versa. [string[]] keeps ConvertTo-Json
 # from collapsing the single-element array into a bare string.
@@ -87,7 +86,20 @@ $metadata.versions[0] | Add-Member -NotePropertyName platforms -NotePropertyValu
 foreach ($field in @("download_sha256", "download_url", "download_size")) {
     $metadata.versions[0].PSObject.Properties.Remove($field)
 }
-$metadata | ConvertTo-Json -Depth 10 | Set-Content "$staging/metadata.json"
+# install_size is every file the zip carries, metadata.json included: KiCad's
+# addon repository sums the unzipped files and rejects a package more than
+# 1024 bytes off (#398). metadata.json holds its own size, so it is rewritten
+# until the number it states stops changing its length.
+$otherSize = [long](Get-ChildItem $staging -Recurse -File | Measure-Object Length -Sum).Sum
+$installSize = $otherSize
+$settled = $false
+for ($i = 0; $i -lt 8 -and -not $settled; $i++) {
+    $metadata.versions[0] | Add-Member -NotePropertyName install_size -NotePropertyValue ([long]$installSize) -Force
+    $metadata | ConvertTo-Json -Depth 10 | Set-Content "$staging/metadata.json"
+    $total = $otherSize + (Get-Item "$staging/metadata.json").Length
+    if ($total -eq $installSize) { $settled = $true } else { $installSize = $total }
+}
+if (-not $settled) { throw "install_size did not settle" }
 
 # Zip it
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null

@@ -32,8 +32,8 @@ settings or the `main` ruleset.
   required checks: Check & Test on `ubuntu-latest`, Clippy, Format, Schematic
   viewer, Plugin (Python), Nix flake, PCM packaging validation and Dependency
   licenses. Check & Test on `windows-latest` joins them later (see
-  [Where CI runs](#where-ci-runs)). Check & Test on `macos-latest` runs on
-  GitHub and is not required.
+  [Where CI runs](#where-ci-runs)). Check & Test on `macos-latest` runs only
+  for a release, so it is not a PR check.
 - **The required checks on the reviewed head are the merge evidence.** Run the
   full local gate again after a merge only when the merged tree differs from
   what CI tested, or something on `main` gives a specific reason to.
@@ -44,8 +44,9 @@ settings or the `main` ruleset.
 maintainer's machine instead, as the **Copperpour Local CI** app. Other workflows
 still run on GitHub: issue self-assignment, and `macos.yml`, because Apple's
 licence allows macOS virtual machines only on Apple hardware. `macos.yml` runs
-Check & Test on `macos-latest` for each PR and `main`, and builds the macOS
-release artifacts for each `v*` tag.
+only for a release, never on a PR or on `main`, to keep GitHub Actions use low:
+on each `v*` tag, and when a maintainer starts it on a release candidate. It
+runs Check & Test on `macos-latest` and builds the macOS release artifacts.
 
 - The required checks are that app's: the same `ci.yml` jobs and check names, run
   against each PR's merge commit. A check's details show the end of its log.
