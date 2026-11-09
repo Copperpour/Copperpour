@@ -304,7 +304,7 @@ pub fn tools() -> Vec<ToolDef> {
              through-hole footprints, circle, rectangle, unchamfered rounded-rectangle and oval \
              pads with one shape on every copper layer (rounded rectangles written as polygons \
              that enclose the copper, ovals as paths as KiCad writes them), round drills, \
-             one straight-line closed outline, \
+             one closed outline made from straight lines and circular arcs (arcs flattened within the board's max_error), \
              and no existing tracks, vias, or zones. Copperpour refuses unsupported geometry or \
              custom DRC rules, or incomplete effective routing rules instead of approximating \
              them, and writes a \

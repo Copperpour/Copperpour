@@ -19,6 +19,9 @@ use std::path::Path;
 
 const UM_PER_MM: f64 = 1_000.0;
 const DSN_RESOLUTION: f32 = 10.0;
+const DEFAULT_OUTLINE_ARC_ERROR_UM: f64 = 5.0;
+const MAX_OUTLINE_ARC_SEGMENTS: usize = 1_000_000;
+const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExportBundle {
@@ -211,7 +214,7 @@ pub(crate) fn export_dsn(
     }
 
     let copper_layers = copper_layers(&tree)?;
-    let outline = simple_closed_outline(&tree)?;
+    let outline = simple_closed_outline(&tree, outline_arc_error_um(board_path, &tree)?)?;
     let net_table = top_level_net_table(&tree);
     let locked_routing = locked_routing(&tree, &net_table, &copper_layers)?;
     let footprints = footprints(&tree, &net_table)?;
@@ -1145,8 +1148,48 @@ fn copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
     Ok(copper)
 }
 
-fn simple_closed_outline(tree: &SexpNode) -> Result<Vec<(i64, i64)>> {
-    let mut edges = Vec::new();
+fn outline_arc_error_um(board_path: &Path, tree: &SexpNode) -> Result<f64> {
+    if !tree
+        .children()
+        .unwrap_or(&[])
+        .iter()
+        .any(|node| node.head() == Some("gr_arc") && node.find_str("layer") == Some("Edge.Cuts"))
+    {
+        return Ok(DEFAULT_OUTLINE_ARC_ERROR_UM);
+    }
+    let project_path = board_path.with_extension("kicad_pro");
+    let bytes = match std::fs::read(&project_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DEFAULT_OUTLINE_ARC_ERROR_UM);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read project {}", project_path.display()));
+        }
+    };
+    let project: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse project {}", project_path.display()))?;
+    let Some(value) = project.pointer("/board/design_settings/rules/max_error") else {
+        return Ok(DEFAULT_OUTLINE_ARC_ERROR_UM);
+    };
+    let error_mm = value.as_f64().with_context(|| {
+        format!(
+            "project {} board.design_settings.rules.max_error is not a number",
+            project_path.display()
+        )
+    })?;
+    let error_um = error_mm * UM_PER_MM;
+    if !error_um.is_finite() || error_um <= 0.0 {
+        bail!(
+            "project {} board.design_settings.rules.max_error must be a positive finite number",
+            project_path.display()
+        );
+    }
+    Ok(error_um)
+}
+
+fn simple_closed_outline(tree: &SexpNode, max_error_um: f64) -> Result<Vec<(i64, i64)>> {
+    let mut edges: Vec<Vec<(i64, i64)>> = Vec::new();
     for node in tree.children().unwrap_or(&[]) {
         if node.find_str("layer") != Some("Edge.Cuts") {
             continue;
@@ -1158,62 +1201,180 @@ fn simple_closed_outline(tree: &SexpNode) -> Result<Vec<(i64, i64)>> {
                 if start == end {
                     bail!("unsupported outline: zero-length Edge.Cuts line");
                 }
-                edges.push((start, end));
+                edges.push(vec![start, end]);
+            }
+            Some("gr_arc") => {
+                let start = point_um_f64(node, "start").context("Edge.Cuts arc has no start")?;
+                let mid = point_um_f64(node, "mid").context("Edge.Cuts arc has no mid")?;
+                let end = point_um_f64(node, "end").context("Edge.Cuts arc has no end")?;
+                edges.push(outline_arc_points(start, mid, end, max_error_um)?);
             }
             Some(tag) if tag.starts_with("gr_") => {
-                bail!("unsupported first routing profile: Edge.Cuts '{tag}' is not a straight line")
+                bail!("unsupported first routing profile: Edge.Cuts '{tag}' is not a line or circular arc")
             }
             _ => {}
         }
     }
     if edges.len() < 3 {
-        bail!("unsupported outline: need at least three Edge.Cuts lines");
+        bail!("unsupported outline: need at least three Edge.Cuts lines or arcs");
     }
 
-    let mut adjacency: BTreeMap<(i64, i64), Vec<(i64, i64)>> = BTreeMap::new();
-    for (start, end) in &edges {
-        adjacency.entry(*start).or_default().push(*end);
-        adjacency.entry(*end).or_default().push(*start);
+    // Stable edge order makes the chosen direction deterministic even when
+    // KiCad serializes the outline primitives in a different order.
+    edges.sort_by(|left, right| {
+        let canonical = |points: &[(i64, i64)]| {
+            let forward = points.to_vec();
+            let reverse = points.iter().rev().copied().collect::<Vec<_>>();
+            if forward <= reverse {
+                forward
+            } else {
+                reverse
+            }
+        };
+        canonical(left).cmp(&canonical(right))
+    });
+
+    let mut adjacency: BTreeMap<(i64, i64), Vec<usize>> = BTreeMap::new();
+    for (index, points) in edges.iter().enumerate() {
+        let start = *points.first().context("outline edge has no points")?;
+        let end = *points.last().context("outline edge has no points")?;
+        adjacency.entry(start).or_default().push(index);
+        adjacency.entry(end).or_default().push(index);
     }
-    for (point, neighbours) in &mut adjacency {
-        neighbours.sort();
-        neighbours.dedup();
-        if neighbours.len() != 2 {
+    for (point, incident_edges) in &mut adjacency {
+        incident_edges.sort_unstable();
+        if incident_edges.len() != 2 {
             bail!(
                 "unsupported outline: vertex ({}, {}) has degree {}, expected 2",
                 point.0,
                 point.1,
-                neighbours.len()
+                incident_edges.len()
             );
         }
     }
 
     let start = *adjacency.keys().next().context("outline has no vertices")?;
     let mut ordered = vec![start];
-    let mut previous = None;
     let mut current = start;
+    let mut used_edges = BTreeSet::new();
     loop {
-        let neighbours = &adjacency[&current];
-        let next = match previous {
-            None => neighbours[0],
-            Some(previous) if neighbours[0] == previous => neighbours[1],
-            Some(_) => neighbours[0],
+        let edge_index = adjacency[&current]
+            .iter()
+            .copied()
+            .find(|index| !used_edges.contains(index))
+            .context("unsupported outline: Edge.Cuts is not one closed loop")?;
+        used_edges.insert(edge_index);
+        let points = &edges[edge_index];
+        let directed = if points.first() == Some(&current) {
+            points.clone()
+        } else if points.last() == Some(&current) {
+            points.iter().rev().copied().collect()
+        } else {
+            bail!("unsupported outline: Edge.Cuts edge is disconnected");
         };
-        if next == start {
-            ordered.push(start);
+        ordered.extend(directed.into_iter().skip(1));
+        current = *ordered.last().context("outline has no points")?;
+        if current == start {
             break;
         }
-        if ordered.contains(&next) {
-            bail!("unsupported outline: Edge.Cuts contains more than one loop");
-        }
-        ordered.push(next);
-        previous = Some(current);
-        current = next;
     }
-    if ordered.len() != edges.len() + 1 {
-        bail!("unsupported outline: Edge.Cuts is not one closed loop");
+    if used_edges.len() != edges.len() {
+        bail!("unsupported outline: Edge.Cuts contains more than one loop");
     }
     Ok(ordered)
+}
+
+/// Flatten a KiCad three-point arc into chords that stay within the board's
+/// `max_error`. A 0.707 µm allowance covers rounding the board's input points
+/// to the exporter’s micrometre coordinate grid.
+fn outline_arc_points(
+    start: (f64, f64),
+    mid: (f64, f64),
+    end: (f64, f64),
+    max_error_um: f64,
+) -> Result<Vec<(i64, i64)>> {
+    use std::f64::consts::{PI, TAU};
+
+    if start == end || start == mid || mid == end {
+        bail!("unsupported outline: Edge.Cuts arc has coincident points");
+    }
+    let (bx, by) = (mid.0 - start.0, mid.1 - start.1);
+    let (cx, cy) = (end.0 - start.0, end.1 - start.1);
+    let cross = bx * cy - by * cx;
+    let span = bx.hypot(by).max(cx.hypot(cy)).max((cx - bx).hypot(cy - by));
+    if !cross.is_finite() || cross.abs() <= f64::EPSILON * span * span * 16.0 {
+        bail!("unsupported outline: Edge.Cuts arc points are collinear");
+    }
+
+    // Circumcentre relative to start; using local coordinates avoids loss of
+    // precision for boards whose origin is far from the outline.
+    let b2 = bx * bx + by * by;
+    let c2 = cx * cx + cy * cy;
+    let ux = (cy * b2 - by * c2) / (2.0 * cross);
+    let uy = (bx * c2 - cx * b2) / (2.0 * cross);
+    let radius = ux.hypot(uy);
+    if !radius.is_finite() || radius <= 0.0 {
+        bail!("unsupported outline: Edge.Cuts arc has no finite radius");
+    }
+
+    let angle = |x: f64, y: f64| (y - uy).atan2(x - ux);
+    let start_angle = angle(0.0, 0.0);
+    let to_mid = (angle(bx, by) - start_angle).rem_euclid(TAU);
+    let to_end = (angle(cx, cy) - start_angle).rem_euclid(TAU);
+    let sweep = if to_mid <= to_end {
+        to_end
+    } else {
+        to_end - TAU
+    };
+    let chord_error_um = max_error_um - std::f64::consts::FRAC_1_SQRT_2;
+    if !chord_error_um.is_finite() || chord_error_um <= 0.0 {
+        bail!("unsupported outline: board max_error is smaller than the DSN coordinate resolution");
+    }
+    let max_step = if chord_error_um >= radius {
+        PI
+    } else {
+        2.0 * (1.0 - chord_error_um / radius).acos()
+    };
+    if !max_step.is_finite() || max_step <= 0.0 {
+        bail!("unsupported outline: board max_error cannot represent an Edge.Cuts arc");
+    }
+    let segment_count = (sweep.abs() / max_step).ceil().max(1.0) as usize;
+    if segment_count > MAX_OUTLINE_ARC_SEGMENTS {
+        bail!(
+            "unsupported outline: Edge.Cuts arc needs more than {MAX_OUTLINE_ARC_SEGMENTS} segments"
+        );
+    }
+
+    let mut points = Vec::with_capacity(segment_count + 1);
+    let start_point = (round_um_i64(start.0)?, round_um_i64(start.1)?);
+    let end_point = (round_um_i64(end.0)?, round_um_i64(end.1)?);
+    points.push(start_point);
+    for index in 1..segment_count {
+        let theta = start_angle + sweep * index as f64 / segment_count as f64;
+        let point = (
+            round_um_i64(start.0 + ux + radius * theta.cos())?,
+            round_um_i64(start.1 + uy + radius * theta.sin())?,
+        );
+        if points.last() != Some(&point) {
+            points.push(point);
+        }
+    }
+    if points.last() != Some(&end_point) {
+        points.push(end_point);
+    }
+    if points.len() < 2 {
+        bail!("unsupported outline: Edge.Cuts arc collapsed at DSN resolution");
+    }
+    Ok(points)
+}
+
+fn round_um_i64(value_um: f64) -> Result<i64> {
+    let rounded = value_um.round();
+    // `i64::MAX as f64` rounds up to 2^63, so the upper bound is exclusive.
+    if !rounded.is_finite() || rounded < i64::MIN as f64 || rounded >= I64_UPPER_EXCLUSIVE {
+        bail!("unsupported outline: flattened Edge.Cuts arc exceeds coordinate range");
+    }
+    Ok(rounded as i64)
 }
 
 fn footprints(
@@ -1997,7 +2158,7 @@ fn build_manifest(
             locked_via_count: locked_routing.vias.len(),
             copper_zones: false,
             custom_rules: false,
-            outline: "one closed loop of straight Edge.Cuts lines".to_string(),
+            outline: "one closed loop of Edge.Cuts lines and circular arcs, with arcs flattened within board max_error".to_string(),
         },
         layers: copper_layers
             .iter()
@@ -2063,10 +2224,19 @@ fn refuse_per_layer_padstack(item: &SexpNode, label: &str) -> Result<()> {
 
 fn point_um(node: &SexpNode, tag: &str) -> Result<(i64, i64)> {
     let point = node.find(tag).with_context(|| format!("missing '{tag}'"))?;
-    Ok((
-        finite_um(point.get_f64(1), tag)?,
-        -finite_um(point.get_f64(2), tag)?,
-    ))
+    let y = finite_um(point.get_f64(2), tag)?
+        .checked_neg()
+        .with_context(|| format!("{tag} is outside the supported coordinate range"))?;
+    Ok((finite_um(point.get_f64(1), tag)?, y))
+}
+
+fn point_um_f64(node: &SexpNode, tag: &str) -> Result<(f64, f64)> {
+    let point = node.find(tag).with_context(|| format!("missing '{tag}'"))?;
+    let y = -finite_um_f64(point.get_f64(2), tag)?;
+    if y >= I64_UPPER_EXCLUSIVE {
+        bail!("{tag} is outside the supported coordinate range");
+    }
+    Ok((finite_um_f64(point.get_f64(1), tag)?, y))
 }
 
 fn finite_number(value: Option<f64>, label: &str) -> Result<f64> {
@@ -2079,10 +2249,18 @@ fn finite_number(value: Option<f64>, label: &str) -> Result<f64> {
 
 fn finite_um(value: Option<f64>, label: &str) -> Result<i64> {
     let value = finite_number(value, label)? * UM_PER_MM;
-    if value < i64::MIN as f64 || value > i64::MAX as f64 {
+    if value < i64::MIN as f64 || value >= I64_UPPER_EXCLUSIVE {
         bail!("{label} is outside the supported coordinate range");
     }
     Ok(value.round() as i64)
+}
+
+fn finite_um_f64(value: Option<f64>, label: &str) -> Result<f64> {
+    let value_um = finite_number(value, label)? * UM_PER_MM;
+    if !value_um.is_finite() || value_um < i64::MIN as f64 || value_um >= I64_UPPER_EXCLUSIVE {
+        bail!("{label} is outside the supported coordinate range");
+    }
+    Ok(value_um)
 }
 
 fn positive_um(value: Option<f64>, label: &str) -> Result<i64> {
@@ -3156,6 +3334,108 @@ pub(crate) mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("degree"), "{error}");
+    }
+
+    #[test]
+    fn rounded_outline_arc_is_flattened_and_closed() {
+        let source = r#"(kicad_pcb
+            (gr_arc (start 10 0) (mid 10.70710678 0.29289322) (end 11 1) (layer "Edge.Cuts"))
+            (gr_line (start 11 1) (end 11 11) (layer "Edge.Cuts"))
+            (gr_line (start 11 11) (end 0 11) (layer "Edge.Cuts"))
+            (gr_line (start 0 11) (end 0 0) (layer "Edge.Cuts"))
+            (gr_line (start 0 0) (end 10 0) (layer "Edge.Cuts")))"#;
+        let tree = parse_sexp(source).unwrap();
+        let outline = simple_closed_outline(&tree, 5.0).unwrap();
+
+        assert!(
+            outline.len() > 6,
+            "the arc should contribute intermediate points"
+        );
+        assert_eq!(outline.first(), outline.last());
+        assert!(outline.contains(&(10_000, 0)));
+        assert!(outline.contains(&(11_000, -1_000)));
+    }
+
+    #[test]
+    fn exporter_accepts_rounded_outline_arcs_and_reports_tolerance() {
+        let fixture = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb")
+            .replace("\r\n", "\n");
+        let outline_start = fixture
+            .find("\t(gr_line\n\t\t(start 80 30)")
+            .expect("fixture has a top-left outline edge");
+        let outline_end = fixture
+            .find("\n\t(embedded_fonts no)")
+            .expect("fixture has a final board property");
+        let rounded_outline = r#"(gr_line (start 82 30) (end 128 30) (layer "Edge.Cuts"))
+            (gr_arc (start 128 30) (mid 129.41421356 30.58578644) (end 130 32) (layer "Edge.Cuts"))
+            (gr_line (start 130 32) (end 130 68) (layer "Edge.Cuts"))
+            (gr_arc (start 130 68) (mid 129.41421356 69.41421356) (end 128 70) (layer "Edge.Cuts"))
+            (gr_line (start 128 70) (end 82 70) (layer "Edge.Cuts"))
+            (gr_arc (start 82 70) (mid 80.58578644 69.41421356) (end 80 68) (layer "Edge.Cuts"))
+            (gr_line (start 80 68) (end 80 32) (layer "Edge.Cuts"))
+            (gr_arc (start 80 32) (mid 80.58578644 30.58578644) (end 82 30) (layer "Edge.Cuts"))"#;
+        let mut source = fixture.to_string();
+        source.replace_range(outline_start..outline_end, rounded_outline);
+        let temp = tempfile::tempdir().unwrap();
+        let board_path = temp.path().join("rounded.kicad_pcb");
+        std::fs::write(&board_path, &source).unwrap();
+
+        let export = export_dsn(&board_path, &source, &rules()).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(
+            manifest["supported_profile"]["outline"],
+            "one closed loop of Edge.Cuts lines and circular arcs, with arcs flattened within board max_error"
+        );
+        assert!(export.dsn.contains("(boundary"));
+    }
+
+    #[test]
+    fn outline_arc_flattening_respects_tolerance_in_both_directions() {
+        let tolerance_um = 5.0;
+        for (start, mid, end) in [
+            ((10_000.0, 0.0), (7_071.067_8, 7_071.067_8), (0.0, 10_000.0)),
+            (
+                (10_000.0, 0.0),
+                (7_071.067_8, -7_071.067_8),
+                (0.0, -10_000.0),
+            ),
+        ] {
+            let points = outline_arc_points(start, mid, end, tolerance_um).unwrap();
+            let rounded_start = (start.0.round() as i64, start.1.round() as i64);
+            let rounded_end = (end.0.round() as i64, end.1.round() as i64);
+            assert_eq!(points.first(), Some(&rounded_start));
+            assert_eq!(points.last(), Some(&rounded_end));
+            assert!(points.len() > 2);
+            let max_sagitta = points
+                .windows(2)
+                .map(|edge| {
+                    let chord =
+                        ((edge[1].0 - edge[0].0) as f64).hypot((edge[1].1 - edge[0].1) as f64);
+                    10_000.0 - (10_000.0_f64.powi(2) - (chord / 2.0).powi(2)).sqrt()
+                })
+                .fold(0.0_f64, f64::max);
+            assert!(
+                max_sagitta <= tolerance_um,
+                "sagitta {max_sagitta} exceeds tolerance"
+            );
+        }
+    }
+
+    #[test]
+    fn outline_arc_error_uses_project_max_error_when_available() {
+        let temp = tempfile::tempdir().unwrap();
+        let board_path = temp.path().join("board.kicad_pcb");
+        let tree = parse_sexp(
+            r#"(kicad_pcb (gr_arc (start 1 0) (mid 0.7 0.7) (end 0 1) (layer "Edge.Cuts")))"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("board.kicad_pro"),
+            r#"{"board":{"design_settings":{"rules":{"max_error":0.012}}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(outline_arc_error_um(&board_path, &tree).unwrap(), 12.0);
     }
 
     #[test]
