@@ -153,7 +153,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "board": { "type": "string", "description": "Open source .kicad_pcb used for the DSN export" },
                     "ses_path": { "type": "string", "description": "Freerouting .ses result" },
                     "manifest_path": { "type": "string", "description": "Copperpour reverse manifest written with the DSN" },
-                    "candidate_output_path": { "type": "string", "description": "New .kicad_pcb path. Existing files are never replaced." }
+                    "candidate_output_path": { "type": "string", "description": "New .kicad_pcb path. Existing files are never replaced." },
+                    "skip_creepage": { "type": "boolean", "default": false, "description": "Run the candidate DRC without the project's creepage constraints (KiCad checks creepage single-threaded over every net pair: minutes to hours on a large board). Every other rule still applies; drc.creepage_skipped says whether constraints were left out. For iterations only: run the full DRC before manufacturing." }
                 },
                 "required": ["board", "ses_path", "manifest_path", "candidate_output_path"]
             }),
@@ -968,6 +969,7 @@ struct ApplyEvidence {
     unconnected_items: usize,
     schematic_parity_violations: usize,
     project_rules_applied: bool,
+    creepage_skipped: bool,
 }
 
 fn created_route_item_ids(items: &[prost_types::Any]) -> anyhow::Result<Vec<String>> {
@@ -1018,6 +1020,18 @@ async fn handle_apply_specctra_ses(
             "must have the .kicad_pcb extension",
         ));
     }
+    let skip_creepage = match args.get("skip_creepage") {
+        None => false,
+        Some(value) => match value.as_bool() {
+            Some(skip) => skip,
+            None => {
+                return Ok(invalid_specctra_argument(
+                    "skip_creepage",
+                    "must be a boolean",
+                ))
+            }
+        },
+    };
     let drc_output = candidate.with_extension("drc.json");
     let conflicts = [&candidate, &drc_output]
         .into_iter()
@@ -1195,6 +1209,7 @@ async fn handle_apply_specctra_ses(
                 &cli_path,
                 &candidate_for_ipc,
                 &board_for_ipc,
+                skip_creepage,
             ))?;
             let parity_count = drc.schematic_parity.as_ref().map_or(0, Vec::len);
             Ok(ApplyEvidence {
@@ -1210,6 +1225,7 @@ async fn handle_apply_specctra_ses(
                 unconnected_items: drc.unconnected_items.as_ref().map_or(0, Vec::len),
                 schematic_parity_violations: parity_count,
                 project_rules_applied,
+                creepage_skipped: drc.creepage_skipped,
             })
         })();
         match operation {
@@ -1277,7 +1293,8 @@ async fn handle_apply_specctra_ses(
                 "violations": evidence.drc_violations,
                 "unconnected_items": evidence.unconnected_items,
                 "schematic_parity_violations": evidence.schematic_parity_violations,
-                "project_rules_applied": evidence.project_rules_applied
+                "project_rules_applied": evidence.project_rules_applied,
+                "creepage_skipped": evidence.creepage_skipped
             }
         }))),
         Err(failure) => {
@@ -5216,14 +5233,26 @@ mod apply_specctra_ses_candidate_drc_tests {
         }
     }
 
-    #[tokio::test]
-    async fn the_candidate_drc_runs_under_the_source_projects_rules() {
+    /// What one served `apply_specctra_ses` call returned and what kicad-cli
+    /// was given.
+    struct Applied {
+        result: CallToolResult,
+        body: serde_json::Value,
+        /// The board path kicad-cli checked, and the rules beside it.
+        checked: Option<std::path::PathBuf>,
+        rules: Option<String>,
+    }
+
+    /// Serves `apply_specctra_ses` on a source project whose `.kicad_dru`
+    /// holds `rules`, the candidate written in another directory, with
+    /// `extra` merged into the arguments.
+    async fn apply_in_project(rules: &str, extra: serde_json::Value) -> Applied {
         let project = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         let seen = tempfile::tempdir().unwrap();
         let board = project.path().join("board.kicad_pcb");
         std::fs::write(&board, SAVED).unwrap();
-        std::fs::write(board.with_extension("kicad_dru"), RULES).unwrap();
+        std::fs::write(board.with_extension("kicad_dru"), rules).unwrap();
         std::fs::write(board.with_extension("kicad_pro"), "{}").unwrap();
         let board = board.canonicalize().unwrap();
         let export = crate::specctra::export_dsn(&board, SAVED, &routing_rules()).unwrap();
@@ -5285,35 +5314,105 @@ mod apply_specctra_ses_candidate_drc_tests {
             },
             Arc::new(ToolRouter::new()),
         );
-        let result = handle_apply_specctra_ses(
-            &json!({
-                "board": board,
-                "ses_path": ses,
-                "manifest_path": manifest,
-                "candidate_output_path": candidate
-            }),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let mut args = json!({
+            "board": board,
+            "ses_path": ses,
+            "manifest_path": manifest,
+            "candidate_output_path": candidate
+        });
+        if let serde_json::Value::Object(extra) = extra {
+            args.as_object_mut().unwrap().extend(extra);
+        }
+        let result = handle_apply_specctra_ses(&args, &ctx).await.unwrap();
         let body = response_json(&result);
-        assert!(!result.is_error, "{body}");
-        assert_eq!(body["drc"]["project_rules_applied"], true, "{body}");
-
-        let checked =
-            std::path::PathBuf::from(std::fs::read_to_string(seen.path().join("board")).unwrap());
+        let checked = std::fs::read_to_string(seen.path().join("board"))
+            .ok()
+            .map(std::path::PathBuf::from);
+        let rules_seen = std::fs::read_to_string(seen.path().join("rules")).ok();
+        if !result.is_error {
+            assert!(candidate.is_file(), "the candidate stays");
+        }
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), SAVED);
         assert_eq!(
-            checked.file_name(),
-            board.file_name(),
+            std::fs::read_to_string(board.with_extension("kicad_dru")).unwrap(),
+            rules,
+            "the project's rules are never written"
+        );
+        Applied {
+            result,
+            body,
+            checked,
+            rules: rules_seen,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_candidate_drc_runs_under_the_source_projects_rules() {
+        let applied = apply_in_project(RULES, json!({})).await;
+        let body = &applied.body;
+        assert!(!applied.result.is_error, "{body}");
+        assert_eq!(body["drc"]["project_rules_applied"], true, "{body}");
+        assert_eq!(body["drc"]["creepage_skipped"], false, "{body}");
+
+        let checked = applied.checked.expect("kicad-cli ran");
+        assert_eq!(
+            checked.file_name().unwrap(),
+            "board.kicad_pcb",
             "kicad-cli checks the candidate under the source board's name: {}",
             checked.display()
         );
         assert_eq!(
-            std::fs::read_to_string(seen.path().join("rules")).unwrap_or_default(),
+            applied.rules.unwrap_or_default(),
             RULES,
             "the candidate DRC reads the source project's custom rules"
         );
-        assert!(candidate.is_file(), "the candidate stays");
-        assert_eq!(std::fs::read_to_string(&board).unwrap(), SAVED);
+    }
+
+    /// `skip_creepage` end to end: the candidate DRC reads the project's
+    /// rules without the creepage constraints, every other rule kept, and
+    /// the response says so.
+    #[tokio::test]
+    async fn skip_creepage_leaves_out_only_the_projects_creepage() {
+        const WITH_CREEPAGE: &str = "(version 1)\n(rule \"mains\"\n\t(constraint clearance (min 40mm)))\n(rule \"hv\"\n\t(constraint creepage (min 8mm)))\n";
+        let applied = apply_in_project(WITH_CREEPAGE, json!({"skip_creepage": true})).await;
+        let body = &applied.body;
+        assert!(!applied.result.is_error, "{body}");
+        assert_eq!(body["drc"]["project_rules_applied"], true, "{body}");
+        assert_eq!(body["drc"]["creepage_skipped"], true, "{body}");
+        let rules = applied.rules.expect("kicad-cli saw rules");
+        assert!(
+            rules.contains("(constraint clearance (min 40mm))"),
+            "{rules}"
+        );
+        assert!(!rules.contains("creepage"), "{rules}");
+
+        let applied = apply_in_project(WITH_CREEPAGE, json!({"skip_creepage": false})).await;
+        assert_eq!(
+            applied.body["drc"]["creepage_skipped"], false,
+            "{}",
+            applied.body
+        );
+        assert_eq!(applied.rules.as_deref(), Some(WITH_CREEPAGE));
+    }
+
+    /// A non-boolean `skip_creepage` is refused before KiCad or kicad-cli is
+    /// reached, and nothing is created.
+    #[tokio::test]
+    async fn a_non_boolean_skip_creepage_is_refused() {
+        for value in [json!("yes"), json!(1), json!(null)] {
+            let applied = apply_in_project(RULES, json!({"skip_creepage": value})).await;
+            assert!(applied.result.is_error, "{value}: {}", applied.body);
+            assert_eq!(
+                applied.body["error"]["kind"], "invalid_argument",
+                "{}",
+                applied.body
+            );
+            assert_eq!(
+                applied.body["error"]["field"], "skip_creepage",
+                "{}",
+                applied.body
+            );
+            assert!(applied.checked.is_none(), "{value}: kicad-cli must not run");
+        }
     }
 }

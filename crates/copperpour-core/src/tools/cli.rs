@@ -1131,6 +1131,10 @@ pub async fn run_drc_with(
 /// board's name is the candidate: the project's netclasses, custom rules and
 /// schematic (for parity) apply, and nothing in the project is written.
 ///
+/// With `skip_creepage`, the view's `.kicad_dru` is the project's without its
+/// creepage constraints, as in [`run_drc_with`]; the report says
+/// `creepage_skipped` when there were constraints to leave out.
+///
 /// The second value says whether the source project's rules applied. It is
 /// `false` only on a platform without symbolic links, where the candidate is
 /// checked on its own as before.
@@ -1138,17 +1142,26 @@ pub async fn run_drc_as_project(
     cli: &str,
     candidate: &Path,
     project_board: &Path,
+    skip_creepage: bool,
 ) -> Result<(DrcReport, bool)> {
     #[cfg(unix)]
     {
-        let (view, checked) = project_view(project_board, candidate, None)?;
-        let report = run_drc_checking(cli, candidate, &checked, project_board, false).await?;
+        let rules = if skip_creepage {
+            std::fs::read_to_string(project_board.with_extension("kicad_dru"))
+                .ok()
+                .and_then(|dru| strip_creepage_constraints(&dru))
+        } else {
+            None
+        };
+        let (view, checked) = project_view(project_board, candidate, rules.as_deref())?;
+        let mut report = run_drc_checking(cli, candidate, &checked, project_board, false).await?;
+        report.creepage_skipped = rules.is_some();
         drop(view);
         Ok((report, true))
     }
     #[cfg(not(unix))]
     {
-        let _ = project_board;
+        let _ = (project_board, skip_creepage);
         warn!("checking a candidate under its project's rules needs symbolic links; checking it alone");
         Ok((
             run_drc_checking(cli, candidate, candidate, candidate, false).await?,
@@ -4424,10 +4437,12 @@ mod creepage_view_tests {
             ),
             "@exit /b 1\r\n",
         );
-        let (report, applied) = run_drc_as_project(cli.to_str().unwrap(), &candidate, &board)
-            .await
-            .unwrap();
+        let (report, applied) =
+            run_drc_as_project(cli.to_str().unwrap(), &candidate, &board, false)
+                .await
+                .unwrap();
         assert!(applied);
+        assert!(!report.creepage_skipped);
         // Parity reads the source project's schematic, so an unchecked
         // parity names that schematic, not one beside the candidate.
         let diagnostic = report.schematic_parity_diagnostic.expect("parity not run");
@@ -4461,6 +4476,81 @@ mod creepage_view_tests {
             listing(elsewhere.path()),
             vec![std::ffi::OsString::from("routed.kicad_pcb")],
             "no report is left beside the candidate"
+        );
+    }
+
+    /// `skip_creepage` on a candidate: the view's rules are the source
+    /// project's without the creepage constraints, every other rule kept, and
+    /// the report says so; without creepage in the project, nothing is left
+    /// out and the report does not claim it. The project is never written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn candidate_skips_only_the_source_projects_creepage() {
+        const RULES: &str = "(version 1)\n(rule \"mains\"\n\t(constraint clearance (min 40mm)))\n(rule \"hv\"\n\t(constraint creepage (min 8mm)))\n";
+        const NO_CREEPAGE: &str =
+            "(version 1)\n(rule \"mains\"\n\t(constraint clearance (min 40mm)))\n";
+        let project = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let seen = tempfile::tempdir().unwrap();
+        let board = project.path().join("b.kicad_pcb");
+        let dru = project.path().join("b.kicad_dru");
+        std::fs::write(&board, "(kicad_pcb source)").unwrap();
+        std::fs::write(&dru, RULES).unwrap();
+        let candidate = elsewhere.path().join("routed.kicad_pcb");
+        std::fs::write(&candidate, "(kicad_pcb candidate)").unwrap();
+        // Records the rules beside the board it was given, then writes an
+        // empty report.
+        let cli = test_support::write_script(
+            seen.path(),
+            "drc-creepage-probe",
+            &format!(
+                "#!/bin/sh\nprev=\nfor a; do [ \"$prev\" = --output ] && out=\"$a\"; prev=\"$a\"; last=\"$a\"; done\n\
+                 cp \"${{last%.kicad_pcb}}.kicad_dru\" '{seen}/rules'\n\
+                 printf '%s' '{{\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]}}' > \"$out\"\nexit 0\n",
+                seen = seen.path().display()
+            ),
+            "@exit /b 1\r\n",
+        );
+        let cli = cli.to_str().unwrap();
+        let rules_seen = || std::fs::read_to_string(seen.path().join("rules")).unwrap();
+
+        let (report, applied) = run_drc_as_project(cli, &candidate, &board, true)
+            .await
+            .unwrap();
+        assert!(applied);
+        assert!(report.creepage_skipped);
+        let checked = rules_seen();
+        assert_eq!(checked, strip_creepage_constraints(RULES).unwrap());
+        assert!(
+            checked.contains("(constraint clearance (min 40mm))"),
+            "{checked}"
+        );
+        assert!(!checked.contains("creepage"), "{checked}");
+        assert_eq!(std::fs::read_to_string(&dru).unwrap(), RULES);
+
+        let (report, _) = run_drc_as_project(cli, &candidate, &board, false)
+            .await
+            .unwrap();
+        assert!(!report.creepage_skipped);
+        assert_eq!(
+            rules_seen(),
+            RULES,
+            "without skip_creepage every rule applies"
+        );
+
+        std::fs::write(&dru, NO_CREEPAGE).unwrap();
+        let (report, _) = run_drc_as_project(cli, &candidate, &board, true)
+            .await
+            .unwrap();
+        assert!(
+            !report.creepage_skipped,
+            "nothing was left out, so the report must not say so"
+        );
+        assert_eq!(rules_seen(), NO_CREEPAGE);
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            "(kicad_pcb source)",
+            "the source board is never written"
         );
     }
 
