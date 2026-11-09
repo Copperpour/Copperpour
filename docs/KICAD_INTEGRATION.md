@@ -239,3 +239,15 @@ Fixing both is part of [#24](https://github.com/Copperpour/Copperpour/issues/24)
 The PCM assembly scripts in `packaging/build-pcm.ps1` and `build-pcm.sh` stage
 only metadata, plugin files, icons, and binaries. Repository developer
 documentation under `docs/` is intentionally not part of the install zip.
+
+Each script builds one platform's zip. `packaging/merge-pcm.py` combines the
+three into `copperpour-pcm-v<version>.zip`, the package KiCad's addon repository
+lists, because it rejects one version number listed once per platform. In it the
+Windows binaries stay in `plugins/bin/`, the Linux x86_64 and macOS ones move to
+`plugins/bin-linux-x86_64/` and `plugins/bin-macos/`, and
+`packaging/pcm-launcher.sh` becomes `plugins/bin/copperpour`, which execs the
+server for the machine it runs on. The server directories sit one level below
+`plugins/`, like `bin/`, so the server still finds `plugins/settings.json` one
+directory up, and `plugins/plugin.json` beside that directory. The IPC action's
+entrypoint is the launcher, which Windows cannot run; the action is hidden, and
+KiCad only logs an entrypoint it cannot run until the action is invoked.

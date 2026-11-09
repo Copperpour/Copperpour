@@ -9,8 +9,9 @@ Two modes, combinable:
 
   python packaging/validate-pcm.py --zip dist/copperpour-pcm-v0.1.2.zip
       Assert the PCM zip structure (metadata at root, plugin launcher,
-      per-OS entrypoint binary, icons, install_size) and validate the embedded
-      metadata.
+      per-OS entrypoint binary, icons, install_size, download size) and
+      validate the embedded metadata. A zip is either one platform's package
+      (build-pcm.sh, build-pcm.ps1) or the multi-platform one (merge-pcm.py).
 
 Exits non-zero on any failure. This is the gate that would have caught the
 v0.1.1 install failures (#4/#8: missing author.contact) and the schema-invalid
@@ -58,6 +59,24 @@ EXECUTABLE_MAGIC = {
 }
 
 
+# The multi-platform package's binary directories, with pcm-launcher.sh at
+# plugins/bin/copperpour (#398; layout in docs/KICAD_INTEGRATION.md).
+MULTI_PLATFORM_DIRS = {
+    "windows": "plugins/bin/",
+    "linux": "plugins/bin-linux-x86_64/",
+    "macos": "plugins/bin-macos/",
+}
+SERVER_NAMES = {"windows": "copperpour.exe", "linux": "copperpour", "macos": "copperpour"}
+LAUNCHER = "plugins/bin/copperpour"
+
+# KiCad's addon repository stops downloading a package at 100 MB and asks for a
+# manual review. Fail with room to spare.
+MAX_DOWNLOAD_SIZE = 90_000_000
+
+# zipfile's create_system for an entry made on Unix, whose mode KiCad applies.
+ZIP_UNIX = 3
+
+
 def identify_executable(blob: bytes) -> str | None:
     """Name the platform whose loader can run `blob`, or None if unrecognized."""
     for platform, magics in EXECUTABLE_MAGIC.items():
@@ -97,6 +116,12 @@ def validate_metadata(meta: dict, label: str) -> list[str]:
 
 def validate_zip(zip_path: Path) -> list[str]:
     errors = []
+    size = zip_path.stat().st_size
+    if size > MAX_DOWNLOAD_SIZE:
+        errors.append(
+            f"{zip_path.name}: is {size} bytes; KiCad's addon repository stops "
+            f"downloading at 100 MB, and this gate at {MAX_DOWNLOAD_SIZE}"
+        )
     z = zipfile.ZipFile(zip_path)
     names = set(z.namelist())
 
@@ -104,10 +129,9 @@ def validate_zip(zip_path: Path) -> list[str]:
         if entry not in names:
             errors.append(f"{zip_path.name}: missing required entry {entry}")
 
-    # Exactly one server binary must be present, and plugin.json's entrypoint
-    # must point at it (PR #7's per-OS stamping contract).
-    binaries = [n for n in names if n.startswith("plugins/bin/copperpour")]
-    if not binaries:
+    # plugin.json's entrypoint must name a file the zip carries (PR #7's
+    # per-OS stamping contract); validate_platforms checks the binaries.
+    if not any(n.startswith("plugins/bin/copperpour") for n in names):
         errors.append(f"{zip_path.name}: no plugins/bin/copperpour* binary found")
 
     if "plugins/plugin.json" in names:
@@ -132,7 +156,7 @@ def validate_zip(zip_path: Path) -> list[str]:
                         f"omit the field or provide a real value"
                     )
 
-        errors += validate_platforms(z, meta, binaries, zip_path.name)
+        errors += validate_platforms(z, meta, zip_path.name)
         errors += validate_install_size(z, meta, zip_path.name)
 
     return errors
@@ -164,11 +188,11 @@ def validate_install_size(z, meta: dict, label: str) -> list[str]:
     return errors
 
 
-def validate_platforms(z, meta: dict, binaries: list[str], label: str) -> list[str]:
-    """Every version must declare exactly the platform its binaries can run on.
+def validate_platforms(z, meta: dict, label: str) -> list[str]:
+    """Every version must declare exactly the platforms its binaries can run on.
 
     Omitting `platforms` means "all platforms" to KiCAD's PCM, which is never
-    true of a package that bundles one native binary — that is how a
+    true of a package that bundles native binaries — that is how a
     Windows-only package came to be offered to macOS and Linux users.
     """
     errors = []
@@ -178,27 +202,82 @@ def validate_platforms(z, meta: dict, binaries: list[str], label: str) -> list[s
             errors.append(
                 f"{label}: version {v.get('version')} declares no 'platforms' — "
                 f"PCM would offer this native package to every OS. Declare the "
-                f"one platform its binaries are built for."
+                f"platforms its binaries are built for."
             )
             continue
-        if len(declared) != 1:
-            errors.append(
-                f"{label}: version {v.get('version')} declares platforms "
-                f"{declared}; a package bundles one platform's binaries"
-            )
-            continue
-
-        # The declaration must match what is actually in the zip.
-        for name in binaries:
-            actual = identify_executable(z.read(name)[:4])
-            if actual is None:
-                errors.append(f"{label}: {name} is not a recognized executable")
-            elif actual != declared[0]:
-                errors.append(
-                    f"{label}: declares platforms {declared} but {name} is a "
-                    f"{actual} executable"
-                )
+        if len(declared) == 1:
+            dirs = {"plugins/bin/": declared[0]}
+        else:
+            dirs = {prefix: p for p, prefix in MULTI_PLATFORM_DIRS.items()}
+        errors += validate_binaries(z, dirs, set(declared), v.get("version"), label)
     return errors
+
+
+def validate_binaries(z, dirs: dict, declared: set, version, label: str) -> list[str]:
+    """Each declared platform has its server, and every binary runs where it sits.
+
+    `dirs` maps each binary directory to the platform whose files it holds.
+    POSIX files must be stored with their exec bit, which KiCad's PCM applies
+    on install. A multi-platform package's plugins/bin/copperpour is the
+    launcher, which must be the POSIX script.
+    """
+    errors = []
+    infos = {i.filename: i for i in z.infolist() if not i.is_dir()}
+    multi = len(declared) > 1
+    for name in sorted(infos):
+        in_bin = name.startswith(("plugins/bin/", "plugins/bin-"))
+        if in_bin and not any(
+            name.startswith(prefix) and "/" not in name[len(prefix):] for prefix in dirs
+        ):
+            errors.append(f"{label}: {name} is not in a binary directory version {version} uses")
+    for prefix, platform in dirs.items():
+        files = sorted(
+            n for n in infos
+            if n.startswith(prefix) and "/" not in n[len(prefix):]
+            and not (multi and n == LAUNCHER)
+        )
+        if platform not in declared:
+            for name in files:
+                errors.append(
+                    f"{label}: {name} is a {platform} file, but version {version} "
+                    f"declares platforms {sorted(declared)}"
+                )
+            continue
+        server = prefix + SERVER_NAMES[platform]
+        if server not in infos:
+            errors.append(f"{label}: version {version} declares {platform} but has no {server}")
+        for name in files:
+            with z.open(name) as f:
+                actual = identify_executable(f.read(4))
+            if actual != platform:
+                found = "not a recognized executable" if actual is None else f"a {actual} executable"
+                errors.append(f"{label}: {name} is {found}, but version {version} "
+                              f"puts it with the {platform} binaries")
+            elif platform != "windows" and not stored_executable(infos[name]):
+                errors.append(f"{label}: {name} is not stored executable")
+
+    if multi and declared & {"linux", "macos"}:
+        # KiCad runs the entrypoint on every platform, so it must be the launcher.
+        plugin = json.loads(z.read("plugins/plugin.json")) if "plugins/plugin.json" in infos else {}
+        for action in plugin.get("actions", []):
+            if action.get("entrypoint") != LAUNCHER.removeprefix("plugins/"):
+                errors.append(
+                    f"{label}: plugin.json entrypoint {action.get('entrypoint')!r} is not "
+                    f"the launcher {LAUNCHER.removeprefix('plugins/')!r}"
+                )
+        launcher = infos.get(LAUNCHER)
+        if launcher is None:
+            errors.append(f"{label}: version {version} declares POSIX platforms but has no {LAUNCHER}")
+        elif not z.read(LAUNCHER).startswith(b"#!/bin/sh\n"):
+            errors.append(f"{label}: {LAUNCHER} is not the POSIX launcher")
+        elif not stored_executable(launcher):
+            errors.append(f"{label}: {LAUNCHER} is not stored executable")
+    return errors
+
+
+def stored_executable(info: zipfile.ZipInfo) -> bool:
+    """Whether KiCad's PCM installs this entry with an exec bit."""
+    return info.create_system == ZIP_UNIX and bool((info.external_attr >> 16) & 0o111)
 
 
 def main() -> int:

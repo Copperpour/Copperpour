@@ -167,7 +167,10 @@ class InstallSize(unittest.TestCase):
             with zipfile.ZipFile(path, "w") as z:
                 z.writestr("metadata.json", blob)
                 for name, data in self.FILES.items():
-                    z.writestr(name, data)
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3  # zip -X on Linux keeps the mode
+                    info.external_attr = (0o100755 if "/bin/" in name else 0o100644) << 16
+                    z.writestr(info, data)
             return validate_pcm.validate_zip(path)
 
     def test_total_with_metadata_passes(self):
