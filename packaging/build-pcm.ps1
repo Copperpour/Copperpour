@@ -16,8 +16,9 @@
 #     icon.png               icon shown in the PCM dialog
 #
 # The package declares the platform it carries binaries for, so KiCAD's PCM only
-# offers it to machines that can run it. A package bundles one native binary, so
-# it is never valid for "all platforms".
+# offers it to machines that can run it. This package bundles one platform's
+# binaries; merge-pcm.py combines the three into the package that declares them
+# all.
 #
 # Usage:
 #   ./packaging/build-pcm.ps1 -Version 0.1.0 -BinaryPath target/release/copperpour.exe `

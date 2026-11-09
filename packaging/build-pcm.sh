@@ -21,8 +21,9 @@
 # build-pcm.ps1 which stamps bin/copperpour.exe for Windows.
 #
 # The package declares the platform it carries binaries for, so KiCAD's PCM
-# only offers it to machines that can run it. A package bundles one native
-# binary, so it is never valid for "all platforms".
+# only offers it to machines that can run it. This package bundles one
+# platform's binaries; merge-pcm.py combines the three into the package that
+# declares them all.
 #
 # Usage:
 #   packaging/build-pcm.sh [--version X.Y.Z] [--binary PATH] [--viewer PATH]
