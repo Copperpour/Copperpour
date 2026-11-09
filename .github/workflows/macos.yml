@@ -2,16 +2,16 @@ name: macOS
 
 # The macOS jobs of ci.yml and release.yml (#392). Those workflows run on local
 # CI, which can't run macOS: Apple's licence allows macOS virtual machines only
-# on Apple hardware. This workflow stays enabled on GitHub. It publishes
+# on Apple hardware. This workflow stays enabled on GitHub, but runs only for
+# a release, never on PRs or main, to keep GitHub Actions use low. It publishes
 # nothing; the maintainer cutting a release downloads its artifacts.
 on:
   push:
-    branches: [main]
     tags: ['v*']
-  pull_request:
-    branches: [main]
-  # Rebuild a tag's artifacts (`gh workflow run macos.yml --ref v1.2.3`), or a
-  # dry run of any other ref under a synthetic version.
+  # Test and build a release candidate before tagging it
+  # (`gh workflow run macos.yml --ref main`), or rebuild a tag's artifacts
+  # (`--ref v1.2.3`). Any ref other than a v* tag is a dry run under a
+  # synthetic version.
   workflow_dispatch:
     inputs:
       version:
@@ -37,7 +37,6 @@ env:
 jobs:
   check:
     name: Check & Test (macos-latest)
-    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -57,7 +56,6 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     timeout-minutes: 60
     strategy:
@@ -101,7 +99,6 @@ jobs:
 
   pcm-package:
     name: KiCAD PCM plugin package (macos)
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
