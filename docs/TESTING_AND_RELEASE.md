@@ -116,15 +116,16 @@ packages, validates both packages and runs the real-KiCad job. It publishes
 nothing.
 
 For the tag, the same job builds the release artifacts from the tagged commit.
-The macOS ones come from GitHub: pushing the tag runs `macos.yml`, which builds
-the `x86_64-apple-darwin` and `aarch64-apple-darwin` archives and the universal
+The macOS ones come from GitHub: pushing the tag runs `macos.yml`, which runs
+Check & Test on macOS and builds the `x86_64-apple-darwin` and `aarch64-apple-darwin` archives and the universal
 macOS PCM package, and validates the package. It publishes nothing. Download
 its artifacts with `gh run download <run-id>` next to local CI's, run
 `packaging/pcm-submission-metadata.py` on the three PCM zips, and publish all of
 them in one release. A failure in any build, on either side, or in the
 real-KiCad job means the release is not cut, so no partial set of assets is
 published. To check the macOS build before tagging, run `gh workflow run
-macos.yml --ref <candidate>`. Linux aarch64, which `release.yml` built on
+macos.yml --ref <candidate>` beside local CI's dry run. Nothing else runs
+macOS: PRs and `main` are not tested on it. Linux aarch64, which `release.yml` built on
 GitHub, is not built.
 
 In the PR description, list every command run and explicitly name checks skipped
