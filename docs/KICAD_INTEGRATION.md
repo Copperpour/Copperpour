@@ -172,6 +172,14 @@ KiCad 10 compatibility path, not a substitute for the executable IPC plugin or
 the KiCad 11 architecture; strict SES planning and atomic IPC apply never pass
 through Python.
 
+Pads that share a number, such as a connector's two `MP` pads, are separate
+physical pads, and the DSN keeps them apart: the first, by pad UUID, is named
+by its number and the others get `@1`, `@2` (`J1-MP`, `J1-MP@1`), as KiCad's
+own export names them. The reverse manifest records each pin's pad UUID, and
+SES planning checks every pin against the live board's pads before applying
+anything. KiCad names repeated pads by file order instead, so a board with
+them is not adopted from the native bridge (#338).
+
 ## Configuration
 
 Copperpour selects the first existing server configuration file in the order below

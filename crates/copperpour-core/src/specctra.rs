@@ -52,7 +52,13 @@ struct PadstackKey {
 
 #[derive(Debug, Clone)]
 struct PadModel {
+    /// KiCad's pad number, which several pads of a footprint may share.
     number: String,
+    /// The pad's own KiCad UUID: its physical identity (#338).
+    uuid: String,
+    /// Its pin name in the DSN image, unique in the footprint: see
+    /// [`dsn_pin_names`].
+    pin: String,
     x_um: i64,
     y_um: i64,
     /// Relative to the footprint, like `x_um`/`y_um`.
@@ -109,6 +115,9 @@ struct RuleKey {
 type RuleGroups = BTreeMap<RuleKey, Vec<String>>;
 type NetClassNames = BTreeMap<String, String>;
 
+/// 2 adds each pin's `pad_uuid` and lets pads share a number (#338).
+pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Debug, Deserialize, Serialize)]
 struct Manifest {
     schema_version: u32,
@@ -160,6 +169,10 @@ struct ManifestComponent {
 #[derive(Debug, Deserialize, Serialize)]
 struct ManifestPin {
     pad_number: String,
+    /// Absent in a schema 1 manifest, written before repeated pad numbers
+    /// were exported (#338).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pad_uuid: Option<String>,
     dsn_pin: String,
     net: Option<String>,
     padstack_name: String,
@@ -211,7 +224,7 @@ pub(crate) fn export_dsn(
                 net_pins
                     .entry(net.clone())
                     .or_default()
-                    .push(format!("{}-{}", footprint.reference, pad.number));
+                    .push(format!("{}-{}", footprint.reference, pad.pin));
             }
         }
     }
@@ -292,13 +305,29 @@ pub(crate) fn adopt_native_dsn(
     mut baseline: ExportBundle,
     native_dsn: String,
 ) -> Result<ExportBundle> {
+    let mut manifest: Manifest =
+        serde_json::from_str(&baseline.manifest).context("parse baseline routing manifest")?;
+    // KiCad names repeated pads by file order and Copperpour by UUID; until a
+    // native fixture proves a one-to-one mapping, adoption refuses (#338).
+    if let Some((component, pin)) = manifest
+        .components
+        .iter()
+        .flat_map(|component| component.pads.iter().map(move |pin| (component, pin)))
+        .find(|(component, pin)| {
+            pin.dsn_pin != format!("{}-{}", component.reference, pin.pad_number)
+        })
+    {
+        bail!(
+            "KiCad native DSN adoption does not map repeated pad numbers yet: {} has more than one pad '{}'",
+            component.reference,
+            pin.pad_number
+        );
+    }
     validate_dsn_syntax(&native_dsn, "KiCad native DSN")?;
     let baseline_tree = parse_dsn_sexp(&baseline.dsn).context("parse Copperpour baseline DSN")?;
     let native_tree = parse_dsn_sexp(&native_dsn).context("parse KiCad native DSN")?;
     let baseline_identity = dsn_identity(&baseline_tree)?;
     let native_identity = dsn_identity(&native_tree)?;
-    let mut manifest: Manifest =
-        serde_json::from_str(&baseline.manifest).context("parse baseline routing manifest")?;
 
     let layer_names = correlate_layers(&baseline_identity, &native_identity)?;
     let (class_names, via_names) = correlate_classes(&baseline_identity, &native_identity)?;
@@ -1154,6 +1183,8 @@ fn footprints(
     tree: &SexpNode,
     net_table: &BTreeMap<String, String>,
 ) -> Result<Vec<FootprintModel>> {
+    // Across the board: a pad UUID names one physical pad.
+    let mut pad_uuids = BTreeSet::new();
     let mut output = Vec::new();
     let mut references = BTreeSet::new();
     for footprint in tree.find_all("footprint") {
@@ -1184,7 +1215,6 @@ fn footprints(
         let image_name = format!("copperpour_image_{reference}");
 
         let mut pads = Vec::new();
-        let mut pad_numbers = BTreeSet::new();
         for pad in footprint.find_all("pad") {
             let number = pad
                 .get(1)
@@ -1192,8 +1222,15 @@ fn footprints(
                 .filter(|number| !number.is_empty())
                 .context("footprint contains an unnumbered pad")?
                 .to_string();
-            if !pad_numbers.insert(number.clone()) {
-                bail!("footprint '{reference}' has duplicate pad number '{number}'");
+            // A repeated number is a separate physical pad; its UUID tells
+            // it apart in the manifest (#338).
+            let uuid = pad
+                .find_str("uuid")
+                .filter(|uuid| !uuid.is_empty())
+                .with_context(|| format!("pad {reference}-{number} has no UUID"))?
+                .to_string();
+            if !pad_uuids.insert(uuid.clone()) {
+                bail!("pad {reference}-{number} repeats the UUID {uuid} of another pad");
             }
             let pad_type = pad
                 .get(2)
@@ -1300,6 +1337,8 @@ fn footprints(
                 .and_then(|node| resolve_net(node, net_table));
             pads.push(PadModel {
                 number,
+                uuid,
+                pin: String::new(),
                 x_um,
                 y_um,
                 rotation_degrees: pin_degrees,
@@ -1317,7 +1356,8 @@ fn footprints(
         if pads.is_empty() {
             bail!("footprint '{reference}' has no pads");
         }
-        pads.sort_by(|left, right| left.number.cmp(&right.number));
+        dsn_pin_names(&reference, &mut pads)?;
+        pads.sort_by(|left, right| left.pin.cmp(&right.pin));
         output.push(FootprintModel {
             reference,
             kiid,
@@ -1330,6 +1370,72 @@ fn footprints(
     }
     output.sort_by(|left, right| left.reference.cmp(&right.reference));
     Ok(output)
+}
+
+/// One pad as the export names it, which the SES importer checks a
+/// manifest's pins against on the live board (#338).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PinIdentity {
+    pub dsn_pin: String,
+    pub pad_number: String,
+    pub pad_uuid: String,
+    pub net: Option<String>,
+}
+
+/// Every routed footprint's pins, by footprint UUID, named as [`export_dsn`]
+/// names them.
+pub(crate) fn board_pin_identities(
+    board_source: &str,
+) -> Result<BTreeMap<String, Vec<PinIdentity>>> {
+    let tree = parse_sexp(board_source).context("parse KiCad board snapshot")?;
+    let net_table = top_level_net_table(&tree);
+    Ok(footprints(&tree, &net_table)?
+        .into_iter()
+        .map(|footprint| {
+            let reference = footprint.reference;
+            let pins = footprint
+                .pads
+                .into_iter()
+                .map(|pad| PinIdentity {
+                    dsn_pin: format!("{reference}-{}", pad.pin),
+                    pad_number: pad.number,
+                    pad_uuid: pad.uuid,
+                    net: pad.net,
+                })
+                .collect();
+            (footprint.kiid, pins)
+        })
+        .collect())
+}
+
+/// Names each pad's DSN pin. A number one pad has is its name, as before. A
+/// number several pads share keeps its name on the first and gets `@1`, `@2`
+/// on the others, the suffix KiCad's own Specctra export gives them. Unlike
+/// KiCad's, the order is by pad UUID, not file order, so the names don't
+/// depend on how the pads are listed (#338). A name that is also another
+/// pad's number is refused rather than renamed.
+fn dsn_pin_names(reference: &str, pads: &mut [PadModel]) -> Result<()> {
+    let mut by_number: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, pad) in pads.iter().enumerate() {
+        by_number.entry(pad.number.clone()).or_default().push(index);
+    }
+    for (number, mut indices) in by_number.clone() {
+        indices.sort_by(|left, right| pads[*left].uuid.cmp(&pads[*right].uuid));
+        for (position, index) in indices.into_iter().enumerate() {
+            pads[index].pin = if position == 0 {
+                number.clone()
+            } else {
+                let alias = format!("{number}@{position}");
+                if by_number.contains_key(&alias) {
+                    bail!(
+                        "footprint '{reference}' repeats pad number '{number}', and its DSN name '{alias}' is another pad's number"
+                    );
+                }
+                alias
+            };
+        }
+    }
+    Ok(())
 }
 
 /// KiCad's corner radius, `min(width, height) * roundrect_rratio` rounded to
@@ -1477,7 +1583,7 @@ fn build_pcb(
                 .map(|pad| dsn::Pin {
                     name: padstack_names[&pad.padstack].clone(),
                     rotate: (pad.rotation_degrees != 0.0).then_some(pad.rotation_degrees),
-                    id: pad.number.clone(),
+                    id: pad.pin.clone(),
                     x: pad.x_um as f64,
                     y: pad.y_um as f64,
                 })
@@ -1773,7 +1879,8 @@ fn build_manifest(
                 .iter()
                 .map(|pad| ManifestPin {
                     pad_number: pad.number.clone(),
-                    dsn_pin: format!("{}-{}", footprint.reference, pad.number),
+                    pad_uuid: Some(pad.uuid.clone()),
+                    dsn_pin: format!("{}-{}", footprint.reference, pad.pin),
                     net: pad.net.clone(),
                     padstack_name: padstack_names[&pad.padstack].clone(),
                 })
@@ -1814,7 +1921,7 @@ fn build_manifest(
     padstacks.sort_by(|left, right| left.name.cmp(&right.name));
 
     serde_json::to_string_pretty(&Manifest {
-        schema_version: 1,
+        schema_version: MANIFEST_SCHEMA_VERSION,
         board_path: board_path.display().to_string(),
         source_sha256: source_sha256.to_string(),
         coordinate_unit: "um".to_string(),
@@ -2264,6 +2371,289 @@ pub(crate) mod tests {
             &native_fixture_rules(),
         )
         .unwrap()
+    }
+
+    /// KiCad's stock JST SH `1MP` connector as J1: pad 1 on VCC, pad 2 and
+    /// both `MP` pads on GND (#338). See its README.
+    const DUPLICATE_MP: &str = include_str!("../tests/fixtures/specctra_duplicate_mp.kicad_pcb");
+    /// The two `MP` pads' UUIDs, in the order that names them `MP` and `MP@1`.
+    const MP_UUIDS: [&str; 2] = [
+        "550c489f-8422-4919-91a6-15d69b43a49a",
+        "ce9e8222-11b6-4e53-9716-46236e235ef7",
+    ];
+
+    fn export_board(source: &str) -> Result<ExportBundle> {
+        export_dsn(Path::new("board.kicad_pcb"), source, &rules())
+    }
+
+    /// J1's manifest pins as (pad number, pad UUID, DSN pin, net).
+    fn j1_pins(bundle: &ExportBundle) -> Vec<(String, String, String, Option<String>)> {
+        let manifest: Manifest = serde_json::from_str(&bundle.manifest).unwrap();
+        manifest
+            .components
+            .into_iter()
+            .find(|component| component.reference == "J1")
+            .unwrap()
+            .pads
+            .into_iter()
+            .map(|pin| (pin.pad_number, pin.pad_uuid.unwrap(), pin.dsn_pin, pin.net))
+            .collect()
+    }
+
+    /// `source` with `edit` applied to the pad block holding `uuid`.
+    fn edit_pad(source: &str, uuid: &str, edit: impl Fn(&str) -> String) -> String {
+        let at = source.find(uuid).unwrap();
+        let start = source[..at].rfind("\t\t(pad ").unwrap();
+        let end = at + source[at..].find("\n\t\t)").unwrap() + "\n\t\t)".len();
+        format!(
+            "{}{}{}",
+            &source[..start],
+            edit(&source[start..end]),
+            &source[end..]
+        )
+    }
+
+    fn pin(
+        number: &str,
+        uuid: &str,
+        dsn: &str,
+        net: Option<&str>,
+    ) -> (String, String, String, Option<String>) {
+        (
+            number.into(),
+            uuid.into(),
+            dsn.into(),
+            net.map(String::from),
+        )
+    }
+
+    /// Two pads share `MP`, both on GND: each is its own DSN pin on GND,
+    /// named as KiCad's exporter names them, and the manifest records which
+    /// physical pad each name is (#338).
+    #[test]
+    fn repeated_mp_pads_export_as_two_pins_on_their_net() {
+        let bundle = export_board(DUPLICATE_MP).unwrap();
+        assert_eq!(bundle.pad_count, 8);
+        assert!(
+            bundle
+                .dsn
+                .contains("(pin copperpour_pad_0003 MP -1800 -1875)"),
+            "{}",
+            bundle.dsn
+        );
+        assert!(
+            bundle
+                .dsn
+                .contains("(pin copperpour_pad_0003 MP@1 1800 -1875)"),
+            "{}",
+            bundle.dsn
+        );
+        assert!(
+            bundle.dsn.contains("(pins J1-2 J1-MP J1-MP@1 R1-2 R2-1)"),
+            "{}",
+            bundle.dsn
+        );
+        let manifest: serde_json::Value = serde_json::from_str(&bundle.manifest).unwrap();
+        assert_eq!(manifest["schema_version"], 2);
+        assert_eq!(
+            j1_pins(&bundle),
+            [
+                pin(
+                    "1",
+                    "95236974-fb55-4796-a22a-73703cb8f5cf",
+                    "J1-1",
+                    Some("VCC")
+                ),
+                pin(
+                    "2",
+                    "3078e2f7-2337-4b75-95e4-f648e3e3ed38",
+                    "J1-2",
+                    Some("GND")
+                ),
+                pin("MP", MP_UUIDS[0], "J1-MP", Some("GND")),
+                pin("MP", MP_UUIDS[1], "J1-MP@1", Some("GND")),
+            ]
+        );
+        // A number one pad has keeps its name: nothing changes there.
+        let two = export_board(include_str!(
+            "../tests/fixtures/specctra_two_resistors.kicad_pcb"
+        ))
+        .unwrap();
+        assert!(
+            two.dsn.contains("(pins R1-2 R2-1)") || two.dsn.contains("(pins R1-1 R2-2)"),
+            "{}",
+            two.dsn
+        );
+        assert!(!two.dsn.contains('@'), "{}", two.dsn);
+    }
+
+    /// The names follow the pads' UUIDs, not the order the file lists them.
+    #[test]
+    fn repeated_pad_names_do_not_depend_on_pad_order() {
+        let first = edit_pad(DUPLICATE_MP, MP_UUIDS[0], |block| block.to_string());
+        let second_block = {
+            let at = DUPLICATE_MP.find(MP_UUIDS[1]).unwrap();
+            let start = DUPLICATE_MP[..at].rfind("\t\t(pad ").unwrap();
+            let end = at + DUPLICATE_MP[at..].find("\n\t\t)").unwrap() + "\n\t\t)".len();
+            DUPLICATE_MP[start..end].to_string()
+        };
+        // Move the second MP block in front of the first.
+        let without = DUPLICATE_MP.replacen(&format!("\n{second_block}"), "", 1);
+        let first_start = without
+            .find(MP_UUIDS[0])
+            .map(|at| without[..at].rfind("\t\t(pad ").unwrap())
+            .unwrap();
+        let swapped = format!(
+            "{}{second_block}\n{}",
+            &without[..first_start],
+            &without[first_start..]
+        );
+        assert_ne!(swapped, first);
+        assert!(swapped.find(MP_UUIDS[1]) < swapped.find(MP_UUIDS[0]));
+        let original = export_board(DUPLICATE_MP).unwrap();
+        let reordered = export_board(&swapped).unwrap();
+        assert_eq!(reordered.dsn, original.dsn);
+        assert_eq!(j1_pins(&reordered), j1_pins(&original));
+    }
+
+    /// Pads sharing a number on different nets stay separate pins, each on
+    /// its own net; pads sharing a number on no net are exported, on no net.
+    #[test]
+    fn repeated_signal_and_netless_pads_keep_their_own_nets() {
+        let as_one = |block: &str| block.replace("(pad \"MP\"", "(pad \"1\"");
+        let signal = edit_pad(
+            &edit_pad(DUPLICATE_MP, MP_UUIDS[0], as_one),
+            MP_UUIDS[1],
+            as_one,
+        );
+        let bundle = export_board(&signal).unwrap();
+        assert_eq!(
+            j1_pins(&bundle),
+            [
+                pin("1", MP_UUIDS[0], "J1-1", Some("GND")),
+                pin(
+                    "1",
+                    "95236974-fb55-4796-a22a-73703cb8f5cf",
+                    "J1-1@1",
+                    Some("VCC")
+                ),
+                pin("1", MP_UUIDS[1], "J1-1@2", Some("GND")),
+                pin(
+                    "2",
+                    "3078e2f7-2337-4b75-95e4-f648e3e3ed38",
+                    "J1-2",
+                    Some("GND")
+                ),
+            ]
+        );
+        assert!(
+            bundle.dsn.contains("(pins J1-1 J1-1@2 J1-2 R1-2 R2-1)"),
+            "{}",
+            bundle.dsn
+        );
+        assert!(
+            bundle.dsn.contains("(pins J1-1@1 R1-1 R2-2)"),
+            "{}",
+            bundle.dsn
+        );
+
+        let netless = |block: &str| block.replace("\t\t\t(net \"GND\")\n", "");
+        let netless = edit_pad(
+            &edit_pad(DUPLICATE_MP, MP_UUIDS[0], netless),
+            MP_UUIDS[1],
+            netless,
+        );
+        let bundle = export_board(&netless).unwrap();
+        assert_eq!(
+            &j1_pins(&bundle)[2..],
+            [
+                pin("MP", MP_UUIDS[0], "J1-MP", None),
+                pin("MP", MP_UUIDS[1], "J1-MP@1", None),
+            ]
+        );
+        assert!(bundle.dsn.contains("MP@1 1800 -1875)"), "{}", bundle.dsn);
+        assert!(
+            bundle.dsn.contains("(pins J1-2 R1-2 R2-1)"),
+            "{}",
+            bundle.dsn
+        );
+    }
+
+    /// A name the suffix would give that is another pad's number, a pad
+    /// without a UUID, and a UUID two pads share are refused.
+    #[test]
+    fn ambiguous_pad_identities_are_refused() {
+        let collides = edit_pad(
+            DUPLICATE_MP,
+            "3078e2f7-2337-4b75-95e4-f648e3e3ed38",
+            |block| block.replace("(pad \"2\"", "(pad \"MP@1\""),
+        );
+        let error = export_board(&collides).unwrap_err().to_string();
+        assert!(
+            error.contains("its DSN name 'MP@1' is another pad's number"),
+            "{error}"
+        );
+
+        let no_uuid = edit_pad(DUPLICATE_MP, MP_UUIDS[1], |block| {
+            block.replace(&format!("\t\t\t(uuid \"{}\")\n", MP_UUIDS[1]), "")
+        });
+        let error = export_board(&no_uuid).unwrap_err().to_string();
+        assert!(error.contains("pad J1-MP has no UUID"), "{error}");
+
+        let shared = DUPLICATE_MP.replace(MP_UUIDS[1], MP_UUIDS[0]);
+        let error = export_board(&shared).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("repeats the UUID {}", MP_UUIDS[0])),
+            "{error}"
+        );
+    }
+
+    /// FreeRouting 2.3.0 routed the fixture's export, reading `J1-MP` and
+    /// `J1-MP@1` as two pins on GND, and the strict import planner accepts
+    /// its session: GND tracks end on both `MP` pads (#338).
+    #[test]
+    fn freerouting_routes_both_repeated_pads_and_the_planner_accepts_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_duplicate_mp.kicad_pcb");
+        std::fs::write(&board, DUPLICATE_MP).unwrap();
+        let bundle = export_dsn(&board, DUPLICATE_MP, &rules()).unwrap();
+        let plan = crate::specctra_ses::parse_import_plan(
+            &board,
+            DUPLICATE_MP,
+            &bundle.manifest,
+            include_str!("../tests/fixtures/specctra_duplicate_mp.freerouting-2.3.0.ses"),
+        )
+        .unwrap();
+        let gnd_ends = plan
+            .tracks
+            .iter()
+            .filter(|track| track.net_name == "GND")
+            .flat_map(|track| [(track.x1_mm, track.y1_mm), (track.x2_mm, track.y2_mm)])
+            .collect::<Vec<_>>();
+        // J1 sits at (105, 60); its MP pads at x 105 -/+ 1.8, y 60 + 1.875.
+        for pad in [(103.2, 61.875), (106.8, 61.875)] {
+            assert!(
+                gnd_ends
+                    .iter()
+                    .any(|end| (end.0 - pad.0).abs() < 1e-6 && (end.1 - pad.1).abs() < 1e-6),
+                "no GND track ends on the MP pad at {pad:?}: {gnd_ends:?}"
+            );
+        }
+    }
+
+    /// KiCad names repeated pads by file order, and adoption of its DSN
+    /// isn't proven for them: it is refused, naming the footprint (#338).
+    #[test]
+    fn native_adoption_refuses_repeated_pad_numbers() {
+        let native = include_str!("../tests/fixtures/specctra_duplicate_mp.native-kicad-10.dsn");
+        assert!(native.contains("(pins R1-2 R2-1 J1-2 J1-MP J1-MP@1)"));
+        let error = adopt_native_dsn(export_board(DUPLICATE_MP).unwrap(), native.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not map repeated pad numbers yet: J1 has more than one pad 'MP'"),
+            "{error}"
+        );
     }
 
     #[test]
