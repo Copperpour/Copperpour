@@ -146,7 +146,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "apply_specctra_ses",
-            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves IPC read-back counts, and runs KiCad DRC before committing.",
+            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves IPC read-back counts, and runs KiCad DRC on it under the source project's netclasses and custom rules before committing.",
             json!({
                 "type": "object",
                 "properties": {
@@ -967,6 +967,7 @@ struct ApplyEvidence {
     drc_violations: usize,
     unconnected_items: usize,
     schematic_parity_violations: usize,
+    project_rules_applied: bool,
 }
 
 fn created_route_item_ids(items: &[prost_types::Any]) -> anyhow::Result<Vec<String>> {
@@ -1188,7 +1189,13 @@ async fn handle_apply_specctra_ses(
             let candidate_source = client.save_document_to_string_in(document.clone())?;
             copperpour_sexp::write_new_atomic(&candidate_for_ipc, &candidate_source)
                 .with_context(|| format!("create candidate {}", candidate_for_ipc.display()))?;
-            let drc = runtime.block_on(cli::run_drc(&cli_path, &candidate_for_ipc, false))?;
+            // Under the source project's netclasses and custom rules: on its
+            // own, the candidate would be checked against KiCad's defaults (#312).
+            let (drc, project_rules_applied) = runtime.block_on(cli::run_drc_as_project(
+                &cli_path,
+                &candidate_for_ipc,
+                &board_for_ipc,
+            ))?;
             let parity_count = drc.schematic_parity.as_ref().map_or(0, Vec::len);
             Ok(ApplyEvidence {
                 source_sha256: plan.source_sha256.clone(),
@@ -1202,6 +1209,7 @@ async fn handle_apply_specctra_ses(
                 drc_violations: drc.violations.len(),
                 unconnected_items: drc.unconnected_items.as_ref().map_or(0, Vec::len),
                 schematic_parity_violations: parity_count,
+                project_rules_applied,
             })
         })();
         match operation {
@@ -1268,7 +1276,8 @@ async fn handle_apply_specctra_ses(
                     && evidence.schematic_parity_violations == 0,
                 "violations": evidence.drc_violations,
                 "unconnected_items": evidence.unconnected_items,
-                "schematic_parity_violations": evidence.schematic_parity_violations
+                "schematic_parity_violations": evidence.schematic_parity_violations,
+                "project_rules_applied": evidence.project_rules_applied
             }
         }))),
         Err(failure) => {
@@ -5134,5 +5143,177 @@ mod route_pad_to_pad_tests {
             result.content
         );
         assert!(tracks.lock().unwrap().is_empty());
+    }
+}
+
+/// #312 end to end: the served `apply_specctra_ses` writes the candidate in
+/// another directory, and its DRC still runs under the source project's
+/// custom rules and netclasses.
+#[cfg(all(test, unix))]
+mod apply_specctra_ses_candidate_drc_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::pcb_board::board_mock::{spawn_kicad_holding_items, ItemStore};
+    use crate::tools::ServerConfig;
+    use copperpour_ipc::gen::kiapi;
+    use copperpour_ipc::{IpcEffectiveRoutingRules, IpcRoutingRules};
+    use std::sync::{Arc, Mutex};
+
+    const SAVED: &str = include_str!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
+    const RULES: &str = "(version 1)\n(rule \"mains\"\n\t(constraint clearance (min 40mm)))\n";
+    const SES: &str = r#"(session board
+  (base_design board)
+  (placement
+    (resolution um 10)
+    (component copperpour_image_R1 (place R1 1000000 -500000 front 0))
+    (component copperpour_image_R2 (place R2 1100000 -500000 front 0))
+  )
+  (was_is)
+  (routes
+    (resolution um 10)
+    (parser (host_cad KiCad) (host_version 10.0.5))
+    (library_out
+      (padstack copperpour_via_0001
+        (shape (circle F.Cu 6000 0 0))
+        (shape (circle B.Cu 6000 0 0))
+        (attach off)
+      )
+    )
+    (network_out
+      (net GND
+        (wire (path F.Cu 2500 995000 -500000 1050000 -500000 1050000 -510000))
+        (via copperpour_via_0001 1050000 -510000 (net GND) (type protect))
+      )
+    )
+  )
+)"#;
+
+    fn routing_rules() -> IpcEffectiveRoutingRules {
+        ["GND", "VCC"]
+            .into_iter()
+            .map(|net| {
+                (
+                    net.to_string(),
+                    IpcRoutingRules {
+                        class_name: "Default".to_string(),
+                        constituents: vec!["Default".to_string()],
+                        track_width_mm: Some(0.25),
+                        clearance_mm: Some(0.2),
+                        via_diameter_mm: Some(0.6),
+                        via_drill_mm: Some(0.3),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn response_json(result: &CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => {
+                serde_json::from_str(text).expect("handler returned JSON text")
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_candidate_drc_runs_under_the_source_projects_rules() {
+        let project = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let seen = tempfile::tempdir().unwrap();
+        let board = project.path().join("board.kicad_pcb");
+        std::fs::write(&board, SAVED).unwrap();
+        std::fs::write(board.with_extension("kicad_dru"), RULES).unwrap();
+        std::fs::write(board.with_extension("kicad_pro"), "{}").unwrap();
+        let board = board.canonicalize().unwrap();
+        let export = crate::specctra::export_dsn(&board, SAVED, &routing_rules()).unwrap();
+        let manifest = elsewhere.path().join("board.dsn.copperpour.json");
+        let ses = elsewhere.path().join("board.ses");
+        std::fs::write(&manifest, export.manifest).unwrap();
+        std::fs::write(&ses, SES).unwrap();
+        let candidate = elsewhere.path().join("board.freerouted.kicad_pcb");
+
+        // Records the board path it was given and the rules beside it, then
+        // writes an empty report.
+        let cli = cli::test_support::write_script(
+            seen.path(),
+            "drc-candidate-probe",
+            &format!(
+                "#!/bin/sh\nprev=\nfor a; do [ \"$prev\" = --output ] && out=\"$a\"; prev=\"$a\"; last=\"$a\"; done\n\
+                 printf '%s' \"$last\" > '{seen}/board'\n\
+                 cp \"${{last%.kicad_pcb}}.kicad_dru\" '{seen}/rules' 2>/dev/null\n\
+                 printf '%s' '{{\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]}}' > \"$out\"\nexit 0\n",
+                seen = seen.path().display()
+            ),
+            "@exit /b 1\r\n",
+        );
+
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec!["", "GND", "VCC"],
+            store.clone(),
+            |_| {},
+            |command, held| {
+                if !command.type_url.ends_with("SaveDocumentToString") {
+                    return None;
+                }
+                // The live board, with the routed items once they exist.
+                let contents = if held.creates == 0 {
+                    SAVED.to_string()
+                } else {
+                    format!("{SAVED}\n")
+                };
+                Some(copperpour_ipc::builders::pack_any(
+                    &kiapi::common::commands::SavedDocumentResponse {
+                        contents,
+                        document: None,
+                    },
+                    "kiapi.common.commands.SavedDocumentResponse",
+                ))
+            },
+        );
+        let ctx = ToolContext::new(
+            ServerConfig {
+                kicad_cli: cli.to_string_lossy().into_owned(),
+                kicad_binary: String::new(),
+                ipc_address: server.address().to_string(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        );
+        let result = handle_apply_specctra_ses(
+            &json!({
+                "board": board,
+                "ses_path": ses,
+                "manifest_path": manifest,
+                "candidate_output_path": candidate
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let body = response_json(&result);
+        assert!(!result.is_error, "{body}");
+        assert_eq!(body["drc"]["project_rules_applied"], true, "{body}");
+
+        let checked =
+            std::path::PathBuf::from(std::fs::read_to_string(seen.path().join("board")).unwrap());
+        assert_eq!(
+            checked.file_name(),
+            board.file_name(),
+            "kicad-cli checks the candidate under the source board's name: {}",
+            checked.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(seen.path().join("rules")).unwrap_or_default(),
+            RULES,
+            "the candidate DRC reads the source project's custom rules"
+        );
+        assert!(candidate.is_file(), "the candidate stays");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), SAVED);
     }
 }
