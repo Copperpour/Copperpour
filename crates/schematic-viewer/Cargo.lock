@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "copperpour-schematic-editor"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "copperpour-sexp",
  "thiserror 1.0.69",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "copperpour-sexp"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2712,7 +2712,7 @@ dependencies = [
 
 [[package]]
 name = "schematic-viewer"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "copperpour-schematic-editor",
  "notify",
