@@ -1,0 +1,174 @@
+name: macOS
+
+# The macOS jobs of ci.yml and release.yml (#392). Those workflows run on local
+# CI, which can't run macOS: Apple's licence allows macOS virtual machines only
+# on Apple hardware. This workflow stays enabled on GitHub. It publishes
+# nothing; the maintainer cutting a release downloads its artifacts.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  # Rebuild a tag's artifacts (`gh workflow run macos.yml --ref v1.2.3`), or a
+  # dry run of any other ref under a synthetic version.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version for a ref that is not a v* tag
+        required: false
+        default: '0.0.0'
+        type: string
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: copperpour
+  RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.version || '0.0.0' }}
+  RELEASE_ARTIFACT_LABEL: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}-smoke', inputs.version || '0.0.0') }}
+  COPPERPOUR_BUILD_COMMIT: ${{ github.sha }}
+
+jobs:
+  check:
+    name: Check & Test (macos-latest)
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc@3.23.4
+          fallback: none
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --workspace --locked
+      - name: Test (unit + integration)
+        run: cargo test --workspace --locked --lib --tests
+      - name: Doctests
+        run: cargo test --workspace --locked --doc
+
+  build:
+    name: Build ${{ matrix.target }}
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # rust-toolchain.toml overrides the action-installed stable with the
+      # pinned toolchain, which only has the host target.
+      - name: Add matrix target to the pinned toolchain
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc@3.23.4
+          fallback: none
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p copperpour
+
+      # `konnect` is the name before the rename; it runs copperpour.
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ env.BINARY_NAME }}-${{ env.RELEASE_ARTIFACT_LABEL }}-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }} konnect
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
+          path: ${{ env.BINARY_NAME }}-${{ env.RELEASE_ARTIFACT_LABEL }}-${{ matrix.target }}.tar.gz
+
+  pcm-package:
+    name: KiCAD PCM plugin package (macos)
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # A universal binary, so one download serves Apple Silicon and Intel:
+      # PCM has a platform dimension but no architecture one.
+      - name: Add the universal targets
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc@3.23.4
+          fallback: none
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: pcm-package-macos
+
+      - name: Build universal binaries
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked -p copperpour --target "$target"
+          done
+          mkdir -p dist/universal
+          lipo -create -output dist/universal/copperpour \
+            target/aarch64-apple-darwin/release/copperpour \
+            target/x86_64-apple-darwin/release/copperpour
+          lipo -info dist/universal/copperpour
+
+      # No continue-on-error: the PCM script omits a missing viewer without
+      # failing, so a failed viewer build must fail the job.
+      - name: Build universal schematic viewer
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --manifest-path crates/schematic-viewer/Cargo.toml --target "$target"
+          done
+          lipo -create -output dist/universal/schematic-viewer \
+            crates/schematic-viewer/target/aarch64-apple-darwin/release/schematic-viewer \
+            crates/schematic-viewer/target/x86_64-apple-darwin/release/schematic-viewer
+          lipo -info dist/universal/schematic-viewer
+
+      - name: Assemble PCM package
+        run: |
+          version="${RELEASE_VERSION#v}"
+          ./packaging/build-pcm.sh --version "$version" \
+            --binary dist/universal/copperpour \
+            --viewer dist/universal/schematic-viewer \
+            --platform macos --out dist
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Validate PCM package against KiCAD schema (release gate)
+        run: |
+          set -euo pipefail
+          python -m pip install jsonschema
+          version="${RELEASE_VERSION#v}"
+          python packaging/validate-pcm.py --zip "dist/copperpour-pcm-v$version-macos.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: copperpour-pcm-macos
+          path: dist/copperpour-pcm-*.zip
