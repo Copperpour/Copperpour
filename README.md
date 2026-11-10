@@ -6,6 +6,11 @@
 
 </div>
 
+> [!IMPORTANT]
+> **On 2026-11-20 Copperpour leaves the `mixelpixx/Konnect` fork network.** Users don't
+> need to do anything. If your fork was made from `mixelpixx/Konnect`, you will need to
+> re-fork before you can open PRs here; see [#413](https://github.com/Copperpour/Copperpour/issues/413).
+
 **AI-assisted PCB design for KiCAD 10.** Copperpour is a native KiCAD plugin — a single
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
