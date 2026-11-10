@@ -4,7 +4,7 @@
 //! `server.pid` only ever named the last server started through the Python
 //! ActionPlugin's toolbar button. KiCad 10 launches the binary itself —
 //! `plugin/plugin.json` declares `"runtime": { "type": "exec" }` with
-//! `"entrypoint": "bin/konnect"` — so for the configuration most users are on
+//! `"entrypoint": "bin/copperpour.exe"` — so for the configuration most users are on
 //! the Python bookkeeping is never in the picture, and nothing records the
 //! server at all. An HTTP server compounds it: `run_http` never reads stdin,
 //! so the parent's death is invisible to it and it outlives the session.

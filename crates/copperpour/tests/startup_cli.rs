@@ -135,25 +135,6 @@ fn mcp_start_does_not_reverse_an_explicit_uninstall() {
     }
 }
 
-/// `konnect`, the name before the rename, runs `copperpour` with the same
-/// arguments and says so on stderr only.
-#[test]
-fn the_old_name_runs_copperpour() {
-    let output = Command::new(env!("CARGO_BIN_EXE_konnect"))
-        .arg("--version")
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        format!("copperpour {}\n", env!("CARGO_PKG_VERSION"))
-    );
-    assert!(String::from_utf8(output.stderr)
-        .unwrap()
-        .contains("now called copperpour"));
-}
-
 /// #400: `install` run through the multi-platform PCM package's launcher
 /// registers `bin/copperpour`, not the server it execs, and replaces the hooks
 /// an earlier install wrote for that server.

@@ -64,9 +64,6 @@
             "copperpour"
             "--bin"
             "copperpour"
-            # The name before the rename; runs copperpour.
-            "--bin"
-            "konnect"
           ];
 
           cargoTestFlags = [
@@ -87,8 +84,6 @@
           meta.mainProgram = "copperpour";
         };
 
-        # The name before the rename.
-        konnect = copperpour;
         default = copperpour;
       }
     );
@@ -98,7 +93,6 @@
         type = "app";
         program = "${self.packages.${system}.copperpour}/bin/copperpour";
       };
-      konnect = self.apps.${system}.copperpour;
       default = self.apps.${system}.copperpour;
     });
 

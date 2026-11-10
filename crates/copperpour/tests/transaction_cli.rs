@@ -1,12 +1,12 @@
 use std::process::Command;
 
-fn konnect() -> Command {
+fn copperpour() -> Command {
     Command::new(env!("CARGO_BIN_EXE_copperpour"))
 }
 
 #[test]
 fn transaction_help_is_advertised() {
-    let output = konnect().arg("--help").output().unwrap();
+    let output = copperpour().arg("--help").output().unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -17,7 +17,7 @@ fn transaction_help_is_advertised() {
 
 #[test]
 fn client_scoped_installer_help_is_advertised() {
-    let output = konnect().arg("--help").output().unwrap();
+    let output = copperpour().arg("--help").output().unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -29,7 +29,7 @@ fn client_scoped_installer_help_is_advertised() {
 
 #[test]
 fn claude_pretooluse_hook_emits_only_structured_json() {
-    let output = konnect().args(["hook", "pre-pcb-ipc"]).output().unwrap();
+    let output = copperpour().args(["hook", "pre-pcb-ipc"]).output().unwrap();
 
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
@@ -51,7 +51,7 @@ fn malformed_journal_requires_force_and_can_be_abandoned() {
             .join(format!("{prefix}malformed-fixture.json"));
         std::fs::write(&active, "not json").unwrap();
 
-        let refused = konnect()
+        let refused = copperpour()
             .args([
                 "transaction",
                 "abandon",
@@ -63,7 +63,7 @@ fn malformed_journal_requires_force_and_can_be_abandoned() {
         assert!(!refused.status.success());
         assert!(active.exists());
 
-        let abandoned = konnect()
+        let abandoned = copperpour()
             .args([
                 "transaction",
                 "abandon",

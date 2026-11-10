@@ -7,7 +7,7 @@ remain in [`CONTRIBUTING.md`](../CONTRIBUTING.md) and
 [`NAMING_CONVENTIONS.md`](NAMING_CONVENTIONS.md).
 
 Copperpour is a Rust MCP server with KiCad integration and packaging support. An
-MCP client talks to the `konnect` binary, which exposes a small starter surface,
+MCP client talks to the `copperpour` binary, which exposes a small starter surface,
 loads domain toolsets on demand, and routes each call to a file, IPC, or
 `kicad-cli` backend.
 

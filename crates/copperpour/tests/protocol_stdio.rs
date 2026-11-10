@@ -70,7 +70,7 @@ impl McpProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .expect("failed to spawn konnect binary");
+            .expect("failed to spawn copperpour binary");
         let stdin = child.stdin.take().unwrap();
         let reader = BufReader::new(child.stdout.take().unwrap());
         let mut p = McpProcess {
@@ -705,7 +705,7 @@ fn run_expecting_startup_failure(dir: &std::path::Path, args: &[&str]) -> (bool,
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("failed to run konnect binary");
+        .expect("failed to run copperpour binary");
     (
         output.status.success(),
         String::from_utf8_lossy(&output.stderr).into_owned(),

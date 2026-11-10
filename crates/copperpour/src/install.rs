@@ -223,8 +223,9 @@ fn legacy_hook_command_tail(hook_name: &str) -> String {
     format!(" skill {hook_name}")
 }
 
-/// The `konnect` alias beside `copperpour` at `exe`, if `exe` is one. The
-/// alias runs that binary, so hooks naming it are this install's own (#244).
+/// The `konnect` alias that v0.15 and v0.16 shipped beside `copperpour` at
+/// `exe`, if `exe` is one. The alias ran that binary, so hooks naming it are
+/// this install's own (#244), and `init` replaces them (#296).
 fn alias_beside(exe: &str) -> Option<String> {
     let name = program_name(exe);
     let suffix = std::env::consts::EXE_SUFFIX;
@@ -234,8 +235,8 @@ fn alias_beside(exe: &str) -> Option<String> {
         .then(|| format!("{}konnect{suffix}", &exe[..exe.len() - name.len()]))
 }
 
-/// `exe`, then the other paths that run it: the `konnect` alias beside it and
-/// the server its PCM launcher runs.
+/// `exe`, then the other paths that run it: the `konnect` alias older
+/// releases put beside it, and the server its PCM launcher runs.
 fn own_executables(exe: &str) -> impl Iterator<Item = String> {
     std::iter::once(exe.to_string())
         .chain(alias_beside(exe))

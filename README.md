@@ -317,8 +317,11 @@ where it is. Nothing is moved when the new directory already exists.
 `KONNECT_STATE_DIR`, `KONNECT_BRIDGE_DIR` and `KONNECT_BUILD_COMMIT` are now
 `COPPERPOUR_*`; the old names are still read when the new ones are unset. A
 `konnect.toml` in the working directory is still read, after `copperpour.toml`.
-Source builds and the standalone archives also include a `konnect` executable
-that runs `copperpour`; it will be removed in a later release.
+The `konnect` executable that v0.15 and v0.16 shipped beside `copperpour` is
+gone, so MCP client configurations must name `copperpour`; delete a `konnect`
+left beside it by unpacking a newer archive over an older one. `copperpour init`
+still replaces the hooks an install through that `konnect` wrote, and
+`uninstall` removes them.
 
 ## Schematic viewer
 
