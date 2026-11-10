@@ -1456,12 +1456,12 @@ pub(crate) fn is_power_symbol_reference(reference: &str) -> bool {
 
 /// Each placed symbol instance with the pins it put on the sheet, as
 /// [`placed_pins_by_reference`] reports them.
-pub(crate) type PlacedPinsByReference = Vec<(
-    copperpour_sexp::schematic::SymbolInstance,
-    Vec<(
-        copperpour_sexp::schematic::LibPin,
-        copperpour_sexp::geometry::PinTransform,
-    )>,
+pub(crate) type PlacedPinsByReference = Vec<(copperpour_sexp::schematic::SymbolInstance, UnitPins)>;
+
+/// The pins one placed unit puts on the sheet, each with its placement.
+pub(crate) type UnitPins = Vec<(
+    copperpour_sexp::schematic::LibPin,
+    copperpour_sexp::geometry::PinTransform,
 )>;
 
 /// [`placed_pins`], grouped under the instance that placed each unit, for
@@ -1471,6 +1471,17 @@ pub(crate) type PlacedPinsByReference = Vec<(
 /// reference alone collapses on a pre-annotation sheet where every part is
 /// `R?`.
 pub(crate) fn placed_pins_by_reference(tree: &copperpour_sexp::SexpNode) -> PlacedPinsByReference {
+    placed_symbols_with_pins(tree)
+        .into_iter()
+        .filter_map(|(inst, pins)| Some((inst, pins?)))
+        .collect()
+}
+
+/// Every placed symbol instance with its pins, or `None` where its library
+/// definition is not embedded.
+fn placed_symbols_with_pins(
+    tree: &copperpour_sexp::SexpNode,
+) -> Vec<(copperpour_sexp::schematic::SymbolInstance, Option<UnitPins>)> {
     use copperpour_sexp::schematic::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol,
     };
@@ -1478,22 +1489,190 @@ pub(crate) fn placed_pins_by_reference(tree: &copperpour_sexp::SexpNode) -> Plac
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    let mut by_reference = Vec::new();
-    for inst in extract_symbol_instances(tree) {
-        // find_lib_symbol, not a lib_id match: an instance carrying a
-        // (lib_name …) is a sheet-local derived symbol whose pins can sit
-        // elsewhere than the base definition's (#143).
-        let Some(sym) = find_lib_symbol(&lib_syms, &inst) else {
-            continue;
-        };
-        let t = inst.pin_transform();
-        let pins = extract_lib_pins_for_unit(sym, inst.unit)
-            .into_iter()
-            .map(|p| (p, t))
-            .collect();
-        by_reference.push((inst, pins));
+    extract_symbol_instances(tree)
+        .into_iter()
+        .map(|inst| {
+            // find_lib_symbol, not a lib_id match: an instance carrying a
+            // (lib_name …) is a sheet-local derived symbol whose pins can sit
+            // elsewhere than the base definition's (#143).
+            let pins = find_lib_symbol(&lib_syms, &inst).map(|sym| {
+                let t = inst.pin_transform();
+                extract_lib_pins_for_unit(sym, inst.unit)
+                    .into_iter()
+                    .map(|p| (p, t))
+                    .collect()
+            });
+            (inst, pins)
+        })
+        .collect()
+}
+
+/// One placed pin a reference + pin number names, as [`PlacedPins::resolve`]
+/// found it.
+pub(crate) struct NamedPin {
+    pub pin: copperpour_sexp::schematic::LibPin,
+    pub t: copperpour_sexp::geometry::PinTransform,
+}
+
+impl NamedPin {
+    pub(crate) fn endpoint(&self) -> (f64, f64) {
+        copperpour_sexp::schematic::pin_endpoint(&self.pin, self.t)
     }
-    by_reference
+
+    pub(crate) fn outward(&self) -> f64 {
+        copperpour_sexp::schematic::pin_outward_direction(&self.pin, self.t)
+    }
+}
+
+/// Why a reference + pin number names no single placed pin.
+pub(crate) enum PinRefusal {
+    /// No such component or pin, or a copy whose pins cannot be read.
+    Stale { target: String, reason: String },
+    /// More than one placed pin: a duplicated reference, or a pin drawn on
+    /// two placed units.
+    Ambiguous {
+        target: String,
+        candidates: Vec<String>,
+    },
+}
+
+impl PinRefusal {
+    /// One line for a batch tool's `errors` list.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Stale { target, reason } => format!("{target}: {reason}"),
+            Self::Ambiguous { target, candidates } => format!(
+                "{target} names more than one placed pin: {}",
+                candidates.join(", ")
+            ),
+        }
+    }
+
+    /// The structured refusal: `cannot <action> <target>`, and for an
+    /// ambiguous pin, `recovery` is the sentence saying how to pick one.
+    pub(crate) fn result(self, action: &str, recovery: &str) -> CallToolResult {
+        match self {
+            Self::Stale { target, reason } => CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::StaleTarget {
+                    target: target.clone(),
+                    reason: reason.clone(),
+                },
+                format!("cannot {action} {target}: {reason}. Nothing was written."),
+            ),
+            Self::Ambiguous { target, candidates } => {
+                let message = format!(
+                    "{target} names more than one placed pin: {}. {recovery} Nothing was \
+                     written.",
+                    candidates.join(", ")
+                );
+                CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::AmbiguousTarget { target, candidates },
+                    message,
+                )
+            }
+        }
+    }
+}
+
+/// Every placed symbol of a sheet with its pins, for resolving pins by
+/// reference and number.
+pub(crate) struct PlacedPins {
+    symbols: Vec<(copperpour_sexp::schematic::SymbolInstance, Option<UnitPins>)>,
+}
+
+impl PlacedPins {
+    pub(crate) fn new(tree: &copperpour_sexp::SexpNode) -> Self {
+        Self {
+            symbols: placed_symbols_with_pins(tree),
+        }
+    }
+
+    /// The one pin `reference` + `pin_number` names. A duplicated reference,
+    /// or a pin drawn on two placed units, is refused rather than resolved to
+    /// whichever comes first in the file, so nothing lands on a pin the
+    /// caller did not choose.
+    pub(crate) fn resolve(
+        &self,
+        reference: &str,
+        pin_number: &str,
+    ) -> Result<NamedPin, PinRefusal> {
+        let target = format!("{reference} pin {pin_number}");
+        let stale = |reason: String| PinRefusal::Stale {
+            target: target.clone(),
+            reason,
+        };
+        let copies: Vec<_> = self
+            .symbols
+            .iter()
+            .filter(|(inst, _)| inst.reference == reference)
+            .collect();
+        if copies.is_empty() {
+            return Err(stale(format!("component {reference} is not present")));
+        }
+        // An instance whose definition is missing may be the one carrying the pin.
+        if copies.iter().any(|(_, pins)| pins.is_none()) {
+            return Err(stale(format!(
+                "a placed unit of {reference} has no embedded library definition"
+            )));
+        }
+
+        let mut found: Vec<(&copperpour_sexp::schematic::SymbolInstance, NamedPin)> = Vec::new();
+        for (inst, pins) in &copies {
+            for (pin, t) in pins
+                .iter()
+                .flatten()
+                .filter(|(p, _)| p.number == pin_number)
+            {
+                let named = NamedPin {
+                    pin: pin.clone(),
+                    t: *t,
+                };
+                let (x, y) = named.endpoint();
+                // Stacked pins sharing a number within one placed unit are one
+                // connection point, not a choice.
+                let stacked = found.iter().any(|(other, seen)| {
+                    let (ox, oy) = seen.endpoint();
+                    other.uuid == inst.uuid
+                        && other.unit == inst.unit
+                        && copperpour_sexp::geometry::points_coincident(ox, oy, x, y, 0.01)
+                });
+                if !stacked {
+                    found.push((inst, named));
+                }
+            }
+        }
+        if found.len() > 1 {
+            let candidates = found
+                .iter()
+                .map(|(inst, pin)| {
+                    let (x, y) = pin.endpoint();
+                    format!(
+                        "unit {} {} at ({}, {})",
+                        inst.unit,
+                        inst.uuid.as_deref().unwrap_or("without uuid"),
+                        copperpour_schematic_editor::types::fmt_f64(x),
+                        copperpour_schematic_editor::types::fmt_f64(y)
+                    )
+                })
+                .collect();
+            return Err(PinRefusal::Ambiguous { target, candidates });
+        }
+        found.pop().map(|(_, pin)| pin).ok_or_else(|| {
+            // Every placed unit was searched, not only the first (mixelpixx/Konnect#35).
+            let mut units: Vec<u32> = copies.iter().map(|(inst, _)| inst.unit).collect();
+            units.sort_unstable();
+            units.dedup();
+            stale(format!(
+                "{reference} has no pin {pin_number} on placed {} {}",
+                if units.len() == 1 { "unit" } else { "units" },
+                units
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })
+    }
 }
 
 /// [`placed_pins_by_reference`], but only when *every* placed symbol resolved.

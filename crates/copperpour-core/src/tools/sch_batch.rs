@@ -17,8 +17,8 @@ use copperpour_sexp::{
     parser::parse_sexp,
     schematic::{
         extract_all_net_labels, extract_buses, extract_labels, extract_symbol_instances,
-        extract_wires, find_lib_symbol, format_net_label, parse_at, pin_endpoint,
-        pin_outward_direction, read_schematic, symbol_bounds_for_instance, SymbolBounds,
+        extract_wires, find_lib_symbol, format_net_label, parse_at, read_schematic,
+        symbol_bounds_for_instance, SymbolBounds,
     },
     writer::{apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit},
 };
@@ -33,10 +33,8 @@ use super::sch_components::{
     place_one_component, placed_component_readback, plan_component_and_item_deletions,
     set_dnp_attribute, set_property_value, ComponentDeleteTargetError,
 };
-use super::sch_wiring::{
-    add_stub_label, add_stub_wire, clear_stub_direction, resolve_pin_endpoint, resolve_placed_pin,
-    route_between,
-};
+use super::sch_wiring::{add_stub_label, add_stub_wire, clear_stub_direction, route_between};
+use super::PlacedPins;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -507,11 +505,7 @@ async fn handle_batch_connect_to_net(
     let is_legacy_placement = is_splice && direction == "auto";
 
     let (content, tree) = read_schematic(&sch_path)?;
-    let instances = extract_symbol_instances(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
+    let placed_pins = PlacedPins::new(&tree);
     let mut sch = if is_splice {
         None
     } else {
@@ -530,7 +524,10 @@ async fn handle_batch_connect_to_net(
         .filter_map(|spec| {
             let reference = spec["reference"].as_str()?;
             let pin_number = spec["pin_number"].as_str()?;
-            resolve_pin_endpoint(&instances, &lib_syms, reference, pin_number).ok()
+            placed_pins
+                .resolve(reference, pin_number)
+                .ok()
+                .map(|pin| pin.endpoint())
         })
         .collect();
     let mut is_changed = false;
@@ -562,17 +559,17 @@ async fn handle_batch_connect_to_net(
             }
         };
 
-        let (pin, t) = match resolve_placed_pin(&instances, &lib_syms, reference, pin_number) {
-            Ok(p) => p,
-            Err(e) => {
-                errors.push(e.to_string());
+        let pin = match placed_pins.resolve(reference, pin_number) {
+            Ok(pin) => pin,
+            Err(refusal) => {
+                errors.push(refusal.describe());
                 continue;
             }
         };
-        let (px, py) = pin_endpoint(&pin, t);
+        let (px, py) = pin.endpoint();
         // `auto` is pin_label_rotation's direction, so the default rotation
         // is unchanged.
-        let outward = Some(pin_outward_direction(&pin, t));
+        let outward = Some(pin.outward());
         let dir = match sch.as_ref() {
             Some(sch) if stub_length > 0.0 => {
                 // ponytail: re-parses the sheet and rebuilds net graphs per pin and
@@ -960,11 +957,7 @@ async fn handle_batch_connect_pins(
 
     let (content, tree) = read_schematic(&sch_path)?;
     let expected = content.clone();
-    let instances = extract_symbol_instances(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
+    let placed_pins = PlacedPins::new(&tree);
 
     // Resolve every endpoint from the initial tree before any wire is
     // inserted -- symbols/lib_symbols never change as wires are added, so
@@ -982,13 +975,14 @@ async fn handle_batch_connect_pins(
             continue;
         };
         match (
-            resolve_pin_endpoint(&instances, &lib_syms, ref1, pin1),
-            resolve_pin_endpoint(&instances, &lib_syms, ref2, pin2),
+            placed_pins.resolve(ref1, pin1),
+            placed_pins.resolve(ref2, pin2),
         ) {
-            (Ok((x1, y1)), Ok((x2, y2))) => {
+            (Ok(a), Ok(b)) => {
+                let ((x1, y1), (x2, y2)) = (a.endpoint(), b.endpoint());
                 resolved.push((format!("{ref1}.{pin1} -> {ref2}.{pin2}"), x1, y1, x2, y2))
             }
-            (Err(e), _) | (_, Err(e)) => errors.push(e.to_string()),
+            (Err(e), _) | (_, Err(e)) => errors.push(e.describe()),
         }
     }
 
