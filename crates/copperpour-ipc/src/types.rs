@@ -475,8 +475,9 @@ impl IpcGraphicDefinition {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcTrack {
-    /// KIID of the track, needed to delete it via delete_track. Empty only if
-    /// KiCAD returned a track without an id.
+    /// KIID of the track, which `delete_trace_segment_verified` and
+    /// `modify_trace_segment_verified` take. Empty only if KiCAD returned a
+    /// track without an id.
     pub uuid: String,
     pub net_name: String,
     pub layer: String,
@@ -571,6 +572,33 @@ pub enum IpcViaPlacement {
         stored: IpcVia,
         removed: bool,
     },
+}
+
+/// What [`modify_trace_segment_verified`](crate::client::KiCadIpcClient::modify_trace_segment_verified)
+/// sets on a track.
+#[derive(Debug, Clone)]
+pub struct IpcTrackEdit<'a> {
+    pub net_name: &'a str,
+    pub layer: &'a str,
+    pub width: f64,
+    pub start: IpcVector2,
+    pub end: IpcVector2,
+}
+
+/// What `modify_trace_segment_verified` did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IpcTraceModify {
+    /// A fresh read-back shows the track as sent.
+    Modified,
+    /// No straight track with that KIID is on the board. Nothing was sent.
+    NotFound,
+    /// The board does not have that layer; `copper` lists the copper layers
+    /// it has. Nothing was sent.
+    LayerNotOnBoard { copper: Vec<String> },
+    /// The board has no net of that name. Nothing was sent.
+    UnknownNet,
+    /// KiCad committed the update, but the read-back did not show it.
+    Unproven(String),
 }
 
 /// What `move_via` did.

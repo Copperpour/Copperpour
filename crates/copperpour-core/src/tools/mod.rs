@@ -45,6 +45,8 @@ pub mod library;
 mod library_footprint;
 pub(crate) mod live_board;
 pub mod manufacturing;
+#[cfg(test)]
+mod modify_trace_tests;
 pub(crate) mod navigation_target;
 mod pad_nets;
 pub mod pcb_board;
