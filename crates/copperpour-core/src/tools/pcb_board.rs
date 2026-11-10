@@ -1111,6 +1111,12 @@ fn insert_mounting_hole_file(
                 ),
             ));
         }
+        if let Some(path) = crate::tools::readback_mismatch_path(&error) {
+            return Err(crate::tools::readback_mismatch_result(
+                path,
+                "add_mounting_hole",
+            ));
+        }
         return Err(CallToolResult::error(format!(
             "Could not add mounting hole {} to {}: {error:#}",
             spec.reference,
@@ -2051,15 +2057,6 @@ async fn handle_set_board_title_block(
     });
     let (before, intended) = match written {
         Ok(written) => written,
-        // Nothing is compared before the write, so a conflict can only be the
-        // readback after it.
-        Err(SexpError::Conflict { .. }) => {
-            return Ok(crate::tools::mutation_outcome_uncertain(
-                &board_path,
-                OPERATION,
-                "the board file did not read back as written",
-            ))
-        }
         Err(error @ SexpError::InvalidValue(_)) => {
             return Ok(title_block_args::unrepresentable(&board_path, &error))
         }
@@ -2245,15 +2242,6 @@ async fn handle_set_board_page(
     });
     let unchanged = match unchanged {
         Ok(unchanged) => unchanged,
-        // Nothing is compared before the write, so a conflict can only be the
-        // readback after it.
-        Err(SexpError::Conflict { .. }) => {
-            return Ok(crate::tools::mutation_outcome_uncertain(
-                &board_path,
-                OPERATION,
-                "the board file did not read back as written",
-            ))
-        }
         Err(error) => return Err(error.into()),
     };
     let (tree, changed) = match unchanged {
@@ -5814,6 +5802,39 @@ mod mounting_hole_name_tests {
         );
     }
 
+    /// #418: a save between the write and its readback is not a failure to
+    /// add the hole. The board was replaced, so the outcome is uncertain.
+    #[test]
+    fn inline_file_placement_reports_a_readback_mismatch_as_uncertain() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+        let spec = MountingHoleSpec::new(3.2, "H1".to_string()).unwrap();
+        let text_offset = mounting_hole_text_offset(spec.drill_diameter_mm);
+        let prepared = super::super::pcb_components::PreparedFootprintPlacement::from_inline(
+            "MountingHole".to_string(),
+            vec![mounting_hole_pad(spec.drill_diameter_mm)],
+            Vec::new(),
+            copperpour_ipc::IpcFieldPlacement {
+                reference_at: Some((0.0, text_offset, 0.0)),
+                value_at: Some((0.0, -text_offset, 0.0)),
+            },
+            format_npth_footprint(5.0, 6.0, &spec),
+        );
+        let before = std::fs::read_to_string(&board).unwrap();
+        copperpour_sexp::writer::test_hooks::save_after_replace(&board, before.clone());
+
+        let result = insert_mounting_hole_file(&board, &spec, &prepared).unwrap_err();
+
+        assert!(!copperpour_sexp::writer::test_hooks::armed(&board));
+        let body: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(
+            body["error"]["kind"], "mutation_outcome_uncertain",
+            "{body}"
+        );
+        assert_eq!(body["error"]["operation"], "add_mounting_hole", "{body}");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+    }
+
     /// The default call — the one Chris's E2E made — writes the name KiCad
     /// ships, and the response reports the name read back from the file.
     #[tokio::test]
@@ -7043,12 +7064,12 @@ mod board_revision_tests {
         }
     }
 
-    /// The writer reports a readback that no longer holds the edit as
-    /// `Conflict` after the board was replaced. That is not a refusal.
+    /// A readback that no longer holds the edit comes after the board was
+    /// replaced. That is not a refusal.
     #[test]
     fn a_readback_mismatch_is_an_uncertain_outcome() {
         let board = Path::new("/boards/board.kicad_pcb");
-        let written = Err(SexpError::Conflict {
+        let written = Err(SexpError::ReadbackMismatch {
             path: board.to_path_buf(),
         });
         let result = crate::tools::replace_outcome(board, "board", "add_board_text", written)

@@ -638,6 +638,9 @@ fn map_sexp_error(error: copperpour_sexp::SexpError) -> crate::error::Error {
     match error {
         copperpour_sexp::SexpError::Io(error) => crate::error::Error::Io(error),
         copperpour_sexp::SexpError::Conflict { path } => crate::error::Error::Conflict(path),
+        copperpour_sexp::SexpError::ReadbackMismatch { path } => {
+            crate::error::Error::ReadbackMismatch(path)
+        }
         copperpour_sexp::SexpError::KiCadEditorLocked {
             path, lock_path, ..
         } => crate::error::Error::KiCadEditorLocked { path, lock_path },

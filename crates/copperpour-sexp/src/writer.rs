@@ -149,6 +149,9 @@ fn write_atomic_unlocked_with(
 /// A stable sibling lock serializes participating writers. The exact source
 /// comparison also catches changes made by applications that do not honor the
 /// advisory lock, including KiCad itself.
+///
+/// `Conflict` means nothing was written. `ReadbackMismatch` means the file
+/// was replaced but no longer holds `content`, so the outcome is uncertain.
 pub fn write_atomic_if_unchanged(
     path: &Path,
     expected: &str,
@@ -165,15 +168,74 @@ pub fn write_atomic_if_unchanged(
     }
 
     write_atomic_unlocked(path, content)?;
-    if std::fs::read_to_string(path)? != content {
-        return Err(SexpError::Conflict {
+    read_back(path, content)
+}
+
+/// `ReadbackMismatch` unless `path` holds `written`, read after the rename
+/// under the same lock. A failed read is one too: the file was replaced.
+fn read_back(path: &Path, written: &str) -> Result<(), SexpError> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    test_hooks::run(path);
+    match std::fs::read_to_string(path) {
+        Ok(observed) if observed == written => Ok(()),
+        _ => Err(SexpError::ReadbackMismatch {
             path: path.to_path_buf(),
-        });
+        }),
     }
-    Ok(())
+}
+
+/// Test seam for another program saving a document between Copperpour's
+/// rename and its readback, which no test can time from outside. Built only
+/// with the `test-hooks` feature, which dependents enable for their tests.
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_hooks {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard};
+
+    static SAVES: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+
+    fn saves() -> MutexGuard<'static, Vec<(PathBuf, String)>> {
+        SAVES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The directory is canonical whether or not the file exists yet.
+    fn key(path: &Path) -> PathBuf {
+        let directory = path.parent().unwrap_or_else(|| Path::new("."));
+        let directory = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.into());
+        directory.join(path.file_name().unwrap_or_default())
+    }
+
+    /// Save `content` to `path` after the next write replaces it, before
+    /// that write reads it back.
+    pub fn save_after_replace(path: &Path, content: impl Into<String>) {
+        saves().push((key(path), content.into()));
+    }
+
+    /// Whether a save armed for `path` is still waiting for a write.
+    pub fn armed(path: &Path) -> bool {
+        let key = key(path);
+        saves().iter().any(|(armed, _)| *armed == key)
+    }
+
+    pub(super) fn run(path: &Path) {
+        let mut saves = saves();
+        if saves.is_empty() {
+            return;
+        }
+        let key = key(path);
+        if let Some(index) = saves.iter().position(|(armed, _)| *armed == key) {
+            let (_, content) = saves.remove(index);
+            std::fs::write(path, content).unwrap();
+        }
+    }
 }
 
 /// Apply a read/modify/write transaction while holding the document lock.
+///
+/// An error from `update` means nothing was written. `ReadbackMismatch` means
+/// the file was replaced but no longer holds the update.
 pub fn transact_atomic<T>(
     path: &Path,
     update: impl FnOnce(&str) -> Result<(String, T), SexpError>,
@@ -185,11 +247,7 @@ pub fn transact_atomic<T>(
 
     if next != current {
         write_atomic_unlocked(path, &next)?;
-        if std::fs::read_to_string(path)? != next {
-            return Err(SexpError::Conflict {
-                path: path.to_path_buf(),
-            });
-        }
+        read_back(path, &next)?;
     }
 
     Ok(result)
@@ -428,17 +486,12 @@ pub fn write_new_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
 }
 
 /// [`write_new_atomic`], then read the new file back under the same lock.
-/// `Conflict` when it no longer holds `content`.
+/// `ReadbackMismatch` when it no longer holds `content`.
 pub fn write_new_atomic_verified(path: &Path, content: &str) -> Result<(), SexpError> {
     let lock = open_document_lock(path)?;
     <std::fs::File as FileExt>::lock(&lock)?;
     write_new_atomic_unlocked(path, content)?;
-    if std::fs::read_to_string(path)? != content {
-        return Err(SexpError::Conflict {
-            path: path.to_path_buf(),
-        });
-    }
-    Ok(())
+    read_back(path, content)
 }
 
 /// What a create-only atomic write asks for as the new file's mode.
@@ -1665,6 +1718,40 @@ mod atomic_write_tests {
 
         assert!(matches!(error, SexpError::Conflict { .. }));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "newer");
+    }
+
+    /// #418: a save between the rename and the readback is not a refusal.
+    /// The file was replaced, so each writer says so with its own variant.
+    #[test]
+    fn a_save_after_the_replacement_is_a_readback_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("design.kicad_sch");
+        type Write = fn(&Path) -> Result<(), SexpError>;
+        let writes: [(&str, Write); 3] = [
+            ("write_atomic_if_unchanged", |path| {
+                write_atomic_if_unchanged(path, "expected", "edited")
+            }),
+            ("transact_atomic", |path| {
+                transact_atomic(path, |_| Ok(("edited".to_string(), ())))
+            }),
+            ("write_new_atomic_verified", |path| {
+                std::fs::remove_file(path)?;
+                write_new_atomic_verified(path, "edited")
+            }),
+        ];
+        for (writer, write) in writes {
+            std::fs::write(&path, "expected").unwrap();
+            test_hooks::save_after_replace(&path, "newer");
+
+            let error = write(&path).unwrap_err();
+
+            assert!(!test_hooks::armed(&path), "{writer} skipped the readback");
+            assert!(
+                matches!(&error, SexpError::ReadbackMismatch { path: reported } if *reported == path),
+                "{writer}: {error:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "newer", "{writer}");
+        }
     }
 
     #[test]

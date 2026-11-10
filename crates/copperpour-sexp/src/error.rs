@@ -22,6 +22,15 @@ pub enum SexpError {
     #[error("write conflict: {path} changed since it was read")]
     Conflict { path: PathBuf },
 
+    /// The write replaced the document, but the readback under the lock did
+    /// not return what was written: another program saved it in between.
+    ///
+    /// Unlike [`SexpError::Conflict`], the file was replaced, so this is an
+    /// uncertain outcome, never a refusal: tools report it as
+    /// `mutation_outcome_uncertain`.
+    #[error("readback mismatch: {path} was replaced but did not read back as written")]
+    ReadbackMismatch { path: PathBuf },
+
     /// KiCad owns, or may still own, the design document through its sibling
     /// lock.
     ///

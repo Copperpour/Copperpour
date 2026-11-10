@@ -64,6 +64,8 @@ pub mod project;
 #[cfg(test)]
 mod project_file_writer_tests;
 #[cfg(test)]
+mod readback_mismatch_tests;
+#[cfg(test)]
 mod route_obstacle_tests;
 pub mod sch_analysis;
 pub(crate) mod sch_annotate;
@@ -1047,13 +1049,39 @@ pub(crate) fn mutation_outcome_uncertain(
     )
 }
 
+/// The file a write replaced but could not read back as written, when that is
+/// what `error` reports. The file changed, so the caller must hear an
+/// uncertain outcome, not a refusal (#418).
+pub(crate) fn readback_mismatch_path(error: &anyhow::Error) -> Option<&std::path::Path> {
+    for cause in error.chain() {
+        if let Some(copperpour_sexp::SexpError::ReadbackMismatch { path }) = cause.downcast_ref() {
+            return Some(path);
+        }
+        if let Some(copperpour_schematic_editor::Error::ReadbackMismatch(path)) =
+            cause.downcast_ref()
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// The `mutation_outcome_uncertain` result for a write `operation` that
+/// replaced `path` but could not read it back as written.
+pub(crate) fn readback_mismatch_result(path: &std::path::Path, operation: &str) -> CallToolResult {
+    mutation_outcome_uncertain(
+        path,
+        operation,
+        "the file was replaced, but did not read back as written; another program may have \
+         saved it in between",
+    )
+}
+
 /// Replace `path` with `next` only while it still holds `read`, the text the
 /// change was built from. A file another program saved in between is refused
-/// as `conflict` and left as that program left it. `write_atomic_if_unchanged`
-/// would report that refusal and a failed post-write readback as the same
-/// `Conflict`; the readback comes after the file was replaced, so it is an
-/// uncertain outcome. `what` names the file in messages, such as "board".
-/// `None` once the change is written and read back.
+/// as `conflict` and left as that program left it; a failed readback after
+/// the replacement is an uncertain outcome. `what` names the file in
+/// messages, such as "board". `None` once the change is written and read back.
 pub(crate) fn replace_if_unchanged(
     path: &std::path::Path,
     what: &str,
@@ -1150,20 +1178,8 @@ pub(crate) fn replace_outcome(
                  nothing. Reload it and retry."
             ),
         ))),
-        Err(copperpour_sexp::SexpError::Conflict { .. }) => {
-            let reason =
-                format!("the {what} no longer held the edit when read back after the write");
-            Ok(Some(CallToolResult::error_kind(
-                crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain {
-                    operation: operation.to_string(),
-                    path: shown.clone(),
-                    reason: reason.clone(),
-                },
-                format!(
-                    "{operation} replaced {what} '{shown}', but {reason}. Another program may \
-                     have saved it. Reload and inspect the {what} before retrying."
-                ),
-            )))
+        Err(copperpour_sexp::SexpError::ReadbackMismatch { .. }) => {
+            Ok(Some(readback_mismatch_result(path, operation)))
         }
         Err(error) => Err(error.into()),
     }

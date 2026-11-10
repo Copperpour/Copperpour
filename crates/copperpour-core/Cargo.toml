@@ -52,6 +52,8 @@ native-bridge = ["dep:reqwest"]
 winreg.workspace = true
 
 [dev-dependencies]
+# A save between a write and its readback, for the readback-mismatch tests (#418).
+copperpour-sexp = { workspace = true, features = ["test-hooks"] }
 # The pcb_components fallback tests spawn a mock KiCAD NNG endpoint to prove
 # a reachable-but-rejecting KiCAD never triggers the file-editing fallback.
 nng.workspace = true

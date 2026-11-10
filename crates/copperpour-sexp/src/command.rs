@@ -747,8 +747,9 @@ pub struct TransactionOutcome {
 ///
 /// # Errors
 ///
-/// Returns an item conflict for a stale target, an invalid-value error for a
-/// malformed command, or an I/O/write conflict from the atomic writer.
+/// Returns a document or item conflict for a stale target and an invalid-value
+/// error for a malformed command, all before any write, or an I/O error or
+/// `ReadbackMismatch` from the atomic writer.
 pub fn commit_command(
     path: impl AsRef<Path>,
     command: &SchematicCommand,

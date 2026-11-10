@@ -839,7 +839,7 @@ async fn handle_place_decoupling(
     }
     let applied = match super::pcb_components::update_closed_board_footprints(&board, &placements) {
         Ok(applied) => applied,
-        Err(error) => return Ok(error.into_result()),
+        Err(error) => return error.into_result(),
     };
     let written = copperpour_sexp::writer::read_consistent(&board)?;
     let score_written = score_of_content(ctx, &written).await?;
@@ -1737,7 +1737,7 @@ async fn handle_force_directed(
     }
     let applied = match super::pcb_components::update_closed_board_footprints(&board, &placements) {
         Ok(applied) => applied,
-        Err(error) => return Ok(error.into_result()),
+        Err(error) => return error.into_result(),
     };
     let written = copperpour_sexp::writer::read_consistent(&board)?;
     let score_written = score_of_content(ctx, &written).await?;

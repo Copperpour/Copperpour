@@ -56,11 +56,11 @@ delete a destination to get around a `conflict`, and never weaken `save()` into 
 unconditional overwrite: a conflict from KiCad's autosave means the mechanism works, so
 reload and reapply.
 
-`write_atomic_if_unchanged` returns the same `SexpError::Conflict` when the file changed
-before the write and when the readback fails after it. The first is a `conflict`
-refusal; the second is `mutation_outcome_uncertain`, because the file was already
-replaced. To tell them apart, call `transact_atomic` and compare inside its closure, as
-`pcb_board.rs::write_board_edits` does.
+The writers return `SexpError::Conflict` only when the file changed before the write, so
+nothing was written: a `conflict` refusal. A readback after the rename that does not
+match is `SexpError::ReadbackMismatch`, which dispatch reports as
+`mutation_outcome_uncertain`, because the file was already replaced. Never turn it into
+an `Ok` refusal; return it, or call `tools::readback_mismatch_result`.
 
 For a post-write readback, parse with `parse_sexp` and read positions with `parse_at`,
 as `sch_wiring.rs::observed_no_connect_moves` does. `Schematic::from_source` in
