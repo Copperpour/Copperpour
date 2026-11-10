@@ -1399,7 +1399,7 @@ fn set_pad_child(pad_block: String, head: &str, child: Option<String>) -> String
 
 /// A pad's fabrication property, KiCad's `PAD_PROP`. KiCad writes it as
 /// `(property pad_prop_<name>)` and writes nothing for `None`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum PadFabricationProperty {
     None,
     Bga,
@@ -1448,7 +1448,7 @@ impl PadFabricationProperty {
         })
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Bga => "bga",

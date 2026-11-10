@@ -1,4 +1,5 @@
 use super::library::PadFabricationProperty;
+use super::library_footprint::{carries_kicad_10_0_7_fields, fab_property};
 use crate::hex::encode_hex;
 use crate::mcp::protocol::{CallToolResult, ToolContent};
 use crate::tool;
@@ -180,29 +181,6 @@ fn default_thermal_spoke_angle(shape: i32) -> f64 {
     } else {
         45.0
     }
-}
-
-/// KiCad's API value for a pad's fabrication property, as
-/// `pcbnew/api/api_pcb_enums.cpp` maps `PAD_PROP`.
-fn fab_property(property: PadFabricationProperty) -> kiapi::board::types::PadFabricationProperty {
-    use kiapi::board::types::PadFabricationProperty as Proto;
-    match property {
-        PadFabricationProperty::None => Proto::PfpNone,
-        PadFabricationProperty::Bga => Proto::PfpBga,
-        PadFabricationProperty::FiducialGlobal => Proto::PfpFiducialGlobal,
-        PadFabricationProperty::FiducialLocal => Proto::PfpFiducialLocal,
-        PadFabricationProperty::Testpoint => Proto::PfpTestpoint,
-        PadFabricationProperty::Heatsink => Proto::PfpHeatsink,
-        PadFabricationProperty::Castellated => Proto::PfpCastellated,
-        PadFabricationProperty::Mechanical => Proto::PfpMechanical,
-        PadFabricationProperty::Pressfit => Proto::PfpPressfit,
-    }
-}
-
-/// Whether `version`'s API carries pad fabrication properties and reference
-/// points: both arrived in KiCad 10.0.7.
-fn carries_kicad_10_0_7_fields(version: &copperpour_ipc::IpcKiCadVersion) -> bool {
-    (version.major, version.minor, version.patch) >= (10, 0, 7)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -1092,20 +1070,8 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     validate_supported_children(&root)?;
     let properties = super::library_footprint::properties(&root)?;
     let pads = super::pcb_components::extract_pad_definitions(source)?;
-    // `extract_pad_definitions` reads the same `pad` nodes in the same order.
     let pad_nodes = root.find_all("pad");
-    let pad_properties = pad_nodes
-        .iter()
-        .copied()
-        .map(PadFabricationProperty::of_pad)
-        .collect::<Vec<_>>();
-    if pad_properties.len() != pads.len() {
-        bail!(
-            "read {} pad properties for {} pads",
-            pad_properties.len(),
-            pads.len()
-        );
-    }
+    let pad_properties = super::library_footprint::pad_properties(&pad_nodes, pads.len())?;
     // Read from the same nodes, so there is one per pad.
     let pad_zones = pad_nodes
         .iter()
