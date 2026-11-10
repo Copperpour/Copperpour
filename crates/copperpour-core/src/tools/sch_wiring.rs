@@ -9,7 +9,8 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::sch_connectivity::COINCIDENT_TOLERANCE as TOLERANCE;
 use crate::tools::{
-    get_path, opt_f64, opt_str, require_array, require_f64, require_str, ToolContext, ToolDef,
+    get_path, opt_f64, opt_str, require_array, require_f64, require_str, PlacedPins, ToolContext,
+    ToolDef,
 };
 use copperpour_schematic_editor as cse;
 use copperpour_schematic_editor::types::fmt_f64;
@@ -17,9 +18,8 @@ use copperpour_sexp::{
     geometry::{round6, snap_point},
     parser::parse_sexp,
     schematic::{
-        extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
-        format_junction, format_wire, parse_at, pin_endpoint, pin_outward_direction,
-        read_schematic, wire_end_needs_junction, Wire,
+        extract_symbol_instances, extract_wires, find_t_junctions, format_junction, format_wire,
+        parse_at, pin_endpoint, read_schematic, wire_end_needs_junction, Wire,
     },
     writer::{
         apply_edits, direct_children_with_tag, find_balanced_block, find_block_starts,
@@ -2454,93 +2454,19 @@ enum PowerSite {
     },
 }
 
-/// Find the one pin `reference` + `pin_number` names, as a [`PowerSite`].
-///
-/// Stricter than [`resolve_placed_pin`], which takes the first match: a
-/// duplicated reference, or a pin drawn on two placed units, would put the
-/// rail on a pin the caller did not choose. Every refusal is structured, and
-/// none of them writes.
+/// The one pin `reference` + `pin_number` names, refused as
+/// `add_power_symbol` words it.
 fn resolve_power_pin(
-    tree: &copperpour_sexp::SexpNode,
+    pins: &PlacedPins,
     reference: &str,
     pin_number: &str,
-) -> Result<PowerSite, CallToolResult> {
-    let target = format!("{reference} pin {pin_number}");
-    let refuse = |reason: String| {
-        CallToolResult::error_kind(
-            crate::mcp::error::ToolErrorKind::StaleTarget {
-                target: target.clone(),
-                reason: reason.clone(),
-            },
-            format!("cannot place a power symbol on {target}: {reason}. Nothing was written."),
+) -> Result<crate::tools::NamedPin, CallToolResult> {
+    pins.resolve(reference, pin_number).map_err(|refusal| {
+        refusal.result(
+            "place a power symbol on",
+            "Give x + y for the one you mean.",
         )
-    };
-    let placed = extract_symbol_instances(tree)
-        .iter()
-        .filter(|i| i.reference == reference)
-        .count();
-    if placed == 0 {
-        return Err(refuse(format!("component {reference} is not present")));
-    }
-    let resolved: Vec<_> = crate::tools::placed_pins_by_reference(tree)
-        .into_iter()
-        .filter(|(inst, _)| inst.reference == reference)
-        .collect();
-    // An instance whose definition is missing may be the one carrying the pin.
-    if resolved.len() != placed {
-        return Err(refuse(format!(
-            "a placed unit of {reference} has no embedded library definition"
-        )));
-    }
-
-    let mut found: Vec<(&copperpour_sexp::schematic::SymbolInstance, (f64, f64), f64)> = Vec::new();
-    for (inst, pins) in &resolved {
-        for (pin, t) in pins.iter().filter(|(p, _)| p.number == pin_number) {
-            let (x, y) = pin_endpoint(pin, *t);
-            // Stacked pins sharing a number within one placed unit are one
-            // connection point, not a choice.
-            let stacked = found.iter().any(|(other, (ox, oy), _)| {
-                other.uuid == inst.uuid
-                    && other.unit == inst.unit
-                    && copperpour_sexp::geometry::points_coincident(*ox, *oy, x, y, 0.01)
-            });
-            if !stacked {
-                found.push((inst, (x, y), pin_outward_direction(pin, *t)));
-            }
-        }
-    }
-    match found.as_slice() {
-        [] => Err(refuse(format!("{reference} has no pin {pin_number}"))),
-        [(_, endpoint, outward)] => Ok(PowerSite::Pin {
-            endpoint: *endpoint,
-            outward: *outward,
-        }),
-        _ => {
-            let candidates: Vec<String> = found
-                .iter()
-                .map(|(inst, (x, y), _)| {
-                    format!(
-                        "unit {} {} at ({}, {})",
-                        inst.unit,
-                        inst.uuid.as_deref().unwrap_or("without uuid"),
-                        fmt_f64(*x),
-                        fmt_f64(*y)
-                    )
-                })
-                .collect();
-            Err(CallToolResult::error_kind(
-                crate::mcp::error::ToolErrorKind::AmbiguousTarget {
-                    target: target.clone(),
-                    candidates: candidates.clone(),
-                },
-                format!(
-                    "{target} names more than one placed pin: {}. Give x + y for the one \
-                     you mean. Nothing was written.",
-                    candidates.join(", ")
-                ),
-            ))
-        }
-    }
+    })
 }
 
 /// The single pin of the power symbol `lib_id` as embedded in `sch`, or `None`
@@ -2776,8 +2702,11 @@ async fn handle_add_power_symbol(
             pin_number,
         } => {
             let tree = parse_sexp(&content)?;
-            let site = match resolve_power_pin(&tree, &reference, &pin_number) {
-                Ok(site) => site,
+            let site = match resolve_power_pin(&PlacedPins::new(&tree), &reference, &pin_number) {
+                Ok(pin) => PowerSite::Pin {
+                    endpoint: pin.endpoint(),
+                    outward: pin.outward(),
+                },
                 Err(e) => return Ok(e),
             };
             // A pin already on this rail needs no second symbol; on a stacked
@@ -3089,6 +3018,7 @@ pub(crate) async fn handle_batch_add_power_symbol(
 
     // Resolve every pin before anything is planned: one bad pin refuses the call.
     let mut points: Vec<PowerPoint> = Vec::new();
+    let placed_pins = PlacedPins::new(&tree);
     for (index, pin) in requested.iter().enumerate() {
         let field = |key: &str| {
             pin[key].as_str().map(str::to_owned).ok_or_else(|| {
@@ -3102,13 +3032,9 @@ pub(crate) async fn handle_batch_add_power_symbol(
             (Ok(r), Ok(n)) => (r, n),
             (Err(e), _) | (_, Err(e)) => return Ok(e),
         };
-        let PowerSite::Pin { endpoint, outward } =
-            (match resolve_power_pin(&tree, &reference, &pin_number) {
-                Ok(site) => site,
-                Err(e) => return Ok(e),
-            })
-        else {
-            unreachable!("resolve_power_pin returns a pin site");
+        let (endpoint, outward) = match resolve_power_pin(&placed_pins, &reference, &pin_number) {
+            Ok(pin) => (pin.endpoint(), pin.outward()),
+            Err(e) => return Ok(e),
         };
         let pin = (reference, pin_number);
         match points
@@ -3603,17 +3529,14 @@ async fn handle_connect_to_net(
     // endpoint, and the error says which pin was wrong.
     let (pin_x, pin_y, outward) = match (opt_str(args, "reference"), opt_str(args, "pin_number")) {
         (Some(reference), Some(pin_number)) => {
-            let instances = extract_symbol_instances(&tree);
-            let lib_syms = tree
-                .find("lib_symbols")
-                .map(|n| n.find_all("symbol"))
-                .unwrap_or_default();
-            match resolve_placed_pin(&instances, &lib_syms, reference, pin_number) {
-                Ok((pin, t)) => {
-                    let (x, y) = pin_endpoint(&pin, t);
-                    (x, y, Some(pin_outward_direction(&pin, t)))
+            match PlacedPins::new(&tree).resolve(reference, pin_number) {
+                Ok(pin) => {
+                    let (x, y) = pin.endpoint();
+                    (x, y, Some(pin.outward()))
                 }
-                Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                Err(refusal) => {
+                    return Ok(refusal.result("connect", "Give pin_x + pin_y for the one you mean."))
+                }
             }
         }
         (Some(_), None) | (None, Some(_)) => {
@@ -3823,16 +3746,17 @@ async fn handle_connect_pins(
 
     // Parse the schematic tree
     let (content, tree) = read_schematic(&sch_path)?;
-    let instances = extract_symbol_instances(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
-
-    // Resolve pin1 board-space endpoint
-    let (x1, y1) = resolve_pin_endpoint(&instances, &lib_syms, &ref1, &pin1)?;
-    // Resolve pin2 board-space endpoint
-    let (x2, y2) = resolve_pin_endpoint(&instances, &lib_syms, &ref2, &pin2)?;
+    let pins = PlacedPins::new(&tree);
+    // No coordinate form here: an ambiguous pin is wired by its endpoint.
+    const RECOVERY: &str = "Call add_schematic_connection with the endpoint of the one you mean.";
+    let (x1, y1) = match pins.resolve(&ref1, &pin1) {
+        Ok(pin) => pin.endpoint(),
+        Err(refusal) => return Ok(refusal.result("connect", RECOVERY)),
+    };
+    let (x2, y2) = match pins.resolve(&ref2, &pin2) {
+        Ok(pin) => pin.endpoint(),
+        Err(refusal) => return Ok(refusal.result("connect", RECOVERY)),
+    };
 
     // Route wire(s) between the two pin endpoints
     let routed = match route_between(&content, x1, y1, x2, y2)? {
@@ -3849,79 +3773,6 @@ async fn handle_connect_pins(
         },
         "path": routed.path
     })))
-}
-
-/// Resolve a pin's schematic-space endpoint by reference and pin number.
-/// Uses the same pattern as sch_analysis::handle_get_pin_connections.
-pub(crate) fn resolve_pin_endpoint(
-    instances: &[copperpour_sexp::schematic::SymbolInstance],
-    lib_syms: &[&copperpour_sexp::parser::SexpNode],
-    reference: &str,
-    pin_number: &str,
-) -> anyhow::Result<(f64, f64)> {
-    let (pin, t) = resolve_placed_pin(instances, lib_syms, reference, pin_number)?;
-    Ok(pin_endpoint(&pin, t))
-}
-
-/// The named pin and the transform placing it, for callers that need more than
-/// its coordinates — `pin_outward_direction` and `pin_label_rotation` both take
-/// this pair, and deriving them here beats searching the sheet for the point we
-/// just computed.
-pub(crate) fn resolve_placed_pin(
-    instances: &[copperpour_sexp::schematic::SymbolInstance],
-    lib_syms: &[&copperpour_sexp::parser::SexpNode],
-    reference: &str,
-    pin_number: &str,
-) -> anyhow::Result<(
-    copperpour_sexp::schematic::LibPin,
-    copperpour_sexp::geometry::PinTransform,
-)> {
-    // A multi-unit part places one instance per unit, all sharing the
-    // reference, so any of them may own the pin: an LM2904's power pins live
-    // on the unit the schematic draws separately from either amplifier.
-    let placed: Vec<_> = instances
-        .iter()
-        .filter(|i| i.reference == reference)
-        .collect();
-    let Some(first) = placed.first() else {
-        anyhow::bail!("Component '{}' not found", reference);
-    };
-
-    let mut searched = Vec::new();
-    for inst in &placed {
-        // find_lib_symbol, not a lib_id match: an instance carrying a
-        // (lib_name …) is a sheet-local derived symbol whose pins can sit
-        // elsewhere than the base definition's, or whose base was never
-        // embedded at all (#143).
-        let Some(lib_sym) = find_lib_symbol(lib_syms, inst) else {
-            continue;
-        };
-        searched.push(inst.unit);
-        // Unit-aware (#35): only the unit that owns the pin may answer for it,
-        // or the wire lands on a superimposed phantom.
-        if let Some(lib_pin) =
-            copperpour_sexp::schematic::extract_lib_pins_for_unit(lib_sym, inst.unit)
-                .into_iter()
-                .find(|p| p.number == pin_number)
-        {
-            return Ok((lib_pin, inst.pin_transform()));
-        }
-    }
-
-    if searched.is_empty() {
-        anyhow::bail!("Library symbol '{}' not found", first.lib_id);
-    }
-    anyhow::bail!(
-        "Pin '{}' not found on '{}' ({} {})",
-        pin_number,
-        reference,
-        if searched.len() == 1 { "unit" } else { "units" },
-        searched
-            .iter()
-            .map(|u| u.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
 }
 
 async fn handle_add_schematic_connection(
@@ -5939,24 +5790,12 @@ mod power_on_pin_tests {
     async fn serve(
         handler: &crate::mcp::handler::McpHandler,
         path: &std::path::Path,
-        mut arguments: serde_json::Value,
+        arguments: serde_json::Value,
     ) -> serde_json::Value {
-        arguments["schematic"] = json!(path.display().to_string());
-        let response = handler
-            .handle_message(json!({
-                "jsonrpc": "2.0",
-                "id": 727,
-                "method": "tools/call",
-                "params": { "name": "add_power_symbol", "arguments": arguments }
-            }))
-            .await
-            .expect("tools/call receives a response");
-        let result = response.result.expect("successful JSON-RPC response");
-        let mut body: serde_json::Value =
-            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        body["is_error"] = json!(result["isError"] == json!(true));
-        body
+        serve_tool(handler, "add_power_symbol", path, arguments).await
     }
+
+    use super::batch_power_tests::serve as serve_tool;
 
     /// The committed symbol the response names: its point and rotation.
     fn committed_at(path: &std::path::Path, placed: &serde_json::Value) -> (f64, f64, f64) {
@@ -6117,7 +5956,7 @@ mod power_on_pin_tests {
             // A missing component and a missing pin read differently.
             let reason = match subject {
                 "R99 pin 1" => Some("component R99 is not present"),
-                "R1 pin 9" => Some("R1 has no pin 9"),
+                "R1 pin 9" => Some("R1 has no pin 9 on placed unit 1"),
                 _ => None,
             };
             if let Some(reason) = reason {
@@ -6211,6 +6050,281 @@ mod power_on_pin_tests {
         assert_eq!(candidates.len(), 2, "{refused}");
         assert!(candidates[0].ends_with("at (180.34, 116.84)"), "{refused}");
         assert!(candidates[1].ends_with("at (200.66, 116.84)"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
+    }
+
+    /// The refusal `add_power_symbol` gives for R4 pin 1, from the wiring
+    /// tools (#88): both copies named at KiCad's ERC positions, nothing written.
+    fn assert_r4_is_ambiguous(refused: &serde_json::Value, path: &std::path::Path) {
+        assert_eq!(refused["is_error"], json!(true), "{refused}");
+        let error = &refused["error"];
+        assert_eq!(error["kind"], "ambiguous_target", "{refused}");
+        assert_eq!(error["target"], "R4 pin 1", "{refused}");
+        let candidates = error["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2, "{refused}");
+        for (candidate, at) in candidates
+            .iter()
+            .zip(["(180.34, 116.84)", "(200.66, 116.84)"])
+        {
+            let candidate = candidate.as_str().unwrap();
+            assert!(candidate.starts_with("unit 1 "), "{refused}");
+            assert!(candidate.ends_with(&format!("at {at}")), "{refused}");
+        }
+        assert_eq!(std::fs::read_to_string(path).unwrap(), SHEET);
+    }
+
+    #[tokio::test]
+    async fn connect_to_net_refuses_a_pin_two_symbols_share() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet(dir.path(), "power_on_pin_kicad10", SHEET);
+        let refused = serve_tool(
+            &handler,
+            "connect_to_net",
+            &path,
+            json!({"reference": "R4", "pin_number": "1", "net": "SIG"}),
+        )
+        .await;
+        assert_r4_is_ambiguous(&refused, &path);
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("Give pin_x + pin_y for the one you mean."),
+            "{refused}"
+        );
+    }
+
+    /// Either end of the pair may be the ambiguous one.
+    #[tokio::test]
+    async fn connect_pins_refuses_a_pin_two_symbols_share_at_either_end() {
+        let handler = handler().await;
+        for (first, second) in [(("R4", "1"), ("R1", "1")), (("R1", "1"), ("R4", "1"))] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = sheet(dir.path(), "power_on_pin_kicad10", SHEET);
+            let refused = serve_tool(
+                &handler,
+                "connect_pins",
+                &path,
+                json!({"ref1": first.0, "pin1": first.1, "ref2": second.0, "pin2": second.1}),
+            )
+            .await;
+            assert_r4_is_ambiguous(&refused, &path);
+        }
+    }
+
+    /// A missing component or pin is a `stale_target` too, not free text.
+    #[tokio::test]
+    async fn the_wiring_tools_refuse_a_missing_pin_as_stale() {
+        let handler = handler().await;
+        let cases = [
+            (
+                "connect_to_net",
+                json!({"reference": "R99", "pin_number": "1", "net": "SIG"}),
+                "R99 pin 1",
+                "component R99 is not present",
+            ),
+            (
+                "connect_to_net",
+                json!({"reference": "U1", "pin_number": "9", "net": "SIG"}),
+                "U1 pin 9",
+                "U1 has no pin 9 on placed units 1, 3",
+            ),
+            (
+                "connect_pins",
+                json!({"ref1": "R1", "pin1": "1", "ref2": "R99", "pin2": "1"}),
+                "R99 pin 1",
+                "component R99 is not present",
+            ),
+            // Two copies of one unit name that unit once.
+            (
+                "connect_to_net",
+                json!({"reference": "R4", "pin_number": "9", "net": "SIG"}),
+                "R4 pin 9",
+                "R4 has no pin 9 on placed unit 1",
+            ),
+        ];
+        for (tool, arguments, target, reason) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = sheet(dir.path(), "power_on_pin_kicad10", SHEET);
+            let refused = serve_tool(&handler, tool, &path, arguments.clone()).await;
+            assert_eq!(
+                refused["is_error"],
+                json!(true),
+                "{tool} {arguments}: {refused}"
+            );
+            let error = &refused["error"];
+            assert_eq!(error["kind"], "stale_target", "{tool}: {refused}");
+            assert_eq!(error["target"], target, "{tool}: {refused}");
+            assert_eq!(error["reason"], reason, "{tool}: {refused}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                SHEET,
+                "{tool} wrote"
+            );
+        }
+    }
+
+    /// One `R4` copy loses its library definition, so it may be the one
+    /// carrying pin 1: the wiring tools refuse rather than wire the other.
+    #[tokio::test]
+    async fn the_wiring_tools_refuse_a_copy_without_a_definition() {
+        let handler = handler().await;
+        let second = SHEET.find("(at 200.66 120.65").expect("the second R4");
+        let lib_id = SHEET[..second]
+            .rfind("(lib_id \"Device:R\")")
+            .expect("its lib_id");
+        let mut content = SHEET.to_string();
+        content.replace_range(
+            lib_id..lib_id + "(lib_id \"Device:R\")".len(),
+            "(lib_id \"Device:R_unembedded\")",
+        );
+        for (tool, arguments) in [
+            (
+                "connect_to_net",
+                json!({"reference": "R4", "pin_number": "1", "net": "SIG"}),
+            ),
+            (
+                "connect_pins",
+                json!({"ref1": "R1", "pin1": "1", "ref2": "R4", "pin2": "1"}),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = sheet(dir.path(), "power_on_pin_kicad10", &content);
+            let refused = serve_tool(&handler, tool, &path, arguments).await;
+            assert_eq!(
+                refused["error"]["kind"], "stale_target",
+                "{tool}: {refused}"
+            );
+            assert_eq!(
+                refused["error"]["reason"],
+                "a placed unit of R4 has no embedded library definition",
+                "{tool}: {refused}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                content,
+                "{tool} wrote"
+            );
+        }
+    }
+
+    /// What must still resolve: a pin only the separately placed power unit
+    /// carries (U1.8), and a De Morgan pin both body styles draw at one point
+    /// (U2.3). Each lands on KiCad's ERC position.
+    #[tokio::test]
+    async fn the_wiring_tools_still_resolve_a_unit_owned_and_a_de_morgan_pin() {
+        let handler = handler().await;
+        // The partner is a pin of the same symbol, so the route has a clear path.
+        for (reference, pin, at, partner) in [
+            ("U1", "8", (137.16, 113.03), "4"),
+            ("U2", "3", (248.92, 120.65), "1"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = sheet(dir.path(), "power_on_pin_kicad10", SHEET);
+            let wired = serve_tool(
+                &handler,
+                "connect_to_net",
+                &path,
+                json!({"reference": reference, "pin_number": pin, "net": "SIG"}),
+            )
+            .await;
+            assert_eq!(
+                wired["is_error"],
+                json!(false),
+                "{reference}.{pin}: {wired}"
+            );
+            assert_eq!(
+                wired["wire"]["x1"],
+                json!(at.0),
+                "{reference}.{pin}: {wired}"
+            );
+            assert_eq!(
+                wired["wire"]["y1"],
+                json!(at.1),
+                "{reference}.{pin}: {wired}"
+            );
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = sheet(dir.path(), "power_on_pin_kicad10", SHEET);
+            let wired = serve_tool(
+                &handler,
+                "connect_pins",
+                &path,
+                json!({"ref1": reference, "pin1": pin, "ref2": reference, "pin2": partner}),
+            )
+            .await;
+            assert_eq!(
+                wired["is_error"],
+                json!(false),
+                "{reference}.{pin}: {wired}"
+            );
+            assert_eq!(wired["connected"]["from"]["x"], json!(at.0), "{wired}");
+            assert_eq!(wired["connected"]["from"]["y"], json!(at.1), "{wired}");
+        }
+    }
+
+    /// In a batch the ambiguous pin is skipped and named, and the rest land,
+    /// as an unresolved pin's always have.
+    #[tokio::test]
+    async fn batch_connect_to_net_skips_a_pin_two_symbols_share() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet(dir.path(), "power_on_pin_kicad10", SHEET);
+        let result = serve_tool(
+            &handler,
+            "batch_connect_to_net",
+            &path,
+            json!({"net_name": "SIG", "pins": [
+                {"reference": "R4", "pin_number": "1"},
+                {"reference": "R1", "pin_number": "2"}
+            ]}),
+        )
+        .await;
+        assert_eq!(result["is_error"], json!(false), "{result}");
+        let added = result["added"].as_array().unwrap();
+        assert_eq!(added.len(), 1, "{result}");
+        assert_eq!(added[0]["reference"], "R1", "{result}");
+        let errors = result["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{result}");
+        let error = errors[0].as_str().unwrap();
+        assert!(
+            error.starts_with("R4 pin 1 names more than one placed pin: unit 1 "),
+            "{result}"
+        );
+        assert!(error.contains("(180.34, 116.84)") && error.contains("(200.66, 116.84)"));
+        let labels: Vec<(f64, f64)> = copperpour_sexp::schematic::extract_labels(
+            &parse_sexp(&std::fs::read_to_string(&path).unwrap()).unwrap(),
+        )
+        .iter()
+        .filter(|l| l.net == "SIG")
+        .map(|l| (l.x, l.y))
+        .collect();
+        // R1.2 at KiCad's ERC position, and neither R4 copy.
+        assert_eq!(labels, vec![(100.33, 83.82)], "{result}");
+    }
+
+    #[tokio::test]
+    async fn batch_connect_pins_skips_a_pin_two_symbols_share() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet(dir.path(), "power_on_pin_kicad10", SHEET);
+        let result = serve_tool(
+            &handler,
+            "batch_connect_pins",
+            &path,
+            json!({"connections": [
+                {"ref1": "R1", "pin1": "1", "ref2": "R4", "pin2": "1"}
+            ]}),
+        )
+        .await;
+        assert_eq!(result["is_error"], json!(true), "{result}");
+        assert_eq!(result["connected_count"], 0, "{result}");
+        let error = result["errors"][0].as_str().unwrap();
+        assert!(
+            error.starts_with("R4 pin 1 names more than one placed pin"),
+            "{result}"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
     }
 }
@@ -7134,7 +7248,7 @@ mod batch_power_tests {
         .expect("handler builds")
     }
 
-    async fn serve(
+    pub(super) async fn serve(
         handler: &crate::mcp::handler::McpHandler,
         tool: &str,
         path: &std::path::Path,

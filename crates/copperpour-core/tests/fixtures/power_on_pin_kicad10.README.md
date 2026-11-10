@@ -3,7 +3,8 @@
 `power_on_pin_kicad10.kicad_sch` carries pins facing each way, a mirrored
 symbol, a power unit placed apart from its amplifier, a De Morgan gate, and a
 reference two symbols share. `add_power_symbol` with `reference` + `pin_number` is checked
-against it. `power_on_off_grid_pin.kicad_sch` supplies a pin off the
+against it, and so is the refusal of a shared pin by `connect_to_net`,
+`connect_pins` and their batch forms (#88). `power_on_off_grid_pin.kicad_sch` supplies a pin off the
 1.27mm grid.
 
 ## Provenance
@@ -69,6 +70,21 @@ the tests expect:
 R4 is reported once per copy, and the netlist keeps the two copies as separate
 nets (`unconnected-(R4-Pad1)` and `unconnected-(R4-Pad1)_1`). A request for
 "R4 pin 1" therefore names two places.
+
+Wiring `R4` pin 1 by name shows why it must be refused. A `connect_to_net` to
+`SIG` that picks the first copy, as the wiring tools did before #88, gives:
+
+| Net | Pins |
+|---|---|
+| `/SIG` | R4.1 (the copy at x = 180.34) |
+| `unconnected-(R4-Pad1)` | R4.1 (the copy at x = 200.66) |
+
+```text
+kicad-cli sch export netlist --format kicadxml power_on_pin_kicad10.kicad_sch
+```
+
+Either copy is a guess, so the wiring tools refuse the call and the netlist
+keeps both copies unconnected.
 
 `74LS00` carries a De Morgan body style. Its library draws pin 3 in both
 `74LS00_1_1` and `74LS00_1_2`, at the same point, and KiCad reports U2.3 once.
