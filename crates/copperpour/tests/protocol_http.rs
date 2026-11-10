@@ -55,7 +55,7 @@ impl HttpServer {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("failed to spawn konnect binary");
+            .expect("failed to spawn copperpour binary");
 
         let mut server = HttpServer {
             child,

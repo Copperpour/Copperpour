@@ -86,8 +86,9 @@ client uses. Each file and hook is compared with that binary's bundle:
 
 A `different` hook carries a reason: `legacy_handler` is the pre-hook-JSON
 `… skill <name>` form, which Claude ignores; `alias_handler` is a hook for the
-`konnect` alias beside this binary, or, in the all-platforms PCM package, for
-the server behind the `bin/copperpour` launcher; both run this binary, and
+`konnect` alias that v0.15 and v0.16 shipped beside this binary, or, in
+the all-platforms PCM package, for the server behind the `bin/copperpour`
+launcher; both are this install's own, and
 `init` replaces them; `duplicate_handler` is the current hook with another handler of
 ours beside it, or a second entry for it, which `init` removes;
 `stale_matcher` is our entry under a tool matcher from an older release,
@@ -160,9 +161,9 @@ Step by step (based on the diagnostic guide contributed in
 3. In KiCAD, open **Tools → External Plugins → Copperpour** to open the settings
    dialog.
 4. Paste the address into the **IPC Socket** field and click **Save**.
-5. Confirm your AI client (Claude Code, Claude Desktop, …) has the `konnect`
-   MCP server registered in its own config (`.mcp.json` or
-   `claude_desktop_config.json`) pointing at the `konnect` binary — see
+5. Confirm your AI client (Claude Code, Claude Desktop, …) has the
+   `copperpour` MCP server registered in its own config (`.mcp.json` or
+   `claude_desktop_config.json`) pointing at the `copperpour` binary — see
    [examples/](../examples/). This registration is separate from the KiCAD
    plugin settings.
 6. Restart the AI client session so it spawns a fresh Copperpour process that
@@ -234,7 +235,7 @@ http_address = "127.0.0.1:3000"
 ipc_address = "ipc://C:/Users/<you>/AppData/Local/Temp/kicad/api.sock"
 ```
 
-Start `konnect` from a normal terminal and point the client at
+Start `copperpour` from a normal terminal and point the client at
 `http://127.0.0.1:3000/mcp`; `http://127.0.0.1:3000/health` answers `ok` while
 the server is up. Keep the address on `127.0.0.1`: the HTTP transport has no
 authentication. KiCad needs no change.

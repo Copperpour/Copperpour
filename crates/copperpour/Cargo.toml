@@ -11,11 +11,6 @@ license.workspace = true
 name = "copperpour"
 path = "src/main.rs"
 
-# The name before the rename: runs `copperpour` beside it. Kept for one release.
-[[bin]]
-name = "konnect"
-path = "src/bin/konnect.rs"
-
 [lib]
 name = "copperpour_plugin"
 crate-type = ["cdylib", "rlib"]

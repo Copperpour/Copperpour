@@ -155,7 +155,7 @@ jobs:
       - name: No vendor hosts in the binaries
         run: |
           found=$(grep -a -o -i -h -E '[a-z0-9.-]*(lcsc|jlcpcb|easyeda|lceda)\.(com|cn)' \
-            target/debug/copperpour target/debug/konnect target/debug/libcopperpour_plugin.so | sort -u || true)
+            target/debug/copperpour target/debug/libcopperpour_plugin.so | sort -u || true)
           if [ -n "$found" ]; then echo "$found"; exit 1; fi
       - name: Each integration builds on its own
         run: |
