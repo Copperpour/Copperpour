@@ -7,6 +7,7 @@
 //! and every footprint the sync placed reached the board with no mounting
 //! style, no exclusion flags, no description or keywords and no 3D model.
 
+use super::library::PadFabricationProperty;
 use anyhow::{bail, Context, Result};
 use copperpour_ipc::gen::kiapi;
 use copperpour_sexp::SexpNode;
@@ -55,6 +56,65 @@ pub(crate) fn description_and_keywords(
         description: root.find_str("descr").unwrap_or_default().to_string(),
         keywords: root.find_str("tags").unwrap_or_default().to_string(),
         ..Default::default()
+    }
+}
+
+/// Each pad's fabrication property, from the footprint's `pad` nodes, which
+/// `extract_pad_definitions` reads as `pads` pads in the same order.
+pub(crate) fn pad_properties(
+    pad_nodes: &[&SexpNode],
+    pads: usize,
+) -> Result<Vec<PadFabricationProperty>> {
+    if pad_nodes.len() != pads {
+        bail!("read {} pad properties for {pads} pads", pad_nodes.len());
+    }
+    Ok(pad_nodes
+        .iter()
+        .copied()
+        .map(PadFabricationProperty::of_pad)
+        .collect())
+}
+
+/// KiCad's API value for a pad's fabrication property, as
+/// `pcbnew/api/api_pcb_enums.cpp` maps `PAD_PROP`.
+pub(crate) fn fab_property(
+    property: PadFabricationProperty,
+) -> kiapi::board::types::PadFabricationProperty {
+    use kiapi::board::types::PadFabricationProperty as Proto;
+    match property {
+        PadFabricationProperty::None => Proto::PfpNone,
+        PadFabricationProperty::Bga => Proto::PfpBga,
+        PadFabricationProperty::FiducialGlobal => Proto::PfpFiducialGlobal,
+        PadFabricationProperty::FiducialLocal => Proto::PfpFiducialLocal,
+        PadFabricationProperty::Testpoint => Proto::PfpTestpoint,
+        PadFabricationProperty::Heatsink => Proto::PfpHeatsink,
+        PadFabricationProperty::Castellated => Proto::PfpCastellated,
+        PadFabricationProperty::Mechanical => Proto::PfpMechanical,
+        PadFabricationProperty::Pressfit => Proto::PfpPressfit,
+    }
+}
+
+/// Whether `version`'s API carries pad fabrication properties and reference
+/// points: both arrived in KiCad 10.0.7.
+pub(crate) fn carries_kicad_10_0_7_fields(version: &copperpour_ipc::IpcKiCadVersion) -> bool {
+    (version.major, version.minor, version.patch) >= (10, 0, 7)
+}
+
+/// The fabrication property KiCad reports for a pad, or `None` for
+/// `PFP_NONE` and for `PFP_UNKNOWN`, which KiCad before 10.0.7 sends for
+/// every pad.
+pub(crate) fn reported_fab_property(value: i32) -> Option<PadFabricationProperty> {
+    use kiapi::board::types::PadFabricationProperty as Proto;
+    match Proto::try_from(value).ok()? {
+        Proto::PfpUnknown | Proto::PfpNone => None,
+        Proto::PfpBga => Some(PadFabricationProperty::Bga),
+        Proto::PfpFiducialGlobal => Some(PadFabricationProperty::FiducialGlobal),
+        Proto::PfpFiducialLocal => Some(PadFabricationProperty::FiducialLocal),
+        Proto::PfpTestpoint => Some(PadFabricationProperty::Testpoint),
+        Proto::PfpHeatsink => Some(PadFabricationProperty::Heatsink),
+        Proto::PfpCastellated => Some(PadFabricationProperty::Castellated),
+        Proto::PfpMechanical => Some(PadFabricationProperty::Mechanical),
+        Proto::PfpPressfit => Some(PadFabricationProperty::Pressfit),
     }
 }
 

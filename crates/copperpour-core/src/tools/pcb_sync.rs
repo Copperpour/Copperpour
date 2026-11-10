@@ -8,6 +8,8 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::library::PadFabricationProperty;
+use super::library_footprint::{carries_kicad_10_0_7_fields, fab_property, reported_fab_property};
 use crate::hex::encode_hex;
 use crate::mcp::protocol::{CallToolResult, ToolContent};
 use crate::tools::{
@@ -318,8 +320,21 @@ struct PreparedFootprint {
     /// The library's properties as typed fields, or why they could not be
     /// read. Unreadable properties never refuse the part (#789).
     library_fields: std::result::Result<super::library_footprint::LibraryProperties, String>,
+    /// Each pad's fabrication property, in the order of `pads` (#149).
+    pad_properties: Vec<PadFabricationProperty>,
     width: f64,
     height: f64,
+}
+
+impl PreparedFootprint {
+    /// Each pad that has a fabrication property, by number.
+    fn fabricated_pads(&self) -> impl Iterator<Item = (&str, PadFabricationProperty)> {
+        self.pads
+            .iter()
+            .zip(&self.pad_properties)
+            .filter(|(_, property)| **property != PadFabricationProperty::None)
+            .map(|(pad, property)| (pad.number.as_str(), *property))
+    }
 }
 
 pub(crate) async fn handle_update_pcb_from_schematic(
@@ -459,6 +474,26 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             refresh_revision_with_staging(&mut plan);
             plan.diagnostics
                 .extend(library_fields_not_carried(&plan, &prepared));
+            // Asked only when a part has a pad property, so every other sync
+            // sends what it sent before #149.
+            let carry_pad_properties =
+                if prepared.values().any(|part| part.fabricated_pads().next().is_some()) {
+                    let kicad = client.get_kicad_version()?;
+                    let carried = carries_kicad_10_0_7_fields(&kicad);
+                    if !carried {
+                        plan.diagnostics
+                            .extend(pad_properties_not_carried(&plan, &prepared, &kicad));
+                        // The apply sends something else then, so a plan made
+                        // on one side of 10.0.7 is stale on the other.
+                        let mut hasher = Sha256::new();
+                        hasher.update(plan.plan_revision.as_bytes());
+                        hasher.update(b"pad_properties_not_carried");
+                        plan.plan_revision = encode_hex(&hasher.finalize());
+                    }
+                    carried
+                } else {
+                    false
+                };
 
             if dry_run || plan.status == PlanStatus::Conflict {
                 let status = match plan.status {
@@ -484,7 +519,8 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 return Ok(sync_response(&plan, "noop", hierarchy.len(), false, &options));
             }
 
-            let (creates, updates) = build_mutation_items(&plan, &prepared, &snapshot)?;
+            let (creates, updates) =
+                build_mutation_items(&plan, &prepared, &snapshot, carry_pad_properties)?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
             client.run_commit_recovering_in(snapshot.document.clone(), "Update PCB from saved schematic", |client| {
@@ -1557,6 +1593,9 @@ struct FootprintShape {
     model_files: Vec<String>,
     /// Every field by name: the mandatory four and the custom ones (#789).
     fields: BTreeMap<String, FieldShape>,
+    /// Each pad with a fabrication property, by number, sorted (#149). A pad
+    /// KiCad reports as `PFP_NONE`, or before 10.0.7 not at all, has none.
+    pad_properties: Vec<(String, PadFabricationProperty)>,
 }
 
 /// What a field shows: its text, its layer, whether it is visible and
@@ -1696,7 +1735,14 @@ fn footprint_shapes<'a>(
         }
         for child in &definition.items {
             match copperpour_ipc::builders::any_type_name(child) {
-                "kiapi.board.types.Pad" => shape.pads += 1,
+                "kiapi.board.types.Pad" => {
+                    shape.pads += 1;
+                    if let Ok(pad) = kiapi::board::types::Pad::decode(child.value.as_slice()) {
+                        if let Some(property) = reported_fab_property(pad.fab_property) {
+                            shape.pad_properties.push((pad.number, property));
+                        }
+                    }
+                }
                 "kiapi.board.types.BoardGraphicShape" | "kiapi.board.types.BoardText" => {
                     shape.drawings += 1
                 }
@@ -1718,6 +1764,7 @@ fn footprint_shapes<'a>(
             }
         }
         shape.model_files.sort();
+        shape.pad_properties.sort();
         out.insert(reference, shape);
     }
     out
@@ -1783,6 +1830,18 @@ fn verify_board_matches_what_was_sent(
                 "{reference}: sent attributes [{}], board now has [{}]",
                 want.attributes.listed(),
                 got.attributes.listed()
+            ));
+        }
+        if got.pad_properties != want.pad_properties {
+            // Only the pads that differ: on a BGA both whole lists would be
+            // cut to the same first entries.
+            let lost = sorted_difference(&want.pad_properties, &got.pad_properties);
+            let gained = sorted_difference(&got.pad_properties, &want.pad_properties);
+            suspicious.push(format!(
+                "{reference}: pad fabrication properties sent but not on the board [{}], \
+                 on the board but not sent [{}]",
+                listed_pad_properties(lost),
+                listed_pad_properties(gained)
             ));
         }
         if got.model_files != want.model_files {
@@ -2358,6 +2417,9 @@ fn prepare_footprint_source(
         .context("invalid footprint S-expression")
         .map_err(unsupported)?;
     let attributes = super::library_footprint::attributes(&root).map_err(unsupported)?;
+    let pad_properties =
+        super::library_footprint::pad_properties(&root.find_all("pad"), pads.len())
+            .map_err(unsupported)?;
     let description_and_keywords = super::library_footprint::description_and_keywords(&root);
     let models = super::library_footprint::models(&root).map_err(unsupported)?;
     let library_fields =
@@ -2380,6 +2442,7 @@ fn prepare_footprint_source(
         description_and_keywords,
         models,
         library_fields,
+        pad_properties,
         width,
         height,
     })
@@ -2617,21 +2680,7 @@ fn library_fields_not_carried(
     plan: &SyncPlan,
     prepared: &BTreeMap<String, PreparedFootprint>,
 ) -> Vec<SyncDiagnostic> {
-    let mut references: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for change in &plan.changes {
-        if let PlannedChange::Add {
-            footprint_id,
-            reference,
-            ..
-        } = change
-        {
-            references
-                .entry(footprint_id.as_str())
-                .or_default()
-                .push(reference.clone());
-        }
-    }
-    references
+    additions_by_footprint(plan)
         .into_iter()
         .filter_map(|(footprint_id, references)| {
             let reason = prepared.get(footprint_id)?.library_fields.as_ref().err()?;
@@ -2647,6 +2696,93 @@ fn library_fields_not_carried(
             ))
         })
         .collect()
+}
+
+/// Footprints the plan adds whose pads have fabrication properties a KiCad
+/// before 10.0.7 cannot take over its API (#149). They are placed without
+/// them, as KiCad's own Update Footprints from Library can still restore,
+/// rather than refusing every board with a QFN exposed pad or a BGA. The
+/// refresh refuses instead, because there the board's pads already have the
+/// property and replacing them would remove it; an added pad loses nothing.
+fn pad_properties_not_carried(
+    plan: &SyncPlan,
+    prepared: &BTreeMap<String, PreparedFootprint>,
+    kicad: &copperpour_ipc::IpcKiCadVersion,
+) -> Vec<SyncDiagnostic> {
+    additions_by_footprint(plan)
+        .into_iter()
+        .filter_map(|(footprint_id, references)| {
+            let pads = listed_pad_properties(prepared.get(footprint_id)?.fabricated_pads());
+            (!pads.is_empty()).then(|| {
+                footprint_conflict(
+                    "pad_properties_not_carried",
+                    format!(
+                        "{footprint_id} has pad fabrication properties ({pads}), which \
+                         KiCad's API carries only from KiCad 10.0.7; this KiCad is {}, so {} \
+                         will be placed without them. KiCad's Tools > Update Footprints from \
+                         Library restores them.",
+                        kicad.full_version,
+                        listed(&references)
+                    ),
+                    footprint_id,
+                    references,
+                )
+            })
+        })
+        .collect()
+}
+
+/// Pad fabrication properties for a message, one entry per pad number and
+/// property, bounded as [`listed`] bounds references.
+fn listed_pad_properties<'a>(
+    pads: impl IntoIterator<Item = (&'a str, PadFabricationProperty)>,
+) -> String {
+    let mut counts = BTreeMap::<(&str, &str), usize>::new();
+    for (number, property) in pads {
+        *counts.entry((number, property.as_str())).or_default() += 1;
+    }
+    let entries = counts
+        .into_iter()
+        .map(|((number, property), count)| match count {
+            1 => format!("pad {number}: {property}"),
+            _ => format!("pad {number}: {property} ({count} pads)"),
+        })
+        .collect::<Vec<_>>();
+    listed(&entries)
+}
+
+/// The entries of sorted `a` that sorted `b` lacks, counting repeats.
+fn sorted_difference<'a>(
+    a: &'a [(String, PadFabricationProperty)],
+    b: &[(String, PadFabricationProperty)],
+) -> Vec<(&'a str, PadFabricationProperty)> {
+    let mut b = b.iter().peekable();
+    a.iter()
+        .filter(|entry| {
+            while b.next_if(|other| *other < *entry).is_some() {}
+            b.next_if(|other| *other == *entry).is_none()
+        })
+        .map(|(number, property)| (number.as_str(), *property))
+        .collect()
+}
+
+/// Every part the plan adds, grouped by library footprint.
+fn additions_by_footprint(plan: &SyncPlan) -> BTreeMap<&str, Vec<String>> {
+    let mut references: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for change in &plan.changes {
+        if let PlannedChange::Add {
+            footprint_id,
+            reference,
+            ..
+        } = change
+        {
+            references
+                .entry(footprint_id.as_str())
+                .or_default()
+                .push(reference.clone());
+        }
+    }
+    references
 }
 
 /// Prepare every footprint the plan adds. One that cannot be prepared does
@@ -2954,10 +3090,13 @@ fn restage_additions(
 /// One footprint the plan adds, as `CreateItems` receives it: built from the
 /// library's pads, drawings and fields, given the rest of the library's data,
 /// then the schematic's reference, value, symbol path, DNP and pad nets.
+/// `carry_pad_properties` says the KiCad it goes to takes pad fabrication
+/// properties (10.0.7+).
 fn build_added_footprint(
     change: &PlannedChange,
     part: &PreparedFootprint,
     net_codes: &BTreeMap<String, i32>,
+    carry_pad_properties: bool,
 ) -> Result<prost_types::Any> {
     let PlannedChange::Add {
         reference,
@@ -2987,6 +3126,9 @@ fn build_added_footprint(
     )?;
     let mut footprint =
         copperpour_ipc::gen::kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+    if carry_pad_properties {
+        apply_pad_properties(&mut footprint, &part.pad_properties)?;
+    }
     apply_library_data(&mut footprint, part)?;
     apply_symbol_fields(&mut footprint, fields)?;
     apply_footprint_fields(
@@ -3005,10 +3147,39 @@ fn build_added_footprint(
     ))
 }
 
+/// Give each built pad its library fabrication property, as KiCad loads it.
+/// The builder emits the pads in the library's order.
+fn apply_pad_properties(
+    footprint: &mut copperpour_ipc::gen::kiapi::board::types::FootprintInstance,
+    properties: &[PadFabricationProperty],
+) -> Result<()> {
+    use copperpour_ipc::gen::kiapi::board::types::Pad;
+    let definition = footprint
+        .definition
+        .as_mut()
+        .context("built footprint has no definition")?;
+    let mut properties = properties.iter();
+    for item in &mut definition.items {
+        if copperpour_ipc::builders::any_is(item, "kiapi.board.types.Pad") {
+            let mut pad = Pad::decode(item.value.as_slice())?;
+            let property = properties
+                .next()
+                .context("typed footprint builder returned more pads than the library has")?;
+            pad.fab_property = fab_property(*property) as i32;
+            *item = copperpour_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
+        }
+    }
+    if properties.next().is_some() {
+        bail!("typed footprint builder returned fewer pads than the library has");
+    }
+    Ok(())
+}
+
 fn build_mutation_items(
     plan: &SyncPlan,
     prepared: &BTreeMap<String, PreparedFootprint>,
     snapshot: &LiveSnapshot,
+    carry_pad_properties: bool,
 ) -> Result<(Vec<prost_types::Any>, Vec<prost_types::Any>)> {
     let mut creates = Vec::new();
     let mut updates = Vec::new();
@@ -3018,7 +3189,12 @@ fn build_mutation_items(
                 let part = prepared
                     .get(footprint_id)
                     .with_context(|| format!("no prepared footprint for {footprint_id}"))?;
-                creates.push(build_added_footprint(change, part, &snapshot.net_codes)?);
+                creates.push(build_added_footprint(
+                    change,
+                    part,
+                    &snapshot.net_codes,
+                    carry_pad_properties,
+                )?);
             }
             PlannedChange::Update { kiid, .. } => {
                 let item = snapshot
@@ -5790,12 +5966,17 @@ mod tests {
         "Package_DFN_QFN:Texas_RJE0020A_VQFN-20-1EP_3x3mm_P0.45mm_EP0.675x0.76mm";
     const GENERIC_VQFN: &str = "Package_DFN_QFN:VQFN-20-1EP_3x3mm_P0.45mm_EP1.55x1.55mm";
     const STOCK_0603: &str = "Capacitor_SMD:C_0603_1608Metric";
+    /// KiCad 10.0.8's stock DFN-14 whose eight thermal-via pads carry
+    /// `(property pad_prop_heatsink)` (`tests/fixtures/issue_283_ipc.README.md`).
+    const THERMAL_DFN: &str =
+        "Package_DFN_QFN:DFN-14-1EP_3x4.5mm_P0.65mm_EP1.65x4.25mm_ThermalVias";
 
-    /// A project whose own `fp-lib-table` resolves three stock KiCad 10.0.5
+    /// A project whose own `fp-lib-table` resolves four stock KiCad 10
     /// footprints: the two with custom-shape pads that #657 met on a real
-    /// board (provenance in `tests/fixtures/custom_pads_kicad10.README.md`)
-    /// and a plain 0603. A project table shadows the global one, so these
-    /// files are the ones read whether or not KiCad is installed.
+    /// board (provenance in `tests/fixtures/custom_pads_kicad10.README.md`),
+    /// a plain 0603 and the DFN-14 with heatsink pads. A project table
+    /// shadows the global one, so these files are the ones read whether or
+    /// not KiCad is installed.
     fn project_with_stock_footprints() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let board = temp.path().join("carrier.kicad_pcb");
@@ -5804,7 +5985,7 @@ mod tests {
             include_bytes!("../../tests/fixtures/specctra_two_resistors.kicad_pcb"),
         )
         .unwrap();
-        let stock: [(&str, &[u8]); 3] = [
+        let stock: [(&str, &[u8]); 4] = [
             (
                 TEXAS_VQFN,
                 include_bytes!("../../tests/fixtures/custom_pads_texas_rje0020a_kicad10.kicad_mod"),
@@ -5816,6 +5997,12 @@ mod tests {
             (
                 STOCK_0603,
                 include_bytes!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod"),
+            ),
+            (
+                THERMAL_DFN,
+                include_bytes!(
+                    "../../tests/fixtures/issue_283_dfn14_thermalvias_kicad10.kicad_mod"
+                ),
             ),
         ];
         for (footprint_id, source) in stock {
@@ -6106,6 +6293,8 @@ mod tests {
         board_text: std::sync::Arc<std::sync::Mutex<String>>,
         /// The command each request carried, in order.
         commands: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// What `GetVersion` answers: `(major, minor, patch)`.
+        kicad_version: std::sync::Arc<std::sync::Mutex<(u32, u32, u32)>>,
     }
 
     /// A listed footprint's KIID.
@@ -6140,6 +6329,12 @@ mod tests {
         /// What was sent without its custom fields, and with Value moved back
         /// to the hidden silkscreen field the builder used to give it.
         WithoutLibraryFields,
+        /// What was sent with every pad's fabrication property cleared, as
+        /// KiCad before 10.0.7 would read it.
+        WithoutPadProperties,
+        /// What was sent, with each pad sent without a fabrication property
+        /// reported as `PFP_NONE`, as KiCad 10.0.7+ reports it.
+        UnknownPadPropertiesAsNone,
     }
 
     impl ServedSync {
@@ -6209,6 +6404,8 @@ mod tests {
             let text = board_text.clone();
             let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let seen = commands.clone();
+            let kicad_version = std::sync::Arc::new(std::sync::Mutex::new((10, 0, 8)));
+            let version = kicad_version.clone();
 
             let (temp, board) = project_with_stock_footprints();
             let schematic = temp.path().join("carrier.kicad_sch");
@@ -6236,6 +6433,20 @@ mod tests {
                 move |command| {
                     let name = command.type_url.rsplit('.').next().unwrap_or_default();
                     seen.lock().unwrap().push(name.to_string());
+                    if command.type_url.ends_with("GetVersion") {
+                        let (major, minor, patch) = *version.lock().unwrap();
+                        return Some(copperpour_ipc::builders::pack_any(
+                            &kiapi::common::commands::GetVersionResponse {
+                                version: Some(kiapi::common::types::KiCadVersion {
+                                    major,
+                                    minor,
+                                    patch,
+                                    full_version: format!("{major}.{minor}.{patch}"),
+                                }),
+                            },
+                            "kiapi.common.commands.GetVersionResponse",
+                        ));
+                    }
                     if command.type_url.ends_with("GetItems") {
                         let request =
                             kiapi::common::commands::GetItems::decode(command.value.as_slice())
@@ -6423,7 +6634,13 @@ mod tests {
                 held: held_footprints,
                 board_text,
                 commands,
+                kicad_version,
             }
+        }
+
+        /// Have `GetVersion` answer `major.minor.patch` from now on.
+        fn report_kicad_version(&self, major: u32, minor: u32, patch: u32) {
+            *self.kicad_version.lock().unwrap() = (major, minor, patch);
         }
 
         /// Have `SaveDocumentToString` answer with `text` from now on.
@@ -6567,6 +6784,28 @@ mod tests {
                             "kiapi.board.types.Footprint3DModel",
                         )
                     });
+                }
+                copperpour_ipc::builders::pack_any(
+                    &footprint,
+                    "kiapi.board.types.FootprintInstance",
+                )
+            }
+            Readback::WithoutPadProperties | Readback::UnknownPadPropertiesAsNone => {
+                use copperpour_ipc::gen::kiapi::board::types::{
+                    FootprintInstance, Pad, PadFabricationProperty,
+                };
+                let mut footprint =
+                    FootprintInstance::decode(item.value.as_slice()).expect("a footprint");
+                for child in &mut footprint.definition.as_mut().unwrap().items {
+                    if copperpour_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
+                        let mut pad = Pad::decode(child.value.as_slice()).unwrap();
+                        pad.fab_property = match readback {
+                            Readback::WithoutPadProperties => 0,
+                            _ if pad.fab_property == 0 => PadFabricationProperty::PfpNone as i32,
+                            _ => pad.fab_property,
+                        };
+                        *child = copperpour_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
+                    }
                 }
                 copperpour_ipc::builders::pack_any(
                     &footprint,
@@ -7390,6 +7629,208 @@ mod tests {
         assert!(message.contains("more than once"), "{message}");
     }
 
+    // ─── #149: pad fabrication properties ────────────────────────────────────
+
+    /// Each pad's number and fabrication property, sorted.
+    fn pad_properties_of(
+        footprint: &copperpour_ipc::gen::kiapi::board::types::FootprintInstance,
+    ) -> Vec<(String, i32)> {
+        let mut pads = footprint
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| copperpour_ipc::builders::any_is(item, "kiapi.board.types.Pad"))
+            .map(|item| {
+                let pad =
+                    copperpour_ipc::gen::kiapi::board::types::Pad::decode(item.value.as_slice())
+                        .unwrap();
+                (pad.number, pad.fab_property)
+            })
+            .collect::<Vec<_>>();
+        pads.sort();
+        pads
+    }
+
+    /// On KiCad 10.0.7+, an added footprint's pads go out with the library's
+    /// fabrication properties, as KiCad 10.0.8 itself reports the same stock
+    /// footprint placed from its library: eight `PFP_HEATSINK` pads numbered
+    /// 15 and `PFP_NONE` on the other 25.
+    #[tokio::test]
+    async fn an_added_footprint_carries_its_pad_fabrication_properties() {
+        use copperpour_ipc::gen::kiapi::board::types::{FootprintInstance, PadFabricationProperty};
+
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        let netlist = exported_netlist(&[("U1", THERMAL_DFN, &["1", "15"])]);
+
+        let applied = served.apply(&netlist).await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+        let kicad = FootprintInstance::decode(
+            include_bytes!("../../tests/fixtures/issue_283_u1.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        let expected = pad_properties_of(&kicad);
+        let heatsink = PadFabricationProperty::PfpHeatsink as i32;
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|(_, property)| *property == heatsink)
+                .count(),
+            8
+        );
+        assert_eq!(pad_properties_of(&served.sent_footprints()[0]), expected);
+        // Asked once per call: the dry run and the apply.
+        assert_eq!(served.sent("GetVersion"), 2);
+    }
+
+    /// KiCad before 10.0.7 cannot take the property over its API, so the
+    /// footprint is placed without it, and the dry run and the apply both
+    /// name the footprint, the part, the pads and the KiCad version.
+    #[tokio::test]
+    async fn pad_fabrication_properties_an_older_kicad_cannot_take_are_reported() {
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        served.report_kicad_version(10, 0, 6);
+        let netlist = exported_netlist(&[("U1", THERMAL_DFN, &["1", "15"])]);
+
+        let plan = served.dry_run(&netlist).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        let applied = served.apply(&netlist).await;
+
+        for response in [&plan, &applied] {
+            let diagnostics = response["diagnostics"].as_array().unwrap();
+            assert_eq!(diagnostics.len(), 1, "{response:#}");
+            assert_eq!(diagnostics[0]["code"], "pad_properties_not_carried");
+            assert_eq!(diagnostics[0]["footprint_id"], THERMAL_DFN);
+            assert_eq!(diagnostics[0]["references"], serde_json::json!(["U1"]));
+            let message = diagnostics[0]["message"].as_str().unwrap();
+            for part in ["pad 15: heatsink (8 pads)", "10.0.7", "10.0.6", "U1"] {
+                assert!(message.contains(part), "{part} missing from: {message}");
+            }
+        }
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        // Sent as before: KiCad 10.0.6 has no field to read.
+        assert!(pad_properties_of(&served.sent_footprints()[0])
+            .iter()
+            .all(|(_, property)| *property == 0));
+    }
+
+    /// KiCad 10.0.7+ reports `PFP_NONE` for a pad sent without a property,
+    /// which is no difference: with and without pad properties.
+    #[tokio::test]
+    async fn a_pad_reported_without_a_property_is_no_readback_difference() {
+        for (reference, footprint_id, pads) in [
+            ("C1", STOCK_0603, ["1", "2"]),
+            ("U1", THERMAL_DFN, ["1", "15"]),
+        ] {
+            let served = ServedSync::reading_back(Readback::UnknownPadPropertiesAsNone).await;
+            let applied = served
+                .apply(&exported_netlist(&[(reference, footprint_id, &pads)]))
+                .await;
+            assert_eq!(applied["status"], "applied", "{applied:#}");
+            assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+        }
+    }
+
+    /// A plan made on one side of KiCad 10.0.7 is stale on the other: the
+    /// apply would send something the dry run didn't describe.
+    #[tokio::test]
+    async fn a_plan_is_stale_across_the_kicad_version_that_carries_pad_properties() {
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        let netlist = exported_netlist(&[("U1", THERMAL_DFN, &["1", "15"])]);
+        for (planned_on, applied_on) in [(6, 8), (8, 6)] {
+            served.report_kicad_version(10, 0, planned_on);
+            let plan = served.dry_run(&netlist).await;
+            assert_eq!(plan["status"], "ready", "{plan:#}");
+            served.report_kicad_version(10, 0, applied_on);
+            let (_, applied) = served
+                .sync(
+                    &netlist,
+                    serde_json::json!({
+                        "dry_run": false,
+                        "expected_plan_revision": plan["plan_revision"],
+                    }),
+                )
+                .await;
+            assert_eq!(applied["status"], "conflict", "{applied:#}");
+            let codes = applied["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|diagnostic| diagnostic["code"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert!(codes.contains(&"stale_plan_revision"), "{applied:#}");
+        }
+        assert!(served.sent_footprints().is_empty());
+    }
+
+    /// The readback names only the pads that differ, so a BGA's one lost
+    /// pad isn't hidden behind the same first entries of two long lists.
+    #[test]
+    fn the_readback_names_only_the_pads_whose_property_differs() {
+        let bga = |number: &str| (number.to_string(), PadFabricationProperty::Bga);
+        let mut sent = (1..=20).map(|n| bga(&format!("A{n}"))).collect::<Vec<_>>();
+        sent.push(bga("A1"));
+        sent.sort();
+        let kept = sent
+            .iter()
+            .filter(|(number, _)| number != "A17")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sorted_difference(&sent, &kept),
+            [("A17", PadFabricationProperty::Bga)]
+        );
+        assert!(sorted_difference(&kept, &sent).is_empty());
+        // A repeated number counts: one of the two A1 pads lost it.
+        let one_a1 = sent[1..].to_vec();
+        assert_eq!(sent[0].0, "A1");
+        assert_eq!(
+            sorted_difference(&sent, &one_a1),
+            [("A1", PadFabricationProperty::Bga)]
+        );
+    }
+
+    /// A sync whose footprints have no pad property never asks KiCad its
+    /// version, so it sends what it sent before #149.
+    #[tokio::test]
+    async fn a_footprint_without_pad_properties_never_asks_the_kicad_version() {
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+
+        let applied = served
+            .apply(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(served.sent("GetVersion"), 0);
+    }
+
+    /// A board that comes back without the pad properties that were sent is
+    /// reported, as a lost attribute or model is.
+    #[tokio::test]
+    async fn pad_fabrication_properties_the_board_lost_are_reported() {
+        let served = ServedSync::reading_back(Readback::WithoutPadProperties).await;
+
+        let applied = served
+            .apply(&exported_netlist(&[("U1", THERMAL_DFN, &["1", "15"])]))
+            .await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        let diagnostics = applied["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1, "{applied:#}");
+        assert_eq!(diagnostics[0]["code"], "board_readback_differs");
+        let message = diagnostics[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains(
+                "U1: pad fabrication properties sent but not on the board \
+                 [pad 15: heatsink (8 pads)], on the board but not sent []"
+            ),
+            "{message}"
+        );
+    }
+
     /// The apply reports the same `staging` evidence as the dry run, owed
     /// from #799: both read it off the plan made against the snapshot.
     #[tokio::test]
@@ -7433,7 +7874,8 @@ mod tests {
             fields: Vec::new(),
         };
         let built_dnp = |part: &PreparedFootprint, dnp: bool| {
-            let item = build_added_footprint(&addition(dnp), part, &BTreeMap::new()).unwrap();
+            let item =
+                build_added_footprint(&addition(dnp), part, &BTreeMap::new(), false).unwrap();
             let footprint =
                 kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
             let attributes = footprint.attributes.unwrap();
