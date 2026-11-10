@@ -483,6 +483,16 @@ impl McpHandler {
                         Some("invalid_argument".to_string()),
                     )
                 }
+                // The write replaced the file, so whatever the handler made of
+                // the error, the caller must reload before retrying (#418).
+                Err(e) if crate::tools::readback_mismatch_path(&e).is_some() => {
+                    let path = crate::tools::readback_mismatch_path(&e).expect("guard matched");
+                    (
+                        crate::tools::readback_mismatch_result(path, name),
+                        CallStatus::Error,
+                        Some("mutation_outcome_uncertain".to_string()),
+                    )
+                }
                 Err(e) if kicad_editor_locked_path(&e).is_some() => {
                     let locked = kicad_editor_locked_path(&e).expect("guard matched");
                     let path = locked.display().to_string();

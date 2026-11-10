@@ -347,6 +347,30 @@ fn overwrite_rejects_a_stale_loaded_revision() {
     );
 }
 
+/// #418: another program saving after the rename is not a refusal. The
+/// file was replaced, so the error says so.
+#[test]
+fn overwrite_reports_a_failed_readback_as_a_mismatch() {
+    use copperpour_sexp::writer::test_hooks;
+    let tmp = fresh_minimal_file();
+    let mut schematic = Schematic::load(tmp.path()).unwrap();
+    schematic
+        .symbols
+        .by_reference_mut("R1")
+        .unwrap()
+        .set_value_str("4.7k");
+    test_hooks::save_after_replace(tmp.path(), minimal_sch());
+
+    let error = schematic.overwrite().unwrap_err();
+
+    assert!(!test_hooks::armed(tmp.path()));
+    assert!(
+        matches!(&error, Error::ReadbackMismatch(path) if path == tmp.path()),
+        "{error:?}"
+    );
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), minimal_sch());
+}
+
 #[test]
 fn repeated_overwrites_advance_the_owned_revision_baseline() {
     let tmp = fresh_minimal_file();

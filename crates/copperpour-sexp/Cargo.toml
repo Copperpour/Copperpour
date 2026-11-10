@@ -18,6 +18,10 @@ dirs.workspace = true
 fs4.workspace = true
 sha2.workspace = true
 
+[features]
+# `writer::test_hooks`, for dependents' tests only; never in a release build.
+test-hooks = []
+
 [dev-dependencies]
 pretty_assertions = "1"
 proptest = "1"

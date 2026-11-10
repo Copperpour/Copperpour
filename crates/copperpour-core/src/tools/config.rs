@@ -249,9 +249,9 @@ fn update_config(
                 ),
             ));
         }
-        // Everything else proves nothing about the disk: the conditional
-        // writer returns `Conflict` both before a replacement and after one
-        // whose readback differs (#579), and an I/O error can follow either.
+        // Everything else is reported as uncertain: a readback mismatch
+        // follows a replacement (#579), and an I/O error can come before or
+        // after one.
         Err(error) => {
             return Err(super::file_outcome_uncertain(
                 path,
@@ -1117,12 +1117,12 @@ mod config_state_tests {
                 "save_user_config",
                 set_key("ui.theme", json!("dark")),
                 |target, expected, content| {
+                    let path = target.to_path_buf();
                     if after_replacement {
                         persist_config(target, expected, content).unwrap();
+                        return Err(SexpError::ReadbackMismatch { path });
                     }
-                    Err(SexpError::Conflict {
-                        path: target.to_path_buf(),
-                    })
+                    Err(SexpError::Conflict { path })
                 },
             )
             .err()

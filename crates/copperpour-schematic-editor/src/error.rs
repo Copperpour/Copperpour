@@ -15,6 +15,10 @@ pub enum Error {
     #[error("write conflict: '{0}' changed since it was loaded")]
     Conflict(PathBuf),
 
+    /// The file was replaced but did not read back as written.
+    #[error("readback mismatch: '{0}' was replaced but did not read back as written")]
+    ReadbackMismatch(PathBuf),
+
     #[error("KiCad editor lock blocks write to '{path}': {lock_path}")]
     KiCadEditorLocked { path: PathBuf, lock_path: PathBuf },
 }

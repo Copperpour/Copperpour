@@ -2181,14 +2181,14 @@ mod tests {
                 &path,
                 AnnotateOptions::default(),
                 |target, expected, prospective| {
+                    let path = target.to_path_buf();
                     if after_replacement {
                         // Execute the real conditional atomic replacement, then
-                        // simulate the writer's post-write readback conflict.
+                        // simulate the writer's failed post-write readback.
                         write_atomic_if_unchanged(target, expected, prospective).unwrap();
+                        return Err(SexpError::ReadbackMismatch { path });
                     }
-                    Err(SexpError::Conflict {
-                        path: target.to_path_buf(),
-                    })
+                    Err(SexpError::Conflict { path })
                 },
             );
             let saved = std::fs::read_to_string(&path).unwrap();

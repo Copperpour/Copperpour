@@ -388,7 +388,7 @@ impl SchematicBuilder {
 fn verify_saved_schematic(path: &Path, expected: &str) -> anyhow::Result<()> {
     let observed = read_consistent(path)?;
     if observed != expected {
-        return Err(SexpError::Conflict {
+        return Err(SexpError::ReadbackMismatch {
             path: path.to_path_buf(),
         }
         .into());
@@ -610,6 +610,22 @@ mod tests {
             "(kicad_sch (lib_symbols) (wire (start 0 0) (end 1 1)) (paper \"A4\"))"
         )
         .is_err());
+    }
+
+    /// #418: the save's own readback comes after the file was written, so a
+    /// difference there is a mismatch, not a refusal.
+    #[test]
+    fn a_saved_file_that_reads_back_differently_is_a_readback_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("saved.kicad_sch");
+        std::fs::write(&path, "another program's save").unwrap();
+
+        let error = verify_saved_schematic(&path, &hierarchical_fixture()).unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<SexpError>(),
+            Some(SexpError::ReadbackMismatch { .. })
+        ));
     }
 
     #[test]

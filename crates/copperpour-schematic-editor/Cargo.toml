@@ -14,3 +14,5 @@ copperpour-sexp.workspace = true  # For geometry (pin transforms, snap, T-juncti
 
 [dev-dependencies]
 tempfile = "3"
+# A save between a write and its readback (#418).
+copperpour-sexp = { workspace = true, features = ["test-hooks"] }

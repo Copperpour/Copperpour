@@ -1211,10 +1211,11 @@ pub(crate) enum ClosedBoardError {
 }
 
 impl ClosedBoardError {
-    /// The result to hand back. Never `Err`: every one of these is something
-    /// the caller can act on, and all of them leave the board untouched.
-    pub(crate) fn into_result(self) -> CallToolResult {
-        match self {
+    /// The result to hand back: something the caller can act on, with the
+    /// board untouched. A readback mismatch after the write is the one `Err`,
+    /// for dispatch to report as an uncertain outcome (#418).
+    pub(crate) fn into_result(self) -> anyhow::Result<CallToolResult> {
+        Ok(match self {
             Self::ReferenceNotFound(reference) => CallToolResult::error_kind(
                 crate::mcp::error::ToolErrorKind::InvalidArgument {
                     field: "reference".to_string(),
@@ -1246,8 +1247,11 @@ impl ClosedBoardError {
                 },
                 format!("Refusing to flip: {reason}. The board file was not modified."),
             ),
+            Self::Io(error) if crate::tools::readback_mismatch_path(&error).is_some() => {
+                return Err(error)
+            }
             Self::Io(error) => CallToolResult::error(format!("{error:#}")),
-        }
+        })
     }
 }
 
@@ -1326,7 +1330,7 @@ fn closed_board_dry_run(
     board_path: &Path,
     updates: &[(String, FootprintPlacementUpdate)],
     reason: &NoLiveBoard,
-) -> CallToolResult {
+) -> anyhow::Result<CallToolResult> {
     let planned = read_consistent(board_path)
         .map_err(|error| ClosedBoardError::Io(error.into()))
         .and_then(|content| {
@@ -1355,14 +1359,14 @@ fn closed_board_dry_run(
                 .collect::<Result<Vec<_>, _>>()
         });
     match planned {
-        Ok(placements) => CallToolResult::json(&json!({
+        Ok(placements) => Ok(CallToolResult::json(&json!({
             "dry_run": true,
             "count": placements.len(),
             "placements": placements,
             "source": "file",
             "fallback_reason": reason.evidence(),
             "copper_check": pcb_copper_check::not_run_on_closed_board()
-        })),
+        }))),
         Err(error) => error.into_result(),
     }
 }
@@ -2733,11 +2737,11 @@ async fn handle_move_component(
         BoardWrite::Ipc(Checked::Blocked(check)) => Ok(check.blocked_result("move_component")),
         BoardWrite::Ipc(Checked::DryRun(check)) => Ok(check.dry_run_result()),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File(reason) if options.dry_run => Ok(closed_board_dry_run(
+        BoardWrite::File(reason) if options.dry_run => closed_board_dry_run(
             &board,
             &[(reference, FootprintPlacementUpdate::Move { x, y })],
             &reason,
-        )),
+        ),
         BoardWrite::File(reason) => {
             match update_closed_board_footprint(
                 &board,
@@ -2753,7 +2757,7 @@ async fn handle_move_component(
                     "warning": reason.warning(),
                     "copper_check": pcb_copper_check::not_run_on_closed_board()
                 }))),
-                Err(error) => Ok(error.into_result()),
+                Err(error) => error.into_result(),
             }
         }
     }
@@ -2864,11 +2868,11 @@ async fn handle_rotate_component(
         BoardWrite::Ipc(Checked::Blocked(check)) => Ok(check.blocked_result("rotate_component")),
         BoardWrite::Ipc(Checked::DryRun(check)) => Ok(check.dry_run_result()),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File(reason) if options.dry_run => Ok(closed_board_dry_run(
+        BoardWrite::File(reason) if options.dry_run => closed_board_dry_run(
             &board,
             &[(reference, FootprintPlacementUpdate::Rotate { rotation })],
             &reason,
-        )),
+        ),
         BoardWrite::File(reason) => {
             match update_closed_board_footprint(
                 &board,
@@ -2883,7 +2887,7 @@ async fn handle_rotate_component(
                     "warning": reason.warning(),
                     "copper_check": pcb_copper_check::not_run_on_closed_board()
                 }))),
-                Err(error) => Ok(error.into_result()),
+                Err(error) => error.into_result(),
             }
         }
     }
@@ -3005,7 +3009,7 @@ async fn handle_set_component_placements(
                     )
                 })
                 .collect();
-            Ok(closed_board_dry_run(&board, &updates, &reason))
+            closed_board_dry_run(&board, &updates, &reason)
         }
         BoardWrite::File(reason) => match update_closed_board_footprints(&board, &placements) {
             Ok(applied) => Ok(CallToolResult::json(&json!({
@@ -3016,7 +3020,7 @@ async fn handle_set_component_placements(
                 "warning": reason.warning(),
                 "copper_check": pcb_copper_check::not_run_on_closed_board()
             }))),
-            Err(error) => Ok(error.into_result()),
+            Err(error) => error.into_result(),
         },
     }
 }
@@ -3073,7 +3077,7 @@ async fn handle_flip_component(
                     "fallback_reason": reason.evidence(),
                     "warning": reason.warning()
                 }))),
-                Err(error) => Ok(error.into_result()),
+                Err(error) => error.into_result(),
             }
         }
     }
@@ -6824,7 +6828,7 @@ mod tests {
             "(layers (0 \"F.Cu\" signal) (6 \"In2.Cu\" signal) (2 \"B.Cu\" signal))\n  (net 0 \"\")",
         );
         let error = prepare_closed_board_footprint_side(&irregular, "U1", "B.Cu").unwrap_err();
-        let result = error.into_result();
+        let result = error.into_result().unwrap();
         assert_eq!(
             crate::mcp::error::extract_error_kind(&result).as_deref(),
             Some("plan_blocked")
