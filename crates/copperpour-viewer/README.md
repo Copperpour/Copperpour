@@ -32,6 +32,18 @@ shutdown; `shutdown().await` also waits for the render worker and HTTP service.
 Accepted HTTP/1 connections are owned tasks, with one second to drain before
 forced closure, so a slow response cannot outlive the viewer. An in-progress
 response may be interrupted when its owner shuts down.
+Connection-aborted/reset/refused accept errors are retried immediately. Other
+accept errors (including file-descriptor pressure) are logged and retried after
+one second; shutdown interrupts that backoff. Accepted connections remain owned
+and retain the same bounded drain behavior.
+
+Startup renders each unchanged sheet once. Source modification times and lengths
+are recorded before discovery reads, then checked after watches are installed.
+Only changed sources and newly discovered sheets need catch-up rendering; a
+changed sibling project invalidates all sheets. Unavailable revision metadata
+conservatively requests catch-up. An unchanged startup stays at revision 1 until
+an actual update or explicit refresh; revision is an opaque change marker.
+
 On viewer shutdown, in-flight CLI processes are killed and reaped. Opening KiCad is
 an explicit authenticated user action; that GUI is allowed to outlive the viewer.
 Its response establishes process spawn, not that an editor became ready.

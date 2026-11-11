@@ -21,7 +21,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::{
     sync::{mpsc, oneshot, watch, RwLock},
@@ -82,7 +82,14 @@ impl BrowserViewer {
         let root = root
             .canonicalize()
             .map_err(|e| format!("resolve schematic: {e}"))?;
-        let sheets = checked_sheets(&root)?;
+        let mut revisions = HashMap::new();
+        let sheets = checked_sheets_observed(&root, &mut |path| {
+            revisions
+                .entry(path.to_path_buf())
+                .or_insert_with(|| source_revision(path));
+        })?;
+        let project = root.with_extension("kicad_pro");
+        revisions.insert(project.clone(), source_revision(&project));
         let (stop, stop_rx) = watch::channel(false);
         let (svg, errors) = render(&root, &sheets, cli, render_timeout, stop_rx.clone()).await;
         let root_file = root.to_string_lossy().into_owned();
@@ -116,11 +123,7 @@ impl BrowserViewer {
             port,
         });
         let (changes, change_rx) = mpsc::unbounded_channel();
-        // Close the render-to-watch installation gap with an initial invalidation.
-        let _ = changes.send(Change {
-            paths: Vec::new(),
-            error: None,
-        });
+        let notifications = changes.clone();
         let mut watcher =
             notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
                 let relevant = match &event {
@@ -140,7 +143,7 @@ impl BrowserViewer {
                         .map(|event| event.paths.clone())
                         .unwrap_or_default();
                     let error = event.err().map(|e| format!("watcher: {e}"));
-                    let _ = changes.send(Change { paths, error });
+                    let _ = notifications.send(Change { paths, error });
                 }
             })
             .map_err(|e| format!("create watcher: {e}"))?;
@@ -149,6 +152,19 @@ impl BrowserViewer {
             watcher
                 .watch(dir, RecursiveMode::NonRecursive)
                 .map_err(|e| format!("watch {}: {e}", dir.display()))?;
+        }
+        // Watches now cover edits after this check. Catch only sources that
+        // changed since discovery/snapshotting, rather than rendering all twice.
+        let changed = startup_changes(
+            &revisions,
+            &project,
+            &shared.cache.read().await.snapshot.sheets,
+        );
+        if !changed.is_empty() {
+            let _ = changes.send(Change {
+                paths: changed,
+                error: None,
+            });
         }
         let watcher = Arc::new(std::sync::Mutex::new(Some(watcher)));
         let worker = tokio::spawn(worker(
@@ -215,14 +231,44 @@ impl Drop for BrowserViewer {
 async fn serve_owned(
     listener: tokio::net::TcpListener,
     app: Router,
-    mut stop: watch::Receiver<bool>,
+    stop: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
+    serve_accepting(|| listener.accept(), app, stop).await
+}
+
+// The accept seam permits deterministic transient-error tests without changing
+// the process-wide file-descriptor limit or depending on OS socket races.
+async fn serve_accepting<F, Fut>(
+    mut accept: F,
+    app: Router,
+    mut stop: watch::Receiver<bool>,
+) -> std::io::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+        Output = std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>,
+    >,
+{
     let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             _ = stop.changed() => break,
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+            accepted = accept() => {
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        if !matches!(error.kind(), std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset)
+                        {
+                            tracing::error!(%error, "viewer accept failed; retrying in one second");
+                            tokio::select! {
+                                _ = stop.changed() => break,
+                                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                            }
+                        }
+                        continue;
+                    }
+                };
                 let service = hyper_util::service::TowerToHyperService::new(app.clone());
                 let mut stopping = stop.clone();
                 connections.spawn(async move {
@@ -246,12 +292,57 @@ async fn serve_owned(
     Ok(())
 }
 
+#[derive(PartialEq, Eq)]
+enum SourceRevision {
+    Missing,
+    Known(SystemTime, u64),
+    Unavailable,
+}
+fn source_revision(path: &Path) -> SourceRevision {
+    match std::fs::metadata(path) {
+        Ok(metadata) => match metadata.modified() {
+            Ok(modified) => SourceRevision::Known(modified, metadata.len()),
+            Err(_) => SourceRevision::Unavailable,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => SourceRevision::Missing,
+        Err(_) => SourceRevision::Unavailable,
+    }
+}
+fn startup_changes(
+    before: &HashMap<PathBuf, SourceRevision>,
+    project: &Path,
+    sheets: &[crate::SheetEntry],
+) -> Vec<PathBuf> {
+    let changed: Vec<_> = before
+        .iter()
+        .filter(|(path, revision)| {
+            **revision == SourceRevision::Unavailable || **revision != source_revision(path)
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+    // Project settings affect every sheet, including ones whose source is stable.
+    if changed.iter().any(|path| path == project) {
+        sheets
+            .iter()
+            .map(|sheet| PathBuf::from(&sheet.file))
+            .collect()
+    } else {
+        changed
+    }
+}
+
 fn checked_sheets(root: &Path) -> Result<Vec<crate::SheetEntry>, String> {
+    checked_sheets_observed(root, &mut |_| {})
+}
+fn checked_sheets_observed(
+    root: &Path,
+    before_read: &mut impl FnMut(&Path),
+) -> Result<Vec<crate::SheetEntry>, String> {
     if root.extension().and_then(|s| s.to_str()) != Some("kicad_sch") || !root.is_file() {
         return Err("viewer root must be a schematic file".into());
     }
     let base = root.parent().ok_or("schematic has no parent")?;
-    let sheets = crate::walk_sheet_tree(root);
+    let sheets = crate::walk_sheet_tree_observed(root, before_read);
     let known: HashSet<_> = sheets
         .iter()
         .map(|entry| PathBuf::from(&entry.file).canonicalize())
@@ -912,7 +1003,7 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</t
             tokio::time::timeout(Duration::from_secs(6), async {
                 loop {
                     let state = self.state().await;
-                    if state["revision"].as_u64().unwrap() >= 2 && state["rendering"] == false {
+                    if state["rendering"] == false {
                         return state;
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -927,6 +1018,344 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</t
                 .append_pair("file", &file.to_string_lossy());
             url.to_string()
         }
+    }
+    async fn assert_accept_recovery(errors: Vec<std::io::ErrorKind>, minimum: Duration) {
+        let listener = Arc::new(
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap(),
+        );
+        let address = listener.local_addr().unwrap();
+        let mut errors = std::collections::VecDeque::from(errors);
+        let (stop, rx) = watch::channel(false);
+        let server = tokio::spawn(async move {
+            serve_accepting(
+                move || {
+                    let error = errors.pop_front();
+                    let listener = listener.clone();
+                    async move {
+                        if let Some(error) = error {
+                            Err(std::io::Error::from(error))
+                        } else {
+                            listener.accept().await
+                        }
+                    }
+                },
+                Router::new().route("/", get(|| async { "recovered" })),
+                rx,
+            )
+            .await
+        });
+        let start = tokio::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            reqwest::get(format!("http://{address}/")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "recovered");
+        assert!(
+            start.elapsed() >= minimum,
+            "resource-pressure errors must back off"
+        );
+        stop.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn browser_accept_retries_connection_errors_without_backoff() {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            assert_accept_recovery(
+                vec![
+                    std::io::ErrorKind::ConnectionAborted,
+                    std::io::ErrorKind::ConnectionReset,
+                    std::io::ErrorKind::ConnectionRefused,
+                ],
+                Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("connection errors must not back off on each retry");
+    }
+    #[tokio::test]
+    async fn browser_accept_recovers_after_resource_pressure_with_backoff() {
+        assert_accept_recovery(vec![std::io::ErrorKind::Other], Duration::from_secs(1)).await;
+    }
+    #[tokio::test]
+    async fn browser_shutdown_interrupts_accept_error_backoff() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = started.clone();
+        let (stop, rx) = watch::channel(false);
+        let server = tokio::spawn(serve_accepting(
+            move || {
+                notify.notify_one();
+                std::future::ready(Err(std::io::Error::from(std::io::ErrorKind::Other)))
+            },
+            Router::new(),
+            rx,
+        ));
+        started.notified().await;
+        stop.send_replace(true);
+        tokio::time::timeout(Duration::from_millis(500), server)
+            .await
+            .expect("shutdown must interrupt backoff")
+            .unwrap()
+            .unwrap();
+    }
+    fn add_child(root: &Path, name: &str, file: &str) {
+        let mut sch = copperpour_schematic_editor::Schematic::load(root).unwrap();
+        sch.add_sheet(copperpour_schematic_editor::Sheet::new(
+            name, file, 50.0, 50.0, 80.0, 50.0,
+        ));
+        sch.overwrite().unwrap();
+    }
+    #[tokio::test]
+    async fn browser_startup_renders_each_unchanged_sheet_only_once() {
+        let fixture = Fixture::new();
+        let child = fixture.root.parent().unwrap().join("child.kicad_sch");
+        std::fs::copy(&fixture.root, &child).unwrap();
+        add_child(&fixture.root, "child", "child.kicad_sch");
+        let viewer = fixture.start().await;
+        let client = Client::new(&viewer);
+        tokio::time::sleep(crate::QUIET_WINDOW * 2).await;
+        let state = client.state().await;
+        assert_eq!(state["revision"], 1);
+        assert_eq!(state["rendering"], false);
+        let calls = std::fs::read_to_string(fixture.cli.with_extension("calls")).unwrap();
+        assert_eq!(calls.lines().count(), 2, "{calls}");
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|name| *name == "child.kicad_sch")
+                .count(),
+            1
+        );
+        viewer.shutdown().await;
+    }
+    #[tokio::test]
+    async fn browser_startup_catches_edits_and_new_children_without_rerendering_stable_sheets() {
+        let fixture = Fixture::new();
+        let child = fixture.root.parent().unwrap().join("child.kicad_sch");
+        let added = fixture.root.parent().unwrap().join("added.kicad_sch");
+        std::fs::copy(&fixture.root, &child).unwrap();
+        std::fs::copy(&fixture.root, &added).unwrap();
+        add_child(&fixture.root, "child", "child.kicad_sch");
+        // Initial snapshots already exist when the first CLI call pauses.
+        let script = std::fs::read_to_string(&fixture.cli).unwrap().replace(
+            "mkdir -p",
+            "touch \"$0.started\"\nwhile [ ! -f \"$0.continue\" ]; do sleep 0.02; done\nmkdir -p",
+        );
+        std::fs::write(&fixture.cli, script).unwrap();
+        let root = fixture.root.clone();
+        let cli = fixture.cli.to_string_lossy().into_owned();
+        let starting = tokio::spawn(async move {
+            BrowserViewer::start(&root, &cli, Duration::from_secs(5))
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while !fixture.cli.with_extension("started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        add_child(&child, "added", "added.kicad_sch");
+        let expected_size = std::fs::metadata(&child).unwrap().len();
+        std::fs::write(fixture.cli.with_extension("continue"), "").unwrap();
+        let viewer = starting.await.unwrap();
+        let client = Client::new(&viewer);
+        let state = wait_revision(&client, 1).await;
+        assert_eq!(state["sheets"].as_array().unwrap().len(), 3);
+        let calls = std::fs::read_to_string(fixture.cli.with_extension("calls")).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|name| *name == "root.revision.kicad_sch")
+                .count(),
+            1,
+            "stable root rendered again: {calls}"
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|name| *name == "child.kicad_sch")
+                .count(),
+            2,
+            "changed child was not refreshed: {calls}"
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|name| *name == "added.kicad_sch")
+                .count(),
+            1,
+            "new child missing: {calls}"
+        );
+        let svg = client
+            .http
+            .get(client.sheet_url(&child))
+            .bearer_auth(&client.token)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            svg.contains(&format!(">{expected_size}</text>")),
+            "stale startup SVG: {svg}"
+        );
+        viewer.shutdown().await;
+    }
+    #[test]
+    fn browser_startup_records_sources_before_discovery_reads() {
+        let fixture = Fixture::new();
+        let child = fixture.root.parent().unwrap().join("child.kicad_sch");
+        std::fs::copy(&fixture.root, &child).unwrap();
+        let mut revisions = HashMap::new();
+        let mut edited = false;
+        let sheets = checked_sheets_observed(&fixture.root, &mut |path| {
+            revisions
+                .entry(path.to_path_buf())
+                .or_insert_with(|| source_revision(path));
+            if path == fixture.root && !edited {
+                edited = true;
+                let modified = std::fs::metadata(&fixture.root)
+                    .unwrap()
+                    .modified()
+                    .unwrap();
+                add_child(&fixture.root, "child", "child.kicad_sch");
+                // Keep mtime stable to pin the length fallback independently.
+                std::fs::File::open(&fixture.root)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            sheets.len(),
+            2,
+            "discovery must read after revision observation"
+        );
+        assert_eq!(
+            startup_changes(
+                &revisions,
+                &fixture.root.with_extension("kicad_pro"),
+                &sheets
+            ),
+            vec![fixture.root]
+        );
+    }
+    #[test]
+    fn browser_startup_project_changes_invalidate_every_sheet_and_unknown_revisions_retry() {
+        let fixture = Fixture::new();
+        let child = fixture.root.parent().unwrap().join("child.kicad_sch");
+        std::fs::copy(&fixture.root, &child).unwrap();
+        add_child(&fixture.root, "child", "child.kicad_sch");
+        let sheets = checked_sheets(&fixture.root).unwrap();
+        let project = fixture.root.with_extension("kicad_pro");
+        let mut revisions: HashMap<_, _> = sheets
+            .iter()
+            .map(|sheet| {
+                (
+                    PathBuf::from(&sheet.file),
+                    source_revision(Path::new(&sheet.file)),
+                )
+            })
+            .collect();
+        revisions.insert(project.clone(), source_revision(&project));
+        assert!(
+            startup_changes(&revisions, &project, &sheets).is_empty(),
+            "absent project is stable"
+        );
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../copperpour-core/tests/fixtures/specctra_rounded_outline.kicad_pro"),
+            &project,
+        )
+        .unwrap();
+        let changed: HashSet<_> = startup_changes(&revisions, &project, &sheets)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            changed,
+            sheets
+                .iter()
+                .map(|sheet| PathBuf::from(&sheet.file))
+                .collect()
+        );
+        revisions.insert(project.clone(), source_revision(&project));
+        let modified = std::fs::metadata(&project).unwrap().modified().unwrap();
+        std::fs::File::open(&project)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified + Duration::from_secs(2)))
+            .unwrap();
+        let changed: HashSet<_> = startup_changes(&revisions, &project, &sheets)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            changed,
+            sheets
+                .iter()
+                .map(|sheet| PathBuf::from(&sheet.file))
+                .collect(),
+            "mtime-only project change must refresh all sheets"
+        );
+        revisions.insert(project.clone(), source_revision(&project));
+        revisions.insert(child.clone(), SourceRevision::Unavailable);
+        assert_eq!(startup_changes(&revisions, &project, &sheets), vec![child]);
+        // Both observations can fail, so equality of unavailable metadata must
+        // never establish that a source stayed unchanged.
+        let unavailable = fixture.root.join("not-a-directory.kicad_sch");
+        let unknown = HashMap::from([(unavailable.clone(), source_revision(&unavailable))]);
+        assert!(matches!(unknown[&unavailable], SourceRevision::Unavailable));
+        assert_eq!(
+            startup_changes(&unknown, &project, &sheets),
+            vec![unavailable]
+        );
+    }
+    #[test]
+    fn browser_parent_traversal_inside_root_gets_the_lexical_refusal() {
+        let fixture = Fixture::new();
+        std::fs::create_dir(fixture.root.parent().unwrap().join("sub")).unwrap();
+        std::fs::copy(
+            &fixture.root,
+            fixture.root.parent().unwrap().join("inside.kicad_sch"),
+        )
+        .unwrap();
+        add_child(&fixture.root, "inside", "sub/../inside.kicad_sch");
+        let error = checked_sheets(&fixture.root).unwrap_err();
+        assert!(
+            error.contains("relative child paths without parent traversal"),
+            "{error}"
+        );
+    }
+    #[test]
+    fn browser_parent_traversal_outside_root_gets_the_lexical_refusal_first() {
+        let fixture = Fixture::new();
+        let folder = fixture.root.parent().unwrap().join("project");
+        std::fs::create_dir(&folder).unwrap();
+        let root = folder.join("root.kicad_sch");
+        std::fs::copy(&fixture.root, &root).unwrap();
+        std::fs::copy(
+            &fixture.root,
+            fixture.root.parent().unwrap().join("outside.kicad_sch"),
+        )
+        .unwrap();
+        add_child(&root, "outside", "../outside.kicad_sch");
+        let error = checked_sheets(&root).unwrap_err();
+        assert!(
+            error.contains("relative child paths without parent traversal"),
+            "{error}"
+        );
     }
     #[test]
     fn svg_validation_accepts_kicad_doctype_but_never_resolves_entities() {

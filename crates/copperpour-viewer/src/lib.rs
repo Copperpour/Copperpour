@@ -36,6 +36,15 @@ const MAX_SHEET_DEPTH: usize = 20;
 /// `validate_sheet_pins`/`get_sheet_hierarchy` tools are where that's
 /// surfaced loudly.
 pub fn walk_sheet_tree(root: &Path) -> Vec<SheetEntry> {
+    walk_sheet_tree_observed(root, &mut |_| {})
+}
+
+/// Capture source revisions before discovery reads them, so the browser can
+/// reconcile edits made during discovery/rendering before watches are installed.
+pub(crate) fn walk_sheet_tree_observed(
+    root: &Path,
+    before_read: &mut impl FnMut(&Path),
+) -> Vec<SheetEntry> {
     let root_name = root
         .file_stem()
         .unwrap_or_default()
@@ -43,7 +52,7 @@ pub fn walk_sheet_tree(root: &Path) -> Vec<SheetEntry> {
         .to_string();
     let mut out = Vec::new();
     let mut visited = HashSet::new();
-    walk_sheet_tree_inner(root, &root_name, 0, &mut visited, &mut out);
+    walk_sheet_tree_inner(root, &root_name, 0, &mut visited, &mut out, before_read);
     out
 }
 
@@ -53,6 +62,7 @@ fn walk_sheet_tree_inner(
     depth: usize,
     visited: &mut HashSet<PathBuf>,
     out: &mut Vec<SheetEntry>,
+    before_read: &mut impl FnMut(&Path),
 ) {
     if depth > MAX_SHEET_DEPTH {
         return;
@@ -68,12 +78,20 @@ fn walk_sheet_tree_inner(
         depth,
     });
 
+    before_read(path);
     if let Ok(sch) = copperpour_schematic_editor::Schematic::load(path) {
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         for sheet in sch.sheets.iter() {
             let child_path = dir.join(sheet.file());
             if child_path.exists() {
-                walk_sheet_tree_inner(&child_path, sheet.name(), depth + 1, visited, out);
+                walk_sheet_tree_inner(
+                    &child_path,
+                    sheet.name(),
+                    depth + 1,
+                    visited,
+                    out,
+                    before_read,
+                );
             }
         }
     }
