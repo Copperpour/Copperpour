@@ -1079,6 +1079,98 @@ pub(crate) fn readback_mismatch_result(path: &std::path::Path, operation: &str) 
     )
 }
 
+/// A KiCad editor lock that refused a write: the document, its lock file, and
+/// why the lock file could not be inspected, when that is what happened.
+pub(crate) struct LockedDocument<'e> {
+    pub path: &'e std::path::Path,
+    pub lock_path: &'e std::path::Path,
+    pub inspection_error: Option<&'e str>,
+}
+
+/// The KiCad editor lock that `error` reports.
+pub(crate) fn kicad_editor_lock<'e>(
+    error: &'e (dyn std::error::Error + 'static),
+) -> Option<LockedDocument<'e>> {
+    let (path, lock_path, inspection_error) = match (error.downcast_ref(), error.downcast_ref()) {
+        (
+            Some(copperpour_sexp::SexpError::KiCadEditorLocked {
+                path,
+                lock_path,
+                inspection_error,
+            }),
+            _,
+        )
+        | (
+            _,
+            Some(copperpour_schematic_editor::Error::KiCadEditorLocked {
+                path,
+                lock_path,
+                inspection_error,
+            }),
+        ) => (path, lock_path, inspection_error),
+        _ => return None,
+    };
+    Some(LockedDocument {
+        path,
+        lock_path,
+        inspection_error: inspection_error.as_deref(),
+    })
+}
+
+/// The `conflict` refusal for a schematic write that `error` shows never
+/// happened: KiCad's editor lock blocked it, or the file changed after it was
+/// read. Single-file writers check both before the rename, so the file is as
+/// it was (#427); a transaction only before its journal. `None` for any other
+/// error, which may come after the rename.
+pub(crate) fn unwritten_schematic_refusal(
+    operation: &str,
+    error: &(dyn std::error::Error + 'static),
+) -> Option<CallToolResult> {
+    use copperpour_schematic_editor::Error as EditorError;
+    use copperpour_sexp::SexpError;
+    if let Some(locked) = kicad_editor_lock(error) {
+        // `paths` names the schematic, as dispatch's lock refusal does.
+        let shown = copperpour_sexp::paths::display_path(locked.path);
+        let lock = copperpour_sexp::paths::display_path(locked.lock_path);
+        let message = match locked.inspection_error {
+            None => format!(
+                "KiCad's editor lock '{lock}' is present, so {operation} wrote nothing to \
+                 '{shown}'. Save and close the schematic in Eeschema, then retry. Remove a \
+                 stale lock only after confirming that no editor owns the file."
+            ),
+            Some(reason) => format!(
+                "KiCad's editor lock '{lock}' could not be checked ({reason}), so {operation} \
+                 wrote nothing to '{shown}'. Make the lock path readable, then retry."
+            ),
+        };
+        return Some(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::Conflict { paths: vec![shown] },
+            message,
+        ));
+    }
+    let changed = match (error.downcast_ref(), error.downcast_ref()) {
+        (Some(SexpError::Conflict { path } | SexpError::TransactionConflict { path, .. }), _)
+        | (_, Some(EditorError::Conflict(path))) => path,
+        _ => return None,
+    };
+    Some(changed_after_read(changed, "schematic", operation))
+}
+
+/// The `conflict` refusal for a `what` file that changed after Copperpour
+/// read it, so `operation` wrote nothing.
+fn changed_after_read(path: &std::path::Path, what: &str, operation: &str) -> CallToolResult {
+    let shown = copperpour_sexp::paths::display_path(path);
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::Conflict {
+            paths: vec![shown.clone()],
+        },
+        format!(
+            "The {what} '{shown}' changed after Copperpour read it, so {operation} wrote \
+             nothing. Reload it and retry."
+        ),
+    )
+}
+
 /// Replace `path` with `next` only while it still holds `read`, the text the
 /// change was built from. A file another program saved in between is refused
 /// as `conflict` and left as that program left it; a failed readback after
@@ -1168,18 +1260,9 @@ pub(crate) fn replace_outcome(
     operation: &str,
     written: Result<bool, copperpour_sexp::SexpError>,
 ) -> anyhow::Result<Option<CallToolResult>> {
-    let shown = path.display().to_string();
     match written {
         Ok(true) => Ok(None),
-        Ok(false) => Ok(Some(CallToolResult::error_kind(
-            crate::mcp::error::ToolErrorKind::Conflict {
-                paths: vec![shown.clone()],
-            },
-            format!(
-                "The {what} '{shown}' changed after Copperpour read it, so {operation} wrote \
-                 nothing. Reload it and retry."
-            ),
-        ))),
+        Ok(false) => Ok(Some(changed_after_read(path, what, operation))),
         Err(copperpour_sexp::SexpError::ReadbackMismatch { .. }) => {
             Ok(Some(readback_mismatch_result(path, operation)))
         }
@@ -3848,5 +3931,112 @@ mod ipc_failure_evidence_tests {
         });
         assert_eq!(evidence["kind"], "request_failed");
         assert_eq!(evidence["message"], "AS_NOT_READY");
+    }
+}
+
+#[cfg(test)]
+mod unwritten_schematic_refusal_tests {
+    use super::unwritten_schematic_refusal;
+    use crate::mcp::error::extract_error_kind;
+    use copperpour_schematic_editor::Error as EditorError;
+    use copperpour_sexp::SexpError;
+    fn kind(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+        unwritten_schematic_refusal("op", error).map(|result| extract_error_kind(&result).unwrap())
+    }
+
+    /// Only errors the writer raises before the rename are refusals; the rest,
+    /// a readback mismatch above all, may follow a replacement (#427).
+    #[test]
+    fn only_errors_before_the_rename_are_refusals() {
+        let conflict = Some("conflict".to_string());
+        assert_eq!(
+            kind(&SexpError::KiCadEditorLocked {
+                path: "a.kicad_sch".into(),
+                lock_path: "~a.kicad_sch.lck".into(),
+                inspection_error: Some("denied".into()),
+            }),
+            conflict
+        );
+        assert_eq!(
+            kind(&EditorError::KiCadEditorLocked {
+                path: "a.kicad_sch".into(),
+                lock_path: "~a.kicad_sch.lck".into(),
+                inspection_error: None,
+            }),
+            conflict
+        );
+        assert_eq!(
+            kind(&SexpError::TransactionConflict {
+                path: "a.kicad_sch".into(),
+                journal: "j.json".into(),
+                reason: "changed".into(),
+            }),
+            conflict
+        );
+        assert_eq!(
+            kind(&SexpError::Conflict {
+                path: "a.kicad_sch".into()
+            }),
+            conflict
+        );
+        assert_eq!(kind(&EditorError::Conflict("a.kicad_sch".into())), conflict);
+        assert_eq!(
+            kind(&SexpError::ReadbackMismatch {
+                path: "a.kicad_sch".into()
+            }),
+            None
+        );
+        assert_eq!(
+            kind(&EditorError::ReadbackMismatch("a.kicad_sch".into())),
+            None
+        );
+        assert_eq!(kind(&SexpError::Io(std::io::Error::other("disk"))), None);
+        assert_eq!(kind(&EditorError::Io(std::io::Error::other("disk"))), None);
+    }
+
+    /// The writer reports the paths it resolved, which on Windows carry the
+    /// `\\?\` verbatim prefix; the refusal shows them as a user types them.
+    #[test]
+    fn a_refusal_shows_paths_without_the_verbatim_prefix() {
+        let locked = SexpError::KiCadEditorLocked {
+            path: r"\\?\C:\p\a.kicad_sch".into(),
+            lock_path: r"\\?\C:\p\~a.kicad_sch.lck".into(),
+            inspection_error: None,
+        };
+        let changed = SexpError::TransactionConflict {
+            path: r"\\?\C:\p\a.kicad_sch".into(),
+            journal: r"\\?\C:\p\j.json".into(),
+            reason: "changed".into(),
+        };
+        for error in [locked, changed] {
+            let result = unwritten_schematic_refusal("op", &error).unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("{result:?}");
+            };
+            assert!(!text.contains(r"\\?\"), "{text}");
+            assert!(text.contains(r"C:\\p\\a.kicad_sch"), "{text}");
+        }
+    }
+
+    /// A lock path that could not be inspected is not reported as a lock that
+    /// is present.
+    #[test]
+    fn an_unreadable_lock_is_not_called_present() {
+        let message = |inspection_error: Option<&str>| {
+            let error = SexpError::KiCadEditorLocked {
+                path: "a.kicad_sch".into(),
+                lock_path: "~a.kicad_sch.lck".into(),
+                inspection_error: inspection_error.map(str::to_owned),
+            };
+            let result = unwritten_schematic_refusal("op", &error).unwrap();
+            match &result.content[0] {
+                crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(message(None).contains("is present"));
+        let unreadable = message(Some("permission denied"));
+        assert!(!unreadable.contains("is present"), "{unreadable}");
+        assert!(unreadable.contains("permission denied"), "{unreadable}");
     }
 }

@@ -832,6 +832,15 @@ async fn handle_batch_place_components(
         junctions_added = added;
         junctions_pruned = pruned;
         if let Err(error) = write_atomic_if_unchanged(&sch_path, &before_source, &candidate) {
+            if let Some(refusal) =
+                super::unwritten_schematic_refusal("batch_place_components", &error)
+            {
+                return Ok(crate::outcome::refused_before_write(
+                    refusal,
+                    sch_path.display().to_string(),
+                    components.len(),
+                ));
+            }
             let result = super::mutation_outcome_uncertain(
                 &sch_path,
                 "batch_place_components",

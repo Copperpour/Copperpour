@@ -607,6 +607,15 @@ pub(crate) async fn handle_add_schematic_component(
         unit,
     );
     if let Err(error) = sch.overwrite() {
+        if let Some(refusal) =
+            crate::tools::unwritten_schematic_refusal("add_schematic_component", &error)
+        {
+            return Ok(crate::outcome::refused_before_write(
+                refusal,
+                sch_path.display().to_string(),
+                1,
+            ));
+        }
         let uncertain = crate::tools::mutation_outcome_uncertain(
             &sch_path,
             "add_schematic_component",
@@ -13543,5 +13552,92 @@ mod mirror_component_tests {
         assert!(tools()
             .iter()
             .any(|tool| tool.name == "mirror_schematic_component"));
+    }
+}
+
+/// A write KiCad's editor lock refused wrote nothing, so it is a `conflict`
+/// refusal that names the lock, never `mutation_outcome_uncertain` (#427).
+#[cfg(test)]
+mod editor_lock_refusal_tests {
+    use crate::tools::ServerConfig;
+    use serde_json::{json, Value};
+
+    const PLACED: &str = include_str!("../../tests/fixtures/derived_lib_name.kicad_sch");
+    const UNANNOTATED: &str = include_str!("../../tests/fixtures/annotate_duplicates.kicad_sch");
+
+    #[tokio::test]
+    async fn served_placement_and_annotation_refuse_a_locked_schematic() {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        let cases = [
+            (
+                "add_schematic_component",
+                ("derived_lib_name", PLACED),
+                json!({ "lib_id": "Device:R", "x": 190.5, "y": 101.6, "reference": "R9" }),
+                1,
+            ),
+            (
+                "batch_place_components",
+                ("derived_lib_name", PLACED),
+                json!({ "components": [
+                    { "lib_id": "Device:R", "x": 190.5, "y": 101.6, "reference": "R9" },
+                    { "lib_id": "Device:R", "x": 203.2, "y": 101.6, "reference": "R10" }
+                ] }),
+                2,
+            ),
+            (
+                "annotate_schematic",
+                ("adj", UNANNOTATED),
+                json!({}),
+                // Two `C?` to number, and the duplicate `R1`s left unresolved.
+                3,
+            ),
+        ];
+        for (tool, (project, source), mut arguments, requested) in cases {
+            // Named after the fixture's project, which its instances record.
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("{project}.kicad_sch"));
+            std::fs::write(&path, source).unwrap();
+            std::fs::write(dir.path().join(format!("{project}.kicad_pro")), "{}\n").unwrap();
+            let lock = dir.path().join(format!("~{project}.kicad_sch.lck"));
+            std::fs::write(&lock, r#"{"hostname":"x","username":"y"}"#).unwrap();
+            arguments["schematic"] = json!(path.display().to_string());
+
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "id": 427, "method": "tools/call",
+                    "params": { "name": tool, "arguments": arguments }
+                }))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            assert_eq!(response["isError"], true, "{tool}: {response}");
+            let body: Value =
+                serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(body["error"]["kind"], "conflict", "{tool}: {body}");
+            assert_eq!(
+                body["error"]["paths"],
+                json!([path.display().to_string()]),
+                "{tool}: {body}"
+            );
+            let message = body["message"].as_str().unwrap();
+            assert!(message.contains("wrote nothing"), "{tool}: {body}");
+            assert!(
+                message.contains(&lock.display().to_string()),
+                "{tool}: {body}"
+            );
+            let outcome = &body["outcome"];
+            assert_eq!(outcome["status"], "failed", "{tool}: {body}");
+            assert_eq!(outcome["completed"], 0, "{tool}: {body}");
+            assert_eq!(outcome["failed"], requested, "{tool}: {body}");
+            assert_eq!(outcome["retry"]["safe"], true, "{tool}: {body}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source, "{tool}");
+            assert!(lock.exists(), "{tool} must leave KiCad's lock alone");
+        }
     }
 }

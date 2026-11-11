@@ -92,6 +92,27 @@ pub fn inspect_before_retry() -> Value {
     })
 }
 
+/// Attach the outcome of a refusal that applied none of the `requested` items
+/// to `target`, the saved file.
+pub fn refused_before_write(
+    result: CallToolResult,
+    target: impl Into<String>,
+    requested: usize,
+) -> CallToolResult {
+    attach(
+        result,
+        summary(
+            OutcomeStatus::Failed,
+            target,
+            "saved_file",
+            requested,
+            0,
+            requested,
+            Some(retry_whole_request()),
+        ),
+    )
+}
+
 /// Add the shared envelope while preserving every existing response field.
 pub fn attach(mut result: CallToolResult, outcome: Value) -> CallToolResult {
     let Some(ToolContent::Text { text }) = result.content.first_mut() else {
