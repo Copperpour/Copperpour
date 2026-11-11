@@ -32,4 +32,4 @@ rounded boundary; this fixture tests rejection, not a manufacturable board.
 
 Generated `.kicad_prl` files and the multiple-loop board's duplicate project
 are not part of the fixtures. No SES round trip is claimed here. D-shaped
-two-edge boundaries remain outside this PR's supported profile.
+two-edge boundaries are covered by `specctra_d_outline.README.md`.
