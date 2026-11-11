@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 /// turn one refusal into a long scan.
 const MAX_SHEETS: usize = 200;
 
+/// The prefix KiCad gives the autosave copy of a sheet it has open.
+const AUTOSAVE_PREFIX: &str = "_autosave-";
+
 /// One place a reference was found.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ReferenceSite {
@@ -48,6 +51,14 @@ pub(crate) fn locate_reference(sch_path: &Path, reference: &str) -> Vec<Referenc
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "kicad_sch"))
+        // KiCad's autosave copy of an open sheet is not a sheet of the
+        // project; naming it would send the caller to a file KiCad discards.
+        .filter(|path| {
+            !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(AUTOSAVE_PREFIX))
+        })
         .filter(|path| own.is_none() || std::fs::canonicalize(path).ok() != own)
         .collect();
     files.sort();
@@ -178,6 +189,7 @@ mod tests {
         let dir = project(&[
             ("root.kicad_sch", sheet(&[symbol("R1", &["R1"])])),
             ("sub.kicad_sch", sheet(&[symbol("Q7", &["Q7"])])),
+            ("_autosave-sub.kicad_sch", sheet(&[symbol("Q7", &["Q7"])])),
         ]);
         let root = dir.path().join("root.kicad_sch");
         let sites = locate_reference(&root, "Q7");
