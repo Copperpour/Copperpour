@@ -7,8 +7,8 @@ gives a board is exported: `F.Cu`, `In1.Cu`..`In<N-2>.Cu` and `B.Cu`, N even,
 written top to bottom as DSN signal layers 0 to N-1 whatever the order of the
 board's layer table. A copper set with a gap, a repeat or a missing outer
 layer is still refused. Through-hole pads must cover every copper layer
-(`*.Cu`, or every layer listed); a through-hole pad on `F.Cu` and `B.Cu` only of
-a four-layer board is refused. A locked via must still be a through via, which
+(`*.Cu`, or every copper layer listed once, in any order); a through-hole pad
+on `F.Cu` and `B.Cu` only of a four-layer board is refused. A locked via must still be a through via, which
 KiCad writes as `F.Cu` to `B.Cu` on any stack; its DSN padstack, like each
 routing via's, has a shape on every copper layer. Component side, zones and
 custom rules are unchanged.
