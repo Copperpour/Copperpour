@@ -243,7 +243,10 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
         );
     }
     if copperpour_sexp::layers::CopperStack::new(manifest.supported_profile.copper_layers).is_err()
-        || manifest.supported_profile.component_side != "front"
+        || !matches!(
+            manifest.supported_profile.component_side.as_str(),
+            "front" | "back" | "both"
+        )
         || manifest.supported_profile.custom_rules
         || manifest.supported_profile.outline.is_empty()
         || manifest.supported_profile.pad_shapes.is_empty()
@@ -314,7 +317,17 @@ fn validate_pins_against_board(board_source: &str, manifest: &Manifest) -> Resul
                 component.reference
             )
         })?;
-        let mut expected = live.iter().map(key).collect::<Vec<_>>();
+        // The side is an import-owned check: the SES placement is compared
+        // with the manifest, and the manifest with the board, in every mode.
+        if component.side != live.side {
+            bail!(
+                "routing manifest places {} on the {} side, the live board on the {} side",
+                component.reference,
+                component.side,
+                live.side
+            );
+        }
+        let mut expected = live.pins.iter().map(key).collect::<Vec<_>>();
         let mut recorded = component
             .pads
             .iter()
@@ -414,7 +427,7 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
             || component.kiid.is_empty()
             || component.image_name.is_empty()
             || !component.rotation_degrees.is_finite()
-            || component.side != "front"
+            || !matches!(component.side.as_str(), "front" | "back")
             || !references.insert(component.reference.as_str())
         {
             bail!("manifest contains invalid component placement metadata");
@@ -453,6 +466,20 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
                 );
             }
         }
+    }
+    // The profile's side is the components' sides, as the export derives it.
+    let front = manifest.components.iter().any(|c| c.side == "front");
+    let back = manifest.components.iter().any(|c| c.side == "back");
+    let derived = match (front, back) {
+        (true, true) => "both",
+        (false, true) => "back",
+        _ => "front",
+    };
+    if manifest.supported_profile.component_side != derived {
+        bail!(
+            "manifest profile side '{}' does not match its components ({derived})",
+            manifest.supported_profile.component_side
+        );
     }
     for net in &manifest.nets {
         if net.class_name.is_empty() || net.pins.is_empty() {

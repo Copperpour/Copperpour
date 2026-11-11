@@ -37,6 +37,8 @@ pub(crate) struct ExportBundle {
     /// Copper zones of the exported board, each written as one `plane` per
     /// copper layer it covers.
     pub copper_zone_count: usize,
+    /// The sides the exported footprints sit on: `front`, `back` or `both`.
+    pub component_side: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -84,8 +86,27 @@ struct FootprintModel {
     image_name: String,
     x_um: i64,
     y_um: i64,
+    /// The `place` rotation: KiCad's for a front footprint, KiCad's plus 180
+    /// for a bottom one, as KiCad's own Specctra export writes it.
     rotation_degrees: f64,
+    side: Side,
     pads: Vec<PadModel>,
+}
+
+/// The board side a footprint sits on, by its `F.Cu` or `B.Cu` layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Front,
+    Back,
+}
+
+impl Side {
+    fn name(self) -> &'static str {
+        match self {
+            Side::Front => "front",
+            Side::Back => "back",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -341,6 +362,7 @@ pub(crate) fn export_dsn(
         class_count: class_nets.len(),
         copper_layer_count: copper_layers.len(),
         copper_zone_count: zones.len(),
+        component_side: component_side(&footprints),
     })
 }
 
@@ -1661,9 +1683,11 @@ fn footprints(
         let layer = footprint
             .find_str("layer")
             .context("footprint has no layer")?;
-        if layer != "F.Cu" {
-            bail!("unsupported first routing profile: footprint on '{layer}'");
-        }
+        let side = match layer {
+            "F.Cu" => Side::Front,
+            "B.Cu" => Side::Back,
+            _ => bail!("unsupported first routing profile: footprint on '{layer}'"),
+        };
         if footprint.find("clearance").is_some() {
             bail!("unsupported first routing profile: footprint has a local clearance override");
         }
@@ -1682,6 +1706,14 @@ fn footprints(
         let x_um = finite_um(at.get_f64(1), "footprint x")?;
         let y_um = -finite_um(at.get_f64(2), "footprint y")?;
         let rotation_degrees = finite_number(at.get_f64(3).or(Some(0.0)), "footprint rotation")?;
+        // KiCad keeps a bottom footprint's pads mirrored about its local X
+        // axis, and its Specctra export unflips them: the image is the front
+        // one and the `place` is `back` at KiCad's rotation plus 180, which
+        // the router mirrors back about the image's Y axis.
+        let place_degrees = match side {
+            Side::Front => rotation_degrees,
+            Side::Back => pin_rotation(rotation_degrees + 180.0, 0.0),
+        };
         let image_name = format!("copperpour_image_{reference}");
 
         let mut pads = Vec::new();
@@ -1724,11 +1756,13 @@ fn footprints(
             };
             let at = pad.find("at").context("pad has no position")?;
             let x_um = finite_um(at.get_f64(1), "pad x")?;
-            let y_um = -finite_um(at.get_f64(2), "pad y")?;
-            let pin_degrees = pin_rotation(
-                finite_number(at.get_f64(3).or(Some(0.0)), "pad rotation")?,
-                rotation_degrees,
-            );
+            let file_y_um = finite_um(at.get_f64(2), "pad y")?;
+            let pad_degrees = finite_number(at.get_f64(3).or(Some(0.0)), "pad rotation")?;
+            // Unflipped, a bottom pad's local Y and its turn change sign.
+            let (y_um, pin_degrees) = match side {
+                Side::Front => (-file_y_um, pin_rotation(pad_degrees, rotation_degrees)),
+                Side::Back => (file_y_um, pin_rotation(rotation_degrees, pad_degrees)),
+            };
             let size = pad.find("size").context("pad has no size")?;
             let size_x_um = positive_um(size.get_f64(1), "pad width")?;
             let size_y_um = positive_um(size.get_f64(2), "pad height")?;
@@ -1775,13 +1809,19 @@ fn footprints(
                 .map(str::to_string)
                 .collect::<Vec<_>>();
             let (layers, drill_um) = if pad_type == "smd" {
-                if layers != ["F.Cu".to_string()] {
+                // An SMD pad is on its footprint's side; the front image
+                // carries it on F.Cu, as KiCad's export writes it.
+                let own = match side {
+                    Side::Front => "F.Cu",
+                    Side::Back => "B.Cu",
+                };
+                if layers != [own.to_string()] {
                     bail!(
                         "unsupported SMD pad {reference}-{number}: copper layers are [{}]",
                         layers.join(", ")
                     );
                 }
-                (layers, None)
+                (vec!["F.Cu".to_string()], None)
             } else {
                 // Every copper layer, as a wildcard or each listed once. KiCad
                 // saves a pad on every layer as `*.Cu`; a list written by hand
@@ -1840,7 +1880,8 @@ fn footprints(
             image_name,
             x_um,
             y_um,
-            rotation_degrees,
+            rotation_degrees: place_degrees,
+            side,
             pads,
         });
     }
@@ -1858,11 +1899,16 @@ pub(crate) struct PinIdentity {
     pub net: Option<String>,
 }
 
-/// Every routed footprint's pins, by footprint UUID, named as [`export_dsn`]
-/// names them.
-pub(crate) fn board_pin_identities(
-    board_source: &str,
-) -> Result<BTreeMap<String, Vec<PinIdentity>>> {
+/// A routed footprint of the live board: the side it sits on and its pins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveFootprint {
+    pub side: &'static str,
+    pub pins: Vec<PinIdentity>,
+}
+
+/// Every routed footprint's side and pins, by footprint UUID, named as
+/// [`export_dsn`] names them.
+pub(crate) fn board_pin_identities(board_source: &str) -> Result<BTreeMap<String, LiveFootprint>> {
     let tree = parse_sexp(board_source).context("parse KiCad board snapshot")?;
     let net_table = top_level_net_table(&tree);
     let copper_layers = copper_layers(&tree)?;
@@ -1880,7 +1926,13 @@ pub(crate) fn board_pin_identities(
                     net: pad.net,
                 })
                 .collect();
-            (footprint.kiid, pins)
+            (
+                footprint.kiid,
+                LiveFootprint {
+                    side: footprint.side.name(),
+                    pins,
+                },
+            )
         })
         .collect())
 }
@@ -2050,7 +2102,7 @@ fn build_pcb(
                 name: footprint.reference.clone(),
                 x: footprint.x_um as f64,
                 y: footprint.y_um as f64,
-                side: "front".to_string(),
+                side: footprint.side.name().to_string(),
                 rotation: footprint.rotation_degrees,
                 PN: None,
             }],
@@ -2379,6 +2431,22 @@ fn serialize_and_validate(pcb: dsn::Pcb) -> Result<String> {
     Ok(text)
 }
 
+/// The sides the board's footprints sit on, derived from them: `front`,
+/// `back`, or `both`, the words `export_position_file` uses.
+fn component_side(footprints: &[FootprintModel]) -> &'static str {
+    let front = footprints
+        .iter()
+        .any(|footprint| footprint.side == Side::Front);
+    let back = footprints
+        .iter()
+        .any(|footprint| footprint.side == Side::Back);
+    match (front, back) {
+        (true, true) => "both",
+        (false, true) => "back",
+        _ => "front",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_manifest(
     board_path: &Path,
@@ -2401,7 +2469,7 @@ fn build_manifest(
             x_um: footprint.x_um,
             y_um: footprint.y_um,
             rotation_degrees: footprint.rotation_degrees,
-            side: "front".to_string(),
+            side: footprint.side.name().to_string(),
             pads: footprint
                 .pads
                 .iter()
@@ -2457,7 +2525,7 @@ fn build_manifest(
         supported_profile: SupportedProfile {
             copper_layers: u32::try_from(copper_layers.len())
                 .context("copper layer count does not fit the manifest")?,
-            component_side: "front".to_string(),
+            component_side: component_side(footprints).to_string(),
             pad_shapes: ["circle", "rect", "roundrect", "oval"]
                 .map(String::from)
                 .to_vec(),
@@ -4674,5 +4742,248 @@ pub(crate) mod tests {
                 "{name}: {error}"
             );
         }
+    }
+
+    const BOTTOM_SIDE: &str = include_str!("../tests/fixtures/specctra_bottom_side.kicad_pcb");
+    const BOTTOM_SIDE_NATIVE_FILE: &str =
+        include_str!("../tests/fixtures/specctra_bottom_side.native-kicad-10.dsn");
+    const BOTTOM_SIDE_SES: &str = include_str!(
+        "../tests/fixtures/specctra_bottom_side.native-kicad-10.freerouting-2.3.0.ses"
+    );
+
+    /// KiCad's export of the bottom-side fixture without its courtyard
+    /// `(outline (polygon ...))` forms, which the Specctra parser behind
+    /// `validate_dsn_syntax` cannot read (#98); a form may run over lines.
+    fn bottom_side_native() -> String {
+        let mut kept = String::new();
+        let mut depth = 0i32;
+        for line in BOTTOM_SIDE_NATIVE_FILE.lines() {
+            if depth == 0 && !line.trim_start().starts_with("(outline (polygon ") {
+                kept.push_str(line);
+                kept.push('\n');
+                continue;
+            }
+            depth += line.matches('(').count() as i32 - line.matches(')').count() as i32;
+        }
+        kept
+    }
+
+    fn bottom_side_board() -> (tempfile::TempDir, std::path::PathBuf, ExportBundle) {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_bottom_side.kicad_pcb");
+        std::fs::write(&board, BOTTOM_SIDE).unwrap();
+        let baseline = export_dsn(&board, BOTTOM_SIDE, &native_fixture_rules()).unwrap();
+        let adopted = adopt_native_dsn(baseline, bottom_side_native()).unwrap();
+        (temp, board, adopted)
+    }
+
+    /// A bottom footprint is written as KiCad writes it: its front image,
+    /// SMD pads on F.Cu, placed `back` at KiCad's rotation plus 180, a pin's
+    /// own turn mirrored. KiCad's native DSN of the same board is adopted
+    /// unchanged, so both paths give the router the same placement (#430).
+    #[test]
+    fn bottom_footprints_are_written_as_kicads_native_export_writes_them() {
+        let export = native_baseline(BOTTOM_SIDE);
+        for place in [
+            "(place R1 100000 -50000 front 0)",
+            "(place R2 110000 -50000 back 270)",
+            "(place U1 112000 -56000 back 330)",
+            "(place R3 104000 -56000 back 315)",
+            "(place J1 120000 -45000 back 180)",
+        ] {
+            assert!(export.dsn.contains(place), "{place}\n{}", export.dsn);
+        }
+        assert_eq!(export.component_side, "both");
+        let native = bottom_side_native();
+        assert_ne!(native, BOTTOM_SIDE_NATIVE_FILE);
+        let adopted = adopt_native_dsn(export, native.clone()).unwrap();
+        assert_eq!(adopted.dsn, native);
+        let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        assert_eq!(manifest["supported_profile"]["component_side"], "both");
+        let sides = manifest["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|component| {
+                (
+                    component["reference"].as_str().unwrap(),
+                    component["side"].as_str().unwrap(),
+                    component["rotation_degrees"].as_f64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sides,
+            [
+                ("J1", "back", 180.0),
+                ("R1", "front", 0.0),
+                ("R2", "back", 270.0),
+                ("R3", "back", 315.0),
+                ("U1", "back", 330.0),
+            ]
+        );
+    }
+
+    /// KiCad's front image of the bottom SOT-23W: pin 3 alone on the right,
+    /// pins 1 and 2 above and below on the left. A mirrored image would put
+    /// them on the other side, and the native DSN would be refused.
+    #[test]
+    fn a_bottom_footprints_image_is_the_unflipped_front_one() {
+        let export = native_baseline(BOTTOM_SIDE);
+        let rotations = pin_rotations(&export.dsn);
+        assert_eq!(rotations[&("R3".to_string(), "2".to_string())], "90");
+        for pin in ["1 -1200 950)", "2 -1200 -950)", "3 1200 0)"] {
+            assert!(export.dsn.contains(pin), "{pin}\n{}", export.dsn);
+        }
+        let mirrored = bottom_side_native().replacen("3 1200 0)", "3 -1200 0)", 1);
+        let error = adopt_native_dsn(native_baseline(BOTTOM_SIDE), mirrored)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("native DSN changed pin position for component 'U1' pin '3'"),
+            "{error}"
+        );
+    }
+
+    /// An SMD pad of a bottom footprint is on B.Cu; one on F.Cu, the other
+    /// side's copper, is refused rather than moved.
+    #[test]
+    fn a_bottom_footprints_smd_pad_must_be_on_b_cu() {
+        let wrong_side = BOTTOM_SIDE.replacen(
+            r#"(layers "B.Cu" "B.Mask" "B.Paste")"#,
+            r#"(layers "F.Cu" "B.Mask" "B.Paste")"#,
+            1,
+        );
+        assert_ne!(wrong_side, BOTTOM_SIDE);
+        let error = export_dsn(
+            Path::new("board.kicad_pcb"),
+            &wrong_side,
+            &native_fixture_rules(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unsupported SMD pad") && error.contains("copper layers are [F.Cu]"),
+            "{error}"
+        );
+        // A front footprint's SMD pad on B.Cu is still refused.
+        let front_on_back = FOUR_LAYERS.replacen(
+            r#"(layers "F.Cu" "F.Mask" "F.Paste")"#,
+            r#"(layers "B.Cu" "F.Mask" "F.Paste")"#,
+            1,
+        );
+        let error = export_dsn(
+            Path::new("board.kicad_pcb"),
+            &front_on_back,
+            &native_fixture_rules(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("copper layers are [B.Cu]"), "{error}");
+    }
+
+    /// Freerouting 2.3.0 keeps every bottom placement and routes the bottom
+    /// pads on B.Cu; the strict planner accepts the session.
+    #[test]
+    fn freerouting_routes_bottom_pads_and_the_planner_accepts_it() {
+        let (_temp, board, adopted) = bottom_side_board();
+        let plan = crate::specctra_ses::parse_import_plan(
+            &board,
+            BOTTOM_SIDE,
+            &adopted.manifest,
+            BOTTOM_SIDE_SES,
+        )
+        .unwrap();
+        let back = plan
+            .tracks
+            .iter()
+            .filter(|track| track.layer == "B.Cu")
+            .count();
+        assert!(back > 0, "{:?}", plan.tracks);
+        assert_eq!(plan.vias.len(), 3);
+    }
+
+    /// The SES must keep each footprint's side: a bottom footprint the
+    /// session puts on the front is refused.
+    #[test]
+    fn a_session_that_turns_a_footprint_over_is_refused() {
+        let (_temp, board, adopted) = bottom_side_board();
+        let flipped = BOTTOM_SIDE_SES.replacen(
+            "(place R2 1100000 -500000 back 270)",
+            "(place R2 1100000 -500000 front 270)",
+            1,
+        );
+        assert_ne!(flipped, BOTTOM_SIDE_SES);
+        let error = crate::specctra_ses::parse_import_plan(
+            &board,
+            BOTTOM_SIDE,
+            &adopted.manifest,
+            &flipped,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("SES changes placement of component 'R2'"),
+            "{error}"
+        );
+    }
+
+    /// The manifest's sides are checked against the live board and its
+    /// profile against its components, whichever DSN was routed (#72).
+    #[test]
+    fn manifest_sides_must_match_the_board_and_the_profile() {
+        let (_temp, board, adopted) = bottom_side_board();
+        let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        let plan = |manifest: &serde_json::Value| {
+            crate::specctra_ses::parse_import_plan(
+                &board,
+                BOTTOM_SIDE,
+                &manifest.to_string(),
+                BOTTOM_SIDE_SES,
+            )
+            .unwrap_err()
+            .to_string()
+        };
+
+        // R2 recorded on the front, the session too: the board says back.
+        let mut front_r2 = manifest.clone();
+        let r2 = front_r2["components"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|component| component["reference"] == "R2")
+            .unwrap();
+        r2["side"] = "front".into();
+        let error = plan(&front_r2);
+        assert!(
+            error.contains(
+                "routing manifest places R2 on the front side, the live board on the back side"
+            ),
+            "{error}"
+        );
+
+        // A profile that says front while components are on the back.
+        let mut front_profile = manifest.clone();
+        front_profile["supported_profile"]["component_side"] = "front".into();
+        let error = plan(&front_profile);
+        assert!(
+            error.contains("manifest profile side 'front' does not match its components (both)"),
+            "{error}"
+        );
+
+        let mut unknown = manifest.clone();
+        unknown["supported_profile"]["component_side"] = "top".into();
+        let error = plan(&unknown);
+        assert!(
+            error.contains("manifest does not describe the supported first routing profile"),
+            "{error}"
+        );
+    }
+
+    /// The profile side is derived from the footprints.
+    #[test]
+    fn the_profile_side_is_derived_from_the_footprints() {
+        assert_eq!(native_baseline(FOUR_LAYERS).component_side, "front");
+        assert_eq!(native_baseline(BOTTOM_SIDE).component_side, "both");
     }
 }
