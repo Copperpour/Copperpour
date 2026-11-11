@@ -3336,106 +3336,168 @@ pub(crate) mod tests {
         assert!(error.contains("degree"), "{error}");
     }
 
+    const ROUNDED_OUTLINE: &str =
+        include_str!("../tests/fixtures/specctra_rounded_outline.kicad_pcb");
+
+    fn point_segment_distance(point: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+        let delta = (b.0 - a.0, b.1 - a.1);
+        let t = (((point.0 - a.0) * delta.0 + (point.1 - a.1) * delta.1)
+            / (delta.0 * delta.0 + delta.1 * delta.1))
+            .clamp(0.0, 1.0);
+        (point.0 - a.0 - t * delta.0).hypot(point.1 - a.1 - t * delta.1)
+    }
+
+    fn boundary_points(dsn: &str) -> Vec<(f64, f64)> {
+        let tree = parse_dsn_sexp(dsn).unwrap();
+        let path = tree
+            .find("structure")
+            .unwrap()
+            .find("boundary")
+            .unwrap()
+            .find("path")
+            .unwrap();
+        path.children().unwrap()[3..]
+            .chunks_exact(2)
+            .map(|pair| {
+                (
+                    pair[0].as_str().unwrap().parse().unwrap(),
+                    pair[1].as_str().unwrap().parse().unwrap(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn rounded_outline_arc_is_flattened_and_closed() {
-        let source = r#"(kicad_pcb
-            (gr_arc (start 10 0) (mid 10.70710678 0.29289322) (end 11 1) (layer "Edge.Cuts"))
-            (gr_line (start 11 1) (end 11 11) (layer "Edge.Cuts"))
-            (gr_line (start 11 11) (end 0 11) (layer "Edge.Cuts"))
-            (gr_line (start 0 11) (end 0 0) (layer "Edge.Cuts"))
-            (gr_line (start 0 0) (end 10 0) (layer "Edge.Cuts")))"#;
-        let tree = parse_sexp(source).unwrap();
+        let tree = parse_sexp(ROUNDED_OUTLINE).unwrap();
         let outline = simple_closed_outline(&tree, 5.0).unwrap();
-
-        assert!(
-            outline.len() > 6,
-            "the arc should contribute intermediate points"
-        );
         assert_eq!(outline.first(), outline.last());
-        assert!(outline.contains(&(10_000, 0)));
-        assert!(outline.contains(&(11_000, -1_000)));
+        // Three convex corners (12 chords each), one concave notch (19), four lines.
+        assert_eq!(outline.len(), 12 * 3 + 19 + 4 + 1);
     }
 
     #[test]
     fn exporter_accepts_rounded_outline_arcs_and_reports_tolerance() {
-        let fixture = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb")
-            .replace("\r\n", "\n");
-        let outline_start = fixture
-            .find("\t(gr_line\n\t\t(start 80 30)")
-            .expect("fixture has a top-left outline edge");
-        let outline_end = fixture
-            .find("\n\t(embedded_fonts no)")
-            .expect("fixture has a final board property");
-        let rounded_outline = r#"(gr_line (start 82 30) (end 128 30) (layer "Edge.Cuts"))
-            (gr_arc (start 128 30) (mid 129.41421356 30.58578644) (end 130 32) (layer "Edge.Cuts"))
-            (gr_line (start 130 32) (end 130 68) (layer "Edge.Cuts"))
-            (gr_arc (start 130 68) (mid 129.41421356 69.41421356) (end 128 70) (layer "Edge.Cuts"))
-            (gr_line (start 128 70) (end 82 70) (layer "Edge.Cuts"))
-            (gr_arc (start 82 70) (mid 80.58578644 69.41421356) (end 80 68) (layer "Edge.Cuts"))
-            (gr_line (start 80 68) (end 80 32) (layer "Edge.Cuts"))
-            (gr_arc (start 80 32) (mid 80.58578644 30.58578644) (end 82 30) (layer "Edge.Cuts"))"#;
-        let mut source = fixture.to_string();
-        source.replace_range(outline_start..outline_end, rounded_outline);
         let temp = tempfile::tempdir().unwrap();
         let board_path = temp.path().join("rounded.kicad_pcb");
-        std::fs::write(&board_path, &source).unwrap();
-
-        let export = export_dsn(&board_path, &source, &rules()).unwrap();
+        std::fs::write(
+            board_path.with_extension("kicad_pro"),
+            include_str!("../tests/fixtures/specctra_rounded_outline.kicad_pro"),
+        )
+        .unwrap();
+        let export = export_dsn(&board_path, ROUNDED_OUTLINE, &rules()).unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
         assert_eq!(
             manifest["supported_profile"]["outline"],
             "one closed loop of Edge.Cuts lines and circular arcs, with arcs flattened within board max_error"
         );
-        assert!(export.dsn.contains("(boundary"));
+        let native = include_str!("../tests/fixtures/specctra_rounded_outline.native-kicad-10.dsn");
+        // Independent circles and counts from KiCad's native export, not the flattener.
+        for points in [boundary_points(&export.dsn), boundary_points(native)] {
+            assert_eq!(points.first(), points.last());
+            for (center, radius, expected_segments) in [
+                ((128_000.0, -32_000.0), 2_000.0, 12),
+                ((130_000.0, -70_000.0), 5_000.0, 19),
+                ((82_000.0, -68_000.0), 2_000.0, 12),
+                ((82_000.0, -32_000.0), 2_000.0, 12),
+            ] {
+                let radial_error =
+                    |p: (f64, f64)| ((p.0 - center.0).hypot(p.1 - center.1) - radius).abs();
+                let arc_edges = points
+                    .windows(2)
+                    .filter(|edge| radial_error(edge[0]) < 5.0 && radial_error(edge[1]) < 5.0)
+                    .collect::<Vec<_>>();
+                assert_eq!(arc_edges.len(), expected_segments, "circle {center:?}");
+                for edge in arc_edges {
+                    assert!(radial_error(edge[0]) <= 5.0);
+                    assert!(radial_error(edge[1]) <= 5.0);
+                    let midpoint = ((edge[0].0 + edge[1].0) / 2.0, (edge[0].1 + edge[1].1) / 2.0);
+                    assert!(radial_error(midpoint) <= 5.0, "chord {edge:?}");
+                }
+            }
+        }
     }
 
     #[test]
     fn outline_arc_flattening_respects_tolerance_in_both_directions() {
-        let tolerance_um = 5.0;
-        for (start, mid, end) in [
-            ((10_000.0, 0.0), (7_071.067_8, 7_071.067_8), (0.0, 10_000.0)),
-            (
-                (10_000.0, 0.0),
-                (7_071.067_8, -7_071.067_8),
-                (0.0, -10_000.0),
-            ),
-        ] {
-            let points = outline_arc_points(start, mid, end, tolerance_um).unwrap();
-            let rounded_start = (start.0.round() as i64, start.1.round() as i64);
-            let rounded_end = (end.0.round() as i64, end.1.round() as i64);
-            assert_eq!(points.first(), Some(&rounded_start));
-            assert_eq!(points.last(), Some(&rounded_end));
-            assert!(points.len() > 2);
-            let max_sagitta = points
-                .windows(2)
-                .map(|edge| {
-                    let chord =
-                        ((edge[1].0 - edge[0].0) as f64).hypot((edge[1].1 - edge[0].1) as f64);
-                    10_000.0 - (10_000.0_f64.powi(2) - (chord / 2.0).powi(2)).sqrt()
-                })
-                .fold(0.0_f64, f64::max);
-            assert!(
-                max_sagitta <= tolerance_um,
-                "sagitta {max_sagitta} exceeds tolerance"
-            );
+        let tree = parse_sexp(ROUNDED_OUTLINE).unwrap();
+        for arc in tree.find_all("gr_arc") {
+            let start = point_um_f64(arc, "start").unwrap();
+            let mid = point_um_f64(arc, "mid").unwrap();
+            let end = point_um_f64(arc, "end").unwrap();
+            for (start, end) in [(start, end), (end, start)] {
+                let points = outline_arc_points(start, mid, end, 5.0).unwrap();
+                assert_eq!(
+                    points.first(),
+                    Some(&(start.0.round() as i64, start.1.round() as i64))
+                );
+                assert_eq!(
+                    points.last(),
+                    Some(&(end.0.round() as i64, end.1.round() as i64))
+                );
+                let distance = points
+                    .windows(2)
+                    .map(|edge| {
+                        point_segment_distance(
+                            mid,
+                            (edge[0].0 as f64, edge[0].1 as f64),
+                            (edge[1].0 as f64, edge[1].1 as f64),
+                        )
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                assert!(distance <= 5.0, "arc misses its midpoint by {distance} um");
+            }
         }
+    }
+
+    #[test]
+    fn multiple_outline_loops_are_refused() {
+        let source = include_str!("../tests/fixtures/specctra_multiple_outline_loops.kicad_pcb");
+        let error = export_dsn(Path::new("board.kicad_pcb"), source, &rules())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("more than one loop"), "{error}");
     }
 
     #[test]
     fn outline_arc_error_uses_project_max_error_when_available() {
         let temp = tempfile::tempdir().unwrap();
         let board_path = temp.path().join("board.kicad_pcb");
-        let tree = parse_sexp(
-            r#"(kicad_pcb (gr_arc (start 1 0) (mid 0.7 0.7) (end 0 1) (layer "Edge.Cuts")))"#,
-        )
+        let tree = parse_sexp(ROUNDED_OUTLINE).unwrap();
+        let mut project: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/specctra_rounded_outline.kicad_pro"
+        ))
         .unwrap();
+        project["board"]["design_settings"]["rules"]["max_error"] = serde_json::json!(0.01);
         std::fs::write(
-            temp.path().join("board.kicad_pro"),
-            r#"{"board":{"design_settings":{"rules":{"max_error":0.012}}}}"#,
+            board_path.with_extension("kicad_pro"),
+            serde_json::to_vec(&project).unwrap(),
         )
         .unwrap();
+        assert_eq!(outline_arc_error_um(&board_path, &tree).unwrap(), 10.0);
+        let outline =
+            simple_closed_outline(&tree, outline_arc_error_um(&board_path, &tree).unwrap())
+                .unwrap();
+        assert_eq!(outline.len(), 9 * 3 + 13 + 4 + 1);
+    }
 
-        assert_eq!(outline_arc_error_um(&board_path, &tree).unwrap(), 12.0);
+    #[test]
+    fn malformed_outline_project_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let board_path = temp.path().join("board.kicad_pcb");
+        for (project, expected) in [
+            ("{", "parse project"),
+            (
+                r#"{"board":{"design_settings":{"rules":{"max_error":"bad"}}}}"#,
+                "max_error is not a number",
+            ),
+        ] {
+            std::fs::write(board_path.with_extension("kicad_pro"), project).unwrap();
+            let error = export_dsn(&board_path, ROUNDED_OUTLINE, &rules())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]
