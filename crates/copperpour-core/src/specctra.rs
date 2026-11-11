@@ -1236,8 +1236,11 @@ fn simple_closed_outline(tree: &SexpNode, max_error_um: f64) -> Result<Vec<(i64,
             _ => {}
         }
     }
-    if edges.len() < 3 {
-        bail!("unsupported outline: need at least three Edge.Cuts lines or arcs");
+    // Two edges are enough for a D-shaped board (one line, one arc). A single
+    // edge fails the degree check below, and the enclosed-area check after the
+    // walk refuses two edges that only retrace each other.
+    if edges.is_empty() {
+        bail!("unsupported outline: no Edge.Cuts lines or arcs");
     }
 
     // Stable edge order makes the chosen direction deterministic even when
@@ -1301,6 +1304,20 @@ fn simple_closed_outline(tree: &SexpNode, max_error_um: f64) -> Result<Vec<(i64,
     }
     if used_edges.len() != edges.len() {
         bail!("unsupported outline: Edge.Cuts contains more than one loop");
+    }
+    // Two straight lines between the same two points, or one arc drawn twice,
+    // walk back over themselves: the loop is closed but encloses nothing.
+    if edges.len() == 2 {
+        let doubled_area: i128 = ordered
+            .windows(2)
+            .map(|edge| {
+                i128::from(edge[0].0) * i128::from(edge[1].1)
+                    - i128::from(edge[1].0) * i128::from(edge[0].1)
+            })
+            .sum();
+        if doubled_area == 0 {
+            bail!("unsupported outline: two Edge.Cuts edges enclose no area");
+        }
     }
     Ok(ordered)
 }
@@ -3471,6 +3488,73 @@ pub(crate) mod tests {
                 assert!(distance <= 5.0, "arc misses its midpoint by {distance} um");
             }
         }
+    }
+
+    const D_OUTLINE: &str = include_str!("../tests/fixtures/specctra_d_outline.kicad_pcb");
+    const D_OUTLINE_ARC: &str = "(gr_arc\n\t\t(start 90 25)\n\t\t(mid 115 50)\n\t\t(end 90 75)";
+
+    #[test]
+    fn exporter_accepts_a_two_edge_d_shaped_outline() {
+        let export = export_dsn(Path::new("board.kicad_pcb"), D_OUTLINE, &rules()).unwrap();
+        let native = include_str!("../tests/fixtures/specctra_d_outline.native-kicad-10.dsn");
+        // KiCad's native export splits the 25 mm half circle into 80 chords.
+        // The Rust flattener keeps each chord within max_error minus the DSN
+        // grid allowance, which needs 85 at this radius (the small corners of
+        // the rounded fixture happen to give equal counts).
+        let (center, radius) = ((90_000.0, -50_000.0), 25_000.0);
+        let radial_error = |p: (f64, f64)| ((p.0 - center.0).hypot(p.1 - center.1) - radius).abs();
+        for (points, expected_chords) in [
+            (boundary_points(&export.dsn), 85),
+            (boundary_points(native), 80),
+        ] {
+            assert_eq!(points.first(), points.last());
+            let (arc_edges, straight_edges): (Vec<_>, Vec<_>) =
+                points.windows(2).partition(|edge| {
+                    let midpoint = ((edge[0].0 + edge[1].0) / 2.0, (edge[0].1 + edge[1].1) / 2.0);
+                    radial_error(midpoint) <= 5.0
+                });
+            assert_eq!(arc_edges.len(), expected_chords);
+            for edge in arc_edges {
+                assert!(radial_error(edge[0]) <= 5.0, "chord {edge:?}");
+                assert!(radial_error(edge[1]) <= 5.0, "chord {edge:?}");
+                // The half circle bulges through (115, 50), not to x < 90 mm.
+                assert!(edge.iter().all(|p| p.0 >= 89_999.5), "chord {edge:?}");
+            }
+            // The straight edge is the line x = 90 mm from y = 25 mm to 75 mm.
+            assert_eq!(straight_edges.len(), 1);
+            let line = straight_edges[0];
+            assert!(line.iter().all(|p| (p.0 - 90_000.0).abs() < 0.5));
+            assert!(((line[0].1 - line[1].1).abs() - 50_000.0).abs() < 0.5);
+        }
+    }
+
+    #[test]
+    fn two_edge_outlines_without_area_are_refused() {
+        let two_lines = D_OUTLINE.replace(
+            D_OUTLINE_ARC,
+            "(gr_line\n\t\t(start 90 75)\n\t\t(end 90 25)",
+        );
+        let same_arc_twice = D_OUTLINE.replace(
+            "(gr_line\n\t\t(start 90 25)\n\t\t(end 90 75)",
+            D_OUTLINE_ARC,
+        );
+        for source in [two_lines, same_arc_twice] {
+            assert_ne!(source, D_OUTLINE);
+            let error = export_dsn(Path::new("board.kicad_pcb"), &source, &rules())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("enclose no area"), "{error}");
+        }
+    }
+
+    #[test]
+    fn board_without_edge_cuts_is_refused() {
+        let source = D_OUTLINE.replace("(layer \"Edge.Cuts\")", "(layer \"F.SilkS\")");
+        assert_ne!(source, D_OUTLINE);
+        let error = export_dsn(Path::new("board.kicad_pcb"), &source, &rules())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no Edge.Cuts lines or arcs"), "{error}");
     }
 
     #[test]
