@@ -79,9 +79,11 @@ open-document set, an ambiguous document set, and a request KiCad rejected.
 
 `crates/copperpour-viewer` owns sheet discovery, snapshot SVG rendering,
 incremental cache selection and event-batching helpers. It is a workspace
-member with no Tauri or GUI dependency. The Tauri application currently uses
-it; the planned browser service will reuse it. Watcher integration, commands
-and frontend remain in the Tauri application during this extraction phase.
+member with no Tauri or GUI dependency. Its `browser` module adds a root-bound
+loopback HTTP/SSE service with owned watcher/render tasks. The Tauri application
+and browser adapter share frontend assets in the retained `schematic-viewer/frontend` directory.
+The MCP launch tool still selects Tauri; the browser service is currently used
+through its Rust API and development example.
 
 ### Non-workspace and non-Rust boundaries
 
