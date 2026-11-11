@@ -103,6 +103,7 @@ copperpour-ipc = { path = "crates/copperpour-ipc" }
 copperpour-core = { path = "crates/copperpour-core", default-features = false }
 copperpour-schematic-editor = { path = "crates/copperpour-schematic-editor" }
 copperpour-render = { path = "crates/copperpour-render" }
+copperpour-viewer = { path = "crates/copperpour-viewer" }
 copperpour-vcs = { path = "crates/copperpour-vcs" }
 
 # Full debuginfo doubles the workspace test compile (221 s vs 109 s, #291).

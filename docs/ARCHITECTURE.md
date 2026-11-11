@@ -75,6 +75,14 @@ request/reply transport, typed board operations, and the distinction among an
 unreachable transport, a requested board positively absent from KiCad's complete
 open-document set, an ambiguous document set, and a request KiCad rejected.
 
+### Shared viewer engine
+
+`crates/copperpour-viewer` owns sheet discovery, snapshot SVG rendering,
+incremental cache selection and event-batching helpers. It is a workspace
+member with no Tauri or GUI dependency. The Tauri application currently uses
+it; the planned browser service will reuse it. Watcher integration, commands
+and frontend remain in the Tauri application during this extraction phase.
+
 ### Non-workspace and non-Rust boundaries
 
 `crates/schematic-viewer` is a separate Tauri application and is deliberately
