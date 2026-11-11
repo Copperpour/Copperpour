@@ -188,6 +188,11 @@ that board open and a tool still refuses, the error you get back is the tool's
 own reason — "a polygon needs at least 3 points", "requested board … is not open
 in KiCAD" — and it names what to change about the request.
 
+`place_component`, `move_component`, `rotate_component`, and (on KiCad 10.0.6+)
+`flip_component` can fall back to a closed board file when no KiCad process is
+reachable. An older, reachable KiCad makes `flip_component` refuse rather than
+silently edit the file underneath it.
+
 ## KiCad is running, but `ipc_failure` says it did not answer
 
 `check_kicad_ui` and `open_project` report `ipc_failure` as
@@ -591,7 +596,7 @@ restart the Muse session: Muse does not respawn a running MCP server, so the
 setting takes effect on the next session start. Cost is the usual ~25K tokens
 per listing instead of ~2K.
 
-## Plugin doesn't appear in KiCAD
+## Plugin doesn't appear in KiCad
 
 Install via **Plugin and Content Manager → Install from File** with the
 `copperpour-pcm-*.zip` release asset (not the bare binary archives), then restart
