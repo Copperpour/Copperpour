@@ -20,6 +20,10 @@ pub(crate) struct SesImportPlan {
     pub session_id: String,
     pub locked_track_count: usize,
     pub locked_via_count: usize,
+    /// Copper zones per layer and net, as the manifest and the live board
+    /// both record them. The import never touches a zone, so their fills
+    /// predate the imported routing.
+    pub zones: Vec<crate::specctra::ManifestZoneCount>,
     pub tracks: Vec<SesTrack>,
     pub arcs: Vec<SesArc>,
     pub vias: Vec<SesVia>,
@@ -72,6 +76,9 @@ struct Manifest {
     components: Vec<ManifestComponent>,
     nets: Vec<ManifestNet>,
     padstacks: Vec<ManifestPadstack>,
+    /// Required with copper zones, from schema 3 (#430).
+    #[serde(default)]
+    zones: Vec<crate::specctra::ManifestZoneCount>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,6 +219,7 @@ pub(crate) fn parse_import_plan(
         session_id,
         locked_track_count: manifest.supported_profile.locked_track_count,
         locked_via_count: manifest.supported_profile.locked_via_count,
+        zones: manifest.zones,
         tracks,
         arcs,
         vias,
@@ -236,7 +244,6 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
     }
     if copperpour_sexp::layers::CopperStack::new(manifest.supported_profile.copper_layers).is_err()
         || manifest.supported_profile.component_side != "front"
-        || manifest.supported_profile.copper_zones
         || manifest.supported_profile.custom_rules
         || manifest.supported_profile.outline.is_empty()
         || manifest.supported_profile.pad_shapes.is_empty()
@@ -250,6 +257,15 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
         || manifest.supported_profile.locked_via_count != locked_via_count
     {
         bail!("manifest locked-routing inventory does not match the live board snapshot");
+    }
+    // Schemas 1 and 2 had no zones; from 3 the inventory is the live board's.
+    if manifest.supported_profile.copper_zones == manifest.zones.is_empty()
+        || (manifest.schema_version < 3 && !manifest.zones.is_empty())
+    {
+        bail!("manifest copper-zone flag does not match its zone inventory");
+    }
+    if crate::specctra::board_zone_inventory(board_source)? != manifest.zones {
+        bail!("manifest copper-zone inventory does not match the live board snapshot");
     }
     let requested = canonical_existing(board_path)?;
     let recorded = canonical_existing(Path::new(&manifest.board_path))?;
@@ -1112,9 +1128,9 @@ mod tests {
             }
         }
         assert_eq!(check(&board, &schema_1), invalid);
-        let mut schema_3 = manifest.clone();
-        schema_3["schema_version"] = 3.into();
-        assert!(check(&board, &schema_3).contains("unsupported Specctra manifest schema 3"));
+        let mut schema_4 = manifest.clone();
+        schema_4["schema_version"] = 4.into();
+        assert!(check(&board, &schema_4).contains("unsupported Specctra manifest schema 4"));
     }
 
     #[test]
