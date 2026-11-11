@@ -1,0 +1,124 @@
+(pcb board.dsn
+  (parser
+    (string_quote ")
+    (space_in_quoted_tokens on)
+    (host_cad "KiCad's Pcbnew")
+    (host_version "10.0.8-10.0.8~ubuntu24.04.1")
+  )
+  (resolution um 10)
+  (unit um)
+  (structure
+    (layer F.Cu
+      (type signal)
+      (property
+        (index 0)
+      )
+    )
+    (layer In1.Cu
+      (type signal)
+      (property
+        (index 1)
+      )
+    )
+    (layer In2.Cu
+      (type signal)
+      (property
+        (index 2)
+      )
+    )
+    (layer B.Cu
+      (type signal)
+      (property
+        (index 3)
+      )
+    )
+    (boundary
+      (path pcb 0  130000 -70000  80000 -70000  80000 -30000  130000 -30000
+            130000 -70000)
+    )
+    (via "Via[0-3]_600:300_um")
+    (rule
+      (width 200)
+      (clearance 200)
+      (clearance 50 (type smd_smd))
+    )
+  )
+  (placement
+    (component Resistor_SMD:R_0402
+      (place R1 100000 -50000 front 0 (PN 10k))
+      (place R2 110000 -50000 front 0 (PN 4.7k))
+    )
+    (component PinHeader_1x02_P2.54mm_Vertical
+      (place J1 120000 -45000 front 0 (PN PinHeader_1x02_P2.54mm_Vertical))
+    )
+  )
+  (library
+    (image Resistor_SMD:R_0402
+      (pin Rect[T]Pad_600.000000x500.000000_um 1 -500 0)
+      (pin Rect[T]Pad_600.000000x500.000000_um 2 500 0)
+    )
+    (image PinHeader_1x02_P2.54mm_Vertical
+      (outline (polygon signal 0  1765 -4315  -1765 -4315  -1765 1765  1765 1765))
+      (outline (path signal 120  -1380 1380  0 1380))
+      (outline (path signal 120  -1380 0  -1380 1380))
+      (outline (path signal 120  -1380 -1270  -1380 -3920))
+      (outline (path signal 120  -1380 -1270  1380 -1270))
+      (outline (path signal 120  -1380 -3920  1380 -3920))
+      (outline (path signal 120  1380 -1270  1380 -3920))
+      (outline (path signal 100  -1270 635  -635 1270))
+      (outline (path signal 100  -1270 -3810  -1270 635))
+      (outline (path signal 100  -635 1270  1270 1270))
+      (outline (path signal 100  1270 1270  1270 -3810))
+      (outline (path signal 100  1270 -3810  -1270 -3810))
+      (pin Rect[A]Pad_1700.000000x1700.000000_um 1 0 0)
+      (pin Round[A]Pad_1700.000000_um 2 0 -2540)
+    )
+    (padstack Round[A]Pad_1700.000000_um
+      (shape (circle F.Cu 1700))
+      (shape (circle In1.Cu 1700))
+      (shape (circle In2.Cu 1700))
+      (shape (circle B.Cu 1700))
+      (attach off)
+    )
+    (padstack Rect[T]Pad_600.000000x500.000000_um
+      (shape (rect F.Cu -300 -250 300 250))
+      (attach off)
+    )
+    (padstack Rect[A]Pad_1700.000000x1700.000000_um
+      (shape (rect F.Cu -850 -850 850 850))
+      (shape (rect In1.Cu -850 -850 850 850))
+      (shape (rect In2.Cu -850 -850 850 850))
+      (shape (rect B.Cu -850 -850 850 850))
+      (attach off)
+    )
+    (padstack "Via[0-3]_600:300_um"
+      (shape (circle F.Cu 600))
+      (shape (circle In1.Cu 600))
+      (shape (circle In2.Cu 600))
+      (shape (circle B.Cu 600))
+      (attach off)
+    )
+  )
+  (network
+    (net VCC
+      (pins R1-1 R2-2 J1-1)
+    )
+    (net GND
+      (pins R1-2 R2-1 J1-2)
+    )
+    (class kicad_default GND VCC
+      (circuit
+        (use_via "Via[0-3]_600:300_um")
+      )
+      (rule
+        (width 200)
+        (clearance 200)
+      )
+    )
+  )
+  (wiring
+    (wire (path F.Cu 250  100500 -50000  105000 -50000)(net GND)(type fix))
+    (wire (path In1.Cu 250  105000 -50000  105000 -55000)(net GND)(type fix))
+    (via "Via[0-3]_600:300_um"  105000 -50000 (net GND)(type fix))
+  )
+)
