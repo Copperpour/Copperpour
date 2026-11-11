@@ -1135,10 +1135,11 @@ fn locked_routing(
 }
 
 /// The board's copper layers from top to bottom: `F.Cu`, `In1.Cu`..`In<N-2>.Cu`
-/// and `B.Cu`, the order Specctra layer indices follow. The file lists them by
-/// ordinal (KiCad 10 puts `B.Cu`, ordinal 2, before `In1.Cu`, ordinal 4), so
-/// the order is rebuilt from the names; a set with a gap, a repeat or a missing
-/// outer layer is refused.
+/// and `B.Cu`, the order Specctra layer indices follow. KiCad 10 writes the
+/// layer table top to bottom (`F.Cu` 0, `In1.Cu` 4, `In2.Cu` 6, `B.Cu` 2) but
+/// writes a pad's layer list by ordinal (`F.Cu`, `B.Cu`, `In2.Cu`), so the
+/// order is rebuilt from the names rather than taken from either list; a set
+/// with a gap, a repeat or a missing outer layer is refused.
 fn copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
     let table = tree.find("layers").context("board has no layers table")?;
     let copper = copperpour_sexp::layers::table_layers(table)
@@ -1533,8 +1534,14 @@ fn footprints(
                 }
                 (layers, None)
             } else {
-                // Every copper layer, as a wildcard or listed in full.
-                if !(layers == ["*.Cu".to_string()] || layers == copper_layers) {
+                // Every copper layer, as a wildcard or each listed once. KiCad
+                // saves a pad on every layer as `*.Cu`; a list written by hand
+                // or by another tool may follow the ordinal order of pad lists
+                // (`F.Cu`, `B.Cu`, `In1.Cu`, ...), so it is compared as a set.
+                let listed_in_full = layers.len() == copper_layers.len()
+                    && layers.iter().collect::<BTreeSet<_>>()
+                        == copper_layers.iter().collect::<BTreeSet<_>>();
+                if !(layers == ["*.Cu".to_string()] || listed_in_full) {
                     bail!(
                         "unsupported through-hole pad {reference}-{number}: copper layers are [{}]",
                         layers.join(", ")
@@ -3722,7 +3729,15 @@ pub(crate) mod tests {
             copper_of(r#"(0 "F.Cu" signal) (2 "B.Cu" signal) (9 "F.Adhes" user)"#).unwrap(),
             ["F.Cu", "B.Cu"]
         );
-        // KiCad 10 lists copper by ordinal: B.Cu (2) before In1.Cu (4).
+        // KiCad 10 writes the table top to bottom, as in the four-layer fixture.
+        assert_eq!(
+            copper_of(
+                r#"(0 "F.Cu" signal) (4 "In1.Cu" power) (6 "In2.Cu" mixed) (2 "B.Cu" signal)"#
+            )
+            .unwrap(),
+            ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+        );
+        // An order KiCad does not write in the table gives the same stack.
         assert_eq!(
             copper_of(
                 r#"(0 "F.Cu" signal) (2 "B.Cu" signal) (4 "In1.Cu" power) (6 "In2.Cu" mixed)"#
@@ -3846,17 +3861,47 @@ pub(crate) mod tests {
             error.contains("unsupported through-hole pad J1-1: copper layers are [F.Cu, B.Cu]"),
             "{error}"
         );
-        let listed = FOUR_LAYERS.replacen(
-            r#"(layers "*.Cu" "*.Mask")"#,
-            r#"(layers "F.Cu" "In1.Cu" "In2.Cu" "B.Cu" "*.Mask")"#,
-            1,
-        );
-        export_dsn(
-            Path::new("board.kicad_pcb"),
-            &listed,
-            &native_fixture_rules(),
-        )
-        .unwrap();
+        // KiCad saves a pad on every copper layer as `*.Cu`; a list in full
+        // is accepted in the ordinal order of pad lists or top to bottom.
+        for list in [
+            r#""F.Cu" "B.Cu" "In1.Cu" "In2.Cu""#,
+            r#""F.Cu" "In1.Cu" "In2.Cu" "B.Cu""#,
+        ] {
+            let listed = FOUR_LAYERS.replacen(
+                r#"(layers "*.Cu" "*.Mask")"#,
+                &format!(r#"(layers {list} "*.Mask")"#),
+                1,
+            );
+            assert_ne!(listed, FOUR_LAYERS);
+            export_dsn(
+                Path::new("board.kicad_pcb"),
+                &listed,
+                &native_fixture_rules(),
+            )
+            .unwrap_or_else(|error| panic!("{list}: {error}"));
+        }
+        // Every layer named, but one of them twice, or one missing.
+        for list in [
+            r#""F.Cu" "B.Cu" "In1.Cu" "In2.Cu" "In2.Cu""#,
+            r#""F.Cu" "B.Cu" "In1.Cu" "In1.Cu""#,
+        ] {
+            let repeated = FOUR_LAYERS.replacen(
+                r#"(layers "*.Cu" "*.Mask")"#,
+                &format!(r#"(layers {list} "*.Mask")"#),
+                1,
+            );
+            let error = export_dsn(
+                Path::new("board.kicad_pcb"),
+                &repeated,
+                &native_fixture_rules(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("unsupported through-hole pad J1-1: copper layers are"),
+                "{list}: {error}"
+            );
+        }
     }
 
     #[test]

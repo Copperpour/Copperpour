@@ -13,7 +13,9 @@ and saving it through KiCad, after:
 
 It was then re-saved with `kicad-cli pcb upgrade --force`. The locked through
 via keeps KiCad's `(layers "F.Cu" "B.Cu")` span on four layers, and the layer
-table lists copper by ordinal (`F.Cu` 0, `In1.Cu` 4, `In2.Cu` 6, `B.Cu` 2).
+table lists copper top to bottom (`F.Cu` 0, `In1.Cu` 4, `In2.Cu` 6, `B.Cu` 2).
+A pad's layer list, by contrast, follows the ordinal order (`F.Cu`, `B.Cu`,
+`In2.Cu`), and a pad on every copper layer is saved as `*.Cu`.
 
 `specctra_four_layers.native-kicad-10.dsn` was exported from that board by
 KiCad 10.0.8's `pcbnew.ExportSpecctraDSN(board, path)`. Only the absolute
