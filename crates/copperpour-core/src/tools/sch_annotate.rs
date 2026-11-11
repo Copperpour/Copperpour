@@ -31,13 +31,14 @@ use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::outcome::{self, OutcomeStatus};
 use crate::tools::sch_hierarchy::{load_saved_hierarchy, SavedHierarchy};
 use copperpour_sexp::{
-    commit_file_transaction, inspect_file_transactions, parse_sexp, recover_file_transactions,
+    inspect_file_transactions, parse_sexp, recover_file_transactions,
     schematic::parse_subsymbol_unit,
+    try_commit_file_transaction,
     writer::{
         apply_edits, find_enclosing_block, kicad_editor_lock_path, read_consistent,
         write_atomic_if_unchanged, SexpEdit,
     },
-    FileTransition, SexpError, SexpNode,
+    FileTransition, SexpError, SexpNode, TransactionFailure,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -1399,9 +1400,11 @@ fn annotate_file_with_persistence(
     match persist(path, &content, &prospective) {
         Ok(()) => {}
         Err(error) => {
-            // The shared writer can return Conflict before replacement OR
-            // after replacement when its readback differs. Without timing
-            // evidence, no persistence error proves that nothing was applied.
+            // A lock or revision conflict is refused before the rename;
+            // anything else may come after it, so the outcome is uncertain.
+            if let Some(refusal) = crate::tools::unwritten_schematic_refusal(OPERATION, &error) {
+                return outcome::refused_before_write(refusal, target, requested);
+            }
             let result = crate::tools::mutation_outcome_uncertain(
                 path,
                 OPERATION,
@@ -1731,7 +1734,7 @@ fn hierarchy_body(
 /// project whose root `path` is, and report exactly what happened.
 pub(crate) fn annotate_hierarchy(path: &Path, options: AnnotateOptions) -> CallToolResult {
     annotate_hierarchy_with_persistence(path, options, |directory, transitions| {
-        commit_file_transaction(directory, transitions).map(|_| ())
+        try_commit_file_transaction(directory, transitions).map(|_| ())
     })
 }
 
@@ -1770,7 +1773,7 @@ pub(crate) fn sole_top_level_sheet(
 fn annotate_hierarchy_with_persistence(
     path: &Path,
     options: AnnotateOptions,
-    persist: impl FnOnce(&Path, Vec<FileTransition>) -> Result<(), SexpError>,
+    persist: impl FnOnce(&Path, Vec<FileTransition>) -> Result<(), TransactionFailure>,
 ) -> CallToolResult {
     let invalid = |field: &str, reason: String| {
         CallToolResult::error_kind(
@@ -2034,14 +2037,22 @@ fn annotate_hierarchy_with_persistence(
         .iter()
         .map(|transition| transition.path().display().to_string())
         .collect();
-    if let Err(error) = persist(&directory, transitions) {
-        // As in file scope, no persistence error proves that nothing was
-        // applied; the journal says what was.
+    if let Err(failure) = persist(&directory, transitions) {
+        // Before its journal, the transaction touched nothing, so a lock or a
+        // changed file is a refusal. After it, the journal says what applied.
+        if failure.journal.is_none() {
+            if let Some(refusal) =
+                crate::tools::unwritten_schematic_refusal(OPERATION, &failure.error)
+            {
+                return outcome::refused_before_write(refusal, target, requested);
+            }
+        }
         return uncertain(
             format!(
-                "the transaction over {} failed: {error}; `copperpour transaction status {shown}` \
+                "the transaction over {} failed: {}; `copperpour transaction status {shown}` \
                  shows what was applied",
-                written.join(", ")
+                written.join(", "),
+                failure.error
             ),
             requested,
         );
@@ -2173,8 +2184,10 @@ mod tests {
     use crate::mcp::error::extract_error_kind;
     use crate::mcp::protocol::ToolContent;
 
+    /// A readback mismatch came after the rename, so the outcome is uncertain;
+    /// a revision conflict came before it and wrote nothing (#427).
     #[test]
-    fn persistence_conflicts_require_inspection_before_retry() {
+    fn persistence_errors_are_uncertain_only_after_the_rename() {
         for after_replacement in [true, false] {
             let (_dir, path) = write_fixture(BEFORE);
             let result = annotate_file_with_persistence(
@@ -2198,17 +2211,23 @@ mod tests {
                 assert_eq!(saved, BEFORE);
             }
             let body = response_json(&result);
-            assert_eq!(body["outcome"]["status"], "uncertain", "{body}");
+            let (status, retry, kind) = if after_replacement {
+                (
+                    "uncertain",
+                    outcome::inspect_before_retry(),
+                    "mutation_outcome_uncertain",
+                )
+            } else {
+                ("failed", outcome::retry_whole_request(), "conflict")
+            };
+            assert_eq!(body["outcome"]["status"], status, "{body}");
+            assert_eq!(body["outcome"]["retry"], retry, "{body}");
+            assert_eq!(extract_error_kind(&result).as_deref(), Some(kind));
             assert_eq!(
-                body["outcome"]["retry"],
-                outcome::inspect_before_retry(),
+                text_of(&result).contains("wrote nothing"),
+                !after_replacement,
                 "{body}"
             );
-            assert_eq!(
-                extract_error_kind(&result).as_deref(),
-                Some("mutation_outcome_uncertain")
-            );
-            assert!(!text_of(&result).contains("nothing was written"));
         }
     }
 
@@ -4021,6 +4040,38 @@ mod tests {
         }
     }
 
+    /// A lock that appears after the hierarchy's own lock check is refused by
+    /// the transaction before its journal: nothing changed, so `conflict`
+    /// (#427).
+    #[test]
+    fn a_lock_the_transaction_refuses_is_a_conflict() {
+        let (dir, root) = nested_project(|_, content| reset_designators(content, |_| true));
+        let before = saved(dir.path(), &nested_names());
+        let lock = dir.path().join("~bank.kicad_sch.lck");
+        let result = annotate_hierarchy_with_persistence(
+            &root,
+            AnnotateOptions::default(),
+            |directory, transitions| {
+                std::fs::write(&lock, r#"{"hostname":"x","username":"y"}"#).unwrap();
+                try_commit_file_transaction(directory, transitions).map(|_| ())
+            },
+        );
+        let body = response_json(&result);
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("conflict"),
+            "{body}"
+        );
+        assert_eq!(body["outcome"]["status"], "failed", "{body}");
+        assert_eq!(body["outcome"]["retry"], outcome::retry_whole_request());
+        // The decoded message: JSON escapes a Windows path's backslashes.
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains(&lock.display().to_string()), "{body}");
+        assert!(message.contains("wrote nothing"), "{body}");
+        assert_eq!(saved(dir.path(), &nested_names()), before);
+        assert!(lock.exists());
+    }
+
     #[test]
     fn a_failed_transaction_is_uncertain_and_names_every_file() {
         for committed in [true, false] {
@@ -4031,10 +4082,14 @@ mod tests {
                 AnnotateOptions::default(),
                 |directory, transitions| {
                     if committed {
-                        commit_file_transaction(directory, transitions).unwrap();
+                        try_commit_file_transaction(directory, transitions).unwrap();
                     }
-                    Err(SexpError::Conflict {
-                        path: directory.to_path_buf(),
+                    // A journal reached disk, so the targets may have changed.
+                    Err(TransactionFailure {
+                        error: SexpError::Conflict {
+                            path: directory.to_path_buf(),
+                        },
+                        journal: Some(directory.join(".copperpour-transaction-x.json")),
                     })
                 },
             );
@@ -4155,7 +4210,7 @@ mod tests {
             &root,
             AnnotateOptions::default(),
             |directory, transitions| {
-                commit_file_transaction(directory, transitions)?;
+                try_commit_file_transaction(directory, transitions)?;
                 let content = std::fs::read_to_string(&bank).unwrap();
                 std::fs::write(&bank, set_record(&content, &r3, &page2, "R6")).unwrap();
                 Ok(())

@@ -642,8 +642,38 @@ fn map_sexp_error(error: copperpour_sexp::SexpError) -> crate::error::Error {
             crate::error::Error::ReadbackMismatch(path)
         }
         copperpour_sexp::SexpError::KiCadEditorLocked {
-            path, lock_path, ..
-        } => crate::error::Error::KiCadEditorLocked { path, lock_path },
+            path,
+            lock_path,
+            inspection_error,
+        } => crate::error::Error::KiCadEditorLocked {
+            path,
+            lock_path,
+            inspection_error,
+        },
         error => crate::error::Error::Io(std::io::Error::other(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_sexp_error;
+
+    /// A lock path that could not be inspected keeps its reason, so callers
+    /// do not report it as a lock that is present (#427).
+    #[test]
+    fn an_unreadable_lock_keeps_its_inspection_error() {
+        let mapped = map_sexp_error(copperpour_sexp::SexpError::KiCadEditorLocked {
+            path: "a.kicad_sch".into(),
+            lock_path: "~a.kicad_sch.lck".into(),
+            inspection_error: Some("permission denied".into()),
+        });
+        assert!(
+            matches!(
+                &mapped,
+                crate::error::Error::KiCadEditorLocked { inspection_error: Some(reason), .. }
+                    if reason == "permission denied"
+            ),
+            "{mapped:?}"
+        );
     }
 }

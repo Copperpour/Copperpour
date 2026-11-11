@@ -533,6 +533,9 @@ async fn handle_apply_template(
     // revision loaded above. All placements are prepared in memory, so a
     // preflight or library failure leaves the schematic byte-for-byte intact.
     if let Err(error) = sch.overwrite() {
+        if let Some(refusal) = crate::tools::unwritten_schematic_refusal("apply_template", &error) {
+            return Ok(refusal);
+        }
         return Ok(crate::tools::mutation_outcome_uncertain(
             &sch_path,
             "apply_template",
@@ -869,6 +872,48 @@ mod tests {
             Some("stale_target")
         );
         assert_eq!(std::fs::read(&schematic).unwrap(), before);
+    }
+
+    /// KiCad's editor lock refuses the template before anything is written,
+    /// so the caller hears `conflict`, not an uncertain outcome (#427).
+    #[tokio::test]
+    async fn apply_template_refuses_a_locked_schematic_without_writing() {
+        if !in_isolated_home(
+            "tools::templates::tests::apply_template_refuses_a_locked_schematic_without_writing",
+        ) {
+            return;
+        }
+        let (_dir, schematic) = template_fixture();
+        let lock = schematic.with_file_name("~derived_lib_name.kicad_sch.lck");
+        std::fs::write(&lock, r#"{"hostname":"x","username":"y"}"#).unwrap();
+        let before = std::fs::read(&schematic).unwrap();
+
+        let refused = call_registered(
+            tools(),
+            "apply_template",
+            json!({
+                "schematic": schematic.display().to_string(),
+                "template_id": "test_one_resistor"
+            }),
+            test_ctx(),
+        )
+        .await;
+        assert!(refused.is_error, "{refused:?}");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&refused).as_deref(),
+            Some("conflict"),
+            "{refused:?}"
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &refused.content[0] else {
+            panic!("expected text content: {refused:?}");
+        };
+        // The decoded message: JSON escapes a Windows path's backslashes.
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains(&lock.display().to_string()), "{text}");
+        assert!(message.contains("wrote nothing"), "{text}");
+        assert_eq!(std::fs::read(&schematic).unwrap(), before);
+        assert!(lock.exists(), "the lock is KiCad's to remove");
     }
 
     /// Every name a pin answers to: its number, its name and its alternate

@@ -493,14 +493,15 @@ impl McpHandler {
                         Some("mutation_outcome_uncertain".to_string()),
                     )
                 }
-                Err(e) if kicad_editor_locked_path(&e).is_some() => {
-                    let locked = kicad_editor_locked_path(&e).expect("guard matched");
+                Err(e) if kicad_editor_lock(&e).is_some() => {
+                    let lock = kicad_editor_lock(&e).expect("guard matched");
+                    let locked = lock.path;
                     let path = locked.display().to_string();
                     if locked
                         .extension()
                         .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pcb"))
                     {
-                        let reason = kicad_board_lock_reason(&e).to_string();
+                        let reason = board_lock_reason(&lock).to_string();
                         (
                             CallToolResult::error_kind(
                                 ToolErrorKind::UnsafeFileFallback {
@@ -615,36 +616,18 @@ async fn with_request_progress<F: std::future::Future>(
     REQUEST_PROGRESS.scope(progress, future).await
 }
 
-fn kicad_editor_locked_path(error: &anyhow::Error) -> Option<&std::path::Path> {
-    for cause in error.chain() {
-        if let Some(copperpour_sexp::SexpError::KiCadEditorLocked { path, .. }) =
-            cause.downcast_ref::<copperpour_sexp::SexpError>()
-        {
-            return Some(path);
-        }
-        if let Some(copperpour_schematic_editor::Error::KiCadEditorLocked { path, .. }) =
-            cause.downcast_ref::<copperpour_schematic_editor::Error>()
-        {
-            return Some(path);
-        }
+/// The `unsafe_file_fallback` reason for a board write KiCad's lock refused.
+fn board_lock_reason(lock: &crate::tools::LockedDocument<'_>) -> &'static str {
+    if lock.inspection_error.is_some() {
+        "kicad_lock_unreadable"
+    } else {
+        "kicad_lock_present"
     }
-    None
 }
 
-fn kicad_board_lock_reason(error: &anyhow::Error) -> &'static str {
-    for cause in error.chain() {
-        if let Some(copperpour_sexp::SexpError::KiCadEditorLocked {
-            inspection_error, ..
-        }) = cause.downcast_ref::<copperpour_sexp::SexpError>()
-        {
-            return if inspection_error.is_some() {
-                "kicad_lock_unreadable"
-            } else {
-                "kicad_lock_present"
-            };
-        }
-    }
-    "kicad_lock_present"
+/// The KiCad editor lock anywhere in `error`'s chain.
+fn kicad_editor_lock(error: &anyhow::Error) -> Option<crate::tools::LockedDocument<'_>> {
+    error.chain().find_map(crate::tools::kicad_editor_lock)
 }
 
 /// Sum of content bytes in a `CallToolResult` — used for observability size
@@ -782,6 +765,23 @@ mod path_argument_taxonomy_tests {
 mod required_argument_dispatch_tests {
     use super::*;
     use crate::tools::ServerConfig;
+
+    /// A board lock that could not be inspected is reported as unreadable,
+    /// wherever in the error's chain the lock error sits.
+    #[test]
+    fn an_unreadable_board_lock_keeps_its_reason() {
+        let reason = |inspection_error: Option<&str>| {
+            let error = anyhow::Error::new(copperpour_sexp::SexpError::KiCadEditorLocked {
+                path: "a.kicad_pcb".into(),
+                lock_path: "~a.kicad_pcb.lck".into(),
+                inspection_error: inspection_error.map(str::to_owned),
+            })
+            .context("writing the board");
+            board_lock_reason(&kicad_editor_lock(&error).unwrap())
+        };
+        assert_eq!(reason(None), "kicad_lock_present");
+        assert_eq!(reason(Some("permission denied")), "kicad_lock_unreadable");
+    }
 
     async fn handler() -> McpHandler {
         McpHandler::new(ServerConfig {

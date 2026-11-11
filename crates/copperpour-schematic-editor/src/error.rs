@@ -20,7 +20,12 @@ pub enum Error {
     ReadbackMismatch(PathBuf),
 
     #[error("KiCad editor lock blocks write to '{path}': {lock_path}")]
-    KiCadEditorLocked { path: PathBuf, lock_path: PathBuf },
+    KiCadEditorLocked {
+        path: PathBuf,
+        lock_path: PathBuf,
+        /// Why the lock path could not be inspected, when it could not.
+        inspection_error: Option<String>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
