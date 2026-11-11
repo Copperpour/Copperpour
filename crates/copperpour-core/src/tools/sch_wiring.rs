@@ -224,6 +224,7 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
+                    "verbose": { "type": "boolean", "description": "Return the full saved readback per part (fields, field placements, instance paths, units) instead of the compact entry. Default false." },
                     "schematic": { "type": "string" },
                     "power_net": { "type": "string", "description": "Net name (e.g. 'VCC', 'GND')" },
                     "reference": { "type": "string",
@@ -2780,6 +2781,11 @@ async fn handle_add_power_symbol(
         Ok(result) => result,
         Err(error) => return Ok(error),
     };
+    if !super::sch_components::wants_verbose(args) {
+        let mut compact = super::sch_components::compact_placement(&observed);
+        compact["schematic"] = observed["schematic"].clone();
+        observed = compact;
+    }
     observed["added_power"] = observed["value"].clone();
     observed["junctions_added"] = json!(junctions_added
         .iter()

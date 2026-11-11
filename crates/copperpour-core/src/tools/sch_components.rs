@@ -50,6 +50,7 @@ pub fn tools() -> Vec<ToolDef> {
             super::placement_schema(json!({
                 "type": "object",
                 "properties": {
+                    "verbose": { "type": "boolean", "description": "Return the full saved readback per part (fields, field placements, instance paths, units) instead of the compact entry. Default false." },
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "lib_id": { "type": "string", "description": "Library:Symbol (e.g. 'Device:R')" },
                     "x": { "type": "number", "description": "X position in mm" },
@@ -152,11 +153,14 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "list_schematic_components",
             "List all symbol instances in a schematic with their positions, values, \
-             footprints, DNP state, and properties.",
+             footprints, DNP state, and properties. properties leaves out what is already \
+             listed (Reference, Value, Footprint), empty fields, and the library's \
+             Datasheet and Description; verbose: true lists every field.",
             json!({
                 "type": "object",
                 "properties": {
-                    "schematic": { "type": "string" }
+                    "schematic": { "type": "string" },
+                    "verbose": { "type": "boolean", "description": "List every field in properties, including the ones repeated above and empty ones. Default false." }
                 },
                 "required": ["schematic"]
             }),
@@ -708,6 +712,11 @@ pub(crate) async fn handle_add_schematic_component(
             ));
         }
     };
+    if !wants_verbose(args) {
+        let mut compact = compact_placement(&result);
+        compact["schematic"] = result["schematic"].clone();
+        result = compact;
+    }
     result["junctions_added"] = json!(junctions
         .iter()
         .map(|(x, y)| json!({ "x": x, "y": y }))
@@ -1986,6 +1995,49 @@ fn copy_component_observation(result: &mut serde_json::Value, observed: &serde_j
 /// Build a placement response only from the committed schematic that was read
 /// back after the write. The UUID is the mutation's stable identity; requested
 /// coordinates, fields, and hierarchy paths are never echoed as proof.
+/// Whether the caller asked for the full placement readback (`verbose`).
+pub(crate) fn wants_verbose(args: &serde_json::Value) -> bool {
+    args["verbose"].as_bool().unwrap_or(false)
+}
+
+/// The compact entry for a placed part: what a caller needs to go on
+/// (#114). The full readback repeated every field twice, `lib_id` three
+/// times and each field's placement; `verbose: true` still returns it, and
+/// the readback is verified the same either way.
+pub(crate) fn compact_placement(full: &serde_json::Value) -> serde_json::Value {
+    let mut entry = serde_json::Map::new();
+    for key in [
+        "reference",
+        "uuid",
+        "lib_id",
+        "value",
+        "footprint",
+        "x",
+        "y",
+        "rotation",
+        "unit",
+    ] {
+        if let Some(value) = full.get(key) {
+            entry.insert(key.to_string(), value.clone());
+        }
+    }
+    // Only when they say something.
+    for key in ["mirror_x", "mirror_y", "dnp"] {
+        if full[key] == json!(true) {
+            entry.insert(key.to_string(), json!(true));
+        }
+    }
+    if full["unit_count"].as_u64().is_some_and(|count| count > 1) {
+        entry.insert("unit_count".to_string(), full["unit_count"].clone());
+    }
+    for key in ["in_bom", "on_board"] {
+        if full[key] == json!(false) {
+            entry.insert(key.to_string(), json!(false));
+        }
+    }
+    serde_json::Value::Object(entry)
+}
+
 pub(crate) fn placed_component_readback(
     sch_path: &std::path::Path,
     committed: &cse::Schematic,
@@ -3802,11 +3854,28 @@ async fn handle_get_schematic_component(
     })))
 }
 
+/// The properties `list_schematic_components` shows by default: not the ones
+/// each row already carries (Reference, Value, Footprint), not empty ones, and
+/// not the library's Datasheet and Description, which repeat on every
+/// instance of a symbol. On a 57-part sheet they were most of the response.
+fn listed_properties<'a>(mut properties: BTreeMap<&'a str, &'a str>) -> BTreeMap<&'a str, &'a str> {
+    const LEFT_OUT: [&str; 5] = [
+        "Reference",
+        "Value",
+        "Footprint",
+        "Datasheet",
+        "Description",
+    ];
+    properties.retain(|name, value| !LEFT_OUT.contains(name) && !value.is_empty());
+    properties
+}
+
 async fn handle_list_schematic_components(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    let verbose = wants_verbose(args);
     let sch = cse::Schematic::load(&sch_path)?;
 
     let items: Vec<serde_json::Value> = sch
@@ -3827,7 +3896,11 @@ async fn handle_list_schematic_components(
                 "mirror_x": mirror.contains('x'),
                 "mirror_y": mirror.contains('y'),
                 "dnp": sym.dnp,
-                "properties": symbol_properties(sym)
+                "properties": if verbose {
+                    symbol_properties(sym)
+                } else {
+                    listed_properties(symbol_properties(sym))
+                }
             })
         })
         .collect();
@@ -5617,6 +5690,7 @@ mod tests {
         let inherited = handle_add_schematic_component(
             &json!({
                 "schematic": path.display().to_string(),
+                "verbose": true,
                 "lib_id": "Device:WITH_DEFAULTS",
                 "x": 100.0, "y": 80.0,
                 "reference": "U1"
@@ -5636,6 +5710,7 @@ mod tests {
         let overridden = handle_add_schematic_component(
             &json!({
                 "schematic": path.display().to_string(),
+                "verbose": true,
                 "lib_id": "Device:WITH_DEFAULTS",
                 "x": 120.0, "y": 80.0,
                 "reference": "U2",
@@ -5813,6 +5888,7 @@ mod tests {
         let result = handle_add_schematic_component(
             &json!({
                 "schematic": path.display().to_string(),
+                "verbose": true,
                 "lib_id": "Device:OPAMP_DUAL",
                 "x": 100.0, "y": 80.0,
                 "reference": "U1",
@@ -10378,9 +10454,12 @@ mod multi_unit_component_tests {
         assert_eq!(component["properties"]["Value"], "OLD", "{component}");
         assert_eq!(component["value"], "OLD", "{component}");
         let listed = body(
-            handle_list_schematic_components(&json!({ "schematic": path }), &context())
-                .await
-                .unwrap(),
+            handle_list_schematic_components(
+                &json!({ "schematic": path, "verbose": true }),
+                &context(),
+            )
+            .await
+            .unwrap(),
         );
         for row in listed["components"].as_array().unwrap() {
             assert_eq!(row["properties"]["Value"], row["value"], "{listed}");
@@ -12026,6 +12105,58 @@ mod native_dnp_tests {
 
     /// Readback comes from the file: C1 is DNP in the KiCad-saved fixture
     /// with nothing written, and a write shows up in both readers.
+    /// The list leaves out properties each row already carries, empty ones
+    /// and the library's Datasheet and Description; verbose keeps them all.
+    #[tokio::test]
+    async fn list_properties_are_compact_unless_verbose() {
+        let (_dir, path) = fixture(SHEET);
+        body(
+            &call(
+                "edit_schematic_component",
+                &path,
+                json!({ "reference": "R1", "fields": { "MPN": "RC0805FR-0710KL" } }),
+            )
+            .await,
+        );
+        let row = |list: &serde_json::Value| {
+            list["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["reference"] == "R1")
+                .cloned()
+                .unwrap()
+        };
+        let compact = row(&body(
+            &call("list_schematic_components", &path, json!({})).await,
+        ));
+        assert_eq!(compact["properties"]["MPN"], "RC0805FR-0710KL", "{compact}");
+        for absent in [
+            "Reference",
+            "Value",
+            "Footprint",
+            "Datasheet",
+            "Description",
+        ] {
+            assert!(
+                compact["properties"].get(absent).is_none(),
+                "{absent} in {compact}"
+            );
+        }
+        assert!(compact["value"].is_string());
+
+        let full = row(&body(
+            &call(
+                "list_schematic_components",
+                &path,
+                json!({ "verbose": true }),
+            )
+            .await,
+        ));
+        assert_eq!(full["properties"]["Reference"], "R1", "{full}");
+        assert_eq!(full["properties"]["MPN"], "RC0805FR-0710KL");
+    }
+
     #[tokio::test]
     async fn get_and_list_report_the_stored_attribute() {
         let (_dir, path) = fixture(SHEET);
