@@ -564,6 +564,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "copperpour-viewer"
+version = "0.16.1"
+dependencies = [
+ "copperpour-schematic-editor",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

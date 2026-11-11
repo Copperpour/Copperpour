@@ -20,7 +20,8 @@ loads domain toolsets on demand, and routes each call to a file, IPC, or
 | S-expression engine | `crates/copperpour-sexp` | KiCad file parsing/writing, atomic edits, reversible commands, and transaction journals |
 | Typed schematic editor | `crates/copperpour-schematic-editor` | Higher-level schematic parse, mutation, library resolution, and serialization |
 | KiCad IPC client | `crates/copperpour-ipc` | Typed KiCad IPC messages, NNG transport, board targeting, and failure classification |
-| Schematic viewer | `crates/schematic-viewer` | Separate Tauri application for live schematic rendering |
+| Viewer engine | `crates/copperpour-viewer` | GUI-independent sheet discovery, snapshot SVG rendering and change-batching helpers |
+| Schematic viewer | `crates/schematic-viewer` | Separate Tauri application, commands and watcher integration using the shared engine |
 | KiCad launcher plugin | `plugin` | Python ActionPlugin and settings UI for the packaged server |
 | Packaging | `packaging` | KiCad PCM metadata, package assembly, and package validation |
 
