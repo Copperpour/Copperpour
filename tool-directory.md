@@ -329,7 +329,7 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `apply_copper` | Create a batch of straight tracks and through vias on the live board in one KiCad commit (one undo step), without saving. Dry run by default: checks every item (nets and copper layers the board has, sizes above zero, drill smaller than size, no zero-length track) and returns the plan rounded to the nanometre with a `plan_revision`; apply needs it as `expected_plan_revision`. One commit plus a read-back by UUID, not an atomic transaction: a batch KiCad stores partly on other nets is removed again in a second commit and refused with `plan_blocked`; a partial create is dropped; an unconfirmed removal is `mutation_outcome_uncertain` with the UUIDs. |
+| `apply_copper` | Create a batch of straight tracks and vias (through, blind, buried or micro, with `start_layer` and `end_layer`) on the live board in one KiCad commit (one undo step), without saving. Dry run by default: checks every item (nets and copper layers the board has, sizes above zero, drill smaller than size, a via span that is its type's, no zero-length track) and returns the plan rounded to the nanometre with a `plan_revision`; apply needs it as `expected_plan_revision`. One commit plus a read-back by UUID, not an atomic transaction: a batch KiCad stores partly on other nets is removed again in a second commit and refused with `plan_blocked`; a partial create is dropped; an unconfirmed removal is `mutation_outcome_uncertain` with the UUIDs. |
 
 ### `placement` · 5 tools
 **Purpose:** Placement quality and automation — score, plan decoupling rows, plan BGA fanouts; every plan reports its own before/after score.
