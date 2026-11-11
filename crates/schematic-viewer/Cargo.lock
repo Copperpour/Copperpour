@@ -449,6 +449,8 @@ version = "0.16.1"
 dependencies = [
  "axum",
  "copperpour-schematic-editor",
+ "hyper",
+ "hyper-util",
  "notify",
  "roxmltree",
  "serde",

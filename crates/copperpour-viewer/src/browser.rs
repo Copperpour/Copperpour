@@ -164,15 +164,8 @@ impl BrowserViewer {
                 watched,
             },
         ));
-        let mut server_stop = stop_rx;
         let app = router(shared.clone());
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = server_stop.changed().await;
-                })
-                .await
-        });
+        let server = tokio::spawn(serve_owned(listener, app, stop_rx));
         Ok(Self {
             url: format!("http://127.0.0.1:{port}/#token={token}"),
             stop,
@@ -217,6 +210,42 @@ impl Drop for BrowserViewer {
         self.signal_stop();
     }
 }
+// Own accepted connections as well as the listener. Aborting an axum::serve
+// future alone does not bound a slow response's lifetime after shutdown.
+async fn serve_owned(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    mut stop: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = stop.changed() => break,
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let service = hyper_util::service::TowerToHyperService::new(app.clone());
+                let mut stopping = stop.clone();
+                connections.spawn(async move {
+                    if *stopping.borrow() { return; }
+                    let connection = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service);
+                    tokio::pin!(connection);
+                    tokio::select! {
+                        _ = stopping.changed() => {
+                            connection.as_mut().graceful_shutdown();
+                            let _ = tokio::time::timeout(Duration::from_secs(1), &mut connection).await;
+                        }
+                        _ = &mut connection => {}
+                    }
+                });
+            }
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+        }
+    }
+    while connections.join_next().await.is_some() {}
+    Ok(())
+}
+
 fn checked_sheets(root: &Path) -> Result<Vec<crate::SheetEntry>, String> {
     if root.extension().and_then(|s| s.to_str()) != Some("kicad_sch") || !root.is_file() {
         return Err("viewer root must be a schematic file".into());
@@ -1539,6 +1568,46 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</t
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn owned_http_connections_close_even_when_a_response_cannot_drain() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, rx) = watch::channel(false);
+        let app = Router::new().route(
+            "/pending",
+            get(|| async {
+                let stream =
+                    tokio_stream::once(Ok::<_, Infallible>(Event::default().data("ready")))
+                        .chain(tokio_stream::pending::<Result<Event, Infallible>>());
+                Sse::new(stream)
+            }),
+        );
+        let server = tokio::spawn(serve_owned(listener, app, rx));
+        let mut response = reqwest::get(format!("http://{address}/pending"))
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(response.chunk().await.unwrap().unwrap().to_vec())
+                .unwrap()
+                .contains("ready")
+        );
+        stop.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // A forced close may be EOF or an incomplete chunked-response error.
+        // Either must arrive promptly; an accepted task may not outlive shutdown.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), response.chunk())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

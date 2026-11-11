@@ -29,6 +29,9 @@ control. Pan, zoom, theme, sheet selection and manual refresh are shared.
 positive per-render timeout. It binds IPv4 loopback on an ephemeral port and
 returns a handle and credential URL; it does not launch a browser. Drop signals
 shutdown; `shutdown().await` also waits for the render worker and HTTP service.
+Accepted HTTP/1 connections are owned tasks, with one second to drain before
+forced closure, so a slow response cannot outlive the viewer. An in-progress
+response may be interrupted when its owner shuts down.
 On viewer shutdown, in-flight CLI processes are killed and reaped. Opening KiCad is
 an explicit authenticated user action; that GUI is allowed to outlive the viewer.
 Its response establishes process spawn, not that an editor became ready.

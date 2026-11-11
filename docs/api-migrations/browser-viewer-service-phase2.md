@@ -1,4 +1,4 @@
-# Shared browser viewer service (phase two of #242)
+### Shared browser viewer service (minor release; phase two of #242)
 
 This phase adds a development browser service in `copperpour-viewer`, accessible
 through its Rust API and `browser_viewer` example. It does not switch
