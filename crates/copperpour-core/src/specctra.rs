@@ -32,6 +32,8 @@ pub(crate) struct ExportBundle {
     pub pad_count: usize,
     pub net_count: usize,
     pub class_count: usize,
+    /// Copper layers of the exported board, counted from its layer table.
+    pub copper_layer_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -217,7 +219,7 @@ pub(crate) fn export_dsn(
     let outline = simple_closed_outline(&tree, outline_arc_error_um(board_path, &tree)?)?;
     let net_table = top_level_net_table(&tree);
     let locked_routing = locked_routing(&tree, &net_table, &copper_layers)?;
-    let footprints = footprints(&tree, &net_table)?;
+    let footprints = footprints(&tree, &net_table, &copper_layers)?;
     if footprints.is_empty() {
         bail!("supported routing profile requires at least one footprint");
     }
@@ -299,6 +301,7 @@ pub(crate) fn export_dsn(
             .sum(),
         net_count: net_pins.len(),
         class_count: class_nets.len(),
+        copper_layer_count: copper_layers.len(),
     })
 }
 
@@ -1061,11 +1064,17 @@ fn locked_routing(
             .filter_map(SexpNode::as_str)
             .map(str::to_string)
             .collect::<Vec<_>>();
-        if layers != copper_layers {
+        // KiCad writes a through via's span as its two outer layers, on any
+        // number of copper layers.
+        let through = [
+            copper_layers[0].clone(),
+            copper_layers[copper_layers.len() - 1].clone(),
+        ];
+        if layers != through {
             bail!(
                 "unsupported locked via layer span [{}]; expected [{}]",
                 layers.join(", "),
-                copper_layers.join(", ")
+                through.join(", ")
             );
         }
         let net = via
@@ -1125,27 +1134,39 @@ fn locked_routing(
     Ok(routing)
 }
 
+/// The board's copper layers from top to bottom: `F.Cu`, `In1.Cu`..`In<N-2>.Cu`
+/// and `B.Cu`, the order Specctra layer indices follow. The file lists them by
+/// ordinal (KiCad 10 puts `B.Cu`, ordinal 2, before `In1.Cu`, ordinal 4), so
+/// the order is rebuilt from the names; a set with a gap, a repeat or a missing
+/// outer layer is refused.
 fn copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
-    let layers = tree.find("layers").context("board has no layers table")?;
-    let mut copper = layers
-        .children()
-        .unwrap_or(&[])
-        .iter()
-        .skip(1)
-        // Layer table rows are `(numeric-id "name" type)`, so the layer name
-        // is the first data item even though the numeric id is the list head.
-        .filter_map(|layer| layer.get(1).and_then(SexpNode::as_str))
-        .filter(|name| name.ends_with(".Cu"))
-        .map(str::to_string)
+    let table = tree.find("layers").context("board has no layers table")?;
+    let copper = copperpour_sexp::layers::table_layers(table)
+        .into_iter()
+        .filter(copperpour_sexp::layers::Layer::is_copper)
+        .map(|layer| layer.name)
         .collect::<Vec<_>>();
-    copper.dedup();
-    if copper != ["F.Cu".to_string(), "B.Cu".to_string()] {
-        bail!(
-            "unsupported first routing profile: expected exactly F.Cu and B.Cu, got [{}]",
+    let distinct = copper.iter().collect::<BTreeSet<_>>();
+    let stack = copperpour_sexp::layers::CopperStack::from_layer_names(
+        copper.iter().map(String::as_str),
+    )
+    .ok()
+    .filter(|_| distinct.len() == copper.len())
+    .with_context(|| {
+        format!(
+            "unsupported routing profile: copper layers must be F.Cu, In1.Cu..In<N-2>.Cu and B.Cu, got [{}]",
             copper.join(", ")
-        );
-    }
-    Ok(copper)
+        )
+    })?;
+    Ok(stack_layer_names(stack.count()))
+}
+
+/// `F.Cu`, `In1.Cu`..`In<count-2>.Cu`, `B.Cu`.
+pub(crate) fn stack_layer_names(count: u32) -> Vec<String> {
+    std::iter::once("F.Cu".to_string())
+        .chain((1..count.saturating_sub(1)).map(|k| format!("In{k}.Cu")))
+        .chain(std::iter::once("B.Cu".to_string()))
+        .collect()
 }
 
 fn outline_arc_error_um(board_path: &Path, tree: &SexpNode) -> Result<f64> {
@@ -1380,6 +1401,7 @@ fn round_um_i64(value_um: f64) -> Result<i64> {
 fn footprints(
     tree: &SexpNode,
     net_table: &BTreeMap<String, String>,
+    copper_layers: &[String],
 ) -> Result<Vec<FootprintModel>> {
     // Across the board: a pad UUID names one physical pad.
     let mut pad_uuids = BTreeSet::new();
@@ -1511,9 +1533,8 @@ fn footprints(
                 }
                 (layers, None)
             } else {
-                if !(layers == ["*.Cu".to_string()]
-                    || layers == ["F.Cu".to_string(), "B.Cu".to_string()])
-                {
+                // Every copper layer, as a wildcard or listed in full.
+                if !(layers == ["*.Cu".to_string()] || layers == copper_layers) {
                     bail!(
                         "unsupported through-hole pad {reference}-{number}: copper layers are [{}]",
                         layers.join(", ")
@@ -1529,7 +1550,7 @@ fn footprints(
                         "pad {reference}-{number} drill {drill_um} um is not smaller than its copper size"
                     );
                 }
-                (vec!["F.Cu".to_string(), "B.Cu".to_string()], Some(drill_um))
+                (copper_layers.to_vec(), Some(drill_um))
             };
             let net = pad
                 .find("net")
@@ -1588,7 +1609,8 @@ pub(crate) fn board_pin_identities(
 ) -> Result<BTreeMap<String, Vec<PinIdentity>>> {
     let tree = parse_sexp(board_source).context("parse KiCad board snapshot")?;
     let net_table = top_level_net_table(&tree);
-    Ok(footprints(&tree, &net_table)?
+    let copper_layers = copper_layers(&tree)?;
+    Ok(footprints(&tree, &net_table, &copper_layers)?
         .into_iter()
         .map(|footprint| {
             let reference = footprint.reference;
@@ -2148,7 +2170,8 @@ fn build_manifest(
         coordinate_unit: "um".to_string(),
         resolution: DSN_RESOLUTION as u32,
         supported_profile: SupportedProfile {
-            copper_layers: 2,
+            copper_layers: u32::try_from(copper_layers.len())
+                .context("copper layer count does not fit the manifest")?,
             component_side: "front".to_string(),
             pad_shapes: ["circle", "rect", "roundrect", "oval"]
                 .map(String::from)
@@ -3671,5 +3694,280 @@ pub(crate) mod tests {
             error.contains("locked via at (105, 50) mm has a 'front_inner_back' padstack"),
             "{error}"
         );
+    }
+
+    /// KiCad 10's four-layer copy of the locked two-resistor board, with a
+    /// stock through-hole header and a locked track on `In1.Cu`. See its README.
+    const FOUR_LAYERS: &str = include_str!("../tests/fixtures/specctra_four_layers.kicad_pcb");
+    const FOUR_LAYERS_NATIVE_FILE: &str =
+        include_str!("../tests/fixtures/specctra_four_layers.native-kicad-10.dsn");
+
+    /// The native DSN without the header's courtyard polygon, which the DSN
+    /// parser does not read yet, as the odd oval-pad test does too.
+    fn four_layers_native() -> String {
+        FOUR_LAYERS_NATIVE_FILE
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
+    fn copper_of(table: &str) -> Result<Vec<String>> {
+        copper_layers(&parse_sexp(&format!("(kicad_pcb (layers {table}))")).unwrap())
+    }
+
+    #[test]
+    fn copper_layers_run_top_to_bottom_whatever_the_file_order() {
+        assert_eq!(
+            copper_of(r#"(0 "F.Cu" signal) (2 "B.Cu" signal) (9 "F.Adhes" user)"#).unwrap(),
+            ["F.Cu", "B.Cu"]
+        );
+        // KiCad 10 lists copper by ordinal: B.Cu (2) before In1.Cu (4).
+        assert_eq!(
+            copper_of(
+                r#"(0 "F.Cu" signal) (2 "B.Cu" signal) (4 "In1.Cu" power) (6 "In2.Cu" mixed)"#
+            )
+            .unwrap(),
+            ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+        );
+        for table in [
+            r#"(0 "F.Cu" signal) (6 "In2.Cu" signal) (2 "B.Cu" signal)"#,
+            r#"(0 "F.Cu" signal) (4 "In1.Cu" signal) (2 "B.Cu" signal)"#,
+            r#"(0 "F.Cu" signal) (4 "In1.Cu" signal) (6 "In2.Cu" signal)"#,
+            r#"(0 "F.Cu" signal) (0 "F.Cu" signal) (2 "B.Cu" signal)"#,
+            r#"(0 "F.Cu" signal)"#,
+            r#"(9 "F.Adhes" user)"#,
+        ] {
+            let error = copper_of(table).unwrap_err().to_string();
+            assert!(
+                error.contains("copper layers must be F.Cu, In1.Cu..In<N-2>.Cu and B.Cu"),
+                "{table}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn four_layer_board_exports_every_copper_layer() {
+        let export = export_dsn(
+            Path::new("board.kicad_pcb"),
+            FOUR_LAYERS,
+            &native_fixture_rules(),
+        )
+        .unwrap();
+        assert_eq!(export.copper_layer_count, 4);
+        let tree = parse_dsn_sexp(&export.dsn).unwrap();
+        let identity = dsn_identity(&tree).unwrap();
+        assert_eq!(
+            identity.layers.values().collect::<Vec<_>>(),
+            ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+        );
+        // The header's through-hole pads and the via cover all four layers.
+        for name in ["In1.Cu", "In2.Cu"] {
+            assert!(
+                export
+                    .dsn
+                    .contains(&format!("(rect {name} -850 -850 850 850)")),
+                "{}",
+                export.dsn
+            );
+            assert!(
+                export.dsn.contains(&format!("(circle {name} 600)")),
+                "{}",
+                export.dsn
+            );
+        }
+        assert!(
+            export
+                .dsn
+                .contains("(path In1.Cu 250 105000 -50000 105000 -55000)"),
+            "{}",
+            export.dsn
+        );
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(manifest["supported_profile"]["copper_layers"], 4);
+        assert_eq!(manifest["supported_profile"]["locked_track_count"], 2);
+        assert_eq!(manifest["supported_profile"]["locked_via_count"], 1);
+        assert_eq!(
+            manifest["layers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|layer| (
+                    layer["index"].as_u64().unwrap(),
+                    layer["kicad_name"].as_str().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            [(0, "F.Cu"), (1, "In1.Cu"), (2, "In2.Cu"), (3, "B.Cu")]
+        );
+        let via = manifest["padstacks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|padstack| padstack["purpose"] == "via")
+            .unwrap();
+        assert_eq!(
+            via["layers"],
+            serde_json::json!(["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
+        );
+    }
+
+    /// KiCad's own export of the same board passes the semantic comparison
+    /// layer by layer, pad by pad: both paths describe one routing job.
+    #[test]
+    fn four_layer_native_dsn_matches_the_rust_export() {
+        let baseline = native_baseline(FOUR_LAYERS);
+        let adopted = adopt_native_dsn(baseline, four_layers_native()).unwrap();
+        assert_eq!(adopted.dsn, four_layers_native());
+        assert_ne!(adopted.dsn, FOUR_LAYERS_NATIVE_FILE);
+        let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        assert!(manifest["padstacks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|padstack| padstack["name"] == "Via[0-3]_600:300_um"));
+    }
+
+    #[test]
+    fn four_layer_through_hole_pad_must_cover_every_copper_layer() {
+        let two_layer_pad = FOUR_LAYERS.replacen(
+            r#"(layers "*.Cu" "*.Mask")"#,
+            r#"(layers "F.Cu" "B.Cu" "*.Mask")"#,
+            1,
+        );
+        assert_ne!(two_layer_pad, FOUR_LAYERS);
+        let error = export_dsn(
+            Path::new("board.kicad_pcb"),
+            &two_layer_pad,
+            &native_fixture_rules(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unsupported through-hole pad J1-1: copper layers are [F.Cu, B.Cu]"),
+            "{error}"
+        );
+        let listed = FOUR_LAYERS.replacen(
+            r#"(layers "*.Cu" "*.Mask")"#,
+            r#"(layers "F.Cu" "In1.Cu" "In2.Cu" "B.Cu" "*.Mask")"#,
+            1,
+        );
+        export_dsn(
+            Path::new("board.kicad_pcb"),
+            &listed,
+            &native_fixture_rules(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn four_layer_locked_via_must_be_a_through_via() {
+        let blind_span = FOUR_LAYERS.replacen(
+            "(drill 0.3)\n\t\t(layers \"F.Cu\" \"B.Cu\")",
+            "(drill 0.3)\n\t\t(layers \"F.Cu\" \"In1.Cu\")",
+            1,
+        );
+        assert_ne!(blind_span, FOUR_LAYERS);
+        let error = export_dsn(
+            Path::new("board.kicad_pcb"),
+            &blind_span,
+            &native_fixture_rules(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(
+                "unsupported locked via layer span [F.Cu, In1.Cu]; expected [F.Cu, B.Cu]"
+            ),
+            "{error}"
+        );
+    }
+
+    /// Freerouting 2.3.0 routed KiCad's native four-layer export on F.Cu,
+    /// In1.Cu and In2.Cu with two vias; the strict planner accepts the session, inner
+    /// layers included.
+    #[test]
+    fn freerouting_routes_four_layers_and_the_planner_accepts_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_four_layers.kicad_pcb");
+        std::fs::write(&board, FOUR_LAYERS).unwrap();
+        let baseline = export_dsn(&board, FOUR_LAYERS, &native_fixture_rules()).unwrap();
+        let adopted = adopt_native_dsn(baseline, four_layers_native()).unwrap();
+        let ses = include_str!(
+            "../tests/fixtures/specctra_four_layers.native-kicad-10.freerouting-2.3.0.ses"
+        );
+        let plan =
+            crate::specctra_ses::parse_import_plan(&board, FOUR_LAYERS, &adopted.manifest, ses)
+                .unwrap();
+        let layers = plan
+            .tracks
+            .iter()
+            .map(|track| track.layer.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(layers, BTreeSet::from(["F.Cu", "In1.Cu", "In2.Cu"]));
+        assert_eq!(plan.vias.len(), 2);
+
+        // A session that names a layer the manifest does not map is refused.
+        let stray = ses.replacen("(path In2.Cu", "(path In3.Cu", 1);
+        assert_ne!(stray, ses);
+        let error =
+            crate::specctra_ses::parse_import_plan(&board, FOUR_LAYERS, &adopted.manifest, &stray)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("SES path uses unknown layer 'In3.Cu'"),
+            "{error}"
+        );
+    }
+
+    /// The manifest's layer mappings are the count it declares, top to bottom.
+    #[test]
+    fn manifest_layer_mappings_must_match_its_copper_layer_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_four_layers.kicad_pcb");
+        std::fs::write(&board, FOUR_LAYERS).unwrap();
+        let export = export_dsn(&board, FOUR_LAYERS, &native_fixture_rules()).unwrap();
+        let ses = include_str!(
+            "../tests/fixtures/specctra_four_layers.native-kicad-10.freerouting-2.3.0.ses"
+        );
+        let adopted = adopt_native_dsn(export, four_layers_native()).unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        let mapping = "manifest layer mappings do not match its";
+        let profile = "manifest does not describe the supported first routing profile";
+        type ManifestEdit = fn(&mut serde_json::Value);
+        let cases: [(&str, &str, ManifestEdit); 4] = [
+            ("count", mapping, |m| {
+                m["supported_profile"]["copper_layers"] = 2.into()
+            }),
+            // Three layers mapped as F.Cu, In1.Cu, B.Cu: only the count is wrong.
+            ("odd", profile, |m| {
+                m["supported_profile"]["copper_layers"] = 3.into();
+                m["layers"].as_array_mut().unwrap().remove(2);
+                m["layers"][2]["index"] = 2.into();
+            }),
+            // B.Cu unmapped: the session never routes on it.
+            ("dropped", mapping, |m| {
+                m["layers"].as_array_mut().unwrap().remove(3);
+            }),
+            ("swapped", mapping, |m| {
+                m["layers"][1]["kicad_name"] = "In2.Cu".into();
+                m["layers"][2]["kicad_name"] = "In1.Cu".into();
+            }),
+        ];
+        for (name, expected, edit) in cases {
+            let mut edited = manifest.clone();
+            edit(&mut edited);
+            let error = crate::specctra_ses::parse_import_plan(
+                &board,
+                FOUR_LAYERS,
+                &edited.to_string(),
+                ses,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+        manifest["schema_version"] = 2.into();
+        crate::specctra_ses::parse_import_plan(&board, FOUR_LAYERS, &manifest.to_string(), ses)
+            .unwrap();
     }
 }

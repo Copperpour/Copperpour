@@ -234,7 +234,7 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
             manifest.resolution
         );
     }
-    if manifest.supported_profile.copper_layers != 2
+    if copperpour_sexp::layers::CopperStack::new(manifest.supported_profile.copper_layers).is_err()
         || manifest.supported_profile.component_side != "front"
         || manifest.supported_profile.copper_zones
         || manifest.supported_profile.custom_rules
@@ -355,8 +355,22 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
             bail!("manifest contains an invalid or duplicate layer mapping");
         }
     }
-    if layer_names.len() != 2 {
-        bail!("manifest must contain exactly two copper layer mappings");
+    // One mapping per copper layer, indexed top to bottom as the export
+    // writes them; a SES path on any other layer is refused when it is read.
+    let mut by_index = manifest.layers.iter().collect::<Vec<_>>();
+    by_index.sort_by_key(|layer| layer.index);
+    let stack = crate::specctra::stack_layer_names(manifest.supported_profile.copper_layers);
+    if by_index.len() != stack.len()
+        || by_index
+            .iter()
+            .zip(&stack)
+            .enumerate()
+            .any(|(index, (layer, name))| layer.index != index || &layer.kicad_name != name)
+    {
+        bail!(
+            "manifest layer mappings do not match its {} copper layers",
+            manifest.supported_profile.copper_layers
+        );
     }
 
     let net_names = manifest
