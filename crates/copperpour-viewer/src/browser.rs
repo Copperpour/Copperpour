@@ -1472,12 +1472,9 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</t
     async fn browser_refuses_an_uncopied_project_instead_of_using_default_settings() {
         let fixture = Fixture::new();
         let project = fixture.root.with_extension("kicad_pro");
-        std::fs::write(
-            &project,
-            include_str!("../../copperpour-core/tests/fixtures/specctra_rounded_outline.kicad_pro"),
-        )
-        .unwrap();
-        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Reading a directory as project bytes fails even for root/capability-
+        // privileged CI runners, unlike chmod(000), which they can bypass.
+        std::fs::create_dir(&project).unwrap();
         let entries = crate::walk_sheet_tree(&fixture.root);
         let (_stop, rx) = watch::channel(false);
         let (cache, errors) = render(
@@ -1492,6 +1489,10 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</t
         assert!(errors
             .iter()
             .any(|error| error.contains("project snapshot copy failed")));
+        assert!(
+            !fixture.cli.with_extension("calls").exists(),
+            "renderer must not run after failed project snapshot"
+        );
     }
 
     #[cfg(target_os = "linux")]
