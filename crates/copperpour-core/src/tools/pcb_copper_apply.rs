@@ -1,10 +1,11 @@
-//! `apply_copper`: create a batch of tracks and through vias on the live board
+//! `apply_copper`: create a batch of tracks and vias on the live board
 //! in one KiCad commit (#95).
 //!
 //! The plan is checked before anything is written: every length rounded to the
 //! nanometre as KiCad's board reader rounds, each layer a copper layer the
 //! board has, each net one the board has (never net 0, no net), no size of zero
-//! or less, no drill as large as its via, no zero-length track. A dry run, the
+//! or less, no drill as large as its via, no via span that is not its type's,
+//! no zero-length track. A dry run, the
 //! default, returns that normalized plan and a `plan_revision` bound to it, to
 //! the document KiCad named for the board, and to the board's net table and
 //! enabled layers, so a renamed net makes the revision stale. An apply needs
@@ -35,7 +36,7 @@ use copperpour_ipc::builders::{self, any_is, nm_to_mm, pack_any};
 use copperpour_ipc::client::{IpcItemCreation, IpcOutcomeUnknown, KiCadIpcClient};
 use copperpour_ipc::gen::kiapi;
 use copperpour_ipc::{IpcEnabledLayers, IpcNet};
-use kiapi::board::types::BoardLayer;
+use kiapi::board::types::{BoardLayer, ViaType};
 use kiapi::common::types::{DocumentSpecifier, Vector2};
 use prost::Message;
 use serde_json::{json, Value};
@@ -85,17 +86,36 @@ pub(crate) fn tool() -> ToolDef {
         "net".to_string(),
         json!({ "type": "string", "description": "Name of a net the board has" }),
     );
+    via.insert(
+        "via_type".to_string(),
+        json!({
+            "type": "string",
+            "enum": ["through", "blind", "buried", "micro"],
+            "default": "through",
+            "description": "through: F.Cu to B.Cu; blind: F.Cu or B.Cu to an inner layer; \
+                            buried: two inner layers; micro: any two layers"
+        }),
+    );
+    via.insert(
+        "start_layer".to_string(),
+        json!({ "type": "string", "description": "First copper layer the drill spans; required unless via_type is through" }),
+    );
+    via.insert(
+        "end_layer".to_string(),
+        json!({ "type": "string", "description": "Last copper layer the drill spans; required unless via_type is through" }),
+    );
 
     tool!(
         "apply_copper",
-        "Create a batch of straight tracks and through vias on the board KiCad holds open, in \
+        "Create a batch of straight tracks and vias on the board KiCad holds open, in \
          one KiCad commit (one undo step), without saving. A dry run, the default, checks every \
          item and returns the normalized plan (millimetres rounded to the nanometre, layers and \
          nets resolved) and a plan_revision; apply with dry_run=false and that plan_revision as \
          expected_plan_revision. Refused before anything is written: a net the board does not \
          have (an empty net is refused, never bound to no net), a layer that is not a copper \
          layer of the board, a width, drill or size of zero or less, a drill not smaller than \
-         its via, a zero-length track, an empty plan, a missing or stale revision. KiCad \
+         its via, a via span that is not its via_type's, a zero-length track, an empty plan, \
+         a missing or stale revision. KiCad \
          answers per item and can store an item on the net of the copper it touches, so this \
          is one commit plus a read-back, not an atomic transaction: every created item is read \
          back by UUID after the commit and the response comes from that read-back. If KiCad \
@@ -103,8 +123,7 @@ pub(crate) fn tool() -> ToolDef {
          and the call fails with plan_blocked naming each item and the net KiCad chose; if \
          KiCad created only some items, the commit is dropped and the call fails. A removal \
          that cannot be confirmed returns mutation_outcome_uncertain with the UUIDs to inspect. \
-         Copper already on the board is not matched or skipped; no arcs, no blind, buried or \
-         micro vias.",
+         Copper already on the board is not matched or skipped; no arcs.",
         json!({
             "type": "object",
             "properties": {
@@ -120,7 +139,7 @@ pub(crate) fn tool() -> ToolDef {
                 },
                 "vias": {
                     "type": "array",
-                    "description": "Through vias (F.Cu to B.Cu) to create; position {x, y} in mm",
+                    "description": "Vias to create; position {x, y} in mm",
                     "items": {
                         "type": "object",
                         "properties": via,
@@ -180,6 +199,24 @@ struct ViaRequest {
     drill: i64,
     size: i64,
     net: String,
+    via_type: ViaType,
+    /// The drill's ends as the request gives them; F.Cu and B.Cu for a
+    /// through via that gives none.
+    start_layer: BoardLayer,
+    end_layer: BoardLayer,
+}
+
+impl ViaRequest {
+    /// The drill's ends, the one nearer F.Cu first, as KiCad orders them:
+    /// `BL_F_Cu`, `BL_In1_Cu` … `BL_In30_Cu`, `BL_B_Cu` ascend.
+    fn span(&self) -> (BoardLayer, BoardLayer) {
+        let (start, end) = (self.start_layer, self.end_layer);
+        if (start as i32) <= (end as i32) {
+            (start, end)
+        } else {
+            (end, start)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -312,6 +349,7 @@ fn parse_via(value: &Value, field: &str, faults: &mut Vec<Fault>) -> Option<ViaR
     let drill = length(&value["drill"], &format!("{field}.drill"), faults);
     let size = length(&value["size"], &format!("{field}.size"), faults);
     let net = net_name(&value["net"], &format!("{field}.net"), faults);
+    let span = via_span(value, field, faults);
     if let (Some(drill), Some(size)) = (drill, size) {
         if drill >= size {
             faults.push(Fault::new(
@@ -327,12 +365,120 @@ fn parse_via(value: &Value, field: &str, faults: &mut Vec<Fault>) -> Option<ViaR
     if faults.len() != before {
         return None;
     }
+    let (via_type, start_layer, end_layer) = span?;
     Some(ViaRequest {
         position: position?,
         drill: drill?,
         size: size?,
         net: net?,
+        via_type,
+        start_layer,
+        end_layer,
     })
+}
+
+/// A via's type and the copper layers its drill spans, as given. A through
+/// via spans F.Cu to B.Cu, so its layers may be left out; KiCad resets any
+/// other span of one to that (`PCB_VIA::SanitizeLayers`). KiCad tells a blind
+/// via from a buried one by its span alone (`PCB_VIA::IsBlindVia`,
+/// `IsBuriedVia`): a blind via has exactly one end on F.Cu or B.Cu, a buried
+/// via neither. A micro via may join any two layers.
+fn via_span(
+    value: &Value,
+    field: &str,
+    faults: &mut Vec<Fault>,
+) -> Option<(ViaType, BoardLayer, BoardLayer)> {
+    let before = faults.len();
+    let type_field = format!("{field}.via_type");
+    let via_type = match &value["via_type"] {
+        Value::Null => Some(("through", ViaType::VtThrough)),
+        given => {
+            let known = VIA_TYPES
+                .into_iter()
+                .find(|(name, _)| given.as_str() == Some(*name));
+            if known.is_none() {
+                faults.push(Fault::new(
+                    &type_field,
+                    "must be through, blind, buried or micro",
+                ));
+            }
+            known
+        }
+    };
+    let mut ends = Vec::new();
+    for key in ["start_layer", "end_layer"] {
+        if !value[key].is_null() {
+            ends.push(copper_layer(&value[key], &format!("{field}.{key}"), faults));
+        }
+    }
+    if faults.len() != before {
+        return None;
+    }
+    let (name, via_type) = via_type?;
+    let (start, end) = match ends[..] {
+        [] if via_type == ViaType::VtThrough => (BoardLayer::BlFCu, BoardLayer::BlBCu),
+        [Some(a), Some(b)] if a == b => {
+            faults.push(Fault::new(
+                format!("{field}.end_layer"),
+                format!(
+                    "is {}, as start_layer is: a via joins two layers",
+                    layer_text(a)
+                ),
+            ));
+            return None;
+        }
+        [Some(a), Some(b)] => (a, b),
+        _ => {
+            let missing = if value["start_layer"].is_null() {
+                "start_layer"
+            } else {
+                "end_layer"
+            };
+            let reason = if via_type == ViaType::VtThrough {
+                "a through via takes both start_layer and end_layer or neither".to_string()
+            } else {
+                format!("a {name} via needs both start_layer and end_layer")
+            };
+            faults.push(Fault::new(format!("{field}.{missing}"), reason));
+            return None;
+        }
+    };
+    let outer = |layer: BoardLayer| matches!(layer, BoardLayer::BlFCu | BoardLayer::BlBCu);
+    let rule = match via_type {
+        ViaType::VtThrough if !(outer(start) && outer(end)) => "a through via spans F.Cu to B.Cu",
+        ViaType::VtBlind if outer(start) == outer(end) => {
+            "a blind via has exactly one end on F.Cu or B.Cu"
+        }
+        ViaType::VtBuried if outer(start) || outer(end) => {
+            "a buried via has neither end on F.Cu or B.Cu"
+        }
+        _ => return Some((via_type, start, end)),
+    };
+    faults.push(Fault::new(
+        type_field,
+        format!(
+            "is {name}, but {} to {} is not its span: {rule}",
+            layer_text(start),
+            layer_text(end)
+        ),
+    ));
+    None
+}
+
+/// The via types, named as `query_vias` names them.
+const VIA_TYPES: [(&str, ViaType); 4] = [
+    ("through", ViaType::VtThrough),
+    ("blind", ViaType::VtBlind),
+    ("buried", ViaType::VtBuried),
+    ("micro", ViaType::VtMicro),
+];
+
+/// A via type as [`VIA_TYPES`] names it; `None` for any other.
+fn via_type_name(via_type: ViaType) -> Option<&'static str> {
+    VIA_TYPES
+        .iter()
+        .find(|(_, known)| *known == via_type)
+        .map(|(name, _)| *name)
 }
 
 /// Millimetres rounded to the nanometre, as KiCad's board reader rounds
@@ -498,6 +644,21 @@ fn resolve(
         }
     }
     for (index, via) in request.vias.iter().enumerate() {
+        for (key, layer) in [
+            ("start_layer", via.start_layer),
+            ("end_layer", via.end_layer),
+        ] {
+            if !layers.contains(&(layer as i32)) {
+                faults.push(Fault::new(
+                    format!("vias[{index}].{key}"),
+                    format!(
+                        "the board has no layer {}: its copper layers are {}",
+                        layer_text(layer),
+                        copper_layers_text(&layers)
+                    ),
+                ));
+            }
+        }
         if let Some(code) = lookup(&via.net, format!("vias[{index}].net"), &mut faults) {
             plan.vias.push((via.clone(), code));
         }
@@ -571,6 +732,10 @@ fn plan_revision(
         for value in [via.position.0, via.position.1, via.drill, via.size] {
             digest.update(value.to_le_bytes());
         }
+        let (start, end) = via.span();
+        for value in [via.via_type as i32, start as i32, end as i32] {
+            digest.update(value.to_le_bytes());
+        }
         field(&mut digest, via.net.as_bytes());
         digest.update(code.to_le_bytes());
     }
@@ -598,7 +763,9 @@ fn plan_json(plan: &Plan, revision: &str) -> Value {
             "size": nm_to_mm(via.size),
             "net": via.net,
             "net_code": code,
-            "via_type": "through",
+            "via_type": via_type_name(via.via_type),
+            "start_layer": layer_text(via.span().0),
+            "end_layer": layer_text(via.span().1),
         })).collect::<Vec<_>>(),
         "source": "ipc",
     })
@@ -663,9 +830,16 @@ impl Plan {
         let vias = self.vias.iter().map(|(via, code)| {
             let mut item = builders::build_via(&via.net, *code, 0.0, 0.0, 0.0, 0.0);
             item.position = vector(via.position);
+            item.r#type = via.via_type as i32;
+            let (start, end) = via.span();
             if let Some(stack) = item.pad_stack.as_mut() {
+                // KiCad takes a via's layers from its drill; the stack lists
+                // the two ends, as KiCad's own blind vias do.
+                stack.layers = vec![start as i32, end as i32];
                 if let Some(drill) = stack.drill.as_mut() {
                     drill.diameter = square(via.drill);
+                    drill.start_layer = start as i32;
+                    drill.end_layer = end as i32;
                 }
                 for layer in &mut stack.copper_layers {
                     layer.size = square(via.size);
@@ -797,11 +971,12 @@ fn stored_item(item: &prost_types::Any) -> Option<Stored> {
         let kiid = via.id?.value;
         let net = via.net.map(|net| net.name).unwrap_or_default();
         let stack = via.pad_stack.as_ref();
+        let drill = stack.and_then(|stack| stack.drill.as_ref());
+        let layer = |id: i32| BoardLayer::try_from(id).ok().and_then(builders::layer_name);
         let report = json!({
             "uuid": kiid,
             "position": via.position.map_or(Value::Null, |v| point_json((v.x_nm, v.y_nm))),
-            "drill": stack
-                .and_then(|stack| stack.drill.as_ref())
+            "drill": drill
                 .and_then(|drill| drill.diameter)
                 .map(|diameter| nm_to_mm(diameter.x_nm)),
             "size": stack
@@ -809,6 +984,9 @@ fn stored_item(item: &prost_types::Any) -> Option<Stored> {
                 .and_then(|layer| layer.size)
                 .map(|size| nm_to_mm(size.x_nm)),
             "net": net,
+            "via_type": ViaType::try_from(via.r#type).ok().and_then(via_type_name),
+            "start_layer": drill.and_then(|drill| layer(drill.start_layer)),
+            "end_layer": drill.and_then(|drill| layer(drill.end_layer)),
         });
         Some(Stored {
             kiid,
@@ -1212,6 +1390,13 @@ mod plan_tests {
     const NETS: &[u8] = include_bytes!("../../tests/fixtures/issue_95_nets.ipc.bin");
     const ENABLED_LAYERS: &[u8] =
         include_bytes!("../../tests/fixtures/issue_95_enabled_layers.ipc.bin");
+    const READ_BACK: &[u8] = include_bytes!("../../tests/fixtures/issue_95_readback.ipc.bin");
+    /// The four-layer board's layers and its two blind vias, F.Cu-In1.Cu at
+    /// (146, 90) and In2.Cu-B.Cu at (140, 90), as KiCad 10.0.8 answered for
+    /// them (`tests/fixtures/issue_96_layers_ipc.README.md`).
+    const FOUR_LAYERS: &[u8] =
+        include_bytes!("../../tests/fixtures/issue_96_layers_enabled_layers.ipc.bin");
+    const BLIND_VIAS: &[u8] = include_bytes!("../../tests/fixtures/issue_96_layers_vias.ipc.bin");
 
     /// KiCad's net table, read as `get_nets_in` reads it.
     fn nets() -> Vec<IpcNet> {
@@ -1228,8 +1413,15 @@ mod plan_tests {
 
     /// KiCad's enabled layers, read as `get_enabled_layers_in` reads them.
     fn enabled() -> IpcEnabledLayers {
-        let answer =
-            kiapi::board::commands::BoardEnabledLayersResponse::decode(ENABLED_LAYERS).unwrap();
+        enabled_layers(ENABLED_LAYERS)
+    }
+
+    fn four_layers() -> IpcEnabledLayers {
+        enabled_layers(FOUR_LAYERS)
+    }
+
+    fn enabled_layers(recorded: &[u8]) -> IpcEnabledLayers {
+        let answer = kiapi::board::commands::BoardEnabledLayersResponse::decode(recorded).unwrap();
         IpcEnabledLayers {
             copper_layer_count: answer.copper_layer_count,
             layers: answer
@@ -1259,6 +1451,19 @@ mod plan_tests {
 
     fn via(at: (f64, f64), drill: f64, size: f64, net: &str) -> Value {
         json!({ "position": { "x": at.0, "y": at.1 }, "drill": drill, "size": size, "net": net })
+    }
+
+    /// A via of `via_type` with the layers given, at (146, 90).
+    fn spanned(via_type: &str, start: Option<&str>, end: Option<&str>) -> Value {
+        let mut item = via((146.0, 90.0), 0.3, 0.6, "NET_C");
+        item["via_type"] = json!(via_type);
+        if let Some(start) = start {
+            item["start_layer"] = json!(start);
+        }
+        if let Some(end) = end {
+            item["end_layer"] = json!(end);
+        }
+        item
     }
 
     /// The recorded batch: T1 and T2 as tracks, V1 and V2 as vias.
@@ -1517,6 +1722,280 @@ mod plan_tests {
         assert_eq!(answer["vias"][1]["drill"], json!(0.3));
         assert_eq!(answer["vias"][1]["size"], json!(0.6));
         assert_eq!(answer["vias"][1]["net_code"], 4);
+        // A via given no type is a through via.
+        assert_eq!(answer["vias"][1]["via_type"], "through");
+        assert_eq!(answer["vias"][1]["start_layer"], "F.Cu");
+        assert_eq!(answer["vias"][1]["end_layer"], "B.Cu");
+    }
+
+    #[test]
+    fn a_via_span_must_be_its_types() {
+        // (via_type, start_layer, end_layer, the field refused)
+        let refused = [
+            ("laser", Some("F.Cu"), Some("In1.Cu"), "via_type"),
+            ("blind", None, None, "start_layer"),
+            ("micro", Some("F.Cu"), None, "end_layer"),
+            ("micro", Some("F.SilkS"), Some("In1.Cu"), "start_layer"),
+            ("buried", Some("In1.Cu"), Some("In1.Cu"), "end_layer"),
+            // KiCad reads a span with one end on F.Cu or B.Cu as blind and
+            // one with neither as buried, and keeps a through via F.Cu to B.Cu.
+            ("blind", Some("In1.Cu"), Some("In2.Cu"), "via_type"),
+            ("blind", Some("F.Cu"), Some("B.Cu"), "via_type"),
+            ("buried", Some("F.Cu"), Some("In2.Cu"), "via_type"),
+            ("through", Some("F.Cu"), Some("In1.Cu"), "via_type"),
+            ("through", Some("F.Cu"), None, "end_layer"),
+        ];
+        for (via_type, start, end, field) in refused {
+            let args = json!({ "vias": [spanned(via_type, start, end)] });
+            let faults = parse_request(&args).expect_err(&args.to_string());
+            assert_eq!(fields(&faults), [format!("vias[0].{field}")], "{args}");
+        }
+        let args = json!({ "vias": [spanned("blind", Some("In1.Cu"), Some("In2.Cu"))] });
+        let reason = &parse_request(&args).unwrap_err()[0].reason;
+        assert!(
+            reason.contains("In1.Cu to In2.Cu is not its span: a blind via has exactly one end"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_via_span_is_taken_front_first() {
+        use ViaType::{VtBlind, VtBuried, VtMicro, VtThrough};
+        // (via_type, start_layer, end_layer, the type and span sent, front first)
+        let accepted = [
+            (None, None, None, VtThrough, "F.Cu", "B.Cu"),
+            (None, Some("B.Cu"), Some("F.Cu"), VtThrough, "F.Cu", "B.Cu"),
+            (
+                Some("blind"),
+                Some("In1.Cu"),
+                Some("F.Cu"),
+                VtBlind,
+                "F.Cu",
+                "In1.Cu",
+            ),
+            (
+                Some("blind"),
+                Some("B.Cu"),
+                Some("In2.Cu"),
+                VtBlind,
+                "In2.Cu",
+                "B.Cu",
+            ),
+            (
+                Some("buried"),
+                Some("In2.Cu"),
+                Some("In1.Cu"),
+                VtBuried,
+                "In1.Cu",
+                "In2.Cu",
+            ),
+            (
+                Some("micro"),
+                Some("F.Cu"),
+                Some("In1.Cu"),
+                VtMicro,
+                "F.Cu",
+                "In1.Cu",
+            ),
+            (
+                Some("micro"),
+                Some("B.Cu"),
+                Some("F.Cu"),
+                VtMicro,
+                "F.Cu",
+                "B.Cu",
+            ),
+        ];
+        for (via_type, start, end, sent_type, front, back) in accepted {
+            let mut item = via((146.0, 90.0), 0.3, 0.6, "NET_C");
+            for (key, value) in [
+                ("via_type", via_type),
+                ("start_layer", start),
+                ("end_layer", end),
+            ] {
+                if let Some(value) = value {
+                    item[key] = json!(value);
+                }
+            }
+            let args = json!({ "vias": [item] });
+            let request =
+                parse_request(&args).unwrap_or_else(|faults| panic!("{args}: {faults:?}"));
+            let via = &request.vias[0];
+            let (start, end) = via.span();
+            assert_eq!(
+                (via.via_type, layer_text(start), layer_text(end)),
+                (sent_type, front, back),
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_via_span_on_a_layer_the_board_lacks_is_refused() {
+        let blind =
+            parse_request(&json!({ "vias": [spanned("blind", Some("F.Cu"), Some("In1.Cu"))] }))
+                .unwrap();
+        let faults = resolve(&blind, &nets(), &enabled()).unwrap_err();
+        assert_eq!(fields(&faults), ["vias[0].end_layer"]);
+        assert!(
+            faults[0].reason.contains("F.Cu, B.Cu"),
+            "{}",
+            faults[0].reason
+        );
+        assert!(resolve(&blind, &nets(), &four_layers()).is_ok());
+        // The fault is under the key the request gave the layer.
+        let reversed =
+            parse_request(&json!({ "vias": [spanned("micro", Some("In1.Cu"), Some("F.Cu"))] }))
+                .unwrap();
+        assert_eq!(
+            fields(&resolve(&reversed, &nets(), &enabled()).unwrap_err()),
+            ["vias[0].start_layer"]
+        );
+
+        let buried =
+            parse_request(&json!({ "vias": [spanned("buried", Some("In2.Cu"), Some("In3.Cu"))] }))
+                .unwrap();
+        let faults = resolve(&buried, &nets(), &four_layers()).unwrap_err();
+        assert_eq!(fields(&faults), ["vias[0].end_layer"]);
+        assert!(
+            faults[0].reason.contains("F.Cu, In1.Cu, In2.Cu, B.Cu"),
+            "{}",
+            faults[0].reason
+        );
+    }
+
+    /// What is sent for a blind via is what KiCad 10.0.8 itself holds for
+    /// the two on the four-layer board: the type, the drill's ends, front
+    /// first, and the one copper entry on F.Cu.
+    #[test]
+    fn a_blind_via_is_sent_as_kicad_holds_its_own() {
+        let mut front = spanned("blind", Some("In1.Cu"), Some("F.Cu"));
+        front["position"] = json!({ "x": 146.0, "y": 90.0 });
+        let mut back = spanned("blind", Some("B.Cu"), Some("In2.Cu"));
+        back["position"] = json!({ "x": 140.0, "y": 90.0 });
+        let request = parse_request(&json!({ "vias": [front, back] })).unwrap();
+        let plan = resolve(&request, &nets(), &four_layers()).unwrap();
+
+        let answer = plan_json(&plan, "sha256:x");
+        assert_eq!(answer["vias"][0]["via_type"], "blind");
+        assert_eq!(answer["vias"][0]["start_layer"], "F.Cu");
+        assert_eq!(answer["vias"][0]["end_layer"], "In1.Cu");
+        assert_eq!(answer["vias"][1]["start_layer"], "In2.Cu");
+        assert_eq!(answer["vias"][1]["end_layer"], "B.Cu");
+
+        let kicad = kiapi::common::commands::GetItemsResponse::decode(BLIND_VIAS).unwrap();
+        let held: Vec<kiapi::board::types::Via> = kicad
+            .items
+            .iter()
+            .map(|item| kiapi::board::types::Via::decode(item.value.as_slice()).unwrap())
+            .collect();
+        for item in plan.items() {
+            let sent = kiapi::board::types::Via::decode(item.value.as_slice()).unwrap();
+            let own = held
+                .iter()
+                .find(|via| via.position == sent.position)
+                .expect("KiCad holds a via there");
+            assert_eq!(sent.r#type, own.r#type);
+            assert_eq!(sent.r#type, ViaType::VtBlind as i32);
+            let (stack, kicad_stack) = (sent.pad_stack.unwrap(), own.pad_stack.clone().unwrap());
+            assert_eq!(stack.r#type, kicad_stack.r#type);
+            let (mut layers, mut kicad_layers) = (stack.layers.clone(), kicad_stack.layers.clone());
+            layers.sort_unstable();
+            kicad_layers.sort_unstable();
+            assert_eq!(layers, kicad_layers);
+            let (drill, kicad_drill) = (stack.drill.unwrap(), kicad_stack.drill.unwrap());
+            assert_eq!(
+                (
+                    drill.start_layer,
+                    drill.end_layer,
+                    drill.diameter,
+                    drill.shape
+                ),
+                (
+                    kicad_drill.start_layer,
+                    kicad_drill.end_layer,
+                    kicad_drill.diameter,
+                    kicad_drill.shape
+                )
+            );
+            assert_eq!(stack.copper_layers.len(), 1);
+            assert_eq!(kicad_stack.copper_layers.len(), 1);
+            let (copper, kicad_copper) = (&stack.copper_layers[0], &kicad_stack.copper_layers[0]);
+            assert_eq!(
+                (copper.layer, copper.shape, copper.size),
+                (kicad_copper.layer, kicad_copper.shape, kicad_copper.size)
+            );
+        }
+    }
+
+    /// The response names a created via's type and span from what KiCad
+    /// reads back: the recorded through via, and the recorded blind ones.
+    #[test]
+    fn the_read_back_reports_kicads_via_type_and_span() {
+        let report = |recorded: &[u8], kiid: &str| {
+            kiapi::common::commands::GetItemsResponse::decode(recorded)
+                .unwrap()
+                .items
+                .iter()
+                .filter_map(stored_item)
+                .find(|stored| stored.kiid == kiid)
+                .unwrap()
+                .report
+        };
+        for (recorded, kiid, via_type, start, end) in [
+            (
+                READ_BACK,
+                "97fb9c73-15ec-4507-bd0d-27f94c7eb709",
+                "through",
+                "F.Cu",
+                "B.Cu",
+            ),
+            (
+                BLIND_VIAS,
+                "ab6f8834-1aac-4fb7-b536-bb2b9e1d69cf",
+                "blind",
+                "F.Cu",
+                "In1.Cu",
+            ),
+            (
+                BLIND_VIAS,
+                "17b4d6e4-982d-4d3d-aa69-1ad59d44a1c3",
+                "blind",
+                "In2.Cu",
+                "B.Cu",
+            ),
+        ] {
+            let report = report(recorded, kiid);
+            assert_eq!(report["via_type"], via_type, "{report}");
+            assert_eq!(report["start_layer"], start, "{report}");
+            assert_eq!(report["end_layer"], end, "{report}");
+        }
+    }
+
+    #[test]
+    fn the_plan_revision_covers_each_vias_type_and_span() {
+        let revision = |item: Value| {
+            let args = json!({ "vias": [item] });
+            revision_of(&args, &nets(), &four_layers())
+        };
+        let blind = revision(spanned("blind", Some("F.Cu"), Some("In1.Cu")));
+        assert_eq!(
+            blind,
+            revision(spanned("blind", Some("In1.Cu"), Some("F.Cu")))
+        );
+        assert_ne!(
+            blind,
+            revision(spanned("micro", Some("F.Cu"), Some("In1.Cu")))
+        );
+        assert_ne!(
+            blind,
+            revision(spanned("blind", Some("F.Cu"), Some("In2.Cu")))
+        );
+        assert_ne!(
+            blind,
+            revision(spanned("buried", Some("In1.Cu"), Some("In2.Cu")))
+        );
+        assert_ne!(blind, revision(via((146.0, 90.0), 0.3, 0.6, "NET_C")));
     }
 
     #[test]
@@ -2158,6 +2637,38 @@ mod served_tests {
         kicad.assert_untouched();
     }
 
+    /// A via's type and layers reach the plan through `tools/call`; on this
+    /// two-layer board a blind via has no inner layer to end on.
+    #[tokio::test]
+    async fn a_via_span_is_planned_and_checked_against_the_board() {
+        let kicad = kicad().await;
+        let mut through = v1();
+        through["via_type"] = json!("through");
+        through["start_layer"] = json!("B.Cu");
+        through["end_layer"] = json!("F.Cu");
+        let (is_error, answer) = kicad.call(json!({ "vias": [through] })).await;
+        assert!(!is_error, "{answer}");
+        assert_eq!(answer["vias"][0]["via_type"], "through");
+        assert_eq!(answer["vias"][0]["start_layer"], "F.Cu");
+        assert_eq!(answer["vias"][0]["end_layer"], "B.Cu");
+
+        let mut blind = v1();
+        blind["via_type"] = json!("blind");
+        blind["start_layer"] = json!("F.Cu");
+        blind["end_layer"] = json!("In1.Cu");
+        let (is_error, answer) = kicad.call(json!({ "vias": [blind] })).await;
+        assert!(is_error, "{answer}");
+        assert_eq!(kind(&answer), "invalid_argument");
+        assert_eq!(answer["error"]["field"], "vias[0].end_layer");
+
+        let mut unknown = v1();
+        unknown["via_type"] = json!("laser");
+        let (is_error, answer) = kicad.call(json!({ "vias": [unknown] })).await;
+        assert!(is_error, "{answer}");
+        assert_eq!(kind(&answer), "invalid_argument");
+        kicad.assert_untouched();
+    }
+
     #[tokio::test]
     async fn an_apply_without_a_revision_sends_nothing() {
         let kicad = kicad().await;
@@ -2213,6 +2724,9 @@ mod served_tests {
         assert_eq!(answer["vias"][0]["uuid"], V1);
         assert_eq!(answer["vias"][0]["net"], "NET_D");
         assert_eq!(answer["vias"][0]["drill"], json!(0.3));
+        assert_eq!(answer["vias"][0]["via_type"], "through");
+        assert_eq!(answer["vias"][0]["start_layer"], "F.Cu");
+        assert_eq!(answer["vias"][0]["end_layer"], "B.Cu");
         assert_eq!(answer["source"], "ipc_readback");
         for (command, times) in [
             ("BeginCommit", 1),
