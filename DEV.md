@@ -280,7 +280,7 @@ meta-tools. JSONL IO failures never fail a call (`tracing::warn!`, dropped). Tes
 
 ## Tool Routing
 
-`tools/list` does not expose all 257 tools (264 tools with the 7 meta-tools, ~23K tokens):
+`tools/list` does not expose all 257 tools (265 tools with the 8 meta-tools, ~23K tokens):
 
 - **Startup** loads only `registry.rs::STARTER_KIT` (`project`, `config`): with the
   meta-tools, 21 tools ≈ 2K tokens.
@@ -427,10 +427,10 @@ checked readers for domain rules.
 
 ## Current Stats
 
-- **23 toolsets, 257 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime
+- **23 toolsets, 257 tools** + 8 meta-tools (5 routing + 2 observability + 1 runtime
   diagnostic — see `tool-directory.md`). The standalone Unix executable adds
   `reload_server` over stdio only — not embedded, HTTP, mixed transport or Windows.
-- Baseline `tools/list`: 21 tools / ~2K tokens. Full catalogue: 264 tools (257 registered + 7 meta) / ~25K tokens.
+- Baseline `tools/list`: 22 tools / ~2K tokens. Full catalogue: 265 tools (257 registered + 8 meta) / ~25K tokens.
 - **0 IPC stubs**, **0 unimplemented tools**.
 - **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands:
   `export_specctra_dsn` makes a revision-bound job from the live editor,

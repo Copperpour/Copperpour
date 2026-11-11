@@ -246,6 +246,32 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
             }),
         },
         McpToolDescription {
+            name: "call_tool".to_string(),
+            description:
+                "Call any Copperpour tool by name, whether or not its toolset is loaded and \
+                 whether or not it appears in your tool list. Use it when a tool you need is \
+                 missing from your tools, e.g. after load_toolset if your client does not \
+                 refresh its tool list. arguments are the tool's own arguments; the result \
+                 is the tool's own result."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Tool name, e.g. 'get_component_nets'"
+                    },
+                    "arguments": {
+                        "type": "object",
+                        // The target's schema checks these, not this one.
+                        "additionalProperties": true,
+                        "description": "The tool's arguments (default: {})"
+                    }
+                },
+                "required": ["name"]
+            }),
+        },
+        McpToolDescription {
             name: "unload_toolset".to_string(),
             description: "Unload a toolset to remove its tools from the active session. \
                  Use this to keep the tool list manageable when switching tasks. \

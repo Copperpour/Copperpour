@@ -97,6 +97,15 @@ impl ToolRouter {
         None
     }
 
+    /// The definition of a domain tool, whether or not its toolset is loaded.
+    /// `call_tool` runs tools through this without changing `tools/list`.
+    pub fn tool_definition(&self, tool_name: &str) -> Option<ToolDef> {
+        let toolset = self.find_toolset_for_tool(tool_name)?;
+        registry::tools_for(toolset)?
+            .into_iter()
+            .find(|def| def.name == tool_name)
+    }
+
     pub async fn unload(&self, name: &str) -> bool {
         let defs = match registry::tools_for(name) {
             Some(d) => d,
@@ -222,7 +231,10 @@ mod tests {
                         "set_erc_severity/properties/severities" |
                         // Passed through to Freerouting; what it does not
                         // apply is read back and refused before routing.
-                        "route_specctra_dsn/properties/router_settings"
+                        "route_specctra_dsn/properties/router_settings" |
+                        // The target tool's arguments; its own closed
+                        // schema validates them before it runs.
+                        "call_tool/properties/arguments"
                     ),
                         "unreviewed open input record: {path}"
                     );

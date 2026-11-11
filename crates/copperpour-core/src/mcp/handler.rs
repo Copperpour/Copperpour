@@ -61,6 +61,24 @@ pub struct McpHandler {
 /// inferred, not observed inside the app.
 const CLIENTS_THAT_CACHE_TOOL_LIST: &[&str] = &["claude-ai", "local-agent-mode-"];
 
+/// The meta-tool that runs another tool by name (see `dispatch_call_tool`).
+const CALL_TOOL: &str = "call_tool";
+
+/// An `invalid_argument` refusal for `field`.
+fn invalid_argument(field: &str, reason: &str) -> (CallToolResult, CallStatus, Option<String>) {
+    (
+        CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: field.to_string(),
+                reason: reason.to_string(),
+            },
+            format!("Argument '{field}' is invalid: {reason}"),
+        ),
+        CallStatus::Error,
+        Some("invalid_argument".to_string()),
+    )
+}
+
 pub(crate) fn client_caches_tool_list(client_name: &str) -> bool {
     let name = client_name.trim().to_ascii_lowercase();
     CLIENTS_THAT_CACHE_TOOL_LIST
@@ -362,11 +380,17 @@ impl McpHandler {
         let started = Instant::now();
         let ts = unix_ms();
 
+        // A call through call_tool is recorded under the tool it ran, so the
+        // call log still says which tools were used.
+        let recorded_name = match args["name"].as_str() {
+            Some(target) if params.name == CALL_TOOL => target.to_string(),
+            _ => params.name.clone(),
+        };
         // Pre-compute the owning toolset (if any) once for the call record.
         let toolset = self
             .ctx
             .router
-            .find_toolset_for_tool(&params.name)
+            .find_toolset_for_tool(&recorded_name)
             .map(str::to_string);
 
         let args_bytes = serde_json::to_string(&args).map(|s| s.len()).unwrap_or(0);
@@ -395,7 +419,7 @@ impl McpHandler {
             .record(CallRecord {
                 call_id,
                 ts,
-                tool: params.name.clone(),
+                tool: recorded_name,
                 toolset,
                 dur_ms,
                 status,
@@ -421,6 +445,9 @@ impl McpHandler {
                 return schema_argument_error(&error);
             }
         }
+        if name == CALL_TOOL {
+            return self.dispatch_call_tool(args).await;
+        }
         if let Some(result) =
             meta_tools::handle_meta_tool_with_reload(name, args, &self.ctx, &self.reload).await
         {
@@ -444,6 +471,53 @@ impl McpHandler {
         }
 
         if let Some(tool_def) = tool_def {
+            return self.run_tool_definition(name, &tool_def, args).await;
+        }
+
+        // Not loaded — try to give an actionable hint.
+        self.tool_not_loaded(name)
+    }
+
+    /// `call_tool`: run the named tool as `tools/call` would, but without
+    /// requiring its toolset to be loaded and without changing `tools/list`.
+    /// For clients that never see tools added after their first listing.
+    async fn dispatch_call_tool(
+        &self,
+        args: &Value,
+    ) -> (CallToolResult, CallStatus, Option<String>) {
+        let Some(target) = args["name"].as_str() else {
+            return invalid_argument("name", "missing or not a string");
+        };
+        let target_args = match &args["arguments"] {
+            Value::Null => json!({}),
+            Value::Object(_) => args["arguments"].clone(),
+            _ => return invalid_argument("arguments", "not an object"),
+        };
+        if target == CALL_TOOL {
+            return invalid_argument("name", "call_tool cannot call itself");
+        }
+        if self.meta_input_validators.contains_key(target) {
+            return Box::pin(self.dispatch_tool(target, &target_args)).await;
+        }
+        let tool_def = match self.ctx.router.get_tool(target).await {
+            Some(def) => Some(def),
+            None => self.ctx.router.tool_definition(target),
+        };
+        match tool_def {
+            Some(def) => self.run_tool_definition(target, &def, &target_args).await,
+            None => self.tool_not_loaded(target),
+        }
+    }
+
+    /// Validate `args` against a domain tool and run it, mapping handler
+    /// errors to structured results.
+    async fn run_tool_definition(
+        &self,
+        name: &str,
+        tool_def: &crate::tools::ToolDef,
+        args: &Value,
+    ) -> (CallToolResult, CallStatus, Option<String>) {
+        {
             // Nothing validated `required` before this: the schema is
             // advertised to the client and was never enforced server-side, so
             // a handler reading an absent argument with `unwrap_or` ran with a
@@ -574,8 +648,10 @@ impl McpHandler {
                 }
             };
         }
+    }
 
-        // Not loaded — try to give an actionable hint.
+    /// The refusal for a tool that is not loaded, or not known at all.
+    fn tool_not_loaded(&self, name: &str) -> (CallToolResult, CallStatus, Option<String>) {
         match self.ctx.router.find_toolset_for_tool(name) {
             Some(toolset) => {
                 let kind = ToolErrorKind::ToolsetNotLoaded {
@@ -5147,5 +5223,135 @@ mod progress_delivery_tests {
             report_during_call(&handler, &params(meta.clone())).await;
             assert!(rx.try_recv().is_err(), "{meta:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod call_tool_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    async fn lazy_handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: false,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    fn text(result: &CallToolResult) -> &str {
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    async fn listed(handler: &McpHandler) -> usize {
+        handler.ctx.router.active_tools().await.len()
+    }
+
+    /// A tool of an unloaded toolset runs through call_tool, gives what a
+    /// direct call would, and leaves the tool list as it was.
+    #[tokio::test]
+    async fn runs_a_tool_whose_toolset_is_not_loaded() {
+        let handler = lazy_handler().await;
+        assert!(!handler
+            .ctx
+            .router
+            .active_names()
+            .await
+            .iter()
+            .any(|name| name == "templates"));
+        let before = listed(&handler).await;
+
+        let (via, status, kind) = handler
+            .dispatch_tool(
+                "call_tool",
+                &json!({ "name": "get_template", "arguments": { "template_id": "usb_c_5v_sink" } }),
+            )
+            .await;
+        assert_eq!(listed(&handler).await, before, "tools/list must not change");
+        assert!(!handler
+            .ctx
+            .router
+            .active_names()
+            .await
+            .iter()
+            .any(|name| name == "templates"));
+
+        handler.ctx.router.load("templates").await;
+        let (direct, direct_status, direct_kind) = handler
+            .dispatch_tool("get_template", &json!({ "template_id": "usb_c_5v_sink" }))
+            .await;
+        assert_eq!(text(&via), text(&direct));
+        assert_eq!(via.is_error, direct.is_error);
+        assert_eq!(status, direct_status);
+        assert_eq!(kind, direct_kind);
+    }
+
+    /// The target's own argument checks still run.
+    #[tokio::test]
+    async fn the_target_still_refuses_a_missing_argument() {
+        let handler = lazy_handler().await;
+        let (result, status, kind) = handler
+            .dispatch_tool("call_tool", &json!({ "name": "get_template" }))
+            .await;
+        assert!(result.is_error);
+        assert_eq!(status, CallStatus::Error);
+        assert_eq!(kind.as_deref(), Some("invalid_argument"));
+        assert!(text(&result).contains("template_id"), "{}", text(&result));
+    }
+
+    #[tokio::test]
+    async fn runs_a_meta_tool() {
+        let handler = lazy_handler().await;
+        let (result, _, _) = handler
+            .dispatch_tool("call_tool", &json!({ "name": "get_active_toolsets" }))
+            .await;
+        assert!(!result.is_error, "{}", text(&result));
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unknown_tool_itself_and_non_object_arguments() {
+        let handler = lazy_handler().await;
+        let (_, status, kind) = handler
+            .dispatch_tool("call_tool", &json!({ "name": "no_such_tool" }))
+            .await;
+        assert_eq!(status, CallStatus::NotFound);
+        assert_eq!(kind.as_deref(), Some("unknown_tool"));
+
+        let (_, _, kind) = handler
+            .dispatch_tool("call_tool", &json!({ "name": "call_tool" }))
+            .await;
+        assert_eq!(kind.as_deref(), Some("invalid_argument"));
+
+        let (_, _, kind) = handler
+            .dispatch_tool(
+                "call_tool",
+                &json!({ "name": "get_template", "arguments": "template_id=x" }),
+            )
+            .await;
+        assert_eq!(kind.as_deref(), Some("invalid_argument"));
+    }
+
+    /// The call log names the tool that ran, not call_tool.
+    #[tokio::test]
+    async fn the_call_log_records_the_target() {
+        let handler = lazy_handler().await;
+        let params: CallToolParams = serde_json::from_value(json!({
+            "name": "call_tool",
+            "arguments": { "name": "list_template_categories" }
+        }))
+        .unwrap();
+        handler.execute_tool(&params).await;
+        let recent = handler.observer.recent(1).await;
+        assert_eq!(recent[0].tool, "list_template_categories");
+        assert_eq!(recent[0].toolset.as_deref(), Some("templates"));
     }
 }
