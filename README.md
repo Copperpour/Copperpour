@@ -286,9 +286,10 @@ selector. The tool returns a private loopback URL and asks the OS to open it;
 use `open_browser: false` to return the URL without opening a browser. If opening
 a browser fails, the service remains available at the returned URL.
 
-The server reuses one viewer per canonical root schematic for the MCP session.
-Keep the URL private: its fragment contains the launch credential. Keep the MCP
-session running; ending it shuts down the viewer. The display reflects saved
+The server reuses one viewer per canonical root schematic for the MCP server
+context. Keep the URL private: its fragment contains the launch credential.
+Stdio disconnect or HTTP server shutdown ends the viewer; disconnecting a client
+from the stateless HTTP transport does not stop it. The display reflects saved
 files, including agent edits, rather than unsaved KiCad changes. Pan by dragging,
 zoom with the wheel, press `0` to fit or `R` to refresh, and use the toolbar to
 select sheets or launch KiCad. Browser mode is bound to its root at launch and

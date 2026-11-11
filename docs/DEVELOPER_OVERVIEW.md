@@ -21,7 +21,7 @@ loads domain toolsets on demand, and routes each call to a file, IPC, or
 | Typed schematic editor | `crates/copperpour-schematic-editor` | Higher-level schematic parse, mutation, library resolution, and serialization |
 | KiCad IPC client | `crates/copperpour-ipc` | Typed KiCad IPC messages, NNG transport, board targeting, and failure classification |
 | Viewer engine | `crates/copperpour-viewer` | Shared engine, root-bound loopback browser service and shared frontend assets |
-| Schematic viewer | `crates/schematic-viewer` | Deprecated standalone Tauri application retained through a shipped deprecation release; MCP uses the session-owned browser service |
+| Schematic viewer | `crates/schematic-viewer` | Deprecated standalone Tauri application retained through a shipped deprecation release; MCP uses the context-owned browser service |
 | KiCad launcher plugin | `plugin` | Python ActionPlugin and settings UI for the packaged server |
 | Packaging | `packaging` | KiCad PCM metadata, package assembly, and package validation |
 

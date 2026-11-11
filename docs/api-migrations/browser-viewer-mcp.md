@@ -19,9 +19,11 @@ Root resolution, render or bind failure returns a tool error without a success U
 
 The URL includes a fragment credential; treat it as a private local capability.
 One viewer is reused per canonical root in a `ToolContext`. It lives until that
-MCP session ends, including when its browser tab is closed. Closing the session
-signals shutdown of listener, watcher and render processes. A later session gets
-a new URL; old URLs cannot reconnect to it. For headless/SSH use, forward the
+MCP server context ends; closing a browser tab does not stop it. Dropping the
+context signals shutdown of listener, watcher and render processes. With stdio, the
+context ends when its connection closes. The stateless HTTP transport shares one
+context across clients; disconnecting a client does not stop viewers, which remain
+until HTTP server shutdown. A later server context gets a new URL; old URLs cannot reconnect to it. For headless/SSH use, forward the
 printed port to the same local port, preserving the printed `127.0.0.1` origin;
 Host/Origin validation rejects other ports or hostnames. The service makes no
 outbound network requests and remains available in offline builds.

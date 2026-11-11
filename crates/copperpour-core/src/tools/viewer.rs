@@ -136,7 +136,7 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
         response
     }
     #[tokio::test]
-    async fn browser_mcp_reuses_canonical_root_serves_data_and_stops_with_session() {
+    async fn browser_mcp_reuses_canonical_root_serves_data_and_stops_with_context() {
         let (dir, root, cli) = fixture();
         let handler = handler(cli).await;
         let alias = dir.path().join("alias.kicad_sch");
@@ -172,7 +172,7 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
             }
         })
         .await
-        .expect("session drop closes listener");
+        .expect("context drop closes listener");
     }
     #[tokio::test]
     async fn browser_mcp_refuses_bad_options_missing_files_and_render_failure() {

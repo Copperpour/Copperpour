@@ -243,7 +243,7 @@ registered but hides its toolbar button: it has no icon, and its stdio server
 exits at once ([#277](https://github.com/Copperpour/Copperpour/issues/277)).
 Fixing both is part of [#24](https://github.com/Copperpour/Copperpour/issues/24). The browser viewer launched by
 `open_schematic_viewer` is embedded in the MCP server. It watches saved schematic
-files and renders private snapshots through `kicad-cli`; its session-owned
+files and renders private snapshots through `kicad-cli`; its context-owned
 loopback service needs no GUI runtime in the server. The tool returns a credential
 URL even when the OS browser opener fails or `open_browser: false` is passed.
 The standalone Tauri viewer in `crates/schematic-viewer` is deprecated, retained

@@ -184,7 +184,7 @@ in a merge request to <https://gitlab.com/kicad/addons/metadata>.
 ## Browser viewer default and Tauri deprecation
 
 `open_schematic_viewer` now uses the browser service. Core tests exercise its served
-MCP schema, canonical-root reuse, saved-data HTTP response and session teardown,
+MCP schema, canonical-root reuse, saved-data HTTP response and context teardown,
 plus opener success/failure/timeout and startup recovery. Run
 `cargo test -p copperpour-core --locked tools::viewer` and the workspace gates.
 Also check `--no-default-features`: this loopback service is available offline.

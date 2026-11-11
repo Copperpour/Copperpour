@@ -306,7 +306,7 @@ pub struct ToolContext {
     pub observer: crate::observability::CallObserver,
     /// In-memory TTL cache for repeated JLCPCB parts-database queries.
     pub jlcpcb_cache: QueryCache,
-    /// Session-owned browser viewers, keyed by canonical root schematic.
+    /// Context-owned browser viewers, keyed by canonical root schematic.
     viewers: viewer::ViewerRegistry,
     /// Boards positively observed open through IPC during this server process.
     /// Sticky state prevents an unsafe file fallback after KiCad disappears.

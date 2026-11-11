@@ -138,8 +138,8 @@ pub fn tools() -> Vec<ToolDef> {
             "open_schematic_viewer",
             "Open a live browser schematic viewer for saved files. Returns an authenticated loopback URL; \
              auto-refreshes on saved changes. Pass the root schematic for hierarchical designs. \
-             Reuses the session's viewer for the same root. Set open_browser=false for headless use. \
-             The service stops when the MCP session ends; keep the returned URL private.",
+             Reuses the server context's viewer for the same root. Set open_browser=false for headless use. \
+             The service stops on stdio disconnect or HTTP server shutdown; keep the returned URL private.",
             json!({
                 "type": "object",
                 "properties": {
@@ -589,7 +589,7 @@ async fn handle_open_viewer(
         "browser_launch_requested": open_browser,
         "browser_launch_succeeded": browser.succeeded,
         "browser_launch_error": browser.error,
-        "note": "Browser viewer service is running for saved files until this MCP session ends. Browser launch status describes the OS opener, not proof of a visible browser. Open the returned URL manually if needed; keep its credential private."
+        "note": "Browser viewer service is running for saved files until stdio disconnect or HTTP server shutdown. Browser launch status describes the OS opener, not proof of a visible browser. Open the returned URL manually if needed; keep its credential private."
     })))
 }
 
@@ -752,6 +752,25 @@ mod tests {
             extract_error_kind(&error).as_deref(),
             Some("invalid_argument")
         );
+    }
+
+    #[tokio::test]
+    async fn browser_viewer_direct_handler_rejects_malformed_present_open_browser() {
+        let ctx = test_ctx();
+        for value in [json!(null), json!("false"), json!(0)] {
+            let result = handle_open_viewer(
+                &json!({"schematic":"/nonexistent/root.kicad_sch", "open_browser":value}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                extract_error_kind(&result).as_deref(),
+                Some("invalid_argument")
+            );
+            let encoded = serde_json::to_string(&result).unwrap();
+            assert!(encoded.contains("open_browser"), "{encoded}");
+        }
     }
 
     // ─── handle_create_project ─────────────────────────────────────────────

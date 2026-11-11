@@ -69,7 +69,7 @@ and Windows servers do not.
 | `get_project_info` | Read project metadata from a `.kicad_pro` file. Returns name, schematic/PCB paths, last-modified time, project-file format version, and the generator versions recorded by the sibling design files. |
 | `rename_project` | Rename the `.kicad_pro`/`.kicad_sch`/`.kicad_pcb`/`.kicad_prl` files *and* the internal references that carry the old name. Renaming the files alone makes KiCad treat the design as unannotated, losing every reference designator, because each symbol instance stores `(project "name")`. Supports `dry_run`. |
 | `snapshot_project` | Export the schematic and PCB to PDF as a timestamped snapshot/checkpoint. Useful before major edits. |
-| `open_schematic_viewer` | Open a session-owned browser viewer for saved schematics; returns a private loopback URL. Set `open_browser: false` for headless use. |
+| `open_schematic_viewer` | Open a context-owned browser viewer for saved schematics; returns a private loopback URL. Set `open_browser: false` for headless use. |
 
 ### `editor_navigation` · 5 tools
 **Purpose:** Observe and semantically navigate exact KiCad editor, document, sheet, selection, and cross-probe context.

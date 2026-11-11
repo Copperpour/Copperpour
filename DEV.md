@@ -370,7 +370,7 @@ the engine alone requires no GTK, WebKit or display. The process invocation and
 Tauri plumbing remain thin adapters. The browser service is exercised by the
 viewer crate's HTTP/SSE integration tests; `examples/browser_viewer.rs` is its
 local development entry point. The MCP launch tool uses the browser service, owned by a registry on `ToolContext`
-until the session ends. `open_browser: false` suppresses the OS opener; all successful
+until the server context ends. `open_browser: false` suppresses the OS opener; all successful
 service starts return a credential URL. The standalone Tauri app is deprecated
 and retained for one shipped release containing the migration notice. See [the viewer README](crates/copperpour-viewer/README.md).
 

@@ -2,7 +2,8 @@
 
 The crate contains the GUI-independent viewer engine and browser service.
 `open_schematic_viewer` uses this service by default; `ToolContext` owns and reuses
-an instance per canonical root until the MCP session ends. Set `open_browser: false`
+an instance per canonical root until the MCP server context ends (stdio disconnect
+or HTTP server shutdown). Set `open_browser: false`
 to obtain the private URL without launching a browser. The standalone Tauri
 `schematic-viewer` is deprecated and retained through one shipped release containing
 the notice; its CLI remains available.
