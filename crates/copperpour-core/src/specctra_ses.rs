@@ -496,7 +496,7 @@ fn validate_placement(node: &SexpNode, manifest: &Manifest) -> Result<()> {
             if x_um != component.x_um
                 || y_um != component.y_um
                 || side != component.side
-                || (rotation - component.rotation_degrees).abs() > 1e-9
+                || !same_angle(rotation, component.rotation_degrees)
             {
                 bail!("SES changes placement of component '{reference}'");
             }
@@ -511,6 +511,15 @@ fn validate_placement(node: &SexpNode, manifest: &Manifest) -> Result<()> {
         bail!("SES placement omits component(s): {}", missing.join(", "));
     }
     Ok(())
+}
+
+/// Whether two placement angles name the same direction. KiCad writes a
+/// footprint's angle in (-180, 180] and Freerouting returns it in [0, 360):
+/// KiCad's -90 comes back as 270. The tolerance is the one the comparison
+/// already had.
+fn same_angle(a: f64, b: f64) -> bool {
+    let turn = (a - b).rem_euclid(360.0);
+    turn <= 1e-9 || 360.0 - turn <= 1e-9
 }
 
 fn validate_parser(node: &SexpNode) -> Result<()> {
@@ -1203,6 +1212,136 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("revision"), "{error}");
+    }
+
+    /// KiCad 10.0.8's board with footprints at -90, 0, -45 and 180 degrees
+    /// (`specctra_negative_rotation.generate.py`), and Freerouting 2.3.0's
+    /// session for its Rust export, which writes the angles in [0, 360).
+    const NEGATIVE_ROTATION: &str =
+        include_str!("../tests/fixtures/specctra_negative_rotation.kicad_pcb");
+    const NEGATIVE_ROTATION_SES: &str =
+        include_str!("../tests/fixtures/specctra_negative_rotation.freerouting-2.3.0.ses");
+
+    fn negative_rotation_fixture() -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, NEGATIVE_ROTATION).unwrap();
+        let export = export_dsn(&board, NEGATIVE_ROTATION, &rules()).unwrap();
+        (dir, board, export.manifest)
+    }
+
+    #[test]
+    fn freerouting_session_of_negative_angles_imports() {
+        let (_dir, board, manifest) = negative_rotation_fixture();
+        let rotations = serde_json::from_str::<serde_json::Value>(&manifest).unwrap()["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|component| {
+                (
+                    component["reference"].as_str().unwrap().to_string(),
+                    component["rotation_degrees"].as_f64().unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let expected = [("R1", -90.0), ("R2", 0.0), ("R3", -45.0), ("R4", 180.0)]
+            .into_iter()
+            .map(|(reference, degrees)| (reference.to_string(), degrees))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rotations, expected);
+        for place in [
+            "(place R1 1000000 -500000 front 270)",
+            "(place R3 1000000 -400000 front 315)",
+            "(place R4 1100000 -400000 front 180)",
+        ] {
+            assert!(NEGATIVE_ROTATION_SES.contains(place), "{place}");
+        }
+        let plan =
+            parse_import_plan(&board, NEGATIVE_ROTATION, &manifest, NEGATIVE_ROTATION_SES).unwrap();
+        assert!(!plan.tracks.is_empty());
+    }
+
+    #[test]
+    fn session_angle_written_as_kicad_does_still_imports() {
+        let (_dir, board, manifest) = negative_rotation_fixture();
+        let ses = NEGATIVE_ROTATION_SES
+            .replace(
+                "(place R1 1000000 -500000 front 270)",
+                "(place R1 1000000 -500000 front -90)",
+            )
+            .replace(
+                "(place R4 1100000 -400000 front 180)",
+                "(place R4 1100000 -400000 front -180)",
+            );
+        parse_import_plan(&board, NEGATIVE_ROTATION, &manifest, &ses).unwrap();
+    }
+
+    #[test]
+    fn real_rotation_in_session_is_refused() {
+        let (_dir, board, manifest) = negative_rotation_fixture();
+        for (from, to, reference) in [
+            (
+                "(place R1 1000000 -500000 front 270)",
+                "(place R1 1000000 -500000 front 180)",
+                "R1",
+            ),
+            (
+                "(place R1 1000000 -500000 front 270)",
+                "(place R1 1000000 -500000 front 90)",
+                "R1",
+            ),
+            (
+                "(place R2 1100000 -500000 front 0)",
+                "(place R2 1100000 -500000 front 90)",
+                "R2",
+            ),
+            (
+                "(place R3 1000000 -400000 front 315)",
+                "(place R3 1000000 -400000 front 45)",
+                "R3",
+            ),
+            (
+                "(place R4 1100000 -400000 front 180)",
+                "(place R4 1100000 -400000 front 0)",
+                "R4",
+            ),
+        ] {
+            assert!(NEGATIVE_ROTATION_SES.contains(from), "{from}");
+            let ses = NEGATIVE_ROTATION_SES.replace(from, to);
+            let error = parse_import_plan(&board, NEGATIVE_ROTATION, &manifest, &ses)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!("SES changes placement of component '{reference}'"),
+                "{to}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_angle_compares_modulo_a_full_turn() {
+        for (a, b) in [
+            (-90.0, 270.0),
+            (270.0, -90.0),
+            (-45.0, 315.0),
+            (180.0, -180.0),
+            (0.0, 360.0),
+            (0.0, -720.0),
+            (-90.0, 269.999_999_999_9),
+            (-90.0, 270.000_000_000_1),
+        ] {
+            assert!(same_angle(a, b), "{a} {b}");
+        }
+        for (a, b) in [
+            (90.0, 180.0),
+            (-90.0, 90.0),
+            (0.0, 1e-6),
+            (0.0, 359.999_999),
+            (-45.0, 45.0),
+        ] {
+            assert!(!same_angle(a, b), "{a} {b}");
+        }
     }
 
     #[test]
