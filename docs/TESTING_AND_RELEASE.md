@@ -25,7 +25,7 @@ cargo fmt --all -- --check
 | Typed schematic model | `crates/copperpour-schematic-editor` tests |
 | IPC builders, transport, and client behavior | `crates/copperpour-ipc` tests |
 | Real KiCad behavior | ignored live tests and local CI's real-KiCad job (`e2e-kicad.yml`'s steps) |
-| Viewer engine | `crates/copperpour-viewer` tests, included in workspace checks |
+| Viewer engine and browser service | `crates/copperpour-viewer` engine and HTTP/SSE tests, included in workspace checks |
 | Tauri viewer adapter | `crates/schematic-viewer` tests and its separate CI job |
 | Python plugin | `plugin/tests` and the plugin CI job |
 | PCM package | `packaging/validate-pcm.py` and packaging CI jobs |
@@ -34,7 +34,9 @@ Run the engine tests without GUI prerequisites using
 `cargo test -p copperpour-viewer --locked`. The Tauri adapter remains outside
 the Cargo workspace: also run
 `cargo test --locked --manifest-path crates/schematic-viewer/Cargo.toml`.
-Workspace commands cover the engine but do not build or test the Tauri adapter.
+Workspace commands cover the engine and browser service but do not build or test
+the Tauri adapter. Browser visual/CSP execution checks and native KiCad-renderer
+smoke tests are separate evidence; HTTP header tests do not substitute for them.
 
 ## Evidence-Focused Regression Tests
 

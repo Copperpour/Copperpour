@@ -35,9 +35,13 @@ jsonschema = { version = "0.58", default-features = false }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
+notify = "8"
+roxmltree = "0.21"
 
 # HTTP/SSE transport
 axum = { version = "0.8", features = ["macros"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 
 # S-expression parsing
 nom = "8"

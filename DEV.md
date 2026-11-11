@@ -81,11 +81,12 @@ crates/
 │   └── proto/ (from KiCad v10) · build.rs (prost) · src/ gen.rs · client.rs (NNG
 │       req/rep) · builders.rs (protobuf helpers, mm→nm) · transform.rs (footprint
 │       children are ABSOLUTE board coords, mixelpixx/Konnect#23) · types.rs
-├── copperpour-viewer/           # Sheet discovery, snapshot rendering, cache/debounce helpers
+├── copperpour-viewer/           # Shared engine, loopback browser service, shared frontend
 └── schematic-viewer/            # Tauri app, outside the workspace
     └── capabilities/default.json (core:default grant — without it event.listen() is
         silently denied) · src/main.rs (commands and multi-sheet watcher
-        integration using copperpour-viewer) · frontend/index.html (pan/zoom, sheets)
+        integration using copperpour-viewer); frontend assets live in
+        schematic-viewer/frontend (shared pan/zoom and sheet adapters)
 plugin/      Python launcher inside KiCad: __init__.py (PCB-editor ActionPlugin settings
              dialog) · settings_dialog.py · native_bridge.py (see Plugin) · plugin.json
 packaging/   build-pcm.{ps1,sh} (one platform) · merge-pcm.py + pcm-launcher.sh (all
@@ -365,7 +366,10 @@ Run all: `PROTOC=<path> cargo test --workspace --lib --tests`
 `drain_until_quiet`, `files_needing_render`, `render_all` errors). The Tauri app
 uses that engine and retains its frontend/configuration check; building and testing
 the engine alone requires no GTK, WebKit or display. The process invocation and
-Tauri plumbing remain thin adapters.
+Tauri plumbing remain thin adapters. The browser service is exercised by the
+viewer crate's HTTP/SSE integration tests; `examples/browser_viewer.rs` is its
+local development entry point. The MCP launch tool still selects Tauri in this
+phase. See [the viewer README](crates/copperpour-viewer/README.md).
 
 ## Adding a New Tool
 

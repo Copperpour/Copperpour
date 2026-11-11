@@ -4,6 +4,8 @@
 //! Existing snapshot fallback and partial-render behavior is preserved here;
 //! this extraction does not establish the browser service's security boundary.
 
+pub mod browser;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
