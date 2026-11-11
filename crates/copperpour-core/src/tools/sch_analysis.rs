@@ -5,6 +5,7 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::reference_hint::component_not_found;
 use crate::tools::sch_connectivity::{label_roots, net_graph_for, pt_key, ConnectivityIndex};
 use crate::tools::{
     get_path, is_power_symbol_reference, opt_f64, opt_positive_f64, placed_pins_by_reference,
@@ -381,7 +382,7 @@ async fn handle_get_pin_connections(
         .iter()
         .any(|instance| instance.reference == reference)
     {
-        return Err(anyhow::anyhow!("Component '{}' not found", reference));
+        return Err(anyhow::anyhow!(component_not_found(&sch_path, &reference)));
     }
     let pin_ep = placed_pins_by_reference(&tree)
         .into_iter()
@@ -421,7 +422,7 @@ async fn handle_get_component_nets(
         .iter()
         .any(|instance| instance.reference == reference)
     {
-        return Err(anyhow::anyhow!("Component '{}' not found", reference));
+        return Err(anyhow::anyhow!(component_not_found(&sch_path, &reference)));
     }
     let mut g = net_graph_for(&tree, &wires, &labels);
     let pins: Vec<serde_json::Value> = placed_pins_by_reference(&tree)
@@ -888,9 +889,8 @@ async fn handle_get_connected_items(
         .iter()
         .any(|instance| instance.reference == reference)
     {
-        return Ok(CallToolResult::error(format!(
-            "Component '{}' not found",
-            reference
+        return Ok(CallToolResult::error(component_not_found(
+            &sch_path, &reference,
         )));
     }
     let placed_pins = placed_pins_by_reference(&tree);
@@ -2466,6 +2466,31 @@ mod multi_unit_tool_tests {
         let pin_y = result["pin_y"].as_f64().unwrap();
         assert!((pin_x - 60.96).abs() < 1e-9, "wrong unit x: {pin_x}");
         assert!((pin_y - 86.36).abs() < 1e-9, "wrong unit y: {pin_y}");
+    }
+
+    /// A reference on another sheet of the project is refused with that
+    /// sheet's file, not a bare "not found" that reads as "no such part".
+    #[tokio::test]
+    async fn component_nets_name_the_sheet_a_missing_reference_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root.kicad_sch");
+        let sub = dir.path().join("sub.kicad_sch");
+        std::fs::write(&root, ECC83).unwrap();
+        std::fs::write(&sub, ECC83.replace("\"U1\"", "\"U7\"")).unwrap();
+        let context = Arc::new(ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        ));
+        let args = json!({ "schematic": root.to_str().unwrap(), "reference": "U7" });
+        let error = handle_get_component_nets(&args, &context)
+            .await
+            .expect_err("U7 is not on the root sheet")
+            .to_string();
+        assert!(
+            error.starts_with("Component 'U7' not found on this sheet"),
+            "{error}"
+        );
+        assert!(error.contains(sub.to_str().unwrap()), "{error}");
     }
 
     #[tokio::test]

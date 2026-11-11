@@ -67,6 +67,7 @@ pub mod project;
 mod project_file_writer_tests;
 #[cfg(test)]
 mod readback_mismatch_tests;
+mod reference_hint;
 #[cfg(test)]
 mod route_obstacle_tests;
 pub mod sch_analysis;

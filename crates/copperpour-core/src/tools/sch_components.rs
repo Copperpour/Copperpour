@@ -9,6 +9,7 @@ use crate::mcp::{
     protocol::{CallToolResult, ToolContent},
 };
 use crate::tool;
+use crate::tools::reference_hint::component_not_found;
 use crate::tools::{
     find_all_symbol_instance_blocks, get_path, invalid_arg, opt_f64, opt_str, opt_u32,
     reembed_lib_symbols, require_array, require_f64, require_str,
@@ -3811,9 +3812,8 @@ async fn handle_get_schematic_component(
         .filter(|symbol| symbol.reference() == Some(reference.as_str()))
         .collect();
     let Some(anchor) = placed.iter().copied().min_by_key(|symbol| symbol.unit) else {
-        return Ok(CallToolResult::error(format!(
-            "Component '{}' not found",
-            reference
+        return Ok(CallToolResult::error(component_not_found(
+            &sch_path, &reference,
         )));
     };
     let (x, y) = anchor.position();
@@ -4488,6 +4488,16 @@ async fn handle_get_schematic_pin_locations(
     let (_, tree) = read_schematic(&sch_path)?;
     match pin_locations_for_reference(&tree, &reference) {
         Ok(result) => Ok(CallToolResult::json(&result)),
+        // Not on this sheet: say which sheet it is on, if any.
+        Err(_)
+            if !extract_symbol_instances(&tree)
+                .iter()
+                .any(|instance| instance.reference == reference) =>
+        {
+            Ok(CallToolResult::error(component_not_found(
+                &sch_path, &reference,
+            )))
+        }
         Err(error) => Ok(CallToolResult::error(error)),
     }
 }
@@ -5116,9 +5126,8 @@ async fn handle_replace_component(
 
     let blocks = find_all_symbol_instance_blocks(&content, &reference);
     if blocks.is_empty() {
-        return Ok(CallToolResult::error(format!(
-            "Component '{}' not found",
-            reference
+        return Ok(CallToolResult::error(component_not_found(
+            &sch_path, &reference,
         )));
     }
     if blocks.len() > 1 && new_unit.is_some() {
