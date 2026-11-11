@@ -1,0 +1,118 @@
+(session board
+  (base_design board)
+  (placement
+    (resolution um 10)
+    (component "copperpour_image_J1"
+      (place J1 1200000 -400000 front 0)
+    )
+    (component "copperpour_image_J2"
+      (place J2 1250000 -400000 front 0)
+    )
+    (component "copperpour_image_R1"
+      (place R1 1000000 -500000 front 0)
+    )
+    (component "copperpour_image_R2"
+      (place R2 1100000 -500000 front 0)
+    )
+  )
+  (was_is
+  )
+  (routes 
+    (resolution um 10)
+    (parser
+      (host_cad Copperpour)
+      (host_version "0.16.1")
+    )
+    (library_out 
+      (padstack "copperpour_via_0001"
+        (shape
+          (circle F.Cu 6000 0 0)
+        )
+        (shape
+          (circle B.Cu 6000 0 0)
+        )
+        (attach off)
+      )
+    )
+    (network_out 
+      (net GND
+        (wire
+          (path B.Cu 2000
+            1200000 -425400
+            1250000 -425400
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1095000 -500000
+            1095000 -494483
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1200000 -425400
+            1164083 -425400
+            1095000 -494483
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1095000 -500000
+            1005000 -500000
+          )
+        )
+      )
+      (net VCC
+        (wire
+          (path F.Cu 2000
+            1250000 -400000
+            1200000 -400000
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1200000 -400000
+            1200000 -411517
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1105000 -500000
+            1141972 -500000
+            1211517 -430455
+            1211517 -420154
+            1202880 -411517
+            1200000 -411517
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1105000 -500000
+            1105000 -505517
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            997209 -507726
+            1102791 -507726
+            1105000 -505517
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            997209 -507726
+            995000 -505517
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            995000 -500000
+            995000 -505517
+          )
+        )
+        (via "copperpour_via_0001" 997209 -507726
+        )
+      )
+    )
+  )
+)

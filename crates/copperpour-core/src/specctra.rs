@@ -408,6 +408,7 @@ pub(crate) fn adopt_native_dsn(
         .collect();
     let padstack_names =
         correlate_components(&baseline_identity, &native_identity, &roundrect_models)?;
+    refuse_merged_padstacks(&manifest, &padstack_names)?;
     validate_native_nets(&baseline_identity, &native_identity)?;
     if baseline_identity.planes != native_identity.planes {
         bail!("native DSN changed the copper-zone planes");
@@ -882,6 +883,54 @@ fn correlate_components(
         }
     }
     Ok(padstacks)
+}
+
+/// KiCad names a pad's padstack after its copper only, so two pads that share
+/// a shape but not a drill get one native padstack. The reverse manifest would
+/// then hold that name twice, and the importer refuses such a manifest only
+/// after routing. Refuse the adoption instead, naming the pads on each side.
+fn refuse_merged_padstacks(
+    manifest: &Manifest,
+    padstack_names: &BTreeMap<String, String>,
+) -> Result<()> {
+    let mut by_native: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (baseline, native) in padstack_names {
+        by_native.entry(native).or_default().push(baseline);
+    }
+    let Some((native, merged)) = by_native.iter().find(|(_, merged)| merged.len() > 1) else {
+        return Ok(());
+    };
+    let sides = merged
+        .iter()
+        .map(|baseline| {
+            let pads = manifest
+                .components
+                .iter()
+                .flat_map(|component| {
+                    component
+                        .pads
+                        .iter()
+                        .filter(|pin| pin.padstack_name == *baseline)
+                        .map(move |pin| format!("{}-{}", component.reference, pin.pad_number))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let drill = match manifest
+                .padstacks
+                .iter()
+                .find(|padstack| padstack.name == *baseline)
+                .and_then(|padstack| padstack.drill_um)
+            {
+                Some(drill_um) => format!("drill {drill_um} um"),
+                None => "no drill".to_string(),
+            };
+            format!("{pads} ({drill})")
+        })
+        .collect::<Vec<_>>()
+        .join(" and ");
+    bail!(
+        "KiCad native DSN gives one padstack '{native}' to pads that the Rust export keeps apart: {sides}"
+    );
 }
 
 /// A rounded rectangle is judged against its pad; every other shape must be
@@ -4428,6 +4477,83 @@ pub(crate) mod tests {
         manifest["schema_version"] = 2.into();
         crate::specctra_ses::parse_import_plan(&board, FOUR_LAYERS, &manifest.to_string(), ses)
             .unwrap();
+    }
+
+    /// Two stock pin headers whose pads share 1.7 mm copper but not a drill
+    /// (1.0 and 0.8 mm). See its README.
+    const PADSTACK_DRILLS: &str =
+        include_str!("../tests/fixtures/specctra_padstack_drills.kicad_pcb");
+    const PADSTACK_DRILLS_NATIVE_FILE: &str =
+        include_str!("../tests/fixtures/specctra_padstack_drills.native-kicad-10.dsn");
+
+    /// The native DSN without the header's courtyard polygon, which the DSN
+    /// parser does not read yet.
+    fn padstack_drills_native() -> String {
+        PADSTACK_DRILLS_NATIVE_FILE
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
+    /// KiCad names both headers' pads after their copper alone: J1's 1.0 mm
+    /// and J2's 0.8 mm holes share one native padstack per shape. Adoption
+    /// refuses before routing and names the pads, instead of a manifest that
+    /// the importer refuses once the board is routed.
+    #[test]
+    fn native_padstacks_merged_across_drills_are_refused_before_routing() {
+        let error = adopt_native_dsn(native_baseline(PADSTACK_DRILLS), padstack_drills_native())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("KiCad native DSN gives one padstack 'Rect[A]Pad_1700.000000x1700.000000_um' to pads that the Rust export keeps apart"),
+            "{error}"
+        );
+        assert!(
+            error.contains("J2-1 (drill 800 um)") && error.contains("J1-1 (drill 1000 um)"),
+            "{error}"
+        );
+    }
+
+    /// The same pads in the Rust export: one padstack per shape and drill,
+    /// and Freerouting 2.3.0's session for that DSN (0 unrouted) imports.
+    #[test]
+    fn rust_export_keeps_drills_apart_and_its_session_imports() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_padstack_drills.kicad_pcb");
+        std::fs::write(&board, PADSTACK_DRILLS).unwrap();
+        let export = export_dsn(&board, PADSTACK_DRILLS, &native_fixture_rules()).unwrap();
+        let manifest: Manifest = serde_json::from_str(&export.manifest).unwrap();
+        let through = manifest
+            .padstacks
+            .iter()
+            .filter(|padstack| padstack.purpose == "pad")
+            .filter_map(|padstack| {
+                padstack
+                    .drill_um
+                    .map(|drill| (padstack.shape, padstack.size_x_um, drill))
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            through,
+            BTreeSet::from([
+                (PadShape::Circle, 1700, 800),
+                (PadShape::Circle, 1700, 1000),
+                (PadShape::Rect, 1700, 800),
+                (PadShape::Rect, 1700, 1000),
+            ])
+        );
+        let names = manifest
+            .padstacks
+            .iter()
+            .map(|padstack| padstack.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), manifest.padstacks.len());
+        let ses = include_str!("../tests/fixtures/specctra_padstack_drills.freerouting-2.3.0.ses");
+        let plan =
+            crate::specctra_ses::parse_import_plan(&board, PADSTACK_DRILLS, &export.manifest, ses)
+                .unwrap();
+        assert!(!plan.tracks.is_empty());
     }
 
     /// The four-layer board with a GND plane on In1.Cu, a VCC plane on In2.Cu
