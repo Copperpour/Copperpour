@@ -18,7 +18,6 @@ use copperpour_sexp::{
 };
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -137,17 +136,21 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "open_schematic_viewer",
-            "Launch the live schematic viewer. The viewer shows the schematic as SVG and \
-             auto-refreshes when the file changes. Use this after placing components so the \
-             user can see the schematic in real-time as you edit it. For hierarchical designs, \
-             pass the root schematic — the viewer discovers every sheet reachable from it and \
-             shows a sheet selector.",
+            "Open a live browser schematic viewer for saved files. Returns an authenticated loopback URL; \
+             auto-refreshes on saved changes. Pass the root schematic for hierarchical designs. \
+             Reuses the session's viewer for the same root. Set open_browser=false for headless use. \
+             The service stops when the MCP session ends; keep the returned URL private.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": {
                         "type": "string",
                         "description": "Path to the root .kicad_sch file to view"
+                    },
+                    "open_browser": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Ask the OS to open the viewer URL (false returns the URL without launching a browser)"
                     }
                 },
                 "required": ["schematic"]
@@ -550,78 +553,44 @@ async fn handle_open_viewer(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-
-    if !sch_path.exists() {
-        return Ok(CallToolResult::error(format!(
-            "File not found: {}",
-            sch_path.display()
-        )));
-    }
-
-    let viewer_binary = find_viewer_binary();
-
-    match viewer_binary {
-        Some(viewer_path) => {
-            tracing::info!(
-                "[BETA] Launching schematic viewer: {} {}",
-                viewer_path.display(),
+    let open_browser = match args.get("open_browser") {
+        None => true,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(_) => return Ok(invalid_arg("open_browser", "must be a boolean")),
+    };
+    let root = match sch_path.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            return Ok(CallToolResult::error(format!(
+                "Resolve viewer schematic '{}': {error}",
                 sch_path.display()
-            );
-
-            // Spawn as detached process, forwarding the configured kicad-cli
-            // path so the viewer renders with the same binary we use.
-            let mut cmd = std::process::Command::new(&viewer_path);
-            if !ctx.config.kicad_cli.is_empty() {
-                cmd.arg("--kicad-cli").arg(&ctx.config.kicad_cli);
-            }
-            cmd.arg(&sch_path);
-
-            match launch_viewer(cmd, super::launch::STARTUP_WINDOW).await {
-                Ok(()) => Ok(CallToolResult::text(
-                    serde_json::to_string(&json!({
-                        "launched": true,
-                        "viewer": viewer_path.to_str().unwrap_or(""),
-                        "schematic": sch_path.to_str().unwrap_or(""),
-                        "note": "Schematic viewer opened. It will auto-refresh as you make changes to the schematic file."
-                    }))
-                    .unwrap(),
-                )),
-                Err(message) => Ok(CallToolResult::error(message)),
-            }
+            )))
         }
-        None => Ok(CallToolResult::error(format!(
-            "Schematic viewer binary ({}) not found. \
-             It should be in the same directory as the Copperpour server, or on PATH.",
-            viewer_filename()
-        ))),
-    }
-}
-
-/// Spawns the viewer and watches it for `window`. An exit inside the window
-/// is a failed launch, reported with the exit status and stderr tail.
-async fn launch_viewer(cmd: std::process::Command, window: Duration) -> Result<(), String> {
-    let mut viewer = super::launch::spawn(
-        cmd,
-        "Schematic viewer",
-        |line| tracing::warn!(target: "schematic_viewer", "{line}"),
-    )
-    .map_err(|e| format!("Failed to launch viewer: {e}"))?;
-    viewer.watch(window).await
-}
-
-fn viewer_filename() -> String {
-    format!("schematic-viewer{}", std::env::consts::EXE_SUFFIX)
-}
-
-/// Next to the server binary, then on `PATH`. Never the working directory: a
-/// bare name found there would be spawned through `PATH` instead (#184).
-fn find_viewer_binary() -> Option<std::path::PathBuf> {
-    let name = viewer_filename();
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(&name)))
-        .filter(|viewer| viewer.is_file())
-        .or_else(|| crate::kicad_install::find_on_path(name.as_ref()))
+    };
+    let (url, reused) = match ctx.viewers.open(&root, &ctx.config.kicad_cli).await {
+        Ok(viewer) => viewer,
+        Err(error) => {
+            return Ok(CallToolResult::error(format!(
+                "Start schematic viewer: {error}"
+            )))
+        }
+    };
+    let browser = if open_browser {
+        super::viewer::launch_browser(&url).await
+    } else {
+        super::viewer::BrowserLaunch::not_requested()
+    };
+    Ok(CallToolResult::json(&json!({
+        "launched": true,
+        "viewer": "browser",
+        "schematic": root,
+        "url": url,
+        "reused": reused,
+        "browser_launch_requested": open_browser,
+        "browser_launch_succeeded": browser.succeeded,
+        "browser_launch_error": browser.error,
+        "note": "Browser viewer service is running for saved files until this MCP session ends. Browser launch status describes the OS opener, not proof of a visible browser. Open the returned URL manually if needed; keep its credential private."
+    })))
 }
 
 // ─── Blank file templates ──────────────────────────────────────────────────────
@@ -2064,50 +2033,5 @@ mod rename_revision_tests {
             "{error}"
         );
         assert_eq!(read(&dir.path().join("mixer.kicad_sch")), ROOT);
-    }
-}
-
-/// `open_schematic_viewer` used to report `launched: true` for any successful
-/// `spawn()`, including a viewer that panicked at once for lack of a display
-/// (#702). `sh` stands in for the viewer, so these run on Unix only.
-#[cfg(all(test, unix))]
-mod viewer_launch_tests {
-    use super::launch_viewer;
-    use std::time::Duration;
-
-    fn sh(script: &str) -> std::process::Command {
-        let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(script);
-        cmd
-    }
-
-    /// The panic tao prints when GTK cannot open a display, then the exit
-    /// code a Rust panic gives, as the issue's reproduction recorded them.
-    /// The rest of the watching is tested in `tools::launch`.
-    #[tokio::test]
-    async fn a_viewer_that_crashes_on_startup_is_a_failed_launch() {
-        let err = launch_viewer(
-            sh("echo 'Failed to initialize gtk backend!' >&2; exit 101"),
-            Duration::from_secs(10),
-        )
-        .await
-        .expect_err("an exit inside the window must not count as launched");
-        assert!(
-            err.starts_with("Schematic viewer exited during startup")
-                && err.contains("101")
-                && err.ends_with("Failed to initialize gtk backend!"),
-            "{err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_missing_binary_is_a_failed_launch() {
-        let err = launch_viewer(
-            std::process::Command::new("/nonexistent/schematic-viewer"),
-            Duration::from_secs(1),
-        )
-        .await
-        .unwrap_err();
-        assert!(err.starts_with("Failed to launch viewer:"), "{err}");
     }
 }

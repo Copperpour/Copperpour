@@ -620,47 +620,103 @@ fn a_kicad_cli_in_the_working_directory_does_not_stop_discovery() {
     );
 }
 
-/// A `schematic-viewer` in the working directory was returned as the bare
-/// relative name, which the spawn then looked up on `PATH`, so the response
-/// named a binary other than the one launched (#184). A script stands in for
-/// the viewer, so this runs on Unix only.
+/// The browser default does not discover or launch a Tauri executable. Verify
+/// the default opener, headless reuse and failed opener through real stdio MCP.
 #[cfg(unix)]
 #[test]
-fn a_viewer_in_the_working_directory_is_not_reported_as_launched() {
+fn browser_viewer_stdio_reports_service_and_opener_separately() {
     use std::os::unix::fs::PermissionsExt;
-
     let tmp = tempfile::tempdir().unwrap();
     let bin = tmp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
-    std::fs::write(tmp.path().join("schematic-viewer"), "").unwrap();
-    let viewer = bin.join("schematic-viewer");
-    // The server runs with the PATH below, so take `sleep`'s full path from
-    // this process's; the Nix build sandbox has no /bin or /usr/bin.
-    let sleep = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-        .map(|dir| dir.join("sleep"))
-        .find(|path| path.is_file())
-        .expect("sleep on PATH");
-    std::fs::write(&viewer, format!("#!/bin/sh\nexec {} 3\n", sleep.display())).unwrap();
-    std::fs::set_permissions(&viewer, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let schematic = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../copperpour-core/tests/fixtures/derived_lib_name.kicad_sch"
-    );
-
-    // A viewer built into this target directory would be found first.
-    let server = std::path::Path::new(env!("CARGO_BIN_EXE_copperpour"));
-    assert!(
-        !server.with_file_name("schematic-viewer").exists(),
-        "a schematic-viewer next to {} shadows the PATH lookup",
-        server.display()
-    );
-    let mut p = spawn_with_path_to(tmp.path(), &bin);
-    let result = p.call_tool("open_schematic_viewer", json!({"schematic": schematic}));
-    assert_ne!(result["isError"], json!(true), "{result:#?}");
+    let executable = |name: &str| {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+            .unwrap()
+    };
+    let shell = executable("sh");
+    let mkdir = executable("mkdir");
+    let cli = bin.join("cli");
+    std::fs::write(&cli, format!("#!{}\n{} -p \"$5\"\nprintf '<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><text>saved</text></svg>' > \"$5/root.svg\"\n", shell.display(), mkdir.display())).unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let opener = bin.join("xdg-open");
+    // macOS uses `open`; Windows uses rundll32 and is tested separately.
+    #[cfg(target_os = "macos")]
+    let opener = bin.join("open");
+    std::fs::write(
+        &opener,
+        format!(
+            "#!{}\nprintf '%s' \"$1\" > \"$0.called\"\n",
+            shell.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        tmp.path().join("schematic-viewer"),
+        "must never be launched",
+    )
+    .unwrap();
+    let schematic = tmp.path().join("root.kicad_sch");
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../copperpour-core/tests/fixtures/derived_lib_name.kicad_sch"
+        ),
+        &schematic,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("copperpour.toml"),
+        format!(
+            "kicad_cli = {}\n",
+            serde_json::to_string(cli.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    let mut paths = vec![bin.clone()];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let path = std::env::join_paths(paths).unwrap();
+    let mut p =
+        McpProcess::spawn_with_env(Some(tmp.path()), true, &[("PATH", path.to_str().unwrap())]);
+    let first = p.call_tool("open_schematic_viewer", json!({"schematic":schematic}));
+    assert_ne!(first["isError"], true, "{first}");
+    let first = McpProcess::tool_body(&first);
+    assert_eq!(first["viewer"], "browser");
+    assert_eq!(first["launched"], true);
+    assert_eq!(first["browser_launch_requested"], true);
+    assert_eq!(first["browser_launch_succeeded"], true);
     assert_eq!(
-        McpProcess::tool_body(&result)["viewer"],
-        viewer.to_str().unwrap()
+        std::fs::read_to_string(opener.with_file_name(format!(
+            "{}.called",
+            opener.file_name().unwrap().to_str().unwrap()
+        )))
+        .unwrap(),
+        first["url"].as_str().unwrap()
     );
+    let headless = p.call_tool(
+        "open_schematic_viewer",
+        json!({"schematic":schematic,"open_browser":false}),
+    );
+    let headless = McpProcess::tool_body(&headless);
+    assert_eq!(headless["url"], first["url"]);
+    assert_eq!(headless["reused"], true);
+    assert_eq!(headless["browser_launch_requested"], false);
+    assert_eq!(headless["browser_launch_succeeded"], false);
+    std::fs::write(&opener, format!("#!{}\nexit 7\n", shell.display())).unwrap();
+    let failed = p.call_tool("open_schematic_viewer", json!({"schematic":schematic}));
+    assert_ne!(failed["isError"], true, "{failed}");
+    let failed = McpProcess::tool_body(&failed);
+    assert_eq!(failed["url"], first["url"]);
+    assert_eq!(failed["launched"], true);
+    assert_eq!(failed["browser_launch_requested"], true);
+    assert_eq!(failed["browser_launch_succeeded"], false);
+    assert!(failed["browser_launch_error"]
+        .as_str()
+        .unwrap()
+        .contains('7'));
 }
 
 #[test]

@@ -21,7 +21,7 @@ loads domain toolsets on demand, and routes each call to a file, IPC, or
 | Typed schematic editor | `crates/copperpour-schematic-editor` | Higher-level schematic parse, mutation, library resolution, and serialization |
 | KiCad IPC client | `crates/copperpour-ipc` | Typed KiCad IPC messages, NNG transport, board targeting, and failure classification |
 | Viewer engine | `crates/copperpour-viewer` | Shared engine, root-bound loopback browser service and shared frontend assets |
-| Schematic viewer | `crates/schematic-viewer` | Separate Tauri application, commands and watcher integration using the shared engine |
+| Schematic viewer | `crates/schematic-viewer` | Deprecated standalone Tauri application retained through a shipped deprecation release; MCP uses the session-owned browser service |
 | KiCad launcher plugin | `plugin` | Python ActionPlugin and settings UI for the packaged server |
 | Packaging | `packaging` | KiCad PCM metadata, package assembly, and package validation |
 
@@ -61,3 +61,8 @@ decision and its safety gates are described in
    paths and the gates between them.
 5. [Testing and release](TESTING_AND_RELEASE.md) maps changes to tests, CI, live
    KiCad validation, documentation, and packaging.
+
+The MCP browser viewer registry lives on `ToolContext` and reuses services by canonical
+root schematic. `open_schematic_viewer` returns a private URL plus separate OS-opener
+status; `open_browser: false` supports headless use. See the
+[browser migration](api-migrations/browser-viewer-mcp.md).

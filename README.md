@@ -280,26 +280,33 @@ set `native_bridge_mode` to `"prefer"` (fall back to Copperpour's exporter) or
 
 ## Schematic viewer
 
-The PCM package ships a standalone viewer beside the server, in the same `bin/`
-folder: `schematic-viewer` (`schematic-viewer.exe` on Windows). It auto-refreshes as
-the schematic file changes:
+The `open_schematic_viewer` MCP tool starts a browser viewer that refreshes when
+saved schematic files change. Pass the root sheet of a hierarchy to get a sheet
+selector. The tool returns a private loopback URL and asks the OS to open it;
+use `open_browser: false` to return the URL without opening a browser. If opening
+a browser fails, the service remains available at the returned URL.
+
+The server reuses one viewer per canonical root schematic for the MCP session.
+Keep the URL private: its fragment contains the launch credential. Keep the MCP
+session running; ending it shuts down the viewer. The display reflects saved
+files, including agent edits, rather than unsaved KiCad changes. Pan by dragging,
+zoom with the wheel, press `0` to fit or `R` to refresh, and use the toolbar to
+select sheets or launch KiCad. Browser mode is bound to its root at launch and
+has no file-drop control. It needs `kicad-cli`, using the server's configured path
+or normal discovery, and a browser; no Tauri runtime is needed.
+
+The standalone Tauri viewer is deprecated but remains available for one shipped
+release containing this notice, including its `--kicad-cli` flag:
 
 ```bash
-schematic-viewer path/to/your/root_schematic.kicad_sch
+schematic-viewer path/to/root.kicad_sch --kicad-cli /path/to/kicad-cli
 ```
 
-Point it at the root sheet of a hierarchical design and every sub-sheet is rendered
-too, with a depth-indented sheet selector in the toolbar. Edits saved from KiCad (or
-made by the AI through the schematic tools) re-render only the sheets that changed
-and refresh the view live — rendering runs against temp-folder snapshots, so the
-viewer never blocks KiCad from saving. Pan with click-drag, zoom with the wheel,
-`0` to fit, `R` to refresh, drag-and-drop to open a different file. The AI can also
-open it with the `open_schematic_viewer` tool.
-
-It uses the system WebView: WebView2 on Windows (pre-installed on 10 and 11),
-WebKitGTK on Linux; macOS has had less testing. It needs KiCad's `kicad-cli`
-(auto-discovered, or pass `--kicad-cli <path>`). To build it from source, see
-[DEV.md](DEV.md).
+Its drag-and-drop support and platform WebView prerequisites remain unchanged.
+It is built separately from the main workspace; see [DEV.md](DEV.md). Removal
+must wait until the deprecation release has shipped. See the
+[migration note](docs/api-migrations/browser-viewer-mcp.md) for the response contract
+and headless port-forwarding guidance.
 
 ## Requirements
 

@@ -18,7 +18,7 @@ cargo check                          # ~15s
 cargo test --workspace --lib --tests # all tests
 cargo test -p copperpour-core -p copperpour --no-default-features --lib --tests  # the offline build (#210)
 cargo build --release -p copperpour     # MCP server binary
-cd crates/schematic-viewer && cargo build --release   # viewer (separate crate)
+cd crates/schematic-viewer && cargo build --release   # deprecated standalone Tauri viewer
 ```
 
 ### Nix
@@ -315,7 +315,8 @@ Router: `crates/copperpour-core/src/router/mod.rs`.
   notably Chocolatey and scoop shims. Debian/Ubuntu need `protobuf-compiler` **and**
   `libprotobuf-dev`, Fedora `protobuf-compiler` and `protobuf-devel`; otherwise the build
   fails with `google/protobuf/any.proto: File not found`.
-- Schematic viewer: Tauri 2 prerequisites (WebView2 on Windows, usually present). At
+- Browser schematic viewer: included in the MCP server; needs a browser and `kicad-cli`.
+  The deprecated standalone viewer still needs Tauri 2 prerequisites (WebView2 on Windows, usually present). At
   runtime it finds `kicad-cli` in the standard install paths, then PATH, or
   `--kicad-cli <path>`. On Windows, if `cargo` is missing in a fresh shell, run
   `set PATH=%PATH%;%USERPROFILE%\.cargo\bin`, and close the viewer before rebuilding (a
@@ -368,8 +369,10 @@ uses that engine and retains its frontend/configuration check; building and test
 the engine alone requires no GTK, WebKit or display. The process invocation and
 Tauri plumbing remain thin adapters. The browser service is exercised by the
 viewer crate's HTTP/SSE integration tests; `examples/browser_viewer.rs` is its
-local development entry point. The MCP launch tool still selects Tauri in this
-phase. See [the viewer README](crates/copperpour-viewer/README.md).
+local development entry point. The MCP launch tool uses the browser service, owned by a registry on `ToolContext`
+until the session ends. `open_browser: false` suppresses the OS opener; all successful
+service starts return a credential URL. The standalone Tauri app is deprecated
+and retained for one shipped release containing the migration notice. See [the viewer README](crates/copperpour-viewer/README.md).
 
 ## Adding a New Tool
 

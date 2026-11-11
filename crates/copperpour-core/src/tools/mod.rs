@@ -97,6 +97,7 @@ pub(crate) mod title_block_args;
 #[cfg(test)]
 mod top_level_sheet_tests;
 pub mod verification;
+mod viewer;
 
 use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::router::ToolRouter;
@@ -305,6 +306,8 @@ pub struct ToolContext {
     pub observer: crate::observability::CallObserver,
     /// In-memory TTL cache for repeated JLCPCB parts-database queries.
     pub jlcpcb_cache: QueryCache,
+    /// Session-owned browser viewers, keyed by canonical root schematic.
+    viewers: viewer::ViewerRegistry,
     /// Boards positively observed open through IPC during this server process.
     /// Sticky state prevents an unsafe file fallback after KiCad disappears.
     pub(crate) board_session: board_session::BoardSessionMemory,
@@ -327,6 +330,7 @@ impl ToolContext {
             router,
             observer: crate::observability::CallObserver::new(None),
             jlcpcb_cache: QueryCache::default(),
+            viewers: viewer::ViewerRegistry::default(),
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
@@ -345,6 +349,7 @@ impl ToolContext {
             router,
             observer,
             jlcpcb_cache: QueryCache::default(),
+            viewers: viewer::ViewerRegistry::default(),
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),

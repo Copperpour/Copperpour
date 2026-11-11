@@ -180,3 +180,17 @@ a version number listed twice, and says `"license": "open-source"`, because the
 repository also checks against the v1 schema, which has no AGPL entry. To list a
 release, copy its `versions` entries into `packages/<identifier>/metadata.json`
 in a merge request to <https://gitlab.com/kicad/addons/metadata>.
+
+## Browser viewer default and Tauri deprecation
+
+`open_schematic_viewer` now uses the browser service. Core tests exercise its served
+MCP schema, canonical-root reuse, saved-data HTTP response and session teardown,
+plus opener success/failure/timeout and startup recovery. Run
+`cargo test -p copperpour-core --locked tools::viewer` and the workspace gates.
+Also check `--no-default-features`: this loopback service is available offline.
+
+The standalone `schematic-viewer` binary, `--kicad-cli` flag, packaging and separate
+CI job remain available during deprecation. Ship a release containing the migration
+notice before a later PR removes Tauri; do not remove it in that same release cycle.
+Keep standalone tests running until removal. Linux interactive feedback is available;
+Windows/macOS browser launch and interactive behavior need platform verification.
