@@ -13641,3 +13641,183 @@ mod editor_lock_refusal_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod root_editor_lock_tests {
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+    use serde_json::{json, Value};
+
+    async fn call(handler: &McpHandler, name: &str, arguments: Value) -> Value {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 428, "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    /// Tools that report an `outcome` envelope with their refusal.
+    const OUTCOME_TOOLS: [&str; 3] = [
+        "add_schematic_component",
+        "batch_place_components",
+        "annotate_schematic",
+    ];
+
+    async fn root_lock_case(tool: &str, mut arguments: Value) {
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let names = [
+            "nested_pages.kicad_pro",
+            "nested_pages.kicad_sch",
+            "bank.kicad_sch",
+            "cell.kicad_sch",
+        ];
+        for name in names {
+            std::fs::copy(
+                fixtures.join("annotate_nested_hierarchy").join(name),
+                directory.path().join(name),
+            )
+            .unwrap();
+        }
+        let child = directory.path().join("bank.kicad_sch");
+        // Use the existing KiCad-authored library, independent of installed libraries.
+        let library = fixtures.join("reference_prefix_kicad10/Device.kicad_sym");
+        std::fs::write(directory.path().join("sym-lib-table"), format!(
+            "(sym_lib_table (version 7) (lib (name \"Device\") (type \"KiCad\") (uri {}) (options \"\") (descr \"\")))",
+            crate::tools::library::quote_lib_table_string(&library.display().to_string())
+        )).unwrap();
+        // An unannotated part for annotation, and R99 for the tools that edit one.
+        // `bank` is placed twice, so annotation would also see R99 as a duplicate.
+        let parts: &[_] = if tool == "annotate_schematic" {
+            &[(200.66, None)]
+        } else {
+            &[(200.66, None), (226.06, Some("R99"))]
+        };
+        for &(x, reference) in parts {
+            let mut part = json!({ "schematic": child, "lib_id": "Device:R", "x": x, "y": 101.6 });
+            if let Some(reference) = reference {
+                part["reference"] = json!(reference);
+            }
+            let prepared = call(&handler, "add_schematic_component", part).await;
+            assert_eq!(prepared["outcome"]["status"], "complete", "{prepared}");
+        }
+        let before: Vec<_> = names
+            .iter()
+            .map(|name| std::fs::read(directory.path().join(name)).unwrap())
+            .collect();
+        let root = directory.path().join("nested_pages.kicad_sch");
+        let lock = directory.path().join("~nested_pages.kicad_sch.lck");
+        std::fs::write(&lock, r#"{"hostname":"x","username":"y"}"#).unwrap();
+        arguments["schematic"] = json!(child);
+        let refused = call(&handler, tool, arguments.clone()).await;
+        if tool == "delete_schematic_component" {
+            // Its document binding sees the root lock before the writer does.
+            assert_eq!(refused["error"]["kind"], "stale_target", "{refused}");
+            assert_eq!(refused["error"]["target"], json!(child), "{refused}");
+        } else {
+            assert_eq!(refused["error"]["kind"], "conflict", "{tool}: {refused}");
+            assert_eq!(refused["error"]["paths"], json!([root]), "{refused}");
+            let message = refused["message"].as_str().unwrap();
+            assert!(message.contains(&root.display().to_string()), "{refused}");
+        }
+        if OUTCOME_TOOLS.contains(&tool) {
+            let message = refused["message"].as_str().unwrap();
+            assert!(message.contains(&lock.display().to_string()), "{refused}");
+            assert_eq!(refused["outcome"]["status"], "failed", "{refused}");
+            assert_eq!(refused["outcome"]["completed"], 0, "{refused}");
+            assert_eq!(refused["outcome"]["retry"]["safe"], true, "{refused}");
+        }
+        for (name, expected) in names.iter().zip(&before) {
+            assert_eq!(
+                &std::fs::read(directory.path().join(name)).unwrap(),
+                expected,
+                "{tool}: {name}"
+            );
+        }
+        assert!(lock.exists());
+        if tool == "annotate_schematic" {
+            let mut dry = arguments.clone();
+            dry["dry_run"] = json!(true);
+            let planned = call(&handler, tool, dry).await;
+            assert_eq!(planned["outcome"]["status"], "complete", "{planned}");
+            assert_eq!(std::fs::read(&child).unwrap(), before[2]);
+        }
+        // The same request succeeds once Eeschema releases its root lock.
+        std::fs::remove_file(lock).unwrap();
+        let applied = call(&handler, tool, arguments).await;
+        assert!(applied.get("error").is_none(), "{tool}: {applied}");
+        assert_ne!(std::fs::read(&child).unwrap(), before[2], "{tool}");
+        for index in [0, 1, 3] {
+            assert_eq!(
+                std::fs::read(directory.path().join(names[index])).unwrap(),
+                before[index],
+                "{tool}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn root_lock_refuses_single_child_placement() {
+        root_lock_case(
+            "add_schematic_component",
+            json!({"lib_id":"Device:R", "x":251.46,"y":101.6,"reference":"R98"}),
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn root_lock_refuses_batch_child_placement() {
+        root_lock_case(
+            "batch_place_components",
+            json!({"components":[{"lib_id":"Device:R", "x":251.46,"y":101.6,"reference":"R98"}]}),
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn root_lock_refuses_child_template() {
+        root_lock_case("apply_template", json!({"template_id":"i2c_pullups"})).await;
+    }
+    #[tokio::test]
+    async fn root_lock_refuses_child_file_annotation() {
+        root_lock_case("annotate_schematic", json!({"schematic_scope":"file"})).await;
+    }
+
+    /// Every other sheet writer reaches the same check in the shared writer.
+    #[tokio::test]
+    async fn root_lock_refuses_other_child_writes() {
+        let cases = [
+            (
+                "add_wire",
+                json!({"x1": 100.33, "y1": 50.8, "x2": 120.65, "y2": 50.8}),
+            ),
+            ("add_junction", json!({"x": 100.33, "y": 50.8})),
+            ("add_no_connect", json!({"x": 100.33, "y": 50.8})),
+            (
+                "add_schematic_net_label",
+                json!({"net": "SIG", "x": 100.33, "y": 50.8}),
+            ),
+            (
+                "move_schematic_component",
+                json!({"reference": "R99", "x": 251.46, "y": 101.6}),
+            ),
+            (
+                "edit_schematic_component",
+                json!({"reference": "R99", "value": "10k"}),
+            ),
+            ("delete_schematic_component", json!({"reference": "R99"})),
+        ];
+        for (tool, arguments) in cases {
+            root_lock_case(tool, arguments).await;
+        }
+    }
+}

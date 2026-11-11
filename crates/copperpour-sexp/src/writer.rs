@@ -105,8 +105,7 @@ pub fn apply_edits(mut content: String, mut edits: Vec<SexpEdit>) -> String {
 /// can itself fail on a locked or read-only directory, and a write already
 /// failing is the wrong moment to start reporting a second error.
 pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
-    let lock = open_document_lock(path)?;
-    <std::fs::File as FileExt>::lock(&lock)?;
+    let _lock = lock_document_exclusive(path)?;
     write_atomic_unlocked(path, content)
 }
 
@@ -157,8 +156,7 @@ pub fn write_atomic_if_unchanged(
     expected: &str,
     content: &str,
 ) -> Result<(), SexpError> {
-    let lock = open_document_lock(path)?;
-    <std::fs::File as FileExt>::lock(&lock)?;
+    let _lock = lock_document_exclusive(path)?;
 
     let current = read_string_unlocked(path)?;
     if current != expected {
@@ -240,8 +238,7 @@ pub fn transact_atomic<T>(
     path: &Path,
     update: impl FnOnce(&str) -> Result<(String, T), SexpError>,
 ) -> Result<T, SexpError> {
-    let lock = open_document_lock(path)?;
-    <std::fs::File as FileExt>::lock(&lock)?;
+    let _lock = lock_document_exclusive(path)?;
     let current = read_string_unlocked(path)?;
     let (next, result) = update(&current)?;
 
@@ -255,9 +252,48 @@ pub fn transact_atomic<T>(
 
 /// Read a complete document while participating in the document lock.
 pub fn read_consistent(path: &Path) -> Result<String, SexpError> {
-    let lock = open_document_lock(path)?;
+    let lock_path = document_lock_path(path)?;
+    // Already held exclusively by this thread (a write resolving the
+    // document's owners, #428): the shared lock could never be granted.
+    if HELD_EXCLUSIVE.with(|held| held.borrow().contains(&lock_path)) {
+        return read_string_unlocked(path);
+    }
+    let lock = open_lock_file(&lock_path)?;
     <std::fs::File as FileExt>::lock_shared(&lock)?;
     read_string_unlocked(path)
+}
+
+thread_local! {
+    static HELD_EXCLUSIVE: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A document's cooperative lock, held exclusively by this thread until drop.
+pub(crate) struct ExclusiveDocumentLock {
+    lock_path: PathBuf,
+    _file: std::fs::File,
+}
+
+impl Drop for ExclusiveDocumentLock {
+    fn drop(&mut self) {
+        HELD_EXCLUSIVE.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(index) = held.iter().position(|path| *path == self.lock_path) {
+                held.swap_remove(index);
+            }
+        });
+    }
+}
+
+pub(crate) fn lock_document_exclusive(path: &Path) -> Result<ExclusiveDocumentLock, SexpError> {
+    let lock_path = document_lock_path(path)?;
+    let file = open_lock_file(&lock_path)?;
+    <std::fs::File as FileExt>::lock(&file)?;
+    HELD_EXCLUSIVE.with(|held| held.borrow_mut().push(lock_path.clone()));
+    Ok(ExclusiveDocumentLock {
+        lock_path,
+        _file: file,
+    })
 }
 
 pub(crate) fn read_string_unlocked(path: &Path) -> Result<String, SexpError> {
@@ -268,11 +304,6 @@ pub(crate) fn read_string_unlocked(path: &Path) -> Result<String, SexpError> {
     Ok(content)
 }
 
-pub(crate) fn open_document_lock(path: &Path) -> Result<std::fs::File, SexpError> {
-    let lock_path = document_lock_path(path)?;
-    open_lock_file(&lock_path)
-}
-
 /// Refuse a `.kicad_sch` or `.kicad_pcb` mutation while KiCad's sibling lock
 /// is present.
 ///
@@ -281,14 +312,45 @@ pub(crate) fn open_document_lock(path: &Path) -> Result<std::fs::File, SexpError
 /// is stale, especially for another host. Its contents are therefore neither
 /// parsed nor trusted: any filesystem entry at the lock path blocks the write.
 /// Reads and non-design-document writes are unaffected.
+///
+/// A document's owners, registered with [`set_editor_owners`], are checked the
+/// same way: Eeschema locks only a project's root schematic and saves every
+/// sheet from memory, so a child sheet is held while its root's lock exists.
 pub fn ensure_kicad_design_document_is_closed(path: &Path) -> Result<(), SexpError> {
     let Some(lock_path) = kicad_editor_lock_path(path) else {
         return Ok(());
     };
+    let inspect = |path: &Path| std::fs::symlink_metadata(path).map(|_| ());
+    ensure_kicad_design_document_is_closed_with(path, &lock_path, inspect)?;
 
-    ensure_kicad_design_document_is_closed_with(path, &lock_path, |path| {
-        std::fs::symlink_metadata(path).map(|_| ())
-    })
+    let Some(owners) = EDITOR_OWNERS.get() else {
+        return Ok(());
+    };
+    let owners = owners(path).map_err(|reason| SexpError::KiCadEditorLocked {
+        path: path.to_path_buf(),
+        lock_path: lock_path.clone(),
+        inspection_error: Some(reason),
+    })?;
+    for owner in owners {
+        if let Some(owner_lock) = kicad_editor_lock_path(&owner) {
+            if owner_lock != lock_path {
+                ensure_kicad_design_document_is_closed_with(&owner, &owner_lock, inspect)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The documents an editor holds open along with `path`, whose locks therefore
+/// guard it too. `Err` means they could not be established, and refuses the write.
+pub type EditorOwners = fn(&Path) -> Result<Vec<PathBuf>, String>;
+
+static EDITOR_OWNERS: std::sync::OnceLock<EditorOwners> = std::sync::OnceLock::new();
+
+/// Registers how [`ensure_kicad_design_document_is_closed`] finds a document's
+/// owners. Project discovery lives above this crate; the first registration wins.
+pub fn set_editor_owners(owners: EditorOwners) {
+    let _ = EDITOR_OWNERS.set(owners);
 }
 
 fn ensure_kicad_design_document_is_closed_with(
@@ -480,16 +542,14 @@ fn hash_native_os_str(hasher: &mut Sha256, value: &OsStr) {
 /// The new file takes the ordinary create mode — `0o666 & !umask` on Unix,
 /// the same as any other newly created file.
 pub fn write_new_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
-    let lock = open_document_lock(path)?;
-    <std::fs::File as FileExt>::lock(&lock)?;
+    let _lock = lock_document_exclusive(path)?;
     write_new_atomic_unlocked(path, content)
 }
 
 /// [`write_new_atomic`], then read the new file back under the same lock.
 /// `ReadbackMismatch` when it no longer holds `content`.
 pub fn write_new_atomic_verified(path: &Path, content: &str) -> Result<(), SexpError> {
-    let lock = open_document_lock(path)?;
-    <std::fs::File as FileExt>::lock(&lock)?;
+    let _lock = lock_document_exclusive(path)?;
     write_new_atomic_unlocked(path, content)?;
     read_back(path, content)
 }
@@ -980,6 +1040,25 @@ pub(crate) mod mode_probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A write that resolves its document's owners reads that document while
+    /// holding its exclusive lock (#428); a shared lock there never returns.
+    #[test]
+    fn the_thread_holding_a_document_lock_can_still_read_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.kicad_sch");
+        std::fs::write(&path, "(kicad_sch)").unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let reader = path.clone();
+        std::thread::spawn(move || {
+            let _held = lock_document_exclusive(&reader).unwrap();
+            sent.send(read_consistent(&reader).unwrap()).unwrap();
+        });
+        let read = received.recv_timeout(std::time::Duration::from_secs(10));
+        assert_eq!(read.as_deref(), Ok("(kicad_sch)"));
+        // Released on drop: another thread's shared read is granted again.
+        assert_eq!(read_consistent(&path).unwrap(), "(kicad_sch)");
+    }
 
     #[test]
     fn apply_edits_reverse_order() {

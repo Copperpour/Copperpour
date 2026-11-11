@@ -7,12 +7,11 @@
 //! explicit resolution.
 
 use crate::writer::{
-    ensure_kicad_design_document_is_closed, open_document_lock, read_string_unlocked,
+    ensure_kicad_design_document_is_closed, lock_document_exclusive, read_string_unlocked,
     sync_parent_directory, write_atomic_unlocked, write_new_atomic_unlocked,
-    write_new_atomic_unlocked_private,
+    write_new_atomic_unlocked_private, ExclusiveDocumentLock,
 };
 use crate::SexpError;
-use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -643,14 +642,14 @@ fn normalize_target(root: &Path, path: &Path) -> Result<PathBuf, SexpError> {
         })
 }
 
-fn lock_entries(root: &Path, entries: &[JournalEntry]) -> Result<Vec<std::fs::File>, SexpError> {
-    let mut locks = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let lock = open_document_lock(&root.join(&entry.path))?;
-        <std::fs::File as FileExt>::lock(&lock)?;
-        locks.push(lock);
-    }
-    Ok(locks)
+fn lock_entries(
+    root: &Path,
+    entries: &[JournalEntry],
+) -> Result<Vec<ExclusiveDocumentLock>, SexpError> {
+    entries
+        .iter()
+        .map(|entry| lock_document_exclusive(&root.join(&entry.path)))
+        .collect()
 }
 
 fn ensure_entries_are_closed(root: &Path, entries: &[JournalEntry]) -> Result<(), SexpError> {
