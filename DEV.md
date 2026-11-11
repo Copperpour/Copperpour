@@ -81,6 +81,7 @@ crates/
 │   └── proto/ (from KiCad v10) · build.rs (prost) · src/ gen.rs · client.rs (NNG
 │       req/rep) · builders.rs (protobuf helpers, mm→nm) · transform.rs (footprint
 │       children are ABSOLUTE board coords, mixelpixx/Konnect#23) · types.rs
+├── copperpour-viewer/          # GUI-independent viewer engine, tested in the workspace
 └── schematic-viewer/            # Tauri app, outside the workspace
     └── capabilities/default.json (core:default grant — without it event.listen() is
         silently denied) · src/main.rs (multi-sheet watcher, snapshot-isolated
@@ -358,10 +359,12 @@ Run all: `PROTOC=<path> cargo test --workspace --lib --tests`
 
 `schematic-viewer` is in `[workspace] exclude`, so `--workspace` never builds it; CI's
 `viewer` job runs its `cargo check` and `cargo test`. Locally:
-`cd crates/schematic-viewer && cargo test`. Its unit tests cover the pure logic
-(`walk_sheet_tree`, `compute_watch_dirs`, `snapshot_tree`, `drain_until_quiet`,
-`files_needing_render`, `render_all` errors); the `kicad-cli` call and Tauri plumbing stay
-thin and untested, like other `kicad-cli` callers.
+`cd crates/schematic-viewer && cargo test`. The pure viewer logic and its tests now live in the workspace crate
+`copperpour-viewer` (`walk_sheet_tree`, `compute_watch_dirs`, `snapshot_tree`,
+`drain_until_quiet`, `files_needing_render`, `render_all` errors). The Tauri app
+uses that engine and retains its frontend/configuration check; building and testing
+the engine alone requires no GTK, WebKit or display. The process invocation and
+Tauri plumbing remain thin adapters.
 
 ## Adding a New Tool
 

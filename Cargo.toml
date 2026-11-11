@@ -7,6 +7,7 @@ members = [
     "crates/copperpour-ipc",
     "crates/copperpour-schematic-editor",
     "crates/copperpour-render",
+    "crates/copperpour-viewer",
     "crates/copperpour-vcs",
     "xtask",
 ]
