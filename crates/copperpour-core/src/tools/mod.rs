@@ -320,6 +320,12 @@ pub struct ToolContext {
     /// Reads installed guidance for drift. Set once by the standalone binary,
     /// which owns the bundle; absent in embedded and test contexts (#728).
     pub(crate) guidance: std::sync::OnceLock<std::sync::Arc<dyn crate::guidance::GuidanceProbe>>,
+    /// Look for KiCad's socket again on every IPC call instead of keeping the
+    /// startup address (#32). Set only by the server entry points, and only
+    /// when the address was detected or not found: a configured or
+    /// `KICAD_API_SOCKET` address stays authoritative, and test contexts keep
+    /// the address they set.
+    ipc_rediscovery: std::sync::atomic::AtomicBool,
 }
 
 impl ToolContext {
@@ -336,6 +342,7 @@ impl ToolContext {
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
+            ipc_rediscovery: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -356,12 +363,36 @@ impl ToolContext {
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
+            ipc_rediscovery: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// Attach the startup configuration decision. Separate from the constructors
     /// so the 60-plus existing `ServerConfig` call sites keep their signatures;
     /// only the real server entry point records provenance.
+    /// Re-detect KiCad's socket on each IPC call (see `ipc_rediscovery`).
+    pub fn enable_ipc_rediscovery(&self) {
+        self.ipc_rediscovery
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The IPC address for this call. With rediscovery on, the socket KiCad
+    /// has now: started after Copperpour, restarted, or moved to
+    /// `api-<pid>.sock` (#374). Detection reads file metadata only and never
+    /// connects; when it finds nothing the startup address is kept, so the
+    /// caller's own bounded `Ping` reports the failure as before.
+    pub fn ipc_address(&self) -> String {
+        if self
+            .ipc_rediscovery
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(address) = copperpour_ipc::detect_ipc_address() {
+                return address;
+            }
+        }
+        self.config.ipc_address.clone()
+    }
+
     pub fn with_config_resolution(
         mut self,
         resolution: crate::config_resolution::ConfigResolution,
@@ -816,7 +847,7 @@ where
     let requested = board_path.to_path_buf();
     let observation = requested.clone();
     let memory = ctx.board_session.clone();
-    with_ipc_classified(ctx.config.ipc_address.clone(), move |client| {
+    with_ipc_classified(ctx.ipc_address(), move |client| {
         let document = match client.find_open_board(&requested) {
             Ok(document) => document,
             // Classified by the typed status in the chain, never by message
@@ -4110,5 +4141,39 @@ mod unwritten_schematic_refusal_tests {
         let unreadable = message(Some("permission denied"));
         assert!(!unreadable.contains("is present"), "{unreadable}");
         assert!(unreadable.contains("permission denied"), "{unreadable}");
+    }
+}
+
+#[cfg(test)]
+mod ipc_rediscovery_tests {
+    use super::*;
+
+    fn context(address: &str) -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                ipc_address: address.to_string(),
+                ..ServerConfig::default()
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// Without rediscovery the startup address is used as given: what every
+    /// test context and every configured address relies on.
+    #[test]
+    fn the_startup_address_is_kept_by_default() {
+        let ctx = context("ipc:///configured/api.sock");
+        assert_eq!(ctx.ipc_address(), "ipc:///configured/api.sock");
+    }
+
+    /// With rediscovery the socket found now wins, and the startup address
+    /// is kept when nothing is found.
+    #[test]
+    fn rediscovery_uses_what_detection_finds_now() {
+        let ctx = context("ipc:///startup/api.sock");
+        ctx.enable_ipc_rediscovery();
+        let expected = copperpour_ipc::detect_ipc_address()
+            .unwrap_or_else(|| "ipc:///startup/api.sock".to_string());
+        assert_eq!(ctx.ipc_address(), expected);
     }
 }

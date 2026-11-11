@@ -813,7 +813,7 @@ async fn handle_export_specctra_dsn(
         ));
     }
     let board_for_ipc = board_path.clone();
-    let addr = ctx.config.ipc_address.clone();
+    let addr = ctx.ipc_address();
     let export = with_ipc(addr, move |client| {
         let document = client.find_open_board(&board_for_ipc)?;
         let before = client.save_document_to_string_in(document.clone())?;
@@ -852,7 +852,7 @@ async fn handle_export_specctra_dsn(
         bridge_diagnostics = attempt.diagnostics;
         if let Some(native) = attempt.export {
             let board_for_stability = board_path.clone();
-            let addr = ctx.config.ipc_address.clone();
+            let addr = ctx.ipc_address();
             let stable = with_ipc(addr, move |client| {
                 let document = client.find_open_board(&board_for_stability)?;
                 client.save_document_to_string_in(document)

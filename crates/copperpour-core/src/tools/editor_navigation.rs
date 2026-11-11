@@ -117,7 +117,7 @@ async fn handle_get_editor_state(
     _args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let address = ctx.config.ipc_address.clone();
+    let address = ctx.ipc_address();
     if address.is_empty() {
         return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
     }
@@ -211,7 +211,7 @@ async fn handle_get_editor_selection(
         Ok(target) => target,
         Err(result) => return Ok(result),
     };
-    let address = ctx.config.ipc_address.clone();
+    let address = ctx.ipc_address();
     if address.is_empty() {
         return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
     }
@@ -381,7 +381,7 @@ async fn handle_resolve_navigation_target(
             .then(|| request.document_path.display().to_string()),
         sheet_instance_path: request.sheet_instance_path.clone(),
     };
-    let address = ctx.config.ipc_address.clone();
+    let address = ctx.ipc_address();
     if address.is_empty() {
         return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
     }
@@ -527,7 +527,7 @@ async fn handle_mutate_editor_selection(
         Ok(request) => request,
         Err(result) => return Ok(result),
     };
-    let address = ctx.config.ipc_address.clone();
+    let address = ctx.ipc_address();
     if address.is_empty() {
         return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
     }
@@ -738,7 +738,7 @@ async fn handle_resolve_cross_probe_target(
         Ok(request) => request,
         Err(result) => return Ok(result),
     };
-    let address = ctx.config.ipc_address.clone();
+    let address = ctx.ipc_address();
     if address.is_empty() {
         return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
     }

@@ -92,6 +92,16 @@ pub enum IpcAddressSource {
 }
 
 impl IpcAddressSource {
+    /// Whether the address may be looked for again while the server runs:
+    /// only one that was detected or not found. A configured or environment
+    /// address is the user's choice and is never replaced (#32).
+    pub fn rediscovers(self) -> bool {
+        matches!(
+            self,
+            IpcAddressSource::Detected | IpcAddressSource::Unresolved
+        )
+    }
+
     /// Report the resolution once tracing is initialized.
     pub fn log(self, address: &str) {
         if let Some(message) = self.resolved_log_message(address) {
@@ -718,5 +728,14 @@ mod tests {
 
         assert_eq!(resolution.source().as_str(), "explicit_path");
         assert!(resolution.skipped_existing_paths().is_empty());
+    }
+
+    /// Only a detected or missing address is looked for again (#32).
+    #[test]
+    fn only_detected_or_missing_addresses_are_rediscovered() {
+        assert!(IpcAddressSource::Detected.rediscovers());
+        assert!(IpcAddressSource::Unresolved.rediscovers());
+        assert!(!IpcAddressSource::Config.rediscovers());
+        assert!(!IpcAddressSource::Environment.rediscovers());
     }
 }

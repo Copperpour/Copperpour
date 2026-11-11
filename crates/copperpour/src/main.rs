@@ -174,6 +174,9 @@ async fn main() -> Result<()> {
 
     let server_config = config.apply_to_process();
     let handler = McpHandler::new_with_config_resolution(server_config, config_resolution).await?;
+    if ipc_source.rediscovers() {
+        handler.enable_ipc_rediscovery();
+    }
     match install::InstalledGuidanceProbe::for_current_user() {
         Ok(probe) => handler.set_guidance_probe(std::sync::Arc::new(probe)),
         Err(error) => tracing::warn!("guidance drift detection unavailable: {error:#}"),

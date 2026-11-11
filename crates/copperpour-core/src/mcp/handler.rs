@@ -588,6 +588,12 @@ impl McpHandler {
         }
     }
 
+    /// Look for KiCad's socket again on each IPC call (#32). For an address
+    /// that was detected at startup, or not found at all.
+    pub fn enable_ipc_rediscovery(&self) {
+        self.ctx.enable_ipc_rediscovery();
+    }
+
     async fn notify_tools_list_changed(&self) {
         let notification = JsonRpcNotification::new(TOOLS_LIST_CHANGED, None);
         let Ok(json) = serde_json::to_string(&notification) else {

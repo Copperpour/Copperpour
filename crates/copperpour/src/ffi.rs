@@ -64,7 +64,12 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
             .try_init();
         ipc_source.log(&config.ipc_address);
         let server_config = config.apply_to_process();
-        match McpHandler::new_with_config_resolution(server_config, config_resolution).await {
+        let handler =
+            McpHandler::new_with_config_resolution(server_config, config_resolution).await;
+        if let (Ok(handler), true) = (&handler, ipc_source.rediscovers()) {
+            handler.enable_ipc_rediscovery();
+        }
+        match handler {
             Ok(handler) => match config.transport {
                 TransportMode::Stdio => {
                     // This server is embedded in the host process. Even on

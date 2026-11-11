@@ -54,9 +54,98 @@ fn candidates_in(temp_dir: &Path) -> Vec<PathBuf> {
 /// liveness here instead would mean a second, hand-written handshake against
 /// the socket, which is exactly what #498 is.
 pub fn detect_ipc_address() -> Option<String> {
-    detect_ipc_address_in(&candidate_socket_paths(), is_adoptable)
+    #[cfg(unix)]
+    {
+        let candidates = candidate_socket_paths();
+        let fallbacks = pid_socket_fallbacks(&candidates, pid_is_alive);
+        detect_with_fallbacks(&candidates, &fallbacks, is_adoptable, modified)
+    }
+    #[cfg(not(unix))]
+    {
+        detect_ipc_address_in(&candidate_socket_paths(), is_adoptable)
+    }
 }
 
+/// `api-<pid>.sock` beside each candidate whose `<pid>` is a running process.
+///
+/// KiCad 10 binds `api.sock` only while it holds `api.lock`. A lock left by a
+/// session that did not exit cleanly sends the next KiCad to
+/// `api-<pid>.sock` instead (#374), so a server that only looked at `api.sock`
+/// adopted the dead socket and reported "Connection refused" while KiCad was
+/// listening next to it. A socket whose process is gone is left out: KiCad
+/// does not unlink these either.
+#[cfg(unix)]
+fn pid_socket_fallbacks(candidates: &[PathBuf], is_alive: impl Fn(i32) -> bool) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for candidate in candidates {
+        let Some(dir) = candidate.parent() else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("api-"))
+                .and_then(|rest| rest.strip_suffix(".sock"))
+                .and_then(|digits| digits.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            if pid > 0 && is_alive(pid) {
+                found.push(entry.path());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Whether a process with this id exists. Signal 0 checks without sending
+/// anything; `EPERM` means it exists under another account.
+#[cfg(unix)]
+fn pid_is_alive(pid: i32) -> bool {
+    // SAFETY: kill with signal 0 performs only the existence and permission
+    // checks and touches no memory.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+}
+
+/// The first adoptable candidate, unless an adoptable `api-<pid>.sock` was
+/// bound after it: then the newest of those, since the KiCad that made it
+/// started after whatever left `api.sock` behind.
+#[cfg(unix)]
+fn detect_with_fallbacks(
+    candidates: &[PathBuf],
+    fallbacks: &[PathBuf],
+    is_adoptable: impl Fn(&Path) -> bool,
+    modified: impl Fn(&Path) -> Option<std::time::SystemTime>,
+) -> Option<String> {
+    let primary = candidates.iter().find(|path| is_adoptable(path));
+    let newest_fallback = fallbacks
+        .iter()
+        .filter(|path| is_adoptable(path))
+        .max_by_key(|path| modified(path));
+    let chosen = match (primary, newest_fallback) {
+        (Some(primary), Some(fallback)) if modified(fallback) > modified(primary) => fallback,
+        (Some(primary), _) => primary,
+        (None, Some(fallback)) => fallback,
+        (None, None) => return None,
+    };
+    Some(format_address(chosen))
+}
+
+// On Unix `detect_with_fallbacks` does this and more; the tests keep it.
+#[cfg(any(not(unix), test))]
 fn detect_ipc_address_in(
     candidates: &[PathBuf],
     is_adoptable: impl Fn(&Path) -> bool,
@@ -480,5 +569,94 @@ mod tests {
             format_address(Path::new("/tmp/kicad/api.sock")),
             "ipc:///tmp/kicad/api.sock"
         );
+    }
+
+    #[cfg(unix)]
+    mod pid_sockets {
+        use super::super::*;
+        use std::time::{Duration, SystemTime};
+
+        fn touch(dir: &Path, name: &str) -> PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, b"").unwrap();
+            path
+        }
+
+        #[test]
+        fn only_live_pid_sockets_are_fallbacks() {
+            let dir = tempfile::tempdir().unwrap();
+            let primary = dir.path().join("api.sock");
+            touch(dir.path(), "api-100.sock");
+            touch(dir.path(), "api-200.sock");
+            touch(dir.path(), "api-x.sock");
+            touch(dir.path(), "api-300.lock");
+            let found = pid_socket_fallbacks(&[primary], |pid| pid == 200);
+            assert_eq!(found, vec![dir.path().join("api-200.sock")]);
+        }
+
+        #[test]
+        fn a_newer_pid_socket_wins_over_a_stale_api_sock() {
+            let primary = PathBuf::from("/k/api.sock");
+            let fallback = PathBuf::from("/k/api-42.sock");
+            let at = |path: &Path| {
+                let base = SystemTime::UNIX_EPOCH;
+                Some(if path == Path::new("/k/api.sock") {
+                    base + Duration::from_secs(10)
+                } else {
+                    base + Duration::from_secs(20)
+                })
+            };
+            let chosen = detect_with_fallbacks(
+                std::slice::from_ref(&primary),
+                std::slice::from_ref(&fallback),
+                |_| true,
+                at,
+            );
+            assert_eq!(chosen.as_deref(), Some("ipc:///k/api-42.sock"));
+        }
+
+        #[test]
+        fn api_sock_stays_first_when_it_is_the_newest() {
+            let primary = PathBuf::from("/k/api.sock");
+            let fallback = PathBuf::from("/k/api-42.sock");
+            let at = |path: &Path| {
+                let base = SystemTime::UNIX_EPOCH;
+                Some(if path == Path::new("/k/api.sock") {
+                    base + Duration::from_secs(30)
+                } else {
+                    base + Duration::from_secs(20)
+                })
+            };
+            let chosen = detect_with_fallbacks(
+                std::slice::from_ref(&primary),
+                std::slice::from_ref(&fallback),
+                |_| true,
+                at,
+            );
+            assert_eq!(chosen.as_deref(), Some("ipc:///k/api.sock"));
+        }
+
+        #[test]
+        fn a_pid_socket_is_used_when_api_sock_is_absent_and_never_unadoptable() {
+            let primary = PathBuf::from("/k/api.sock");
+            let fallback = PathBuf::from("/k/api-42.sock");
+            let fallbacks = std::slice::from_ref(&fallback);
+            let only_fallback = |path: &Path| path == Path::new("/k/api-42.sock");
+            let chosen = detect_with_fallbacks(
+                std::slice::from_ref(&primary),
+                fallbacks,
+                only_fallback,
+                |_| None,
+            );
+            assert_eq!(chosen.as_deref(), Some("ipc:///k/api-42.sock"));
+
+            let chosen = detect_with_fallbacks(
+                std::slice::from_ref(&primary),
+                fallbacks,
+                |_| false,
+                |_| None,
+            );
+            assert_eq!(chosen, None);
+        }
     }
 }

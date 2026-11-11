@@ -314,7 +314,7 @@ async fn handle_open_project(
         Ok(requested) => requested,
         Err(error) => return Ok(error),
     };
-    let ipc = copperpour_ipc::KiCadIpcClient::new(&ctx.config.ipc_address);
+    let ipc = copperpour_ipc::KiCadIpcClient::new(ctx.ipc_address());
     let ping = ipc.ping_outcome();
     let connected = ping.is_responsive();
     let (open_boards, open_boards_error) = if connected {
@@ -371,7 +371,7 @@ async fn handle_open_project(
     Ok(CallToolResult::json(&json!({
         "kicad_ui_running": connected,
         "ipc_available": connected,
-        "ipc_address": ctx.config.ipc_address,
+        "ipc_address": ctx.ipc_address(),
         "ipc_failure": crate::tools::ipc_failure_evidence(&ping),
         "open_board_count": open_boards.len(),
         "open_boards": open_boards,
@@ -421,7 +421,7 @@ async fn handle_save_project(
     _args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let ipc = copperpour_ipc::KiCadIpcClient::new(&ctx.config.ipc_address);
+    let ipc = copperpour_ipc::KiCadIpcClient::new(ctx.ipc_address());
     ipc.save_board()?;
     Ok(CallToolResult::text("Board saved successfully."))
 }

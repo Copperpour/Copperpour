@@ -1030,7 +1030,7 @@ async fn handle_check_kicad_ui(
         Ok(timeout) => timeout,
         Err(error) => return Ok(error),
     };
-    let addr = ctx.config.ipc_address.clone();
+    let addr = ctx.ipc_address();
     let started = std::time::Instant::now();
     let check = async move {
         let process_detected = task::spawn_blocking(is_kicad_running).await?;
@@ -1110,7 +1110,7 @@ async fn handle_launch_kicad_ui(
 
     // Poll IPC until responsive or timeout. A KiCad that exited will never
     // answer, so its exit ends the wait, even while a ping is in flight.
-    let addr = ctx.config.ipc_address.clone();
+    let addr = ctx.ipc_address();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         if let Err(message) = kicad.watch(KICAD_IPC_POLL).await {
