@@ -1,0 +1,162 @@
+(session board
+  (base_design board)
+  (placement
+    (resolution um 10)
+    (component "Resistor_SMD:R_0402"
+      (place R1 1000000 -500000 front 0)
+      (place R2 1100000 -500000 back 270)
+    )
+    (component "PinHeader_1x02_P2.54mm_Vertical"
+      (place J1 1200000 -450000 back 180)
+    )
+    (component "SOT-23W"
+      (place U1 1120000 -560000 back 330)
+    )
+    (component "R_0603_1608Metric"
+      (place R3 1040000 -560000 back 315)
+    )
+  )
+  (was_is
+  )
+  (routes 
+    (resolution um 10)
+    (parser
+      (host_cad "KiCad's Pcbnew")
+      (host_version "10.0.8-10.0.8~ubuntu24.04.1")
+    )
+    (library_out 
+      (padstack "Via[0-3]_600:300_um"
+        (shape
+          (circle F.Cu 6000 0 0)
+        )
+        (shape
+          (circle In1.Cu 6000 0 0)
+        )
+        (shape
+          (circle In2.Cu 6000 0 0)
+        )
+        (shape
+          (circle B.Cu 6000 0 0)
+        )
+        (attach off)
+      )
+    )
+    (network_out 
+      (net VCC
+        (wire
+          (path In2.Cu 2000
+            1200000 -450000
+            1188483 -450000
+          )
+        )
+        (wire
+          (path In2.Cu 2000
+            1188483 -450000
+            1121214 -517269
+            1109608 -517269
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            995000 -505517
+            997179 -507696
+          )
+        )
+        (wire
+          (path In2.Cu 2000
+            1109608 -517269
+            1006752 -517269
+            997179 -507696
+          )
+        )
+        (wire
+          (path B.Cu 2000
+            1109608 -517269
+            1109608 -499091
+            1105517 -495000
+          )
+        )
+        (wire
+          (path B.Cu 2000
+            1109608 -554000
+            1109608 -517269
+          )
+        )
+        (via "Via[0-3]_600:300_um" 1109608 -517269
+        )
+        (wire
+          (path B.Cu 2000
+            1100000 -495000
+            1105517 -495000
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            995000 -500000
+            995000 -505517
+          )
+        )
+        (via "Via[0-3]_600:300_um" 997179 -507696
+        )
+        (wire
+          (path B.Cu 2000
+            1045834 -565834
+            1097774 -565834
+            1109608 -554000
+          )
+        )
+        (wire
+          (path B.Cu 2000
+            1135142 -557773
+            1113381 -557773
+            1109608 -554000
+          )
+        )
+      )
+      (net GND
+        (wire
+          (path In1.Cu 2000
+            1200000 -424600
+            1125642 -498958
+            1125642 -584215
+          )
+        )
+        (wire
+          (path In1.Cu 2000
+            1125642 -584215
+            1091427 -550000
+            1050000 -550000
+          )
+        )
+        (wire
+          (path B.Cu 2000
+            1052500 -505000
+            1052500 -535832
+            1034166 -554166
+          )
+        )
+        (wire
+          (path B.Cu 2000
+            1050000 -500000
+            1052500 -502500
+            1052500 -505000
+          )
+        )
+        (wire
+          (path B.Cu 2000
+            1052500 -505000
+            1100000 -505000
+          )
+        )
+        (wire
+          (path B.Cu 2000
+            1125642 -584215
+            1125642 -574227
+          )
+        )
+        (via "Via[0-3]_600:300_um" 1125642 -584215
+        )
+      )
+    )
+  )
+)

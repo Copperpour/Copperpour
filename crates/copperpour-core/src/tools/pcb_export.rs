@@ -301,7 +301,8 @@ pub fn tools() -> Vec<ToolDef> {
              IPC snapshot and reverse manifest remain authoritative; otherwise the Rust exporter \
              is used. The first \
              supported profile is deliberately narrow: an even number of copper layers (F.Cu, \
-             In1.Cu..In<N-2>.Cu, B.Cu; 2 to 32), front-side SMD or through-hole footprints, \
+             In1.Cu..In<N-2>.Cu, B.Cu; 2 to 32), SMD or through-hole footprints on either side \
+             (a bottom footprint written as KiCad writes it: its front image placed on the back), \
              through-hole pads and vias on every copper layer, circle, rectangle, unchamfered rounded-rectangle and oval \
              pads with one shape on every copper layer (rounded rectangles written as polygons \
              that enclose the copper, ovals as paths as KiCad writes them), round drills, \
@@ -940,9 +941,10 @@ async fn handle_export_specctra_dsn(
                 "ses_import_available": false,
                 "freerouting_bridge_available": false,
                 "source_revision_bound": true,
-                "supported_profile": "even_layer_front_side_circle_rect_roundrect_oval_no_existing_routing_zones_as_planes",
+                "supported_profile": "even_layer_both_sides_circle_rect_roundrect_oval_no_existing_routing_zones_as_planes",
                 "copper_layers": export.copper_layer_count,
-                "copper_zones": export.copper_zone_count
+                "copper_zones": export.copper_zone_count,
+                "component_side": export.component_side
             }
         })
         .to_string(),
@@ -1819,9 +1821,10 @@ mod specctra_roundrect_served_tests {
         assert_eq!(body["pad_count"], 6);
         assert_eq!(
             body["capabilities"]["supported_profile"],
-            "even_layer_front_side_circle_rect_roundrect_oval_no_existing_routing_zones_as_planes"
+            "even_layer_both_sides_circle_rect_roundrect_oval_no_existing_routing_zones_as_planes"
         );
         assert_eq!(body["capabilities"]["copper_layers"], 2);
+        assert_eq!(body["capabilities"]["component_side"], "front");
         assert_eq!(body["capabilities"]["copper_zones"], 0);
         assert_eq!(dsn.matches("(polygon F.Cu 0").count(), 3, "{dsn}");
         let manifest: Value = serde_json::from_str(
@@ -1866,6 +1869,20 @@ mod specctra_roundrect_served_tests {
         assert_eq!(dsn.matches("(plane GND\n").count(), 3, "{dsn}");
         assert_eq!(dsn.matches("(plane VCC\n").count(), 1, "{dsn}");
         assert!(dsn.contains("(polygon In2.Cu 0 81000 -31000"), "{dsn}");
+    }
+
+    /// The response says which sides the footprints are on, and a bottom
+    /// footprint is placed `back` (#430).
+    #[tokio::test]
+    async fn served_export_reports_bottom_side_footprints() {
+        let (_dir, body, dsn) = served_export(
+            "specctra_bottom_side.kicad_pcb",
+            include_str!("../../tests/fixtures/specctra_bottom_side.kicad_pcb"),
+            &["GND", "VCC"],
+        )
+        .await;
+        assert_eq!(body["capabilities"]["component_side"], "both", "{body}");
+        assert!(dsn.contains("(place U1 112000 -56000 back 330)"), "{dsn}");
     }
 }
 
