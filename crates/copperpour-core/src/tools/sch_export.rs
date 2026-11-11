@@ -51,7 +51,8 @@ pub fn tools() -> Vec<ToolDef> {
             "Render a schematic sheet to PNG: kicad-cli SVG export rasterized in-process \
              (deterministic stroke-font rendering, no system fonts consulted). Returns the \
              PNG path and its actual pixel dimensions; with 'inline' true the response also \
-             carries the image as base64 so the caller can inspect its own output. Width is \
+             carries the image as an image content block so the caller can look at its own \
+             output. Width is \
              capped at 4096 px.",
             json!({
                 "type": "object",
@@ -59,7 +60,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "output":    { "type": "string", "description": "Output PNG path (default: alongside the schematic)" },
                     "width_px":  { "type": "integer", "description": "Output width in pixels", "default": 1600, "maximum": 4096 },
-                    "inline":    { "type": "boolean", "description": "Also return the PNG as base64 content", "default": false },
+                    "inline":    { "type": "boolean", "description": "Also return the PNG as an image content block", "default": false },
                     "monochrome": { "type": "boolean", "description": "Render in black and white", "default": false }
                 },
                 "required": ["schematic"]
@@ -93,7 +94,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "inline_diff": { "type": "boolean", "description": "Also return the current render as base64 for inspection", "default": false }
+                    "inline_diff": { "type": "boolean", "description": "Also return the current render as an image content block for inspection", "default": false }
                 },
                 "required": ["schematic"]
             }),
@@ -308,19 +309,33 @@ async fn handle_render_png(
     std::fs::write(&output_path, &rendered.png)?;
 
     // Dimensions come from the produced image, never echoed from the request.
-    let mut response = json!({
+    let response = json!({
         "rendered": output_path.display().to_string(),
         "width_px": rendered.width_px,
         "height_px": rendered.height_px,
         "png_bytes": rendered.png.len(),
         "monochrome": monochrome
     });
-    if inline {
+    Ok(json_with_png(
+        &response,
+        inline.then_some(&rendered.png[..]),
+    ))
+}
+
+/// The JSON report, followed by `png` as an MCP image block when given. An
+/// image block reaches a model as a picture; the same bytes as a base64
+/// string inside the JSON reached it as ~200k characters of text it could not
+/// look at.
+fn json_with_png(response: &serde_json::Value, png: Option<&[u8]>) -> CallToolResult {
+    let mut result = CallToolResult::json(response);
+    if let Some(png) = png {
         use base64::Engine as _;
-        response["png_base64"] =
-            json!(base64::engine::general_purpose::STANDARD.encode(&rendered.png));
+        let data = base64::engine::general_purpose::STANDARD.encode(png);
+        result
+            .content
+            .extend(CallToolResult::image(data, "image/png").content);
     }
-    Ok(CallToolResult::json(&response))
+    result
 }
 
 /// Baseline storage for a sheet: `<project>/.copperpour/baselines/<stem>.png`
@@ -477,7 +492,7 @@ async fn handle_baseline_compare(
     } else {
         "PASS"
     };
-    let mut response = json!({
+    let response = json!({
         "status": status,
         "changed_pct_of_content": diff.changed_pct_of_content,
         "content_pixels": diff.content_pixels,
@@ -492,12 +507,10 @@ async fn handle_baseline_compare(
         "baseline_renderer": meta["renderer"],
         "warnings": warnings,
     });
-    if inline_diff {
-        use base64::Engine as _;
-        response["current_png_base64"] =
-            json!(base64::engine::general_purpose::STANDARD.encode(&rendered.png));
-    }
-    Ok(CallToolResult::json(&response))
+    Ok(json_with_png(
+        &response,
+        inline_diff.then_some(&rendered.png[..]),
+    ))
 }
 
 async fn handle_export_pdf(
@@ -2052,5 +2065,42 @@ mod erc_response_tests {
         let errors_only = erc_response(&erc_report(Some("10.0.6")), "error");
         assert_eq!(errors_only["total"], 3);
         assert_eq!(errors_only["warnings"], 0);
+    }
+}
+
+#[cfg(test)]
+mod image_content_tests {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+
+    /// With an image the report comes first as JSON text, without the bytes,
+    /// and the image follows as its own block; without one only the report.
+    #[test]
+    fn a_png_is_an_image_block_not_a_json_string() {
+        let report = json!({ "rendered": "/tmp/x.png", "width_px": 2 });
+        let png = [0x89, b'P', b'N', b'G'];
+
+        let with = json_with_png(&report, Some(&png));
+        assert!(!with.is_error);
+        let [ToolContent::Text { text }, ToolContent::Image { data, mime_type }] =
+            &with.content[..]
+        else {
+            panic!("expected text then image, got {:?}", with.content);
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(text).unwrap(),
+            report
+        );
+        assert_eq!(mime_type, "image/png");
+        use base64::Engine as _;
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap(),
+            png
+        );
+
+        let without = json_with_png(&report, None);
+        assert!(matches!(&without.content[..], [ToolContent::Text { .. }]));
     }
 }
