@@ -2255,7 +2255,7 @@ async fn handle_create_netclass(
 ///
 /// Iterative rather than recursive: a pattern is user data, and `*`-heavy input
 /// makes the naive recursion blow the stack on names a real board can carry.
-fn wildcard_matches(pattern: &str, name: &str) -> bool {
+pub(crate) fn wildcard_matches(pattern: &str, name: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let txt: Vec<char> = name.chars().collect();
     let (mut p, mut t) = (0usize, 0usize);

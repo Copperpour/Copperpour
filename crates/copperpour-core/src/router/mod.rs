@@ -236,7 +236,9 @@ mod tests {
                         "route_specctra_dsn/properties/router_settings" |
                         // The target tool's arguments; its own closed
                         // schema validates them before it runs.
-                        "call_tool/properties/arguments"
+                        "call_tool/properties/arguments" |
+                        // Caller-named groups of net patterns.
+                        "get_placement_overview/properties/net_groups"
                     ),
                         "unreviewed open input record: {path}"
                     );
