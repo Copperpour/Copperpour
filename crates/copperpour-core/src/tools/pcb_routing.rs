@@ -147,7 +147,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "apply_specctra_ses",
-            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves IPC read-back counts, and runs KiCad DRC on it under the source project's netclasses and custom rules before committing.",
+            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves IPC read-back counts, and runs KiCad DRC on it under the source project's netclasses and custom rules before committing. It never creates, changes, deletes or refills a copper zone: when the board has zones, zone_refill.required is true, and the DRC ran on the fills as exported; refill them afterwards (refill_zones, or run_drc with refill_zones and sync_live_board).",
             json!({
                 "type": "object",
                 "properties": {
@@ -941,6 +941,7 @@ async fn handle_plan_specctra_ses_import(
                 "tracks": plan.locked_track_count,
                 "vias": plan.locked_via_count
             },
+            "zone_refill": zone_refill(&plan.zones),
             "tracks": plan.tracks,
             "arcs": plan.arcs,
             "vias": plan.vias,
@@ -973,6 +974,22 @@ struct ApplyEvidence {
     schematic_parity_violations: usize,
     project_rules_applied: bool,
     creepage_skipped: bool,
+    zones: Vec<crate::specctra::ManifestZoneCount>,
+}
+
+/// What an SES import says about the board's copper zones: it never touches
+/// them, so their fills predate its routing. A declared consequence of the
+/// import, derived from the manifest's zone inventory, not an observation of
+/// the fills (#71, #430).
+fn zone_refill(zones: &[crate::specctra::ManifestZoneCount]) -> serde_json::Value {
+    let required = !zones.is_empty();
+    json!({
+        "required": required,
+        "zones": zones,
+        "remedy": required.then_some(
+            "the import does not refill zones: refill them (refill_zones, or run_drc with refill_zones and sync_live_board) before judging DRC"
+        )
+    })
 }
 
 fn created_route_item_ids(items: &[prost_types::Any]) -> anyhow::Result<Vec<String>> {
@@ -1229,6 +1246,7 @@ async fn handle_apply_specctra_ses(
                 schematic_parity_violations: parity_count,
                 project_rules_applied,
                 creepage_skipped: drc.creepage_skipped,
+                zones: plan.zones.clone(),
             })
         })();
         match operation {
@@ -1298,7 +1316,8 @@ async fn handle_apply_specctra_ses(
                 "schematic_parity_violations": evidence.schematic_parity_violations,
                 "project_rules_applied": evidence.project_rules_applied,
                 "creepage_skipped": evidence.creepage_skipped
-            }
+            },
+            "zone_refill": zone_refill(&evidence.zones)
         }))),
         Err(failure) => {
             let reason = failure.message().to_string();
@@ -5397,6 +5416,12 @@ mod apply_specctra_ses_candidate_drc_tests {
         assert!(!applied.result.is_error, "{body}");
         assert_eq!(body["drc"]["project_rules_applied"], true, "{body}");
         assert_eq!(body["drc"]["creepage_skipped"], false, "{body}");
+        // No zone on the board: nothing to refill.
+        assert_eq!(
+            body["zone_refill"],
+            json!({"required": false, "zones": [], "remedy": null}),
+            "{body}"
+        );
 
         let checked = applied.checked.expect("kicad-cli ran");
         assert_eq!(
@@ -5437,6 +5462,97 @@ mod apply_specctra_ses_candidate_drc_tests {
             applied.body
         );
         assert_eq!(applied.rules.as_deref(), Some(WITH_CREEPAGE));
+    }
+
+    /// The four-layer board with copper zones: the served dry run says the
+    /// import leaves their fills to be refilled, zone by layer and net, as the
+    /// manifest and the live board both count them (#430).
+    #[tokio::test]
+    async fn a_board_with_zones_is_told_to_refill_them() {
+        const ZONES: &str = include_str!("../../tests/fixtures/specctra_zones.kicad_pcb");
+        const NATIVE: &str =
+            include_str!("../../tests/fixtures/specctra_zones.native-kicad-10.dsn");
+        const ZONES_SES: &str = include_str!(
+            "../../tests/fixtures/specctra_zones.native-kicad-10.freerouting-2.3.0.ses"
+        );
+        let project = tempfile::tempdir().unwrap();
+        let board = project.path().join("board.kicad_pcb");
+        std::fs::write(&board, ZONES).unwrap();
+        let board = board.canonicalize().unwrap();
+        let mut rules = routing_rules();
+        for rule in rules.values_mut() {
+            rule.track_width_mm = Some(0.2);
+        }
+        // The native DSN without the header's courtyard, which the DSN parser
+        // does not read yet.
+        let native = NATIVE
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let export = crate::specctra::adopt_native_dsn(
+            crate::specctra::export_dsn(&board, ZONES, &rules).unwrap(),
+            native,
+        )
+        .unwrap();
+        let manifest = project.path().join("board.dsn.copperpour.json");
+        let ses = project.path().join("board.ses");
+        std::fs::write(&manifest, export.manifest).unwrap();
+        std::fs::write(&ses, ZONES_SES).unwrap();
+
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec!["", "GND", "VCC"],
+            store,
+            |_| {},
+            |command, _| {
+                command.type_url.ends_with("SaveDocumentToString").then(|| {
+                    copperpour_ipc::builders::pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            contents: ZONES.to_string(),
+                            document: None,
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    )
+                })
+            },
+        );
+        let ctx = ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: server.address().to_string(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        );
+        let args = json!({"board": board, "ses_path": ses, "manifest_path": manifest});
+        let result = handle_plan_specctra_ses_import(&args, &ctx).await.unwrap();
+        let body = response_json(&result);
+        assert!(!result.is_error, "{body}");
+        assert_eq!(body["mutated"], false, "{body}");
+        assert_eq!(body["zone_refill"]["required"], true, "{body}");
+        assert_eq!(
+            body["zone_refill"]["zones"],
+            json!([
+                {"layer": "B.Cu", "net": "GND", "count": 1},
+                {"layer": "F.Cu", "net": "GND", "count": 1},
+                {"layer": "In1.Cu", "net": "GND", "count": 1},
+                {"layer": "In2.Cu", "net": "VCC", "count": 1}
+            ]),
+            "{body}"
+        );
+        assert!(
+            body["zone_refill"]["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("refill_zones"),
+            "{body}"
+        );
     }
 
     /// A non-boolean `skip_creepage` is refused before KiCad or kicad-cli is

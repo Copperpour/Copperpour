@@ -34,6 +34,9 @@ pub(crate) struct ExportBundle {
     pub class_count: usize,
     /// Copper layers of the exported board, counted from its layer table.
     pub copper_layer_count: usize,
+    /// Copper zones of the exported board, each written as one `plane` per
+    /// copper layer it covers.
+    pub copper_zone_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -105,6 +108,16 @@ struct LockedViaModel {
     net: String,
 }
 
+/// One copper zone of the board: its net, the copper layers it covers (top to
+/// bottom) and its outline, in DSN micrometres. Its fill is not exported: like
+/// KiCad's own exporter, the DSN gives Freerouting the outline as a `plane`.
+#[derive(Debug, Clone)]
+struct CopperZoneModel {
+    net: String,
+    layers: Vec<String>,
+    outline: Vec<(i64, i64)>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct LockedRouting {
     tracks: Vec<LockedTrackModel>,
@@ -123,7 +136,8 @@ type RuleGroups = BTreeMap<RuleKey, Vec<String>>;
 type NetClassNames = BTreeMap<String, String>;
 
 /// 2 adds each pin's `pad_uuid` and lets pads share a number (#338).
-pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 2;
+/// 3 adds the copper-zone inventory, `zones` (#430).
+pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Manifest {
@@ -137,6 +151,18 @@ struct Manifest {
     components: Vec<ManifestComponent>,
     nets: Vec<ManifestNet>,
     padstacks: Vec<ManifestPadstack>,
+    /// Absent before schema 3, which had no copper zones (#430).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    zones: Vec<ManifestZoneCount>,
+}
+
+/// How many copper zones of one net cover one copper layer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManifestZoneCount {
+    pub layer: String,
+    pub net: String,
+    pub count: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -216,9 +242,11 @@ pub(crate) fn export_dsn(
     }
 
     let copper_layers = copper_layers(&tree)?;
+    let power_layers = power_layers(&tree);
     let outline = simple_closed_outline(&tree, outline_arc_error_um(board_path, &tree)?)?;
     let net_table = top_level_net_table(&tree);
     let locked_routing = locked_routing(&tree, &net_table, &copper_layers)?;
+    let zones = copper_zones(&tree, &net_table, &copper_layers)?;
     let footprints = footprints(&tree, &net_table, &copper_layers)?;
     if footprints.is_empty() {
         bail!("supported routing profile requires at least one footprint");
@@ -241,6 +269,13 @@ pub(crate) fn export_dsn(
     for pins in net_pins.values_mut() {
         pins.sort();
         pins.dedup();
+    }
+    // A plane names a DSN net, and the DSN only has nets with pads.
+    if let Some(zone) = zones.iter().find(|zone| !net_pins.contains_key(&zone.net)) {
+        bail!(
+            "unsupported routing profile: copper zone on net '{}', which has no pad",
+            zone.net
+        );
     }
 
     let (class_nets, net_classes) = normalize_rules(&net_pins, effective_rules)?;
@@ -267,6 +302,7 @@ pub(crate) fn export_dsn(
     let pcb = build_pcb(
         board_path,
         &copper_layers,
+        &power_layers,
         &outline,
         &footprints,
         &net_pins,
@@ -275,6 +311,7 @@ pub(crate) fn export_dsn(
         &padstack_names,
         &via_names,
         &locked_routing,
+        &zones,
     )?;
     let dsn = serialize_and_validate(pcb)?;
     let source_sha256 = sha256_hex(board_source.as_bytes());
@@ -288,6 +325,7 @@ pub(crate) fn export_dsn(
         &padstack_names,
         &via_names,
         &locked_routing,
+        &zones,
     )?;
 
     Ok(ExportBundle {
@@ -302,6 +340,7 @@ pub(crate) fn export_dsn(
         net_count: net_pins.len(),
         class_count: class_nets.len(),
         copper_layer_count: copper_layers.len(),
+        copper_zone_count: zones.len(),
     })
 }
 
@@ -348,6 +387,9 @@ pub(crate) fn adopt_native_dsn(
     let padstack_names =
         correlate_components(&baseline_identity, &native_identity, &roundrect_models)?;
     validate_native_nets(&baseline_identity, &native_identity)?;
+    if baseline_identity.planes != native_identity.planes {
+        bail!("native DSN changed the copper-zone planes");
+    }
 
     for layer in &mut manifest.layers {
         layer.dsn_name = layer_names
@@ -470,11 +512,19 @@ enum DsnShapeIdentity {
 #[derive(Debug, Clone)]
 struct DsnIdentity {
     layers: BTreeMap<usize, String>,
+    /// Each layer's `(type …)`, by index.
+    layer_types: BTreeMap<usize, String>,
     components: BTreeMap<String, DsnPlacementIdentity>,
     nets: BTreeMap<String, BTreeSet<String>>,
     classes: BTreeMap<String, DsnClassIdentity>,
     padstacks: BTreeMap<String, Vec<DsnShapeIdentity>>,
+    /// Every `plane`, sorted: the two exporters need not list them in the
+    /// same order.
+    planes: Vec<DsnPlaneIdentity>,
 }
+
+/// `(net, layer, closed outline)` of one DSN `plane`.
+type DsnPlaneIdentity = (String, String, Vec<(i64, i64)>);
 
 fn validate_dsn_syntax(source: &str, label: &str) -> Result<()> {
     let cursor = Cursor::new(source.as_bytes());
@@ -500,6 +550,7 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
     }
     let structure = root.find("structure").context("DSN has no structure")?;
     let mut layers = BTreeMap::new();
+    let mut layer_types = BTreeMap::new();
     for layer in structure.find_all("layer") {
         let name = dsn_atom(layer, 1, "layer name")?.to_string();
         let index = layer
@@ -510,10 +561,45 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
             .context("DSN layer has no index")?
             .parse::<usize>()
             .context("DSN layer index is not an integer")?;
+        let kind = layer
+            .find("type")
+            .and_then(|kind| kind.get(1))
+            .and_then(SexpNode::as_str)
+            .context("DSN layer has no type")?
+            .to_string();
         if layers.insert(index, name).is_some() {
             bail!("DSN repeats a layer index");
         }
+        layer_types.insert(index, kind);
     }
+    let mut planes = Vec::new();
+    for plane in structure.find_all("plane") {
+        let net = dsn_atom(plane, 1, "plane net")?.to_string();
+        // `(plane <net> (polygon <layer> 0 x y ...))`; a `window` (a cutout) or
+        // any other shape is not a plane the export writes.
+        let children = plane.children().map_or(0, <[SexpNode]>::len);
+        let polygon = plane
+            .get(2)
+            .filter(|polygon| polygon.head() == Some("polygon") && children == 3)
+            .with_context(|| format!("DSN plane on net '{net}' is not one polygon"))?;
+        let DsnShapeIdentity::Polygon { layer, points } = dsn_polygon(polygon)? else {
+            unreachable!("dsn_polygon returns a polygon");
+        };
+        let points = points
+            .iter()
+            .map(|(x, y)| {
+                let integer = |value: OrderedF64| {
+                    let value = value.value();
+                    (value.fract() == 0.0 && value.abs() < I64_UPPER_EXCLUSIVE)
+                        .then_some(value as i64)
+                        .context("DSN plane coordinate is not a supported integer")
+                };
+                Ok((integer(*x)?, integer(*y)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        planes.push((net, layer, points));
+    }
+    planes.sort();
 
     let library = root.find("library").context("DSN has no library")?;
     let mut image_pins = BTreeMap::<String, BTreeMap<String, DsnPinIdentity>>::new();
@@ -672,10 +758,12 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
     }
     Ok(DsnIdentity {
         layers,
+        layer_types,
         components,
         nets,
         classes,
         padstacks,
+        planes,
     })
 }
 
@@ -699,6 +787,9 @@ fn correlate_layers(
         .collect::<Result<BTreeMap<_, _>>>()?;
     if mappings.iter().any(|(baseline, native)| baseline != native) {
         bail!("native DSN renamed a KiCad copper layer");
+    }
+    if baseline.layer_types != native.layer_types {
+        bail!("native DSN changed a copper layer's signal or power type");
     }
     Ok(mappings)
 }
@@ -991,12 +1082,6 @@ fn locked_routing(
     net_table: &BTreeMap<String, String>,
     copper_layers: &[String],
 ) -> Result<LockedRouting> {
-    let zone_count = tree.find_all("zone").len();
-    if zone_count > 0 {
-        bail!(
-            "unsupported first routing profile: board contains {zone_count} copper zone or rule area(s)"
-        );
-    }
     let arc_count = tree.find_all("arc").len();
     if arc_count > 0 {
         let locked = tree
@@ -1134,6 +1219,140 @@ fn locked_routing(
     Ok(routing)
 }
 
+/// The board's copper zones (#430). Each one is exported as its outline, one
+/// `plane` per copper layer it covers, as KiCad's own exporter writes it; what
+/// that cannot say exactly is refused: a rule area (keep-outs stay with #81),
+/// a zone without a net (KiCad would invent a net for it), an outline with a
+/// cutout (a `window` in the DSN), a zone off the copper stack, and a zone
+/// inside a footprint.
+fn copper_zones(
+    tree: &SexpNode,
+    net_table: &BTreeMap<String, String>,
+    copper_layers: &[String],
+) -> Result<Vec<CopperZoneModel>> {
+    for footprint in tree.find_all("footprint") {
+        if !footprint.find_all("zone").is_empty() {
+            let reference = property_value(footprint, "Reference").unwrap_or("?");
+            bail!("unsupported routing profile: footprint {reference} contains a zone");
+        }
+    }
+    let mut zones = Vec::new();
+    for zone in tree.find_all("zone") {
+        let name = zone.find_str("name").unwrap_or("");
+        let label = if name.is_empty() {
+            "copper zone".to_string()
+        } else {
+            format!("copper zone '{name}'")
+        };
+        if zone.find("keepout").is_some() || zone.find("placement").is_some() {
+            bail!("unsupported routing profile: board contains a rule area, which this exporter does not write as a keep-out");
+        }
+        let named = match (zone.find("layer"), zone.find("layers")) {
+            (Some(layer), None) => layer
+                .get(1)
+                .and_then(SexpNode::as_str)
+                .map(|name| vec![name.to_string()])
+                .unwrap_or_default(),
+            (None, Some(layers)) => layers
+                .children()
+                .unwrap_or(&[])
+                .iter()
+                .skip(1)
+                .filter_map(SexpNode::as_str)
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        };
+        if named.is_empty() {
+            bail!("{label} has no layer");
+        }
+        let covered = if named == ["*.Cu"] {
+            copper_layers.to_vec()
+        } else {
+            if let Some(layer) = named.iter().find(|name| !copper_layers.contains(name)) {
+                bail!("unsupported routing profile: {label} is on '{layer}', which is not a copper layer of the board");
+            }
+            if named.iter().collect::<BTreeSet<_>>().len() != named.len() {
+                bail!("{label} repeats a layer");
+            }
+            copper_layers
+                .iter()
+                .filter(|layer| named.contains(layer))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let net = zone
+            .find("net")
+            .and_then(|node| resolve_net(node, net_table))
+            .with_context(|| {
+                format!("unsupported routing profile: {label} has no net, which KiCad exports under an invented net name")
+            })?;
+        let polygons = zone.find_all("polygon");
+        if polygons.len() != 1 {
+            bail!(
+                "unsupported routing profile: {label} on net '{net}' has {} outlines; an outline with a cutout is not exported",
+                polygons.len()
+            );
+        }
+        let points = polygons[0]
+            .find("pts")
+            .and_then(SexpNode::children)
+            .with_context(|| format!("{label} outline has no points"))?;
+        let mut outline = Vec::with_capacity(points.len());
+        for point in points.iter().skip(1) {
+            if point.head() != Some("xy") {
+                bail!(
+                    "unsupported routing profile: {label} outline has a '{}' point; only straight edges are exported",
+                    point.head().unwrap_or("?")
+                );
+            }
+            let x = finite_um(point.get_f64(1), "zone x")?;
+            let y = finite_um(point.get_f64(2), "zone y")?
+                .checked_neg()
+                .context("zone y is outside the supported coordinate range")?;
+            outline.push((x, y));
+        }
+        if outline.iter().collect::<BTreeSet<_>>().len() < 3 {
+            bail!("{label} outline has fewer than three distinct points");
+        }
+        zones.push(CopperZoneModel {
+            net,
+            layers: covered,
+            outline,
+        });
+    }
+    Ok(zones)
+}
+
+/// How many copper zones of each net cover each copper layer of the board,
+/// sorted by layer then net: the inventory the manifest records.
+fn zone_inventory(zones: &[CopperZoneModel]) -> Vec<ManifestZoneCount> {
+    let mut counts = BTreeMap::<(&str, &str), usize>::new();
+    for zone in zones {
+        for layer in &zone.layers {
+            *counts
+                .entry((layer.as_str(), zone.net.as_str()))
+                .or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|((layer, net), count)| ManifestZoneCount {
+            layer: layer.to_string(),
+            net: net.to_string(),
+            count,
+        })
+        .collect()
+}
+
+/// The copper-zone inventory of a live board, read the way the export reads it.
+pub(crate) fn board_zone_inventory(board_source: &str) -> Result<Vec<ManifestZoneCount>> {
+    let tree = parse_sexp(board_source).context("parse KiCad board for its copper zones")?;
+    let copper_layers = copper_layers(&tree)?;
+    let zones = copper_zones(&tree, &top_level_net_table(&tree), &copper_layers)?;
+    Ok(zone_inventory(&zones))
+}
+
 /// The board's copper layers from top to bottom: `F.Cu`, `In1.Cu`..`In<N-2>.Cu`
 /// and `B.Cu`, the order Specctra layer indices follow. The file lists them by
 /// ordinal (KiCad 10 puts `B.Cu`, ordinal 2, before `In1.Cu`, ordinal 4), so
@@ -1159,6 +1378,19 @@ fn copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
         )
     })?;
     Ok(stack_layer_names(stack.count()))
+}
+
+/// The copper layers the board's layer table marks `power`. KiCad's exporter
+/// writes them as DSN `power` layers, where Freerouting lays no track, and
+/// every other copper layer (`signal`, `mixed`, `jumper`) as `signal`.
+fn power_layers(tree: &SexpNode) -> BTreeSet<String> {
+    tree.find("layers")
+        .map(copperpour_sexp::layers::table_layers)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|layer| layer.is_copper() && layer.kind == "power")
+        .map(|layer| layer.name)
+        .collect()
 }
 
 /// `F.Cu`, `In1.Cu`..`In<count-2>.Cu`, `B.Cu`.
@@ -1762,6 +1994,7 @@ fn normalize_rules(
 fn build_pcb(
     board_path: &Path,
     copper_layers: &[String],
+    power_layers: &BTreeSet<String>,
     outline: &[(i64, i64)],
     footprints: &[FootprintModel],
     net_pins: &BTreeMap<String, Vec<String>>,
@@ -1770,6 +2003,7 @@ fn build_pcb(
     padstack_names: &BTreeMap<PadstackKey, String>,
     via_names: &BTreeMap<RuleKey, String>,
     locked_routing: &LockedRouting,
+    zones: &[CopperZoneModel],
 ) -> Result<dsn::Pcb> {
     let default_rule = class_nets
         .keys()
@@ -1780,7 +2014,12 @@ fn build_pcb(
         .enumerate()
         .map(|(index, name)| dsn::Layer {
             name: name.clone(),
-            r#type: "signal".to_string(),
+            r#type: if power_layers.contains(name) {
+                "power"
+            } else {
+                "signal"
+            }
+            .to_string(),
             property: Some(dsn::Property { index }),
         })
         .collect();
@@ -1960,7 +2199,28 @@ fn build_pcb(
             layers,
             boundary,
             place_boundary: None,
-            planes: Vec::new(),
+            planes: zones
+                .iter()
+                .flat_map(|zone| {
+                    zone.layers.iter().map(|layer| dsn::Plane {
+                        net: zone.net.clone(),
+                        polygon: dsn::Polygon {
+                            layer: layer.clone(),
+                            width: 0.0,
+                            // Closed, as KiCad writes it.
+                            coords: zone
+                                .outline
+                                .iter()
+                                .chain(zone.outline.first())
+                                .map(|(x, y)| dsn::Point {
+                                    x: *x as f64,
+                                    y: *y as f64,
+                                })
+                                .collect(),
+                        },
+                    })
+                })
+                .collect(),
             keepouts: dsn::Keepouts(Vec::new()),
             via: dsn::ViaNames {
                 names: via_names.values().cloned().collect(),
@@ -2123,6 +2383,7 @@ fn build_manifest(
     padstack_names: &BTreeMap<PadstackKey, String>,
     via_names: &BTreeMap<RuleKey, String>,
     locked_routing: &LockedRouting,
+    zones: &[CopperZoneModel],
 ) -> Result<String> {
     let components = footprints
         .iter()
@@ -2196,7 +2457,7 @@ fn build_manifest(
             existing_routing: !locked_routing.tracks.is_empty() || !locked_routing.vias.is_empty(),
             locked_track_count: locked_routing.tracks.len(),
             locked_via_count: locked_routing.vias.len(),
-            copper_zones: false,
+            copper_zones: !zones.is_empty(),
             custom_rules: false,
             outline: "one closed loop of Edge.Cuts lines and circular arcs, with arcs flattened within board max_error".to_string(),
         },
@@ -2212,6 +2473,7 @@ fn build_manifest(
         components,
         nets,
         padstacks,
+        zones: zone_inventory(zones),
     })
     .context("serialize routing manifest")
 }
@@ -2734,7 +2996,7 @@ pub(crate) mod tests {
             bundle.dsn
         );
         let manifest: serde_json::Value = serde_json::from_str(&bundle.manifest).unwrap();
-        assert_eq!(manifest["schema_version"], 2);
+        assert_eq!(manifest["schema_version"], 3);
         assert_eq!(
             j1_pins(&bundle),
             [
@@ -4053,5 +4315,319 @@ pub(crate) mod tests {
         manifest["schema_version"] = 2.into();
         crate::specctra_ses::parse_import_plan(&board, FOUR_LAYERS, &manifest.to_string(), ses)
             .unwrap();
+    }
+
+    /// The four-layer board with a GND plane on In1.Cu, a VCC plane on In2.Cu
+    /// and a GND pour on F.Cu and B.Cu, filled by KiCad. See its README.
+    const ZONES: &str = include_str!("../tests/fixtures/specctra_zones.kicad_pcb");
+    const ZONES_NATIVE_FILE: &str =
+        include_str!("../tests/fixtures/specctra_zones.native-kicad-10.dsn");
+    const ZONES_SES: &str =
+        include_str!("../tests/fixtures/specctra_zones.native-kicad-10.freerouting-2.3.0.ses");
+
+    /// Without the header's courtyard polygon, as for the four-layer board.
+    fn zones_native() -> String {
+        ZONES_NATIVE_FILE
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
+    fn zone_counts(manifest: &serde_json::Value) -> Vec<(String, String, u64)> {
+        manifest["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|zone| {
+                (
+                    zone["layer"].as_str().unwrap().to_string(),
+                    zone["net"].as_str().unwrap().to_string(),
+                    zone["count"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn copper_zones_export_as_planes_on_each_layer_they_cover() {
+        let export = native_baseline(ZONES);
+        assert_eq!(export.copper_zone_count, 3);
+        let identity = dsn_identity(&parse_dsn_sexp(&export.dsn).unwrap()).unwrap();
+        let square = vec![
+            (81000, -31000),
+            (129000, -31000),
+            (129000, -69000),
+            (81000, -69000),
+            (81000, -31000),
+        ];
+        let pour = vec![
+            (82000, -60000),
+            (95000, -60000),
+            (95000, -68000),
+            (82000, -68000),
+            (82000, -60000),
+        ];
+        assert_eq!(
+            identity.planes,
+            [
+                ("GND".to_string(), "B.Cu".to_string(), pour.clone()),
+                ("GND".to_string(), "F.Cu".to_string(), pour),
+                ("GND".to_string(), "In1.Cu".to_string(), square.clone()),
+                ("VCC".to_string(), "In2.Cu".to_string(), square),
+            ]
+        );
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(manifest["schema_version"], 3);
+        assert_eq!(manifest["supported_profile"]["copper_zones"], true);
+        let count = |layer: &str, net: &str| (layer.to_string(), net.to_string(), 1);
+        assert_eq!(
+            zone_counts(&manifest),
+            [
+                count("B.Cu", "GND"),
+                count("F.Cu", "GND"),
+                count("In1.Cu", "GND"),
+                count("In2.Cu", "VCC"),
+            ]
+        );
+        // A board without zones writes neither planes nor an inventory.
+        let plain = native_baseline(FOUR_LAYERS);
+        assert_eq!(plain.copper_zone_count, 0);
+        assert!(!plain.dsn.contains("(plane "), "{}", plain.dsn);
+        let manifest: serde_json::Value = serde_json::from_str(&plain.manifest).unwrap();
+        assert_eq!(manifest["supported_profile"]["copper_zones"], false);
+        assert!(manifest.get("zones").is_none(), "{manifest}");
+    }
+
+    /// KiCad's own export writes the same planes, in another order.
+    #[test]
+    fn zone_native_dsn_matches_the_rust_export() {
+        let adopted = adopt_native_dsn(native_baseline(ZONES), zones_native()).unwrap();
+        assert_eq!(adopted.dsn, zones_native());
+        let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        assert_eq!(zone_counts(&manifest).len(), 4);
+
+        let moved = zones_native().replacen("95000 -60000", "95000 -61000", 1);
+        assert_ne!(moved, zones_native());
+        let renetted = zones_native().replacen("(plane VCC", "(plane GND", 1);
+        let mut dropped = zones_native();
+        let start = dropped.find("    (plane VCC").unwrap();
+        let end = start + dropped[start..].find("))\n").unwrap() + 3;
+        dropped.replace_range(start..end, "");
+        for (name, native) in [
+            ("moved", moved),
+            ("renetted", renetted),
+            ("dropped", dropped),
+        ] {
+            let error = adopt_native_dsn(native_baseline(ZONES), native)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("native DSN changed the copper-zone planes"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    /// Freerouting 2.3.0 reaches the planes through vias; the planner takes
+    /// the session and carries the zone inventory to the import's response.
+    #[test]
+    fn freerouting_routes_to_the_planes_and_the_planner_keeps_the_zones() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_zones.kicad_pcb");
+        std::fs::write(&board, ZONES).unwrap();
+        let baseline = export_dsn(&board, ZONES, &native_fixture_rules()).unwrap();
+        let adopted = adopt_native_dsn(baseline, zones_native()).unwrap();
+        let plan =
+            crate::specctra_ses::parse_import_plan(&board, ZONES, &adopted.manifest, ZONES_SES)
+                .unwrap();
+        assert!(!plan.vias.is_empty());
+        assert_eq!(
+            plan.zones
+                .iter()
+                .map(|zone| (zone.layer.as_str(), zone.net.as_str(), zone.count))
+                .collect::<Vec<_>>(),
+            [
+                ("B.Cu", "GND", 1),
+                ("F.Cu", "GND", 1),
+                ("In1.Cu", "GND", 1),
+                ("In2.Cu", "VCC", 1)
+            ]
+        );
+    }
+
+    /// The manifest's zone inventory is the live board's, from schema 3.
+    #[test]
+    fn manifest_zone_inventory_must_match_the_live_board() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_zones.kicad_pcb");
+        std::fs::write(&board, ZONES).unwrap();
+        let adopted = adopt_native_dsn(
+            export_dsn(&board, ZONES, &native_fixture_rules()).unwrap(),
+            zones_native(),
+        )
+        .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        let inventory = "manifest copper-zone inventory does not match the live board snapshot";
+        let flag = "manifest copper-zone flag does not match its zone inventory";
+        type ManifestEdit = fn(&mut serde_json::Value);
+        let cases: [(&str, &str, ManifestEdit); 6] = [
+            ("count", inventory, |m| m["zones"][0]["count"] = 2.into()),
+            ("net", inventory, |m| m["zones"][3]["net"] = "GND".into()),
+            ("layer", inventory, |m| {
+                m["zones"][2]["layer"] = "In2.Cu".into()
+            }),
+            ("dropped", inventory, |m| {
+                m["zones"].as_array_mut().unwrap().remove(1);
+            }),
+            ("unflagged", flag, |m| {
+                m["supported_profile"]["copper_zones"] = false.into()
+            }),
+            ("schema 2", flag, |m| m["schema_version"] = 2.into()),
+        ];
+        for (name, expected, edit) in cases {
+            let mut edited = manifest.clone();
+            edit(&mut edited);
+            let error = crate::specctra_ses::parse_import_plan(
+                &board,
+                ZONES,
+                &edited.to_string(),
+                ZONES_SES,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+        // A zone-free manifest against a board with zones.
+        let mut emptied = manifest.clone();
+        emptied.as_object_mut().unwrap().remove("zones");
+        emptied["supported_profile"]["copper_zones"] = false.into();
+        let error =
+            crate::specctra_ses::parse_import_plan(&board, ZONES, &emptied.to_string(), ZONES_SES)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains(inventory), "{error}");
+    }
+
+    /// What the planes cannot say exactly is refused, not approximated.
+    #[test]
+    fn zones_the_planes_cannot_describe_are_refused() {
+        let plane = "(layer \"In1.Cu\")\n\t\t(uuid";
+        let outline = "(polygon\n\t\t\t(pts\n\t\t\t\t(xy 81 31)";
+        let cases = [
+            (
+                "rule area",
+                ZONES.replacen("(name \"gnd_plane\")", "(name \"gnd_plane\") (keepout (tracks not_allowed))", 1),
+                "board contains a rule area",
+            ),
+            (
+                "no net",
+                ZONES.replacen("(net \"VCC\")\n\t\t(layer \"In2.Cu\")", "(net \"\")\n\t\t(layer \"In2.Cu\")", 1),
+                "copper zone 'vcc_plane' has no net",
+            ),
+            (
+                "cutout",
+                ZONES.replacen(
+                    outline,
+                    "(polygon (pts (xy 100 40) (xy 110 40) (xy 110 45)))\n\t\t(polygon\n\t\t\t(pts\n\t\t\t\t(xy 81 31)",
+                    1,
+                ),
+                "copper zone 'gnd_plane' on net 'GND' has 2 outlines",
+            ),
+            (
+                "arc",
+                ZONES.replacen(
+                    "(xy 81 31) (xy 129 31)",
+                    "(xy 81 31) (arc (start 100 31) (mid 105 30) (end 110 31)) (xy 129 31)",
+                    1,
+                ),
+                "outline has a 'arc' point",
+            ),
+            (
+                "not copper",
+                ZONES.replacen(plane, "(layer \"F.SilkS\")\n\t\t(uuid", 1),
+                "copper zone 'gnd_plane' is on 'F.SilkS', which is not a copper layer of the board",
+            ),
+            (
+                "padless net",
+                ZONES.replacen("(net \"VCC\")\n\t\t(layer \"In2.Cu\")", "(net \"SPARE\")\n\t\t(layer \"In2.Cu\")", 1),
+                "copper zone on net 'SPARE', which has no pad",
+            ),
+            (
+                "footprint zone",
+                ZONES.replacen(
+                    "(property \"Reference\" \"J1\"",
+                    "(zone (net \"GND\") (layer \"F.Cu\") (polygon (pts (xy 0 0) (xy 1 0) (xy 1 1))))\n\t\t(property \"Reference\" \"J1\"",
+                    1,
+                ),
+                "footprint J1 contains a zone",
+            ),
+        ];
+        for (name, board, expected) in cases {
+            assert_ne!(board, ZONES, "{name}");
+            let error = export_dsn(
+                Path::new("board.kicad_pcb"),
+                &board,
+                &native_fixture_rules(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+        // `*.Cu` covers every copper layer, top to bottom.
+        let all = ZONES.replacen(plane, "(layers \"*.Cu\")\n\t\t(uuid", 1);
+        let export =
+            export_dsn(Path::new("board.kicad_pcb"), &all, &native_fixture_rules()).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(
+            zone_counts(&manifest)
+                .iter()
+                .filter(|(_, net, _)| net == "GND")
+                .map(|(layer, _, count)| (layer.as_str(), *count))
+                .collect::<Vec<_>>(),
+            [("B.Cu", 2), ("F.Cu", 2), ("In1.Cu", 1), ("In2.Cu", 1)]
+        );
+    }
+
+    /// A copper layer the board marks `power` is a DSN `power` layer, where
+    /// Freerouting lays no track, as KiCad 10.0.8 writes it (`mixed` stays
+    /// `signal`); the native DSN must agree.
+    #[test]
+    fn power_layers_export_as_power_layers() {
+        let board = ZONES
+            .replacen("(4 \"In1.Cu\" signal)", "(4 \"In1.Cu\" power)", 1)
+            .replacen("(6 \"In2.Cu\" signal)", "(6 \"In2.Cu\" mixed)", 1);
+        assert_ne!(board, ZONES);
+        let export = native_baseline(&board);
+        let identity = dsn_identity(&parse_dsn_sexp(&export.dsn).unwrap()).unwrap();
+        assert_eq!(
+            identity.layer_types.values().collect::<Vec<_>>(),
+            ["signal", "power", "signal", "signal"]
+        );
+        let power_native = zones_native().replacen(
+            "(layer In1.Cu\n      (type signal)",
+            "(layer In1.Cu\n      (type power)",
+            1,
+        );
+        assert_ne!(power_native, zones_native());
+        adopt_native_dsn(native_baseline(&board), power_native.clone()).unwrap();
+        for (name, baseline, native) in [
+            (
+                "signal written as power",
+                native_baseline(ZONES),
+                power_native,
+            ),
+            (
+                "power written as signal",
+                native_baseline(&board),
+                zones_native(),
+            ),
+        ] {
+            let error = adopt_native_dsn(baseline, native).unwrap_err().to_string();
+            assert!(
+                error.contains("native DSN changed a copper layer's signal or power type"),
+                "{name}: {error}"
+            );
+        }
     }
 }

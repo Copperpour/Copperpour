@@ -306,7 +306,9 @@ pub fn tools() -> Vec<ToolDef> {
              pads with one shape on every copper layer (rounded rectangles written as polygons \
              that enclose the copper, ovals as paths as KiCad writes them), round drills, \
              one closed outline made from straight lines and circular arcs (arcs flattened within the board's max_error), \
-             and no existing tracks, vias, or zones. Copperpour refuses unsupported geometry or \
+             no existing tracks or vias, and copper zones with a net and a straight-edged outline \
+             without cutouts, each written as a plane on every copper layer it covers (its fill is \
+             not exported; rule areas are refused). Copperpour refuses unsupported geometry or \
              custom DRC rules, or incomplete effective routing rules instead of approximating \
              them, and writes a \
              revision-bound reverse manifest beside the DSN for later SES import.",
@@ -938,8 +940,9 @@ async fn handle_export_specctra_dsn(
                 "ses_import_available": false,
                 "freerouting_bridge_available": false,
                 "source_revision_bound": true,
-                "supported_profile": "even_layer_front_side_circle_rect_roundrect_oval_no_existing_routing_or_zones",
-                "copper_layers": export.copper_layer_count
+                "supported_profile": "even_layer_front_side_circle_rect_roundrect_oval_no_existing_routing_zones_as_planes",
+                "copper_layers": export.copper_layer_count,
+                "copper_zones": export.copper_zone_count
             }
         })
         .to_string(),
@@ -1816,9 +1819,10 @@ mod specctra_roundrect_served_tests {
         assert_eq!(body["pad_count"], 6);
         assert_eq!(
             body["capabilities"]["supported_profile"],
-            "even_layer_front_side_circle_rect_roundrect_oval_no_existing_routing_or_zones"
+            "even_layer_front_side_circle_rect_roundrect_oval_no_existing_routing_zones_as_planes"
         );
         assert_eq!(body["capabilities"]["copper_layers"], 2);
+        assert_eq!(body["capabilities"]["copper_zones"], 0);
         assert_eq!(dsn.matches("(polygon F.Cu 0").count(), 3, "{dsn}");
         let manifest: Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join("board.dsn.copperpour.json")).unwrap(),
@@ -1846,6 +1850,22 @@ mod specctra_roundrect_served_tests {
         assert_eq!(body["capabilities"]["copper_layers"], 4);
         assert_eq!(body["pad_count"], 6);
         assert!(dsn.contains("(layer In2.Cu"), "{dsn}");
+    }
+
+    /// The response's zone count is the board's, each zone a plane per
+    /// copper layer it covers (#430).
+    #[tokio::test]
+    async fn served_export_reports_the_boards_copper_zones() {
+        let (_dir, body, dsn) = served_export(
+            "specctra_zones.kicad_pcb",
+            include_str!("../../tests/fixtures/specctra_zones.kicad_pcb"),
+            &["GND", "VCC"],
+        )
+        .await;
+        assert_eq!(body["capabilities"]["copper_zones"], 3, "{body}");
+        assert_eq!(dsn.matches("(plane GND\n").count(), 3, "{dsn}");
+        assert_eq!(dsn.matches("(plane VCC\n").count(), 1, "{dsn}");
+        assert!(dsn.contains("(polygon In2.Cu 0 81000 -31000"), "{dsn}");
     }
 }
 
@@ -2038,7 +2058,7 @@ mod specctra_rotation_served_tests {
             &std::fs::read_to_string(body["manifest_output_path"].as_str().unwrap()).unwrap(),
         )
         .unwrap();
-        assert_eq!(manifest["schema_version"], 2);
+        assert_eq!(manifest["schema_version"], 3);
         let j1 = manifest["components"]
             .as_array()
             .unwrap()

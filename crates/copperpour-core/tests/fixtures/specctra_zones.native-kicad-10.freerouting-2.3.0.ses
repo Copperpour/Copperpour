@@ -1,0 +1,67 @@
+(session board
+  (base_design board)
+  (placement
+    (resolution um 10)
+    (component "Resistor_SMD:R_0402"
+      (place R1 1000000 -500000 front 0)
+      (place R2 1100000 -500000 front 0)
+    )
+    (component "PinHeader_1x02_P2.54mm_Vertical"
+      (place J1 1200000 -450000 front 0)
+    )
+  )
+  (was_is
+  )
+  (routes 
+    (resolution um 10)
+    (parser
+      (host_cad "KiCad's Pcbnew")
+      (host_version "10.0.8-10.0.8~ubuntu24.04.1")
+    )
+    (library_out 
+      (padstack "Via[0-3]_600:300_um"
+        (shape
+          (circle F.Cu 6000 0 0)
+        )
+        (shape
+          (circle In1.Cu 6000 0 0)
+        )
+        (shape
+          (circle In2.Cu 6000 0 0)
+        )
+        (shape
+          (circle B.Cu 6000 0 0)
+        )
+        (attach off)
+      )
+    )
+    (network_out 
+      (net GND
+        (wire
+          (path F.Cu 2000
+            1050000 -500000
+            1095000 -500000
+          )
+        )
+      )
+      (net VCC
+        (wire
+          (path F.Cu 2000
+            1105000 -507752
+            1105000 -500000
+          )
+        )
+        (via "Via[0-3]_600:300_um" 1105000 -507752
+        )
+        (wire
+          (path F.Cu 2000
+            995000 -507720
+            995000 -500000
+          )
+        )
+        (via "Via[0-3]_600:300_um" 995000 -507720
+        )
+      )
+    )
+  )
+)
