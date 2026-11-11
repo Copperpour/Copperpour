@@ -111,6 +111,11 @@ impl ToolRouter {
         true
     }
 
+    /// Whether the toolset is currently loaded.
+    pub async fn is_active(&self, name: &str) -> bool {
+        self.active.read().await.contains(name)
+    }
+
     pub async fn active_names(&self) -> Vec<String> {
         self.active.read().await.iter().cloned().collect()
     }
