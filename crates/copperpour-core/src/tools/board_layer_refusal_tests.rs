@@ -141,15 +141,6 @@ fn kicad_recording(board: &Path, received: Received) -> MockIpcServer {
                     },
                     "kiapi.board.commands.NetsResponse",
                 )),
-                // `modify_trace` deletes the old track first.
-                "DeleteItems" => Some(copperpour_ipc::builders::pack_any(
-                    &kiapi::common::commands::DeleteItemsResponse {
-                        header: None,
-                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                        deleted_items: Vec::new(),
-                    },
-                    "kiapi.common.commands.DeleteItemsResponse",
-                )),
                 _ => None,
             };
         }
@@ -292,13 +283,13 @@ async fn route_differential_pair_refuses_a_layer_that_is_not_copper() {
 }
 
 /// A copper layer still reaches KiCad as that layer, in every track a routing
-/// tool creates; `route_differential_pair` defaults to `F.Cu`.
+/// tool creates; `route_differential_pair` defaults to `F.Cu`. `modify_trace`
+/// creates none: `modify_trace_tests` covers its layer.
 #[tokio::test]
 async fn a_copper_layer_still_reaches_kicad_on_every_track() {
     let cases = [
         ("route_trace", Some("In1.Cu"), BoardLayer::BlIn1Cu),
         ("route_trace", Some("B.Cu"), BoardLayer::BlBCu),
-        ("modify_trace", Some("In4.Cu"), BoardLayer::BlIn4Cu),
         ("route_differential_pair", None, BoardLayer::BlFCu),
         ("route_differential_pair", Some("B.Cu"), BoardLayer::BlBCu),
     ];

@@ -3455,13 +3455,80 @@ impl KiCadIpcClient {
         Ok(Some(track))
     }
 
-    /// Delete a board item by UUID.
+    /// Change one observed trace segment in place, keeping its KIID.
     ///
-    /// This low-level compatibility helper does not verify an item type or
-    /// postcondition. User-facing trace deletion must use
-    /// [`Self::delete_trace_segment_verified`].
-    pub fn delete_track(&self, uuid: &str) -> Result<()> {
-        self.delete_items(vec![uuid.to_string()])
+    /// The layer and net are checked against the board before anything is
+    /// sent, and the update is one `UpdateItems` in one commit, so a refusal
+    /// leaves the track as it was and a success is one undo step (#366).
+    /// Fields `edit` does not name, such as the lock, are carried over from
+    /// KiCad's own message.
+    pub fn modify_trace_segment_verified(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        uuid: &str,
+        edit: &IpcTrackEdit<'_>,
+    ) -> Result<IpcTraceModify> {
+        let Some(mut track) = self.find_track_in(document.clone(), uuid)? else {
+            return Ok(IpcTraceModify::NotFound);
+        };
+        let layer = crate::builders::try_layer_from_name(edit.layer)? as i32;
+        let enabled = self.get_layers_in(document.clone())?;
+        if !enabled.iter().any(|enabled| enabled.id == layer) {
+            return Ok(IpcTraceModify::LayerNotOnBoard {
+                copper: enabled
+                    .into_iter()
+                    .filter(|l| copperpour_sexp::layers::is_copper_name(&l.name))
+                    .map(|l| l.name)
+                    .collect(),
+            });
+        }
+        let Some(net) = self
+            .get_nets_in(document.clone())?
+            .into_iter()
+            .find(|net| net.name == edit.net_name)
+        else {
+            return Ok(IpcTraceModify::UnknownNet);
+        };
+
+        track.start = Some(crate::builders::vec2(edit.start.x, edit.start.y));
+        track.end = Some(crate::builders::vec2(edit.end.x, edit.end.y));
+        track.width = Some(crate::builders::distance(edit.width));
+        track.layer = layer;
+        track.net = Some(crate::builders::net(&net.name, net.netcode));
+        let packed = crate::builders::pack_any(&track, "kiapi.board.types.Track");
+        self.run_commit("Modify trace", |client| {
+            client.update_items_in(document.clone(), vec![packed])
+        })?;
+
+        let unproven = match self.find_track_in(document, uuid) {
+            Ok(Some(after)) if holds_edit(&after, &track) => return Ok(IpcTraceModify::Modified),
+            Ok(Some(after)) => format!("reads back as {after:?}, not as sent"),
+            Ok(None) => "is no longer on the board".to_string(),
+            Err(error) => format!("could not be read back: {error:#}"),
+        };
+        Ok(IpcTraceModify::Unproven(format!(
+            "trace segment '{uuid}' {unproven}"
+        )))
+    }
+
+    /// The straight track carrying `uuid` on one exact open board, as KiCad's
+    /// message. `GetItemsById` takes any item's KIID, so the type is checked.
+    fn find_track_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        uuid: &str,
+    ) -> Result<Option<kiapi::board::types::Track>> {
+        for item in self.get_items_by_id_in(document, &[uuid.to_string()])? {
+            if !crate::builders::any_is(&item, "kiapi.board.types.Track") {
+                continue;
+            }
+            let track = kiapi::board::types::Track::decode(item.value.as_slice())
+                .context("KiCad returned an unreadable track")?;
+            if track.id.as_ref().map(|id| id.value.as_str()) == Some(uuid) {
+                return Ok(Some(track));
+            }
+        }
+        Ok(None)
     }
 
     /// Query tracks, optionally filtered by net and/or layer.
@@ -5715,6 +5782,17 @@ impl KiCadIpcClient {
             changed: true,
         }))
     }
+}
+
+/// Whether `after` has what `sent` set. KiCad 10.0.6 reads a track back with
+/// its parent board and its net by name, without the net code, so the
+/// message is not compared whole.
+fn holds_edit(after: &kiapi::board::types::Track, sent: &kiapi::board::types::Track) -> bool {
+    after.start == sent.start
+        && after.end == sent.end
+        && after.width == sent.width
+        && after.layer == sent.layer
+        && after.net.as_ref().map(|net| &net.name) == sent.net.as_ref().map(|net| &net.name)
 }
 
 /// A via message as the read-back type, with every field taken from KiCad.

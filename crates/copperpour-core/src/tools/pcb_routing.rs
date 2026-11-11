@@ -12,6 +12,7 @@ use crate::tools::{
     with_board_ipc_classified, with_bound_board_ipc_classified, BoardBinding, ToolContext, ToolDef,
 };
 use anyhow::Context;
+use copperpour_ipc::types::IpcTraceModify;
 use copperpour_sexp::writer::{apply_edits, write_atomic_if_unchanged, SexpEdit};
 use prost::Message;
 use serde_json::json;
@@ -270,7 +271,9 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "modify_trace",
-            "Modify a trace segment by deleting and re-adding it with new parameters.",
+            "Change a trace segment in place, keeping its UUID, in one KiCad undo step. \
+             Refuses, leaving the board unchanged, when the UUID is not a trace segment \
+             or the board has no such net or copper layer.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1845,20 +1848,61 @@ async fn handle_modify_trace(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let width = args["width"].as_f64().unwrap_or(0.25);
+    let width = match opt_positive_f64(args, "width") {
+        Ok(v) => v.unwrap_or(0.25),
+        Err(e) => return Ok(e),
+    };
 
-    let uuid_ipc = uuid.clone();
-    let net_ipc = net_name.clone();
-    let layer_ipc = layer.clone();
-    ipc!(ctx, args, |c| {
-        c.delete_track(&uuid_ipc)?;
-        c.add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2)
-    });
-    Ok(CallToolResult::json(&json!({
-        "modified_uuid": uuid,
-        "net": net_name, "layer": layer, "width": width,
-        "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 }
-    })))
+    let board = get_path(args, "board")?;
+    let (uuid_ipc, net_ipc, layer_ipc) = (uuid.clone(), net_name.clone(), layer.clone());
+    let outcome = match with_board_ipc_classified(ctx, &board, move |client, document| {
+        let edit = copperpour_ipc::types::IpcTrackEdit {
+            net_name: &net_ipc,
+            layer: &layer_ipc,
+            width,
+            start: copperpour_ipc::types::IpcVector2 { x: x1, y: y1 },
+            end: copperpour_ipc::types::IpcVector2 { x: x2, y: y2 },
+        };
+        client.modify_trace_segment_verified(document, &uuid_ipc, &edit)
+    })
+    .await?
+    {
+        Ok(outcome) => outcome,
+        Err(failure) => return Ok(crate::tools::ipc_failure_result(failure)),
+    };
+    let unchanged = "The board is unchanged.";
+    Ok(match outcome {
+        IpcTraceModify::Modified => CallToolResult::json(&json!({
+            "modified_uuid": uuid,
+            "net": net_name, "layer": layer, "width": width,
+            "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 }
+        })),
+        IpcTraceModify::NotFound => CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: uuid,
+                reason: "the UUID is not an observed trace segment on the requested board"
+                    .to_string(),
+            },
+            format!(
+                "The requested UUID is not a trace segment on the requested board. {unchanged}"
+            ),
+        ),
+        IpcTraceModify::LayerNotOnBoard { copper } => invalid_arg(
+            "layer",
+            &format!(
+                "the board has no copper layer '{layer}'; it has {}. {unchanged}",
+                copper.join(", ")
+            ),
+        ),
+        IpcTraceModify::UnknownNet => invalid_arg(
+            "net_name",
+            &format!("the board has no net '{net_name}'. {unchanged}"),
+        ),
+        // A live edit, not a file one: the saved board was never touched.
+        IpcTraceModify::Unproven(reason) => crate::tools::ipc_uncertain_result(&format!(
+            "KiCad committed the modify_trace update, but {reason}"
+        )),
+    })
 }
 
 /// The sibling `<project>.kicad_pro`, which is where KiCad ≥ 7 keeps net
