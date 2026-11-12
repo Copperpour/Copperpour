@@ -5,8 +5,7 @@ The crate contains the GUI-independent viewer engine and browser service.
 an instance per canonical root until the MCP server context ends (stdio disconnect
 or HTTP server shutdown). Set `open_browser: false`
 to obtain the private URL without launching a browser. The standalone Tauri
-`schematic-viewer` is deprecated and retained through one shipped release containing
-the notice; its CLI remains available.
+command has been [retired](../../docs/api-migrations/retire-standalone-viewer.md).
 
 For local browser testing:
 
@@ -19,12 +18,10 @@ local capability: do not publish it. Ctrl-C shuts down the service. It can show
 changes made by KiCad or an MCP agent to the saved schematic, without changing
 how the agent connects to Copperpour. It does not show unsaved editor changes.
 
-The browser and Tauri adapters share `crates/schematic-viewer/frontend/index.html` and its adjacent
-`viewer.js`. The existing asset path is retained during the Tauri compatibility
-period; the browser module embeds the same source assets.
-Tauri uses invoke/events; browser mode uses authenticated HTTP and SSE. Browser
-instances are bound to their launch root, so browser mode has no file-drop/open
-control. Pan, zoom, theme, sheet selection and manual refresh are shared.
+The browser module embeds `frontend/index.html` and `frontend/viewer.js` from
+this crate. It uses authenticated HTTP and SSE. Instances are bound to their
+launch root, so there is no file-drop/open control. Pan, zoom, theme, sheet
+selection, manual refresh and explicit KiCad launch are available.
 
 ## Service contract
 
@@ -67,8 +64,7 @@ The browser path currently requires child references to be relative, without
 parent traversal, and to resolve inside the root directory. Missing files,
 symlinks outside that directory, cycles and hierarchies beyond the engine's
 discovery depth are refused. It refuses snapshot copy failure instead of using
-the legacy engine's live-file fallback. These stricter browser restrictions do
-not alter the legacy Tauri engine API.
+the engine’s live-file fallback.
 
 All service requests validate Host; supplied Origin headers must match that
 loopback origin. POSTs also require Origin. Data/control endpoints need the
@@ -84,8 +80,7 @@ external script, and the frame has a separate resource-restricting CSP. SVGs are
 XML-validated; KiCad's standard DOCTYPE is accepted without an external entity
 resolver. Validation is not sanitization: the sandbox is the script isolation
 boundary. Direct SVG responses also carry a sandbox CSP. Do not replace this
-with privileged-page `innerHTML` injection. Tauri's existing rendering path is
-retained during the transition.
+with privileged-page `innerHTML` injection.
 
 ## Validation
 
@@ -96,8 +91,7 @@ refresh ordering, authentication, origin/Host checks, allowlisting, snapshot and
 hierarchy refusals, timeout, invalid SVG, and renderer shutdown. Linux additionally
 checks that an in-flight renderer PID was reaped. The existing engine tests remain.
 
-The Tauri application is outside the workspace and still needs its own check/test
-commands. Native renderer smoke tests are separate from browser execution tests:
+Native renderer smoke tests are separate from browser execution tests:
 HTTP headers and Rust tests alone do not prove that a browser enforced the CSP or
 sandbox. Linux interactive browser feedback is available. Headless Chromium checks exercised the displayed SVG, theme/zoom/fit/refresh
 and blocked script/event-handler payloads, with a positive payload control in a

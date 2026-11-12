@@ -1,5 +1,9 @@
 ### `open_schematic_viewer` uses the browser service; standalone Tauri viewer deprecated (minor release)
 
+> Later superseded by [standalone viewer retirement](retire-standalone-viewer.md):
+> the owner waived the planned release grace period and approved immediate removal.
+> Statements below about retention describe this earlier phase only.
+
 The tool name and required `schematic` argument remain. An optional `open_browser`
 boolean defaults to true; false starts/reuses the service without launching a
 browser. Malformed present values, including null, are refused. The service uses

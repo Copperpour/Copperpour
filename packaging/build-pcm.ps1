@@ -11,7 +11,6 @@
 #     native_bridge.py       authenticated KiCad 10 native Specctra bridge
 #     resources/icon.png     toolbar icon (referenced by __init__.py)
 #     bin/copperpour.exe        the MCP server binary
-#     bin/schematic-viewer.exe  (optional) live schematic viewer
 #   resources/
 #     icon.png               icon shown in the PCM dialog
 #
@@ -22,7 +21,6 @@
 #
 # Usage:
 #   ./packaging/build-pcm.ps1 -Version 0.1.0 -BinaryPath target/release/copperpour.exe `
-#       [-ViewerPath crates/schematic-viewer/target/release/schematic-viewer.exe] `
 #       [-Platform windows] [-OutDir dist]
 #
 # Prints the zip path, size, and SHA256 (needed for the kicad-addons
@@ -31,6 +29,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Version,
     [Parameter(Mandatory = $true)][string]$BinaryPath,
+    # Retained only to reject old calls without shifting positional arguments.
     [string]$ViewerPath = "",
     [ValidateSet("windows")][string]$Platform = "windows",
     [string]$OutDir = "dist"
@@ -38,6 +37,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
+
+if ($PSBoundParameters.ContainsKey("ViewerPath")) {
+    throw "-ViewerPath was retired: the browser viewer is embedded in copperpour; remove this argument"
+}
 
 if (-not (Test-Path $BinaryPath)) { throw "Binary not found: $BinaryPath" }
 
@@ -51,11 +54,6 @@ Copy-Item "$repoRoot/plugin/plugin.json" "$staging/plugins/"
 Copy-Item "$repoRoot/plugin/settings_dialog.py" "$staging/plugins/"
 Copy-Item "$repoRoot/plugin/native_bridge.py" "$staging/plugins/"
 Copy-Item $BinaryPath "$staging/plugins/bin/copperpour.exe"
-if ($ViewerPath -and (Test-Path $ViewerPath)) {
-    Copy-Item $ViewerPath "$staging/plugins/bin/schematic-viewer.exe"
-    Write-Host "Included schematic viewer: $ViewerPath"
-}
-
 # Stamp the IPC entrypoint to this platform's binary name. plugin.json ships the
 # Windows default; the packaging step is authoritative so a package points at the
 # binary it actually bundles (build-pcm.sh stamps bin/copperpour for macOS/Linux).

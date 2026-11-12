@@ -65,7 +65,7 @@ def settle(meta: dict, others: int) -> bytes:
 
 def platform_zip(directory: Path, platform: str, version: str = "0.0.0",
                  change=None) -> Path:
-    """A zip laid out the way build-pcm.sh and build-pcm.ps1 lay theirs out."""
+    """A legacy zip including the standalone viewer; old releases remain supported."""
     files = {
         f"plugins/{name}": (REPO / "plugin" / name).read_bytes()
         for name in ("__init__.py", "settings_dialog.py", "native_bridge.py")
@@ -251,7 +251,7 @@ class Merge(unittest.TestCase):
 
 
 class SinglePlatformValidation(unittest.TestCase):
-    """validate-pcm.py on one platform's zip, as build-pcm.sh and build-pcm.ps1 lay it out."""
+    """validate-pcm.py on a legacy single-platform zip, including its standalone viewer."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())

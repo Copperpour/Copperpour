@@ -131,25 +131,11 @@ jobs:
             target/x86_64-apple-darwin/release/copperpour
           lipo -info dist/universal/copperpour
 
-      # No continue-on-error: the PCM script omits a missing viewer without
-      # failing, so a failed viewer build must fail the job.
-      - name: Build universal schematic viewer
-        run: |
-          set -euo pipefail
-          for target in aarch64-apple-darwin x86_64-apple-darwin; do
-            cargo build --release --locked --manifest-path crates/schematic-viewer/Cargo.toml --target "$target"
-          done
-          lipo -create -output dist/universal/schematic-viewer \
-            crates/schematic-viewer/target/aarch64-apple-darwin/release/schematic-viewer \
-            crates/schematic-viewer/target/x86_64-apple-darwin/release/schematic-viewer
-          lipo -info dist/universal/schematic-viewer
-
       - name: Assemble PCM package
         run: |
           version="${RELEASE_VERSION#v}"
           ./packaging/build-pcm.sh --version "$version" \
             --binary dist/universal/copperpour \
-            --viewer dist/universal/schematic-viewer \
             --platform macos --out dist
 
       - uses: actions/setup-python@v7

@@ -26,16 +26,13 @@ cargo fmt --all -- --check
 | IPC builders, transport, and client behavior | `crates/copperpour-ipc` tests |
 | Real KiCad behavior | ignored live tests and local CI's real-KiCad job (`e2e-kicad.yml`'s steps) |
 | Viewer engine and browser service | `crates/copperpour-viewer` engine and HTTP/SSE tests, included in workspace checks |
-| Tauri viewer adapter | `crates/schematic-viewer` tests and its separate CI job |
 | Python plugin | `plugin/tests` and the plugin CI job |
 | PCM package | `packaging/validate-pcm.py` and packaging CI jobs |
 
 Run the engine tests without GUI prerequisites using
-`cargo test -p copperpour-viewer --locked`. The Tauri adapter remains outside
-the Cargo workspace: also run
-`cargo test --locked --manifest-path crates/schematic-viewer/Cargo.toml`.
-Workspace commands cover the engine and browser service but do not build or test
-the Tauri adapter. Browser visual/CSP execution checks and native KiCad-renderer
+`cargo test -p copperpour-viewer --locked`. Workspace commands compile the
+embedded frontend assets along with the engine/service, but do not execute their
+JavaScript. Browser visual/CSP execution checks and native KiCad-renderer
 smoke tests are separate evidence; HTTP header tests do not substitute for them.
 
 ## Evidence-Focused Regression Tests
@@ -181,7 +178,7 @@ repository also checks against the v1 schema, which has no AGPL entry. To list a
 release, copy its `versions` entries into `packages/<identifier>/metadata.json`
 in a merge request to <https://gitlab.com/kicad/addons/metadata>.
 
-## Browser viewer default and Tauri deprecation
+## Browser viewer and standalone retirement
 
 `open_schematic_viewer` now uses the browser service. Core tests exercise its served
 MCP schema, canonical-root reuse, saved-data HTTP response and context teardown,
@@ -189,8 +186,8 @@ plus opener success/failure/timeout and startup recovery. Run
 `cargo test -p copperpour-core --locked tools::viewer` and the workspace gates.
 Also check `--no-default-features`: this loopback service is available offline.
 
-The standalone `schematic-viewer` binary, `--kicad-cli` flag, packaging and separate
-CI job remain available during deprecation. Ship a release containing the migration
-notice before a later PR removes Tauri; do not remove it in that same release cycle.
-Keep standalone tests running until removal. Linux interactive feedback is available;
+The standalone `schematic-viewer` command, Tauri crate, packaging and separate
+CI job have been removed with the owner’s explicit waiver of the planned grace
+period; see [the migration](api-migrations/retire-standalone-viewer.md). The
+workspace build embeds the browser viewer in the server. Linux interactive feedback is available;
 Windows/macOS browser launch and interactive behavior need platform verification.

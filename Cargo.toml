@@ -11,9 +11,6 @@ members = [
     "crates/copperpour-vcs",
     "xtask",
 ]
-exclude = [
-    "crates/schematic-viewer",  # Tauri app — built separately with `cargo tauri build`
-]
 
 [workspace.package]
 version = "0.16.1"

@@ -1,5 +1,4 @@
 
-  const isTauri = Boolean(window.__TAURI__);
   const token = new URLSearchParams(location.hash.slice(1)).get('token') || '';
   let selectedFile = null;
   let eventSource = null;
@@ -16,7 +15,7 @@
   async function getSheet(file) {
     return (await request('/sheet?' + new URLSearchParams({ file }))).text();
   }
-  const invoke = isTauri ? window.__TAURI__.core.invoke : async (command, args = {}) => {
+  const invoke = async (command, args = {}) => {
     if (command === 'get_startup_file') return (await (await request('/state')).json()).root_file;
     if (command === 'open_schematic') {
       const state = await (await request('/state')).json();
@@ -33,7 +32,7 @@
     if (!endpoint) throw new Error('Unknown viewer command');
     return (await request(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ file: selectedFile }) })).json();
   };
-  const listen = isTauri ? window.__TAURI__.event.listen : async (name, handler) => {
+  const listen = async (name, handler) => {
     handlers.set(name, handler);
     if (!eventSource) {
       eventSource = new EventSource('/events?' + new URLSearchParams({ token }));
@@ -57,12 +56,6 @@
     }
     return () => handlers.delete(name);
   };
-
-  // WebView2's native right-click menu includes its own "Reload", which
-  // reloads the whole embedded page (losing track of the open file — the
-  // startup-file argument is consumed on first read) rather than doing
-  // anything meaningful for a single-purpose viewer like this one.
-  if (isTauri) document.addEventListener('contextmenu', (e) => e.preventDefault());
 
   const MIN_SCALE = 0.05, MAX_SCALE = 40;
 
@@ -110,7 +103,7 @@
     if (size) {
       svgEl.setAttribute('width', String(size.w * scale));
       svgEl.setAttribute('height', String(size.h * scale));
-      if (!isTauri && svgFrame) {
+      if (svgFrame) {
         svgFrame.style.width = `${size.w * scale}px`;
         svgFrame.style.height = `${size.h * scale}px`;
       }
@@ -135,7 +128,7 @@
 
   let svgFrame = null;
   function currentSvg() {
-    return isTauri ? container.querySelector('svg') : svgFrame?.contentDocument?.querySelector('svg');
+    return svgFrame?.contentDocument?.querySelector('svg');
   }
   let svgQueue = Promise.resolve();
   function setSvg(svgContent) {
@@ -143,23 +136,19 @@
     return svgQueue;
   }
   async function replaceSvg(svgContent) {
-    if (isTauri) {
-      container.innerHTML = svgContent;
-    } else {
-      if (!svgFrame) {
-        svgFrame = document.createElement('iframe');
-        // Same-origin permits the trusted parent to adjust SVG dimensions. Never
-        // allow scripts: the SVG must not access the parent's launch credential.
-        svgFrame.setAttribute('sandbox', 'allow-same-origin');
-        svgFrame.setAttribute('title', 'Schematic');
-        svgFrame.style.cssText = 'border:0;pointer-events:none;display:block';
-        container.replaceChildren(svgFrame);
-      }
-      await new Promise(resolve => {
-        svgFrame.onload = resolve;
-        svgFrame.srcdoc = '<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; img-src data:; base-uri \'none\'; form-action \'none\'"><style>html,body{margin:0;overflow:hidden;background:transparent}</style>' + svgContent;
-      });
+    if (!svgFrame) {
+      svgFrame = document.createElement('iframe');
+      // Same-origin permits the trusted parent to adjust SVG dimensions. Never
+      // allow scripts: the SVG must not access the parent's launch credential.
+      svgFrame.setAttribute('sandbox', 'allow-same-origin');
+      svgFrame.setAttribute('title', 'Schematic');
+      svgFrame.style.cssText = 'border:0;pointer-events:none;display:block';
+      container.replaceChildren(svgFrame);
     }
+    await new Promise(resolve => {
+      svgFrame.onload = resolve;
+      svgFrame.srcdoc = '<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; img-src data:; base-uri \'none\'; form-action \'none\'"><style>html,body{margin:0;overflow:hidden;background:transparent}</style>' + svgContent;
+    });
     emptyState.style.display = 'none';
     hideLoading();
 
@@ -340,14 +329,7 @@
     }
   }
 
-  // Live updates and errors from the Rust backend.
-  //
-  // listen() returns a promise that REJECTS if the event API isn't permitted
-  // by the app's Tauri capability file — and a top-level unhandled rejection
-  // is completely silent. That exact failure shipped once: with no
-  // capabilities/ dir, every listener below was dead, the backend emitted
-  // into a void, and live updates simply "didn't work" with nothing in any
-  // log. Surface it unmissably instead.
+  // Surface event setup failures in the viewer.
   function listenOrWarn(name, handler) {
     listen(name, handler).catch((e) => {
       statusEl.textContent = 'Event wiring failed';
@@ -398,27 +380,7 @@
     flash(String(event.payload), true);
   });
 
-  // Drag & drop a .kicad_sch onto the window
-  if (isTauri) window.__TAURI__.window.getCurrentWindow().onDragDropEvent((event) => {
-    const t = event.payload.type;
-    if (t === 'enter' || t === 'over') {
-      viewer.classList.add('drop-target');
-    } else if (t === 'leave') {
-      viewer.classList.remove('drop-target');
-    } else if (t === 'drop') {
-      viewer.classList.remove('drop-target');
-      const path = (event.payload.paths || []).find(p => p.toLowerCase().endsWith('.kicad_sch'));
-      if (path) {
-        window.loadSchematic(path);
-      } else {
-        flash('Not a .kicad_sch file', true);
-      }
-    }
-  });
-
-  // Called on startup (with the CLI-arg file, if any) and on drag-drop.
-  // Opens the ROOT of a design — the backend walks the full sheet tree from
-  // there and eagerly renders every sheet it finds.
+  // Open the launch root and populate its eagerly rendered sheet hierarchy.
   window.loadSchematic = async function(path) {
     try {
       filenameEl.textContent = path.split(/[\\/]/).pop();
@@ -440,15 +402,14 @@
     }
   };
 
-  // Startup: ask the backend for the CLI-arg file. This replaces the old
-  // sleep-and-eval handoff — the frontend pulls when it's ready.
+  // Startup: ask the root-bound browser service for its launch file.
   (async function init() {
     try {
       const startupFile = await invoke('get_startup_file');
       if (startupFile) {
         await window.loadSchematic(startupFile);
       } else {
-        statusEl.textContent = 'Ready — drop a file or use the open_schematic_viewer MCP tool';
+        statusEl.textContent = 'No launch schematic available';
       }
     } catch (e) {
       console.error(e);
@@ -458,8 +419,5 @@
   const actions = { zoomIn, zoomOut, fitToPage, manualRefresh, toggleTheme, openInKicad };
   document.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', actions[button.dataset.action]));
   sheetSelector.addEventListener('change', onSheetSelected);
-  if (!isTauri) {
-    document.getElementById('open-prompt').textContent = 'This viewer shows the schematic selected at launch.';
-    window.addEventListener('dragover', event => event.preventDefault());
-    window.addEventListener('drop', event => event.preventDefault());
-  }
+  window.addEventListener('dragover', event => event.preventDefault());
+  window.addEventListener('drop', event => event.preventDefault());

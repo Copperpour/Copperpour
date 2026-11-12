@@ -1,5 +1,9 @@
 ### Shared browser viewer service (minor release; phase two of #242)
 
+> Later superseded by [standalone viewer retirement](retire-standalone-viewer.md):
+> the owner waived the planned release grace period and approved immediate removal.
+> Statements below about retention describe this earlier phase only.
+
 This phase adds a development browser service in `copperpour-viewer`, accessible
 through its Rust API and `browser_viewer` example. It does not switch
 `open_schematic_viewer`, deprecate Tauri, remove `schematic-viewer`, or change

@@ -1,7 +1,0 @@
-{
-  "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "description": "Default capability for the viewer's single main window. Without this file Tauri 2 denies all core-plugin APIs (deny-by-default ACL): app-defined invoke commands still work, but the frontend's event.listen() calls are silently rejected, so no backend-emitted event (schematic-updated, sheets-updated, viewer-error, change-detected) ever reaches the UI and live updates appear dead.",
-  "windows": ["main"],
-  "permissions": ["core:default"]
-}
