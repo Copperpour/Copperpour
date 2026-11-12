@@ -112,8 +112,33 @@ impl Scene {
         let server = if matches!(net_reply, NetReply::Missing) {
             let recorded = store.clone();
             spawn_kicad_holding_board(&board, move |command| {
+                let mut store = recorded.lock().unwrap();
                 if command.type_url.ends_with("CreateItems") {
-                    recorded.lock().unwrap().creates += 1;
+                    store.creates += 1;
+                } else if command.type_url.ends_with("UpdateItems") {
+                    store.updates += 1;
+                } else if command.type_url.ends_with("DeleteItems") {
+                    store.deletes += 1;
+                } else if command.type_url.ends_with("GetItemsById") {
+                    let query =
+                        kiapi::common::commands::GetItemsById::decode(command.value.as_slice())
+                            .unwrap();
+                    assert_eq!(query.header.unwrap().document, Some(document.clone()));
+                    assert_eq!(query.items.len(), 1);
+                    assert_eq!(query.items[0].value, "net-reader-track");
+                    return Some(pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items: store
+                                .items
+                                .iter()
+                                .filter(|item| item.type_url.ends_with("Track"))
+                                .cloned()
+                                .collect(),
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ));
                 }
                 // Unlike the item-store helper, this double can return AS_OK with no body.
                 metadata_reply(command, &document, net_reply, empty_layers)
@@ -144,7 +169,7 @@ impl Scene {
     }
     async fn call(&self, tool: &str, changes: Value) -> Value {
         let mut arguments = json!({"board":self.board, "net_name":"VCC", "layer":"In4.Cu", "x1":10.0,"y1":10.0,"x2":20.0,"y2":10.0});
-        if tool == "get_nets_list" {
+        if matches!(tool, "get_nets_list" | "get_netclasses" | "apply_copper") {
             arguments = json!({"board":self.board});
         } else if tool == "route_differential_pair" {
             arguments.as_object_mut().unwrap().remove("net_name");
@@ -169,8 +194,19 @@ impl Scene {
         }
         let response = self.handler.handle_message(json!({"jsonrpc":"2.0","id":421,"method":"tools/call","params":{"name":tool,"arguments":arguments}})).await.unwrap();
         let response = response.result.unwrap();
-        serde_json::from_str(response["content"][0]["text"].as_str().unwrap())
-            .unwrap_or_else(|_| json!({"message":response["content"][0]["text"]}))
+        let body: Value = serde_json::from_str(response["content"][0]["text"].as_str().unwrap())
+            .unwrap_or_else(|_| json!({"message":response["content"][0]["text"]}));
+        if tool == "get_nets_list" {
+            assert_eq!(
+                response["isError"],
+                body.get("error").is_some(),
+                "{response}"
+            );
+        }
+        if matches!(tool, "modify_trace" | "apply_copper") {
+            assert_eq!(response["isError"], true, "{response}");
+        }
+        body
     }
 }
 async fn refused(tool: &str, changes: Value, field: &str, value: &str) {
@@ -323,9 +359,154 @@ async fn routing_preflight_explicit_empty_net_list_proves_a_missing_net() {
     assert_eq!(scene.store.lock().unwrap().creates, 0);
 }
 #[tokio::test]
-async fn routing_preflight_preserves_the_legacy_net_reader_fallback() {
+async fn net_reader_requires_a_response_body() {
     let scene = Scene::with_evidence(NetReply::Missing, false).await;
+    let before = std::fs::read(&scene.board).unwrap();
+    let body = scene.call("get_nets_list", json!({})).await;
+    assert_eq!(body["error"]["kind"], "editor_unavailable", "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("no GetNets response payload"), "{body}");
+    assert!(message.contains(scene.board.to_str().unwrap()), "{body}");
+    assert!(body.get("count").is_none(), "{body}");
+    assert!(body.get("nets").is_none(), "{body}");
+    assert_eq!(scene.store.lock().unwrap().creates, 0);
+    assert_eq!(std::fs::read(&scene.board).unwrap(), before);
+}
+
+#[tokio::test]
+async fn net_reader_accepts_explicit_empty_response() {
+    let scene = Scene::with_evidence(NetReply::Empty, false).await;
     let body = scene.call("get_nets_list", json!({})).await;
     assert_eq!(body["count"], 0, "{body}");
     assert_eq!(body["nets"], json!([]), "{body}");
+    assert!(body.get("error").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn net_reader_reports_observed_nets() {
+    let scene = Scene::new().await;
+    let body = scene.call("get_nets_list", json!({})).await;
+    assert_eq!(body["count"], 3, "{body}");
+    assert_eq!(
+        body["nets"],
+        json!([
+            {"name":"", "netcode":0},
+            {"name":"VCC", "netcode":1},
+            {"name":"GND", "netcode":2}
+        ]),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn net_reader_sibling_netclasses_requires_response() {
+    let scene = Scene::with_evidence(NetReply::Missing, false).await;
+    std::fs::write(
+        scene.board.with_extension("kicad_pro"),
+        r#"{"net_settings":{"classes":[],"netclass_patterns":[]}}"#,
+    )
+    .unwrap();
+    let body = scene
+        .call("get_netclasses", json!({"board_source":"live"}))
+        .await;
+    assert_eq!(body["error"]["kind"], "editor_unavailable", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("no GetNets response payload"),
+        "{body}"
+    );
+    assert!(body.get("netclasses").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn net_reader_malformed_response_is_unavailable() {
+    let scene = Scene::with_evidence(NetReply::Malformed, false).await;
+    let body = scene.call("get_nets_list", json!({})).await;
+    assert_eq!(body["error"]["kind"], "editor_unavailable", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains(scene.board.to_str().unwrap()),
+        "{body}"
+    );
+    assert!(body.get("count").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn net_reader_preserves_wrong_document_refusal() {
+    let scene = Scene::new().await;
+    let other = scene._dir.path().join("other.kicad_pcb");
+    std::fs::copy(&scene.board, &other).unwrap();
+    let body = scene.call("get_nets_list", json!({"board":other})).await;
+    assert_eq!(body["error"]["kind"], "wrong_document", "{body}");
+    assert_eq!(
+        body["error"]["requested"],
+        other.to_str().unwrap(),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn net_reader_sibling_netclasses_accepts_explicit_empty() {
+    let scene = Scene::with_evidence(NetReply::Empty, false).await;
+    std::fs::write(
+        scene.board.with_extension("kicad_pro"),
+        r#"{"net_settings":{"classes":[],"netclass_patterns":[]}}"#,
+    )
+    .unwrap();
+    let body = scene
+        .call("get_netclasses", json!({"board_source":"live"}))
+        .await;
+    assert_eq!(body["nets_on_board"], 0, "{body}");
+    assert_eq!(body["sources"]["board_nets"], "ipc", "{body}");
+    assert!(body.get("error").is_none(), "{body}");
+}
+
+async fn net_reader_writer_failure(tool: &str, changes: Value) {
+    let scene = Scene::with_evidence(NetReply::Missing, false).await;
+    let mut track =
+        copperpour_ipc::builders::build_track("VCC", 1, "B.Cu", 0.25, 10.0, 10.0, 20.0, 10.0);
+    track.id = Some(kiapi::common::types::Kiid {
+        value: "net-reader-track".into(),
+    });
+    scene
+        .store
+        .lock()
+        .unwrap()
+        .items
+        .push(pack_any(&track, "kiapi.board.types.Track"));
+    let before = std::fs::read(&scene.board).unwrap();
+    let items = scene.store.lock().unwrap().items.clone();
+    let body = scene.call(tool, changes).await;
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("no GetNets response payload"),
+        "{tool}: {body}"
+    );
+    assert_ne!(body["error"]["kind"], "invalid_argument", "{tool}: {body}");
+    assert!(body.get("plan_revision").is_none(), "{body}");
+    let store = scene.store.lock().unwrap();
+    assert_eq!((store.creates, store.updates, store.deletes), (0, 0, 0));
+    assert_eq!(store.items, items);
+    assert_eq!(std::fs::read(&scene.board).unwrap(), before);
+}
+
+#[tokio::test]
+async fn net_reader_modify_trace_requires_response_before_update() {
+    net_reader_writer_failure("modify_trace", json!({"uuid":"net-reader-track"})).await;
+}
+
+#[tokio::test]
+async fn net_reader_apply_copper_requires_response_before_planning_or_creation() {
+    for dry_run in [true, false] {
+        net_reader_writer_failure("apply_copper", json!({
+            "tracks":[{"start":{"x":10.0,"y":10.0},"end":{"x":20.0,"y":10.0},"width":0.25,"layer":"B.Cu","net":"VCC"}],
+            "dry_run":dry_run,"expected_plan_revision":"unobserved"
+        })).await;
+    }
 }

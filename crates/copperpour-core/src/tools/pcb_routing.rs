@@ -1890,7 +1890,32 @@ async fn handle_get_nets_list(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let nets = ipc!(ctx, args, |c| c.get_nets());
+    let board_path = get_path(args, "board")?;
+    let unavailable = |reason: &str| {
+        let message = format!(
+            "KiCad did not complete the net list query for '{}': {reason}. Retry the live query; no saved-file or empty-list substitute was used.",
+            board_path.display()
+        );
+        CallToolResult::error_kind(
+            ToolErrorKind::EditorUnavailable {
+                editor: "pcb".to_string(),
+                reason: message.clone(),
+            },
+            message,
+        )
+    };
+    let nets = match with_bound_board_ipc_classified(ctx, &board_path, |client, document| {
+        client.get_nets_in(document)
+    })
+    .await?
+    {
+        Ok(BoardBinding::Bound(nets)) => nets,
+        Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
+            return Ok(crate::tools::ipc_target_error_result(&error));
+        }
+        Ok(BoardBinding::Unserved { message, .. }) => return Ok(unavailable(&message)),
+        Err(error) => return Ok(unavailable(error.message())),
+    };
     let items: Vec<serde_json::Value> = nets
         .iter()
         .map(|n| json!({ "name": n.name, "netcode": n.netcode }))

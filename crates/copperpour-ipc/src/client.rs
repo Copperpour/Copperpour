@@ -2187,36 +2187,16 @@ impl KiCadIpcClient {
     }
 
     /// As [`Self::get_nets`], targeting a specific open document.
-    pub fn get_nets_in(&self, doc: kiapi::common::types::DocumentSpecifier) -> Result<Vec<IpcNet>> {
-        self.get_nets_in_impl(doc, false)
-    }
-
-    /// As [`Self::get_nets_in`], requiring KiCad to provide a net-list response.
     /// An explicit empty list is valid; an absent response is unavailable evidence.
-    pub fn get_nets_required_in(
-        &self,
-        doc: kiapi::common::types::DocumentSpecifier,
-    ) -> Result<Vec<IpcNet>> {
-        self.get_nets_in_impl(doc, true)
-    }
-
-    fn get_nets_in_impl(
-        &self,
-        doc: kiapi::common::types::DocumentSpecifier,
-        require_response: bool,
-    ) -> Result<Vec<IpcNet>> {
+    pub fn get_nets_in(&self, doc: kiapi::common::types::DocumentSpecifier) -> Result<Vec<IpcNet>> {
         let cmd = kiapi::board::commands::GetNets {
             board: Some(doc),
             netclass_filter: vec![],
         };
-        let response_any = self.send_command(&cmd, "kiapi.board.commands.GetNets")?;
-        let resp: kiapi::board::commands::NetsResponse = if require_response {
-            unpack_required(response_any, "GetNets")?
-        } else if let Some(any) = response_any {
-            unpack_any(&any)?
-        } else {
-            return Ok(vec![]);
-        };
+        let resp: kiapi::board::commands::NetsResponse = unpack_required(
+            self.send_command(&cmd, "kiapi.board.commands.GetNets")?,
+            "GetNets",
+        )?;
         Ok(resp
             .nets
             .iter()
@@ -2225,6 +2205,14 @@ impl KiCadIpcClient {
                 netcode: n.code.as_ref().map(|c| c.value).unwrap_or(0),
             })
             .collect())
+    }
+
+    /// Compatibility alias for [`Self::get_nets_in`], which also requires a response.
+    pub fn get_nets_required_in(
+        &self,
+        doc: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<Vec<IpcNet>> {
+        self.get_nets_in(doc)
     }
 
     /// Return the effective merged routing rules for every connected net in
