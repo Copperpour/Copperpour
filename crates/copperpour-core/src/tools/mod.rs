@@ -322,6 +322,7 @@ impl ToolContext {
     /// Construct a context with an in-memory-only observer (no JSONL). Used by
     /// tests and by callers that don't need persistent call logs.
     pub fn new(config: ServerConfig, router: Arc<ToolRouter>) -> Self {
+        install_schematic_editor_owners();
         ToolContext {
             config: config.normalized(),
             router,
@@ -340,6 +341,7 @@ impl ToolContext {
         router: Arc<ToolRouter>,
         observer: crate::observability::CallObserver,
     ) -> Self {
+        install_schematic_editor_owners();
         ToolContext {
             config: config.normalized(),
             router,
@@ -1115,6 +1117,34 @@ pub(crate) fn kicad_editor_lock<'e>(
         lock_path,
         inspection_error: inspection_error.as_deref(),
     })
+}
+
+/// The editor schematics whose KiCad lock also guards a write to `path`
+/// (#428). With several candidate projects, any of them may hold the sheet.
+fn schematic_editor_owners(path: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    if path
+        .extension()
+        .is_none_or(|extension| extension != "kicad_sch")
+    {
+        return Ok(Vec::new());
+    }
+    match resolve_schematic_ownership(path) {
+        Ok(ownership) => Ok(ownership
+            .map(|o| o.editor_schematic())
+            .into_iter()
+            .collect()),
+        Err(SchematicTargetError::ProjectConflict { .. }) => Ok(candidate_project_files(path)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|project| project.with_extension("kicad_sch"))
+            .collect()),
+        Err(error) => Err(format!("the owning project's editor lock: {error}")),
+    }
+}
+
+/// Makes every schematic write in this process check its owning root's lock.
+pub(crate) fn install_schematic_editor_owners() {
+    copperpour_sexp::writer::set_editor_owners(schematic_editor_owners);
 }
 
 /// The `conflict` refusal for a schematic write that `error` shows never
