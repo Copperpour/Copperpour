@@ -5346,4 +5346,54 @@ pub(crate) mod tests {
             "{error}"
         );
     }
+
+    /// Only an `smd` pad is set aside: a drilled pad on no copper layer
+    /// (a mounting hole with its copper removed) is still refused.
+    #[test]
+    fn a_drilled_pad_on_no_copper_layer_is_still_refused() {
+        for pad_type in ["np_thru_hole", "thru_hole"] {
+            let drilled = PASTE_PADS.replacen(
+                r#"(pad "" smd roundrect"#,
+                &format!(r#"(pad "" {pad_type} roundrect"#),
+                1,
+            );
+            assert_ne!(drilled, PASTE_PADS);
+            let error = export_dsn(
+                Path::new("board.kicad_pcb"),
+                &drilled,
+                &native_fixture_rules(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("footprint contains an unnumbered pad"),
+                "{pad_type}: {error}"
+            );
+        }
+    }
+
+    /// Two pads on no copper layer that share a UUID are refused at export,
+    /// as the import side refuses them in the manifest.
+    #[test]
+    fn a_pad_on_no_copper_layer_with_a_repeated_uuid_is_refused() {
+        let repeated = PASTE_PADS.replacen(
+            "aed7a5d2-2a7b-418d-86bb-2b666374d871",
+            "a6cc1fb6-c476-4559-8318-c7e768ea2507",
+            1,
+        );
+        assert_ne!(repeated, PASTE_PADS);
+        let error = export_dsn(
+            Path::new("board.kicad_pcb"),
+            &repeated,
+            &native_fixture_rules(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(
+                "pad on no copper layer of U1 repeats the UUID a6cc1fb6-c476-4559-8318-c7e768ea2507"
+            ),
+            "{error}"
+        );
+    }
 }
