@@ -597,6 +597,21 @@ impl std::fmt::Display for UnreachableDetail {
     }
 }
 
+/// The refusal of a client built by [`KiCadIpcClient::ambiguous`].
+pub fn ambiguous_endpoint_message(candidates: &[String]) -> String {
+    format!(
+        "KiCAD IPC socket path not configured: more than one KiCad socket qualifies and \
+         not exactly one answered, so none was picked: {}. Set ipc_address to the one \
+         KiCad lists under Preferences > Plugins ('Enable KiCad API'), or quit the extra \
+         KiCad. See https://github.com/Copperpour/Copperpour/blob/main/docs/TROUBLESHOOTING.md",
+        candidates
+            .iter()
+            .map(|candidate| crate::redact_endpoint(candidate))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 /// The error for a request that never reached KiCad, carrying `reason`.
 fn unreachable_error(reason: UnreachableReason, message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(TransportUnreachable).context(UnreachableDetail {
@@ -1206,6 +1221,9 @@ impl std::fmt::Display for IpcFailure {
 
 pub struct KiCadIpcClient {
     socket_path: String,
+    /// Set only by [`Self::ambiguous`]: the sockets detection could not tell
+    /// apart, named by the not-configured refusal (#374).
+    ambiguous_candidates: Vec<String>,
     kicad_token: String,
     client_name: String,
     bound_board: std::sync::Mutex<Option<BoundBoardTarget>>,
@@ -1236,11 +1254,26 @@ impl KiCadIpcClient {
         };
         KiCadIpcClient {
             socket_path: effective_path,
+            ambiguous_candidates: Vec::new(),
             kicad_token: std::env::var("KICAD_API_TOKEN").unwrap_or_default(),
             client_name: format!("copperpour-{}", std::process::id()),
             bound_board: std::sync::Mutex::new(None),
             recovery: None,
         }
+    }
+
+    /// A client for an endpoint detection could not settle: several sockets
+    /// qualify and not exactly one answered (`IpcDetection::Ambiguous`).
+    ///
+    /// It has no address, and `KICAD_API_SOCKET` is not consulted either:
+    /// every request fails as not configured, naming `candidates`, and none
+    /// of them is dialled. The candidates are the ones detection already
+    /// found, so building this refusal costs no second round of Pings.
+    pub fn ambiguous(candidates: Vec<String>) -> Self {
+        let mut client = Self::new("");
+        client.socket_path.clear();
+        client.ambiguous_candidates = candidates;
+        client
     }
 
     /// Create a client with an explicit API token.
@@ -1277,21 +1310,10 @@ impl KiCadIpcClient {
         if self.socket_path.is_empty() {
             // Several sockets qualifying is the one unconfigured state the
             // user can settle in one step, so name them (#374).
-            if let crate::IpcDetection::Ambiguous(candidates) = crate::detect_ipc_endpoint() {
+            if !self.ambiguous_candidates.is_empty() {
                 return Err(unreachable_error(
                     UnreachableReason::NotConfigured,
-                    format!(
-                        "KiCAD IPC socket path not configured: more than one KiCad socket \
-                         qualifies and not exactly one answered, so none was picked: {}. \
-                         Set ipc_address to the one KiCad lists under Preferences > Plugins \
-                         ('Enable KiCad API'), or quit the extra KiCad. See \
-                         https://github.com/Copperpour/Copperpour/blob/main/docs/TROUBLESHOOTING.md",
-                        candidates
-                            .iter()
-                            .map(|c| crate::redact_endpoint(c))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
+                    ambiguous_endpoint_message(&self.ambiguous_candidates),
                 ));
             }
             return Err(unreachable_error(
@@ -1549,6 +1571,7 @@ impl KiCadIpcClient {
         let contents = self.recovery_snapshot_in(document.clone())?;
         let scoped = Self {
             socket_path: self.socket_path.clone(),
+            ambiguous_candidates: self.ambiguous_candidates.clone(),
             kicad_token: self.kicad_token.clone(),
             client_name: self.client_name.clone(),
             bound_board: std::sync::Mutex::new(
@@ -7171,6 +7194,29 @@ mod diagnostic_tests {
         assert!(AccessDenied
             .explanation()
             .contains("same operating-system user"));
+    }
+
+    /// An ambiguous client refuses as not configured, names every
+    /// candidate, and dials none of them: the addresses below do not exist,
+    /// so a dial would report `no_listener` instead.
+    #[test]
+    fn an_ambiguous_client_names_the_candidates_and_dials_none() {
+        let client = KiCadIpcClient::ambiguous(vec![
+            "ipc:///nonexistent/kicad/api.sock".into(),
+            "ipc:///nonexistent/kicad/api-42.sock".into(),
+        ]);
+        let outcome = client.ping_outcome();
+        assert_eq!(
+            outcome.failure_kind(),
+            Some("not_configured"),
+            "{outcome:?}"
+        );
+        let error = client.get_open_documents().unwrap_err();
+        assert!(is_transport_unreachable(&error));
+        let message = format!("{error:#}");
+        assert!(message.contains("api.sock"), "{message}");
+        assert!(message.contains("api-42.sock"), "{message}");
+        assert!(message.contains("none was picked"), "{message}");
     }
 
     #[test]

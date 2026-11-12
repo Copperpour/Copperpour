@@ -164,8 +164,12 @@ the next KiCad listens on `api-<pid>.sock` instead, and a server that only
 knew `api.sock` reported "Connection refused". Copperpour now finds that
 socket. When more than one socket qualifies (an old `api.sock` beside
 `api-<pid>.sock`, or two KiCads running), it uses the one that answers a Ping;
-if not exactly one answers, it picks none and the error lists every candidate:
-set `ipc_address` to the one KiCad shows under Preferences → Plugins. Quitting
+if not exactly one answers, it picks none and the error lists every candidate,
+on every call, never falling back to the address found at startup: set
+`ipc_address` to the one KiCad shows under Preferences → Plugins. Telling
+candidates apart sends each a Ping before the call, so a busy KiCad that does
+not answer within the 30 s reply timeout delays the call and counts as not
+answering. Quitting
 every KiCad and deleting the stale `api.lock` and `api*.sock` files also clears
 it.
 

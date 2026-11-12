@@ -1030,14 +1030,11 @@ async fn handle_check_kicad_ui(
         Ok(timeout) => timeout,
         Err(error) => return Ok(error),
     };
-    let addr = ctx.ipc_address();
+    let endpoint = ctx.ipc_endpoint();
     let started = std::time::Instant::now();
     let check = async move {
         let process_detected = task::spawn_blocking(is_kicad_running).await?;
-        let ipc = task::spawn_blocking(move || {
-            copperpour_ipc::client::KiCadIpcClient::new(&addr).ping_outcome()
-        })
-        .await?;
+        let ipc = task::spawn_blocking(move || endpoint.client().ping_outcome()).await?;
         Ok::<_, tokio::task::JoinError>((process_detected, ipc))
     };
 
@@ -1110,18 +1107,14 @@ async fn handle_launch_kicad_ui(
 
     // Poll IPC until responsive or timeout. A KiCad that exited will never
     // answer, so its exit ends the wait, even while a ping is in flight.
-    let addr = ctx.ipc_address();
+    let endpoint = ctx.ipc_endpoint();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         if let Err(message) = kicad.watch(KICAD_IPC_POLL).await {
             return Ok(CallToolResult::error(message));
         }
-        let addr2 = addr.clone();
-        let ping = task::spawn_blocking(move || {
-            copperpour_ipc::client::KiCadIpcClient::new(&addr2)
-                .ping()
-                .unwrap_or(false)
-        });
+        let endpoint = endpoint.clone();
+        let ping = task::spawn_blocking(move || endpoint.client().ping().unwrap_or(false));
         let ok = tokio::select! {
             ok = ping => ok.unwrap_or(false),
             message = kicad.exited() => return Ok(CallToolResult::error(message)),

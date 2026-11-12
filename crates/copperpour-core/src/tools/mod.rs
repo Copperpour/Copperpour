@@ -367,32 +367,41 @@ impl ToolContext {
         }
     }
 
-    /// Attach the startup configuration decision. Separate from the constructors
-    /// so the 60-plus existing `ServerConfig` call sites keep their signatures;
-    /// only the real server entry point records provenance.
     /// Re-detect KiCad's socket on each IPC call (see `ipc_rediscovery`).
     pub fn enable_ipc_rediscovery(&self) {
         self.ipc_rediscovery
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// The IPC address for this call. With rediscovery on, the socket KiCad
-    /// has now: started after Copperpour, restarted, or moved to
-    /// `api-<pid>.sock` (#374). Detection reads file metadata only and never
-    /// connects; when it finds nothing the startup address is kept, so the
-    /// caller's own bounded `Ping` reports the failure as before.
-    pub fn ipc_address(&self) -> String {
-        if self
-            .ipc_rediscovery
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            if let Some(address) = copperpour_ipc::detect_ipc_address() {
-                return address;
-            }
-        }
-        self.config.ipc_address.clone()
+    /// The IPC endpoint for this call. Read it once per call and use the same
+    /// value for the request and for anything the call reports about it.
+    ///
+    /// With rediscovery on, this is the socket KiCad has now: started after
+    /// Copperpour, restarted, or moved to `api-<pid>.sock` (#374). With one
+    /// candidate, detection reads file metadata only and never connects. With
+    /// several, it sends each one, in turn, the NNG `Ping` of
+    /// [`copperpour_ipc::KiCadIpcClient`] before the call's own request, so
+    /// the call first waits on those Pings: each is bounded by the client's
+    /// reply timeout (30 s). A candidate whose Ping times out, such as a busy
+    /// KiCad, counts as not answering, so the result is
+    /// [`IpcEndpoint::Ambiguous`] unless exactly one other candidate
+    /// answered, and the call is refused as not configured.
+    ///
+    /// The startup address is kept only when detection finds nothing, so the
+    /// caller's own `Ping` reports the failure as before. It is never used
+    /// when several sockets qualify: that would be the guess #374 rules out.
+    pub fn ipc_endpoint(&self) -> IpcEndpoint {
+        endpoint_for(
+            self.ipc_rediscovery
+                .load(std::sync::atomic::Ordering::Relaxed),
+            &self.config.ipc_address,
+            copperpour_ipc::detect_ipc_endpoint,
+        )
     }
 
+    /// Attach the startup configuration decision. Separate from the constructors
+    /// so the 60-plus existing `ServerConfig` call sites keep their signatures;
+    /// only the real server entry point records provenance.
     pub fn with_config_resolution(
         mut self,
         resolution: crate::config_resolution::ConfigResolution,
@@ -641,6 +650,67 @@ pub(crate) fn compile_input_validator(
 
 // ─── IPC helpers ──────────────────────────────────────────────────────────────
 
+/// The KiCad IPC endpoint one tool call uses, from [`ToolContext::ipc_endpoint`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcEndpoint {
+    /// Dial this address. Empty means none is configured or detected; the
+    /// client then reports `not_configured`.
+    Address(String),
+    /// Several sockets qualify and not exactly one answered a Ping (#374).
+    /// No address: every request is refused as not configured, naming these.
+    Ambiguous(Vec<String>),
+}
+
+impl IpcEndpoint {
+    /// The client for this endpoint. An ambiguous one dials nothing.
+    pub fn client(&self) -> copperpour_ipc::KiCadIpcClient {
+        match self {
+            IpcEndpoint::Address(address) => copperpour_ipc::KiCadIpcClient::new(address.clone()),
+            IpcEndpoint::Ambiguous(candidates) => {
+                copperpour_ipc::KiCadIpcClient::ambiguous(candidates.clone())
+            }
+        }
+    }
+
+    /// The address to report: empty when there is none to dial.
+    pub fn address(&self) -> &str {
+        match self {
+            IpcEndpoint::Address(address) => address,
+            IpcEndpoint::Ambiguous(_) => "",
+        }
+    }
+
+    /// Why no request can be sent, when that is known without sending one.
+    pub fn unavailable_reason(&self) -> Option<String> {
+        match self {
+            IpcEndpoint::Address(address) if address.is_empty() => {
+                Some("no KiCad IPC endpoint is configured".to_string())
+            }
+            IpcEndpoint::Address(_) => None,
+            IpcEndpoint::Ambiguous(candidates) => Some(
+                copperpour_ipc::client::ambiguous_endpoint_message(candidates),
+            ),
+        }
+    }
+}
+
+/// [`ToolContext::ipc_endpoint`]'s decision, with detection supplied so a test
+/// can state its outcome. Detection runs only with rediscovery on.
+fn endpoint_for(
+    rediscovery: bool,
+    startup: &str,
+    detect: impl FnOnce() -> copperpour_ipc::IpcDetection,
+) -> IpcEndpoint {
+    if !rediscovery {
+        return IpcEndpoint::Address(startup.to_string());
+    }
+    match detect() {
+        copperpour_ipc::IpcDetection::Found(address) => IpcEndpoint::Address(address),
+        copperpour_ipc::IpcDetection::Ambiguous(candidates) => IpcEndpoint::Ambiguous(candidates),
+        copperpour_ipc::IpcDetection::NotFound => IpcEndpoint::Address(startup.to_string()),
+    }
+}
+
 /// Run `f` against KiCad's IPC API, classifying a failure as
 /// transport-unreachable vs KiCad-rejected via [`copperpour_ipc::IpcFailure`].
 ///
@@ -650,7 +720,7 @@ pub(crate) fn compile_input_validator(
 /// KiCad?) whose copies must not drift, as the per-toolset `with_ipc` helpers
 /// this and `with_ipc` replaced had.
 pub async fn with_ipc_classified<T, F>(
-    address: String,
+    endpoint: IpcEndpoint,
     f: F,
 ) -> anyhow::Result<Result<T, copperpour_ipc::IpcFailure>>
 where
@@ -658,8 +728,8 @@ where
     F: FnOnce(&copperpour_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
 {
     match tokio::task::spawn_blocking(move || {
-        f(&copperpour_ipc::client::KiCadIpcClient::new(&address)).map_err(|error| {
-            warn_if_ipc_unreachable(&address, &error);
+        f(&endpoint.client()).map_err(|error| {
+            warn_if_ipc_unreachable(endpoint.address(), &error);
             copperpour_ipc::IpcFailure::from_error(error)
         })
     })
@@ -847,7 +917,7 @@ where
     let requested = board_path.to_path_buf();
     let observation = requested.clone();
     let memory = ctx.board_session.clone();
-    with_ipc_classified(ctx.ipc_address(), move |client| {
+    with_ipc_classified(ctx.ipc_endpoint(), move |client| {
         let document = match client.find_open_board(&requested) {
             Ok(document) => document,
             // Classified by the typed status in the chain, never by message
@@ -876,14 +946,14 @@ where
 /// Callers that edit board files when this fails want
 /// [`with_ipc_classified`] instead: only the classification says whether a
 /// live KiCad could be holding the board.
-pub(crate) async fn with_ipc<T, F>(address: String, f: F) -> anyhow::Result<Result<T, String>>
+pub(crate) async fn with_ipc<T, F>(endpoint: IpcEndpoint, f: F) -> anyhow::Result<Result<T, String>>
 where
     T: Send + 'static,
     F: FnOnce(&copperpour_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
 {
     match tokio::task::spawn_blocking(move || {
-        f(&copperpour_ipc::client::KiCadIpcClient::new(&address)).map_err(|error| {
-            warn_if_ipc_unreachable(&address, &error);
+        f(&endpoint.client()).map_err(|error| {
+            warn_if_ipc_unreachable(endpoint.address(), &error);
             format!("{error:#}")
         })
     })
@@ -4147,33 +4217,72 @@ mod unwritten_schematic_refusal_tests {
 #[cfg(test)]
 mod ipc_rediscovery_tests {
     use super::*;
+    use copperpour_ipc::IpcDetection;
 
-    fn context(address: &str) -> ToolContext {
-        ToolContext::new(
+    const STARTUP: &str = "ipc:///startup/api.sock";
+
+    /// Without rediscovery the startup address is used as given, and
+    /// detection does not run: what every test context and every configured
+    /// address relies on.
+    #[test]
+    fn without_rediscovery_the_startup_address_is_kept_and_nothing_is_detected() {
+        let endpoint = endpoint_for(false, STARTUP, || panic!("detection must not run"));
+        assert_eq!(endpoint, IpcEndpoint::Address(STARTUP.into()));
+    }
+
+    #[test]
+    fn with_rediscovery_the_socket_found_now_wins() {
+        let endpoint = endpoint_for(true, STARTUP, || {
+            IpcDetection::Found("ipc:///tmp/kicad/api-42.sock".into())
+        });
+        assert_eq!(
+            endpoint,
+            IpcEndpoint::Address("ipc:///tmp/kicad/api-42.sock".into())
+        );
+    }
+
+    #[test]
+    fn with_rediscovery_nothing_found_keeps_the_startup_address() {
+        let endpoint = endpoint_for(true, STARTUP, || IpcDetection::NotFound);
+        assert_eq!(endpoint, IpcEndpoint::Address(STARTUP.into()));
+    }
+
+    /// Several qualifying sockets never fall back to the startup one, even
+    /// when the startup one is among them (#374): no address, every
+    /// candidate named, and the client dials none of them.
+    #[test]
+    fn with_rediscovery_an_ambiguous_detection_never_uses_the_startup_address() {
+        let candidates = vec![
+            STARTUP.to_string(),
+            "ipc:///startup/api-42.sock".to_string(),
+        ];
+        let endpoint = endpoint_for(true, STARTUP, || {
+            IpcDetection::Ambiguous(candidates.clone())
+        });
+        assert_eq!(endpoint, IpcEndpoint::Ambiguous(candidates));
+        assert_eq!(endpoint.address(), "");
+        let reason = endpoint.unavailable_reason().expect("refused");
+        assert!(reason.contains("api-42.sock"), "{reason}");
+        assert_eq!(
+            endpoint.client().ping_outcome().failure_kind(),
+            Some("not_configured")
+        );
+    }
+
+    /// The context reads its own flag and startup address; a context built
+    /// for tests has rediscovery off.
+    #[test]
+    fn a_test_context_keeps_its_configured_address() {
+        let ctx = ToolContext::new(
             ServerConfig {
-                ipc_address: address.to_string(),
+                ipc_address: "ipc:///configured/api.sock".to_string(),
                 ..ServerConfig::default()
             },
             Arc::new(ToolRouter::new()),
-        )
-    }
-
-    /// Without rediscovery the startup address is used as given: what every
-    /// test context and every configured address relies on.
-    #[test]
-    fn the_startup_address_is_kept_by_default() {
-        let ctx = context("ipc:///configured/api.sock");
-        assert_eq!(ctx.ipc_address(), "ipc:///configured/api.sock");
-    }
-
-    /// With rediscovery the socket found now wins, and the startup address
-    /// is kept when nothing is found.
-    #[test]
-    fn rediscovery_uses_what_detection_finds_now() {
-        let ctx = context("ipc:///startup/api.sock");
-        ctx.enable_ipc_rediscovery();
-        let expected = copperpour_ipc::detect_ipc_address()
-            .unwrap_or_else(|| "ipc:///startup/api.sock".to_string());
-        assert_eq!(ctx.ipc_address(), expected);
+        );
+        assert_eq!(
+            ctx.ipc_endpoint(),
+            IpcEndpoint::Address("ipc:///configured/api.sock".into())
+        );
     }
 }
