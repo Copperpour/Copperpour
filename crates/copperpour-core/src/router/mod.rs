@@ -213,6 +213,7 @@ mod tests {
                         "edit_schematic_component/properties/fields" |
                         "edit_schematic_component/properties/field_placements" |
                         "batch_edit_schematic_components/properties/edits/items/properties/fields" |
+                        "batch_edit_schematic_components/properties/edits/items/properties/field_placements" |
                         "create_symbol/properties/fields" |
                         "set_symbol_properties/properties/fields" |
                         "set_symbol_properties/properties/rename_fields" |
