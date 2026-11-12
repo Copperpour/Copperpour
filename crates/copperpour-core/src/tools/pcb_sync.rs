@@ -2419,15 +2419,16 @@ fn board_layer_name(layer: i32) -> String {
 }
 
 /// What a zone pours: a copper zone its own net (`Zone.copper_settings.net`,
-/// empty for a zone on no net), a rule area nothing (#779).
+/// empty for a zone on no net), a rule area nothing (#779). Shared with
+/// `update_footprints_from_library`'s routed-net snapshot (#102).
 #[derive(Debug, PartialEq)]
-enum ZoneNet {
+pub(crate) enum ZoneNet {
     Copper(copperpour_ipc::gen::kiapi::board::types::Net),
     RuleArea,
     Unreadable,
 }
 
-fn zone_net(bytes: &[u8]) -> ZoneNet {
+pub(crate) fn zone_net(bytes: &[u8]) -> ZoneNet {
     use copperpour_ipc::gen::kiapi::board::types::{zone::Settings, Zone};
     match Zone::decode(bytes).map(|zone| zone.settings) {
         Ok(Some(Settings::CopperSettings(copper))) => {

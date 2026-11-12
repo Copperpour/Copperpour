@@ -625,10 +625,22 @@ fn snapshot_routed_nets(
             }
         }
     }
-    if !client
-        .get_items_in(document.clone(), ObjectType::KotPcbZone)?
-        .is_empty()
-    {
+    // A copper zone is copper on its own net only, and a rule area on none,
+    // as in `update_pcb_from_schematic` (#779, #102).
+    let mut unreadable_zone = false;
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbZone)? {
+        match super::pcb_sync::zone_net(item.value.as_slice()) {
+            super::pcb_sync::ZoneNet::Copper(net) => {
+                if !net.name.is_empty() {
+                    routed.insert(net.name);
+                }
+            }
+            super::pcb_sync::ZoneNet::RuleArea => {}
+            super::pcb_sync::ZoneNet::Unreadable => unreadable_zone = true,
+        }
+    }
+    if unreadable_zone {
+        // A zone whose net cannot be read could pour any net.
         routed.extend(
             client
                 .get_nets_in(document)?
@@ -4540,6 +4552,95 @@ mod tests {
             .unwrap()
             .contains("live-IPC-only"));
         assert_eq!(std::fs::read_to_string(board).unwrap(), before);
+    }
+
+    /// #102: KiCad's captured `GND` pour and rule area (`issue_474_ipc.README.md`)
+    /// mark only `GND` as routed copper, as `update_pcb_from_schematic` counts
+    /// them (#779), so a removed pad on `SIG` is not reported "with routed
+    /// copper". A pour whose net cannot be read still marks every net.
+    #[test]
+    fn a_pour_marks_only_its_own_net_as_routed() {
+        use kiapi::common::types::KiCadObjectType as ObjectType;
+        const GND_POUR: &[u8] =
+            include_bytes!("../../tests/fixtures/issue_474_copper_zone_0.ipc.bin");
+        const RULE_AREA: &[u8] = include_bytes!("../../tests/fixtures/issue_474_zone_0.ipc.bin");
+        let zone = |bytes: &[u8]| prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.Zone".to_string(),
+            value: bytes.to_vec(),
+        };
+        let mut netless = kiapi::board::types::Zone::decode(GND_POUR).unwrap();
+        let Some(kiapi::board::types::zone::Settings::CopperSettings(copper)) =
+            netless.settings.as_mut()
+        else {
+            panic!("the captured pour is a copper zone");
+        };
+        copper.net = None;
+        let netless = zone(&netless.encode_to_vec());
+
+        let routed = |zones: Vec<prost_types::Any>| {
+            let kicad = crate::test_support::MockIpcServer::spawn("routed-nets", move |request| {
+                let message = request.message.expect("request message");
+                if message.type_url.ends_with("GetItems") {
+                    let command =
+                        kiapi::common::commands::GetItems::decode(message.value.as_slice())
+                            .unwrap();
+                    let items = if command.types == [ObjectType::KotPcbTrace as i32] {
+                        vec![builders::pack_any(
+                            &kiapi::board::types::Track {
+                                net: Some(builders::net("VCC", 1)),
+                                ..Default::default()
+                            },
+                            "kiapi.board.types.Track",
+                        )]
+                    } else if command.types == [ObjectType::KotPcbZone as i32] {
+                        zones.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    api_reply(builders::pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items,
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ))
+                } else if message.type_url.ends_with("GetNets") {
+                    api_reply(builders::pack_any(
+                        &kiapi::board::commands::NetsResponse {
+                            nets: vec![
+                                builders::net("VCC", 1),
+                                builders::net("GND", 2),
+                                builders::net("SIG", 3),
+                            ],
+                        },
+                        "kiapi.board.commands.NetsResponse",
+                    ))
+                } else {
+                    panic!("unexpected request {}", message.type_url)
+                }
+            });
+            let client = copperpour_ipc::KiCadIpcClient::new(kicad.address().to_string());
+            let document = kiapi::common::types::DocumentSpecifier {
+                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                identifier: Some(
+                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                        "poured.kicad_pcb".to_string(),
+                    ),
+                ),
+                project: None,
+            };
+            snapshot_routed_nets(&client, document).unwrap()
+        };
+
+        assert_eq!(
+            routed(vec![zone(GND_POUR), zone(RULE_AREA)]),
+            BTreeSet::from(["GND".to_string(), "VCC".to_string()])
+        );
+        assert_eq!(
+            routed(vec![zone(GND_POUR), netless]),
+            BTreeSet::from(["GND", "SIG", "VCC"].map(String::from))
+        );
     }
 
     #[derive(Default)]
