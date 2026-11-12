@@ -51,7 +51,8 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of violations to return",
+                        "description": "Maximum violations to display (0 for counts only). Full DRC and output report are unaffected.",
+                        "minimum": 0,
                         "default": 50
                     }
                 },
@@ -279,7 +280,10 @@ async fn handle_run_drc(
     let board = get_path(args, "board")?;
     let severity_filter = args["severity"].as_str().unwrap_or("warning");
     let min_rank = severity_rank(severity_filter);
-    let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+    let limit = match super::response_limit(args, 50) {
+        Ok(limit) => limit,
+        Err(error) => return Ok(error),
+    };
 
     let (report, provenance) = match super::drc::run(ctx, &board, args).await? {
         Ok(result) => result,
@@ -304,8 +308,7 @@ async fn handle_run_drc(
 
     let errors = filtered.iter().filter(|v| v.severity == "error").count();
     let warnings = filtered.iter().filter(|v| v.severity == "warning").count();
-    let shown = filtered.len().min(limit);
-    let truncated = filtered.len() > limit;
+    let bounded = super::BoundedList::new(&filtered, limit);
     let missing = report.missing_categories();
 
     Ok(CallToolResult::text(
@@ -330,9 +333,9 @@ async fn handle_run_drc(
             "errors": errors,
             "warnings": warnings,
             "severity_filter": severity_filter,
-            "shown": shown,
-            "truncated": truncated,
-            "violations": filtered.iter().take(limit).map(|v| json!({
+            "shown": bounded.shown,
+            "truncated": bounded.truncated,
+            "violations": bounded.items.iter().map(|v| json!({
                 "severity": v.severity,
                 "rule": v.rule,
                 "description": v.description,

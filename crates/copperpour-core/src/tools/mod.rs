@@ -2161,6 +2161,21 @@ pub(crate) const FALLBACK_VALUE_AT: (f64, f64, f64) = (0.0, -3.81, 0.0);
 
 // ─── Response helpers ────────────────────────────────────────────────────────
 
+/// Read a presentation limit without narrowing through `u64` or silently
+/// defaulting malformed direct calls. JSON Schema also accepts integral floats.
+pub(crate) fn response_limit(
+    args: &serde_json::Value,
+    default: usize,
+) -> Result<usize, CallToolResult> {
+    match args.get("limit") {
+        None => Ok(default),
+        Some(value) => match value.as_f64() {
+            Some(limit) if limit >= 0.0 && limit.fract() == 0.0 => Ok(limit as usize),
+            _ => Err(invalid_arg("limit", "expected a non-negative integer")),
+        },
+    }
+}
+
 /// The first `limit` entries of a list a response renders, with how many it
 /// holds (#69), for the `shown` and `truncated` that `run_drc` reports
 /// beside its list.
@@ -2190,6 +2205,27 @@ impl<'a, T> BoundedList<'a, T> {
 #[cfg(test)]
 mod bounded_list_tests {
     use super::BoundedList;
+
+    #[test]
+    fn bounded_response_limit_accepts_integral_numbers_and_refuses_bad_direct_calls() {
+        for (args, expected) in [
+            (serde_json::json!({}), 50),
+            (serde_json::json!({"limit":0}), 0),
+            (serde_json::json!({"limit":1.0}), 1),
+            (serde_json::json!({"limit": u64::MAX}), usize::MAX),
+        ] {
+            assert_eq!(super::response_limit(&args, 50).unwrap(), expected);
+        }
+        for limit in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(null),
+            serde_json::json!("1"),
+            serde_json::json!(true),
+        ] {
+            assert!(super::response_limit(&serde_json::json!({"limit": limit}), 50).is_err());
+        }
+    }
 
     #[test]
     fn a_list_over_its_limit_shows_the_first_entries_and_counts_them_all() {

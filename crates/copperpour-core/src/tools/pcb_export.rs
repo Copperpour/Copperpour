@@ -463,6 +463,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Optional path to write DRC report JSON" },
                     "sync_live_board": { "type": "boolean", "default": false, "description": "Bind the requested open board, optionally refill, save and verify its persisted snapshot before CLI DRC. Finish other mutations first." },
                     "refill_zones": { "type": "boolean", "default": false, "description": "Refill before checking: persisted IPC fill with sync_live_board, analysis-only CLI fill otherwise." },
+                    "limit": { "type": "integer", "minimum": 0, "default": 50, "description": "Maximum violations to display (0 for counts only). Full DRC and output report are unaffected; shown/truncated describe the displayed list." },
                     "severity": {
                         "type": "string",
                         "description": "Minimum severity to include: 'error', 'warning' (default), 'info'",
@@ -1118,6 +1119,10 @@ async fn handle_get_drc_violations(
     let board = get_path(args, "board")?;
     let severity_filter = args["severity"].as_str().unwrap_or("warning");
     let min_rank = severity_rank(severity_filter);
+    let limit = match super::response_limit(args, 50) {
+        Ok(limit) => limit,
+        Err(error) => return Ok(error),
+    };
 
     let (report, provenance) = match super::drc::run(ctx, &board, args).await? {
         Ok(result) => result,
@@ -1142,6 +1147,7 @@ async fn handle_get_drc_violations(
         .filter(|v| severity_rank(&v.severity) >= min_rank)
         .collect();
 
+    let bounded = super::BoundedList::new(&filtered, limit);
     let summary = json!({
         "total": report.all().count(),
         "source": provenance.source,
@@ -1155,7 +1161,9 @@ async fn handle_get_drc_violations(
         "schematic_parity_diagnostic": report.schematic_parity_diagnostic,
         "filtered_count": filtered.len(),
         "severity_filter": severity_filter,
-        "violations": filtered.iter().map(|v| json!({
+        "shown": bounded.shown,
+        "truncated": bounded.truncated,
+        "violations": bounded.items.iter().map(|v| json!({
             "severity": v.severity,
             "rule": v.rule,
             "description": v.description,

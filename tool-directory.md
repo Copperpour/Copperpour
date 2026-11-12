@@ -364,7 +364,7 @@ and Windows servers do not.
 | `export_ipc2581` | Export the PCB in IPC-2581 format using kicad-cli — a unified fab/assembly/test data format. |
 | `export_odb` | Export the PCB in ODB++ format using kicad-cli — a unified fabrication data format. |
 | `refill_zones` | Refill every copper pour zone over KiCad IPC. Per-zone selection is not available; requires a running KiCad with the board open. |
-| `get_drc_violations` | Run the Design Rule Check and return a list of violations. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — resolved by exact UUID against the board that was checked. |
+| `get_drc_violations` | Run the complete Design Rule Check and return up to `limit` violations (default 50), with full totals and `shown`/`truncated`; optional `output` writes the full report. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — resolved by exact UUID against the board that was checked. |
 
 ---
 
@@ -387,13 +387,13 @@ and Windows servers do not.
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
 | `set_symbol_properties` | Set the Value, Footprint, Description, keywords, footprint filters or custom fields of an existing library symbol, or rename or remove its custom fields, with a revision-checked write, reporting each field's previous and current value. Empty keywords or filters remove their property. |
 | `edit_symbol_pin` | Set the electrical type, graphic style, name, number, position, angle or length of one pin of an existing library symbol, chosen by number, and by unit or body style where the number is in more than one, refusing a number KiCad's symbol checker would call a duplicate, with a revision-checked write, reporting each changed part's previous and current value. |
-| `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
+| `list_symbols_in_library` | List symbol names in a `.kicad_sym` file, up to `limit` (default 100), with full `count` and `shown`/`truncated`. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |
-| `search_symbols` | Search for symbols across all registered libraries by name or keyword. |
+| `search_symbols` | Search registered symbol libraries by name or keyword, up to `limit` (default 50); `count`/`shown` count returned matches and `truncated` identifies an additional match. |
 | `list_library_footprints` | List all footprints in a specific registered library (`.pretty` directory). |
 | `get_footprint_info` | Return detailed information about a footprint. Set `include_graphics` (and optionally `graphics_layer`) to inspect supported top-level primitives, geometry, stroke, fill, and item IDs. |
-| `search_footprints` | Search for footprints across all registered libraries by name or keyword. |
+| `search_footprints` | Search registered footprint libraries by name, up to `limit` (default 50); `count`/`shown` count returned matches and `truncated` identifies an additional match. |
 | `get_symbol_info` | Return detailed information about a schematic symbol: pins, properties, description. |
 
 ---
@@ -433,7 +433,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 | Tool | Description |
 |------|-------------|
-| `run_drc` | Run KiCad's complete configured DRC ruleset — schematic parity included when the board's project has a root schematic to compare against, reported as unchecked (`null`, with a diagnostic quoting KiCad) when KiCad says it could not fetch one — and return structured violation results. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. |
+| `run_drc` | Run KiCad's complete configured DRC ruleset — schematic parity included when the board's project has a root schematic to compare against, reported as unchecked (`null`, with a diagnostic quoting KiCad) when KiCad says it could not fetch one — and return up to `limit` structured violations (default 50), with complete counts and `shown`/`truncated`; optional `output` writes the full report. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. |
 | `set_design_rules` | Set board-level design rules (clearance, trace width, via size, via annular width, hole clearance, copper-to-edge clearance, silkscreen text height and thickness) in the sibling `.kicad_pro` project file. The board file is not modified. |
 | `get_design_rules` | Return the current design rule constraints from the sibling `.kicad_pro` project file. |
 | `set_predefined_sizes` | Write the PCB editor Pre-defined Sizes list (track widths and via pad/drill pairs) into the sibling `.kicad_pro`. These fill the Track/Via dropdowns; they are not DRC limits. |
