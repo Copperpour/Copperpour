@@ -191,13 +191,15 @@ impl BrowserViewer {
             worker: Some(worker),
         })
     }
-    /// Whether both owned service tasks are still running.
+    /// Whether both owned tasks are still running and shutdown is not requested.
     pub fn is_running(&self) -> bool {
         self.server.as_ref().is_some_and(|task| !task.is_finished())
             && self.worker.as_ref().is_some_and(|task| !task.is_finished())
             && !*self.stop.borrow()
     }
-    fn signal_stop(&mut self) {
+    /// Signal shutdown without consuming the handle. Health becomes false
+    /// immediately; use `shutdown().await` to wait for owned tasks to finish.
+    pub fn request_shutdown(&self) {
         self.watcher.lock().unwrap().take();
         self.stop.send_replace(true);
         let mut last = self.shared.events.borrow().clone();
@@ -206,7 +208,7 @@ impl BrowserViewer {
     }
     /// Wait for the render worker (including a cancelled CLI) and HTTP server.
     pub async fn shutdown(mut self) {
-        self.signal_stop();
+        self.request_shutdown();
         if let Some(mut worker) = self.worker.take() {
             if tokio::time::timeout(Duration::from_secs(3), &mut worker)
                 .await
@@ -229,7 +231,7 @@ impl BrowserViewer {
 }
 impl Drop for BrowserViewer {
     fn drop(&mut self) {
-        self.signal_stop();
+        self.request_shutdown();
     }
 }
 // Own accepted connections as well as the listener. Aborting an axum::serve

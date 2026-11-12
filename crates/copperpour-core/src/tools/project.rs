@@ -560,6 +560,14 @@ async fn handle_open_viewer(
     };
     let root = match sch_path.canonicalize() {
         Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::FileNotFound {
+                    path: sch_path.display().to_string(),
+                },
+                format!("Viewer schematic not found: {}", sch_path.display()),
+            ));
+        }
         Err(error) => {
             return Ok(CallToolResult::error(format!(
                 "Resolve viewer schematic '{}': {error}",

@@ -1,5 +1,35 @@
 # Troubleshooting
 
+## Schematic viewer without a desktop session
+
+On current `main`, `open_schematic_viewer` uses the loopback browser service
+instead of launching the Tauri/GTK application. It can serve saved schematics
+when the MCP client's server environment has no `DISPLAY`, `WAYLAND_DISPLAY`,
+or `XDG_RUNTIME_DIR`. Set `open_browser: false` for headless or remote use:
+
+```json
+{"schematic": "/absolute/project/root.kicad_sch", "open_browser": false}
+```
+
+Open the returned private `url` in a browser yourself. A default OS-opener failure
+is reported separately in `browser_launch_error`; it does not stop a successfully
+started service or remove the returned URL. The viewer displays saved files,
+so save the schematic before expecting edits to appear. For remote use, forward
+the returned loopback port to the same local port, preserving `127.0.0.1`
+and the URL's private credential fragment;
+see [viewer service contract](../crates/copperpour-viewer/README.md#service-contract).
+
+If `open_schematic_viewer` still reports `Failed to initialize GTK`, check
+`get_installation_info`: restart the MCP client with a build containing the
+browser-backed tool (merged in #439), or upgrade when that release is available.
+Older installed binaries keep their previous behavior.
+
+The deprecated standalone `schematic-viewer` command still uses GTK/WebKit and
+needs a usable desktop session. When running that legacy command, provide the
+appropriate `DISPLAY` or `WAYLAND_DISPLAY`, plus `XDG_RUNTIME_DIR` where required,
+through the launching client's environment. The browser-backed MCP tool does
+not require those desktop-session variables.
+
 ## JLCPCB assembly cannot obtain native midpoint geometry
 
 Open the exact requested `.kicad_pcb` in PCB Editor and enable KiCad IPC.
