@@ -2083,7 +2083,7 @@ mod specctra_rotation_served_tests {
             &std::fs::read_to_string(body["manifest_output_path"].as_str().unwrap()).unwrap(),
         )
         .unwrap();
-        assert_eq!(manifest["schema_version"], 3);
+        assert_eq!(manifest["schema_version"], 4);
         let j1 = manifest["components"]
             .as_array()
             .unwrap()

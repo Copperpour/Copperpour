@@ -1,0 +1,154 @@
+(pcb board.dsn
+  (parser
+    (string_quote ")
+    (space_in_quoted_tokens on)
+    (host_cad "KiCad's Pcbnew")
+    (host_version "10.0.8-10.0.8~ubuntu24.04.1")
+  )
+  (resolution um 10)
+  (unit um)
+  (structure
+    (layer F.Cu
+      (type signal)
+      (property
+        (index 0)
+      )
+    )
+    (layer B.Cu
+      (type signal)
+      (property
+        (index 1)
+      )
+    )
+    (boundary
+      (path pcb 0  130000 -70000  80000 -70000  80000 -30000  130000 -30000
+            130000 -70000)
+    )
+    (via "Via[0-1]_600:300_um")
+    (rule
+      (width 200)
+      (clearance 200)
+      (clearance 50 (type smd_smd))
+    )
+  )
+  (placement
+    (component Resistor_SMD:R_0402
+      (place R1 100000 -50000 front 0 (PN 10k))
+      (place R2 110000 -50000 front 0 (PN 4.7k))
+    )
+    (component "TO-252-2"
+      (place U1 120000 -40000 front 0 (PN "TO-252-2"))
+    )
+    (component "TO-263-2"
+      (place U2 118000 -60000 back 0 (PN "TO-263-2"))
+    )
+  )
+  (library
+    (image Resistor_SMD:R_0402
+      (pin Rect[T]Pad_600.000000x500.000000_um 1 -500 0)
+      (pin Rect[T]Pad_600.000000x500.000000_um 2 500 0)
+    )
+    (image "TO-252-2"
+      (outline (polygon signal 0  4705 -3495  -6385 -3495  -6385 3495  4705 3495))
+      (outline (path signal 120  -3310 3450  -3310 3180))
+      (outline (path signal 120  -3310 -3450  -3310 -3180))
+      (outline (path signal 120  3110 3450  -3310 3450))
+      (outline (path signal 120  3110 -3450  -3310 -3450))
+      (outline (path signal 100  -5810 2655  -5810 1905))
+      (outline (path signal 100  -5810 1905  -3110 1905))
+      (outline (path signal 100  -5810 -1905  -5810 -2655))
+      (outline (path signal 100  -5810 -2655  -3110 -2655))
+      (outline (path signal 100  -3110 -1905  -5810 -1905))
+      (outline (path signal 100  -2705 2655  -5810 2655))
+      (outline (path signal 100  3110 2700  4110 2700))
+      (outline (path signal 100  4110 2700  4110 -2700))
+      (outline (path signal 100  4110 -2700  3110 -2700))
+      (pin RoundRect[T]Pad_2200.000000x1200.000000_250.951000_um_0.000000_0 1 -5040 2280)
+      (pin RoundRect[T]Pad_6400.000000x5800.000000_250.948000_um_0.000000_0 2 1260 0)
+      (pin RoundRect[T]Pad_2200.000000x1200.000000_250.951000_um_0.000000_0 3 -5040 -2280)
+    )
+    (image "TO-263-2"
+      (outline (polygon signal 0  -10195 5645  6445 5645  6445 -5645  -10195 -5645))
+      (outline (path signal 120  -3460 5200  -4825 5200))
+      (outline (path signal 120  -3460 -5200  -4825 -5200))
+      (outline (path signal 120  -4825 5200  -4825 3390))
+      (outline (path signal 120  -4825 -5200  -4825 -3390))
+      (outline (path signal 100  5625 5000  5625 -5000))
+      (outline (path signal 100  5625 -5000  4625 -5000))
+      (outline (path signal 100  4625 5000  5625 5000))
+      (outline (path signal 100  -4625 3040  -9325 3040))
+      (outline (path signal 100  -4625 -2040  -9325 -2040))
+      (outline (path signal 100  -9325 3040  -9325 2040))
+      (outline (path signal 100  -9325 2040  -4625 2040))
+      (outline (path signal 100  -9325 -2040  -9325 -3040))
+      (outline (path signal 100  -9325 -3040  -4625 -3040))
+      (pin RoundRect[T]Pad_4600.000000x1100.000000_250.951000_um_0.000000_0 1 -7650 2540)
+      (pin RoundRect[T]Pad_9400.000000x10800.000000_250.953000_um_0.000000_0 2 1500 0)
+      (pin RoundRect[T]Pad_4600.000000x1100.000000_250.951000_um_0.000000_0 3 -7650 -2540)
+    )
+    (padstack RoundRect[T]Pad_2200.000000x1200.000000_250.951000_um_0.000000_0
+      (shape (polygon F.Cu 0  -1100.95 350  -1081.85 446.035  -1027.45 527.449  -946.035 581.848
+            -849.999 600.95  850 600.951  946.035 581.848  1027.45 527.449
+            1081.85 446.035  1100.95 349.999  1100.95 -350  1081.85 -446.035
+            1027.45 -527.449  946.035 -581.848  849.999 -600.95  -850 -600.951
+            -946.035 -581.848  -1027.45 -527.449  -1081.85 -446.035  -1100.95 -349.999
+            -1100.95 350))
+      (attach off)
+    )
+    (padstack RoundRect[T]Pad_4600.000000x1100.000000_250.951000_um_0.000000_0
+      (shape (polygon F.Cu 0  -2300.95 300  -2281.85 396.035  -2227.45 477.449  -2146.03 531.848
+            -2050 550.95  2050 550.951  2146.03 531.848  2227.45 477.449
+            2281.85 396.035  2300.95 299.999  2300.95 -300  2281.85 -396.035
+            2227.45 -477.449  2146.03 -531.848  2050 -550.95  -2050 -550.951
+            -2146.03 -531.848  -2227.45 -477.449  -2281.85 -396.035  -2300.95 -299.999
+            -2300.95 300))
+      (attach off)
+    )
+    (padstack RoundRect[T]Pad_6400.000000x5800.000000_250.948000_um_0.000000_0
+      (shape (polygon F.Cu 0  -3200.95 2650  -3181.85 2746.04  -3127.45 2827.45  -3046.04 2881.85
+            -2950 2900.95  2950 2900.95  3046.04 2881.85  3127.45 2827.45
+            3181.85 2746.04  3200.95 2650  3200.95 -2650  3181.85 -2746.04
+            3127.45 -2827.45  3046.04 -2881.85  2950 -2900.95  -2950 -2900.95
+            -3046.04 -2881.85  -3127.45 -2827.45  -3181.85 -2746.04  -3200.95 -2650
+            -3200.95 2650))
+      (attach off)
+    )
+    (padstack RoundRect[T]Pad_9400.000000x10800.000000_250.953000_um_0.000000_0
+      (shape (polygon F.Cu 0  -4700.95 5150  -4681.85 5246.03  -4627.45 5327.45  -4546.03 5381.85
+            -4450 5400.95  4450 5400.95  4546.03 5381.85  4627.45 5327.45
+            4681.85 5246.03  4700.95 5150  4700.95 -5150  4681.85 -5246.03
+            4627.45 -5327.45  4546.03 -5381.85  4450 -5400.95  -4450 -5400.95
+            -4546.03 -5381.85  -4627.45 -5327.45  -4681.85 -5246.03  -4700.95 -5150
+            -4700.95 5150))
+      (attach off)
+    )
+    (padstack Rect[T]Pad_600.000000x500.000000_um
+      (shape (rect F.Cu -300 -250 300 250))
+      (attach off)
+    )
+    (padstack "Via[0-1]_600:300_um"
+      (shape (circle F.Cu 600))
+      (shape (circle B.Cu 600))
+      (attach off)
+    )
+  )
+  (network
+    (net VCC
+      (pins R1-1 R2-2 U1-1 U2-1)
+    )
+    (net GND
+      (pins R1-2 R2-1 U1-2 U2-2)
+    )
+    (class kicad_default GND VCC
+      (circuit
+        (use_via "Via[0-1]_600:300_um")
+      )
+      (rule
+        (width 200)
+        (clearance 200)
+      )
+    )
+  )
+  (wiring
+  )
+)
