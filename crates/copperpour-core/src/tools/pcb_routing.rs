@@ -518,6 +518,47 @@ fn board_is_kicad_10(tree: &copperpour_sexp::SexpNode) -> bool {
     copperpour_sexp::net::names_nets_in_place(tree)
 }
 
+/// Validate caller-selected routing state on the exact board that will be written.
+/// Domain refusals are values, so the IPC wrapper cannot misclassify them as transport errors.
+fn routing_preflight(
+    client: &copperpour_ipc::client::KiCadIpcClient,
+    document: &copperpour_ipc::gen::kiapi::common::types::DocumentSpecifier,
+    layer: Option<&str>,
+    nets: &[(&str, &str)],
+) -> anyhow::Result<Option<CallToolResult>> {
+    if let Some(layer) = layer {
+        let id = copperpour_ipc::builders::try_layer_from_name(layer)? as i32;
+        let enabled = client.get_layers_in(document.clone())?;
+        if enabled.is_empty() {
+            anyhow::bail!("KiCad returned an empty enabled-layer set for the requested board");
+        }
+        if !enabled.iter().any(|enabled| enabled.id == id) {
+            let copper: Vec<_> = enabled
+                .iter()
+                .filter(|enabled| copperpour_sexp::layers::is_copper_name(&enabled.name))
+                .map(|enabled| enabled.name.as_str())
+                .collect();
+            return Ok(Some(invalid_arg(
+                "layer",
+                &format!(
+                    "the board has no copper layer '{layer}'; it has {}. The board is unchanged.",
+                    copper.join(", ")
+                ),
+            )));
+        }
+    }
+    let available = client.get_nets_required_in(document.clone())?;
+    for &(field, name) in nets {
+        if !available.iter().any(|net| net.name == name) {
+            return Ok(Some(invalid_arg(
+                field,
+                &format!("the board has no net '{name}'. The board is unchanged."),
+            )));
+        }
+    }
+    Ok(None)
+}
+
 async fn handle_route_trace(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -550,8 +591,18 @@ async fn handle_route_trace(
 
     let net_ipc = net_name.clone();
     let layer_ipc = layer.clone();
-    ipc!(ctx, args, |c| c
-        .add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2));
+    let routed = ipc!(ctx, args, |c, document| {
+        if let Some(refusal) =
+            routing_preflight(c, &document, Some(&layer_ipc), &[("net_name", &net_ipc)])?
+        {
+            return Ok(Err(refusal));
+        }
+        c.add_tracks_in(document, &net_ipc, &layer_ipc, width, &[(x1, y1, x2, y2)])?;
+        Ok(Ok(()))
+    });
+    if let Err(refusal) = routed {
+        return Ok(refusal);
+    }
     Ok(CallToolResult::json(&json!({
         "net": net_name, "layer": layer, "width": width,
         "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 }
@@ -594,14 +645,19 @@ async fn handle_route_pad_to_pad(
     let (net_ipc, layer_ipc) = (net_name.clone(), layer.clone());
     let ends = [(ref1.clone(), pad1.clone()), (ref2.clone(), pad2.clone())];
     let routed = ipc!(ctx, args, |c, document| {
+        if let Some(refusal) =
+            routing_preflight(c, &document, Some(&layer_ipc), &[("net_name", &net_ipc)])?
+        {
+            return Ok(Err(refusal));
+        }
         let [(ref1, pad1), (ref2, pad2)] = &ends;
         let (x1, y1) = match get_live_pad(c, &document, ref1, pad1)? {
             Ok(at) => at,
-            Err(message) => return Ok(Err(message)),
+            Err(message) => return Ok(Err(CallToolResult::error(message))),
         };
         let (x2, y2) = match get_live_pad(c, &document, ref2, pad2)? {
             Ok(at) => at,
-            Err(message) => return Ok(Err(message)),
+            Err(message) => return Ok(Err(CallToolResult::error(message))),
         };
         let segments: &[_] = if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
             // Already axis-aligned: single segment
@@ -615,7 +671,7 @@ async fn handle_route_pad_to_pad(
     });
     let ((x1, y1), (x2, y2)) = match routed {
         Ok(ends) => ends,
-        Err(message) => return Ok(CallToolResult::error(message)),
+        Err(refusal) => return Ok(refusal),
     };
 
     Ok(CallToolResult::json(&json!({
@@ -667,8 +723,17 @@ async fn handle_add_via(
     let pad_size = args["pad_size"].as_f64().unwrap_or(0.8);
 
     let net_ipc = net_name.clone();
-    let placement = ipc!(ctx, args, |c, document| c
-        .add_via_verified_in(document, &net_ipc, x, y, drill, pad_size));
+    let placement = ipc!(ctx, args, |c, document| {
+        if let Some(refusal) = routing_preflight(c, &document, None, &[("net_name", &net_ipc)])? {
+            return Ok(Err(refusal));
+        }
+        c.add_via_verified_in(document, &net_ipc, x, y, drill, pad_size)
+            .map(Ok)
+    });
+    let placement = match placement {
+        Ok(placement) => placement,
+        Err(refusal) => return Ok(refusal),
+    };
     match placement {
         copperpour_ipc::IpcViaPlacement::Placed(via) => Ok(CallToolResult::json(&json!({
             "uuid": via.uuid,
@@ -2863,26 +2928,35 @@ async fn handle_route_diff_pair(
     let np_ipc = net_pos.clone();
     let nn_ipc = net_neg.clone();
     let layer_ipc = layer.clone();
-    ipc!(ctx, args, |c| {
-        c.add_track(
+    let routed = ipc!(ctx, args, |c, document| {
+        // Both nets must exist before either side is created.
+        if let Some(refusal) = routing_preflight(
+            c,
+            &document,
+            Some(&layer_ipc),
+            &[("net_pos", &np_ipc), ("net_neg", &nn_ipc)],
+        )? {
+            return Ok(Err(refusal));
+        }
+        c.add_tracks_in(
+            document.clone(),
             &np_ipc,
             &layer_ipc,
             width,
-            x1 + perp_x,
-            y1 + perp_y,
-            x2 + perp_x,
-            y2 + perp_y,
+            &[(x1 + perp_x, y1 + perp_y, x2 + perp_x, y2 + perp_y)],
         )?;
-        c.add_track(
+        c.add_tracks_in(
+            document,
             &nn_ipc,
             &layer_ipc,
             width,
-            x1 - perp_x,
-            y1 - perp_y,
-            x2 - perp_x,
-            y2 - perp_y,
-        )
+            &[(x1 - perp_x, y1 - perp_y, x2 - perp_x, y2 - perp_y)],
+        )?;
+        Ok(Ok(()))
     });
+    if let Err(refusal) = routed {
+        return Ok(refusal);
+    }
 
     Ok(CallToolResult::json(&json!({
         "net_pos": net_pos, "net_neg": net_neg,
@@ -5063,6 +5137,23 @@ mod route_pad_to_pad_tests {
                     "kiapi.common.commands.GetItemsResponse",
                 ));
             }
+            if command.type_url.ends_with("GetBoardEnabledLayers") {
+                let request = kiapi::board::commands::GetBoardEnabledLayers::decode(bytes).unwrap();
+                named
+                    .lock()
+                    .unwrap()
+                    .push(("GetBoardEnabledLayers", request.board));
+                return Some(copperpour_ipc::builders::pack_any(
+                    &kiapi::board::commands::BoardEnabledLayersResponse {
+                        copper_layer_count: 2,
+                        layers: vec![
+                            kiapi::board::types::BoardLayer::BlFCu as i32,
+                            kiapi::board::types::BoardLayer::BlBCu as i32,
+                        ],
+                    },
+                    "kiapi.board.commands.BoardEnabledLayersResponse",
+                ));
+            }
             if command.type_url.ends_with("GetNets") {
                 let request = kiapi::board::commands::GetNets::decode(bytes).unwrap();
                 named.lock().unwrap().push(("GetNets", request.board));
@@ -5111,7 +5202,7 @@ mod route_pad_to_pad_tests {
 
     /// R1 at (100, 60) live, R2 where the file has it. Pad positions are the
     /// file's local offsets (-0.5 / +0.5) added to each live anchor.
-    fn moved_r1() -> Vec<prost_types::Any> {
+    pub(super) fn moved_r1() -> Vec<prost_types::Any> {
         vec![
             footprint(
                 "R1",
@@ -5175,6 +5266,8 @@ mod route_pad_to_pad_tests {
         assert_eq!(
             *named.lock().unwrap(),
             [
+                ("GetBoardEnabledLayers", resolved.clone()),
+                ("GetNets", resolved.clone()),
                 ("GetItems", resolved.clone()),
                 ("GetItems", resolved.clone()),
                 ("GetNets", resolved.clone()),
@@ -5576,3 +5669,7 @@ mod apply_specctra_ses_candidate_drc_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "routing_preflight_tests.rs"]
+mod routing_preflight_tests;
