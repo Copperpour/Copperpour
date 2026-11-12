@@ -47,6 +47,8 @@ pub mod manufacturing;
 #[cfg(test)]
 mod modify_trace_tests;
 pub(crate) mod navigation_target;
+#[cfg(test)]
+mod own_at_children_tests;
 mod pad_nets;
 pub mod pcb_board;
 mod pcb_board_outline;
