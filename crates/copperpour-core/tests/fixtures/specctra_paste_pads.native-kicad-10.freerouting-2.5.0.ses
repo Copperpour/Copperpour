@@ -1,0 +1,126 @@
+(session board
+  (base_design board)
+  (placement
+    (resolution um 10)
+    (component "Resistor_SMD:R_0402"
+      (place R1 1000000 -500000 front 0)
+      (place R2 1100000 -500000 front 0)
+    )
+    (component "TO-252-2"
+      (place U1 1200000 -400000 front 0)
+    )
+    (component "TO-263-2"
+      (place U2 1180000 -600000 back 0)
+    )
+  )
+  (was_is
+  )
+  (routes 
+    (resolution um 10)
+    (parser
+      (host_cad "KiCad's Pcbnew")
+      (host_version "10.0.8-10.0.8~ubuntu24.04.1")
+    )
+    (library_out 
+      (padstack "Via[0-1]_600:300_um"
+        (shape
+          (circle F.Cu 6000 0 0)
+        )
+        (shape
+          (circle B.Cu 6000 0 0)
+        )
+        (attach off)
+      )
+    )
+    (network_out 
+      (net VCC
+        (wire
+          (path F.Cu 2000
+            1105000 -514024
+            1003507 -514024
+            995000 -505517
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1256500 -563925
+            1206599 -514024
+            1105000 -514024
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1105000 -514024
+            1105000 -505517
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1149600 -377200
+            1105000 -421800
+            1105000 -500000
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1105000 -500000
+            1105000 -505517
+          )
+        )
+        (wire
+          (path B.Cu 2000
+            1256500 -574600
+            1256500 -563925
+          )
+        )
+        (via "Via[0-1]_600:300_um" 1256500 -563925
+        )
+        (wire
+          (path F.Cu 2000
+            995000 -500000
+            995000 -505517
+          )
+        )
+      )
+      (net GND
+        (wire
+          (path F.Cu 2000
+            1212600 -400000
+            1180323 -367723
+            1138784 -367723
+            1095000 -411507
+            1095000 -500000
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1095000 -500000
+            1095000 -505517
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1098650 -507762
+            1096405 -505517
+            1095000 -505517
+          )
+        )
+        (via "Via[0-1]_600:300_um" 1098650 -507762
+        )
+        (wire
+          (path B.Cu 2000
+            1165000 -600000
+            1098650 -533650
+            1098650 -507762
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1095000 -500000
+            1005000 -500000
+          )
+        )
+      )
+    )
+  )
+)

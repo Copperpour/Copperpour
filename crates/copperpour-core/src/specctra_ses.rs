@@ -116,6 +116,17 @@ struct ManifestComponent {
     rotation_degrees: f64,
     side: String,
     pads: Vec<ManifestPin>,
+    /// Pads on no copper layer, recorded but not routed; from schema 4 (#458).
+    #[serde(default)]
+    non_copper_pads: Vec<ManifestNonCopperPad>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestNonCopperPad {
+    pad_number: String,
+    pad_uuid: String,
+    layers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -348,6 +359,24 @@ fn validate_pins_against_board(board_source: &str, manifest: &Manifest) -> Resul
                 component.reference
             );
         }
+        // Pads on no copper layer are not routed, but the board they were
+        // exported from must still have them, unchanged (#458).
+        let mut recorded = component
+            .non_copper_pads
+            .iter()
+            .map(|pad| crate::specctra::NonCopperPadIdentity {
+                pad_number: pad.pad_number.clone(),
+                pad_uuid: pad.pad_uuid.clone(),
+                layers: pad.layers.clone(),
+            })
+            .collect::<Vec<_>>();
+        recorded.sort();
+        if live.non_copper_pads != recorded {
+            bail!(
+                "routing manifest pads on no copper layer of {} do not match the live board",
+                component.reference
+            );
+        }
     }
     Ok(())
 }
@@ -462,6 +491,21 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
             {
                 bail!(
                     "manifest contains invalid pin mapping for {}",
+                    component.reference
+                );
+            }
+        }
+        // A pad on no copper layer has a UUID of its own and only technical
+        // layers; schemas before 4 never recorded one (#458).
+        for pad in &component.non_copper_pads {
+            if manifest.schema_version < 4
+                || pad.pad_uuid.is_empty()
+                || !pad_uuids.insert(pad.pad_uuid.as_str())
+                || pad.layers.is_empty()
+                || pad.layers.iter().any(|layer| layer.ends_with(".Cu"))
+            {
+                bail!(
+                    "manifest contains an invalid pad on no copper layer for {}",
                     component.reference
                 );
             }
@@ -1088,6 +1132,86 @@ mod tests {
     /// Every manifest pin must be the live board's pad with that UUID,
     /// number and net, under the name the export gives it. A swapped, stale,
     /// missing or invented mapping is refused before anything is planned.
+    /// KiCad's stock TO-252-2 on the front and TO-263-2 on the bottom, each
+    /// with four unnumbered paste-aperture pads (#458).
+    const PASTE_PADS: &str = include_str!("../tests/fixtures/specctra_paste_pads.kicad_pcb");
+
+    fn paste_fixture() -> (tempfile::TempDir, std::path::PathBuf, serde_json::Value) {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, PASTE_PADS).unwrap();
+        let export = export_dsn(&board, PASTE_PADS, &rules()).unwrap();
+        (dir, board, serde_json::from_str(&export.manifest).unwrap())
+    }
+    fn check_paste(board: &std::path::Path, manifest: &serde_json::Value) -> String {
+        let manifest: Manifest = serde_json::from_value(manifest.clone()).unwrap();
+        match validate_manifest(board, PASTE_PADS, &manifest) {
+            Ok(()) => "ok".to_string(),
+            Err(error) => format!("{error:#}"),
+        }
+    }
+    fn u1_pads(manifest: &mut serde_json::Value) -> &mut Vec<serde_json::Value> {
+        manifest["components"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|component| component["reference"] == "U1")
+            .unwrap()["non_copper_pads"]
+            .as_array_mut()
+            .unwrap()
+    }
+
+    /// The pads on no copper layer the manifest records are the live
+    /// board's: one missing, one too many, another UUID or other layers
+    /// refuse the import (#458).
+    #[test]
+    fn manifest_pads_on_no_copper_layer_must_be_the_live_boards() {
+        let (_dir, board, manifest) = paste_fixture();
+        assert_eq!(check_paste(&board, &manifest), "ok");
+        let mismatch = "routing manifest pads on no copper layer of U1 do not match the live board";
+
+        let mut missing = manifest.clone();
+        u1_pads(&mut missing).pop();
+        assert_eq!(check_paste(&board, &missing), mismatch);
+
+        let mut stale = manifest.clone();
+        u1_pads(&mut stale)[0]["pad_uuid"] = "00000000-0000-4000-8000-000000000000".into();
+        assert_eq!(check_paste(&board, &stale), mismatch);
+
+        let mut moved = manifest.clone();
+        u1_pads(&mut moved)[0]["layers"] = serde_json::json!(["F.Mask"]);
+        assert_eq!(check_paste(&board, &moved), mismatch);
+
+        let mut renumbered = manifest.clone();
+        u1_pads(&mut renumbered)[0]["pad_number"] = "25".into();
+        assert_eq!(check_paste(&board, &renumbered), mismatch);
+    }
+
+    /// A recorded pad on no copper layer must have its own UUID and only
+    /// technical layers, and only a schema 4 manifest records one (#458).
+    #[test]
+    fn manifest_pads_on_no_copper_layer_are_validated() {
+        let (_dir, board, manifest) = paste_fixture();
+        let invalid = "manifest contains an invalid pad on no copper layer for U1";
+
+        let mut copper = manifest.clone();
+        u1_pads(&mut copper)[0]["layers"] = serde_json::json!(["F.Cu", "F.Paste"]);
+        assert_eq!(check_paste(&board, &copper), invalid);
+
+        let mut no_layers = manifest.clone();
+        u1_pads(&mut no_layers)[0]["layers"] = serde_json::json!([]);
+        assert_eq!(check_paste(&board, &no_layers), invalid);
+
+        let mut repeated = manifest.clone();
+        let uuid = u1_pads(&mut repeated)[0]["pad_uuid"].clone();
+        u1_pads(&mut repeated)[1]["pad_uuid"] = uuid;
+        assert_eq!(check_paste(&board, &repeated), invalid);
+
+        let mut schema_3 = manifest.clone();
+        schema_3["schema_version"] = 3.into();
+        assert_eq!(check_paste(&board, &schema_3), invalid);
+    }
+
     #[test]
     fn manifest_pins_must_be_the_live_boards_pads() {
         let (_dir, board, manifest) = duplicate_fixture();
@@ -1164,9 +1288,9 @@ mod tests {
             }
         }
         assert_eq!(check(&board, &schema_1), invalid);
-        let mut schema_4 = manifest.clone();
-        schema_4["schema_version"] = 4.into();
-        assert!(check(&board, &schema_4).contains("unsupported Specctra manifest schema 4"));
+        let mut schema_5 = manifest.clone();
+        schema_5["schema_version"] = 5.into();
+        assert!(check(&board, &schema_5).contains("unsupported Specctra manifest schema 5"));
     }
 
     #[test]

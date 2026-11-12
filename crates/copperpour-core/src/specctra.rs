@@ -91,6 +91,21 @@ struct FootprintModel {
     rotation_degrees: f64,
     side: Side,
     pads: Vec<PadModel>,
+    /// Pads on no copper layer, such as the paste apertures of a QFN's
+    /// exposed pad. KiCad's Specctra export leaves them out of the image, and
+    /// so does this one; the manifest still lists them (#458).
+    non_copper_pads: Vec<NonCopperPadModel>,
+}
+
+/// A pad on no copper layer: not routed, but part of the footprint the
+/// manifest is checked against (#458).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NonCopperPadModel {
+    /// KiCad's pad number, often empty for a paste aperture.
+    number: String,
+    uuid: String,
+    /// Its KiCad layers, all technical (`F.Paste`, `B.Mask`, ...).
+    layers: Vec<String>,
 }
 
 /// The board side a footprint sits on, by its `F.Cu` or `B.Cu` layer.
@@ -158,7 +173,8 @@ type NetClassNames = BTreeMap<String, String>;
 
 /// 2 adds each pin's `pad_uuid` and lets pads share a number (#338).
 /// 3 adds the copper-zone inventory, `zones` (#430).
-pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 3;
+/// 4 adds each component's pads on no copper layer, `non_copper_pads` (#458).
+pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Manifest {
@@ -218,6 +234,18 @@ struct ManifestComponent {
     rotation_degrees: f64,
     side: String,
     pads: Vec<ManifestPin>,
+    /// Pads on no copper layer: not in the DSN, checked against the live
+    /// board on import. Absent before schema 4 (#458).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    non_copper_pads: Vec<ManifestNonCopperPad>,
+}
+
+/// A pad on no copper layer, recorded but not routed (#458).
+#[derive(Debug, Deserialize, Serialize)]
+struct ManifestNonCopperPad {
+    pad_number: String,
+    pad_uuid: String,
+    layers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1766,7 +1794,41 @@ fn footprints(
         let image_name = format!("copperpour_image_{reference}");
 
         let mut pads = Vec::new();
+        let mut non_copper_pads = Vec::new();
         for pad in footprint.find_all("pad") {
+            // An SMD pad on no copper layer (a paste aperture) is not routed:
+            // KiCad's export skips it, and this one only records it (#458).
+            let pad_layers = pad
+                .find("layers")
+                .and_then(SexpNode::children)
+                .unwrap_or(&[])
+                .iter()
+                .skip(1)
+                .filter_map(SexpNode::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if pad.get(2).and_then(SexpNode::as_str) == Some("smd")
+                && !pad_layers.is_empty()
+                && !pad_layers.iter().any(|layer| layer.ends_with(".Cu"))
+            {
+                let number = pad.get(1).and_then(SexpNode::as_str).unwrap_or("");
+                let uuid = pad
+                    .find_str("uuid")
+                    .filter(|uuid| !uuid.is_empty())
+                    .with_context(|| format!("pad on no copper layer of {reference} has no UUID"))?
+                    .to_string();
+                if !pad_uuids.insert(uuid.clone()) {
+                    bail!(
+                        "pad on no copper layer of {reference} repeats the UUID {uuid} of another pad"
+                    );
+                }
+                non_copper_pads.push(NonCopperPadModel {
+                    number: number.to_string(),
+                    uuid,
+                    layers: pad_layers,
+                });
+                continue;
+            }
             let number = pad
                 .get(1)
                 .and_then(SexpNode::as_str)
@@ -1923,6 +1985,7 @@ fn footprints(
         }
         dsn_pin_names(&reference, &mut pads)?;
         pads.sort_by(|left, right| left.pin.cmp(&right.pin));
+        non_copper_pads.sort();
         output.push(FootprintModel {
             reference,
             kiid,
@@ -1932,6 +1995,7 @@ fn footprints(
             rotation_degrees: place_degrees,
             side,
             pads,
+            non_copper_pads,
         });
     }
     output.sort_by(|left, right| left.reference.cmp(&right.reference));
@@ -1948,11 +2012,21 @@ pub(crate) struct PinIdentity {
     pub net: Option<String>,
 }
 
-/// A routed footprint of the live board: the side it sits on and its pins.
+/// A pad on no copper layer as the manifest records it (#458).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct NonCopperPadIdentity {
+    pub pad_number: String,
+    pub pad_uuid: String,
+    pub layers: Vec<String>,
+}
+
+/// A routed footprint of the live board: the side it sits on, its pins, and
+/// its pads on no copper layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LiveFootprint {
     pub side: &'static str,
     pub pins: Vec<PinIdentity>,
+    pub non_copper_pads: Vec<NonCopperPadIdentity>,
 }
 
 /// Every routed footprint's side and pins, by footprint UUID, named as
@@ -1980,6 +2054,15 @@ pub(crate) fn board_pin_identities(board_source: &str) -> Result<BTreeMap<String
                 LiveFootprint {
                     side: footprint.side.name(),
                     pins,
+                    non_copper_pads: footprint
+                        .non_copper_pads
+                        .into_iter()
+                        .map(|pad| NonCopperPadIdentity {
+                            pad_number: pad.number,
+                            pad_uuid: pad.uuid,
+                            layers: pad.layers,
+                        })
+                        .collect(),
                 },
             )
         })
@@ -2528,6 +2611,15 @@ fn build_manifest(
                     dsn_pin: format!("{}-{}", footprint.reference, pad.pin),
                     net: pad.net.clone(),
                     padstack_name: padstack_names[&pad.padstack].clone(),
+                })
+                .collect(),
+            non_copper_pads: footprint
+                .non_copper_pads
+                .iter()
+                .map(|pad| ManifestNonCopperPad {
+                    pad_number: pad.number.clone(),
+                    pad_uuid: pad.uuid.clone(),
+                    layers: pad.layers.clone(),
                 })
                 .collect(),
         })
@@ -3120,7 +3212,7 @@ pub(crate) mod tests {
             bundle.dsn
         );
         let manifest: serde_json::Value = serde_json::from_str(&bundle.manifest).unwrap();
-        assert_eq!(manifest["schema_version"], 3);
+        assert_eq!(manifest["schema_version"], 4);
         assert_eq!(
             j1_pins(&bundle),
             [
@@ -4617,7 +4709,7 @@ pub(crate) mod tests {
             ]
         );
         let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
-        assert_eq!(manifest["schema_version"], 3);
+        assert_eq!(manifest["schema_version"], 4);
         assert_eq!(manifest["supported_profile"]["copper_zones"], true);
         let count = |layer: &str, net: &str| (layer.to_string(), net.to_string(), 1);
         assert_eq!(
@@ -5111,5 +5203,147 @@ pub(crate) mod tests {
     fn the_profile_side_is_derived_from_the_footprints() {
         assert_eq!(native_baseline(FOUR_LAYERS).component_side, "front");
         assert_eq!(native_baseline(BOTTOM_SIDE).component_side, "both");
+    }
+
+    /// KiCad's stock TO-252-2 as U1 on the front and TO-263-2 as U2 flipped
+    /// to the bottom: each has four unnumbered paste-aperture pads over its
+    /// tab (#458). See its README.
+    const PASTE_PADS: &str = include_str!("../tests/fixtures/specctra_paste_pads.kicad_pcb");
+    const PASTE_PADS_NATIVE_FILE: &str =
+        include_str!("../tests/fixtures/specctra_paste_pads.native-kicad-10.dsn");
+    const PASTE_PADS_SES: &str =
+        include_str!("../tests/fixtures/specctra_paste_pads.native-kicad-10.freerouting-2.5.0.ses");
+
+    /// KiCad's export of the paste-pad fixture without its courtyard
+    /// `(outline (polygon ...))` forms, which `validate_dsn_syntax` cannot
+    /// read (#98); a form may run over lines.
+    fn paste_pads_native() -> String {
+        let mut kept = String::new();
+        let mut depth = 0i32;
+        for line in PASTE_PADS_NATIVE_FILE.lines() {
+            if depth == 0 && !line.trim_start().starts_with("(outline (polygon ") {
+                kept.push_str(line);
+                kept.push('\n');
+                continue;
+            }
+            depth += line.matches('(').count() as i32 - line.matches(')').count() as i32;
+        }
+        kept
+    }
+
+    fn non_copper_pads(manifest: &serde_json::Value, reference: &str) -> Vec<(String, String)> {
+        manifest["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["reference"] == reference)
+            .unwrap()["non_copper_pads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pad| {
+                (
+                    pad["pad_number"].as_str().unwrap().to_string(),
+                    pad["layers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|layer| layer.as_str().unwrap())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            })
+            .collect()
+    }
+
+    /// A pad on no copper layer is left out of the DSN image, as KiCad's
+    /// own export does, and listed in the manifest with its layers: front
+    /// apertures on F.Paste, bottom ones on B.Paste. KiCad's native DSN of
+    /// the same board is adopted unchanged (#458).
+    #[test]
+    fn paste_apertures_stay_out_of_the_dsn_and_in_the_manifest() {
+        let export = native_baseline(PASTE_PADS);
+        let pins = |image: &str| {
+            let start = export.dsn.find(&format!("(image {image}")).unwrap();
+            let body = &export.dsn[start..];
+            let end = body.find("\n    (image ").unwrap_or(body.len());
+            body[..end].matches("(pin ").count()
+        };
+        assert_eq!(pins("copperpour_image_U1"), 3);
+        assert_eq!(pins("copperpour_image_U2"), 3);
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(manifest["schema_version"], MANIFEST_SCHEMA_VERSION);
+        let front = vec![(String::new(), "F.Paste".to_string()); 4];
+        let back = vec![(String::new(), "B.Paste".to_string()); 4];
+        assert_eq!(non_copper_pads(&manifest, "U1"), front);
+        assert_eq!(non_copper_pads(&manifest, "U2"), back);
+        // A footprint without such pads writes no list.
+        let r1 = manifest["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["reference"] == "R1")
+            .unwrap();
+        assert!(r1.get("non_copper_pads").is_none(), "{r1}");
+        let native = paste_pads_native();
+        let adopted = adopt_native_dsn(export, native.clone()).unwrap();
+        assert_eq!(adopted.dsn, native);
+    }
+
+    /// The live board's identities carry the same pads on no copper layer,
+    /// so the importer compares them with the manifest (#458).
+    #[test]
+    fn live_identities_list_the_pads_on_no_copper_layer() {
+        let live = board_pin_identities(PASTE_PADS).unwrap();
+        let u1 = live
+            .values()
+            .find(|footprint| footprint.pins.iter().any(|pin| pin.dsn_pin == "U1-2"))
+            .unwrap();
+        assert_eq!(u1.pins.len(), 3);
+        assert_eq!(u1.non_copper_pads.len(), 4);
+        assert!(u1
+            .non_copper_pads
+            .iter()
+            .all(|pad| pad.pad_number.is_empty() && pad.layers == ["F.Paste"]));
+    }
+
+    /// Freerouting routes KiCad's native DSN, which has no aperture pads,
+    /// and the strict planner accepts the session against the manifest.
+    #[test]
+    fn a_session_for_a_board_with_paste_apertures_is_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_paste_pads.kicad_pcb");
+        std::fs::write(&board, PASTE_PADS).unwrap();
+        let baseline = export_dsn(&board, PASTE_PADS, &native_fixture_rules()).unwrap();
+        let adopted = adopt_native_dsn(baseline, paste_pads_native()).unwrap();
+        let plan = crate::specctra_ses::parse_import_plan(
+            &board,
+            PASTE_PADS,
+            &adopted.manifest,
+            PASTE_PADS_SES,
+        )
+        .unwrap();
+        assert!(!plan.tracks.is_empty());
+        assert_eq!(plan.vias.len(), 2);
+    }
+
+    /// Only a pad with no copper at all is set aside: an unnumbered pad
+    /// with copper is still refused.
+    #[test]
+    fn an_unnumbered_pad_with_copper_is_still_refused() {
+        let with_copper =
+            PASTE_PADS.replacen(r#"(layers "F.Paste")"#, r#"(layers "F.Cu" "F.Paste")"#, 1);
+        assert_ne!(with_copper, PASTE_PADS);
+        let error = export_dsn(
+            Path::new("board.kicad_pcb"),
+            &with_copper,
+            &native_fixture_rules(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("footprint contains an unnumbered pad"),
+            "{error}"
+        );
     }
 }
