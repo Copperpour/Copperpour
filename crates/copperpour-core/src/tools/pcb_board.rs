@@ -523,7 +523,7 @@ fn unsafe_file_fallback(
 /// board that KiCad's autosave, an editor or another call saved in between is
 /// refused as `conflict` instead of being overwritten with an edit of the
 /// older read.
-fn write_board_edits(
+pub(crate) fn write_board_edits(
     board_path: &Path,
     operation: &str,
     content: String,

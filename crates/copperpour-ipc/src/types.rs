@@ -1181,6 +1181,43 @@ impl IpcTextEdit {
     }
 }
 
+/// One field a batch edit covered, before the edit and as a fresh read holds
+/// it afterwards. The two are equal for a field that already held every
+/// requested value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcFootprintFieldStyleChange {
+    pub before: IpcFootprintField,
+    pub after: IpcFootprintField,
+}
+
+/// A field a whole-board batch edit left alone because it could not be
+/// edited and proven; never a field the caller named explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcFootprintFieldSkip {
+    pub footprint_reference: String,
+    pub footprint_kiid: String,
+    pub slot: String,
+    pub reason: String,
+}
+
+/// Readback-derived result of applying one edit to fields of many footprints.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcFootprintFieldBatchOutcome {
+    /// Every covered field holds the requested values, proven by a fresh
+    /// read. `sent` is false when they all did already and nothing was sent.
+    Settled {
+        fields: Vec<IpcFootprintFieldStyleChange>,
+        skipped: Vec<IpcFootprintFieldSkip>,
+        sent: bool,
+    },
+    /// The update may have changed the board, but a fresh read did not prove
+    /// the requested state for every footprint. Inspect before retrying.
+    Uncertain {
+        mismatches: Vec<String>,
+        reason: String,
+    },
+}
+
 /// Readback-derived result of editing one text item in place.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IpcTextEditOutcome<T> {
