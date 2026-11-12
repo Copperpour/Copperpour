@@ -176,12 +176,39 @@ Run `init` only if you want native skill discovery, locally editable skill files
 or Claude agents/hooks. Use the binary from Step 2 (PCM does not add it to `PATH`):
 
 ```bash
-copperpour init                  # Claude: skills, agents and hooks
-copperpour init --client codex   # Codex: skills under ~/.agents/skills
+copperpour init                  # Claude Code: skills, agents and hooks
+copperpour init --client codex   # Codex CLI/desktop: skills under ~/.agents/skills
 ```
 
-Re-run after upgrading Copperpour; it overwrites differing files, so back up any
-you edited. See [Managing skills](#advanced-installation).
+Re-run after upgrading Copperpour; these native Claude Code/Codex installs overwrite
+differing files, so back up any you edited. See [Managing skills](#advanced-installation).
+
+For other local clients, `init`, `status`, and `uninstall` also accept these
+**skills-only** presets. They use ownership checks to preserve edited/unrelated
+content and retain the target root on uninstall:
+
+| Client | Install command | Default user skills root |
+| --- | --- | --- |
+| [Gemini CLI](https://geminicli.com/docs/cli/skills/) | `copperpour init --client gemini` | `~/.gemini/skills` |
+| [Cursor](https://cursor.com/docs/skills) | `copperpour init --client cursor` | `~/.cursor/skills` |
+| [Antigravity](https://antigravity.google/docs/skills) | `copperpour init --client antigravity` (or `agy`) | `~/.gemini/config/skills` |
+
+Use the same `--client` with `status` and `uninstall`. For example,
+`copperpour status --client cursor` checks that installation. An explicit
+`--skills-dir` overrides `COPPERPOUR_SKILLS_DIR`, which overrides the preset root.
+To install project skills, use an absolute project skills directory with
+`--skills-dir`. These presets install guidance; configure the MCP connection in
+Step 2 separately. Local installation alone does not deploy skills or Copperpour
+to remote/cloud agent environments. Gemini CLI and Cursor also discover the
+shared `~/.agents/skills` directory: if you already installed there with
+`--client codex`, use that target rather than installing duplicate copies.
+
+[Codex skills](https://learn.chatgpt.com/docs/build-skills) also work in the desktop
+app; no separate desktop preset is needed. The `claude` target means
+[Claude Code](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview).
+It does not install skills into Claude Desktop's chat interface, whose custom
+skills use a [ZIP-upload workflow](https://support.claude.com/en/articles/12512180-use-skills-in-claude).
+Desktop skill packaging is separate from this installer.
 
 ### Step 4: Verify
 
@@ -278,8 +305,9 @@ On Windows, use an absolute path such as `"C:\agent\skills"`. Alternatively set
 relative targets are rejected. These three commands use the custom target in
 **skills-only** mode, even with `--client claude`: they do not write client profile
 files, agents, hooks, or native installation markers. Existing commands without
-an override keep their client-specific behavior. The override does not configure
-MCP startup or the double-click installer.
+an override keep their client-specific behavior. Gemini, Cursor, and Antigravity
+presets always use this ownership-checked skills-only mode. The override does not
+configure MCP startup or the double-click installer.
 
 Point your client's skill discovery at this root. It contains portable Markdown
 `<skill>/SKILL.md` files with frontmatter and optional `references/` files; automatic
@@ -293,8 +321,9 @@ only empty skill directories. It never removes the root. Reinitializing refuses
 to overwrite locally edited or unowned content that differs from the bundle;
 back it up and move it aside before updating. Custom targets reject symlinks at
 the root or along managed paths, including the ownership marker. Avoid concurrent
-installers or edits while installing/removing skills. Use explicit `status` for custom-target drift checks;
-the MCP startup notice checks native client installations.
+installers or edits while installing/removing skills. Use explicit `status` with
+the same target or preset for portable-target drift checks; the MCP startup notice
+checks native client installations.
 
 </details>
 

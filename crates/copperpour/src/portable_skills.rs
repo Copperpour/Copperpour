@@ -21,6 +21,7 @@ struct Ownership {
 pub fn run(command: &str, args: &[String]) -> Result<()> {
     let mut native_args = Vec::new();
     let mut explicit = None;
+    let mut preset = None;
     let mut index = 0;
     while index < args.len() {
         if args[index] == "--skills-dir" {
@@ -33,20 +34,32 @@ pub fn run(command: &str, args: &[String]) -> Result<()> {
                     .clone(),
             );
             index += 2;
+        } else if args[index] == "--client" {
+            let value = args.get(index + 1).context(
+                "--client requires claude, codex, gemini, cursor, or antigravity (alias agy)",
+            )?;
+            preset = preset_directory(&value.to_ascii_lowercase());
+            native_args.push(args[index].clone());
+            // The legacy parser still validates duplicates and unknown arguments.
+            // Presets always resolve a portable target or fail before native dispatch.
+            native_args.push(if preset.is_some() {
+                "codex".to_owned()
+            } else {
+                value.clone()
+            });
+            index += 2;
         } else {
             native_args.push(args[index].clone());
             index += 1;
         }
     }
-    let client = install::client_from_args(&native_args)?;
+    let client = install::client_from_args(&native_args).context(
+        "installer clients: claude (Claude Code), codex, gemini, cursor, antigravity (alias agy)",
+    )?;
     let target = explicit
         .map(std::ffi::OsString::from)
         .or_else(|| std::env::var_os("COPPERPOUR_SKILLS_DIR"));
-    if let Some(target) = target {
-        let root: PathBuf = PathBuf::from(target).components().collect();
-        if !root.is_absolute() {
-            bail!("skills directory must be a nonempty absolute path");
-        }
+    if let Some(root) = target_path(target, preset, copperpour_core::app_dirs::home_dir)? {
         return run_at(command, &root);
     }
     match command {
@@ -55,6 +68,37 @@ pub fn run(command: &str, args: &[String]) -> Result<()> {
         "uninstall" => install::run_uninstall(client),
         _ => unreachable!("installer subcommand"),
     }
+}
+
+/// Installer-only presets: MCP registration and server client selection are separate.
+fn preset_directory(client: &str) -> Option<&'static str> {
+    match client {
+        "gemini" => Some(".gemini/skills"),
+        "cursor" => Some(".cursor/skills"),
+        "antigravity" | "agy" => Some(".gemini/config/skills"),
+        _ => None,
+    }
+}
+
+fn target_path(
+    overridden: Option<std::ffi::OsString>,
+    preset: Option<&str>,
+    home: impl FnOnce() -> Option<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    let target = match overridden {
+        Some(path) => PathBuf::from(path),
+        None => match preset {
+            Some(relative) => home()
+                .context(copperpour_core::app_dirs::NO_USER_DIR)?
+                .join(relative),
+            None => return Ok(None),
+        },
+    };
+    let root: PathBuf = target.components().collect();
+    if !root.is_absolute() {
+        bail!("skills directory must be a nonempty absolute path");
+    }
+    Ok(Some(root))
 }
 
 fn bundled() -> BTreeMap<String, &'static str> {
@@ -214,4 +258,43 @@ fn run_at(command: &str, root: &Path) -> Result<()> {
         _ => unreachable!("installer subcommand"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presets_resolve_under_home_and_never_fall_back_when_home_is_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        for (client, relative) in [
+            ("gemini", ".gemini/skills"),
+            ("cursor", ".cursor/skills"),
+            ("antigravity", ".gemini/config/skills"),
+            ("agy", ".gemini/config/skills"),
+        ] {
+            let preset = preset_directory(client);
+            assert!(preset.is_some());
+            assert_eq!(
+                target_path(None, preset, || Some(temp.path().to_path_buf())).unwrap(),
+                Some(temp.path().join(relative))
+            );
+            assert!(target_path(None, preset, || None).is_err());
+            assert_eq!(
+                target_path(Some(temp.path().as_os_str().to_owned()), preset, || panic!(
+                    "override must not resolve home"
+                ))
+                .unwrap(),
+                Some(temp.path().to_path_buf())
+            );
+        }
+        assert_eq!(
+            target_path(None, None, || panic!(
+                "native target resolves its own paths"
+            ))
+            .unwrap(),
+            None
+        );
+        assert!(target_path(Some("".into()), Some(".cursor/skills"), || None).is_err());
+    }
 }

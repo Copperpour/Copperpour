@@ -244,12 +244,13 @@ fn exec_reload(plan: copperpour_core::router::meta_tools::ReloadPlan) -> Result<
 fn print_help_for(subcommand: Option<&str>) {
     let clients = || {
         println!("\nCLIENTS:");
-        println!("  claude (default)         Skills, agents, and hooks under ~/.claude");
-        println!("  codex                    Skills under ~/.agents/skills");
+        println!("  claude (default)         Claude Code: skills, agents, hooks under ~/.claude");
+        println!("  codex                    Codex CLI/desktop: skills under ~/.agents/skills");
+        print_installer_presets();
     };
     match subcommand {
         Some("init") => {
-            println!("copperpour init [--client <claude|codex>] [--skills-dir <path>]\n");
+            println!("copperpour init [--client <client>] [--skills-dir <path>]\n");
             println!("Install Copperpour's skills and agents for an AI client.");
             println!("Writes to that client's configuration directory.");
             clients();
@@ -259,7 +260,7 @@ fn print_help_for(subcommand: Option<&str>) {
             println!("Defaults to COPPERPOUR_SKILLS_DIR when set; explicit flag takes precedence.");
         }
         Some("uninstall") => {
-            println!("copperpour uninstall [--client <claude|codex>] [--skills-dir <path>]\n");
+            println!("copperpour uninstall [--client <client>] [--skills-dir <path>]\n");
             println!("Remove the skills and agents Copperpour installed for a client.");
             println!("Only Copperpour's own named assets are removed.");
             clients();
@@ -269,7 +270,7 @@ fn print_help_for(subcommand: Option<&str>) {
             println!("Defaults to COPPERPOUR_SKILLS_DIR when set; explicit flag takes precedence.");
         }
         Some("status") => {
-            println!("copperpour status [--client <claude|codex>] [--skills-dir <path>]\n");
+            println!("copperpour status [--client <client>] [--skills-dir <path>]\n");
             println!("Report what is installed for a client. Writes nothing.");
             clients();
             println!(
@@ -296,6 +297,13 @@ fn print_help_for(subcommand: Option<&str>) {
     }
 }
 
+fn print_installer_presets() {
+    println!("  gemini                   Skills only under ~/.gemini/skills");
+    println!("  cursor                   Skills only under ~/.cursor/skills");
+    println!("  antigravity (alias agy)   Skills only under ~/.gemini/config/skills");
+    println!("  These three presets apply to init/status/uninstall, not server startup.");
+}
+
 fn print_help() {
     println!("Copperpour v{}", env!("CARGO_PKG_VERSION"));
     println!("MCP server for KiCad EDA with embedded guidance.\n");
@@ -314,8 +322,9 @@ fn print_help() {
     println!("  copperpour --version     Print version");
     println!("  copperpour --help        This message");
     println!("\nCLIENTS:");
-    println!("  claude (default)         Skills, agents, and hooks under ~/.claude");
-    println!("  codex                    Skills under ~/.agents/skills");
+    println!("  claude (default)         Claude Code: skills, agents, hooks under ~/.claude");
+    println!("  codex                    Codex CLI/desktop: skills under ~/.agents/skills");
+    print_installer_presets();
 }
 
 #[cfg(test)]

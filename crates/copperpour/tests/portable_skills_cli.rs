@@ -248,3 +248,115 @@ fn symlink_root_with_trailing_separator_is_refused() {
     }
     assert_eq!(fs::read_dir(external).unwrap().count(), 0);
 }
+
+#[test]
+fn named_presets_use_portable_ownership_and_honor_overrides() {
+    let temp = tempfile::tempdir().unwrap();
+    for client in ["gemini", "cursor", "antigravity", "agy", "GeMiNi"] {
+        let root = temp.path().join(client);
+        let home = temp.path().join(format!("home-{client}"));
+        fs::create_dir(&home).unwrap();
+        let ignored = temp.path().join("ignored-env");
+        for action in ["init", "status", "uninstall"] {
+            let output = success(
+                command()
+                    .env("HOME", &home)
+                    .env("USERPROFILE", &home)
+                    .env("COPPERPOUR_STATE_DIR", home.join("state"))
+                    .env("COPPERPOUR_SKILLS_DIR", &ignored)
+                    .arg(action)
+                    .args(["--client", client, "--skills-dir"])
+                    .arg(&root)
+                    .output()
+                    .unwrap(),
+            );
+            assert!(output.contains(&root.display().to_string()));
+            if action == "init" {
+                assert!(root.join(".copperpour-skills.json").is_file());
+                fs::write(root.join("copperpour/SKILL.md"), "keep edits").unwrap();
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("copperpour/SKILL.md")).unwrap(),
+            "keep edits"
+        );
+        assert_eq!(fs::read_dir(home).unwrap().count(), 0);
+        assert!(!ignored.exists());
+        let env_root = temp.path().join(format!("env-{client}"));
+        success(
+            command()
+                .env("COPPERPOUR_SKILLS_DIR", &env_root)
+                .args(["init", "--client", client])
+                .output()
+                .unwrap(),
+        );
+        assert!(env_root.join(".copperpour-skills.json").is_file());
+        success(
+            command()
+                .env("COPPERPOUR_SKILLS_DIR", &env_root)
+                .args(["uninstall", "--client", client])
+                .output()
+                .unwrap(),
+        );
+        assert!(env_root.is_dir());
+    }
+}
+
+#[test]
+fn preset_arguments_still_refuse_duplicates_unknown_clients_and_bad_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["--client", "gemini", "--client", "cursor"],
+        vec!["--client", "cursor", "--client", "codex"],
+        vec!["--client", "unknown"],
+        vec!["--client"],
+        vec!["--client", "agy", "--typo"],
+        vec!["--client", "agy", "--skills-dir", ""],
+    ] {
+        assert!(!command()
+            .arg("init")
+            .env("COPPERPOUR_SKILLS_DIR", temp.path())
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn presets_install_to_documented_home_directories() {
+    // Windows ignores HOME for native home resolution. Deterministic unit tests
+    // cover the same resolver there; don't risk its real client directories.
+    let temp = tempfile::tempdir().unwrap();
+    for (client, relative) in [
+        ("gemini", ".gemini/skills"),
+        ("cursor", ".cursor/skills"),
+        ("antigravity", ".gemini/config/skills"),
+        ("agy", ".gemini/config/skills"),
+    ] {
+        let home = temp.path().join(client);
+        fs::create_dir(&home).unwrap();
+        for action in ["init", "status", "uninstall"] {
+            success(
+                command()
+                    .env("HOME", &home)
+                    .env("COPPERPOUR_STATE_DIR", home.join("state"))
+                    .args([action, "--client", client])
+                    .output()
+                    .unwrap(),
+            );
+            if action == "init" {
+                assert!(home
+                    .join(relative)
+                    .join(".copperpour-skills.json")
+                    .is_file());
+            }
+        }
+        assert!(home.join(relative).is_dir());
+        assert!(!home.join(".claude").exists());
+        assert!(!home.join("state").exists());
+    }
+}

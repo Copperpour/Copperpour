@@ -103,8 +103,9 @@ does not touch them, so an older install keeps advising the old tools. Run
 `copperpour status` (add `--client codex` for Codex) with the binary your MCP
 client uses. For a portable installation, pass the same `--skills-dir <absolute path>`
 or `COPPERPOUR_SKILLS_DIR` to `status`, `init`, and `uninstall`; these operate on
-skills only. Keep `.copperpour-skills.json` in that target: it records ownership
-and installed contents, so custom uninstall preserves local edits. If custom init
+skills only. The `gemini`, `cursor`, and `antigravity` (`agy`) presets use the same
+ownership-checked mode; pass the same `--client` to all three commands. Keep
+`.copperpour-skills.json` in that target: it records ownership and installed contents, so custom uninstall preserves local edits. If custom init
 refuses an edited file, back it up and move it aside before retrying. It also
 refuses unknown paths in a marker rather than trusting them as deletion targets.
 See [Managing skills](../README.md#advanced-installation).
