@@ -29,8 +29,8 @@ use tokio::{
 };
 use tokio_stream::{wrappers::WatchStream, StreamExt};
 
-const PAGE: &str = include_str!("../../schematic-viewer/frontend/index.html");
-const SCRIPT: &str = include_str!("../../schematic-viewer/frontend/viewer.js");
+const PAGE: &str = include_str!("../frontend/index.html");
+const SCRIPT: &str = include_str!("../frontend/viewer.js");
 const PAGE_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; frame-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 const SVG_CSP: &str = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'";
 

@@ -50,8 +50,11 @@ runs Check & Test on `macos-latest` and builds the macOS release artifacts.
 
 - The required checks are that app's: the same `ci.yml` jobs and check names, run
   against each PR's merge commit. A check's details show the end of its log.
-- Nix flake and Schematic viewer show as skipped (neutral) on a PR that changes
-  nothing they build from. Nix flake also runs on `main` after each merge.
+- Nix flake shows as skipped (neutral) on a PR that changes nothing it builds
+  from, and also runs on `main` after each merge. The standalone Schematic viewer
+  job has been retired. Its required-check entry must be removed from the live
+  ruleset and Local CI configuration by a maintainer before the retirement PR
+  can merge; repository settings are not changed by the source PR.
 - PR builds other than Nix flake have no network access: crates are downloaded
   first with `cargo vendor --locked`, then the jobs build from that copy. Nix
   flake has network access, so on a contributor's PR it waits for a maintainer to

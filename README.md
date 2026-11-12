@@ -2,7 +2,7 @@
 
 <div align="center">
 
-<h1><img src="crates/schematic-viewer/icons/icon.png" alt="" height="48" align="absmiddle"> Copperpour</h1>
+<h1><img src="packaging/resources/icon.png" alt="" height="48" align="absmiddle"> Copperpour</h1>
 
 </div>
 
@@ -235,8 +235,8 @@ Then build:
 cargo build --release -p copperpour
 ```
 
-The program is at `target/release/copperpour`. The schematic viewer is built
-separately; see [DEV.md](DEV.md).
+The program is at `target/release/copperpour`, including the browser schematic
+viewer. See [DEV.md](DEV.md) for build and test details.
 
 For a build that makes no outbound connections, leave out the integrations:
 
@@ -296,18 +296,11 @@ select sheets or launch KiCad. Browser mode is bound to its root at launch and
 has no file-drop control. It needs `kicad-cli`, using the server's configured path
 or normal discovery, and a browser; no Tauri runtime is needed.
 
-The standalone Tauri viewer is deprecated but remains available for one shipped
-release containing this notice, including its `--kicad-cli` flag:
-
-```bash
-schematic-viewer path/to/root.kicad_sch --kicad-cli /path/to/kicad-cli
-```
-
-Its drag-and-drop support and platform WebView prerequisites remain unchanged.
-It is built separately from the main workspace; see [DEV.md](DEV.md). Removal
-must wait until the deprecation release has shipped. See the
-[migration note](docs/api-migrations/browser-viewer-mcp.md) for the response contract
-and headless port-forwarding guidance.
+The browser viewer is embedded in the MCP server and PCM package. No separate
+viewer executable or GTK/WebKit/WebView build is needed. The standalone
+`schematic-viewer` command has been retired; use `open_schematic_viewer` instead.
+See the [retirement migration](docs/api-migrations/retire-standalone-viewer.md) and
+[browser response contract](docs/api-migrations/browser-viewer-mcp.md).
 
 ## Requirements
 

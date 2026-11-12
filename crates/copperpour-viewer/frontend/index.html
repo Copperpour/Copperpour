@@ -103,7 +103,6 @@
     cursor: grab;
   }
   #viewer.dragging { cursor: grabbing; }
-  #viewer.drop-target { outline: 3px dashed var(--accent); outline-offset: -3px; }
   #viewer svg, #viewer img {
     position: absolute;
     transform-origin: 0 0;
@@ -195,7 +194,7 @@
     </svg>
     <h2>Copperpour</h2>
     <p>Schematic Viewer</p>
-    <p id="open-prompt" style="margin-top:12px">Drag a .kicad_sch file here or use the MCP tool to open</p>
+    <p id="open-prompt" style="margin-top:12px">This viewer shows the schematic selected at launch.</p>
   </div>
   <div class="overlay" id="loading-overlay" style="display:none;">
     <div class="spinner"></div>

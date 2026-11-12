@@ -1,6 +1,6 @@
 //! GUI-independent schematic discovery, snapshot rendering and change batching.
 //!
-//! Shared by the legacy Tauri viewer and the planned browser viewer (#242).
+//! Used by the context-owned browser schematic viewer (#242).
 //! Existing snapshot fallback and partial-render behavior is preserved here;
 //! this extraction does not establish the browser service's security boundary.
 

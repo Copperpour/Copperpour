@@ -161,40 +161,9 @@ jobs:
         with:
           key: pcm-package-${{ matrix.platform }}
 
-      # Tauri 2 needs the GTK/WebKit stack to compile on Linux. Without
-      # these the viewer build fails on glib-sys and (before the require
-      # gate below existed) the Linux zip silently shipped without the
-      # viewer — true of every release up to and including v0.2.0.
-      - name: Install viewer system deps (Linux)
-        if: matrix.platform == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
-            libayatana-appindicator3-dev librsvg2-dev patchelf
-
       - name: Build server binary
         if: matrix.platform != 'macos'
         run: cargo build --release --locked -p copperpour
-
-      - name: Build schematic viewer (optional)
-        if: matrix.platform != 'macos'
-        continue-on-error: true
-        run: cargo build --release --locked --manifest-path crates/schematic-viewer/Cargo.toml
-
-      # continue-on-error above keeps partial logs useful, but a release
-      # artifact must not silently ship without the viewer — the PCM scripts
-      # omit a missing viewer binary without failing.
-      - name: Require viewer binary (Windows)
-        if: matrix.platform == 'windows'
-        shell: pwsh
-        run: |
-          if (-not (Test-Path "crates/schematic-viewer/target/release/schematic-viewer.exe")) {
-            Write-Error "schematic-viewer build failed - refusing to package without it"
-            exit 1
-          }
-      - name: Require viewer binary (Linux)
-        if: matrix.platform == 'linux'
-        run: test -f crates/schematic-viewer/target/release/schematic-viewer
 
       - name: Build universal binaries (macOS)
         if: matrix.platform == 'macos'
@@ -209,23 +178,6 @@ jobs:
             target/x86_64-apple-darwin/release/copperpour
           lipo -info dist/universal/copperpour
 
-      - name: Build universal schematic viewer (macOS, optional)
-        if: matrix.platform == 'macos'
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          for target in aarch64-apple-darwin x86_64-apple-darwin; do
-            cargo build --release --locked --manifest-path crates/schematic-viewer/Cargo.toml --target "$target"
-          done
-          lipo -create -output dist/universal/schematic-viewer \
-            crates/schematic-viewer/target/aarch64-apple-darwin/release/schematic-viewer \
-            crates/schematic-viewer/target/x86_64-apple-darwin/release/schematic-viewer
-          lipo -info dist/universal/schematic-viewer
-
-      - name: Require viewer binary (macOS)
-        if: matrix.platform == 'macos'
-        run: test -f dist/universal/schematic-viewer
-
       - name: Assemble PCM package (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -233,7 +185,6 @@ jobs:
           $version = "${{ env.RELEASE_VERSION }}".TrimStart('v')
           ./packaging/build-pcm.ps1 -Version $version `
             -BinaryPath target/release/copperpour.exe `
-            -ViewerPath crates/schematic-viewer/target/release/schematic-viewer.exe `
             -Platform windows `
             -OutDir dist
 
@@ -243,7 +194,6 @@ jobs:
           version="${RELEASE_VERSION#v}"
           ./packaging/build-pcm.sh --version "$version" \
             --binary dist/universal/copperpour \
-            --viewer dist/universal/schematic-viewer \
             --platform macos --out dist
 
       - name: Assemble PCM package (Linux)
@@ -252,7 +202,6 @@ jobs:
           version="${RELEASE_VERSION#v}"
           ./packaging/build-pcm.sh --version "$version" \
             --binary target/release/copperpour \
-            --viewer crates/schematic-viewer/target/release/schematic-viewer \
             --platform linux --out dist
 
       # Gate: the package must declare the platform it carries, and the bundled

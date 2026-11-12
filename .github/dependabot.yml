@@ -12,34 +12,6 @@ updates:
       minor-and-patch:
         update-types: ["minor", "patch"]
 
-  # The viewer is excluded from the workspace (Tauri app, built separately) and
-  # keeps its own Cargo.lock, so it needs its own entry here.
-  #
-  # `direct` is load-bearing, not tidiness. The viewer reaches the workspace
-  # crates by path, and those declare their dependencies in the ROOT manifest.
-  # Without this, dependabot scanning here sees a root-declared dependency
-  # through that path edge, and opens a PR that edits the ROOT Cargo.toml while
-  # regenerating only the viewer's lockfile. Manifest and root lock then
-  # disagree and `cargo test --workspace --locked` fails. That is exactly what
-  # #124 (sha2) and #126 (dirs) did, both labelled "in /crates/schematic-viewer"
-  # while touching the root manifest; both had to be closed.
-  #
-  # Restricting to direct dependencies leaves this ecosystem with what the
-  # viewer manifest actually declares — tauri, notify, tokio, serde, serde_json
-  # — and leaves everything root-declared to the root ecosystem above, which is
-  # the only one that can update both the manifest and the matching lockfile.
-  - package-ecosystem: cargo
-    directory: "/crates/schematic-viewer"
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 3
-    allow:
-      - dependency-type: "direct"
-    groups:
-      minor-and-patch:
-        update-types: ["minor", "patch"]
-
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

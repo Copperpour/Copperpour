@@ -2,8 +2,7 @@
 
 ## Schematic viewer without a desktop session
 
-On current `main`, `open_schematic_viewer` uses the loopback browser service
-instead of launching the Tauri/GTK application. It can serve saved schematics
+`open_schematic_viewer` uses the loopback browser service. It can serve saved schematics
 when the MCP client's server environment has no `DISPLAY`, `WAYLAND_DISPLAY`,
 or `XDG_RUNTIME_DIR`. Set `open_browser: false` for headless or remote use:
 
@@ -21,14 +20,11 @@ see [viewer service contract](../crates/copperpour-viewer/README.md#service-cont
 
 If `open_schematic_viewer` still reports `Failed to initialize GTK`, check
 `get_installation_info`: restart the MCP client with a build containing the
-browser-backed tool (merged in #439), or upgrade when that release is available.
+browser-backed tool (introduced in #439).
 Older installed binaries keep their previous behavior.
 
-The deprecated standalone `schematic-viewer` command still uses GTK/WebKit and
-needs a usable desktop session. When running that legacy command, provide the
-appropriate `DISPLAY` or `WAYLAND_DISPLAY`, plus `XDG_RUNTIME_DIR` where required,
-through the launching client's environment. The browser-backed MCP tool does
-not require those desktop-session variables.
+The standalone `schematic-viewer` command has been retired. Use the MCP tool
+instead; there is no separate viewer executable to install or configure.
 
 ## JLCPCB assembly cannot obtain native midpoint geometry
 

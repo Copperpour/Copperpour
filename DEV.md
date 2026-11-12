@@ -18,7 +18,6 @@ cargo check                          # ~15s
 cargo test --workspace --lib --tests # all tests
 cargo test -p copperpour-core -p copperpour --no-default-features --lib --tests  # the offline build (#210)
 cargo build --release -p copperpour     # MCP server binary
-cd crates/schematic-viewer && cargo build --release   # deprecated standalone Tauri viewer
 ```
 
 ### Nix
@@ -81,18 +80,14 @@ crates/
 │   └── proto/ (from KiCad v10) · build.rs (prost) · src/ gen.rs · client.rs (NNG
 │       req/rep) · builders.rs (protobuf helpers, mm→nm) · transform.rs (footprint
 │       children are ABSOLUTE board coords, mixelpixx/Konnect#23) · types.rs
-├── copperpour-viewer/           # Shared engine, loopback browser service, shared frontend
-└── schematic-viewer/            # Tauri app, outside the workspace
-    └── capabilities/default.json (core:default grant — without it event.listen() is
-        silently denied) · src/main.rs (commands and multi-sheet watcher
-        integration using copperpour-viewer); frontend assets live in
-        schematic-viewer/frontend (shared pan/zoom and sheet adapters)
+└── copperpour-viewer/           # Viewer engine and loopback browser service
+    └── frontend/               # Embedded browser page and script
 plugin/      Python launcher inside KiCad: __init__.py (PCB-editor ActionPlugin settings
              dialog) · settings_dialog.py · native_bridge.py (see Plugin) · plugin.json
 packaging/   build-pcm.{ps1,sh} (one platform) · merge-pcm.py + pcm-launcher.sh (all
              platforms, #398) · metadata.json · validate-pcm.py · schema/ · resources/
 .github/workflows/  disabled on GitHub; local CI runs their jobs (GOVERNANCE.md)
-    ci.yml        check+test (Linux, Windows), clippy, fmt, viewer, Python plugin,
+    ci.yml        check+test (Linux, Windows), clippy, fmt, Python plugin,
                   Nix, PCM validation, licenses, offline build — per PR
     e2e-kicad.yml real KiCad 10.0.5: e2e suite, demo-corpus conformance, PCM;
                   release gate, on request for a PR
@@ -316,11 +311,8 @@ Router: `crates/copperpour-core/src/router/mod.rs`.
   `libprotobuf-dev`, Fedora `protobuf-compiler` and `protobuf-devel`; otherwise the build
   fails with `google/protobuf/any.proto: File not found`.
 - Browser schematic viewer: included in the MCP server; needs a browser and `kicad-cli`.
-  The deprecated standalone viewer still needs Tauri 2 prerequisites (WebView2 on Windows, usually present). At
-  runtime it finds `kicad-cli` in the standard install paths, then PATH, or
-  `--kicad-cli <path>`. On Windows, if `cargo` is missing in a fresh shell, run
-  `set PATH=%PATH%;%USERPROFILE%\.cargo\bin`, and close the viewer before rebuilding (a
-  running `.exe` is locked, so linking fails).
+  Configure the server’s `kicad_cli` or let normal CLI discovery find KiCad.
+  No separate viewer binary or WebView runtime is required.
 
 ## Build Features
 
@@ -360,19 +352,18 @@ Run all: `PROTOC=<path> cargo test --workspace --lib --tests`
 | `copperpour-viewer` unit | Sheet discovery, snapshot rendering, cache selection and event batching |
 | `crates/copperpour/tests/` | stdio protocol, doc/asset count guards, transaction CLI, `#[ignore]`d live-KiCad tests |
 
-`schematic-viewer` is in `[workspace] exclude`, so `--workspace` never builds it; CI's
-`viewer` job runs its `cargo check` and `cargo test`. Locally:
-`cd crates/schematic-viewer && cargo test`. The pure viewer logic and its tests now live in the workspace crate
-`copperpour-viewer` (`walk_sheet_tree`, `compute_watch_dirs`, `snapshot_tree`,
-`drain_until_quiet`, `files_needing_render`, `render_all` errors). The Tauri app
-uses that engine and retains its frontend/configuration check; building and testing
-the engine alone requires no GTK, WebKit or display. The process invocation and
-Tauri plumbing remain thin adapters. The browser service is exercised by the
-viewer crate's HTTP/SSE integration tests; `examples/browser_viewer.rs` is its
-local development entry point. The MCP launch tool uses the browser service, owned by a registry on `ToolContext`
-until the server context ends. `open_browser: false` suppresses the OS opener; all successful
-service starts return a credential URL. The standalone Tauri app is deprecated
-and retained for one shipped release containing the migration notice. See [the viewer README](crates/copperpour-viewer/README.md).
+The viewer engine, browser service and embedded frontend are in the workspace
+crate `copperpour-viewer`; workspace checks cover them without GTK, WebKit or a
+display. Its HTTP/SSE tests cover the service; `examples/browser_viewer.rs` is
+the local development entry point. Browser execution and native renderer smoke
+checks remain separate evidence. The MCP launch tool owns viewers through a
+registry on `ToolContext` until the server context ends. `open_browser: false`
+suppresses the OS opener; successful service starts return a private credential
+URL. See [the viewer README](crates/copperpour-viewer/README.md).
+
+The standalone Tauri crate, binary and separate CI job have been removed under
+[the retirement migration](docs/api-migrations/retire-standalone-viewer.md).
+Build only the MCP server; PCM packaging embeds the browser viewer with it.
 
 ## Adding a New Tool
 

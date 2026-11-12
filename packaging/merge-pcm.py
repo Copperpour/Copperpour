@@ -9,10 +9,10 @@ version number, so a release cannot list one zip per platform (#398). Each
 platform's zip is still built on its own machine; this script combines them
 into copperpour-pcm-v<version>.zip, one version entry for all three platforms:
 
-  plugins/bin/copperpour.exe              Windows server (and its viewer)
+  plugins/bin/copperpour.exe              Windows server (browser viewer embedded)
   plugins/bin/copperpour                  pcm-launcher.sh, runs the one below
-  plugins/bin-linux-x86_64/copperpour     Linux server (and its viewer)
-  plugins/bin-macos/copperpour            macOS universal server (and its viewer)
+  plugins/bin-linux-x86_64/copperpour     Linux server (browser viewer embedded)
+  plugins/bin-macos/copperpour            macOS universal server (browser viewer embedded)
 
 Everything else must be the same in all three zips, line endings aside (a
 Windows checkout may carry CRLF); plugin.json may differ only in the

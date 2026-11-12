@@ -101,17 +101,6 @@
         pkgs = pkgsFor system;
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         python = pkgs.python3.withPackages (pythonPackages: [pythonPackages.jsonschema]);
-        viewerLibraries = with pkgs; [
-          dbus
-          glib
-          gtk3
-          libappindicator-gtk3
-          libayatana-appindicator
-          librsvg
-          libsoup_3
-          openssl
-          webkitgtk_4_1
-        ];
       in {
         default = pkgs.mkShell {
           packages = with pkgs; [
@@ -121,12 +110,9 @@
             pkg-config
             file
             kicad-small
-            patchelf
             python
             zip
           ];
-
-          buildInputs = viewerLibraries;
 
           # copperpour-ipc/build.rs can discover these from PATH, but setting
           # them explicitly also makes protobuf's well-known types reliable
@@ -137,11 +123,6 @@
           # The ignored real-KiCad integration test needs both kicad-cli and
           # the stock Device library, even on an otherwise clean machine.
           KICAD10_SYMBOL_DIR = "${pkgs.kicad.libraries.symbols}/share/kicad/symbols";
-
-          # Cargo-built Tauri test binaries are not wrapped like installed
-          # Nix applications, so expose their shared libraries while inside
-          # the development shell.
-          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath viewerLibraries;
         };
       }
     );

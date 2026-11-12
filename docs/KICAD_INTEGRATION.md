@@ -246,9 +246,9 @@ Fixing both is part of [#24](https://github.com/Copperpour/Copperpour/issues/24)
 files and renders private snapshots through `kicad-cli`; its context-owned
 loopback service needs no GUI runtime in the server. The tool returns a credential
 URL even when the OS browser opener fails or `open_browser: false` is passed.
-The standalone Tauri viewer in `crates/schematic-viewer` is deprecated, retained
-for one shipped release containing the notice, and still built and tested
-separately from the Rust workspace.
+The browser frontend is embedded in `copperpour-viewer`; the standalone Tauri
+application and separate viewer packaging have been retired. See the
+[retirement migration](api-migrations/retire-standalone-viewer.md).
 
 The PCM assembly scripts in `packaging/build-pcm.ps1` and `build-pcm.sh` stage
 only metadata, plugin files, icons, and binaries. Repository developer

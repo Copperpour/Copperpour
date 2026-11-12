@@ -1,4 +1,4 @@
-//! Development entry point for phase 2; the MCP tool still launches Tauri.
+//! Development entry point for the same browser service used by the MCP tool.
 use copperpour_viewer::browser::BrowserViewer;
 use std::{path::PathBuf, time::Duration};
 #[tokio::main]

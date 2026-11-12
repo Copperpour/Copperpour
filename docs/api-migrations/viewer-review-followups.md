@@ -1,5 +1,9 @@
 ### `open_schematic_viewer` identifies missing schematics (minor release)
 
+> Later superseded by [standalone viewer retirement](retire-standalone-viewer.md):
+> the owner waived the planned release grace period and approved immediate removal.
+> Statements below about retention describe this earlier phase only.
+
 A schematic path that cannot resolve because it does not exist now returns
 structured `file_not_found` with the requested `path`, instead of a generic
 `handler_error`. Other resolution failures retain their existing legacy error text; clients

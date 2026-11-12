@@ -12,7 +12,6 @@
 #     native_bridge.py            authenticated KiCad 10 native Specctra bridge
 #     resources/icon.png          toolbar icon (referenced by __init__.py)
 #     bin/copperpour                 the MCP server binary
-#     bin/schematic-viewer        (optional) live schematic viewer
 #   resources/
 #     icon.png                    icon shown in the PCM dialog
 #
@@ -26,7 +25,7 @@
 # declares them all.
 #
 # Usage:
-#   packaging/build-pcm.sh [--version X.Y.Z] [--binary PATH] [--viewer PATH]
+#   packaging/build-pcm.sh [--version X.Y.Z] [--binary PATH]
 #                          [--platform macos|linux] [--out DIR]
 #
 # Defaults: version from Cargo.toml, binary target/release/copperpour, platform
@@ -39,13 +38,12 @@ bin_name="copperpour"
 
 version=""
 binary="$repo_root/target/release/$bin_name"
-viewer=""
 platform=""
 out_dir="$repo_root/dist"
 
 usage() {
     cat >&2 <<'EOF'
-Usage: packaging/build-pcm.sh [--version X.Y.Z] [--binary PATH] [--viewer PATH]
+Usage: packaging/build-pcm.sh [--version X.Y.Z] [--binary PATH]
                               [--platform macos|linux] [--out DIR]
 
 Assembles the KiCAD PCM plugin zip (macOS/Linux port of build-pcm.ps1).
@@ -58,7 +56,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --version) version="${2:?--version needs a value}"; shift 2;;
         --binary)  binary="${2:?--binary needs a value}";   shift 2;;
-        --viewer)  viewer="${2:?--viewer needs a value}";   shift 2;;
+        --viewer) echo "--viewer was retired: the browser viewer is embedded in copperpour; remove this argument" >&2; exit 2;;
         --platform) platform="${2:?--platform needs a value}"; shift 2;;
         --out)     out_dir="${2:?--out needs a value}";     shift 2;;
         -h|--help) usage; exit 0;;
@@ -101,12 +99,6 @@ cp "$repo_root/plugin/settings_dialog.py" "$staging/plugins/"
 cp "$repo_root/plugin/native_bridge.py"   "$staging/plugins/"
 cp "$binary"                              "$staging/plugins/bin/$bin_name"
 chmod +x "$staging/plugins/bin/$bin_name"
-if [ -n "$viewer" ] && [ -f "$viewer" ]; then
-    cp "$viewer" "$staging/plugins/bin/schematic-viewer"
-    chmod +x "$staging/plugins/bin/schematic-viewer"
-    echo "Included schematic viewer: $viewer"
-fi
-
 # Icons: PCM dialog icon at resources/, toolbar icon inside plugins/
 cp "$repo_root/packaging/resources/icon.png" "$staging/resources/icon.png"
 cp "$repo_root/packaging/resources/icon.png" "$staging/plugins/resources/icon.png"

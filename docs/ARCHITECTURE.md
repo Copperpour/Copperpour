@@ -80,20 +80,18 @@ open-document set, an ambiguous document set, and a request KiCad rejected.
 `crates/copperpour-viewer` owns sheet discovery, snapshot SVG rendering,
 incremental cache selection and event-batching helpers. It is a workspace
 member with no Tauri or GUI dependency. Its `browser` module adds a root-bound
-loopback HTTP/SSE service with owned watcher/render tasks. The Tauri application
-and browser adapter share frontend assets in the retained `schematic-viewer/frontend` directory.
+loopback HTTP/SSE service with owned watcher/render tasks. Browser frontend assets
+are embedded from `crates/copperpour-viewer/frontend`.
 The MCP launch tool uses the browser service. A `ToolContext` registry serializes
 starts and reuses an instance per canonical root; dropping the context signals
 shutdown of its viewers. Browser-launch status describes the OS opener separately
-from successful service startup. The standalone Tauri app is deprecated and
-retained through one shipped release containing the notice.
+from successful service startup. The standalone Tauri application has been retired;
+there is no separate viewer process or GUI build.
 
 ### Non-workspace and non-Rust boundaries
 
-`crates/schematic-viewer` is a separate Tauri application and is deliberately
-outside the Cargo workspace. `plugin` is the thin Python KiCad integration
-layer. `packaging` contains the PCM build scripts, metadata, schema, and package
-validation. Bundled AI guidance under `crates/copperpour/assets/skills` and
+`plugin` is the thin Python KiCad integration layer. `packaging` contains the
+PCM build scripts, metadata, schema, and package validation. Bundled AI guidance under `crates/copperpour/assets/skills` and
 `assets/agents` is user-facing workflow behavior and must track the tools it
 names.
 
