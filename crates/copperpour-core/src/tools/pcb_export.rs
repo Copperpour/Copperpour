@@ -277,15 +277,19 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "export_netlist",
-            "Export the PCB netlist to a file in KiCAD or IPC-D-356 format.",
+            "Export a netlist file. format 'ipc' writes the board's IPC-D-356 netlist \
+             (kicad-cli `pcb export ipcd356`). format 'kicad' writes a KiCad netlist, which \
+             kicad-cli can only produce from the schematic: given a .kicad_pcb it is exported \
+             from the root schematic of the same name beside the board (reported as \
+             `source_schematic`), and refused when that schematic does not exist.",
             json!({
                 "type": "object",
                 "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file (or .kicad_sch for schematic netlist)" },
+                    "board": { "type": "string", "description": "Path to the .kicad_pcb file. For format 'kicad' the netlist comes from the <board name>.kicad_sch beside it; a .kicad_sch path is also accepted directly." },
                     "output": { "type": "string", "description": "Output netlist file path" },
                     "format": {
                         "type": "string",
-                        "description": "Netlist format: 'kicad' or 'ipc' (IPC-D-356)",
+                        "description": "Netlist format: 'ipc' (IPC-D-356, from the board), or a schematic netlist format: 'kicad', 'kicadxml', 'cadstar', 'orcadpcb2', 'spice', 'spicemodel', 'pads' or 'allegro'. Any other name is refused before kicad-cli runs.",
                         "default": "kicad"
                     }
                 },
@@ -662,18 +666,104 @@ async fn handle_export_netlist(
     let output = get_path(args, "output")?;
     let format = args["format"].as_str().unwrap_or("kicad");
 
+    let source = match netlist_source(&board, format) {
+        Ok(source) => source,
+        Err(refusal) => return Ok(refusal),
+    };
+
     let cli = &ctx.config.kicad_cli;
-    // kicad-cli `sch export netlist` works on both .kicad_sch and .kicad_pcb paths.
-    // For PCB-specific netlist formats (IPC-D-356), delegate same way.
-    cli::export_netlist(cli, &board, &output, format).await?;
+    let mut response = json!({
+        "success": true,
+        "format": format,
+        "output": output.to_str().unwrap_or("")
+    });
+    match &source {
+        NetlistSource::Board(board) => cli::export_ipcd356(cli, board, &output).await?,
+        NetlistSource::Schematic(schematic) => {
+            cli::export_netlist(cli, schematic, &output, format).await?;
+            response["source_schematic"] = json!(schematic.to_str().unwrap_or(""));
+        }
+    }
 
     Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "format": format,
-            "output": output.to_str().unwrap_or("")
-        }))
-        .unwrap(),
+        serde_json::to_string(&response).unwrap(),
+    ))
+}
+
+/// The file `export_netlist` hands to kicad-cli.
+#[derive(Debug, PartialEq)]
+enum NetlistSource {
+    /// `pcb export ipcd356` on the board.
+    Board(PathBuf),
+    /// `sch export netlist` on a schematic.
+    Schematic(PathBuf),
+}
+
+/// The schematic netlist formats `export_netlist` names in a refusal: KiCad
+/// 10's `sch export netlist --format` values, with `kicad` for `kicadsexpr`.
+const SCHEMATIC_NETLIST_FORMATS: [&str; 8] = [
+    "kicad",
+    "kicadxml",
+    "cadstar",
+    "orcadpcb2",
+    "spice",
+    "spicemodel",
+    "pads",
+    "allegro",
+];
+
+/// The names `export_netlist` takes for IPC-D-356.
+fn is_ipcd356_format(format: &str) -> bool {
+    matches!(
+        format.to_ascii_lowercase().as_str(),
+        "ipc" | "ipcd356" | "ipc-d-356" | "ipc_d_356" | "d356"
+    )
+}
+
+/// Which file a netlist in `format` is exported from, given the `board`
+/// argument. kicad-cli has two unrelated commands: `pcb export ipcd356` reads
+/// a board, and `sch export netlist` reads a schematic, does not load a
+/// `.kicad_pcb` and has no IPC-D-356 format (#155). So every format but
+/// IPC-D-356 needs the schematic, which for a board path is the root schematic
+/// KiCad keeps beside it under the same name.
+fn netlist_source(input: &Path, format: &str) -> Result<NetlistSource, CallToolResult> {
+    let is_board = extension_is(input, "kicad_pcb");
+    if is_ipcd356_format(format) {
+        if extension_is(input, "kicad_sch") {
+            return Err(invalid_export_argument(
+                "board",
+                "an IPC-D-356 netlist is exported from the board; pass the .kicad_pcb file",
+            ));
+        }
+        return Ok(NetlistSource::Board(input.to_path_buf()));
+    }
+    // kicad-cli answered a name it does not know with "Invalid format" only
+    // after it ran; refuse it here, naming the formats there are (#155).
+    if cli::netlist_cli_format(format).is_none() {
+        return Err(invalid_export_argument(
+            "format",
+            format!(
+                "unknown netlist format '{format}'; use 'ipc' (IPC-D-356, from the board) or a \
+                 schematic netlist format: {}",
+                SCHEMATIC_NETLIST_FORMATS.join(", ")
+            ),
+        ));
+    }
+    if !is_board {
+        return Ok(NetlistSource::Schematic(input.to_path_buf()));
+    }
+    let schematic = input.with_extension("kicad_sch");
+    if schematic.is_file() {
+        return Ok(NetlistSource::Schematic(schematic));
+    }
+    Err(invalid_export_argument(
+        "board",
+        format!(
+            "a '{format}' netlist is exported from the schematic, not the board, and no \
+             schematic '{}' exists beside this board; pass the root .kicad_sch file here or \
+             to generate_netlist, or use format 'ipc' for the board's IPC-D-356 netlist",
+            schematic.display()
+        ),
     ))
 }
 
@@ -2266,3 +2356,225 @@ mod specctra_padstack_served_tests {
 #[cfg(all(test, unix, feature = "native-bridge"))]
 #[path = "native_specctra_order_tests.rs"]
 mod native_specctra_order_tests;
+
+/// `export_netlist` ran `sch export netlist` on the board whatever the format.
+/// That command does not load a `.kicad_pcb` ("Failed to load schematic") and
+/// has no IPC-D-356 format ("Invalid format"), so neither format worked (#155).
+#[cfg(test)]
+mod netlist_export_tests {
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+    use serde_json::{json, Value};
+
+    struct Run {
+        dir: tempfile::TempDir,
+        result: Value,
+        /// The fake `kicad-cli` command line, or `None` when it never ran.
+        argv: Option<String>,
+    }
+
+    impl Run {
+        fn path(&self, name: &str) -> String {
+            self.dir.path().join(name).display().to_string()
+        }
+
+        fn body(&self) -> Value {
+            serde_json::from_str(self.result["content"][0]["text"].as_str().unwrap()).unwrap()
+        }
+    }
+
+    /// Calls `export_netlist` on `input` through the served dispatch, in a
+    /// directory holding `files`, with a fake `kicad-cli` that records its
+    /// command line and writes the file named by `--output`.
+    async fn export(files: &[&str], input: &str, format: Option<&str>) -> Run {
+        let dir = tempfile::tempdir().unwrap();
+        for file in files {
+            std::fs::write(dir.path().join(file), "").unwrap();
+        }
+        let recorded = dir.path().join("argv.txt");
+        let cli = cli::test_support::write_script(
+            dir.path(),
+            "fake-kicad-cli",
+            &format!(
+                "#!/bin/sh\nprintf '%s ' \"$@\" > '{}'\n\
+                 while [ $# -gt 0 ]; do [ \"$1\" = --output ] && printf x > \"$2\"; shift; done\n",
+                recorded.display()
+            ),
+            &format!(
+                "@echo off\r\necho %* > \"{}\"\r\n\
+                 :next\r\nif \"%~1\"==\"--output\" (echo x> \"%~2\")\r\n\
+                 shift\r\nif not \"%~1\"==\"\" goto next\r\nexit /b 0\r\n",
+                recorded.display()
+            ),
+        );
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: cli.display().to_string(),
+            auto_load_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut args = json!({
+            "board": dir.path().join(input).display().to_string(),
+            "output": dir.path().join("out.net").display().to_string(),
+        });
+        if let Some(format) = format {
+            args["format"] = json!(format);
+        }
+        let result = handler
+            .handle_message(json!({"jsonrpc": "2.0", "id": 199, "method": "tools/call",
+                "params": {"name": "export_netlist", "arguments": args}}))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        // Windows quotes batch-file arguments that hold a space.
+        let argv = std::fs::read_to_string(&recorded)
+            .ok()
+            .map(|argv| argv.replace('"', "").trim().to_string());
+        Run { dir, result, argv }
+    }
+
+    #[tokio::test]
+    async fn ipc_runs_pcb_export_ipcd356_on_the_board() {
+        for format in ["ipc", "IPC", "ipcd356", "IPC-D-356"] {
+            // A schematic beside the board must not divert a board export.
+            let run = export(
+                &["demo.kicad_pcb", "demo.kicad_sch"],
+                "demo.kicad_pcb",
+                Some(format),
+            )
+            .await;
+            assert_ne!(run.result["isError"], true, "{format}: {}", run.result);
+            let expected = format!(
+                "pcb export ipcd356 --output {} {}",
+                run.path("out.net"),
+                run.path("demo.kicad_pcb")
+            );
+            assert_eq!(run.argv.as_deref(), Some(expected.as_str()), "{format}");
+            let body = run.body();
+            assert_eq!(body["format"], format);
+            assert!(body.get("source_schematic").is_none(), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn kicad_exports_from_the_schematic_beside_the_board() {
+        for format in [None, Some("kicad")] {
+            let run = export(
+                &["demo.kicad_pcb", "demo.kicad_sch"],
+                "demo.kicad_pcb",
+                format,
+            )
+            .await;
+            assert_ne!(run.result["isError"], true, "{format:?}: {}", run.result);
+            let expected = format!(
+                "sch export netlist --output {} --format kicadsexpr {}",
+                run.path("out.net"),
+                run.path("demo.kicad_sch")
+            );
+            assert_eq!(run.argv.as_deref(), Some(expected.as_str()), "{format:?}");
+            assert_eq!(
+                run.body()["source_schematic"],
+                run.path("demo.kicad_sch"),
+                "{format:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kicad_without_a_schematic_is_refused_before_kicad_cli_runs() {
+        let run = export(&["demo.kicad_pcb"], "demo.kicad_pcb", Some("kicad")).await;
+
+        assert_eq!(run.result["isError"], true, "{}", run.result);
+        let body = run.body();
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "board");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("exported from the schematic"), "{message}");
+        assert!(message.contains("generate_netlist"), "{message}");
+        assert!(message.contains(&run.path("demo.kicad_sch")), "{message}");
+        assert_eq!(run.argv, None, "kicad-cli must not run");
+        assert!(!run.dir.path().join("out.net").exists());
+    }
+
+    #[tokio::test]
+    async fn a_schematic_path_still_exports_its_netlist() {
+        let run = export(&["demo.kicad_sch"], "demo.kicad_sch", Some("kicad")).await;
+
+        assert_ne!(run.result["isError"], true, "{}", run.result);
+        let argv = run.argv.as_deref().unwrap();
+        assert!(argv.starts_with("sch export netlist "), "{argv}");
+        assert!(argv.ends_with(&run.path("demo.kicad_sch")), "{argv}");
+    }
+
+    #[tokio::test]
+    async fn ipc_from_a_schematic_path_is_refused() {
+        let run = export(&["demo.kicad_sch"], "demo.kicad_sch", Some("ipc")).await;
+
+        assert_eq!(run.result["isError"], true, "{}", run.result);
+        assert_eq!(run.body()["error"]["field"], "board");
+        assert_eq!(run.argv, None, "kicad-cli must not run");
+        assert!(!run.dir.path().join("out.net").exists());
+    }
+
+    /// An unknown name reached kicad-cli, which refused it only after it ran
+    /// ("Invalid format"). It is refused on `format`, for a board or a
+    /// schematic, before kicad-cli runs.
+    #[tokio::test]
+    async fn an_unknown_format_is_refused_before_kicad_cli_runs() {
+        for input in ["demo.kicad_pcb", "demo.kicad_sch"] {
+            let run = export(&["demo.kicad_pcb", "demo.kicad_sch"], input, Some("gerber")).await;
+
+            assert_eq!(run.result["isError"], true, "{input}: {}", run.result);
+            let body = run.body();
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{input}");
+            assert_eq!(body["error"]["field"], "format", "{input}");
+            let message = body["message"].as_str().unwrap();
+            assert!(message.contains("'gerber'"), "{message}");
+            assert!(
+                message.contains("'ipc'") && message.contains("kicadxml"),
+                "{message}"
+            );
+            assert_eq!(run.argv, None, "{input}: kicad-cli must not run");
+            assert!(!run.dir.path().join("out.net").exists(), "{input}");
+        }
+    }
+
+    /// Every format kicad-cli 10 lists for `sch export netlist` is accepted
+    /// under the name the refusal gives for it.
+    #[test]
+    fn every_listed_schematic_format_is_accepted() {
+        for format in SCHEMATIC_NETLIST_FORMATS {
+            assert!(cli::netlist_cli_format(format).is_some(), "{format}");
+        }
+        assert_eq!(cli::netlist_cli_format("SpiceModel"), Some("spicemodel"));
+        assert_eq!(cli::netlist_cli_format("ipc"), None);
+    }
+
+    #[test]
+    fn the_source_follows_the_format_and_the_files_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("demo.kicad_pcb");
+        let schematic = dir.path().join("demo.kicad_sch");
+
+        assert_eq!(
+            netlist_source(&board, "ipc").ok(),
+            Some(NetlistSource::Board(board.clone()))
+        );
+        assert!(netlist_source(&board, "kicad").is_err());
+        // Every schematic netlist format needs the schematic, not only 'kicad'.
+        assert!(netlist_source(&board, "spice").is_err());
+
+        std::fs::write(&schematic, "").unwrap();
+        assert_eq!(
+            netlist_source(&board, "kicad").ok(),
+            Some(NetlistSource::Schematic(schematic.clone()))
+        );
+        assert_eq!(
+            netlist_source(&schematic, "kicad").ok(),
+            Some(NetlistSource::Schematic(schematic))
+        );
+    }
+}
