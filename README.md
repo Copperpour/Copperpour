@@ -265,6 +265,37 @@ cargo build --release -p copperpour --no-default-features
 - Re-run `copperpour init` to update them.
 - `copperpour uninstall` removes them. Add `--client codex` for Codex.
 
+For another client, or an isolated installation, choose an **absolute skills root**:
+
+```sh
+copperpour init --skills-dir /absolute/path/to/client/skills
+copperpour status --skills-dir /absolute/path/to/client/skills
+copperpour uninstall --skills-dir /absolute/path/to/client/skills
+```
+
+On Windows, use an absolute path such as `"C:\agent\skills"`. Alternatively set
+`COPPERPOUR_SKILLS_DIR`; an explicit `--skills-dir` takes precedence. Empty or
+relative targets are rejected. These three commands use the custom target in
+**skills-only** mode, even with `--client claude`: they do not write client profile
+files, agents, hooks, or native installation markers. Existing commands without
+an override keep their client-specific behavior. The override does not configure
+MCP startup or the double-click installer.
+
+Point your client's skill discovery at this root. It contains portable Markdown
+`<skill>/SKILL.md` files with frontmatter and optional `references/` files; automatic
+discovery depends on the client. Clients without skill discovery can read those
+files as guidance. Claude agents and hooks are separate integrations.
+
+Custom installation records the installed contents in `.copperpour-skills.json`
+inside the target. Keep that ownership marker: uninstall removes only recorded
+files whose contents still match, preserves edits and unrelated files, and removes
+only empty skill directories. It never removes the root. Reinitializing refuses
+to overwrite locally edited or unowned content that differs from the bundle;
+back it up and move it aside before updating. Custom targets reject symlinks at
+the root or along managed paths, including the ownership marker. Avoid concurrent
+installers or edits while installing/removing skills. Use explicit `status` for custom-target drift checks;
+the MCP startup notice checks native client installations.
+
 </details>
 
 <details>
