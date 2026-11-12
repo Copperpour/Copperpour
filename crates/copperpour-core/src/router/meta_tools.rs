@@ -212,8 +212,9 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
             name: "load_toolset".to_string(),
             description:
                 "Load a toolset by name so its tools appear in tools/list and can be called. \
-                 Returns the list of tools that were added. Use list_toolboxes() first to \
-                 see valid names. Pass an array to load several toolsets in one call -- \
+                 Returns the list of tools that were added. A toolset that is already \
+                 loaded is named in already_loaded, without its tools again: no need to \
+                 reload it. Use list_toolboxes() first to see valid names. Pass an array to load several toolsets in one call -- \
                  cheaper, one tools/list refresh."
                     .to_string(),
             input_schema: json!({
@@ -543,25 +544,37 @@ async fn handle_list_toolboxes(ctx: &std::sync::Arc<ToolContext>) -> CallToolRes
 
 async fn handle_load_toolset(args: &Value, ctx: &std::sync::Arc<ToolContext>) -> CallToolResult {
     match &args["name"] {
-        // Legacy single-name form: result shape is byte-identical to the
-        // pre-batch behavior (`loaded` is a string, `tools` echoes descriptions).
-        Value::String(name) => match ctx.router.load(name).await {
-            Some(tools) => {
-                let tool_list: Vec<Value> = tools
-                    .iter()
-                    .map(|t| json!({ "name": t.name, "description": t.description }))
-                    .collect();
-                CallToolResult::json(&json!({
+        // Legacy single-name form: `loaded` is a string and `tools` echoes
+        // descriptions, as before the batch form. A toolset that was already
+        // loaded adds `already_loaded: true` and leaves `tools` empty: its
+        // descriptions are in the caller's tool list, and repeating them on
+        // every redundant call was most of the server's output.
+        Value::String(name) => {
+            let already = ctx.router.is_active(name).await;
+            match ctx.router.load(name).await {
+                Some(tools) if already => CallToolResult::json(&json!({
                     "loaded": name,
+                    "already_loaded": true,
                     "tools_added": tools.len(),
-                    "tools": tool_list
-                }))
+                    "tools": []
+                })),
+                Some(tools) => {
+                    let tool_list: Vec<Value> = tools
+                        .iter()
+                        .map(|t| json!({ "name": t.name, "description": t.description }))
+                        .collect();
+                    CallToolResult::json(&json!({
+                        "loaded": name,
+                        "tools_added": tools.len(),
+                        "tools": tool_list
+                    }))
+                }
+                None => CallToolResult::error(format!(
+                    "Unknown toolset '{}'. Call list_toolboxes() to see valid names.",
+                    name
+                )),
             }
-            None => CallToolResult::error(format!(
-                "Unknown toolset '{}'. Call list_toolboxes() to see valid names.",
-                name
-            )),
-        },
+        }
         // New array form: one load, one tools/list_changed notification.
         Value::Array(arr) => {
             let mut names: Vec<String> =
@@ -574,15 +587,23 @@ async fn handle_load_toolset(args: &Value, ctx: &std::sync::Arc<ToolContext>) ->
             names.retain(|n| seen.insert(n.clone()));
 
             let mut loaded = Vec::new();
+            let mut already_loaded = Vec::new();
             let mut tools_added = 0usize;
             let mut tool_list: Vec<Value> = Vec::new();
             let mut errors = Vec::new();
 
             for name in &names {
+                let already = ctx.router.is_active(name).await;
                 match ctx.router.load(name).await {
                     Some(tools) => {
                         loaded.push(name.clone());
                         tools_added += tools.len();
+                        // Descriptions only for toolsets this call loaded; see
+                        // the single-name form.
+                        if already {
+                            already_loaded.push(name.clone());
+                            continue;
+                        }
                         tool_list.extend(
                             tools
                                 .iter()
@@ -614,12 +635,16 @@ async fn handle_load_toolset(args: &Value, ctx: &std::sync::Arc<ToolContext>) ->
 
             // Partial success (some names unknown, some loaded) is not an error --
             // the caller gets what loaded plus an errors array for the rest.
-            CallToolResult::json(&json!({
+            let mut body = json!({
                 "loaded": loaded,
                 "tools_added": tools_added,
                 "tools": tool_list,
                 "errors": errors,
-            }))
+            });
+            if !already_loaded.is_empty() {
+                body["already_loaded"] = json!(already_loaded);
+            }
+            CallToolResult::json(&body)
         }
         _ => CallToolResult::error("Missing required argument: name (string or array of strings)"),
     }
@@ -961,5 +986,82 @@ mod reload_tests {
             child.wait().unwrap().success(),
             "child failed:\n{output:#?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod load_toolset_tests {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use crate::router::{registry, ToolRouter};
+    use crate::tools::ServerConfig;
+
+    fn context() -> Arc<ToolContext> {
+        Arc::new(ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(ToolRouter::new()),
+        ))
+    }
+
+    async fn load(ctx: &Arc<ToolContext>, name: Value) -> Value {
+        let result = handle_load_toolset(&json!({ "name": name }), ctx).await;
+        assert!(!result.is_error, "{result:?}");
+        match &result.content[..] {
+            [ToolContent::Text { text }] => serde_json::from_str(text).unwrap(),
+            other => panic!("expected one text block, got {other:?}"),
+        }
+    }
+
+    /// A first load echoes every tool with its description.
+    #[tokio::test]
+    async fn a_first_load_lists_the_added_tools() {
+        let ctx = context();
+        let body = load(&ctx, json!("templates")).await;
+        let added = body["tools_added"].as_u64().unwrap();
+        assert!(added > 0);
+        assert_eq!(body["tools"].as_array().unwrap().len() as u64, added);
+        assert!(body.get("already_loaded").is_none(), "{body}");
+    }
+
+    /// Reloading a loaded toolset by name says so and repeats no
+    /// descriptions; `loaded` and `tools_added` keep their meaning.
+    #[tokio::test]
+    async fn reloading_by_name_repeats_no_descriptions() {
+        let ctx = context();
+        let first = load(&ctx, json!("templates")).await;
+        let again = load(&ctx, json!("templates")).await;
+        assert_eq!(again["loaded"], "templates");
+        assert_eq!(again["already_loaded"], true);
+        assert_eq!(again["tools_added"], first["tools_added"]);
+        assert_eq!(again["tools"], json!([]));
+    }
+
+    /// In the array form only the newly loaded toolsets contribute
+    /// descriptions; the rest are named in `already_loaded`.
+    #[tokio::test]
+    async fn the_array_form_describes_only_new_toolsets() {
+        let ctx = context();
+        let templates = load(&ctx, json!("templates")).await;
+        let body = load(&ctx, json!(["templates", "sch_wiring"])).await;
+        assert_eq!(body["loaded"], json!(["templates", "sch_wiring"]));
+        assert_eq!(body["already_loaded"], json!(["templates"]));
+
+        let wiring = registry::tools_for("sch_wiring").unwrap();
+        let listed: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, wiring.iter().map(|t| t.name).collect::<Vec<_>>());
+        assert_eq!(
+            body["tools_added"].as_u64().unwrap(),
+            templates["tools_added"].as_u64().unwrap() + wiring.len() as u64
+        );
+
+        // Nothing new at all: no descriptions, everything already loaded.
+        let body = load(&ctx, json!(["templates", "sch_wiring"])).await;
+        assert_eq!(body["tools"], json!([]));
+        assert_eq!(body["already_loaded"], json!(["templates", "sch_wiring"]));
     }
 }
