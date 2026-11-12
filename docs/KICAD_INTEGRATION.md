@@ -163,10 +163,28 @@ checks that the native DSN has the same components, pads, nets, layers, and
 routing rules, and writes the revision-bound reverse manifest. The temporary
 file is consumed and deleted.
 
-The `native_bridge_mode` tool argument controls selection: `disable` (the
-default) uses the Rust DSN exporter only, `prefer` uses a running bridge and
-otherwise falls back to the Rust exporter, and `require` fails if native export
-cannot be used.
+Shared import-safety checks run first in every mode: the supported copper stack,
+representable SMD and all-copper through-hole pads, routing rules, locked-routing
+inventory and zone representation. They retain main’s multilayer, both-side and
+copper-plane support. Rule areas, custom `.kicad_dru` files, nonuniform per-layer
+pad geometry and other unsupported manifest features remain refused. A native
+exporter cannot bypass those checks.
+
+| `native_bridge_mode` | Export order after shared checks |
+|---|---|
+| `disable` (default) | Rust writer checks, then Rust DSN. |
+| `prefer` | Authenticated native bridge and semantic validation first. If unavailable or invalid, Rust writer checks and Rust DSN; a refused fallback reports both reasons. |
+| `require` | Authenticated native bridge and semantic validation; a native-path refusal if unusable, with no Rust fallback. |
+
+The snapshot model builds the manifest and expected identities independently of
+DSN generation. Only the Rust writer requires one closed loop of Edge.Cuts lines
+and circular arcs (flattened within board `max_error`). A KiCad-native DSN can
+therefore retain circular cutouts that the Rust writer cannot emit. It is still
+correlated against the same snapshot’s components, pad shapes, nets, layer types,
+classes/vias and planes; the live revision must remain unchanged after export.
+The native manifest labels its boundary as KiCad-native, rather than claiming it
+was flattened by Rust. SES parsing and apply retain their source/hash binding.
+
 Native export is disabled in the plugin settings by default. This bridge is a
 KiCad 10 compatibility path, not a substitute for the executable IPC plugin or
 the KiCad 11 architecture; strict SES planning and atomic IPC apply never pass

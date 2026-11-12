@@ -454,6 +454,15 @@ includes bounded `native_bridge_diagnostics`. Use `native_bridge_mode: "require"
 when testing the native path so an unavailable bridge is an error instead of a
 fallback.
 
+Shared import-safety refusals apply to all modes. A `.kicad_dru` refusal is an
+SES-import limitation, not a Rust outline limitation; `require` does not bypass
+it (#75 owns future custom-rule support). In contrast, a circular Edge.Cuts cutout
+can use native export: `require` attempts the bridge before any Rust-only outline
+check. If `prefer` cannot use native and the Rust writer also refuses, the error
+includes both the native diagnostic and the Rust fallback reason. Correct the
+reported cause and retry with new output paths; no DSN/manifest is published on
+these pre-publication refusals. See [selection order](KICAD_INTEGRATION.md).
+
 The bridge listens only on an ephemeral IPv4 loopback port and requires a
 per-session bearer token. Registration and temporary DSN files live under the
 per-user local-data directory (`%LOCALAPPDATA%\copperpour\native-bridge` on

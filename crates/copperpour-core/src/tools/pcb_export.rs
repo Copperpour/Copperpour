@@ -295,24 +295,20 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "export_specctra_dsn",
-            "Export a deterministic Specctra DSN routing job from the exact live KiCad PCB \
-             editor revision. Requires the named board to be open with IPC enabled. On KiCad 10, \
-             an enabled authenticated ActionPlugin bridge supplies KiCad's native DSN while the \
-             IPC snapshot and reverse manifest remain authoritative; otherwise the Rust exporter \
-             is used. The first \
-             supported profile is deliberately narrow: an even number of copper layers (F.Cu, \
-             In1.Cu..In<N-2>.Cu, B.Cu; 2 to 32), SMD or through-hole footprints on either side \
-             (a bottom footprint written as KiCad writes it: its front image placed on the back), \
-             through-hole pads and vias on every copper layer, circle, rectangle, unchamfered rounded-rectangle and oval \
-             pads with one shape on every copper layer (rounded rectangles written as polygons \
-             that enclose the copper, ovals as paths as KiCad writes them), round drills, \
-             one closed outline made from straight lines and circular arcs (arcs flattened within the board's max_error), \
-             no existing tracks or vias, and copper zones with a net and a straight-edged outline \
-             without cutouts, each written as a plane on every copper layer it covers (its fill is \
-             not exported; rule areas are refused). Copperpour refuses unsupported geometry or \
-             custom DRC rules, or incomplete effective routing rules instead of approximating \
-             them, and writes a \
-             revision-bound reverse manifest beside the DSN for later SES import.",
+            "Export a revision-bound Specctra DSN plus reverse manifest from the exact live \
+             KiCad PCB editor revision. Requires the named board open with IPC enabled. Shared \
+             import-safety checks run first in every mode: an even 2-32-layer copper stack, \
+             representable SMD and all-copper through-hole pads on either side, complete \
+             effective routing rules, no custom DRC rules or rule areas, and no unlocked \
+             tracks/vias or routed arcs. Supported netted copper zones become planes; locked \
+             straight tracks and through vias are preserved. The default 'disable' uses only the \
+             Rust writer, requiring one closed Edge.Cuts loop of lines/circular arcs (flattened \
+             within board max_error). On KiCad 10, 'prefer'/'require' first try the \
+             authenticated ActionPlugin native exporter and validate its identities against the \
+             snapshot model, without running Rust outline checks. Native boundaries may contain \
+             circular cutouts. 'prefer' falls back to Rust only if native is unavailable or fails \
+             semantic validation; Rust writer limits then apply. 'require' never falls back. \
+             Source revision and manifest validation remain mandatory for either writer.",
             json!({
                 "type": "object",
                 "properties": {
@@ -332,7 +328,7 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "enum": ["prefer", "require", "disable"],
                         "default": "disable",
-                        "description": "KiCad 10 native-export policy. Rust-only 'disable' is the default; 'prefer' explicitly opts into the enabled authenticated ActionPlugin bridge with the Rust exporter as fallback; 'require' refuses fallback."
+                        "description": "KiCad 10 native-export policy after shared import-safety checks: default 'disable' uses Rust only; 'prefer' tries the authenticated native bridge first, then Rust if native is unavailable/invalid; 'require' tries native and never falls back. Rust-only outline geometry limits apply only when Rust is used."
                     }
                 },
                 "required": ["board", "output"]
@@ -742,8 +738,16 @@ fn write_specctra_export_pair(
     Ok(())
 }
 
-fn resolve_native_bridge_mode(args: &serde_json::Value) -> &str {
-    args["native_bridge_mode"].as_str().unwrap_or("disable")
+fn resolve_native_bridge_mode(args: &serde_json::Value) -> Result<&str, CallToolResult> {
+    match args.get("native_bridge_mode") {
+        None => Ok("disable"),
+        Some(value) => value.as_str().ok_or_else(|| {
+            invalid_export_argument(
+                "native_bridge_mode",
+                "must be 'prefer', 'require', or 'disable'",
+            )
+        }),
+    }
 }
 
 async fn handle_export_specctra_dsn(
@@ -756,7 +760,10 @@ async fn handle_export_specctra_dsn(
         .as_str()
         .map(PathBuf::from)
         .unwrap_or_else(|| default_specctra_manifest_path(&output_path));
-    let native_bridge_mode = resolve_native_bridge_mode(args);
+    let native_bridge_mode = match resolve_native_bridge_mode(args) {
+        Ok(mode) => mode,
+        Err(refusal) => return Ok(refusal),
+    };
 
     if !extension_is(&board_path, "kicad_pcb") {
         return Ok(invalid_export_argument(
@@ -802,12 +809,12 @@ async fn handle_export_specctra_dsn(
         return Ok(CallToolResult::error_kind(
             ToolErrorKind::HandlerError {
                 reason: format!(
-                    "custom DRC rules are outside the first supported routing profile: {}",
+                    "custom DRC rules are not supported by the revision-bound SES import: {}",
                     custom_rules_path.display()
                 ),
             },
             format!(
-                "Specctra export refused: custom DRC rules are outside the first supported routing profile ({})",
+                "Specctra export refused: custom DRC rules are not supported by the revision-bound SES import; native export cannot bypass this check ({})",
                 custom_rules_path.display()
             ),
         ));
@@ -823,11 +830,11 @@ async fn handle_export_specctra_dsn(
                 "KiCad board changed while routing rules were captured; retry from a stable editor revision"
             );
         }
-        let export = crate::specctra::export_dsn(&board_for_ipc, &before, &rules)?;
+        let export = crate::specctra::prepare_export(&board_for_ipc, &before, &rules)?;
         Ok((export, before))
     })
     .await?;
-    let (baseline, source_snapshot) = match export {
+    let (snapshot, source_snapshot) = match export {
         Ok(export) => export,
         Err(reason) => {
             return Ok(CallToolResult::error_kind(
@@ -844,8 +851,29 @@ async fn handle_export_specctra_dsn(
     let mut bridge_pid = None;
     let mut bridge_protocol_version = None;
     let mut bridge_diagnostics = Vec::new();
+    let rust_export = |diagnostics: &[String]| {
+        snapshot.export_rust().map_err(|error| {
+            let reason = if diagnostics.is_empty() {
+                format!("{error:#}")
+            } else {
+                format!(
+                    "Rust fallback refused: {error:#}; native bridge: {}",
+                    diagnostics.join("; ")
+                )
+            };
+            CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: reason.clone(),
+                },
+                format!("Specctra export refused: {reason}"),
+            )
+        })
+    };
     let export = if native_bridge_mode == "disable" {
-        baseline
+        match rust_export(&[]) {
+            Ok(export) => export,
+            Err(refusal) => return Ok(refusal),
+        }
     } else {
         let attempt = crate::native_specctra_bridge::try_export(&board_path).await;
         bridge_diagnostics = attempt.diagnostics;
@@ -875,7 +903,7 @@ async fn handle_export_specctra_dsn(
                     "KiCad board changed during native Specctra export; retry from a stable editor revision",
                 ));
             }
-            match crate::specctra::adopt_native_dsn(baseline.clone(), native.dsn) {
+            match snapshot.adopt_native(native.dsn) {
                 Ok(adopted) => {
                     method = "kicad10_native_actionplugin";
                     bridge_pid = Some(native.plugin_pid);
@@ -883,10 +911,12 @@ async fn handle_export_specctra_dsn(
                     adopted
                 }
                 Err(error) if native_bridge_mode == "prefer" => {
-                    bridge_diagnostics.push(format!(
-                        "native DSN semantic validation failed; used Rust fallback: {error:#}"
-                    ));
-                    baseline
+                    bridge_diagnostics
+                        .push(format!("native DSN semantic validation failed: {error:#}"));
+                    match rust_export(&bridge_diagnostics) {
+                        Ok(export) => export,
+                        Err(refusal) => return Ok(refusal),
+                    }
                 }
                 Err(error) => {
                     return Ok(CallToolResult::error(format!(
@@ -900,7 +930,10 @@ async fn handle_export_specctra_dsn(
                 bridge_diagnostics.join("; ")
             )));
         } else {
-            baseline
+            match rust_export(&bridge_diagnostics) {
+                Ok(export) => export,
+                Err(refusal) => return Ok(refusal),
+            }
         }
     };
 
@@ -1215,9 +1248,9 @@ mod new_export_format_tests {
 
     #[test]
     fn rust_specctra_export_is_the_default_path() {
-        assert_eq!(resolve_native_bridge_mode(&json!({})), "disable");
+        assert_eq!(resolve_native_bridge_mode(&json!({})).unwrap(), "disable");
         assert_eq!(
-            resolve_native_bridge_mode(&json!({ "native_bridge_mode": "prefer" })),
+            resolve_native_bridge_mode(&json!({ "native_bridge_mode": "prefer" })).unwrap(),
             "prefer"
         );
     }
@@ -2229,3 +2262,7 @@ mod specctra_padstack_served_tests {
         }
     }
 }
+
+#[cfg(all(test, unix, feature = "native-bridge"))]
+#[path = "native_specctra_order_tests.rs"]
+mod native_specctra_order_tests;

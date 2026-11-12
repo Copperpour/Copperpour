@@ -280,11 +280,28 @@ struct ManifestPadstack {
     drill_um: Option<i64>,
 }
 
-pub(crate) fn export_dsn(
+/// Import-owned snapshot model. No Rust boundary is generated or substituted.
+pub(crate) struct RoutingSnapshot {
+    board_path: std::path::PathBuf,
+    tree: SexpNode,
+    source_sha256: String,
+    copper_layers: Vec<String>,
+    power_layers: BTreeSet<String>,
+    footprints: Vec<FootprintModel>,
+    net_pins: BTreeMap<String, Vec<String>>,
+    class_nets: RuleGroups,
+    net_classes: NetClassNames,
+    padstack_names: BTreeMap<PadstackKey, String>,
+    via_names: BTreeMap<RuleKey, String>,
+    locked_routing: LockedRouting,
+    zones: Vec<CopperZoneModel>,
+}
+
+pub(crate) fn prepare_export(
     board_path: &Path,
     board_source: &str,
     effective_rules: &IpcEffectiveRoutingRules,
-) -> Result<ExportBundle> {
+) -> Result<RoutingSnapshot> {
     let tree = parse_sexp(board_source).context("parse KiCad IPC board snapshot")?;
     if tree.head() != Some("kicad_pcb") {
         bail!("KiCad IPC snapshot root is not 'kicad_pcb'");
@@ -292,7 +309,6 @@ pub(crate) fn export_dsn(
 
     let copper_layers = copper_layers(&tree)?;
     let power_layers = power_layers(&tree);
-    let outline = simple_closed_outline(&tree, outline_arc_error_um(board_path, &tree)?)?;
     let net_table = top_level_net_table(&tree);
     let locked_routing = locked_routing(&tree, &net_table, &copper_layers)?;
     let zones = copper_zones(&tree, &net_table, &copper_layers)?;
@@ -348,58 +364,237 @@ pub(crate) fn export_dsn(
         .map(|(index, key)| (key, format!("copperpour_via_{:04}", index + 1)))
         .collect();
 
-    let pcb = build_pcb(
-        board_path,
-        &copper_layers,
-        &power_layers,
-        &outline,
-        &footprints,
-        &net_pins,
-        &class_nets,
-        &net_classes,
-        &padstack_names,
-        &via_names,
-        &locked_routing,
-        &zones,
-    )?;
-    let dsn = serialize_and_validate(pcb)?;
-    let source_sha256 = sha256_hex(board_source.as_bytes());
-    let manifest = build_manifest(
-        board_path,
-        &source_sha256,
-        &copper_layers,
-        &footprints,
-        &net_pins,
-        &net_classes,
-        &padstack_names,
-        &via_names,
-        &locked_routing,
-        &zones,
-    )?;
-
-    Ok(ExportBundle {
-        dsn,
-        manifest,
-        source_sha256,
-        component_count: footprints.len(),
-        pad_count: footprints
-            .iter()
-            .map(|footprint| footprint.pads.len())
-            .sum(),
-        net_count: net_pins.len(),
-        class_count: class_nets.len(),
-        copper_layer_count: copper_layers.len(),
-        copper_zone_count: zones.len(),
-        component_side: component_side(&footprints),
+    Ok(RoutingSnapshot {
+        board_path: board_path.to_path_buf(),
+        tree,
+        source_sha256: sha256_hex(board_source.as_bytes()),
+        copper_layers,
+        power_layers,
+        footprints,
+        net_pins,
+        class_nets,
+        net_classes,
+        padstack_names,
+        via_names,
+        locked_routing,
+        zones,
     })
 }
 
-/// Replace Copperpour's deterministic DSN with a KiCad-native DSN while keeping
-/// the same fail-closed board profile and rewriting the reverse manifest to
-/// the exact identifiers KiCad emitted. This lets the strict SES importer
-/// remain authoritative instead of trusting a second, looser return path.
-pub(crate) fn adopt_native_dsn(
+#[cfg(test)]
+pub(crate) fn export_dsn(
+    board_path: &Path,
+    board_source: &str,
+    effective_rules: &IpcEffectiveRoutingRules,
+) -> Result<ExportBundle> {
+    prepare_export(board_path, board_source, effective_rules)?.export_rust()
+}
+
+impl RoutingSnapshot {
+    pub(crate) fn export_rust(&self) -> Result<ExportBundle> {
+        let outline = simple_closed_outline(
+            &self.tree,
+            outline_arc_error_um(&self.board_path, &self.tree)?,
+        )?;
+        let pcb = build_pcb(
+            &self.board_path,
+            &self.copper_layers,
+            &self.power_layers,
+            &outline,
+            &self.footprints,
+            &self.net_pins,
+            &self.class_nets,
+            &self.net_classes,
+            &self.padstack_names,
+            &self.via_names,
+            &self.locked_routing,
+            &self.zones,
+        )?;
+        self.bundle(serialize_and_validate(pcb)?, RUST_OUTLINE)
+    }
+
+    pub(crate) fn adopt_native(&self, native_dsn: String) -> Result<ExportBundle> {
+        let identity = self.identity()?;
+        let baseline = self.bundle(
+            String::new(),
+            "KiCad-native board boundary; source revision bound, not flattened by the Rust writer",
+        )?;
+        adopt_native_with_identity(baseline, identity, native_dsn)
+    }
+
+    fn bundle(&self, dsn: String, outline: &str) -> Result<ExportBundle> {
+        let manifest = build_manifest(
+            &self.board_path,
+            &self.source_sha256,
+            &self.copper_layers,
+            &self.footprints,
+            &self.net_pins,
+            &self.net_classes,
+            &self.padstack_names,
+            &self.via_names,
+            &self.locked_routing,
+            &self.zones,
+            outline,
+        )?;
+        Ok(ExportBundle {
+            dsn,
+            manifest,
+            source_sha256: self.source_sha256.clone(),
+            component_count: self.footprints.len(),
+            pad_count: self.footprints.iter().map(|f| f.pads.len()).sum(),
+            net_count: self.net_pins.len(),
+            class_count: self.class_nets.len(),
+            copper_layer_count: self.copper_layers.len(),
+            copper_zone_count: self.zones.len(),
+            component_side: component_side(&self.footprints),
+        })
+    }
+
+    /// The same identities the existing native correlator checks, constructed
+    /// from the validated board model rather than a Rust-generated DSN.
+    fn identity(&self) -> Result<DsnIdentity> {
+        let mut padstacks = BTreeMap::new();
+        for (key, name) in &self.padstack_names {
+            padstacks.insert(name.clone(), key.layers.iter().map(|layer| {
+                Ok(match key.shape {
+                    PadShape::Circle => DsnShapeIdentity::Circle { layer: layer.clone(), diameter: key.size_x_um },
+                    PadShape::Rect => {
+                        if key.size_x_um % 2 != 0 || key.size_y_um % 2 != 0 {
+                            bail!("native correlation requires integer-micrometre rectangle corners");
+                        }
+                        DsnShapeIdentity::Rect { layer: layer.clone(), x1: -key.size_x_um/2, y1: -key.size_y_um/2, x2: key.size_x_um/2, y2: key.size_y_um/2 }
+                    },
+                    PadShape::RoundRect => DsnShapeIdentity::Polygon {
+                        layer: layer.clone(), points: roundrect_outline(key.size_x_um, key.size_y_um, key.corner_radius_um.unwrap_or(0)).into_iter()
+                            .map(|(x,y)| Ok((OrderedF64::new(x)?, OrderedF64::new(y)?))).collect::<Result<_>>()?,
+                    },
+                    PadShape::Oval => DsnShapeIdentity::Path {
+                        layer: layer.clone(), width: OrderedF64::new(key.size_x_um.min(key.size_y_um) as f64)?,
+                        points: oval_spine(key.size_x_um, key.size_y_um).into_iter()
+                            .map(|(x,y)| Ok((OrderedF64::new(x)?, OrderedF64::new(y)?))).collect::<Result<_>>()?,
+                    },
+                })
+            }).collect::<Result<_>>()?);
+        }
+        for (rule, name) in &self.via_names {
+            padstacks.insert(
+                name.clone(),
+                self.copper_layers
+                    .iter()
+                    .map(|layer| DsnShapeIdentity::Circle {
+                        layer: layer.clone(),
+                        diameter: rule.via_diameter_um,
+                    })
+                    .collect(),
+            );
+        }
+        let mut components = BTreeMap::new();
+        for footprint in &self.footprints {
+            let pins = footprint
+                .pads
+                .iter()
+                .map(|pad| {
+                    Ok((
+                        pad.pin.clone(),
+                        DsnPinIdentity {
+                            padstack: self.padstack_names[&pad.padstack].clone(),
+                            rotation: OrderedF64::new(pad.rotation_degrees)?,
+                            x: pad.x_um,
+                            y: pad.y_um,
+                        },
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            components.insert(
+                footprint.reference.clone(),
+                DsnPlacementIdentity {
+                    image_name: footprint.image_name.clone(),
+                    x: footprint.x_um,
+                    y: footprint.y_um,
+                    side: footprint.side.name().into(),
+                    rotation: OrderedF64::new(footprint.rotation_degrees)?,
+                    pins,
+                },
+            );
+        }
+        let mut planes = self
+            .zones
+            .iter()
+            .flat_map(|zone| {
+                zone.layers.iter().map(|layer| {
+                    (
+                        zone.net.clone(),
+                        layer.clone(),
+                        zone.outline
+                            .iter()
+                            .chain(zone.outline.first())
+                            .copied()
+                            .collect(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        planes.sort();
+        Ok(DsnIdentity {
+            layers: self.copper_layers.iter().cloned().enumerate().collect(),
+            layer_types: self
+                .copper_layers
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    (
+                        i,
+                        if self.power_layers.contains(name) {
+                            "power"
+                        } else {
+                            "signal"
+                        }
+                        .into(),
+                    )
+                })
+                .collect(),
+            components,
+            nets: self
+                .net_pins
+                .iter()
+                .map(|(n, p)| (n.clone(), p.iter().cloned().collect()))
+                .collect(),
+            classes: self
+                .class_nets
+                .iter()
+                .enumerate()
+                .map(|(i, (rule, nets))| {
+                    (
+                        class_name(i),
+                        DsnClassIdentity {
+                            nets: nets.iter().cloned().collect(),
+                            via_name: self.via_names[rule].clone(),
+                            width: rule.track_width_um,
+                            clearance: rule.clearance_um,
+                        },
+                    )
+                })
+                .collect(),
+            padstacks,
+            planes,
+        })
+    }
+}
+
+const RUST_OUTLINE: &str = "one closed loop of Edge.Cuts lines and circular arcs, with arcs flattened within board max_error";
+
+/// Compatibility test entry point for the existing Rust/native differential
+/// corpus. Production adopts against RoutingSnapshot::identity, without first
+/// generating a Rust DSN or checking its outline.
+#[cfg(test)]
+pub(crate) fn adopt_native_dsn(baseline: ExportBundle, native_dsn: String) -> Result<ExportBundle> {
+    let tree = parse_dsn_sexp(&baseline.dsn).context("parse Copperpour baseline DSN")?;
+    adopt_native_with_identity(baseline, dsn_identity(&tree)?, native_dsn)
+}
+
+fn adopt_native_with_identity(
     mut baseline: ExportBundle,
+    baseline_identity: DsnIdentity,
     native_dsn: String,
 ) -> Result<ExportBundle> {
     let mut manifest: Manifest =
@@ -421,9 +616,7 @@ pub(crate) fn adopt_native_dsn(
         );
     }
     validate_dsn_syntax(&native_dsn, "KiCad native DSN")?;
-    let baseline_tree = parse_dsn_sexp(&baseline.dsn).context("parse Copperpour baseline DSN")?;
     let native_tree = parse_dsn_sexp(&native_dsn).context("parse KiCad native DSN")?;
-    let baseline_identity = dsn_identity(&baseline_tree)?;
     let native_identity = dsn_identity(&native_tree)?;
 
     let layer_names = correlate_layers(&baseline_identity, &native_identity)?;
@@ -492,7 +685,7 @@ pub(crate) fn adopt_native_dsn(
     Ok(baseline)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DsnPlacementIdentity {
     image_name: String,
     x: i64,
@@ -526,7 +719,7 @@ impl OrderedF64 {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DsnClassIdentity {
     nets: BTreeSet<String>,
     via_name: String,
@@ -560,7 +753,7 @@ enum DsnShapeIdentity {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DsnIdentity {
     layers: BTreeMap<usize, String>,
     /// Each layer's `(type …)`, by index.
@@ -2591,6 +2784,7 @@ fn build_manifest(
     via_names: &BTreeMap<RuleKey, String>,
     locked_routing: &LockedRouting,
     zones: &[CopperZoneModel],
+    outline: &str,
 ) -> Result<String> {
     let components = footprints
         .iter()
@@ -2675,7 +2869,7 @@ fn build_manifest(
             locked_via_count: locked_routing.vias.len(),
             copper_zones: !zones.is_empty(),
             custom_rules: false,
-            outline: "one closed loop of Edge.Cuts lines and circular arcs, with arcs flattened within board max_error".to_string(),
+            outline: outline.to_string(),
         },
         layers: copper_layers
             .iter()
@@ -4416,6 +4610,19 @@ pub(crate) mod tests {
             error.contains("unsupported through-hole pad J1-1: copper layers are [F.Cu, B.Cu]"),
             "{error}"
         );
+        let prep_error = prepare_export(
+            Path::new("board.kicad_pcb"),
+            &two_layer_pad,
+            &native_fixture_rules(),
+        )
+        .err()
+        .expect("partial-layer through-hole pad must be refused before export")
+        .to_string();
+        assert!(
+            prep_error
+                .contains("unsupported through-hole pad J1-1: copper layers are [F.Cu, B.Cu]"),
+            "{prep_error}"
+        );
         // KiCad saves a pad on every copper layer as `*.Cu`; a list in full
         // is accepted in the ordinal order of pad lists or top to bottom.
         for list in [
@@ -5395,5 +5602,72 @@ pub(crate) mod tests {
             ),
             "{error}"
         );
+    }
+    const NATIVE_CIRCLE: &str = include_str!("../tests/fixtures/specctra_native_circle.kicad_pcb");
+    const NATIVE_CIRCLE_DSN: &str =
+        include_str!("../tests/fixtures/specctra_native_circle.native-kicad-10.dsn");
+    const NATIVE_CIRCLE_SES: &str = include_str!(
+        "../tests/fixtures/specctra_native_circle.native-kicad-10.freerouting-2.5.0.ses"
+    );
+
+    #[test]
+    fn native_profile_snapshot_identity_matches_existing_rust_semantics() {
+        for source in [
+            include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb"),
+            ROUNDED_OUTLINE,
+            D_OUTLINE,
+            ROTATED,
+            FOUR_LAYERS,
+            ZONES,
+            BOTTOM_SIDE,
+            OVAL_PADS,
+            PASTE_PADS,
+        ] {
+            let model =
+                prepare_export(Path::new("board.kicad_pcb"), source, &stock_rules()).unwrap();
+            let rust = model.export_rust().unwrap();
+            let expected = dsn_identity(&parse_dsn_sexp(&rust.dsn).unwrap()).unwrap();
+            assert_eq!(model.identity().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn native_profile_circle_is_adopted_without_running_rust_outline_and_its_session_is_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, NATIVE_CIRCLE).unwrap();
+        let model = prepare_export(&board, NATIVE_CIRCLE, &native_fixture_rules()).unwrap();
+        assert!(model
+            .export_rust()
+            .unwrap_err()
+            .to_string()
+            .contains("gr_circle"));
+        let native = model.adopt_native(NATIVE_CIRCLE_DSN.to_string()).unwrap();
+        assert_eq!(native.dsn, NATIVE_CIRCLE_DSN);
+        let manifest: serde_json::Value = serde_json::from_str(&native.manifest).unwrap();
+        assert!(manifest["supported_profile"]["outline"]
+            .as_str()
+            .unwrap()
+            .contains("KiCad-native"));
+        let plan = crate::specctra_ses::parse_import_plan(
+            &board,
+            NATIVE_CIRCLE,
+            &native.manifest,
+            NATIVE_CIRCLE_SES,
+        )
+        .unwrap();
+        assert!(!plan.tracks.is_empty());
+        let stale = format!("{NATIVE_CIRCLE}\n");
+        assert!(crate::specctra_ses::parse_import_plan(
+            &board,
+            &stale,
+            &native.manifest,
+            NATIVE_CIRCLE_SES
+        )
+        .is_err());
+        let changed =
+            NATIVE_CIRCLE_DSN.replace("(place R1 100000 -50000", "(place R1 101000 -50000");
+        assert_ne!(changed, NATIVE_CIRCLE_DSN);
+        assert!(model.adopt_native(changed).is_err());
     }
 }
