@@ -135,6 +135,25 @@ fn kicad_recording(board: &Path, received: Received) -> MockIpcServer {
         if name != "CreateItems" {
             received.lock().unwrap().push((name.clone(), Vec::new()));
             return match name.as_str() {
+                // KiCad's six-layer fixture, now queried by routing preflight (#421).
+                "GetBoardEnabledLayers" => Some(copperpour_ipc::builders::pack_any(
+                    &kiapi::board::commands::BoardEnabledLayersResponse {
+                        copper_layer_count: 6,
+                        layers: [
+                            BoardLayer::BlFCu,
+                            BoardLayer::BlIn1Cu,
+                            BoardLayer::BlIn2Cu,
+                            BoardLayer::BlIn3Cu,
+                            BoardLayer::BlIn4Cu,
+                            BoardLayer::BlBCu,
+                            BoardLayer::BlEdgeCuts,
+                        ]
+                        .iter()
+                        .map(|layer| *layer as i32)
+                        .collect(),
+                    },
+                    "kiapi.board.commands.BoardEnabledLayersResponse",
+                )),
                 "GetNets" => Some(copperpour_ipc::builders::pack_any(
                     &kiapi::board::commands::NetsResponse {
                         nets: vec![copperpour_ipc::builders::net("GND", 1)],

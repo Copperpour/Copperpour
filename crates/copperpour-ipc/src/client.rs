@@ -2188,24 +2188,43 @@ impl KiCadIpcClient {
 
     /// As [`Self::get_nets`], targeting a specific open document.
     pub fn get_nets_in(&self, doc: kiapi::common::types::DocumentSpecifier) -> Result<Vec<IpcNet>> {
+        self.get_nets_in_impl(doc, false)
+    }
+
+    /// As [`Self::get_nets_in`], requiring KiCad to provide a net-list response.
+    /// An explicit empty list is valid; an absent response is unavailable evidence.
+    pub fn get_nets_required_in(
+        &self,
+        doc: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<Vec<IpcNet>> {
+        self.get_nets_in_impl(doc, true)
+    }
+
+    fn get_nets_in_impl(
+        &self,
+        doc: kiapi::common::types::DocumentSpecifier,
+        require_response: bool,
+    ) -> Result<Vec<IpcNet>> {
         let cmd = kiapi::board::commands::GetNets {
             board: Some(doc),
             netclass_filter: vec![],
         };
         let response_any = self.send_command(&cmd, "kiapi.board.commands.GetNets")?;
-        if let Some(any) = response_any {
-            let resp: kiapi::board::commands::NetsResponse = unpack_any(&any)?;
-            Ok(resp
-                .nets
-                .iter()
-                .map(|n| IpcNet {
-                    name: n.name.clone(),
-                    netcode: n.code.as_ref().map(|c| c.value).unwrap_or(0),
-                })
-                .collect())
+        let resp: kiapi::board::commands::NetsResponse = if require_response {
+            unpack_required(response_any, "GetNets")?
+        } else if let Some(any) = response_any {
+            unpack_any(&any)?
         } else {
-            Ok(vec![])
-        }
+            return Ok(vec![]);
+        };
+        Ok(resp
+            .nets
+            .iter()
+            .map(|n| IpcNet {
+                name: n.name.clone(),
+                netcode: n.code.as_ref().map(|c| c.value).unwrap_or(0),
+            })
+            .collect())
     }
 
     /// Return the effective merged routing rules for every connected net in
