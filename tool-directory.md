@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **22 toolsets** organized into 10 categories
+- **23 toolsets** organized into 10 categories
 - **257 registered tools** + **7 always-visible meta-tools** = **264 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<copperpour dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
@@ -29,7 +29,7 @@ and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 22 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 23 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -268,6 +268,17 @@ and Windows servers do not.
 | `delete_zone` | Delete exactly one zone UUID returned by `list_zones` using its matching source and revision. Live deletion uses one KiCad commit; it then requests refill, waits for readiness and verifies full readback. Saved-file deletion checks the same revision under the atomic document lock and verifies absence and preserved zone metadata. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 | `set_footprint_field` | Add or update a custom field (LCSC, MPN, …) on a placed footprint via KiCAD IPC. Refuses the mandatory fields; a new field is hidden by default and sits on the footprint's Fab layer. One undo step; the response is a fresh read-back. |
+
+### `pcb_text` · 4 tools
+**Purpose:** List and edit placed board text and footprint reference/value fields in place.
+**Source:** [`crates/copperpour-core/src/tools/pcb_text.rs`](crates/copperpour-core/src/tools/pcb_text.rs)
+
+| Tool | Description |
+|------|-------------|
+| `list_board_texts` | List board-level text items with their UUID, raw text (including any `${VARIABLE}`), board-absolute position, angle, glyph size, thickness, font face, layer, alignment, and KiCad's bounding box. Live only. |
+| `edit_board_text` | Move, rotate, resize, re-layer, re-word or restyle (`mirrored`, `horizontal_alignment`, `vertical_alignment`, `bold`, `italic`, `keep_upright`, `knockout`, `locked`, `font`) one board-level text item in place by UUID, preserving every property not named (font face, non-square size, raw variable text). `mirror: "auto"` sets `mirrored` from the side of the layer the text ends on. Refuses when the live text has lost a text variable the saved board holds. One undo step; fresh readback, and a property KiCad did not take is an error. Live only. |
+| `list_footprint_fields` | List the reference, value and other fields of one or every placed footprint with board-absolute position, absolute angle, glyph size, thickness, layer, visibility, alignment, and KiCad's bounding box. Live only. |
+| `edit_footprint_field` | Move, rotate, resize, hide/show, re-layer or restyle (`mirrored`, `horizontal_alignment`, `vertical_alignment`, `bold`, `italic`, `keep_upright`, `knockout`, `locked`, `font`) a placed footprint's reference or value field in place, preserving every property not named. `mirror: "auto"` sets `mirrored` from the side of the layer the field ends on. One undo step; fresh readback, and a mismatch is an error. Live only. |
 
 ### `pcb_components` · 20 tools
 **Purpose:** Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics and 3D models.

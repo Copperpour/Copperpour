@@ -71,6 +71,11 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         category: "pcb",
     },
     ToolsetMeta {
+        name: "pcb_text",
+        description: "List and edit placed board text and footprint reference/value fields in place",
+        category: "pcb",
+    },
+    ToolsetMeta {
         name: "pcb_components",
         description: "Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics",
         category: "pcb",
@@ -182,6 +187,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "sch_export" => Some(sch_export::tools()),
         "sch_hierarchy" => Some(sch_hierarchy::tools()),
         "pcb_board" => Some(pcb_board::tools()),
+        "pcb_text" => Some(pcb_text::tools()),
         "pcb_components" => Some(pcb_components::tools()),
         "pcb_routing" => Some(pcb_routing::tools()),
         "pcb_copper" => Some(pcb_copper::tools()),

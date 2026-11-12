@@ -946,3 +946,256 @@ pub enum IpcFlipOutcome {
         reason: String,
     },
 }
+
+// ─── Placed text: footprint fields and board-level text ──────────────────────
+
+/// One text item's properties exactly as KiCad holds them.
+///
+/// Lengths stay in integer nanometres so a readback compares what KiCad
+/// stored rather than a rounded millimetre value. `x_nm`/`y_nm` are
+/// board-absolute even for a footprint field: KiCad serializes every child of
+/// a footprint in board coordinates (see the `transform` module), and
+/// `angle_degrees` is the text's own absolute angle, which for a field already
+/// includes the footprint's orientation.
+///
+/// `text` is the raw string KiCad sent. KiCad 10 serializes `EDA_TEXT` with
+/// `GetText()`, not `GetShownText()`, so a `${VARIABLE}` arrives unexpanded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcTextState {
+    pub text: String,
+    pub x_nm: i64,
+    pub y_nm: i64,
+    pub angle_degrees: f64,
+    pub size_x_nm: i64,
+    pub size_y_nm: i64,
+    pub stroke_width_nm: i64,
+    pub layer: String,
+    /// Empty for KiCad's built-in stroke font.
+    pub font_name: String,
+    pub horizontal_alignment: String,
+    pub vertical_alignment: String,
+    pub italic: bool,
+    pub bold: bool,
+    pub underlined: bool,
+    pub mirrored: bool,
+    pub multiline: bool,
+    pub keep_upright: bool,
+    pub line_spacing: f64,
+    pub knockout: bool,
+    pub locked: bool,
+}
+
+/// An axis-aligned box in board nanometres, as KiCad's `GetBoundingBox`
+/// measured it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcBox2 {
+    pub min_x_nm: i64,
+    pub min_y_nm: i64,
+    pub max_x_nm: i64,
+    pub max_y_nm: i64,
+}
+
+/// Which of a footprint's four mandatory fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IpcFootprintFieldSlot {
+    Reference,
+    Value,
+    Datasheet,
+    Description,
+}
+
+impl IpcFootprintFieldSlot {
+    pub const ALL: [Self; 4] = [
+        Self::Reference,
+        Self::Value,
+        Self::Datasheet,
+        Self::Description,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Value => "value",
+            Self::Datasheet => "datasheet",
+            Self::Description => "description",
+        }
+    }
+}
+
+/// One field of a placed footprint.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcFootprintField {
+    pub footprint_reference: String,
+    pub footprint_kiid: String,
+    /// `reference`, `value`, `datasheet`, `description`, or `user` for a
+    /// field that is not one of the four mandatory ones.
+    pub slot: String,
+    /// The field name KiCad reported.
+    pub name: String,
+    /// The text item's own KIID, empty if KiCad sent none.
+    pub kiid: String,
+    pub visible: bool,
+    /// `None` when KiCad's message lacked a part needed to describe the text;
+    /// `unreadable_reason` then says which. Never a fabricated default.
+    pub state: Option<IpcTextState>,
+    pub unreadable_reason: Option<String>,
+    /// `None` when KiCad returned no box for this KIID.
+    pub bounding_box: Option<IpcBox2>,
+}
+
+/// Every field of the footprints a listing covered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcFootprintFieldListing {
+    pub fields: Vec<IpcFootprintField>,
+    /// Set when the bounding-box request as a whole failed; individual boxes
+    /// are then all `None` for that reason rather than because KiCad skipped
+    /// their KIIDs.
+    pub bounding_boxes_unavailable: Option<String>,
+}
+
+/// One board-level text item (`PCB_TEXT` owned by the board, not a footprint).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcBoardTextItem {
+    pub kiid: String,
+    pub state: Option<IpcTextState>,
+    pub unreadable_reason: Option<String>,
+    pub bounding_box: Option<IpcBox2>,
+}
+
+/// Every board-level text item on a board.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcBoardTextListing {
+    pub texts: Vec<IpcBoardTextItem>,
+    pub bounding_boxes_unavailable: Option<String>,
+}
+
+/// A partial edit to one text item. `None` leaves that property exactly as
+/// KiCad holds it; nothing is defaulted.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IpcTextEdit {
+    /// Board-absolute position in nanometres.
+    pub position_nm: Option<(i64, i64)>,
+    pub angle_degrees: Option<f64>,
+    pub size_x_nm: Option<i64>,
+    pub size_y_nm: Option<i64>,
+    pub stroke_width_nm: Option<i64>,
+    pub layer: Option<String>,
+    /// Raw replacement text, written verbatim. Board text only.
+    pub text: Option<String>,
+    /// Field visibility. Footprint fields only.
+    pub visible: Option<bool>,
+    /// Draw the glyphs mirrored, as text on a back layer must be to read
+    /// correctly from that side.
+    pub mirrored: Option<bool>,
+    /// Set `mirrored` from the side of the layer the text ends up on: true on
+    /// a back layer, false on a front layer, untouched on a layer with no
+    /// side. That layer is the one this edit names, or the one KiCad holds
+    /// when it names none. Cannot be combined with `mirrored`.
+    pub mirror_to_match_layer: bool,
+    pub horizontal_alignment: Option<IpcHorizontalAlignment>,
+    pub vertical_alignment: Option<IpcVerticalAlignment>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub keep_upright: Option<bool>,
+    pub knockout: Option<bool>,
+    pub locked: Option<bool>,
+    /// Font face name; the empty string selects KiCad's stroke font.
+    pub font_name: Option<String>,
+}
+
+/// The mirror flag text on the layer named `layer` needs to read correctly
+/// from its own side of the board: set on a back layer (`B.SilkS`), clear on
+/// a front one (`F.Fab`). `None` for a layer with no side (inner copper,
+/// `Edge.Cuts`, the user layers), where neither value is the right one.
+///
+/// This is the end state KiCad's Flip leaves a normally-drawn text in. Flip
+/// itself toggles the flag; setting it from the side instead also repairs a
+/// text that was moved to the back without being mirrored, which a toggle
+/// from the same layer could not.
+pub fn mirrored_for_layer_name(layer: &str) -> Option<bool> {
+    if layer.starts_with("B.") {
+        Some(true)
+    } else if layer.starts_with("F.") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// A horizontal text alignment a caller may request. KiCad's
+/// `HA_INDETERMINATE` describes a mixed selection in its dialogs and is not a
+/// value one text can be given, so it has no variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IpcHorizontalAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+impl IpcHorizontalAlignment {
+    /// The name `IpcTextState::horizontal_alignment` reports for this value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Center => "center",
+            Self::Right => "right",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Left, Self::Center, Self::Right]
+            .into_iter()
+            .find(|alignment| alignment.as_str() == name)
+    }
+}
+
+/// A vertical text alignment a caller may request; see
+/// [`IpcHorizontalAlignment`] for why there is no indeterminate variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IpcVerticalAlignment {
+    Top,
+    Center,
+    Bottom,
+}
+
+impl IpcVerticalAlignment {
+    /// The name `IpcTextState::vertical_alignment` reports for this value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Center => "center",
+            Self::Bottom => "bottom",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Top, Self::Center, Self::Bottom]
+            .into_iter()
+            .find(|alignment| alignment.as_str() == name)
+    }
+}
+
+impl IpcTextEdit {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Readback-derived result of editing one text item in place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcTextEditOutcome<T> {
+    /// The item already held every requested value; nothing was sent.
+    Unchanged { current: T },
+    /// KiCad applied the edit and a fresh read proved every requested value
+    /// and every preserved one.
+    Applied { before: T, after: T },
+    /// The update may have changed the board, but a fresh read did not prove
+    /// the requested state. Inspect before retrying.
+    Uncertain {
+        before: T,
+        expected: T,
+        observed: Option<T>,
+        mismatches: Vec<String>,
+        reason: String,
+    },
+}
