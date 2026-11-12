@@ -54,9 +54,21 @@ impl McpProcess {
         isolate_home: bool,
         env: &[(&str, &str)],
     ) -> Self {
+        Self::spawn_with_env_without(dir, isolate_home, env, &[])
+    }
+
+    fn spawn_with_env_without(
+        dir: Option<&std::path::Path>,
+        isolate_home: bool,
+        env: &[(&str, &str)],
+        removed_env: &[&str],
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_copperpour"));
         for (key, value) in env {
             command.env(key, value);
+        }
+        for name in removed_env {
+            command.env_remove(name);
         }
         if let Some(dir) = dir {
             command.current_dir(dir);
@@ -625,6 +637,18 @@ fn a_kicad_cli_in_the_working_directory_does_not_stop_discovery() {
 #[cfg(unix)]
 #[test]
 fn browser_viewer_stdio_reports_service_and_opener_separately() {
+    browser_viewer_stdio_case(false);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires kicad-cli; renders only a disposable fixture without a display session"]
+fn browser_viewer_stdio_native_without_display_serves_svg_despite_opener_failure() {
+    browser_viewer_stdio_case(true);
+}
+
+#[cfg(unix)]
+fn browser_viewer_stdio_case(native_cli: bool) {
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let bin = tmp.path().join("bin");
@@ -648,7 +672,7 @@ fn browser_viewer_stdio_reports_service_and_opener_separately() {
     std::fs::write(
         &opener,
         format!(
-            "#!{}\nprintf '%s' \"$1\" > \"$0.called\"\n",
+            "#!{}\nprintf '%s' \"$1\" > \"$0.called\"\nprintf 'garbage-on-stdout\\n'\n",
             shell.display()
         ),
     )
@@ -668,6 +692,13 @@ fn browser_viewer_stdio_reports_service_and_opener_separately() {
         &schematic,
     )
     .unwrap();
+    let cli = if native_cli {
+        std::env::var_os("COPPERPOUR_TEST_KICAD_CLI")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| executable("kicad-cli"))
+    } else {
+        cli
+    };
     std::fs::write(
         tmp.path().join("copperpour.toml"),
         format!(
@@ -679,8 +710,13 @@ fn browser_viewer_stdio_reports_service_and_opener_separately() {
     let mut paths = vec![bin.clone()];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     let path = std::env::join_paths(paths).unwrap();
-    let mut p =
-        McpProcess::spawn_with_env(Some(tmp.path()), true, &[("PATH", path.to_str().unwrap())]);
+    // The MCP client need not inherit a desktop session (#373).
+    let mut p = McpProcess::spawn_with_env_without(
+        Some(tmp.path()),
+        true,
+        &[("PATH", path.to_str().unwrap())],
+        &["DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"],
+    );
     let first = p.call_tool("open_schematic_viewer", json!({"schematic":schematic}));
     assert_ne!(first["isError"], true, "{first}");
     let first = McpProcess::tool_body(&first);
@@ -705,6 +741,27 @@ fn browser_viewer_stdio_reports_service_and_opener_separately() {
     assert_eq!(headless["reused"], true);
     assert_eq!(headless["browser_launch_requested"], false);
     assert_eq!(headless["browser_launch_succeeded"], false);
+    let assert_served = |url: &str| {
+        use std::io::Read;
+        let (base, token) = url.split_once("/#token=").unwrap();
+        let address = base.strip_prefix("http://").unwrap();
+        let sheet = format!(
+            "/sheet?file={}",
+            schematic.canonicalize().unwrap().display()
+        );
+        for (target, expected) in [("/state", "root.kicad_sch"), (sheet.as_str(), "<svg")] {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            write!(stream, "GET {target} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n").unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(response.contains(expected), "expected {expected}");
+        }
+    };
+    assert_served(headless["url"].as_str().unwrap());
     std::fs::write(&opener, format!("#!{}\nexit 7\n", shell.display())).unwrap();
     let failed = p.call_tool("open_schematic_viewer", json!({"schematic":schematic}));
     assert_ne!(failed["isError"], true, "{failed}");
@@ -717,6 +774,7 @@ fn browser_viewer_stdio_reports_service_and_opener_separately() {
         .as_str()
         .unwrap()
         .contains('7'));
+    assert_served(failed["url"].as_str().unwrap());
 }
 
 #[test]

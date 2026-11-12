@@ -31,14 +31,19 @@ control. Pan, zoom, theme, sheet selection and manual refresh are shared.
 `BrowserViewer::start` takes the root path, an explicit CLI executable and a
 positive per-render timeout. It binds IPv4 loopback on an ephemeral port and
 returns a handle and credential URL; it does not launch a browser. Drop signals
-shutdown; `shutdown().await` also waits for the render worker and HTTP service.
+shutdown; `request_shutdown()` signals stop while retaining the handle, and
+`shutdown().await` also waits for the render worker and HTTP service.
 Accepted HTTP/1 connections are owned tasks, with one second to drain before
 forced closure, so a slow response cannot outlive the viewer. An in-progress
 response may be interrupted when its owner shuts down.
 Connection-aborted/reset/refused accept errors are retried immediately. Other
 accept errors (including file-descriptor pressure) are logged and retried after
 one second; shutdown interrupts that backoff. Accepted connections remain owned
-and retain the same bounded drain behavior.
+and retain the same bounded drain behavior. Retries have no consecutive-failure
+cap: task liveness is not proof that the listener can currently accept connections.
+A permanent listener failure can therefore keep its URL registered while it logs
+and retries. If it does not recover, restart the owning MCP server/session to
+release the service and obtain a fresh URL; closing a browser tab does not stop it.
 
 Startup renders each unchanged sheet once. Source modification times and lengths
 are recorded before discovery reads, then checked after watches are installed.

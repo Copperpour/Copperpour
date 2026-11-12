@@ -205,13 +205,70 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
         let (other_url, reused) = registry.open(&other_root, &cli).await.unwrap();
         assert!(!reused);
         assert_ne!(url, other_url);
-        // A stopped/failed service must not be returned as a healthy reuse.
-        let old = registry.0.lock().await.remove(&root).unwrap();
-        old.shutdown().await;
+    }
+    #[tokio::test]
+    async fn browser_registry_replaces_stopped_service_that_remains_in_map() {
+        let (_dir, root, cli) = fixture();
+        let registry = ViewerRegistry::default();
+        let (url, reused) = registry.open(&root, &cli).await.unwrap();
+        assert!(!reused);
+        {
+            let viewers = registry.0.lock().await;
+            let viewer = viewers.get(&root).unwrap();
+            viewer.request_shutdown();
+            assert!(!viewer.is_running());
+        }
+        let address = url
+            .strip_prefix("http://")
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while tokio::net::TcpStream::connect(address).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("stopped service releases its listener while still registered");
+        assert!(registry.0.lock().await.contains_key(&root));
         let (new_url, reused) = registry.open(&root, &cli).await.unwrap();
         assert!(!reused);
         assert_ne!(url, new_url);
+        assert!(state(&new_url).await.starts_with("HTTP/1.1 200"));
     }
+    #[tokio::test]
+    async fn browser_mcp_missing_schematic_is_typed_without_misclassifying_other_io_errors() {
+        let (dir, _root, cli) = fixture();
+        let handler = handler(cli).await;
+        let missing = dir.path().join("missing.kicad_sch");
+        let response = call(&handler, json!({"schematic":missing,"open_browser":false})).await;
+        assert_eq!(response["result"]["isError"], true);
+        let error: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(error["error"]["kind"], "file_not_found");
+        assert_eq!(error["error"]["path"], json!(missing));
+        let recursive = dir.path().join("recursive.kicad_sch");
+        symlink("recursive.kicad_sch", &recursive).unwrap();
+        let response = call(
+            &handler,
+            json!({"schematic":recursive,"open_browser":false}),
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], true);
+        let legacy: crate::mcp::protocol::CallToolResult =
+            serde_json::from_value(response["result"].clone()).unwrap();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&legacy).as_deref(),
+            Some("handler_error")
+        );
+        assert!(response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Resolve viewer schematic"));
+    }
+
     fn command(script: &str) -> tokio::process::Command {
         let mut c = tokio::process::Command::new("sh");
         c.arg("-c").arg(script);
