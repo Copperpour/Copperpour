@@ -98,17 +98,21 @@ to verify the process that actually restarted. This diagnostic writes nothing.
 
 ## Installed guidance is out of date
 
-`copperpour init` writes skills, agents, and Claude hooks once. Upgrading Copperpour
-does not touch them, so an older install keeps advising the old tools. Run
-`copperpour status` (add `--client codex` for Codex) with the binary your MCP
-client uses. For a portable installation, pass the same `--skills-dir <absolute path>`
-or `COPPERPOUR_SKILLS_DIR` to `status`, `init`, and `uninstall`; these operate on
-skills only. The `gemini`, `cursor`, and `antigravity` (`agy`) presets use the same
-ownership-checked mode; pass the same `--client` to all three commands. Keep
-`.copperpour-skills.json` in that target: it records ownership and installed contents, so custom uninstall preserves local edits. If custom init
-refuses an edited file, back it up and move it aside before retrying. It also
-refuses unknown paths in a marker rather than trusting them as deletion targets.
-See [Managing skills](../README.md#advanced-installation).
+Installing a new Copperpour binary does not update installed guidance. Run
+`copperpour status` with the binary your MCP client uses and the same client or
+directory selection used for installation. The default client is Claude Code;
+for other clients, use `--client` with `codex`, `gemini`, `cursor`, or `antigravity`
+(alias `agy`).
+See the [client setup table](../README.md#step-3-install-the-skills-optional).
+
+For a custom directory, pass the same `--skills-dir <absolute path>` or
+`COPPERPOUR_SKILLS_DIR` to `status`, `init`, and `uninstall`. Custom targets and the
+Gemini, Cursor, and Antigravity presets use the ownership-checked skills-only mode.
+Keep `.copperpour-skills.json` in that target: it records ownership and installed
+contents, so uninstall preserves local edits. If init refuses an edited file,
+back it up and move it aside before retrying. Unknown paths in a marker are
+refused rather than trusted as deletion targets. See
+[Managing skills](../README.md#advanced-installation).
 
 For native client installations, each file and hook is compared with that
 binary's bundle:
