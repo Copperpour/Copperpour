@@ -5,10 +5,12 @@
 //! fails as unconfigured. KiCad's own default is predictable —
 //! `<temp dir>/kicad/api.sock` — so look there before giving up.
 //!
-//! Looking is all this module does, and it never opens a connection: what
-//! sits at that path is KiCad's NNG endpoint, and dialling it outside the NNG
-//! protocol is what wedged the editor in #498. Whether the endpoint answers is
-//! decided later, by the bounded NNG `Ping` in [`crate::client`].
+//! Looking is almost all this module does, and it never dials a candidate
+//! outside the NNG protocol: what sits at that path is KiCad's NNG endpoint,
+//! and dialling it any other way is what wedged the editor in #498. Whether
+//! the endpoint answers is decided by the bounded NNG `Ping` in
+//! [`crate::client`]: later for a single candidate, and here only when
+//! several qualify and that Ping is the evidence that tells them apart.
 //!
 //! Where "looking" happens is per-platform, because the endpoint is. On Unix
 //! the socket is a filesystem entry and this reads its metadata. On Windows
@@ -54,26 +56,82 @@ fn candidates_in(temp_dir: &Path) -> Vec<PathBuf> {
 /// liveness here instead would mean a second, hand-written handshake against
 /// the socket, which is exactly what #498 is.
 pub fn detect_ipc_address() -> Option<String> {
-    #[cfg(unix)]
-    {
-        let candidates = candidate_socket_paths();
-        let fallbacks = pid_socket_fallbacks(&candidates, pid_is_alive);
-        detect_with_fallbacks(&candidates, &fallbacks, is_adoptable, modified)
+    match detect_ipc_endpoint() {
+        IpcDetection::Found(address) => Some(address),
+        IpcDetection::Ambiguous(_) | IpcDetection::NotFound => None,
     }
+}
+
+/// What detection found: one endpoint to use, several that qualify and could
+/// not be told apart, or none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcDetection {
+    Found(String),
+    /// More than one socket qualifies and not exactly one of them answers a
+    /// Ping. None is adopted: picking one would be a guess, and the wrong
+    /// guess hands the board to another KiCad. Every candidate is reported so
+    /// the user can set `ipc_address` to the right one (#374).
+    Ambiguous(Vec<String>),
+    NotFound,
+}
+
+/// Detect KiCad's endpoint, reporting ambiguity instead of resolving it by
+/// guesswork.
+///
+/// On Unix the candidates are this platform's default `api.sock` paths and,
+/// beside each, every `api-<pid>.sock` whose process is running: KiCad 10
+/// binds `api.sock` only while it holds `api.lock`, and a lock left by a
+/// session that did not exit cleanly sends the next KiCad to
+/// `api-<pid>.sock` (#374). Every candidate must pass the same ownership and
+/// socket-type check, because `/tmp` is shared.
+///
+/// One candidate is returned as before, unproven. Several are told apart only
+/// by the bounded NNG Ping of [`crate::client`], the one handshake this crate
+/// performs: exactly one answering is evidence, not a guess. Otherwise the
+/// result is [`IpcDetection::Ambiguous`].
+pub fn detect_ipc_endpoint() -> IpcDetection {
+    #[cfg(unix)]
+    let candidates = {
+        let defaults = candidate_socket_paths();
+        let fallbacks = pid_socket_fallbacks(&defaults, pid_is_alive);
+        defaults
+            .into_iter()
+            .chain(fallbacks)
+            .filter(|path| is_adoptable(path))
+            .collect::<Vec<_>>()
+    };
     #[cfg(not(unix))]
-    {
-        detect_ipc_address_in(&candidate_socket_paths(), is_adoptable)
+    let candidates = candidate_socket_paths()
+        .into_iter()
+        .filter(|path| is_adoptable(path))
+        .take(1)
+        .collect::<Vec<_>>();
+    choose_endpoint(&candidates, |address| {
+        crate::KiCadIpcClient::new(address)
+            .ping_outcome()
+            .is_responsive()
+    })
+}
+
+/// [`detect_ipc_endpoint`]'s decision with the Ping supplied, so a test can
+/// state which candidates answer. The Ping runs only when there is a choice.
+fn choose_endpoint(candidates: &[PathBuf], responds: impl Fn(&str) -> bool) -> IpcDetection {
+    let addresses: Vec<String> = candidates.iter().map(|path| format_address(path)).collect();
+    match addresses.as_slice() {
+        [] => IpcDetection::NotFound,
+        [only] => IpcDetection::Found(only.clone()),
+        _ => {
+            let answering: Vec<&String> = addresses.iter().filter(|a| responds(a)).collect();
+            match answering.as_slice() {
+                [one] => IpcDetection::Found((*one).clone()),
+                _ => IpcDetection::Ambiguous(addresses),
+            }
+        }
     }
 }
 
 /// `api-<pid>.sock` beside each candidate whose `<pid>` is a running process.
-///
-/// KiCad 10 binds `api.sock` only while it holds `api.lock`. A lock left by a
-/// session that did not exit cleanly sends the next KiCad to
-/// `api-<pid>.sock` instead (#374), so a server that only looked at `api.sock`
-/// adopted the dead socket and reported "Connection refused" while KiCad was
-/// listening next to it. A socket whose process is gone is left out: KiCad
-/// does not unlink these either.
+/// A socket whose process is gone is left out: KiCad does not unlink these.
 #[cfg(unix)]
 fn pid_socket_fallbacks(candidates: &[PathBuf], is_alive: impl Fn(i32) -> bool) -> Vec<PathBuf> {
     let mut found = Vec::new();
@@ -100,6 +158,7 @@ fn pid_socket_fallbacks(candidates: &[PathBuf], is_alive: impl Fn(i32) -> bool) 
         }
     }
     found.sort();
+    found.dedup();
     found
 }
 
@@ -113,39 +172,7 @@ fn pid_is_alive(pid: i32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(unix)]
-fn modified(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
-}
-
-/// The first adoptable candidate, unless an adoptable `api-<pid>.sock` was
-/// bound after it: then the newest of those, since the KiCad that made it
-/// started after whatever left `api.sock` behind.
-#[cfg(unix)]
-fn detect_with_fallbacks(
-    candidates: &[PathBuf],
-    fallbacks: &[PathBuf],
-    is_adoptable: impl Fn(&Path) -> bool,
-    modified: impl Fn(&Path) -> Option<std::time::SystemTime>,
-) -> Option<String> {
-    let primary = candidates.iter().find(|path| is_adoptable(path));
-    let newest_fallback = fallbacks
-        .iter()
-        .filter(|path| is_adoptable(path))
-        .max_by_key(|path| modified(path));
-    let chosen = match (primary, newest_fallback) {
-        (Some(primary), Some(fallback)) if modified(fallback) > modified(primary) => fallback,
-        (Some(primary), _) => primary,
-        (None, Some(fallback)) => fallback,
-        (None, None) => return None,
-    };
-    Some(format_address(chosen))
-}
-
-// On Unix `detect_with_fallbacks` does this and more; the tests keep it.
-#[cfg(any(not(unix), test))]
+#[cfg(test)]
 fn detect_ipc_address_in(
     candidates: &[PathBuf],
     is_adoptable: impl Fn(&Path) -> bool,
@@ -574,7 +601,6 @@ mod tests {
     #[cfg(unix)]
     mod pid_sockets {
         use super::super::*;
-        use std::time::{Duration, SystemTime};
 
         fn touch(dir: &Path, name: &str) -> PathBuf {
             let path = dir.join(name);
@@ -594,69 +620,50 @@ mod tests {
             assert_eq!(found, vec![dir.path().join("api-200.sock")]);
         }
 
-        #[test]
-        fn a_newer_pid_socket_wins_over_a_stale_api_sock() {
-            let primary = PathBuf::from("/k/api.sock");
-            let fallback = PathBuf::from("/k/api-42.sock");
-            let at = |path: &Path| {
-                let base = SystemTime::UNIX_EPOCH;
-                Some(if path == Path::new("/k/api.sock") {
-                    base + Duration::from_secs(10)
-                } else {
-                    base + Duration::from_secs(20)
-                })
-            };
-            let chosen = detect_with_fallbacks(
-                std::slice::from_ref(&primary),
-                std::slice::from_ref(&fallback),
-                |_| true,
-                at,
-            );
-            assert_eq!(chosen.as_deref(), Some("ipc:///k/api-42.sock"));
+        fn paths(names: &[&str]) -> Vec<PathBuf> {
+            names
+                .iter()
+                .map(|n| PathBuf::from(format!("/k/{n}")))
+                .collect()
         }
 
         #[test]
-        fn api_sock_stays_first_when_it_is_the_newest() {
-            let primary = PathBuf::from("/k/api.sock");
-            let fallback = PathBuf::from("/k/api-42.sock");
-            let at = |path: &Path| {
-                let base = SystemTime::UNIX_EPOCH;
-                Some(if path == Path::new("/k/api.sock") {
-                    base + Duration::from_secs(30)
-                } else {
-                    base + Duration::from_secs(20)
-                })
-            };
-            let chosen = detect_with_fallbacks(
-                std::slice::from_ref(&primary),
-                std::slice::from_ref(&fallback),
-                |_| true,
-                at,
-            );
-            assert_eq!(chosen.as_deref(), Some("ipc:///k/api.sock"));
+        fn one_candidate_is_used_without_a_ping() {
+            let chosen = choose_endpoint(&paths(&["api-42.sock"]), |_| panic!("no ping needed"));
+            assert_eq!(chosen, IpcDetection::Found("ipc:///k/api-42.sock".into()));
         }
 
         #[test]
-        fn a_pid_socket_is_used_when_api_sock_is_absent_and_never_unadoptable() {
-            let primary = PathBuf::from("/k/api.sock");
-            let fallback = PathBuf::from("/k/api-42.sock");
-            let fallbacks = std::slice::from_ref(&fallback);
-            let only_fallback = |path: &Path| path == Path::new("/k/api-42.sock");
-            let chosen = detect_with_fallbacks(
-                std::slice::from_ref(&primary),
-                fallbacks,
-                only_fallback,
-                |_| None,
-            );
-            assert_eq!(chosen.as_deref(), Some("ipc:///k/api-42.sock"));
+        fn the_only_candidate_that_answers_is_used() {
+            let chosen = choose_endpoint(&paths(&["api.sock", "api-42.sock"]), |a| {
+                a.ends_with("api-42.sock")
+            });
+            assert_eq!(chosen, IpcDetection::Found("ipc:///k/api-42.sock".into()));
+        }
 
-            let chosen = detect_with_fallbacks(
-                std::slice::from_ref(&primary),
-                fallbacks,
-                |_| false,
-                |_| None,
+        /// Two live KiCads, or none answering: no guess, every candidate is
+        /// reported (#374).
+        #[test]
+        fn several_candidates_without_one_answer_are_all_reported() {
+            let all = vec![
+                "ipc:///k/api.sock".to_string(),
+                "ipc:///k/api-42.sock".to_string(),
+                "ipc:///k/api-43.sock".to_string(),
+            ];
+            let candidates = paths(&["api.sock", "api-42.sock", "api-43.sock"]);
+            assert_eq!(
+                choose_endpoint(&candidates, |a| a.contains("api-4")),
+                IpcDetection::Ambiguous(all.clone())
             );
-            assert_eq!(chosen, None);
+            assert_eq!(
+                choose_endpoint(&candidates, |_| false),
+                IpcDetection::Ambiguous(all)
+            );
+        }
+
+        #[test]
+        fn no_candidate_is_not_found() {
+            assert_eq!(choose_endpoint(&[], |_| true), IpcDetection::NotFound);
         }
     }
 }

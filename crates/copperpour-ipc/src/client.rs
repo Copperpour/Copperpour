@@ -1275,6 +1275,25 @@ impl KiCadIpcClient {
         recv_timeout: std::time::Duration,
     ) -> Result<Option<prost_types::Any>> {
         if self.socket_path.is_empty() {
+            // Several sockets qualifying is the one unconfigured state the
+            // user can settle in one step, so name them (#374).
+            if let crate::IpcDetection::Ambiguous(candidates) = crate::detect_ipc_endpoint() {
+                return Err(unreachable_error(
+                    UnreachableReason::NotConfigured,
+                    format!(
+                        "KiCAD IPC socket path not configured: more than one KiCad socket \
+                         qualifies and not exactly one answered, so none was picked: {}. \
+                         Set ipc_address to the one KiCad lists under Preferences > Plugins \
+                         ('Enable KiCad API'), or quit the extra KiCad. See \
+                         https://github.com/Copperpour/Copperpour/blob/main/docs/TROUBLESHOOTING.md",
+                        candidates
+                            .iter()
+                            .map(|c| crate::redact_endpoint(c))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            }
             return Err(unreachable_error(
                 UnreachableReason::NotConfigured,
                 "KiCAD IPC socket path not configured. To fix: \

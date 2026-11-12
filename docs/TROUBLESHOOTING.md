@@ -146,20 +146,28 @@ update. It overwrites `different` files, so save any edits you made first.
 Any tool that talks to a live KiCAD session (`save_project`, PCB editing,
 `check_kicad_ui`, …) needs the IPC socket address.
 
-**At startup** — once, and only then — Copperpour resolves it in order: the
-`ipc_address` in your config, then `KICAD_API_SOCKET` (set only for plugins
-KiCad launches itself), then the platform default — `<temp dir>/kicad/api.sock`,
-used only if something is actually listening there. The startup log on stderr
-says which it picked, and warns when nothing was found.
+**At startup** Copperpour resolves it in order: the `ipc_address` in your
+config, then `KICAD_API_SOCKET` (set only for plugins KiCad launches itself),
+then the platform default — `<temp dir>/kicad/api.sock` and, on Linux and
+macOS, any `api-<pid>.sock` beside it whose process is running. The startup log
+on stderr says which it picked, and warns when nothing was found.
 
-So **if KiCad is already running with the API enabled when Copperpour starts**,
-no configuration is needed on any platform. That order matters and is easy to
-get wrong: an MCP client normally launches the Copperpour server itself, before
-you open KiCad. Copperpour does not re-probe afterwards, so a server started first
-stays unresolved for its whole life no matter what you open later. Start KiCad
-first, or restart the Copperpour server (in most clients, reconnect the MCP
-server) once KiCad is up — or set `ipc_address` explicitly, which never depends
-on ordering.
+When the address came from that probe, or nothing was found, Copperpour probes
+again on every IPC call. So the order in which the AI client and KiCad start no
+longer matters, and a KiCad restarted while the server runs is found again
+without restarting the server. A configured `ipc_address` or `KICAD_API_SOCKET`
+is used as given and never replaced.
+
+**A stale `api.lock`.** KiCad 10 binds `api.sock` only while it holds
+`<temp dir>/kicad/api.lock`. If a session that crashed left that lock behind,
+the next KiCad listens on `api-<pid>.sock` instead, and a server that only
+knew `api.sock` reported "Connection refused". Copperpour now finds that
+socket. When more than one socket qualifies (an old `api.sock` beside
+`api-<pid>.sock`, or two KiCads running), it uses the one that answers a Ping;
+if not exactly one answers, it picks none and the error lists every candidate:
+set `ipc_address` to the one KiCad shows under Preferences → Plugins. Quitting
+every KiCad and deleting the stale `api.lock` and `api*.sock` files also clears
+it.
 
 Where the probe looks differs by platform, because the endpoint does. On Linux
 and macOS the socket is a filesystem entry and its metadata is read. On Windows

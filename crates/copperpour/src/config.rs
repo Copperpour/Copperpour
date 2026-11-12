@@ -109,6 +109,21 @@ impl IpcAddressSource {
             return;
         }
 
+        if let copperpour_ipc::IpcDetection::Ambiguous(candidates) =
+            copperpour_ipc::detect_ipc_endpoint()
+        {
+            warn!(
+                "More than one KiCad IPC socket qualifies and not exactly one answered, \
+                 so none was picked: {}. Set ipc_address to the one KiCad lists under \
+                 Preferences > Plugins. Copperpour looks again on every IPC call.",
+                candidates
+                    .iter()
+                    .map(|c| copperpour_ipc::redact_endpoint(c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return;
+        }
         warn!(
             "No KiCad IPC socket found (no KICAD_API_SOCKET, none detected at {}). \
              Live-KiCad tools will fail and file-backed ones will edit the \
