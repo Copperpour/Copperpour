@@ -95,7 +95,10 @@ pub(crate) fn tools() -> Vec<ToolDef> {
             "Move, rotate, resize, hide/show, restyle (mirrored, alignment, bold, italic, \
              keep_upright, knockout, locked, font), or change the layer of a placed footprint's \
              reference or value field in place. Name at least one property; every property not \
-             named is sent back exactly as KiCad holds it. x/y are board-absolute mm (both or \
+             named is sent back exactly as KiCad holds it. KiCad 10 replaces the whole \
+             footprint, though: its symbol-unit mapping is lost until Update PCB from \
+             Schematic, and a rule area inside it may be rewritten; the readback sees neither. \
+             x/y are board-absolute mm (both or \
              neither); rotation is the field's absolute angle in degrees, the same frame \
              list_footprint_fields reports. Changing the layer alone does not mirror the text: \
              pass mirror 'auto' with it to mirror on a back layer and unmirror on a front one, \
@@ -1425,6 +1428,10 @@ mod tests {
         /// Accept an update but keep each text's mirror flag as it was: the
         /// KiCad behaviour #202 could not rule out.
         keep_mirror_flag: bool,
+        /// Accept a footprint update but shift the footprint 1 mm in x,
+        /// leaving its fields where the update put them, so only the
+        /// footprint's own pose shows the change.
+        move_footprint_on_update: bool,
         updates: usize,
     }
 
@@ -1533,6 +1540,7 @@ mod tests {
                     let request = commands::UpdateItems::decode(command.value.as_slice()).unwrap();
                     held.updates += request.items.len();
                     let keep_mirror_flag = held.keep_mirror_flag;
+                    let move_footprint = held.move_footprint_on_update;
                     for item in &request.items {
                         if item.type_url.ends_with("BoardText") {
                             let mut updated =
@@ -1562,6 +1570,9 @@ mod tests {
                                 let new = updated.reference_field.as_mut().unwrap();
                                 *mirror_flag(new.text.as_mut().unwrap()) =
                                     *mirror_flag(old.text.as_mut().unwrap());
+                            }
+                            if move_footprint {
+                                updated.position.as_mut().unwrap().x_nm += 1_000_000;
                             }
                             *slot = updated;
                         }
@@ -1610,7 +1621,7 @@ mod tests {
                 texts: vec![held_text("title", "Konnect rev A", "B.SilkS", false)],
                 footprints: vec![held_footprint("fp-r1", "R1")],
                 keep_mirror_flag,
-                updates: 0,
+                ..Default::default()
             }));
             let kicad = spawn_text_kicad(&board, held.clone());
             let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
@@ -1770,6 +1781,35 @@ mod tests {
                 "{tool}: {body}"
             );
         }
+    }
+
+    /// A KiCad that takes a field edit but moves the footprint under it. The
+    /// field reads back exactly as asked, so only the comparison of the
+    /// footprint's own pose can tell, and the result must be an error naming
+    /// `footprint.position`, not `applied`.
+    #[tokio::test]
+    async fn a_kicad_that_moves_the_footprint_is_an_error_through_the_served_dispatch() {
+        let scene = LiveScene::new(false).await;
+        scene.held.lock().unwrap().move_footprint_on_update = true;
+        let (is_error, body) = scene
+            .call(
+                "edit_footprint_field",
+                json!({ "reference": "R1", "bold": true }),
+            )
+            .await;
+        assert!(is_error, "{body}");
+        assert_eq!(
+            body["error"]["kind"], "mutation_outcome_uncertain",
+            "{body}"
+        );
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("footprint.position: expected"),
+            "{body}"
+        );
+        assert_eq!(scene.held.lock().unwrap().updates, 1);
     }
 
     /// Item 3 of #202 through `tools/call`: a layer change with
