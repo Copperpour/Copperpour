@@ -258,9 +258,13 @@ impl McpHandler {
             Err(e) => Some(JsonRpcResponse::error(
                 id,
                 JsonRpcError {
-                    code: INTERNAL_ERROR,
+                    code: e
+                        .downcast_ref::<crate::guidance::ResourceRequestError>()
+                        .map_or(INTERNAL_ERROR, |error| error.code),
                     message: e.to_string(),
-                    data: None,
+                    data: e
+                        .downcast_ref::<crate::guidance::ResourceRequestError>()
+                        .and_then(|error| error.data.clone()),
                 },
             )),
         }
@@ -334,8 +338,15 @@ impl McpHandler {
                 Ok(Some(serde_json::to_value(call_result)?))
             }
 
+            // Static embedded guidance only; resource reads never touch the filesystem.
+            "resources/list" => Ok(Some(crate::guidance::list_resources(req.params.as_ref())?)),
+            "resources/read" => Ok(Some(crate::guidance::read_resource(req.params.as_ref())?)),
+            "resources/templates/list" => {
+                crate::guidance::validate_list_params(req.params.as_ref())?;
+                Ok(Some(json!({"resourceTemplates": []})))
+            }
+
             // ── Unimplemented MCP methods ──────────────────────────────────
-            "resources/list" | "resources/read" => Ok(Some(json!({ "resources": [] }))),
             "prompts/list" => Ok(Some(json!({ "prompts": [] }))),
 
             method => {
@@ -3013,24 +3024,29 @@ mod client_adaptation_tests {
             .expect("initialize returns a result")
     }
 
-    /// Drift reaches the model through `instructions` (#728); with nothing
-    /// to report, or no probe at all, the field is absent rather than empty.
+    /// Rules reach every session, independently of the optional drift notice.
     #[tokio::test]
     async fn initialize_carries_a_guidance_notice_only_when_there_is_one() {
         let bare = lazy_handler().await;
-        assert!(initialize_result(&bare).await.get("instructions").is_none());
+        assert_eq!(
+            initialize_result(&bare).await["instructions"],
+            crate::guidance::SESSION_RULES
+        );
 
         let quiet = lazy_handler().await;
         quiet.set_guidance_probe(Arc::new(FixedProbe(None)));
-        assert!(initialize_result(&quiet)
-            .await
-            .get("instructions")
-            .is_none());
+        assert_eq!(
+            initialize_result(&quiet).await["instructions"],
+            crate::guidance::SESSION_RULES
+        );
 
         let drifted = lazy_handler().await;
         drifted.set_guidance_probe(Arc::new(FixedProbe(Some("run copperpour init"))));
         let result = initialize_result(&drifted).await;
-        assert_eq!(result["instructions"], "run copperpour init");
+        assert_eq!(
+            result["instructions"],
+            format!("{}\n\nrun copperpour init", crate::guidance::SESSION_RULES)
+        );
         assert_eq!(result["serverInfo"]["name"], "copperpour");
     }
 

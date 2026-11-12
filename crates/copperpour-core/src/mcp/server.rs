@@ -20,13 +20,16 @@ impl McpServerState {
                 tools: Some(ToolsCapability {
                     list_changed: Some(true),
                 }),
+                resources: Some(serde_json::json!({})),
                 ..Default::default()
             },
             server_info: ServerInfo {
                 name: crate::app_dirs::APP_NAME.to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
-            instructions,
+            instructions: Some(crate::guidance::session_instructions(
+                instructions.as_deref(),
+            )),
         }
     }
 }

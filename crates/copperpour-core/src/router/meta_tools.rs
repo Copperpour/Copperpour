@@ -1,4 +1,7 @@
-//! The 7 cross-platform meta-tools, plus an optional Unix stdio reload tool.
+//! Cross-platform meta-tools, plus an optional Unix stdio reload tool.
+//!
+//! Guidance:
+//!   get_guidance(path?)       — embedded skills and references, no local file reads
 //!
 //! Discovery / routing:
 //!   list_toolboxes()          — show every toolset with descriptions and load state
@@ -194,6 +197,17 @@ pub fn meta_tool_descriptions() -> Vec<McpToolDescription> {
 pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescription> {
     let descriptions = vec![
         McpToolDescription {
+            name: "get_guidance".to_string(),
+            description: "Read this build's bundled Copperpour/KiCad guidance without installing skill files. Omit path to list all skills and references, then pass an exact listed path (for example copperpour/SKILL.md). Read copperpour/references/reliability-contract.md before mutations and completion claims. No filesystem access.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Exact bundle path from get_guidance; omitted lists the catalog. Relative references resolve within the listed skill folder."}
+                },
+                "required": []
+            }),
+        },
+        McpToolDescription {
             name: "list_toolboxes".to_string(),
             description:
                 "List all available KiCAD toolsets with descriptions, categories, tool counts, \
@@ -365,6 +379,7 @@ pub async fn handle_meta_tool_with_reload(
     #[cfg(not(unix))]
     let _ = reload;
     match name {
+        "get_guidance" => Some(crate::guidance::get_guidance(args)),
         "list_toolboxes" => Some(handle_list_toolboxes(ctx).await),
         "load_toolset" => Some(handle_load_toolset(args, ctx).await),
         "unload_toolset" => Some(handle_unload_toolset(args, ctx).await),
