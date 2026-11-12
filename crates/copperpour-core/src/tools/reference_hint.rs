@@ -8,6 +8,11 @@
 //! the symbol when the reference belongs to another instance of a sheet that
 //! is placed more than once.
 //!
+//! The search is the given sheet's directory, not the project hierarchy: a
+//! sheet in a subdirectory is not found, and a sheet of another project in
+//! the same directory can be named. That is enough for a hint and is said in
+//! the message; it is not a statement about the project.
+//!
 //! It only ever reads, and only on the not-found path, so it costs nothing on
 //! a call that succeeds.
 
@@ -145,7 +150,7 @@ pub(crate) fn component_not_found(sch_path: &Path, reference: &str) -> String {
         })
         .collect();
     format!(
-        "{base} on this sheet ({}). It is on another sheet of the project: {}. \
+        "{base} on this sheet ({}). A sheet file in the same directory places it: {}. \
          Pass that file as `schematic`.",
         sch_path.display(),
         described.join("; ")
@@ -154,90 +159,118 @@ pub(crate) fn component_not_found(sch_path: &Path, reference: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Against the KiCad-saved `annotate_nested_hierarchy` fixture: the root
+    //! places `bank.kicad_sch` twice and `bank.kicad_sch` places
+    //! `cell.kicad_sch` twice. Expectations come from `kicad-cli` 10.0.7
+    //! (`sch export netlist --format kicadxml` on the root): `R7`, `R9`, `R14`
+    //! and `R16` are one symbol (tstamp `229a802a-…`) with Sheetfile
+    //! `cell.kicad_sch`, saved there with `Reference` `R7`; `R3` and `R10`
+    //! are one symbol on `bank.kicad_sch`, saved as `R3`; `R6` is on
+    //! `cell.kicad_sch`, saved as `R6`.
+
     use super::*;
 
-    fn symbol(reference: &str, instance_refs: &[&str]) -> String {
-        let paths: String = instance_refs
-            .iter()
-            .enumerate()
-            .map(|(i, r)| format!("(path \"/root/s{i}\" (reference \"{r}\") (unit 1))"))
-            .collect();
-        format!(
-            "(symbol (lib_id \"Device:R\") (at 10 10 0) (unit 1) \
-             (property \"Reference\" \"{reference}\" (at 0 0 0)) \
-             (instances (project \"p\" {paths})))"
-        )
-    }
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/annotate_nested_hierarchy"
+    );
 
-    fn sheet(symbols: &[String]) -> String {
-        format!(
-            "(kicad_sch (version 20250114) (uuid \"u\") (lib_symbols (symbol \"Device:R\")) {})",
-            symbols.join(" ")
-        )
-    }
-
-    fn project(files: &[(&str, String)]) -> tempfile::TempDir {
+    /// A temporary copy of the fixture, so tests that add files never touch
+    /// the checked-in one.
+    fn project() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        for (name, content) in files {
-            std::fs::write(dir.path().join(name), content).unwrap();
+        for name in [
+            "nested_pages.kicad_pro",
+            "nested_pages.kicad_sch",
+            "bank.kicad_sch",
+            "cell.kicad_sch",
+        ] {
+            std::fs::copy(Path::new(FIXTURE).join(name), dir.path().join(name)).unwrap();
         }
         dir
     }
 
+    fn site(dir: &tempfile::TempDir, file: &str, saved: &str) -> ReferenceSite {
+        ReferenceSite {
+            file: dir.path().join(file),
+            saved_reference: saved.into(),
+        }
+    }
+
     #[test]
-    fn a_reference_on_a_sub_sheet_is_located() {
-        let dir = project(&[
-            ("root.kicad_sch", sheet(&[symbol("R1", &["R1"])])),
-            ("sub.kicad_sch", sheet(&[symbol("Q7", &["Q7"])])),
-            ("_autosave-sub.kicad_sch", sheet(&[symbol("Q7", &["Q7"])])),
-        ]);
-        let root = dir.path().join("root.kicad_sch");
-        let sites = locate_reference(&root, "Q7");
+    fn another_instance_reference_on_the_root_names_the_saved_one() {
+        let dir = project();
+        let root = dir.path().join("nested_pages.kicad_sch");
         assert_eq!(
-            sites,
-            vec![ReferenceSite {
-                file: dir.path().join("sub.kicad_sch"),
-                saved_reference: "Q7".into()
-            }]
+            locate_reference(&root, "R9"),
+            vec![site(&dir, "cell.kicad_sch", "R7")]
         );
-        let message = component_not_found(&root, "Q7");
-        assert!(message.starts_with("Component 'Q7' not found on this sheet"));
-        assert!(message.contains("sub.kicad_sch"), "{message}");
+        let message = component_not_found(&root, "R9");
+        assert!(
+            message.starts_with("Component 'R9' not found on this sheet"),
+            "{message}"
+        );
+        assert!(message.contains("cell.kicad_sch"), "{message}");
+        assert!(message.contains("address it as 'R7'"), "{message}");
     }
 
     #[test]
-    fn a_second_instance_reference_names_the_saved_one() {
-        let dir = project(&[
-            ("root.kicad_sch", sheet(&[])),
-            ("ch.kicad_sch", sheet(&[symbol("R103", &["R103", "R203"])])),
-        ]);
-        let root = dir.path().join("root.kicad_sch");
-        let sites = locate_reference(&root, "R203");
-        assert_eq!(sites.len(), 1);
-        assert_eq!(sites[0].saved_reference, "R103");
-        let message = component_not_found(&root, "R203");
-        assert!(message.contains("address it as 'R103'"), "{message}");
+    fn a_reference_saved_on_a_sub_sheet_is_named_as_is() {
+        let dir = project();
+        let root = dir.path().join("nested_pages.kicad_sch");
+        assert_eq!(
+            locate_reference(&root, "R3"),
+            vec![site(&dir, "bank.kicad_sch", "R3")]
+        );
+        assert_eq!(
+            locate_reference(&root, "R10"),
+            vec![site(&dir, "bank.kicad_sch", "R3")]
+        );
+        let message = component_not_found(&root, "R3");
+        assert!(message.contains("bank.kicad_sch"), "{message}");
+        assert!(!message.contains("address it as"), "{message}");
     }
 
     #[test]
-    fn the_given_sheet_and_library_definitions_are_not_reported() {
-        // A library definition named like the reference is no placed symbol.
-        let lib_only = "(kicad_sch (version 20250114) (uuid \"u\") \
-                        (lib_symbols (symbol \"Q7\" (property \"Reference\" \"Q7\"))))";
-        let dir = project(&[
-            ("root.kicad_sch", sheet(&[symbol("Q7", &["Q7"])])),
-            ("lib.kicad_sch", lib_only.to_string()),
-            ("broken.kicad_sch", "(kicad_sch".to_string()),
-        ]);
-        let root = dir.path().join("root.kicad_sch");
-        assert!(locate_reference(&root, "Q7").is_empty());
-        assert_eq!(component_not_found(&root, "Q7"), "Component 'Q7' not found");
+    fn a_sub_sheet_points_to_the_sheet_it_places() {
+        let dir = project();
+        let bank = dir.path().join("bank.kicad_sch");
+        assert_eq!(
+            locate_reference(&bank, "R6"),
+            vec![site(&dir, "cell.kicad_sch", "R6")]
+        );
+        assert_eq!(
+            locate_reference(&bank, "R16"),
+            vec![site(&dir, "cell.kicad_sch", "R7")]
+        );
+    }
+
+    #[test]
+    fn the_given_sheet_autosaves_and_library_definitions_are_not_reported() {
+        let dir = project();
+        // KiCad's autosave copy of an open sheet, and an unparsable file.
+        std::fs::copy(
+            dir.path().join("cell.kicad_sch"),
+            dir.path().join("_autosave-cell.kicad_sch"),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("broken.kicad_sch"), "(kicad_sch").unwrap();
+        let root = dir.path().join("nested_pages.kicad_sch");
+        assert_eq!(
+            locate_reference(&root, "R9"),
+            vec![site(&dir, "cell.kicad_sch", "R7")]
+        );
+        // `R1` is on the root itself, and every sheet's `lib_symbols` defines
+        // a `Device:R` whose Reference property is the bare prefix `R`.
+        assert!(locate_reference(&root, "R1").is_empty());
+        assert!(locate_reference(&root, "R").is_empty());
+        assert_eq!(component_not_found(&root, "R"), "Component 'R' not found");
     }
 
     #[test]
     fn an_unknown_reference_keeps_the_plain_message() {
-        let dir = project(&[("root.kicad_sch", sheet(&[]))]);
-        let root = dir.path().join("root.kicad_sch");
+        let dir = project();
+        let root = dir.path().join("nested_pages.kicad_sch");
         assert_eq!(component_not_found(&root, "U9"), "Component 'U9' not found");
     }
 }

@@ -2470,27 +2470,40 @@ mod multi_unit_tool_tests {
 
     /// A reference on another sheet of the project is refused with that
     /// sheet's file, not a bare "not found" that reads as "no such part".
+    /// KiCad-saved `annotate_nested_hierarchy`: `kicad-cli` netlists `R9` on
+    /// Sheetfile `cell.kicad_sch`, as the instance of the symbol saved there
+    /// as `R7` (see `reference_hint::tests`).
     #[tokio::test]
     async fn component_nets_name_the_sheet_a_missing_reference_is_on() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/annotate_nested_hierarchy"
+        );
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("root.kicad_sch");
-        let sub = dir.path().join("sub.kicad_sch");
-        std::fs::write(&root, ECC83).unwrap();
-        std::fs::write(&sub, ECC83.replace("\"U1\"", "\"U7\"")).unwrap();
+        for name in ["nested_pages.kicad_sch", "bank.kicad_sch", "cell.kicad_sch"] {
+            std::fs::copy(
+                std::path::Path::new(fixture).join(name),
+                dir.path().join(name),
+            )
+            .unwrap();
+        }
+        let root = dir.path().join("nested_pages.kicad_sch");
+        let cell = dir.path().join("cell.kicad_sch");
         let context = Arc::new(ToolContext::new(
             ServerConfig::default(),
             Arc::new(crate::router::ToolRouter::new()),
         ));
-        let args = json!({ "schematic": root.to_str().unwrap(), "reference": "U7" });
+        let args = json!({ "schematic": root.to_str().unwrap(), "reference": "R9" });
         let error = handle_get_component_nets(&args, &context)
             .await
-            .expect_err("U7 is not on the root sheet")
+            .expect_err("R9 is not on the root sheet")
             .to_string();
         assert!(
-            error.starts_with("Component 'U7' not found on this sheet"),
+            error.starts_with("Component 'R9' not found on this sheet"),
             "{error}"
         );
-        assert!(error.contains(sub.to_str().unwrap()), "{error}");
+        assert!(error.contains(cell.to_str().unwrap()), "{error}");
+        assert!(error.contains("address it as 'R7'"), "{error}");
     }
 
     #[tokio::test]
