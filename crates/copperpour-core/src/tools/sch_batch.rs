@@ -1,9 +1,9 @@
 //! `sch_batch` toolset — bulk/batch operations on schematic elements.
 //!
-//! **Critical invariant**: every write handler performs a single file read,
-//! plans or applies all mutations in memory, then commits exactly once. This
-//! fixes the Python bug where `batch_connect_to_net` did N separate read/write
-//! cycles.
+//! **Critical invariant**: plan mutations in memory against one document
+//! revision, then commit exactly once. Saved-file readbacks verify the write.
+//! This fixes the Python bug where `batch_connect_to_net` did N separate
+//! read/write cycles.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -29,9 +29,12 @@ use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
 // Re-use the single-item component placer and pin-to-pin router.
 use super::sch_annotate::opt_string;
 use super::sch_components::{
-    commit_component_deletion, dnp_property_refusal, indexed_uuid_items, is_dnp_property,
-    place_one_component, placed_component_readback, plan_component_and_item_deletions,
-    set_dnp_attribute, set_property_value, ComponentDeleteTargetError,
+    commit_component_deletion, dnp_property_refusal, field_placement_unit,
+    field_placement_unit_schema, field_placements_schema, indexed_uuid_items, is_dnp_property,
+    place_one_component, placed_component_readback, plan_batch_field_placements,
+    plan_component_and_item_deletions, set_dnp_attribute, set_property_value,
+    validate_field_placement_unit_scope, verify_component_mutation_intents,
+    ComponentDeleteTargetError, ComponentMutationIntent,
 };
 use super::sch_wiring::{add_stub_label, add_stub_wire, clear_stub_direction, route_between};
 use super::PlacedPins;
@@ -251,7 +254,7 @@ pub fn tools() -> Vec<ToolDef> {
             "Apply field updates (Value, Footprint, custom properties) and KiCad's native \
              do-not-populate (DNP) attribute to multiple components in a single atomic file \
              write. Missing custom properties are created on every placed unit only when \
-             create_missing is true.",
+             create_missing is true. Field text placements use absolute schematic coordinates; unit selects their placed unit only. Placement entries include saved-file units readback.",
             json!({
                 "type": "object",
                 "properties": {
@@ -263,7 +266,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "edits": {
                         "type": "array",
-                        "description": "List of {reference, value?, footprint?, dnp?, fields?} edit objects",
+                        "description": "List of {reference, value?, footprint?, dnp?, fields?, field_placements?, unit?} edit objects",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -274,6 +277,8 @@ pub fn tools() -> Vec<ToolDef> {
                                     "type": "boolean",
                                     "description": "Set KiCad's native do-not-populate attribute, (dnp yes|no), on every placed unit of this component. A property named DNP is refused in 'fields'."
                                 },
+                                "field_placements": field_placements_schema(),
+                                "unit": field_placement_unit_schema(),
                                 "fields": {
                                     "type": "object",
                                     "additionalProperties": { "type": "string" },
@@ -1277,6 +1282,22 @@ async fn handle_bulk_move(
     })))
 }
 
+fn placement_error_message(error: &CallToolResult) -> String {
+    error
+        .content
+        .iter()
+        .find_map(|content| match content {
+            crate::mcp::protocol::ToolContent::Text { text } => Some(
+                serde_json::from_str::<Value>(text)
+                    .ok()
+                    .and_then(|body| body["message"].as_str().map(str::to_owned))
+                    .unwrap_or_else(|| text.clone()),
+            ),
+            _ => None,
+        })
+        .unwrap_or_else(|| "field placement could not be verified".to_owned())
+}
+
 async fn handle_batch_edit(
     args: &serde_json::Value,
     _ctx: &crate::tools::ToolContext,
@@ -1317,6 +1338,10 @@ async fn handle_batch_edit(
     let mut created_unit_copies = 0;
     // (index into `changed`, reference, requested state) for the readback.
     let mut dnp_writes: Vec<(usize, String, bool)> = Vec::new();
+    let mut placement_writes: Vec<(usize, String, ComponentMutationIntent)> = Vec::new();
+    let mut placement_assignments = HashSet::new();
+    let mut final_fields: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut final_dnp = BTreeMap::new();
 
     for edit_spec in &edits_arr {
         let reference = match edit_spec["reference"].as_str() {
@@ -1326,6 +1351,27 @@ async fn handle_batch_edit(
                 continue;
             }
         };
+
+        if let Err(error) = validate_field_placement_unit_scope(
+            edit_spec,
+            edit_spec["dnp"].as_bool().map(|_| "dnp"),
+        ) {
+            errors.push(format!(
+                "'{reference}': {}",
+                placement_error_message(&error)
+            ));
+            continue;
+        }
+
+        if edit_spec["field_placements"].is_object() {
+            if let Err(error) = field_placement_unit(edit_spec) {
+                errors.push(format!(
+                    "'{reference}': {}",
+                    placement_error_message(&error)
+                ));
+                continue;
+            }
+        }
 
         let mut component_changes: Vec<String> = Vec::new();
         let mut field_results = Vec::new();
@@ -1395,6 +1441,10 @@ async fn handle_batch_edit(
                     }
                 };
             content = next;
+            final_fields
+                .entry(reference.to_owned())
+                .or_default()
+                .insert(field.clone(), new_val.clone());
             updated_unit_copies += counts.updated;
             created_unit_copies += counts.added;
             if counts.updated > 0 {
@@ -1434,6 +1484,7 @@ async fn handle_batch_edit(
                     Ok((next, units)) => {
                         content = next;
                         applied_dnp = Some(dnp);
+                        final_dnp.insert(reference.to_owned(), dnp);
                         let state = if dnp { "yes" } else { "no" };
                         component_changes.push(if units > 1 {
                             format!("dnp → {state} ({units} units)")
@@ -1443,6 +1494,33 @@ async fn handle_batch_edit(
                     }
                     Err(error) => errors.push(format!("dnp on '{reference}': {error}")),
                 }
+            }
+        }
+
+        if edit_spec["field_placements"].is_object() {
+            let mut candidate = content.clone();
+            match plan_batch_field_placements(&sch_path, &mut candidate, reference, edit_spec) {
+                Ok(plan) => {
+                    errors.extend(
+                        plan.errors
+                            .into_iter()
+                            .map(|why| format!("'{reference}': {why}")),
+                    );
+                    let keys = plan.intent.placement_keys();
+                    if keys.iter().any(|key| placement_assignments.contains(key)) {
+                        errors.push(format!("Duplicate field placement assignment on '{reference}'; placements in this entry were not applied"));
+                    } else if !plan.changes.is_empty() {
+                        placement_assignments.extend(keys);
+                        content = candidate;
+                        component_changes.extend(plan.changes);
+                        placement_writes.push((changed.len(), reference.to_owned(), plan.intent));
+                    }
+                }
+                Err(failure) if failure.abort_batch => return Ok(failure.error),
+                Err(failure) => errors.push(format!(
+                    "'{reference}': {}",
+                    placement_error_message(&failure.error)
+                )),
             }
         }
 
@@ -1460,13 +1538,37 @@ async fn handle_batch_edit(
         }
     }
 
+    let placement_intents: Vec<_> = placement_writes
+        .iter()
+        .map(|(_, reference, intent)| {
+            intent.clone().with_batch_updates(
+                final_fields.get(reference).unwrap_or(&BTreeMap::new()),
+                final_dnp.get(reference).copied(),
+            )
+        })
+        .collect();
+    #[cfg(test)]
+    let content = apply_batch_placement_prospective_fault(content);
+    if !placement_intents.is_empty() {
+        // Refuse an unprovable candidate before writing any successful sibling.
+        let prospective = cse::Schematic::from_source(&sch_path, content.clone())?;
+        if let Err(error) = verify_component_mutation_intents(
+            &sch_path,
+            &prospective,
+            &placement_intents,
+            "prospective",
+        ) {
+            return Ok(error);
+        }
+    }
+
     #[cfg(test)]
     let content = apply_batch_write_fault(content);
     write_atomic_if_unchanged(&sch_path, &expected, &content)?;
 
     // The DNP state reported is the one the saved file holds, read back from
     // it, not the one requested.
-    if !dnp_writes.is_empty() {
+    if !dnp_writes.is_empty() || !placement_writes.is_empty() {
         // An uncertain outcome still names what the write carried, so the
         // caller can inspect those entries rather than re-derive them.
         let carried = changed
@@ -1498,6 +1600,19 @@ async fn handle_batch_edit(
                 )))
             }
         };
+        let placements = match verify_component_mutation_intents(
+            &sch_path,
+            &committed,
+            &placement_intents,
+            "post-commit",
+        ) {
+            Ok(observations) => observations,
+            Err(error) => return Ok(uncertain(placement_error_message(&error))),
+        };
+        for ((index, _, _), observed) in placement_writes.iter().zip(placements) {
+            changed[*index]["unit_count"] = observed["unit_count"].clone();
+            changed[*index]["units"] = observed["units"].clone();
+        }
         for (index, reference, requested) in dnp_writes {
             match observed_dnp(&committed, &reference) {
                 Ok(observed) if observed == requested => changed[index]["dnp"] = json!(observed),
@@ -1526,6 +1641,26 @@ thread_local! {
     /// test can reach the readback's refusal of a write that did not land.
     pub(crate) static BATCH_WRITE_FAULT: std::cell::RefCell<Option<(String, String)>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static BATCH_PLACEMENT_PROSPECTIVE_FAULT: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn apply_batch_placement_prospective_fault(content: String) -> String {
+    BATCH_PLACEMENT_PROSPECTIVE_FAULT.with(|fault| match fault.borrow_mut().take() {
+        Some((from, to)) => {
+            assert!(
+                content.contains(&from),
+                "prospective fault anchor absent: {from}"
+            );
+            content.replacen(&from, &to, 1)
+        }
+        None => content,
+    })
 }
 
 #[cfg(test)]
@@ -5472,5 +5607,495 @@ mod batch_connect_options_tests {
             assert_eq!(entry["label"]["x"], json!(lx), "{reference}.{number}");
             assert_eq!(entry["label"]["y"], json!(ly), "{reference}.{number}");
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_field_placement_tests {
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+    use std::path::Path;
+
+    const ECC83: &str = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batch.kicad_sch");
+        std::fs::write(&path, ECC83).unwrap();
+        (dir, path)
+    }
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            auto_load_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn served(
+        handler: &McpHandler,
+        path: &Path,
+        name: &str,
+        mut args: Value,
+    ) -> (bool, Value) {
+        args["schematic"] = json!(path);
+        let result = handler.handle_message(json!({"jsonrpc":"2.0", "id":116, "method":"tools/call", "params":{"name":name,"arguments":args}})).await.unwrap().result.unwrap();
+        let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        (result["isError"].as_bool().unwrap(), body)
+    }
+
+    async fn batch(handler: &McpHandler, path: &Path, edits: Value) -> Value {
+        let (error, body) = served(
+            handler,
+            path,
+            "batch_edit_schematic_components",
+            json!({"edits":edits}),
+        )
+        .await;
+        assert!(!error, "{body}");
+        body
+    }
+
+    fn placement(source: &str, reference: &str, unit: u32, field: &str) -> Value {
+        let root = parse_sexp(source).unwrap();
+        let symbol = root
+            .find_all("symbol")
+            .into_iter()
+            .find(|symbol| {
+                symbol.find("lib_id").is_some()
+                    && symbol.find_all("property").into_iter().any(|p| {
+                        p.get(1).and_then(|n| n.as_str()) == Some("Reference")
+                            && p.get(2).and_then(|n| n.as_str()) == Some(reference)
+                    })
+                    && symbol
+                        .find("unit")
+                        .and_then(|u| u.get(1))
+                        .and_then(|n| n.as_str().and_then(|s| s.parse::<f64>().ok()))
+                        .unwrap_or(1.0)
+                        == f64::from(unit)
+            })
+            .unwrap();
+        let property = symbol
+            .find_all("property")
+            .into_iter()
+            .find(|p| p.get(1).and_then(|n| n.as_str()) == Some(field))
+            .unwrap();
+        let at = property.find("at").unwrap();
+        let hidden = property
+            .find("hide")
+            .or_else(|| property.find("effects").and_then(|e| e.find("hide")))
+            .and_then(|h| h.get(1))
+            .and_then(|n| n.as_str())
+            == Some("yes");
+        json!({"x":at.get(1).unwrap().as_str().unwrap().parse::<f64>().unwrap(),"y":at.get(2).unwrap().as_str().unwrap().parse::<f64>().unwrap(),"rotation":at.get(3).and_then(|n| n.as_str().and_then(|s| s.parse::<f64>().ok())).unwrap_or(0.0),"hide":hidden})
+    }
+
+    #[tokio::test]
+    async fn batch_field_placements_move_multiple_parts_and_preserve_geometry_and_fields() {
+        let (_dir, path) = fixture();
+        let handler = handler().await;
+        let before = extract_symbol_instances(&parse_sexp(ECC83).unwrap());
+        let body = batch(&handler, &path, json!([
+            {"reference":"R1","field_placements":{"Value":{"x":12.5,"y":34.5,"rotation":90,"hide":true}}},
+            {"reference":"U1","unit":2.0,"field_placements":{"Value":{"x":70,"y":80}}},
+            {"reference":"U1","unit":1,"field_placements":{"Reference":{"rotation":90,"hide":true}}}
+        ])).await;
+        assert_eq!(body["errors"], json!([]));
+        assert_eq!(body["updated_count"], 3);
+        let after = std::fs::read_to_string(&path).unwrap();
+        let seen = placement(&after, "R1", 1, "Value");
+        assert_eq!(seen, json!({"x":12.5,"y":34.5,"rotation":90.0,"hide":true}));
+        assert_eq!(
+            body["updated"][0]["units"][0]["field_placements"]["Value"],
+            seen
+        );
+        let units = body["updated"][1]["units"].as_array().unwrap();
+        assert_eq!(units.len(), 3);
+        assert_eq!(
+            units.iter().find(|u| u["unit"] == 2).unwrap()["field_placements"]["Value"]["x"],
+            70.0
+        );
+        for unit in [1, 3] {
+            assert_eq!(
+                placement(&after, "U1", unit, "Value"),
+                placement(ECC83, "U1", unit, "Value")
+            );
+        }
+        let after_instances = extract_symbol_instances(&parse_sexp(&after).unwrap());
+        assert_eq!(before.len(), after_instances.len());
+        for original in before {
+            let current = after_instances
+                .iter()
+                .find(|s| s.uuid == original.uuid)
+                .unwrap();
+            assert_eq!(
+                (current.x, current.y, current.rotation, current.unit),
+                (original.x, original.y, original.rotation, original.unit)
+            );
+            assert_eq!(
+                (&current.reference, &current.value, &current.lib_id),
+                (&original.reference, &original.value, &original.lib_id)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_field_placements_allow_later_value_dnp_and_distinct_units_on_same_part() {
+        let (_dir, path) = fixture();
+        let handler = handler().await;
+        let body = batch(
+            &handler,
+            &path,
+            json!([
+                {"reference":"U1","unit":1,"field_placements":{"Value":{"x":20}}},
+                {"reference":"U1","unit":2,"field_placements":{"Value":{"y":30}}},
+                {"reference":"U1","value":"Changed","dnp":true,"fields":{"Tolerance":"1%"}}
+            ]),
+        )
+        .await;
+        assert!(
+            body["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e.as_str().unwrap().contains("Tolerance")),
+            "{body}"
+        );
+        assert_eq!(body["updated_count"], 3);
+        for entry in body["updated"].as_array().unwrap().iter().take(2) {
+            for unit in entry["units"].as_array().unwrap() {
+                assert_eq!(unit["fields"]["Value"], "Changed");
+                assert_eq!(unit["dnp"], true);
+            }
+        }
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(placement(&after, "U1", 1, "Value")["x"], 20.0);
+        assert_eq!(placement(&after, "U1", 2, "Value")["y"], 30.0);
+    }
+
+    #[tokio::test]
+    async fn batch_field_placements_report_local_refusals_and_keep_successful_siblings() {
+        let (_dir, path) = fixture();
+        let handler = handler().await;
+        let body=batch(&handler,&path,json!([
+            {"reference":"U1","field_placements":{"Value":{"x":10}}},
+            {"reference":"U1","unit":99,"field_placements":{"Value":{"y":10}}},
+            {"reference":"R1","field_placements":{"NoSuchField":{"hide":true},"Value":{"rotation":90}}},
+            {"reference":"R1","field_placements":{"Reference":{}}},
+            {"reference":"NoSuchPart","field_placements":{"Value":{"hide":true}}},
+            {"reference":"U1","unit":0,"value":"Must not change","dnp":true,"field_placements":{"Value":{"hide":true}}}
+        ])).await;
+        assert_eq!(body["updated_count"], 1, "{body}");
+        assert_eq!(body["errors"].as_array().unwrap().len(), 6, "{body}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        for unit in [1, 2, 3] {
+            assert_eq!(
+                placement(&after, "U1", unit, "Value"),
+                placement(ECC83, "U1", unit, "Value")
+            );
+        }
+        assert_eq!(placement(&after, "R1", 1, "Value")["rotation"], 90.0);
+        let components = extract_symbol_instances(&parse_sexp(&after).unwrap());
+        assert!(components
+            .iter()
+            .filter(|s| s.reference == "U1")
+            .all(|s| s.value != "Must not change"));
+    }
+
+    #[tokio::test]
+    async fn batch_field_placements_rotate_hide_and_show_every_unit_without_selecting_one() {
+        let (_dir, path) = fixture();
+        let handler = handler().await;
+        for hide in [true, false] {
+            let body=batch(&handler,&path,json!([{"reference":"U1","field_placements":{"Value":{"rotation":90,"hide":hide}}}])).await;
+            assert_eq!(body["errors"], json!([]));
+            let after = std::fs::read_to_string(&path).unwrap();
+            for unit in [1, 2, 3] {
+                let seen = placement(&after, "U1", unit, "Value");
+                let old = placement(ECC83, "U1", unit, "Value");
+                assert_eq!(seen["x"], old["x"]);
+                assert_eq!(seen["y"], old["y"]);
+                assert_eq!(seen["rotation"], 90.0);
+                assert_eq!(seen["hide"], hide);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_field_placements_refuse_overlapping_assignments_without_losing_first() {
+        let (_dir, path) = fixture();
+        let handler = handler().await;
+        let body=batch(&handler,&path,json!([
+            {"reference":"U1","field_placements":{"Value":{"hide":true}}},
+            {"reference":"U1","unit":2,"field_placements":{"Value":{"x":100},"Reference":{"hide":true}}},
+            {"reference":"R1","field_placements":{"Value":{"x":50}}}
+        ])).await;
+        assert_eq!(body["updated_count"], 2, "{body}");
+        assert_eq!(body["errors"].as_array().unwrap().len(), 1);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            placement(&after, "U1", 2, "Value")["x"],
+            placement(ECC83, "U1", 2, "Value")["x"]
+        );
+        assert_eq!(
+            placement(&after, "U1", 2, "Reference"),
+            placement(ECC83, "U1", 2, "Reference")
+        );
+        for unit in [1, 2, 3] {
+            assert_eq!(placement(&after, "U1", unit, "Value")["hide"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_field_placements_and_single_tool_share_schemas_and_saved_results() {
+        let batch_definition = tools()
+            .into_iter()
+            .find(|t| t.name == "batch_edit_schematic_components")
+            .unwrap();
+        let single = super::super::sch_components::tools()
+            .into_iter()
+            .find(|t| t.name == "edit_schematic_component")
+            .unwrap();
+        for field in ["unit", "field_placements"] {
+            assert_eq!(
+                batch_definition.input_schema["properties"]["edits"]["items"]["properties"][field],
+                single.input_schema["properties"][field]
+            );
+        }
+        let (_a, first) = fixture();
+        let (_b, second) = fixture();
+        let handler = handler().await;
+        let edit = json!({"reference":"R1","field_placements":{"Value":{"x":25,"rotation":90,"hide":true}}});
+        batch(&handler, &first, json!([edit.clone()])).await;
+        let (error, body) = served(&handler, &second, "edit_schematic_component", edit).await;
+        assert!(!error, "{body}");
+        assert_eq!(
+            std::fs::read(first).unwrap(),
+            std::fs::read(second).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_field_placements_unit_selects_text_while_dnp_reaches_every_unit() {
+        let (_dir, path) = fixture();
+        let handler = handler().await;
+        let body=batch(&handler,&path,json!([{"reference":"U1","unit":2,"dnp":true,"field_placements":{"Value":{"hide":true}}}])).await;
+        assert_eq!(body["errors"], json!([]));
+        assert_eq!(body["updated"][0]["dnp"], true);
+        let after = std::fs::read_to_string(&path).unwrap();
+        for unit in body["updated"][0]["units"].as_array().unwrap() {
+            assert_eq!(unit["dnp"], true);
+        }
+        assert_eq!(placement(&after, "U1", 2, "Value")["hide"], true);
+        for unit in [1, 3] {
+            assert_eq!(
+                placement(&after, "U1", unit, "Value"),
+                placement(ECC83, "U1", unit, "Value")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_field_placements_invalid_unit_refuses_its_whole_entry_before_values_change() {
+        let (_dir, path) = fixture();
+        let handler = handler().await;
+        let body=batch(&handler,&path,json!([{"reference":"U1","unit":0,"value":"Must not land","dnp":true,"field_placements":{"Value":{"hide":true}}}])).await;
+        assert_eq!(body["updated_count"], 0);
+        assert_eq!(body["errors"].as_array().unwrap().len(), 1);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), ECC83);
+    }
+
+    #[tokio::test]
+    async fn batch_field_placements_unit_does_not_scope_dnp_and_schema_refusals_do_not_write() {
+        let (_dir, path) = fixture();
+        let handler = handler().await;
+        let body = batch(
+            &handler,
+            &path,
+            json!([{"reference":"U1","unit":2,"dnp":true}]),
+        )
+        .await;
+        assert_eq!(body["updated_count"], 0);
+        assert_eq!(body["errors"].as_array().unwrap().len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ECC83);
+        for edits in [
+            json!([{"reference":"R1","field_placements":{"Value":{"x":"bad"}}}]),
+            json!([{"reference":"R1","field_placements":{"Value":{"offest_x":10}}}]),
+            json!([{"reference":"R1","unit":1.5,"field_placements":{"Value":{"hide":true}}}]),
+        ] {
+            let (error, body) = served(
+                &handler,
+                &path,
+                "batch_edit_schematic_components",
+                json!({"edits":edits}),
+            )
+            .await;
+            assert!(error, "{body}");
+            assert_eq!(body["error"]["kind"], "invalid_argument");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), ECC83);
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_field_placements_can_place_a_custom_field_created_in_the_same_entry() {
+        let (_dir, path) = fixture();
+        let handler = handler().await;
+        let (error,body)=served(&handler,&path,"batch_edit_schematic_components",json!({
+            "create_missing":true,"edits":[{"reference":"U1","fields":{"Note":"a quoted \"note\""},"field_placements":{"Note":{"rotation":90,"hide":true}}}]
+        })).await;
+        assert!(!error, "{body}");
+        assert_eq!(body["errors"], json!([]));
+        assert_eq!(body["created_unit_copies"], 3);
+        let after = std::fs::read_to_string(&path).unwrap();
+        for unit in body["updated"][0]["units"].as_array().unwrap() {
+            assert_eq!(unit["fields"]["Note"], "a quoted \"note\"");
+            assert_eq!(unit["field_placements"]["Note"]["rotation"], 90.0);
+            assert_eq!(unit["field_placements"]["Note"]["hide"], true);
+            let number = unit["unit"].as_u64().unwrap() as u32;
+            assert_eq!(placement(&after, "U1", number, "Note")["rotation"], 90.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_field_placements_malformed_source_refuses_all_planned_siblings() {
+        let (_dir, path) = fixture();
+        // Deliberately corrupt one numeric token in a disposable native fixture
+        // to exercise the existing malformed-placement refusal, not a new fixture.
+        let (start, end) = find_all_symbol_instance_blocks(ECC83, "R1")[0];
+        let value = start + ECC83[start..end].find("(property \"Value\"").unwrap();
+        let at = value + ECC83[value..end].find("(at ").unwrap();
+        let at_end = at + ECC83[at..end].find(')').unwrap() + 1;
+        let broken = apply_edits(
+            ECC83.to_owned(),
+            vec![SexpEdit::replace(at, at_end, "(at bad 20 90)".to_owned())],
+        );
+        std::fs::write(&path, &broken).unwrap();
+        let ctx = crate::tools::ToolContext::new(
+            ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_batch_edit(
+            &json!({"schematic":path,"edits":[
+                {"reference":"U1","value":"Must not land"},
+                {"reference":"R1","field_placements":{"Value":{"rotation":90}}}
+            ]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), broken);
+    }
+
+    #[tokio::test]
+    async fn batch_field_placements_refuse_a_bad_prospective_write_before_any_entry_lands() {
+        let (_dir, path) = fixture();
+        BATCH_PLACEMENT_PROSPECTIVE_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some(("(at 12.5 34.5 90)".into(), "(at 99 34.5 90)".into()))
+        });
+        let ctx = crate::tools::ToolContext::new(
+            ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_batch_edit(
+            &json!({"schematic":path,"edits":[
+                {"reference":"R1","field_placements":{"Value":{"x":12.5,"y":34.5,"rotation":90}}},
+                {"reference":"U1","value":"Must not land"}
+            ]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ECC83);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires kicad-cli; only exports a disposable native fixture copy"]
+    async fn batch_field_placements_native_kicad_keeps_component_and_net_semantics() {
+        let (_dir, path) = fixture();
+        let handler = handler().await;
+        let output = path.with_extension("net");
+        let export = || {
+            let result = std::process::Command::new(
+                crate::app_dirs::env_var("TEST_KICAD_CLI").unwrap_or_else(|| "kicad-cli".into()),
+            )
+            .args(["sch", "export", "netlist", "--format", "kicadsexpr", "-o"])
+            .arg(&output)
+            .arg(&path)
+            .output()
+            .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            parse_sexp(&std::fs::read_to_string(&output).unwrap()).unwrap()
+        };
+        let before = export();
+        let body=batch(&handler,&path,json!([
+            {"reference":"R1","field_placements":{"Value":{"x":12.5,"y":34.5,"rotation":90,"hide":true}}},
+            {"reference":"U1","unit":2,"field_placements":{"Reference":{"x":70,"y":80,"rotation":180}}},
+            {"reference":"U1","field_placements":{"Value":{"hide":true}}}
+        ])).await;
+        assert_eq!(body["errors"], json!([]));
+        let after = export();
+        for section in ["components", "libparts", "libraries", "nets"] {
+            let original = before
+                .find(section)
+                .expect("native netlist section is present");
+            let observed = after
+                .find(section)
+                .expect("edited netlist section is present");
+            assert_eq!(original, observed, "{section}");
+        }
+        let svg_dir = path.parent().unwrap().join("svg");
+        let result = std::process::Command::new(
+            crate::app_dirs::env_var("TEST_KICAD_CLI").unwrap_or_else(|| "kicad-cli".into()),
+        )
+        .args(["sch", "export", "svg", "-o"])
+        .arg(&svg_dir)
+        .arg(&path)
+        .output()
+        .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(std::fs::read_dir(svg_dir).unwrap().any(|entry| entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "svg")));
+    }
+
+    #[tokio::test]
+    async fn batch_field_placements_uncertain_readback_names_the_entries_already_written() {
+        let (_dir, path) = fixture();
+        BATCH_WRITE_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some(("(at 12.5 34.5 90)".into(), "(at 99 34.5 90)".into()))
+        });
+        // Direct call keeps the existing thread-local fault on this test's thread.
+        let ctx = crate::tools::ToolContext::new(
+            ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result=handle_batch_edit(&json!({"schematic":path,"edits":[{"reference":"R1","field_placements":{"Value":{"x":12.5,"y":34.5,"rotation":90}}}]}),&ctx).await.unwrap();
+        assert!(result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!()
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["kind"], "mutation_outcome_uncertain");
+        assert!(text.contains("R1"));
+        assert!(text.contains("Entries in the write"));
+        assert_eq!(
+            placement(&std::fs::read_to_string(&path).unwrap(), "R1", 1, "Value")["x"],
+            99.0
+        );
     }
 }

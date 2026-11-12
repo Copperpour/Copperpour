@@ -38,6 +38,29 @@ use copperpour_sexp::{
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) fn field_placements_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "description": "Move or hide a field's text, keyed by field name (Reference, Value, Footprint, or a custom property). Each entry may set x, y, rotation and hide; an omitted part is left as the file has it. Coordinates are absolute schematic millimetres, as KiCad stores them — not offsets from the body.",
+        "additionalProperties": {
+            "type": "object",
+            "properties": {
+                "x": { "type": "number" },
+                "y": { "type": "number" },
+                "rotation": { "type": "number" },
+                "hide": { "type": "boolean", "description": "true hides the field's text on the sheet; false shows it." }
+            }
+        }
+    })
+}
+
+pub(crate) fn field_placement_unit_schema() -> serde_json::Value {
+    json!({
+        "type": "integer",
+        "description": "Which placed unit field_placements applies to. Required when x or y is given and the component has more than one placed unit, because a field position is absolute and one coordinate cannot be right for several placements."
+    })
+}
+
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
@@ -115,23 +138,8 @@ pub fn tools() -> Vec<ToolDef> {
                         "items": { "type": "string" },
                         "description": "Custom property names to delete from every placed unit. KiCad's mandatory fields (Reference, Value, Footprint, Datasheet, Description) cannot be removed. A name no unit carries is reported in absent_fields."
                     },
-                    "field_placements": {
-                        "type": "object",
-                        "description": "Move or hide a field's text, keyed by field name (Reference, Value, Footprint, or a custom property). Each entry may set x, y, rotation and hide; an omitted part is left as the file has it. Coordinates are absolute schematic millimetres, as KiCad stores them — not offsets from the body.",
-                        "additionalProperties": {
-                            "type": "object",
-                            "properties": {
-                                "x": { "type": "number" },
-                                "y": { "type": "number" },
-                                "rotation": { "type": "number" },
-                                "hide": { "type": "boolean", "description": "true hides the field's text on the sheet; false shows it." }
-                            }
-                        }
-                    },
-                    "unit": {
-                        "type": "integer",
-                        "description": "Which placed unit field_placements applies to. Required when x or y is given and the component has more than one placed unit, because a field position is absolute and one coordinate cannot be right for several placements."
-                    }
+                    "field_placements": field_placements_schema(),
+                    "unit": field_placement_unit_schema()
                 },
                 "required": ["schematic", "reference"]
             }),
@@ -1779,7 +1787,7 @@ fn load_component_mutation_readback(
 }
 
 #[derive(Debug, Clone)]
-struct ComponentMutationIntent {
+pub(crate) struct ComponentMutationIntent {
     target: ComponentTarget,
     field_placements: Vec<(String, FieldPlacement)>,
     placement_unit: Option<u32>,
@@ -1792,6 +1800,31 @@ impl ComponentMutationIntent {
             field_placements: Vec::new(),
             placement_unit: None,
         }
+    }
+
+    /// Later batch entries may update values/DNP on the same component. Hold
+    /// those to their final successful assignments while retaining placement
+    /// identity and geometry bound before the field-text edit.
+    pub(crate) fn with_batch_updates(
+        mut self,
+        fields: &BTreeMap<String, String>,
+        dnp: Option<bool>,
+    ) -> Self {
+        self.target = self.target.with_fields(fields).with_dnp(dnp);
+        self
+    }
+
+    pub(crate) fn placement_keys(&self) -> Vec<(String, String)> {
+        self.target
+            .units
+            .iter()
+            .filter(|unit| self.placement_unit.is_none_or(|wanted| unit.unit == wanted))
+            .flat_map(|unit| {
+                self.field_placements
+                    .iter()
+                    .map(move |(name, _)| (unit.uuid.clone(), name.clone()))
+            })
+            .collect()
     }
 
     fn with_field_placements(
@@ -1834,7 +1867,7 @@ fn verify_requested_field_placements(
     Ok(())
 }
 
-fn verify_component_mutation_intents(
+pub(crate) fn verify_component_mutation_intents(
     path: &std::path::Path,
     schematic: &cse::Schematic,
     intents: &[ComponentMutationIntent],
@@ -3054,6 +3087,184 @@ fn plan_property_removal(
     Ok((edits, units))
 }
 
+#[derive(Default)]
+struct FieldPlacementEdits {
+    changes: Vec<String>,
+    errors: Vec<String>,
+    applied: Vec<(String, FieldPlacement)>,
+    unit: Option<u32>,
+}
+
+pub(crate) struct FieldPlacementFailure {
+    pub(crate) error: CallToolResult,
+    pub(crate) abort_batch: bool,
+}
+
+impl FieldPlacementFailure {
+    fn local(error: CallToolResult) -> Self {
+        Self {
+            error,
+            abort_batch: false,
+        }
+    }
+}
+
+fn apply_field_placements(
+    content: &mut String,
+    reference: &str,
+    args: &serde_json::Value,
+    unit_count: usize,
+) -> Result<FieldPlacementEdits, FieldPlacementFailure> {
+    let placements = args["field_placements"].as_object();
+    let mut plan = FieldPlacementEdits::default();
+    if let Some(placements) = placements {
+        let only_unit = field_placement_unit(args).map_err(FieldPlacementFailure::local)?;
+        for (name, spec) in placements {
+            let Some(spec) = spec.as_object() else {
+                plan.errors
+                    .push(format!("{name}: field_placements entries must be objects"));
+                continue;
+            };
+            let mut placement = FieldPlacement::default();
+            let mut bad = false;
+            for (key, slot) in [
+                ("x", &mut placement.x),
+                ("y", &mut placement.y),
+                ("rotation", &mut placement.rotation),
+            ] {
+                match spec.get(key) {
+                    None | Some(serde_json::Value::Null) => {}
+                    Some(value) => match value.as_f64() {
+                        Some(number) => *slot = Some(number),
+                        None => {
+                            plan.errors.push(format!("{name}.{key}: expected a number"));
+                            bad = true;
+                        }
+                    },
+                }
+            }
+            match spec.get("hide") {
+                None | Some(serde_json::Value::Null) => {}
+                Some(value) => match value.as_bool() {
+                    Some(hide) => placement.hide = Some(hide),
+                    None => {
+                        plan.errors
+                            .push(format!("{name}.hide: expected true or false"));
+                        bad = true;
+                    }
+                },
+            }
+            if bad {
+                continue;
+            }
+            if placement.is_empty() {
+                plan.errors.push(format!(
+                    "{name}: field_placements entry sets nothing — give x, y, rotation or hide"
+                ));
+                continue;
+            }
+            // A field's position is absolute, so one coordinate cannot be
+            // right for several placements. Writing it to every unit would
+            // stack the text of a quad gate's four Values on one point and
+            // report success.
+            if placement.moves_the_text() && only_unit.is_none() && unit_count > 1 {
+                plan.errors.push(format!(
+                    "{name}: '{reference}' has {} placed units, so a field position needs 'unit' — \
+                     an absolute coordinate cannot be right for all of them",
+                    unit_count
+                ));
+                continue;
+            }
+            match set_property_placement(content, reference, name, &placement, only_unit) {
+                Ok((updated, touched)) => {
+                    *content = updated;
+                    plan.applied.push((name.clone(), placement));
+                    plan.unit = only_unit;
+                    plan.changes
+                        .push(format!("{name} placement ({touched} unit(s))"));
+                }
+                // A malformed file aborts the whole call. This handler edits
+                // text and commits once, at the end, so a sibling edit that
+                // succeeded would otherwise be written into a file already
+                // found to be broken: the refusal would be reported while the
+                // write went ahead anyway.
+                Err(refusal @ PlacementRefusal::MalformedFile(_)) => {
+                    return Err(FieldPlacementFailure {
+                        abort_batch: true,
+                        error: CallToolResult::error(format!(
+                            "No fields were updated on '{reference}': {name}: {}",
+                            refusal.reason()
+                        )),
+                    })
+                }
+                Err(refusal) => plan.errors.push(format!("{name}: {}", refusal.reason())),
+            }
+        }
+    }
+
+    Ok(plan)
+}
+
+pub(crate) struct BatchFieldPlacements {
+    pub(crate) changes: Vec<String>,
+    pub(crate) errors: Vec<String>,
+    pub(crate) intent: ComponentMutationIntent,
+}
+
+/// Plan with the same parser and placement writer as the single tool. Bind
+/// UUIDs and body geometry before moving text so readback cannot bless a body
+/// move merely because the requested field position was also written.
+pub(crate) fn plan_batch_field_placements(
+    path: &std::path::Path,
+    content: &mut String,
+    reference: &str,
+    args: &serde_json::Value,
+) -> Result<BatchFieldPlacements, FieldPlacementFailure> {
+    parse_sexp(content).map_err(|error| FieldPlacementFailure {
+        error: CallToolResult::error(format!("Schematic is malformed: {error}")),
+        abort_batch: true,
+    })?;
+    let target = component_target_from_source(path, content, reference)
+        .map_err(|error| FieldPlacementFailure::local(error.into_result()))?;
+    let plan = apply_field_placements(content, reference, args, target.units.len())?;
+    Ok(BatchFieldPlacements {
+        changes: plan.changes,
+        errors: plan.errors,
+        intent: ComponentMutationIntent::new(target).with_field_placements(plan.applied, plan.unit),
+    })
+}
+
+pub(crate) fn field_placement_unit(
+    args: &serde_json::Value,
+) -> Result<Option<u32>, CallToolResult> {
+    match opt_u32(args, "unit")? {
+        Some(0) => Err(crate::tools::invalid_arg(
+            "unit",
+            "expected a positive integer unit number",
+        )),
+        unit => Ok(unit),
+    }
+}
+
+pub(crate) fn validate_field_placement_unit_scope(
+    args: &serde_json::Value,
+    whole_part_flag: Option<&str>,
+) -> Result<(), CallToolResult> {
+    if let Some(flag) = whole_part_flag {
+        if !args["unit"].is_null()
+            && args["field_placements"]
+                .as_object()
+                .is_none_or(|p| p.is_empty())
+        {
+            return Err(crate::tools::invalid_arg(
+                "unit",
+                &format!("selects the unit for field_placements only; {flag} is set on every placed unit"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// What `edit_schematic_component` may change about where a field's text sits.
 /// Every part is optional: an absent one leaves the file's value alone rather
 /// than defaulting, so moving a field cannot silently unhide it.
@@ -3387,19 +3598,8 @@ async fn handle_edit_schematic_component(
     let whole_part_flag = requested_dnp
         .map(|_| "dnp")
         .or_else(|| requested_flags.first().map(|(flag, _)| *flag));
-    if let Some(flag) = whole_part_flag {
-        if !args["unit"].is_null()
-            && args["field_placements"]
-                .as_object()
-                .is_none_or(|p| p.is_empty())
-        {
-            return Ok(crate::tools::invalid_arg(
-                "unit",
-                &format!(
-                    "selects the unit for field_placements only; {flag} is set on every placed unit"
-                ),
-            ));
-        }
+    if let Err(error) = validate_field_placement_unit_scope(args, whole_part_flag) {
+        return Ok(error);
     }
     // A property named DNP refuses the whole request, before anything is
     // read for writing: none of its other edits is applied either.
@@ -3615,95 +3815,15 @@ async fn handle_edit_schematic_component(
     // overloading one argument's value type would make the schema lie about
     // what it accepts.
     let placements = args["field_placements"].as_object();
-    let mut applied_placements: Vec<(String, FieldPlacement)> = Vec::new();
-    let mut placement_unit: Option<u32> = None;
-    if let Some(placements) = placements {
-        let only_unit = match opt_u32(args, "unit") {
-            Ok(Some(0)) => {
-                return Ok(crate::tools::invalid_arg(
-                    "unit",
-                    "expected a positive integer unit number",
-                ))
-            }
-            Ok(unit) => unit,
-            Err(error) => return Ok(error),
-        };
-        for (name, spec) in placements {
-            let Some(spec) = spec.as_object() else {
-                errors.push(format!("{name}: field_placements entries must be objects"));
-                continue;
-            };
-            let mut placement = FieldPlacement::default();
-            let mut bad = false;
-            for (key, slot) in [
-                ("x", &mut placement.x),
-                ("y", &mut placement.y),
-                ("rotation", &mut placement.rotation),
-            ] {
-                match spec.get(key) {
-                    None | Some(serde_json::Value::Null) => {}
-                    Some(value) => match value.as_f64() {
-                        Some(number) => *slot = Some(number),
-                        None => {
-                            errors.push(format!("{name}.{key}: expected a number"));
-                            bad = true;
-                        }
-                    },
-                }
-            }
-            match spec.get("hide") {
-                None | Some(serde_json::Value::Null) => {}
-                Some(value) => match value.as_bool() {
-                    Some(hide) => placement.hide = Some(hide),
-                    None => {
-                        errors.push(format!("{name}.hide: expected true or false"));
-                        bad = true;
-                    }
-                },
-            }
-            if bad {
-                continue;
-            }
-            if placement.is_empty() {
-                errors.push(format!(
-                    "{name}: field_placements entry sets nothing — give x, y, rotation or hide"
-                ));
-                continue;
-            }
-            // A field's position is absolute, so one coordinate cannot be
-            // right for several placements. Writing it to every unit would
-            // stack the text of a quad gate's four Values on one point and
-            // report success.
-            if placement.moves_the_text() && only_unit.is_none() && target.units.len() > 1 {
-                errors.push(format!(
-                    "{name}: '{reference}' has {} placed units, so a field position needs 'unit' — \
-                     an absolute coordinate cannot be right for all of them",
-                    target.units.len()
-                ));
-                continue;
-            }
-            match set_property_placement(&content, edit_reference, name, &placement, only_unit) {
-                Ok((updated, touched)) => {
-                    content = updated;
-                    applied_placements.push((name.clone(), placement));
-                    placement_unit = only_unit;
-                    changed.push(format!("{name} placement ({touched} unit(s))"));
-                }
-                // A malformed file aborts the whole call. This handler edits
-                // text and commits once, at the end, so a sibling edit that
-                // succeeded would otherwise be written into a file already
-                // found to be broken: the refusal would be reported while the
-                // write went ahead anyway.
-                Err(refusal @ PlacementRefusal::MalformedFile(_)) => {
-                    return Ok(CallToolResult::error(format!(
-                        "No fields were updated on '{reference}': {name}: {}",
-                        refusal.reason()
-                    )))
-                }
-                Err(refusal) => errors.push(format!("{name}: {}", refusal.reason())),
-            }
-        }
-    }
+    let plan = match apply_field_placements(&mut content, edit_reference, args, target.units.len())
+    {
+        Ok(plan) => plan,
+        Err(failure) => return Ok(failure.error),
+    };
+    changed.extend(plan.changes);
+    errors.extend(plan.errors);
+    let applied_placements = plan.applied;
+    let placement_unit = plan.unit;
 
     // A request that changed nothing is a failure, not a success — silently
     // reporting `"changes": []` is what let the tab-indentation bug hide, and
@@ -13946,6 +14066,10 @@ mod root_editor_lock_tests {
                 json!({"reference": "R99", "value": "10k"}),
             ),
             ("delete_schematic_component", json!({"reference": "R99"})),
+            (
+                "batch_edit_schematic_components",
+                json!({"edits":[{"reference":"R99", "field_placements":{"Value":{"x":238.76,"y":104.14}}}]}),
+            ),
         ];
         for (tool, arguments) in cases {
             root_lock_case(tool, arguments).await;
