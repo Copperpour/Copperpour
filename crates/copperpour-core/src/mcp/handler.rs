@@ -3635,7 +3635,7 @@ mod component_properties_dispatch_tests {
         let listed = call(
             &handler,
             "list_schematic_components",
-            json!({ "schematic": schematic(&dir) }),
+            json!({ "schematic": schematic(&dir), "verbose": true }),
         )
         .await;
         assert_eq!(listed["count"], 4, "{listed}");

@@ -145,6 +145,7 @@ pub fn tools() -> Vec<ToolDef> {
             super::placement_schema(json!({
                 "type": "object",
                 "properties": {
+                    "verbose": { "type": "boolean", "description": "Return the full saved readback per part (fields, field placements, instance paths, units) instead of the compact entry. Default false." },
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "components": {
                         "type": "array",
@@ -696,6 +697,7 @@ async fn handle_batch_place_components(
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    let verbose = super::sch_components::wants_verbose(args);
     let components = match args["components"].as_array() {
         Some(a) => a.clone(),
         None => return Ok(CallToolResult::error("Missing 'components' array")),
@@ -884,6 +886,9 @@ async fn handle_batch_place_components(
         for (placement, lcsc_catalog) in placements.iter().zip(&lcsc_catalogs) {
             match placed_component_readback(&sch_path, &committed, placement, &context) {
                 Ok(mut result) => {
+                    if !verbose {
+                        result = super::sch_components::compact_placement(&result);
+                    }
                     if let Some(report) = lcsc_catalog {
                         result["lcsc_catalog"] = report.clone();
                     }
@@ -2833,11 +2838,61 @@ mod batch_place_and_connect_tests {
         );
     }
 
+    /// By default each placed part is a compact entry; `verbose` restores the
+    /// full readback (#114).
+    #[tokio::test]
+    async fn batch_placement_is_compact_unless_verbose() {
+        let place = |verbose: bool| {
+            let (dir, path) = seeded_schematic();
+            async move {
+                let result = handle_batch_place_components(
+                    &json!({
+                        "schematic": path.display().to_string(),
+                        "verbose": verbose,
+                        "components": [
+                            { "lib_id": "Device:WITH_DEFAULTS", "x": 100.0, "y": 100.0, "reference": "U1" }
+                        ]
+                    }),
+                    &test_ctx(),
+                )
+                .await
+                .unwrap();
+                drop(dir);
+                assert!(!result.is_error, "{result:?}");
+                let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                    panic!("expected JSON text")
+                };
+                (
+                    text.len(),
+                    serde_json::from_str::<serde_json::Value>(text).unwrap(),
+                )
+            }
+        };
+        let (compact_len, compact) = place(false).await;
+        let entry = &compact["placed"][0];
+        assert_eq!(entry["reference"], "U1");
+        assert_eq!(entry["lib_id"], "Device:WITH_DEFAULTS");
+        assert_eq!(entry["value"], "Library Default");
+        assert!(entry["uuid"].is_string());
+        for absent in ["fields", "units", "instance_paths", "added", "schematic"] {
+            assert!(entry.get(absent).is_none(), "{absent} in {entry}");
+        }
+        assert_eq!(compact["placed_count"], 1);
+
+        let (verbose_len, verbose) = place(true).await;
+        assert!(verbose["placed"][0]["units"].is_array());
+        assert!(
+            compact_len * 2 < verbose_len,
+            "compact {compact_len} B vs verbose {verbose_len} B"
+        );
+    }
+
     #[tokio::test]
     async fn batch_placement_uses_library_fields_and_per_entry_overrides() {
         let (_d, path) = seeded_schematic();
         let result = handle_batch_place_components(
             &json!({
+                "verbose": true,
                 "schematic": path.display().to_string(),
                 "components": [
                     { "lib_id": "Device:WITH_DEFAULTS", "x": 100.0, "y": 100.0, "reference": "U1" },

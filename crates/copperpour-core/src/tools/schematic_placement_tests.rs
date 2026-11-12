@@ -127,6 +127,8 @@ async fn place(name: &str, child: &Path) -> CallToolResult {
         _ => unreachable!(),
     };
     args["schematic"] = json!(child.display().to_string());
+    // These tests check the full readback, not the compact default (#114).
+    args["verbose"] = json!(true);
     let context = Arc::new(ToolContext::new(
         ServerConfig {
             kicad_cli: String::new(),
@@ -149,6 +151,8 @@ async fn place(name: &str, child: &Path) -> CallToolResult {
 async fn add_native_component(child: &Path, component: Value) -> CallToolResult {
     let mut args = component;
     args["schematic"] = json!(child.display().to_string());
+    // These tests check the full readback, not the compact default (#114).
+    args["verbose"] = json!(true);
     let context = Arc::new(ToolContext::new(
         ServerConfig::default(),
         Arc::new(ToolRouter::new()),
