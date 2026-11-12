@@ -14,5 +14,5 @@ pub use client::{
     PingOutcome, PreflightCause, PreflightRefusal, TransportUnreachable, UnreachableReason,
 };
 pub use endpoint::redact_endpoint;
-pub use socket::{candidate_socket_paths, detect_ipc_address};
+pub use socket::{candidate_socket_paths, detect_ipc_address, detect_ipc_endpoint, IpcDetection};
 pub use types::*;

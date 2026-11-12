@@ -117,15 +117,13 @@ async fn handle_get_editor_state(
     _args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let address = ctx.config.ipc_address.clone();
-    if address.is_empty() {
-        return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
+    let endpoint = ctx.ipc_endpoint();
+    if let Some(reason) = endpoint.unavailable_reason() {
+        return Ok(editor_unavailable(&reason));
     }
 
-    let result = tokio::task::spawn_blocking(move || {
-        copperpour_ipc::KiCadIpcClient::new(address).observe_editor_state()
-    })
-    .await?;
+    let result =
+        tokio::task::spawn_blocking(move || endpoint.client().observe_editor_state()).await?;
     match result {
         Ok(observation) => Ok(CallToolResult::json(&observation)),
         Err(error) => {
@@ -211,14 +209,12 @@ async fn handle_get_editor_selection(
         Ok(target) => target,
         Err(result) => return Ok(result),
     };
-    let address = ctx.config.ipc_address.clone();
-    if address.is_empty() {
-        return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
+    let endpoint = ctx.ipc_endpoint();
+    if let Some(reason) = endpoint.unavailable_reason() {
+        return Ok(editor_unavailable(&reason));
     }
-    let result = tokio::task::spawn_blocking(move || {
-        copperpour_ipc::KiCadIpcClient::new(address).observe_selection(&target)
-    })
-    .await?;
+    let result =
+        tokio::task::spawn_blocking(move || endpoint.client().observe_selection(&target)).await?;
     match result {
         Ok(observation) => Ok(CallToolResult::json(&observation)),
         Err(error) => Ok(selection_error_result(error)),
@@ -381,12 +377,14 @@ async fn handle_resolve_navigation_target(
             .then(|| request.document_path.display().to_string()),
         sheet_instance_path: request.sheet_instance_path.clone(),
     };
-    let address = ctx.config.ipc_address.clone();
-    if address.is_empty() {
-        return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
+    let endpoint = ctx.ipc_endpoint();
+    if let Some(reason) = endpoint.unavailable_reason() {
+        return Ok(editor_unavailable(&reason));
     }
     let observed = tokio::task::spawn_blocking(move || {
-        copperpour_ipc::KiCadIpcClient::new(address).observe_exact_open_document(&live_document)
+        endpoint
+            .client()
+            .observe_exact_open_document(&live_document)
     })
     .await?;
     let observed = match observed {
@@ -527,9 +525,9 @@ async fn handle_mutate_editor_selection(
         Ok(request) => request,
         Err(result) => return Ok(result),
     };
-    let address = ctx.config.ipc_address.clone();
-    if address.is_empty() {
-        return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
+    let endpoint = ctx.ipc_endpoint();
+    if let Some(reason) = endpoint.unavailable_reason() {
+        return Ok(editor_unavailable(&reason));
     }
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let resolved_targets = request
@@ -537,7 +535,7 @@ async fn handle_mutate_editor_selection(
             .iter()
             .map(resolve_navigation_target)
             .collect::<Result<Vec<_>, _>>()?;
-        let mutation = copperpour_ipc::KiCadIpcClient::new(address).mutate_selection(
+        let mutation = endpoint.client().mutate_selection(
             &request.live_document,
             request.operation,
             &request.object_kiids,
@@ -738,9 +736,9 @@ async fn handle_resolve_cross_probe_target(
         Ok(request) => request,
         Err(result) => return Ok(result),
     };
-    let address = ctx.config.ipc_address.clone();
-    if address.is_empty() {
-        return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
+    let endpoint = ctx.ipc_endpoint();
+    if let Some(reason) = endpoint.unavailable_reason() {
+        return Ok(editor_unavailable(&reason));
     }
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let resolution = resolve_cross_probe(&request)?;
@@ -750,7 +748,7 @@ async fn handle_resolve_cross_probe_target(
             IpcEditorKind::Pcb => IpcEditorKind::Schematic,
         };
         let destination_live = live_cross_probe_document(&request, destination_editor);
-        let client = copperpour_ipc::KiCadIpcClient::new(address);
+        let client = endpoint.client();
         let source_observed = client.observe_exact_open_document(&source_live)?;
         let destination_observed = client.observe_exact_open_document(&destination_live)?;
         Ok((resolution, source_observed, destination_observed))

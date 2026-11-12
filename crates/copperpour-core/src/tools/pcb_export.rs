@@ -813,8 +813,7 @@ async fn handle_export_specctra_dsn(
         ));
     }
     let board_for_ipc = board_path.clone();
-    let addr = ctx.config.ipc_address.clone();
-    let export = with_ipc(addr, move |client| {
+    let export = with_ipc(ctx.ipc_endpoint(), move |client| {
         let document = client.find_open_board(&board_for_ipc)?;
         let before = client.save_document_to_string_in(document.clone())?;
         let rules = client.get_effective_routing_rules_in(document.clone())?;
@@ -852,8 +851,7 @@ async fn handle_export_specctra_dsn(
         bridge_diagnostics = attempt.diagnostics;
         if let Some(native) = attempt.export {
             let board_for_stability = board_path.clone();
-            let addr = ctx.config.ipc_address.clone();
-            let stable = with_ipc(addr, move |client| {
+            let stable = with_ipc(ctx.ipc_endpoint(), move |client| {
                 let document = client.find_open_board(&board_for_stability)?;
                 client.save_document_to_string_in(document)
             })

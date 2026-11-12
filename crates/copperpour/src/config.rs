@@ -92,6 +92,16 @@ pub enum IpcAddressSource {
 }
 
 impl IpcAddressSource {
+    /// Whether the address may be looked for again while the server runs:
+    /// only one that was detected or not found. A configured or environment
+    /// address is the user's choice and is never replaced (#32).
+    pub fn rediscovers(self) -> bool {
+        matches!(
+            self,
+            IpcAddressSource::Detected | IpcAddressSource::Unresolved
+        )
+    }
+
     /// Report the resolution once tracing is initialized.
     pub fn log(self, address: &str) {
         if let Some(message) = self.resolved_log_message(address) {
@@ -99,6 +109,21 @@ impl IpcAddressSource {
             return;
         }
 
+        if let copperpour_ipc::IpcDetection::Ambiguous(candidates) =
+            copperpour_ipc::detect_ipc_endpoint()
+        {
+            warn!(
+                "More than one KiCad IPC socket qualifies and not exactly one answered, \
+                 so none was picked: {}. Set ipc_address to the one KiCad lists under \
+                 Preferences > Plugins. Copperpour looks again on every IPC call.",
+                candidates
+                    .iter()
+                    .map(|c| copperpour_ipc::redact_endpoint(c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return;
+        }
         warn!(
             "No KiCad IPC socket found (no KICAD_API_SOCKET, none detected at {}). \
              Live-KiCad tools will fail and file-backed ones will edit the \
@@ -718,5 +743,14 @@ mod tests {
 
         assert_eq!(resolution.source().as_str(), "explicit_path");
         assert!(resolution.skipped_existing_paths().is_empty());
+    }
+
+    /// Only a detected or missing address is looked for again (#32).
+    #[test]
+    fn only_detected_or_missing_addresses_are_rediscovered() {
+        assert!(IpcAddressSource::Detected.rediscovers());
+        assert!(IpcAddressSource::Unresolved.rediscovers());
+        assert!(!IpcAddressSource::Config.rediscovers());
+        assert!(!IpcAddressSource::Environment.rediscovers());
     }
 }
