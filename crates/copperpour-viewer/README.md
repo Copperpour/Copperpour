@@ -1,9 +1,12 @@
 # Shared schematic viewer
 
-The crate contains the GUI-independent viewer engine and the phase-two browser
-service. `schematic-viewer` remains the supported Tauri application;
-`open_schematic_viewer` still launches it. Connecting that MCP tool to the
-browser service is phase three of #242.
+The crate contains the GUI-independent viewer engine and browser service.
+`open_schematic_viewer` uses this service by default; `ToolContext` owns and reuses
+an instance per canonical root until the MCP server context ends (stdio disconnect
+or HTTP server shutdown). Set `open_browser: false`
+to obtain the private URL without launching a browser. The standalone Tauri
+`schematic-viewer` is deprecated and retained through one shipped release containing
+the notice; its CLI remains available.
 
 For local browser testing:
 
@@ -79,5 +82,7 @@ checks that an in-flight renderer PID was reaped. The existing engine tests rema
 The Tauri application is outside the workspace and still needs its own check/test
 commands. Native renderer smoke tests are separate from browser execution tests:
 HTTP headers and Rust tests alone do not prove that a browser enforced the CSP or
-sandbox. Browser visual/security execution and Windows/macOS observations must be
-recorded before making the browser path the MCP default.
+sandbox. Linux interactive browser feedback is available. Headless Chromium checks exercised the displayed SVG, theme/zoom/fit/refresh
+and blocked script/event-handler payloads, with a positive payload control in a
+policy-free document. Windows/macOS runtime observations remain separate platform
+validation.

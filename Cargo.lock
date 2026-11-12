@@ -473,6 +473,7 @@ dependencies = [
  "copperpour-render",
  "copperpour-schematic-editor",
  "copperpour-sexp",
+ "copperpour-viewer",
  "csv",
  "dirs",
  "jsonschema",

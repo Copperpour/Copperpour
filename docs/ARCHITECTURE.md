@@ -82,8 +82,11 @@ incremental cache selection and event-batching helpers. It is a workspace
 member with no Tauri or GUI dependency. Its `browser` module adds a root-bound
 loopback HTTP/SSE service with owned watcher/render tasks. The Tauri application
 and browser adapter share frontend assets in the retained `schematic-viewer/frontend` directory.
-The MCP launch tool still selects Tauri; the browser service is currently used
-through its Rust API and development example.
+The MCP launch tool uses the browser service. A `ToolContext` registry serializes
+starts and reuses an instance per canonical root; dropping the context signals
+shutdown of its viewers. Browser-launch status describes the OS opener separately
+from successful service startup. The standalone Tauri app is deprecated and
+retained through one shipped release containing the notice.
 
 ### Non-workspace and non-Rust boundaries
 

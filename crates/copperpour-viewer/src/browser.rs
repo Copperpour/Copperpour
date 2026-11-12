@@ -175,6 +175,12 @@ impl BrowserViewer {
             worker: Some(worker),
         })
     }
+    /// Whether both owned service tasks are still running.
+    pub fn is_running(&self) -> bool {
+        self.server.as_ref().is_some_and(|task| !task.is_finished())
+            && self.worker.as_ref().is_some_and(|task| !task.is_finished())
+            && !*self.stop.borrow()
+    }
     fn signal_stop(&mut self) {
         self.watcher.lock().unwrap().take();
         self.stop.send_replace(true);
@@ -872,6 +878,22 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</t
             .await
             .unwrap()
         }
+    }
+    #[tokio::test]
+    async fn service_health_requires_both_owned_tasks() {
+        let fixture = Fixture::new();
+        let viewer = fixture.start().await;
+        assert!(viewer.is_running());
+        viewer.server.as_ref().unwrap().abort();
+        tokio::task::yield_now().await;
+        assert!(!viewer.is_running());
+        viewer.shutdown().await;
+        let viewer = fixture.start().await;
+        assert!(viewer.is_running());
+        viewer.worker.as_ref().unwrap().abort();
+        tokio::task::yield_now().await;
+        assert!(!viewer.is_running());
+        viewer.shutdown().await;
     }
     struct Client {
         http: reqwest::Client,

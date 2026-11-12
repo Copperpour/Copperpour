@@ -11,6 +11,7 @@ copperpour-sexp.workspace = true
 copperpour-render.workspace = true
 copperpour-ipc.workspace = true
 copperpour-schematic-editor.workspace = true
+copperpour-viewer.workspace = true
 topola_specctra.workspace = true
 
 prost-types.workspace = true
