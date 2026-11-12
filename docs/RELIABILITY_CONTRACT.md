@@ -83,7 +83,7 @@ table below is its human-readable explanation.
 
 | Area | Current gap | Tracking | Removal condition |
 |---|---|---|---|
-| DRC entry points | `tools::drc` shares explicit save/refill ordering and source evidence. Default calls still read saved files; general source authority and the outcome-envelope migration remain incomplete. | [#16](https://github.com/Copperpour/Copperpour/issues/16), [#58](https://github.com/Copperpour/Copperpour/issues/58) | One owned DRC execution/result contract identifies source state and unavailable or partial evidence, including the remaining migration. |
+| DRC entry points | `tools::drc` shares explicit save/refill ordering and source evidence. Default calls still read saved files; general source authority and the outcome-envelope migration remain incomplete. | [#58](https://github.com/Copperpour/Copperpour/issues/58) | One owned DRC execution/result contract identifies source state and unavailable or partial evidence, including the remaining migration. |
 | Explicit config loading | A failed explicit plugin config can fall through to defaults and report success. | [#545](https://github.com/mixelpixx/Konnect/issues/545) | Explicit-config refusal is structured, does not start with substituted defaults, and has regression coverage. |
 | Live/file board readers | `get_layer_list` and `get_netclasses` read the saved file while sibling writers can operate on the live board. | [#542](https://github.com/mixelpixx/Konnect/issues/542) | Readers disclose and consistently select the live or saved source, with stale-file coverage. |
 

@@ -42,10 +42,24 @@ also checked after CLI.
 This detects a changed final source, but cannot prove the absence of transient
 concurrent changes; callers must finish their mutations first. General live/file
 authority and the shared outcome-envelope migration remain tracked separately
-in [#58](https://github.com/Copperpour/Copperpour/issues/58) and
-[#16](https://github.com/Copperpour/Copperpour/issues/16); this synchronization does
-not close
-those larger contracts.
+in [#58](https://github.com/Copperpour/Copperpour/issues/58); response bounding
+does not complete that migration.
+
+## Bounded responses and complete reports
+
+Both DRC tools display at most `limit` severity-filtered violations (default 50;
+0 for counts only). `shown` equals the returned list length; `truncated` means
+`filtered_count` exceeds `shown`. Filtering and bounding include every reported
+category, in the existing order: design-rule violations, unconnected items, then
+schematic parity. Existing totals and `run_drc` error/warning counts are computed
+before bounding. Missing categories remain `null` and appear in
+`categories_not_reported`.
+
+The optional `output` report includes every reported category and severity,
+regardless of `limit` or `severity`. Bounding does not reduce the checks KiCad runs
+or alter synchronization, refill, report publication, or source evidence. Raise
+`limit` for a larger sample or inspect the full report; there is no pagination.
+This limits row counts, not bytes or nested violation items.
 
 ## Evidence
 

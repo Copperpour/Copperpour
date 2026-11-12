@@ -378,7 +378,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "library_path": { "type": "string", "description": "Path to .kicad_sym library file" },
-                    "limit": { "type": "integer", "description": "Maximum number of symbols to return", "default": 100 }
+                    "limit": { "type": "integer", "minimum": 0, "description": "Maximum symbols to display (0 for count only). count is the full library size; shown/truncated describe the displayed list.", "default": 100 }
                 },
                 "required": ["library_path"]
             }),
@@ -434,7 +434,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search string (partial name or keyword match)" },
-                    "limit": { "type": "integer", "description": "Maximum number of results to return", "default": 50 },
+                    "limit": { "type": "integer", "minimum": 0, "description": "Maximum matches to display (0 for existence only). count/shown are returned matches; truncated means another match was found, not a full catalogue total.", "default": 50 },
                     "project_dir": { "type": "string", "description": "Project directory whose sym-lib-table is also searched. Defaults to the configured project_dir." }
                 },
                 "required": ["query"]
@@ -477,7 +477,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search string (partial name or keyword)" },
-                    "limit": { "type": "integer", "description": "Maximum number of results to return", "default": 50 }
+                    "limit": { "type": "integer", "minimum": 0, "description": "Maximum matches to display (0 for existence only). count/shown are returned matches; truncated means another match was found, not a full catalogue total.", "default": 50 }
                 },
                 "required": ["query"]
             }),
@@ -5124,18 +5124,21 @@ async fn handle_list_symbols_in_library(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
+    let limit = match super::response_limit(args, 100) {
+        Ok(limit) => limit,
+        Err(error) => return Ok(error),
+    };
     let content = tokio::fs::read_to_string(&lib_path).await?;
-
     let symbols = top_level_symbol_names(&content)?;
-    let limit = args["limit"].as_u64().unwrap_or(100) as usize;
-    let truncated = symbols.len() > limit;
+    let bounded = super::BoundedList::new(&symbols, limit);
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "library": lib_path.to_str().unwrap_or(""),
             "count": symbols.len(),
-            "truncated": truncated,
-            "symbols": symbols.into_iter().take(limit).collect::<Vec<_>>()
+            "shown": bounded.shown,
+            "truncated": bounded.truncated,
+            "symbols": bounded.items
         }))
         .unwrap(),
     ))
@@ -5149,7 +5152,10 @@ async fn handle_search_symbols(
         Ok(v) => v.to_lowercase(),
         Err(e) => return Ok(e),
     };
-    let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+    let limit = match super::response_limit(args, 50) {
+        Ok(limit) => limit,
+        Err(error) => return Ok(error),
+    };
 
     let project_dir = args["project_dir"]
         .as_str()
@@ -5174,6 +5180,17 @@ async fn handle_search_symbols(
         }
     }
 
+    let results = search_symbol_entries(entries, &query, limit).await;
+    Ok(search_response(&query, &results, limit))
+}
+
+/// Stop after one extra match: enough to prove truncation without scanning the
+/// rest of the installed catalogue just to compute a total we never promised.
+async fn search_symbol_entries(
+    entries: Vec<(String, String)>,
+    query: &str,
+    limit: usize,
+) -> Vec<serde_json::Value> {
     let mut results = Vec::new();
     // `entries` holds resolved filesystem paths, not the raw uris they came
     // from — read_flat_lib_table does that expansion now.
@@ -5185,22 +5202,26 @@ async fn handle_search_symbols(
         let Ok(lib_content) = tokio::fs::read_to_string(&lib_path).await else {
             continue;
         };
-        for hit in search_lib_symbols(&nickname, &lib_content, &query) {
+        for hit in search_lib_symbols(&nickname, &lib_content, query) {
             results.push(hit);
-            if results.len() >= limit {
+            if results.len() > limit {
                 break 'outer;
             }
         }
     }
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "query": query,
-            "count": results.len(),
-            "results": results
-        }))
-        .unwrap(),
-    ))
+    results
+}
+
+fn search_response(query: &str, results: &[serde_json::Value], limit: usize) -> CallToolResult {
+    let bounded = super::BoundedList::new(results, limit);
+    CallToolResult::json(&json!({
+        "query": query,
+        "count": bounded.shown,
+        "shown": bounded.shown,
+        "truncated": bounded.truncated,
+        "results": bounded.items
+    }))
 }
 
 async fn handle_list_library_footprints(
@@ -5382,12 +5403,29 @@ async fn handle_search_footprints(
         Ok(v) => v.to_lowercase(),
         Err(e) => return Ok(e),
     };
-    let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+    let limit = match super::response_limit(args, 50) {
+        Ok(limit) => limit,
+        Err(error) => return Ok(error),
+    };
 
+    let results =
+        search_footprint_entries(read_global_lib_table(global_fp_lib_table()), &query, limit).await;
+    Ok(search_response(
+        args["query"].as_str().unwrap(),
+        &results,
+        limit,
+    ))
+}
+
+async fn search_footprint_entries(
+    libraries: Vec<serde_json::Value>,
+    query: &str,
+    limit: usize,
+) -> Vec<serde_json::Value> {
     // Walk global fp-lib-table
     let mut results = Vec::new();
 
-    'outer: for lib in read_global_lib_table(global_fp_lib_table()) {
+    'outer: for lib in libraries {
         let nickname = lib["nickname"].as_str().unwrap_or("").to_string();
         let Some(dir) = lib["path"].as_str().map(PathBuf::from) else {
             continue;
@@ -5401,27 +5439,20 @@ async fn handle_search_footprints(
             let Some(fp_name) = fname_str.strip_suffix(".kicad_mod") else {
                 continue;
             };
-            if fp_name.to_lowercase().contains(&query) {
+            if fp_name.to_lowercase().contains(query) {
                 results.push(json!({
                     "library": nickname,
                     "name": fp_name,
                     "id": format!("{}:{}", nickname, fp_name)
                 }));
-                if results.len() >= limit {
+                if results.len() > limit {
                     break 'outer;
                 }
             }
         }
     }
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "query": args["query"].as_str().unwrap_or(""),
-            "count": results.len(),
-            "results": results
-        }))
-        .unwrap(),
-    ))
+    results
 }
 
 // ─── get_symbol_info (moved from verification toolset) ───────────────────────
@@ -9171,6 +9202,166 @@ mod tests {
             !c.contains("SINGLE_1_1"),
             "single unit must not create a _1_1 unit"
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_catalogue_search_proves_an_extra_match_across_libraries() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/reference_prefix_kicad10/Device.kicad_sym");
+        let content = std::fs::read_to_string(&fixture).unwrap();
+        let names = top_level_symbol_names(&content).unwrap();
+        assert_eq!(names, ["R"]);
+        // Each library supplies exactly one match. Lookahead must cross the
+        // library boundary to distinguish exactly full from truncated.
+        let query = "r".to_string();
+        let per_library = 1;
+        let entries = vec![
+            ("first".into(), fixture.display().to_string()),
+            ("second".into(), fixture.display().to_string()),
+        ];
+        for (limit, shown, truncated) in [
+            (0, 0, true),
+            (per_library, per_library, true),
+            (per_library * 2, per_library * 2, false),
+        ] {
+            let hits = search_symbol_entries(entries.clone(), &query, limit).await;
+            let body: serde_json::Value =
+                serde_json::from_str(&result_text(&search_response(&query, &hits, limit))).unwrap();
+            assert_eq!(body["shown"], shown);
+            assert_eq!(body["count"], shown);
+            assert_eq!(body["truncated"], truncated);
+            assert_eq!(body["results"].as_array().unwrap().len(), shown);
+            if shown > 0 {
+                assert_eq!(body["results"][0]["library"], "first");
+            }
+        }
+        let hits = search_symbol_entries(entries, "no-such-symbol-issue16", 0).await;
+        assert!(hits.is_empty());
+        let body: serde_json::Value =
+            serde_json::from_str(&result_text(&search_response("none", &hits, 0))).unwrap();
+        assert_eq!(body["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn bounded_footprint_search_proves_an_extra_match_across_libraries() {
+        let dir = tempfile::tempdir().unwrap();
+        let native =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/socket_kicad10.kicad_mod");
+        let mut libraries = Vec::new();
+        for name in ["first", "second"] {
+            let folder = dir.path().join(name);
+            std::fs::create_dir(&folder).unwrap();
+            std::fs::copy(&native, folder.join("Match.kicad_mod")).unwrap();
+            libraries.push(json!({"nickname": name, "path": folder}));
+        }
+        for (limit, shown, truncated) in [(0, 0, true), (1, 1, true), (2, 2, false), (3, 2, false)]
+        {
+            let hits = search_footprint_entries(libraries.clone(), "match", limit).await;
+            let body: serde_json::Value =
+                serde_json::from_str(&result_text(&search_response("Match", &hits, limit)))
+                    .unwrap();
+            assert_eq!(body["shown"], shown);
+            assert_eq!(body["count"], shown);
+            assert_eq!(body["truncated"], truncated);
+            assert_eq!(body["results"].as_array().unwrap().len(), shown);
+        }
+        assert!(search_footprint_entries(libraries, "absent", 0)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounded_catalogue_listing_is_served_with_full_count_and_sample() {
+        let handler = crate::mcp::handler::McpHandler::new(test_ctx().config.clone())
+            .await
+            .unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/symbol_fields_kicad10.kicad_sym");
+        let names = ["FIELDS_BARE", "FIELDS_FULL"];
+        handler
+            .handle_message(json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"load_toolset", "arguments":{"name":"library"}}}))
+            .await;
+        for (limit, shown) in [
+            (json!(0), 0),
+            (json!(1.0), 1),
+            (json!(names.len()), names.len()),
+        ] {
+            let response = handler.handle_message(json!({"jsonrpc":"2.0", "id":2, "method":"tools/call",
+                "params":{"name":"list_symbols_in_library", "arguments":{"library_path":fixture,"limit":limit}}})).await.unwrap().result.unwrap();
+            assert_eq!(response["isError"], false, "{response}");
+            let body: serde_json::Value =
+                serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(body["count"], names.len());
+            assert_eq!(body["shown"], shown);
+            assert_eq!(body["truncated"], shown < names.len());
+            assert_eq!(body["symbols"], json!(&names[..shown]));
+        }
+    }
+
+    #[test]
+    fn bounded_tool_schemas_refuse_negative_limits_and_accept_integral_floats() {
+        for (tool, args) in [
+            ("run_drc", json!({"board":"missing.kicad_pcb"})),
+            ("get_drc_violations", json!({"board":"missing.kicad_pcb"})),
+            (
+                "list_symbols_in_library",
+                json!({"library_path":"missing.kicad_sym"}),
+            ),
+            ("search_symbols", json!({"query":"R"})),
+            ("search_footprints", json!({"query":"R"})),
+        ] {
+            let def = tools()
+                .into_iter()
+                .chain(super::super::verification::tools())
+                .chain(super::super::pcb_export::tools())
+                .find(|def| def.name == tool)
+                .unwrap();
+            for (limit, valid) in [
+                (json!(-1), false),
+                (json!(1.5), false),
+                (json!(0), true),
+                (json!(1.0), true),
+            ] {
+                let mut args = args.clone();
+                args["limit"] = limit;
+                assert_eq!(def.input_validator.is_valid(&args), valid, "{tool}: {args}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_tools_refuse_invalid_limits_through_served_dispatch() {
+        let mut config = test_ctx().config.clone();
+        config.auto_load_toolsets = true;
+        let handler = crate::mcp::handler::McpHandler::new(config).await.unwrap();
+        for (tool, args) in [
+            ("run_drc", json!({"board":"missing.kicad_pcb"})),
+            ("get_drc_violations", json!({"board":"missing.kicad_pcb"})),
+            (
+                "list_symbols_in_library",
+                json!({"library_path":"missing.kicad_sym"}),
+            ),
+            ("search_symbols", json!({"query":"R"})),
+            ("search_footprints", json!({"query":"R"})),
+        ] {
+            for limit in [json!(-1), json!(1.5), json!("1"), json!(null), json!(true)] {
+                let mut args = args.clone();
+                args["limit"] = limit;
+                let response = handler
+                    .handle_message(json!({"jsonrpc":"2.0", "id":3, "method":"tools/call",
+                    "params":{"name":tool, "arguments":args}}))
+                    .await
+                    .unwrap()
+                    .result
+                    .unwrap();
+                assert_eq!(response["isError"], true, "{tool}: {response}");
+                let body: serde_json::Value =
+                    serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(body["error"]["kind"], "invalid_argument", "{tool}: {body}");
+                assert_eq!(body["error"]["field"], "limit", "{tool}: {body}");
+            }
+        }
     }
 
     #[tokio::test]
