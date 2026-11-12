@@ -61,6 +61,28 @@ or alter synchronization, refill, report publication, or source evidence. Raise
 `limit` for a larger sample or inspect the full report; there is no pagination.
 This limits row counts, not bytes or nested violation items.
 
+## Rule summaries and selection
+
+`run_drc` adds `by_rule`, an object keyed by the exact rule names in the complete
+filtered result. Each value has `errors` and `warnings`, counted before `limit`
+is applied, even with `limit: 0`. The buckets count those two severities, matching
+the global error/warning counters. With `severity: "info"`, informational rows
+still contribute to `filtered_count` and the displayed list; a rule with only
+informational rows appears with zero errors and zero warnings.
+
+The optional `rules` array selects exact, case-sensitive rule names for the
+response. Omit it for all rules; an empty array selects none. Duplicate names
+are coalesced. `rules_filter` reports the sorted, distinct effective selection,
+or `null` when all rules are included. Unknown names produce no matching rows.
+`filtered_count`, `errors`, `warnings`, `by_rule`, `shown`, `truncated`, and
+`violations` all describe the set after both severity and rule selection.
+
+The category counts and `total_violations` remain full-report counts, and
+`output` still contains every reported category and severity. Rule selection
+changes presentation only: KiCad still runs the complete configured DRC ruleset.
+Use a rule name returned in `by_rule` to inspect a less common rule without the
+response's display limit being spent on another rule's repeated findings.
+
 ## Evidence
 
 Unit tests in `tools::drc::tests` use the served `tools/call` dispatch, the shared

@@ -422,6 +422,302 @@ mod tests {
         })
     }
 
+    fn drc_rule_report() -> Value {
+        let row = |severity: &str, rule: &str| json!({"severity":severity,"type":rule,"description":rule,"items":[]});
+        let mut violations = vec![row("error", "clearance"); 4];
+        violations.extend([row("warning", "clearance"), row("info", "info_rule")]);
+        json!({"violations":violations,
+            "unconnected_items":[row("error","unconnected"),row("warning","clearance")],
+            "schematic_parity":[row("warning","parity"),row("error","clearance")]})
+    }
+
+    #[tokio::test]
+    async fn drc_rule_summary_counts_every_selected_category_before_the_display_limit() {
+        for limit in [0, 1, 50] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("clock.kicad_pcb");
+            std::fs::write(&board, OLD).unwrap();
+            let executable = cli_fixture(dir.path(), &board);
+            std::fs::write(
+                board.with_extension("drc.json"),
+                drc_rule_report().to_string(),
+            )
+            .unwrap();
+            let body = call("run_drc", &board, "", &executable, json!({"limit":limit})).await;
+            assert_eq!(body["isError"], false, "{body}");
+            assert_eq!(
+                body["by_rule"],
+                json!({"clearance":{"errors":5,"warnings":2},"unconnected":{"errors":1,"warnings":0},"parity":{"errors":0,"warnings":1}})
+            );
+            assert_eq!(body["rules_filter"], Value::Null);
+            assert_eq!(body["errors"], 6);
+            assert_eq!(body["warnings"], 3);
+            assert_eq!(body["filtered_count"], 9);
+            assert_eq!(body["shown"], limit.min(9));
+            assert_eq!(body["truncated"], limit < 9);
+            assert_eq!(body["total_violations"], 10);
+            assert_eq!(body["design_rule_violations"], 6);
+            assert_eq!(body["unconnected_items"], 2);
+            assert_eq!(body["schematic_parity"], 2);
+            if limit > 0 {
+                assert_eq!(body["violations"][0]["rule"], "clearance");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn drc_rule_filter_selects_exact_names_and_preserves_the_complete_report() {
+        for (extra, expected, count, errors, warnings, filter) in [
+            (
+                json!({"rules":["parity"]}),
+                json!({"parity":{"errors":0,"warnings":1}}),
+                1,
+                0,
+                1,
+                json!(["parity"]),
+            ),
+            (
+                json!({"rules":["unconnected","clearance","clearance"]}),
+                json!({"clearance":{"errors":5,"warnings":2},"unconnected":{"errors":1,"warnings":0}}),
+                8,
+                6,
+                2,
+                json!(["clearance", "unconnected"]),
+            ),
+            (
+                json!({"rules":["clearance"],"severity":"error"}),
+                json!({"clearance":{"errors":5,"warnings":0}}),
+                5,
+                5,
+                0,
+                json!(["clearance"]),
+            ),
+            (json!({"rules":[]}), json!({}), 0, 0, 0, json!([])),
+            (
+                json!({"rules":["CLEARANCE"]}),
+                json!({}),
+                0,
+                0,
+                0,
+                json!(["CLEARANCE"]),
+            ),
+            (
+                json!({"rules":["info_rule"]}),
+                json!({}),
+                0,
+                0,
+                0,
+                json!(["info_rule"]),
+            ),
+            (
+                json!({"rules":["info_rule"],"severity":"info"}),
+                json!({"info_rule":{"errors":0,"warnings":0}}),
+                1,
+                0,
+                0,
+                json!(["info_rule"]),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("clock.kicad_pcb");
+            std::fs::write(&board, OLD).unwrap();
+            let executable = cli_fixture(dir.path(), &board);
+            std::fs::write(
+                board.with_extension("drc.json"),
+                drc_rule_report().to_string(),
+            )
+            .unwrap();
+            let output = dir.path().join("reports/full.json");
+            let mut args = extra;
+            args["limit"] = json!(1);
+            args["output"] = json!(output);
+            let body = call("run_drc", &board, "", &executable, args).await;
+            assert_eq!(body["isError"], false, "{body}");
+            assert_eq!(body["by_rule"], expected, "{body}");
+            assert_eq!(body["rules_filter"], filter);
+            assert_eq!(body["filtered_count"], count);
+            assert_eq!(body["errors"], errors);
+            assert_eq!(body["warnings"], warnings);
+            assert_eq!(body["shown"], count.min(1));
+            assert_eq!(body["truncated"], count > 1);
+            let rows = body["violations"].as_array().unwrap();
+            assert_eq!(rows.len(), count.min(1) as usize);
+            for row in rows {
+                assert!(filter.as_array().unwrap().contains(&row["rule"]));
+            }
+            assert_eq!(body["total_violations"], 10);
+            assert_eq!(body["design_rule_violations"], 6);
+            assert_eq!(body["unconnected_items"], 2);
+            assert_eq!(body["schematic_parity"], 2);
+            assert!(
+                board.with_extension("kicad_pcb.observed").exists(),
+                "even an empty filter runs DRC"
+            );
+            let report: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+            assert_eq!(report["violations"].as_array().unwrap().len(), 6);
+            assert_eq!(report["unconnected_items"].as_array().unwrap().len(), 2);
+            assert_eq!(report["schematic_parity"].as_array().unwrap().len(), 2);
+            assert!(report["violations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["severity"] == "info"));
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), OLD);
+        }
+    }
+
+    #[tokio::test]
+    async fn drc_rule_summary_obeys_severity_even_when_info_is_not_an_error_or_warning() {
+        for (severity, expected, count, warnings) in [
+            (
+                "error",
+                json!({"clearance":{"errors":5,"warnings":0},"unconnected":{"errors":1,"warnings":0}}),
+                6,
+                0,
+            ),
+            (
+                "info",
+                json!({"clearance":{"errors":5,"warnings":2},"unconnected":{"errors":1,"warnings":0},"parity":{"errors":0,"warnings":1},"info_rule":{"errors":0,"warnings":0}}),
+                10,
+                3,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("clock.kicad_pcb");
+            std::fs::write(&board, OLD).unwrap();
+            let executable = cli_fixture(dir.path(), &board);
+            std::fs::write(
+                board.with_extension("drc.json"),
+                drc_rule_report().to_string(),
+            )
+            .unwrap();
+            let body = call(
+                "run_drc",
+                &board,
+                "",
+                &executable,
+                json!({"severity":severity,"limit":0}),
+            )
+            .await;
+            assert_eq!(body["isError"], false, "{body}");
+            assert_eq!(body["by_rule"], expected);
+            assert_eq!(body["filtered_count"], count);
+            assert_eq!(body["errors"], 6);
+            assert_eq!(body["warnings"], warnings);
+        }
+    }
+
+    #[tokio::test]
+    async fn drc_rule_summary_empty_evidence_keeps_missing_categories_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("clock.kicad_pcb");
+        std::fs::write(&board, OLD).unwrap();
+        let executable = cli_fixture(dir.path(), &board);
+        std::fs::write(board.with_extension("drc.json"), r#"{"violations":[]}"#).unwrap();
+        let body = call("run_drc", &board, "", &executable, json!({"limit":0})).await;
+        assert_eq!(body["isError"], false, "{body}");
+        assert_eq!(body["by_rule"], json!({}));
+        assert_eq!(body["filtered_count"], 0);
+        assert_eq!(body["shown"], 0);
+        assert_eq!(body["truncated"], false);
+        assert!(body["unconnected_items"].is_null());
+        assert!(body["schematic_parity"].is_null());
+        assert_eq!(
+            body["categories_not_reported"],
+            json!(["unconnected_items", "schematic_parity"])
+        );
+    }
+
+    #[tokio::test]
+    async fn drc_rules_bad_schema_inputs_refuse_before_cli_or_report_work() {
+        for value in [
+            json!(null),
+            json!("clearance"),
+            json!(1),
+            json!(false),
+            json!(["clearance", 1]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("clock.kicad_pcb");
+            std::fs::write(&board, OLD).unwrap();
+            let executable = cli_fixture(dir.path(), &board);
+            let output = dir.path().join("reports/full.json");
+            let body = call(
+                "run_drc",
+                &board,
+                "",
+                &executable,
+                json!({"rules":value,"output":output,"sync_live_board":true}),
+            )
+            .await;
+            assert_eq!(body["isError"], true, "{body}");
+            assert_eq!(body["error"]["kind"], "invalid_argument");
+            assert!(body["error"]["field"]
+                .as_str()
+                .unwrap()
+                .starts_with("rules"));
+            assert!(!board.with_extension("kicad_pcb.observed").exists());
+            assert!(!output.exists());
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), OLD);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires kicad-cli; checks only a disposable native board copy"]
+    async fn drc_rule_native_summary_and_filter_keep_full_report_and_source() {
+        let executable = std::path::PathBuf::from(
+            crate::app_dirs::env_var("TEST_KICAD_CLI").unwrap_or_else(|| "kicad-cli".into()),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("clock.kicad_pcb");
+        std::fs::write(&board, OLD).unwrap();
+        let first_output = dir.path().join("all.json");
+        let all = call(
+            "run_drc",
+            &board,
+            "",
+            &executable,
+            json!({"limit":0,"output":first_output}),
+        )
+        .await;
+        assert_eq!(all["isError"], false, "{all}");
+        assert_eq!(all["shown"], 0);
+        let map = all["by_rule"].as_object().unwrap();
+        assert!(!map.is_empty(), "native fixture has violations");
+        let (rule, counts) = map.iter().next().unwrap();
+        let selected_output = dir.path().join("selected.json");
+        let selected = call(
+            "run_drc",
+            &board,
+            "",
+            &executable,
+            json!({"limit":1,"rules":[rule],"output":selected_output}),
+        )
+        .await;
+        assert_eq!(selected["isError"], false, "{selected}");
+        assert_eq!(selected["by_rule"], json!({(rule):counts}));
+        assert_eq!(
+            selected["filtered_count"].as_u64().unwrap(),
+            counts["errors"].as_u64().unwrap() + counts["warnings"].as_u64().unwrap()
+        );
+        assert_eq!(selected["violations"][0]["rule"], rule.as_str());
+        for key in [
+            "total_violations",
+            "design_rule_violations",
+            "unconnected_items",
+            "schematic_parity",
+        ] {
+            assert_eq!(selected[key], all[key], "{key}");
+        }
+        let first: Value = serde_json::from_slice(&std::fs::read(first_output).unwrap()).unwrap();
+        let second: Value =
+            serde_json::from_slice(&std::fs::read(selected_output).unwrap()).unwrap();
+        for key in ["violations", "unconnected_items", "schematic_parity"] {
+            assert_eq!(first[key], second[key], "{key}");
+        }
+        assert_eq!(std::fs::read_to_string(board).unwrap(), OLD);
+    }
+
     #[tokio::test]
     async fn bounded_drc_preserves_all_counts_categories_and_full_report() {
         for tool in ["run_drc", "get_drc_violations"] {
