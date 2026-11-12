@@ -21,7 +21,7 @@ use copperpour_sexp::writer::{
 };
 use copperpour_sexp::{parse_sexp, SexpError, SexpNode};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use tokio::task;
 
@@ -32,7 +32,7 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "run_drc",
             "Run the Design Rule Check on the PCB and return structured violation results, \
-             with separate error and warning counts in the summary. Prefer this over \
+             with error/warning counts overall and by rule, and optional result filtering by rule. Prefer this over \
              `get_drc_violations` (pcb_export toolset) — they run the same underlying \
              kicad-cli check, but `run_drc` returns a cleaner breakdown. KiCad runs the \
              complete configured DRC ruleset; kicad-cli has no per-test selector.",
@@ -48,6 +48,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Minimum violation severity to include: 'error', 'warning' (default), 'info'",
                         "default": "warning"
+                    },
+                    "rules": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Include only exact, case-sensitive rule names in the returned results and by_rule summary. Omit for all rules; [] selects none; duplicate names are coalesced. Does not limit KiCad checks or the complete output report."
                     },
                     "limit": {
                         "type": "integer",
@@ -273,6 +278,35 @@ fn severity_rank(s: &str) -> u8 {
     }
 }
 
+#[derive(Default, serde::Serialize)]
+struct DrcRuleCounts {
+    errors: usize,
+    warnings: usize,
+}
+
+fn drc_rules_filter(args: &Value) -> Result<Option<BTreeSet<String>>, CallToolResult> {
+    let Some(value) = args.get("rules") else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(invalid_arg(
+            "rules",
+            "expected an array of exact rule-name strings",
+        ));
+    };
+    let mut rules = BTreeSet::new();
+    for (index, value) in values.iter().enumerate() {
+        let Some(name) = value.as_str() else {
+            return Err(invalid_arg(
+                &format!("rules[{index}]"),
+                "expected a rule-name string",
+            ));
+        };
+        rules.insert(name.to_owned());
+    }
+    Ok(Some(rules))
+}
+
 async fn handle_run_drc(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -282,6 +316,11 @@ async fn handle_run_drc(
     let min_rank = severity_rank(severity_filter);
     let limit = match super::response_limit(args, 50) {
         Ok(limit) => limit,
+        Err(error) => return Ok(error),
+    };
+
+    let rules_filter = match drc_rules_filter(args) {
+        Ok(rules) => rules,
         Err(error) => return Ok(error),
     };
 
@@ -304,10 +343,25 @@ async fn handle_run_drc(
     let filtered: Vec<_> = report
         .all()
         .filter(|v| severity_rank(&v.severity) >= min_rank)
+        .filter(|v| {
+            rules_filter
+                .as_ref()
+                .is_none_or(|rules| rules.contains(v.rule.as_str()))
+        })
         .collect();
 
     let errors = filtered.iter().filter(|v| v.severity == "error").count();
     let warnings = filtered.iter().filter(|v| v.severity == "warning").count();
+    // Aggregate the complete selected set, never the displayed prefix.
+    let mut by_rule: BTreeMap<&str, DrcRuleCounts> = BTreeMap::new();
+    for violation in &filtered {
+        let counts = by_rule.entry(violation.rule.as_str()).or_default();
+        match violation.severity.as_str() {
+            "error" => counts.errors += 1,
+            "warning" => counts.warnings += 1,
+            _ => {}
+        }
+    }
     let bounded = super::BoundedList::new(&filtered, limit);
     let missing = report.missing_categories();
 
@@ -333,6 +387,8 @@ async fn handle_run_drc(
             "errors": errors,
             "warnings": warnings,
             "severity_filter": severity_filter,
+            "rules_filter": rules_filter,
+            "by_rule": by_rule,
             "shown": bounded.shown,
             "truncated": bounded.truncated,
             "violations": bounded.items.iter().map(|v| json!({
@@ -2648,5 +2704,49 @@ mod kicad_launch_tests {
             serde_json::from_str::<Value>(&text).unwrap(),
             json!({"launched": true, "ipc_ready": true})
         );
+    }
+}
+
+#[cfg(test)]
+mod drc_rule_filter_tests {
+    use super::*;
+
+    #[test]
+    fn drc_rules_filter_distinguishes_omitted_empty_and_deduplicated_names() {
+        assert_eq!(drc_rules_filter(&json!({})).unwrap(), None);
+        assert_eq!(
+            drc_rules_filter(&json!({"rules":[]})).unwrap(),
+            Some(BTreeSet::new())
+        );
+        assert_eq!(
+            drc_rules_filter(&json!({"rules":["z","a","z"]})).unwrap(),
+            Some(BTreeSet::from(["a".into(), "z".into()]))
+        );
+    }
+
+    #[test]
+    fn drc_rules_filter_refuses_non_array_present_values_in_direct_calls() {
+        for value in [json!(null), json!("clearance"), json!(false), json!(1)] {
+            let error = drc_rules_filter(&json!({"rules":value}))
+                .expect_err("malformed rule list must refuse");
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&error).as_deref(),
+                Some("invalid_argument")
+            );
+        }
+    }
+
+    #[test]
+    fn drc_rules_filter_refuses_non_string_entries_in_direct_calls() {
+        for value in [json!(null), json!(1), json!(false), json!({})] {
+            let error = drc_rules_filter(&json!({"rules":["clearance",value]}))
+                .expect_err("malformed rule name must refuse");
+            let crate::mcp::protocol::ToolContent::Text { text } = &error.content[0] else {
+                panic!()
+            };
+            let body: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["error"]["kind"], "invalid_argument");
+            assert_eq!(body["error"]["field"], "rules[1]");
+        }
     }
 }
