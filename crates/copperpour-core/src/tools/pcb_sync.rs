@@ -95,6 +95,8 @@ struct DesignComponent {
     /// The symbol fields KiCad's Update PCB copies onto the footprint, in the
     /// order the netlist lists them (#788).
     fields: Vec<SymbolField>,
+    /// The sheet KiCad's Update PCB gives the footprint (#237).
+    sheet: SymbolSheet,
 }
 
 /// A symbol field to copy onto the footprint. An empty value is still a field:
@@ -103,6 +105,34 @@ struct DesignComponent {
 struct SymbolField {
     name: String,
     value: String,
+}
+
+/// The sheet a symbol is placed on and its library symbol's footprint
+/// filters, which KiCad's Update PCB sets on the footprint together. Rule
+/// areas generated from sheets, and Repeat Layout with them, find a sheet's
+/// footprints by `sheet_name` (#237).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct SymbolSheet {
+    sheet_name: String,
+    sheet_file: String,
+    footprint_filters: String,
+}
+
+impl SymbolSheet {
+    fn of(footprint: &copperpour_ipc::gen::kiapi::board::types::FootprintInstance) -> Self {
+        Self {
+            sheet_name: footprint.symbol_sheet_name.clone(),
+            sheet_file: footprint.symbol_sheet_filename.clone(),
+            footprint_filters: footprint.symbol_footprint_filters.clone(),
+        }
+    }
+
+    fn listed(&self) -> String {
+        format!(
+            "sheet name {:?}, sheet file {:?}, footprint filters {:?}",
+            self.sheet_name, self.sheet_file, self.footprint_filters
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -140,6 +170,8 @@ struct BoardFootprint {
     /// Every field but Reference and Value, by name: Datasheet, Description
     /// and the custom ones (#788).
     fields: BTreeMap<String, String>,
+    /// The sheet the live footprint carries (#237).
+    sheet: SymbolSheet,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -200,6 +232,9 @@ enum PlannedChange {
         position: Point,
         /// Every symbol field the footprint receives.
         fields: Vec<SymbolField>,
+        /// The sheet the footprint receives (#237).
+        #[serde(flatten)]
+        sheet: SymbolSheet,
     },
     Update {
         kiid: String,
@@ -212,6 +247,12 @@ enum PlannedChange {
         preserve: PreservedBoardState,
         /// Only the symbol fields whose value the footprint lacks or differs on.
         fields: Vec<SymbolField>,
+        /// The sheet the footprint takes, whether or not it differs (#237).
+        #[serde(flatten)]
+        sheet: SymbolSheet,
+        /// The footprint differs from its symbol in its sheet alone (#237).
+        #[serde(skip)]
+        sheet_only: bool,
     },
 }
 
@@ -454,22 +495,23 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 .map(UnpreparedFootprint::into_diagnostic)
                 .collect::<Vec<_>>();
             preflight.extend(additions_missing_pads(&plan, &prepared));
+            let mut left_out = Vec::new();
             if plan
                 .changes
                 .iter()
                 .any(|change| matches!(change, PlannedChange::Update { .. }))
             {
                 let board_text = client.save_document_to_string_in(snapshot.document.clone())?;
-                preflight.extend(updates_not_carried(
-                    &plan,
-                    &snapshot.state.footprints,
-                    &board_text,
-                ));
+                let (refused, sheet_only) =
+                    updates_not_carried(&plan, &snapshot.state.footprints, &board_text);
+                preflight.extend(refused);
+                left_out = sheet_only;
             }
             if !preflight.is_empty() {
                 refuse_plan(&mut plan, preflight);
                 return Ok(sync_response(&plan, "conflict", hierarchy.len(), false, &options));
             }
+            leave_out_updates(&mut plan, left_out);
             restage_additions(&mut plan, &prepared, snapshot.state.bounds);
             refresh_revision_with_staging(&mut plan);
             plan.diagnostics
@@ -971,6 +1013,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 pad_nets: component.pad_nets.clone(),
                 position,
                 fields: component.fields.clone(),
+                sheet: component.sheet.clone(),
             });
             counts.added.planned += 1;
             continue;
@@ -1063,14 +1106,14 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             .filter(|field| footprint.fields.get(&field.name) != Some(&field.value))
             .cloned()
             .collect::<Vec<_>>();
-        let needs_update = footprint.reference != component.reference
+        let differs_beyond_sheet = footprint.reference != component.reference
             || footprint.value != component.value
             || footprint.symbol_path.as_deref() != Some(component.symbol_path.as_str())
             || footprint.dnp != component.dnp
             || footprint.exclude_from_bom != component.exclude_from_bom
             || changed_pads > 0
             || !changed_fields.is_empty();
-        if needs_update {
+        if differs_beyond_sheet || footprint.sheet != component.sheet {
             changes.push(PlannedChange::Update {
                 kiid: footprint.kiid.clone(),
                 reference: component.reference.clone(),
@@ -1086,6 +1129,8 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                     locked: footprint.locked,
                 },
                 fields: changed_fields,
+                sheet: component.sheet.clone(),
+                sheet_only: !differs_beyond_sheet,
             });
             counts.updated.planned += 1;
             counts.pads_reassigned.planned += changed_pads;
@@ -1365,6 +1410,7 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
             exclude_from_bom,
             pad_nets: BTreeMap::new(),
             fields: symbol_fields(component_node),
+            sheet: symbol_sheet(component_node),
         });
     }
 
@@ -1443,6 +1489,33 @@ fn symbol_fields(component_node: &SexpNode) -> Vec<SymbolField> {
     fields
 }
 
+/// The sheet name, sheet file and footprint filters KiCad's Update PCB gives a
+/// `(comp …)`'s footprint: the sheet path's `names`, or the `Sheetname`
+/// property when they are empty, the `Sheetfile` property and the
+/// `ki_fp_filters` property. A property named twice keeps its last value, as
+/// KiCad's reader does.
+fn symbol_sheet(component_node: &SexpNode) -> SymbolSheet {
+    let property = |name: &str| {
+        component_node
+            .find_all("property")
+            .into_iter()
+            .rev()
+            .find(|property| property.find_str("name") == Some(name))
+            .and_then(|property| property.find_str("value"))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let names = component_node
+        .find("sheetpath")
+        .and_then(|sheet| sheet.find_str("names"))
+        .filter(|names| !names.is_empty());
+    SymbolSheet {
+        sheet_name: names.map_or_else(|| property("Sheetname"), str::to_owned),
+        sheet_file: property("Sheetfile"),
+        footprint_filters: property("ki_fp_filters"),
+    }
+}
+
 fn required_value(node: &SexpNode, tag: &str) -> Result<String> {
     node.find_str(tag)
         .map(str::to_owned)
@@ -1466,6 +1539,7 @@ fn update_footprint_item(
         exclude_from_bom,
         pad_nets,
         fields,
+        sheet,
         ..
     } = change
     else {
@@ -1478,6 +1552,7 @@ fn update_footprint_item(
     }
 
     apply_symbol_fields(&mut footprint, fields)?;
+    apply_symbol_sheet(&mut footprint, sheet);
     apply_footprint_fields(
         &mut footprint,
         reference,
@@ -1596,6 +1671,8 @@ struct FootprintShape {
     /// Each pad with a fabrication property, by number, sorted (#149). A pad
     /// KiCad reports as `PFP_NONE`, or before 10.0.7 not at all, has none.
     pad_properties: Vec<(String, PadFabricationProperty)>,
+    /// Its sheet name, sheet file and footprint filters (#237).
+    sheet: SymbolSheet,
 }
 
 /// What a field shows: its text, its layer, whether it is visible and
@@ -1721,6 +1798,7 @@ fn footprint_shapes<'a>(
         }
         let mut shape = FootprintShape {
             attributes: AttributeSet::of(footprint.attributes.as_ref()),
+            sheet: SymbolSheet::of(&footprint),
             ..Default::default()
         };
         for (name, field) in [
@@ -1849,6 +1927,13 @@ fn verify_board_matches_what_was_sent(
                 "{reference}: sent 3D models [{}], board now has [{}]",
                 want.model_files.join(", "),
                 got.model_files.join(", ")
+            ));
+        }
+        if got.sheet != want.sheet {
+            suspicious.push(format!(
+                "{reference}: sent {}, board now has {}",
+                want.sheet.listed(),
+                got.sheet.listed()
             ));
         }
         // Only the fields that were sent: KiCad fills in a Datasheet and a
@@ -2273,6 +2358,7 @@ fn board_footprint_from_instance(
             .map(|attributes| attributes.not_in_schematic)
             .unwrap_or(false),
         fields,
+        sheet: SymbolSheet::of(footprint),
     })
 }
 
@@ -2529,6 +2615,17 @@ fn apply_library_fields(
         ));
     }
     Ok(())
+}
+
+/// Give a footprint its symbol's sheet name, sheet file and footprint filters,
+/// as KiCad's Update PCB does (#237).
+fn apply_symbol_sheet(
+    footprint: &mut copperpour_ipc::gen::kiapi::board::types::FootprintInstance,
+    sheet: &SymbolSheet,
+) {
+    footprint.symbol_sheet_name = sheet.sheet_name.clone();
+    footprint.symbol_sheet_filename = sheet.sheet_file.clone();
+    footprint.symbol_footprint_filters = sheet.footprint_filters.clone();
 }
 
 /// Copy the schematic's fields onto a footprint as KiCad's Update PCB does by
@@ -2947,7 +3044,9 @@ fn not_carried_by_kiid(board_text: &str) -> Result<BTreeMap<String, NotCarried>>
     Ok(owned)
 }
 
-/// Each updated footprint that owns groups, points or variants (#836).
+/// Each updated footprint that owns groups, points or variants (#836): the
+/// conflicts, and the updates that would set only a footprint's sheet, to be
+/// left out with a diagnostic that refuses nothing (#237), by KIID.
 ///
 /// KiCad's API updates a footprint by replacing it with a new one built from
 /// the `FootprintInstance` sent (`handleCreateUpdateItemsInternal`, KiCad
@@ -2957,18 +3056,47 @@ fn updates_not_carried(
     plan: &SyncPlan,
     footprints: &[BoardFootprint],
     board_text: &str,
-) -> Vec<SyncDiagnostic> {
+) -> (Vec<SyncDiagnostic>, Vec<(String, SyncDiagnostic)>) {
     let owned = not_carried_by_kiid(board_text);
+    let footprint_id = |kiid: &str| {
+        // The plan was made from these footprints, so the update's is among them.
+        footprints
+            .iter()
+            .find(|footprint| footprint.kiid == kiid)
+            .map_or("", |footprint| footprint.footprint_id.as_str())
+    };
     let mut diagnostics = Vec::new();
+    let mut left_out = Vec::new();
     for change in &plan.changes {
         let PlannedChange::Update {
-            kiid, reference, ..
+            kiid,
+            reference,
+            sheet_only,
+            ..
         } = change
         else {
             continue;
         };
         let message = match owned.as_ref().map(|owned| owned.get(kiid)) {
             Ok(Some(found)) if *found == NotCarried::default() => continue,
+            Ok(Some(found)) if *sheet_only => {
+                left_out.push((
+                    kiid.clone(),
+                    footprint_conflict(
+                        "footprint_sheet_not_updated",
+                        format!(
+                            "{reference} differs from the schematic only in its sheet name, \
+                             sheet file or footprint filters, and owns {}, which KiCad drops \
+                             when its API updates a footprint; it is left out of this sync, \
+                             and KiCad's Update PCB from Schematic sets its sheet in place",
+                            found.described()
+                        ),
+                        footprint_id(kiid),
+                        vec![reference.clone()],
+                    ),
+                ));
+                continue;
+            }
             Ok(Some(found)) => format!(
                 "{reference} owns {}, which KiCad drops when its API updates a footprint; \
                  update {reference} with KiCad's Update PCB from Schematic, which edits it \
@@ -2981,19 +3109,29 @@ fn updates_not_carried(
             ),
             Err(error) => format!("what an update of {reference} would drop is unknown: {error:#}"),
         };
-        // The plan was made from these footprints, so the update's is among them.
-        let footprint_id = footprints
-            .iter()
-            .find(|footprint| &footprint.kiid == kiid)
-            .map_or("", |footprint| footprint.footprint_id.as_str());
         diagnostics.push(footprint_conflict(
             "footprint_children_not_carried",
             message,
-            footprint_id,
+            footprint_id(kiid),
             vec![reference.clone()],
         ));
     }
-    diagnostics
+    (diagnostics, left_out)
+}
+
+/// Take each update [`updates_not_carried`] leaves out off the plan, with its
+/// diagnostic; a plan left with no change is a no-op.
+fn leave_out_updates(plan: &mut SyncPlan, left_out: Vec<(String, SyncDiagnostic)>) {
+    for (kiid, diagnostic) in left_out {
+        plan.changes.retain(
+            |change| !matches!(change, PlannedChange::Update { kiid: planned, .. } if *planned == kiid),
+        );
+        plan.counts.updated.planned -= 1;
+        plan.diagnostics.push(diagnostic);
+    }
+    if plan.changes.is_empty() && plan.status == PlanStatus::Ready {
+        plan.status = PlanStatus::Noop;
+    }
 }
 
 /// Turn a plan into a conflict the way `plan_sync` does for its own
@@ -3108,6 +3246,7 @@ fn build_added_footprint(
         pad_nets,
         position,
         fields,
+        sheet,
     } = change
     else {
         bail!("only a planned addition builds a new footprint");
@@ -3131,6 +3270,7 @@ fn build_added_footprint(
     }
     apply_library_data(&mut footprint, part)?;
     apply_symbol_fields(&mut footprint, fields)?;
+    apply_symbol_sheet(&mut footprint, sheet);
     apply_footprint_fields(
         &mut footprint,
         reference,
@@ -3624,6 +3764,73 @@ mod tests {
         assert!(!component.dnp);
     }
 
+    /// Real `kicad-cli sch export netlist` output: one sheet file placed
+    /// twice, as `CH1` and `CH2`, with a capacitor on it, and a capacitor on
+    /// the root. Provenance in `tests/fixtures/sheet_fields_kicad10.README.md`.
+    const SHEET_FIELDS: &str = include_str!("../../tests/fixtures/sheet_fields_kicad10.net");
+
+    /// #237: each footprint gets its sheet path's names, the `Sheetfile`
+    /// property and the `ki_fp_filters` property, as KiCad's Update PCB gives
+    /// them. The names win over the `Sheetname` property: the root's is
+    /// `sheet_fields`, and its footprint's sheet name is `/`.
+    #[test]
+    fn each_component_carries_its_sheet_as_update_pcb_reads_it() {
+        let design = parse_exported_netlist(SHEET_FIELDS).unwrap();
+
+        let sheets = design
+            .components
+            .iter()
+            .map(|component| {
+                (
+                    component.reference.as_str(),
+                    component.sheet.sheet_name.as_str(),
+                    component.sheet.sheet_file.as_str(),
+                    component.sheet.footprint_filters.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sheets,
+            vec![
+                ("C1", "/", "sheet_fields.kicad_sch", "C_*"),
+                ("C2", "/CH1/", "channel.kicad_sch", "C_*"),
+                ("C3", "/CH2/", "channel.kicad_sch", "C_*"),
+            ]
+        );
+    }
+
+    /// KiCad 10 writes every sheet path's names, so the fixture is edited to
+    /// reach the case KiCad's reader also covers: no names, and the sheet name
+    /// is the `Sheetname` property.
+    #[test]
+    fn a_sheet_path_without_names_takes_the_sheetname_property() {
+        let design =
+            parse_exported_netlist(&SHEET_FIELDS.replace("(names \"/CH1/\")", "(names \"\")"))
+                .unwrap();
+
+        assert_eq!(design.components[1].sheet.sheet_name, "CH1");
+        assert_eq!(design.components[2].sheet.sheet_name, "/CH2/");
+    }
+
+    /// A property named twice keeps its last value, as in KiCad's reader.
+    /// KiCad writes each once, so the fixture is edited to repeat C1's.
+    #[test]
+    fn a_property_named_twice_keeps_its_last_value() {
+        let property = "(name \"ki_fp_filters\")\n\t\t\t\t(value \"C_*\")\n\t\t\t)";
+        let repeated = SHEET_FIELDS.replacen(
+            property,
+            &format!(
+                "{property}\n\t\t\t(property\n\t\t\t\t(name \"ki_fp_filters\")\n\t\t\t\t\
+                 (value \"CP_*\")\n\t\t\t)"
+            ),
+            1,
+        );
+        let design = parse_exported_netlist(&repeated).unwrap();
+
+        assert_eq!(design.components[0].sheet.footprint_filters, "CP_*");
+        assert_eq!(design.components[1].sheet.footprint_filters, "C_*");
+    }
+
     /// Real `kicad-cli sch export netlist` output: `R1` never had a footprint
     /// assigned, so the export carries no `(footprint …)` node for it and
     /// still nets its pin 1 to `C1`. Provenance in
@@ -3922,6 +4129,7 @@ mod tests {
                 ("2".to_string(), "GND".to_string()),
             ]),
             fields: Vec::new(),
+            sheet: SymbolSheet::default(),
         }
     }
 
@@ -3945,6 +4153,7 @@ mod tests {
             exclude_from_bom: false,
             not_in_schematic: false,
             fields: BTreeMap::new(),
+            sheet: SymbolSheet::default(),
         }
     }
 
@@ -3992,6 +4201,7 @@ mod tests {
                     exclude_from_bom: false,
                     not_in_schematic: false,
                     fields: BTreeMap::new(),
+                    sheet: SymbolSheet::default(),
                 },
                 BoardFootprint {
                     kiid: "board-only".to_string(),
@@ -4009,6 +4219,7 @@ mod tests {
                     exclude_from_bom: false,
                     not_in_schematic: true,
                     fields: BTreeMap::new(),
+                    sheet: SymbolSheet::default(),
                 },
             ],
             routed_nets: BTreeMap::new(),
@@ -4242,6 +4453,8 @@ mod tests {
                 locked: false,
             },
             fields: Vec::new(),
+            sheet: SymbolSheet::default(),
+            sheet_only: false,
         };
         let updated =
             update_footprint_item(&item, &change, &BTreeMap::from([("GND".to_string(), 1)]))
@@ -4577,6 +4790,8 @@ mod tests {
                 locked: true,
             },
             fields: Vec::new(),
+            sheet: SymbolSheet::default(),
+            sheet_only: false,
         };
 
         let updated =
@@ -4737,6 +4952,8 @@ mod tests {
                 locked: board.locked,
             },
             fields,
+            sheet: board.sheet.clone(),
+            sheet_only: false,
         };
         let item = copperpour_ipc::builders::pack_any(live, "kiapi.board.types.FootprintInstance");
         let updated = update_footprint_item(&item, &change, &BTreeMap::new()).unwrap();
@@ -4915,6 +5132,7 @@ mod tests {
                 exclude_from_bom: false,
                 not_in_schematic: false,
                 fields: BTreeMap::new(),
+                sheet: SymbolSheet::default(),
             }],
             routed_nets: BTreeMap::from([("VCC".to_string(), 1)]),
             bounds: Bounds {
@@ -6033,6 +6251,7 @@ mod tests {
                 .collect(),
             position: Point { x: 0.0, y: 0.0 },
             fields: Vec::new(),
+            sheet: SymbolSheet::default(),
         }
     }
 
@@ -6335,6 +6554,9 @@ mod tests {
         /// What was sent, with each pad sent without a fabrication property
         /// reported as `PFP_NONE`, as KiCad 10.0.7+ reports it.
         UnknownPadPropertiesAsNone,
+        /// What was sent without its sheet name, sheet file and footprint
+        /// filters: the board the sync built before #237.
+        WithoutSheet,
     }
 
     impl ServedSync {
@@ -6821,6 +7043,20 @@ mod tests {
                 if let Some(attributes) = footprint.attributes.as_mut() {
                     attributes.do_not_populate = false;
                 }
+                copperpour_ipc::builders::pack_any(
+                    &footprint,
+                    "kiapi.board.types.FootprintInstance",
+                )
+            }
+            Readback::WithoutSheet => {
+                let mut footprint =
+                    copperpour_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+                        item.value.as_slice(),
+                    )
+                    .expect("a footprint");
+                footprint.symbol_sheet_name.clear();
+                footprint.symbol_sheet_filename.clear();
+                footprint.symbol_footprint_filters.clear();
                 copperpour_ipc::builders::pack_any(
                     &footprint,
                     "kiapi.board.types.FootprintInstance",
@@ -7406,6 +7642,140 @@ mod tests {
         assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
     }
 
+    /// The sheet name, sheet file and footprint filters of each added
+    /// footprint, by reference, as `CreateItems` received them.
+    fn sent_sheets(served: &ServedSync) -> Vec<(String, String, String, String)> {
+        served
+            .sent_footprints()
+            .iter()
+            .map(|footprint| {
+                (
+                    field_text(&footprint.reference_field),
+                    footprint.symbol_sheet_name.clone(),
+                    footprint.symbol_sheet_filename.clone(),
+                    footprint.symbol_footprint_filters.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// #237 through the served boundary: each added footprint carries its
+    /// sheet name, sheet file and footprint filters, the two channels one file
+    /// under two names, and the plan lists them with the addition.
+    #[tokio::test]
+    async fn an_added_footprint_carries_its_sheet() {
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        let plan = served.dry_run(SHEET_FIELDS).await;
+        let addition = &plan["changes"][1];
+        assert_eq!(addition["reference"], "C2", "{plan:#}");
+        assert_eq!(addition["sheet_name"], "/CH1/", "{plan:#}");
+        assert_eq!(addition["sheet_file"], "channel.kicad_sch", "{plan:#}");
+        assert_eq!(addition["footprint_filters"], "C_*", "{plan:#}");
+
+        let applied = served.apply(SHEET_FIELDS).await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+        let sheet = |reference: &str, name: &str, file: &str| {
+            (
+                reference.to_string(),
+                name.to_string(),
+                file.to_string(),
+                "C_*".to_string(),
+            )
+        };
+        assert_eq!(
+            sent_sheets(&served),
+            vec![
+                sheet("C1", "/", "sheet_fields.kicad_sch"),
+                sheet("C2", "/CH1/", "channel.kicad_sch"),
+                sheet("C3", "/CH2/", "channel.kicad_sch"),
+            ]
+        );
+    }
+
+    /// A board that did not keep a footprint's sheet is reported for that
+    /// footprint, as any other part of it the board did not keep.
+    #[tokio::test]
+    async fn the_readback_names_a_sheet_the_board_did_not_keep() {
+        let served = ServedSync::reading_back(Readback::WithoutSheet).await;
+        let applied = served.apply(SHEET_FIELDS).await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        let messages = applied["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|diagnostic| {
+                assert_eq!(diagnostic["code"], "board_readback_differs", "{applied:#}");
+                diagnostic["message"].as_str().unwrap().to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(messages.len(), 3, "{applied:#}");
+        assert!(
+            messages[1].contains(
+                "C2: sent sheet name \"/CH1/\", sheet file \"channel.kicad_sch\", \
+                 footprint filters \"C_*\", board now has sheet name \"\", sheet file \"\", \
+                 footprint filters \"\""
+            ),
+            "{}",
+            messages[1]
+        );
+    }
+
+    /// A footprint an earlier sync placed is linked to its symbol but has no
+    /// sheet name, sheet file or filters. Its sheet alone differs from the
+    /// schematic's, and that is an update, as in KiCad's Update PCB: the
+    /// footprint keeps its place and takes the sheet, and the next dry run has
+    /// nothing to do.
+    #[tokio::test]
+    async fn a_footprint_without_its_sheet_is_updated_to_it() {
+        use copperpour_ipc::gen::kiapi::board::types::FootprintInstance;
+        let mut footprint =
+            FootprintInstance::decode(schematic_backed_resistor().value.as_slice()).unwrap();
+        set_field_text(&mut footprint.value_field, "Value", "10k");
+        assert_eq!(SymbolSheet::of(&footprint), SymbolSheet::default());
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![copperpour_ipc::builders::pack_any(
+                &footprint,
+                "kiapi.board.types.FootprintInstance",
+            )],
+            zones: Vec::new(),
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+        let netlist = r1_at_10k();
+
+        let plan = served.dry_run(&netlist).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(
+            plan["coverage"]["footprints_updated"]["planned"], 1,
+            "{plan:#}"
+        );
+        assert_eq!(
+            plan["coverage"]["pads_reassigned"]["planned"], 0,
+            "{plan:#}"
+        );
+        assert_eq!(plan["changes"][0]["kind"], "update", "{plan:#}");
+        assert_eq!(plan["changes"][0]["sheet_name"], "/Power/", "{plan:#}");
+
+        let applied = served.apply(&netlist).await;
+        assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+        let held =
+            FootprintInstance::decode(served.held.lock().unwrap()[0].value.as_slice()).unwrap();
+        // The export names no `Sheetfile` or `ki_fp_filters` for it, so both
+        // are empty, as Update PCB leaves them.
+        assert_eq!(
+            SymbolSheet::of(&held),
+            SymbolSheet {
+                sheet_name: "/Power/".to_string(),
+                ..SymbolSheet::default()
+            }
+        );
+        assert_eq!(held.position, footprint.position);
+        assert_eq!(served.dry_run(&netlist).await["status"], "noop");
+    }
+
     /// #789's second increment through the served boundary. The added 0603
     /// carries its library's fields: Reference and Value on the library's
     /// layers with its visibility (Value on `F.Fab`, shown, not the hidden
@@ -7872,6 +8242,7 @@ mod tests {
             pad_nets: BTreeMap::new(),
             position: Point { x: 10.0, y: 10.0 },
             fields: Vec::new(),
+            sheet: SymbolSheet::default(),
         };
         let built_dnp = |part: &PreparedFootprint, dnp: bool| {
             let item =
@@ -8000,9 +8371,15 @@ mod tests {
         );
     }
 
-    /// KiCad holding the captured R1 at `value` under `kiid`, a KIID of
-    /// [`FOOTPRINT_CHILDREN`], which it answers `SaveDocumentToString` with.
-    async fn served_r1(kiid: &str, value: &str) -> ServedSync {
+    /// The captured R1 as `reference` at `value` under `kiid`, linked to the
+    /// symbol `symbol` on `/Power/`, with `sheet_name` as its sheet name.
+    fn captured_resistor(
+        kiid: &str,
+        reference: &str,
+        symbol: &str,
+        value: &str,
+        sheet_name: &str,
+    ) -> prost_types::Any {
         use copperpour_ipc::gen::kiapi;
 
         let mut footprint = kiapi::board::types::FootprintInstance::decode(
@@ -8013,7 +8390,7 @@ mod tests {
             value: kiid.to_string(),
         });
         footprint.symbol_path = Some(kiapi::common::types::SheetPath {
-            path: ["sheet-uuid", "symbol-uuid"]
+            path: ["sheet-uuid", symbol]
                 .into_iter()
                 .map(|value| kiapi::common::types::Kiid {
                     value: value.to_string(),
@@ -8021,17 +8398,37 @@ mod tests {
                 .collect(),
             path_human_readable: "/Power/".to_string(),
         });
+        footprint.symbol_sheet_name = sheet_name.to_string();
+        set_field_text(&mut footprint.reference_field, "Reference", reference);
         set_field_text(&mut footprint.value_field, "Value", value);
-        let held =
-            copperpour_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+        copperpour_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+    }
+
+    /// KiCad holding `footprints`, which answers `SaveDocumentToString` with
+    /// [`FOOTPRINT_CHILDREN`].
+    async fn served_children(footprints: Vec<prost_types::Any>) -> ServedSync {
         let served = ServedSync::holding(HeldBoard {
-            footprints: vec![held],
+            footprints,
             zones: Vec::new(),
             nets: vec!["VCC", "GND"],
         })
         .await;
         served.hold_board_text(FOOTPRINT_CHILDREN);
         served
+    }
+
+    /// KiCad holding the captured R1 at `value` under `kiid`, a KIID of
+    /// [`FOOTPRINT_CHILDREN`], with the sheet name KiCad's Update PCB gives it
+    /// (#237).
+    async fn served_r1(kiid: &str, value: &str) -> ServedSync {
+        served_children(vec![captured_resistor(
+            kiid,
+            "R1",
+            "symbol-uuid",
+            value,
+            "/Power/",
+        )])
+        .await
     }
 
     /// The schematic's R1, at 10k, on the captured footprint and its nets.
@@ -8161,6 +8558,192 @@ mod tests {
         let (plan, _) = dry_run_then_apply(&served).await;
 
         assert_refused(&plan, "what an update of R1 would drop is unknown");
+        assert_eq!(served.sent("UpdateItems"), 0);
+    }
+
+    /// R1 and R2 at 10k on `/Power/`, each on the captured footprint's nets.
+    const TWO_RESISTORS: &str = r#"
+(export
+  (components
+    (comp
+      (ref "R1")
+      (value "10k")
+      (footprint "Resistor_SMD:R_0402")
+      (sheetpath (names "/Power/") (tstamps "/sheet-uuid/"))
+      (tstamps "symbol-uuid")
+      (units (unit (name "A") (pins (pin (num "1")) (pin (num "2"))))))
+    (comp
+      (ref "R2")
+      (value "10k")
+      (footprint "Resistor_SMD:R_0402")
+      (sheetpath (names "/Power/") (tstamps "/sheet-uuid/"))
+      (tstamps "symbol-uuid-2")
+      (units (unit (name "A") (pins (pin (num "1")) (pin (num "2")))))))
+  (nets
+    (net (code "1") (name "VCC") (class "Default")
+      (node (ref "R1") (pin "1") (pintype "passive"))
+      (node (ref "R2") (pin "1") (pintype "passive")))
+    (net (code "2") (name "GND") (class "Default")
+      (node (ref "R1") (pin "2") (pintype "passive"))
+      (node (ref "R2") (pin "2") (pintype "passive")))))
+"#;
+
+    /// #237's first sync of a board an earlier sync built: R1 owns a group,
+    /// a point and a variant and lacks only its sheet, so it leaves the plan
+    /// with a diagnostic that refuses nothing, and R2's value change applies.
+    #[tokio::test]
+    async fn a_footprint_that_owns_them_and_lacks_only_its_sheet_is_left_out() {
+        use copperpour_ipc::gen::kiapi::board::types::FootprintInstance;
+
+        let r1 = captured_resistor(OWNS_ALL_THREE, "R1", "symbol-uuid", "10k", "");
+        let r2 = captured_resistor(OWNS_NONE, "R2", "symbol-uuid-2", "1k", "/Power/");
+        let served = served_children(vec![r1.clone(), r2]).await;
+
+        let plan = served.dry_run(TWO_RESISTORS).await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["coverage"]["footprints_updated"]["planned"], 1);
+        let changes = plan["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1, "{plan:#}");
+        assert_eq!(changes[0]["reference"], "R2");
+        let diagnostics = plan["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1, "{plan:#}");
+        assert_eq!(diagnostics[0]["code"], "footprint_sheet_not_updated");
+        assert_eq!(diagnostics[0]["reference"], "R1");
+        assert_eq!(diagnostics[0]["footprint_id"], "Resistor_SMD:R_0402");
+        let message = diagnostics[0]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with(
+                "R1 differs from the schematic only in its sheet name, sheet file or \
+                 footprint filters, and owns 1 group, 1 point and variant 'NoTimer'"
+            ),
+            "{message}"
+        );
+
+        let applied = served.apply(TWO_RESISTORS).await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["coverage"]["footprints_updated"]["applied"], 1);
+        assert_eq!(applied["diagnostics"], plan["diagnostics"], "{applied:#}");
+        assert_eq!(served.sent("UpdateItems"), 1);
+        let held = served.held.lock().unwrap().clone();
+        let held_as = |kiid: &str| {
+            held.iter()
+                .find(|item| footprint_kiid(item) == kiid)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(held_as(OWNS_ALL_THREE), r1, "R1 is left as it was");
+        let r2 = FootprintInstance::decode(held_as(OWNS_NONE).value.as_slice()).unwrap();
+        assert_eq!(board_footprint_from_instance(&r2).unwrap().value, "10k");
+    }
+
+    /// With nothing else to change, the plan is a no-op that still names R1.
+    #[tokio::test]
+    async fn a_plan_whose_only_update_is_left_out_is_a_noop() {
+        let served = served_children(vec![captured_resistor(
+            OWNS_ALL_THREE,
+            "R1",
+            "symbol-uuid",
+            "10k",
+            "",
+        )])
+        .await;
+
+        let (plan, applied) = dry_run_then_apply(&served).await;
+
+        for body in [&plan, &applied] {
+            assert_eq!(body["status"], "noop", "{body:#}");
+            assert_eq!(body["changes"], serde_json::json!([]));
+            assert_eq!(body["coverage"]["footprints_updated"]["planned"], 0);
+            assert_eq!(
+                body["diagnostics"][0]["code"],
+                "footprint_sheet_not_updated"
+            );
+        }
+        assert_eq!(served.sent("BeginCommit"), 0);
+    }
+
+    /// The dry run planned R1's sheet; it owns a group, a point and a variant
+    /// by the apply, so the apply would leave it out, and its plan is stale.
+    #[tokio::test]
+    async fn a_footprint_that_gains_them_after_a_sheet_only_dry_run_makes_the_plan_stale() {
+        let served = served_children(vec![captured_resistor(
+            OWNS_NONE,
+            "R1",
+            "symbol-uuid",
+            "10k",
+            "",
+        )])
+        .await;
+        let (_, plan) = served.dry_run_result(&r1_at_10k()).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+
+        // The same board with the two footprints' KIIDs swapped.
+        served.hold_board_text(
+            &FOOTPRINT_CHILDREN
+                .replace(OWNS_NONE, "\u{0}")
+                .replace(OWNS_ALL_THREE, OWNS_NONE)
+                .replace('\u{0}', OWNS_ALL_THREE),
+        );
+        let (_, applied) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic.to_string_lossy(),
+                "board": served.board.to_string_lossy(),
+                "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"],
+            }))
+            .await;
+
+        assert_eq!(applied["status"], "conflict", "{applied:#}");
+        let codes = applied["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|diagnostic| diagnostic["code"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(codes.contains(&"stale_plan_revision"), "{applied:#}");
+        assert_eq!(served.sent("UpdateItems"), 0);
+    }
+
+    /// A plan another update refuses lists only its conflicts: R2 is missing
+    /// from the board KiCad wrote, and R1, left out, is not named.
+    #[tokio::test]
+    async fn a_refused_plan_lists_only_its_conflicts() {
+        let missing = "00000000-0000-0000-0000-000000000836";
+        let served = served_children(vec![
+            captured_resistor(OWNS_ALL_THREE, "R1", "symbol-uuid", "10k", ""),
+            captured_resistor(missing, "R2", "symbol-uuid-2", "1k", "/Power/"),
+        ])
+        .await;
+
+        let plan = served.dry_run(TWO_RESISTORS).await;
+
+        assert_eq!(plan["status"], "conflict", "{plan:#}");
+        assert_eq!(plan["coverage"]["conflicts"]["planned"], 1, "{plan:#}");
+        let diagnostics = plan["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1, "{plan:#}");
+        assert_eq!(diagnostics[0]["code"], "footprint_children_not_carried");
+        assert_eq!(diagnostics[0]["reference"], "R2");
+    }
+
+    /// A footprint that lacks its sheet and differs in anything else as well
+    /// is refused as before.
+    #[tokio::test]
+    async fn a_footprint_that_owns_them_and_lacks_its_sheet_and_value_is_refused() {
+        let served = served_children(vec![captured_resistor(
+            OWNS_ALL_THREE,
+            "R1",
+            "symbol-uuid",
+            "1k",
+            "",
+        )])
+        .await;
+
+        let (plan, applied) = dry_run_then_apply(&served).await;
+
+        assert_refused(&plan, REFUSED_FOR);
+        assert_refused(&applied, REFUSED_FOR);
         assert_eq!(served.sent("UpdateItems"), 0);
     }
 
