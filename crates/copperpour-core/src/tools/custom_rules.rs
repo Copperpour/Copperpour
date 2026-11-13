@@ -32,10 +32,12 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 /// The constraint types a caller may write: those whose values are min, opt
-/// and max. Lengths are written in mm; `track_angle` and `via_count` are
-/// among KiCad's unitless types.
+/// and max, and the two that take none (`VALUELESS_TYPES`). Lengths are
+/// written in mm; `track_angle` and `via_count` are among KiCad's unitless
+/// types.
 const CALLER_TYPES: &[&str] = &[
     "annular_width",
+    "bridged_mask",
     "clearance",
     "connection_width",
     "courtyard_clearance",
@@ -62,8 +64,14 @@ const CALLER_TYPES: &[&str] = &[
     "track_segment_length",
     "track_width",
     "via_count",
+    "via_dangling",
     "via_diameter",
 ];
+
+/// The types that take no min, opt or max: KiCad's DRC reads only their
+/// rule's severity (`pcbnew/drc/drc_test_provider_solder_mask.cpp`,
+/// `pcbnew/drc/drc_test_provider_connectivity.cpp`).
+const VALUELESS_TYPES: &[&str] = &["bridged_mask", "via_dangling"];
 
 /// Every constraint type KiCad 10's rule parser reads.
 const FILE_TYPES: &[&str] = &[
@@ -208,7 +216,7 @@ pub(super) fn tool() -> ToolDef {
     tool!(
         "set_custom_rule",
         "Add or replace one named rule in the board's sibling .kicad_dru custom rules file: \
-         its constraints' min, opt and max values, and an optional condition, layer and \
+         its constraints and their min, opt and max values, and an optional condition, layer and \
          severity. A rule of the same name is replaced where it stands; a new one goes last, \
          where KiCad gives it precedence over every earlier rule that matches the same items. \
          The rest of the file is left as written. kicad-cli drops a rules file it cannot \
@@ -224,7 +232,7 @@ pub(super) fn tool() -> ToolDef {
                 "constraints": {
                     "type": "array",
                     "minItems": 1,
-                    "description": "The rule's constraints. Values are in mm, except track_angle in degrees and via_count as a count. disallow, zone_connection, min_resolved_spokes, assertion, via_dangling and bridged_mask take other arguments or none, and solder_paste_rel_margin is not a length, so this tool does not write them",
+                    "description": "The rule's constraints. Values are in mm, except track_angle in degrees and via_count as a count. bridged_mask and via_dangling take no value, and one given a value is refused: KiCad's DRC reads only the rule's severity. disallow, zone_connection, min_resolved_spokes and assertion take other arguments, and solder_paste_rel_margin is not a length, so this tool does not write them",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -292,12 +300,27 @@ impl Request {
             return Err(invalid_arg("name", "KiCad reads a rule name on one line"));
         }
         let mut constraints = Vec::new();
-        for item in args["constraints"].as_array().into_iter().flatten() {
+        for (index, item) in args["constraints"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
             let kind = require_str(item, "type")?;
-            let values = ["min", "opt", "max"]
+            let values: Vec<_> = ["min", "opt", "max"]
                 .into_iter()
                 .filter_map(|key| item[key].as_f64().map(|value| (key, value)))
                 .collect();
+            if VALUELESS_TYPES.contains(&kind) {
+                if let Some((key, _)) = values.first() {
+                    return Err(invalid_arg(
+                        &format!("constraints[{index}].{key}"),
+                        &format!(
+                            "{kind} takes no min, opt or max; KiCad reads only the rule's severity"
+                        ),
+                    ));
+                }
+            }
             constraints.push(Constraint {
                 kind: kind.to_string(),
                 values,
@@ -2123,6 +2146,54 @@ mod tests {
         assert_eq!(rules_of(&board).unwrap(), RULES);
     }
 
+    /// The form of KiCad's own example, a rule that lets solder mask bridge
+    /// (`pcbnew/dialogs/panel_setup_rules_help_9more_examples.md`).
+    #[tokio::test]
+    async fn a_constraint_that_takes_no_value_is_written_bare() {
+        let (_dir, board) = board_with(Some(RULES));
+        let body = call(json!({
+            "board": board, "name": "bridging", "severity": "ignore",
+            "condition": "A.memberOfFootprint('R1')",
+            "constraints": [{"type": "bridged_mask"}, {"type": "via_dangling"}]
+        }))
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        let written = "(rule \"bridging\"\n  (condition \"A.memberOfFootprint('R1')\")\n  \
+                       (constraint bridged_mask)\n  (constraint via_dangling)\n  \
+                       (severity ignore))";
+        assert_eq!(body["current"], json!(written));
+        assert_eq!(
+            rules_of(&board).unwrap(),
+            format!("{}\n\n{written}\n", RULES.trim_end())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_on_a_constraint_that_takes_none_is_refused() {
+        for (field, constraints) in [
+            (
+                "constraints[0].min",
+                json!([{"type": "bridged_mask", "min": 0.1}]),
+            ),
+            (
+                "constraints[1].max",
+                json!([{"type": "clearance", "min": 0.1}, {"type": "via_dangling", "max": 1}]),
+            ),
+            (
+                "constraints[0].opt",
+                json!([{"type": "via_dangling", "opt": 1, "max": 2}]),
+            ),
+        ] {
+            let (_dir, board) = board_with(Some(RULES));
+            let mut request = dp_pairs(&board);
+            request["constraints"] = constraints;
+            let body = call(request).await;
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], field, "{body}");
+            assert_eq!(rules_of(&board).unwrap(), RULES);
+        }
+    }
+
     #[tokio::test]
     async fn a_name_on_two_lines_is_refused_as_an_argument() {
         let (_dir, board) = board_with(Some(RULES));
@@ -2432,6 +2503,27 @@ mod tests {
             "{body}"
         );
         assert_eq!(rules_of(&board).unwrap(), written);
+    }
+
+    /// Live, as above: kicad-cli loads a rule whose constraints take no value.
+    ///
+    ///     KICAD_CLI=/usr/bin/kicad-cli \
+    ///     cargo test -p copperpour-core --lib custom_rules::tests::live -- --ignored
+    #[tokio::test]
+    #[ignore = "needs a real kicad-cli"]
+    async fn live_kicad_cli_loads_a_constraint_that_takes_no_value() {
+        let cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string());
+        let (_dir, board) = board_with(None);
+        let body = call_with(
+            &cli,
+            json!({
+                "board": board, "name": "bridging", "severity": "ignore",
+                "constraints": [{"type": "bridged_mask"}, {"type": "via_dangling"}]
+            }),
+        )
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(body["kicad_checked"], true, "{body}");
     }
 
     #[test]
