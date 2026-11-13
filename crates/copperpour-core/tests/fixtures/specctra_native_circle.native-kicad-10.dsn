@@ -1,0 +1,86 @@
+(pcb "board.dsn"
+  (parser
+    (string_quote ")
+    (space_in_quoted_tokens on)
+    (host_cad "KiCad's Pcbnew")
+    (host_version "10.0.6-10.0.6~ubuntu22.04.1")
+  )
+  (resolution um 10)
+  (unit um)
+  (structure
+    (layer F.Cu
+      (type signal)
+      (property
+        (index 0)
+      )
+    )
+    (layer B.Cu
+      (type signal)
+      (property
+        (index 1)
+      )
+    )
+    (boundary
+      (path pcb 0  130000 -70000  80000 -70000  80000 -30000  130000 -30000
+            130000 -70000)
+    )
+    (keepout "" (polygon signal 0  119574 -58043.2  119300 -58123.7  119040 -58242.4  118800 -58396.9
+            118584 -58584  118397 -58799.9  118242 -59040.3  118124 -59300.2
+            118043 -59574.3  118003 -59857.1  118003 -60142.9  118043 -60425.7
+            118124 -60699.8  118242 -60959.7  118397 -61200.1  118584 -61416
+            118800 -61603.1  119040 -61757.6  119300 -61876.3  119574 -61956.8
+            119857 -61997.5  120143 -61997.5  120426 -61956.8  120700 -61876.3
+            120960 -61757.6  121200 -61603.1  121416 -61416  121603 -61200.1
+            121758 -60959.7  121876 -60699.8  121957 -60425.7  121997 -60142.9
+            122000 -60000  121997 -59857.1  121957 -59574.3  121876 -59300.2
+            121758 -59040.3  121603 -58799.9  121416 -58584  121200 -58396.9
+            120960 -58242.4  120700 -58123.7  120426 -58043.2  120143 -58002.5
+            119857 -58002.5  119574 -58043.2))
+    (via "Via[0-1]_600:300_um")
+    (rule
+      (width 200)
+      (clearance 200)
+      (clearance 50 (type smd_smd))
+    )
+  )
+  (placement
+    (component Resistor_SMD:R_0402
+      (place R1 100000 -50000 front 0 (PN 10k))
+      (place R2 110000 -50000 front 0 (PN 4.7k))
+    )
+  )
+  (library
+    (image Resistor_SMD:R_0402
+      (pin Rect[T]Pad_600.000000x500.000000_um 1 -500 0)
+      (pin Rect[T]Pad_600.000000x500.000000_um 2 500 0)
+    )
+    (padstack Rect[T]Pad_600.000000x500.000000_um
+      (shape (rect F.Cu -300 -250 300 250))
+      (attach off)
+    )
+    (padstack "Via[0-1]_600:300_um"
+      (shape (circle F.Cu 600))
+      (shape (circle B.Cu 600))
+      (attach off)
+    )
+  )
+  (network
+    (net VCC
+      (pins R1-1 R2-2)
+    )
+    (net GND
+      (pins R1-2 R2-1)
+    )
+    (class kicad_default GND VCC
+      (circuit
+        (use_via "Via[0-1]_600:300_um")
+      )
+      (rule
+        (width 200)
+        (clearance 200)
+      )
+    )
+  )
+  (wiring
+  )
+)

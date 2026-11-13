@@ -281,7 +281,9 @@ zones or unlocked routing are refused before anything changes.
 Optionally, KiCad 10 can export the board itself instead of Copperpour's own
 exporter: enable the **native Specctra bridge** in Copperpour's settings dialog and
 set `native_bridge_mode` to `"prefer"` (fall back to Copperpour's exporter) or
-`"require"` (fail if KiCad's export is unavailable).
+`"require"` (fail if native export is unavailable or invalid). Native export is
+attempted before Rust-only outline checks; shared import-safety limits still apply.
+See [the mode contract](docs/KICAD_INTEGRATION.md).
 
 </details>
 

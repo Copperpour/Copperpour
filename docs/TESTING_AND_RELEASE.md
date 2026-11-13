@@ -202,3 +202,23 @@ installed, and the one-time drift notice does not suppress rules on later starts
 Resource-not-found and malformed-parameter errors remain JSON-RPC errors; bad
 `get_guidance` inputs remain structured tool errors. Local profile edits are not
 served as resources. The normal workspace gates cover catalog/installer sharing.
+
+## Native/Rust Specctra selection (#72)
+
+`cargo test -p copperpour-core --locked --lib specctra` covers the shared model,
+existing parser/adoption corpus and exporter selection. The native-profile mode
+matrix uses a child process with an isolated bridge directory, an authenticated
+HTTP bridge double serving KiCad-authored DSNs and a bound IPC double. It checks
+all modes, unavailable/invalid native exports, Rust fallback, shared safety
+refusals and post-export source changes. Model identities are compared against
+the historical Rust-DSN-derived identities on existing fixtures.
+
+The circular-cutout fixture is generated/exported by KiCad and routed by
+Freerouting. Its manifest-bound SES apply is served with an IPC double and a
+native-import board oracle; created geometry/layers/nets are compared with that
+oracle. The default test uses a DRC stub only for control-flow evidence. For real
+KiCad DRC on the resulting candidate, run
+`cargo test -p copperpour-core --locked --lib native_profile_circle_manifest_apply_with_native_drc -- --ignored --nocapture`.
+This does not claim a real GUI IPC transaction; native bridge/UI observations
+on other platforms remain separate evidence. Fixture provenance is recorded
+beside the board.

@@ -1,0 +1,61 @@
+(session "specctra_native_circle.native-kicad-10"
+  (base_design "specctra_native_circle.native-kicad-10")
+  (placement
+    (resolution um 10)
+    (component "Resistor_SMD:R_0402"
+      (place R1 1000000 -500000 front 0)
+      (place R2 1100000 -500000 front 0)
+    )
+  )
+  (was_is
+  )
+  (routes 
+    (resolution um 10)
+    (parser
+      (host_cad "KiCad's Pcbnew")
+      (host_version "10.0.6-10.0.6~ubuntu22.04.1")
+    )
+    (library_out 
+      (padstack "Via[0-1]_600:300_um"
+        (shape
+          (circle F.Cu 6000 0 0)
+        )
+        (shape
+          (circle B.Cu 6000 0 0)
+        )
+        (attach off)
+      )
+    )
+    (network_out 
+      (net VCC
+        (wire
+          (path F.Cu 2000
+            1105000 -500000
+            1105000 -505517
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            995000 -504508
+            996009 -505517
+            1105000 -505517
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            995000 -500000
+            995000 -504508
+          )
+        )
+      )
+      (net GND
+        (wire
+          (path F.Cu 2000
+            1095000 -500000
+            1005000 -500000
+          )
+        )
+      )
+    )
+  )
+)
