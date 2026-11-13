@@ -619,7 +619,7 @@ fn project_lock_refusal_from(
             "kicad_project_lock_present",
             format!(
                 "KiCad's project lock '{}' is present, so a KiCad program holds this project.",
-                lock_path.display()
+                display_path(&lock_path)
             ),
         ),
         live_board::EditorLock::Unreadable(lock_path, error) => (
@@ -627,7 +627,7 @@ fn project_lock_refusal_from(
             format!(
                 "KiCad's project lock '{}' could not be inspected ({error}), so a KiCad program \
                  holding this project cannot be ruled out.",
-                lock_path.display()
+                display_path(&lock_path)
             ),
         ),
     };
@@ -4660,6 +4660,31 @@ mod board_session_safety_tests {
             let message = body["message"].as_str().expect("a message");
             assert!(
                 message.contains(r"'C:\proj\~board.kicad_pcb.lck'"),
+                "{message}"
+            );
+            assert!(!message.contains(r"\\?\"), "{message}");
+        }
+    }
+
+    /// The project lock is resolved the same way, so its refusal shows the
+    /// lock as a user can paste it back too (#673, #804).
+    #[test]
+    fn a_project_lock_refusal_names_the_lock_without_the_verbatim_prefix() {
+        let project = std::path::Path::new(r"C:\proj\demo.kicad_pro");
+        let lock = std::path::PathBuf::from(r"\\?\C:\proj\~demo.kicad_pro.lck");
+        let denied = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+
+        for observed in [
+            live_board::EditorLock::Present(lock.clone()),
+            live_board::EditorLock::Unreadable(lock.clone(), denied()),
+        ] {
+            let result = project_lock_refusal_from(project, "netclass change", observed)
+                .expect("a lock refuses");
+            let body: serde_json::Value =
+                serde_json::from_str(&super::mounting_hole_tests::result_text(&result)).unwrap();
+            let message = body["message"].as_str().expect("a message");
+            assert!(
+                message.contains(r"'C:\proj\~demo.kicad_pro.lck'"),
                 "{message}"
             );
             assert!(!message.contains(r"\\?\"), "{message}");
