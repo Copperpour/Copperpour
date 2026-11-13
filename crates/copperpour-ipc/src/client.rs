@@ -2826,10 +2826,23 @@ impl KiCadIpcClient {
 
     /// Wait for the bound board to accept reads after an asynchronous operation.
     /// Only KiCad's explicit AS_BUSY response is retried; mutations are never replayed.
+    ///
+    /// The probe is a `GetItems`: in KiCad 10.0.8 `GetOpenDocuments` never
+    /// answers AS_BUSY, only commands that run `checkForBusy()` do (`GetItems`,
+    /// `SaveDocument`, `RefillZones`). A probe through the document lookup
+    /// alone ended the wait while a zone refill was still running, and the
+    /// `SaveDocument` after it failed with AS_BUSY. Dimensions are asked for
+    /// because a board has few of them, so the probe stays cheap.
     pub fn wait_for_board_ready(&self, timeout: std::time::Duration) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            match self.get_board_document() {
+            let probe = self.get_board_document().and_then(|document| {
+                self.get_items_of_types_in(
+                    document,
+                    &[kiapi::common::types::KiCadObjectType::KotPcbDimension],
+                )
+            });
+            match probe {
                 Ok(_) => return Ok(()),
                 Err(error) => {
                     let busy = ApiStatusError::from_error(&error).is_some_and(|status| {

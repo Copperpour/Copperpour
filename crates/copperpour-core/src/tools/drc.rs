@@ -330,7 +330,9 @@ mod tests {
             let command = request.message.unwrap();
             let name = command.type_url.rsplit('/').next().unwrap().to_string();
             commands.lock().unwrap().push(name.clone());
-            if *busy.lock().unwrap() && name == "kiapi.common.commands.GetOpenDocuments" {
+            // Like KiCad 10.0.8: GetOpenDocuments never reports AS_BUSY, the
+            // item reads (and saves) do. The readiness probe must see this.
+            if *busy.lock().unwrap() && name == "kiapi.common.commands.GetItems" {
                 if mode != "busy-forever" {
                     *busy.lock().unwrap() = false;
                 }
@@ -362,6 +364,17 @@ mod tests {
                             },
                         },
                         "kiapi.common.commands.GetOpenDocumentsResponse",
+                    ),
+                    false,
+                ),
+                "kiapi.common.commands.GetItems" => response(
+                    packed(
+                        kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items: vec![],
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
                     ),
                     false,
                 ),
