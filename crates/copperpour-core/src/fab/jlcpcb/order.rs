@@ -749,7 +749,7 @@ mod tests {
         let bytes = zip_files(&files).unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_owned())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
             .collect();
         assert_eq!(names, ["a-PTH.drl", "b-F_Cu.gtl"]);
         let mut text = String::new();
