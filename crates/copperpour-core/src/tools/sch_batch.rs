@@ -526,7 +526,7 @@ fn batch_net_name(args: &serde_json::Value) -> Result<String, CallToolResult> {
     }
 }
 
-async fn handle_batch_connect_to_net(
+pub(crate) async fn handle_batch_connect_to_net(
     args: &serde_json::Value,
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
