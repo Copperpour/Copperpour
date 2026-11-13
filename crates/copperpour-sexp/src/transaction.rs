@@ -258,8 +258,10 @@ pub struct TransactionFailure {
     pub error: SexpError,
     /// The journal that reached disk, so this transaction's targets may
     /// already hold their replacements and recovery may still complete them.
-    /// `None` means none of its targets was touched.
-    pub journal: Option<PathBuf>,
+    /// `None` means none of its targets was touched. Boxed, so the error
+    /// stays under clippy's `result_large_err` limit where `PathBuf` is
+    /// larger, as on Windows.
+    pub journal: Option<Box<Path>>,
 }
 
 /// [`commit_file_transaction`], reporting whether a failure came before any
@@ -300,7 +302,7 @@ pub fn try_commit_file_transaction(
         error,
         journal: std::fs::symlink_metadata(&journal_path)
             .is_ok()
-            .then(|| journal_path.clone()),
+            .then(|| journal_path.clone().into_boxed_path()),
     })?;
 
     (|| -> Result<(), SexpError> {
@@ -312,7 +314,7 @@ pub fn try_commit_file_transaction(
     })()
     .map_err(|error| TransactionFailure {
         error,
-        journal: Some(journal_path.clone()),
+        journal: Some(journal_path.into_boxed_path()),
     })?;
 
     Ok(TransactionCommit {
@@ -916,7 +918,7 @@ mod tests {
         assert!(name.starts_with(".copperpour-transaction-"), "{name}");
         let active = inspect_file_transactions(directory.path()).unwrap();
         assert_eq!(active.len(), 1);
-        assert_eq!(active[0].journal, journal);
+        assert_eq!(active[0].journal.as_path(), &*journal);
     }
 
     #[cfg(unix)]
