@@ -918,7 +918,7 @@ mod tests {
         assert!(name.starts_with(".copperpour-transaction-"), "{name}");
         let active = inspect_file_transactions(directory.path()).unwrap();
         assert_eq!(active.len(), 1);
-        assert_eq!(active[0].journal, journal);
+        assert_eq!(active[0].journal.as_path(), &*journal);
     }
 
     #[cfg(unix)]
