@@ -29,7 +29,10 @@ the workspace `Cargo.toml`. Not tracked automatically: `cargoBuildFlags`
 (`-p copperpour --bin copperpour`) and `preCheck` (exports `COPPERPOUR_STATE_DIR`).
 **Renaming the binary, adding a workspace member the server depends on, or adding a test
 that needs another env var breaks only the Nix build** — the `Nix flake` CI job catches
-that, so treat its failure as a real break.
+that, so treat its failure as a real break. `dontCargoUseSystemLibs` keeps nixpkgs'
+cargo hook from switching `aws-lc-sys` and `libsqlite3-sys` to system libraries
+([#494](https://github.com/Copperpour/Copperpour/issues/494)); removing it breaks the
+build.
 
 ## Architecture
 

@@ -59,6 +59,12 @@
           PROTOC = "${pkgs.protobuf}/bin/protoc";
           PROTOC_INCLUDE = "${pkgs.protobuf}/include";
 
+          # Since NixOS/nixpkgs#537108, cargoSetupHook forces -sys crates onto
+          # system libraries (aws-lc-sys, libsqlite3-sys, ...). Opt out of all
+          # of it, so the vendored C libraries match the release builds
+          # (Copperpour/Copperpour#494).
+          dontCargoUseSystemLibs = true;
+
           cargoBuildFlags = [
             "-p"
             "copperpour"
