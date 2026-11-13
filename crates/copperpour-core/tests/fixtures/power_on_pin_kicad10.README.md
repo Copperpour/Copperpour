@@ -147,3 +147,23 @@ off the 1.27mm grid on both axes. KiCad's netlist of the demo puts C4.2 on
 
 D2 pin 2 looks like a simpler choice, but it is not usable here: its snapped
 point falls on D2's own wire, so both placements join it to GND.
+
+## Strict bus and analysis resolution (#415)
+
+`tests/strict_pin_resolution.rs` exercises `connect_pins_to_bus`,
+`get_pin_connections` and `get_pin_net_name` through served dispatch. R4.1
+must be refused/skipped, with byte-identical files for calls with no valid
+items. Missing R99.1 and R1.99 are stale. A mixed bus call connects only its
+valid item. R1.2, U1.8 and U2.3 still resolve at the ERC positions above;
+readback checks the saved labels and the analysis tools observe `SIG`.
+
+The same tests use the unchanged stock `power_on_off_grid_pin.kicad_sch`
+demo: D2 uses sheet-local `lib_name` `DIODE_5` with base ID
+`Simulation_SPICE:DIODE`. Its pin 2 is at `(131.572, 96.52)` and KiCad's
+XML netlist puts it on `/d2` with C2.2, C4.1 and D3.1. The bus resolver must
+use that sheet-local definition. Oracle commands (rerun with KiCad 10.0.8):
+
+```text
+kicad-cli sch erc --severity-all power_on_pin_kicad10.kicad_sch
+kicad-cli sch export netlist --format kicadxml power_on_off_grid_pin.kicad_sch
+```

@@ -21,13 +21,10 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, opt_f64, opt_str, require_f64, ToolContext, ToolDef};
+use crate::tools::{get_path, opt_f64, opt_str, require_f64, PlacedPins, ToolContext, ToolDef};
 use copperpour_sexp::{
     parser::parse_sexp,
-    schematic::{
-        extract_lib_pins_for_unit, extract_symbol_instances, format_bus, format_bus_entry,
-        format_net_label, format_wire, pin_endpoint, BusEntryDirection,
-    },
+    schematic::{format_bus, format_bus_entry, format_net_label, format_wire, BusEntryDirection},
 };
 use serde_json::json;
 
@@ -343,11 +340,7 @@ async fn handle_connect_pins_to_bus(
         Ok(t) => t,
         Err(e) => return Ok(CallToolResult::error(format!("Parse error: {e}"))),
     };
-    let instances = extract_symbol_instances(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
+    let placed_pins = PlacedPins::new(&tree);
 
     let mut inserts = String::new();
     let mut added: Vec<serde_json::Value> = Vec::new();
@@ -366,25 +359,10 @@ async fn handle_connect_pins_to_bus(
             }
         };
 
-        // Resolve against the unit that actually owns the pin — a multi-unit
-        // part repeats its reference on every unit.
-        let ep = instances
-            .iter()
-            .filter(|i| i.reference == reference)
-            .find_map(|inst| {
-                let sym = lib_syms
-                    .iter()
-                    .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))?;
-                extract_lib_pins_for_unit(sym, inst.unit)
-                    .into_iter()
-                    .find(|p| p.number == pin_number)
-                    .map(|p| pin_endpoint(&p, inst.pin_transform()))
-            });
-
-        let (px, py) = match ep {
-            Some(v) => v,
-            None => {
-                errors.push(format!("Pin {pin_number} of '{reference}' not found"));
+        let (px, py) = match placed_pins.resolve(reference, pin_number) {
+            Ok(pin) => pin.endpoint(),
+            Err(refusal) => {
+                errors.push(refusal.describe());
                 continue;
             }
         };
