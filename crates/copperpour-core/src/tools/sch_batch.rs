@@ -95,6 +95,45 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_batch_connect_to_net(args, ctx).await }
         ),
         tool!(
+            "batch_add_schematic_net_label",
+            "Add multiple net labels in a single file read/write cycle, each as \
+             add_schematic_net_label takes it: a sheet's hierarchical labels are one call. \
+             Every label is checked before the file is touched, so a malformed one adds \
+             none. `added` is read back from the written file, with each label's uuid.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "labels": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "net": { "type": "string", "description": "Net name" },
+                                "x": { "type": "number" }, "y": { "type": "number" },
+                                "rotation": { "type": "number", "default": 0 },
+                                "label_type": {
+                                    "type": "string",
+                                    "enum": super::sch_wiring::LABEL_TYPES,
+                                    "default": "net_label"
+                                },
+                                "shape": {
+                                    "type": "string",
+                                    "enum": super::sch_hierarchy::ALLOWED_PIN_TYPES,
+                                    "description": "Shape of a global or hierarchical label, input when omitted; a net_label has none"
+                                }
+                            },
+                            "required": ["net", "x", "y"]
+                        }
+                    }
+                },
+                "required": ["schematic", "labels"]
+            }),
+            |args, ctx| async move {
+                super::sch_wiring::handle_batch_add_schematic_net_label(args, ctx).await
+            }
+        ),
+        tool!(
             "batch_add_power_symbol",
             "Tie several pins to one power net the way a schematic is drawn by hand: pins \
              that face the same way, sit on one row and lie within max_gap of a neighbour \

@@ -140,6 +140,7 @@ pattern.
 | Bus signals (D0-D7)                     | `connect_to_net`        | Net labels with bus naming               |
 | Cross-sheet signal                      | Global label            | Connects across schematic sheets         |
 | Multiple pins to same net (3+)          | `batch_connect_to_net`  | Efficient bulk operation                 |
+| A sheet's hierarchical labels           | `batch_add_schematic_net_label` | One write for every signal       |
 
 ### connect_pins
 
