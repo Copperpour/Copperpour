@@ -68,3 +68,25 @@ The tests refuse `F.Silk`, `Not.A.Layer` and the numbers in the last row, and
 still write `F.SilkS`. The display names in the row above it name a layer
 Copperpour knows, so the tools accept them but write the canonical name
 (`F.SilkS`, `Cmts.User`, `Dwgs.User`) instead (#99).
+
+## Board-info source-policy regression (#468)
+
+The served `board_info_source_tests` reuse these unchanged KiCad-resaved bytes.
+KiCad 10.0.8 independently confirms the saved count with:
+
+```sh
+kicad-cli pcb export gerbers -o /tmp/board-info-gerbers/ six_layer_power_planes_kicad10.kicad_pcb
+kicad-cli pcb export ipcd356 -o /tmp/board-info.ipc six_layer_power_planes_kicad10.kicad_pcb
+```
+
+| Observation | Expected result |
+|---|---|
+| Saved copper plots | 6: F.Cu, In1.Cu, In2.Cu, In3.Cu, In4.Cu, B.Cu |
+| All enabled layer plots | 20 |
+| Saved IPC-D-356 nets | 0 (header and terminator only, no net records) |
+| IPC double (deliberately different from the saved board) | 2 copper layers, 3 real nets, title `Live title` |
+| Each required live query returns AS_OK without a payload | Error naming the unavailable domain; no saved metadata substituted |
+| Saved selection / board proven not open | Saved six-layer count with source evidence |
+| Live paper settings | Saved A4, independently disclosed from live metadata |
+
+The IPC double is deterministic protocol evidence, not a real-editor observation.

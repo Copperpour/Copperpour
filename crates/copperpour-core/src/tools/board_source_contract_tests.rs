@@ -616,19 +616,22 @@ async fn live_refuses_when_no_kicad_is_reachable() {
 async fn a_failure_after_identification_is_not_answered_from_the_file() {
     let scene = Scene::rejecting().await;
 
-    for mode in [Some("auto"), Some("live")] {
-        let result = scene.call("get_layer_list", mode).await;
-        assert!(result.is_error, "{mode:?}: {:?}", body_of(&result));
-        assert_eq!(
-            kind_of(&result).as_deref(),
-            Some("editor_unavailable"),
-            "{mode:?}"
-        );
-        let refusal = body_of(&result).to_string();
-        assert!(
-            !refusal.contains(SAVED_ONLY_LAYERS[0]) && !refusal.contains(SAVED_FAB_DISPLAY_NAME),
-            "{mode:?}: the saved stackup must not be reported as this board's state: {refusal}"
-        );
+    for tool in ["get_layer_list", "get_board_info"] {
+        for mode in [Some("auto"), Some("live")] {
+            let result = scene.call(tool, mode).await;
+            assert!(result.is_error, "{mode:?}: {:?}", body_of(&result));
+            assert_eq!(
+                kind_of(&result).as_deref(),
+                Some("editor_unavailable"),
+                "{mode:?}"
+            );
+            let refusal = body_of(&result).to_string();
+            assert!(
+                !refusal.contains(SAVED_ONLY_LAYERS[0])
+                    && !refusal.contains(SAVED_FAB_DISPLAY_NAME),
+                "{mode:?}: the saved stackup must not be reported as this board's state: {refusal}"
+            );
+        }
     }
 }
 
