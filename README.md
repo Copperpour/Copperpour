@@ -100,18 +100,9 @@ Requires **KiCad 10** on Windows, macOS or Linux.
 
 Verify: **PCB Editor → Tools → External Plugins** lists **Copperpour**.
 
-### macOS: point Copperpour at KiCad
-
 <a id="macos"></a>
-
-KiCad's tools live inside the app bundle and aren't on `PATH`. Add to
-`~/Library/Application Support/copperpour/config.toml`:
-
-```toml
-kicad_cli = "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"
-kicad_binary = "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad"
-ipc_address = "ipc:///tmp/kicad/api.sock"
-```
+Copperpour finds KiCad executables on `PATH` and in standard install locations,
+including the macOS app bundle. Normal installations need no manual path settings.
 
 ### Step 2: Register the MCP server
 
@@ -206,6 +197,8 @@ Upgrading from Konnect? See [Migrating from Konnect](docs/MIGRATING_FROM_KONNECT
 ## Advanced installation
 
 You don't need any of this for a normal install. Expand a section when you need it.
+For unusual KiCad locations or a custom API socket, see
+[Manual configuration](docs/CONFIGURATION.md).
 
 <details>
 <summary><b>Standalone binary</b>: run the server without the KiCad plugin</summary>

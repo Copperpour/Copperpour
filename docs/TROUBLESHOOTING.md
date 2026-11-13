@@ -429,15 +429,16 @@ result is not what you expect.
 
 ## "kicad-cli not found"
 
-Common install paths are auto-detected (including the Windows registry). If
-your install is somewhere unusual, set the path in the plugin settings dialog
-in a `settings.json` beside the binary, or in a `copperpour.toml` in the working directory (`kicad_cli`). Discovery order is `copperpour.toml`, `konnect.toml` (its name before the rename) and `settings.json` in the CWD, then `settings.json` next to the binary and one level up, then the platform config dir. **Only the first existing file is loaded — later ones are not merged in**, so a `kicad_cli` set in a lower-priority file is ignored while a higher-priority file exists. A file under any other name is only read when passed with `--config`.
+Common install paths are auto-detected (including the Windows registry and macOS
+app bundle). Call `get_installation_info`: its `kicad` block reports the resolved
+CLI path and probe status. `not_found` with a null `cli_path` means discovery
+found no CLI.
 
-If a setting appears to be ignored, call `get_installation_info` and read its
-`configuration` block: `selected_path` is the file that configured the running
-process and `skipped_existing_paths` lists the ones it shadowed. That
-distinguishes "my file was never read" from "my file was read and the value is
-wrong", which otherwise look identical.
+For an unusual install location, follow [Manual configuration](CONFIGURATION.md).
+If a setting appears to be ignored, inspect the tool's `configuration` block:
+`selected_path` identifies the file used by the running server, and
+`skipped_existing_paths` lists files it shadowed. Only the first existing file is
+loaded; settings from later files are not merged.
 
 ## Native Specctra export used the Rust fallback
 
