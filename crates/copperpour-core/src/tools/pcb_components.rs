@@ -1250,6 +1250,10 @@ impl ClosedBoardError {
             Self::Io(error) if crate::tools::readback_mismatch_path(&error).is_some() => {
                 return Err(error)
             }
+            // Refused before the write: dispatch answers `conflict`.
+            Self::Io(error) if crate::tools::revision_conflict_path(&error).is_some() => {
+                return Err(error)
+            }
             Self::Io(error) => CallToolResult::error(format!("{error:#}")),
         })
     }

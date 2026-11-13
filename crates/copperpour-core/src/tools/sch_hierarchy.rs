@@ -354,8 +354,18 @@ pub(crate) async fn handle_create_schematic(
     // Write the template then immediately load/save through cse so the file
     // is normalised to cse's writer output format.
     write_new_atomic(&path, &template)?;
-    let sch = cse::Schematic::load(&path)?;
-    sch.overwrite()?;
+    // The file exists now, so a failure from here on is not a refusal.
+    if let Err(error) = cse::Schematic::load(&path).and_then(|sch| sch.overwrite()) {
+        let error = anyhow::Error::from(error);
+        if crate::tools::readback_mismatch_path(&error).is_some() {
+            return Err(error);
+        }
+        return Ok(crate::tools::mutation_outcome_uncertain(
+            &path,
+            "create_schematic",
+            format!("the created schematic could not be rewritten: {error}"),
+        ));
+    }
     Ok(CallToolResult::json(&json!({
         "created": path.display().to_string(),
         "size": size,

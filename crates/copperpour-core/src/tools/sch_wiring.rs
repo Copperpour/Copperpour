@@ -2773,7 +2773,17 @@ async fn handle_add_power_symbol(
 
     // A power pin landing mid-segment on an existing wire needs a junction
     // dot, or KiCad ERC reports it as not connected.
-    let junctions_added = crate::tools::add_pin_midwire_junctions(&sch_path, &pwr_ref)?;
+    let junctions_added = match crate::tools::add_pin_midwire_junctions(&sch_path, &pwr_ref) {
+        Ok(junctions) => junctions,
+        Err(error) if crate::tools::readback_mismatch_path(&error).is_some() => return Err(error),
+        Err(error) => {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "add_power_symbol",
+                format!("post-write junction processing failed: {error}"),
+            ))
+        }
+    };
     let committed = cse::Schematic::load(&sch_path)?;
     let mut observed = match super::sch_components::placed_component_readback(
         &sch_path, &committed, &placement, &context,

@@ -539,6 +539,17 @@ impl McpHandler {
                         )
                     }
                 }
+                // The file changed after the tool read it, and the writer
+                // refused before replacing it: a refusal, as a structured
+                // `conflict` from the tool would be.
+                Err(e) if crate::tools::revision_conflict_path(&e).is_some() => {
+                    let path = crate::tools::revision_conflict_path(&e).expect("guard matched");
+                    (
+                        crate::tools::revision_conflict_result(path, name),
+                        CallStatus::Error,
+                        Some("conflict".to_string()),
+                    )
+                }
                 Err(e) => {
                     warn!(tool = %name, error = %e, "tool handler returned anyhow::Error");
                     let kind = ToolErrorKind::HandlerError {
