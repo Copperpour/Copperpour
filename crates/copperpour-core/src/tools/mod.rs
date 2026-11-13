@@ -70,6 +70,8 @@ mod project_file_writer_tests;
 mod readback_mismatch_tests;
 mod reference_hint;
 #[cfg(test)]
+mod revision_conflict_tests;
+#[cfg(test)]
 mod route_obstacle_tests;
 pub mod sch_analysis;
 pub(crate) mod sch_annotate;
@@ -1176,6 +1178,35 @@ pub(crate) fn readback_mismatch_path(error: &anyhow::Error) -> Option<&std::path
         }
     }
     None
+}
+
+/// The file a write refused because it changed after the caller read it, when
+/// that is what `error` reports. The writer refuses before the rename, so
+/// nothing was written to it: a `conflict` refusal, not an uncertain outcome.
+pub(crate) fn revision_conflict_path(error: &anyhow::Error) -> Option<&std::path::Path> {
+    for cause in error.chain() {
+        if let Some(copperpour_sexp::SexpError::Conflict { path }) = cause.downcast_ref() {
+            return Some(path);
+        }
+        if let Some(copperpour_schematic_editor::Error::Conflict(path)) = cause.downcast_ref() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// The `conflict` refusal for a write `operation` that the writer refused
+/// because `path` changed after it was read.
+pub(crate) fn revision_conflict_result(path: &std::path::Path, operation: &str) -> CallToolResult {
+    let extension = path.extension().and_then(|e| e.to_str());
+    let what = match extension.map(str::to_ascii_lowercase).as_deref() {
+        Some("kicad_sch") => "schematic",
+        Some("kicad_pcb") => "board",
+        Some("kicad_sym") => "symbol library",
+        Some("kicad_mod") => "footprint",
+        _ => "file",
+    };
+    changed_after_read(path, what, operation)
 }
 
 /// The `mutation_outcome_uncertain` result for a write `operation` that

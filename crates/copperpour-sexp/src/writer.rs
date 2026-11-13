@@ -158,6 +158,8 @@ pub fn write_atomic_if_unchanged(
 ) -> Result<(), SexpError> {
     let _lock = lock_document_exclusive(path)?;
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    test_hooks::run_before_compare(path);
     let current = read_string_unlocked(path)?;
     if current != expected {
         return Err(SexpError::Conflict {
@@ -183,16 +185,24 @@ fn read_back(path: &Path, written: &str) -> Result<(), SexpError> {
 }
 
 /// Test seam for another program saving a document between Copperpour's
-/// rename and its readback, which no test can time from outside. Built only
-/// with the `test-hooks` feature, which dependents enable for their tests.
+/// rename and its readback, or between its read and its write, which no test
+/// can time from outside. Built only with the `test-hooks` feature, which
+/// dependents enable for their tests.
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod test_hooks {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard};
 
-    static SAVES: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+    /// When an armed save runs.
+    #[derive(PartialEq)]
+    enum Moment {
+        AfterReplace,
+        BeforeCompare,
+    }
 
-    fn saves() -> MutexGuard<'static, Vec<(PathBuf, String)>> {
+    static SAVES: Mutex<Vec<(PathBuf, Moment, String)>> = Mutex::new(Vec::new());
+
+    fn saves() -> MutexGuard<'static, Vec<(PathBuf, Moment, String)>> {
         SAVES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -208,23 +218,40 @@ pub mod test_hooks {
     /// Save `content` to `path` after the next write replaces it, before
     /// that write reads it back.
     pub fn save_after_replace(path: &Path, content: impl Into<String>) {
-        saves().push((key(path), content.into()));
+        saves().push((key(path), Moment::AfterReplace, content.into()));
+    }
+
+    /// Save `content` to `path` once the next write holds its lock, before
+    /// that write compares the file with what its caller read.
+    pub fn save_before_compare(path: &Path, content: impl Into<String>) {
+        saves().push((key(path), Moment::BeforeCompare, content.into()));
     }
 
     /// Whether a save armed for `path` is still waiting for a write.
     pub fn armed(path: &Path) -> bool {
         let key = key(path);
-        saves().iter().any(|(armed, _)| *armed == key)
+        saves().iter().any(|(armed, _, _)| *armed == key)
     }
 
     pub(super) fn run(path: &Path) {
+        run_at(path, Moment::AfterReplace);
+    }
+
+    pub(super) fn run_before_compare(path: &Path) {
+        run_at(path, Moment::BeforeCompare);
+    }
+
+    fn run_at(path: &Path, moment: Moment) {
         let mut saves = saves();
         if saves.is_empty() {
             return;
         }
         let key = key(path);
-        if let Some(index) = saves.iter().position(|(armed, _)| *armed == key) {
-            let (_, content) = saves.remove(index);
+        if let Some(index) = saves
+            .iter()
+            .position(|(armed, when, _)| *armed == key && *when == moment)
+        {
+            let (_, _, content) = saves.remove(index);
             std::fs::write(path, content).unwrap();
         }
     }
