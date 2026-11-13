@@ -25,6 +25,12 @@ and *runtime diagnostics*. The standalone Unix executable running exclusively
 over stdio also advertises `reload_server`; embedded, HTTP, mixed-transport,
 and Windows servers do not.
 
+### Guidance
+
+| Tool | Purpose |
+|------|---------|
+| `get_guidance` | Read this build’s bundled skills and references without installing files. Omit `path` to list all exact bundle paths; pass a listed path such as `copperpour/SKILL.md` to return MCP-shaped `contents`. Read-only, always visible, no filesystem or network fallback. |
+
 ### Discovery / routing
 
 | Tool | Purpose |

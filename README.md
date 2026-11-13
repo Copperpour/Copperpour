@@ -166,7 +166,14 @@ no arguments. Most clients take the same shape as Claude Desktop:
 
 ### Step 3: Install the skills (optional)
 
-Run the binary from Step 2 (it is not on `PATH` after a PCM install):
+MCP registration is enough to receive short operating rules each session.
+The server also serves its bundled skills and references on demand through
+`get_guidance` and MCP resources, matching the running binary. No local skill
+installation is needed for this guidance. Client support determines whether it
+uses the instructions/resources; `get_guidance` is available before toolset loading.
+
+Run `init` only if you want native skill discovery, locally editable skill files,
+or Claude agents/hooks. Use the binary from Step 2 (PCM does not add it to `PATH`):
 
 ```bash
 copperpour init                  # Claude: skills, agents and hooks

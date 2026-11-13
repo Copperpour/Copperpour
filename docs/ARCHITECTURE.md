@@ -112,6 +112,17 @@ The latter exists for clients that do not refresh after
 `notifications/tools/list_changed`; the configuration contract is documented
 beside the fields in `crates/copperpour/src/config.rs`.
 
+## Server guidance
+
+`copperpour-core::guidance` owns one embedded catalog consumed by both MCP
+endpoints and the standalone skill installer. `initialize` always combines short
+operating rules with the optional drift notice. The always-visible `get_guidance`
+meta-tool and `resources/list` / `resources/read` expose the same immutable
+skill/reference bytes. Resource identities use `copperpour://guidance/` and match
+exactly against the catalog, with no filesystem reads or URL normalization.
+Resources are static for a running build; upgrades require reconnecting to the
+new server. Client-side adoption of guidance is separate from successful delivery.
+
 ## Listing, Loading, And Calling Tools
 
 ```text

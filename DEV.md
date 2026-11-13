@@ -365,6 +365,30 @@ The standalone Tauri crate, binary and separate CI job have been removed under
 [the retirement migration](docs/api-migrations/retire-standalone-viewer.md).
 Build only the MCP server; PCM packaging embeds the browser viewer with it.
 
+## Server-delivered guidance
+
+Every `initialize` response includes short Copperpour operating rules plus any
+one-time installed-guidance drift notice. The embedded bundle catalog in
+`copperpour-core/src/guidance/bundle.rs` is shared with the native installer’s
+manifest, so serving and installing a file use the same bytes. Asset sources
+remain under `crates/copperpour/assets/skills`; the reliability reference comes
+from `docs/RELIABILITY_CONTRACT.md`.
+
+`get_guidance` is an always-visible meta-tool. Without `path` it lists bundle
+paths; with an exact listed path it returns the same `contents` as
+`resources/read`. The resource namespace is `copperpour://guidance/`, with each
+skill’s `SKILL.md` and `references/` listed separately. Relative Markdown links
+resolve inside that skill’s resource directory; tool callers supply the full
+listed bundle path. Neither endpoint reads local files, downloads content or
+installs guidance. Both stdio and HTTP use the same core handler.
+
+The static catalog advertises `resources: {}`: no subscriptions, list-change
+notifications, templates or pagination. Unknown URIs return JSON-RPC `-32002`;
+malformed requests or continuation cursors return `-32602`. Tool errors retain
+the structured `invalid_argument` contract. `init`, `status`, `uninstall`, local
+drift detection and Claude hooks keep their existing behavior. Custom skill
+roots and setup snippets are later #461 phases.
+
 ## Adding a New Tool
 
 `ToolDef::new` closes fixed input records before the schema is advertised and compiled.

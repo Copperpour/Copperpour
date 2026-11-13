@@ -191,3 +191,14 @@ CI job have been removed with the owner’s explicit waiver of the planned grace
 period; see [the migration](api-migrations/retire-standalone-viewer.md). The
 workspace build embeds the browser viewer in the server. Linux interactive feedback is available;
 Windows/macOS browser launch and interactive behavior need platform verification.
+
+## Server guidance delivery
+
+Run `cargo test -p copperpour-core --locked guidance` for served resource/tool
+success and refusal cases, embedded asset inventory, and instructions with/without
+a drift probe. `cargo test -p copperpour --locked --test protocol_stdio guidance`
+checks the real binary: guidance works without `init`, no native skill files are
+installed, and the one-time drift notice does not suppress rules on later starts.
+Resource-not-found and malformed-parameter errors remain JSON-RPC errors; bad
+`get_guidance` inputs remain structured tool errors. Local profile edits are not
+served as resources. The normal workspace gates cover catalog/installer sharing.

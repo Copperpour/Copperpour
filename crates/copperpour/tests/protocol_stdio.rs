@@ -992,11 +992,16 @@ fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
     let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
     let instructions = p.initialized["result"]["instructions"].as_str().unwrap();
     assert!(
-        instructions.starts_with("Copperpour Claude guidance (installed by v0.2.2)"),
+        instructions.starts_with("Copperpour operating rules for KiCad work:")
+            && instructions.contains("Copperpour Claude guidance (installed by v0.2.2)"),
         "{instructions}"
     );
     assert!(instructions.contains("`copperpour init`"), "{instructions}");
-    assert_eq!(instructions.lines().count(), 1, "Codex was never installed");
+    assert_eq!(instructions.matches("installed by v0.2.2").count(), 1);
+    assert!(
+        !instructions.contains("Copperpour Codex guidance"),
+        "Codex was never installed"
+    );
 
     let result = p.call_tool("get_installation_info", json!({}));
     let body = McpProcess::tool_body(&result);
@@ -1015,7 +1020,10 @@ fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
 
     let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
     let init = &p.initialized["result"];
-    assert!(init.get("instructions").is_none(), "{init}");
+    assert_eq!(
+        init["instructions"],
+        copperpour_core::guidance::SESSION_RULES
+    );
     let result = p.call_tool("get_installation_info", json!({}));
     let guidance = &McpProcess::tool_body(&result)["guidance"];
     assert_eq!(guidance["claude"]["state"], "out_of_sync");
@@ -1298,4 +1306,33 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     files
+}
+
+/// PCM/MCP registration alone exposes bundled guidance; no native skill install.
+#[cfg(unix)]
+#[test]
+fn server_guidance_works_over_stdio_without_init_or_profile_skill_writes() {
+    let profile = tempfile::tempdir().unwrap();
+    let mut process = McpProcess::spawn_configured(Some(profile.path()), true);
+    let init = &process.initialized["result"];
+    assert!(init["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("Never hand-edit"));
+    assert_eq!(init["capabilities"]["resources"], json!({}));
+    let listed = McpProcess::tool_body(&process.call_tool("get_guidance", json!({})));
+    assert_eq!(listed["count"], 16);
+    let uri = "copperpour://guidance/copperpour/references/reliability-contract.md";
+    let resource = process.request("resources/read", json!({"uri":uri}));
+    let tool = McpProcess::tool_body(&process.call_tool(
+        "get_guidance",
+        json!({"path":"copperpour/references/reliability-contract.md"}),
+    ));
+    assert_eq!(resource["result"], tool);
+    assert_eq!(
+        tool["contents"][0]["text"],
+        include_str!("../../../docs/RELIABILITY_CONTRACT.md")
+    );
+    assert!(!profile.path().join(".claude").exists());
+    assert!(!profile.path().join(".agents").exists());
 }
