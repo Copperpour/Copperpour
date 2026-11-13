@@ -4089,7 +4089,11 @@ mod tests {
                         error: SexpError::Conflict {
                             path: directory.to_path_buf(),
                         },
-                        journal: Some(directory.join(".copperpour-transaction-x.json")),
+                        journal: Some(
+                            directory
+                                .join(".copperpour-transaction-x.json")
+                                .into_boxed_path(),
+                        ),
                     })
                 },
             );

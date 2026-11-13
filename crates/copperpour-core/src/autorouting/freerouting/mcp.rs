@@ -1904,7 +1904,8 @@ mod tests {
     }
 
     /// The tool schemas `validate_tool_contracts` accepts, as `tools/list`
-    /// returns them.
+    /// returns them. Only the unix tests use it.
+    #[cfg(unix)]
     fn conforming_tools_list() -> Value {
         let object = |properties: Value, required: Value| json!({ "type": "object", "properties": properties, "required": required });
         let file = object(
@@ -2351,7 +2352,9 @@ done"#,
     }
 
     /// [`super::run_state_machine`] without project rules, as most tests run
-    /// it. It shadows the glob import, like [`route_local`] above.
+    /// it. It shadows the glob import, like [`route_local`] above. Only the
+    /// unix tests use it.
+    #[cfg(unix)]
     async fn run_state_machine(
         client: &mut LocalMcpClient,
         dsn: &Path,
