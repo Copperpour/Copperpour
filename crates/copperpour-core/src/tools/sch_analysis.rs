@@ -168,8 +168,13 @@ pub fn tools() -> Vec<ToolDef> {
              label, or a stub left by a deleted component. Component pins and hierarchical \
              sheet pins count; a power symbol's own pin names the rail rather than consuming \
              it and does not. Reports the pin and label counts, and every label kind that \
-             named the net. Read per sheet: a net a global, hierarchical or power label can \
-             carry off this one is flagged cross_sheet_unverified.",
+             named the net. A net named by a global label or power symbol is checked across \
+             the saved hierarchy of the project that owns the sheet, counting each pin once \
+             per sheet instance as KiCad's netlist does, so a sheet placed twice gives its \
+             pin twice: with a second pin it is left out and named in cross_sheet_resolved. \
+             A net that only a hierarchical label carries off this sheet, or any net when \
+             the owning project or its hierarchy cannot be established, is flagged \
+             cross_sheet_unverified.",
             json!({ "type": "object",
                 "properties": { "schematic": { "type": "string" } },
                 "required": ["schematic"] }),
@@ -704,6 +709,92 @@ fn reaches_beyond_this_sheet(kind: &LabelKind) -> bool {
     }
 }
 
+/// Component pins on each net a global label or power symbol names, for one
+/// sheet. Those names join nets across the whole project, so these counts are
+/// what another sheet adds to a net `find_single_pin_nets` sees on its own.
+fn global_net_pin_counts(tree: &copperpour_sexp::SexpNode) -> HashMap<String, usize> {
+    let wires = extract_wires(tree);
+    let labels = extract_all_net_labels(tree);
+    let mut graph = net_graph_for(tree, &wires, &labels);
+    let mut pins_by_root: HashMap<(i64, i64), usize> = HashMap::new();
+    for (instance, pins) in placed_pins_by_reference(tree) {
+        if is_power_symbol_reference(&instance.reference) {
+            continue;
+        }
+        for (pin, transform) in pins {
+            let (x, y) = copperpour_sexp::schematic::pin_endpoint(&pin, transform);
+            *pins_by_root.entry(graph.root_at(x, y)).or_default() += 1;
+        }
+    }
+    let mut roots_by_net: HashMap<String, HashSet<(i64, i64)>> = HashMap::new();
+    for (root, label) in label_roots(&mut graph, &labels) {
+        if matches!(label.kind, LabelKind::GlobalLabel | LabelKind::PowerSymbol) {
+            roots_by_net
+                .entry(label.net.clone())
+                .or_default()
+                .insert(root);
+        }
+    }
+    roots_by_net
+        .into_iter()
+        .map(|(net, roots)| {
+            let pins = roots.iter().filter_map(|root| pins_by_root.get(root)).sum();
+            (net, pins)
+        })
+        .collect()
+}
+
+/// What the rest of a project adds to the nets global labels and power
+/// symbols name, counted the way KiCad's netlist counts them: once per sheet
+/// instance, not once per sheet file.
+struct ProjectPins {
+    /// Distinct sheet files read across every top-level sheet's hierarchy.
+    sheet_files: usize,
+    /// How often the saved hierarchy places the sheet the tool was given.
+    own_instances: usize,
+    /// Per net name, the component pins on every other sheet file, each
+    /// multiplied by the number of times that file is placed.
+    elsewhere: HashMap<String, usize>,
+}
+
+/// [`ProjectPins`] for the project that owns `sch_path`.
+///
+/// The project is the one [`crate::tools::resolve_schematic_ownership`]
+/// proves; every top-level sheet it lists is walked, because eeschema joins
+/// their nets as one design. `None` when there is no owning project, when
+/// ownership is ambiguous or unproven, when a hierarchy cannot be walked, or
+/// when no walk places `sch_path`: then nothing is resolved across sheets and
+/// the per-sheet answer stands, flagged as before.
+fn project_pins(sch_path: &std::path::Path) -> Option<ProjectPins> {
+    let ownership = crate::tools::resolve_schematic_ownership(sch_path).ok()??;
+    let own = std::fs::canonicalize(sch_path).ok()?;
+    let mut sheet_files: HashSet<std::path::PathBuf> = HashSet::new();
+    let mut own_instances = 0;
+    let mut elsewhere: HashMap<String, usize> = HashMap::new();
+    for top in &ownership.top_level_sheets {
+        let hierarchy = crate::tools::sch_hierarchy::load_saved_hierarchy(&top.schematic).ok()?;
+        let mut placements = vec![0usize; hierarchy.files.len()];
+        for instance in &hierarchy.instances {
+            placements[instance.file] += 1;
+        }
+        for (file, placed) in hierarchy.files.iter().zip(placements) {
+            sheet_files.insert(file.canonical.clone());
+            if file.canonical == own {
+                own_instances += placed;
+            } else if placed > 0 {
+                for (net, pins) in global_net_pin_counts(&file.tree) {
+                    *elsewhere.entry(net).or_default() += pins * placed;
+                }
+            }
+        }
+    }
+    (own_instances > 0).then_some(ProjectPins {
+        sheet_files: sheet_files.len(),
+        own_instances,
+        elsewhere,
+    })
+}
+
 /// Nets that reach at most one pin.
 ///
 /// Zero counts as well as one: a label whose net reaches nothing is the orphan
@@ -825,37 +916,62 @@ async fn handle_find_single_pin_nets(
     let mut by_net: Vec<(&str, NamedNet)> = by_net.into_iter().collect();
     by_net.sort_by_key(|(net, _)| *net);
 
-    let singles: Vec<serde_json::Value> = by_net
-        .iter()
-        .filter_map(|(net, named)| {
-            let mut on_net = named
-                .roots
-                .iter()
-                .filter_map(|root| pins_by_root.get(root))
-                .flatten();
-            let reached = on_net.next();
-            if on_net.next().is_some() {
-                return None;
+    // A net a global label or power symbol names continues on every sheet
+    // that names it too. Read the rest of the project once, and only when a
+    // net here needs it. On a six-sheet project all 30 per-sheet findings
+    // were such leads.
+    let joins_globally = |named: &NamedNet| {
+        named.kinds.contains("GlobalLabel") || named.kinds.contains("PowerSymbol")
+    };
+    let mut project: Option<Option<ProjectPins>> = None;
+    let mut resolved: Vec<&str> = Vec::new();
+    let mut singles: Vec<serde_json::Value> = Vec::new();
+    for (net, named) in &by_net {
+        let mut on_net = named
+            .roots
+            .iter()
+            .filter_map(|root| pins_by_root.get(root))
+            .flatten();
+        let reached = on_net.next();
+        if on_net.next().is_some() {
+            continue;
+        }
+        let mut cross_sheet_unverified = named.cross_sheet_unverified;
+        if joins_globally(named) {
+            if let Some(pins) = project.get_or_insert_with(|| project_pins(&sch_path)) {
+                // This sheet's pin is in the design once per placement of
+                // this sheet, as every other sheet's pins are.
+                let here = usize::from(reached.is_some()) * pins.own_instances;
+                let elsewhere = pins.elsewhere.get(*net).copied().unwrap_or(0);
+                if here + elsewhere >= 2 {
+                    resolved.push(net);
+                    continue;
+                }
+                // Checked project-wide; only a hierarchical label can still
+                // carry it somewhere this did not look.
+                cross_sheet_unverified = named.kinds.contains("HierarchicalLabel");
             }
-            let pins: Vec<serde_json::Value> =
-                reached.map(Connection::to_json).into_iter().collect();
-            Some(json!({
-                "net": net,
-                "x": named.first_label.x,
-                "y": named.first_label.y,
-                "type": format!("{:?}", named.first_label.kind),
-                "label_types": named.kinds,
-                "cross_sheet_unverified": named.cross_sheet_unverified,
-                "pin_count": pins.len(),
-                "label_count": named.label_count,
-                "pins": pins
-            }))
-        })
-        .collect();
+        }
+        let pins: Vec<serde_json::Value> = reached.map(Connection::to_json).into_iter().collect();
+        singles.push(json!({
+            "net": net,
+            "x": named.first_label.x,
+            "y": named.first_label.y,
+            "type": format!("{:?}", named.first_label.kind),
+            "label_types": named.kinds,
+            "cross_sheet_unverified": cross_sheet_unverified,
+            "pin_count": pins.len(),
+            "label_count": named.label_count,
+            "pins": pins
+        }));
+    }
 
-    Ok(CallToolResult::json(
-        &json!({ "single_pin_net_count": singles.len(), "nets": singles }),
-    ))
+    let mut response = json!({ "single_pin_net_count": singles.len(), "nets": singles });
+    if let Some(Some(pins)) = &project {
+        response["sheets_checked"] = json!(pins.sheet_files);
+        response["cross_sheet_resolved"] = json!(resolved);
+    }
+    Ok(CallToolResult::json(&response))
 }
 
 async fn handle_get_connected_items(
@@ -2028,6 +2144,7 @@ mod tool_call_support {
         let def = tools()
             .into_iter()
             .chain(crate::tools::sch_batch::tools())
+            .chain(crate::tools::sch_wiring::tools())
             .find(|t| t.name == tool)
             .unwrap();
         let ctx = ToolContext::new(
@@ -2397,6 +2514,153 @@ mod single_pin_net_tests {
             .collect();
 
         assert_eq!(names, vec!["FLAGGED", "LONE", "MIXED", "STUB", "VCC"]);
+    }
+}
+
+#[cfg(test)]
+mod cross_sheet_single_pin_tests {
+    use super::tool_call_support::call_at;
+    use super::*;
+
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/annotate_nested_hierarchy"
+    );
+
+    /// A copy of the nested fixture. `nested_pages` places `bank` twice and
+    /// `bank` places `cell` twice, so `cell` is in the design four times.
+    /// `+3V3` is on all three sheets and reaches no component pin.
+    ///
+    /// Expected pin counts are KiCad's, not this code's: each scenario below
+    /// was applied to a copy with `add_power_symbol` and exported with
+    /// `kicad-cli sch export netlist --format kicadxml nested_pages.kicad_sch`
+    /// (KiCad 10.0.7):
+    ///
+    /// | tie                                 | `+3V3` nodes      |
+    /// |-------------------------------------|-------------------|
+    /// | none                                | none (no such net) |
+    /// | `cell` R7 pin 1 to `+3V3`           | R7, R9, R14, R16  |
+    /// | `bank` R3 pin 1 to `+3V3`           | R3, R10           |
+    /// | `nested_pages` R1 pin 1 to `+3V3`   | R1                |
+    ///
+    /// Only `+3V3` is used: its symbol is cached in the fixture's sheets, so
+    /// `add_power_symbol` needs no installed KiCad library.
+    fn project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for entry in std::fs::read_dir(FIXTURE).unwrap().flatten() {
+            std::fs::copy(entry.path(), dir.path().join(entry.file_name())).unwrap();
+        }
+        dir
+    }
+
+    fn net<'a>(report: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+        report["nets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|net| net["net"] == name)
+    }
+
+    async fn single_pin_nets(sheet: &std::path::Path) -> serde_json::Value {
+        call_at(sheet, "find_single_pin_nets", json!({})).await
+    }
+
+    async fn tie_to_3v3(sheet: &std::path::Path, reference: &str) {
+        call_at(
+            sheet,
+            "add_power_symbol",
+            json!({ "power_net": "+3V3", "reference": reference, "pin_number": "1" }),
+        )
+        .await;
+    }
+
+    /// KiCad: `+3V3` reaches no pin. Checked across the whole project it is a
+    /// finding, no longer a lead.
+    #[tokio::test]
+    async fn a_net_checked_project_wide_is_verified() {
+        let dir = project();
+        let report = single_pin_nets(&dir.path().join("cell.kicad_sch")).await;
+        let rail = net(&report, "+3V3").expect("+3V3 reaches no pin anywhere");
+        assert_eq!(rail["pin_count"], 0, "{report}");
+        assert_eq!(rail["cross_sheet_unverified"], false, "{report}");
+        assert_eq!(report["sheets_checked"], 3, "{report}");
+        assert_eq!(report["cross_sheet_resolved"], json!([]), "{report}");
+    }
+
+    /// KiCad: one pin on `cell` is four pins in the design, because `cell` is
+    /// placed four times. Asked from `cell` itself and from the root, which
+    /// sees the pin only through the other sheet, `+3V3` is resolved.
+    #[tokio::test]
+    async fn a_pin_on_a_sheet_placed_four_times_is_four_pins() {
+        let dir = project();
+        let cell = dir.path().join("cell.kicad_sch");
+        tie_to_3v3(&cell, "R7").await;
+        for sheet in [cell.clone(), dir.path().join("nested_pages.kicad_sch")] {
+            let report = single_pin_nets(&sheet).await;
+            assert!(net(&report, "+3V3").is_none(), "{report}");
+            assert_eq!(report["cross_sheet_resolved"], json!(["+3V3"]), "{report}");
+        }
+    }
+
+    /// KiCad: one pin on `bank`, placed twice, is two pins. The sheet the
+    /// tool is given is weighted by its own placements too.
+    #[tokio::test]
+    async fn the_given_sheet_counts_once_per_placement() {
+        let dir = project();
+        let bank = dir.path().join("bank.kicad_sch");
+        tie_to_3v3(&bank, "R3").await;
+        let report = single_pin_nets(&bank).await;
+        assert!(net(&report, "+3V3").is_none(), "{report}");
+        assert_eq!(report["cross_sheet_resolved"], json!(["+3V3"]), "{report}");
+    }
+
+    /// KiCad: one pin on the root, placed once, is one pin. It stays a
+    /// verified single-pin net.
+    #[tokio::test]
+    async fn one_pin_on_a_sheet_placed_once_is_a_verified_finding() {
+        let dir = project();
+        let root = dir.path().join("nested_pages.kicad_sch");
+        tie_to_3v3(&root, "R1").await;
+        let report = single_pin_nets(&root).await;
+        let rail = net(&report, "+3V3").expect("one pin in the whole design");
+        assert_eq!(rail["pin_count"], 1, "{report}");
+        assert_eq!(rail["cross_sheet_unverified"], false, "{report}");
+        assert_eq!(report["cross_sheet_resolved"], json!([]), "{report}");
+    }
+
+    /// Without a project file there is no hierarchy to read: the per-sheet
+    /// answer and its flag stand, and nothing claims a project-wide check.
+    #[tokio::test]
+    async fn without_a_project_the_net_stays_unverified() {
+        let dir = project();
+        std::fs::remove_file(dir.path().join("nested_pages.kicad_pro")).unwrap();
+        let report = single_pin_nets(&dir.path().join("cell.kicad_sch")).await;
+        assert_eq!(
+            net(&report, "+3V3").unwrap()["cross_sheet_unverified"],
+            true
+        );
+        assert!(report.get("sheets_checked").is_none(), "{report}");
+        assert!(report.get("cross_sheet_resolved").is_none(), "{report}");
+    }
+
+    /// A second project file beside the first makes ownership unproven
+    /// (`resolve_schematic_ownership` refuses it), whatever order the
+    /// directory lists them in: the per-sheet answer stands.
+    #[tokio::test]
+    async fn two_project_files_leave_the_per_sheet_answer() {
+        let dir = project();
+        std::fs::copy(
+            dir.path().join("nested_pages.kicad_pro"),
+            dir.path().join("another.kicad_pro"),
+        )
+        .unwrap();
+        let report = single_pin_nets(&dir.path().join("cell.kicad_sch")).await;
+        assert_eq!(
+            net(&report, "+3V3").unwrap()["cross_sheet_unverified"],
+            true,
+            "{report}"
+        );
+        assert!(report.get("sheets_checked").is_none(), "{report}");
     }
 }
 
