@@ -880,6 +880,11 @@ mod required_argument_dispatch_tests {
             ),
             ("batch_rotate_labels", json!({ "schematic": s }), "labels"),
             (
+                "batch_add_schematic_net_label",
+                json!({ "schematic": s }),
+                "labels",
+            ),
+            (
                 "bulk_move_schematic_components",
                 json!({ "schematic": s, "dx": 1.0, "dy": 1.0 }),
                 "references",

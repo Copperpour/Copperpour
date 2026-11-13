@@ -1941,36 +1941,282 @@ async fn handle_add_net_label(
     let shape = opt_str(args, "shape").unwrap_or("input");
 
     let mut sch = cse::Schematic::load(&sch_path)?;
+    push_net_label(&mut sch, label_type, &net, shape, (x, y), rotation);
+    sch.overwrite()?;
 
+    Ok(CallToolResult::json(
+        &json!({ "added_label": net, "type": label_type, "x": x, "y": y }),
+    ))
+}
+
+/// The `label_type`s `add_schematic_net_label` writes, in `LABEL_TAGS` order.
+pub(crate) const LABEL_TYPES: [&str; 3] = ["net_label", "global_label", "hierarchical_label"];
+
+/// Add one label to `sch` as `add_schematic_net_label` writes it; a
+/// `label_type` it does not know is a plain label, and only a global or
+/// hierarchical label takes `shape`.
+fn push_net_label(
+    sch: &mut cse::Schematic,
+    label_type: &str,
+    net: &str,
+    shape: &str,
+    (x, y): (f64, f64),
+    rotation: f64,
+) {
     // set_rotation also writes the (effects … (justify …)) block. justify is
     // what turns the text away from the anchor, so a label created without one
     // renders backwards at 180°/270°, over whatever it points at.
     match label_type {
         "global_label" => {
-            sch.add_global_label(&net, shape, x, y);
+            sch.add_global_label(net, shape, x, y);
             let idx = sch.global_labels.len() - 1;
             if let Some(gl) = sch.global_labels.get_mut(idx) {
                 gl.set_rotation(rotation);
             }
         }
         "hierarchical_label" => {
-            sch.add_hierarchical_label(&net, shape, x, y);
+            sch.add_hierarchical_label(net, shape, x, y);
             let idx = sch.hierarchical_labels.len() - 1;
             if let Some(hl) = sch.hierarchical_labels.get_mut(idx) {
                 hl.set_rotation(rotation);
             }
         }
         _ => {
-            let label = sch.add_label(&net, x, y);
+            let label = sch.add_label(net, x, y);
             label.set_rotation(rotation);
         }
     }
+}
 
-    sch.overwrite()?;
+/// One entry of `batch_add_schematic_net_label`'s `labels`.
+struct LabelRequest<'a> {
+    net: &'a str,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    label_type: &'a str,
+    shape: Option<&'a str>,
+}
 
-    Ok(CallToolResult::json(
-        &json!({ "added_label": net, "type": label_type, "x": x, "y": y }),
-    ))
+impl<'a> LabelRequest<'a> {
+    /// `labels[index]`, or the refusal naming its field. Dispatch checks the
+    /// schema first; a direct call gets the same answers here.
+    fn parse(label: &'a serde_json::Value, index: usize) -> Result<Self, CallToolResult> {
+        let refuse = |key: &str, reason: &str| {
+            crate::tools::invalid_arg(&format!("labels[{index}].{key}"), reason)
+        };
+        let number = |key: &str| {
+            label[key]
+                .as_f64()
+                .ok_or_else(|| refuse(key, "missing or not a number"))
+        };
+        let one_of = |key: &str, allowed: &[&str]| match &label[key] {
+            serde_json::Value::Null => Ok(None),
+            value => value
+                .as_str()
+                .filter(|v| allowed.contains(v))
+                .map(Some)
+                .ok_or_else(|| refuse(key, &format!("must be one of {}", allowed.join(", ")))),
+        };
+        let net = label["net"]
+            .as_str()
+            .ok_or_else(|| refuse("net", "missing or not a string"))?;
+        let (x, y) = (number("x")?, number("y")?);
+        let rotation = match label["rotation"] {
+            serde_json::Value::Null => 0.0,
+            _ => number("rotation")?,
+        };
+        let label_type = one_of("label_type", &LABEL_TYPES)?.unwrap_or("net_label");
+        let shape = one_of("shape", super::sch_hierarchy::ALLOWED_PIN_TYPES)?;
+        // KiCad's format gives a plain label no shape, so one would be dropped.
+        if label_type == "net_label" && shape.is_some() {
+            return Err(refuse(
+                "shape",
+                "a net_label has no shape; only a global or hierarchical label takes one",
+            ));
+        }
+        Ok(Self {
+            net,
+            x,
+            y,
+            rotation,
+            label_type,
+            shape,
+        })
+    }
+}
+
+/// A label as a written file holds it.
+struct PlacedLabel {
+    label_type: &'static str,
+    net: String,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    shape: Option<String>,
+    uuid: Option<String>,
+}
+
+impl PlacedLabel {
+    fn is(&self, label_type: &str, net: &str, at: (f64, f64, f64), shape: Option<&str>) -> bool {
+        self.label_type == label_type
+            && self.net == net
+            && same_point(self.x, at.0)
+            && same_point(self.y, at.1)
+            && same_point(self.rotation, at.2)
+            && self.shape.as_deref() == shape
+    }
+
+    fn answers(&self, request: &LabelRequest) -> bool {
+        let shape = (request.label_type != "net_label").then(|| request.shape.unwrap_or("input"));
+        self.is(
+            request.label_type,
+            request.net,
+            (request.x, request.y, request.rotation),
+            shape,
+        )
+    }
+}
+
+/// Every label on the sheet `tree`.
+fn placed_labels(tree: &copperpour_sexp::parser::SexpNode) -> Vec<PlacedLabel> {
+    let mut labels = Vec::new();
+    for (tag, label_type) in LABEL_TAGS.into_iter().zip(LABEL_TYPES) {
+        for node in tree.find_all(tag) {
+            let (x, y, rotation) = parse_at(node).unwrap_or((0.0, 0.0, 0.0));
+            labels.push(PlacedLabel {
+                label_type,
+                net: node
+                    .get(1)
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                x,
+                y,
+                rotation,
+                shape: node.find_str("shape").map(str::to_owned),
+                uuid: node.find_str("uuid").map(str::to_owned),
+            });
+        }
+    }
+    labels
+}
+
+/// What `after` gained over `before`, one entry per request in its order,
+/// when that is exactly `requests` and every label `before` held is still
+/// there unchanged; `None` otherwise.
+fn added_labels(
+    before: &[PlacedLabel],
+    after: &[PlacedLabel],
+    requests: &[LabelRequest],
+) -> Option<Vec<serde_json::Value>> {
+    let mut pool: Vec<&PlacedLabel> = after.iter().collect();
+    for old in before {
+        let at = (old.x, old.y, old.rotation);
+        let same = |l: &PlacedLabel| l.is(old.label_type, &old.net, at, old.shape.as_deref());
+        // An old label without a uuid takes one without a uuid first, so a
+        // new label just like it keeps its own uuid in `added`.
+        let i = match old.uuid {
+            Some(_) => pool.iter().position(|l| same(l) && l.uuid == old.uuid),
+            None => pool
+                .iter()
+                .position(|l| same(l) && l.uuid.is_none())
+                .or_else(|| pool.iter().position(|l| same(l))),
+        }?;
+        pool.swap_remove(i);
+    }
+    let added = requests
+        .iter()
+        .map(|request| {
+            let label = pool.swap_remove(pool.iter().position(|l| l.answers(request))?);
+            Some(json!({
+                "net": label.net,
+                "label_type": label.label_type,
+                "shape": label.shape,
+                "x": label.x,
+                "y": label.y,
+                "rotation": label.rotation,
+                "uuid": label.uuid
+            }))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    pool.is_empty().then_some(added)
+}
+
+pub(crate) async fn handle_batch_add_schematic_net_label(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    const OPERATION: &str = "batch_add_schematic_net_label";
+    let sch_path = get_path(args, "schematic")?;
+    let labels = match require_array(args, "labels") {
+        Ok(a) => a,
+        Err(e) => return Ok(e),
+    };
+    // Check every label before touching the file, as batch_add_wire does, so
+    // a malformed batch changes nothing.
+    let mut requests = Vec::with_capacity(labels.len());
+    for (index, label) in labels.iter().enumerate() {
+        match LabelRequest::parse(label, index) {
+            Ok(request) => requests.push(request),
+            Err(refusal) => return Ok(refusal),
+        }
+    }
+
+    let (content, tree) = read_schematic(&sch_path)?;
+    if requests.is_empty() {
+        return Ok(CallToolResult::json(
+            &json!({ "added_count": 0, "added": [] }),
+        ));
+    }
+    let before = placed_labels(&tree);
+    let mut sch = cse::Schematic::from_source(&sch_path, content)?;
+    for request in &requests {
+        let shape = request.shape.unwrap_or("input");
+        let at = (request.x, request.y);
+        push_net_label(
+            &mut sch,
+            request.label_type,
+            request.net,
+            shape,
+            at,
+            request.rotation,
+        );
+    }
+    #[cfg(test)]
+    crate::tools::write_hook::run(&sch_path);
+    // Revision-checked against `content`: a save in between refuses the write.
+    if let Err(error) = sch.overwrite() {
+        if let Some(refusal) = crate::tools::unwritten_schematic_refusal(OPERATION, &error) {
+            return Ok(refusal);
+        }
+        return Ok(crate::tools::mutation_outcome_uncertain(
+            &sch_path,
+            OPERATION,
+            format!("schematic persistence failed: {error}"),
+        ));
+    }
+
+    let uncertain =
+        |reason: String| crate::tools::mutation_outcome_uncertain(&sch_path, OPERATION, reason);
+    let written = match read_schematic(&sch_path) {
+        Ok((_, written)) => written,
+        Err(error) => {
+            return Ok(uncertain(format!(
+                "the sheet could not be read back: {error}"
+            )))
+        }
+    };
+    let Some(added) = added_labels(&before, &placed_labels(&written), &requests) else {
+        return Ok(uncertain(
+            "the written file does not hold exactly the requested labels beside the ones it had"
+                .to_owned(),
+        ));
+    };
+    Ok(CallToolResult::json(&json!({
+        "added_count": added.len(),
+        "added": added
+    })))
 }
 
 async fn handle_delete_net_label(
@@ -5080,6 +5326,377 @@ mod label_tests {
         assert_ne!(renamed, LABEL_MOVE);
         assert!(!labels_landed(&renamed, "(at 1 2)", &target));
         assert!(!labels_landed(LABEL_MOVE, "(at 1 2)", &target));
+    }
+}
+
+#[cfg(test)]
+mod batch_net_label_tests {
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::project_file_writer_tests::{served_call, text_of};
+    use crate::tools::ServerConfig;
+    use serde_json::Value;
+    use std::path::{Path, PathBuf};
+
+    /// A KiCad-saved project whose child sheet `interface` holds J1 (see the
+    /// fixture's README).
+    const PROJECT: [&str; 3] = [
+        "batch_net_labels.kicad_pro",
+        "batch_net_labels.kicad_sch",
+        "interface.kicad_sch",
+    ];
+    /// `interface` after `interface_labels`, which KiCad resaves byte for byte.
+    const LABELLED: &str =
+        include_str!("../../tests/fixtures/batch_net_labels_kicad10/interface.labelled.kicad_sch");
+
+    fn project() -> (tempfile::TempDir, PathBuf) {
+        let fixtures =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/batch_net_labels_kicad10");
+        let dir = tempfile::tempdir().unwrap();
+        for name in PROJECT {
+            std::fs::copy(fixtures.join(name), dir.path().join(name)).unwrap();
+        }
+        let child = dir.path().join("interface.kicad_sch");
+        (dir, child)
+    }
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    async fn direct(arguments: Value) -> CallToolResult {
+        handle_batch_add_schematic_net_label(
+            &arguments,
+            &ToolContext::new(
+                ServerConfig::default(),
+                std::sync::Arc::new(crate::router::ToolRouter::new()),
+            ),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn body(result: &CallToolResult) -> Value {
+        serde_json::from_str(text_of(result)).unwrap()
+    }
+
+    /// A hierarchical label on each of J1's four pins, pointing away from it.
+    fn interface_labels() -> Value {
+        json!([
+            { "net": "SDA", "x": 96.52, "y": 99.06, "rotation": 180,
+              "label_type": "hierarchical_label", "shape": "bidirectional" },
+            { "net": "SCL", "x": 96.52, "y": 101.6, "rotation": 180,
+              "label_type": "hierarchical_label", "shape": "input" },
+            { "net": "INT", "x": 96.52, "y": 104.14, "rotation": 180,
+              "label_type": "hierarchical_label", "shape": "output" },
+            { "net": "EN", "x": 96.52, "y": 106.68, "rotation": 180,
+              "label_type": "hierarchical_label" }
+        ])
+    }
+
+    fn arguments(child: &Path, labels: Value) -> Value {
+        json!({ "schematic": child.display().to_string(), "labels": labels })
+    }
+
+    /// A malformed label is refused by name at the schema gate before
+    /// anything is written, wherever it stands in the list.
+    #[tokio::test]
+    async fn the_schema_gate_refuses_a_malformed_label_and_writes_nothing() {
+        let handler = handler().await;
+        let good = json!({ "net": "SDA", "x": 96.52, "y": 99.06 });
+        for (labels, field) in [
+            (json!([{ "x": 96.52, "y": 99.06 }]), "labels[0].net"),
+            (
+                json!([good.clone(), { "net": "SCL", "y": 101.6 }]),
+                "labels[1].x",
+            ),
+            (
+                json!([{ "net": "SDA", "x": "96.52", "y": 99.06 }]),
+                "labels[0].x",
+            ),
+            (
+                json!([{ "net": "SDA", "x": 96.52, "y": 99.06,
+                         "label_type": "hierarchical_label", "shape": "bidir" }]),
+                "labels[0].shape",
+            ),
+            (
+                json!([{ "net": "SDA", "x": 96.52, "y": 99.06, "label_type": "power" }]),
+                "labels[0].label_type",
+            ),
+            // The schema allows it; the handler refuses it.
+            (
+                json!([good.clone(), { "net": "SCL", "x": 96.52, "y": 101.6, "shape": "input" }]),
+                "labels[1].shape",
+            ),
+        ] {
+            let (_d, child) = project();
+            let before = std::fs::read_to_string(&child).unwrap();
+            let result = served_call(
+                &handler,
+                "batch_add_schematic_net_label",
+                arguments(&child, labels),
+            )
+            .await;
+            assert!(result.is_error, "{field}");
+            let body = body(&result);
+            assert_eq!(body["error"]["kind"], json!("invalid_argument"), "{body}");
+            assert_eq!(body["error"]["field"], json!(field), "{body}");
+            assert_eq!(std::fs::read_to_string(&child).unwrap(), before, "{field}");
+        }
+    }
+
+    /// The handler refuses the same labels when the schema gate is not in
+    /// front of it, and a shape KiCad gives no global or hierarchical label.
+    #[tokio::test]
+    async fn the_handler_checks_every_label_before_writing() {
+        let good = json!({ "net": "SDA", "x": 96.52, "y": 99.06 });
+        for (labels, field) in [
+            (
+                json!([good.clone(), { "net": "SCL", "x": 96.52 }]),
+                "labels[1].y",
+            ),
+            (
+                json!([{ "net": 5, "x": 96.52, "y": 99.06 }]),
+                "labels[0].net",
+            ),
+            (
+                json!([{ "net": "SDA", "x": 96.52, "y": 99.06, "rotation": "180" }]),
+                "labels[0].rotation",
+            ),
+            (
+                json!([good.clone(), { "net": "SCL", "x": 96.52, "y": 101.6, "shape": "output" }]),
+                "labels[1].shape",
+            ),
+            (
+                json!([{ "net": "SDA", "x": 96.52, "y": 99.06,
+                         "label_type": "hierarchical_label", "shape": "dot" }]),
+                "labels[0].shape",
+            ),
+            (
+                json!([{ "net": "SDA", "x": 96.52, "y": 99.06, "label_type": "label" }]),
+                "labels[0].label_type",
+            ),
+        ] {
+            let (_d, child) = project();
+            let before = std::fs::read_to_string(&child).unwrap();
+            let result = direct(arguments(&child, labels)).await;
+            assert!(result.is_error, "{field}");
+            let body = body(&result);
+            assert_eq!(body["error"]["field"], json!(field), "{body}");
+            assert_eq!(std::fs::read_to_string(&child).unwrap(), before, "{field}");
+        }
+    }
+
+    /// Eeschema locks only the root, so its lock refuses a write to the child.
+    #[tokio::test]
+    async fn the_roots_editor_lock_refuses_the_childs_labels() {
+        let (dir, child) = project();
+        let root = dir.path().join("batch_net_labels.kicad_sch");
+        std::fs::write(
+            dir.path().join("~batch_net_labels.kicad_sch.lck"),
+            r#"{"hostname":"x","username":"y"}"#,
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&child).unwrap();
+        let result = served_call(
+            &handler().await,
+            "batch_add_schematic_net_label",
+            arguments(&child, interface_labels()),
+        )
+        .await;
+        let body = body(&result);
+        assert_eq!(body["error"]["kind"], json!("conflict"), "{body}");
+        assert_eq!(body["error"]["paths"], json!([root]), "{body}");
+        assert_eq!(std::fs::read_to_string(&child).unwrap(), before);
+    }
+
+    /// A save between the read and the write is refused as `conflict` and kept.
+    #[tokio::test]
+    async fn a_save_made_after_the_read_is_kept() {
+        let (_d, child) = project();
+        let before = std::fs::read_to_string(&child).unwrap();
+        let saved = before.replacen("(paper \"A4\")", "(paper \"A3\")", 1);
+        assert_ne!(saved, before);
+        crate::tools::write_hook::set(saved.clone());
+        let result = served_call(
+            &handler().await,
+            "batch_add_schematic_net_label",
+            arguments(&child, interface_labels()),
+        )
+        .await;
+        assert!(!crate::tools::write_hook::armed(), "the write never ran");
+        let body = body(&result);
+        assert_eq!(body["error"]["kind"], json!("conflict"), "{body}");
+        assert_eq!(std::fs::read_to_string(&child).unwrap(), saved);
+    }
+
+    /// Four hierarchical labels land in one write as KiCad writes them, and
+    /// `added` reports each from the file, with its uuid.
+    #[tokio::test]
+    async fn a_sheets_interface_lands_in_one_write() {
+        let (_d, child) = project();
+        let result = served_call(
+            &handler().await,
+            "batch_add_schematic_net_label",
+            arguments(&child, interface_labels()),
+        )
+        .await;
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = body(&result);
+        assert_eq!(body["added_count"], json!(4), "{body}");
+        let added = body["added"].as_array().unwrap();
+        let shapes: Vec<_> = added.iter().map(|l| (&l["net"], &l["shape"])).collect();
+        assert_eq!(
+            shapes,
+            [
+                (&json!("SDA"), &json!("bidirectional")),
+                (&json!("SCL"), &json!("input")),
+                (&json!("INT"), &json!("output")),
+                (&json!("EN"), &json!("input")),
+            ]
+        );
+
+        // KiCad's resave differs from the written file only in the new uuids.
+        let oracle = placed_labels(&parse_sexp(LABELLED).unwrap());
+        assert_eq!(oracle.len(), 4);
+        let mut written = std::fs::read_to_string(&child).unwrap();
+        for (label, kicad) in added.iter().zip(&oracle) {
+            let uuid = label["uuid"].as_str().unwrap();
+            assert_eq!(written.matches(uuid).count(), 1, "{uuid}");
+            written = written.replace(uuid, kicad.uuid.as_deref().unwrap());
+        }
+        assert_eq!(written, LABELLED);
+    }
+
+    /// A global and a plain label land with the hierarchical one, each with
+    /// the shape its kind takes.
+    #[tokio::test]
+    async fn every_label_type_lands_in_the_same_write() {
+        let (_d, child) = project();
+        let result = served_call(
+            &handler().await,
+            "batch_add_schematic_net_label",
+            arguments(
+                &child,
+                json!([
+                    { "net": "VBUS", "x": 96.52, "y": 99.06, "rotation": 180,
+                      "label_type": "global_label", "shape": "passive" },
+                    { "net": "SCL", "x": 96.52, "y": 101.6, "rotation": 180 },
+                    { "net": "INT", "x": 96.52, "y": 104.14, "rotation": 180,
+                      "label_type": "hierarchical_label", "shape": "tri_state" }
+                ]),
+            ),
+        )
+        .await;
+        assert!(!result.is_error, "{:?}", result.content);
+        let kinds: Vec<_> = body(&result)["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| (l["label_type"].clone(), l["shape"].clone()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (json!("global_label"), json!("passive")),
+                (json!("net_label"), Value::Null),
+                (json!("hierarchical_label"), json!("tri_state")),
+            ]
+        );
+        let file = std::fs::read_to_string(&child).unwrap();
+        let tree = parse_sexp(&file).unwrap();
+        let labels = copperpour_sexp::schematic::extract_labels(&tree);
+        assert_eq!(labels.len(), 3, "{file}");
+    }
+
+    /// An empty list adds nothing and leaves the file alone.
+    #[tokio::test]
+    async fn an_empty_list_writes_nothing() {
+        let (_d, child) = project();
+        let before = std::fs::read_to_string(&child).unwrap();
+        let result = served_call(
+            &handler().await,
+            "batch_add_schematic_net_label",
+            arguments(&child, json!([])),
+        )
+        .await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(body(&result), json!({ "added_count": 0, "added": [] }));
+        assert_eq!(std::fs::read_to_string(&child).unwrap(), before);
+    }
+
+    /// The readback holds the file to exactly the requested labels beside
+    /// the ones it had.
+    #[test]
+    fn added_labels_refuses_a_missing_extra_or_changed_label() {
+        let labels = interface_labels();
+        let requests: Vec<_> = labels
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, l)| LabelRequest::parse(l, i).ok().unwrap())
+            .collect();
+        let labelled = placed_labels(&parse_sexp(LABELLED).unwrap());
+        let added = added_labels(&[], &labelled, &requests).expect("exact");
+        assert_eq!(added.len(), 4);
+        assert!(
+            added_labels(&[], &labelled, &requests[..3]).is_none(),
+            "an extra label"
+        );
+        assert!(
+            added_labels(&[], &labelled[..3], &requests).is_none(),
+            "a missing label"
+        );
+        assert!(
+            added_labels(&labelled, &labelled, &[]).is_some_and(|a| a.is_empty()),
+            "nothing requested, nothing changed"
+        );
+        let reshaped = LABELLED.replacen("(shape output)", "(shape input)", 1);
+        assert_ne!(reshaped, LABELLED);
+        let reshaped = placed_labels(&parse_sexp(&reshaped).unwrap());
+        assert!(
+            added_labels(&[], &reshaped, &requests).is_none(),
+            "a new label's shape"
+        );
+        assert!(
+            added_labels(&labelled, &reshaped, &[]).is_none(),
+            "an old label's shape"
+        );
+    }
+
+    /// A new label just like an old one is reported with its own uuid,
+    /// written before the old one, and whether or not the old has a uuid.
+    /// Eeschema writes every label's uuid, so the label without one is cut here.
+    #[test]
+    fn added_labels_reports_the_new_twin_of_an_old_label() {
+        const NEW: &str = "5da01e1b-bde0-4b3d-8aa1-47f589375546";
+        let labels = interface_labels();
+        let sda = LabelRequest::parse(&labels[0], 0).ok().unwrap();
+        let old = placed_labels(&parse_sexp(LABELLED).unwrap())[0]
+            .uuid
+            .clone()
+            .unwrap();
+        let start = LABELLED.find("\t(hierarchical_label \"SDA\"").unwrap();
+        let end = start + LABELLED[start..].find("\n\t)\n").unwrap() + "\n\t)\n".len();
+        let block = &LABELLED[start..end];
+        let twin = block.replace(&old, NEW);
+        let unnamed = block.replace(&format!("\t\t(uuid \"{old}\")\n"), "");
+        assert_ne!(unnamed, block);
+        for before in [LABELLED.to_owned(), LABELLED.replacen(block, &unnamed, 1)] {
+            let after = before.replacen(block, &format!("{twin}{block}"), 1);
+            let after = after.replacen(&unnamed, &format!("{twin}{unnamed}"), 1);
+            let before = placed_labels(&parse_sexp(&before).unwrap());
+            let after = placed_labels(&parse_sexp(&after).unwrap());
+            assert_eq!(after.len(), before.len() + 1);
+            let added = added_labels(&before, &after, std::slice::from_ref(&sda)).unwrap();
+            assert_eq!(added[0]["uuid"], json!(NEW));
+        }
     }
 }
 
