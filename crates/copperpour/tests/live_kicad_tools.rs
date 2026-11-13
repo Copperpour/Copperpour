@@ -842,3 +842,243 @@ fn board_extents_live_and_saved_agree_on_an_unedited_board() {
         }
     }
 }
+
+fn tool_body(result: &Value) -> Value {
+    serde_json::from_str(result["content"][0]["text"].as_str().unwrap())
+        .expect("the tool did not return JSON")
+}
+
+/// Every pad of a live footprint as (number, position), in KiCad's order.
+fn footprint_pads(
+    footprint: &kiapi::board::types::FootprintInstance,
+) -> Vec<(String, Option<(i64, i64)>)> {
+    footprint
+        .definition
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
+        .map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap())
+        .map(|pad| (pad.number, pad.position.map(|at| (at.x_nm, at.y_nm))))
+        .collect()
+}
+
+/// Whether a saved text's `(effects …)` carries `(justify … mirror …)`.
+fn saved_mirrored(text: &SexpNode) -> bool {
+    text.find("effects")
+        .and_then(|effects| effects.find("justify"))
+        .and_then(SexpNode::children)
+        .is_some_and(|tokens| tokens.iter().any(|token| token.as_str() == Some("mirror")))
+}
+
+fn assert_mm(body: &Value, key: &str, expected: f64) {
+    let actual = body[key]
+        .as_f64()
+        .unwrap_or_else(|| panic!("{key} missing: {body}"));
+    assert!(
+        (actual - expected).abs() < 1e-6,
+        "{key}: expected {expected}, got {actual}: {body}"
+    );
+}
+
+/// The `pcb_text` tools against a real KiCad (#97): a placed footprint's
+/// Reference and Value fields and one board text are edited in place. Each
+/// edit must be proven by KiCad's own readback, asking again must send
+/// nothing, the footprint's identity, pose and pads must not move, and a
+/// KiCad save must write what the readback reported, including the raw
+/// `${REVISION}` variable.
+///
+/// It places a resistor and adds a board text, so run it against a fresh
+/// disposable board:
+///
+/// ```text
+/// KICAD_API_SOCKET=… COPPERPOUR_LIVE_KICAD_BOARD=… \
+///   cargo test -p copperpour --test live_kicad_tools -- --ignored --nocapture \
+///   pcb_text_edits_round_trip_through_live_kicad
+/// ```
+#[test]
+#[ignore = "requires a running KiCad GUI, API socket, disposable open board, and standard footprint libraries"]
+fn pcb_text_edits_round_trip_through_live_kicad() {
+    let board = std::path::PathBuf::from(
+        test_env("LIVE_KICAD_BOARD")
+            .expect("COPPERPOUR_LIVE_KICAD_BOARD must name the disposable open board"),
+    );
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let reference = test_env("LIVE_KICAD_TEXT_REFERENCE").unwrap_or_else(|| "R910".to_string());
+    let label = "Rev ${REVISION} pcb_text";
+
+    let ipc = KiCadIpcClient::new(&socket);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match ipc.find_open_board(&board) {
+            Ok(_) => break,
+            Err(error)
+                if error.to_string().contains("AS_NOT_READY")
+                    && std::time::Instant::now() < deadline => {}
+            Err(error) => panic!("KiCad did not open the disposable board: {error:#}"),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let mut mcp = McpProcess::spawn(&socket);
+    for toolset in ["pcb_components", "pcb_board", "pcb_text"] {
+        mcp.tool("load_toolset", json!({"name": toolset}));
+    }
+    let placed = tool_body(&mcp.tool(
+        "place_component",
+        json!({
+            "board": board,
+            "footprint": "Resistor_SMD:R_0402_1005Metric",
+            "reference": reference,
+            "x": 60.0,
+            "y": 40.0,
+            "rotation": 0.0,
+            "layer": "F.Cu"
+        }),
+    ));
+    assert_eq!(placed["placed"], reference, "{placed}");
+    let added = tool_body(&mcp.tool(
+        "add_board_text",
+        json!({"board": board, "text": label, "x": 60.0, "y": 50.0, "layer": "B.SilkS", "size": 1.5}),
+    ));
+    assert_eq!(added["source"], "ipc", "{added}");
+    // The saved-file variable check needs the text on disk first.
+    ipc.save_board().expect("failed to save live board");
+    let pristine = live_footprint(&ipc, &board, &reference);
+
+    // Reference field: move, rotate, resize, restyle, and flip to the back.
+    let edit = json!({
+        "board": board, "reference": reference, "field": "reference",
+        "x": 61.5, "y": 38.0, "rotation": 90.0, "size_x": 0.8, "size_y": 1.2,
+        "bold": true, "layer": "B.SilkS", "mirror": "auto"
+    });
+    let body = tool_body(&mcp.tool("edit_footprint_field", edit.clone()));
+    println!("edit_footprint_field reference: {body}");
+    assert_eq!(body["status"], "applied", "{body}");
+    let after = &body["after"];
+    assert_mm(after, "x_mm", 61.5);
+    assert_mm(after, "y_mm", 38.0);
+    assert_mm(after, "angle_degrees", 90.0);
+    assert_mm(after, "size_x_mm", 0.8);
+    assert_mm(after, "size_y_mm", 1.2);
+    assert_eq!(after["layer"], "B.SilkS", "{body}");
+    assert_eq!(after["mirrored"], true, "{body}");
+    assert_eq!(after["bold"], true, "{body}");
+    assert_eq!(after["text"], reference, "{body}");
+    assert_eq!(body["mirror"]["side"], "back", "{body}");
+
+    let again = tool_body(&mcp.tool("edit_footprint_field", edit));
+    assert_eq!(
+        again["status"], "unchanged",
+        "asking again must send nothing: {again}"
+    );
+
+    // Value field: flip its visibility. Whether place_component leaves it
+    // shown is its own business (#157), so read it first.
+    let fields = tool_body(&mcp.tool(
+        "list_footprint_fields",
+        json!({"board": board, "reference": reference}),
+    ));
+    let value_shown = fields["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|field| field["field"] == "value")
+        .unwrap_or_else(|| panic!("no value field listed: {fields}"))["visible"]
+        .as_bool()
+        .unwrap();
+    let body = tool_body(&mcp.tool(
+        "edit_footprint_field",
+        json!({"board": board, "reference": reference, "field": "value", "visible": !value_shown}),
+    ));
+    println!("edit_footprint_field value: {body}");
+    assert_eq!(body["status"], "applied", "{body}");
+    assert_eq!(body["before"]["visible"], value_shown, "{body}");
+    assert_eq!(body["after"]["visible"], !value_shown, "{body}");
+
+    // The footprint itself did not move.
+    let live = live_footprint(&ipc, &board, &reference);
+    assert_eq!(live.id, pristine.id, "the footprint's KIID changed");
+    assert_eq!(live.position, pristine.position);
+    assert_eq!(live.orientation, pristine.orientation);
+    assert_eq!(live.layer, pristine.layer);
+    assert_eq!(footprint_pads(&live), footprint_pads(&pristine));
+
+    // Board text: mirror it where it is, then move it to the front.
+    let listing = tool_body(&mcp.tool("list_board_texts", json!({"board": board})));
+    let uuid = listing["texts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|text| text["text"] == label)
+        .unwrap_or_else(|| panic!("the added text is not listed raw: {listing}"))["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let body = tool_body(&mcp.tool(
+        "edit_board_text",
+        json!({"board": board, "uuid": uuid, "x": 62.0, "y": 52.0, "bold": true, "mirror": "auto"}),
+    ));
+    println!("edit_board_text back: {body}");
+    assert_eq!(body["status"], "applied", "{body}");
+    assert_eq!(body["text_check"], "matches_saved_file", "{body}");
+    assert_eq!(body["after"]["text"], label, "{body}");
+    assert_eq!(body["after"]["mirrored"], true, "{body}");
+    assert_eq!(body["after"]["bold"], true, "{body}");
+    assert_mm(&body["after"], "x_mm", 62.0);
+    assert_mm(&body["after"], "y_mm", 52.0);
+
+    let body = tool_body(&mcp.tool(
+        "edit_board_text",
+        json!({"board": board, "uuid": uuid, "layer": "F.SilkS", "mirror": "auto"}),
+    ));
+    println!("edit_board_text front: {body}");
+    assert_eq!(body["status"], "applied", "{body}");
+    assert_eq!(body["after"]["layer"], "F.SilkS", "{body}");
+    assert_eq!(body["after"]["mirrored"], false, "{body}");
+    assert_eq!(body["after"]["text"], label, "{body}");
+
+    // A KiCad save writes what the readback reported.
+    ipc.save_board().expect("failed to save live board");
+    let tree = parse_sexp(&std::fs::read_to_string(&board).unwrap()).unwrap();
+    let saved = footprint(&tree, &reference);
+    let at = saved.find("at").expect("saved footprint has no position");
+    assert_eq!(
+        (at.get_f64(1), at.get_f64(2)),
+        (Some(60.0), Some(40.0)),
+        "the footprint moved in the saved file"
+    );
+    let property = |name: &str| {
+        saved
+            .find_all("property")
+            .into_iter()
+            .find(|property| property.get(1).and_then(SexpNode::as_str) == Some(name))
+            .unwrap_or_else(|| panic!("saved footprint has no {name} property"))
+    };
+    let saved_reference = property("Reference");
+    assert_eq!(saved_reference.find_str("layer"), Some("B.SilkS"));
+    assert!(
+        saved_mirrored(saved_reference),
+        "Reference is not mirrored on disk"
+    );
+    assert_eq!(
+        property("Value").find_str("hide") == Some("yes"),
+        value_shown,
+        "the Value field's visibility did not reach the file"
+    );
+
+    let saved_text = tree
+        .find_all("gr_text")
+        .into_iter()
+        .find(|text| text.get(1).and_then(SexpNode::as_str) == Some(label))
+        .expect("the saved board lost the raw ${REVISION} text");
+    assert_eq!(saved_text.find_str("layer"), Some("F.SilkS"));
+    assert!(
+        !saved_mirrored(saved_text),
+        "front text is still mirrored on disk"
+    );
+    let at = saved_text.find("at").expect("saved text has no position");
+    assert_eq!((at.get_f64(1), at.get_f64(2)), (Some(62.0), Some(52.0)));
+}

@@ -3223,3 +3223,1043 @@ mod board_stackup {
         );
     }
 }
+
+// ─── Placed text: footprint fields and board-level text ──────────────────────
+//
+// A stateful mock: it holds footprints and board text the way KiCad sends
+// them, applies UpdateItems by KIID, and answers the fresh read that follows,
+// so "applied" is proven by readback through the real client code rather than
+// by echoing the request. Behaviour flags simulate a KiCad that ignores an
+// update, rejects it, or loses the font face on the way in.
+
+#[derive(Default)]
+struct TextBoard {
+    footprints: Vec<kiapi::board::types::FootprintInstance>,
+    texts: Vec<kiapi::board::types::BoardText>,
+    updates: Vec<prost_types::Any>,
+    begin_commits: usize,
+    end_commits: Vec<kiapi::common::commands::CommitAction>,
+    ignore_updates: bool,
+    reject_updates: bool,
+    drop_font_on_update: bool,
+    /// Play a KiCad whose `UpdateItems` accepts a text but keeps the mirror
+    /// flag and both alignments it already held. Whether a real KiCad honours
+    /// those on update is unconfirmed (#202); this is the case the readback
+    /// has to catch if it does not.
+    keep_mirror_and_alignment_on_update: bool,
+    refuse_bounding_boxes: bool,
+}
+
+/// Put `old`'s mirror flag and alignments back on `new`.
+fn keep_mirror_and_alignment(
+    old: Option<&kiapi::board::types::BoardText>,
+    new: Option<&mut kiapi::board::types::BoardText>,
+) {
+    let (Some(old), Some(new)) = (old, new) else {
+        return;
+    };
+    let old = old.text.as_ref().unwrap().attributes.as_ref().unwrap();
+    let new = new.text.as_mut().unwrap().attributes.as_mut().unwrap();
+    new.mirrored = old.mirrored;
+    new.horizontal_alignment = old.horizontal_alignment;
+    new.vertical_alignment = old.vertical_alignment;
+}
+
+const RAW_REVISION_TEXT: &str = "Rev ${REVISION}";
+
+fn kicad_text(
+    id: &str,
+    text: &str,
+    position_nm: (i64, i64),
+    layer: kiapi::board::types::BoardLayer,
+    font_name: &str,
+    size_nm: (i64, i64),
+) -> kiapi::board::types::BoardText {
+    use kiapi::common::types as common;
+    kiapi::board::types::BoardText {
+        id: Some(kiid(id)),
+        text: Some(common::Text {
+            position: Some(common::Vector2 {
+                x_nm: position_nm.0,
+                y_nm: position_nm.1,
+            }),
+            attributes: Some(common::TextAttributes {
+                font_name: font_name.to_string(),
+                horizontal_alignment: common::HorizontalAlignment::HaLeft as i32,
+                vertical_alignment: common::VerticalAlignment::VaBottom as i32,
+                angle: Some(common::Angle {
+                    value_degrees: 90.0,
+                }),
+                line_spacing: 1.0,
+                stroke_width: Some(common::Distance { value_nm: 150_000 }),
+                italic: false,
+                bold: true,
+                underlined: false,
+                visible: true,
+                mirrored: false,
+                multiline: false,
+                keep_upright: true,
+                size: Some(common::Vector2 {
+                    x_nm: size_nm.0,
+                    y_nm: size_nm.1,
+                }),
+            }),
+            text: text.to_string(),
+            hyperlink: String::new(),
+        }),
+        layer: layer as i32,
+        knockout: false,
+        locked: common::LockedState::LsUnlocked as i32,
+        parent: None,
+    }
+}
+
+fn kicad_field(
+    id: i32,
+    name: &str,
+    text: kiapi::board::types::BoardText,
+    visible: bool,
+) -> kiapi::board::types::Field {
+    kiapi::board::types::Field {
+        id: Some(kiapi::board::types::FieldId { id }),
+        name: name.to_string(),
+        text: Some(text),
+        visible,
+    }
+}
+
+/// A placed resistor as KiCad 10 sends it: four mandatory fields with full
+/// attributes, a pad, and one user field in `definition.items`.
+fn kicad_footprint(footprint_id: &str, reference: &str) -> kiapi::board::types::FootprintInstance {
+    use kiapi::board::types::BoardLayer;
+    let text = |suffix: &str, value: &str, layer| {
+        kicad_text(
+            &format!("{footprint_id}-{suffix}"),
+            value,
+            (98_500_000, 50_000_000),
+            layer,
+            "",
+            (1_000_000, 1_000_000),
+        )
+    };
+    kiapi::board::types::FootprintInstance {
+        id: Some(kiid(footprint_id)),
+        position: Some(kiapi::common::types::Vector2 {
+            x_nm: 100_000_000,
+            y_nm: 50_000_000,
+        }),
+        orientation: Some(kiapi::common::types::Angle {
+            value_degrees: 90.0,
+        }),
+        layer: BoardLayer::BlFCu as i32,
+        reference_field: Some(kicad_field(
+            1,
+            "Reference",
+            text("ref", reference, BoardLayer::BlFSilkS),
+            true,
+        )),
+        value_field: Some(kicad_field(
+            2,
+            "Value",
+            text("val", "10k", BoardLayer::BlFFab),
+            true,
+        )),
+        datasheet_field: Some(kicad_field(
+            3,
+            "Datasheet",
+            text("ds", "~", BoardLayer::BlFFab),
+            false,
+        )),
+        description_field: Some(kicad_field(
+            4,
+            "Description",
+            text("desc", "Resistor", BoardLayer::BlFFab),
+            false,
+        )),
+        definition: Some(kiapi::board::types::Footprint {
+            items: vec![
+                pad_at("1", 100.0, 50.0, "GND"),
+                builders::pack_any(
+                    &kicad_field(5, "MPN", text("mpn", "RC0402", BoardLayer::BlFFab), false),
+                    "kiapi.board.types.Field",
+                ),
+            ],
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The board text the silkscreen clean-up has to move without loss: a custom
+/// font face, a non-square glyph, and an unexpanded text variable.
+fn revision_text() -> kiapi::board::types::BoardText {
+    kicad_text(
+        "rev-text",
+        RAW_REVISION_TEXT,
+        (20_000_000, 30_000_000),
+        kiapi::board::types::BoardLayer::BlFSilkS,
+        "Osifont",
+        (1_200_000, 1_300_000),
+    )
+}
+
+fn text_board() -> Arc<Mutex<TextBoard>> {
+    Arc::new(Mutex::new(TextBoard {
+        footprints: vec![
+            kicad_footprint("fp-r1", "R1"),
+            kicad_footprint("fp-r2", "R2"),
+        ],
+        texts: vec![revision_text()],
+        ..Default::default()
+    }))
+}
+
+/// Every text on the board by KIID: footprint fields and board text alike.
+fn texts_by_kiid(board: &TextBoard) -> Vec<kiapi::board::types::BoardText> {
+    let mut texts = board.texts.clone();
+    for footprint in &board.footprints {
+        for field in [
+            &footprint.reference_field,
+            &footprint.value_field,
+            &footprint.datasheet_field,
+            &footprint.description_field,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            texts.extend(field.text.clone());
+        }
+        for item in &footprint.definition.as_ref().unwrap().items {
+            if builders::any_is(item, "kiapi.board.types.Field") {
+                let field = kiapi::board::types::Field::decode(item.value.as_slice()).unwrap();
+                texts.extend(field.text);
+            }
+        }
+    }
+    texts
+}
+
+fn spawn_text_board(board: Arc<Mutex<TextBoard>>) -> MockKicad {
+    use kiapi::common::commands;
+    spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        let command = message.type_url.rsplit('.').next().unwrap().to_string();
+        let mut board = board.lock().unwrap();
+        match command.as_str() {
+            "GetOpenDocuments" => Some(open_board_response()),
+            "GetItems" => {
+                let request = commands::GetItems::decode(message.value.as_slice()).unwrap();
+                let mut items = Vec::new();
+                for kind in request.types {
+                    if kind == kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32 {
+                        items.extend(board.footprints.iter().map(|footprint| {
+                            builders::pack_any(footprint, "kiapi.board.types.FootprintInstance")
+                        }));
+                    } else if kind == kiapi::common::types::KiCadObjectType::KotPcbText as i32 {
+                        items.extend(
+                            board.texts.iter().map(|text| {
+                                builders::pack_any(text, "kiapi.board.types.BoardText")
+                            }),
+                        );
+                    }
+                }
+                Some(reply_with(builders::pack_any(
+                    &commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items,
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                )))
+            }
+            "GetBoundingBox" => {
+                if board.refuse_bounding_boxes {
+                    return Some(unsupported_response(
+                        kiapi::common::ApiStatusCode::AsUnhandled,
+                    ));
+                }
+                let request = commands::GetBoundingBox::decode(message.value.as_slice()).unwrap();
+                let known = texts_by_kiid(&board);
+                let mut response = commands::GetBoundingBoxResponse::default();
+                // Like KiCad, an unresolvable KIID is skipped, not failed.
+                for id in request.items {
+                    let Some(text) = known.iter().find(|text| text.id.as_ref() == Some(&id)) else {
+                        continue;
+                    };
+                    let at = text.text.as_ref().unwrap().position.unwrap();
+                    response.items.push(id);
+                    response.boxes.push(kiapi::common::types::Box2 {
+                        position: Some(kiapi::common::types::Vector2 {
+                            x_nm: at.x_nm - 1_000_000,
+                            y_nm: at.y_nm - 500_000,
+                        }),
+                        size: Some(kiapi::common::types::Vector2 {
+                            x_nm: 2_000_000,
+                            y_nm: 1_000_000,
+                        }),
+                    });
+                }
+                Some(reply_with(builders::pack_any(
+                    &response,
+                    "kiapi.common.commands.GetBoundingBoxResponse",
+                )))
+            }
+            "BeginCommit" => {
+                board.begin_commits += 1;
+                Some(reply_with(builders::pack_any(
+                    &commands::BeginCommitResponse {
+                        id: Some(kiid("text-commit")),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                )))
+            }
+            "EndCommit" => {
+                let request = commands::EndCommit::decode(message.value.as_slice()).unwrap();
+                board.end_commits.push(request.action());
+                Some(reply_with(builders::pack_any(
+                    &commands::EndCommitResponse {},
+                    "kiapi.common.commands.EndCommitResponse",
+                )))
+            }
+            "UpdateItems" => {
+                let request = commands::UpdateItems::decode(message.value.as_slice()).unwrap();
+                board.updates.extend(request.items.iter().cloned());
+                let code = if board.reject_updates {
+                    commands::ItemStatusCode::IscInvalidData
+                } else {
+                    commands::ItemStatusCode::IscOk
+                };
+                if !board.reject_updates && !board.ignore_updates {
+                    for item in &request.items {
+                        if builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+                            let mut updated = kiapi::board::types::FootprintInstance::decode(
+                                item.value.as_slice(),
+                            )
+                            .unwrap();
+                            let keep_style = board.keep_mirror_and_alignment_on_update;
+                            let slot = board
+                                .footprints
+                                .iter_mut()
+                                .find(|footprint| footprint.id == updated.id)
+                                .expect("update names an existing footprint");
+                            if keep_style {
+                                for (old, new) in [
+                                    (&slot.reference_field, &mut updated.reference_field),
+                                    (&slot.value_field, &mut updated.value_field),
+                                ] {
+                                    keep_mirror_and_alignment(
+                                        old.as_ref().and_then(|field| field.text.as_ref()),
+                                        new.as_mut().and_then(|field| field.text.as_mut()),
+                                    );
+                                }
+                            }
+                            *slot = updated;
+                        } else if builders::any_is(item, "kiapi.board.types.BoardText") {
+                            let mut updated =
+                                kiapi::board::types::BoardText::decode(item.value.as_slice())
+                                    .unwrap();
+                            if board.drop_font_on_update {
+                                updated
+                                    .text
+                                    .as_mut()
+                                    .unwrap()
+                                    .attributes
+                                    .as_mut()
+                                    .unwrap()
+                                    .font_name
+                                    .clear();
+                            }
+                            let keep_style = board.keep_mirror_and_alignment_on_update;
+                            let slot = board
+                                .texts
+                                .iter_mut()
+                                .find(|text| text.id == updated.id)
+                                .expect("update names an existing text");
+                            if keep_style {
+                                keep_mirror_and_alignment(Some(&*slot), Some(&mut updated));
+                            }
+                            *slot = updated;
+                        } else {
+                            panic!("unexpected update of {}", item.type_url);
+                        }
+                    }
+                }
+                Some(reply_with(builders::pack_any(
+                    &commands::UpdateItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        updated_items: request
+                            .items
+                            .iter()
+                            .map(|_| commands::ItemUpdateResult {
+                                status: Some(commands::ItemStatus {
+                                    code: code as i32,
+                                    error_message: if board.reject_updates {
+                                        "rejected by mock".to_string()
+                                    } else {
+                                        String::new()
+                                    },
+                                }),
+                                item: None,
+                            })
+                            .collect(),
+                    },
+                    "kiapi.common.commands.UpdateItemsResponse",
+                )))
+            }
+            other => panic!("unexpected command {other}"),
+        }
+    })
+}
+
+fn text_client(mock: &MockKicad) -> (KiCadIpcClient, kiapi::common::types::DocumentSpecifier) {
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = client
+        .find_open_board(&mock_board("test.kicad_pcb"))
+        .expect("bind the mock board");
+    (client, document)
+}
+
+fn state(field: &copperpour_ipc::IpcFootprintField) -> &copperpour_ipc::IpcTextState {
+    field.state.as_ref().expect("field is describable")
+}
+
+#[test]
+fn footprint_fields_list_in_board_coordinates_with_kicad_boxes() {
+    let board = text_board();
+    let mock = spawn_text_board(board.clone());
+    let (client, document) = text_client(&mock);
+
+    let listing = client
+        .list_footprint_fields_in(document.clone(), Some("R1"))
+        .expect("list one footprint");
+    assert_eq!(listing.bounding_boxes_unavailable, None);
+    let slots: Vec<&str> = listing.fields.iter().map(|f| f.slot.as_str()).collect();
+    assert_eq!(
+        slots,
+        ["reference", "value", "datasheet", "description", "user"]
+    );
+
+    let reference = &listing.fields[0];
+    assert_eq!(reference.footprint_reference, "R1");
+    assert_eq!(reference.footprint_kiid, "fp-r1");
+    assert_eq!(reference.kiid, "fp-r1-ref");
+    assert!(reference.visible);
+    let text = state(reference);
+    // Board-absolute, exactly as KiCad sent it — not footprint-relative.
+    assert_eq!((text.x_nm, text.y_nm), (98_500_000, 50_000_000));
+    assert_eq!(text.layer, "F.SilkS");
+    assert_eq!(text.horizontal_alignment, "left");
+    assert!(text.keep_upright);
+    assert_eq!(
+        reference.bounding_box,
+        Some(copperpour_ipc::IpcBox2 {
+            min_x_nm: 97_500_000,
+            min_y_nm: 49_500_000,
+            max_x_nm: 99_500_000,
+            max_y_nm: 50_500_000,
+        })
+    );
+    assert_eq!(listing.fields[4].name, "MPN");
+    assert!(!listing.fields[4].visible);
+
+    let everything = client
+        .list_footprint_fields_in(document, None)
+        .expect("list every footprint");
+    assert_eq!(everything.fields.len(), 10);
+}
+
+#[test]
+fn a_listing_survives_a_kicad_that_will_not_measure_boxes() {
+    let board = text_board();
+    board.lock().unwrap().refuse_bounding_boxes = true;
+    let mock = spawn_text_board(board);
+    let (client, document) = text_client(&mock);
+
+    let listing = client.list_board_texts_in(document).expect("list text");
+    assert_eq!(listing.texts.len(), 1);
+    assert_eq!(listing.texts[0].bounding_box, None);
+    assert!(
+        listing.bounding_boxes_unavailable.is_some(),
+        "the reason the boxes are missing must be reported"
+    );
+}
+
+#[test]
+fn a_field_edit_changes_only_what_was_named_and_is_proven_by_readback() {
+    let board = text_board();
+    let mock = spawn_text_board(board.clone());
+    let (client, document) = text_client(&mock);
+
+    let outcome = client
+        .edit_footprint_field_in(
+            document,
+            "R1",
+            copperpour_ipc::IpcFootprintFieldSlot::Reference,
+            &copperpour_ipc::IpcTextEdit {
+                position_nm: Some((101_000_000, 47_000_000)),
+                angle_degrees: Some(0.0),
+                size_y_nm: Some(800_000),
+                visible: Some(false),
+                ..Default::default()
+            },
+        )
+        .expect("edit applies");
+    let copperpour_ipc::IpcTextEditOutcome::Applied { before, after } = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    assert!(before.visible && !after.visible);
+    let (before, after) = (state(&before).clone(), state(&after).clone());
+    assert_eq!((after.x_nm, after.y_nm), (101_000_000, 47_000_000));
+    assert_eq!(after.angle_degrees, 0.0);
+    assert_eq!((after.size_x_nm, after.size_y_nm), (1_000_000, 800_000));
+    // Unnamed properties travel back verbatim.
+    assert_eq!(after.text, before.text);
+    assert_eq!(after.stroke_width_nm, before.stroke_width_nm);
+    assert_eq!(after.font_name, before.font_name);
+    assert_eq!(after.bold, before.bold);
+    assert_eq!(after.horizontal_alignment, before.horizontal_alignment);
+    assert_eq!(after.layer, before.layer);
+
+    let board = board.lock().unwrap();
+    assert_eq!(board.updates.len(), 1, "one update for one edit");
+    assert_eq!(board.begin_commits, 1);
+    assert_eq!(
+        board.end_commits,
+        [kiapi::common::commands::CommitAction::CmaCommit],
+        "one KiCad undo step"
+    );
+    // The footprint itself and its other fields were not touched.
+    let r1 = &board.footprints[0];
+    let pristine = kicad_footprint("fp-r1", "R1");
+    assert_eq!(r1.position, pristine.position);
+    assert_eq!(r1.orientation, pristine.orientation);
+    assert_eq!(r1.value_field, pristine.value_field);
+    assert_eq!(r1.definition, pristine.definition);
+    assert_eq!(board.footprints[1], kicad_footprint("fp-r2", "R2"));
+}
+
+#[test]
+fn an_edit_the_board_already_satisfies_sends_nothing() {
+    let board = text_board();
+    let mock = spawn_text_board(board.clone());
+    let (client, document) = text_client(&mock);
+
+    let outcome = client
+        .edit_footprint_field_in(
+            document,
+            "R1",
+            copperpour_ipc::IpcFootprintFieldSlot::Reference,
+            &copperpour_ipc::IpcTextEdit {
+                position_nm: Some((98_500_000, 50_000_000)),
+                // The same direction KiCad holds as 90.
+                angle_degrees: Some(-270.0),
+                ..Default::default()
+            },
+        )
+        .expect("no-op edit");
+    assert!(
+        matches!(
+            outcome,
+            copperpour_ipc::IpcTextEditOutcome::Unchanged { .. }
+        ),
+        "{outcome:?}"
+    );
+    let board = board.lock().unwrap();
+    assert!(board.updates.is_empty());
+    assert_eq!(board.begin_commits, 0);
+}
+
+#[test]
+fn a_kicad_that_accepts_but_ignores_an_update_is_not_reported_as_success() {
+    let board = text_board();
+    board.lock().unwrap().ignore_updates = true;
+    let mock = spawn_text_board(board.clone());
+    let (client, document) = text_client(&mock);
+
+    let outcome = client
+        .edit_footprint_field_in(
+            document,
+            "R1",
+            copperpour_ipc::IpcFootprintFieldSlot::Value,
+            &copperpour_ipc::IpcTextEdit {
+                visible: Some(false),
+                ..Default::default()
+            },
+        )
+        .expect("an uncertain outcome, not an error");
+    let copperpour_ipc::IpcTextEditOutcome::Uncertain {
+        mismatches,
+        observed,
+        ..
+    } = outcome
+    else {
+        panic!("expected Uncertain, got {outcome:?}");
+    };
+    assert_eq!(
+        mismatches,
+        ["value.visible: expected false, observed true".to_string()]
+    );
+    assert!(observed.expect("readback succeeded").visible);
+}
+
+#[test]
+fn a_rejected_field_update_with_an_unchanged_board_is_a_refusal() {
+    let board = text_board();
+    board.lock().unwrap().reject_updates = true;
+    let mock = spawn_text_board(board.clone());
+    let (client, document) = text_client(&mock);
+
+    let error = client
+        .edit_footprint_field_in(
+            document,
+            "R1",
+            copperpour_ipc::IpcFootprintFieldSlot::Reference,
+            &copperpour_ipc::IpcTextEdit {
+                layer: Some("F.Fab".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect_err("KiCad said no");
+    let message = format!("{error:#}");
+    assert!(message.contains("rejected by mock"), "{message}");
+    assert!(message.contains("unchanged"), "{message}");
+    assert_eq!(
+        board.lock().unwrap().end_commits,
+        [kiapi::common::commands::CommitAction::CmaDrop],
+        "a failed batch is dropped, not published"
+    );
+}
+
+#[test]
+fn board_text_edit_keeps_font_non_square_size_and_raw_variable_text() {
+    let board = text_board();
+    let mock = spawn_text_board(board.clone());
+    let (client, document) = text_client(&mock);
+
+    let outcome = client
+        .edit_board_text_in(
+            document,
+            "rev-text",
+            &copperpour_ipc::IpcTextEdit {
+                position_nm: Some((25_000_000, 31_500_000)),
+                angle_degrees: Some(180.0),
+                ..Default::default()
+            },
+            |_| Ok(()),
+        )
+        .expect("edit applies");
+    let copperpour_ipc::IpcTextEditOutcome::Applied { after, .. } = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    let after = after.state.expect("describable");
+    assert_eq!((after.x_nm, after.y_nm), (25_000_000, 31_500_000));
+    assert_eq!(after.angle_degrees, 180.0);
+    assert_eq!(after.text, RAW_REVISION_TEXT);
+    assert_eq!(after.font_name, "Osifont");
+    assert_eq!((after.size_x_nm, after.size_y_nm), (1_200_000, 1_300_000));
+
+    // What went over the wire is the raw string, not an expansion.
+    let board = board.lock().unwrap();
+    let sent = kiapi::board::types::BoardText::decode(board.updates[0].value.as_slice()).unwrap();
+    assert_eq!(sent.text.unwrap().text, RAW_REVISION_TEXT);
+}
+
+#[test]
+fn caller_supplied_board_text_is_written_verbatim() {
+    let board = text_board();
+    let mock = spawn_text_board(board.clone());
+    let (client, document) = text_client(&mock);
+
+    let outcome = client
+        .edit_board_text_in(
+            document,
+            "rev-text",
+            &copperpour_ipc::IpcTextEdit {
+                text: Some("Rev ${REVISION} / ${BOARD_NAME}".to_string()),
+                size_x_nm: Some(1_000_000),
+                ..Default::default()
+            },
+            |_| Ok(()),
+        )
+        .expect("edit applies");
+    let copperpour_ipc::IpcTextEditOutcome::Applied { after, .. } = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    let after = after.state.unwrap();
+    assert_eq!(after.text, "Rev ${REVISION} / ${BOARD_NAME}");
+    assert_eq!((after.size_x_nm, after.size_y_nm), (1_000_000, 1_300_000));
+}
+
+#[test]
+fn a_kicad_that_loses_the_font_face_is_reported_uncertain() {
+    let board = text_board();
+    board.lock().unwrap().drop_font_on_update = true;
+    let mock = spawn_text_board(board);
+    let (client, document) = text_client(&mock);
+
+    let outcome = client
+        .edit_board_text_in(
+            document,
+            "rev-text",
+            &copperpour_ipc::IpcTextEdit {
+                position_nm: Some((21_000_000, 30_000_000)),
+                ..Default::default()
+            },
+            |_| Ok(()),
+        )
+        .expect("an uncertain outcome, not an error");
+    let copperpour_ipc::IpcTextEditOutcome::Uncertain { mismatches, .. } = outcome else {
+        panic!("expected Uncertain, got {outcome:?}");
+    };
+    assert_eq!(
+        mismatches,
+        ["text.font_name: expected \"Osifont\", observed \"\"".to_string()]
+    );
+}
+
+/// The case that prompted #202: a text moved to the back silkscreen stays
+/// unmirrored until something can set the flag.
+#[test]
+fn board_text_style_attributes_are_written_and_proven_by_readback() {
+    let board = text_board();
+    let mock = spawn_text_board(board.clone());
+    let (client, document) = text_client(&mock);
+
+    let outcome = client
+        .edit_board_text_in(
+            document,
+            "rev-text",
+            &copperpour_ipc::IpcTextEdit {
+                layer: Some("B.SilkS".to_string()),
+                mirrored: Some(true),
+                horizontal_alignment: Some(copperpour_ipc::IpcHorizontalAlignment::Right),
+                vertical_alignment: Some(copperpour_ipc::IpcVerticalAlignment::Center),
+                bold: Some(false),
+                italic: Some(true),
+                keep_upright: Some(false),
+                knockout: Some(true),
+                locked: Some(true),
+                ..Default::default()
+            },
+            |_| Ok(()),
+        )
+        .expect("edit applies");
+    let copperpour_ipc::IpcTextEditOutcome::Applied { before, after } = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    let (before, after) = (before.state.unwrap(), after.state.unwrap());
+    assert_eq!(after.layer, "B.SilkS");
+    assert!(after.mirrored && !before.mirrored);
+    assert_eq!(after.horizontal_alignment, "right");
+    assert_eq!(after.vertical_alignment, "center");
+    assert!(!after.bold && after.italic && !after.keep_upright);
+    assert!(after.knockout && after.locked);
+    // The properties the edit did not name, the ones a delete-and-recreate
+    // loses.
+    assert_eq!(after.text, RAW_REVISION_TEXT);
+    assert_eq!(after.font_name, "Osifont");
+    assert_eq!((after.size_x_nm, after.size_y_nm), (1_200_000, 1_300_000));
+    assert_eq!((after.x_nm, after.y_nm), (before.x_nm, before.y_nm));
+    assert_eq!(after.angle_degrees, before.angle_degrees);
+    assert_eq!(after.stroke_width_nm, before.stroke_width_nm);
+
+    let board = board.lock().unwrap();
+    assert_eq!(board.updates.len(), 1, "one update for one edit");
+    let sent = kiapi::board::types::BoardText::decode(board.updates[0].value.as_slice()).unwrap();
+    assert_eq!(
+        sent.locked,
+        kiapi::common::types::LockedState::LsLocked as i32
+    );
+    assert!(sent.knockout);
+    assert!(sent.text.unwrap().attributes.unwrap().mirrored);
+}
+
+/// Item 3 of #202: one edit moves a text to the back and mirrors it, and the
+/// same option on the way back to the front clears the flag.
+#[test]
+fn mirroring_to_match_the_layer_sets_and_clears_the_flag_with_the_side() {
+    let board = text_board();
+    let mock = spawn_text_board(board.clone());
+    let (client, document) = text_client(&mock);
+    let to = |layer: &str| copperpour_ipc::IpcTextEdit {
+        layer: Some(layer.to_string()),
+        mirror_to_match_layer: true,
+        ..Default::default()
+    };
+    let applied = |outcome: copperpour_ipc::IpcTextEditOutcome<
+        copperpour_ipc::IpcBoardTextItem,
+    >| match outcome {
+        copperpour_ipc::IpcTextEditOutcome::Applied { after, .. } => after,
+        other => panic!("expected Applied, got {other:?}"),
+    };
+
+    let after = applied(
+        client
+            .edit_board_text_in(document.clone(), "rev-text", &to("B.SilkS"), |_| Ok(()))
+            .expect("to the back"),
+    );
+    let text = after.state.unwrap();
+    assert_eq!((text.layer.as_str(), text.mirrored), ("B.SilkS", true));
+    // The option changes the flag and the layer, not the placement.
+    assert_eq!((text.x_nm, text.y_nm), (20_000_000, 30_000_000));
+    assert_eq!(text.angle_degrees, 90.0);
+    assert_eq!(text.horizontal_alignment, "left");
+
+    let after = applied(
+        client
+            .edit_board_text_in(document.clone(), "rev-text", &to("F.SilkS"), |_| Ok(()))
+            .expect("back to the front"),
+    );
+    let text = after.state.unwrap();
+    assert_eq!((text.layer.as_str(), text.mirrored), ("F.SilkS", false));
+
+    // A footprint field takes the same option.
+    let outcome = client
+        .edit_footprint_field_in(
+            document.clone(),
+            "R1",
+            copperpour_ipc::IpcFootprintFieldSlot::Reference,
+            &to("B.SilkS"),
+        )
+        .expect("field to the back");
+    let copperpour_ipc::IpcTextEditOutcome::Applied { after, .. } = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    assert_eq!(
+        (state(&after).layer.as_str(), state(&after).mirrored),
+        ("B.SilkS", true)
+    );
+
+    // Nothing to do is nothing sent: the field is already mirrored on the back.
+    let sent = board.lock().unwrap().updates.len();
+    let outcome = client
+        .edit_footprint_field_in(
+            document,
+            "R1",
+            copperpour_ipc::IpcFootprintFieldSlot::Reference,
+            &copperpour_ipc::IpcTextEdit {
+                mirror_to_match_layer: true,
+                ..Default::default()
+            },
+        )
+        .expect("no-op");
+    assert!(
+        matches!(
+            outcome,
+            copperpour_ipc::IpcTextEditOutcome::Unchanged { .. }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(board.lock().unwrap().updates.len(), sent);
+}
+
+#[test]
+fn a_font_face_is_replaced_or_cleared_for_the_stroke_font() {
+    let board = text_board();
+    let mock = spawn_text_board(board);
+    let (client, document) = text_client(&mock);
+    for (font, expected) in [("Arial", "Arial"), ("", "")] {
+        let outcome = client
+            .edit_board_text_in(
+                document.clone(),
+                "rev-text",
+                &copperpour_ipc::IpcTextEdit {
+                    font_name: Some(font.to_string()),
+                    ..Default::default()
+                },
+                |_| Ok(()),
+            )
+            .expect("edit applies");
+        let copperpour_ipc::IpcTextEditOutcome::Applied { after, .. } = outcome else {
+            panic!("expected Applied, got {outcome:?}");
+        };
+        assert_eq!(after.state.unwrap().font_name, expected);
+    }
+}
+
+/// Nobody has confirmed that KiCad's `UpdateItems` honours `mirrored` and
+/// the alignments (#202). If it does not, the edit must not read as success.
+#[test]
+fn a_kicad_that_keeps_the_old_mirror_flag_and_alignment_is_reported_uncertain() {
+    let board = text_board();
+    board.lock().unwrap().keep_mirror_and_alignment_on_update = true;
+    let mock = spawn_text_board(board);
+    let (client, document) = text_client(&mock);
+
+    let outcome = client
+        .edit_board_text_in(
+            document.clone(),
+            "rev-text",
+            &copperpour_ipc::IpcTextEdit {
+                mirrored: Some(true),
+                horizontal_alignment: Some(copperpour_ipc::IpcHorizontalAlignment::Center),
+                position_nm: Some((21_000_000, 30_000_000)),
+                ..Default::default()
+            },
+            |_| Ok(()),
+        )
+        .expect("an uncertain outcome, not an error");
+    let copperpour_ipc::IpcTextEditOutcome::Uncertain {
+        mismatches,
+        observed,
+        ..
+    } = outcome
+    else {
+        panic!("expected Uncertain, got {outcome:?}");
+    };
+    assert_eq!(
+        mismatches,
+        [
+            "text.horizontal_alignment: expected \"center\", observed \"left\"".to_string(),
+            "text.mirrored: expected true, observed false".to_string(),
+        ]
+    );
+    // The part KiCad did apply is in the evidence, not hidden.
+    assert_eq!(observed.unwrap().state.unwrap().x_nm, 21_000_000);
+
+    let outcome = client
+        .edit_footprint_field_in(
+            document,
+            "R1",
+            copperpour_ipc::IpcFootprintFieldSlot::Reference,
+            &copperpour_ipc::IpcTextEdit {
+                mirrored: Some(true),
+                ..Default::default()
+            },
+        )
+        .expect("an uncertain outcome, not an error");
+    let copperpour_ipc::IpcTextEditOutcome::Uncertain { mismatches, .. } = outcome else {
+        panic!("expected Uncertain, got {outcome:?}");
+    };
+    assert_eq!(
+        mismatches,
+        ["reference.mirrored: expected true, observed false".to_string()]
+    );
+}
+
+#[test]
+fn a_field_takes_the_same_style_attributes_and_keeps_the_rest_of_its_footprint() {
+    let board = text_board();
+    let mock = spawn_text_board(board.clone());
+    let (client, document) = text_client(&mock);
+
+    let outcome = client
+        .edit_footprint_field_in(
+            document,
+            "R1",
+            copperpour_ipc::IpcFootprintFieldSlot::Reference,
+            &copperpour_ipc::IpcTextEdit {
+                layer: Some("B.SilkS".to_string()),
+                mirrored: Some(true),
+                horizontal_alignment: Some(copperpour_ipc::IpcHorizontalAlignment::Center),
+                vertical_alignment: Some(copperpour_ipc::IpcVerticalAlignment::Center),
+                bold: Some(false),
+                keep_upright: Some(false),
+                font_name: Some("Osifont".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("edit applies");
+    let copperpour_ipc::IpcTextEditOutcome::Applied { before, after } = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    let (before, after) = (state(&before).clone(), state(&after).clone());
+    assert!(after.mirrored);
+    assert_eq!(after.layer, "B.SilkS");
+    assert_eq!(after.horizontal_alignment, "center");
+    assert_eq!(after.vertical_alignment, "center");
+    assert!(before.bold && !after.bold);
+    assert!(before.keep_upright && !after.keep_upright);
+    assert_eq!(after.font_name, "Osifont");
+    assert_eq!(after.text, "R1");
+    assert_eq!((after.x_nm, after.y_nm), (before.x_nm, before.y_nm));
+    assert_eq!(after.stroke_width_nm, before.stroke_width_nm);
+
+    let board = board.lock().unwrap();
+    let pristine = kicad_footprint("fp-r1", "R1");
+    assert_eq!(board.footprints[0].value_field, pristine.value_field);
+    assert_eq!(board.footprints[0].definition, pristine.definition);
+    assert_eq!(board.footprints[1], kicad_footprint("fp-r2", "R2"));
+}
+
+#[test]
+fn unknown_targets_and_preflight_refusals_write_nothing() {
+    let board = text_board();
+    {
+        let mut board = board.lock().unwrap();
+        board.footprints[1].value_field = None;
+    }
+    let mock = spawn_text_board(board.clone());
+    let (client, document) = text_client(&mock);
+    let move_it = copperpour_ipc::IpcTextEdit {
+        position_nm: Some((1, 1)),
+        ..Default::default()
+    };
+
+    let error = client
+        .edit_footprint_field_in(
+            document.clone(),
+            "R99",
+            copperpour_ipc::IpcFootprintFieldSlot::Reference,
+            &move_it,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<copperpour_ipc::client::FootprintTargetError>(),
+            Some(copperpour_ipc::client::FootprintTargetError::Missing { .. })
+        ),
+        "{error:#}"
+    );
+
+    let error = client
+        .edit_footprint_field_in(
+            document.clone(),
+            "R2",
+            copperpour_ipc::IpcFootprintFieldSlot::Value,
+            &move_it,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<copperpour_ipc::client::TextTargetError>(),
+            Some(copperpour_ipc::client::TextTargetError::MissingField { .. })
+        ),
+        "{error:#}"
+    );
+
+    let error = client
+        .edit_board_text_in(document.clone(), "no-such-text", &move_it, |_| Ok(()))
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<copperpour_ipc::client::TextTargetError>(),
+            Some(copperpour_ipc::client::TextTargetError::MissingBoardText { .. })
+        ),
+        "{error:#}"
+    );
+
+    // A footprint field's KIID is not a board text.
+    let error = client
+        .edit_board_text_in(document.clone(), "fp-r1-ref", &move_it, |_| Ok(()))
+        .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<copperpour_ipc::client::TextTargetError>()
+            .is_some(),
+        "{error:#}"
+    );
+
+    let error = client
+        .edit_board_text_in(document, "rev-text", &move_it, |before| {
+            assert_eq!(before.state.as_ref().unwrap().text, RAW_REVISION_TEXT);
+            anyhow::bail!("preflight says no")
+        })
+        .unwrap_err();
+    assert_eq!(format!("{error:#}"), "preflight says no");
+
+    let board = board.lock().unwrap();
+    assert!(board.updates.is_empty(), "no refusal may write");
+    assert_eq!(board.begin_commits, 0);
+}

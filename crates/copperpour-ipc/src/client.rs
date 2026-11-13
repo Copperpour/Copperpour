@@ -19,6 +19,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
+mod text_edit;
+pub use text_edit::TextTargetError;
+
 /// How long the per-layer name lookups behind `get_enabled_layers_with_names_in`
 /// may wait on KiCad in total. One socket and one round trip each, and up to
 /// 32 enabled layers: at the default receive timeout, a KiCad that wedges

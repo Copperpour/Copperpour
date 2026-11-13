@@ -385,7 +385,7 @@ checked readers for domain rules.
 
 ## Current Stats
 
-- **22 toolsets, 257 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime
+- **23 toolsets, 257 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime
   diagnostic — see `tool-directory.md`). The standalone Unix executable adds
   `reload_server` over stdio only — not embedded, HTTP, mixed transport or Windows.
 - Baseline `tools/list`: 21 tools / ~2K tokens. Full catalogue: 264 tools (257 registered + 7 meta) / ~25K tokens.
