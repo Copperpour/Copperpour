@@ -9,7 +9,7 @@ use crate::tools::reference_hint::component_not_found;
 use crate::tools::sch_connectivity::{label_roots, net_graph_for, pt_key, ConnectivityIndex};
 use crate::tools::{
     get_path, is_power_symbol_reference, opt_f64, opt_positive_f64, placed_pins_by_reference,
-    require_f64, require_str, resolved_placed_pins_by_reference, ToolContext, ToolDef,
+    require_f64, require_str, resolved_placed_pins_by_reference, PlacedPins, ToolContext, ToolDef,
     UNRESOLVED_PIN_GEOMETRY,
 };
 use copperpour_schematic_editor as cse;
@@ -375,30 +375,17 @@ async fn handle_get_pin_connections(
         Err(e) => return Ok(e),
     };
     let (_, tree) = read_schematic(&sch_path)?;
-    let instances = extract_symbol_instances(&tree);
-    let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
-    if !instances
-        .iter()
-        .any(|instance| instance.reference == reference)
-    {
-        return Err(anyhow::anyhow!(component_not_found(&sch_path, &reference)));
-    }
-    let pin_ep = placed_pins_by_reference(&tree)
-        .into_iter()
-        .filter(|(instance, _)| instance.reference == reference)
-        .flat_map(|(_, pins)| pins)
-        .find(|(pin, _)| pin.number == pin_number)
-        .map(|(pin, transform)| copperpour_sexp::schematic::pin_endpoint(&pin, transform));
-    let (px, py) = match pin_ep {
-        Some(ep) => ep,
-        None => {
-            return Ok(CallToolResult::error(format!(
-                "Pin '{}' not found on '{}'",
-                pin_number, reference
-            )))
+    let (px, py) = match PlacedPins::new(&tree).resolve(&reference, &pin_number) {
+        Ok(pin) => pin.endpoint(),
+        Err(refusal) => {
+            return Ok(refusal.result(
+                "inspect",
+                "Give placed symbols unique references, or inspect the intended candidate by position with trace_from_point.",
+            ))
         }
     };
+    let wires = extract_wires(&tree);
+    let labels = extract_all_net_labels(&tree);
     let mut g = net_graph_for(&tree, &wires, &labels);
     Ok(CallToolResult::json(
         &json!({ "reference": reference, "pin": pin_number, "pin_x": px, "pin_y": py, "net": g.net_at(px, py) }),
