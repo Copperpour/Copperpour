@@ -137,7 +137,8 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "shape": {
                         "type": "string",
-                        "description": "Shape for global/hierarchical labels (input/output/bidirectional/etc.)",
+                        "enum": super::sch_hierarchy::ALLOWED_PIN_TYPES,
+                        "description": "Shape for global/hierarchical labels; a net_label writes none",
                         "default": "input"
                     }
                 },
@@ -1938,7 +1939,19 @@ async fn handle_add_net_label(
     };
     let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
-    let shape = opt_str(args, "shape").unwrap_or("input");
+    // KiCad cannot load a sheet whose label has a shape it does not know, and
+    // indexes past its hierarchical label shapes drawing a flag shape.
+    let shapes = super::sch_hierarchy::ALLOWED_PIN_TYPES;
+    let shape = match &args["shape"] {
+        serde_json::Value::Null => "input",
+        given => match given.as_str().filter(|shape| shapes.contains(shape)) {
+            Some(shape) => shape,
+            None => {
+                let reason = format!("{given} is not one of {}", shapes.join(", "));
+                return Ok(crate::tools::invalid_arg("shape", &reason));
+            }
+        },
+    };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
     push_net_label(&mut sch, label_type, &net, shape, (x, y), rotation);
@@ -5042,6 +5055,107 @@ mod label_tests {
         let (_d, path) = sch_with(TWO_PLAIN);
         let result = delete(&path, "NOPE", 100.0, 100.0).await;
         assert!(result.is_error);
+    }
+
+    // ─── shape ─────────────────────────────────────────────────────────────
+
+    fn shaped_label(
+        path: &std::path::Path,
+        label_type: &str,
+        shape: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({ "schematic": path.display().to_string(), "net": "IFACE", "x": 127.0,
+                "y": 97.79, "label_type": label_type, "shape": shape })
+    }
+
+    /// Each of the five shapes is written as given.
+    #[tokio::test]
+    async fn add_net_label_writes_each_label_shape() {
+        for shape in crate::tools::sch_hierarchy::ALLOWED_PIN_TYPES {
+            for label_type in ["hierarchical_label", "global_label"] {
+                let (_d, path) = label_move_sheet();
+                let args = shaped_label(&path, label_type, json!(shape));
+                let result = handle_add_net_label(&args, &test_ctx()).await.unwrap();
+                assert!(!result.is_error, "{shape}: {:?}", result.content);
+                let tree = parse_sexp(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                let written: Vec<_> = tree
+                    .find_all(label_type)
+                    .into_iter()
+                    .filter(|l| l.get(1).and_then(|n| n.as_str()) == Some("IFACE"))
+                    .map(|l| l.find_str("shape"))
+                    .collect();
+                assert_eq!(written, [Some(*shape)], "{label_type}");
+            }
+        }
+    }
+
+    /// Any other shape is refused by name on every label type, served and
+    /// called directly, and nothing is written: KiCad 10.0.6 cannot load a
+    /// sheet whose label has `bidir`, and kicad-cli crashes plotting a
+    /// hierarchical label with `dot`.
+    #[tokio::test]
+    async fn add_net_label_refuses_another_shape() {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+        for (label_type, shape) in [
+            ("hierarchical_label", json!("bidir")),
+            ("hierarchical_label", json!("dot")),
+            ("hierarchical_label", json!(5)),
+            ("global_label", json!("dot")),
+            ("net_label", json!("bidir")),
+        ] {
+            let (_d, path) = label_move_sheet();
+            let args = shaped_label(&path, label_type, shape.clone());
+            let served = crate::tools::project_file_writer_tests::served_call(
+                &handler,
+                "add_schematic_net_label",
+                args.clone(),
+            )
+            .await;
+            let direct = handle_add_net_label(&args, &test_ctx()).await.unwrap();
+            for result in [served, direct] {
+                assert!(result.is_error, "{label_type} {shape}");
+                let text = crate::tools::project_file_writer_tests::text_of(&result);
+                let body: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(body["error"]["kind"], json!("invalid_argument"), "{body}");
+                assert_eq!(body["error"]["field"], json!("shape"), "{body}");
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), LABEL_MOVE);
+            }
+        }
+    }
+
+    /// The schema advertises the shapes the handler takes, so dispatch
+    /// refuses the others before the handler runs.
+    #[test]
+    fn add_net_label_advertises_its_shapes() {
+        let tool = tools()
+            .into_iter()
+            .find(|t| t.name == "add_schematic_net_label")
+            .unwrap();
+        assert_eq!(
+            tool.input_schema["properties"]["shape"]["enum"],
+            json!(["input", "output", "bidirectional", "tri_state", "passive"])
+        );
+    }
+
+    /// A plain label still takes the schema's default shape, and writes none.
+    #[tokio::test]
+    async fn add_net_label_still_takes_a_shape_on_a_plain_label() {
+        let (_d, path) = label_move_sheet();
+        let args = shaped_label(&path, "net_label", json!("input"));
+        let result = handle_add_net_label(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let tree = parse_sexp(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let label = tree
+            .find_all("label")
+            .into_iter()
+            .find(|l| l.get(1).and_then(|n| n.as_str()) == Some("IFACE"))
+            .expect("the plain label");
+        assert_eq!(label.find_str("shape"), None);
     }
 
     // ─── justify / rotation ────────────────────────────────────────────────
