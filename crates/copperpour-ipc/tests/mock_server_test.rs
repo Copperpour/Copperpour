@@ -946,6 +946,77 @@ fn failed_multi_step_commit_is_dropped() {
     );
 }
 
+/// KiCad 10.0.8 refuses `BeginCommit` and `EndCommit` without a document
+/// header while more than one editor is open ("BeginCommit without a document
+/// specified is not allowed when multiple editors are open"). Once a board is
+/// bound, both name it; an unbound client sends none, as before.
+#[test]
+fn commits_name_the_bound_board_in_their_header() {
+    let headers = Arc::new(Mutex::new(Vec::new()));
+    let captured = headers.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request message");
+        let name = message.type_url.rsplit('.').next().unwrap().to_string();
+        match name.as_str() {
+            "GetOpenDocuments" => Some(open_board_response()),
+            "BeginCommit" => {
+                let command =
+                    kiapi::common::commands::BeginCommit::decode(message.value.as_slice()).unwrap();
+                captured.lock().unwrap().push((name, command.header));
+                Some(reply_with(builders::pack_any(
+                    &kiapi::common::commands::BeginCommitResponse {
+                        id: Some(kiapi::common::types::Kiid {
+                            value: "commit-1".to_string(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                )))
+            }
+            "EndCommit" => {
+                let command =
+                    kiapi::common::commands::EndCommit::decode(message.value.as_slice()).unwrap();
+                captured.lock().unwrap().push((name, command.header));
+                Some(reply_with(builders::pack_any(
+                    &kiapi::common::commands::EndCommitResponse {},
+                    "kiapi.common.commands.EndCommitResponse",
+                )))
+            }
+            other => panic!("unexpected command {other}"),
+        }
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+
+    client
+        .run_commit("unbound", |_| Ok(()))
+        .expect("an unbound commit");
+    let document = client
+        .find_open_board(&mock_board("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb");
+    client
+        .run_commit("bound", |_| Ok(()))
+        .expect("a bound commit");
+
+    let headers = headers.lock().unwrap();
+    let documents: Vec<(&str, Option<&kiapi::common::types::DocumentSpecifier>)> = headers
+        .iter()
+        .map(|(name, header)| {
+            (
+                name.as_str(),
+                header.as_ref().and_then(|header| header.document.as_ref()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        documents,
+        vec![
+            ("BeginCommit", None),
+            ("EndCommit", None),
+            ("BeginCommit", Some(&document)),
+            ("EndCommit", Some(&document)),
+        ]
+    );
+}
+
 #[test]
 fn uncertain_batch_does_not_send_a_blind_drop_or_publish() {
     let commands = Arc::new(Mutex::new(Vec::new()));

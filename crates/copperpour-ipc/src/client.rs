@@ -2854,10 +2854,27 @@ impl KiCadIpcClient {
         Ok(())
     }
 
+    /// The document header for `BeginCommit`/`EndCommit`: the board this
+    /// client has bound. KiCad 10.0.7 added the field, and KiCad 10.0.8
+    /// refuses a commit without it while more than one editor is open, for
+    /// example the schematic and the board in one project
+    /// (`rejectIfMultipleEditors` in `common/api/api_handler_editor.cpp`).
+    /// The binding is reused rather than looked up again, so a commit costs
+    /// no extra round trip. A client that has bound no board sends none,
+    /// which KiCad still accepts while only one editor is open.
+    fn commit_header(&self) -> Option<kiapi::common::types::ItemHeader> {
+        self.bound_board
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|bound| header_for(bound.document.clone()))
+    }
+
     /// Begin a commit (undo group).
     pub fn begin_commit(&self) -> Result<String> {
-        // `header` (KiCad 10.0.7+) is left unset, as before the sync.
-        let cmd = kiapi::common::commands::BeginCommit { header: None };
+        let cmd = kiapi::common::commands::BeginCommit {
+            header: self.commit_header(),
+        };
         let response_any = self.send_command(&cmd, "kiapi.common.commands.BeginCommit")?;
         let response: kiapi::common::commands::BeginCommitResponse =
             unpack_required(response_any, "BeginCommit")?;
@@ -2884,8 +2901,7 @@ impl KiCadIpcClient {
             }),
             action: action as i32,
             message: message.to_string(),
-            // KiCad 10.0.7+; left unset, as before the sync.
-            header: None,
+            header: self.commit_header(),
         };
         let _: kiapi::common::commands::EndCommitResponse = unpack_required(
             self.send_command(&cmd, "kiapi.common.commands.EndCommit")?,
