@@ -213,12 +213,15 @@ all modes, unavailable/invalid native exports, Rust fallback, shared safety
 refusals and post-export source changes. Model identities are compared against
 the historical Rust-DSN-derived identities on existing fixtures.
 
-The circular-cutout fixture is generated/exported by KiCad and routed by
-Freerouting. Its manifest-bound SES apply is served with an IPC double and a
-native-import board oracle; created geometry/layers/nets are compared with that
-oracle. The default test uses a DRC stub only for control-flow evidence. For real
-KiCad DRC on the resulting candidate, run
-`cargo test -p copperpour-core --locked --lib native_profile_circle_manifest_apply_with_native_drc -- --ignored --nocapture`.
-This does not claim a real GUI IPC transaction; native bridge/UI observations
+The circular-cutout and partial-layer through-hole (#484) fixtures are
+generated/exported by KiCad and routed by Freerouting. Their manifest-bound SES
+apply tests are served with an IPC double and native-import board oracles; created
+geometry/layers/nets (and vias) are compared with those oracles. The default tests
+use a DRC stub only for control-flow evidence. For real KiCad DRC on the resulting
+candidates, run
+`cargo test -p copperpour-core --locked --lib native_profile_circle_manifest_apply_with_native_drc -- --ignored --nocapture`
+and
+`cargo test -p copperpour-core --locked --lib native_profile_partial_th_manifest_apply_with_native_drc -- --ignored --nocapture`.
+These do not claim a real GUI IPC transaction; native bridge/UI observations
 on other platforms remain separate evidence. Fixture provenance is recorded
-beside the board.
+beside each board.

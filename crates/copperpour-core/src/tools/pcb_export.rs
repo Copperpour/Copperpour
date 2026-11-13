@@ -298,17 +298,19 @@ pub fn tools() -> Vec<ToolDef> {
             "Export a revision-bound Specctra DSN plus reverse manifest from the exact live \
              KiCad PCB editor revision. Requires the named board open with IPC enabled. Shared \
              import-safety checks run first in every mode: an even 2-32-layer copper stack, \
-             representable SMD and all-copper through-hole pads on either side, complete \
-             effective routing rules, no custom DRC rules or rule areas, and no unlocked \
-             tracks/vias or routed arcs. Supported netted copper zones become planes; locked \
-             straight tracks and through vias are preserved. The default 'disable' uses only the \
-             Rust writer, requiring one closed Edge.Cuts loop of lines/circular arcs (flattened \
-             within board max_error). On KiCad 10, 'prefer'/'require' first try the \
-             authenticated ActionPlugin native exporter and validate its identities against the \
-             snapshot model, without running Rust outline checks. Native boundaries may contain \
-             circular cutouts. 'prefer' falls back to Rust only if native is unavailable or fails \
-             semantic validation; Rust writer limits then apply. 'require' never falls back. \
-             Source revision and manifest validation remain mandatory for either writer.",
+             representable SMD/through-hole pads on either side, complete effective routing \
+             rules, no custom DRC rules or rule areas, and no unlocked tracks/vias or routed \
+             arcs. Supported netted copper zones become planes; locked straight tracks and \
+             through vias are preserved. The default 'disable' uses only the Rust writer, \
+             requiring one closed Edge.Cuts loop of lines/circular arcs (flattened within board \
+             max_error) and through-hole copper on every layer. On KiCad 10, 'prefer'/'require' \
+             first try the authenticated ActionPlugin native exporter and validate its identities \
+             against the snapshot model, without running Rust outline or through-hole layer \
+             checks. Native boundaries may contain circular cutouts and native through-hole pads \
+             may cover a valid non-empty subset of copper layers. 'prefer' falls back to Rust \
+             only if native is unavailable or fails semantic validation; Rust writer limits then \
+             apply. 'require' never falls back. Source revision and manifest validation remain \
+             mandatory for either writer.",
             json!({
                 "type": "object",
                 "properties": {
@@ -328,7 +330,7 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "enum": ["prefer", "require", "disable"],
                         "default": "disable",
-                        "description": "KiCad 10 native-export policy after shared import-safety checks: default 'disable' uses Rust only; 'prefer' tries the authenticated native bridge first, then Rust if native is unavailable/invalid; 'require' tries native and never falls back. Rust-only outline geometry limits apply only when Rust is used."
+                        "description": "KiCad 10 native-export policy after shared import-safety checks: default 'disable' uses Rust only; 'prefer' tries the authenticated native bridge first, then Rust if native is unavailable/invalid; 'require' tries native and never falls back. Rust-only outline and through-hole layer limits apply only when Rust is used."
                     }
                 },
                 "required": ["board", "output"]

@@ -164,8 +164,8 @@ routing rules, and writes the revision-bound reverse manifest. The temporary
 file is consumed and deleted.
 
 Shared import-safety checks run first in every mode: the supported copper stack,
-representable SMD and all-copper through-hole pads, routing rules, locked-routing
-inventory and zone representation. They retain main’s multilayer, both-side and
+representable SMD/through-hole pads, routing rules, locked-routing inventory
+and zone representation. They retain main’s multilayer, both-side and
 copper-plane support. Rule areas, custom `.kicad_dru` files, nonuniform per-layer
 pad geometry and other unsupported manifest features remain refused. A native
 exporter cannot bypass those checks.
@@ -178,12 +178,18 @@ exporter cannot bypass those checks.
 
 The snapshot model builds the manifest and expected identities independently of
 DSN generation. Only the Rust writer requires one closed loop of Edge.Cuts lines
-and circular arcs (flattened within board `max_error`). A KiCad-native DSN can
-therefore retain circular cutouts that the Rust writer cannot emit. It is still
-correlated against the same snapshot’s components, pad shapes, nets, layer types,
-classes/vias and planes; the live revision must remain unchanged after export.
-The native manifest labels its boundary as KiCad-native, rather than claiming it
-was flattened by Rust. SES parsing and apply retain their source/hash binding.
+and circular arcs (flattened within board `max_error`) and through-hole copper on
+every layer. A KiCad-native DSN can therefore retain circular cutouts and
+partial-layer through-hole pads (using front-image layer mapping for back-side
+footprints) that the Rust writer cannot emit. Empty, duplicate or foreign copper
+layer lists on through-hole pads remain refused in every mode, and note that
+KiCad 10’s `.kicad_pcb` disk loader expands `thru_hole` pads back to `*.Cu`
+on reload whereas live in-memory pad layer sets preserve partial layers in native
+export. It is still correlated against the same snapshot’s components, pad
+shapes, nets, layer types, classes/vias and planes; the live revision must
+remain unchanged after export. The native manifest labels its boundary as
+KiCad-native, rather than claiming it was flattened by Rust. SES parsing and
+apply retain their source/hash binding.
 
 Native export is disabled in the plugin settings by default. This bridge is a
 KiCad 10 compatibility path, not a substitute for the executable IPC plugin or

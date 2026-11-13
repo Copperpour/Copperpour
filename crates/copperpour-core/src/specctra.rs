@@ -392,6 +392,17 @@ pub(crate) fn export_dsn(
 
 impl RoutingSnapshot {
     pub(crate) fn export_rust(&self) -> Result<ExportBundle> {
+        for footprint in &self.footprints {
+            for pad in &footprint.pads {
+                if pad.padstack.drill_um.is_some() && pad.padstack.layers != self.copper_layers {
+                    bail!(
+                        "unsupported through-hole pad {}-{}: Rust export requires a shape on every copper layer",
+                        footprint.reference,
+                        pad.number
+                    );
+                }
+            }
+        }
         let outline = simple_closed_outline(
             &self.tree,
             outline_arc_error_um(&self.board_path, &self.tree)?,
@@ -2134,12 +2145,33 @@ fn footprints(
                 let listed_in_full = layers.len() == copper_layers.len()
                     && layers.iter().collect::<BTreeSet<_>>()
                         == copper_layers.iter().collect::<BTreeSet<_>>();
-                if !(layers == ["*.Cu".to_string()] || listed_in_full) {
-                    bail!(
-                        "unsupported through-hole pad {reference}-{number}: copper layers are [{}]",
-                        layers.join(", ")
-                    );
-                }
+                let model_layers = if layers == ["*.Cu".to_string()] || listed_in_full {
+                    copper_layers.to_vec()
+                } else {
+                    if layers.is_empty()
+                        || layers.iter().collect::<BTreeSet<_>>().len() != layers.len()
+                        || layers.iter().any(|layer| !copper_layers.contains(layer))
+                    {
+                        bail!(
+                            "unsupported through-hole pad {reference}-{number}: copper layers are [{}]",
+                            layers.join(", ")
+                        );
+                    }
+                    // Native KiCad export describes every padstack in front-image
+                    // coordinates; bottom-side footprints mirror physical copper layers
+                    // top-to-bottom onto image layers.
+                    copper_layers
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, layer)| {
+                            let physical = match side {
+                                Side::Front => layer,
+                                Side::Back => &copper_layers[copper_layers.len() - 1 - i],
+                            };
+                            layers.contains(physical).then(|| layer.clone())
+                        })
+                        .collect()
+                };
                 let drill = pad.find("drill").context("through-hole pad has no drill")?;
                 if drill.get(1).and_then(SexpNode::as_str) == Some("oval") {
                     bail!("unsupported through-hole pad {reference}-{number}: oval drill");
@@ -2150,7 +2182,7 @@ fn footprints(
                         "pad {reference}-{number} drill {drill_um} um is not smaller than its copper size"
                     );
                 }
-                (copper_layers.to_vec(), Some(drill_um))
+                (model_layers, Some(drill_um))
             };
             let net = pad
                 .find("net")
@@ -4607,21 +4639,25 @@ pub(crate) mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            error.contains("unsupported through-hole pad J1-1: copper layers are [F.Cu, B.Cu]"),
+            error.contains(
+                "unsupported through-hole pad J1-1: Rust export requires a shape on every copper layer"
+            ),
             "{error}"
         );
-        let prep_error = prepare_export(
+        // Import identity discovery allows valid partial-layer through-hole pads;
+        // only the Rust writer requires a shape on every copper layer.
+        let model = prepare_export(
             Path::new("board.kicad_pcb"),
             &two_layer_pad,
             &native_fixture_rules(),
         )
-        .err()
-        .expect("partial-layer through-hole pad must be refused before export")
-        .to_string();
+        .expect("partial-layer through-hole pad must be accepted in snapshot model");
+        let rust_error = model.export_rust().unwrap_err().to_string();
         assert!(
-            prep_error
-                .contains("unsupported through-hole pad J1-1: copper layers are [F.Cu, B.Cu]"),
-            "{prep_error}"
+            rust_error.contains(
+                "unsupported through-hole pad J1-1: Rust export requires a shape on every copper layer"
+            ),
+            "{rust_error}"
         );
         // KiCad saves a pad on every copper layer as `*.Cu`; a list in full
         // is accepted in the ordinal order of pad lists or top to bottom.
@@ -5669,5 +5705,132 @@ pub(crate) mod tests {
             NATIVE_CIRCLE_DSN.replace("(place R1 100000 -50000", "(place R1 101000 -50000");
         assert_ne!(changed, NATIVE_CIRCLE_DSN);
         assert!(model.adopt_native(changed).is_err());
+    }
+
+    const NATIVE_PARTIAL_TH: &str =
+        include_str!("../tests/fixtures/specctra_native_partial_th.kicad_pcb");
+    const NATIVE_PARTIAL_TH_DSN: &str =
+        include_str!("../tests/fixtures/specctra_native_partial_th.native-kicad-10.dsn");
+    const NATIVE_PARTIAL_TH_SES: &str = include_str!(
+        "../tests/fixtures/specctra_native_partial_th.native-kicad-10.freerouting-2.5.0.ses"
+    );
+
+    /// The native DSN without the header's courtyard polygon, which `topola_specctra`
+    /// does not read yet, matching `four_layers_native`.
+    fn partial_th_native() -> String {
+        NATIVE_PARTIAL_TH_DSN
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
+    #[test]
+    fn native_profile_partial_through_hole_pads_adopt_mirror_back_layers_and_bind_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, NATIVE_PARTIAL_TH).unwrap();
+        let model = prepare_export(&board, NATIVE_PARTIAL_TH, &native_fixture_rules()).unwrap();
+        let rust_error = model.export_rust().unwrap_err().to_string();
+        assert!(
+            rust_error.contains(
+                "unsupported through-hole pad J1-1: Rust export requires a shape on every copper layer"
+            ),
+            "{rust_error}"
+        );
+        let native_dsn = partial_th_native();
+        let native = model.adopt_native(native_dsn.clone()).unwrap();
+        assert_eq!(native.dsn, native_dsn);
+        let manifest: serde_json::Value = serde_json::from_str(&native.manifest).unwrap();
+        let padstack_layers = |reference: &str, pad: &str| {
+            let component = manifest["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["reference"] == reference)
+                .unwrap();
+            let pin = component["pads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["pad_number"] == pad)
+                .unwrap();
+            let ps_name = pin["padstack_name"].as_str().unwrap();
+            manifest["padstacks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|ps| ps["name"] == ps_name)
+                .unwrap()["layers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(padstack_layers("J1", "1"), vec!["F.Cu", "In1.Cu"]);
+        assert_eq!(padstack_layers("J1", "2"), vec!["F.Cu", "In2.Cu"]);
+        // J2 is on the back side: physical [B.Cu, In2.Cu] and [B.Cu, In1.Cu]
+        // mirror to front-image [F.Cu, In1.Cu] and [F.Cu, In2.Cu] respectively.
+        assert_eq!(padstack_layers("J2", "1"), vec!["F.Cu", "In1.Cu"]);
+        assert_eq!(padstack_layers("J2", "2"), vec!["F.Cu", "In2.Cu"]);
+
+        // Semantic correlation must reject un-mirrored padstack layers.
+        let unmirrored = native_dsn.replace(
+            "(padstack Round[T2]Pad_1700.000000_um\n      (shape (circle F.Cu 1700))\n      (shape (circle In2.Cu 1700))",
+            "(padstack Round[T2]Pad_1700.000000_um\n      (shape (circle B.Cu 1700))\n      (shape (circle In1.Cu 1700))",
+        );
+        assert_ne!(unmirrored, native_dsn);
+        assert!(model.adopt_native(unmirrored).is_err());
+
+        let plan = crate::specctra_ses::parse_import_plan(
+            &board,
+            NATIVE_PARTIAL_TH,
+            &native.manifest,
+            NATIVE_PARTIAL_TH_SES,
+        )
+        .unwrap();
+        assert!(!plan.tracks.is_empty());
+        assert!(!plan.vias.is_empty());
+        let stale = format!("{NATIVE_PARTIAL_TH}\n");
+        assert!(crate::specctra_ses::parse_import_plan(
+            &board,
+            &stale,
+            &native.manifest,
+            NATIVE_PARTIAL_TH_SES,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn prepare_export_refuses_invalid_partial_through_hole_copper_layers() {
+        for (layers, reason) in [
+            (r#""F.Cu" "In99.Cu" "*.Mask""#, "foreign layer"),
+            (r#""F.Cu" "F.Cu" "*.Mask""#, "duplicate layer"),
+            (
+                r#""*.Cu" "F.Cu" "*.Mask""#,
+                "wildcard mixed with named layer",
+            ),
+            (r#""*.Mask""#, "empty copper layers"),
+        ] {
+            let invalid = FOUR_LAYERS.replacen(
+                r#"(layers "*.Cu" "*.Mask")"#,
+                &format!(r#"(layers {layers})"#),
+                1,
+            );
+            assert_ne!(invalid, FOUR_LAYERS, "{reason}");
+            let error = prepare_export(
+                Path::new("board.kicad_pcb"),
+                &invalid,
+                &native_fixture_rules(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{reason} must fail prepare_export"))
+            .to_string();
+            assert!(
+                error.contains("unsupported through-hole pad J1-1: copper layers are"),
+                "{reason}: {error}"
+            );
+        }
     }
 }
