@@ -106,12 +106,17 @@ for other clients, use `--client` with `codex`, `gemini`, `cursor`, or `antigrav
 See the [client setup table](../README.md#step-3-install-the-skills-optional).
 
 For a custom directory, pass the same `--skills-dir <absolute path>` or
-`COPPERPOUR_SKILLS_DIR` to `status`, `init`, and `uninstall`. Custom targets and the
+`COPPERPOUR_SKILLS_DIR` to `status`, `init`, and `uninstall` (the variable is
+ignored when `--client` is given). Custom targets and the
 Gemini, Cursor, and Antigravity presets use the ownership-checked skills-only mode.
 Keep `.copperpour-skills.json` in that target: it records ownership and installed
 contents, so uninstall preserves local edits. If init refuses an edited file,
-back it up and move it aside before retrying. Unknown paths in a marker are
-refused rather than trusted as deletion targets. See
+back it up and move it aside before retrying. Init also refuses a file the marker
+does not list, even with identical contents, because it may belong to another
+installation. Files an earlier release installed and this one no longer bundles
+are reported by `status` and removed by `init` or `uninstall` unless edited.
+Marker entries that are not skill file paths are refused rather than trusted as
+deletion targets. See
 [Managing skills](../README.md#advanced-installation).
 
 For native client installations, each file and hook is compared with that

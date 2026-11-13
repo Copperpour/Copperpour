@@ -193,8 +193,9 @@ skill ZIP packaging is outside this installer.
 Use the same `--client` with `status` and `uninstall`, for example
 `copperpour status --client cursor`. For custom or project skills directories,
 see [Managing skills](#advanced-installation), including update/removal behavior.
-An explicit `--skills-dir` overrides `COPPERPOUR_SKILLS_DIR`, which overrides the
-client's default skills location; either override selects skills-only mode.
+An explicit `--skills-dir` overrides everything. `COPPERPOUR_SKILLS_DIR` applies
+only when neither `--skills-dir` nor `--client` is given. Either override selects
+skills-only mode.
 
 Skill installation is separate from registering the MCP connection in Step 2.
 It does not deploy skills or Copperpour to remote/cloud agent environments.
@@ -302,9 +303,10 @@ copperpour uninstall --skills-dir /absolute/path/to/client/skills
 ```
 
 On Windows, use an absolute path such as `"C:\agent\skills"`. Alternatively set
-`COPPERPOUR_SKILLS_DIR`; an explicit `--skills-dir` takes precedence. Empty or
+`COPPERPOUR_SKILLS_DIR`. The variable applies only when neither `--skills-dir` nor
+`--client` is given, and the commands name it when it selects the target. Empty or
 relative targets are rejected. These three commands use the custom target in
-**skills-only** mode, even with `--client claude`: they do not write client profile
+**skills-only** mode, even with `--client claude --skills-dir <path>`: they do not write client profile
 files, agents, hooks, or native installation markers. Without an override, the
 client defaults in Step 3 apply. The override does not configure MCP startup or
 the double-click installer.

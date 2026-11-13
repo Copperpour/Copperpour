@@ -79,13 +79,14 @@ fn flag_precedes_env_and_status_never_creates_target() {
     let temp = tempfile::tempdir().unwrap();
     let env_root = temp.path().join("environment");
     let flag_root = temp.path().join("flag");
-    success(
+    let installed = success(
         command()
             .env("COPPERPOUR_SKILLS_DIR", &env_root)
             .arg("init")
             .output()
             .unwrap(),
     );
+    assert!(installed.contains("Target from COPPERPOUR_SKILLS_DIR"));
     assert!(env_root.join("copperpour/SKILL.md").exists());
     let status = success(
         command()
@@ -96,6 +97,7 @@ fn flag_precedes_env_and_status_never_creates_target() {
             .unwrap(),
     );
     assert!(status.contains(&flag_root.display().to_string()));
+    assert!(!status.contains("COPPERPOUR_SKILLS_DIR"));
     assert!(!flag_root.exists());
     success(
         command()
@@ -252,9 +254,14 @@ fn symlink_root_with_trailing_separator_is_refused() {
 #[test]
 fn named_presets_use_portable_ownership_and_honor_overrides() {
     let temp = tempfile::tempdir().unwrap();
-    for client in ["gemini", "cursor", "antigravity", "agy", "GeMiNi"] {
-        let root = temp.path().join(client);
-        let home = temp.path().join(format!("home-{client}"));
+    // Directories are named by index: NTFS is case-insensitive, so `GeMiNi`
+    // and `gemini` would otherwise collide on Windows.
+    for (index, client) in ["gemini", "cursor", "antigravity", "agy", "GeMiNi"]
+        .into_iter()
+        .enumerate()
+    {
+        let root = temp.path().join(format!("root-{index}"));
+        let home = temp.path().join(format!("home-{index}"));
         fs::create_dir(&home).unwrap();
         let ignored = temp.path().join("ignored-env");
         for action in ["init", "status", "uninstall"] {
@@ -282,23 +289,6 @@ fn named_presets_use_portable_ownership_and_honor_overrides() {
         );
         assert_eq!(fs::read_dir(home).unwrap().count(), 0);
         assert!(!ignored.exists());
-        let env_root = temp.path().join(format!("env-{client}"));
-        success(
-            command()
-                .env("COPPERPOUR_SKILLS_DIR", &env_root)
-                .args(["init", "--client", client])
-                .output()
-                .unwrap(),
-        );
-        assert!(env_root.join(".copperpour-skills.json").is_file());
-        success(
-            command()
-                .env("COPPERPOUR_SKILLS_DIR", &env_root)
-                .args(["uninstall", "--client", client])
-                .output()
-                .unwrap(),
-        );
-        assert!(env_root.is_dir());
     }
 }
 
@@ -339,11 +329,14 @@ fn presets_install_to_documented_home_directories() {
     ] {
         let home = temp.path().join(client);
         fs::create_dir(&home).unwrap();
+        let ignored = temp.path().join(format!("ignored-env-{client}"));
         for action in ["init", "status", "uninstall"] {
             success(
                 command()
                     .env("HOME", &home)
                     .env("COPPERPOUR_STATE_DIR", home.join("state"))
+                    // An explicit --client wins over the environment.
+                    .env("COPPERPOUR_SKILLS_DIR", &ignored)
                     .args([action, "--client", client])
                     .output()
                     .unwrap(),
@@ -356,7 +349,108 @@ fn presets_install_to_documented_home_directories() {
             }
         }
         assert!(home.join(relative).is_dir());
+        assert!(!ignored.exists());
         assert!(!home.join(".claude").exists());
         assert!(!home.join("state").exists());
     }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn explicit_native_client_ignores_skills_dir_environment() {
+    // `status` writes nothing, and HOME keeps the native lookup hermetic.
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let ignored = temp.path().join("cursor-skills");
+    for client in ["claude", "codex"] {
+        let output = success(
+            command()
+                .env("HOME", &home)
+                .env("COPPERPOUR_STATE_DIR", home.join("state"))
+                .env("COPPERPOUR_SKILLS_DIR", &ignored)
+                .args(["status", "--client", client])
+                .output()
+                .unwrap(),
+        );
+        assert!(!output.contains("Portable skills"), "{output}");
+        assert!(!output.contains(&ignored.display().to_string()), "{output}");
+    }
+    assert!(!ignored.exists());
+}
+
+#[test]
+fn identical_unowned_files_are_not_adopted() {
+    // Bytes equal to the bundle can still belong to another installation, such
+    // as a native Codex install in ~/.agents/skills; a portable uninstall
+    // must never remove them.
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    success(run("init", &source));
+    let root = temp.path().join("other");
+    fs::create_dir_all(root.join("copperpour")).unwrap();
+    fs::copy(
+        source.join("copperpour/SKILL.md"),
+        root.join("copperpour/SKILL.md"),
+    )
+    .unwrap();
+    assert!(!run("init", &root).status.success());
+    assert!(!root.join(".copperpour-skills.json").exists());
+    success(run("uninstall", &root));
+    assert!(root.join("copperpour/SKILL.md").is_file());
+}
+
+#[test]
+fn files_retired_by_a_newer_release_stay_upgradable_and_removable() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    success(run("init", root));
+    // An earlier release installed `konnect/` (renamed to `copperpour/` in
+    // b33babc4) and one reference this binary no longer bundles.
+    let marker = root.join(".copperpour-skills.json");
+    let mut ownership: serde_json::Value =
+        serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    for (name, content) in [
+        ("konnect/SKILL.md", "old konnect skill"),
+        ("konnect/references/old.md", "old reference"),
+        ("kicad-pcb/references/dropped.md", "dropped reference"),
+    ] {
+        ownership["files"][name] = content.into();
+        let path = root.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    fs::write(&marker, serde_json::to_vec(&ownership).unwrap()).unwrap();
+    // An edited retired file is preserved, never deleted.
+    fs::write(root.join("kicad-pcb/references/dropped.md"), "my edits").unwrap();
+
+    let status = success(run("status", root));
+    assert!(status.contains("retired (removed by init or uninstall): konnect/SKILL.md"));
+    let init = success(run("init", root));
+    assert!(init.contains("Removed retired konnect/SKILL.md"), "{init}");
+    assert!(!root.join("konnect").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("kicad-pcb/references/dropped.md")).unwrap(),
+        "my edits"
+    );
+    let ownership: serde_json::Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    assert!(ownership["files"].get("konnect/SKILL.md").is_none());
+    assert!(ownership["files"]
+        .get("kicad-pcb/references/dropped.md")
+        .is_some());
+
+    // A marker written before the upgrade is removable as well.
+    let mut ownership = ownership;
+    ownership["files"]["konnect/SKILL.md"] = "old konnect skill".into();
+    fs::create_dir_all(root.join("konnect")).unwrap();
+    fs::write(root.join("konnect/SKILL.md"), "old konnect skill").unwrap();
+    fs::write(&marker, serde_json::to_vec(&ownership).unwrap()).unwrap();
+    success(run("uninstall", root));
+    assert!(!root.join("konnect").exists());
+    assert!(!root.join("copperpour").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("kicad-pcb/references/dropped.md")).unwrap(),
+        "my edits"
+    );
+    assert!(!marker.exists());
 }
