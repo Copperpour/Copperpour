@@ -1224,12 +1224,30 @@ fn validate_user_text(text: &copperpour_sexp::SexpNode) -> Result<()> {
     let mut saw_at = false;
     let mut saw_layer = false;
     let mut saw_effects = false;
+    let mut saw_unlocked = false;
     let mut identifier = None;
     for clause in text.children().unwrap_or_default().iter().skip(3) {
         let tag = clause
             .head()
             .context("fp_text user contains an unsupported atom")?;
         match tag {
+            // KiCad's "don't keep upright", despite the name. The graphic
+            // carries it as `keep_upright` (`text_keeps_upright`), so it is
+            // reproduced exactly; KiCad's own Pico footprints use it.
+            "unlocked" => {
+                if saw_unlocked {
+                    bail!("fp_text user contains duplicate 'unlocked' clauses");
+                }
+                saw_unlocked = true;
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || !matches!(
+                        clause.get(1).and_then(copperpour_sexp::SexpNode::as_str),
+                        Some("yes" | "no")
+                    )
+                {
+                    bail!("fp_text user 'unlocked' must be 'yes' or 'no'");
+                }
+            }
             "at" => {
                 if saw_at {
                     bail!("fp_text user contains duplicate 'at' clauses");
@@ -3372,13 +3390,51 @@ mod tests {
         );
     }
 
+    /// `(unlocked yes)` is KiCad's "don't keep upright"; the Pico footprints
+    /// in KiCad 10's Module library carry it on their user texts. The refresh
+    /// accepts it and builds the text without keep-upright; `(unlocked no)`
+    /// and no clause keep it upright, KiCad's default.
+    #[test]
+    fn parser_carries_unlocked_user_text_as_not_kept_upright() {
+        let keeps_upright = |source: &str| {
+            parse_library_footprint("Test:Socket", source)
+                .unwrap()
+                .graphics
+                .iter()
+                .find_map(|graphic| match graphic {
+                    copperpour_ipc::IpcGraphicDefinition::Text { keep_upright, .. } => {
+                        Some(*keep_upright)
+                    }
+                    _ => None,
+                })
+                .expect("the library footprint has a user text")
+        };
+        let with = |clause: &str| {
+            let source = LIBRARY_FOOTPRINT.replacen(
+                "(at 0 1.5 0) (layer \"F.Fab\")",
+                &format!("(at 0 1.5 0) {clause} (layer \"F.Fab\")"),
+                1,
+            );
+            assert_ne!(source, LIBRARY_FOOTPRINT);
+            source
+        };
+        assert!(keeps_upright(LIBRARY_FOOTPRINT));
+        assert!(!keeps_upright(&with("(unlocked yes)")));
+        assert!(keeps_upright(&with("(unlocked no)")));
+    }
+
     #[test]
     fn parser_rejects_lossy_user_text_variants() {
         for (from, to, expected) in [
             (
                 "(at 0 1.5 0) (layer \"F.Fab\")",
-                "(at 0 1.5 0) (unlocked yes) (layer \"F.Fab\")",
-                "unlocked",
+                "(at 0 1.5 0) (unlocked maybe) (layer \"F.Fab\")",
+                "'unlocked' must be 'yes' or 'no'",
+            ),
+            (
+                "(at 0 1.5 0) (layer \"F.Fab\")",
+                "(at 0 1.5 0) (unlocked yes) (unlocked yes) (layer \"F.Fab\")",
+                "duplicate 'unlocked'",
             ),
             (
                 "(effects (font (size 0.8 0.8) (thickness 0.11)))",
