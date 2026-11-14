@@ -178,7 +178,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "move_schematic_component",
             "Move a component's lowest-numbered unit to a new position and translate every \
-             other placed unit by the same delta. Does NOT adjust connected wires. \
+             other placed unit by the same delta; with unit, move only that placed unit. \
+             Does NOT adjust connected wires. \
              Junction dots are re-judged where the pins moved: a dot left with fewer \
              than three exits (wires, pins, sheet pins, bus entries) is removed unless \
              it is what joins wires there, and a pin that makes three, mid-span on one \
@@ -193,7 +194,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string" },
                     "reference": { "type": "string" },
                     "x": { "type": "number", "description": "New X position in mm" },
-                    "y": { "type": "number", "description": "New Y position in mm" }
+                    "y": { "type": "number", "description": "New Y position in mm" },
+                    "unit": { "type": "integer", "minimum": 1, "description": "Which placed unit to move to x, y. Every other placed unit stays where it is. Refused, naming the placed units, when the component has no such unit on this sheet. When omitted, every placed unit moves together." }
                 },
                 "required": ["schematic", "reference", "x", "y"]
             }),
@@ -4049,16 +4051,29 @@ async fn handle_move_schematic_component(
         Err(e) => return Ok(e),
     };
     let (new_x, new_y) = snap_point(new_x, new_y, 1.27);
+    // Unit 0 needs no check of its own: no unit 0 is ever placed, so it is
+    // refused below with the units that are.
+    let only_unit = match opt_u32(args, "unit") {
+        Ok(unit) => unit,
+        Err(error) => return Ok(error),
+    };
 
     let before_source = read_consistent(&sch_path)?;
     let mut sch = cse::Schematic::from_source(&sch_path, before_source.clone())?;
+    // A unit carried by two placements of the reference is refused here as an
+    // ambiguous target, before anything is selected.
     let mut target = match component_target_from_source(&sch_path, &before_source, &reference) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
-    let target_uuids = target.uuids();
-    let selected = target_uuids.iter().cloned().collect::<BTreeSet<_>>();
-    let anchor_uuid = &target.units[0].uuid;
+    let moving = match select_units(&target, &reference, only_unit) {
+        Ok(moving) => moving,
+        Err(error) => return Ok(error),
+    };
+    let selected = moving.iter().cloned().collect::<BTreeSet<_>>();
+    // The lowest-numbered unit of the selection is the one placed at (x, y);
+    // the others of it follow by the same delta.
+    let anchor_uuid = &moving[0];
     let anchor = sch
         .symbols
         .iter()
@@ -4066,7 +4081,13 @@ async fn handle_move_schematic_component(
         .expect("structural target UUID is present in the loaded schematic");
     let (old_x, old_y) = anchor.position();
     let (dx, dy) = (new_x - old_x, new_y - old_y);
-    for unit in &mut target.units {
+    // Every unit left out is bound where the file has it, so the readback
+    // proves it did not move.
+    for unit in target
+        .units
+        .iter_mut()
+        .filter(|unit| selected.contains(&unit.uuid))
+    {
         unit.x += dx;
         unit.y += dy;
     }
@@ -4099,7 +4120,7 @@ async fn handle_move_schematic_component(
         "moved": observed["reference"],
         "x": observed["x"],
         "y": observed["y"],
-        "moved_units": observed["unit_count"],
+        "moved_units": selected.len(),
         "placements": observed["units"],
         "junctions_added_count": added,
         "junctions_pruned_count": pruned,
@@ -4188,6 +4209,43 @@ async fn handle_rotate_schematic_component(
     Ok(CallToolResult::json(&result))
 }
 
+/// The UUIDs of the placements a `unit` argument selects, in unit order: the
+/// one carrying that unit number, or every placement when it is omitted. A
+/// unit the component has no placement for is an invalid argument that names
+/// the placed ones.
+fn select_units(
+    target: &ComponentTarget,
+    reference: &str,
+    only_unit: Option<u32>,
+) -> Result<Vec<String>, CallToolResult> {
+    let selected = target
+        .units
+        .iter()
+        .filter(|unit| only_unit.is_none_or(|wanted| unit.unit == wanted))
+        .map(|unit| unit.uuid.clone())
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        let placed = target
+            .units
+            .iter()
+            .map(|unit| unit.unit)
+            .collect::<BTreeSet<_>>();
+        return Err(crate::tools::invalid_arg(
+            "unit",
+            &format!(
+                "'{reference}' has no placed unit {} on this sheet (placed: {})",
+                only_unit.unwrap_or_default(),
+                placed
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    Ok(selected)
+}
+
 async fn handle_mirror_schematic_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -4222,31 +4280,10 @@ async fn handle_mirror_schematic_component(
     // KiCad stores the mirror per placed unit, so the selection is by unit
     // number. Every unit left out keeps the mirror the file already gives it,
     // and the readback below holds it to that bound state.
-    let selected = target
-        .units
-        .iter()
-        .filter(|unit| only_unit.is_none_or(|wanted| unit.unit == wanted))
-        .map(|unit| unit.uuid.clone())
-        .collect::<BTreeSet<_>>();
-    if selected.is_empty() {
-        let placed = target
-            .units
-            .iter()
-            .map(|unit| unit.unit)
-            .collect::<BTreeSet<_>>();
-        return Ok(crate::tools::invalid_arg(
-            "unit",
-            &format!(
-                "'{reference}' has no placed unit {} on this sheet (placed: {})",
-                only_unit.unwrap_or_default(),
-                placed
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ));
-    }
+    let selected = match select_units(&target, &reference, only_unit) {
+        Ok(selected) => selected.into_iter().collect::<BTreeSet<_>>(),
+        Err(error) => return Ok(error),
+    };
     // The intent is bound apart from the writer: the requested reflection on
     // each unit's own turn, in the pair eeschema writes for it. A unit whose
     // bound pair is unchanged is already as requested.
@@ -9192,6 +9229,158 @@ mod multi_unit_component_tests {
         placed.sort_by_key(|instance| instance.unit);
         assert!((placed[0].x - placed[1].x).abs() < 0.001);
         assert!(((placed[1].y - placed[0].y) - 20.0).abs() < 0.001);
+    }
+
+    /// U1's placements in the real eeschema save, by unit: x, y.
+    fn ecc83_units(path: &std::path::Path) -> Vec<(u32, f64, f64)> {
+        let (_, tree) = read_schematic(path).unwrap();
+        let mut placed = extract_symbol_instances(&tree)
+            .into_iter()
+            .filter(|instance| instance.reference == "U1")
+            .map(|instance| (instance.unit, instance.x, instance.y))
+            .collect::<Vec<_>>();
+        placed.sort_by_key(|unit| unit.0);
+        placed
+    }
+
+    /// With `unit`, that placement alone goes to x, y; the saved file holds
+    /// the other units where KiCad put them, byte for byte, and the reply says
+    /// one unit moved. Without it, every unit moves
+    /// (`move_translates_every_unit_by_one_shared_delta`).
+    #[tokio::test]
+    async fn move_with_unit_moves_only_that_placement() {
+        let (_directory, path) = eeschema_fixture();
+        assert_eq!(
+            ecc83_units(&path),
+            vec![(1, 160.02, 64.77), (2, 157.48, 107.95), (3, 63.5, 74.93)],
+            "fixture premise"
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+        let schema = tools()
+            .into_iter()
+            .find(|tool| tool.name == "move_schematic_component")
+            .unwrap()
+            .input_schema;
+        assert_eq!(schema["properties"]["unit"]["type"], "integer");
+        let result = body(
+            handle_move_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "U1",
+                    "x": 101.6,
+                    "y": 50.8,
+                    "unit": 2
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["moved_units"], 1, "{result}");
+        let moved = result["placements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|unit| {
+                (
+                    unit["unit"].as_u64().unwrap(),
+                    unit["x"].clone(),
+                    unit["y"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(moved.len(), 3, "{result}");
+        assert_eq!(moved[1], (2, json!(101.6), json!(50.8)), "{result}");
+        let after = ecc83_units(&path);
+        assert_eq!(after[1], (2, 101.6, 50.8));
+        assert_eq!((after[0], after[2]), ((1, 160.02, 64.77), (3, 63.5, 74.93)));
+        // Units 1 and 3 are the same text, not just the same numbers.
+        let committed = std::fs::read_to_string(&path).unwrap();
+        for number in [1, 3] {
+            let block = |source: &str| {
+                let marker = format!("(unit {number})");
+                let at = source.find("(lib_id \"ecc83-pp:ECC83\")").unwrap();
+                let at = source[at..].find(&marker).map(|i| i + at).unwrap();
+                let open = source[..at].rfind("(symbol").unwrap();
+                let close = source[at..].find("(instances").unwrap() + at;
+                source[open..close].to_owned()
+            };
+            assert_eq!(block(&before), block(&committed), "unit {number} changed");
+        }
+    }
+
+    /// A unit the component has no placement for, 0 included, is an invalid
+    /// argument that names the placed units, and nothing is written.
+    #[tokio::test]
+    async fn move_with_an_unplaced_unit_is_refused_without_writing() {
+        for unit in [0, 4] {
+            let (_directory, path) = eeschema_fixture();
+            let before = std::fs::read_to_string(&path).unwrap();
+            let result = handle_move_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "U1",
+                    "x": 101.6,
+                    "y": 50.8,
+                    "unit": unit
+                }),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "unit {unit}");
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("invalid_argument"),
+                "unit {unit}"
+            );
+            let ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text");
+            };
+            assert!(text.contains("placed: 1, 2, 3"), "{text}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
+    }
+
+    /// `add_schematic_component` can write a second placement of a unit that
+    /// is already placed, a state KiCad reports as duplicate items. A move
+    /// that names that unit is refused as an ambiguous target, as every
+    /// component edit refuses it, and writes nothing.
+    #[tokio::test]
+    async fn move_with_a_unit_on_two_placements_is_ambiguous_and_writes_nothing() {
+        let (_directory, path) = eeschema_placement_fixture();
+        let placed = handle_add_schematic_component(
+            &json!({
+                "schematic": path,
+                "lib_id": "ecc83-pp:ECC83",
+                "x": 101.6,
+                "y": 25.4,
+                "reference": "U1",
+                "unit": 1
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!placed.is_error, "{placed:?}");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_move_schematic_component(
+            &json!({
+                "schematic": path,
+                "reference": "U1",
+                "x": 101.6,
+                "y": 50.8,
+                "unit": 1
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("ambiguous_target")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     /// Moving a field's text must move the text and nothing else: the value
