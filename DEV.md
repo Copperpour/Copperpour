@@ -302,8 +302,8 @@ Router: `crates/copperpour-core/src/router/mod.rs`.
 `specctra::prepare_export` captures the import-owned board model without invoking
 the Rust DSN writer. `RoutingSnapshot::identity` supplies the existing native
 correlator directly; it is checked against the historical DSN-derived identity
-on the fixture corpus. `export_rust` owns Edge.Cuts outline geometry and flattening
-checks. `adopt_native` preserves the actual native DSN and rewrites only its
+on the fixture corpus. `export_rust` owns Edge.Cuts outline geometry/flattening and the all-copper
+through-hole writer restriction. `adopt_native` preserves the actual native DSN and rewrites only its
 reverse-manifest identifiers/outline label after validation.
 
 `handle_export_specctra_dsn` keeps one stable IPC snapshot/rules capture, runs

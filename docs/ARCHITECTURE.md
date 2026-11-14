@@ -100,8 +100,8 @@ names.
 `specctra::RoutingSnapshot` owns the validated live-board model and manifest
 inputs. Rust DSN generation and native DSN adoption consume that same model.
 Native correlation no longer requires generating a Rust DSN first; Rust-only
-Edge.Cuts outline geometry checks run only for the default writer or an
-actual fallback. Source stability, identity correlation and strict SES import
+Edge.Cuts outline geometry and all-copper through-hole layer checks run only
+for the default writer or an actual fallback. Source stability, identity correlation and strict SES import
 remain shared. The optional native bridge is KiCad-10-only; see
 [selection and safety checks](KICAD_INTEGRATION.md).
 

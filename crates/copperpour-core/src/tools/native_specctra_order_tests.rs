@@ -22,6 +22,27 @@ const SES: &str = include_str!(
 );
 const APPLIED: &str =
     include_str!("../../tests/fixtures/specctra_native_circle.native-applied.kicad_pcb");
+const PARTIAL_TH: &str = include_str!("../../tests/fixtures/specctra_native_partial_th.kicad_pcb");
+const PARTIAL_TH_DSN_RAW: &str =
+    include_str!("../../tests/fixtures/specctra_native_partial_th.native-kicad-10.dsn");
+
+/// Strip header courtyard polygons (`(outline (polygon ...))`) not yet read by
+/// `topola_specctra`, matching `specctra::tests::four_layers_native`.
+fn partial_th_dsn() -> &'static str {
+    Box::leak(
+        PARTIAL_TH_DSN_RAW
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>()
+            .into_boxed_str(),
+    )
+}
+const PARTIAL_TH_SES: &str = include_str!(
+    "../../tests/fixtures/specctra_native_partial_th.native-kicad-10.freerouting-2.5.0.ses"
+);
+const PARTIAL_TH_APPLIED: &str =
+    include_str!("../../tests/fixtures/specctra_native_partial_th.native-applied.kicad_pcb");
 const RECT: &str = include_str!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
 const RECT_DSN: &str =
     include_str!("../../tests/fixtures/specctra_two_resistors.native-kicad-10.dsn");
@@ -404,9 +425,101 @@ fn run_isolated_native_profile(test_name: &str, group: &str) {
                 assert_eq!(count, 1);
                 assert!(!dsn && !manifest);
             }
+            "partial-th" => {
+                let partial_th_native = partial_th_dsn();
+                for mode in ["prefer", "require"] {
+                    let (error, body, count, dsn, manifest) = scenario(
+                        &root,
+                        &format!("partial-th-{mode}"),
+                        PARTIAL_TH,
+                        Some(partial_th_native),
+                        mode,
+                        false,
+                        false,
+                    )
+                    .await;
+                    assert!(!error, "{body}");
+                    assert_eq!(body["method"], "kicad10_native_actionplugin");
+                    assert_eq!(count, 1);
+                    assert!(dsn && manifest);
+                }
+                let (error, body, count, dsn, manifest) = scenario(
+                    &root,
+                    "partial-th-disabled",
+                    PARTIAL_TH,
+                    Some(partial_th_native),
+                    "disable",
+                    false,
+                    false,
+                )
+                .await;
+                assert!(
+                    error
+                        && body
+                            .to_string()
+                            .contains("Rust export requires a shape on every copper layer"),
+                    "{body}"
+                );
+                assert_eq!(count, 0);
+                assert!(!dsn && !manifest);
+                let (error, body, count, dsn, manifest) = scenario(
+                    &root,
+                    "partial-th-fallback-unavailable",
+                    PARTIAL_TH,
+                    None,
+                    "prefer",
+                    false,
+                    false,
+                )
+                .await;
+                assert!(
+                    error
+                        && body.to_string().contains("Rust fallback refused")
+                        && body
+                            .to_string()
+                            .contains("Rust export requires a shape on every copper layer"),
+                    "{body}"
+                );
+                assert_eq!(count, 0);
+                assert!(!dsn && !manifest);
+                let foreign: &'static str = Box::leak(
+                    PARTIAL_TH
+                        .replacen(
+                            r#"(layers "*.Mask" "F.Cu" "In1.Cu")"#,
+                            r#"(layers "F.Cu" "In99.Cu" "*.Mask")"#,
+                            1,
+                        )
+                        .into_boxed_str(),
+                );
+                assert_ne!(foreign, PARTIAL_TH);
+                let (error, body, count, dsn, manifest) = scenario(
+                    &root,
+                    "partial-th-foreign-layer",
+                    foreign,
+                    Some(partial_th_native),
+                    "require",
+                    false,
+                    false,
+                )
+                .await;
+                assert!(
+                    error
+                        && body
+                            .to_string()
+                            .contains("unsupported through-hole pad J1-1: copper layers are"),
+                    "{body}"
+                );
+                assert_eq!(count, 0);
+                assert!(!dsn && !manifest);
+            }
             _ => panic!("unknown native-profile test group"),
         }
     });
+}
+
+#[test]
+fn native_profile_partial_through_hole_pads() {
+    run_isolated_native_profile("native_profile_partial_through_hole_pads", "partial-th");
 }
 
 #[test]
@@ -484,10 +597,17 @@ async fn native_profile_invalid_mode_types_refuse_in_direct_and_served_calls() {
     }
 }
 
-async fn apply_circle_with_manifest(cli: Option<&str>) {
+async fn apply_native_with_manifest(
+    board_source: &'static str,
+    native_dsn: &str,
+    ses_source: &str,
+    applied_source: &'static str,
+    log_tag: &str,
+    cli: Option<&str>,
+) {
     let temp = tempfile::tempdir().unwrap();
     let board = temp.path().join("board.kicad_pcb");
-    std::fs::write(&board, CIRCLE).unwrap();
+    std::fs::write(&board, board_source).unwrap();
     let rules: copperpour_ipc::IpcEffectiveRoutingRules = ["GND", "VCC"]
         .into_iter()
         .map(|n| {
@@ -504,14 +624,14 @@ async fn apply_circle_with_manifest(cli: Option<&str>) {
             )
         })
         .collect();
-    let export = crate::specctra::prepare_export(&board, CIRCLE, &rules)
+    let export = crate::specctra::prepare_export(&board, board_source, &rules)
         .unwrap()
-        .adopt_native(CIRCLE_DSN.into())
+        .adopt_native(native_dsn.into())
         .unwrap();
     let manifest = temp.path().join("board.manifest.json");
     let ses = temp.path().join("board.ses");
     std::fs::write(&manifest, &export.manifest).unwrap();
-    std::fs::write(&ses, SES).unwrap();
+    std::fs::write(&ses, ses_source).unwrap();
     let fake=crate::tools::cli::test_support::write_script(temp.path(),"drc-stub",
         "#!/bin/sh\nprev=\nfor a; do [ \"$prev\" = --output ] && out=\"$a\"; prev=\"$a\"; done\nprintf '%s' '{\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]}' > \"$out\"\n", "@exit /b 1\r\n");
     let store = Arc::new(Mutex::new(ItemStore::default()));
@@ -534,9 +654,9 @@ async fn apply_circle_with_manifest(cli: Option<&str>) {
                 pack_any(
                     &kiapi::common::commands::SavedDocumentResponse {
                         contents: if held.creates == 0 {
-                            CIRCLE.into()
+                            board_source.into()
                         } else {
-                            APPLIED.into()
+                            applied_source.into()
                         },
                         document: None,
                     },
@@ -568,7 +688,6 @@ async fn apply_circle_with_manifest(cli: Option<&str>) {
     std::fs::write(&manifest, export.manifest).unwrap();
     let (error,body)=call(&handler,"apply_specctra_ses",json!({"board":board,"ses_path":ses,"manifest_path":manifest,"candidate_output_path":candidate})).await;
     assert!(!error, "{body}");
-    assert_eq!(body["created_count"], 5);
     assert_eq!(
         commits
             .lock()
@@ -588,44 +707,72 @@ async fn apply_circle_with_manifest(cli: Option<&str>) {
         1
     );
     assert_eq!(body["undo_description"], "Import Freerouting SES");
-    assert_eq!(std::fs::read_to_string(&candidate).unwrap(), APPLIED);
-    assert_eq!(std::fs::read_to_string(&board).unwrap(), CIRCLE);
+    assert_eq!(std::fs::read_to_string(&candidate).unwrap(), applied_source);
+    assert_eq!(std::fs::read_to_string(&board).unwrap(), board_source);
     // Compare the IPC-created geometry against KiCad's actual SES import, not
     // against the planner's own arithmetic. Native UUIDs/order need not agree.
-    let tree = copperpour_sexp::parse_sexp(APPLIED).unwrap();
-    let mut expected = tree
+    let tree = copperpour_sexp::parse_sexp(applied_source).unwrap();
+    let mm_to_nm = |node: &copperpour_sexp::SexpNode, tag: &str, index: usize| {
+        (node.find(tag).unwrap().get_f64(index).unwrap() * 1_000_000.0).round() as i64
+    };
+    let mut expected_tracks = tree
         .find_all("segment")
         .into_iter()
         .map(|segment| {
-            let at = |tag: &str, index| {
-                (segment.find(tag).unwrap().get_f64(index).unwrap() * 1_000_000.0).round() as i64
-            };
             let mut ends = [
-                (at("start", 1), at("start", 2)),
-                (at("end", 1), at("end", 2)),
+                (mm_to_nm(segment, "start", 1), mm_to_nm(segment, "start", 2)),
+                (mm_to_nm(segment, "end", 1), mm_to_nm(segment, "end", 2)),
             ];
             ends.sort();
             (
                 ends,
-                at("width", 1),
+                mm_to_nm(segment, "width", 1),
                 segment.find_str("layer").unwrap().to_string(),
                 segment.find_str("net").unwrap().to_string(),
             )
         })
         .collect::<Vec<_>>();
-    let mut actual = store
-        .lock()
-        .unwrap()
-        .items
-        .iter()
-        .map(|item| {
+    let mut expected_vias = tree
+        .find_all("via")
+        .into_iter()
+        .map(|via| {
+            (
+                mm_to_nm(via, "at", 1),
+                mm_to_nm(via, "at", 2),
+                mm_to_nm(via, "size", 1),
+                mm_to_nm(via, "drill", 1),
+                via.find_str("net").unwrap().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        body["created_count"],
+        expected_tracks.len() + expected_vias.len()
+    );
+    let mut actual_tracks = Vec::new();
+    let mut actual_vias = Vec::new();
+    for item in &store.lock().unwrap().items {
+        if item.type_url.ends_with("Via") {
+            let via = kiapi::board::types::Via::decode(item.value.as_slice()).unwrap();
+            let pos = via.position.unwrap();
+            let stack = via.pad_stack.unwrap();
+            let drill = stack.drill.unwrap().diameter.unwrap();
+            let size = stack.copper_layers.first().unwrap().size.unwrap();
+            actual_vias.push((
+                pos.x_nm,
+                pos.y_nm,
+                size.x_nm,
+                drill.x_nm,
+                via.net.unwrap().name,
+            ));
+        } else {
             let track = kiapi::board::types::Track::decode(item.value.as_slice()).unwrap();
             let net = track.net.as_ref().unwrap().name.clone();
             let a = track.start.unwrap();
             let b = track.end.unwrap();
             let mut ends = [(a.x_nm, a.y_nm), (b.x_nm, b.y_nm)];
             ends.sort();
-            (
+            actual_tracks.push((
                 ends,
                 track.width.unwrap().value_nm,
                 copperpour_ipc::builders::layer_name(
@@ -634,21 +781,24 @@ async fn apply_circle_with_manifest(cli: Option<&str>) {
                 .unwrap()
                 .to_string(),
                 net,
-            )
-        })
-        .collect::<Vec<_>>();
-    expected.sort();
-    actual.sort();
-    assert_eq!(actual, expected);
+            ));
+        }
+    }
+    expected_tracks.sort();
+    actual_tracks.sort();
+    assert_eq!(actual_tracks, expected_tracks);
+    expected_vias.sort();
+    actual_vias.sort();
+    assert_eq!(actual_vias, expected_vias);
     if cli.is_some() {
         assert_eq!(body["drc"]["unconnected_items"], 0, "{body}");
-        eprintln!("NATIVE_CIRCLE_DRC: {}", body["drc"]);
+        eprintln!("{log_tag}: {}", body["drc"]);
     }
 }
 
 #[tokio::test]
 async fn native_profile_circle_manifest_applies_its_native_session() {
-    apply_circle_with_manifest(None).await;
+    apply_native_with_manifest(CIRCLE, CIRCLE_DSN, SES, APPLIED, "NATIVE_CIRCLE_DRC", None).await;
 }
 
 #[tokio::test]
@@ -660,5 +810,46 @@ async fn native_profile_circle_manifest_apply_with_native_drc() {
         .output()
         .expect("native kicad-cli required");
     assert!(version.status.success());
-    apply_circle_with_manifest(Some(&cli)).await;
+    apply_native_with_manifest(
+        CIRCLE,
+        CIRCLE_DSN,
+        SES,
+        APPLIED,
+        "NATIVE_CIRCLE_DRC",
+        Some(&cli),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn native_profile_partial_th_manifest_applies_its_native_session() {
+    apply_native_with_manifest(
+        PARTIAL_TH,
+        partial_th_dsn(),
+        PARTIAL_TH_SES,
+        PARTIAL_TH_APPLIED,
+        "NATIVE_PARTIAL_TH_DRC",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "native KiCad CLI smoke; requires kicad-cli"]
+async fn native_profile_partial_th_manifest_apply_with_native_drc() {
+    let cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".into());
+    let version = std::process::Command::new(&cli)
+        .arg("version")
+        .output()
+        .expect("native kicad-cli required");
+    assert!(version.status.success());
+    apply_native_with_manifest(
+        PARTIAL_TH,
+        partial_th_dsn(),
+        PARTIAL_TH_SES,
+        PARTIAL_TH_APPLIED,
+        "NATIVE_PARTIAL_TH_DRC",
+        Some(&cli),
+    )
+    .await;
 }
