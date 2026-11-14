@@ -222,7 +222,9 @@ mod tests {
                         "set_erc_severity/properties/severities" |
                         // Passed through to Freerouting; what it does not
                         // apply is read back and refused before routing.
-                        "route_specctra_dsn/properties/router_settings"
+                        "route_specctra_dsn/properties/router_settings" |
+                        // Caller-named groups of net patterns.
+                        "get_placement_overview/properties/net_groups"
                     ),
                         "unreviewed open input record: {path}"
                     );

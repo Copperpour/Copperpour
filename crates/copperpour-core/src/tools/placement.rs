@@ -38,6 +38,7 @@
 //! Every response field is derived from the parsed board — never echoed from
 //! the request (the recurring defect class this repo pins tests against).
 
+mod overview;
 mod plan_status;
 
 use crate::mcp::error::ToolErrorKind;
@@ -185,6 +186,7 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_force_directed(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
+        overview::tool(),
     ]
 }
 
@@ -229,6 +231,54 @@ fn read_saved_board(board: &std::path::Path) -> anyhow::Result<Result<String, Ca
     }
 }
 
+/// The board as KiCad holds it when it is open there, else the saved file:
+/// `(content, source)` with source `"ipc"` or `"saved_file"`. A saved-file
+/// read of an open board would describe a stale snapshot against moves KiCad
+/// already applied (#595), so the live copy wins whenever it can be had.
+pub(crate) async fn live_or_saved_board(
+    ctx: &ToolContext,
+    board: &std::path::Path,
+) -> anyhow::Result<Result<(String, &'static str), CallToolResult>> {
+    let board = board.to_path_buf();
+    let live = with_board_ipc_classified(ctx, &board, move |client, document| {
+        client.save_document_to_string_in(document)
+    })
+    .await?;
+    let (content, source) = match live {
+        Ok(content) => (content, "ipc"),
+        Err(copperpour_ipc::IpcFailure::Unreachable(_)) => match read_saved_board(&board)? {
+            Ok(content) => (content, "saved_file"),
+            Err(result) => return Ok(Err(result)),
+        },
+        Err(copperpour_ipc::IpcFailure::Target { error, .. }) if error.proves_not_open() => {
+            match read_saved_board(&board)? {
+                Ok(content) => (content, "saved_file"),
+                Err(result) => return Ok(Err(result)),
+            }
+        }
+        Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
+            return Ok(Err(crate::tools::ipc_target_error_result(&error)));
+        }
+        // Reading the board raises no refusal of Copperpour's own (#240).
+        Err(
+            copperpour_ipc::IpcFailure::Rejected(message)
+            | copperpour_ipc::IpcFailure::Preflight(copperpour_ipc::PreflightRefusal {
+                reason: message,
+                ..
+            }),
+        ) => {
+            return Ok(Err(CallToolResult::error(message)));
+        }
+        Err(copperpour_ipc::IpcFailure::Recovered(message)) => {
+            return Ok(Err(crate::tools::ipc_recovered_result(&message)));
+        }
+        Err(copperpour_ipc::IpcFailure::Uncertain(message)) => {
+            return Ok(Err(crate::tools::ipc_uncertain_result(&message)));
+        }
+    };
+    Ok(Ok((content, source)))
+}
+
 async fn handle_score_placement(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -241,41 +291,9 @@ async fn handle_score_placement(
     // disk yet — the failure mode #595 was filed against. The saved file
     // remains the disclosed fallback for a closed or unreachable board;
     // scoring policy itself is unchanged either way.
-    let live = with_board_ipc_classified(ctx, &board, move |client, document| {
-        client.save_document_to_string_in(document)
-    })
-    .await?;
-    let (content, source) = match live {
-        Ok(content) => (content, "ipc"),
-        Err(copperpour_ipc::IpcFailure::Unreachable(_)) => match read_saved_board(&board)? {
-            Ok(content) => (content, "saved_file"),
-            Err(result) => return Ok(result),
-        },
-        Err(copperpour_ipc::IpcFailure::Target { error, .. }) if error.proves_not_open() => {
-            match read_saved_board(&board)? {
-                Ok(content) => (content, "saved_file"),
-                Err(result) => return Ok(result),
-            }
-        }
-        Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
-            return Ok(crate::tools::ipc_target_error_result(&error));
-        }
-        // Reading the board raises no refusal of Copperpour's own (#240).
-        Err(
-            copperpour_ipc::IpcFailure::Rejected(message)
-            | copperpour_ipc::IpcFailure::Preflight(copperpour_ipc::PreflightRefusal {
-                reason: message,
-                ..
-            }),
-        ) => {
-            return Ok(CallToolResult::error(message));
-        }
-        Err(copperpour_ipc::IpcFailure::Recovered(message)) => {
-            return Ok(crate::tools::ipc_recovered_result(&message));
-        }
-        Err(copperpour_ipc::IpcFailure::Uncertain(message)) => {
-            return Ok(crate::tools::ipc_uncertain_result(&message));
-        }
+    let (content, source) = match live_or_saved_board(ctx, &board).await? {
+        Ok(read) => read,
+        Err(result) => return Ok(result),
     };
     let tree = copperpour_sexp::parse_sexp(&content)?;
 
