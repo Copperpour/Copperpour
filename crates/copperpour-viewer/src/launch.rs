@@ -7,6 +7,7 @@
 //! (mixelpixx/Konnect#702, mixelpixx/Konnect#764, #496).
 
 use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,9 +27,26 @@ const STDERR_LINE_CHARS: usize = 500;
 /// started can hold the pipe open after it exits.
 const STDERR_DRAIN: Duration = Duration::from_millis(500);
 
+/// Why a GUI started with this environment would find no display, or `None`.
+/// `env` reads the started program's environment (Copperpour#225).
+pub fn no_display_reason(env: impl Fn(&str) -> Option<OsString>) -> Option<&'static str> {
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        return None;
+    }
+    let set = |name| env(name).is_some_and(|value| !value.is_empty());
+    (!set("DISPLAY") && !set("WAYLAND_DISPLAY")).then_some(
+        "Neither DISPLAY nor WAYLAND_DISPLAY is set in the server's environment, as when it \
+         runs from an SSH session.",
+    )
+}
+
 /// A spawned application, watched until the caller decides it is up.
 pub struct Launch {
     name: &'static str,
+    /// [`no_display_reason`] for the environment it was started with.
+    no_display: Option<&'static str>,
+    /// What the caller's user can do about `no_display`.
+    no_display_remedy: Option<&'static str>,
     child: tokio::process::Child,
     tail: Arc<Mutex<VecDeque<String>>>,
     forwarder: Option<tokio::task::JoinHandle<()>>,
@@ -44,6 +62,13 @@ pub fn spawn(
     name: &'static str,
     log: fn(&str),
 ) -> std::io::Result<Launch> {
+    let no_display =
+        no_display_reason(
+            |name| match cmd.get_envs().find(|(key, _)| *key == OsStr::new(name)) {
+                Some((_, value)) => value.map(OsStr::to_os_string),
+                None => std::env::var_os(name),
+            },
+        );
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -77,6 +102,8 @@ pub fn spawn(
 
     Ok(Launch {
         name,
+        no_display,
+        no_display_remedy: None,
         child,
         tail,
         forwarder,
@@ -84,6 +111,16 @@ pub fn spawn(
 }
 
 impl Launch {
+    /// Whether it was started with no display, so [`Self::exited`] says so.
+    pub fn lacks_display(&self) -> bool {
+        self.no_display.is_some()
+    }
+
+    /// A sentence [`Self::exited`] adds after saying the display is missing.
+    pub fn on_no_display(&mut self, remedy: &'static str) {
+        self.no_display_remedy = Some(remedy);
+    }
+
     /// Waits up to `window` for the application to exit. `Ok` means it is
     /// still running; an exit is reported with its status and stderr tail.
     pub async fn watch(&mut self, window: Duration) -> Result<(), String> {
@@ -108,11 +145,20 @@ impl Launch {
             .map(|mut tail| tail.make_contiguous().join("\n"))
             .unwrap_or_default();
         let name = self.name;
-        if tail.is_empty() {
+        let mut message = if tail.is_empty() {
             format!("{name} exited during startup ({status}) with no stderr output.")
         } else {
             format!("{name} exited during startup ({status}). Its stderr ended with:\n{tail}")
+        };
+        if let Some(reason) = self.no_display {
+            message.push('\n');
+            message.push_str(reason);
+            if let Some(remedy) = self.no_display_remedy {
+                message.push(' ');
+                message.push_str(remedy);
+            }
         }
+        message
     }
 }
 
@@ -121,9 +167,10 @@ impl Launch {
 mod tests {
     use super::*;
 
+    /// On a display, so only the test that drops it gets the no-display line.
     fn sh(script: &str) -> std::process::Command {
         let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(script);
+        cmd.arg("-c").arg(script).env("DISPLAY", ":0");
         cmd
     }
 
@@ -150,6 +197,47 @@ mod tests {
             err.contains("Failed to initialize gtk backend!"),
             "stderr missing: {err}"
         );
+    }
+
+    /// The server's environment does not matter: `cmd`'s own wins.
+    #[tokio::test]
+    async fn an_exit_with_no_display_says_so() {
+        let mut cmd = sh("echo 'cannot open display' >&2; exit 1");
+        cmd.env("DISPLAY", "").env_remove("WAYLAND_DISPLAY");
+        let mut app = spawn(cmd, "Test app", |_| {}).expect("sh spawns");
+        let missing = !cfg!(target_os = "macos");
+        assert_eq!(app.lacks_display(), missing);
+        app.on_no_display("Try a display.");
+        let err = app.watch(Duration::from_secs(10)).await.unwrap_err();
+        assert!(err.contains("cannot open display"), "{err}");
+        assert_eq!(
+            err.ends_with("Neither DISPLAY nor WAYLAND_DISPLAY is set in the server's environment, as when it runs from an SSH session. Try a display."),
+            missing,
+            "{err}"
+        );
+        // A display set in `cmd` is not a missing one.
+        assert!(!spawn(sh("exit 1"), "Test app", |_| {})
+            .unwrap()
+            .lacks_display());
+    }
+
+    #[test]
+    fn no_display_is_named_only_when_both_variables_are_unset_or_empty() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        let missing = !cfg!(target_os = "macos");
+        assert_eq!(no_display_reason(env(&[])).is_some(), missing);
+        assert_eq!(
+            no_display_reason(env(&[("DISPLAY", ""), ("WAYLAND_DISPLAY", "")])).is_some(),
+            missing
+        );
+        assert!(no_display_reason(env(&[("DISPLAY", ":0")])).is_none());
+        assert!(no_display_reason(env(&[("WAYLAND_DISPLAY", "wayland-0")])).is_none());
     }
 
     #[tokio::test]

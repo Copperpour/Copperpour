@@ -231,6 +231,24 @@ in KiCAD" — and it names what to change about the request.
 reachable. An older, reachable KiCad makes `flip_component` refuse rather than
 silently edit the file underneath it.
 
+## `launch_kicad_ui` from an SSH session
+
+A server started from an SSH session inherits no `DISPLAY` or `WAYLAND_DISPLAY`,
+so KiCad exits at once with `Unable to initialize GTK+, is DISPLAY set properly?`.
+`launch_kicad_ui` reports that exit and says the server has no display. Pass
+`display` to open KiCad on the desktop's X display (Xwayland on a Wayland desktop):
+
+```json
+{"project": "/absolute/project/board.kicad_pro", "display": ":0"}
+```
+
+`display` takes local displays only (`:N` or `:N.S`). KiCad takes `XAUTHORITY`
+from the server's environment. If the X server refuses the connection, set
+`XAUTHORITY` where the MCP client starts the server, to the cookie file the
+desktop session uses: `echo $XAUTHORITY` in a terminal on the desktop shows it.
+That is often `~/.Xauthority` on an X11 session, and a file under
+`$XDG_RUNTIME_DIR` (such as `.mutter-Xwaylandauth.*`) under Xwayland.
+
 ## KiCad is running, but `ipc_failure` says it did not answer
 
 `check_kicad_ui` and `open_project` report `ipc_failure` as
@@ -244,11 +262,11 @@ apart cases that used to share one `false`, and each has a different fix:
 | `kind` | What happened | What to do |
 |---|---|---|
 | `not_configured` | No address was configured or discovered. | See ["KiCAD IPC socket path not configured"](#kicad-ipc-socket-path-not-configured). |
-| `no_listener` | Nothing is listening at the address. | Open an editor with the API enabled, and check the address against KiCad's "Listening on" line. |
+| `no_listener` | Nothing is listening at the address. | Open an editor with the API enabled, and check the address against KiCad's "Listening on" line. KiCad's first-run wizard can write a missing `kicad_common.json` with `api.enable_server: false`; set it back to `true`. |
 | `access_denied` | The operating system refused this account access to the endpoint. Likely a different account or a restrictive ACL. | Run Copperpour as the same operating-system user as KiCad; see below. |
 | `handshake_failed` | A listener accepted the connection and did not complete NNG's handshake. | Another program holds KiCad's address ([#52](https://github.com/Copperpour/Copperpour/issues/52)). Close it, then restart KiCad so it can bind. |
 | `transport_error` | Any other dial or send failure. | Read `message`. |
-| `request_failed` | The request did not complete and may have reached the endpoint. A KiCad status in `message` (for example `AS_NOT_READY` while an editor is still loading) proves it did; a receive timeout or a malformed reply does not. | With a KiCad status: wait for the editor to finish loading, then retry. Without one: treat the endpoint as unproven and check what holds the address. |
+| `request_failed` | The request did not complete and may have reached the endpoint. A KiCad status in `message` (for example `AS_NOT_READY` while an editor is still loading) proves it did; a receive timeout or a malformed reply does not. | With a KiCad status: wait for the editor to finish loading, then retry. Without one: treat the endpoint as unproven and check what holds the address. For `AS_NOT_READY`, `ipc_failure` also carries a `note`: if it keeps coming back, a modal dialog (the first-run wizard, a message box) is open; close it. |
 
 `handshake_failed` takes NNG's fixed 10-second negotiation limit to appear.
 That is longer than `check_kicad_ui`'s default 5-second budget, which then

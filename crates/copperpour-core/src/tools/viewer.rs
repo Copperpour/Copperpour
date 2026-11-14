@@ -79,13 +79,26 @@ pub(super) async fn launch_browser(url: &str) -> BrowserLaunch {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let mut command = tokio::process::Command::new("xdg-open");
     command.arg(url);
-    observe_browser_launch(command, Duration::from_secs(5)).await
+    let no_display = copperpour_viewer::launch::no_display_reason(|name| std::env::var_os(name));
+    observe_browser_launch(command, Duration::from_secs(5), no_display).await
 }
 
+/// `no_display` is added to an opener that failed, not one that timed out.
 async fn observe_browser_launch(
     mut command: tokio::process::Command,
     timeout: Duration,
+    no_display: Option<&str>,
 ) -> BrowserLaunch {
+    let failed = |error: String| BrowserLaunch {
+        succeeded: false,
+        error: Some(match no_display {
+            Some(reason) => format!(
+                "{error}. {reason} Open the URL in a browser on the desktop, or pass \
+                 open_browser=false."
+            ),
+            None => format!("{error}; use the returned URL manually"),
+        }),
+    };
     // Never inherit the MCP stdio stream, and never forward a token-bearing URL
     // from opener diagnostics. Exit success proves only that the opener accepted it.
     command
@@ -96,8 +109,8 @@ async fn observe_browser_launch(
     let outcome = tokio::time::timeout(timeout, command.status()).await;
     match outcome {
         Ok(Ok(status)) if status.success() => BrowserLaunch { succeeded: true, error: None },
-        Ok(Ok(status)) => BrowserLaunch { succeeded: false, error: Some(format!("OS browser opener exited with {status}; use the returned URL manually")) },
-        Ok(Err(error)) => BrowserLaunch { succeeded: false, error: Some(format!("Could not start OS browser opener: {error}; use the returned URL manually")) },
+        Ok(Ok(status)) => failed(format!("OS browser opener exited with {status}")),
+        Ok(Err(error)) => failed(format!("Could not start OS browser opener: {error}")),
         Err(_) => BrowserLaunch { succeeded: false, error: Some("OS browser opener did not finish within five seconds; a browser may still have opened. Use the returned URL if needed".into()) },
     }
 }
@@ -372,20 +385,33 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
     }
     #[tokio::test]
     async fn browser_opener_reports_exit_failure_spawn_failure_and_timeout_truthfully() {
-        let success = observe_browser_launch(command("exit 0"), Duration::from_secs(1)).await;
+        const NO_DISPLAY: &str = "Neither DISPLAY nor WAYLAND_DISPLAY is set.";
+        let success = observe_browser_launch(command("exit 0"), Duration::from_secs(1), None).await;
         assert!(success.succeeded);
         assert!(success.error.is_none());
-        for c in [
-            command("exit 9"),
-            tokio::process::Command::new("/nonexistent/browser"),
-        ] {
-            let result = observe_browser_launch(c, Duration::from_secs(1)).await;
-            assert!(!result.succeeded);
-            assert!(result.error.is_some());
+        for no_display in [None, Some(NO_DISPLAY)] {
+            for c in [
+                command("exit 9"),
+                tokio::process::Command::new("/nonexistent/browser"),
+            ] {
+                let result = observe_browser_launch(c, Duration::from_secs(1), no_display).await;
+                assert!(!result.succeeded);
+                let error = result.error.unwrap();
+                assert_eq!(error.contains(NO_DISPLAY), no_display.is_some(), "{error}");
+            }
         }
-        let result =
-            observe_browser_launch(command("exec sleep 10"), Duration::from_millis(50)).await;
+        // A timeout is not blamed on the display (#225).
+        let result = observe_browser_launch(
+            command("exec sleep 10"),
+            Duration::from_millis(50),
+            Some(NO_DISPLAY),
+        )
+        .await;
         assert!(!result.succeeded);
-        assert!(result.error.unwrap().contains("did not finish"));
+        let error = result.error.unwrap();
+        assert!(
+            error.contains("did not finish") && !error.contains(NO_DISPLAY),
+            "{error}"
+        );
     }
 }

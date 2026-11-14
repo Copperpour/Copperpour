@@ -818,10 +818,13 @@ fn browser_viewer_stdio_case(native_cli: bool) {
     assert_eq!(failed["launched"], true);
     assert_eq!(failed["browser_launch_requested"], true);
     assert_eq!(failed["browser_launch_succeeded"], false);
-    assert!(failed["browser_launch_error"]
-        .as_str()
-        .unwrap()
-        .contains('7'));
+    let error = failed["browser_launch_error"].as_str().unwrap();
+    assert!(error.contains('7'), "{error}");
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        error.contains("Neither DISPLAY nor WAYLAND_DISPLAY is set"),
+        "{error}"
+    );
     assert_served(failed["url"].as_str().unwrap());
 }
 
@@ -918,6 +921,58 @@ fn a_malformed_explicit_config_stops_startup_instead_of_falling_back() {
     assert!(
         !stderr.contains("configuration:"),
         "startup must not report any configuration selection: {stderr}"
+    );
+}
+
+/// A server started from an SSH session has no display; `launch_kicad_ui`
+/// says so, and `display` aims KiCad at one (#225). `/bin/sh` stands in for
+/// KiCad and runs the `project` argument as its script.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn launch_kicad_ui_over_ssh_names_the_missing_display_and_takes_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("copperpour.toml"),
+        "kicad_binary = \"/bin/sh\"\n",
+    )
+    .unwrap();
+    let kicad = tmp.path().join("kicad.sh");
+    std::fs::write(
+        &kicad,
+        "echo \"DISPLAY=$DISPLAY WAYLAND_DISPLAY=${WAYLAND_DISPLAY-unset} GDK_BACKEND=${GDK_BACKEND-unset}\" >&2; exit 255\n",
+    )
+    .unwrap();
+    let mut p = McpProcess::spawn_with_env_without(
+        Some(tmp.path()),
+        true,
+        &[("WAYLAND_DISPLAY", ""), ("GDK_BACKEND", "wayland")],
+        &["DISPLAY"],
+    );
+    McpProcess::tool_body(&p.call_tool("load_toolset", json!({"name": "verification"})));
+    let project = kicad.to_str().unwrap();
+
+    let bare = p.call_tool(
+        "launch_kicad_ui",
+        json!({"project": project, "wait_ready": false}),
+    );
+    assert_eq!(bare["isError"], true, "{bare}");
+    let text = bare["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("DISPLAY= WAYLAND_DISPLAY= GDK_BACKEND=wayland\n")
+            && text.contains("Neither DISPLAY nor WAYLAND_DISPLAY is set")
+            && text.contains("Pass display"),
+        "{text}"
+    );
+
+    let aimed = p.call_tool(
+        "launch_kicad_ui",
+        json!({"project": project, "wait_ready": false, "display": ":0"}),
+    );
+    assert_eq!(aimed["isError"], true, "{aimed}");
+    let text = aimed["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.ends_with("DISPLAY=:0 WAYLAND_DISPLAY=unset GDK_BACKEND=x11"),
+        "the display reaches KiCad, and no hint follows: {text}"
     );
 }
 
