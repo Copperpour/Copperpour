@@ -1432,6 +1432,10 @@ mod tests {
         /// leaving its fields where the update put them, so only the
         /// footprint's own pose shows the change.
         move_footprint_on_update: bool,
+        /// The same, but turn the footprint 90° instead of moving it.
+        rotate_footprint_on_update: bool,
+        /// The same, but put the footprint on B.Cu instead of moving it.
+        flip_footprint_on_update: bool,
         updates: usize,
     }
 
@@ -1541,6 +1545,8 @@ mod tests {
                     held.updates += request.items.len();
                     let keep_mirror_flag = held.keep_mirror_flag;
                     let move_footprint = held.move_footprint_on_update;
+                    let rotate_footprint = held.rotate_footprint_on_update;
+                    let flip_footprint = held.flip_footprint_on_update;
                     for item in &request.items {
                         if item.type_url.ends_with("BoardText") {
                             let mut updated =
@@ -1573,6 +1579,12 @@ mod tests {
                             }
                             if move_footprint {
                                 updated.position.as_mut().unwrap().x_nm += 1_000_000;
+                            }
+                            if rotate_footprint {
+                                updated.orientation.as_mut().unwrap().value_degrees += 90.0;
+                            }
+                            if flip_footprint {
+                                updated.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
                             }
                             *slot = updated;
                         }
@@ -1810,6 +1822,51 @@ mod tests {
             "{body}"
         );
         assert_eq!(scene.held.lock().unwrap().updates, 1);
+    }
+
+    /// Edit R1's Reference field bold through a KiCad double that `alters`
+    /// the footprint as it takes the update, and return the error reason.
+    async fn reason_when_kicad_alters_the_footprint(alter: impl FnOnce(&mut Held)) -> String {
+        let scene = LiveScene::new(false).await;
+        alter(&mut scene.held.lock().unwrap());
+        let (is_error, body) = scene
+            .call(
+                "edit_footprint_field",
+                json!({ "reference": "R1", "bold": true }),
+            )
+            .await;
+        assert!(is_error, "{body}");
+        assert_eq!(
+            body["error"]["kind"], "mutation_outcome_uncertain",
+            "{body}"
+        );
+        assert_eq!(scene.held.lock().unwrap().updates, 1);
+        body["error"]["reason"].as_str().unwrap().to_string()
+    }
+
+    /// As the moved footprint above, for its orientation: a KiCad that turns
+    /// the footprint 90° under a field edit is an error naming
+    /// `footprint.orientation`.
+    #[tokio::test]
+    async fn a_kicad_that_turns_the_footprint_is_an_error_through_the_served_dispatch() {
+        let reason =
+            reason_when_kicad_alters_the_footprint(|held| held.rotate_footprint_on_update = true)
+                .await;
+        assert!(
+            reason.contains("footprint.orientation: expected"),
+            "{reason}"
+        );
+    }
+
+    /// As the moved footprint above, for its layer: a KiCad that puts the
+    /// footprint on B.Cu under a field edit is an error naming
+    /// `footprint.layer`.
+    #[tokio::test]
+    async fn a_kicad_that_flips_the_footprint_is_an_error_through_the_served_dispatch() {
+        let reason =
+            reason_when_kicad_alters_the_footprint(|held| held.flip_footprint_on_update = true)
+                .await;
+        assert!(reason.contains("footprint.layer: expected"), "{reason}");
     }
 
     /// Item 3 of #202 through `tools/call`: a layer change with
