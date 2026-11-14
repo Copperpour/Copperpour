@@ -1336,3 +1336,318 @@ fn server_guidance_works_over_stdio_without_init_or_profile_skill_writes() {
     assert!(!profile.path().join(".claude").exists());
     assert!(!profile.path().join(".agents").exists());
 }
+
+// ─── call_tool: what the gateway may run (#60) ────────────────────────────────
+//
+// A client approves tools by name, so these go through the served
+// `tools/call`: what they prove is what a client that allowed only `call_tool`
+// can and cannot make the server do.
+
+fn list_changed_count(lines: &[Value]) -> usize {
+    lines
+        .iter()
+        .filter(|v| {
+            v.get("method").and_then(Value::as_str) == Some("notifications/tools/list_changed")
+                && v.get("id").is_none()
+        })
+        .count()
+}
+
+/// The `tools/call` result among the lines `call_tool_then_fence` returned.
+fn fenced_result(lines: &[Value]) -> Value {
+    lines
+        .iter()
+        .find(|v| v["result"].get("content").is_some())
+        .unwrap_or_else(|| panic!("no tools/call result in {lines:#?}"))["result"]
+        .clone()
+}
+
+fn listed_tools(p: &mut McpProcess) -> Vec<String> {
+    let list = p.request("tools/list", json!({}));
+    list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[track_caller]
+fn assert_not_permitted(result: &Value, tool: &str, reason: &str) {
+    assert_eq!(result["isError"], json!(true), "{result}");
+    let body = McpProcess::tool_body(result);
+    assert_eq!(body["error"]["kind"], "tool_not_permitted", "{body}");
+    assert_eq!(body["error"]["tool"], tool, "{body}");
+    assert_eq!(body["error"]["reason"], reason, "{body}");
+}
+
+/// By default a writing target is refused before its handler runs, whether
+/// its toolset is unloaded, loaded at startup or loaded later. The arguments
+/// are ones the handler accepts: the same call made directly writes the file.
+#[test]
+fn call_tool_refuses_a_writing_target_before_its_handler_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sheet = tmp.path().join("gateway.kicad_sch");
+    let sheet_args = json!({"path": sheet.to_string_lossy()});
+    let project = tmp.path().join("gateway_project");
+    let mut p = McpProcess::spawn();
+    let before = listed_tools(&mut p);
+    assert!(before.iter().any(|name| name == "call_tool"));
+    assert!(before.iter().any(|name| name == "create_project"));
+    assert!(!before.iter().any(|name| name == "create_schematic"));
+
+    // Unloaded toolset.
+    let lines = p.call_tool_then_fence(
+        "call_tool",
+        json!({"name": "create_schematic", "arguments": sheet_args}),
+    );
+    assert_not_permitted(
+        &fenced_result(&lines),
+        "create_schematic",
+        "writes_not_enabled",
+    );
+    assert_eq!(list_changed_count(&lines), 0, "{lines:#?}");
+    assert!(!sheet.exists(), "the refused handler wrote {sheet:?}");
+
+    // Toolset of the starter kit: listed, and still not reachable this way.
+    let r = p.call_tool(
+        "call_tool",
+        json!({
+            "name": "create_project",
+            "arguments": {"name": "gateway_project", "path": project.to_string_lossy()}
+        }),
+    );
+    assert_not_permitted(&r, "create_project", "writes_not_enabled");
+    assert!(!project.exists(), "the refused handler wrote {project:?}");
+
+    // No argument widens the gateway: the setting is the operator's.
+    let r = p.call_tool(
+        "call_tool",
+        json!({"name": "create_schematic", "arguments": sheet_args, "allow_writes": true}),
+    );
+    assert_eq!(
+        McpProcess::tool_body(&r)["error"]["kind"],
+        "invalid_argument"
+    );
+    let r = p.call_tool(
+        "call_tool",
+        json!({
+            "name": "create_schematic",
+            "arguments": sheet_args,
+            "call_tool_allow_writes": true
+        }),
+    );
+    assert_eq!(
+        McpProcess::tool_body(&r)["error"]["kind"],
+        "invalid_argument"
+    );
+    assert!(!sheet.exists());
+
+    // Loading the toolset changes what is listed, not what the gateway runs.
+    let loaded = p.call_tool("load_toolset", json!({"name": "sch_hierarchy"}));
+    assert_ne!(loaded["isError"], json!(true), "{loaded}");
+    let r = p.call_tool(
+        "call_tool",
+        json!({"name": "create_schematic", "arguments": sheet_args}),
+    );
+    assert_not_permitted(&r, "create_schematic", "writes_not_enabled");
+    assert!(!sheet.exists(), "the refused handler wrote {sheet:?}");
+
+    // The refusal is logged under the target's name.
+    let recent = McpProcess::tool_body(&p.call_tool("get_recent_calls", json!({"limit": 1})));
+    assert_eq!(recent["calls"][0]["tool"], "create_schematic", "{recent}");
+    assert_eq!(
+        recent["calls"][0]["error_kind"], "tool_not_permitted",
+        "{recent}"
+    );
+
+    // Control: the same arguments, called directly, reach the handler.
+    let direct = p.call_tool("create_schematic", sheet_args);
+    assert_ne!(direct["isError"], json!(true), "{direct}");
+    assert!(sheet.exists());
+}
+
+/// A read-only target runs from an unloaded toolset, gives what the direct
+/// call gives, and is checked as a direct call is: the presence check, the
+/// compiled schema's types and its closed set of keys. The catalogue does not
+/// change and no notification is sent.
+#[test]
+fn call_tool_runs_a_read_only_target_with_its_own_argument_validation() {
+    let mut p = McpProcess::spawn();
+    let before = listed_tools(&mut p);
+    assert!(!before.iter().any(|name| name == "get_template"));
+
+    let refused = |p: &mut McpProcess, arguments: Value| {
+        let r = p.call_tool(
+            "call_tool",
+            json!({"name": "get_template", "arguments": arguments}),
+        );
+        assert_eq!(r["isError"], json!(true), "{r}");
+        McpProcess::tool_body(&r)["error"].clone()
+    };
+    let missing = refused(&mut p, json!({}));
+    assert_eq!(missing["kind"], "invalid_argument", "{missing}");
+    assert_eq!(missing["field"], "template_id", "{missing}");
+    let wrong_type = refused(&mut p, json!({"template_id": 5}));
+    assert_eq!(wrong_type["kind"], "invalid_argument", "{wrong_type}");
+    assert_eq!(wrong_type["field"], "template_id", "{wrong_type}");
+    let unknown_key = refused(
+        &mut p,
+        json!({"template_id": "usb_c_5v_sink", "no_such_argument": 1}),
+    );
+    assert_eq!(unknown_key["kind"], "invalid_argument", "{unknown_key}");
+
+    let lines = p.call_tool_then_fence(
+        "call_tool",
+        json!({"name": "get_template", "arguments": {"template_id": "usb_c_5v_sink"}}),
+    );
+    let via = fenced_result(&lines);
+    assert_ne!(via["isError"], json!(true), "{via}");
+    assert_eq!(list_changed_count(&lines), 0, "{lines:#?}");
+    assert_eq!(listed_tools(&mut p), before, "tools/list changed");
+    let active = McpProcess::tool_body(&p.call_tool("get_active_toolsets", json!({})));
+    assert!(!active.to_string().contains("templates"), "{active}");
+
+    let loaded = p.call_tool("load_toolset", json!({"name": "templates"}));
+    assert_ne!(loaded["isError"], json!(true), "{loaded}");
+    let direct = p.call_tool("get_template", json!({"template_id": "usb_c_5v_sink"}));
+    assert_eq!(via, direct);
+}
+
+/// Meta-tools by default: the ones that only report run; `load_toolset` and
+/// `unload_toolset` change the session and are refused, so the catalogue
+/// stays and no `tools/list_changed` is sent; `call_tool` and `reload_server`
+/// are never run.
+#[test]
+fn call_tool_applies_its_meta_tool_policy_by_default() {
+    let mut p = McpProcess::spawn();
+    let before = listed_tools(&mut p);
+
+    let r = p.call_tool("call_tool", json!({"name": "get_active_toolsets"}));
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let direct = p.call_tool("get_active_toolsets", json!({}));
+    assert_eq!(r, direct);
+
+    let lines = p.call_tool_then_fence(
+        "call_tool",
+        json!({"name": "load_toolset", "arguments": {"name": "templates"}}),
+    );
+    assert_not_permitted(&fenced_result(&lines), "load_toolset", "writes_not_enabled");
+    assert_eq!(list_changed_count(&lines), 0, "{lines:#?}");
+    let lines = p.call_tool_then_fence(
+        "call_tool",
+        json!({"name": "unload_toolset", "arguments": {"name": "config"}}),
+    );
+    assert_not_permitted(
+        &fenced_result(&lines),
+        "unload_toolset",
+        "writes_not_enabled",
+    );
+    assert_eq!(list_changed_count(&lines), 0, "{lines:#?}");
+    assert_eq!(listed_tools(&mut p), before, "tools/list changed");
+
+    let r = p.call_tool(
+        "call_tool",
+        json!({"name": "call_tool", "arguments": {"name": "get_active_toolsets"}}),
+    );
+    assert_not_permitted(&r, "call_tool", "never_through_call_tool");
+    let r = p.call_tool(
+        "call_tool",
+        json!({"name": "reload_server", "arguments": {"confirm": true}}),
+    );
+    assert_not_permitted(&r, "reload_server", "never_through_call_tool");
+    // The server was not replaced and still answers.
+    assert!(p.request("ping", json!({})).get("result").is_some());
+
+    let r = p.call_tool("call_tool", json!({"name": "frobnicate_board"}));
+    assert_eq!(McpProcess::tool_body(&r)["error"]["kind"], "unknown_tool");
+}
+
+/// With the operator's `call_tool_allow_writes = true` a writing target runs,
+/// still under its own argument checks; a wrapped domain call leaves the
+/// catalogue alone, a wrapped `load_toolset` changes it and sends one
+/// `tools/list_changed` as the direct call does; `call_tool` and
+/// `reload_server` stay refused.
+#[test]
+fn call_tool_allow_writes_is_the_operators_opt_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("copperpour.toml"),
+        "call_tool_allow_writes = true\n",
+    )
+    .unwrap();
+    let sheet = tmp.path().join("gateway.kicad_sch");
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let before = listed_tools(&mut p);
+    assert!(!before.iter().any(|name| name == "create_schematic"));
+
+    let r = p.call_tool("call_tool", json!({"name": "create_schematic"}));
+    let body = McpProcess::tool_body(&r);
+    assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+    assert_eq!(body["error"]["field"], "path", "{body}");
+    let r = p.call_tool(
+        "call_tool",
+        json!({"name": "create_schematic", "arguments": {"path": 7}}),
+    );
+    assert_eq!(
+        McpProcess::tool_body(&r)["error"]["kind"],
+        "invalid_argument"
+    );
+    assert!(!sheet.exists());
+
+    let lines = p.call_tool_then_fence(
+        "call_tool",
+        json!({"name": "create_schematic", "arguments": {"path": sheet.to_string_lossy()}}),
+    );
+    let created = fenced_result(&lines);
+    assert_ne!(created["isError"], json!(true), "{created}");
+    assert!(sheet.exists());
+    assert_eq!(list_changed_count(&lines), 0, "{lines:#?}");
+    assert_eq!(listed_tools(&mut p), before, "tools/list changed");
+
+    let lines = p.call_tool_then_fence(
+        "call_tool",
+        json!({"name": "load_toolset", "arguments": {"name": "templates"}}),
+    );
+    let loaded = fenced_result(&lines);
+    assert_ne!(loaded["isError"], json!(true), "{loaded}");
+    assert_eq!(list_changed_count(&lines), 1, "{lines:#?}");
+    assert!(listed_tools(&mut p)
+        .iter()
+        .any(|name| name == "get_template"));
+
+    let r = p.call_tool(
+        "call_tool",
+        json!({"name": "call_tool", "arguments": {"name": "get_active_toolsets"}}),
+    );
+    assert_not_permitted(&r, "call_tool", "never_through_call_tool");
+    let r = p.call_tool(
+        "call_tool",
+        json!({"name": "reload_server", "arguments": {"confirm": true}}),
+    );
+    assert_not_permitted(&r, "reload_server", "never_through_call_tool");
+    assert!(p.request("ping", json!({})).get("result").is_some());
+}
+
+/// The description a client shows says what allowing `call_tool` allows.
+#[test]
+fn call_tool_description_states_the_approval_consequence() {
+    let mut p = McpProcess::spawn();
+    let list = p.request("tools/list", json!({}));
+    let description = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "call_tool")
+        .expect("call_tool is listed")["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for phrase in [
+        "only read-only tools",
+        "call_tool_allow_writes",
+        "without their usual individual approval prompts",
+    ] {
+        assert!(description.contains(phrase), "{description}");
+    }
+}

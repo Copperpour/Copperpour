@@ -240,7 +240,8 @@ described here, so its path does not answer "which file configured the server".
 list above is not consulted, and `get_installation_info` reports
 `source: "explicit_path"` with no skipped candidates. Relevant fields include `kicad_cli`,
 `kicad_binary`, `ipc_address`, `transport`, `http_address`, `jlcpcb_db_path`,
-`log_level`, `auto_load_toolsets`, `eager_toolsets`, and `kicad_cli_timeout_seconds` (timeout of
+`log_level`, `auto_load_toolsets`, `eager_toolsets`, `call_tool_allow_writes` (lets the
+`call_tool` meta-tool run tools that are not read-only; see `docs/TOOL_SYSTEM.md`), and `kicad_cli_timeout_seconds` (timeout of
 long kicad-cli operations such as DRC, default 600 s, 0 read as 1 s; a timed-out kicad-cli is
 killed). The legacy `ipc_socket_path` alias is accepted by the serde definition
 in `config.rs`.

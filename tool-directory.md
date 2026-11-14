@@ -37,6 +37,7 @@ and Windows servers do not.
 |------|---------|
 | `list_toolboxes` | List all 23 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
+| `call_tool` | Call a tool by name, whether or not its toolset is loaded or listed. `tools/list` does not change. For clients that never see tools added after their first listing. Runs only the reviewed read-only tools unless the operator sets `call_tool_allow_writes = true` in the server configuration; anything else is refused with `tool_not_permitted` before it runs. Never runs itself or `reload_server`. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
 
