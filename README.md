@@ -173,15 +173,35 @@ installation is needed for this guidance. Client support determines whether it
 uses the instructions/resources; `get_guidance` is available before toolset loading.
 
 Run `init` only if you want native skill discovery, locally editable skill files,
-or Claude agents/hooks. Use the binary from Step 2 (PCM does not add it to `PATH`):
+or Claude agents/hooks. Use the binary from Step 2 (PCM does not add it to `PATH`)
+and choose the client where you want to use the skills:
 
-```bash
-copperpour init                  # Claude: skills, agents and hooks
-copperpour init --client codex   # Codex: skills under ~/.agents/skills
-```
+| Client | Install command or workflow | Default skills location |
+| --- | --- | --- |
+| [Claude Code](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview) | `copperpour init --client claude` (default) | `~/.claude/skills` |
+| [Codex CLI / desktop](https://learn.chatgpt.com/docs/build-skills) | `copperpour init --client codex` | `~/.agents/skills` |
+| [Gemini CLI](https://geminicli.com/docs/cli/skills/) | `copperpour init --client gemini` | `~/.gemini/skills` |
+| [Cursor](https://cursor.com/docs/skills) | `copperpour init --client cursor` | `~/.cursor/skills` |
+| [Antigravity](https://antigravity.google/docs/skills) | `copperpour init --client antigravity` (alias `agy`) | `~/.gemini/config/skills` |
+| [Claude Desktop chat](https://support.claude.com/en/articles/12512180-use-skills-in-claude) | Manual skill ZIP upload; no `init` preset | Managed in Claude |
 
-Re-run after upgrading Copperpour; it overwrites differing files, so back up any
-you edited. See [Managing skills](#advanced-installation).
+With no client or directory override, `copperpour init` selects Claude Code,
+including its agents and hooks. Codex installs skills only and also covers the
+desktop app. Gemini, Cursor, and Antigravity use the ownership-checked, skills-only installer. Claude Desktop
+skill ZIP packaging is outside this installer.
+
+Use the same `--client` with `status` and `uninstall`, for example
+`copperpour status --client cursor`. For custom or project skills directories,
+see [Managing skills](#advanced-installation), including update/removal behavior.
+An explicit `--skills-dir` overrides everything. `COPPERPOUR_SKILLS_DIR` applies
+only when neither `--skills-dir` nor `--client` is given. Either override selects
+skills-only mode.
+
+Skill installation is separate from registering the MCP connection in Step 2.
+It does not deploy skills or Copperpour to remote/cloud agent environments.
+Gemini CLI and Cursor also discover the shared `~/.agents/skills` directory: if you
+already installed there with `--client codex`, use that target rather than
+installing duplicate copies.
 
 ### Step 4: Verify
 
@@ -258,12 +278,53 @@ cargo build --release -p copperpour --no-default-features
 <details>
 <summary><b>Managing skills</b>: check, update or remove what <code>copperpour init</code> installed</summary>
 
-- `copperpour status` shows whether the installed skills match your Copperpour version.
-- The server makes the same check once for each installed version. If the skills
-  differ, it adds a one-line notice to its `initialize` instructions, and
-  `get_installation_info` shows the result.
-- Re-run `copperpour init` to update them.
-- `copperpour uninstall` removes them. Add `--client codex` for Codex.
+Use the same client or directory selection for all three commands:
+
+- `copperpour status` compares installed guidance with the running binary's bundle.
+- Re-run `copperpour init` after upgrading to update the installed files.
+- `copperpour uninstall` removes the installed guidance.
+
+For example, add `--client cursor` to each command for Cursor. Without a client or
+directory override, these commands select Claude Code. Native Claude Code and
+Codex installs overwrite differing files on update and remove their named assets
+on uninstall, so back up local changes first. The Gemini, Cursor, and Antigravity
+presets and all custom directory targets use the ownership checks described below.
+MCP startup checks native Claude Code/Codex installs and reports drift in its
+initialize notice and `get_installation_info`. Use explicit `status` with the
+same target/preset for portable installations.
+
+For project-scoped guidance or another isolated target, choose an absolute skills
+root:
+
+```sh
+copperpour init --skills-dir /absolute/path/to/client/skills
+copperpour status --skills-dir /absolute/path/to/client/skills
+copperpour uninstall --skills-dir /absolute/path/to/client/skills
+```
+
+On Windows, use an absolute path such as `"C:\agent\skills"`. Alternatively set
+`COPPERPOUR_SKILLS_DIR`. The variable applies only when neither `--skills-dir` nor
+`--client` is given, and the commands name it when it selects the target. Empty or
+relative targets are rejected. These three commands use the custom target in
+**skills-only** mode, even with `--client claude --skills-dir <path>`: they do not write client profile
+files, agents, hooks, or native installation markers. Without an override, the
+client defaults in Step 3 apply. The override does not configure MCP startup or
+the double-click installer.
+
+Point your client's skill discovery at this root. It contains portable Markdown
+`<skill>/SKILL.md` files with frontmatter and optional `references/` files; automatic
+discovery depends on the client. Clients without skill discovery can read those
+files as guidance. Claude agents and hooks are separate integrations.
+
+The portable installer (custom targets and Gemini/Cursor/Antigravity presets)
+records the installed contents in `.copperpour-skills.json` inside the target.
+Keep that ownership marker: uninstall removes only recorded files whose contents
+still match, preserves edits and unrelated files, and removes
+only empty skill directories. It never removes the root. Reinitializing refuses
+to overwrite locally edited or unowned content that differs from the bundle;
+back it up and move it aside before updating. The portable installer rejects
+symlinks at the root or along managed paths, including the ownership marker. Avoid concurrent
+installers or edits while installing/removing skills.
 
 </details>
 
