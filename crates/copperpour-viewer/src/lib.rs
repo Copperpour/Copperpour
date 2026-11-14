@@ -5,6 +5,7 @@
 //! this extraction does not establish the browser service's security boundary.
 
 pub mod browser;
+pub mod launch;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

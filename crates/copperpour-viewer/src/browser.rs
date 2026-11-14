@@ -53,6 +53,10 @@ struct Shared {
     commands: mpsc::Sender<Refresh>,
     token: String,
     port: u16,
+    kicad: String,
+    /// Held while a KiCad launch is being watched, so a second click cannot
+    /// start another before the first has written its lock file.
+    launching: tokio::sync::Mutex<()>,
 }
 struct Change {
     paths: Vec<PathBuf>,
@@ -76,6 +80,14 @@ impl BrowserViewer {
     /// Start a root-bound viewer on an ephemeral IPv4 loopback port. The CLI is
     /// supplied by the caller, not accepted from HTTP. Each render is bounded.
     pub async fn start(root: &Path, cli: &str, render_timeout: Duration) -> Result<Self, String> {
+        Self::start_with_kicad(root, cli, crate::resolve_kicad_binary(), render_timeout).await
+    }
+    async fn start_with_kicad(
+        root: &Path,
+        cli: &str,
+        kicad: String,
+        render_timeout: Duration,
+    ) -> Result<Self, String> {
         if render_timeout.is_zero() {
             return Err("render timeout must be positive".into());
         }
@@ -121,6 +133,8 @@ impl BrowserViewer {
             commands,
             token: token.clone(),
             port,
+            kicad,
+            launching: Default::default(),
         });
         let (changes, change_rx) = mpsc::unbounded_channel();
         let notifications = changes.clone();
@@ -909,24 +923,32 @@ async fn open_in_kicad(
     } else {
         PathBuf::from(request.file)
     };
+    let Ok(_launching) = shared.launching.try_lock() else {
+        return (StatusCode::CONFLICT, "KiCad is already being launched").into_response();
+    };
     if crate::kicad_lock_path(&target).exists() {
         return (StatusCode::CONFLICT, "project is already open in KiCad").into_response();
     }
-    match tokio::process::Command::new(crate::resolve_kicad_binary())
-        .arg(target)
-        .spawn()
-    {
-        Ok(mut child) => {
-            tokio::spawn(async move {
-                let _ = child.wait().await;
-            });
-            Json(serde_json::json!({"spawned":true})).into_response()
+    let mut command = std::process::Command::new(&shared.kicad);
+    command.arg(target);
+    let mut kicad = match crate::launch::spawn(
+        command,
+        "KiCad",
+        |line| tracing::warn!(target: "kicad", "{line}"),
+    ) {
+        Ok(kicad) => kicad,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("launch KiCad: {error}"),
+            )
+                .into_response()
         }
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("launch KiCad: {error}"),
-        )
-            .into_response(),
+    };
+    // A KiCad that cannot open a window exits at once (#496).
+    match kicad.watch(crate::launch::STARTUP_WINDOW).await {
+        Ok(()) => Json(serde_json::json!({"spawned":true})).into_response(),
+        Err(message) => (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
     }
 }
 
@@ -971,6 +993,91 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</t
             .await
             .unwrap()
         }
+        /// Starts a viewer whose Open in KiCAD runs `script` as KiCad.
+        async fn start_with_kicad(&self, script: &str) -> BrowserViewer {
+            let kicad = self.root.with_file_name("kicad");
+            std::fs::write(&kicad, format!("#!/bin/sh\n{script}\n")).unwrap();
+            std::fs::set_permissions(&kicad, std::fs::Permissions::from_mode(0o700)).unwrap();
+            BrowserViewer::start_with_kicad(
+                &self.root,
+                self.cli.to_str().unwrap(),
+                kicad.to_string_lossy().into_owned(),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap()
+        }
+    }
+    /// The exit KiCad 10.0.8 makes with no DISPLAY, as #496 traced it.
+    #[tokio::test]
+    async fn open_in_kicad_reports_a_kicad_that_exits_at_startup() {
+        let fixture = Fixture::new();
+        let viewer = fixture
+            .start_with_kicad(
+                "echo \"12:32:09: Error: Unable to initialize GTK+, is DISPLAY set properly?\" >&2; exit 255",
+            )
+            .await;
+        let response = Client::new(&viewer)
+            .post("/open-in-kicad", &fixture.root)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503);
+        let body = response.text().await.unwrap();
+        assert!(body.starts_with("KiCad exited during startup"), "{body}");
+        assert!(body.contains("255"), "exit status missing: {body}");
+        assert!(
+            body.ends_with("Unable to initialize GTK+, is DISPLAY set properly?"),
+            "stderr missing: {body}"
+        );
+        viewer.shutdown().await;
+    }
+    #[tokio::test]
+    async fn open_in_kicad_reports_a_kicad_that_stays_up() {
+        let fixture = Fixture::new();
+        let args = fixture.root.with_file_name("kicad.args");
+        let viewer = fixture
+            .start_with_kicad(&format!("echo \"$@\" > '{}'; sleep 3", args.display()))
+            .await;
+        let response = Client::new(&viewer)
+            .post("/open-in-kicad", &fixture.root)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({"spawned": true})
+        );
+        let root = fixture.root.canonicalize().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&args).unwrap().trim_end(),
+            root.to_str().unwrap()
+        );
+        viewer.shutdown().await;
+    }
+    /// KiCad writes its lock file only once it has loaded, so the lock check
+    /// cannot stop a second click while the first launch is being watched.
+    #[tokio::test]
+    async fn open_in_kicad_refuses_a_second_launch_while_one_is_watched() {
+        let fixture = Fixture::new();
+        let launches = fixture.root.with_file_name("kicad.launches");
+        let viewer = fixture
+            .start_with_kicad(&format!("echo >> '{}'; sleep 3", launches.display()))
+            .await;
+        let client = Client::new(&viewer);
+        let (a, b) = tokio::join!(
+            client.post("/open-in-kicad", &fixture.root).send(),
+            client.post("/open-in-kicad", &fixture.root).send()
+        );
+        let mut statuses = [a.unwrap().status(), b.unwrap().status()];
+        statuses.sort();
+        assert_eq!(statuses, [200, 409]);
+        assert_eq!(
+            std::fs::read_to_string(&launches).unwrap().lines().count(),
+            1
+        );
+        viewer.shutdown().await;
     }
     #[tokio::test]
     async fn service_health_requires_both_owned_tasks() {

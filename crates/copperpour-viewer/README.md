@@ -51,7 +51,10 @@ an actual update or explicit refresh; revision is an opaque change marker.
 
 On viewer shutdown, in-flight CLI processes are killed and reaped. Opening KiCad is
 an explicit authenticated user action; that GUI is allowed to outlive the viewer.
-Its response establishes process spawn, not that an editor became ready.
+It reports success once KiCad has stayed up for a second, not that an editor became
+ready; a KiCad that exits sooner, such as one with no display, is a 503 quoting its
+exit status and the end of its stderr, and a second request during that second is a
+409.
 
 Only sheets discovered in the launch hierarchy and present in the SVG cache can
 be fetched. Unknown sheets return 404, and a known sheet whose rendering failed

@@ -1,10 +1,10 @@
-//! Starting a GUI application the server does not wait for: the schematic
-//! viewer and KiCad itself.
+//! Starting a GUI application the server does not wait for: KiCad, from
+//! `launch_kicad_ui` and the browser viewer's Open in KiCAD.
 //!
 //! A successful `spawn()` only means `exec` worked. An application that cannot
 //! open a window, such as one started without a display on Linux, exits a
-//! moment later, so the caller watches it before reporting a launch (#702,
-//! #764).
+//! moment later, so the caller watches it before reporting a launch
+//! (mixelpixx/Konnect#702, mixelpixx/Konnect#764, #496).
 
 use std::collections::VecDeque;
 use std::process::Stdio;
@@ -13,8 +13,9 @@ use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 
 /// How long an application must stay up before it counts as launched. One
-/// that cannot open a window exits well inside this (#702, #764).
-pub(crate) const STARTUP_WINDOW: Duration = Duration::from_secs(1);
+/// that cannot open a window exits well inside this (mixelpixx/Konnect#702,
+/// mixelpixx/Konnect#764).
+pub const STARTUP_WINDOW: Duration = Duration::from_secs(1);
 
 /// Stderr lines quoted when the application exits during startup, and the
 /// length each is cut to, so a huge panic message cannot flood the tool result.
@@ -22,11 +23,11 @@ const STDERR_TAIL_LINES: usize = 20;
 const STDERR_LINE_CHARS: usize = 500;
 
 /// How long to wait for the rest of a dead application's stderr. A process it
-/// started, such as a `kicad-cli` render, can hold the pipe open after it exits.
+/// started can hold the pipe open after it exits.
 const STDERR_DRAIN: Duration = Duration::from_millis(500);
 
 /// A spawned application, watched until the caller decides it is up.
-pub(crate) struct Launch {
+pub struct Launch {
     name: &'static str,
     child: tokio::process::Child,
     tail: Arc<Mutex<VecDeque<String>>>,
@@ -35,9 +36,10 @@ pub(crate) struct Launch {
 
 /// Spawns `cmd` as `name`, sending each stderr line to `log`.
 ///
-/// stdin and stdout carry the stdio transport's JSON-RPC stream, so the
-/// application must not hold them. Not `kill_on_drop`: it outlives the call.
-pub(crate) fn spawn(
+/// The application gets neither the caller's stdin nor its stdout, which may
+/// carry the MCP server's stdio transport. Not `kill_on_drop`: it outlives the
+/// call.
+pub fn spawn(
     mut cmd: std::process::Command,
     name: &'static str,
     log: fn(&str),
@@ -84,7 +86,7 @@ pub(crate) fn spawn(
 impl Launch {
     /// Waits up to `window` for the application to exit. `Ok` means it is
     /// still running; an exit is reported with its status and stderr tail.
-    pub(crate) async fn watch(&mut self, window: Duration) -> Result<(), String> {
+    pub async fn watch(&mut self, window: Duration) -> Result<(), String> {
         match tokio::time::timeout(window, self.exited()).await {
             Err(_still_running) => Ok(()),
             Ok(message) => Err(message),
@@ -92,7 +94,7 @@ impl Launch {
     }
 
     /// Waits for the application to exit and describes the exit.
-    pub(crate) async fn exited(&mut self) -> String {
+    pub async fn exited(&mut self) -> String {
         let status = match self.child.wait().await {
             Ok(status) => status,
             Err(e) => return format!("Failed to check the {} process: {e}", self.name),
@@ -134,7 +136,8 @@ mod tests {
     }
 
     /// The panic tao prints when GTK cannot open a display, then the exit
-    /// code a Rust panic gives, as #702's reproduction recorded them.
+    /// code a Rust panic gives, as mixelpixx/Konnect#702's reproduction recorded
+    /// them.
     #[tokio::test]
     async fn an_app_that_crashes_on_startup_is_a_failed_launch() {
         let err =
@@ -175,8 +178,8 @@ mod tests {
         assert!(!err.contains(&"a".repeat(501)), "{err}");
     }
 
-    /// A `kicad-cli` render the viewer started can still be writing after
-    /// the viewer itself has exited.
+    /// A process the application started can still be writing after the
+    /// application itself has exited.
     #[tokio::test]
     async fn stderr_from_a_child_the_app_started_is_still_quoted() {
         let err = launch("(sleep 0.2; echo 'render failed' >&2) & exit 1")

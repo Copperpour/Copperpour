@@ -38,7 +38,6 @@ mod footprint_models;
 pub mod integration;
 #[cfg(test)]
 mod kicad10_schematic_identity_tests;
-pub(crate) mod launch;
 #[cfg(feature = "jlcpcb")]
 pub(crate) mod lcsc_packages;
 pub mod library;

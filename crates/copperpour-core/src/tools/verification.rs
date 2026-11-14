@@ -1137,7 +1137,7 @@ async fn handle_launch_kicad_ui(
         cmd.arg(project);
     }
 
-    let mut kicad = match super::launch::spawn(
+    let mut kicad = match copperpour_viewer::launch::spawn(
         cmd,
         "KiCAD",
         |line| tracing::warn!(target: "kicad", "{line}"),
@@ -1152,7 +1152,7 @@ async fn handle_launch_kicad_ui(
     };
 
     if !wait_ready {
-        if let Err(message) = kicad.watch(super::launch::STARTUP_WINDOW).await {
+        if let Err(message) = kicad.watch(copperpour_viewer::launch::STARTUP_WINDOW).await {
             return Ok(CallToolResult::error(message));
         }
         return Ok(CallToolResult::json(&json!({
