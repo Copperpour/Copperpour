@@ -411,6 +411,49 @@ impl SymbolBounds {
             && axis(self.min_y, self.max_y, other.min_y, other.max_y)
     }
 
+    /// Whether the segment passes through the interior of the box, in any
+    /// direction. It is clipped to the box (Liang-Barsky) and counts only when
+    /// the midpoint of the clipped run lies strictly inside, so a segment along
+    /// an edge, or touching one or a corner, is contact, not a crossing.
+    pub fn segment_enters(self, (x1, y1): (f64, f64), (x2, y2): (f64, f64)) -> bool {
+        let (dx, dy) = (x2 - x1, y2 - y1);
+        let (mut enter, mut leave) = (0.0f64, 1.0f64);
+        for (direction, room) in [
+            (-dx, x1 - self.min_x),
+            (dx, self.max_x - x1),
+            (-dy, y1 - self.min_y),
+            (dy, self.max_y - y1),
+        ] {
+            if direction.abs() <= GEOMETRY_EPSILON {
+                if room < 0.0 {
+                    return false;
+                }
+                continue;
+            }
+            let at = room / direction;
+            if direction < 0.0 {
+                if at > leave {
+                    return false;
+                }
+                enter = enter.max(at);
+            } else {
+                if at < enter {
+                    return false;
+                }
+                leave = leave.min(at);
+            }
+        }
+        if leave <= enter {
+            return false;
+        }
+        let middle = (enter + leave) / 2.0;
+        let (x, y) = (x1 + middle * dx, y1 + middle * dy);
+        self.min_x + GEOMETRY_EPSILON < x
+            && x < self.max_x - GEOMETRY_EPSILON
+            && self.min_y + GEOMETRY_EPSILON < y
+            && y < self.max_y - GEOMETRY_EPSILON
+    }
+
     /// Whether the boxes are apart, with not even an edge or corner shared.
     pub fn separated(self, other: Self) -> bool {
         let (x, y) = self.overlap_depth(other);
@@ -708,6 +751,26 @@ impl SymbolGeometry {
                 .iter()
                 .any(|a| other.pins.iter().any(|b| a.collides(*b)))
     }
+
+    /// Whether a wire has an end on one of this symbol's pin tips and does not
+    /// head back toward the pin's root, the way a wire is drawn to a pin. A
+    /// drawing may reach past a pin's tip, so such a wire can clip the body
+    /// box without running through the body. A wire that runs from the tip
+    /// toward the root does not leave it, and a zero-length pin has no root
+    /// direction, so it never exempts a wire: that keeps a wire running from a
+    /// power symbol's tip into its own drawing a crossing.
+    pub fn wire_leaves_pin(&self, from: (f64, f64), to: (f64, f64)) -> bool {
+        self.pins.iter().any(|pin| {
+            let out = (pin.tip.0 - pin.root.0, pin.tip.1 - pin.root.1);
+            if out.0.abs() <= GEOMETRY_EPSILON && out.1.abs() <= GEOMETRY_EPSILON {
+                return false;
+            }
+            [(from, to), (to, from)].into_iter().any(|(end, far)| {
+                points_coincident(end.0, end.1, pin.tip.0, pin.tip.1, GEOMETRY_EPSILON)
+                    && (far.0 - end.0) * out.0 + (far.1 - end.1) * out.1 >= 0.0
+            })
+        })
+    }
 }
 
 /// Place a selected library unit's drawings and pins for one instance.
@@ -924,6 +987,75 @@ mod symbol_bounds_tests {
         assert!(!up.collides(&down));
         let body = geometry(Some(boxed(0.0, 0.0, 10.0, 10.0)), &[]);
         assert!(!body.collides(&geometry(None, &[pin((5.0, 5.0), (5.0, 5.0))])));
+    }
+
+    /// Plain coordinates for the clip: diagonals, which `add_wire` is
+    /// documented not to draw, edge and corner contact, and a point.
+    #[test]
+    fn a_segment_enters_only_through_the_interior() {
+        let body = boxed(-1.0, -2.0, 1.0, 2.0);
+        for (case, from, to, expected) in [
+            ("across", (-3.0, 0.0), (3.0, 0.0), true),
+            ("diagonal across", (-3.0, -3.0), (3.0, 3.0), true),
+            ("wholly inside", (0.0, 0.0), (0.5, 0.5), true),
+            ("ending inside", (-3.0, 1.0), (0.0, 0.0), true),
+            ("diagonal clipping a corner", (-2.0, 0.0), (0.0, 2.0), true),
+            ("along an edge", (-1.0, -3.0), (-1.0, 3.0), false),
+            ("along the top edge", (-3.0, 2.0), (3.0, 2.0), false),
+            ("ending on an edge", (-3.0, 0.0), (-1.0, 0.0), false),
+            ("beside", (-3.0, 0.0), (-2.0, 0.0), false),
+            ("diagonal, apart", (-2.0, 3.0), (-3.0, 4.0), false),
+            (
+                "diagonal ending on a corner",
+                (-2.0, 1.0),
+                (-1.0, 2.0),
+                false,
+            ),
+            ("a point inside", (0.0, 0.0), (0.0, 0.0), true),
+            ("a point on an edge", (1.0, 0.0), (1.0, 0.0), false),
+            ("a point outside", (3.0, 0.0), (3.0, 0.0), false),
+        ] {
+            assert_eq!(body.segment_enters(from, to), expected, "{case}");
+            assert_eq!(body.segment_enters(to, from), expected, "{case}, reversed");
+        }
+    }
+
+    /// A wire with an end on a pin tip is exempt unless it heads back toward
+    /// the pin's root; a zero-length pin, as a power symbol has, exempts none.
+    #[test]
+    fn a_wire_on_a_pin_tip_is_exempt_unless_it_heads_for_the_root() {
+        let one = geometry(None, &[pin((0.0, 0.0), (0.0, 1.0))]);
+        for (case, from, to, expected) in [
+            ("outward", (0.0, 0.0), (0.0, -5.0), true),
+            ("either end", (0.0, -5.0), (0.0, 0.0), true),
+            ("slanting out", (0.0, 0.0), (3.0, -1.0), true),
+            (
+                "square to the pin, exempt even where drawing crosses it (the limit)",
+                (0.0, 0.0),
+                (5.0, 0.0),
+                true,
+            ),
+            ("toward the root", (0.0, 0.0), (0.0, 5.0), false),
+            ("slanting back", (0.0, 0.0), (3.0, 1.0), false),
+            ("no end on the tip", (0.0, -1.0), (0.0, -5.0), false),
+            ("through the tip", (0.0, 5.0), (0.0, -5.0), false),
+        ] {
+            assert_eq!(one.wire_leaves_pin(from, to), expected, "{case}");
+        }
+        let tips = geometry(
+            None,
+            &[pin((0.0, 0.0), (1.0, 0.0)), pin((4.0, 0.0), (3.0, 0.0))],
+        );
+        assert!(!tips.wire_leaves_pin((0.0, 0.0), (4.0, 0.0)), "tip to tip");
+        let point = power((0.0, 0.0));
+        assert!(
+            !point.wire_leaves_pin((0.0, 0.0), (0.0, -5.0)),
+            "zero-length pin"
+        );
+        assert!(
+            !point.wire_leaves_pin((0.0, 0.0), (0.0, 5.0)),
+            "zero-length, into it"
+        );
     }
 
     #[test]
