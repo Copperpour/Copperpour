@@ -8,10 +8,11 @@ use crate::observability::{
     default_calls_log_path, new_call_id, unix_ms, CallObserver, CallRecord, CallStatus,
 };
 use crate::outcome::OutcomeStatus;
-use crate::router::{meta_tools, ToolRouter};
+use crate::router::{call_tool_policy, meta_tools, ToolRouter};
 use axum::response::sse::Event;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
@@ -39,6 +40,10 @@ pub struct McpHandler {
     /// Meta-tools bypass the domain router, so their advertised schemas are
     /// compiled here once and enforced at the same dispatch boundary.
     meta_input_validators: Arc<HashMap<String, Arc<jsonschema::Validator>>>,
+    /// The operator's `call_tool_allow_writes`: whether `call_tool` may run
+    /// tools outside the reviewed read-only list. Set once at startup from
+    /// the server configuration; no request can change it.
+    call_tool_allow_writes: Arc<AtomicBool>,
 }
 
 /// MCP clients known to cache the first `tools/list` and ignore
@@ -76,6 +81,36 @@ fn invalid_argument(field: &str, reason: &str) -> (CallToolResult, CallStatus, O
         ),
         CallStatus::Error,
         Some("invalid_argument".to_string()),
+    )
+}
+
+/// The refusal for a target `call_tool` may not run.
+fn tool_not_permitted(
+    target: &str,
+    refusal: call_tool_policy::Refusal,
+) -> (CallToolResult, CallStatus, Option<String>) {
+    let message = match refusal {
+        call_tool_policy::Refusal::WritesNotEnabled => format!(
+            "call_tool did not run '{target}': it is not on the list of read-only tools, \
+             and this server's call_tool_allow_writes is off. Call '{target}' directly under \
+             its own name (load_toolset its toolset first if it is not in your tool list). \
+             Only the server's operator can turn call_tool_allow_writes on, in the server \
+             configuration; no argument does."
+        ),
+        call_tool_policy::Refusal::Never => {
+            format!("call_tool never runs '{target}'. Call it directly under its own name.")
+        }
+    };
+    (
+        CallToolResult::error_kind(
+            ToolErrorKind::ToolNotPermitted {
+                tool: target.to_string(),
+                reason: refusal.code().to_string(),
+            },
+            message,
+        ),
+        CallStatus::Error,
+        Some("tool_not_permitted".to_string()),
     )
 }
 
@@ -144,6 +179,7 @@ impl McpHandler {
             immediate_sinks: Arc::new(std::sync::RwLock::new(Vec::new())),
             observer,
             meta_input_validators: Arc::new(meta_input_validators),
+            call_tool_allow_writes: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -167,6 +203,20 @@ impl McpHandler {
     /// a second call is ignored.
     pub fn set_guidance_probe(&self, probe: Arc<dyn crate::guidance::GuidanceProbe>) {
         let _ = self.ctx.guidance.set(probe);
+    }
+
+    /// Let `call_tool` run every tool except the ones it never runs, not only
+    /// the reviewed read-only ones. The server entry points call this for the
+    /// operator's `call_tool_allow_writes = true`; nothing a client sends
+    /// reaches it. A client that has allowed `call_tool` then runs mutating
+    /// tools without the approval prompt each has under its own name.
+    pub fn allow_call_tool_writes(&self) {
+        self.call_tool_allow_writes.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether `call_tool` may run tools outside the read-only list.
+    pub fn call_tool_writes_allowed(&self) -> bool {
+        self.call_tool_allow_writes.load(Ordering::Relaxed)
     }
 
     pub fn take_reload_request(&self) -> Option<meta_tools::ReloadPlan> {
@@ -481,6 +531,11 @@ impl McpHandler {
     /// `call_tool`: run the named tool as `tools/call` would, but without
     /// requiring its toolset to be loaded and without changing `tools/list`.
     /// For clients that never see tools added after their first listing.
+    ///
+    /// A client approves tools by name, so its approval of `call_tool` says
+    /// nothing about the target. `call_tool_policy` therefore decides, by the
+    /// target's name and before anything of the target runs, whether this
+    /// server lets the gateway run it.
     async fn dispatch_call_tool(
         &self,
         args: &Value,
@@ -493,10 +548,20 @@ impl McpHandler {
             Value::Object(_) => args["arguments"].clone(),
             _ => return invalid_argument("arguments", "not an object"),
         };
-        if target == CALL_TOOL {
-            return invalid_argument("name", "call_tool cannot call itself");
+        let refusal = call_tool_policy::refusal(target, self.call_tool_writes_allowed());
+        // Before the lookup: `reload_server` is refused the same way on a
+        // server that does not have it.
+        if refusal == Some(call_tool_policy::Refusal::Never) {
+            return tool_not_permitted(target, call_tool_policy::Refusal::Never);
         }
-        if self.meta_input_validators.contains_key(target) {
+        let is_meta_tool = self.meta_input_validators.contains_key(target);
+        if !is_meta_tool && self.ctx.router.find_toolset_for_tool(target).is_none() {
+            return self.tool_not_loaded(target);
+        }
+        if let Some(refusal) = refusal {
+            return tool_not_permitted(target, refusal);
+        }
+        if is_meta_tool {
             return Box::pin(self.dispatch_tool(target, &target_args)).await;
         }
         let tool_def = match self.ctx.router.get_tool(target).await {
@@ -5329,7 +5394,7 @@ mod call_tool_tests {
         let (_, _, kind) = handler
             .dispatch_tool("call_tool", &json!({ "name": "call_tool" }))
             .await;
-        assert_eq!(kind.as_deref(), Some("invalid_argument"));
+        assert_eq!(kind.as_deref(), Some("tool_not_permitted"));
 
         let (_, _, kind) = handler
             .dispatch_tool(

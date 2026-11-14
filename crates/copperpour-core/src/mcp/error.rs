@@ -45,6 +45,12 @@ pub enum ToolErrorKind {
     ToolsetNotLoaded { toolset: String, tool: String },
     /// No tool with this name exists in any registered toolset.
     UnknownTool { tool: String },
+    /// `call_tool` may not run this tool. `reason` is `writes_not_enabled` for
+    /// a tool that is not on the reviewed read-only list while the server's
+    /// `call_tool_allow_writes` is off, and `never_through_call_tool` for a
+    /// tool no setting lets it run. The tool itself is still callable
+    /// directly, under its own name.
+    ToolNotPermitted { tool: String, reason: String },
     /// A required argument is missing or malformed.
     InvalidArgument { field: String, reason: String },
     /// A referenced file or discovery directory doesn't exist or can't be read.
@@ -155,6 +161,7 @@ impl ToolErrorKind {
         match self {
             Self::ToolsetNotLoaded { .. } => "toolset_not_loaded",
             Self::UnknownTool { .. } => "unknown_tool",
+            Self::ToolNotPermitted { .. } => "tool_not_permitted",
             Self::InvalidArgument { .. } => "invalid_argument",
             Self::FileNotFound { .. } => "file_not_found",
             Self::Conflict { .. } => "conflict",
@@ -289,6 +296,10 @@ mod tests {
                 tool: "y".into(),
             },
             ToolErrorKind::UnknownTool { tool: "x".into() },
+            ToolErrorKind::ToolNotPermitted {
+                tool: "x".into(),
+                reason: "r".into(),
+            },
             ToolErrorKind::InvalidArgument {
                 field: "f".into(),
                 reason: "r".into(),

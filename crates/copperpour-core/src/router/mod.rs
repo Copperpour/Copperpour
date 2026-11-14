@@ -1,3 +1,4 @@
+pub mod call_tool_policy;
 pub mod meta_tools;
 pub mod registry;
 

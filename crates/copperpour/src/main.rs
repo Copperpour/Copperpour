@@ -174,6 +174,7 @@ async fn main() -> Result<()> {
 
     let server_config = config.apply_to_process();
     let handler = McpHandler::new_with_config_resolution(server_config, config_resolution).await?;
+    config.apply_to_handler(&handler);
     if ipc_source.rediscovers() {
         handler.enable_ipc_rediscovery();
     }
