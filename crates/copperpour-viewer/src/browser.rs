@@ -965,13 +965,17 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let root = dir.path().join("root.revision.kicad_sch");
+            // The viewer works on the canonical root (`BrowserViewer::start`
+            // canonicalizes it), so the fixture must too: on macOS the temp
+            // dir sits under `/var`, a symlink to `/private/var`.
+            let base = dir.path().canonicalize().unwrap();
+            let root = base.join("root.revision.kicad_sch");
             std::fs::write(
                 &root,
                 include_str!("../../copperpour-core/tests/fixtures/derived_lib_name.kicad_sch"),
             )
             .unwrap();
-            let cli = dir.path().join("cli");
+            let cli = base.join("cli");
             std::fs::write(&cli, r##"#!/bin/sh
 mkdir -p "$5"
 printf '%s\n' "$(basename "$6")" >> "$0.calls"
