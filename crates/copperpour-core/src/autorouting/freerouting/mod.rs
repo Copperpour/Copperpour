@@ -628,9 +628,7 @@ fn read_project_rules(project: RouteProject) -> Result<ProjectRules, CallToolRes
     };
     if !path.is_file() {
         return Err(CallToolResult::error_kind(
-            ToolErrorKind::FileNotFound {
-                path: path.display().to_string(),
-            },
+            ToolErrorKind::file_not_found(&path),
             format!(
                 "project_path is not a file: {}. Nothing was routed.",
                 path.display()
@@ -805,9 +803,7 @@ pub(crate) async fn route_specctra_dsn(
         FreeroutingJar::Found(jar) => jar,
         FreeroutingJar::SuppliedPathIsNotAFile(path) => {
             return Ok(CallToolResult::error_kind(
-                ToolErrorKind::FileNotFound {
-                    path: path.display().to_string(),
-                },
+                ToolErrorKind::file_not_found(&path),
                 format!("jar_path is not a file: {}", path.display()),
             ));
         }

@@ -101,9 +101,7 @@ async fn handle_set_footprint_metadata(
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(CallToolResult::error_kind(
-                ToolErrorKind::FileNotFound {
-                    path: path.display().to_string(),
-                },
+                ToolErrorKind::file_not_found(&path),
                 format!("Footprint file not found: {}", path.display()),
             ));
         }
@@ -123,9 +121,7 @@ async fn handle_set_footprint_metadata(
             if error.kind() == std::io::ErrorKind::NotFound =>
         {
             return Ok(CallToolResult::error_kind(
-                ToolErrorKind::FileNotFound {
-                    path: path.display().to_string(),
-                },
+                ToolErrorKind::file_not_found(&path),
                 format!("Footprint file not found: {}", path.display()),
             ));
         }

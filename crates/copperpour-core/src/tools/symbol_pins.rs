@@ -377,9 +377,7 @@ async fn handle_edit_symbol_pin(
         Ok(source) => source,
         Err(SexpError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(CallToolResult::error_kind(
-                ToolErrorKind::FileNotFound {
-                    path: path.display().to_string(),
-                },
+                ToolErrorKind::file_not_found(&path),
                 format!("Symbol library not found: {}", path.display()),
             ));
         }

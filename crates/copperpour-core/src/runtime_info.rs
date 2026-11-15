@@ -64,6 +64,7 @@ pub(crate) async fn collect(
         },
         "runtime": {
             "executable_path": executable_path.as_deref().map(display_path),
+            "working_directory": std::env::current_dir().ok().as_deref().map(display_path),
         },
         "installation": {
             "source": installation.name,

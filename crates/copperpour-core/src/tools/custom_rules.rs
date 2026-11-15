@@ -503,9 +503,7 @@ async fn handle_delete_custom_rule(
         Ok(text) => text,
         Err(SexpError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(CallToolResult::error_kind(
-                ToolErrorKind::FileNotFound {
-                    path: rules_path.display().to_string(),
-                },
+                ToolErrorKind::file_not_found(&rules_path),
                 format!(
                     "'{}' does not exist, so it holds no rule '{name}' to delete.",
                     rules_path.display()

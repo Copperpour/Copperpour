@@ -310,6 +310,7 @@ fn installation_info_reports_the_serving_process_without_leaking_endpoint_secret
         assert!(body["build"]["commit_source"].is_null());
     }
     assert!(body["runtime"]["executable_path"].is_string());
+    assert!(body["runtime"]["working_directory"].is_string());
     assert_eq!(body["installation"]["binary_on_disk"]["probe_status"], "ok");
     assert_eq!(
         body["installation"]["binary_on_disk"]["version"],

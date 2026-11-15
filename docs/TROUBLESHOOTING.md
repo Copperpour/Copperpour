@@ -81,9 +81,10 @@ it or publishes a partial group sequence automatically.
 
 Call the always-visible `get_installation_info` tool in the affected MCP
 session. The result comes from the process serving that call and includes its
-version, build commit when available, executable path, conservatively detected
-install source, the version produced by the binary currently on disk at that
-same path, KiCad CLI version, redacted IPC endpoint, and restart guidance.
+version, build commit when available, executable path, process working directory
+(`runtime.working_directory`), conservatively detected install source, the version
+produced by the binary currently on disk at that same path, KiCad CLI version,
+redacted IPC endpoint, and restart guidance.
 
 `installation.binary_on_disk.newer_than_running: true` is reported only when
 both stable versions can be parsed and the on-disk binary is newer. `null`
@@ -95,6 +96,19 @@ credentials and query or fragment data are redacted.
 Follow the returned platform-specific guidance, restart the MCP client (and
 KiCad when it owns the server process), then call `get_installation_info` again
 to verify the process that actually restarted. This diagnostic writes nothing.
+
+## Relative paths return `file_not_found`
+
+Relative paths in tool arguments resolve against the Copperpour server
+process's working directory (`std::env::current_dir()`), which the MCP client sets
+when launching the server. They do not resolve against an editor's workspace root
+or the directory of any open project.
+
+Callers and agents should pass absolute filesystem paths to avoid ambiguity.
+When a handler refuses on a missing path, the structured `file_not_found` error
+reports the exact `absolute_path` it checked alongside the argument `path` as given.
+Call `get_installation_info` to inspect `runtime.working_directory` and see which
+directory the server process is running from.
 
 ## Installed guidance is out of date
 

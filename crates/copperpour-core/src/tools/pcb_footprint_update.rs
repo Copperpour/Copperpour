@@ -473,9 +473,7 @@ pub(crate) async fn handle_update_footprints_from_library(
     }
     if !board_path.is_file() {
         return Ok(CallToolResult::error_kind(
-            crate::mcp::error::ToolErrorKind::FileNotFound {
-                path: board_path.display().to_string(),
-            },
+            crate::mcp::error::ToolErrorKind::file_not_found(&board_path),
             format!("Board file not found: {}", board_path.display()),
         ));
     }

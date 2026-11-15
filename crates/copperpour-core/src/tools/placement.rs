@@ -217,9 +217,7 @@ fn read_saved_board(board: &std::path::Path) -> anyhow::Result<Result<String, Ca
         Err(error) => {
             if !board.exists() {
                 Ok(Err(CallToolResult::error_kind(
-                    ToolErrorKind::FileNotFound {
-                        path: board.display().to_string(),
-                    },
+                    ToolErrorKind::file_not_found(board),
                     format!("Board file not found: {}", board.display()),
                 )))
             } else {

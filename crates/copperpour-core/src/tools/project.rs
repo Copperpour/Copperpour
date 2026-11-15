@@ -439,9 +439,7 @@ async fn handle_get_project_info(
     // the message.
     if !path.exists() {
         return Ok(CallToolResult::error_kind(
-            crate::mcp::error::ToolErrorKind::FileNotFound {
-                path: path.display().to_string(),
-            },
+            crate::mcp::error::ToolErrorKind::file_not_found(&path),
             format!("Project file not found: {}", path.display()),
         ));
     }
@@ -564,9 +562,7 @@ async fn handle_open_viewer(
         Ok(root) => root,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(CallToolResult::error_kind(
-                crate::mcp::error::ToolErrorKind::FileNotFound {
-                    path: sch_path.display().to_string(),
-                },
+                crate::mcp::error::ToolErrorKind::file_not_found(&sch_path),
                 format!("Viewer schematic not found: {}", sch_path.display()),
             ));
         }
@@ -1017,6 +1013,183 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_project_info_missing_relative_path_reports_absolute_path_checked() {
+        let ctx = test_ctx();
+        let relative = "esp32h2-zigbee-climatic/esp32h2-zigbee-climatic.kicad_pro";
+        let args = json!({ "path": relative });
+
+        let result = handle_get_project_info(&args, &ctx)
+            .await
+            .expect("handler should return Ok with a structured error body");
+        assert!(result.is_error);
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("file_not_found")
+        );
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text,
+            other => panic!("expected text content, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["path"], relative);
+        let expected_absolute = std::env::current_dir()
+            .unwrap()
+            .join(relative)
+            .display()
+            .to_string();
+        assert_eq!(body["error"]["absolute_path"], expected_absolute);
+    }
+
+    #[tokio::test]
+    async fn get_project_info_missing_absolute_path_reports_absolute_path_checked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = test_ctx();
+        let missing = dir.path().join("does_not_exist.kicad_pro");
+        let path_str = missing.display().to_string();
+        let args = json!({ "path": path_str });
+
+        let result = handle_get_project_info(&args, &ctx)
+            .await
+            .expect("handler should return Ok with a structured error body");
+        assert!(result.is_error);
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("file_not_found")
+        );
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text,
+            other => panic!("expected text content, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["path"], path_str);
+        assert_eq!(body["error"]["absolute_path"], path_str);
+    }
+
+    #[tokio::test]
+    async fn served_file_not_found_reports_absolute_path_across_tool_families() {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+
+        let cwd = std::env::current_dir().unwrap();
+
+        // 1. project family: get_project_info (relative)
+        let rel_pro = "missing_sub/test.kicad_pro";
+        let res = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "get_project_info", "arguments": { "path": rel_pro } }
+            }))
+            .await
+            .expect("response");
+        let text = res.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["error"]["kind"], "file_not_found");
+        assert_eq!(body["error"]["path"], rel_pro);
+        assert_eq!(
+            body["error"]["absolute_path"],
+            cwd.join(rel_pro).display().to_string()
+        );
+
+        // 2. pcb family: update_footprints_from_library (relative board)
+        let rel_board = "missing_sub/test.kicad_pcb";
+        let res = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "update_footprints_from_library", "arguments": { "board": rel_board, "dry_run": true } }
+            }))
+            .await
+            .expect("response");
+        let text = res.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["error"]["kind"], "file_not_found");
+        assert_eq!(body["error"]["path"], rel_board);
+        assert_eq!(
+            body["error"]["absolute_path"],
+            cwd.join(rel_board).display().to_string()
+        );
+
+        // 3. library family: set_symbol_properties (relative library)
+        let rel_lib = "missing_sub/test.kicad_sym";
+        let res = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": { "name": "set_symbol_properties", "arguments": { "library_path": rel_lib, "symbol_name": "R", "value": "10k" } }
+            }))
+            .await
+            .expect("response");
+        let text = res.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["error"]["kind"], "file_not_found");
+        assert_eq!(body["error"]["path"], rel_lib);
+        assert_eq!(
+            body["error"]["absolute_path"],
+            cwd.join(rel_lib).display().to_string()
+        );
+
+        // 4. verification family: set_erc_severity (relative project)
+        let res = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": {
+                    "name": "set_erc_severity",
+                    "arguments": {
+                        "project": rel_pro,
+                        "severities": { "single_global_label": "error" }
+                    }
+                }
+            }))
+            .await
+            .expect("response");
+        let text = res.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["error"]["kind"], "file_not_found");
+        assert_eq!(body["error"]["path"], rel_pro);
+        assert_eq!(
+            body["error"]["absolute_path"],
+            cwd.join(rel_pro).display().to_string()
+        );
+
+        // 5. meta tools: get_installation_info reports working_directory in runtime
+        let res = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": { "name": "get_installation_info", "arguments": {} }
+            }))
+            .await
+            .expect("response");
+        let text = res.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            body["runtime"]["working_directory"],
+            cwd.display().to_string()
+        );
+    }
+
+    #[tokio::test]
     async fn snapshot_propagates_a_missing_pcb_artifact() {
         let dir = tempfile::tempdir().unwrap();
         // Produce the first (schematic) PDF, then report success without
@@ -1370,9 +1543,7 @@ async fn handle_rename_project(
 
     if !pro_path.exists() {
         return Ok(CallToolResult::error_kind(
-            crate::mcp::error::ToolErrorKind::FileNotFound {
-                path: pro_path.display().to_string(),
-            },
+            crate::mcp::error::ToolErrorKind::file_not_found(&pro_path),
             format!("Project file not found: {}", pro_path.display()),
         ));
     }

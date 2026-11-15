@@ -44,7 +44,7 @@ Before a mutation, a dependent check, a retry, or a completion claim, read
 recovery rules to the fields this installed server actually returns. Guidance
 does not establish that a missing server-side check ran.
 
-1. **Identify the project** — locate the `.kicad_pro` file
+1. **Identify the project** — locate the `.kicad_pro` file. Always pass **absolute filesystem paths** in tool arguments (`/path/to/project.kicad_pro`), because relative paths resolve against the MCP server process's working directory rather than the editor workspace.
 2. **Classify the task** — read-only (Channel 2 or 3) or write (Channel 1)
 3. **Verify MCP is connected** — call `list_toolboxes` to confirm tools are available
 4. **Describe the change** — state in plain English what will happen before invoking any tool

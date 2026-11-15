@@ -209,7 +209,7 @@ In a handler:
 ```rust
 if !path.exists() {
     return Ok(CallToolResult::error_kind(
-        ToolErrorKind::FileNotFound { path: path.display().to_string() },
+        ToolErrorKind::file_not_found(&path),
         format!("Project file not found: {}", path.display()),
     ));
 }

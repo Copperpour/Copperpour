@@ -941,6 +941,10 @@ mod reload_tests {
             let info = text(info);
             assert_eq!(info["runtime"]["executable_path"], installed_text);
             assert_eq!(
+                info["runtime"]["working_directory"],
+                std::env::current_dir().unwrap().display().to_string()
+            );
+            assert_eq!(
                 info["installation"]["binary_on_disk"],
                 json!({"probe_status": "ok", "version": "99.0.0", "newer_than_running": true})
             );
