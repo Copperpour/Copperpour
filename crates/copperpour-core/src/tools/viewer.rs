@@ -28,18 +28,29 @@ impl ViewerRegistry {
         if let Some(viewer) = viewers.remove(root) {
             viewer.shutdown().await;
         }
-        // From the configured CLI, not the fallback below, as `launch_kicad_ui` resolves it.
+        // From the configured CLI, not the resolved one below, as `launch_kicad_ui` resolves it.
         let kicad = crate::kicad_install::gui_or_default(kicad_binary, cli);
-        let cli = if cli.is_empty() {
-            copperpour_viewer::resolve_kicad_cli(None)
-        } else {
-            cli.to_owned()
-        };
+        let cli = viewer_cli(cli);
         let viewer =
             BrowserViewer::start_with_kicad(root, &cli, kicad, Duration::from_secs(30)).await?;
         let url = viewer.url.clone();
         viewers.insert(root.to_owned(), viewer);
         Ok((url, false))
+    }
+}
+
+/// The `kicad-cli` the viewer renders with: the one the kicad-cli tools spawn.
+/// For an unset or bare-name value that is the one `get_installation_info`
+/// reports (#521). Unlike the tools, an empty value is discovered rather than
+/// meaning "no kicad-cli", with a bare `kicad-cli` as the last resort.
+fn viewer_cli(configured: &str) -> String {
+    if configured.trim().is_empty() {
+        crate::kicad_install::find_cli("")
+            .map_or_else(|| "kicad-cli".into(), |p| p.to_string_lossy().into_owned())
+    } else {
+        super::cli::resolve_cli_executable(configured)
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -152,6 +163,38 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
     }
     async fn state(url: &str) -> String {
         request(url, "GET", "/state", None).await
+    }
+    /// #521: for an unset or bare-name `kicad_cli`, the viewer renders with the
+    /// `kicad-cli` that `get_installation_info` reports.
+    #[tokio::test]
+    async fn viewer_cli_is_the_one_get_installation_info_reports() {
+        for configured in ["", "kicad-cli"] {
+            let handler = handler(configured.into()).await;
+            let response = handler.handle_message(json!({"jsonrpc":"2.0", "id":521, "method":"tools/call", "params":{"name":"get_installation_info", "arguments":{}}})).await.unwrap();
+            let info = body(&serde_json::to_value(response).unwrap());
+            let reported = info["kicad"]["cli_path"].as_str().unwrap_or("kicad-cli");
+            assert_eq!(
+                viewer_cli(configured),
+                reported,
+                "kicad_cli = {configured:?}"
+            );
+        }
+        assert_eq!(
+            viewer_cli(" /nonexistent/kicad-cli "),
+            "/nonexistent/kicad-cli"
+        );
+    }
+    /// #521: the viewer renders with the resolved CLI, not the raw configured
+    /// name, which the OS cannot find when it is not on `PATH`.
+    #[tokio::test]
+    async fn browser_mcp_renders_with_the_resolved_kicad_cli() {
+        if crate::kicad_install::find_cli("").is_none() {
+            eprintln!("SKIP: no installed kicad-cli");
+            return;
+        }
+        let (_dir, root, _cli) = fixture();
+        let handler = handler("no-such-kicad-cli".into()).await;
+        body(&call(&handler, json!({"schematic":root,"open_browser":false})).await);
     }
     /// #500: Open in KiCAD runs the configured `kicad_binary`, as `launch_kicad_ui` does.
     #[tokio::test]

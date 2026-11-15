@@ -70,6 +70,7 @@ fn cli_candidates() -> Vec<PathBuf> {
         vec![
             PathBuf::from("/usr/bin/kicad-cli"),
             PathBuf::from("/usr/local/bin/kicad-cli"),
+            PathBuf::from("/snap/kicad/current/usr/bin/kicad-cli"),
         ]
     }
 }
