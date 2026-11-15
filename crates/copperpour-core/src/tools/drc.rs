@@ -478,6 +478,41 @@ mod tests {
         }
     }
 
+    /// A check set to ignore is not run, so it never appears among the
+    /// findings. The summary names the checks KiCad's report lists as
+    /// ignored, and says null, not "none", for a report without that list.
+    #[tokio::test]
+    async fn run_drc_names_the_checks_the_report_ignored() {
+        let ignored = json!([
+            {"key": "silk_edge_clearance", "description": "Silkscreen clipped by board edge"},
+            {"key": "silk_overlap", "description": "Silkscreen overlap"}
+        ]);
+        for (listed, expected) in [
+            (
+                Some(ignored),
+                json!(["silk_edge_clearance", "silk_overlap"]),
+            ),
+            (Some(json!([])), json!([])),
+            (None, Value::Null),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("clock.kicad_pcb");
+            std::fs::write(&board, OLD).unwrap();
+            let executable = cli_fixture(dir.path(), &board);
+            let mut report = drc_rule_report();
+            if let Some(listed) = listed {
+                report["ignored_checks"] = listed;
+            }
+            std::fs::write(board.with_extension("drc.json"), report.to_string()).unwrap();
+
+            let body = call("run_drc", &board, "", &executable, json!({})).await;
+
+            assert_eq!(body["isError"], false, "{body}");
+            assert_eq!(body["ignored_checks"], expected, "{body}");
+            assert_eq!(body["total_violations"], 10, "{body}");
+        }
+    }
+
     #[tokio::test]
     async fn drc_rule_filter_selects_exact_names_and_preserves_the_complete_report() {
         for (extra, expected, count, errors, warnings, filter) in [

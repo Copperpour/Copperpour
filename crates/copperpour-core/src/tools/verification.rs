@@ -35,7 +35,9 @@ pub fn tools() -> Vec<ToolDef> {
              with error/warning counts overall and by rule, and optional result filtering by rule. Prefer this over \
              `get_drc_violations` (pcb_export toolset) — they run the same underlying \
              kicad-cli check, but `run_drc` returns a cleaner breakdown. KiCad runs the \
-             complete configured DRC ruleset; kicad-cli has no per-test selector.",
+             complete configured DRC ruleset; kicad-cli has no per-test selector. \
+             `ignored_checks` names the checks whose severity is ignore: they were not run, \
+             so no count covers them (`set_drc_severity` sets a check's severity).",
             json!({
                 "type": "object",
                 "properties": {
@@ -384,6 +386,12 @@ async fn handle_run_drc(
             // beside the board — kicad-cli writes an empty array then, which
             // is not a checked zero (#516).
             "schematic_parity_diagnostic": report.schematic_parity_diagnostic,
+            // The checks this run had switched off, from KiCad's own report.
+            // None of them can appear below, so a count of zero says nothing
+            // about them. Null when the report carries no such list.
+            "ignored_checks": report.ignored_checks.as_ref().map(|checks| {
+                checks.iter().map(|check| check.key.as_str()).collect::<Vec<_>>()
+            }),
             "filtered_count": filtered.len(),
             "errors": errors,
             "warnings": warnings,

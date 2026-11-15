@@ -94,9 +94,9 @@ pub(super) fn tool() -> ToolDef {
          the key KiCad gives it in the .kicad_pro (e.g. silk_edge_clearance), to error, \
          warning or ignore. A check is one KiCad 10.0.6 has or one the file already names. \
          Changes only the checks named, under board.design_settings.rule_severities, and \
-         run_drc reports by them from its next run; a check set to ignore is not run at all. \
-         The reply gives each check's previous and current severity, previous null where \
-         the file did not name it. Refuses while KiCad holds the project (its \
+         run_drc reports by them from its next run; a check set to ignore is not run at all, \
+         and run_drc names it in ignored_checks. The reply gives each check's previous and \
+         current severity, previous null where the file did not name it. Refuses while KiCad holds the project (its \
          ~<project>.kicad_pro.lck), because pcbnew and Eeschema rewrite the project file \
          from their own copy when they save.",
         json!({
@@ -691,6 +691,12 @@ mod tests {
                         .iter()
                         .filter(|violation| violation["rule"] == "copper_edge_clearance")
                         .collect();
+                    // KiCad's report names the check exactly while it is off.
+                    let ignored = body["ignored_checks"]
+                        .as_array()
+                        .expect("KiCad 10 lists the ignored checks")
+                        .contains(&json!("copper_edge_clearance"));
+                    assert_eq!(ignored, severity == "ignore", "{body}");
                     match severity.as_str() {
                         "ignore" => assert!(found.is_empty(), "{body}"),
                         _ => {
