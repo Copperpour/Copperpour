@@ -252,6 +252,19 @@ async fn handle_list_nets(
     ))
 }
 
+/// A label's entry in a net query's answer: the tool's own `fields`, and the
+/// label's `uuid`, the one `list_schematic_labels` lists and `batch_delete`
+/// takes. A power symbol's pseudo-label carries the symbol's UUID, and deleting
+/// by that removes the symbol, so its entry gets none.
+fn label_entry(label: &Label, mut fields: serde_json::Value) -> serde_json::Value {
+    if label.kind != LabelKind::PowerSymbol {
+        if let Some(uuid) = &label.uuid {
+            fields["uuid"] = json!(uuid);
+        }
+    }
+    fields
+}
+
 async fn handle_list_labels(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -339,7 +352,12 @@ async fn handle_get_net_connections(
     let matching: Vec<_> = by_root
         .iter()
         .filter(|(root, _)| net_roots.contains(root))
-        .map(|(_, l)| json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
+        .map(|(_, l)| {
+            label_entry(
+                l,
+                json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }),
+            )
+        })
         .collect();
     let net_pts: HashSet<(i64, i64)> = g.points_on_roots(&net_roots).into_iter().collect();
     let on_net = &net_pts;
@@ -382,12 +400,17 @@ async fn handle_get_net_connectivity(
     let net_wires: Vec<_> = wires
         .iter()
         .filter(|w| net_pts.contains(&pt_key(w.x1, w.y1)) || net_pts.contains(&pt_key(w.x2, w.y2)))
-        .map(|w| json!({ "x1": w.x1, "y1": w.y1, "x2": w.x2, "y2": w.y2 }))
+        .map(|w| json!({ "x1": w.x1, "y1": w.y1, "x2": w.x2, "y2": w.y2, "uuid": w.uuid }))
         .collect();
     let net_labels: Vec<_> = labels
         .iter()
         .filter(|l| l.net == net)
-        .map(|l| json!({ "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
+        .map(|l| {
+            label_entry(
+                l,
+                json!({ "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }),
+            )
+        })
         .collect();
     let net_wire_objs: Vec<Wire> = wires
         .iter()
@@ -550,7 +573,7 @@ async fn handle_trace_from_point(
     let at_label: Vec<_> = labels
         .iter()
         .filter(|l| points_coincident(x, y, l.x, l.y, tol))
-        .map(|l| json!({ "net": l.net, "type": format!("{:?}", l.kind) }))
+        .map(|l| label_entry(l, json!({ "net": l.net, "type": format!("{:?}", l.kind) })))
         .collect();
     // A pin and a junction dot sit on a point as readily as a wire or a label,
     // and this is the tool whose whole promise is what is there (#539). Both
@@ -1074,7 +1097,12 @@ async fn handle_get_connected_items(
     let connected_labels: Vec<serde_json::Value> = label_roots(&mut g, &labels)
         .into_iter()
         .filter(|(root, _)| connected_roots.contains(root))
-        .map(|(_, l)| json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
+        .map(|(_, l)| {
+            label_entry(
+                l,
+                json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }),
+            )
+        })
         .collect();
 
     // Find other components on the same nets (excluding the queried one)
@@ -3185,6 +3213,174 @@ mod two_name_net_tests {
         assert_eq!(after["count"], 0, "{after}");
         let wires_after = call_at(&path, "list_schematic_wires", json!({})).await["count"].clone();
         assert_eq!(wires_after, wires_before);
+    }
+
+    /// Every label entry the four net queries return for the sheet at `path`,
+    /// with the tool and the net name asked for: `get_net_connections` and
+    /// `get_net_connectivity` for every name on the sheet,
+    /// `get_connected_items` for U1, R1, TP2 and TP4, whose nets carry every
+    /// label, and `trace_from_point` at every label. `ALT` shares its point with a `+3V3`
+    /// symbol's pin, so the trace meets a power symbol too.
+    async fn net_query_labels(
+        path: &std::path::Path,
+    ) -> Vec<(&'static str, String, serde_json::Value)> {
+        let mut found = Vec::new();
+        let nets = call_at(path, "list_schematic_nets", json!({})).await;
+        for net in nets["nets"].as_array().unwrap() {
+            let net = net.as_str().unwrap();
+            for tool in ["get_net_connections", "get_net_connectivity"] {
+                let body = call_at(path, tool, json!({ "net": net })).await;
+                for label in body["labels"].as_array().unwrap() {
+                    found.push((tool, net.to_string(), label.clone()));
+                }
+            }
+        }
+        for reference in ["U1", "R1", "TP2", "TP4"] {
+            let body = call_at(
+                path,
+                "get_connected_items",
+                json!({ "reference": reference }),
+            )
+            .await;
+            for label in body["labels"].as_array().unwrap() {
+                found.push(("get_connected_items", String::new(), label.clone()));
+            }
+        }
+        let labels = call_at(path, "list_schematic_labels", json!({})).await;
+        for at in labels["labels"].as_array().unwrap() {
+            let body = call_at(
+                path,
+                "trace_from_point",
+                json!({ "x": at["x"], "y": at["y"] }),
+            )
+            .await;
+            for label in body["labels_here"].as_array().unwrap() {
+                found.push(("trace_from_point", String::new(), label.clone()));
+            }
+        }
+        found
+    }
+
+    /// The net queries give each label the UUID KiCad wrote for it, for all
+    /// three kinds, and a power symbol's entry none: its pseudo-label carries
+    /// the symbol's UUID.
+    #[tokio::test]
+    async fn net_queries_report_each_labels_own_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two_name_nets.kicad_sch");
+        std::fs::write(&path, SCH).unwrap();
+
+        let expected: BTreeSet<(String, String, String)> = KICAD_LABELS
+            .iter()
+            .map(|&(kind, net, uuid)| (kind.into(), net.into(), uuid.into()))
+            .collect();
+        let mut rows: std::collections::BTreeMap<&str, BTreeSet<(String, String, String)>> =
+            Default::default();
+        let mut power: HashMap<&str, usize> = HashMap::new();
+        for (tool, asked, label) in net_query_labels(&path).await {
+            let kind = label["type"].as_str().unwrap();
+            if kind == "PowerSymbol" {
+                assert!(label.get("uuid").is_none(), "{tool}: {label}");
+                *power.entry(tool).or_default() += 1;
+                continue;
+            }
+            // `get_net_connectivity` lists only labels spelling the name asked
+            // for, and leaves the name out.
+            let net = label["net"].as_str().unwrap_or(&asked);
+            let uuid = label["uuid"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{tool}: {label}"));
+            rows.entry(tool)
+                .or_default()
+                .insert((kind.into(), net.into(), uuid.into()));
+        }
+        for tool in [
+            "get_net_connections",
+            "get_net_connectivity",
+            "get_connected_items",
+            "trace_from_point",
+        ] {
+            assert_eq!(rows.get(tool), Some(&expected), "{tool}");
+            assert!(power.get(tool).is_some_and(|&n| n > 0), "{tool}: {power:?}");
+        }
+    }
+
+    /// Every UUID the net queries give a label is what `batch_delete` takes:
+    /// one call removes the sheet's 15 labels, and the power symbols, wires
+    /// and components stay.
+    #[tokio::test]
+    async fn net_query_label_uuids_delete_only_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two_name_nets.kicad_sch");
+        std::fs::write(&path, SCH).unwrap();
+
+        let mut uuids: Vec<String> = net_query_labels(&path)
+            .await
+            .into_iter()
+            .filter_map(|(_, _, label)| label["uuid"].as_str().map(String::from))
+            .collect();
+        uuids.sort_unstable();
+        uuids.dedup();
+        let wires_before = call_at(&path, "list_schematic_wires", json!({})).await["count"].clone();
+
+        let deleted = call_at(&path, "batch_delete", json!({ "uuids": uuids })).await;
+        let mut deleted_uuids: Vec<&str> = deleted["deleted_item_uuids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u.as_str().unwrap())
+            .collect();
+        deleted_uuids.sort_unstable();
+        let mut kicad_uuids: Vec<&str> = KICAD_LABELS.iter().map(|(_, _, u)| *u).collect();
+        kicad_uuids.sort_unstable();
+        assert_eq!(deleted_uuids, kicad_uuids, "{deleted}");
+        assert_eq!(deleted["deleted_components"], json!([]), "{deleted}");
+        assert_eq!(deleted["removed_no_connects_count"], 0, "{deleted}");
+        assert_eq!(deleted["junctions_pruned_count"], 0, "{deleted}");
+        assert_eq!(deleted["errors"], json!([]), "{deleted}");
+
+        let after = call_at(&path, "list_schematic_labels", json!({})).await;
+        assert_eq!(after["count"], 0, "{after}");
+        let nets_after = call_at(&path, "list_schematic_nets", json!({})).await;
+        assert_eq!(
+            nets_after["nets"],
+            json!(["+3V3", "+5V", "GND"]),
+            "{nets_after}"
+        );
+        let wires_after = call_at(&path, "list_schematic_wires", json!({})).await["count"].clone();
+        assert_eq!(wires_after, wires_before);
+    }
+
+    /// `get_net_connectivity`'s wires carry the UUID `list_schematic_wires`
+    /// lists for the same segment, as `get_connected_items`' wires do.
+    #[tokio::test]
+    async fn net_connectivity_reports_each_wires_uuid() {
+        let listed = call(SCH, "list_schematic_wires", json!({})).await;
+        let by_uuid: HashMap<&str, &serde_json::Value> = listed["wires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|wire| (wire["uuid"].as_str().unwrap(), wire))
+            .collect();
+        let nets = call(SCH, "list_schematic_nets", json!({})).await;
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for net in nets["nets"].as_array().unwrap() {
+            let body = call(SCH, "get_net_connectivity", json!({ "net": net })).await;
+            for wire in body["wires"].as_array().unwrap() {
+                let uuid = wire["uuid"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{net}: {wire}"));
+                let same = by_uuid
+                    .get(uuid)
+                    .unwrap_or_else(|| panic!("{net}: {wire} is not listed"));
+                for end in ["x1", "y1", "x2", "y2"] {
+                    assert_eq!(wire[end].as_f64(), same[end].as_f64(), "{net}: {wire}");
+                }
+                seen.insert(uuid.to_string());
+            }
+        }
+        // Every wire but the one on the net no label names, TP8 to TP9.
+        assert_eq!(seen.len(), by_uuid.len() - 1, "{listed}");
     }
 }
 
