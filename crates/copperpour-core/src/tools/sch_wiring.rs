@@ -3440,6 +3440,24 @@ pub(crate) async fn handle_batch_add_power_symbol(
     for w in &all_wires {
         junctions.extend(pins_mid_segment(&power_pins, w.x1, w.y1, w.x2, w.y2));
     }
+    // A bar's corners and its power pin, judged as a new wire's ends are: a
+    // two-pin group's symbol sits on a corner, where the stub, the bar and
+    // the power pin are three exits (#376).
+    let exits: Vec<(f64, f64)> = crate::tools::junction_exit_points(&tree)
+        .into_iter()
+        .chain(power_pins.iter().copied())
+        .collect();
+    for plan in &plans {
+        // `power_bar` draws the bar last.
+        let Some(&(first, last)) = plan.wires.last() else {
+            continue;
+        };
+        junctions.extend(
+            [first, last, plan.pin_at]
+                .into_iter()
+                .filter(|&(x, y)| wire_end_needs_junction(&all_wires, &exits, x, y, 0.01)),
+        );
+    }
     let mut junctions_added: Vec<(f64, f64)> = Vec::new();
     for (x, y) in junctions {
         let present = sch
@@ -8157,8 +8175,44 @@ mod batch_power_tests {
                 ((139.7, 146.05), (154.94, 146.05)),
             ])
         );
-        // The middle cap's stub meets the bar mid-span; the U1 bar has no T.
-        assert_eq!(junctions_in(&path), vec![(147.32, 146.05)]);
+        // The middle cap's stub meets the bar mid-span; the U1 bar's symbol
+        // sits on its corner, beside the stub and the bar.
+        assert_eq!(junctions_in(&path), vec![(101.6, 132.08), (147.32, 146.05)]);
+    }
+
+    /// The case #376 was filed for: with two pins the symbol takes the first
+    /// stub's end, a corner of the bar.
+    #[tokio::test]
+    async fn a_two_pin_bar_dots_the_corner_its_symbol_sits_on() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet(dir.path());
+        let body = serve(
+            &handler,
+            "batch_add_power_symbol",
+            &path,
+            json!({"power_net": "GND", "pins": pins(&["C1.2", "C2.2"])}),
+        )
+        .await;
+        assert_eq!(body["is_error"], json!(false), "{body}");
+        assert_eq!(
+            groups(&path, &body),
+            sorted_groups(vec![("C1.2,C2.2", true, (139.7, 146.05, 0.0))])
+        );
+        assert_eq!(
+            wires_in(&path),
+            sorted_segs(vec![
+                ((139.7, 143.51), (139.7, 146.05)),
+                ((147.32, 143.51), (147.32, 146.05)),
+                ((139.7, 146.05), (147.32, 146.05)),
+            ])
+        );
+        assert_eq!(junctions_in(&path), vec![(139.7, 146.05)]);
+        assert_eq!(
+            body["junctions_added"],
+            json!([{"x": 139.7, "y": 146.05}]),
+            "{body}"
+        );
     }
 
     #[tokio::test]

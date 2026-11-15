@@ -94,7 +94,7 @@ The groups the tests expect:
 
 | Pins | Joined | Symbol at | Rotation |
 |---|---|---|---|
-| U1.23, U1.35, U1.47, U1.8 | yes | `(101.6, 132.08)` | 0 |
+| U1.23, U1.35, U1.47, U1.8 | yes, dot at `(101.6, 132.08)` | `(101.6, 132.08)` | 0 |
 | C1.2, C2.2, C3.2 | yes, dot at `(147.32, 146.05)` | `(147.32, 146.05)` | 0 |
 | C4.2 | no: 20.32 mm > `max_gap` | `(175.26, 143.51)` | 0 |
 | C7.2 | no: faces away from C8.2 | `(195.58, 143.51)` | 0 |
@@ -105,4 +105,6 @@ The groups the tests expect:
 
 Each joined row has a stub from every pin to 2.54 mm beyond it, and one bar
 along the stub ends. The symbol sits on the end of the middle stub (for an even
-count, the one just before the middle).
+count, the one just before the middle). With two points, as U1's VSS and VSSA,
+or C1.2 and C2.2 alone, that is a corner of the bar, and it takes a dot: the
+stub, the bar and the power pin are three exits there.
