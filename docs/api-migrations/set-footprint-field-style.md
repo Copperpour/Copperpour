@@ -12,9 +12,12 @@ named in `references`, or of every footprint when it is omitted. With KiCad
 holding the board it is one undo step, read back afterwards; with the board
 closed it edits the saved file, only while the file still holds what it read.
 Both paths answer with the same fields: `source` says which ran (`ipc` or
-`file`), `undo` is set on the live path only, and `fallback_reason` and
-`warning` (why the file was edited) are null on the live path. The response
-lists every field's values before and after, and a whole-board run reports a
-field it could not edit in `skipped`.
+`file`), `undo` is set on the live path only, and `fallback_reason` (why the
+file was edited) is null on the live path. `warning` says why the file was
+edited on the file path; on the live path it is set only when footprints were
+sent, because each goes back to KiCad whole, which on KiCad 10 drops its
+symbol-unit mapping until Update PCB from Schematic. The response lists every
+field's values before and after, and a whole-board run reports a field it
+could not edit in `skipped`.
 
 No existing call changes.

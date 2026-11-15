@@ -1,19 +1,20 @@
 //! `set_footprint_field_style`: set the glyph size and stroke thickness of
-//! the reference or value field on many placed footprints at once (#198).
+//! the reference or value field on many placed footprints at once (#520).
 //!
-//! A board synced before footprint fields carried their library's stroke
-//! thickness holds every Reference at KiCad's derived default, which a
-//! fabricator's minimum then flags once per footprint. Nothing could repair
-//! that short of KiCad's own "Edit Text and Graphics Properties":
-//! `update_footprints_from_library` keeps placed fields by design and
-//! `edit_footprint_field` takes one footprint per call on a live board only.
+//! `update_footprints_from_library` with `reset_text_sizes_and_styles` gives
+//! Reference and Value their library's text style (#154). A style of the
+//! caller's own choosing, such as a fabricator's minimum thickness above the
+//! library's or one text size across the board, otherwise takes one
+//! `edit_footprint_field` call per footprint, on a live board only.
 //!
 //! This tool is live-first with a file fallback. On a live board the fields
 //! go through the same whole-footprint update `edit_footprint_field` uses, in
-//! one undo step. With no live KiCad holding the board, the `(size …)` and
-//! `(thickness …)` of each field's `(font …)` are rewritten in the saved
-//! file, guarded against a concurrent save, and re-read to prove the result.
-//! Either way the response lists the old and new values of every field.
+//! one undo step, and the response's `warning` names what sending a footprint
+//! whole costs on KiCad 10. With no live KiCad holding the board, the
+//! `(size …)` and `(thickness …)` of each field's `(font …)` are rewritten in
+//! the saved file, guarded against a concurrent save, and re-read to prove
+//! the result. Either way the response lists the old and new values of every
+//! field.
 
 use super::{live_error_result, mm, positive_length_nm, MAX_TEXT_SIZE_MM};
 use crate::mcp::error::ToolErrorKind;
@@ -180,10 +181,19 @@ fn entry(footprint: &str, field: &str, before: Value, after: Value) -> Value {
     })
 }
 
+/// The live `warning` when footprints were sent. The same caveat as
+/// `edit_footprint_field`'s description, in the result itself so a caller
+/// that reads only the result still sees it.
+const WHOLE_FOOTPRINT_WARNING: &str =
+    "Each footprint whose field changed was sent back to KiCad whole. On KiCad 10 that \
+     drops its symbol-unit mapping until Update PCB from Schematic, and a rule area inside \
+     it may be rewritten; the readback sees neither.";
+
 /// The success body both paths share, so a caller reads one shape whichever
 /// ran and `source` names it. `wrote` is whether anything was sent or
 /// written, which is what makes the status `applied`. `fallback_reason` and
-/// `warning` are null here; the file path fills them in.
+/// `warning` are null here; the file path fills both in, and the live path
+/// sets `warning` when it sent something.
 fn settled_body(source: &str, wrote: bool, fields: Vec<Value>, skipped: Vec<Value>) -> Value {
     let changed = fields
         .iter()
@@ -245,7 +255,11 @@ fn live_result(outcome: IpcFootprintFieldBatchOutcome, board: &Path) -> CallTool
                     })
                 })
                 .collect();
-            CallToolResult::json(&settled_body("ipc", sent, fields, skipped))
+            let mut body = settled_body("ipc", sent, fields, skipped);
+            if sent {
+                body["warning"] = json!(WHOLE_FOOTPRINT_WARNING);
+            }
+            CallToolResult::json(&body)
         }
         IpcFootprintFieldBatchOutcome::Uncertain { mismatches, reason } => uncertain(
             board,

@@ -1,12 +1,14 @@
-//! `set_footprint_field_style` on both of its paths (#198).
+//! `set_footprint_field_style` on both of its paths (#520).
 //!
 //! The file path runs on `tests/fixtures/specctra_two_resistors.kicad_pcb`, a
 //! board KiCad 10.0.5 saved (see `specctra_two_resistors.README.md`). That
 //! file is the oracle for how KiCad writes a field's font: `(size 1 1)` then
 //! `(thickness 0.15)` on the next line for both resistors' Reference and
 //! Value, and `(size 1.27 1.27)` with no thickness at all for the Datasheet
-//! and Description fields. The live path runs through served `tools/call`
-//! against the KiCad double the other text tools share.
+//! and Description fields. Two boards KiCad derived from it carry the cases
+//! it lacks, a reference held by two footprints and a field with no thickness
+//! (see `field_style_kicad10.README.md`). The live path runs through served
+//! `tools/call` against the KiCad double the other text tools share.
 
 use super::super::tests::{held_footprint, LiveScene};
 use super::*;
@@ -16,6 +18,18 @@ use crate::tools::BoardAccess;
 const FIXTURE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/specctra_two_resistors.kicad_pcb"
+));
+
+/// KiCad's save of [`FIXTURE`] with R2's reference changed to R1.
+const DUPLICATE_R1: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/field_style_duplicate_reference_kicad10.kicad_pcb"
+));
+
+/// KiCad's save of [`FIXTURE`] with the thickness of R1's Reference set to 0.
+const R1_NO_THICKNESS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/field_style_no_thickness_kicad10.kicad_pcb"
 ));
 
 /// The fixture's Reference and Value font, exactly as KiCad wrote it. The
@@ -126,20 +140,25 @@ async fn the_file_path_sets_every_reference_and_changes_nothing_else() {
 }
 
 /// A field saved with no thickness (KiCad then draws size/8, which is what
-/// DRC flags) gets one where KiCad writes it. Removing the thickness line
-/// from R1's Reference and asking for 0.15 must give back the KiCad-saved
-/// fixture byte for byte.
+/// DRC flags) gets one where KiCad writes it. Both ends are KiCad's: its save
+/// of R1's Reference at thickness 0, which leaves the thickness line out, and
+/// its save at 0.15, the fixture. Asking for 0.15 must turn the first into
+/// the second byte for byte.
 #[tokio::test]
 async fn a_missing_thickness_is_written_where_kicad_writes_it() {
-    let without = with_font(
-        FIXTURE,
-        "R1",
-        "Reference",
-        "R1",
-        "(font\r\n\t\t\t\t\t(size 1 1)\r\n\t\t\t\t)",
+    // KiCad's own zero-thickness save differs from the fixture in that line
+    // alone, so the comparison below rests on nothing but that line.
+    assert_eq!(
+        R1_NO_THICKNESS,
+        with_font(
+            FIXTURE,
+            "R1",
+            "Reference",
+            "R1",
+            "(font\r\n\t\t\t\t\t(size 1 1)\r\n\t\t\t\t)",
+        )
     );
-    assert_ne!(without, FIXTURE);
-    let closed = Closed::holding(&without);
+    let closed = Closed::holding(R1_NO_THICKNESS);
     let (is_error, body) = closed
         .call(json!({ "references": ["R1"], "thickness": 0.15 }))
         .await;
@@ -229,6 +248,32 @@ async fn an_unknown_reference_refuses_the_whole_file_edit() {
     assert_eq!(body["error"]["kind"], "stale_target");
     assert_eq!(body["error"]["target"], "R99");
     assert_eq!(closed.content(), FIXTURE, "R1 must not be edited either");
+}
+
+/// A reference two footprints carry names neither: the call is refused with
+/// the number of matches and the file is not written. Taking the first match
+/// would restyle one of the two and report success.
+#[tokio::test]
+async fn an_ambiguous_reference_refuses_the_whole_file_edit() {
+    assert_eq!(
+        DUPLICATE_R1
+            .matches("(property \"Reference\" \"R1\"")
+            .count(),
+        2
+    );
+    let closed = Closed::holding(DUPLICATE_R1);
+    let (is_error, body) = closed
+        .call(json!({ "references": ["R1"], "thickness": 0.2 }))
+        .await;
+    assert!(is_error, "{body}");
+    assert_eq!(body["error"]["kind"], "ambiguous_target", "{body}");
+    assert_eq!(body["error"]["target"], "R1");
+    assert_eq!(
+        body["error"]["candidates"].as_array().map(Vec::len),
+        Some(2),
+        "{body}"
+    );
+    assert_eq!(closed.content(), DUPLICATE_R1, "neither R1 may be edited");
 }
 
 /// A save that lands between the read and the write is kept, and the call
@@ -415,7 +460,8 @@ async fn the_live_path_sets_every_reference_in_one_undo_step() {
     assert_eq!(body["changed_count"], 2);
     assert_eq!(body["skipped"], json!([]));
     assert_eq!(body["fallback_reason"], Value::Null, "{body}");
-    assert_eq!(body["warning"], Value::Null, "{body}");
+    // Sending a footprint whole has a cost the result itself must name.
+    assert_eq!(body["warning"], WHOLE_FOOTPRINT_WARNING, "{body}");
     assert_eq!(
         body["fields"],
         json!([
@@ -452,6 +498,8 @@ async fn the_live_path_sets_every_reference_in_one_undo_step() {
     assert_eq!(body["status"], "unchanged");
     assert_eq!(body["changed_count"], 0);
     assert_eq!(body["undo"], Value::Null);
+    // Nothing was sent, so there is nothing to warn about.
+    assert_eq!(body["warning"], Value::Null, "{body}");
     let held = scene.held.lock().unwrap();
     assert_eq!((held.updates, held.commits), (2, 1));
 }
@@ -535,6 +583,35 @@ async fn the_live_path_refuses_an_unknown_reference_before_sending_anything() {
     assert!(is_error, "{body}");
     assert_eq!(body["error"]["kind"], "stale_target");
     assert_eq!(body["error"]["target"], "R99");
+    let held = scene.held.lock().unwrap();
+    assert_eq!((held.updates, held.commits), (0, 0));
+}
+
+/// A reference two footprints carry is refused with the number of matches
+/// before anything is sent, R2 named before it included.
+#[tokio::test]
+async fn the_live_path_refuses_an_ambiguous_reference_before_sending_anything() {
+    let scene = two_resistor_scene().await;
+    scene
+        .held
+        .lock()
+        .unwrap()
+        .footprints
+        .push(held_footprint("fp-r1-again", "R1"));
+    let (is_error, body) = scene
+        .call(
+            OPERATION,
+            json!({ "references": ["R2", "R1"], "thickness": 0.2 }),
+        )
+        .await;
+    assert!(is_error, "{body}");
+    assert_eq!(body["error"]["kind"], "ambiguous_target", "{body}");
+    assert_eq!(body["error"]["target"], "R1");
+    assert_eq!(
+        body["error"]["candidates"].as_array().map(Vec::len),
+        Some(2),
+        "{body}"
+    );
     let held = scene.held.lock().unwrap();
     assert_eq!((held.updates, held.commits), (0, 0));
 }

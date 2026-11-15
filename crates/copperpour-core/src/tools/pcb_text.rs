@@ -193,15 +193,16 @@ pub(crate) fn tools() -> Vec<ToolDef> {
              text_thickness), for example Reference fields placed without their library's \
              thickness. Name at least one of size_x, size_y, thickness; position, angle, layer, \
              font and visibility are not touched. With KiCad running on the board the edit is \
-             live, in one undo step, and each footprint is sent back whole, as \
-             edit_footprint_field sends it (on KiCad 10.0 that drops the footprint's symbol-unit \
-             mapping; run Update PCB from Schematic afterwards). With no live KiCad holding the \
-             board the saved file is edited instead, which has no such side effect. Both paths \
-             answer with the same fields: 'source' says which ran (ipc or file), and \
-             'fallback_reason' and 'warning' are null on the live path. The response lists \
-             every field with its values before and after, read back from the board or the \
-             file, and 'skipped' the fields a whole-board run could not edit; a result that \
-             does not hold the request is an error. On the file path 'thickness_mm' is null where the file stores \
+             live, in one undo step, and each changed footprint is sent back whole, as \
+             edit_footprint_field sends it: on KiCad 10 that drops its symbol-unit mapping \
+             until Update PCB from Schematic, and a rule area inside it may be rewritten, which \
+             the live 'warning' repeats whenever a footprint was sent. With no live KiCad \
+             holding the board the saved file is edited instead, which has no such side effect. \
+             Both paths answer with the same fields: 'source' says which ran (ipc or file), and \
+             'fallback_reason' is null on the live path. The response lists every field with \
+             its values before and after, read back from the board or the file, and 'skipped' \
+             the fields a whole-board run could not edit; a result that does not hold the \
+             request is an error. On the file path 'thickness_mm' is null where the file stores \
              none and KiCad derives it from the size. Does not save a live board.",
             field_style::input_schema(),
             |args, ctx| async move {
