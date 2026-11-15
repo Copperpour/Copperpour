@@ -83,7 +83,7 @@ dirs = "7"
 winreg = "0.56"
 
 # SVG parsing (import_svg_logo)
-usvg = "0.48"
+usvg = "0.49"
 
 # Rasterization for the visual-feedback tools (copperpour-render). resvg and
 # tiny-skia are pinned EXACTLY: visual baselines compare pixel output across
