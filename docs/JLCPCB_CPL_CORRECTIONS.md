@@ -174,7 +174,8 @@ project.
 
 ## Required evidence
 
-The tool response contains:
+The JSON file beside the CPL, `CPL-<project>.orientation.json`, which the
+response names in `placement_orientation.evidence_path`, contains:
 
 - `geometry`: observed anchor, native pad-box midpoint, and algorithm for every
   exported designator; these are separate from the policy correction evidence;
@@ -185,6 +186,12 @@ The tool response contains:
 - `unverified_footprints`: components matched by an unverified rule;
 - `policies`: the policy ID, schema version, provenance, and precedence; and
 - `status: "PREVIEW_REQUIRED"` with `physical_validation: false`.
+
+The response's `placement_orientation` carries `status`, `physical_validation`,
+`note` and `policies`, the first `limit` (50 by default) `applied_corrections`
+with `applied_corrections_count`, `applied_corrections_shown` and
+`applied_corrections_truncated`, and `geometry_count`,
+`unmatched_footprints_count` and `unverified_footprints_count`.
 
 Both kinds also reach `warnings`: one entry per unverified rule, and one
 listing every polarized or multi-pin footprint no rule covers. They do not make

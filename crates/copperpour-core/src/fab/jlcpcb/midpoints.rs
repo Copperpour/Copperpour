@@ -499,6 +499,196 @@ mod tests {
         }
     }
 
+    /// The JLCPCB package of this fixture's board, saved as
+    /// `<stem>.kicad_pcb`, through `handle_message` at `limit` 1: the
+    /// response text and the output directory. The stand-in kicad-cli
+    /// writes one Gerber per requested layer and a drill file, named from
+    /// the board, copies KiCad's own position export of the fixture, and
+    /// writes a BOM naming its eleven parts, as the fixture has no
+    /// schematic. Unix only: the stand-in is a shell script.
+    #[cfg(unix)]
+    async fn served_package(dir: &std::path::Path, stem: &str) -> (String, std::path::PathBuf) {
+        use crate::mcp::handler::McpHandler;
+        use crate::tools::ServerConfig;
+        let board = dir.join(format!("{stem}.kicad_pcb"));
+        std::fs::write(
+            &board,
+            include_str!("../../../tests/fixtures/jlcpcb_midpoints/midpoints.kicad_pcb"),
+        )
+        .unwrap();
+        let positions = dir.join("positions.csv");
+        std::fs::write(
+            &positions,
+            include_str!("../../../tests/fixtures/jlcpcb_midpoints/positions.csv"),
+        )
+        .unwrap();
+        // The board is the last argument of each export.
+        let cli = crate::tools::cli::test_support::write_script(
+            dir,
+            "package-cli",
+            &format!(
+                "#!/bin/sh\nkind=$3\n\
+                 while [ \"$#\" -gt 0 ]; do\n\
+                 \x20 case \"$1\" in --output) out=$2; shift ;; --layers) layers=$2; shift ;; esac\n\
+                 \x20 board=$1\n\
+                 \x20 shift\n\
+                 done\n\
+                 stem=$(basename \"$board\" .kicad_pcb)\n\
+                 case \"$kind\" in\n\
+                 \x20 gerbers) for layer in $(echo \"$layers\" | tr , ' '); do\n\
+                 \x20   echo G04 > \"$out/$stem-$(echo \"$layer\" | tr . _).gbr\"; done ;;\n\
+                 \x20 drill) echo M48 > \"${{out}}$stem-PTH.drl\" ;;\n\
+                 \x20 pos) cp '{}' \"$out\" ;;\n\
+                 \x20 bom) printf 'Reference\\n\"JB0,JB1,JB2,JB3,JB4,JF0,JF1,JF2,JF3,JF4\"\\nR1\\n' > \"$out\" ;;\n\
+                 esac\n",
+                positions.display()
+            ),
+            "@exit /b 1\r\n",
+        );
+        // One verified rule for the ten pin headers; R1 matches none.
+        let policy = dir.join("corrections.json");
+        std::fs::write(
+            &policy,
+            serde_json::json!({
+                "schema_version": 1,
+                "policy_id": "midpoint-headers",
+                "provenance": "test",
+                "footprint_rules": [{
+                    "id": "header",
+                    "footprint_exact": "PinHeader_1x02_P2.54mm_Vertical",
+                    "rotation_degrees": 90
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let output = dir.join("package");
+        let mock = fixture_server(&board, "good");
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: cli.display().to_string(),
+            kicad_binary: String::new(),
+            ipc_address: mock.address().into(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .unwrap();
+        let response = handler
+            .handle_message(serde_json::json!({
+                "jsonrpc": "2.0", "id": 69, "method": "tools/call",
+                "params": {"name": "export_manufacturing_package", "arguments": {
+                    "board": board, "output_dir": output, "fab_house": "jlcpcb",
+                    "schematic": board.with_extension("kicad_sch"),
+                    "jlcpcb_cpl_corrections_path": policy, "limit": 1
+                }}
+            }))
+            .await
+            .unwrap();
+        let result = response.result.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap().to_string();
+        (text, output)
+    }
+
+    /// #69: the package writes its whole placement evidence beside the CPL
+    /// and its response carries the counts and the first `limit` applied
+    /// corrections, the verdict first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn served_jlcpcb_package_writes_its_evidence_and_summarises_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (text, output) = served_package(dir.path(), "midpoints").await;
+        assert!(
+            text.starts_with(r#"{"complete":true,"summary":"Complete package"#),
+            "{text}"
+        );
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let orientation = &body["placement_orientation"];
+        assert_eq!(orientation["status"], "PREVIEW_REQUIRED", "{body:#}");
+        assert_eq!(orientation["geometry_count"], 11);
+        assert_eq!(orientation["applied_corrections_count"], 10);
+        assert_eq!(orientation["applied_corrections_shown"], 1);
+        assert_eq!(orientation["applied_corrections_truncated"], true);
+        assert_eq!(orientation["unmatched_footprints_count"], 1);
+        assert_eq!(orientation["unverified_footprints_count"], 0);
+        for list in ["geometry", "unmatched_footprints", "unverified_footprints"] {
+            assert!(orientation.get(list).is_none(), "{list}: {orientation:#}");
+        }
+        let pick_and_place = body["files_generated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["type"] == "pick_and_place")
+            .unwrap();
+        assert!(
+            pick_and_place.get("placement_orientation").is_none(),
+            "{pick_and_place}"
+        );
+
+        let file = output.join("CPL-midpoints.orientation.json");
+        assert_eq!(orientation["evidence_path"], file.to_str().unwrap());
+        let uploads = body["files"].as_array().unwrap();
+        assert!(
+            uploads.contains(&serde_json::json!("CPL-midpoints.csv")),
+            "{uploads:?}"
+        );
+        assert!(
+            !uploads
+                .iter()
+                .any(|path| path.as_str().unwrap().ends_with(".json")),
+            "{uploads:?}"
+        );
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(evidence["geometry"].as_array().unwrap().len(), 11);
+        assert_eq!(
+            evidence["applied_corrections"].as_array().unwrap().len(),
+            10
+        );
+        assert_eq!(evidence["unmatched_footprints"][0]["designator"], "R1");
+        assert_eq!(
+            evidence["applied_corrections"][0],
+            orientation["applied_corrections"][0]
+        );
+        assert_eq!(evidence["policies"], orientation["policies"]);
+    }
+
+    /// #69: evidence that cannot be written leaves a warning, no path and
+    /// the package incomplete; the CPL and the counts stay. The evidence's
+    /// name is 13 bytes longer than the CPL's, so a 236-byte project name
+    /// puts it alone past the 255-byte file-name limit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn served_jlcpcb_package_warns_when_its_evidence_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = "m".repeat(236);
+        let (text, output) = served_package(dir.path(), &stem).await;
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["complete"], false, "{body:#}");
+        // The one warning, so it alone makes the package incomplete.
+        let warnings = body["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0]
+                .as_str()
+                .unwrap()
+                .starts_with("Placement orientation evidence was not written"),
+            "{warnings:#?}"
+        );
+        let orientation = &body["placement_orientation"];
+        assert!(orientation["evidence_path"].is_null(), "{orientation:#}");
+        assert_eq!(orientation["geometry_count"], 11);
+        assert!(
+            body["files"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(format!("CPL-{stem}.csv"))),
+            "{body:#}"
+        );
+        assert!(!output.join(format!("CPL-{stem}.orientation.json")).exists());
+    }
+
     #[test]
     fn native_union_uses_board_boxes_and_integer_nanometres() {
         let boxes = [

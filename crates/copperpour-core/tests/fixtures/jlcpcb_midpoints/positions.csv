@@ -1,0 +1,12 @@
+Ref,Val,Package,PosX,PosY,Rot,Side
+"JB0","header","PinHeader_1x02_P2.54mm_Vertical",20.000000,-20.000000,0.000000,bottom
+"JB1","header","PinHeader_1x02_P2.54mm_Vertical",30.000000,-20.000000,90.000000,bottom
+"JB2","header","PinHeader_1x02_P2.54mm_Vertical",40.000000,-20.000000,180.000000,bottom
+"JB3","header","PinHeader_1x02_P2.54mm_Vertical",50.000000,-20.000000,-90.000000,bottom
+"JB4","header","PinHeader_1x02_P2.54mm_Vertical",60.000000,-20.000000,45.000000,bottom
+"JF0","header","PinHeader_1x02_P2.54mm_Vertical",20.000000,-20.000000,0.000000,top
+"JF1","header","PinHeader_1x02_P2.54mm_Vertical",30.000000,-20.000000,90.000000,top
+"JF2","header","PinHeader_1x02_P2.54mm_Vertical",40.000000,-20.000000,180.000000,top
+"JF3","header","PinHeader_1x02_P2.54mm_Vertical",50.000000,-20.000000,-90.000000,top
+"JF4","header","PinHeader_1x02_P2.54mm_Vertical",60.000000,-20.000000,45.000000,top
+"R1","10k","R_0805_2012Metric",80.000000,-20.000000,0.000000,top

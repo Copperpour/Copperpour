@@ -116,8 +116,8 @@ can still leave a partial directory.
 
 For JLCPCB assembly, open the exact target board with IPC enabled before export.
 The package uses a stable live board snapshot and native pad-box midpoints;
-`placement_orientation.geometry` records the observed source. Saved project
-settings and schematic BOM remain separate inputs. Review legacy position
+the `geometry` of its placement evidence file records the observed source.
+Saved project settings and schematic BOM remain separate inputs. Review legacy position
 offsets that compensated for anchors before retaining them. Read
 `docs/JLCPCB_CPL_CORRECTIONS.md` for coordinates, refusals, and migration details.
 
@@ -134,8 +134,11 @@ policy. Pass a checked-in project policy through
 designator needs a correction. The precedence and JSON format are documented in
 `docs/JLCPCB_CPL_CORRECTIONS.md`.
 
-Inspect **placement_orientation.applied_corrections** and
-**placement_orientation.unmatched_footprints**. **complete: true** proves the
+Inspect the applied corrections and the unmatched footprints in the placement
+evidence file, the JSON beside the CPL that **placement_orientation.evidence_path**
+names. The response counts each list and shows the first `limit`
+**placement_orientation.applied_corrections**; the file holds them all, with
+**unmatched_footprints**. **complete: true** proves the
 package is structurally complete; it does **not** prove physical placement
 orientation. Require **placement_orientation.status == "PREVIEW_REQUIRED"** to
 be discharged by inspecting every component in JLCPCB Component Placements
