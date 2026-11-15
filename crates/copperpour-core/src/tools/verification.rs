@@ -1030,19 +1030,6 @@ fn ui_running(process_detected: bool, ipc_responsive: bool) -> bool {
     process_detected || ipc_responsive
 }
 
-/// Resolve the KiCAD binary path from config or well-known locations.
-fn find_kicad_binary(config_binary: &str, config_cli: &str) -> String {
-    crate::kicad_install::find_gui(config_binary, config_cli)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "windows") {
-                "kicad.exe".to_string()
-            } else {
-                "kicad".to_string()
-            }
-        })
-}
-
 fn health_timeout_seconds(args: &serde_json::Value) -> Result<u64, CallToolResult> {
     let timeout = match args.get("timeout_seconds") {
         None | Some(serde_json::Value::Null) => 5,
@@ -1130,7 +1117,8 @@ async fn handle_launch_kicad_ui(
 ) -> anyhow::Result<CallToolResult> {
     let wait_ready = args["wait_ready"].as_bool().unwrap_or(true);
     let timeout_secs = args["timeout_seconds"].as_u64().unwrap_or(30);
-    let binary = find_kicad_binary(&ctx.config.kicad_binary, &ctx.config.kicad_cli);
+    let binary =
+        crate::kicad_install::gui_or_default(&ctx.config.kicad_binary, &ctx.config.kicad_cli);
 
     let mut cmd = std::process::Command::new(&binary);
     if let Some(project) = args["project"].as_str() {

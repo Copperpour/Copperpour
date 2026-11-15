@@ -11,7 +11,14 @@ use std::{
 pub(super) struct ViewerRegistry(tokio::sync::Mutex<HashMap<PathBuf, BrowserViewer>>);
 
 impl ViewerRegistry {
-    pub async fn open(&self, root: &Path, cli: &str) -> Result<(String, bool), String> {
+    /// `cli` and `kicad_binary` are the configured values; Open in KiCAD runs
+    /// the GUI `launch_kicad_ui` would.
+    pub async fn open(
+        &self,
+        root: &Path,
+        cli: &str,
+        kicad_binary: &str,
+    ) -> Result<(String, bool), String> {
         // Serialize starts as well as lookups: concurrent calls must not create
         // two instances for one root. Cancelled startup is owned by BrowserViewer.
         let mut viewers = self.0.lock().await;
@@ -21,12 +28,15 @@ impl ViewerRegistry {
         if let Some(viewer) = viewers.remove(root) {
             viewer.shutdown().await;
         }
+        // From the configured CLI, not the fallback below, as `launch_kicad_ui` resolves it.
+        let kicad = crate::kicad_install::gui_or_default(kicad_binary, cli);
         let cli = if cli.is_empty() {
             copperpour_viewer::resolve_kicad_cli(None)
         } else {
             cli.to_owned()
         };
-        let viewer = BrowserViewer::start(root, &cli, Duration::from_secs(30)).await?;
+        let viewer =
+            BrowserViewer::start_with_kicad(root, &cli, kicad, Duration::from_secs(30)).await?;
         let url = viewer.url.clone();
         viewers.insert(root.to_owned(), viewer);
         Ok((url, false))
@@ -106,9 +116,12 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
         (dir, root, cli.to_string_lossy().into_owned())
     }
     async fn handler(cli: String) -> McpHandler {
+        handler_with_kicad(cli, String::new()).await
+    }
+    async fn handler_with_kicad(cli: String, kicad_binary: String) -> McpHandler {
         McpHandler::new(ServerConfig {
             kicad_cli: cli,
-            kicad_binary: String::new(),
+            kicad_binary,
             ipc_address: String::new(),
             project_dir: None,
             jlcpcb_db_path: None,
@@ -126,14 +139,54 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
         assert_ne!(response["result"]["isError"], true, "{response}");
         serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
     }
-    async fn state(url: &str) -> String {
+    /// One request to the viewer at `url`, with its credential; returns the raw response.
+    async fn request(url: &str, method: &str, route: &str, body: Option<Value>) -> String {
         let (base, token) = url.split_once("/#token=").unwrap();
         let address = base.strip_prefix("http://").unwrap();
+        let body = body.map(|body| body.to_string()).unwrap_or_default();
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
-        stream.write_all(format!("GET /state HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        stream.write_all(format!("{method} {route} HTTP/1.1\r\nHost: {address}\r\nOrigin: {base}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).await.unwrap();
         response
+    }
+    async fn state(url: &str) -> String {
+        request(url, "GET", "/state", None).await
+    }
+    /// #500: Open in KiCAD runs the configured `kicad_binary`, as `launch_kicad_ui` does.
+    #[tokio::test]
+    async fn browser_mcp_open_in_kicad_runs_the_configured_kicad_binary() {
+        let (dir, root, cli) = fixture();
+        let args = dir.path().join("kicad.args");
+        let kicad = dir.path().join("configured-kicad");
+        std::fs::write(
+            &kicad,
+            format!("#!/bin/sh\necho \"$@\" > '{}'\nsleep 3\n", args.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&kicad, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let handler = handler_with_kicad(cli, kicad.to_string_lossy().into_owned()).await;
+        let opened = body(&call(&handler, json!({"schematic":root,"open_browser":false})).await);
+        let root = root.canonicalize().unwrap();
+        let response = request(
+            opened["url"].as_str().unwrap(),
+            "POST",
+            "/open-in-kicad",
+            Some(json!({ "file": root })),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let launched = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match std::fs::read_to_string(&args) {
+                    Ok(text) if text.ends_with('\n') => break text,
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("the configured kicad_binary never ran");
+        assert_eq!(launched.trim_end(), root.to_str().unwrap());
     }
     #[tokio::test]
     async fn browser_mcp_reuses_canonical_root_serves_data_and_stops_with_context() {
@@ -197,12 +250,12 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
         let (_other, other_root, _) = fixture();
         let registry = ViewerRegistry::default();
         assert!(registry
-            .open(&root, "/nonexistent/kicad-cli")
+            .open(&root, "/nonexistent/kicad-cli", "kicad")
             .await
             .is_err());
-        let (url, reused) = registry.open(&root, &cli).await.unwrap();
+        let (url, reused) = registry.open(&root, &cli, "").await.unwrap();
         assert!(!reused);
-        let (other_url, reused) = registry.open(&other_root, &cli).await.unwrap();
+        let (other_url, reused) = registry.open(&other_root, &cli, "").await.unwrap();
         assert!(!reused);
         assert_ne!(url, other_url);
     }
@@ -210,7 +263,7 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
     async fn browser_registry_replaces_stopped_service_that_remains_in_map() {
         let (_dir, root, cli) = fixture();
         let registry = ViewerRegistry::default();
-        let (url, reused) = registry.open(&root, &cli).await.unwrap();
+        let (url, reused) = registry.open(&root, &cli, "").await.unwrap();
         assert!(!reused);
         {
             let viewers = registry.0.lock().await;
@@ -232,7 +285,7 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
         .await
         .expect("stopped service releases its listener while still registered");
         assert!(registry.0.lock().await.contains_key(&root));
-        let (new_url, reused) = registry.open(&root, &cli).await.unwrap();
+        let (new_url, reused) = registry.open(&root, &cli, "").await.unwrap();
         assert!(!reused);
         assert_ne!(url, new_url);
         assert!(state(&new_url).await.starts_with("HTTP/1.1 200"));

@@ -82,7 +82,8 @@ impl BrowserViewer {
     pub async fn start(root: &Path, cli: &str, render_timeout: Duration) -> Result<Self, String> {
         Self::start_with_kicad(root, cli, crate::resolve_kicad_binary(), render_timeout).await
     }
-    async fn start_with_kicad(
+    /// As [`Self::start`], with Open in KiCAD running `kicad`.
+    pub async fn start_with_kicad(
         root: &Path,
         cli: &str,
         kicad: String,
