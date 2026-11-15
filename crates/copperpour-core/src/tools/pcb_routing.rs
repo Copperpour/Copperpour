@@ -2919,6 +2919,12 @@ async fn handle_route_diff_pair(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    if net_neg == net_pos {
+        return Ok(invalid_arg(
+            "net_neg",
+            &format!("must differ from net_pos ('{net_pos}'). The board is unchanged."),
+        ));
+    }
     let layer = match super::pcb_board::copper_layer_arg(args, Some("F.Cu")) {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -2950,10 +2956,11 @@ async fn handle_route_diff_pair(
     let perp_x = -dy / len * offset;
     let perp_y = dx / len * offset;
 
+    let board = get_path(args, "board")?;
     let np_ipc = net_pos.clone();
     let nn_ipc = net_neg.clone();
     let layer_ipc = layer.clone();
-    let routed = ipc!(ctx, args, |c, document| {
+    let outcome = with_bound_board_ipc_classified(ctx, &board, move |c, document| {
         // Both nets must exist before either side is created.
         if let Some(refusal) = routing_preflight(
             c,
@@ -2963,22 +2970,47 @@ async fn handle_route_diff_pair(
         )? {
             return Ok(Err(refusal));
         }
-        c.add_tracks_in(
-            document.clone(),
-            &np_ipc,
-            &layer_ipc,
-            width,
-            &[(x1 + perp_x, y1 + perp_y, x2 + perp_x, y2 + perp_y)],
-        )?;
-        c.add_tracks_in(
-            document,
-            &nn_ipc,
-            &layer_ipc,
-            width,
-            &[(x1 - perp_x, y1 - perp_y, x2 - perp_x, y2 - perp_y)],
-        )?;
+        let sides = [
+            (
+                &np_ipc,
+                c.resolve_net_code_in(document.clone(), &np_ipc)?,
+                (x1 + perp_x, y1 + perp_y, x2 + perp_x, y2 + perp_y),
+            ),
+            (
+                &nn_ipc,
+                c.resolve_net_code_in(document.clone(), &nn_ipc)?,
+                (x1 - perp_x, y1 - perp_y, x2 - perp_x, y2 - perp_y),
+            ),
+        ];
+        let items = sides
+            .into_iter()
+            .map(|(net, code, (x1, y1, x2, y2))| {
+                let track = copperpour_ipc::builders::build_track(
+                    net, code, &layer_ipc, width, x1, y1, x2, y2,
+                );
+                copperpour_ipc::builders::pack_any(&track, "kiapi.board.types.Track")
+            })
+            .collect();
+        // KiCad keeps the items of a CreateItems it accepts even when it
+        // refuses others (`handleCreateUpdateItemsInternal` in
+        // `pcbnew/api/api_handler_pcb.cpp`), so both sides go in one inside one
+        // commit: a refused side drops the commit, and a pair is one undo step.
+        c.run_commit("Route differential pair", |c| {
+            c.create_items_in(document, items)
+        })?;
         Ok(Ok(()))
-    });
+    })
+    .await?;
+    let routed = match outcome {
+        Ok(BoardBinding::Bound(routed)) => routed,
+        Ok(BoardBinding::Unserved { message, .. }) => {
+            return Ok(CallToolResult::error(format!(
+                "KiCAD must be running with the board loaded (IPC error: {message})"
+            )))
+        }
+        // A commit whose drop KiCad did not confirm is ipc_outcome_unknown.
+        Err(failure) => return Ok(crate::tools::ipc_failure_result(failure)),
+    };
     if let Err(refusal) = routed {
         return Ok(refusal);
     }
