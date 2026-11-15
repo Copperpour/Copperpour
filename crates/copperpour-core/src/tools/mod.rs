@@ -26,6 +26,7 @@ pub mod design_review;
 #[cfg(test)]
 mod design_rules_tests;
 pub(crate) mod drc;
+mod drc_severity;
 #[cfg(feature = "jlcpcb")]
 pub mod easyeda;
 pub mod editor_navigation;

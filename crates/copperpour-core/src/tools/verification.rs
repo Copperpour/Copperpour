@@ -65,6 +65,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_run_drc(args, ctx).await }
         ),
+        super::drc_severity::tool(),
         tool!(
             "set_design_rules",
             "Set board-level design rules (clearance, trace width, via size, via annular width, \
