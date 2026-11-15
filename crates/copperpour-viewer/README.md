@@ -27,7 +27,9 @@ selection, manual refresh and explicit KiCad launch are available.
 
 `BrowserViewer::start` takes the root path, an explicit CLI executable and a
 positive per-render timeout. It binds IPv4 loopback on an ephemeral port and
-returns a handle and credential URL; it does not launch a browser. Drop signals
+returns a handle and credential URL; it does not launch a browser.
+`BrowserViewer::start_with_kicad` also takes the KiCad executable that Open in
+KiCAD runs; `start` uses `resolve_kicad_binary()`. Drop signals
 shutdown; `request_shutdown()` signals stop while retaining the handle, and
 `shutdown().await` also waits for the render worker and HTTP service.
 Accepted HTTP/1 connections are owned tasks, with one second to drain before

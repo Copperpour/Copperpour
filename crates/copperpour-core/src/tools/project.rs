@@ -577,7 +577,11 @@ async fn handle_open_viewer(
             )))
         }
     };
-    let (url, reused) = match ctx.viewers.open(&root, &ctx.config.kicad_cli).await {
+    let (url, reused) = match ctx
+        .viewers
+        .open(&root, &ctx.config.kicad_cli, &ctx.config.kicad_binary)
+        .await
+    {
         Ok(viewer) => viewer,
         Err(error) => {
             return Ok(CallToolResult::error(format!(
