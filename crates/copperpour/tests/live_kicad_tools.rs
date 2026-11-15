@@ -1082,3 +1082,149 @@ fn pcb_text_edits_round_trip_through_live_kicad() {
     let at = saved_text.find("at").expect("saved text has no position");
     assert_eq!((at.get_f64(1), at.get_f64(2)), (Some(62.0), Some(52.0)));
 }
+
+/// A live field's glyph size and stroke width, in nm, as KiCad reports them.
+fn live_field_style(field: Option<&kiapi::board::types::Field>) -> (i64, i64, i64) {
+    let attributes = field
+        .and_then(|field| field.text.as_ref())
+        .and_then(|text| text.text.as_ref())
+        .and_then(|text| text.attributes.as_ref())
+        .expect("the field has no text attributes");
+    let size = attributes.size.as_ref().expect("the field has no size");
+    let stroke = attributes
+        .stroke_width
+        .as_ref()
+        .expect("the field has no stroke width");
+    (size.x_nm, size.y_nm, stroke.value_nm)
+}
+
+/// `set_footprint_field_style` against a real KiCad (#520): the Reference
+/// fields of two placed footprints get one size and thickness in one call.
+/// KiCad's own readback must show the request, asking again must send
+/// nothing, the Value fields and the footprints' pose and pads must not move,
+/// and a KiCad save must write the style. KiCad 10.0.8 refuses a commit with
+/// no document header while more than one editor is open, so this also proves
+/// the commit names its board.
+///
+/// It places two resistors, so run it against a fresh disposable board:
+///
+/// ```text
+/// KICAD_API_SOCKET=… COPPERPOUR_LIVE_KICAD_BOARD=… \
+///   cargo test -p copperpour --test live_kicad_tools -- --ignored --nocapture \
+///   footprint_field_style_round_trips_through_live_kicad
+/// ```
+#[test]
+#[ignore = "requires a running KiCad GUI, API socket, disposable open board, and standard footprint libraries"]
+fn footprint_field_style_round_trips_through_live_kicad() {
+    let board = std::path::PathBuf::from(
+        test_env("LIVE_KICAD_BOARD")
+            .expect("COPPERPOUR_LIVE_KICAD_BOARD must name the disposable open board"),
+    );
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let references = ["R921", "R922"];
+
+    let ipc = KiCadIpcClient::new(&socket);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match ipc.find_open_board(&board) {
+            Ok(_) => break,
+            Err(error)
+                if error.to_string().contains("AS_NOT_READY")
+                    && std::time::Instant::now() < deadline => {}
+            Err(error) => panic!("KiCad did not open the disposable board: {error:#}"),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let mut mcp = McpProcess::spawn(&socket);
+    for toolset in ["pcb_components", "pcb_text"] {
+        mcp.tool("load_toolset", json!({"name": toolset}));
+    }
+    for (index, reference) in references.iter().enumerate() {
+        let placed = tool_body(&mcp.tool(
+            "place_component",
+            json!({
+                "board": board,
+                "footprint": "Resistor_SMD:R_0402_1005Metric",
+                "reference": reference,
+                "x": 70.0 + 5.0 * index as f64,
+                "y": 40.0,
+                "rotation": 0.0,
+                "layer": "F.Cu"
+            }),
+        ));
+        assert_eq!(placed["placed"], *reference, "{placed}");
+    }
+    let pristine: Vec<_> = references
+        .iter()
+        .map(|reference| live_footprint(&ipc, &board, reference))
+        .collect();
+
+    let request = json!({
+        "board": board, "references": references, "fields": ["reference"],
+        "size_x": 1.1, "size_y": 1.2, "thickness": 0.2
+    });
+    let body = tool_body(&mcp.tool("set_footprint_field_style", request.clone()));
+    println!("set_footprint_field_style: {body}");
+    assert_eq!(body["status"], "applied", "{body}");
+    assert_eq!(body["source"], "ipc", "{body}");
+    assert_eq!(body["undo"], "one KiCad undo step", "{body}");
+    assert_eq!(body["fallback_reason"], Value::Null, "{body}");
+    assert_eq!(body["skipped"], json!([]), "{body}");
+    assert_eq!(body["count"], 2, "{body}");
+    let fields = body["fields"].as_array().unwrap();
+    for (field, reference) in fields.iter().zip(references) {
+        assert_eq!(field["footprint"], reference, "{body}");
+        assert_eq!(field["field"], "reference", "{body}");
+        assert_mm(&field["after"], "size_x_mm", 1.1);
+        assert_mm(&field["after"], "size_y_mm", 1.2);
+        assert_mm(&field["after"], "thickness_mm", 0.2);
+    }
+
+    let again = tool_body(&mcp.tool("set_footprint_field_style", request));
+    assert_eq!(
+        again["status"], "unchanged",
+        "asking again must send nothing: {again}"
+    );
+
+    // KiCad's own readback: the Reference fields changed, nothing else did.
+    for (reference, before) in references.iter().zip(&pristine) {
+        let live = live_footprint(&ipc, &board, reference);
+        assert_eq!(
+            live_field_style(live.reference_field.as_ref()),
+            (1_100_000, 1_200_000, 200_000),
+            "{reference}'s Reference field"
+        );
+        assert_eq!(
+            live.value_field, before.value_field,
+            "{reference}'s Value field moved"
+        );
+        assert_eq!(live.id, before.id, "{reference}'s KIID changed");
+        assert_eq!(live.position, before.position);
+        assert_eq!(live.orientation, before.orientation);
+        assert_eq!(live.layer, before.layer);
+        assert_eq!(footprint_pads(&live), footprint_pads(before));
+    }
+
+    // A KiCad save writes the style.
+    ipc.save_board().expect("failed to save live board");
+    let tree = parse_sexp(&std::fs::read_to_string(&board).unwrap()).unwrap();
+    for reference in references {
+        let saved = footprint(&tree, reference);
+        let font = saved
+            .find_all("property")
+            .into_iter()
+            .find(|property| property.get(1).and_then(SexpNode::as_str) == Some("Reference"))
+            .and_then(|property| property.find("effects"))
+            .and_then(|effects| effects.find("font"))
+            .unwrap_or_else(|| panic!("{reference}'s saved Reference has no font"));
+        // KiCad writes `(size <height> <width>)`.
+        let size = font.find("size").expect("saved font has no size");
+        assert_eq!((size.get_f64(1), size.get_f64(2)), (Some(1.2), Some(1.1)));
+        assert_eq!(
+            font.find("thickness")
+                .and_then(|thickness| thickness.get_f64(1)),
+            Some(0.2)
+        );
+    }
+}
