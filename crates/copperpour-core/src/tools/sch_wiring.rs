@@ -2426,22 +2426,25 @@ async fn handle_rotate_label(
     let (block_start, block_end) = find_balanced_block(&content, label.start)
         .ok_or_else(|| anyhow::anyhow!("Cannot parse label block"))?;
     let block = &content[block_start..block_end];
+    // The label's own children, never a text match: the name, or a global
+    // label's Intersheetrefs field, can hold `(at `, `(justify ` or `(uuid`
+    // too, and editing that text renames the label and leaves it unturned
+    // (#94).
+    let child = |source: &str, parent: &str, tag: &str| {
+        copperpour_sexp::writer::direct_children_with_tag(source, parent, tag)
+            .into_iter()
+            .next()
+    };
 
     let mut edits = Vec::new();
 
     // 1. The (at X Y ROT) anchor.
-    let at_rel = block
-        .find("(at ")
-        .ok_or_else(|| anyhow::anyhow!("No (at) in label block"))?;
-    let at_val = block_start + at_rel + "(at ".len();
-    let at_close = content[at_val..]
-        .find(')')
-        .map(|o| at_val + o)
-        .ok_or_else(|| anyhow::anyhow!("Malformed (at)"))?;
+    let (at_start, at_end) =
+        child(block, label.kind, "at").ok_or_else(|| anyhow::anyhow!("No (at) in label block"))?;
     edits.push(SexpEdit::replace(
-        at_val,
-        at_close,
-        format!("{x} {y} {rotation}"),
+        block_start + at_start,
+        block_start + at_end,
+        format!("(at {x} {y} {rotation})"),
     ));
 
     // 2. The justify, which is what actually turns the text — rotating the
@@ -2455,26 +2458,30 @@ async fn handle_rotate_label(
         format!("(justify {justify})")
     };
 
-    if let Some(j_rel) = block.find("(justify ") {
+    let effects = child(block, label.kind, "effects");
+    let justify = effects.and_then(|(e_start, e_end)| {
+        child(&block[e_start..e_end], "effects", "justify")
+            .map(|(j_start, j_end)| (e_start + j_start, e_start + j_end))
+    });
+    if let Some((j_start, j_end)) = justify {
         // Replace the existing justify in place.
-        let j_start = block_start + j_rel;
-        let j_end = find_balanced_block(&content, j_start)
-            .map(|(_, e)| e)
-            .ok_or_else(|| anyhow::anyhow!("Malformed (justify)"))?;
-        edits.push(SexpEdit::replace(j_start, j_end, justify_sexp));
-    } else if let Some(e_rel) = block.find("(effects") {
+        edits.push(SexpEdit::replace(
+            block_start + j_start,
+            block_start + j_end,
+            justify_sexp,
+        ));
+    } else if let Some((_, e_end)) = effects {
         // An effects block with no justify — add one just inside it.
-        let e_start = block_start + e_rel;
-        let (_, e_end) = find_balanced_block(&content, e_start)
-            .ok_or_else(|| anyhow::anyhow!("Malformed (effects)"))?;
-        edits.push(SexpEdit::insert(e_end - 1, format!(" {justify_sexp}")));
+        edits.push(SexpEdit::insert(
+            block_start + e_end - 1,
+            format!(" {justify_sexp}"),
+        ));
     } else {
         // No effects at all — the shape add_schematic_net_label used to write.
         // Insert a complete block where eeschema puts it: before the uuid,
         // matching that line's indentation.
-        let insert_at = block
-            .find("(uuid")
-            .map(|r| block_start + r)
+        let insert_at = child(block, label.kind, "uuid")
+            .map(|(start, _)| block_start + start)
             .unwrap_or(block_end - 1);
         let line_start = content[..insert_at]
             .rfind('\n')

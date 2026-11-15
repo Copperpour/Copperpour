@@ -1102,8 +1102,9 @@ fn is_deletable_schematic_tag(tag: &str) -> bool {
 /// `sym_start..sym_end` by `(ddx, ddy)`.
 ///
 /// A property's own rotation is left untouched: a translation does not turn
-/// text. Block starts come from `find_block_starts`, which is string-aware, so
-/// a property *value* containing `(property` cannot be mistaken for one.
+/// text. Each property is a direct child of the symbol, and its anchor the
+/// direct `(at …)` child of the property, so a name or value containing
+/// `(property` or `(at ` is never taken for one (#94).
 fn property_translation_edits(
     content: &str,
     sym_start: usize,
@@ -1111,28 +1112,23 @@ fn property_translation_edits(
     ddx: f64,
     ddy: f64,
 ) -> Vec<SexpEdit> {
+    use copperpour_sexp::writer::direct_children_with_tag;
     if ddx == 0.0 && ddy == 0.0 {
         return Vec::new();
     }
+    let symbol = &content[sym_start..sym_end];
     let mut edits = Vec::new();
-    for prop_start in copperpour_sexp::writer::find_block_starts(content, "property") {
-        if prop_start < sym_start || prop_start >= sym_end {
-            continue;
-        }
-        let Some((_, prop_end)) = copperpour_sexp::writer::find_balanced_block(content, prop_start)
+    for (prop_start, prop_end) in direct_children_with_tag(symbol, "symbol", "property") {
+        let prop = &symbol[prop_start..prop_end];
+        let Some((at_start, at_end)) = direct_children_with_tag(prop, "property", "at")
+            .into_iter()
+            .next()
         else {
             continue;
         };
-        let prop = &content[prop_start..prop_end];
-        // The property's own (at …), not one nested deeper in (effects …).
-        let Some(at_rel) = prop.find("(at ") else {
-            continue;
-        };
-        let at_abs = prop_start + at_rel + "(at ".len();
-        let Some(close_rel) = prop[at_rel..].find(')') else {
-            continue;
-        };
-        let at_end = prop_start + at_rel + close_rel;
+        // Between the `(at` head and the closing parenthesis.
+        let at_abs = sym_start + prop_start + at_start + "(at".len();
+        let at_end = sym_start + prop_start + at_end - 1;
         let parts: Vec<&str> = content[at_abs..at_end].split_whitespace().collect();
         let (Some(px), Some(py)) = (
             parts.first().and_then(|s| s.parse::<f64>().ok()),
@@ -1145,7 +1141,7 @@ fn property_translation_edits(
             at_abs,
             at_end,
             format!(
-                "{} {} {rot}",
+                " {} {} {rot}",
                 cse::types::fmt_f64(px + ddx),
                 cse::types::fmt_f64(py + ddy)
             ),
@@ -1194,19 +1190,19 @@ async fn handle_bulk_move(
 
         let mut placements: Vec<serde_json::Value> = Vec::new();
         for (sym_start, sym_end) in blocks {
-            // Find first (at X Y [ROT]) inside this symbol block
+            // The symbol's own (at X Y [ROT]): its direct child, not the
+            // first `(at ` in the text, which a lib_id can hold (#94).
             let sym_block = &content[sym_start..sym_end];
-            let at_pat = "(at ";
-            let at_rel = match sym_block.find(at_pat) {
-                Some(r) => r,
-                None => {
-                    errors.push(format!("No (at) in symbol '{}'", reference));
-                    continue;
-                }
+            let Some((at_rel, at_close)) =
+                copperpour_sexp::writer::direct_children_with_tag(sym_block, "symbol", "at")
+                    .into_iter()
+                    .next()
+            else {
+                errors.push(format!("No (at) in symbol '{}'", reference));
+                continue;
             };
-            let at_abs = sym_start + at_rel + at_pat.len();
-            let close_rel = sym_block[at_rel..].find(')').unwrap_or(0);
-            let at_end = sym_start + at_rel + close_rel;
+            let at_abs = sym_start + at_rel + "(at".len();
+            let at_end = sym_start + at_close - 1;
 
             let at_str = &content[at_abs..at_end];
             let parts: Vec<&str> = at_str.split_whitespace().collect();
@@ -1227,7 +1223,7 @@ async fn handle_bulk_move(
             edits.push(SexpEdit::replace(
                 at_abs,
                 at_end,
-                format!("{new_x} {new_y} {rot}"),
+                format!(" {new_x} {new_y} {rot}"),
             ));
             // Property coordinates are ABSOLUTE in .kicad_sch, so the field
             // text does not follow the symbol on its own — moving only the
