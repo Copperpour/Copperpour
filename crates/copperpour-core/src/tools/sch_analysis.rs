@@ -8,9 +8,9 @@ use crate::tool;
 use crate::tools::reference_hint::component_not_found;
 use crate::tools::sch_connectivity::{label_roots, net_graph_for, pt_key, ConnectivityIndex};
 use crate::tools::{
-    get_path, is_power_symbol_reference, opt_f64, opt_positive_f64, placed_pins_by_reference,
-    require_f64, require_str, resolved_placed_pins_by_reference, PlacedPins, ToolContext, ToolDef,
-    UNRESOLVED_PIN_GEOMETRY,
+    get_path, invalid_arg, is_power_symbol_reference, opt_f64, opt_positive_f64,
+    placed_pins_by_reference, require_f64, require_str, resolved_placed_pins_by_reference,
+    PlacedPins, ToolContext, ToolDef, UNRESOLVED_PIN_GEOMETRY,
 };
 use copperpour_schematic_editor as cse;
 use copperpour_sexp::{
@@ -274,6 +274,37 @@ async fn handle_list_labels(
     ))
 }
 
+/// Refuse a net name that no label or power symbol on this sheet spells.
+///
+/// The tools that take a net by name find it through its labels, and a name
+/// matching none came back as a net with nothing on it: a success no caller
+/// could tell from a real net with no pins. KiCad's netlist puts a local
+/// label's sheet path before its name (`/SDA`) and names a net with no label
+/// after one of its pins (`Net-(R1-Pad2)`), so a name copied from it misses.
+/// The refusal offers the name here that differs only by that path or by
+/// case.
+fn unknown_net(net: &str, labels: &[Label]) -> Option<CallToolResult> {
+    if labels.iter().any(|label| label.net == net) {
+        return None;
+    }
+    let bare = net.rsplit('/').next().unwrap_or(net);
+    let near: BTreeSet<&str> = labels
+        .iter()
+        .map(|label| label.net.as_str())
+        .filter(|name| name.eq_ignore_ascii_case(net) || name.eq_ignore_ascii_case(bare))
+        .collect();
+    let mut reason = format!("no label or power symbol on this sheet names net '{net}'");
+    if !near.is_empty() {
+        let near: Vec<String> = near.iter().map(|name| format!("'{name}'")).collect();
+        reason.push_str(&format!(" (did you mean {}?)", near.join(" or ")));
+    }
+    reason.push_str(
+        ". list_schematic_nets lists the names on this sheet; a net with no label or \
+         power symbol has none, and get_connected_items or trace_from_point reach it",
+    );
+    Some(invalid_arg("net", &reason))
+}
+
 async fn handle_get_net_connections(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -293,6 +324,9 @@ async fn handle_get_net_connections(
     };
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
+    if let Some(refusal) = unknown_net(&net, &labels) {
+        return Ok(refusal);
+    }
     let mut g = net_graph_for(&tree, &wires, &labels);
     // The net is its roots, not its name: one net can carry several names, and
     // its labels are every label on those roots, whichever name each spells.
@@ -340,6 +374,9 @@ async fn handle_get_net_connectivity(
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
+    if let Some(refusal) = unknown_net(&net, &labels) {
+        return Ok(refusal);
+    }
     let mut g = net_graph_for(&tree, &wires, &labels);
     let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
     let net_wires: Vec<_> = wires
@@ -443,6 +480,9 @@ async fn handle_get_net_components(
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
+    if let Some(refusal) = unknown_net(&net, &labels) {
+        return Ok(refusal);
+    }
     let mut g = net_graph_for(&tree, &wires, &labels);
     let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
     let result: Vec<serde_json::Value> = placed_pins_by_reference(&tree)
@@ -2836,7 +2876,7 @@ mod multi_unit_tool_tests {
 /// `two_name_nets.README.md`; every expectation below is that table.
 #[cfg(test)]
 mod two_name_net_tests {
-    use super::tool_call_support::{call, call_at, net_pins};
+    use super::tool_call_support::{call, call_at, call_result, net_pins};
     use super::*;
 
     const SCH: &str = include_str!("../../tests/fixtures/two_name_nets.kicad_sch");
@@ -2994,6 +3034,71 @@ mod two_name_net_tests {
             .map(|component| component["reference"].as_str().unwrap())
             .collect();
         assert_eq!(components, ["TP9"], "{items}");
+    }
+
+    const NAMED_NET_TOOLS: [&str; 3] = [
+        "get_net_connections",
+        "get_net_connectivity",
+        "get_net_components",
+    ];
+
+    /// A name no label or power symbol on the sheet spells is refused, not
+    /// answered as a net with nothing on it: a typo, KiCad's netlist name for
+    /// the local `SDA` net, the same in another case, and the name KiCad's
+    /// netlist gives the `TP8`–`TP9` net, which nothing on the sheet names.
+    #[tokio::test]
+    async fn a_name_nothing_on_the_sheet_spells_is_refused() {
+        for tool in NAMED_NET_TOOLS {
+            for (net, offered) in [
+                ("NOPE", ""),
+                ("/SDA", " (did you mean 'SDA'?)"),
+                ("sda", " (did you mean 'SDA'?)"),
+                ("Net-(TP8-Pad1)", ""),
+            ] {
+                let result = call_result(SCH, tool, json!({ "net": net })).await;
+                assert!(result.is_error, "{tool} answered '{net}' as a net");
+                let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                    panic!("expected text content");
+                };
+                let body: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(body["error"]["kind"], "invalid_argument", "{tool}: {body}");
+                assert_eq!(body["error"]["field"], "net", "{tool}: {body}");
+                // The name offered, or nothing, comes straight after the name.
+                let reason = body["error"]["reason"].as_str().unwrap();
+                assert!(
+                    reason.starts_with(&format!(
+                        "no label or power symbol on this sheet names net '{net}'{offered}. \
+                         list_schematic_nets lists the names on this sheet;"
+                    )),
+                    "{tool}: {body}"
+                );
+                assert_eq!(
+                    body["message"],
+                    format!("Argument 'net' is invalid: {reason}"),
+                    "{tool}"
+                );
+            }
+        }
+    }
+
+    /// Every name on the sheet still answers: the label names, the aliases a
+    /// net is not called by among them, and the power symbols' names.
+    #[tokio::test]
+    async fn every_name_on_the_sheet_is_answered() {
+        let listed = call(SCH, "list_schematic_nets", json!({})).await;
+        assert_eq!(
+            listed["nets"],
+            json!([
+                "+3V3", "+5V", "AAA", "ALT", "GND", "MIX", "MIX_H", "PULLUP", "RETURN", "SCL",
+                "SDA", "SYS", "VCC", "ZZZ"
+            ]),
+            "{listed}"
+        );
+        for tool in NAMED_NET_TOOLS {
+            for name in listed["nets"].as_array().unwrap() {
+                call(SCH, tool, json!({ "net": name })).await;
+            }
+        }
     }
 
     /// The 15 labels as Eeschema serialized them, read from the fixture text
