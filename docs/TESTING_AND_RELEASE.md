@@ -128,8 +128,8 @@ three PCM zips with `packaging/merge-pcm.py`, run
 them in one release. A failure in any build, on either side, or in the
 real-KiCad job means the release is not cut, so no partial set of assets is
 published. To check the macOS build before tagging, run `gh workflow run
-macos.yml --ref <candidate>` beside local CI's dry run. Nothing else runs
-macOS: PRs and `main` are not tested on it. Linux aarch64, which `release.yml` built on
+macos.yml --ref <candidate>` beside local CI's dry run. PRs and `main` run
+only its Check & Test job, as an optional check. Linux aarch64, which `release.yml` built on
 GitHub, is not built.
 
 In the PR description, list every command run and explicitly name checks skipped
