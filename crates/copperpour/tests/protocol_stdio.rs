@@ -232,6 +232,54 @@ fn handshake_baseline_and_full_registry_loads() {
     );
 }
 
+// #527: diagnostics must probe the configured executable, even when it cannot
+// launch, instead of substituting a different installed KiCad.
+#[test]
+fn installation_info_cli_keeps_missing_explicit_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("missing-kicad-cli");
+    for configured in [
+        missing.to_string_lossy().into_owned(),
+        " ./missing-kicad-cli ".to_string(),
+        tmp.path().to_string_lossy().into_owned(),
+    ] {
+        std::fs::write(
+            tmp.path().join("konnect.toml"),
+            format!("kicad_cli = {}\n", json!(configured)),
+        )
+        .unwrap();
+        let mut p = McpProcess::spawn_in_dir(Some(tmp.path()));
+        let result = p.call_tool("get_installation_info", json!({}));
+        assert_ne!(result["isError"], true, "{result}");
+        let body = McpProcess::tool_body(&result);
+        assert_eq!(body["kicad"]["cli_path"], configured.trim());
+        assert_eq!(body["kicad"]["probe_status"], "launch_failed");
+        assert!(body["kicad"]["version"].is_null());
+    }
+}
+
+#[test]
+fn installation_info_cli_probes_the_explicit_executable() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The server binary has a real --version command on every CI platform.
+    let executable = env!("CARGO_BIN_EXE_copperpour");
+    std::fs::write(
+        tmp.path().join("konnect.toml"),
+        format!("kicad_cli = {}\n", json!(executable)),
+    )
+    .unwrap();
+    let mut p = McpProcess::spawn_in_dir(Some(tmp.path()));
+    let result = p.call_tool("get_installation_info", json!({}));
+    assert_ne!(result["isError"], true, "{result}");
+    let body = McpProcess::tool_body(&result);
+    assert_eq!(body["kicad"]["cli_path"], executable);
+    assert_eq!(body["kicad"]["probe_status"], "ok");
+    assert_eq!(
+        body["kicad"]["version"],
+        format!("copperpour {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
 #[test]
 fn installation_info_reports_the_serving_process_without_leaking_endpoint_secrets() {
     let tmp = tempfile::tempdir().unwrap();
