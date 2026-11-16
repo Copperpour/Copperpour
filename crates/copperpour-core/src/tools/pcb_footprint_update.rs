@@ -1517,9 +1517,11 @@ fn build_updated_instance(
     let mut old_nets = BTreeMap::<String, kiapi::board::types::Net>::new();
     // The schematic pin each pad belongs to (pin function and type), which
     // Update PCB from Schematic writes and the library does not carry. KiCad's
-    // own footprint exchange copies it from each old pad to its matching new
-    // one (`PCB_EDIT_FRAME::ExchangeFootprint`); the first pad with a number
-    // speaks for it, as for the net.
+    // own footprint exchange copies it to each new pad from the old pad it
+    // pairs it with (`PCB_EDIT_FRAME::ExchangeFootprint`), pairing pads by
+    // number, position and padstack (`matchItemsBySimilarity`). This builder
+    // carries it by pad number alone, its rule for the net: where pads share
+    // a number, the first of them speaks for every new pad with that number.
     let mut old_pins = BTreeMap::<String, kiapi::board::types::SymbolPinInfo>::new();
     for item in &current_definition.items {
         if !item.type_url.ends_with("kiapi.board.types.Pad") {
@@ -2503,6 +2505,7 @@ mod tests {
 
     use copperpour_ipc::builders;
     use copperpour_ipc::gen::kiapi;
+    use kiapi::common::types::ElectricalPinType;
     use prost::Message;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -4453,6 +4456,166 @@ mod tests {
         assert_eq!(after, before, "nets and pins by pad number");
         assert_eq!(after["1"].1, pins.get("1").cloned());
         assert_eq!(after["3"].1, None, "a pad without a pin stays without one");
+    }
+
+    /// KiCad 10.0.8's own report of two stock footprints whose pads carry
+    /// schematic pins, and their stock library files
+    /// (`pin_functions_ipc.README.md`).
+    const PIN_FUNCTION_CAPTURES: [(&[u8], &str, &str, &str); 2] = [
+        (
+            include_bytes!("../../tests/fixtures/pin_functions_j1.ipc.bin"),
+            "Connector_PinHeader_2.54mm",
+            "PinHeader_1x03_P2.54mm_Vertical",
+            include_str!(
+                "../../tests/fixtures/pin_functions_pinheader_1x03_p2.54mm_vertical_kicad10.kicad_mod"
+            ),
+        ),
+        (
+            include_bytes!("../../tests/fixtures/pin_functions_j2.ipc.bin"),
+            "Connector_JST",
+            "JST_SH_SM02B-SRSS-TB_1x02-1MP_P1.00mm_Horizontal",
+            include_str!(
+                "../../tests/fixtures/pin_functions_jst_sh_sm02b-srss-tb_1x02-1mp_p1.00mm_horizontal_kicad10.kicad_mod"
+            ),
+        ),
+    ];
+
+    /// A capture as KiCad reported it, and the update its library builds.
+    fn pin_functions_refresh(
+        index: usize,
+    ) -> (
+        kiapi::board::types::FootprintInstance,
+        kiapi::board::types::FootprintInstance,
+    ) {
+        let (bytes, nickname, entry, source) = PIN_FUNCTION_CAPTURES[index];
+        let current = kiapi::board::types::FootprintInstance::decode(bytes).unwrap();
+        let id = current.definition.as_ref().unwrap().id.clone().unwrap();
+        assert_eq!(
+            (id.library_nickname.as_str(), id.entry_name.as_str()),
+            (nickname, entry)
+        );
+        let library = parse_library_footprint(&format!("{nickname}:{entry}"), source).unwrap();
+        let prepared = build_updated_instance(
+            &current,
+            &library,
+            two_layers(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            TextReset::default(),
+        )
+        .unwrap();
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        (current, updated)
+    }
+
+    /// `instance`'s pads in order as (number, net name, pin name, pin type,
+    /// no-connect), `None` for a pad without a schematic pin.
+    #[allow(clippy::type_complexity)]
+    fn pad_pin_list(
+        instance: &kiapi::board::types::FootprintInstance,
+    ) -> Vec<(String, String, Option<(String, ElectricalPinType, bool)>)> {
+        instance
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
+            .map(|item| {
+                let pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                let net = pad.net.map(|net| net.name).unwrap_or_default();
+                let pin = pad.symbol_pin.map(|pin| {
+                    let kind = ElectricalPinType::try_from(pin.r#type).unwrap();
+                    (pin.name, kind, pin.no_connect)
+                });
+                (pad.number, net, pin)
+            })
+            .collect()
+    }
+
+    fn pin(
+        name: &str,
+        kind: ElectricalPinType,
+        no_connect: bool,
+    ) -> Option<(String, ElectricalPinType, bool)> {
+        Some((name.to_string(), kind, no_connect))
+    }
+
+    /// KiCad's own J1, a stock 1x03 header with the pins `A_1`, `C_2`, `B_3`
+    /// (all passive): KiCad reports each pad's pin in `symbol_pin`, and a
+    /// refresh sends every one of them back unchanged, with the nets.
+    #[test]
+    fn a_refresh_keeps_kicads_own_pin_functions() {
+        let (current, updated) = pin_functions_refresh(0);
+        let expected = vec![
+            (
+                "1".to_string(),
+                "SIG_A".to_string(),
+                pin("A_1", ElectricalPinType::EptPassive, false),
+            ),
+            (
+                "2".to_string(),
+                "SIG_C".to_string(),
+                pin("C_2", ElectricalPinType::EptPassive, false),
+            ),
+            (
+                "3".to_string(),
+                "SIG_B".to_string(),
+                pin("B_3", ElectricalPinType::EptPassive, false),
+            ),
+        ];
+        assert_eq!(pad_pin_list(&current), expected, "as KiCad reported J1");
+        assert_eq!(pad_pin_list(&updated), expected, "as the refresh sends J1");
+    }
+
+    /// KiCad's own J2, a stock JST SH with two `MP` pads: an unconnected
+    /// pin (`passive+no_connect` in the board file) reaches the refresh as
+    /// `no_connect` and keeps it. The two `MP` pads were given different pins
+    /// by hand; the refresh carries pins by pad number, so the first `MP`
+    /// pad's pin goes to both. (KiCad's exchange pairs them by position too,
+    /// so there each would keep its own; Update PCB gives both the same.)
+    #[test]
+    fn a_refresh_keeps_a_no_connect_and_carries_a_shared_numbers_first_pin() {
+        let (current, updated) = pin_functions_refresh(1);
+        let passive = ElectricalPinType::EptPassive;
+        let sda = pin("SDA", ElectricalPinType::EptBidirectional, false);
+        assert_eq!(
+            pad_pin_list(&current),
+            vec![
+                ("1".to_string(), "SDA".to_string(), sda.clone()),
+                ("2".to_string(), String::new(), pin("NC", passive, true)),
+                (
+                    "MP".to_string(),
+                    "SHIELD".to_string(),
+                    pin("SHIELD_A", passive, false)
+                ),
+                (
+                    "MP".to_string(),
+                    "SHIELD".to_string(),
+                    pin("SHIELD_B", passive, false)
+                ),
+            ],
+            "as KiCad reported J2"
+        );
+        assert_eq!(
+            pad_pin_list(&updated),
+            vec![
+                ("1".to_string(), "SDA".to_string(), sda),
+                ("2".to_string(), String::new(), pin("NC", passive, true)),
+                (
+                    "MP".to_string(),
+                    "SHIELD".to_string(),
+                    pin("SHIELD_A", passive, false)
+                ),
+                (
+                    "MP".to_string(),
+                    "SHIELD".to_string(),
+                    pin("SHIELD_A", passive, false)
+                ),
+            ],
+            "as the refresh sends J2"
+        );
     }
 
     /// H1's circles as KiCad reported them are the library build's to the
