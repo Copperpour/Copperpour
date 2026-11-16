@@ -75,3 +75,50 @@ pub(crate) async fn fetch_easyeda_bundle(lcsc_id: &str) -> anyhow::Result<serde_
 
     Ok(result)
 }
+
+/// Downloaded 3D model payloads for an EasyEDA `outline3D` UUID.
+pub(crate) struct Easyeda3dAssets {
+    pub step: Result<Vec<u8>, String>,
+    pub obj: Result<String, String>,
+}
+
+fn easyeda_http_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent("Copperpour/1.0")
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?)
+}
+
+/// Download STEP and OBJ payloads for an EasyEDA 3D model UUID (`SVGNODE.attrs.uuid`).
+pub(crate) async fn fetch_easyeda_3d_assets(uuid: &str) -> anyhow::Result<Easyeda3dAssets> {
+    let clean_uuid = uuid.trim();
+    if clean_uuid.is_empty() {
+        anyhow::bail!("EasyEDA 3D model UUID cannot be empty");
+    }
+    let client = easyeda_http_client()?;
+    let step_url = format!("https://modules.easyeda.com/qAxj6KHrDKw4blvCG8QJPs7Y/{clean_uuid}");
+    let obj_url = format!("https://modules.easyeda.com/3dmodel/{clean_uuid}");
+
+    let (step_res, obj_res) =
+        tokio::join!(client.get(&step_url).send(), client.get(&obj_url).send());
+
+    let step = match step_res {
+        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+            Ok(bytes) => Ok(bytes.to_vec()),
+            Err(e) => Err(format!("reading STEP body failed: {e}")),
+        },
+        Ok(resp) => Err(format!("STEP endpoint returned HTTP {}", resp.status())),
+        Err(e) => Err(format!("STEP request failed: {e}")),
+    };
+
+    let obj = match obj_res {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(text) => Ok(text),
+            Err(e) => Err(format!("reading OBJ body failed: {e}")),
+        },
+        Ok(resp) => Err(format!("OBJ endpoint returned HTTP {}", resp.status())),
+        Err(e) => Err(format!("OBJ request failed: {e}")),
+    };
+
+    Ok(Easyeda3dAssets { step, obj })
+}

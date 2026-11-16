@@ -133,7 +133,7 @@ struct PreparedMutation {
     model_count: usize,
 }
 
-async fn handle_set_footprint_models(
+pub(crate) async fn handle_set_footprint_models(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
