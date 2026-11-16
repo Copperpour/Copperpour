@@ -520,9 +520,7 @@ fn title_block_targets(
                 let child = dir.join(file);
                 if !child.is_file() {
                     return Ok(Err(CallToolResult::error_kind(
-                        ToolErrorKind::FileNotFound {
-                            path: child.display().to_string(),
-                        },
+                        ToolErrorKind::file_not_found(&child),
                         format!(
                             "Sheet file '{}', placed by '{}', does not exist. No sheet was \
                              modified; restore it, or use scope 'sheet'.",
@@ -632,9 +630,7 @@ async fn handle_set_schematic_title_block(
     };
     if !schematic.is_file() {
         return Ok(CallToolResult::error_kind(
-            ToolErrorKind::FileNotFound {
-                path: schematic.display().to_string(),
-            },
+            ToolErrorKind::file_not_found(&schematic),
             format!("Schematic '{}' not found", schematic.display()),
         ));
     }
@@ -1876,9 +1872,7 @@ impl SavedHierarchyError {
     pub(crate) fn into_tool_result(self) -> CallToolResult {
         match self {
             Self::Missing { path } => CallToolResult::error_kind(
-                ToolErrorKind::FileNotFound {
-                    path: path.display().to_string(),
-                },
+                ToolErrorKind::file_not_found(&path),
                 format!("Sheet file not found: {}", path.display()),
             ),
             Self::Invalid { path, reason } => {

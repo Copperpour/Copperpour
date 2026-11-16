@@ -1291,9 +1291,7 @@ fn annotate_file_with_persistence(
         Ok(content) => content,
         Err(SexpError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return CallToolResult::error_kind(
-                ToolErrorKind::FileNotFound {
-                    path: path.display().to_string(),
-                },
+                ToolErrorKind::file_not_found(path),
                 format!("Schematic not found: {}", path.display()),
             );
         }
@@ -1854,9 +1852,7 @@ fn annotate_hierarchy_with_persistence(
         Ok(Some(directory)) => directory,
         _ => {
             return CallToolResult::error_kind(
-                ToolErrorKind::FileNotFound {
-                    path: path.display().to_string(),
-                },
+                ToolErrorKind::file_not_found(path),
                 format!("Schematic not found: {}", path.display()),
             )
         }

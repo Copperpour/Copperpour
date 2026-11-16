@@ -831,13 +831,11 @@ async fn datasheets_from_catalog_for_lcsc_ids(
 ) -> Result<CatalogDatasheets, CallToolResult> {
     let catalog = crate::sourcing::LcscCatalog::resolve(args, ctx);
     let refuse = |reason: String| {
-        let path = catalog.path().map(|path| path.display().to_string());
-        CallToolResult::error_kind(
-            ToolErrorKind::FileNotFound {
-                path: path.unwrap_or_default(),
-            },
-            reason,
-        )
+        let kind = match catalog.path() {
+            Some(path) => ToolErrorKind::file_not_found(path),
+            None => ToolErrorKind::file_not_found(""),
+        };
+        CallToolResult::error_kind(kind, reason)
     };
     match catalog.datasheets(lcsc_ids).await {
         crate::sourcing::Lookup::Read(read) => Ok(CatalogDatasheets::Read(read)),

@@ -244,9 +244,7 @@ fn revision(content: &str) -> String {
 fn read_sheet(path: &Path) -> anyhow::Result<Result<Sheet, CallToolResult>> {
     if !path.is_file() {
         return Ok(Err(CallToolResult::error_kind(
-            ToolErrorKind::FileNotFound {
-                path: path.display().to_string(),
-            },
+            ToolErrorKind::file_not_found(path),
             format!("Schematic '{}' not found", path.display()),
         )));
     }

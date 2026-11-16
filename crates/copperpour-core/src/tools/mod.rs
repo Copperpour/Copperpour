@@ -3190,9 +3190,7 @@ impl SchematicTargetError {
         let message = self.to_string();
         match self {
             Self::DiscoveryFailed { directory, .. } => CallToolResult::error_kind(
-                crate::mcp::error::ToolErrorKind::FileNotFound {
-                    path: directory.display().to_string(),
-                },
+                crate::mcp::error::ToolErrorKind::file_not_found(&directory),
                 message,
             ),
             Self::ProjectConflict { target, roots } => {

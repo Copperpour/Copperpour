@@ -406,9 +406,7 @@ async fn handle_repair_instance_metadata(
     }
     if !schematic.is_file() {
         return Ok(CallToolResult::error_kind(
-            ToolErrorKind::FileNotFound {
-                path: schematic.display().to_string(),
-            },
+            ToolErrorKind::file_not_found(&schematic),
             format!("Schematic '{}' not found", schematic.display()),
         ));
     }

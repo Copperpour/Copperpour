@@ -48,7 +48,7 @@ pub enum ToolErrorKind {
     /// A required argument is missing or malformed.
     InvalidArgument { field: String, reason: String },
     /// A referenced file or discovery directory doesn't exist or can't be read.
-    FileNotFound { path: String },
+    FileNotFound { path: String, absolute_path: String },
     /// A mutation conflicts with filesystem state, or schematic ownership
     /// cannot be proven uniquely. Paths identify the conflicting evidence.
     Conflict { paths: Vec<String> },
@@ -177,6 +177,36 @@ impl ToolErrorKind {
             Self::IpcBatchRecovered { .. } => "ipc_batch_recovered",
         }
     }
+
+    /// Construct a `FileNotFound` error for a missing path.
+    ///
+    /// Reports the path as given, alongside the absolute path checked against
+    /// the server's working directory when `path` is relative (#54).
+    pub fn file_not_found(path: impl AsRef<std::path::Path>) -> Self {
+        let p = path.as_ref();
+        Self::file_not_found_with_checked(p, p)
+    }
+
+    /// Construct a `FileNotFound` error for a missing path where the checked path
+    /// may differ from the given argument path.
+    pub fn file_not_found_with_checked(
+        given: impl AsRef<std::path::Path>,
+        checked: impl AsRef<std::path::Path>,
+    ) -> Self {
+        let given_p = given.as_ref();
+        let checked_p = checked.as_ref();
+        let absolute = if checked_p.is_relative() {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(checked_p)
+        } else {
+            checked_p.to_path_buf()
+        };
+        Self::FileNotFound {
+            path: copperpour_sexp::paths::display_path(given_p),
+            absolute_path: copperpour_sexp::paths::display_path(&absolute),
+        }
+    }
 }
 
 impl CallToolResult {
@@ -293,7 +323,10 @@ mod tests {
                 field: "f".into(),
                 reason: "r".into(),
             },
-            ToolErrorKind::FileNotFound { path: "p".into() },
+            ToolErrorKind::FileNotFound {
+                path: "p".into(),
+                absolute_path: "/p".into(),
+            },
             ToolErrorKind::Conflict {
                 paths: vec!["p".into()],
             },
@@ -358,5 +391,38 @@ mod tests {
             let serialized_kind = json.get("kind").and_then(|v| v.as_str()).unwrap();
             assert_eq!(code, serialized_kind, "drift for {:?}", kind);
         }
+    }
+
+    #[test]
+    fn file_not_found_derives_absolute_path_for_relative_and_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        let rel_err = ToolErrorKind::file_not_found("sub/proj.kicad_pro");
+        let rel_json = serde_json::to_value(&rel_err).unwrap();
+        assert_eq!(rel_json["kind"], "file_not_found");
+        assert_eq!(rel_json["path"], "sub/proj.kicad_pro");
+        assert_eq!(
+            rel_json["absolute_path"],
+            cwd.join("sub/proj.kicad_pro").display().to_string()
+        );
+
+        let abs_path = if cfg!(windows) {
+            "C:\\projects\\demo\\demo.kicad_pro"
+        } else {
+            "/tmp/projects/demo/demo.kicad_pro"
+        };
+        let abs_err = ToolErrorKind::file_not_found(abs_path);
+        let abs_json = serde_json::to_value(&abs_err).unwrap();
+        assert_eq!(abs_json["kind"], "file_not_found");
+        assert_eq!(abs_json["path"], abs_path);
+        assert_eq!(abs_json["absolute_path"], abs_path);
+
+        let checked_rel = "other/sub.kicad_sch";
+        let with_checked = ToolErrorKind::file_not_found_with_checked("sub.kicad_sch", checked_rel);
+        let with_checked_json = serde_json::to_value(&with_checked).unwrap();
+        assert_eq!(with_checked_json["path"], "sub.kicad_sch");
+        assert_eq!(
+            with_checked_json["absolute_path"],
+            cwd.join(checked_rel).display().to_string()
+        );
     }
 }

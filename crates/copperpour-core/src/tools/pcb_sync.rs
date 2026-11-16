@@ -403,9 +403,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             &board
         };
         return Ok(CallToolResult::error_kind(
-            crate::mcp::error::ToolErrorKind::FileNotFound {
-                path: missing.display().to_string(),
-            },
+            crate::mcp::error::ToolErrorKind::file_not_found(missing),
             format!("{} does not exist", missing.display()),
         ));
     }

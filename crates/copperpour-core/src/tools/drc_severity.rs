@@ -152,9 +152,7 @@ async fn handle_set_drc_severity(
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(CallToolResult::error_kind(
-                ToolErrorKind::FileNotFound {
-                    path: project.display().to_string(),
-                },
+                ToolErrorKind::file_not_found(&project),
                 format!(
                     "No project file at {}. DRC severities live in the .kicad_pro beside the \
                      board.",
