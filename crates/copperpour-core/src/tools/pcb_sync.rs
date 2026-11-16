@@ -518,6 +518,12 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 let copper = client
                     .get_enabled_layers_in(snapshot.document.clone())?
                     .copper_layer_count;
+                preflight.extend(replacements_that_cannot_be_built(
+                    &plan,
+                    &replacements,
+                    copper,
+                    &snapshot,
+                ));
                 (replacements, copper)
             } else {
                 (BTreeMap::new(), 0)
@@ -3075,6 +3081,63 @@ fn prepare_replacements(
         }
     }
     (prepared, diagnostics)
+}
+
+/// Each planned replacement built once against the live footprint, as the
+/// apply builds it, so a footprint the builder refuses makes the dry run a
+/// conflict instead of failing the apply after a `ready`. Replacements whose
+/// footprint was not read are refused already and skipped here.
+fn replacements_that_cannot_be_built(
+    plan: &SyncPlan,
+    replacements: &BTreeMap<String, super::pcb_footprint_update::ReplacementFootprint>,
+    copper_layers: u32,
+    snapshot: &LiveSnapshot,
+) -> Vec<SyncDiagnostic> {
+    let mut diagnostics = Vec::new();
+    for change in &plan.changes {
+        let PlannedChange::Update {
+            kiid,
+            reference,
+            replace_footprint: Some(replace),
+            ..
+        } = change
+        else {
+            continue;
+        };
+        let Some(library) = replacements.get(&replace.to) else {
+            continue;
+        };
+        let built = snapshot
+            .items
+            .get(kiid)
+            .with_context(|| format!("planned footprint {kiid} disappeared"))
+            .and_then(|item| {
+                copperpour_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+                    item.value.as_slice(),
+                )
+                .context("KiCad returned an invalid footprint item")
+            })
+            .and_then(|current| {
+                super::pcb_footprint_update::replace_footprint(
+                    &current,
+                    library,
+                    copper_layers,
+                    &snapshot.net_codes,
+                )
+            });
+        if let Err(error) = built {
+            diagnostics.push(footprint_conflict(
+                "unsupported_library_footprint",
+                format!(
+                    "{reference} cannot be replaced by {}: {error:#}",
+                    replace.to
+                ),
+                &replace.to,
+                vec![reference.clone()],
+            ));
+        }
+    }
+    diagnostics
 }
 
 /// One replacement footprint, read as [`prepare_footprint`] reads one, or
@@ -8144,6 +8207,69 @@ mod tests {
         assert_eq!(served.dry_run(&netlist).await["status"], "noop");
     }
 
+    /// A library footprint in the older `fp_text reference` / `fp_text value`
+    /// form, as KiCad 7 wrote them and many libraries still are: two 0603
+    /// pads, a silkscreen line, and Reference and Value as texts.
+    const OLDER_FORM_0603: &str = r#"(footprint "R_0603_OlderForm"
+  (version 20240108)
+  (generator "pcbnew")
+  (layer "F.Cu")
+  (descr "0603 in the fp_text form")
+  (attr smd)
+  (pad "1" smd roundrect (at -0.825 0) (size 0.8 0.95) (layers "F.Cu" "F.Paste" "F.Mask") (roundrect_rratio 0.25))
+  (pad "2" smd roundrect (at 0.825 0) (size 0.8 0.95) (layers "F.Cu" "F.Paste" "F.Mask") (roundrect_rratio 0.25))
+  (fp_line (start -0.16 -0.51) (end 0.16 -0.51) (stroke (width 0.12) (type solid)) (layer "F.SilkS"))
+  (fp_text reference "REF**" (at 0 -1.43 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))
+  (fp_text value "R_0603_OlderForm" (at 0 1.43 0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
+)
+"#;
+
+    /// Found live: the library reader reads Reference and Value only in the
+    /// `(property …)` form, so a replacement by a footprint in the older form
+    /// planned `ready` and then failed its apply. The placed text now keeps
+    /// its position and style, as a refresh without a reset keeps it, and the
+    /// dry run builds each replacement, so `ready` means the apply builds it.
+    #[tokio::test]
+    async fn a_replacement_by_an_older_form_footprint_keeps_the_placed_text() {
+        use copperpour_ipc::gen::kiapi::board::types::FootprintInstance;
+        let before =
+            FootprintInstance::decode(schematic_backed_resistor().value.as_slice()).unwrap();
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![schematic_backed_resistor()],
+            zones: Vec::new(),
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+        std::fs::write(
+            served
+                ._temp
+                .path()
+                .join("Capacitor_SMD.pretty")
+                .join("R_0603_OlderForm.kicad_mod"),
+            OLDER_FORM_0603,
+        )
+        .unwrap();
+        let netlist = r1_on("Capacitor_SMD:R_0603_OlderForm");
+
+        let plan = served.dry_run(&netlist).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        let applied = served.apply(&netlist).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        let held =
+            FootprintInstance::decode(served.held.lock().unwrap()[0].value.as_slice()).unwrap();
+        let id = held.definition.as_ref().unwrap().id.clone().unwrap();
+        assert_eq!(id.entry_name, "R_0603_OlderForm");
+        let position = |footprint: &FootprintInstance| {
+            footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .and_then(|text| text.position)
+        };
+        assert_eq!(position(&held), position(&before));
+    }
+
     /// A replacement whose footprint does not resolve, or that the refresh
     /// cannot rebuild losslessly, is refused before anything is sent, with the
     /// code the sync uses for an addition's footprint.
@@ -8242,6 +8368,60 @@ mod tests {
         );
         assert!(!attributes.exclude_from_position_files);
         assert_eq!(field_text(&held.datasheet_field), LIBRARY_DATASHEET);
+    }
+
+    /// A replacement that only the dry run's build rejects: R1's two pads are
+    /// both numbered 1, one on VCC and one on GND. The stock 0603 resolves,
+    /// reads and keeps every connected pad number, so the preflight passes
+    /// it; rebuilding the footprint refuses a logical pad that carries two
+    /// nets. Without the build in the dry run this plan was `ready` and its
+    /// apply failed after the commit began.
+    #[tokio::test]
+    async fn a_replacement_only_the_build_rejects_is_refused_before_the_commit() {
+        use copperpour_ipc::gen::kiapi;
+        let mut footprint = kiapi::board::types::FootprintInstance::decode(
+            schematic_backed_resistor().value.as_slice(),
+        )
+        .unwrap();
+        let mut nets = [("VCC", 1), ("GND", 2)].into_iter();
+        for item in &mut footprint.definition.as_mut().unwrap().items {
+            if item.type_url.ends_with("kiapi.board.types.Pad") {
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                let (name, code) = nets.next().expect("the capture has two pads");
+                pad.number = "1".to_string();
+                pad.net = Some(kiapi::board::types::Net {
+                    code: Some(kiapi::board::types::NetCode { value: code }),
+                    name: name.to_string(),
+                });
+                item.value = pad.encode_to_vec();
+            }
+        }
+        assert_eq!(nets.next(), None, "both pads were renumbered");
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![copperpour_ipc::builders::pack_any(
+                &footprint,
+                "kiapi.board.types.FootprintInstance",
+            )],
+            zones: Vec::new(),
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+        let plan = served.dry_run(&r1_on(STOCK_0603)).await;
+        assert_eq!(plan["status"], "conflict", "{plan:#}");
+        assert_eq!(plan["changes"], serde_json::json!([]), "{plan:#}");
+        let diagnostic = &plan["diagnostics"][0];
+        assert_eq!(
+            diagnostic["code"], "unsupported_library_footprint",
+            "{plan:#}"
+        );
+        assert_eq!(diagnostic["reference"], "R1", "{plan:#}");
+        assert!(
+            diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("carries multiple nets")),
+            "the build's own refusal: {plan:#}"
+        );
+        assert_eq!(served.sent("BeginCommit"), 0);
     }
 
     /// KiCad's Update PCB leaves a locked footprint's footprint as it is,

@@ -1605,13 +1605,17 @@ pub(crate) fn replace_footprint(
     definition
         .items
         .retain(|item| !item.type_url.ends_with("kiapi.board.types.Field"));
-    // Update PCB replaces with every reset on (`board_netlist_updater.cpp`
-    // `replaceFootprint`): the text sizes, styles and positions, the field
-    // text and the fabrication attributes come from the new footprint, DNP
-    // and "not in schematic" kept as always.
+    // The library reader reads Reference and Value from the `(property …)`
+    // form KiCad 8 and later write. A footprint in the older `fp_text
+    // reference` / `fp_text value` form has neither, and the placed text then
+    // keeps its position and style, as a refresh without a reset keeps it.
+    // Update PCB resets everything else (`board_netlist_updater.cpp`
+    // `replaceFootprint`): the field text and the fabrication attributes come
+    // from the new footprint, DNP and "not in schematic" kept as always.
+    let reference_and_value = library.reference_field.is_some() && library.value_field.is_some();
     let resets = Resets {
-        sizes_and_styles: true,
-        positions: true,
+        sizes_and_styles: reference_and_value,
+        positions: reference_and_value,
         content: true,
         fabrication_attributes: true,
     };
