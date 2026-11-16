@@ -21,6 +21,7 @@ violations). Only the session and base design names were set to `board`.
 Freerouting writes every placement angle in [0, 360): the same directions as
 the DSN, written differently.
 
-KiCad's native DSN of this board is not kept: R3's pads at -45 degrees fall on
-half micrometres, which `adopt_native_dsn` refuses
-([#98](https://github.com/Copperpour/Copperpour/issues/98)).
+KiCad's native DSN of this board is not kept: when this fixture was created,
+R3's pads at -45 degrees fell on half micrometres, which `adopt_native_dsn`
+refused until [#98](https://github.com/Copperpour/Copperpour/issues/98) was
+resolved.

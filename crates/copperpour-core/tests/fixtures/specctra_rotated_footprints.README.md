@@ -59,7 +59,7 @@ when 0:
 | R4 | 90° | 180, 0 | 90, 270 |
 
 KiCad stores R3's pads at ±0.499999 mm, and its DSN writes them at ±499.999 µm.
-`adopt_native_dsn` compares whole-micrometre pin positions, so it refuses that
-board ([#98](https://github.com/Copperpour/Copperpour/issues/98)). The adoption tests
-therefore use the board without R3. The `_45`
-board checks pin rotations only.
+Originally `adopt_native_dsn` compared whole-micrometre pin positions and refused
+that board ([#98](https://github.com/Copperpour/Copperpour/issues/98)); once
+nanometre pad precision and 0.1 µm pin matching landed, `adopt_native_dsn`
+accepts the `_45` native DSN directly as well.

@@ -96,8 +96,9 @@ Every footprint sits at 0°, and every pad centre falls on a whole micrometre.
 Two pre-existing defects, not related to pad shape, would otherwise stop the
 tests before they reach the pads:
 
-- mixelpixx/Konnect#840: the Rust exporter writes a rotated footprint's pad angle twice.
-- [#98](https://github.com/Copperpour/Copperpour/issues/98): native adoption refuses
-  stock 0805 pads at ±912.5 µm. It also refuses
-  courtyard `(outline (polygon ...))` lines, which is why the native tests drop
-  those three lines in test code. The fixture file keeps them.
+- mixelpixx/Konnect#840: the Rust exporter writes a rotated footprint's pad angle twice (fixed separately).
+- [#98](https://github.com/Copperpour/Copperpour/issues/98): originally noted
+  that native adoption refused stock 0805 pads at ±912.5 µm and courtyard
+  `(outline (polygon ...))` lines; both are now accepted directly (see
+  `specctra_stock_half_um.*`), and the tests pass the native DSN fixture
+  unchanged.
