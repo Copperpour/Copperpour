@@ -37,7 +37,11 @@ pub enum SexpError {
     /// KiCad lock files identify only a username and hostname, so their
     /// presence cannot be distinguished reliably from a stale lock. Writers
     /// must fail closed and leave both the document and the lock untouched.
-    #[error("KiCad editor lock blocks write to {path}: {lock_path}")]
+    #[error(
+        "KiCad editor lock blocks write to {}: {}",
+        crate::paths::display_path(.path),
+        crate::paths::display_path(.lock_path)
+    )]
     KiCadEditorLocked {
         path: PathBuf,
         lock_path: PathBuf,
@@ -57,7 +61,11 @@ pub enum SexpError {
 
     /// A durable multi-file transaction found content that matches neither
     /// the recorded before image nor the intended replacement.
-    #[error("transaction conflict in {journal}: {path}: {reason}")]
+    #[error(
+        "transaction conflict in {}: {}: {reason}",
+        crate::paths::display_path(.journal),
+        crate::paths::display_path(.path)
+    )]
     TransactionConflict {
         path: PathBuf,
         journal: PathBuf,

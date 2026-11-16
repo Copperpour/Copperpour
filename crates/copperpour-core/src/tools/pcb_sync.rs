@@ -17,6 +17,7 @@ use crate::tools::{
     BoundedList, ToolContext,
 };
 use anyhow::{bail, Context, Result};
+use copperpour_sexp::paths::display_path;
 use copperpour_sexp::SexpNode;
 use prost::Message;
 use serde::Serialize;
@@ -1988,7 +1989,7 @@ fn saved_hierarchy_files(root: &Path) -> Result<Vec<PathBuf>> {
         if active.contains(&canonical) {
             bail!(
                 "schematic hierarchy contains a cycle at {}",
-                canonical.display()
+                display_path(&canonical)
             );
         }
         if !seen.insert(canonical.clone()) {
@@ -2003,11 +2004,11 @@ fn saved_hierarchy_files(root: &Path) -> Result<Vec<PathBuf>> {
         if lock.exists() {
             bail!(
                 "{} is open in the schematic editor; save and close the hierarchy before syncing",
-                canonical.display()
+                display_path(&canonical)
             );
         }
         let schematic = copperpour_schematic_editor::Schematic::load(&canonical)
-            .with_context(|| format!("cannot load schematic {}", canonical.display()))?;
+            .with_context(|| format!("cannot load schematic {}", display_path(&canonical)))?;
         files.push(canonical.clone());
         let parent = canonical.parent().unwrap_or_else(|| Path::new("."));
         for sheet in schematic.sheets.iter() {
@@ -2015,8 +2016,8 @@ fn saved_hierarchy_files(root: &Path) -> Result<Vec<PathBuf>> {
             if !child.exists() {
                 bail!(
                     "hierarchical sheet {} referenced by {} does not exist",
-                    child.display(),
-                    canonical.display()
+                    display_path(&child),
+                    display_path(&canonical)
                 );
             }
             visit(&child, seen, active, files)?;
