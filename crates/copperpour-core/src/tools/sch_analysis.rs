@@ -201,7 +201,8 @@ pub fn tools() -> Vec<ToolDef> {
              meeting anywhere but tip to tip. Pin-tip contact and touching edges are not \
              reported. Also finds \
              conflicting labels at the same location, colliding label and field text \
-             (`text_overlap`), and reports any symbol whose embedded \
+             (`text_overlap`), wires drawn through a symbol's body (`wire_overlap`), and \
+             reports any symbol whose embedded \
              geometry could not be resolved and used the origin fallback instead.",
             json!({ "type": "object",
                 "properties": {
@@ -1294,9 +1295,48 @@ async fn handle_check_overlaps(
         }
     }
 
+    // A wire drawn through a symbol's body reads as part of the symbol, so
+    // what it connects is hidden; it is reported with the body it crosses. A
+    // wire along an edge or ending on a pin tip outside the body is contact,
+    // and so is one that leaves the symbol's own pin tip outward, though a
+    // drawing that reaches past the tip may clip it.
+    let mut wire_overlaps: Vec<serde_json::Value> = Vec::new();
+    for wire in extract_wires(&tree) {
+        let (from, to) = ((wire.x1, wire.y1), (wire.x2, wire.y2));
+        for (instance, placed) in &placements {
+            let Some((_, geometry)) = placed else {
+                continue;
+            };
+            let Some(body) = geometry.body else {
+                continue;
+            };
+            if body.segment_enters(from, to) && !geometry.wire_leaves_pin(from, to) {
+                wire_overlaps.push(json!({
+                    "type": "wire_overlap",
+                    "a": {
+                        "kind": "wire",
+                        "uuid": wire.uuid,
+                        "x1": wire.x1,
+                        "y1": wire.y1,
+                        "x2": wire.x2,
+                        "y2": wire.y2
+                    },
+                    "b": {
+                        "kind": "symbol_body",
+                        "reference": instance.reference,
+                        "unit": instance.unit,
+                        "symbol_uuid": instance.uuid
+                    },
+                    "bounds_b": bounds_json(body)
+                }));
+            }
+        }
+    }
+
     let mut all = comp_overlaps;
     all.extend(label_overlaps);
     all.extend(text_overlaps);
+    all.extend(wire_overlaps);
     let bounds_unresolved = placements
         .iter()
         .filter(|(_, placed)| placed.is_none())
@@ -1972,6 +2012,86 @@ mod text_overlap_tests {
         assert_eq!(sda["bounds_b"]["x_max"], 50.8762, "{sda}");
         let noisy = crate::tools::noisy_numbers(&body);
         assert!(noisy.is_empty(), "reported {noisy:?}");
+    }
+}
+
+#[cfg(test)]
+mod wire_overlap_tests {
+    //! `wire_overlap` against `tests/fixtures/wire_through_symbol_kicad10.kicad_sch`;
+    //! its README names each case.
+    use super::*;
+
+    const SHEET: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/wire_through_symbol_kicad10.kicad_sch"
+    );
+
+    async fn check() -> serde_json::Value {
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_check_overlaps(&json!({ "schematic": SHEET }), &ctx)
+            .await
+            .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// The wire through the crystal, the wire across `R1`, the wire from
+    /// `X1`'s pin tip into its body and the wire from the `GND` symbol's tip into
+    /// its own drawing are reported, each with its symbol, and nothing else is:
+    /// not the wires on `R2`'s pin tips, along `Y2`'s top edge, ending on `Y3`'s
+    /// edge, beside `R4`, leaving `X1`'s pin tip outward past which its drawing
+    /// reaches, or leaving the pin tips of the stock `D1` LED, whose emission
+    /// arrows reach past its left tip, outward or square to the pin.
+    #[tokio::test]
+    async fn only_the_wires_through_a_body_are_reported() {
+        let body = check().await;
+        let mut found = body["overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["type"] == "wire_overlap")
+            .map(|o| {
+                assert_eq!(o["a"]["kind"], "wire", "{o}");
+                assert_eq!(o["b"]["kind"], "symbol_body", "{o}");
+                assert!(o["b"]["symbol_uuid"].is_string(), "{o}");
+                assert!(o["bounds_b"]["x_min"].is_number(), "{o}");
+                (
+                    o["a"]["uuid"].as_str().unwrap().to_string(),
+                    o["b"]["reference"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        found.sort();
+        let expected = [
+            ("6ca73cc5-a9c5-4da6-b1ad-116b66c7ac4d", "#PWR01"),
+            ("7f228b0f-7e2f-4061-a35f-d496b115f231", "R1"),
+            ("c3143ef8-21cb-4f0b-a9c8-fe7b58052256", "Y1"),
+            ("ff399ce4-c445-46a7-b92c-8ec0839aee42", "X1"),
+        ]
+        .map(|(uuid, reference)| (uuid.to_string(), reference.to_string()));
+        assert_eq!(found, expected, "{body}");
+        assert_eq!(body["overlap_count"], 4, "{body}");
+
+        let through = body["overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["b"]["reference"] == "Y1")
+            .unwrap();
+        let wire = &through["a"];
+        assert_eq!(
+            (wire["x1"].as_f64(), wire["y1"].as_f64()),
+            (Some(46.99), Some(50.8))
+        );
+        assert_eq!(
+            (wire["x2"].as_f64(), wire["y2"].as_f64()),
+            (Some(54.61), Some(50.8))
+        );
     }
 }
 
