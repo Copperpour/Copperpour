@@ -15,8 +15,10 @@ footprints on the bottom, made and saved by KiCad 10.0.8's `pcbnew` API with
   left/right;
 - the through-hole header `J1` flipped top/bottom.
 
-The stock footprints were chosen with whole-micrometre pads: the native-DSN
-reader still refuses KiCad's sub-micrometre pin positions (#841).
+The stock footprints were chosen with whole-micrometre pads because the native-DSN
+reader originally required them (before
+[#98](https://github.com/Copperpour/Copperpour/issues/98) added sub-micrometre
+pin support).
 
 KiCad keeps a bottom footprint's pads mirrored about its local X axis
 (`U1` pad 1 at `(-1.2 0.95)`, the library has `(-1.2 -0.95)`), with

@@ -5633,16 +5633,9 @@ mod apply_specctra_ses_candidate_drc_tests {
         for rule in rules.values_mut() {
             rule.track_width_mm = Some(0.2);
         }
-        // The native DSN without the header's courtyard, which the DSN parser
-        // does not read yet.
-        let native = NATIVE
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
-            .map(|line| format!("{line}\n"))
-            .collect();
         let export = crate::specctra::adopt_native_dsn(
             crate::specctra::export_dsn(&board, ZONES, &rules).unwrap(),
-            native,
+            NATIVE.to_string(),
         )
         .unwrap();
         let manifest = project.path().join("board.dsn.copperpour.json");

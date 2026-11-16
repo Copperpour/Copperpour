@@ -71,8 +71,8 @@ struct PadModel {
     /// Its pin name in the DSN image, unique in the footprint: see
     /// [`dsn_pin_names`].
     pin: String,
-    x_um: i64,
-    y_um: i64,
+    x_um: f64,
+    y_um: f64,
     /// Relative to the footprint, like `x_um`/`y_um`.
     rotation_degrees: f64,
     net: Option<String>,
@@ -499,8 +499,8 @@ impl RoutingSnapshot {
                         DsnPinIdentity {
                             padstack: self.padstack_names[&pad.padstack].clone(),
                             rotation: OrderedF64::new(pad.rotation_degrees)?,
-                            x: pad.x_um,
-                            y: pad.y_um,
+                            x: OrderedF64::new(pad.x_um)?,
+                            y: OrderedF64::new(pad.y_um)?,
                         },
                     ))
                 })
@@ -699,8 +699,8 @@ struct DsnPlacementIdentity {
 struct DsnPinIdentity {
     padstack: String,
     rotation: OrderedF64,
-    x: i64,
-    y: i64,
+    x: OrderedF64,
+    y: OrderedF64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -771,11 +771,69 @@ struct DsnIdentity {
 type DsnPlaneIdentity = (String, String, Vec<(i64, i64)>);
 
 fn validate_dsn_syntax(source: &str, label: &str) -> Result<()> {
-    let cursor = Cursor::new(source.as_bytes());
+    let normalized = normalize_courtyard_outline_polygons(source);
+    let cursor = Cursor::new(normalized.as_bytes());
     let mut tokenizer = ListTokenizer::new(BufReader::new(cursor));
     dsn::DsnFile::read_dsn(&mut tokenizer)
         .map_err(|error| anyhow::anyhow!("{label} failed Specctra parser validation: {error}"))?;
     Ok(())
+}
+
+/// `topola_specctra` 0.1.0's `Outline` grammar only accepts `(outline (path ...))`,
+/// whereas KiCad writes footprint `fp_rect` courtyards as
+/// `(outline (polygon <layer> <width> <coords...>))`. Both carry the same
+/// arguments, so rewrite `polygon` to `path   ` (same byte length to keep line
+/// and column numbers) in a temporary copy for syntax validation.
+fn normalize_courtyard_outline_polygons(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut in_quotes = false;
+    while i < bytes.len() {
+        if !in_quotes && bytes[i..].starts_with(b"(string_quote \")") {
+            out.extend_from_slice(b"(string_quote \")");
+            i += b"(string_quote \")".len();
+            continue;
+        }
+        if bytes[i] == b'"' {
+            in_quotes = !in_quotes;
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        if in_quotes && bytes[i] == b'\\' && i + 1 < bytes.len() {
+            out.push(bytes[i]);
+            out.push(bytes[i + 1]);
+            i += 2;
+            continue;
+        }
+        if !in_quotes && bytes[i..].starts_with(b"(outline") {
+            let mut j = i + b"(outline".len();
+            if j < bytes.len() && (bytes[j].is_ascii_whitespace() || bytes[j] == b'(') {
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'(' {
+                    j += 1;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if bytes[j..].starts_with(b"polygon") {
+                        let after = j + b"polygon".len();
+                        if after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                            out.extend_from_slice(&bytes[i..j]);
+                            out.extend_from_slice(b"path   ");
+                            i = after;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).expect("UTF-8 input stays valid UTF-8")
 }
 
 fn parse_dsn_sexp(source: &str) -> Result<SexpNode> {
@@ -863,8 +921,8 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
             let identity = DsnPinIdentity {
                 padstack,
                 rotation: OrderedF64::new(rotation)?,
-                x: dsn_integer(pin, at + 1, "pin x")?,
-                y: dsn_integer(pin, at + 2, "pin y")?,
+                x: OrderedF64::new(dsn_number(pin, at + 1, "pin x")?)?,
+                y: OrderedF64::new(dsn_number(pin, at + 2, "pin y")?)?,
             };
             if pins.insert(number, identity).is_some() {
                 bail!("DSN image '{name}' repeats a pin number");
@@ -1063,7 +1121,9 @@ fn correlate_components(
         }
         for (pin, baseline_pin) in &baseline_component.pins {
             let native_pin = native_component.pins.get(pin).unwrap();
-            if baseline_pin.x != native_pin.x || baseline_pin.y != native_pin.y {
+            if (baseline_pin.x.value() - native_pin.x.value()).abs() > PIN_POSITION_TOLERANCE_UM
+                || (baseline_pin.y.value() - native_pin.y.value()).abs() > PIN_POSITION_TOLERANCE_UM
+            {
                 bail!("native DSN changed pin position for component '{reference}' pin '{pin}'");
             }
             if baseline_pin.rotation != native_pin.rotation {
@@ -2059,13 +2119,19 @@ fn footprints(
                 None => bail!("pad {reference}-{number} has no shape"),
             };
             let at = pad.find("at").context("pad has no position")?;
-            let x_um = finite_um(at.get_f64(1), "pad x")?;
-            let file_y_um = finite_um(at.get_f64(2), "pad y")?;
+            let x_um = snap_nm_um(finite_um_f64(at.get_f64(1), "pad x")?);
+            let file_y_um = finite_um_f64(at.get_f64(2), "pad y")?;
             let pad_degrees = finite_number(at.get_f64(3).or(Some(0.0)), "pad rotation")?;
             // Unflipped, a bottom pad's local Y and its turn change sign.
             let (y_um, pin_degrees) = match side {
-                Side::Front => (-file_y_um, pin_rotation(pad_degrees, rotation_degrees)),
-                Side::Back => (file_y_um, pin_rotation(rotation_degrees, pad_degrees)),
+                Side::Front => (
+                    snap_nm_um(-file_y_um),
+                    pin_rotation(pad_degrees, rotation_degrees),
+                ),
+                Side::Back => (
+                    snap_nm_um(file_y_um),
+                    pin_rotation(rotation_degrees, pad_degrees),
+                ),
             };
             let size = pad.find("size").context("pad has no size")?;
             let size_x_um = positive_um(size.get_f64(1), "pad width")?;
@@ -2445,8 +2511,8 @@ fn build_pcb(
                     name: padstack_names[&pad.padstack].clone(),
                     rotate: (pad.rotation_degrees != 0.0).then_some(pad.rotation_degrees),
                     id: pad.pin.clone(),
-                    x: pad.x_um as f64,
-                    y: pad.y_um as f64,
+                    x: pad.x_um,
+                    y: pad.y_um,
                 })
                 .collect(),
             keepouts: dsn::Keepouts(Vec::new()),
@@ -2975,6 +3041,16 @@ fn finite_um_f64(value: Option<f64>, label: &str) -> Result<f64> {
     Ok(value_um)
 }
 
+/// Pin-coordinate tolerance (one DSN resolution step, 0.1 um, plus float
+/// rounding margin) so KiCad's `%.6g` pin rounding matches Copperpour's
+/// nanometre-accurate pad offsets.
+const PIN_POSITION_TOLERANCE_UM: f64 = 1.0 / DSN_RESOLUTION as f64 + 1e-9;
+
+fn snap_nm_um(value_um: f64) -> f64 {
+    // `+ 0.0` turns `-0.0` into `0.0` so DSN writes `0` and `OrderedF64` matches.
+    (value_um * 1000.0).round() / 1000.0 + 0.0
+}
+
 fn positive_um(value: Option<f64>, label: &str) -> Result<i64> {
     let value = finite_um(value, label)?;
     if value <= 0 {
@@ -3037,22 +3113,8 @@ pub(crate) mod tests {
         rules
     }
 
-    /// KiCad's export of the stock fixture without its courtyard
-    /// `(outline (polygon ...))` lines, which the Specctra parser behind
-    /// `validate_dsn_syntax` cannot read (#841). Pads and padstacks are
-    /// KiCad's, unchanged.
     fn stock_roundrect_native() -> String {
-        let native = STOCK_ROUNDRECT_NATIVE
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
-            .map(|line| format!("{line}\n"))
-            .collect::<String>();
-        assert_eq!(
-            STOCK_ROUNDRECT_NATIVE.lines().count() - native.lines().count(),
-            3,
-            "one courtyard polygon per image"
-        );
-        native
+        STOCK_ROUNDRECT_NATIVE.to_string()
     }
 
     fn stock_export() -> ExportBundle {
@@ -3177,6 +3239,84 @@ pub(crate) mod tests {
                 ),
             ]
         );
+    }
+
+    const STOCK_HALF_UM: &str = include_str!("../tests/fixtures/specctra_stock_half_um.kicad_pcb");
+    const STOCK_HALF_UM_NATIVE: &str =
+        include_str!("../tests/fixtures/specctra_stock_half_um.native-kicad-10.dsn");
+
+    #[test]
+    fn stock_half_um_native_dsn_with_courtyards_is_adopted() {
+        let baseline =
+            export_dsn(Path::new("board.kicad_pcb"), STOCK_HALF_UM, &stock_rules()).unwrap();
+        assert!(baseline.dsn.contains(" -912.5 0)"), "{}", baseline.dsn);
+        assert!(baseline.dsn.contains(" 912.5 0)"), "{}", baseline.dsn);
+
+        let adopted = adopt_native_dsn(baseline, STOCK_HALF_UM_NATIVE.to_string()).unwrap();
+        assert_eq!(adopted.dsn, STOCK_HALF_UM_NATIVE);
+        assert!(manifest_pads(&adopted.manifest).iter().any(|pad| {
+            pad.name == "RoundRect[T]Pad_1025.000000x1400.000000_250.951000_um_0.000000_0"
+                && pad.corner_radius_um == Some(250)
+        }));
+    }
+
+    #[test]
+    fn rotated_45_native_dsn_with_nanometre_pins_is_adopted() {
+        let source = include_str!("../tests/fixtures/specctra_rotated_footprints_45.kicad_pcb");
+        let native =
+            include_str!("../tests/fixtures/specctra_rotated_footprints_45.native-kicad-10.dsn");
+        let baseline = native_baseline(source);
+        assert!(baseline.dsn.contains("-499.999 0)"), "{}", baseline.dsn);
+        let adopted = adopt_native_dsn(baseline, native.to_string()).unwrap();
+        assert_eq!(adopted.dsn, native);
+    }
+
+    #[test]
+    fn native_dsn_pin_shifted_past_resolution_tolerance_is_refused() {
+        let baseline =
+            || export_dsn(Path::new("board.kicad_pcb"), STOCK_HALF_UM, &stock_rules()).unwrap();
+        for within in ["1 -912.6 0)", "1 -912.4 0)"] {
+            let shifted = STOCK_HALF_UM_NATIVE.replacen("1 -912.5 0)", within, 1);
+            assert_ne!(shifted, STOCK_HALF_UM_NATIVE);
+            adopt_native_dsn(baseline(), shifted).unwrap();
+        }
+        let moved = STOCK_HALF_UM_NATIVE.replacen("1 -912.5 0)", "1 -912.7 0)", 1);
+        assert_ne!(moved, STOCK_HALF_UM_NATIVE);
+        let error = adopt_native_dsn(baseline(), moved).unwrap_err().to_string();
+        assert!(
+            error.contains("native DSN changed pin position for component 'R3' pin '1'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn invalid_courtyard_outline_polygon_still_fails_syntax_validation() {
+        let baseline =
+            export_dsn(Path::new("board.kicad_pcb"), STOCK_HALF_UM, &stock_rules()).unwrap();
+        let broken = STOCK_HALF_UM_NATIVE.replacen(
+            "(outline (polygon signal 0  1675 -945",
+            "(outline (polygon signal 0  not_a_number -945",
+            1,
+        );
+        assert_ne!(broken, STOCK_HALF_UM_NATIVE);
+        let error = adopt_native_dsn(baseline, broken).unwrap_err().to_string();
+        assert!(
+            error.contains("failed Specctra parser validation"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn multiline_courtyard_polygon_normalizes_outside_quotes_only() {
+        let multiline = STOCK_HALF_UM_NATIVE.replacen(
+            "(outline (polygon signal 0  1675 -945",
+            "(outline\n        (polygon signal 0  1675 -945",
+            1,
+        );
+        validate_dsn_syntax(&multiline, "multiline").unwrap();
+        let quoted = r#"(pcb "board (outline (polygon x))" (string_quote "))"#;
+        let normalized = normalize_courtyard_outline_polygons(quoted);
+        assert_eq!(normalized, quoted);
     }
 
     /// Freerouting 2.3.0 routed both exports of the stock board completely;
@@ -3682,33 +3822,18 @@ pub(crate) mod tests {
     }
 
     /// KiCad's DSN of the stock JST PH carries its courtyard as an
-    /// `(outline (polygon ...))`, which the parser refuses (#98), so adoption
-    /// fails closed. Without those lines, the oval padstacks map to KiCad's
-    /// own names.
+    /// `(outline (polygon ...))`, which `validate_dsn_syntax` accepts (#98),
+    /// so the oval padstacks map to KiCad's own names without stripping
+    /// courtyards.
     #[test]
     fn native_oval_padstacks_map_to_kicads_names() {
-        let baseline = || {
-            export_dsn(
-                Path::new("board.kicad_pcb"),
-                OVAL_PADS,
-                &native_fixture_rules(),
-            )
-            .unwrap()
-        };
-        let error = adopt_native_dsn(baseline(), OVAL_PADS_NATIVE.to_string())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("failed Specctra parser validation"),
-            "{error}"
-        );
-
-        let without_courtyards = OVAL_PADS_NATIVE
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
-            .map(|line| format!("{line}\n"))
-            .collect::<String>();
-        let adopted = adopt_native_dsn(baseline(), without_courtyards).unwrap();
+        let baseline = export_dsn(
+            Path::new("board.kicad_pcb"),
+            OVAL_PADS,
+            &native_fixture_rules(),
+        )
+        .unwrap();
+        let adopted = adopt_native_dsn(baseline, OVAL_PADS_NATIVE.to_string()).unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
         let names = manifest["padstacks"]
             .as_array()
@@ -3743,10 +3868,7 @@ pub(crate) mod tests {
             baseline.dsn
         );
         let native = include_str!("../tests/fixtures/specctra_oval_pads_odd.native-kicad-10.dsn")
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
-            .map(|line| format!("{line}\n"))
-            .collect::<String>();
+            .to_string();
         assert!(native.contains("(path F.Cu 600  0 -150.5  0 150.5)"));
         let adopted = adopt_native_dsn(baseline, native).unwrap();
         assert!(adopted
@@ -4458,14 +4580,8 @@ pub(crate) mod tests {
     const FOUR_LAYERS_NATIVE_FILE: &str =
         include_str!("../tests/fixtures/specctra_four_layers.native-kicad-10.dsn");
 
-    /// The native DSN without the header's courtyard polygon, which the DSN
-    /// parser does not read yet, as the odd oval-pad test does too.
     fn four_layers_native() -> String {
-        FOUR_LAYERS_NATIVE_FILE
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
-            .map(|line| format!("{line}\n"))
-            .collect()
+        FOUR_LAYERS_NATIVE_FILE.to_string()
     }
 
     fn copper_of(table: &str) -> Result<Vec<String>> {
@@ -4581,8 +4697,7 @@ pub(crate) mod tests {
     fn four_layer_native_dsn_matches_the_rust_export() {
         let baseline = native_baseline(FOUR_LAYERS);
         let adopted = adopt_native_dsn(baseline, four_layers_native()).unwrap();
-        assert_eq!(adopted.dsn, four_layers_native());
-        assert_ne!(adopted.dsn, FOUR_LAYERS_NATIVE_FILE);
+        assert_eq!(adopted.dsn, FOUR_LAYERS_NATIVE_FILE);
         let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
         assert!(manifest["padstacks"]
             .as_array()
@@ -4785,14 +4900,8 @@ pub(crate) mod tests {
     const PADSTACK_DRILLS_NATIVE_FILE: &str =
         include_str!("../tests/fixtures/specctra_padstack_drills.native-kicad-10.dsn");
 
-    /// The native DSN without the header's courtyard polygon, which the DSN
-    /// parser does not read yet.
     fn padstack_drills_native() -> String {
-        PADSTACK_DRILLS_NATIVE_FILE
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
-            .map(|line| format!("{line}\n"))
-            .collect()
+        PADSTACK_DRILLS_NATIVE_FILE.to_string()
     }
 
     /// KiCad names both headers' pads after their copper alone: J1's 1.0 mm
@@ -4863,13 +4972,8 @@ pub(crate) mod tests {
     const ZONES_SES: &str =
         include_str!("../tests/fixtures/specctra_zones.native-kicad-10.freerouting-2.3.0.ses");
 
-    /// Without the header's courtyard polygon, as for the four-layer board.
     fn zones_native() -> String {
-        ZONES_NATIVE_FILE
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
-            .map(|line| format!("{line}\n"))
-            .collect()
+        ZONES_NATIVE_FILE.to_string()
     }
 
     fn zone_counts(manifest: &serde_json::Value) -> Vec<(String, String, u64)> {
@@ -5176,21 +5280,8 @@ pub(crate) mod tests {
         "../tests/fixtures/specctra_bottom_side.native-kicad-10.freerouting-2.3.0.ses"
     );
 
-    /// KiCad's export of the bottom-side fixture without its courtyard
-    /// `(outline (polygon ...))` forms, which the Specctra parser behind
-    /// `validate_dsn_syntax` cannot read (#98); a form may run over lines.
     fn bottom_side_native() -> String {
-        let mut kept = String::new();
-        let mut depth = 0i32;
-        for line in BOTTOM_SIDE_NATIVE_FILE.lines() {
-            if depth == 0 && !line.trim_start().starts_with("(outline (polygon ") {
-                kept.push_str(line);
-                kept.push('\n');
-                continue;
-            }
-            depth += line.matches('(').count() as i32 - line.matches(')').count() as i32;
-        }
-        kept
+        BOTTOM_SIDE_NATIVE_FILE.to_string()
     }
 
     fn bottom_side_board() -> (tempfile::TempDir, std::path::PathBuf, ExportBundle) {
@@ -5220,9 +5311,8 @@ pub(crate) mod tests {
         }
         assert_eq!(export.component_side, "both");
         let native = bottom_side_native();
-        assert_ne!(native, BOTTOM_SIDE_NATIVE_FILE);
         let adopted = adopt_native_dsn(export, native.clone()).unwrap();
-        assert_eq!(adopted.dsn, native);
+        assert_eq!(adopted.dsn, BOTTOM_SIDE_NATIVE_FILE);
         let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
         assert_eq!(manifest["supported_profile"]["component_side"], "both");
         let sides = manifest["components"]
@@ -5421,21 +5511,8 @@ pub(crate) mod tests {
     const PASTE_PADS_SES: &str =
         include_str!("../tests/fixtures/specctra_paste_pads.native-kicad-10.freerouting-2.5.0.ses");
 
-    /// KiCad's export of the paste-pad fixture without its courtyard
-    /// `(outline (polygon ...))` forms, which `validate_dsn_syntax` cannot
-    /// read (#98); a form may run over lines.
     fn paste_pads_native() -> String {
-        let mut kept = String::new();
-        let mut depth = 0i32;
-        for line in PASTE_PADS_NATIVE_FILE.lines() {
-            if depth == 0 && !line.trim_start().starts_with("(outline (polygon ") {
-                kept.push_str(line);
-                kept.push('\n');
-                continue;
-            }
-            depth += line.matches('(').count() as i32 - line.matches(')').count() as i32;
-        }
-        kept
+        PASTE_PADS_NATIVE_FILE.to_string()
     }
 
     fn non_copper_pads(manifest: &serde_json::Value, reference: &str) -> Vec<(String, String)> {

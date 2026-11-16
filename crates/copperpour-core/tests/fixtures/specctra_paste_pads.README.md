@@ -12,8 +12,9 @@ API with `specctra_paste_pads.generate.py`, then re-saved with
 On each, pad 1 is on `VCC`, the tab (pad 2) on `GND` and pad 3 has no net.
 Each also has four unnumbered pads over its tab on `F.Paste` only (`U2`:
 `B.Paste` once flipped): the paste apertures, with no copper (#458). The two
-footprints were chosen with whole-micrometre pads, which the native-DSN
-reader requires (#841), and differ from each other: KiCad names a second
+footprints were chosen with whole-micrometre pads (before
+[#98](https://github.com/Copperpour/Copperpour/issues/98) added sub-micrometre
+pin support), and differ from each other: KiCad names a second
 image of the same footprint `<name>::1`, and Freerouting's session gives
 both components the first name.
 
