@@ -110,13 +110,13 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
 }
 
 pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), SexpError> {
-    write_atomic_unlocked_with(path, content, || {})
+    write_atomic_unlocked_with(path, content, || Ok(()))
 }
 
-fn write_atomic_unlocked_with(
+pub(crate) fn write_atomic_unlocked_with(
     path: &Path,
     content: &str,
-    before_replace: impl FnOnce(),
+    before_replace: impl FnOnce() -> Result<(), SexpError>,
 ) -> Result<(), SexpError> {
     ensure_kicad_design_document_is_closed(path)?;
     let (tmp_path, mut file) = create_scratch_file(path)?;
@@ -135,9 +135,9 @@ fn write_atomic_unlocked_with(
 
     // A lock may have appeared while the scratch file was being written.
     // Recheck at the last refusal point before replacing the document.
-    before_replace();
     #[cfg(any(test, feature = "test-hooks"))]
     test_hooks::run_before_replace(path);
+    before_replace()?;
     ensure_kicad_design_document_is_closed(path)?;
     std::fs::rename(&tmp_path, path)?;
     cleanup.disarm();
@@ -634,7 +634,15 @@ enum NewFileMode {
 }
 
 pub(crate) fn write_new_atomic_unlocked(path: &Path, content: &str) -> Result<(), SexpError> {
-    write_new_atomic_unlocked_with_mode(path, content, NewFileMode::Ordinary)
+    write_new_atomic_unlocked_with(path, content, || Ok(()))
+}
+
+pub(crate) fn write_new_atomic_unlocked_with(
+    path: &Path,
+    content: &str,
+    before_publish: impl FnOnce() -> Result<(), SexpError>,
+) -> Result<(), SexpError> {
+    write_new_atomic_unlocked_with_mode(path, content, NewFileMode::Ordinary, before_publish)
 }
 
 /// Create-only atomic write for content that must not leave the owner.
@@ -642,13 +650,14 @@ pub(crate) fn write_new_atomic_unlocked_private(
     path: &Path,
     content: &str,
 ) -> Result<(), SexpError> {
-    write_new_atomic_unlocked_with_mode(path, content, NewFileMode::Private)
+    write_new_atomic_unlocked_with_mode(path, content, NewFileMode::Private, || Ok(()))
 }
 
 fn write_new_atomic_unlocked_with_mode(
     path: &Path,
     content: &str,
     _mode: NewFileMode,
+    before_publish: impl FnOnce() -> Result<(), SexpError>,
 ) -> Result<(), SexpError> {
     ensure_kicad_design_document_is_closed(path)?;
     let parent = parent_directory(path);
@@ -682,6 +691,7 @@ fn write_new_atomic_unlocked_with_mode(
     temporary.write_all(content.as_bytes())?;
     temporary.flush()?;
     temporary.as_file().sync_all()?;
+    before_publish()?;
     ensure_kicad_design_document_is_closed(path)?;
     temporary
         .persist_noclobber(path)
@@ -1898,11 +1908,27 @@ mod atomic_write_tests {
 
         let error = write_atomic_unlocked_with(&path, "replacement", || {
             std::fs::write(&lock, "appeared during write").unwrap();
+            Ok(())
         })
         .unwrap_err();
 
         assert!(matches!(error, SexpError::KiCadEditorLocked { .. }));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "expected");
+        assert!(lock.exists());
+    }
+
+    #[test]
+    fn a_lock_appearing_after_the_first_gate_blocks_atomic_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new.kicad_sch");
+        let lock = directory.path().join("~new.kicad_sch.lck");
+        let error = write_new_atomic_unlocked_with(&path, "candidate", || {
+            std::fs::write(&lock, "appeared during write").unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(error, SexpError::KiCadEditorLocked { .. }));
+        assert!(!path.exists());
         assert!(lock.exists());
     }
 
