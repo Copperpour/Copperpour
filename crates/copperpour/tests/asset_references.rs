@@ -177,8 +177,9 @@ fn agents_make_claimed_evidence_executable() {
     let cases = [
         (
             "kicad-schematic-build-agent.md",
-            &["sch_analysis", "sch_export"][..],
+            &["project", "sch_analysis", "sch_export"][..],
             &[
+                "open_schematic_viewer",
                 "find_shorted_nets",
                 "run_erc",
                 "render_schematic_png",
@@ -258,6 +259,60 @@ fn skills_define_the_same_evidence_boundary_as_their_agents() {
     assert!(
         missing.is_empty(),
         "skill completion criteria omit required evidence:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
+/// Schematic creation and editing guidance must teach agents to offer the live
+/// browser viewer link early without auto-opening a browser, blocking on viewer
+/// startup failure, or leaking the token-bearing URL outside the conversation
+/// (#493).
+#[test]
+fn schematic_guidance_offers_the_live_viewer_link_safely() {
+    let root = assets_root();
+    let required_markers = [
+        "open_schematic_viewer",
+        "open_browser: false",
+        "[Open schematic viewer](<url>)",
+        "before substantive edits",
+        "initial root schematic",
+        "root schematic",
+        "refreshes",
+        "repeating the link in every update",
+        "cannot start",
+        "continue the schematic task",
+        "authenticated URL",
+        "public issues, logs, or repository files",
+    ];
+    let mut missing = Vec::new();
+
+    for relative in [
+        "skills/kicad-schematic/SKILL.md",
+        "agents/kicad-schematic-build-agent.md",
+    ] {
+        let text = std::fs::read_to_string(root.join(relative)).unwrap();
+        for marker in required_markers {
+            if !text.contains(marker) {
+                missing.push(format!("{relative} does not prescribe `{marker}`"));
+            }
+        }
+    }
+
+    let skill = std::fs::read_to_string(root.join("skills/kicad-schematic/SKILL.md")).unwrap();
+    for marker in [
+        "open_schematic_viewer(schematic, open_browser?)",
+        "viewer failure does not block schematic work",
+    ] {
+        if !skill.contains(marker) {
+            missing.push(format!(
+                "skills/kicad-schematic/SKILL.md does not include `{marker}`"
+            ));
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "schematic workflow guidance omits live viewer contract:\n  {}",
         missing.join("\n  ")
     );
 }

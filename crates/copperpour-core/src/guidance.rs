@@ -256,6 +256,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schematic_guidance_serves_live_viewer_workflow_over_mcp() {
+        let handler = handler().await;
+        let via_tool = tool(&handler, json!({"path":"kicad-schematic/SKILL.md"})).await;
+        let text = via_tool["contents"][0]["text"].as_str().unwrap();
+        let via_resource = request(
+            &handler,
+            "resources/read",
+            json!({"uri":"copperpour://guidance/kicad-schematic/SKILL.md"}),
+        )
+        .await
+        .result
+        .unwrap();
+        assert_eq!(via_resource["contents"][0]["text"].as_str(), Some(text));
+        for marker in [
+            "open_schematic_viewer(schematic, open_browser?)",
+            "open_browser: false",
+            "[Open schematic viewer](<url>)",
+            "before substantive edits",
+            "initial root schematic",
+            "viewer failure does not block schematic work",
+            "public issues, logs, or repository files",
+        ] {
+            assert!(
+                text.contains(marker),
+                "served kicad-schematic guidance is missing `{marker}`"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn guidance_resources_and_tool_serve_every_bundled_file_with_identical_bytes() {
         let handler = handler().await;
         let listed = request(&handler, "resources/list", json!({}))

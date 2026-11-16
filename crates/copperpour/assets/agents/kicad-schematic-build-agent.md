@@ -34,6 +34,16 @@ load_toolset("project")
 load_toolset("templates")
 ```
 
+Once a saved root `.kicad_sch` exists — before substantive edits on an existing
+design, or as soon as the initial root schematic is saved on a new design — call
+`open_schematic_viewer` on the root schematic with `open_browser: false` and
+present the actual returned `url` as a clickable `[Open schematic viewer](<url>)`
+link in an early progress update, briefly explaining that the viewer refreshes as
+changes are saved. Reuse the existing viewer session and avoid repeating the link in every update.
+If the viewer cannot start, report that briefly and continue the schematic task.
+Keep the authenticated URL within the user's conversation and never copy it into
+public issues, logs, or repository files.
+
 ### Build Workflow
 
 **Step 1: Understand Requirements**

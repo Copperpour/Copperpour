@@ -23,7 +23,7 @@ load_toolset('sch_components')   # place, move, rotate, delete symbols
 load_toolset('sch_wiring')       # wires, net labels, power symbols, connections
 load_toolset('sch_analysis')     # connection validation, short and orphan checks
 load_toolset('sch_export')       # direct ERC and rendered schematic evidence
-load_toolset('project')          # save_project before formal checks
+load_toolset('project')          # open_schematic_viewer; save_project before formal checks
 ```
 
 Load additional toolsets as needed:
@@ -34,6 +34,35 @@ load_toolset('sch_batch')        # batch operations for 3+ items; free text item
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
+
+---
+
+## Live Schematic Viewer
+
+When beginning schematic creation or editing, start or reuse the live browser
+viewer once a saved root `.kicad_sch` exists:
+
+```
+open_schematic_viewer(schematic, open_browser?)
+```
+
+- Pass `open_browser: false` so Copperpour returns the viewer URL without
+  automatically launching a browser, letting the user choose when to open it.
+- For an **existing design**, call `open_schematic_viewer` before substantive edits.
+  For a **new design**, call it as soon as the initial root schematic has been
+  saved (for example immediately after `create_project` or the first saved root
+  sheet).
+- Always pass the **root schematic** path for hierarchical designs, never a
+  child sheet. The server reuses the existing viewer session for the same
+  canonical root (`reused: true`).
+- Present the actual `url` returned by the tool as a clickable
+  `[Open schematic viewer](<url>)` link in an early progress update, and
+  briefly explain that the viewer refreshes as changes are saved. Avoid
+  repeating the link in every update.
+- If the viewer cannot start, report that briefly and continue the schematic task —
+  viewer failure does not block schematic work.
+- Keep the authenticated URL within the user's conversation and never copy it into
+  public issues, logs, or repository files.
 
 ---
 
