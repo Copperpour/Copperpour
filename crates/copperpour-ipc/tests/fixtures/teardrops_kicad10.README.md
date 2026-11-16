@@ -4,6 +4,7 @@ A four-layer board whose GND pads and via carry native teardrop settings, saved 
 
 - `teardrop_fixture_test.rs`, which CI runs: the mock server replays the capture, and every decoded pad and via is checked against the board's own `(teardrops …)` blocks;
 - `live_teardrop_test.rs`, ignored, which drives a running KiCad through the same changes.
+- `copperpour-core`'s `pcb_teardrops` tests, which CI runs: the `get_teardrop_settings` and `set_teardrop_settings` tools against a KiCad double holding this capture and board, and, ignored, `live_teardrop_tools_change_settings_and_copper` against a running KiCad holding a copy of the board (`KICAD_API_SOCKET`, `COPPERPOUR_LIVE_TEARDROP_BOARD`).
 
 ## The board
 
