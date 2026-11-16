@@ -21,7 +21,8 @@ pub fn tools() -> Vec<ToolDef> {
             "export_manufacturing_package",
             "Generate ALL files needed for PCB fabrication and assembly in one call: \
              Gerbers, drill files, BOM (fab-house format), and pick-and-place positions. \
-             Targets a specific fab house (JLCPCB, PCBWay, etc.). JLCPCB assembly requires the exact board open in KiCad with IPC enabled; native pad midpoints and board exports use one stable live snapshot.",
+             Targets a specific fab house (JLCPCB, PCBWay, etc.). JLCPCB assembly requires the exact board open in KiCad with IPC enabled; native pad midpoints and board exports use one stable live snapshot. \
+             The JLCPCB placement evidence is written whole beside the CPL, at `placement_orientation.evidence_path`; the response counts its lists and shows the first `limit` applied corrections.",
             json!({
                 "type": "object",
                 "properties": {
@@ -70,7 +71,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "jlcpcb_cpl_corrections_path": {
                         "type": "string",
                         "description": "Optional path to a versioned JLCPCB CPL correction-policy JSON file, kept with the project (format and example: docs/JLCPCB_CPL_CORRECTIONS.md). Exact designator overrides take highest precedence, then project footprint rules, then built-in rules. Used only when fab_house is 'jlcpcb'."
-                    }
+                    },
+                    "limit": { "type": "integer", "minimum": 0, "description": "Maximum applied CPL corrections to list; the evidence file holds them all", "default": 50 }
                 },
                 "required": ["board", "output_dir"]
             }),
@@ -82,7 +84,9 @@ pub fn tools() -> Vec<ToolDef> {
              fab house. Runs KiCad's DRC and checks board outline, design rules, footprints, \
              and routing evidence. Returns NOT READY — never READY — if \
              DRC reports errors or could not be run, so a READY verdict always rests on \
-             evidence rather than on an absence of findings.",
+             evidence rather than on an absence of findings. The response lists the first \
+             `limit` issues, `issues_count` all of them; `output` writes the whole response \
+             to a file.",
             json!({
                 "type": "object",
                 "properties": {
@@ -91,7 +95,9 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Target manufacturer: 'jlcpcb', 'pcbway', 'oshpark'",
                         "default": "jlcpcb"
-                    }
+                    },
+                    "limit": { "type": "integer", "minimum": 0, "description": "Maximum issues to list; the verdict and issues_count cover them all", "default": 50 },
+                    "output": { "type": "string", "minLength": 1, "description": "Optional path to write the whole response JSON, every issue listed" }
                 },
                 "required": ["board"]
             }),
@@ -205,6 +211,27 @@ impl PackageBuild {
     }
 }
 
+/// The package's response, in the order a caller reads it: the verdict and
+/// the warnings first, the placement evidence last (#69). `json!` sorts its
+/// keys.
+#[derive(serde::Serialize)]
+struct PackageResponse<'a> {
+    complete: bool,
+    summary: &'a str,
+    warnings: &'a [String],
+    next_steps: &'a str,
+    fab_house: &'a str,
+    output_dir: &'a str,
+    files: &'a [String],
+    files_generated: &'a [serde_json::Value],
+    gerber_layers: &'a [String],
+    position_units: Option<&'a str>,
+    position_side: Option<&'a str>,
+    board_source: &'static str,
+    project_settings_source: &'static str,
+    placement_orientation: Option<crate::fab::jlcpcb::JlcpcbOrientationSummary<'a>>,
+}
+
 /// Writes the package `args` ask for: the body of `export_manufacturing_package`.
 pub(crate) async fn build_package(
     args: &serde_json::Value,
@@ -226,6 +253,10 @@ pub(crate) async fn build_package(
         Some(get_path(args, "jlcpcb_cpl_corrections_path")?)
     } else {
         None
+    };
+    let limit = match super::response_limit(args, 50) {
+        Ok(limit) => limit,
+        Err(refusal) => return Ok(Err(refusal)),
     };
     if let Err((field, reason)) =
         pcb_export::validate_position_values("csv", position_side, position_units)
@@ -296,6 +327,7 @@ pub(crate) async fn build_package(
     let mut cpl_designators = None;
     let mut bom_designators = None;
     let mut cpl_orientation_evidence = None;
+    let mut orientation_evidence_path = None;
     let mut cpl_export = None;
     let mut bom_written = None;
 
@@ -377,17 +409,35 @@ pub(crate) async fn build_package(
                     cpl_export = Some(export);
                 }
                 verified_paths.push(pos_path.clone());
-                let mut generated = json!({
+                files_generated.push(json!({
                     "type": "pick_and_place",
                     "path": pos_path.to_str().unwrap_or(""),
                     "format": "csv",
                     "units": position_units,
                     "side": position_side
-                });
+                }));
+                // Every per-part list in full, beside the CPL it describes;
+                // the response counts them (#69). It is not in `files`, as
+                // nothing is uploaded with it.
                 if let Some(evidence) = &cpl_orientation_evidence {
-                    generated["placement_orientation"] = json!(evidence);
+                    let path = pos_path.with_extension("orientation.json");
+                    let written = async {
+                        let text = serde_json::to_string_pretty(evidence)?;
+                        cli::publish_verified_bytes(
+                            &path,
+                            text.as_bytes(),
+                            "placement orientation evidence",
+                        )
+                        .await
+                    }
+                    .await;
+                    match written {
+                        Ok(()) => orientation_evidence_path = Some(path),
+                        Err(e) => warnings.push(format!(
+                            "Placement orientation evidence was not written: {e:#}"
+                        )),
+                    }
                 }
-                files_generated.push(generated);
             }
             Err(e) => {
                 error!(error = %e, "[BETA] Position file export failed");
@@ -517,22 +567,31 @@ pub(crate) async fn build_package(
     } else {
         "Do not upload this package. Resolve every warning and export again.".to_string()
     };
-    let body = serde_json::to_string(&json!({
-        "complete": complete,
-        "fab_house": fab_house,
-        "output_dir": output_dir.to_str().unwrap_or(""),
-        "files": all_files,
-        "files_generated": files_generated,
-        "gerber_layers": gerber_layers,
-        "position_units": if include_assembly { Some(position_units) } else { None },
-        "position_side": if include_assembly { Some(position_side) } else { None },
-        "placement_orientation": cpl_orientation_evidence,
-        "board_source": if snapshot.is_some() { "stable_live_ipc_snapshot" } else { "saved_file" },
-        "project_settings_source": "saved_kicad_pro_if_present",
-        "warnings": warnings,
-        "summary": summary,
-        "next_steps": next_steps
-    }))
+    let evidence_path = orientation_evidence_path
+        .as_deref()
+        .and_then(std::path::Path::to_str);
+    let body = serde_json::to_string(&PackageResponse {
+        complete,
+        summary: &summary,
+        warnings: &warnings,
+        next_steps: &next_steps,
+        fab_house,
+        output_dir: output_dir.to_str().unwrap_or(""),
+        files: &all_files,
+        files_generated: &files_generated,
+        gerber_layers: &gerber_layers,
+        position_units: include_assembly.then_some(position_units),
+        position_side: include_assembly.then_some(position_side),
+        board_source: if snapshot.is_some() {
+            "stable_live_ipc_snapshot"
+        } else {
+            "saved_file"
+        },
+        project_settings_source: "saved_kicad_pro_if_present",
+        placement_orientation: cpl_orientation_evidence
+            .as_ref()
+            .map(|evidence| evidence.summary(evidence_path, limit)),
+    })
     .unwrap();
     Ok(Ok(PackageBuild {
         body,
@@ -771,11 +830,22 @@ async fn upload_order_package(
             },
             "drc": drc,
             "board_source": package_body["board_source"],
-            "placement_orientation": package_body["placement_orientation"],
+            "placement_orientation": without_evidence_path(&package_body["placement_orientation"]),
             "next_steps": "Open order_url and sign in to JLCPCB. Check the board in JLCPCB's viewer and its size, layers and options; with assembly, check every part in the PCBA step's Component Placements before ordering. Nothing has been ordered or paid.",
         })
         .to_string(),
     ))
+}
+
+/// The package's placement summary without its `evidence_path`: the order
+/// link's package is written to a temporary directory, gone once it answers.
+#[cfg(feature = "jlcpcb")]
+fn without_evidence_path(orientation: &serde_json::Value) -> serde_json::Value {
+    let mut orientation = orientation.clone();
+    if let Some(fields) = orientation.as_object_mut() {
+        fields.remove("evidence_path");
+    }
+    orientation
 }
 
 /// A copy of the exported board, with the project's settings and custom
@@ -877,6 +947,20 @@ async fn handle_validate_for_manufacturing(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let fab_house = args["fab_house"].as_str().unwrap_or("jlcpcb");
+    let limit = match super::response_limit(args, 50) {
+        Ok(limit) => limit,
+        Err(refusal) => return Ok(refusal),
+    };
+    let output = args["output"].as_str();
+    // Refused before the board is read, as `run_drc` refuses its report path.
+    if output.is_some_and(|output| {
+        super::drc::output_is_unusable(std::path::Path::new(output), &[board.as_path()])
+    }) {
+        return Ok(invalid_manufacturing_argument(
+            "output",
+            "destination aliases the board, is a directory or has a non-directory ancestor",
+        ));
+    }
 
     info!(
         board = %board.display(),
@@ -948,10 +1032,14 @@ async fn handle_validate_for_manufacturing(
     // returned READY on a board with 25 DRC errors and an unrouted item
     // (#247). A readiness verdict now requires the evidence.
     let drc = cli::run_drc(&ctx.config.kicad_cli, &board, false).await;
+    // One issue per DRC error, listed after every other issue: a long DRC
+    // report must not push the board's own findings, or a check that did not
+    // run, out of the bounded list (#69).
+    let mut drc_errors = Vec::new();
     let drc_summary = match &drc {
         Ok(report) => {
             for violation in report.all().filter(|v| v.severity == "error") {
-                issues.push(json!({
+                drc_errors.push(json!({
                     "severity": "error",
                     "issue": format!("DRC [{}]: {}", violation.rule, violation.description),
                     "fix": "Fix in the PCB editor, or waive the rule deliberately; \
@@ -997,6 +1085,7 @@ async fn handle_validate_for_manufacturing(
             serde_json::Value::Null
         }
     };
+    issues.extend(drc_errors);
 
     let verdict = if issues.iter().any(|i| i["severity"] == "error") {
         "NOT READY"
@@ -1012,28 +1101,71 @@ async fn handle_validate_for_manufacturing(
         "[BETA] Manufacturing validation complete"
     );
 
+    let summary = format!(
+        "{}: {} issues found. {} footprints, {} copper layers.",
+        verdict,
+        issues.len(),
+        fp_count,
+        copper_layers
+    );
+    let board_info = json!({
+        "footprint_count": fp_count,
+        "copper_layers": copper_layers,
+        "net_count": net_count,
+        "track_count": track_count
+    });
+    let response = |limit| {
+        let listed = super::BoundedList::new(&issues, limit);
+        ValidationResponse {
+            verdict,
+            summary: &summary,
+            fab_house,
+            board_info: &board_info,
+            drc: &drc_summary,
+            issues_count: listed.count,
+            issues_shown: listed.shown,
+            issues_truncated: listed.truncated,
+            issues: listed.items,
+        }
+    };
+    if let Some(output) = output {
+        let written = async {
+            let text = serde_json::to_string_pretty(&response(usize::MAX))?;
+            super::drc::write_report(output, &text).await
+        }
+        .await;
+        if let Err(error) = written {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::HandlerError {
+                    reason: format!("the full response was not written to {output}: {error:#}"),
+                },
+                "Nothing was changed. Choose a writable output path and run the check again.",
+            ));
+        }
+    }
     Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "verdict": verdict,
-            "fab_house": fab_house,
-            "board_info": {
-                "footprint_count": fp_count,
-                "copper_layers": copper_layers,
-                "net_count": net_count,
-                "track_count": track_count
-            },
-            // Null means DRC did not run, and an issue above says so. Never a
-            // zeroed-out object: this tool must not be able to imply a clean
-            // board it never checked.
-            "drc": drc_summary,
-            "issues": issues,
-            "summary": format!(
-                "{}: {} issues found. {} footprints, {} copper layers.",
-                verdict, issues.len(), fp_count, copper_layers
-            )
-        }))
-        .unwrap(),
+        serde_json::to_string(&response(limit)).unwrap(),
     ))
+}
+
+/// `validate_for_manufacturing`'s response, the verdict first and the issues
+/// last (#69): `json!` sorts its keys, which put `verdict` after every issue.
+#[derive(serde::Serialize)]
+struct ValidationResponse<'a> {
+    verdict: &'static str,
+    summary: &'a str,
+    fab_house: &'a str,
+    board_info: &'a serde_json::Value,
+    /// Null means DRC did not run, and an issue says so. Never a zeroed-out
+    /// object: this tool must not be able to imply a clean board it never
+    /// checked.
+    drc: &'a serde_json::Value,
+    /// `issues` holds the first `issues_shown` of `issues_count`, as
+    /// `run_drc` reports `shown` and `truncated` beside its list.
+    issues_count: usize,
+    issues_shown: usize,
+    issues_truncated: bool,
+    issues: &'a [serde_json::Value],
 }
 
 /// The board's footprints that a BOM lists, and the references of those it
@@ -1455,6 +1587,44 @@ mod order_link_tests {
         assert!(String::from_utf8_lossy(&request.lock().unwrap()).contains("name=\"gerber\""));
     }
 
+    /// #69: the order link's package is gone once it answers, so the
+    /// placement summary it repeats names no evidence file; the rest stays.
+    #[tokio::test]
+    async fn the_order_link_repeats_the_placement_summary_without_its_file() {
+        let (base, count, _) = endpoint().await;
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("order.kicad_pcb");
+        std::fs::write(&board, ORDER_BOARD).unwrap();
+        let mut package = prepared_package(true);
+        package.body = json!({
+            "warnings": [],
+            "board_source": "saved_file",
+            "placement_orientation": {
+                "status": "PREVIEW_REQUIRED",
+                "evidence_path": dir.path().join("package/CPL-order.orientation.json"),
+                "geometry_count": 2,
+            },
+        })
+        .to_string();
+        let result = upload_order_package(
+            &json!({ "_order_base_url": base }),
+            &ctx(),
+            &board,
+            false,
+            true,
+            package,
+        )
+        .await
+        .unwrap();
+        let answer = body(&result);
+        assert!(!result.is_error, "{answer}");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            answer["placement_orientation"],
+            json!({ "status": "PREVIEW_REQUIRED", "geometry_count": 2 })
+        );
+    }
+
     #[tokio::test]
     async fn a_lost_response_after_receiving_the_files_reports_uncertainty() {
         let (base, count, _) = endpoint_with_status(None).await;
@@ -1718,6 +1888,33 @@ mod package_export_option_tests {
             json!(["front", "back", "both"])
         );
         assert_eq!(properties["jlcpcb_cpl_corrections_path"]["type"], "string");
+    }
+
+    /// #69: a malformed `limit` is refused before anything is written.
+    #[tokio::test]
+    async fn a_malformed_limit_is_refused_before_any_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("package");
+        for limit in [json!(-1), json!(1.5), json!("50")] {
+            let result = handle_export_manufacturing_package(
+                &json!({
+                    "board": dir.path().join("board.kicad_pcb"),
+                    "output_dir": output,
+                    "limit": limit
+                }),
+                &ToolContext::new(
+                    crate::tools::ServerConfig::default(),
+                    std::sync::Arc::new(crate::router::ToolRouter::new()),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{limit}");
+            let refused = result_json(&result);
+            assert_eq!(refused["error"]["kind"], "invalid_argument", "{refused}");
+            assert_eq!(refused["error"]["field"], "limit", "{refused}");
+        }
+        assert!(!output.exists());
     }
 
     #[tokio::test]
@@ -2144,6 +2341,213 @@ mod readiness_evidence_tests {
                 .contains("DRC could not run")),
             "the missing evidence must be named: {issues:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_issue_tests {
+    //! #69: the verdict first, the first `limit` issues listed, every issue
+    //! counted, and `output` for the whole response.
+
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use serde_json::{json, Value};
+
+    /// A board and a stand-in kicad-cli whose DRC report has `errors` errors
+    /// and no `schematic_parity`: one issue more says the check is missing.
+    struct Served {
+        dir: tempfile::TempDir,
+        board: PathBuf,
+        handler: McpHandler,
+    }
+
+    const ERRORS: usize = 60;
+
+    impl Served {
+        async fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("board.kicad_pcb");
+            std::fs::write(
+                &board,
+                include_str!("../../tests/fixtures/specctra_two_resistors.kicad_pcb"),
+            )
+            .unwrap();
+            let row = |n: usize| json!({"severity": "error", "type": "clearance", "description": format!("clearance {n}"), "items": []});
+            std::fs::write(
+                board.with_extension("drc.json"),
+                json!({ "violations": (0..ERRORS).map(row).collect::<Vec<_>>(), "unconnected_items": [] })
+                    .to_string(),
+            )
+            .unwrap();
+            let cli = cli::test_support::noop_cli(dir.path());
+            let handler = McpHandler::new(crate::tools::ServerConfig {
+                kicad_cli: cli.display().to_string(),
+                eager_toolsets: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            Self {
+                dir,
+                board,
+                handler,
+            }
+        }
+
+        /// The response text and whether it is an error.
+        async fn call(&self, extra: Value) -> (bool, String) {
+            let mut args = json!({ "board": self.board });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = self
+                .handler
+                .handle_message(json!({"jsonrpc": "2.0", "id": 69, "method": "tools/call",
+                    "params": {"name": "validate_for_manufacturing", "arguments": args}}))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            (
+                result["isError"] == true,
+                result["content"][0]["text"].as_str().unwrap().to_string(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn issues_past_the_limit_are_counted_and_the_verdict_comes_first() {
+        let served = Served::new().await;
+        let (is_error, text) = served.call(json!({ "limit": 5 })).await;
+        assert!(!is_error, "{text}");
+        assert!(
+            text.starts_with(r#"{"verdict":"NOT READY","summary":"NOT READY: 61 issues found."#),
+            "{text}"
+        );
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["issues_count"], ERRORS + 1);
+        assert_eq!(body["issues_shown"], 5);
+        assert_eq!(body["issues_truncated"], true);
+        let issues = body["issues"].as_array().unwrap();
+        assert_eq!(issues.len(), 5);
+        // The check that did not run leads; the DRC's errors follow it.
+        assert!(
+            issues[0]["issue"]
+                .as_str()
+                .unwrap()
+                .contains("did not report DRC 'schematic_parity'"),
+            "{issues:#?}"
+        );
+        assert_eq!(issues[1]["issue"], "DRC [clearance]: clearance 0");
+        assert_eq!(body["drc"]["errors"], ERRORS);
+    }
+
+    #[tokio::test]
+    async fn fifty_issues_are_listed_when_no_limit_is_named() {
+        let served = Served::new().await;
+        let (_, text) = served.call(json!({})).await;
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["issues_shown"], 50, "{body:#}");
+        assert_eq!(body["issues"].as_array().unwrap().len(), 50);
+        assert_eq!(body["issues_count"], ERRORS + 1);
+    }
+
+    #[tokio::test]
+    async fn the_output_file_holds_every_issue() {
+        let served = Served::new().await;
+        let output = served.dir.path().join("reports").join("validate.json");
+        let (is_error, text) = served.call(json!({ "limit": 0, "output": output })).await;
+        assert!(!is_error, "{text}");
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["issues"], json!([]));
+        assert_eq!(body["issues_count"], ERRORS + 1);
+
+        let written = std::fs::read_to_string(&output).unwrap();
+        assert!(
+            written.starts_with("{\n  \"verdict\": \"NOT READY\""),
+            "{written}"
+        );
+        let written: Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(written["issues"].as_array().unwrap().len(), ERRORS + 1);
+        assert_eq!(written["issues_shown"], ERRORS + 1);
+        assert_eq!(written["issues_truncated"], false);
+        assert_eq!(written["verdict"], body["verdict"]);
+    }
+
+    /// Refused before DRC runs: the stand-in's report, which a DRC run reads
+    /// and deletes, is still there.
+    #[tokio::test]
+    async fn an_output_over_the_board_a_directory_or_a_file_is_refused_first() {
+        let served = Served::new().await;
+        let before = std::fs::read(&served.board).unwrap();
+        for output in [
+            served.board.clone(),
+            served.dir.path().to_path_buf(),
+            served.board.join("validate.json"),
+        ] {
+            let (is_error, text) = served.call(json!({ "output": output })).await;
+            assert!(is_error, "{}: {text}", output.display());
+            let refused: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(refused["error"]["kind"], "invalid_argument", "{refused:#}");
+            assert_eq!(refused["error"]["field"], "output", "{refused:#}");
+        }
+        assert!(served.board.with_extension("drc.json").exists());
+        assert_eq!(std::fs::read(&served.board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_negative_or_fractional_limit_or_an_empty_output_is_refused() {
+        let served = Served::new().await;
+        for (field, extra) in [
+            ("limit", json!({ "limit": -1 })),
+            ("limit", json!({ "limit": 1.5 })),
+            ("output", json!({ "output": "" })),
+        ] {
+            let (is_error, text) = served.call(extra).await;
+            assert!(is_error, "{text}");
+            let refused: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(refused["error"]["kind"], "invalid_argument", "{refused:#}");
+            assert_eq!(refused["error"]["field"], field, "{refused:#}");
+        }
+        // The handler refuses a malformed limit without the schema too.
+        let direct = handle_validate_for_manufacturing(
+            &json!({ "board": served.board, "limit": 1.5 }),
+            &ToolContext::new(
+                crate::tools::ServerConfig::default(),
+                std::sync::Arc::new(crate::router::ToolRouter::new()),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(direct.is_error);
+        let refused: Value = match direct.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert_eq!(refused["error"]["kind"], "invalid_argument", "{refused:#}");
+        assert_eq!(refused["error"]["field"], "limit", "{refused:#}");
+        assert!(served.board.with_extension("drc.json").exists());
+    }
+
+    /// A destination the check passes but the write cannot take, as on a
+    /// full disk: the call fails, saying where, and changed nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_output_that_cannot_be_written_fails_the_call() {
+        let served = Served::new().await;
+        // A socket is neither a file nor a directory, so the check passes it,
+        // and no directory can be made where it stands.
+        let socket = served.dir.path().join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let output = socket.join("validate.json");
+        let (is_error, text) = served.call(json!({ "output": output })).await;
+        assert!(is_error, "{text}");
+        let refused: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(refused["error"]["kind"], "handler_error", "{refused:#}");
+        let reason = refused["error"]["reason"].as_str().unwrap();
+        assert!(reason.contains(output.to_str().unwrap()), "{reason}");
     }
 }
 

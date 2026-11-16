@@ -726,6 +726,7 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "placement_orientation",
         "applied_corrections",
         "unmatched_footprints",
+        "evidence_path",
         // Structured order-link response field, not a callable tool (#208).
         "order_url",
         "order_id",

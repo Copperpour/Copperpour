@@ -565,6 +565,53 @@ impl JlcpcbOrientationEvidence {
         }
         warnings
     }
+
+    /// What a response carries of this evidence (#69). The per-part lists
+    /// grow with the board, `geometry` by one entry for every placed part,
+    /// so they are counted here and held whole in `evidence_path`; the parts
+    /// they call to review are already in [`Self::review_warnings`]. The
+    /// first `limit` applied corrections are listed.
+    pub(crate) fn summary<'a>(
+        &'a self,
+        evidence_path: Option<&'a str>,
+        limit: usize,
+    ) -> JlcpcbOrientationSummary<'a> {
+        let applied = crate::tools::BoundedList::new(&self.applied_corrections, limit);
+        JlcpcbOrientationSummary {
+            status: self.status,
+            physical_validation: self.physical_validation,
+            note: self.note,
+            evidence_path,
+            geometry_count: self.geometry.len(),
+            unmatched_footprints_count: self.unmatched_footprints.len(),
+            unverified_footprints_count: self.unverified_footprints.len(),
+            applied_corrections_count: applied.count,
+            applied_corrections_shown: applied.shown,
+            applied_corrections_truncated: applied.truncated,
+            policies: &self.policies,
+            applied_corrections: applied.items,
+        }
+    }
+}
+
+/// [`JlcpcbOrientationEvidence::summary`], in the order a caller reads it:
+/// the status first, the listed corrections last.
+#[derive(Debug, Serialize)]
+pub(crate) struct JlcpcbOrientationSummary<'a> {
+    status: &'static str,
+    physical_validation: bool,
+    note: &'static str,
+    /// The whole evidence, every list in full; null when it was not written.
+    evidence_path: Option<&'a str>,
+    geometry_count: usize,
+    unmatched_footprints_count: usize,
+    unverified_footprints_count: usize,
+    /// `applied_corrections` holds the first `applied_corrections_shown`.
+    applied_corrections_count: usize,
+    applied_corrections_shown: usize,
+    applied_corrections_truncated: bool,
+    policies: &'a [JlcpcbPolicyEvidence],
+    applied_corrections: &'a [JlcpcbAppliedCorrection],
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1011,6 +1058,53 @@ mod jlcpcb_assembly_tests {
             "JLCPCB rotation not verified for footprint USB_C_Receptacle_HRO_TYPE-C-31-M-12"
         ));
         assert!(warnings[0].contains(": J1."));
+    }
+
+    /// #69: a response lists the first `limit` corrections, counts every
+    /// list, and names the file that holds them; the evidence stays whole.
+    #[test]
+    fn a_summary_lists_the_first_corrections_and_counts_every_list() {
+        let source = concat!(
+            "Ref,Val,Package,PosX,PosY,Rot,Side\n",
+            "U1,timer,Package_SO:SOIC-8_3.9x4.9mm_P1.27mm,47,-35,90,top\n",
+            "J1,usb,Connector_USB:USB_C_Receptacle_HRO_TYPE-C-31-M-12,30,-26.5,0,top\n",
+            "R1,10k,Resistor_SMD:R_0402_1005Metric,1,2,450,top\n",
+            "U2,timer,Package_SO:SOIC-8_3.9x4.9mm_P1.27mm,5,6,90,bottom\n",
+        );
+        let export = jlcpcb_cpl_from_kicad_csv(source, &built_in_policies()).unwrap();
+        let evidence = &export.orientation_evidence;
+        let summary = evidence.summary(Some("CPL-board.orientation.json"), 1);
+        let text = serde_json::to_string(&summary).unwrap();
+        assert!(
+            text.starts_with(r#"{"status":"PREVIEW_REQUIRED""#),
+            "{text}"
+        );
+        assert!(text.ends_with("]}"), "the corrections come last: {text}");
+        let summary: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(summary["evidence_path"], "CPL-board.orientation.json");
+        assert_eq!(summary["applied_corrections_count"], 2);
+        assert_eq!(summary["applied_corrections_shown"], 1);
+        assert_eq!(summary["applied_corrections_truncated"], true);
+        assert_eq!(
+            summary["applied_corrections"],
+            serde_json::to_value(&evidence.applied_corrections[..1]).unwrap()
+        );
+        assert_eq!(summary["unmatched_footprints_count"], 1);
+        assert_eq!(summary["unverified_footprints_count"], 1);
+        assert_eq!(summary["geometry_count"], 0);
+        assert_eq!(
+            summary["policies"],
+            serde_json::to_value(&evidence.policies).unwrap()
+        );
+        for list in ["geometry", "unmatched_footprints", "unverified_footprints"] {
+            assert!(summary.get(list).is_none(), "{list}: {summary}");
+        }
+
+        let whole = serde_json::to_value(evidence.summary(None, 50)).unwrap();
+        assert_eq!(whole["applied_corrections_shown"], 2);
+        assert_eq!(whole["applied_corrections_truncated"], false);
+        assert!(whole["evidence_path"].is_null());
+        assert_eq!(evidence.applied_corrections.len(), 2);
     }
 
     /// The regression bench: every built-in rule must be backed by at least
