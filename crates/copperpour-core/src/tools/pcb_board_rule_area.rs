@@ -17,7 +17,7 @@ use crate::tools::{
     with_bound_board_ipc_classified, BoardAccess, BoardBinding, ToolContext, ToolDef,
 };
 use copperpour_ipc::builders::{self, nm_to_mm, RuleAreaSpec};
-use copperpour_ipc::client::{ApiStatusError, KiCadIpcClient};
+use copperpour_ipc::client::KiCadIpcClient;
 use copperpour_ipc::gen::kiapi;
 use copperpour_ipc::gen::kiapi::board::types::{
     zone::Settings as ZoneSettings, BoardLayer, RuleAreaSettings, Zone, ZoneType,
@@ -33,7 +33,6 @@ const ZONE_TYPE_URL: &str = "kiapi.board.types.Zone";
 const UNDO_DESCRIPTION: &str = "Add PCB rule area";
 const REFILL_SETTLE_DELAY: Duration = Duration::from_millis(500);
 const REFILL_POLL_TIMEOUT: Duration = Duration::from_secs(30);
-const REFILL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// User-facing warning required by #77 until #81 ships rule-area support in
 /// Copperpour's Freerouting bridge.
@@ -1080,36 +1079,11 @@ fn read_settled_zones(
     created_uuid: &str,
     mut read: impl FnMut() -> anyhow::Result<Vec<prost_types::Any>>,
 ) -> anyhow::Result<PostRefillZones> {
-    let deadline = std::time::Instant::now() + timeout;
-    let mut previous: Option<PostRefillZones> = None;
-    loop {
-        match read() {
-            Ok(items) => {
-                let parsed = inspect_zones_after_refill(&items, created_uuid)?;
-                if previous
-                    .as_ref()
-                    .is_some_and(|prev| prev.zone_snapshot_key == parsed.zone_snapshot_key)
-                {
-                    return Ok(parsed);
-                }
-                previous = Some(parsed);
-            }
-            Err(error) => {
-                let busy = ApiStatusError::from_error(&error).is_some_and(|status| {
-                    status.code == kiapi::common::ApiStatusCode::AsBusy as i32
-                });
-                if !busy {
-                    return Err(error);
-                }
-                previous = None;
-            }
-        }
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "post-refill zone inventory did not become readable and stable before the deadline"
-        );
-        std::thread::sleep(REFILL_POLL_INTERVAL);
-    }
+    super::pcb_board_zones::read_settled_by_key(
+        timeout,
+        || inspect_zones_after_refill(&read()?, created_uuid),
+        |zones| zones.zone_snapshot_key.clone(),
+    )
 }
 
 fn build_applied_outcome(
@@ -1195,6 +1169,9 @@ mod tests {
         reject_create: Option<String>,
         alter_readback_tracks: Option<bool>,
         alter_readback_layers: Option<Vec<BoardLayer>>,
+        alter_readback_name: bool,
+        alter_readback_vertex: bool,
+        drop_after_refill: bool,
         fail_readback: bool,
         fail_refill: bool,
         leave_copper_unfilled: bool,
@@ -1357,6 +1334,19 @@ mod tests {
                             if let Some(ref layers) = st.alter_readback_layers {
                                 zone.layers = layers.iter().map(|l| *l as i32).collect();
                             }
+                            if st.alter_readback_name {
+                                zone.name = "unexpected name".to_string();
+                            }
+                            if st.alter_readback_vertex {
+                                let node = &mut zone.outline.as_mut().unwrap().polygons[0]
+                                    .outline
+                                    .as_mut()
+                                    .unwrap()
+                                    .nodes[0];
+                                if let Some(Geometry::Point(ref mut point)) = node.geometry {
+                                    point.x_nm += 1_000_000;
+                                }
+                            }
                             builders::pack_any(&zone, ZONE_TYPE_URL)
                         })
                         .collect();
@@ -1370,6 +1360,13 @@ mod tests {
                     )))
                 }
                 "RefillZones" => {
+                    if st.drop_after_refill {
+                        st.committed_zones.clear();
+                        // A different rule area remains: checking only the type,
+                        // rather than the created KIID, must not prove presence.
+                        st.committed_zones
+                            .push(Zone::decode(REAL_RULE_AREA_IPC).unwrap());
+                    }
                     if st.fail_refill {
                         err_resp(ApiStatusCode::AsBadRequest, "refill failed")
                     } else {
@@ -1760,6 +1757,7 @@ mod tests {
         .await;
         assert!(res.is_error);
         assert_eq!(body(&res)["outcome"]["status"], "failed");
+        assert!(format!("{res:?}").contains("invalid polygon"));
         let st = state.lock().unwrap();
         assert!(st.committed_zones.is_empty());
         assert!(st.sent_commands.iter().any(|c| c == "EndCommit:drop"));
@@ -1767,11 +1765,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn served_readback_mismatch_reports_uncertain_with_created_uuid() {
+    async fn served_flag_mismatch_reports_uncertain_with_created_uuid() {
         let (_dir, board) = temp_board();
         let state = Arc::new(Mutex::new(MockBoardState {
             enabled_copper_layers: vec![BoardLayer::BlFCu, BoardLayer::BlBCu],
             alter_readback_tracks: Some(false),
+            ..Default::default()
+        }));
+        let server = spawn_rule_area_mock(&board, state.clone());
+        let handler = served_handler(server.address().to_string()).await;
+
+        let res = call_served(
+            &handler,
+            json!({
+                "board": board,
+                "layers": ["F.Cu", "B.Cu"],
+                "rect": { "x1": 1.0, "y1": 1.0, "x2": 6.0, "y2": 6.0 }
+            }),
+        )
+        .await;
+        assert!(res.is_error);
+        assert_eq!(
+            extract_error_kind(&res).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
+        let json = body(&res);
+        assert_eq!(json["outcome"]["status"], "uncertain");
+        assert!(json["uuid"].as_str().is_some());
+        assert!(
+            json["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("keepout_tracks"),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn served_layers_mismatch_reports_uncertain_with_created_uuid() {
+        let (_dir, board) = temp_board();
+        let state = Arc::new(Mutex::new(MockBoardState {
+            enabled_copper_layers: vec![BoardLayer::BlFCu, BoardLayer::BlBCu],
             alter_readback_layers: Some(vec![BoardLayer::BlFCu]),
             ..Default::default()
         }));
@@ -1795,7 +1829,81 @@ mod tests {
         let json = body(&res);
         assert_eq!(json["outcome"]["status"], "uncertain");
         assert!(json["uuid"].as_str().is_some());
-        assert_eq!(json["rule_area"]["keepout_tracks"], false);
+        assert!(
+            json["error"]["reason"].as_str().unwrap().contains("layers"),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn served_name_mismatch_reports_uncertain_with_created_uuid() {
+        let (_dir, board) = temp_board();
+        let state = Arc::new(Mutex::new(MockBoardState {
+            enabled_copper_layers: vec![BoardLayer::BlFCu, BoardLayer::BlBCu],
+            alter_readback_name: true,
+            ..Default::default()
+        }));
+        let server = spawn_rule_area_mock(&board, state.clone());
+        let handler = served_handler(server.address().to_string()).await;
+
+        let res = call_served(
+            &handler,
+            json!({
+                "board": board,
+                "layers": ["F.Cu", "B.Cu"],
+                "rect": { "x1": 1.0, "y1": 1.0, "x2": 6.0, "y2": 6.0 }
+            }),
+        )
+        .await;
+        assert!(res.is_error);
+        assert_eq!(
+            extract_error_kind(&res).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
+        let json = body(&res);
+        assert_eq!(json["outcome"]["status"], "uncertain");
+        assert!(json["uuid"].as_str().is_some());
+        assert!(
+            json["error"]["reason"].as_str().unwrap().contains("name"),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn served_vertex_mismatch_reports_uncertain_with_created_uuid() {
+        let (_dir, board) = temp_board();
+        let state = Arc::new(Mutex::new(MockBoardState {
+            enabled_copper_layers: vec![BoardLayer::BlFCu, BoardLayer::BlBCu],
+            alter_readback_vertex: true,
+            ..Default::default()
+        }));
+        let server = spawn_rule_area_mock(&board, state.clone());
+        let handler = served_handler(server.address().to_string()).await;
+
+        let res = call_served(
+            &handler,
+            json!({
+                "board": board,
+                "layers": ["F.Cu", "B.Cu"],
+                "rect": { "x1": 1.0, "y1": 1.0, "x2": 6.0, "y2": 6.0 }
+            }),
+        )
+        .await;
+        assert!(res.is_error);
+        assert_eq!(
+            extract_error_kind(&res).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
+        let json = body(&res);
+        assert_eq!(json["outcome"]["status"], "uncertain");
+        assert!(json["uuid"].as_str().is_some());
+        assert!(
+            json["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("outline"),
+            "{json}"
+        );
     }
 
     #[tokio::test]
@@ -1835,6 +1943,75 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("applied, but zone refill failed"));
+    }
+
+    #[tokio::test]
+    async fn served_accepted_refill_with_unfilled_copper_reports_partial() {
+        let (_dir, board) = temp_board();
+        let state = Arc::new(Mutex::new(MockBoardState {
+            enabled_copper_layers: vec![BoardLayer::BlFCu, BoardLayer::BlBCu],
+            fail_refill: false,
+            has_copper_zone: true,
+            leave_copper_unfilled: true,
+            ..Default::default()
+        }));
+        let server = spawn_rule_area_mock(&board, state.clone());
+        let handler = served_handler(server.address().to_string()).await;
+
+        let res = call_served(
+            &handler,
+            json!({
+                "board": board,
+                "layers": ["F.Cu"],
+                "rect": { "x1": 2.0, "y1": 2.0, "x2": 8.0, "y2": 8.0 },
+                "keepout_copper_pours": true
+            }),
+        )
+        .await;
+        assert!(!res.is_error);
+        let json = body(&res);
+        assert_eq!(json["success"], false);
+        assert_eq!(json["applied"], true);
+        assert_eq!(json["applied_but_not_refilled"], true);
+        assert_eq!(json["readback_verified"], true);
+        assert_eq!(json["refill_request_accepted"], true);
+        assert_eq!(json["refill_completed"], false);
+        assert_eq!(json["copper_zones_filled"], false);
+        assert_eq!(json["outcome"]["status"], "partial");
+    }
+
+    #[tokio::test]
+    async fn served_rule_area_missing_after_refill_is_uncertain() {
+        let (_dir, board) = temp_board();
+        let state = Arc::new(Mutex::new(MockBoardState {
+            enabled_copper_layers: vec![BoardLayer::BlFCu, BoardLayer::BlBCu],
+            drop_after_refill: true,
+            ..Default::default()
+        }));
+        let server = spawn_rule_area_mock(&board, state.clone());
+        let handler = served_handler(server.address().to_string()).await;
+        let res = call_served(
+            &handler,
+            json!({
+                "board": board, "layers": ["F.Cu"],
+                "rect": {"x1": 1, "y1": 1, "x2": 6, "y2": 6}
+            }),
+        )
+        .await;
+        assert!(res.is_error);
+        assert_eq!(
+            extract_error_kind(&res).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
+        let json = body(&res);
+        assert_eq!(json["outcome"]["status"], "uncertain");
+        assert!(json["uuid"].as_str().is_some());
+        assert!(state
+            .lock()
+            .unwrap()
+            .sent_commands
+            .iter()
+            .any(|c| c == "RefillZones"));
     }
 
     #[test]
