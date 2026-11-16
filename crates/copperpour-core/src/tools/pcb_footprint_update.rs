@@ -4261,10 +4261,22 @@ mod tests {
         kiapi::board::types::FootprintInstance,
         kiapi::board::types::FootprintInstance,
     ) {
-        let current = issue_254_capture(reference);
+        refresh_from_library(issue_254_capture(reference), &ISSUE_254_LIBRARIES)
+    }
+
+    /// `current` and the update built for it from its entry in `libraries`,
+    /// given as `(nickname, entry, source)`.
+    fn refresh_from_library(
+        current: kiapi::board::types::FootprintInstance,
+        libraries: &[(&str, &str, &str)],
+    ) -> (
+        kiapi::board::types::FootprintInstance,
+        kiapi::board::types::FootprintInstance,
+    ) {
         let id = current.definition.as_ref().unwrap().id.as_ref().unwrap();
-        let (nickname, entry, source) = ISSUE_254_LIBRARIES
-            .into_iter()
+        let (nickname, entry, source) = libraries
+            .iter()
+            .copied()
             .find(|(nickname, entry, _)| {
                 *nickname == id.library_nickname && *entry == id.entry_name
             })
@@ -4497,6 +4509,96 @@ mod tests {
             changes[0]["changed_domains"],
             serde_json::json!(["attributes"])
         );
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 0);
+        assert!(capture.update_batches.is_empty());
+    }
+
+    /// KiCad's stock `TestPoint_THTPad_D2.0mm_Drill1.0mm` placed twice, as
+    /// KiCad 10.0.8 reported it over IPC. Provenance is in
+    /// `testpoint_circle_ipc.README.md`.
+    const TESTPOINT_CIRCLE_CAPTURES: [(&str, &[u8]); 2] = [
+        (
+            "TP1",
+            include_bytes!("../../tests/fixtures/testpoint_circle_tp1.ipc.bin"),
+        ),
+        (
+            "TP2",
+            include_bytes!("../../tests/fixtures/testpoint_circle_tp2.ipc.bin"),
+        ),
+    ];
+
+    const TESTPOINT_LIBRARY: [(&str, &str, &str); 1] = [(
+        "TestPoint",
+        "TestPoint_THTPad_D2.0mm_Drill1.0mm",
+        include_str!("../../tests/fixtures/testpoint_thtpad_d2.0mm_drill1.0mm_kicad10.kicad_mod"),
+    )];
+
+    fn testpoint_refresh(
+        reference: &str,
+    ) -> (
+        kiapi::board::types::FootprintInstance,
+        kiapi::board::types::FootprintInstance,
+    ) {
+        let (_, bytes) = TESTPOINT_CIRCLE_CAPTURES
+            .iter()
+            .find(|(capture, _)| *capture == reference)
+            .unwrap();
+        let current = kiapi::board::types::FootprintInstance::decode(*bytes).unwrap();
+        refresh_from_library(current, &TESTPOINT_LIBRARY)
+    }
+
+    /// The stock test point's silkscreen circle has its radius point below
+    /// the centre, `(end 0 1.2)`, and KiCad keeps that point, turned with the
+    /// footprint: TP2 is at 90°. The update built from the library holds the
+    /// same points, so neither plans a graphics change.
+    #[test]
+    fn stock_test_points_keep_their_circles_radius_points() {
+        for (reference, expected) in [
+            (
+                "TP1",
+                [
+                    [120_000_000, 80_000_000, 120_000_000, 81_200_000],
+                    [120_000_000, 80_000_000, 121_500_000, 80_000_000],
+                ],
+            ),
+            (
+                "TP2",
+                [
+                    [130_000_000, 80_000_000, 130_000_000, 78_500_000],
+                    [130_000_000, 80_000_000, 131_200_000, 80_000_000],
+                ],
+            ),
+        ] {
+            let (current, updated) = testpoint_refresh(reference);
+            assert_eq!(
+                circle_points(&current),
+                expected,
+                "{reference} as KiCad holds it"
+            );
+            assert_eq!(circle_points(&updated), expected, "{reference} as built");
+            assert!(!graphics_changed(&current, &updated), "{reference}");
+        }
+    }
+
+    /// Through the served dispatch, the two stock test points just placed
+    /// from their library dry-run to `noop`.
+    #[tokio::test]
+    async fn served_dry_run_of_stock_test_points_is_noop() {
+        let (_temp, board) = libraries_project(&TESTPOINT_LIBRARY);
+        let footprints = TESTPOINT_CIRCLE_CAPTURES
+            .iter()
+            .map(|(_, bytes)| prost_types::Any {
+                type_url: "type.googleapis.com/kiapi.board.types.FootprintInstance".to_string(),
+                value: bytes.to_vec(),
+            })
+            .collect();
+        let mock = spawn_planner_mock_keeping(&board, footprints, false, true);
+        let handler = served(mock.kicad.address()).await;
+
+        let body = result_json(&served_call(&handler, serde_json::json!({ "board": board })).await);
+        assert_eq!(body["status"], "noop", "{body}");
+        assert_eq!(body["coverage"]["unchanged"]["planned"], 2, "{body}");
         let capture = mock.capture.lock().unwrap();
         assert_eq!(capture.begin_count, 0);
         assert!(capture.update_batches.is_empty());
