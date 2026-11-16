@@ -174,11 +174,17 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "launch_kicad_ui",
-            "Launch the KiCAD GUI application and optionally open a project file.",
+            "Launch the KiCAD GUI application and optionally open a project file. When KiCad \
+             exits during startup, the error quotes its stderr; on Linux it also says when the \
+             server has no DISPLAY or WAYLAND_DISPLAY, as when it runs from an SSH session.",
             json!({
                 "type": "object",
                 "properties": {
                     "project": { "type": "string", "description": "Path to .kicad_pro file to open (optional)" },
+                    "display": {
+                        "type": "string",
+                        "description": "X display to open KiCad on, such as \":0\" for the desktop when the server runs from an SSH session. Local displays only (:N or :N.S). Sets DISPLAY and GDK_BACKEND=x11 and unsets WAYLAND_DISPLAY for KiCad, so GTK uses X11 (Xwayland on a Wayland desktop); KiCad takes XAUTHORITY from the server's environment. Linux and other X11 systems only: refused on Windows and macOS."
+                    },
                     "wait_ready": {
                         "type": "boolean",
                         "description": "Wait until KiCAD IPC is responsive before returning",
@@ -1111,18 +1117,61 @@ async fn handle_check_kicad_ui(
 /// How often the `wait_ready` loop pings KiCad, watching the process between.
 const KICAD_IPC_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// The `display` argument: an X display name, refused where KiCad does not
+/// use X11.
+fn launch_display(args: &serde_json::Value) -> Result<Option<String>, CallToolResult> {
+    let Some(value) = args.get("display").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let Some(display) = value.as_str() else {
+        return Err(invalid_arg("display", "must be a string"));
+    };
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        return Err(invalid_arg(
+            "display",
+            "applies only to X11 desktops (Linux and other Unix); KiCad on Windows and macOS \
+             does not use DISPLAY",
+        ));
+    }
+    // Local displays only: a `host:N` display would hand the design, and
+    // the editor's input, to another machine.
+    let screen = display
+        .strip_prefix("unix:")
+        .or_else(|| display.strip_prefix(':'))
+        .unwrap_or_default();
+    let (number, screen) = screen.split_once('.').unwrap_or((screen, "0"));
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    if !(digits(number) && digits(screen)) {
+        return Err(invalid_arg(
+            "display",
+            "must be a local X display such as \":0\" or \":1.0\"",
+        ));
+    }
+    Ok(Some(display.to_string()))
+}
+
 async fn handle_launch_kicad_ui(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let wait_ready = args["wait_ready"].as_bool().unwrap_or(true);
     let timeout_secs = args["timeout_seconds"].as_u64().unwrap_or(30);
+    let display = match launch_display(args) {
+        Ok(display) => display,
+        Err(refusal) => return Ok(refusal),
+    };
     let binary =
         crate::kicad_install::gui_or_default(&ctx.config.kicad_binary, &ctx.config.kicad_cli);
 
     let mut cmd = std::process::Command::new(&binary);
     if let Some(project) = args["project"].as_str() {
         cmd.arg(project);
+    }
+    if let Some(display) = &display {
+        // X11 even where GTK would prefer Wayland.
+        cmd.env("DISPLAY", display)
+            .env("GDK_BACKEND", "x11")
+            .env_remove("WAYLAND_DISPLAY");
     }
 
     let mut kicad = match copperpour_viewer::launch::spawn(
@@ -1138,10 +1187,15 @@ async fn handle_launch_kicad_ui(
             )))
         }
     };
+    // Its exit report then says the display is missing; this adds the remedy.
+    kicad.on_no_display(
+        "Pass display (for example \":0\") to open KiCad on the desktop's X display.",
+    );
+    let exited = CallToolResult::error;
 
     if !wait_ready {
         if let Err(message) = kicad.watch(copperpour_viewer::launch::STARTUP_WINDOW).await {
-            return Ok(CallToolResult::error(message));
+            return Ok(exited(message));
         }
         return Ok(CallToolResult::json(&json!({
             "launched": true,
@@ -1155,26 +1209,39 @@ async fn handle_launch_kicad_ui(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         if let Err(message) = kicad.watch(KICAD_IPC_POLL).await {
-            return Ok(CallToolResult::error(message));
+            return Ok(exited(message));
         }
         let endpoint = endpoint.clone();
-        let ping = task::spawn_blocking(move || endpoint.client().ping().unwrap_or(false));
-        let ok = tokio::select! {
-            ok = ping => ok.unwrap_or(false),
-            message = kicad.exited() => return Ok(CallToolResult::error(message)),
+        let ping = task::spawn_blocking(move || endpoint.client().ping_outcome());
+        let outcome = tokio::select! {
+            outcome = ping => outcome.ok(),
+            message = kicad.exited() => return Ok(exited(message)),
         };
 
-        if ok {
+        if outcome
+            .as_ref()
+            .is_some_and(copperpour_ipc::PingOutcome::is_responsive)
+        {
             return Ok(CallToolResult::json(&json!({
                 "launched": true,
                 "ipc_ready": true
             })));
         }
         if std::time::Instant::now() >= deadline {
+            // KiCad has been up for the whole timeout, so a modal dialog is
+            // the likelier reason it is not ready.
+            let note = if outcome
+                .as_ref()
+                .is_some_and(copperpour_ipc::PingOutcome::kicad_not_ready)
+            {
+                crate::tools::NOT_READY_NOTE
+            } else {
+                "KiCAD launched but IPC not yet responsive within timeout"
+            };
             return Ok(CallToolResult::json(&json!({
                 "launched": true,
                 "ipc_ready": false,
-                "note": "KiCAD launched but IPC not yet responsive within timeout"
+                "note": note
             })));
         }
     }
@@ -1933,7 +2000,34 @@ mod tests {
         assert!(
             response["ipc_failure"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("Nothing is listening there")),
+                .is_some_and(|message| message.contains("Nothing is listening there")
+                    && message.contains("api.enable_server")),
+            "{response}"
+        );
+        assert!(response["ipc_failure"].get("note").is_none(), "{response}");
+    }
+
+    /// The first-run wizard holds KiCad at `AS_NOT_READY` for as long as it
+    /// is open (#225).
+    #[tokio::test]
+    async fn check_kicad_ui_says_a_dialog_may_hold_a_kicad_that_is_not_ready() {
+        let kicad = crate::test_support::MockIpcServer::not_ready("check-kicad-ui");
+        let mut ctx = test_ctx();
+        ctx.config.ipc_address = kicad.address().to_string();
+
+        let result = handle_check_kicad_ui(&json!({ "timeout_seconds": 60 }), &ctx)
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+
+        assert_eq!(
+            response["ipc_failure"]["kind"], "request_failed",
+            "{response}"
+        );
+        assert!(
+            response["ipc_failure"]["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("modal dialog")),
             "{response}"
         );
     }
@@ -2607,7 +2701,8 @@ mod kicad_launch_tests {
         assert!(
             text.starts_with("KiCAD exited during startup")
                 && text.contains("255")
-                && text.ends_with("Error: Unable to initialize GTK+, is DISPLAY set properly?"),
+                // The server's own lack of a display may follow it.
+                && text.contains("Error: Unable to initialize GTK+, is DISPLAY set properly?"),
             "{text}"
         );
     }
@@ -2652,7 +2747,7 @@ mod kicad_launch_tests {
         assert!(
             text.starts_with("KiCAD exited during startup")
                 && text.contains("139")
-                && text.ends_with("Segmentation fault"),
+                && text.contains("Segmentation fault"),
             "{text}"
         );
         // Let the abandoned ping finish, or the runtime waits out its receive
@@ -2669,6 +2764,70 @@ mod kicad_launch_tests {
             serde_json::from_str::<Value>(&text).unwrap(),
             json!({"launched": true, "ipc_ready": null})
         );
+    }
+
+    /// KiCad up for the whole wait and still `AS_NOT_READY` is most likely
+    /// held by a dialog; one nobody answers for is not (#225).
+    #[tokio::test]
+    async fn only_a_kicad_not_ready_for_the_whole_wait_is_blamed_on_a_dialog() {
+        let not_ready = MockIpcServer::not_ready("launch-kicad-ui");
+        for (address, note) in [
+            (not_ready.address(), crate::tools::NOT_READY_NOTE),
+            (
+                NOBODY,
+                "KiCAD launched but IPC not yet responsive within timeout",
+            ),
+        ] {
+            let (is_error, text) = launch(
+                "sleep 3\n",
+                address,
+                json!({"wait_ready": true, "timeout_seconds": 1}),
+            )
+            .await;
+            assert!(!is_error, "{text}");
+            let body: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["ipc_ready"], false, "{body}");
+            assert_eq!(body["note"], note, "{body}");
+        }
+    }
+
+    /// The display reaches KiCad, and the no-display hint is left out.
+    /// macOS refuses `display`.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn kicad_starts_on_the_requested_display() {
+        let (is_error, text) = launch(
+            "echo \"DISPLAY=$DISPLAY\" >&2; exit 1\n",
+            NOBODY,
+            json!({"wait_ready": false, "display": ":42"}),
+        )
+        .await;
+        assert!(is_error, "{text}");
+        assert!(text.ends_with("DISPLAY=:42"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_display_that_is_not_an_x_display_name_is_refused() {
+        for display in [
+            "",
+            "wayland-0",
+            ":",
+            ":0.",
+            "localhost:0",
+            "evil.example:0",
+            "unix:",
+        ] {
+            let (is_error, text) = launch(
+                "echo started >&2; exit 1\n",
+                NOBODY,
+                json!({"wait_ready": false, "display": display}),
+            )
+            .await;
+            assert!(is_error, "{text}");
+            let body: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], "display", "{body}");
+        }
     }
 
     #[tokio::test]

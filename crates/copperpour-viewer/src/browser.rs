@@ -1032,7 +1032,8 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</t
         assert!(body.starts_with("KiCad exited during startup"), "{body}");
         assert!(body.contains("255"), "exit status missing: {body}");
         assert!(
-            body.ends_with("Unable to initialize GTK+, is DISPLAY set properly?"),
+            // The server's own lack of a display may follow it.
+            body.contains("Unable to initialize GTK+, is DISPLAY set properly?"),
             "stderr missing: {body}"
         );
         viewer.shutdown().await;

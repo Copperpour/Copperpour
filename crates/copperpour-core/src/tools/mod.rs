@@ -1596,9 +1596,15 @@ pub fn require_u64(args: &Value, key: &str) -> Result<u64, CallToolResult> {
         .ok_or_else(|| invalid_arg(key, "missing or not a non-negative integer"))
 }
 
+/// KiCad answers `AS_NOT_READY` while it starts, and for as long as a modal
+/// dialog holds it, such as the first-run wizard (#225).
+pub(crate) const NOT_READY_NOTE: &str = "KiCad answered AS_NOT_READY. It is either still \
+     starting or held by a modal dialog (the first-run wizard, a message box); if it keeps \
+     answering this, look at the screen and close the dialog.";
+
 /// `ipc_failure` evidence for a response that pinged KiCad: `null` when the
 /// Ping succeeded with `AS_OK`, otherwise `{kind, message}` naming why it did
-/// not (#532). A request that did not complete is a `request_failed` failure,
+/// not (#532), plus a `note` when KiCad answered `AS_NOT_READY`. A request that did not complete is a `request_failed` failure,
 /// not a success, whether or not it reached KiCad.
 ///
 /// `kind` comes from the typed [`copperpour_ipc::PingOutcome`] — never from the
@@ -1608,6 +1614,9 @@ pub fn require_u64(args: &Value, key: &str) -> Result<u64, CallToolResult> {
 /// the endpoint (an explicit KiCad status in `message` proves receipt).
 pub fn ipc_failure_evidence(outcome: &copperpour_ipc::PingOutcome) -> Value {
     match (outcome.failure_kind(), outcome.failure_message()) {
+        (Some(kind), Some(message)) if outcome.kicad_not_ready() => {
+            serde_json::json!({ "kind": kind, "message": message, "note": NOT_READY_NOTE })
+        }
         (Some(kind), Some(message)) => serde_json::json!({ "kind": kind, "message": message }),
         _ => Value::Null,
     }
@@ -4136,9 +4145,27 @@ mod ipc_failure_evidence_tests {
 
         let evidence = ipc_failure_evidence(&PingOutcome::RequestFailed {
             message: "AS_NOT_READY".to_string(),
+            status: None,
         });
         assert_eq!(evidence["kind"], "request_failed");
         assert_eq!(evidence["message"], "AS_NOT_READY");
+        assert!(evidence.get("note").is_none(), "{evidence}");
+    }
+
+    /// The note follows KiCad's status code, not the message text (#225).
+    #[test]
+    fn only_a_not_ready_status_names_a_dialog() {
+        use copperpour_ipc::gen::kiapi::common::ApiStatusCode;
+        let failed = |status| {
+            ipc_failure_evidence(&PingOutcome::RequestFailed {
+                message: String::new(),
+                status: Some(status),
+            })
+        };
+        assert!(failed(ApiStatusCode::AsNotReady)["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("modal dialog")));
+        assert!(failed(ApiStatusCode::AsBusy).get("note").is_none());
     }
 }
 

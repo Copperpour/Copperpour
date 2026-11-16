@@ -35,6 +35,19 @@ impl MockIpcServer {
         )
     }
 
+    /// A KiCad double that answers every request with `AS_NOT_READY`, as
+    /// KiCad does while an editor loads or a modal dialog holds it.
+    pub(crate) fn not_ready(purpose: &str) -> Self {
+        Self::spawn(purpose, |_| kiapi::common::ApiResponse {
+            status: Some(kiapi::common::ApiResponseStatus {
+                status: kiapi::common::ApiStatusCode::AsNotReady as i32,
+                error_message: "KiCad is not ready".to_string(),
+            }),
+            header: None,
+            message: None,
+        })
+    }
+
     /// As [`Self::spawn`], on an endpoint the caller names.
     ///
     /// Lets one test replace the KiCad behind a *running* server without
