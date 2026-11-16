@@ -40,6 +40,26 @@ pub fn no_display_reason(env: impl Fn(&str) -> Option<OsString>) -> Option<&'sta
     )
 }
 
+/// The effective display configuration, including overrides on the child.
+fn command_no_display_reason(cmd: &std::process::Command) -> Option<&'static str> {
+    no_display_reason(
+        |name| match cmd.get_envs().find(|(key, _)| *key == OsStr::new(name)) {
+            Some((_, value)) => value.map(OsStr::to_os_string),
+            None => std::env::var_os(name),
+        },
+    )
+}
+
+/// The Linux viewer tries the local X display only without a configured display.
+/// Returns whether the fallback was applied; the parent environment is untouched.
+pub(crate) fn default_viewer_display(cmd: &mut std::process::Command) -> bool {
+    let fallback = cfg!(target_os = "linux") && command_no_display_reason(cmd).is_some();
+    if fallback {
+        cmd.env("DISPLAY", ":0");
+    }
+    fallback
+}
+
 /// A spawned application, watched until the caller decides it is up.
 pub struct Launch {
     name: &'static str,
@@ -62,13 +82,7 @@ pub fn spawn(
     name: &'static str,
     log: fn(&str),
 ) -> std::io::Result<Launch> {
-    let no_display =
-        no_display_reason(
-            |name| match cmd.get_envs().find(|(key, _)| *key == OsStr::new(name)) {
-                Some((_, value)) => value.map(OsStr::to_os_string),
-                None => std::env::var_os(name),
-            },
-        );
+    let no_display = command_no_display_reason(&cmd);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -274,6 +288,55 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.ends_with("render failed"), "{err}");
+    }
+
+    #[test]
+    fn viewer_display_fallback_preserves_configured_displays() {
+        for (display, wayland) in [(":42", ""), ("", "wayland-7"), (":42", "wayland-7")] {
+            let mut cmd = sh("printf '%s|%s' \"$DISPLAY\" \"$WAYLAND_DISPLAY\"");
+            cmd.env("DISPLAY", display).env("WAYLAND_DISPLAY", wayland);
+            assert!(!default_viewer_display(&mut cmd));
+            let output = cmd.output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("{display}|{wayland}")
+            );
+        }
+    }
+
+    #[test]
+    fn viewer_display_fallback_is_child_only_and_preserves_authorization() {
+        let before = (
+            std::env::var_os("DISPLAY"),
+            std::env::var_os("WAYLAND_DISPLAY"),
+        );
+        for empty in [false, true] {
+            let mut cmd = sh("printf '%s|%s|%s|%s' \"$DISPLAY\" \"$WAYLAND_DISPLAY\" \"$XAUTHORITY\" \"$XDG_RUNTIME_DIR\"");
+            cmd.env_remove("DISPLAY")
+                .env_remove("WAYLAND_DISPLAY")
+                .env("XAUTHORITY", "/tmp/test-xauth")
+                .env("XDG_RUNTIME_DIR", "/tmp/test-runtime");
+            if empty {
+                cmd.env("DISPLAY", "").env("WAYLAND_DISPLAY", "");
+            }
+            assert_eq!(default_viewer_display(&mut cmd), cfg!(target_os = "linux"));
+            let output = cmd.output().unwrap();
+            assert!(output.status.success());
+            let expected = if cfg!(target_os = "linux") {
+                ":0||/tmp/test-xauth|/tmp/test-runtime"
+            } else {
+                "||/tmp/test-xauth|/tmp/test-runtime"
+            };
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+            assert_eq!(
+                (
+                    std::env::var_os("DISPLAY"),
+                    std::env::var_os("WAYLAND_DISPLAY")
+                ),
+                before
+            );
+        }
     }
 
     /// stdin and stdout are the stdio transport's JSON-RPC stream.
