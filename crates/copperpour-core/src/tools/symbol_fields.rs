@@ -562,13 +562,13 @@ struct PreparedEdit {
     changes: serde_json::Map<String, serde_json::Value>,
 }
 
-/// One `(property "NAME" "VALUE" …)` child of the target symbol.
-struct Property {
-    name: String,
+pub(super) struct Property {
+    pub(super) name: String,
+    pub(super) private: bool,
     value: String,
-    block: (usize, usize),
+    pub(super) block: (usize, usize),
     name_span: (usize, usize),
-    value_span: (usize, usize),
+    pub(super) value_span: (usize, usize),
 }
 
 /// The property KiCad reads `name` from. A KiCad 6/7 library keeps the
@@ -797,7 +797,11 @@ pub(super) fn symbol_block(source: &str, symbol: &str) -> Result<(usize, usize),
 
 /// The direct `property` children of the symbol block at `start..end`, or
 /// why the block cannot be edited.
-fn symbol_properties(source: &str, start: usize, end: usize) -> Result<Vec<Property>, String> {
+pub(super) fn symbol_properties(
+    source: &str,
+    start: usize,
+    end: usize,
+) -> Result<Vec<Property>, String> {
     let mut properties: Vec<Property> = Vec::new();
     for (child_start, child_end) in find_direct_child_blocks(&source[start..end], "symbol") {
         let block = (start + child_start, start + child_end);
@@ -821,6 +825,7 @@ fn symbol_properties(source: &str, start: usize, end: usize) -> Result<Vec<Prope
         }
         properties.push(Property {
             name: name.to_string(),
+            private,
             value: value.to_string(),
             block,
             name_span,
