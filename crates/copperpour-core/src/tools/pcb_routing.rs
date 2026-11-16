@@ -31,20 +31,22 @@ macro_rules! ipc {
         match with_bound_board_ipc_classified($ctx, &requested_board, move |$c, $doc| $body).await?
         {
             Ok(BoardBinding::Bound(v)) => v,
-            Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
-                return Ok(crate::tools::ipc_target_error_result(&error))
+            Ok(BoardBinding::Unserved { absence, message }) => {
+                return Ok(crate::tools::ipc_unserved_result(absence, &message))
             }
-            Ok(BoardBinding::Unserved { message, .. }) => {
-                return Ok(CallToolResult::error(format!(
-                    "KiCAD must be running with the board loaded (IPC error: {message})"
-                )))
+            Err(copperpour_ipc::IpcFailure::Rejected(message)) => {
+                let recovery = crate::tools::ipc_recovery::for_ipc_failure(
+                    &copperpour_ipc::IpcFailure::Rejected(message.clone()),
+                );
+                return Ok(CallToolResult::error_kind_with_recovery(
+                    ToolErrorKind::HandlerError {
+                        reason: message.clone(),
+                    },
+                    format!("KiCad IPC error: {message}"),
+                    recovery,
+                ));
             }
-            Err(error) => {
-                return Ok(CallToolResult::error(format!(
-                    "KiCAD must be running with the board loaded (IPC error: {})",
-                    error.message()
-                )))
-            }
+            Err(failure) => return Ok(crate::tools::ipc_failure_result(failure)),
         }
     }};
 }
@@ -1425,12 +1427,7 @@ async fn handle_delete_trace(
     .await?
     {
         Ok(deleted) => deleted,
-        Err(error) => {
-            return Ok(CallToolResult::error(format!(
-                "KiCAD must be running with the board loaded (IPC error: {})",
-                error.message()
-            )))
-        }
+        Err(error) => return Ok(crate::tools::ipc_failure_result(error)),
     };
 
     let Some(trace) = deleted else {
@@ -1891,19 +1888,6 @@ async fn handle_get_nets_list(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
-    let unavailable = |reason: &str| {
-        let message = format!(
-            "KiCad did not complete the net list query for '{}': {reason}. Retry the live query; no saved-file or empty-list substitute was used.",
-            board_path.display()
-        );
-        CallToolResult::error_kind(
-            ToolErrorKind::EditorUnavailable {
-                editor: "pcb".to_string(),
-                reason: message.clone(),
-            },
-            message,
-        )
-    };
     let nets = match with_bound_board_ipc_classified(ctx, &board_path, |client, document| {
         client.get_nets_in(document)
     })
@@ -1913,8 +1897,31 @@ async fn handle_get_nets_list(
         Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
             return Ok(crate::tools::ipc_target_error_result(&error));
         }
-        Ok(BoardBinding::Unserved { message, .. }) => return Ok(unavailable(&message)),
-        Err(error) => return Ok(unavailable(error.message())),
+        Ok(BoardBinding::Unserved { absence, message }) => {
+            return Ok(crate::tools::ipc_unserved_result(absence, &message))
+        }
+        Err(copperpour_ipc::IpcFailure::Uncertain(message)) => {
+            return Ok(crate::tools::ipc_uncertain_result(&message))
+        }
+        Err(copperpour_ipc::IpcFailure::Recovered(message)) => {
+            return Ok(crate::tools::ipc_recovered_result(&message))
+        }
+        Err(failure) => {
+            let recovery = crate::tools::ipc_recovery::for_ipc_failure(&failure);
+            let message = format!(
+                "KiCad did not complete the net list query for '{}': {}. Retry the live query; no saved-file or empty-list substitute was used.",
+                board_path.display(),
+                failure.message()
+            );
+            return Ok(CallToolResult::error_kind_with_recovery(
+                ToolErrorKind::EditorUnavailable {
+                    editor: "pcb".to_string(),
+                    reason: message.clone(),
+                },
+                message,
+                recovery,
+            ));
+        }
     };
     let items: Vec<serde_json::Value> = nets
         .iter()

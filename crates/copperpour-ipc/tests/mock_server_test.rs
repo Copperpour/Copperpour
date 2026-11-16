@@ -1170,7 +1170,7 @@ fn an_unconfigured_socket_classifies_as_unreachable() {
     let client = KiCadIpcClient::new("");
     let failure = copperpour_ipc::IpcFailure::from_error(client.get_open_documents().unwrap_err());
     assert!(
-        matches!(failure, copperpour_ipc::IpcFailure::Unreachable(_)),
+        matches!(failure, copperpour_ipc::IpcFailure::Unreachable { .. }),
         "unexpected classification: {failure:?}"
     );
 }
@@ -1180,7 +1180,7 @@ fn a_dead_endpoint_classifies_as_unreachable() {
     let client = KiCadIpcClient::new("tcp://127.0.0.1:1");
     let failure = copperpour_ipc::IpcFailure::from_error(client.get_open_documents().unwrap_err());
     assert!(
-        matches!(failure, copperpour_ipc::IpcFailure::Unreachable(_)),
+        matches!(failure, copperpour_ipc::IpcFailure::Unreachable { .. }),
         "unexpected classification: {failure:?}"
     );
 }

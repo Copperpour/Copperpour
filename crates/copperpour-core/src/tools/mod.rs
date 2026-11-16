@@ -37,6 +37,7 @@ mod footprint_metadata;
 mod footprint_models;
 #[cfg(any(feature = "jlcpcb", feature = "freerouting"))]
 pub mod integration;
+pub(crate) mod ipc_recovery;
 #[cfg(test)]
 mod kicad10_schematic_identity_tests;
 #[cfg(feature = "jlcpcb")]
@@ -750,43 +751,91 @@ where
 
 /// Unknown is not a rejection or evidence of no mutation. Never advise a blind retry.
 pub(crate) fn ipc_recovered_result(message: &str) -> CallToolResult {
-    CallToolResult::error_kind(
+    CallToolResult::error_kind_with_recovery(
         crate::mcp::error::ToolErrorKind::IpcBatchRecovered {
             board_state: "unchanged".into(), drop_confirmed: true,
             retry_safe: false, reason: message.into(),
         },
         format!("{message}. The apply was aborted, not published. Run a fresh dry run before deciding whether to apply again; no automatic retry or file fallback was attempted."),
+        ipc_recovery::for_ipc_batch_recovered(message),
     )
 }
 
-/// The result for an IPC failure, classified exactly as the `ipc!` macros in
-/// the toolset modules classify it: only an unreachable transport says KiCad
-/// must be running, because only that one is evidence it is not.
+/// The result for an IPC failure, classified from the typed [`IpcFailure`]
+/// without matching message text: unreachable transports report the actual
+/// [`UnreachableReason`](copperpour_ipc::UnreachableReason) and recovery steps.
 pub(crate) fn ipc_failure_result(failure: copperpour_ipc::IpcFailure) -> CallToolResult {
     match failure {
-        copperpour_ipc::IpcFailure::Unreachable(message) => CallToolResult::error(format!(
-            "KiCAD must be running with the board loaded (IPC error: {message})"
-        )),
+        copperpour_ipc::IpcFailure::Unreachable {
+            reason,
+            message,
+            candidates,
+        } => {
+            let recovery = ipc_recovery::for_unreachable(reason, None, &candidates, &message);
+            let summary = ipc_recovery::unreachable_summary(reason, &candidates, &message);
+            CallToolResult::error_kind_with_recovery(
+                crate::mcp::error::ToolErrorKind::EditorUnavailable {
+                    editor: "pcb".to_string(),
+                    reason: message,
+                },
+                summary,
+                recovery,
+            )
+        }
         copperpour_ipc::IpcFailure::Target { error, .. } => ipc_target_error_result(&error),
         // No caller of this raises a refusal of its own (#240).
-        copperpour_ipc::IpcFailure::Rejected(message)
-        | copperpour_ipc::IpcFailure::Preflight(copperpour_ipc::PreflightRefusal {
-            reason: message,
-            ..
-        }) => CallToolResult::error(message),
+        copperpour_ipc::IpcFailure::Rejected(message) => {
+            let recovery = ipc_recovery::for_ipc_failure(&copperpour_ipc::IpcFailure::Rejected(
+                message.clone(),
+            ));
+            CallToolResult::error_kind_with_recovery(
+                crate::mcp::error::ToolErrorKind::HandlerError {
+                    reason: message.clone(),
+                },
+                message,
+                recovery,
+            )
+        }
+        copperpour_ipc::IpcFailure::Preflight(refusal) => {
+            let message = refusal.reason.clone();
+            let recovery =
+                ipc_recovery::for_ipc_failure(&copperpour_ipc::IpcFailure::Preflight(refusal));
+            CallToolResult::error_kind_with_recovery(
+                crate::mcp::error::ToolErrorKind::HandlerError {
+                    reason: message.clone(),
+                },
+                message,
+                recovery,
+            )
+        }
         copperpour_ipc::IpcFailure::Recovered(message) => ipc_recovered_result(&message),
         copperpour_ipc::IpcFailure::Uncertain(message) => ipc_uncertain_result(&message),
     }
 }
 
+pub(crate) fn ipc_unserved_result(absence: BoardEditorAbsence, message: &str) -> CallToolResult {
+    CallToolResult::error_kind_with_recovery(
+        crate::mcp::error::ToolErrorKind::EditorUnavailable {
+            editor: "pcb".to_string(),
+            reason: message.to_string(),
+        },
+        format!(
+            "KiCad is running but {} ({message}). The board file was not modified.",
+            absence.observed()
+        ),
+        ipc_recovery::for_board_editor_absence(absence, message),
+    )
+}
+
 pub(crate) fn ipc_uncertain_result(message: &str) -> CallToolResult {
-    CallToolResult::error_kind(
+    CallToolResult::error_kind_with_recovery(
         crate::mcp::error::ToolErrorKind::IpcOutcomeUnknown {
             board_state: "unknown".to_string(),
             retry_safe: false,
             reason: message.to_string(),
         },
         format!("{message}. Do not repeat the mutation or edit the saved file. Inspect the requested live board and reconcile any applied work before retrying. Automatic recovery has not been established."),
+        ipc_recovery::for_ipc_outcome_unknown(message),
     )
 }
 
@@ -1002,47 +1051,54 @@ pub(crate) fn ipc_target_error_result(error: &copperpour_ipc::BoardTargetError) 
         "{}. Copperpour did not read or modify another board.",
         error
     );
+    let recovery = ipc_recovery::for_board_target_error(error);
     match error {
-        BoardTargetError::NoOpenDocuments { requested } => CallToolResult::error_kind(
-            crate::mcp::error::ToolErrorKind::WrongDocument {
-                requested: requested.clone(),
-                open_documents: Vec::new(),
-            },
-            message,
-        ),
+        BoardTargetError::NoOpenDocuments { requested } => {
+            CallToolResult::error_kind_with_recovery(
+                crate::mcp::error::ToolErrorKind::WrongDocument {
+                    requested: requested.clone(),
+                    open_documents: Vec::new(),
+                },
+                message,
+                recovery,
+            )
+        }
         BoardTargetError::WrongDocument {
             requested,
             open_documents,
-        } => CallToolResult::error_kind(
+        } => CallToolResult::error_kind_with_recovery(
             crate::mcp::error::ToolErrorKind::WrongDocument {
                 requested: requested.clone(),
                 open_documents: open_documents.clone(),
             },
             message,
+            recovery,
         ),
         BoardTargetError::AmbiguousDocument {
             requested,
             candidates,
-        } => CallToolResult::error_kind(
+        } => CallToolResult::error_kind_with_recovery(
             crate::mcp::error::ToolErrorKind::AmbiguousTarget {
                 target: requested.clone(),
                 candidates: candidates.clone(),
             },
             message,
+            recovery,
         ),
         BoardTargetError::UnresolvedDocumentIdentities { requested, .. } => {
-            CallToolResult::error_kind(
+            CallToolResult::error_kind_with_recovery(
                 crate::mcp::error::ToolErrorKind::AmbiguousOpenBoard {
                     path: requested.clone(),
                 },
                 message,
+                recovery,
             )
         }
         BoardTargetError::StaleDocument {
             requested,
             previously_bound,
             open_documents,
-        } => CallToolResult::error_kind(
+        } => CallToolResult::error_kind_with_recovery(
             crate::mcp::error::ToolErrorKind::StaleTarget {
                 target: requested.clone(),
                 reason: format!(
@@ -1052,6 +1108,7 @@ pub(crate) fn ipc_target_error_result(error: &copperpour_ipc::BoardTargetError) 
                 ),
             },
             message,
+            recovery,
         ),
     }
 }
@@ -1615,11 +1672,37 @@ pub(crate) const NOT_READY_NOTE: &str = "KiCad answered AS_NOT_READY. It is eith
 /// `request_failed` for a request that did not complete and may have reached
 /// the endpoint (an explicit KiCad status in `message` proves receipt).
 pub fn ipc_failure_evidence(outcome: &copperpour_ipc::PingOutcome) -> Value {
+    ipc_failure_evidence_with_endpoint(None, outcome)
+}
+
+/// Same as [`ipc_failure_evidence`], also carrying endpoint provenance (redacted
+/// address or ambiguous candidates) into `recovery`.
+pub fn ipc_failure_evidence_for_endpoint(
+    endpoint: &IpcEndpoint,
+    outcome: &copperpour_ipc::PingOutcome,
+) -> Value {
+    ipc_failure_evidence_with_endpoint(Some(endpoint), outcome)
+}
+
+fn ipc_failure_evidence_with_endpoint(
+    endpoint: Option<&IpcEndpoint>,
+    outcome: &copperpour_ipc::PingOutcome,
+) -> Value {
     match (outcome.failure_kind(), outcome.failure_message()) {
-        (Some(kind), Some(message)) if outcome.kicad_not_ready() => {
-            serde_json::json!({ "kind": kind, "message": message, "note": NOT_READY_NOTE })
+        (Some(kind), Some(message)) => {
+            let recovery = ipc_recovery::for_ping_outcome(endpoint, outcome);
+            let mut body = serde_json::json!({
+                "kind": kind,
+                "message": message,
+            });
+            if outcome.kicad_not_ready() {
+                body["note"] = Value::String(NOT_READY_NOTE.to_string());
+            }
+            if let Some(recovery) = recovery {
+                body["recovery"] = serde_json::to_value(recovery).unwrap_or(Value::Null);
+            }
+            body
         }
-        (Some(kind), Some(message)) => serde_json::json!({ "kind": kind, "message": message }),
         _ => Value::Null,
     }
 }

@@ -13,8 +13,8 @@ use crate::outcome::{self, OutcomeStatus};
 use crate::tool;
 use crate::tools::pcb_board_outline::{mm_text, COORDINATE_LIMIT_NM};
 use crate::tools::{
-    get_path, invalid_arg, ipc_failure_result, ipc_target_error_result, opt_bool_flag,
-    with_bound_board_ipc_classified, BoardAccess, BoardBinding, ToolContext, ToolDef,
+    get_path, invalid_arg, ipc_failure_result, opt_bool_flag, with_bound_board_ipc_classified,
+    BoardAccess, BoardBinding, ToolContext, ToolDef,
 };
 use copperpour_ipc::builders::{self, nm_to_mm, RuleAreaSpec};
 use copperpour_ipc::client::KiCadIpcClient;
@@ -189,48 +189,16 @@ async fn handle_add_rule_area(args: &Value, ctx: &ToolContext) -> anyhow::Result
 
     let outcome = match live {
         Ok(BoardBinding::Bound(outcome)) => outcome,
-        Ok(BoardBinding::Unserved { message, .. }) => {
+        Ok(BoardBinding::Unserved { absence, message }) => {
             return Ok(refused_outcome(
-                CallToolResult::error_kind(
-                    ToolErrorKind::EditorUnavailable {
-                        editor: "pcb".to_string(),
-                        reason: message.clone(),
-                    },
-                    format!(
-                        "KiCad must be running with the requested board open in the PCB Editor: {message}. \
-                         The board file was not modified."
-                    ),
-                ),
+                crate::tools::ipc_unserved_result(absence, &message),
                 board_target,
                 "ipc",
             ));
         }
         Err(failure) => {
             let uncertain = matches!(failure, copperpour_ipc::IpcFailure::Uncertain(_));
-            let result = match failure {
-                copperpour_ipc::IpcFailure::Unreachable(message) => CallToolResult::error_kind(
-                    ToolErrorKind::EditorUnavailable {
-                        editor: "pcb".to_string(),
-                        reason: message.clone(),
-                    },
-                    format!(
-                        "KiCad must be running with the requested board open in the PCB Editor \
-                         (IPC error: {message}). The board file was not modified."
-                    ),
-                ),
-                copperpour_ipc::IpcFailure::Target { error, .. } => ipc_target_error_result(&error),
-                copperpour_ipc::IpcFailure::Rejected(reason)
-                | copperpour_ipc::IpcFailure::Preflight(copperpour_ipc::PreflightRefusal {
-                    reason,
-                    ..
-                }) => CallToolResult::error_kind(
-                    ToolErrorKind::HandlerError {
-                        reason: reason.clone(),
-                    },
-                    reason,
-                ),
-                other => ipc_failure_result(other),
-            };
+            let result = ipc_failure_result(failure);
             return Ok(outcome::attach(
                 result,
                 outcome::summary(

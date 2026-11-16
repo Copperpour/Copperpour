@@ -409,7 +409,7 @@ where
         }
         // A lock outranks the never-reached verdict: it is persistent evidence
         // that an editor may hold newer state even where no IPC session ever did.
-        LiveBoard::NeverReached(_) => match board_lock_refusal(board_path) {
+        LiveBoard::NeverReached { .. } => match board_lock_refusal(board_path) {
             Some(refusal) => BoardWrite::Refused(refusal),
             None => BoardWrite::File(NoLiveBoard::Unreachable),
         },
@@ -681,7 +681,7 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
             LiveBoard::Uncertain(message) => Some(crate::tools::ipc_uncertain_result(&message)),
             LiveBoard::Recovered(message) => Some(crate::tools::ipc_recovered_result(&message)),
             LiveBoard::Unresolved(error) => Some(crate::tools::ipc_target_error_result(&error)),
-            LiveBoard::NeverReached(_) => board_lock_refusal(board_path),
+            LiveBoard::NeverReached { .. } => board_lock_refusal(board_path),
             LiveBoard::LostAfterObservation {
                 situation,
                 ipc_unreachable,

@@ -86,13 +86,19 @@ fn uncertain(board: &Path, operation: &str, reason: impl std::fmt::Display) -> C
 fn target_failure(failure: IpcFailure) -> CallToolResult {
     match failure {
         IpcFailure::Target { error, .. } => ipc_target_error_result(&error),
-        other => CallToolResult::error_kind(
-            ToolErrorKind::EditorUnavailable {
-                editor: "pcb".into(),
-                reason: other.to_string(),
-            },
-            format!("Cannot synchronize the requested board: {other}. CLI DRC was not started; open that board with IPC enabled and retry."),
-        ),
+        IpcFailure::Uncertain(message) => crate::tools::ipc_uncertain_result(&message),
+        IpcFailure::Recovered(message) => crate::tools::ipc_recovered_result(&message),
+        other => {
+            let recovery = crate::tools::ipc_recovery::for_ipc_failure(&other);
+            CallToolResult::error_kind_with_recovery(
+                ToolErrorKind::EditorUnavailable {
+                    editor: "pcb".into(),
+                    reason: other.to_string(),
+                },
+                format!("Cannot synchronize the requested board: {other}. CLI DRC was not started; open that board with IPC enabled and retry."),
+                recovery,
+            )
+        }
     }
 }
 

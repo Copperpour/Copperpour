@@ -1157,9 +1157,9 @@ async fn handle_apply_copper(args: &Value, ctx: &ToolContext) -> anyhow::Result<
     .await?;
     Ok(match outcome {
         Ok(BoardBinding::Bound(result)) => result,
-        Ok(BoardBinding::Unserved { message, .. }) => CallToolResult::error(format!(
-            "KiCAD must be running with the board loaded (IPC error: {message})"
-        )),
+        Ok(BoardBinding::Unserved { absence, message }) => {
+            crate::tools::ipc_unserved_result(absence, &message)
+        }
         Err(failure) => ipc_failure_result(failure),
     })
 }

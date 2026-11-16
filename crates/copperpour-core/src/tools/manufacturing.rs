@@ -913,19 +913,25 @@ fn midpoint_failure(error: copperpour_ipc::IpcFailure) -> CallToolResult {
     let message = format!("JLCPCB assembly requires native midpoint geometry from the exact board open in KiCad with IPC enabled; no package was exported. {error}");
     match error {
         IpcFailure::Target { error, .. } => crate::tools::ipc_target_error_result(&error),
-        IpcFailure::Unreachable(reason) => CallToolResult::error_kind(
+        IpcFailure::Unreachable {
+            reason,
+            message: raw_message,
+            candidates,
+        } => CallToolResult::error_kind_with_recovery(
             ToolErrorKind::EditorUnavailable {
                 editor: "pcbnew".into(),
-                reason,
+                reason: raw_message.clone(),
             },
             message,
+            crate::tools::ipc_recovery::for_unreachable(reason, None, &candidates, &raw_message),
         ),
         // This path only reads; an unanswered read does not imply a mutation.
-        other => CallToolResult::error_kind(
+        other => CallToolResult::error_kind_with_recovery(
             ToolErrorKind::HandlerError {
                 reason: format!("native_midpoint_unavailable: {other}"),
             },
             message,
+            crate::tools::ipc_recovery::for_ipc_failure(&other),
         ),
     }
 }

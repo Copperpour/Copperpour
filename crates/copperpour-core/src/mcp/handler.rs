@@ -2173,7 +2173,49 @@ mod ipc_failure_dispatch_tests {
                     .is_some_and(|message| message.contains("Nothing is listening there")),
                 "{tool}: {body}"
             );
+            assert_eq!(
+                body["ipc_failure"]["recovery"]["cause"], "no_listener",
+                "{tool}: {body}"
+            );
+            assert_eq!(
+                body["ipc_failure"]["recovery"]["mutation_outcome"], "none",
+                "{tool}: {body}"
+            );
+            assert_eq!(
+                body["ipc_failure"]["recovery"]["retry_safe"], false,
+                "{tool}: {body}"
+            );
+            assert!(
+                body["ipc_failure"]["recovery"]["troubleshooting_url"]
+                    .as_str()
+                    .is_some_and(|url| url.contains("docs/TROUBLESHOOTING.md#")),
+                "{tool}: {body}"
+            );
         }
+
+        // Sibling board-IPC caller through the served tools/call dispatch.
+        let board_path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board_path, "(kicad_pcb (version 20240108))").unwrap();
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_board_stackup",
+                    "arguments": {"board": board_path.to_string_lossy()}
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("JSON-RPC result");
+        assert_eq!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["kind"], "editor_unavailable", "{body}");
+        assert_eq!(body["recovery"]["cause"], "no_listener", "{body}");
+        assert_eq!(body["recovery"]["mutation_outcome"], "none", "{body}");
+        assert_eq!(body["recovery"]["retry_safe"], false, "{body}");
     }
 }
 

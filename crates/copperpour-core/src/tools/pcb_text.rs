@@ -553,7 +553,9 @@ where
         .await?
         {
             Ok(BoardBinding::Bound(value)) => Ok(value),
-            Ok(BoardBinding::Unserved { message, .. }) => Err(editor_unavailable(&message)),
+            Ok(BoardBinding::Unserved { absence, message }) => {
+                Err(crate::tools::ipc_unserved_result(absence, &message))
+            }
             Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
                 Err(ipc_target_error_result(&error))
             }
@@ -563,18 +565,8 @@ where
             Err(copperpour_ipc::IpcFailure::Uncertain(message)) => {
                 Err(ipc_uncertain_result(&message))
             }
-            Err(failure) => Err(editor_unavailable(failure.message())),
+            Err(failure) => Err(crate::tools::ipc_failure_result(failure)),
         },
-    )
-}
-
-fn editor_unavailable(reason: &str) -> CallToolResult {
-    CallToolResult::error_kind(
-        ToolErrorKind::EditorUnavailable {
-            editor: "pcb".to_string(),
-            reason: reason.to_string(),
-        },
-        format!("KiCad must be running with the requested board open: {reason}"),
     )
 }
 
@@ -671,19 +663,36 @@ fn live_error_result(error: anyhow::Error, operation: &str) -> CallToolResult {
         copperpour_ipc::IpcFailure::Target { error, .. } => ipc_target_error_result(&error),
         copperpour_ipc::IpcFailure::Recovered(message) => ipc_recovered_result(&message),
         copperpour_ipc::IpcFailure::Uncertain(message) => ipc_uncertain_result(&message),
-        copperpour_ipc::IpcFailure::Unreachable(message) => editor_unavailable(&message),
+        failure @ copperpour_ipc::IpcFailure::Unreachable { .. } => {
+            crate::tools::ipc_failure_result(failure)
+        }
         // A refusal Copperpour made before KiCad kept anything is worded as
         // the rejection it was before the variant existed.
-        copperpour_ipc::IpcFailure::Rejected(message)
-        | copperpour_ipc::IpcFailure::Preflight(copperpour_ipc::PreflightRefusal {
-            reason: message,
-            ..
-        }) => CallToolResult::error_kind(
-            ToolErrorKind::HandlerError {
-                reason: message.clone(),
-            },
-            format!("{operation} failed: {message}"),
-        ),
+        copperpour_ipc::IpcFailure::Rejected(message) => {
+            let recovery = crate::tools::ipc_recovery::for_ipc_failure(
+                &copperpour_ipc::IpcFailure::Rejected(message.clone()),
+            );
+            CallToolResult::error_kind_with_recovery(
+                ToolErrorKind::HandlerError {
+                    reason: message.clone(),
+                },
+                format!("{operation} failed: {message}"),
+                recovery,
+            )
+        }
+        copperpour_ipc::IpcFailure::Preflight(refusal) => {
+            let message = refusal.reason.clone();
+            let recovery = crate::tools::ipc_recovery::for_ipc_failure(
+                &copperpour_ipc::IpcFailure::Preflight(refusal),
+            );
+            CallToolResult::error_kind_with_recovery(
+                ToolErrorKind::HandlerError {
+                    reason: message.clone(),
+                },
+                format!("{operation} failed: {message}"),
+                recovery,
+            )
+        }
     }
 }
 

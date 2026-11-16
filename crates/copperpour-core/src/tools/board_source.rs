@@ -180,20 +180,41 @@ where
         // answering it. Nothing here explains the live board away, so the saved
         // file cannot stand in for it under any automatic mode. No read raises
         // a refusal of its own (#240); one would be kept with these.
-        LiveBoard::Rejected(message)
-        | LiveBoard::Preflight(copperpour_ipc::PreflightRefusal {
-            reason: message, ..
-        }) => BoardRead::Refused(CallToolResult::error_kind(
-            ToolErrorKind::EditorUnavailable {
-                editor: "pcb".to_string(),
-                reason: message.clone(),
-            },
-            format!(
-                "KiCad did not complete the {what} for this board: {message}. Copperpour did not \
-                 substitute the saved board file, which may be older than the editor's state. \
-                 Retry, or ask for board_source='saved' to inspect the last saved snapshot."
-            ),
-        )),
+        LiveBoard::Rejected(message) => {
+            let recovery = super::ipc_recovery::for_ipc_failure(
+                &copperpour_ipc::IpcFailure::Rejected(message.clone()),
+            );
+            BoardRead::Refused(CallToolResult::error_kind_with_recovery(
+                ToolErrorKind::EditorUnavailable {
+                    editor: "pcb".to_string(),
+                    reason: message.clone(),
+                },
+                format!(
+                    "KiCad did not complete the {what} for this board: {message}. Copperpour did not \
+                     substitute the saved board file, which may be older than the editor's state. \
+                     Retry, or ask for board_source='saved' to inspect the last saved snapshot."
+                ),
+                recovery,
+            ))
+        }
+        LiveBoard::Preflight(refusal) => {
+            let message = refusal.reason.clone();
+            let recovery = super::ipc_recovery::for_ipc_failure(
+                &copperpour_ipc::IpcFailure::Preflight(refusal),
+            );
+            BoardRead::Refused(CallToolResult::error_kind_with_recovery(
+                ToolErrorKind::EditorUnavailable {
+                    editor: "pcb".to_string(),
+                    reason: message.clone(),
+                },
+                format!(
+                    "KiCad did not complete the {what} for this board: {message}. Copperpour did not \
+                     substitute the saved board file, which may be older than the editor's state. \
+                     Retry, or ask for board_source='saved' to inspect the last saved snapshot."
+                ),
+                recovery,
+            ))
+        }
 
         // KiCad answered and proved it holds no unsaved state for this board.
         // Under `live` that is the established wrong-document refusal, which
@@ -212,10 +233,16 @@ where
         // missing half of it.
         LiveBoard::Unresolved(error) => BoardRead::Refused(ipc_target_error_result(&error)),
 
-        LiveBoard::NeverReached(message) if live_required => {
-            BoardRead::Refused(not_live_enough(what, message))
-        }
-        LiveBoard::NeverReached(_) => BoardRead::Saved(no_live_board(
+        LiveBoard::NeverReached {
+            reason,
+            message,
+            candidates,
+        } if live_required => BoardRead::Refused(not_live_enough(
+            what,
+            &message,
+            super::ipc_recovery::for_unreachable(reason, None, &candidates, &message),
+        )),
+        LiveBoard::NeverReached { .. } => BoardRead::Saved(no_live_board(
             live_board::editor_lock(board_path),
             "kicad_ipc_unreachable",
             "KiCad IPC is unreachable",
@@ -242,9 +269,13 @@ where
                 absence.observed()
             ),
         )),
-        LiveBoard::Unserved { message, .. } if live_required => {
-            BoardRead::Refused(not_live_enough(what, message))
-        }
+        LiveBoard::Unserved {
+            absence, message, ..
+        } if live_required => BoardRead::Refused(not_live_enough(
+            what,
+            &message,
+            super::ipc_recovery::for_board_editor_absence(absence, &message),
+        )),
         LiveBoard::Unserved { absence, .. } => BoardRead::Saved(no_live_board(
             live_board::editor_lock(board_path),
             absence.reason_code(),
@@ -258,8 +289,12 @@ where
 }
 
 /// `board_source='live'` was asked for and this board is not it.
-fn not_live_enough(what: &str, observed: impl std::fmt::Display) -> CallToolResult {
-    CallToolResult::error_kind(
+fn not_live_enough(
+    what: &str,
+    observed: impl std::fmt::Display,
+    recovery: crate::mcp::error::RecoveryGuidance,
+) -> CallToolResult {
+    CallToolResult::error_kind_with_recovery(
         ToolErrorKind::EditorUnavailable {
             editor: "pcb".to_string(),
             reason: observed.to_string(),
@@ -269,6 +304,7 @@ fn not_live_enough(what: &str, observed: impl std::fmt::Display) -> CallToolResu
              {what} did not reach one: {observed}. Open the board with the KiCad IPC API \
              enabled, or ask for board_source='saved'."
         ),
+        recovery,
     )
 }
 
