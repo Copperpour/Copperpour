@@ -46,6 +46,10 @@ pub(super) fn tool() -> ToolDef {
          end, how many airwires of different nets cross, and for each net group (the \
          project's netclasses, or net_groups you pass, e.g. a high-voltage group) its \
          region, the other parts inside that region, and the closest pads of other nets. \
+         Netclass groups come from the project file's patterns, matched against the \
+         whole net name as KiCad does, as wildcards or regular expressions; a net in \
+         several netclasses is in each group. Netclass directives placed in the schematic \
+         are not read. \
          Airwires are each net's minimum spanning tree over its pads; routing is ignored. \
          Ground nets and nets with more than max_net_pads pads are left out of the airwires \
          and listed. Reads the board live from KiCad when it is open there, else the saved \
@@ -57,11 +61,11 @@ pub(super) fn tool() -> ToolDef {
                 "net_groups": {
                     "type": "object",
                     "additionalProperties": { "type": "array", "items": { "type": "string" } },
-                    "description": "Group name to net names or KiCad wildcard patterns, e.g. {\"HV\": [\"HV\", \"D_*\"]}. Default: the project's netclasses other than Default."
+                    "description": "Group name to net names or wildcard patterns, e.g. {\"HV\": [\"HV\", \"D_*\"]}. A pattern also matches a net's name after its last '/', so G_A finds /Output stage/G_A. Default: the project's netclasses other than Default."
                 },
                 "skip_nets": {
                     "type": "array", "items": { "type": "string" },
-                    "description": "Net names or wildcard patterns left out of the airwires. Default: ground nets (GND*, *GND, VSS*, 0V)."
+                    "description": "Net names or wildcard patterns left out of the airwires, matched like net_groups patterns. Default: ground nets (GND*, *GND, VSS*, 0V)."
                 },
                 "max_net_pads": { "type": "integer", "minimum": 2, "description": "Nets with more pads are left out of the airwires. Default 40." },
                 "top": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Entries per ranked list. Default 10." },
@@ -135,12 +139,36 @@ async fn handle_placement_overview(
         None => (project_netclass_patterns(&board), "netclasses"),
     };
     let nets = index.nets();
+    // A netclass pattern is matched as KiCad matches it, against the whole
+    // net name; only a group the caller names also matches the short name.
+    let from_netclasses = groups_source == "netclasses";
+    let group_nets: Vec<BTreeSet<&str>> = group_patterns
+        .iter()
+        .map(|(_, patterns)| {
+            let netclass_patterns: Vec<NetclassPattern> = if from_netclasses {
+                patterns.iter().map(|p| NetclassPattern::new(p)).collect()
+            } else {
+                Vec::new()
+            };
+            nets.iter()
+                .copied()
+                .filter(|net| {
+                    if from_netclasses {
+                        netclass_patterns.iter().any(|p| p.names(net))
+                    } else {
+                        patterns.iter().any(|p| names_net(p, net))
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    // A net in several groups takes the first one's colour in the picture.
     let group_of_net: HashMap<&str, usize> = nets
         .iter()
         .filter_map(|net| {
-            group_patterns
+            group_nets
                 .iter()
-                .position(|(_, patterns)| patterns.iter().any(|p| names_net(p, net)))
+                .position(|members| members.contains(net))
                 .map(|group| (*net, group))
         })
         .collect();
@@ -245,15 +273,14 @@ async fn handle_placement_overview(
     // ── Groups ──────────────────────────────────────────────────────────────
     let groups: Vec<serde_json::Value> = group_patterns
         .iter()
-        .enumerate()
-        .map(|(group, (name, patterns))| {
+        .zip(&group_nets)
+        .map(|((name, patterns), members)| {
             describe_group(
-                group,
                 name,
                 patterns,
                 &nets,
                 &index,
-                &group_of_net,
+                members,
                 &courtyards,
                 board_area,
                 top,
@@ -316,14 +343,48 @@ async fn handle_placement_overview(
     Ok(result)
 }
 
-/// Whether a group or skip pattern names `net`. KiCad names a net local to
-/// a sheet by its path (`/Output stage/G_A`), so a pattern also matches the
-/// name after the last `/`: `G_A` finds that net, as a caller would expect.
+/// Whether a `net_groups` or `skip_nets` pattern names `net`. KiCad names a
+/// net local to a sheet by its path (`/Output stage/G_A`), so a pattern from
+/// the caller also matches the name after the last `/`: `G_A` finds that
+/// net. Netclass patterns are not matched this way: KiCad matches them
+/// against the whole name.
 fn names_net(pattern: &str, net: &str) -> bool {
     wildcard_matches(pattern, net)
         || net
             .rsplit_once('/')
             .is_some_and(|(_, short)| wildcard_matches(pattern, short))
+}
+
+/// A netclass pattern from the project file, matched as KiCad matches it:
+/// against the whole net name, case-sensitively, as a wildcard pattern or as
+/// a regular expression, whichever names the net. `A.B` therefore names
+/// `AxB`, and `+3V3`, no valid expression, still names `+3V3`.
+///
+/// Measured against pcbnew 10.0.7; the fixture
+/// `placement_overview_kicad10` records the patterns. Two kinds of pattern
+/// are matched as wildcards only, where KiCad may name more nets: one with a
+/// brace, which KiCad reads as a repeat count only in some positions, and
+/// one the `regex` crate does not accept, such as look-around or `\Q...\E`.
+struct NetclassPattern {
+    wildcard: String,
+    expression: Option<regex::Regex>,
+}
+
+impl NetclassPattern {
+    fn new(pattern: &str) -> Self {
+        let expression = (!pattern.contains(['{', '}']))
+            .then(|| regex::Regex::new(&format!("^(?:{pattern})$")).ok())
+            .flatten();
+        Self {
+            wildcard: pattern.to_string(),
+            expression,
+        }
+    }
+
+    fn names(&self, net: &str) -> bool {
+        wildcard_matches(&self.wildcard, net)
+            || self.expression.as_ref().is_some_and(|e| e.is_match(net))
+    }
 }
 
 /// The project's netclasses other than `Default`, each with its patterns.
@@ -357,17 +418,16 @@ fn project_netclass_patterns(board: &std::path::Path) -> Vec<(String, Vec<String
 
 #[allow(clippy::too_many_arguments)]
 fn describe_group(
-    group: usize,
     name: &str,
     patterns: &[String],
     nets: &[&str],
     index: &PcbConnectivityIndex,
-    group_of_net: &HashMap<&str, usize>,
+    group_nets: &BTreeSet<&str>,
     courtyards: &[FootprintCourtyard],
     board_area: Option<f64>,
     top: usize,
 ) -> serde_json::Value {
-    let in_group = |net: &str| group_of_net.get(net) == Some(&group);
+    let in_group = |net: &str| group_nets.contains(net);
     let member_nets: Vec<&str> = nets.iter().copied().filter(|net| in_group(net)).collect();
     let group_pads: Vec<&PadSite> = member_nets
         .iter()
@@ -761,6 +821,62 @@ mod tests {
             .map(|(a, b)| distance(refs[*a].at, refs[*b].at))
             .sum();
         assert!((total - 30.0).abs() < 1e-9, "{total}");
+    }
+
+    /// Each row is a pattern and the nets pcbnew 10.0.7 puts in its netclass,
+    /// out of the scratch nets below; `generate.py probe` in the fixture
+    /// `placement_overview_kicad10` prints the table.
+    #[test]
+    fn a_netclass_pattern_names_the_nets_kicad_names() {
+        const NETS: [&str; 15] = [
+            "HV1", "HV22", "HVX", "/a/HV1", "hv1", "D_1", "D_12", "A.B", "AxB", "+3V3", "3V3",
+            "A+B", "AAB", "NN", "N",
+        ];
+        let kicad: [(&str, &[&str]); 22] = [
+            ("HV", &[]),
+            ("HV*", &["HV1", "HV22", "HVX"]),
+            ("HV?", &["HV1", "HVX"]),
+            ("D_?", &["D_1"]),
+            ("hv1", &["hv1"]),
+            ("/a/*", &["/a/HV1"]),
+            ("*HV1", &["/a/HV1", "HV1"]),
+            ("V1", &[]),
+            ("A.B", &["A+B", "A.B", "AAB", "AxB"]),
+            (r"A\.B", &["A.B"]),
+            ("HV.*", &["HV1", "HV22", "HVX"]),
+            ("HV[0-9]+", &["HV1", "HV22"]),
+            ("HV[^0-9]", &["HVX"]),
+            ("HV(1|X)", &["HV1", "HVX"]),
+            ("HV1|HVX", &["HV1", "HVX"]),
+            ("^HV1$", &["HV1"]),
+            (r"HV\d+", &["HV1", "HV22"]),
+            (r"HV\w+", &["HV1", "HV22", "HVX"]),
+            ("HV[[:digit:]]+", &["HV1", "HV22"]),
+            ("(?i)hv1", &["HV1", "hv1"]),
+            ("+3V3", &["+3V3"]),
+            ("A+B", &["A+B", "AAB"]),
+        ];
+        for (pattern, expected) in kicad {
+            let matcher = NetclassPattern::new(pattern);
+            let mut named: Vec<&str> = NETS.into_iter().filter(|n| matcher.names(n)).collect();
+            named.sort_unstable();
+            assert_eq!(named, expected, "pattern {pattern}");
+        }
+    }
+
+    /// Where this differs from pcbnew 10.0.7, it names fewer nets, never
+    /// more: KiCad names `HV22` for `HV[0-9]{2}`, `HV1` for `HV(?=1)1` and
+    /// `A.B` for `\QA.B\E`. `N{2}` and `HV\d{2}` name nothing there either.
+    #[test]
+    fn a_brace_or_unsupported_expression_is_a_wildcard_only() {
+        const NETS: [&str; 6] = ["HV1", "HV22", "A.B", "AxB", "NN", "N"];
+        for pattern in ["N{2}", r"HV\d{2}", "HV[0-9]{2}", "HV(?=1)1", r"\QA.B\E"] {
+            let matcher = NetclassPattern::new(pattern);
+            assert!(
+                !NETS.into_iter().any(|n| matcher.names(n)),
+                "pattern {pattern}"
+            );
+        }
     }
 
     #[test]

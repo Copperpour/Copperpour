@@ -474,6 +474,7 @@ dependencies = [
  "nng",
  "prost",
  "prost-types",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",
