@@ -572,7 +572,7 @@ pub(crate) fn write_project_if_unchanged(
 /// authoritative even when this server has never reached the editor. Lock
 /// contents do not prove process ownership or freshness, so both an observed
 /// lock and an inspection failure veto the unreachable-IPC file fallback.
-fn board_lock_refusal(board_path: &std::path::Path) -> Option<CallToolResult> {
+pub(super) fn board_lock_refusal(board_path: &std::path::Path) -> Option<CallToolResult> {
     board_lock_refusal_from(board_path, live_board::editor_lock(board_path))
 }
 

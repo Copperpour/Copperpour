@@ -477,6 +477,7 @@ dependencies = [
  "prost-types",
  "regex",
  "reqwest",
+ "roxmltree 0.21.2",
  "rusqlite",
  "serde",
  "serde_json",
