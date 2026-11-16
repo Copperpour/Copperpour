@@ -3230,7 +3230,17 @@ impl SchematicTargetError {
 pub(crate) fn resolve_schematic_ownership(
     target: &std::path::Path,
 ) -> Result<Option<SchematicOwnership>, SchematicTargetError> {
-    let project_files = candidate_project_files(target)?;
+    resolve_schematic_ownership_from(target, std::env::current_dir)
+}
+
+/// [`resolve_schematic_ownership`], with a relative `target` scanned from
+/// `current_dir()` instead of the process's, so tests need not depend on
+/// what sits above the checkout (#558).
+pub(crate) fn resolve_schematic_ownership_from(
+    target: &std::path::Path,
+    current_dir: impl FnOnce() -> std::io::Result<std::path::PathBuf>,
+) -> Result<Option<SchematicOwnership>, SchematicTargetError> {
+    let project_files = candidate_project_files_from(target, current_dir)?;
 
     let mut roots = Vec::new();
     let mut owners = Vec::new();
@@ -3286,6 +3296,13 @@ pub(crate) fn resolve_schematic_ownership(
 pub(crate) fn candidate_project_files(
     target: &std::path::Path,
 ) -> Result<std::collections::BTreeSet<std::path::PathBuf>, SchematicTargetError> {
+    candidate_project_files_from(target, std::env::current_dir)
+}
+
+fn candidate_project_files_from(
+    target: &std::path::Path,
+    current_dir: impl FnOnce() -> std::io::Result<std::path::PathBuf>,
+) -> Result<std::collections::BTreeSet<std::path::PathBuf>, SchematicTargetError> {
     let mut project_files = std::collections::BTreeSet::new();
     let Some(start) = target.parent() else {
         return Ok(project_files);
@@ -3295,7 +3312,7 @@ pub(crate) fn candidate_project_files(
     let scan_start = if start.is_absolute() {
         start.to_path_buf()
     } else {
-        std::env::current_dir()
+        current_dir()
             .map_err(|error| SchematicTargetError::DiscoveryFailed {
                 directory: start.to_path_buf(),
                 reason: error.to_string(),
