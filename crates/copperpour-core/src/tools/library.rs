@@ -4651,6 +4651,12 @@ pub(crate) async fn handle_create_symbol(
     }
 
     let mut units_sexp = String::new();
+    let unit_symbol = |unit: usize, inner: &str| {
+        format!(
+            "\n    (symbol {}{inner}\n    )",
+            quote_string(&format!("{name}_{unit}_1"))
+        )
+    };
     let unit_count: usize;
     let power_pin_count: usize;
     let ref_body: SymbolRect;
@@ -4696,7 +4702,7 @@ pub(crate) async fn handle_create_symbol(
             warnings.extend(unit1.displacement_warning("unit 1"));
             units_report.push(unit1.to_json(1));
             let (inner1, body1) = (unit1.sexp, unit1.rect);
-            units_sexp.push_str(&format!("\n    (symbol \"{}_1_1\"{}\n    )", name, inner1));
+            units_sexp.push_str(&unit_symbol(1, &inner1));
             // Unit 2: a rectangular power unit.
             let power_laid = layout_power_unit(&power);
             let unit2 = match build_symbol_unit(&power_laid, None, show_names, None) {
@@ -4707,7 +4713,7 @@ pub(crate) async fn handle_create_symbol(
             warnings.extend(unit2.displacement_warning("unit 2"));
             units_report.push(unit2.to_json(2));
             let inner2 = unit2.sexp;
-            units_sexp.push_str(&format!("\n    (symbol \"{}_2_1\"{}\n    )", name, inner2));
+            units_sexp.push_str(&unit_symbol(2, &inner2));
             unit_count = 2;
             power_pin_count = power_laid.len();
             ref_body = body1;
@@ -4726,7 +4732,7 @@ pub(crate) async fn handle_create_symbol(
             warnings.extend(unit.displacement_warning("unit 1"));
             units_report.push(unit.to_json(1));
             let (inner, body) = (unit.sexp, unit.rect);
-            units_sexp.push_str(&format!("\n    (symbol \"{}_0_1\"{}\n    )", name, inner));
+            units_sexp.push_str(&unit_symbol(0, &inner));
             unit_count = 1;
             power_pin_count = pins_val.iter().filter(|pin| is_power_pin(pin)).count();
             ref_body = body;
@@ -4785,12 +4791,7 @@ pub(crate) async fn handle_create_symbol(
             if i == 0 {
                 first_body = body;
             }
-            units_sexp.push_str(&format!(
-                "\n    (symbol \"{}_{}_1\"{}\n    )",
-                name,
-                i + 1,
-                inner
-            ));
+            units_sexp.push_str(&unit_symbol(i + 1, &inner));
         }
         let mut total = unit_objs.len();
         if !power_pins.is_empty() {
@@ -4826,10 +4827,7 @@ pub(crate) async fn handle_create_symbol(
             warnings.extend(unit.displacement_warning(&format!("unit {total}")));
             units_report.push(unit.to_json(total));
             let inner = unit.sexp;
-            units_sexp.push_str(&format!(
-                "\n    (symbol \"{}_{}_1\"{}\n    )",
-                name, total, inner
-            ));
+            units_sexp.push_str(&unit_symbol(total, &inner));
         }
         unit_count = total;
         power_pin_count = power_pins.len();
@@ -4883,8 +4881,8 @@ pub(crate) async fn handle_create_symbol(
         .collect();
 
     let symbol_sexp = format!(
-        "\n  (symbol \"{}\"{}{}\n    (exclude_from_sim no)\n    (in_bom yes)\n    (on_board yes)\n    (in_pos_files yes)\n    (duplicate_pin_numbers_are_jumpers no){}{}{}{}{}{}{}\n    (embedded_fonts no)\n  )",
-        name,
+        "\n  (symbol {}{}{}\n    (exclude_from_sim no)\n    (in_bom yes)\n    (on_board yes)\n    (in_pos_files yes)\n    (duplicate_pin_numbers_are_jumpers no){}{}{}{}{}{}{}\n    (embedded_fonts no)\n  )",
+        quote_string(name),
         numbers,
         names,
         visible_property("Reference", ref_prefix, ref_y),
@@ -4981,7 +4979,7 @@ pub(crate) async fn handle_delete_symbol(
     // tab-indented, and a nested unit `(symbol "NAME_1_1"` is never a match.
     let (start, end) = find_direct_child_blocks(&content, "kicad_symbol_lib")
         .into_iter()
-        .find(|&(s, e)| super::lib_symbol_name(&content[s..e]) == Some(symbol_name))
+        .find(|&(s, e)| super::lib_symbol_name(&content[s..e]).as_deref() == Some(symbol_name))
         .ok_or_else(|| anyhow::anyhow!("Symbol '{}' not found in library", symbol_name))?;
 
     let line_start = content[..start].rfind('\n').map_or(0, |i| i + 1);
@@ -11585,5 +11583,150 @@ mod required_argument_tests {
         assert!(result.is_error);
         assert_eq!(error_field(&result), "units[0].pins[1].name");
         assert!(!path.exists(), "no library may be created on rejection");
+    }
+
+    #[tokio::test]
+    async fn create_symbol_escapes_quotes_and_backslashes_in_symbol_and_unit_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escaped.kicad_sym");
+        let lib_str = path.to_string_lossy().to_string();
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let dispatch = |tool: &str, arguments: serde_json::Value| {
+            let h = &handler;
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            });
+            async move {
+                let resp = h.handle_message(req).await.unwrap();
+                let res = serde_json::to_value(resp.result.unwrap()).unwrap();
+                let is_error = res["isError"].as_bool().unwrap_or(false);
+                let text = res["content"][0]["text"].as_str().unwrap_or("").to_string();
+                (is_error, text)
+            }
+        };
+
+        // 1. Quote in name (single-unit) must produce valid S-expression and round-trip.
+        let (is_err, text) = dispatch(
+            "create_symbol",
+            json!({
+                "library_path": lib_str,
+                "name": "A\"B",
+                "reference_prefix": "U",
+                "pins": [{"number": "1", "name": "P1", "type": "passive"}]
+            }),
+        )
+        .await;
+        assert!(!is_err, "create_symbol A\"B failed: {text}");
+
+        // 2. Backslash + 'n' in name (single-unit) must stay literal `\n`, not newline.
+        let (is_err, text) = dispatch(
+            "create_symbol",
+            json!({
+                "library_path": lib_str,
+                "name": "A\\nB",
+                "reference_prefix": "U",
+                "pins": [{"number": "1", "name": "P1", "type": "passive"}]
+            }),
+        )
+        .await;
+        assert!(!is_err, "create_symbol A\\nB failed: {text}");
+
+        // Second identical call must be refused as a duplicate.
+        let (is_err, text) = dispatch(
+            "create_symbol",
+            json!({
+                "library_path": lib_str,
+                "name": "A\\nB",
+                "reference_prefix": "U",
+                "pins": [{"number": "1", "name": "P1", "type": "passive"}]
+            }),
+        )
+        .await;
+        assert!(is_err, "duplicate A\\nB should be refused: {text}");
+
+        // 3. Multi-unit with quotes and backslashes.
+        let (is_err, text) = dispatch(
+            "create_symbol",
+            json!({
+                "library_path": lib_str,
+                "name": "M\"U\\n1",
+                "reference_prefix": "U",
+                "units": [{"pins": [{"number": "1", "name": "IN", "type": "input"}]}],
+                "power_pins": [{"number": "2", "name": "VCC", "type": "power_in", "x": 0.0, "y": 2.54, "angle": 270.0, "length": 2.54}]
+            }),
+        )
+        .await;
+        assert!(!is_err, "create_symbol multi-unit failed: {text}");
+
+        // 4. Triangular glyph with power split (unit 1 + unit 2).
+        let (is_err, text) = dispatch(
+            "create_symbol",
+            json!({
+                "library_path": lib_str,
+                "name": "T\"P\\n1",
+                "reference_prefix": "U",
+                "glyph": "opamp",
+                "pins": [
+                    {"number": "1", "name": "IN+", "type": "input"},
+                    {"number": "2", "name": "IN-", "type": "input"},
+                    {"number": "3", "name": "OUT", "type": "output"},
+                    {"number": "4", "name": "VCC", "type": "power_in"},
+                    {"number": "5", "name": "GND", "type": "power_in"}
+                ]
+            }),
+        )
+        .await;
+        assert!(!is_err, "create_symbol split-power failed: {text}");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let root = parse_sexp(&content).expect("written library must parse");
+        let (is_err, list_text) = dispatch(
+            "list_symbols_in_library",
+            json!({ "library_path": lib_str }),
+        )
+        .await;
+        assert!(!is_err, "list_symbols_in_library failed: {list_text}");
+        let list_json: serde_json::Value = serde_json::from_str(&list_text).unwrap();
+        assert_eq!(
+            list_json["symbols"],
+            json!(["A\"B", "A\\nB", "M\"U\\n1", "T\"P\\n1"])
+        );
+
+        // Verify unit sub-symbol names also unescape to `<name>_U_1`.
+        let unit_names: Vec<&str> = root
+            .find_all("symbol")
+            .into_iter()
+            .flat_map(|s| s.find_all("symbol"))
+            .filter_map(|u| u.get(1).and_then(|n| n.as_str()))
+            .collect();
+        assert!(unit_names.contains(&"A\"B_0_1"), "got {unit_names:?}");
+        assert!(unit_names.contains(&"A\\nB_0_1"), "got {unit_names:?}");
+        assert!(unit_names.contains(&"M\"U\\n1_1_1"), "got {unit_names:?}");
+        assert!(unit_names.contains(&"M\"U\\n1_2_1"), "got {unit_names:?}");
+        assert!(unit_names.contains(&"T\"P\\n1_1_1"), "got {unit_names:?}");
+        assert!(unit_names.contains(&"T\"P\\n1_2_1"), "got {unit_names:?}");
+
+        // delete_symbol must find and delete symbols with quotes and backslashes.
+        for sym in ["A\"B", "A\\nB"] {
+            let (is_err, del_text) = dispatch(
+                "delete_symbol",
+                json!({ "library_path": lib_str, "symbol_name": sym }),
+            )
+            .await;
+            assert!(!is_err, "delete_symbol {sym} failed: {del_text}");
+        }
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            top_level_symbol_names(&after).unwrap(),
+            vec!["M\"U\\n1", "T\"P\\n1"]
+        );
     }
 }
