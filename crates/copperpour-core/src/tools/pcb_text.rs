@@ -7,11 +7,18 @@
 //! which loses the font face, a non-square glyph size, and anything else
 //! `add_board_text` does not model.
 //!
-//! Everything here is live-IPC only. Positions are board-absolute
-//! millimetres: KiCad carries a footprint's fields in board coordinates, not
-//! relative to the footprint anchor (see `copperpour_ipc::transform`). Angles are
-//! the text's own absolute angle as KiCad holds it, which for a field already
-//! includes the footprint's orientation.
+//! The four tools in this file are live-IPC only. Positions are
+//! board-absolute millimetres: KiCad carries a footprint's fields in board
+//! coordinates, not relative to the footprint anchor (see
+//! `copperpour_ipc::transform`). Angles are the text's own absolute angle as
+//! KiCad holds it, which for a field already includes the footprint's
+//! orientation. `set_footprint_field_style`, in `field_style`, is the one
+//! tool here that can also edit the saved file.
+
+// A sibling file, not a subdirectory: the schema-usage contract test reads
+// handlers from the top level of this directory only.
+#[path = "pcb_text_field_style.rs"]
+mod field_style;
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -178,6 +185,31 @@ pub(crate) fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_edit_board_text(args, ctx).await }
         )
         .with_board_access(BoardAccess::LiveOnly),
+        tool!(
+            "set_footprint_field_style",
+            "Set the glyph size and/or stroke thickness of the reference or value field on \
+             placed footprints: the ones named in 'references', or every footprint when it is \
+             omitted. Use it to repair fields below a fabricator's minimum text thickness (DRC \
+             text_thickness), for example Reference fields placed without their library's \
+             thickness. Name at least one of size_x, size_y, thickness; position, angle, layer, \
+             font and visibility are not touched. With KiCad running on the board the edit is \
+             live, in one undo step, and each changed footprint is sent back whole, as \
+             edit_footprint_field sends it: on KiCad 10 that drops its symbol-unit mapping \
+             until Update PCB from Schematic, and a rule area inside it may be rewritten, which \
+             the live 'warning' repeats whenever a footprint was sent. With no live KiCad \
+             holding the board the saved file is edited instead, which has no such side effect. \
+             Both paths answer with the same fields: 'source' says which ran (ipc or file), and \
+             'fallback_reason' is null on the live path. The response lists every field with \
+             its values before and after, read back from the board or the file, and 'skipped' \
+             the fields a whole-board run could not edit; a result that does not hold the \
+             request is an error. On the file path 'thickness_mm' is null where the file stores \
+             none and KiCad derives it from the size. Does not save a live board.",
+            field_style::input_schema(),
+            |args, ctx| async move {
+                field_style::handle_set_footprint_field_style(args, ctx).await
+            }
+        )
+        .with_board_access(BoardAccess::LivePreferredWithFallback),
     ]
 }
 
@@ -1420,23 +1452,28 @@ mod tests {
     use prost::Message;
     use std::sync::{Arc, Mutex};
 
-    /// What the KiCad double holds, and how it treats an update.
+    /// What the KiCad double holds, and how it treats an update. Shared with
+    /// the `field_style` tests.
     #[derive(Default)]
-    struct Held {
-        texts: Vec<kiapi::board::types::BoardText>,
-        footprints: Vec<kiapi::board::types::FootprintInstance>,
+    pub(super) struct Held {
+        pub(super) texts: Vec<kiapi::board::types::BoardText>,
+        pub(super) footprints: Vec<kiapi::board::types::FootprintInstance>,
         /// Accept an update but keep each text's mirror flag as it was: the
         /// KiCad behaviour #202 could not rule out.
-        keep_mirror_flag: bool,
+        pub(super) keep_mirror_flag: bool,
         /// Accept a footprint update but shift the footprint 1 mm in x,
         /// leaving its fields where the update put them, so only the
         /// footprint's own pose shows the change.
-        move_footprint_on_update: bool,
+        pub(super) move_footprint_on_update: bool,
         /// The same, but turn the footprint 90° instead of moving it.
-        rotate_footprint_on_update: bool,
+        pub(super) rotate_footprint_on_update: bool,
         /// The same, but put the footprint on B.Cu instead of moving it.
-        flip_footprint_on_update: bool,
-        updates: usize,
+        pub(super) flip_footprint_on_update: bool,
+        /// Accept an update and store none of it.
+        pub(super) ignore_updates: bool,
+        /// Items received in `UpdateItems`, and commits begun.
+        pub(super) updates: usize,
+        pub(super) commits: usize,
     }
 
     fn held_text(
@@ -1454,7 +1491,10 @@ mod tests {
         item
     }
 
-    fn held_footprint(kiid: &str, reference: &str) -> kiapi::board::types::FootprintInstance {
+    pub(super) fn held_footprint(
+        kiid: &str,
+        reference: &str,
+    ) -> kiapi::board::types::FootprintInstance {
         let field = |id, name: &str, suffix: &str, text: &str, layer: &str| {
             Some(kiapi::board::types::Field {
                 id: Some(kiapi::board::types::FieldId { id }),
@@ -1528,14 +1568,17 @@ mod tests {
                         "kiapi.common.commands.GetItemsResponse",
                     ))
                 }
-                "BeginCommit" => Some(copperpour_ipc::builders::pack_any(
-                    &commands::BeginCommitResponse {
-                        id: Some(kiapi::common::types::Kiid {
-                            value: "text-commit".to_string(),
-                        }),
-                    },
-                    "kiapi.common.commands.BeginCommitResponse",
-                )),
+                "BeginCommit" => {
+                    held.commits += 1;
+                    Some(copperpour_ipc::builders::pack_any(
+                        &commands::BeginCommitResponse {
+                            id: Some(kiapi::common::types::Kiid {
+                                value: "text-commit".to_string(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    ))
+                }
                 "EndCommit" => Some(copperpour_ipc::builders::pack_any(
                     &commands::EndCommitResponse {},
                     "kiapi.common.commands.EndCommitResponse",
@@ -1547,7 +1590,12 @@ mod tests {
                     let move_footprint = held.move_footprint_on_update;
                     let rotate_footprint = held.rotate_footprint_on_update;
                     let flip_footprint = held.flip_footprint_on_update;
-                    for item in &request.items {
+                    let stored: &[prost_types::Any] = if held.ignore_updates {
+                        &[]
+                    } else {
+                        &request.items
+                    };
+                    for item in stored {
                         if item.type_url.ends_with("BoardText") {
                             let mut updated =
                                 kiapi::board::types::BoardText::decode(item.value.as_slice())
@@ -1616,16 +1664,16 @@ mod tests {
     /// A served handler talking to a KiCad double that holds one board with
     /// one unmirrored text already on `B.SilkS` (the state #202 was filed
     /// from) and one resistor.
-    struct LiveScene {
+    pub(super) struct LiveScene {
         _dir: tempfile::TempDir,
-        board: std::path::PathBuf,
-        held: Arc<Mutex<Held>>,
+        pub(super) board: std::path::PathBuf,
+        pub(super) held: Arc<Mutex<Held>>,
         _kicad: crate::test_support::MockIpcServer,
         handler: crate::mcp::handler::McpHandler,
     }
 
     impl LiveScene {
-        async fn new(keep_mirror_flag: bool) -> Self {
+        pub(super) async fn new(keep_mirror_flag: bool) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let board = dir.path().join("silk.kicad_pcb");
             std::fs::write(&board, "(kicad_pcb\n\t(version 20250114)\n)\n").unwrap();
@@ -1658,7 +1706,7 @@ mod tests {
 
         /// `tools/call`, returning whether the result is an error and its
         /// JSON body.
-        async fn call(&self, tool: &str, mut arguments: Value) -> (bool, Value) {
+        pub(super) async fn call(&self, tool: &str, mut arguments: Value) -> (bool, Value) {
             arguments["board"] = json!(self.board.to_string_lossy());
             let response = self
                 .handler

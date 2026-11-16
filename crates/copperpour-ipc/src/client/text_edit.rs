@@ -904,6 +904,204 @@ impl KiCadIpcClient {
         })
     }
 
+    /// Apply one edit to the same fields of many placed footprints, in one
+    /// KiCad undo step.
+    ///
+    /// `references` names the footprints; `None` covers every footprint on
+    /// the board. A named reference must identify exactly one footprint and
+    /// carry every field in `slots`, readable, or nothing is sent. On a
+    /// whole-board run a footprint without such a field is reported in
+    /// `skipped` instead, so one odd footprint does not block the rest.
+    ///
+    /// Each footprint is sent back whole, as [`Self::edit_footprint_field_in`]
+    /// sends it, and only footprints the edit really changes are sent.
+    /// Success requires a fresh read in which every one of them holds the
+    /// requested values with its pose and other mandatory fields unchanged.
+    /// This method never saves the board.
+    pub fn edit_footprint_fields_in(
+        &self,
+        document: common::DocumentSpecifier,
+        references: Option<&[String]>,
+        slots: &[IpcFootprintFieldSlot],
+        edit: &IpcTextEdit,
+    ) -> Result<IpcFootprintFieldBatchOutcome> {
+        anyhow::ensure!(!edit.is_empty(), "the edit names no property to change");
+        anyhow::ensure!(!slots.is_empty(), "the edit names no field to change");
+        let placed = self.placed_footprints_in(document.clone())?;
+        let targets: Vec<&board::FootprintInstance> = match references {
+            None => placed.iter().collect(),
+            Some(references) => {
+                let mut targets = Vec::with_capacity(references.len());
+                for reference in references {
+                    let mut matches = placed
+                        .iter()
+                        .filter(|footprint| footprint_reference(footprint) == *reference);
+                    match (matches.next(), matches.count()) {
+                        (Some(footprint), 0) => targets.push(footprint),
+                        (None, _) => {
+                            return Err(FootprintTargetError::Missing {
+                                reference: reference.clone(),
+                            }
+                            .into())
+                        }
+                        (Some(_), more) => {
+                            return Err(FootprintTargetError::Ambiguous {
+                                reference: reference.clone(),
+                                matches: more + 1,
+                            }
+                            .into())
+                        }
+                    }
+                }
+                targets
+            }
+        };
+
+        // (original, edited) for every target, with the slots that were
+        // edited on it.
+        let mut planned: Vec<(
+            &board::FootprintInstance,
+            board::FootprintInstance,
+            Vec<IpcFootprintFieldSlot>,
+        )> = Vec::new();
+        let mut skipped = Vec::new();
+        for footprint in targets {
+            let reference = footprint_reference(footprint);
+            let kiid = footprint_kiid(footprint);
+            let mut edited = footprint.clone();
+            let mut edited_slots = Vec::new();
+            for &slot in slots {
+                let problem = match slot_view(footprint, slot) {
+                    None => Some(TextTargetError::MissingField {
+                        reference: reference.clone(),
+                        field: slot.as_str().to_string(),
+                    }),
+                    Some(view) => {
+                        view.unreadable_reason
+                            .map(|reason| TextTargetError::Unreadable {
+                                target: format!("the {} field of '{reference}'", slot.as_str()),
+                                reason,
+                            })
+                    }
+                };
+                // A footprint without a KIID cannot be found again to prove
+                // the edit, so it is no more editable than an unreadable one.
+                let problem = problem.or_else(|| {
+                    kiid.is_empty().then(|| TextTargetError::Unreadable {
+                        target: format!("footprint '{reference}'"),
+                        reason: "KiCad sent no KIID for it".to_string(),
+                    })
+                });
+                if let Some(problem) = problem {
+                    if references.is_some() {
+                        return Err(problem.into());
+                    }
+                    skipped.push(IpcFootprintFieldSkip {
+                        footprint_reference: reference.clone(),
+                        footprint_kiid: kiid.clone(),
+                        slot: slot.as_str().to_string(),
+                        reason: problem.to_string(),
+                    });
+                    continue;
+                }
+                let field = slot_field_mut(&mut edited, slot)
+                    .context("the selected field vanished from its own copy")?;
+                apply_field_edit(field, edit)?;
+                edited_slots.push(slot);
+            }
+            if !edited_slots.is_empty() {
+                planned.push((footprint, edited, edited_slots));
+            }
+        }
+
+        fn views(
+            footprint: &board::FootprintInstance,
+            slots: &[IpcFootprintFieldSlot],
+        ) -> Vec<IpcFootprintField> {
+            slots
+                .iter()
+                .filter_map(|&slot| slot_view(footprint, slot))
+                .collect()
+        }
+        let to_send: Vec<prost_types::Any> = planned
+            .iter()
+            .filter(|(original, edited, _)| !footprint_mismatches(original, edited).is_empty())
+            .map(|(_, edited, _)| crate::builders::pack_any(edited, FOOTPRINT_INSTANCE))
+            .collect();
+        if to_send.is_empty() {
+            let fields = planned
+                .iter()
+                .flat_map(|(original, _, slots)| views(original, slots))
+                .map(|view| IpcFootprintFieldStyleChange {
+                    before: view.clone(),
+                    after: view,
+                })
+                .collect();
+            return Ok(IpcFootprintFieldBatchOutcome::Settled {
+                fields,
+                skipped,
+                sent: false,
+            });
+        }
+
+        let mutation = self.run_commit("Set footprint field style", |client| {
+            client.update_items_in(document.clone(), to_send)
+        });
+        let readback = self.placed_footprints_in(document);
+        let mut fields = Vec::new();
+        let evidence = readback
+            .as_ref()
+            .map(|after| {
+                let mut to_expected = Vec::new();
+                let mut to_before = Vec::new();
+                for (original, edited, slots) in &planned {
+                    let kiid = footprint_kiid(original);
+                    let reference = footprint_reference(original);
+                    let mut matches = after
+                        .iter()
+                        .filter(|footprint| footprint_kiid(footprint) == kiid);
+                    let (Some(observed), 0) = (matches.next(), matches.count()) else {
+                        let gone = format!("{reference}: not exactly one footprint has its KIID");
+                        to_expected.push(gone.clone());
+                        to_before.push(gone);
+                        continue;
+                    };
+                    let prefixed = |mismatches: Vec<String>| {
+                        mismatches
+                            .into_iter()
+                            .map(|mismatch| format!("{reference}: {mismatch}"))
+                            .collect::<Vec<_>>()
+                    };
+                    to_expected.extend(prefixed(footprint_mismatches(edited, observed)));
+                    to_before.extend(prefixed(footprint_mismatches(original, observed)));
+                    fields.extend(
+                        views(original, slots)
+                            .into_iter()
+                            .zip(views(observed, slots))
+                            .map(|(before, after)| IpcFootprintFieldStyleChange { before, after }),
+                    );
+                }
+                (to_expected, to_before)
+            })
+            .map_err(|error| format!("{error:#}"));
+        Ok(match settle(mutation, evidence) {
+            Settled::Applied => IpcFootprintFieldBatchOutcome::Settled {
+                fields,
+                skipped,
+                sent: true,
+            },
+            Settled::Refused(error) => {
+                return Err(error.context(
+                    "KiCad rejected the field style edit; a fresh read confirmed the footprints \
+                     are unchanged",
+                ))
+            }
+            Settled::Uncertain { mismatches, reason } => {
+                IpcFootprintFieldBatchOutcome::Uncertain { mismatches, reason }
+            }
+        })
+    }
+
     /// Edit one board-level text item in place, by KIID.
     ///
     /// `preflight` sees the item exactly as KiCad sent it and may refuse
