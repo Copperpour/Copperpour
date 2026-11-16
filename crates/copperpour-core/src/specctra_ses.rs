@@ -79,6 +79,9 @@ struct Manifest {
     /// Required with copper zones, from schema 3 (#430).
     #[serde(default)]
     zones: Vec<crate::specctra::ManifestZoneCount>,
+    /// Required with rule areas, from schema 5 (#81).
+    #[serde(default)]
+    rule_areas: Vec<crate::specctra::ManifestRuleArea>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +96,8 @@ struct SupportedProfile {
     #[serde(default)]
     locked_via_count: usize,
     copper_zones: bool,
+    #[serde(default)]
+    rule_areas: bool,
     custom_rules: bool,
     outline: String,
 }
@@ -223,6 +228,7 @@ pub(crate) fn parse_import_plan(
     if tracks.is_empty() && arcs.is_empty() && vias.is_empty() {
         bail!("SES contains no route primitives");
     }
+    validate_routes_against_rule_areas(&tracks, &arcs, &vias, &manifest.rule_areas)?;
 
     Ok(SesImportPlan {
         board_path: manifest.board_path,
@@ -280,6 +286,15 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
     }
     if crate::specctra::board_zone_inventory(board_source)? != manifest.zones {
         bail!("manifest copper-zone inventory does not match the live board snapshot");
+    }
+    // Schemas 1 to 4 had no rule areas; from 5 the inventory is the live board's.
+    if manifest.supported_profile.rule_areas == manifest.rule_areas.is_empty()
+        || (manifest.schema_version < 5 && !manifest.rule_areas.is_empty())
+    {
+        bail!("manifest rule-area flag does not match its rule-area inventory");
+    }
+    if crate::specctra::board_rule_area_inventory(board_source)? != manifest.rule_areas {
+        bail!("manifest rule-area inventory does not match the live board snapshot");
     }
     let requested = canonical_existing(board_path)?;
     let recorded = canonical_existing(Path::new(&manifest.board_path))?;
@@ -1031,6 +1046,271 @@ fn canonical_existing(path: &Path) -> Result<std::path::PathBuf> {
     std::fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))
 }
 
+const KEEPOUT_CLEARANCE_TOLERANCE_MM: f64 = 1e-7;
+
+fn validate_routes_against_rule_areas(
+    tracks: &[SesTrack],
+    arcs: &[SesArc],
+    vias: &[SesVia],
+    rule_areas: &[crate::specctra::ManifestRuleArea],
+) -> Result<()> {
+    if rule_areas.is_empty() {
+        return Ok(());
+    }
+    let areas = rule_areas
+        .iter()
+        .map(|area| {
+            let poly = area
+                .outline_um
+                .iter()
+                .map(|point| {
+                    (
+                        point.x_um as f64 / UM_PER_MM,
+                        -(point.y_um as f64) / UM_PER_MM,
+                    )
+                })
+                .collect::<Vec<_>>();
+            (area, poly)
+        })
+        .collect::<Vec<_>>();
+
+    for track in tracks {
+        let radius = track.width_mm / 2.0;
+        let p1 = (track.x1_mm, track.y1_mm);
+        let p2 = (track.x2_mm, track.y2_mm);
+        for (area, poly) in &areas {
+            if area.kind.keeps_out_tracks()
+                && area.layers.iter().any(|layer| layer == &track.layer)
+                && segment_overlaps_keepout(p1, p2, radius, poly)
+            {
+                bail!(
+                    "SES track on net '{}' ({}) violates a rule-area keep-out",
+                    track.net_name,
+                    track.layer
+                );
+            }
+        }
+    }
+
+    for arc in arcs {
+        let radius = arc.width_mm / 2.0;
+        for (area, poly) in &areas {
+            if area.kind.keeps_out_tracks()
+                && area.layers.iter().any(|layer| layer == &arc.layer)
+                && arc_overlaps_keepout(arc, radius, poly)
+            {
+                bail!(
+                    "SES arc on net '{}' ({}) violates a rule-area keep-out",
+                    arc.net_name,
+                    arc.layer
+                );
+            }
+        }
+    }
+
+    for via in vias {
+        let radius = via.size_mm / 2.0;
+        let center = (via.x_mm, via.y_mm);
+        for (area, poly) in &areas {
+            if area.kind.keeps_out_vias() && disk_overlaps_keepout(center, radius, poly) {
+                bail!(
+                    "SES via on net '{}' at ({:.3}, {:.3}) mm violates a rule-area keep-out",
+                    via.net_name,
+                    via.x_mm,
+                    via.y_mm
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn polygon_edges(poly: &[(f64, f64)]) -> impl Iterator<Item = ((f64, f64), (f64, f64))> + '_ {
+    poly.iter().enumerate().map(|(index, &start)| {
+        let end = poly[(index + 1) % poly.len()];
+        (start, end)
+    })
+}
+
+fn point_in_or_on_polygon(p: (f64, f64), poly: &[(f64, f64)]) -> bool {
+    let mut inside = false;
+    for (a, b) in polygon_edges(poly) {
+        if point_segment_distance(p, a, b) <= 1e-9 {
+            return true;
+        }
+        if (a.1 > p.1) != (b.1 > p.1) {
+            let x_intersect = a.0 + (p.1 - a.1) * (b.0 - a.0) / (b.1 - a.1);
+            if p.0 < x_intersect {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+fn disk_overlaps_keepout(center: (f64, f64), radius: f64, poly: &[(f64, f64)]) -> bool {
+    if point_in_or_on_polygon(center, poly) {
+        return true;
+    }
+    let threshold = radius - KEEPOUT_CLEARANCE_TOLERANCE_MM;
+    polygon_edges(poly).any(|(a, b)| point_segment_distance(center, a, b) < threshold)
+}
+
+fn segment_overlaps_keepout(
+    p1: (f64, f64),
+    p2: (f64, f64),
+    radius: f64,
+    poly: &[(f64, f64)],
+) -> bool {
+    if point_in_or_on_polygon(p1, poly) || point_in_or_on_polygon(p2, poly) {
+        return true;
+    }
+    let threshold = radius - KEEPOUT_CLEARANCE_TOLERANCE_MM;
+    polygon_edges(poly).any(|(a, b)| segment_segment_distance(p1, p2, a, b) < threshold)
+}
+
+fn arc_overlaps_keepout(arc: &SesArc, copper_radius: f64, poly: &[(f64, f64)]) -> bool {
+    let start = (arc.start_x_mm, arc.start_y_mm);
+    let mid = (arc.mid_x_mm, arc.mid_y_mm);
+    let end = (arc.end_x_mm, arc.end_y_mm);
+    if point_in_or_on_polygon(start, poly)
+        || point_in_or_on_polygon(mid, poly)
+        || point_in_or_on_polygon(end, poly)
+    {
+        return true;
+    }
+    let threshold = copper_radius - KEEPOUT_CLEARANCE_TOLERANCE_MM;
+    let Some((center, arc_radius)) = qarc_center_and_radius(start, mid, end) else {
+        return polygon_edges(poly).any(|(a, b)| {
+            segment_segment_distance(start, mid, a, b) < threshold
+                || segment_segment_distance(mid, end, a, b) < threshold
+        });
+    };
+    polygon_edges(poly)
+        .any(|edge| arc_edge_distance(start, mid, end, center, arc_radius, edge) < threshold)
+}
+
+fn qarc_center_and_radius(
+    a: (f64, f64),
+    b: (f64, f64),
+    c: (f64, f64),
+) -> Option<((f64, f64), f64)> {
+    let bx = b.0 - a.0;
+    let by = b.1 - a.1;
+    let cx = c.0 - a.0;
+    let cy = c.1 - a.1;
+    let denom = 2.0 * (bx * cy - by * cx);
+    if denom.abs() <= 1e-18 {
+        return None;
+    }
+    let b2 = bx * bx + by * by;
+    let c2 = cx * cx + cy * cy;
+    let ox = (cy * b2 - by * c2) / denom;
+    let oy = (bx * c2 - cx * b2) / denom;
+    let radius = ox.hypot(oy);
+    radius.is_finite().then_some(((a.0 + ox, a.1 + oy), radius))
+}
+
+fn arc_edge_distance(
+    start: (f64, f64),
+    mid: (f64, f64),
+    end: (f64, f64),
+    center: (f64, f64),
+    radius: f64,
+    edge: ((f64, f64), (f64, f64)),
+) -> f64 {
+    let cross = |u: (f64, f64), v: (f64, f64)| u.0 * v.1 - u.1 * v.0;
+    let unit = |v: (f64, f64)| -> Option<(f64, f64)> {
+        let len = v.0.hypot(v.1);
+        (len > 1e-12).then(|| (v.0 / len, v.1 / len))
+    };
+    let (Some(u_start), Some(u_mid), Some(u_end)) = (
+        unit((start.0 - center.0, start.1 - center.1)),
+        unit((mid.0 - center.0, mid.1 - center.1)),
+        unit((end.0 - center.0, end.1 - center.1)),
+    ) else {
+        return f64::MAX;
+    };
+    let sweep = cross(u_start, u_mid).signum();
+    let dir_on_arc = |v: (f64, f64)| -> bool {
+        let Some(u) = unit(v) else { return false };
+        sweep * cross(u_start, u) >= -1e-11 && sweep * cross(u, u_end) >= -1e-11
+    };
+
+    let c_rel = (edge.0 .0 - center.0, edge.0 .1 - center.1);
+    let d_rel = (edge.1 .0 - center.0, edge.1 .1 - center.1);
+    let v = (d_rel.0 - c_rel.0, d_rel.1 - c_rel.1);
+    let a = v.0 * v.0 + v.1 * v.1;
+    if a > 0.0 {
+        let b = 2.0 * (c_rel.0 * v.0 + c_rel.1 * v.1);
+        let c = c_rel.0 * c_rel.0 + c_rel.1 * c_rel.1 - radius * radius;
+        let disc = b * b - 4.0 * a * c;
+        if disc >= 0.0 {
+            let sqrt_disc = disc.sqrt();
+            for t in [(-b - sqrt_disc) / (2.0 * a), (-b + sqrt_disc) / (2.0 * a)] {
+                if (-1e-11..=1.0 + 1e-11).contains(&t) {
+                    let t = t.clamp(0.0, 1.0);
+                    let p = (c_rel.0 + t * v.0, c_rel.1 + t * v.1);
+                    if dir_on_arc(p) {
+                        return 0.0;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut min_dist = point_segment_distance(start, edge.0, edge.1)
+        .min(point_segment_distance(end, edge.0, edge.1));
+    if a > 0.0 {
+        let t_perp = (-(c_rel.0 * v.0 + c_rel.1 * v.1) / a).clamp(0.0, 1.0);
+        let p_perp = (c_rel.0 + t_perp * v.0, c_rel.1 + t_perp * v.1);
+        if dir_on_arc(p_perp) {
+            min_dist = min_dist.min((p_perp.0.hypot(p_perp.1) - radius).abs());
+        }
+    }
+    for rel in [c_rel, d_rel] {
+        if dir_on_arc(rel) {
+            min_dist = min_dist.min((rel.0.hypot(rel.1) - radius).abs());
+        }
+    }
+    min_dist
+}
+
+fn point_segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let len2 = dx * dx + dy * dy;
+    if len2 == 0.0 {
+        return (p.0 - a.0).hypot(p.1 - a.1);
+    }
+    let t = (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0);
+    (p.0 - (a.0 + t * dx)).hypot(p.1 - (a.1 + t * dy))
+}
+
+fn segment_segment_distance(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> f64 {
+    let orient = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
+        (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
+    };
+    let o1 = orient(a, b, c);
+    let o2 = orient(a, b, d);
+    let o3 = orient(c, d, a);
+    let o4 = orient(c, d, b);
+    if (o1 > 0.0) != (o2 > 0.0)
+        && (o3 > 0.0) != (o4 > 0.0)
+        && o1 != 0.0
+        && o2 != 0.0
+        && o3 != 0.0
+        && o4 != 0.0
+    {
+        return 0.0;
+    }
+    point_segment_distance(a, c, d)
+        .min(point_segment_distance(b, c, d))
+        .min(point_segment_distance(c, a, b))
+        .min(point_segment_distance(d, a, b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1288,9 +1568,12 @@ mod tests {
             }
         }
         assert_eq!(check(&board, &schema_1), invalid);
-        let mut schema_5 = manifest.clone();
-        schema_5["schema_version"] = 5.into();
-        assert!(check(&board, &schema_5).contains("unsupported Specctra manifest schema 5"));
+        let future_schema = crate::specctra::MANIFEST_SCHEMA_VERSION + 1;
+        let mut unsupported_schema = manifest.clone();
+        unsupported_schema["schema_version"] = future_schema.into();
+        assert!(check(&board, &unsupported_schema).contains(&format!(
+            "unsupported Specctra manifest schema {future_schema}"
+        )));
     }
 
     #[test]
@@ -1529,5 +1812,156 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("exactly one path or qarc"), "{error}");
+    }
+
+    #[test]
+    fn ses_routes_violating_rule_area_keepouts_are_refused() {
+        let base_source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        // Keep-out on F.Cu across (103..107, 48..52): right in the path from
+        // R1-2 (100.5, 50) to R2-1 (109.5, 50).
+        let with_keepout = |tracks: &str, vias: &str, layer: &str| {
+            let zone = format!(
+                "\t(zone\n\t\t(layer \"{layer}\")\n\t\t(uuid \"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\")\n\t\t(keepout\n\t\t\t(tracks {tracks})\n\t\t\t(vias {vias})\n\t\t\t(pads allowed)\n\t\t\t(copperpour allowed)\n\t\t\t(footprints allowed)\n\t\t)\n\t\t(placement (enabled no))\n\t\t(polygon (pts (xy 103 48) (xy 107 48) (xy 107 52) (xy 103 52)))\n\t)\n"
+            );
+            let idx = base_source.rfind("\t(embedded_fonts").unwrap();
+            let source = format!("{}{zone}{}", &base_source[..idx], &base_source[idx..]);
+            std::fs::write(&board, &source).unwrap();
+            let export = export_dsn(&board, &source, &rules()).unwrap();
+            (source, export.manifest)
+        };
+        let ses_with_routes = |wires: &str, vias: &str| {
+            format!(
+                "(session board (base_design board)\n\
+                 (placement (resolution um 10)\n\
+                   (component copperpour_image_R1 (place R1 1000000 -500000 front 0))\n\
+                   (component copperpour_image_R2 (place R2 1100000 -500000 front 0)))\n\
+                 (was_is)\n\
+                 (routes (resolution um 10)\n\
+                   (library_out\n\
+                     (padstack copperpour_via_0001\n\
+                       (shape (circle F.Cu 6000 0 0))\n\
+                       (shape (circle B.Cu 6000 0 0))\n\
+                       (attach off)))\n\
+                   (network_out\n\
+                     (net GND {wires} {vias}))))\n"
+            )
+        };
+
+        // 1. `keepout` on F.Cu: track crossing, wholly inside, and copper-overlapping fail;
+        //    tangent track outside (width 0.2mm => radius 0.1mm => y=47.9mm) and B.Cu pass.
+        let (src, manifest) = with_keepout("not_allowed", "not_allowed", "F.Cu");
+        for (label, wire) in [
+            (
+                "crosses polygon",
+                "(wire (path F.Cu 2000 1005000 -500000 1095000 -500000))",
+            ),
+            (
+                "inside polygon",
+                "(wire (path F.Cu 2000 1040000 -500000 1060000 -500000))",
+            ),
+            (
+                "copper overlaps edge",
+                "(wire (path F.Cu 2000 1005000 -479500 1095000 -479500))",
+            ),
+            (
+                "qarc crosses polygon",
+                "(wire (qarc F.Cu 2000 1020000 -500000 1040000 -480000 1040000 -500000))",
+            ),
+        ] {
+            let err = parse_import_plan(&board, &src, &manifest, &ses_with_routes(wire, ""))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("violates a rule-area keep-out"),
+                "{label}: {err}"
+            );
+        }
+        for (label, wire) in [
+            (
+                "tangent outside F.Cu",
+                "(wire (path F.Cu 2000 1005000 -479000 1095000 -479000))",
+            ),
+            (
+                "uncovered B.Cu",
+                "(wire (path B.Cu 2000 1005000 -500000 1095000 -500000))",
+            ),
+        ] {
+            parse_import_plan(&board, &src, &manifest, &ses_with_routes(wire, ""))
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+        }
+        let padstack = "copperpour_via_0001";
+        let via_at = |x: i64, y: i64| format!("(via {padstack} {x} {y})");
+        for (label, via) in [
+            ("via inside keepout", via_at(1050000, -500000)),
+            ("via copper overlaps edge", via_at(1028000, -500000)),
+        ] {
+            let wire = "(wire (path B.Cu 2000 1005000 -500000 1095000 -500000))";
+            let err = parse_import_plan(&board, &src, &manifest, &ses_with_routes(wire, &via))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("violates a rule-area keep-out"),
+                "{label}: {err}"
+            );
+        }
+
+        // 2. `wire_keepout`: forbids track on F.Cu, allows via inside.
+        let (src, manifest) = with_keepout("not_allowed", "allowed", "F.Cu");
+        let via_ok = parse_import_plan(
+            &board,
+            &src,
+            &manifest,
+            &ses_with_routes(
+                "(wire (path B.Cu 2000 1005000 -500000 1095000 -500000))",
+                &via_at(1050000, -500000),
+            ),
+        );
+        assert!(via_ok.is_ok(), "{via_ok:?}");
+        let track_err = parse_import_plan(
+            &board,
+            &src,
+            &manifest,
+            &ses_with_routes(
+                "(wire (path F.Cu 2000 1005000 -500000 1095000 -500000))",
+                "",
+            ),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            track_err.contains("violates a rule-area keep-out"),
+            "{track_err}"
+        );
+
+        // 3. `via_keepout` (even on B.Cu only): allows F.Cu track through, forbids through-via,
+        //    allows tangent via outside (radius 0.3mm => x=102.7mm).
+        let (src, manifest) = with_keepout("allowed", "not_allowed", "B.Cu");
+        let track_ok = parse_import_plan(
+            &board,
+            &src,
+            &manifest,
+            &ses_with_routes(
+                "(wire (path F.Cu 2000 1005000 -500000 1095000 -500000))",
+                &via_at(1027000, -500000),
+            ),
+        );
+        assert!(track_ok.is_ok(), "{track_ok:?}");
+        let via_err = parse_import_plan(
+            &board,
+            &src,
+            &manifest,
+            &ses_with_routes(
+                "(wire (path F.Cu 2000 1005000 -500000 1095000 -500000))",
+                &via_at(1050000, -500000),
+            ),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            via_err.contains("violates a rule-area keep-out"),
+            "{via_err}"
+        );
     }
 }

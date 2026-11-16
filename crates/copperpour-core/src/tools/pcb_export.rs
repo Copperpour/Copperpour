@@ -303,9 +303,11 @@ pub fn tools() -> Vec<ToolDef> {
              KiCad PCB editor revision. Requires the named board open with IPC enabled. Shared \
              import-safety checks run first in every mode: an even 2-32-layer copper stack, \
              representable SMD and all-copper through-hole pads on either side, complete \
-             effective routing rules, no custom DRC rules or rule areas, and no unlocked \
-             tracks/vias or routed arcs. Supported netted copper zones become planes; locked \
-             straight tracks and through vias are preserved. The default 'disable' uses only the \
+             effective routing rules, no custom DRC rules, only representable routing rule \
+             areas (`tracks`/`vias` keep-outs without placement or cutouts), and no unlocked \
+             tracks/vias or routed arcs. Supported netted copper zones become planes, and \
+             supported rule areas become keep-outs (`keepout`, `wire_keepout`, `via_keepout`); \
+             locked straight tracks and through vias are preserved. The default 'disable' uses only the \
              Rust writer, requiring one closed Edge.Cuts loop of lines/circular arcs (flattened \
              within board max_error). On KiCad 10, 'prefer'/'require' first try the \
              authenticated ActionPlugin native exporter and validate its identities against the \
@@ -1063,9 +1065,10 @@ async fn handle_export_specctra_dsn(
                 "ses_import_available": false,
                 "freerouting_bridge_available": false,
                 "source_revision_bound": true,
-                "supported_profile": "even_layer_both_sides_circle_rect_roundrect_oval_no_existing_routing_zones_as_planes",
+                "supported_profile": "even_layer_both_sides_circle_rect_roundrect_oval_no_existing_routing_zones_as_planes_rule_areas_as_keepouts",
                 "copper_layers": export.copper_layer_count,
                 "copper_zones": export.copper_zone_count,
+                "rule_areas": export.rule_area_count,
                 "component_side": export.component_side
             }
         })
@@ -1950,11 +1953,12 @@ mod specctra_roundrect_served_tests {
         assert_eq!(body["pad_count"], 6);
         assert_eq!(
             body["capabilities"]["supported_profile"],
-            "even_layer_both_sides_circle_rect_roundrect_oval_no_existing_routing_zones_as_planes"
+            "even_layer_both_sides_circle_rect_roundrect_oval_no_existing_routing_zones_as_planes_rule_areas_as_keepouts"
         );
         assert_eq!(body["capabilities"]["copper_layers"], 2);
         assert_eq!(body["capabilities"]["component_side"], "front");
         assert_eq!(body["capabilities"]["copper_zones"], 0);
+        assert_eq!(body["capabilities"]["rule_areas"], 0);
         assert_eq!(dsn.matches("(polygon F.Cu 0").count(), 3, "{dsn}");
         let manifest: Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join("board.dsn.copperpour.json")).unwrap(),
@@ -1995,9 +1999,26 @@ mod specctra_roundrect_served_tests {
         )
         .await;
         assert_eq!(body["capabilities"]["copper_zones"], 3, "{body}");
+        assert_eq!(body["capabilities"]["rule_areas"], 0, "{body}");
         assert_eq!(dsn.matches("(plane GND\n").count(), 3, "{dsn}");
         assert_eq!(dsn.matches("(plane VCC\n").count(), 1, "{dsn}");
         assert!(dsn.contains("(polygon In2.Cu 0 81000 -31000"), "{dsn}");
+    }
+
+    /// The response's rule-area count is the board's, each rule area a keep-out
+    /// per copper layer it covers (#81).
+    #[tokio::test]
+    async fn served_export_reports_the_boards_rule_areas() {
+        let (_dir, body, dsn) = served_export(
+            "specctra_rule_areas.kicad_pcb",
+            include_str!("../../tests/fixtures/specctra_rule_areas.kicad_pcb"),
+            &["GND", "VCC"],
+        )
+        .await;
+        assert_eq!(body["capabilities"]["rule_areas"], 3, "{body}");
+        assert_eq!(dsn.matches("(keepout \"\"").count(), 2, "{dsn}");
+        assert_eq!(dsn.matches("(wire_keepout \"\"").count(), 1, "{dsn}");
+        assert_eq!(dsn.matches("(via_keepout \"\"").count(), 2, "{dsn}");
     }
 
     /// The response says which sides the footprints are on, and a bottom
@@ -2204,7 +2225,10 @@ mod specctra_rotation_served_tests {
             &std::fs::read_to_string(body["manifest_output_path"].as_str().unwrap()).unwrap(),
         )
         .unwrap();
-        assert_eq!(manifest["schema_version"], 4);
+        assert_eq!(
+            manifest["schema_version"],
+            crate::specctra::MANIFEST_SCHEMA_VERSION
+        );
         let j1 = manifest["components"]
             .as_array()
             .unwrap()
