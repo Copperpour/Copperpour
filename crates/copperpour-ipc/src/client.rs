@@ -20,7 +20,15 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 mod footprint_edit;
+mod teardrops;
 mod text_edit;
+pub use teardrops::{
+    changes_besides_teardrops, footprint_owned_groups, legacy_teardrops_in_board_text,
+    supports_teardrop_settings, teardrop_targets_from_items, teardrop_zones_from_items,
+    IpcTeardropApplied, IpcTeardropApplyOutcome, IpcTeardropEdit, IpcTeardropRefusal,
+    IpcTeardropSettings, IpcTeardropTarget, IpcTeardropTargetKind, IpcTeardropZone,
+    TeardropReadError, TEARDROP_SETTINGS_MIN_KICAD_VERSION,
+};
 pub use text_edit::TextTargetError;
 
 /// How long the per-layer name lookups behind `get_enabled_layers_with_names_in`
