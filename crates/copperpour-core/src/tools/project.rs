@@ -577,7 +577,11 @@ async fn handle_open_viewer(
             )))
         }
     };
-    let (url, reused) = match ctx.viewers.open(&root, &ctx.config.kicad_cli).await {
+    let (url, reused) = match ctx
+        .viewers
+        .open(&root, &ctx.config.kicad_cli, &ctx.config.kicad_binary)
+        .await
+    {
         Ok(viewer) => viewer,
         Err(error) => {
             return Ok(CallToolResult::error(format!(
@@ -1072,23 +1076,9 @@ mod tests {
         );
     }
 
-    /// A KiCad double that answers every request with `AS_NOT_READY`, the
-    /// status KiCad returns while an editor is still loading.
-    fn spawn_not_ready_kicad() -> crate::test_support::MockIpcServer {
-        use copperpour_ipc::gen::kiapi::common::{ApiResponse, ApiResponseStatus, ApiStatusCode};
-        crate::test_support::MockIpcServer::spawn("not-ready", |_| ApiResponse {
-            status: Some(ApiResponseStatus {
-                status: ApiStatusCode::AsNotReady as i32,
-                error_message: "KiCad is not ready".to_string(),
-            }),
-            header: None,
-            message: None,
-        })
-    }
-
     #[tokio::test]
     async fn open_project_says_kicad_answered_when_it_answered_with_an_error() {
-        let kicad = spawn_not_ready_kicad();
+        let kicad = crate::test_support::MockIpcServer::not_ready("open-project");
         let mut ctx = test_ctx();
         ctx.config.ipc_address = kicad.address().to_string();
 
@@ -1104,6 +1094,12 @@ mod tests {
             response["ipc_failure"]["message"]
                 .as_str()
                 .is_some_and(|message| message.contains("KiCad is not ready")),
+            "{response}"
+        );
+        assert!(
+            response["ipc_failure"]["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("modal dialog")),
             "{response}"
         );
         assert!(
@@ -1130,7 +1126,8 @@ mod tests {
                 .contains("probably not KiCad")
         );
         assert!(unanswered_message(&PingOutcome::RequestFailed {
-            message: String::new()
+            message: String::new(),
+            status: None,
         })
         .contains("did not complete"));
         for reason in [

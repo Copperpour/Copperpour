@@ -34,7 +34,13 @@ pub(crate) async fn collect(
         .and_then(|version| stable_version_cmp(version, running_version))
         .map(|ordering| ordering == Ordering::Greater);
 
-    let kicad_cli_path = crate::kicad_install::find_cli(&config.kicad_cli);
+    // Keep empty-value installation discovery, but probe nonempty overrides
+    // exactly as CLI execution resolves them, including missing explicit paths.
+    let kicad_cli_path = if config.kicad_cli.trim().is_empty() {
+        crate::kicad_install::find_cli("")
+    } else {
+        Some(crate::tools::cli::resolve_cli_executable(&config.kicad_cli))
+    };
     let kicad_probe = match kicad_cli_path.as_deref() {
         Some(path) => probe_command_version(path, VersionCommand::KiCad).await,
         None => VersionProbe::not_found(),

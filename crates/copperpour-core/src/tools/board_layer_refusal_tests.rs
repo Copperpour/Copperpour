@@ -98,7 +98,7 @@ impl Scene {
                 "net_name": "GND", "x1": 0.0, "y1": 0.0, "x2": 5.0, "y2": 0.0
             }),
             "route_differential_pair" => json!({
-                "board": board, "net_pos": "GND", "net_neg": "GND",
+                "board": board, "net_pos": "GND", "net_neg": "VCC",
                 "x1": 0.0, "y1": 0.0, "x2": 5.0, "y2": 0.0
             }),
             _ => json!({
@@ -128,7 +128,7 @@ impl Scene {
 }
 
 /// A KiCad holding `board` that records what it is asked, creates whatever
-/// `CreateItems` names, and knows one net, `GND`.
+/// `CreateItems` names, accepts commits, and knows two nets, `GND` and `VCC`.
 fn kicad_recording(board: &Path, received: Received) -> MockIpcServer {
     spawn_kicad_holding_board(board, move |command| {
         let name = command.type_url.rsplit('.').next().unwrap().to_string();
@@ -156,9 +156,25 @@ fn kicad_recording(board: &Path, received: Received) -> MockIpcServer {
                 )),
                 "GetNets" => Some(copperpour_ipc::builders::pack_any(
                     &kiapi::board::commands::NetsResponse {
-                        nets: vec![copperpour_ipc::builders::net("GND", 1)],
+                        nets: vec![
+                            copperpour_ipc::builders::net("GND", 1),
+                            copperpour_ipc::builders::net("VCC", 2),
+                        ],
                     },
                     "kiapi.board.commands.NetsResponse",
+                )),
+                // `route_differential_pair` creates its pair in one commit (#367).
+                "BeginCommit" => Some(copperpour_ipc::builders::pack_any(
+                    &kiapi::common::commands::BeginCommitResponse {
+                        id: Some(kiapi::common::types::Kiid {
+                            value: "layer-commit".to_string(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                )),
+                "EndCommit" => Some(copperpour_ipc::builders::pack_any(
+                    &kiapi::common::commands::EndCommitResponse {},
+                    "kiapi.common.commands.EndCommitResponse",
                 )),
                 _ => None,
             };

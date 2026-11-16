@@ -958,6 +958,13 @@ struct LibraryFootprintData {
     attributes: copperpour_ipc::gen::kiapi::board::types::FootprintAttributes,
     description_and_keywords: copperpour_ipc::gen::kiapi::board::types::FootprintAttributes,
     models: Vec<copperpour_ipc::gen::kiapi::board::types::Footprint3DModel>,
+    /// The library's properties, whose Reference and Value give the placed
+    /// fields their layer, visibility and text style. When they cannot be
+    /// read, the part keeps the fields every footprint gets, and the response
+    /// says so rather than refusing the part over its text. A field the
+    /// library writes without a position, layer or effects keeps its default
+    /// too, as in the sync.
+    properties: Result<super::library_footprint::LibraryProperties, String>,
 }
 
 impl PreparedFootprintPlacement {
@@ -1009,6 +1016,8 @@ impl PreparedFootprintPlacement {
             attributes: super::library_footprint::attributes(&root)?,
             description_and_keywords: super::library_footprint::description_and_keywords(&root),
             models: super::library_footprint::models(&root)?,
+            properties: super::library_footprint::properties(&root)
+                .map_err(|error| format!("{error:#}")),
         };
         let library_path =
             resolve_footprint_path(lib_id, project_dir).map_err(anyhow::Error::msg)?;
@@ -1061,8 +1070,9 @@ impl PreparedFootprintPlacement {
     }
 
     /// The F.Cu `FootprintInstance` the IPC path creates, with the library's
-    /// 3D models, attributes, description and keywords on it, so the part
-    /// arrives complete rather than as pads and drawings alone.
+    /// 3D models, attributes, description and keywords, and its Reference and
+    /// Value fields, on it, so the part arrives complete rather than as pads
+    /// and drawings alone.
     fn ipc_item(
         &self,
         lib_id: &str,
@@ -1097,9 +1107,22 @@ impl PreparedFootprintPlacement {
         definition.items.extend(library.models.iter().map(|model| {
             copperpour_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
         }));
+        if let Ok(properties) = &library.properties {
+            apply_library_reference_and_value(&mut footprint, properties, reference, &self.value)?;
+        }
         Ok(copperpour_ipc::builders::pack_any(
             &footprint,
             "kiapi.board.types.FootprintInstance",
+        ))
+    }
+
+    /// Why [`Self::ipc_item`] gave the part default Reference and Value
+    /// fields, not the library's, if it did.
+    fn library_fields_not_carried(&self, lib_id: &str, reference: &str) -> Option<String> {
+        let reason = self.library.as_ref()?.properties.as_ref().err()?;
+        Some(format!(
+            "{lib_id}'s library properties could not be read, so {reference} was placed with \
+             default Reference and Value fields, not the library's: {reason}"
         ))
     }
 
@@ -1120,6 +1143,49 @@ impl PreparedFootprintPlacement {
     pub(crate) fn insert_into_board(&self, board_path: &Path) -> anyhow::Result<()> {
         insert_into_board(board_path, &[self.file_block()?])
     }
+}
+
+/// Give a built footprint the library's Reference and Value fields, with the
+/// library's layer, visibility, font and keep-upright, as the sync gives the
+/// footprints it adds (#157). They are placed with the library refresh's own
+/// transform, and their text is the placement's.
+fn apply_library_reference_and_value(
+    footprint: &mut copperpour_ipc::gen::kiapi::board::types::FootprintInstance,
+    properties: &super::library_footprint::LibraryProperties,
+    reference: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    let position = footprint
+        .position
+        .context("built footprint has no position")?;
+    let rotation = footprint
+        .orientation
+        .as_ref()
+        .map_or(0.0, |angle| angle.value_degrees);
+    let place = |field: &copperpour_ipc::gen::kiapi::board::types::Field, text: &str| {
+        let mut placed = super::pcb_footprint_update::transform_library_property(
+            field, &position, rotation, None,
+        )?;
+        if let Some(shown) = placed.text.as_mut().and_then(|text| text.text.as_mut()) {
+            shown.text = text.to_string();
+        }
+        anyhow::Ok(placed)
+    };
+    let definition = footprint
+        .definition
+        .as_mut()
+        .context("built footprint has no definition")?;
+    if let Some(field) = &properties.reference {
+        let placed = place(field, reference)?;
+        definition.reference_field = Some(placed.clone());
+        footprint.reference_field = Some(placed);
+    }
+    if let Some(field) = &properties.value {
+        let placed = place(field, value)?;
+        definition.value_field = Some(placed.clone());
+        footprint.value_field = Some(placed);
+    }
+    Ok(())
 }
 
 fn footprint_references(content: &str) -> anyhow::Result<HashSet<String>> {
@@ -2645,19 +2711,25 @@ async fn handle_place_component(
     .await?;
 
     match attempt {
-        BoardWrite::Ipc(Ok((fp, models))) => Ok(CallToolResult::json(&json!({
-            "placed": fp.reference,
-            "footprint": fp.footprint,
-            "x": fp.position.x, "y": fp.position.y,
-            "rotation": fp.rotation, "layer": fp.layer,
-            "models": models,
-            "source": "ipc",
-            "undo": if on_back {
-                "Two KiCad undo steps: the placement on F.Cu, then KiCad's native flip to B.Cu."
-            } else {
-                "One KiCad undo step reverses the placement."
+        BoardWrite::Ipc(Ok((fp, models))) => {
+            let mut response = json!({
+                "placed": fp.reference,
+                "footprint": fp.footprint,
+                "x": fp.position.x, "y": fp.position.y,
+                "rotation": fp.rotation, "layer": fp.layer,
+                "models": models,
+                "source": "ipc",
+                "undo": if on_back {
+                    "Two KiCad undo steps: the placement on F.Cu, then KiCad's native flip to B.Cu."
+                } else {
+                    "One KiCad undo step reverses the placement."
+                }
+            });
+            if let Some(warning) = prepared.library_fields_not_carried(&footprint, &reference) {
+                response["warning"] = json!(warning);
             }
-        }))),
+            Ok(CallToolResult::json(&response))
+        }
         BoardWrite::Ipc(Err(refusal)) => Ok(refusal),
         BoardWrite::Refused(result) => Ok(result),
         BoardWrite::File(reason) => {
@@ -7786,10 +7858,15 @@ mod tests {
         let pretty = dir.join("Capacitor_SMD.pretty");
         std::fs::create_dir_all(&pretty).unwrap();
         std::fs::write(pretty.join("C_0603_1608Metric.kicad_mod"), footprint).unwrap();
+        library_fixture(dir, "Capacitor_SMD", &pretty)
+    }
+
+    /// A project registering `pretty` as `nickname`, plus an empty board.
+    fn library_fixture(dir: &Path, nickname: &str, pretty: &Path) -> std::path::PathBuf {
         std::fs::write(
             dir.join("fp-lib-table"),
             format!(
-                "(fp_lib_table\n\t(version 7)\n\t(lib (name \"Capacitor_SMD\") (type \"KiCad\") (uri \"{}\") (options \"\") (descr \"\"))\n)\n",
+                "(fp_lib_table\n\t(version 7)\n\t(lib (name \"{nickname}\") (type \"KiCad\") (uri \"{}\") (options \"\") (descr \"\"))\n)\n",
                 pretty.to_string_lossy()
             ),
         )
@@ -7875,6 +7952,196 @@ mod tests {
         let block = prepared.file_block().unwrap();
         assert!(block.contains("(layer \"B.Cu\")"), "{block}");
         assert!(block.contains("(at 10 20 30)"), "{block}");
+    }
+
+    /// The Reference and Value the IPC item carries are the ones KiCad 10.0.6
+    /// gives the stock C_0603 placed from its library at 0° and 180° on F.Cu
+    /// (`c_0603_ipc.README.md`): the library's layer, visibility, font,
+    /// stroke, line spacing and keep-upright, placed as KiCad places them
+    /// (#157). Only what KiCad assigns itself is left out of the comparison.
+    #[test]
+    fn the_ipc_item_carries_the_reference_and_value_kicad_places() {
+        use copperpour_ipc::gen::kiapi::board::types as board;
+        let tmp = tempfile::tempdir().unwrap();
+        capacitor_fixture(tmp.path(), C_0603);
+        let comparable = |field: &Option<board::Field>| {
+            let mut field = field.clone().expect("the footprint has the field");
+            field.id = None;
+            let text = field.text.as_mut().unwrap();
+            text.id = None;
+            text.parent = None;
+            field
+        };
+        let text_of = |field: &Option<board::Field>| {
+            field
+                .as_ref()
+                .unwrap()
+                .text
+                .as_ref()
+                .unwrap()
+                .text
+                .as_ref()
+                .unwrap()
+                .text
+                .clone()
+        };
+        for capture in [
+            &include_bytes!("../../tests/fixtures/c_0603_loaded_front_0.ipc.bin")[..],
+            &include_bytes!("../../tests/fixtures/c_0603_loaded_front_180.ipc.bin")[..],
+        ] {
+            let kicad = board::FootprintInstance::decode(capture).unwrap();
+            let (reference, value) = (text_of(&kicad.reference_field), text_of(&kicad.value_field));
+            let position = kicad.position.unwrap();
+            let x = copperpour_ipc::builders::nm_to_mm(position.x_nm);
+            let y = copperpour_ipc::builders::nm_to_mm(position.y_nm);
+            let rotation = kicad.orientation.unwrap().value_degrees;
+            let prepared = PreparedFootprintPlacement::from_library(
+                C_0603,
+                "Capacitor_SMD:C_0603_1608Metric",
+                &reference,
+                Some(&value),
+                x,
+                y,
+                rotation,
+                "F.Cu",
+                Some(tmp.path()),
+            )
+            .unwrap();
+            let item = prepared
+                .ipc_item("Capacitor_SMD:C_0603_1608Metric", &reference, x, y)
+                .unwrap();
+            let built = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            assert_eq!(
+                comparable(&built.reference_field),
+                comparable(&kicad.reference_field),
+                "Reference at {rotation}°"
+            );
+            assert_eq!(
+                comparable(&built.value_field),
+                comparable(&kicad.value_field),
+                "Value at {rotation}°"
+            );
+            let definition = built.definition.unwrap();
+            assert_eq!(definition.reference_field, built.reference_field);
+            assert_eq!(definition.value_field, built.value_field);
+        }
+    }
+
+    /// The issue's reproduction, served: a stock C_0603 placed live at 180°
+    /// reaches KiCad with the library's Reference on F.SilkS and its Value
+    /// visible on F.Fab, both with a 0.15 mm stroke and kept upright, and the
+    /// response carries no warning (#157).
+    #[tokio::test]
+    async fn place_component_sends_the_librarys_reference_and_value() {
+        use crate::tools::pcb_board::board_mock::{
+            ctx_talking_to, spawn_kicad_holding_items, ItemStore,
+        };
+        use copperpour_ipc::gen::kiapi::board::types as board;
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let board_path = capacitor_fixture(tmp.path(), C_0603);
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let server =
+            spawn_kicad_holding_items(&board_path, vec![], store.clone(), |_| {}, |_, _| None);
+        let args = json!({
+            "board": board_path.to_string_lossy(),
+            "footprint": "Capacitor_SMD:C_0603_1608Metric",
+            "reference": "C11",
+            "x": 20.0, "y": 30.0, "rotation": 180.0,
+        });
+        let res = handle_place_component(&args, &ctx_talking_to(server.address().to_string()))
+            .await
+            .unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(out["source"], "ipc");
+        assert!(out.get("warning").is_none(), "{out}");
+
+        let placed =
+            board::FootprintInstance::decode(store.lock().unwrap().items[0].value.as_slice())
+                .unwrap();
+        for (field, text, layer) in [
+            (&placed.reference_field, "C11", board::BoardLayer::BlFSilkS),
+            (
+                &placed.value_field,
+                "C_0603_1608Metric",
+                board::BoardLayer::BlFFab,
+            ),
+        ] {
+            let field = field.as_ref().unwrap();
+            assert!(field.visible, "{} is visible in the library", field.name);
+            let board_text = field.text.as_ref().unwrap();
+            assert_eq!(board_text.layer, layer as i32, "{}", field.name);
+            let shown = board_text.text.as_ref().unwrap();
+            assert_eq!(shown.text, text);
+            let attributes = shown.attributes.as_ref().unwrap();
+            assert_eq!(attributes.stroke_width.unwrap().value_nm, 150_000);
+            assert_eq!(attributes.line_spacing, 1.0);
+            assert!(attributes.keep_upright, "{} keeps upright", field.name);
+        }
+    }
+
+    /// KiCad 10's stock M.2 edge connectors write Reference and Value twice
+    /// each, and which copy KiCad keeps is not to be guessed. Such a part is
+    /// placed with the fields every footprint gets, and the response says so,
+    /// rather than the part being refused over its text (#157). Read from the
+    /// installed library, which is CC BY-SA; skips without one.
+    #[tokio::test]
+    async fn place_component_says_when_the_librarys_fields_cannot_be_read() {
+        use crate::tools::pcb_board::board_mock::{
+            ctx_talking_to, spawn_kicad_holding_items, ItemStore,
+        };
+        use copperpour_ipc::gen::kiapi::board::types as board;
+        use std::sync::{Arc, Mutex};
+
+        let Some(pretty) = crate::tools::find_kicad_library_dirs("footprints")
+            .into_iter()
+            .map(|dir| dir.join("Connector_PCBEdge.pretty"))
+            .find(|pretty| pretty.join("M.2_2230-xx-E.kicad_mod").is_file())
+        else {
+            eprintln!("SKIP: no installed Connector_PCBEdge.pretty/M.2_2230-xx-E.kicad_mod");
+            return;
+        };
+        let source = std::fs::read_to_string(pretty.join("M.2_2230-xx-E.kicad_mod")).unwrap();
+        if source.matches("(property \"Reference\"").count() < 2 {
+            eprintln!("SKIP: the installed M.2_2230-xx-E writes Reference once");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let board_path = library_fixture(tmp.path(), "Connector_PCBEdge", &pretty);
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let server =
+            spawn_kicad_holding_items(&board_path, vec![], store.clone(), |_| {}, |_, _| None);
+        let args = json!({
+            "board": board_path.to_string_lossy(),
+            "footprint": "Connector_PCBEdge:M.2_2230-xx-E",
+            "reference": "J1",
+            "x": 20.0, "y": 30.0,
+        });
+        let res = handle_place_component(&args, &ctx_talking_to(server.address().to_string()))
+            .await
+            .unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(out["source"], "ipc");
+        let warning = out["warning"].as_str().expect("a warning");
+        assert!(
+            warning.starts_with("Connector_PCBEdge:M.2_2230-xx-E's library properties could not be read, so J1 was placed with default Reference and Value fields"),
+            "{warning}"
+        );
+        assert!(warning.contains("appears more than once"), "{warning}");
+
+        let placed =
+            board::FootprintInstance::decode(store.lock().unwrap().items[0].value.as_slice())
+                .unwrap();
+        let value = placed.value_field.unwrap();
+        assert!(!value.visible, "the default Value is hidden");
+        assert_eq!(
+            value.text.unwrap().layer,
+            board::BoardLayer::BlFSilkS as i32,
+            "the default Value is on the silkscreen"
+        );
     }
 
     #[tokio::test]

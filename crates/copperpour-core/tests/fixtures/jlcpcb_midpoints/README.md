@@ -51,3 +51,13 @@ with/without pads, DNP, actual exported duplicates, and BOM-only exclusion. The
 captured geometry is unchanged; these variants are controlled test mutations,
 not additional live KiCad captures. The included footprint must retain its
 original observed midpoint and convert its position row successfully.
+
+`positions.csv` is KiCad 10.0.6's position export of `midpoints.kicad_pcb`,
+unchanged, made as the package makes its CPL's input:
+
+```text
+kicad-cli pcb export pos --output positions.csv --format csv --side both --units mm --exclude-dnp midpoints.kicad_pcb
+```
+
+The served package test's stand-in kicad-cli copies it, so the replayed
+snapshot and the position rows come from the same board.

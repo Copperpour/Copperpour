@@ -6,6 +6,11 @@ use super::SexpNode;
 pub const KICAD_INDENT: &str = "\t";
 /// What this crate emitted before [`write_with_indent`] existed.
 pub const LEGACY_INDENT: &str = "  ";
+/// KiCAD keeps a run of `(xy …)` points on one line while the line is shorter
+/// than this many characters, a tab counting one, and starts the next point on a
+/// new line once it is not (`xySpecialCaseColumnLimit` in its
+/// `KICAD_FORMAT::Prettify`). One point per line rewrote every wire (#20).
+const XY_COLUMN_LIMIT: usize = 99;
 
 pub fn write(node: &SexpNode) -> String {
     write_with_indent(node, LEGACY_INDENT)
@@ -82,13 +87,23 @@ fn write_node(node: &SexpNode, buf: &mut String, depth: usize, indent: &str) {
                 }
                 buf.push('\n');
             } else if has_list_child {
-                // Multi-line: scalars inline after tag, sub-lists on new lines.
+                // Multi-line: scalars inline after tag, sub-lists on new lines,
+                // but a point after a point stays on its line until the limit.
+                let mut line_start = buf.len();
                 for (i, child) in children.iter().enumerate() {
                     if i == 0 {
                         write_node(child, buf, depth + 1, indent);
                     } else if child.is_list() {
-                        buf.push('\n');
-                        write_indent(buf, depth + 1, indent);
+                        if is_xy(child)
+                            && is_xy(&children[i - 1])
+                            && buf.len() - line_start < XY_COLUMN_LIMIT
+                        {
+                            buf.push(' ');
+                        } else {
+                            buf.push('\n');
+                            line_start = buf.len();
+                            write_indent(buf, depth + 1, indent);
+                        }
                         write_node(child, buf, depth + 1, indent);
                     } else {
                         buf.push(' ');
@@ -114,6 +129,10 @@ fn write_node(node: &SexpNode, buf: &mut String, depth: usize, indent: &str) {
             buf.push(')');
         }
     }
+}
+
+fn is_xy(node: &SexpNode) -> bool {
+    node.tag() == Some("xy")
 }
 
 fn write_indent(buf: &mut String, depth: usize, indent: &str) {

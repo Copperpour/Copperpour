@@ -8,9 +8,9 @@ use crate::tool;
 use crate::tools::reference_hint::component_not_found;
 use crate::tools::sch_connectivity::{label_roots, net_graph_for, pt_key, ConnectivityIndex};
 use crate::tools::{
-    get_path, is_power_symbol_reference, opt_f64, opt_positive_f64, placed_pins_by_reference,
-    require_f64, require_str, resolved_placed_pins_by_reference, PlacedPins, ToolContext, ToolDef,
-    UNRESOLVED_PIN_GEOMETRY,
+    get_path, invalid_arg, is_power_symbol_reference, opt_f64, opt_positive_f64,
+    placed_pins_by_reference, require_f64, require_str, resolved_placed_pins_by_reference,
+    PlacedPins, ToolContext, ToolDef, UNRESOLVED_PIN_GEOMETRY,
 };
 use copperpour_schematic_editor as cse;
 use copperpour_sexp::{
@@ -201,7 +201,8 @@ pub fn tools() -> Vec<ToolDef> {
              meeting anywhere but tip to tip. Pin-tip contact and touching edges are not \
              reported. Also finds \
              conflicting labels at the same location, colliding label and field text \
-             (`text_overlap`), and reports any symbol whose embedded \
+             (`text_overlap`), wires drawn through a symbol's body (`wire_overlap`), and \
+             reports any symbol whose embedded \
              geometry could not be resolved and used the origin fallback instead.",
             json!({ "type": "object",
                 "properties": {
@@ -252,6 +253,19 @@ async fn handle_list_nets(
     ))
 }
 
+/// A label's entry in a net query's answer: the tool's own `fields`, and the
+/// label's `uuid`, the one `list_schematic_labels` lists and `batch_delete`
+/// takes. A power symbol's pseudo-label carries the symbol's UUID, and deleting
+/// by that removes the symbol, so its entry gets none.
+fn label_entry(label: &Label, mut fields: serde_json::Value) -> serde_json::Value {
+    if label.kind != LabelKind::PowerSymbol {
+        if let Some(uuid) = &label.uuid {
+            fields["uuid"] = json!(uuid);
+        }
+    }
+    fields
+}
+
 async fn handle_list_labels(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -274,6 +288,37 @@ async fn handle_list_labels(
     ))
 }
 
+/// Refuse a net name that no label or power symbol on this sheet spells.
+///
+/// The tools that take a net by name find it through its labels, and a name
+/// matching none came back as a net with nothing on it: a success no caller
+/// could tell from a real net with no pins. KiCad's netlist puts a local
+/// label's sheet path before its name (`/SDA`) and names a net with no label
+/// after one of its pins (`Net-(R1-Pad2)`), so a name copied from it misses.
+/// The refusal offers the name here that differs only by that path or by
+/// case.
+fn unknown_net(net: &str, labels: &[Label]) -> Option<CallToolResult> {
+    if labels.iter().any(|label| label.net == net) {
+        return None;
+    }
+    let bare = net.rsplit('/').next().unwrap_or(net);
+    let near: BTreeSet<&str> = labels
+        .iter()
+        .map(|label| label.net.as_str())
+        .filter(|name| name.eq_ignore_ascii_case(net) || name.eq_ignore_ascii_case(bare))
+        .collect();
+    let mut reason = format!("no label or power symbol on this sheet names net '{net}'");
+    if !near.is_empty() {
+        let near: Vec<String> = near.iter().map(|name| format!("'{name}'")).collect();
+        reason.push_str(&format!(" (did you mean {}?)", near.join(" or ")));
+    }
+    reason.push_str(
+        ". list_schematic_nets lists the names on this sheet; a net with no label or \
+         power symbol has none, and get_connected_items or trace_from_point reach it",
+    );
+    Some(invalid_arg("net", &reason))
+}
+
 async fn handle_get_net_connections(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -293,6 +338,9 @@ async fn handle_get_net_connections(
     };
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
+    if let Some(refusal) = unknown_net(&net, &labels) {
+        return Ok(refusal);
+    }
     let mut g = net_graph_for(&tree, &wires, &labels);
     // The net is its roots, not its name: one net can carry several names, and
     // its labels are every label on those roots, whichever name each spells.
@@ -305,7 +353,12 @@ async fn handle_get_net_connections(
     let matching: Vec<_> = by_root
         .iter()
         .filter(|(root, _)| net_roots.contains(root))
-        .map(|(_, l)| json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
+        .map(|(_, l)| {
+            label_entry(
+                l,
+                json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }),
+            )
+        })
         .collect();
     let net_pts: HashSet<(i64, i64)> = g.points_on_roots(&net_roots).into_iter().collect();
     let on_net = &net_pts;
@@ -340,17 +393,25 @@ async fn handle_get_net_connectivity(
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
+    if let Some(refusal) = unknown_net(&net, &labels) {
+        return Ok(refusal);
+    }
     let mut g = net_graph_for(&tree, &wires, &labels);
     let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
     let net_wires: Vec<_> = wires
         .iter()
         .filter(|w| net_pts.contains(&pt_key(w.x1, w.y1)) || net_pts.contains(&pt_key(w.x2, w.y2)))
-        .map(|w| json!({ "x1": w.x1, "y1": w.y1, "x2": w.x2, "y2": w.y2 }))
+        .map(|w| json!({ "x1": w.x1, "y1": w.y1, "x2": w.x2, "y2": w.y2, "uuid": w.uuid }))
         .collect();
     let net_labels: Vec<_> = labels
         .iter()
         .filter(|l| l.net == net)
-        .map(|l| json!({ "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
+        .map(|l| {
+            label_entry(
+                l,
+                json!({ "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }),
+            )
+        })
         .collect();
     let net_wire_objs: Vec<Wire> = wires
         .iter()
@@ -443,6 +504,9 @@ async fn handle_get_net_components(
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
+    if let Some(refusal) = unknown_net(&net, &labels) {
+        return Ok(refusal);
+    }
     let mut g = net_graph_for(&tree, &wires, &labels);
     let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
     let result: Vec<serde_json::Value> = placed_pins_by_reference(&tree)
@@ -510,7 +574,7 @@ async fn handle_trace_from_point(
     let at_label: Vec<_> = labels
         .iter()
         .filter(|l| points_coincident(x, y, l.x, l.y, tol))
-        .map(|l| json!({ "net": l.net, "type": format!("{:?}", l.kind) }))
+        .map(|l| label_entry(l, json!({ "net": l.net, "type": format!("{:?}", l.kind) })))
         .collect();
     // A pin and a junction dot sit on a point as readily as a wire or a label,
     // and this is the tool whose whole promise is what is there (#539). Both
@@ -1034,7 +1098,12 @@ async fn handle_get_connected_items(
     let connected_labels: Vec<serde_json::Value> = label_roots(&mut g, &labels)
         .into_iter()
         .filter(|(root, _)| connected_roots.contains(root))
-        .map(|(_, l)| json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
+        .map(|(_, l)| {
+            label_entry(
+                l,
+                json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }),
+            )
+        })
         .collect();
 
     // Find other components on the same nets (excluding the queried one)
@@ -1226,9 +1295,48 @@ async fn handle_check_overlaps(
         }
     }
 
+    // A wire drawn through a symbol's body reads as part of the symbol, so
+    // what it connects is hidden; it is reported with the body it crosses. A
+    // wire along an edge or ending on a pin tip outside the body is contact,
+    // and so is one that leaves the symbol's own pin tip outward, though a
+    // drawing that reaches past the tip may clip it.
+    let mut wire_overlaps: Vec<serde_json::Value> = Vec::new();
+    for wire in extract_wires(&tree) {
+        let (from, to) = ((wire.x1, wire.y1), (wire.x2, wire.y2));
+        for (instance, placed) in &placements {
+            let Some((_, geometry)) = placed else {
+                continue;
+            };
+            let Some(body) = geometry.body else {
+                continue;
+            };
+            if body.segment_enters(from, to) && !geometry.wire_leaves_pin(from, to) {
+                wire_overlaps.push(json!({
+                    "type": "wire_overlap",
+                    "a": {
+                        "kind": "wire",
+                        "uuid": wire.uuid,
+                        "x1": wire.x1,
+                        "y1": wire.y1,
+                        "x2": wire.x2,
+                        "y2": wire.y2
+                    },
+                    "b": {
+                        "kind": "symbol_body",
+                        "reference": instance.reference,
+                        "unit": instance.unit,
+                        "symbol_uuid": instance.uuid
+                    },
+                    "bounds_b": bounds_json(body)
+                }));
+            }
+        }
+    }
+
     let mut all = comp_overlaps;
     all.extend(label_overlaps);
     all.extend(text_overlaps);
+    all.extend(wire_overlaps);
     let bounds_unresolved = placements
         .iter()
         .filter(|(_, placed)| placed.is_none())
@@ -1904,6 +2012,86 @@ mod text_overlap_tests {
         assert_eq!(sda["bounds_b"]["x_max"], 50.8762, "{sda}");
         let noisy = crate::tools::noisy_numbers(&body);
         assert!(noisy.is_empty(), "reported {noisy:?}");
+    }
+}
+
+#[cfg(test)]
+mod wire_overlap_tests {
+    //! `wire_overlap` against `tests/fixtures/wire_through_symbol_kicad10.kicad_sch`;
+    //! its README names each case.
+    use super::*;
+
+    const SHEET: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/wire_through_symbol_kicad10.kicad_sch"
+    );
+
+    async fn check() -> serde_json::Value {
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_check_overlaps(&json!({ "schematic": SHEET }), &ctx)
+            .await
+            .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// The wire through the crystal, the wire across `R1`, the wire from
+    /// `X1`'s pin tip into its body and the wire from the `GND` symbol's tip into
+    /// its own drawing are reported, each with its symbol, and nothing else is:
+    /// not the wires on `R2`'s pin tips, along `Y2`'s top edge, ending on `Y3`'s
+    /// edge, beside `R4`, leaving `X1`'s pin tip outward past which its drawing
+    /// reaches, or leaving the pin tips of the stock `D1` LED, whose emission
+    /// arrows reach past its left tip, outward or square to the pin.
+    #[tokio::test]
+    async fn only_the_wires_through_a_body_are_reported() {
+        let body = check().await;
+        let mut found = body["overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["type"] == "wire_overlap")
+            .map(|o| {
+                assert_eq!(o["a"]["kind"], "wire", "{o}");
+                assert_eq!(o["b"]["kind"], "symbol_body", "{o}");
+                assert!(o["b"]["symbol_uuid"].is_string(), "{o}");
+                assert!(o["bounds_b"]["x_min"].is_number(), "{o}");
+                (
+                    o["a"]["uuid"].as_str().unwrap().to_string(),
+                    o["b"]["reference"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        found.sort();
+        let expected = [
+            ("6ca73cc5-a9c5-4da6-b1ad-116b66c7ac4d", "#PWR01"),
+            ("7f228b0f-7e2f-4061-a35f-d496b115f231", "R1"),
+            ("c3143ef8-21cb-4f0b-a9c8-fe7b58052256", "Y1"),
+            ("ff399ce4-c445-46a7-b92c-8ec0839aee42", "X1"),
+        ]
+        .map(|(uuid, reference)| (uuid.to_string(), reference.to_string()));
+        assert_eq!(found, expected, "{body}");
+        assert_eq!(body["overlap_count"], 4, "{body}");
+
+        let through = body["overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["b"]["reference"] == "Y1")
+            .unwrap();
+        let wire = &through["a"];
+        assert_eq!(
+            (wire["x1"].as_f64(), wire["y1"].as_f64()),
+            (Some(46.99), Some(50.8))
+        );
+        assert_eq!(
+            (wire["x2"].as_f64(), wire["y2"].as_f64()),
+            (Some(54.61), Some(50.8))
+        );
     }
 }
 
@@ -2836,7 +3024,7 @@ mod multi_unit_tool_tests {
 /// `two_name_nets.README.md`; every expectation below is that table.
 #[cfg(test)]
 mod two_name_net_tests {
-    use super::tool_call_support::{call, call_at, net_pins};
+    use super::tool_call_support::{call, call_at, call_result, net_pins};
     use super::*;
 
     const SCH: &str = include_str!("../../tests/fixtures/two_name_nets.kicad_sch");
@@ -2996,6 +3184,71 @@ mod two_name_net_tests {
         assert_eq!(components, ["TP9"], "{items}");
     }
 
+    const NAMED_NET_TOOLS: [&str; 3] = [
+        "get_net_connections",
+        "get_net_connectivity",
+        "get_net_components",
+    ];
+
+    /// A name no label or power symbol on the sheet spells is refused, not
+    /// answered as a net with nothing on it: a typo, KiCad's netlist name for
+    /// the local `SDA` net, the same in another case, and the name KiCad's
+    /// netlist gives the `TP8`–`TP9` net, which nothing on the sheet names.
+    #[tokio::test]
+    async fn a_name_nothing_on_the_sheet_spells_is_refused() {
+        for tool in NAMED_NET_TOOLS {
+            for (net, offered) in [
+                ("NOPE", ""),
+                ("/SDA", " (did you mean 'SDA'?)"),
+                ("sda", " (did you mean 'SDA'?)"),
+                ("Net-(TP8-Pad1)", ""),
+            ] {
+                let result = call_result(SCH, tool, json!({ "net": net })).await;
+                assert!(result.is_error, "{tool} answered '{net}' as a net");
+                let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                    panic!("expected text content");
+                };
+                let body: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(body["error"]["kind"], "invalid_argument", "{tool}: {body}");
+                assert_eq!(body["error"]["field"], "net", "{tool}: {body}");
+                // The name offered, or nothing, comes straight after the name.
+                let reason = body["error"]["reason"].as_str().unwrap();
+                assert!(
+                    reason.starts_with(&format!(
+                        "no label or power symbol on this sheet names net '{net}'{offered}. \
+                         list_schematic_nets lists the names on this sheet;"
+                    )),
+                    "{tool}: {body}"
+                );
+                assert_eq!(
+                    body["message"],
+                    format!("Argument 'net' is invalid: {reason}"),
+                    "{tool}"
+                );
+            }
+        }
+    }
+
+    /// Every name on the sheet still answers: the label names, the aliases a
+    /// net is not called by among them, and the power symbols' names.
+    #[tokio::test]
+    async fn every_name_on_the_sheet_is_answered() {
+        let listed = call(SCH, "list_schematic_nets", json!({})).await;
+        assert_eq!(
+            listed["nets"],
+            json!([
+                "+3V3", "+5V", "AAA", "ALT", "GND", "MIX", "MIX_H", "PULLUP", "RETURN", "SCL",
+                "SDA", "SYS", "VCC", "ZZZ"
+            ]),
+            "{listed}"
+        );
+        for tool in NAMED_NET_TOOLS {
+            for name in listed["nets"].as_array().unwrap() {
+                call(SCH, tool, json!({ "net": name })).await;
+            }
+        }
+    }
+
     /// The 15 labels as Eeschema serialized them, read from the fixture text
     /// (see the README), not from this crate's parser.
     const KICAD_LABELS: [(&str, &str, &str); 15] = [
@@ -3080,6 +3333,174 @@ mod two_name_net_tests {
         assert_eq!(after["count"], 0, "{after}");
         let wires_after = call_at(&path, "list_schematic_wires", json!({})).await["count"].clone();
         assert_eq!(wires_after, wires_before);
+    }
+
+    /// Every label entry the four net queries return for the sheet at `path`,
+    /// with the tool and the net name asked for: `get_net_connections` and
+    /// `get_net_connectivity` for every name on the sheet,
+    /// `get_connected_items` for U1, R1, TP2 and TP4, whose nets carry every
+    /// label, and `trace_from_point` at every label. `ALT` shares its point with a `+3V3`
+    /// symbol's pin, so the trace meets a power symbol too.
+    async fn net_query_labels(
+        path: &std::path::Path,
+    ) -> Vec<(&'static str, String, serde_json::Value)> {
+        let mut found = Vec::new();
+        let nets = call_at(path, "list_schematic_nets", json!({})).await;
+        for net in nets["nets"].as_array().unwrap() {
+            let net = net.as_str().unwrap();
+            for tool in ["get_net_connections", "get_net_connectivity"] {
+                let body = call_at(path, tool, json!({ "net": net })).await;
+                for label in body["labels"].as_array().unwrap() {
+                    found.push((tool, net.to_string(), label.clone()));
+                }
+            }
+        }
+        for reference in ["U1", "R1", "TP2", "TP4"] {
+            let body = call_at(
+                path,
+                "get_connected_items",
+                json!({ "reference": reference }),
+            )
+            .await;
+            for label in body["labels"].as_array().unwrap() {
+                found.push(("get_connected_items", String::new(), label.clone()));
+            }
+        }
+        let labels = call_at(path, "list_schematic_labels", json!({})).await;
+        for at in labels["labels"].as_array().unwrap() {
+            let body = call_at(
+                path,
+                "trace_from_point",
+                json!({ "x": at["x"], "y": at["y"] }),
+            )
+            .await;
+            for label in body["labels_here"].as_array().unwrap() {
+                found.push(("trace_from_point", String::new(), label.clone()));
+            }
+        }
+        found
+    }
+
+    /// The net queries give each label the UUID KiCad wrote for it, for all
+    /// three kinds, and a power symbol's entry none: its pseudo-label carries
+    /// the symbol's UUID.
+    #[tokio::test]
+    async fn net_queries_report_each_labels_own_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two_name_nets.kicad_sch");
+        std::fs::write(&path, SCH).unwrap();
+
+        let expected: BTreeSet<(String, String, String)> = KICAD_LABELS
+            .iter()
+            .map(|&(kind, net, uuid)| (kind.into(), net.into(), uuid.into()))
+            .collect();
+        let mut rows: std::collections::BTreeMap<&str, BTreeSet<(String, String, String)>> =
+            Default::default();
+        let mut power: HashMap<&str, usize> = HashMap::new();
+        for (tool, asked, label) in net_query_labels(&path).await {
+            let kind = label["type"].as_str().unwrap();
+            if kind == "PowerSymbol" {
+                assert!(label.get("uuid").is_none(), "{tool}: {label}");
+                *power.entry(tool).or_default() += 1;
+                continue;
+            }
+            // `get_net_connectivity` lists only labels spelling the name asked
+            // for, and leaves the name out.
+            let net = label["net"].as_str().unwrap_or(&asked);
+            let uuid = label["uuid"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{tool}: {label}"));
+            rows.entry(tool)
+                .or_default()
+                .insert((kind.into(), net.into(), uuid.into()));
+        }
+        for tool in [
+            "get_net_connections",
+            "get_net_connectivity",
+            "get_connected_items",
+            "trace_from_point",
+        ] {
+            assert_eq!(rows.get(tool), Some(&expected), "{tool}");
+            assert!(power.get(tool).is_some_and(|&n| n > 0), "{tool}: {power:?}");
+        }
+    }
+
+    /// Every UUID the net queries give a label is what `batch_delete` takes:
+    /// one call removes the sheet's 15 labels, and the power symbols, wires
+    /// and components stay.
+    #[tokio::test]
+    async fn net_query_label_uuids_delete_only_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two_name_nets.kicad_sch");
+        std::fs::write(&path, SCH).unwrap();
+
+        let mut uuids: Vec<String> = net_query_labels(&path)
+            .await
+            .into_iter()
+            .filter_map(|(_, _, label)| label["uuid"].as_str().map(String::from))
+            .collect();
+        uuids.sort_unstable();
+        uuids.dedup();
+        let wires_before = call_at(&path, "list_schematic_wires", json!({})).await["count"].clone();
+
+        let deleted = call_at(&path, "batch_delete", json!({ "uuids": uuids })).await;
+        let mut deleted_uuids: Vec<&str> = deleted["deleted_item_uuids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u.as_str().unwrap())
+            .collect();
+        deleted_uuids.sort_unstable();
+        let mut kicad_uuids: Vec<&str> = KICAD_LABELS.iter().map(|(_, _, u)| *u).collect();
+        kicad_uuids.sort_unstable();
+        assert_eq!(deleted_uuids, kicad_uuids, "{deleted}");
+        assert_eq!(deleted["deleted_components"], json!([]), "{deleted}");
+        assert_eq!(deleted["removed_no_connects_count"], 0, "{deleted}");
+        assert_eq!(deleted["junctions_pruned_count"], 0, "{deleted}");
+        assert_eq!(deleted["errors"], json!([]), "{deleted}");
+
+        let after = call_at(&path, "list_schematic_labels", json!({})).await;
+        assert_eq!(after["count"], 0, "{after}");
+        let nets_after = call_at(&path, "list_schematic_nets", json!({})).await;
+        assert_eq!(
+            nets_after["nets"],
+            json!(["+3V3", "+5V", "GND"]),
+            "{nets_after}"
+        );
+        let wires_after = call_at(&path, "list_schematic_wires", json!({})).await["count"].clone();
+        assert_eq!(wires_after, wires_before);
+    }
+
+    /// `get_net_connectivity`'s wires carry the UUID `list_schematic_wires`
+    /// lists for the same segment, as `get_connected_items`' wires do.
+    #[tokio::test]
+    async fn net_connectivity_reports_each_wires_uuid() {
+        let listed = call(SCH, "list_schematic_wires", json!({})).await;
+        let by_uuid: HashMap<&str, &serde_json::Value> = listed["wires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|wire| (wire["uuid"].as_str().unwrap(), wire))
+            .collect();
+        let nets = call(SCH, "list_schematic_nets", json!({})).await;
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for net in nets["nets"].as_array().unwrap() {
+            let body = call(SCH, "get_net_connectivity", json!({ "net": net })).await;
+            for wire in body["wires"].as_array().unwrap() {
+                let uuid = wire["uuid"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{net}: {wire}"));
+                let same = by_uuid
+                    .get(uuid)
+                    .unwrap_or_else(|| panic!("{net}: {wire} is not listed"));
+                for end in ["x1", "y1", "x2", "y2"] {
+                    assert_eq!(wire[end].as_f64(), same[end].as_f64(), "{net}: {wire}");
+                }
+                seen.insert(uuid.to_string());
+            }
+        }
+        // Every wire but the one on the net no label names, TP8 to TP9.
+        assert_eq!(seen.len(), by_uuid.len() - 1, "{listed}");
     }
 }
 

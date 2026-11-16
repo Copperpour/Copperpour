@@ -455,8 +455,9 @@ fn kicad_error_status_maps_to_err() {
     // KiCad received this request and refused it, so it is not "unreachable":
     // ping_outcome must not name a transport reason for it (#532).
     match client.ping_outcome() {
-        PingOutcome::RequestFailed { message } => {
-            assert!(message.contains("no board open"), "{message}")
+        PingOutcome::RequestFailed { message, status } => {
+            assert!(message.contains("no board open"), "{message}");
+            assert_eq!(status, Some(kiapi::common::ApiStatusCode::AsBadRequest));
         }
         other => panic!("a KiCad error status is not a transport failure: {other:?}"),
     }

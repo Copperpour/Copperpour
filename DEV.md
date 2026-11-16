@@ -53,7 +53,6 @@ crates/
 │           ├── mod.rs              ToolDef, ToolContext, tool!, arg helpers, kicad_config_dir()
 │           ├── board_source.rs     live-vs-saved board reads + provenance
 │           ├── live_board.rs       what KiCad's answer proves about a board (read + write gates)
-│           ├── launch.rs           start viewer/KiCad detached; report exit during startup
 │           ├── cli.rs              kicad-cli v10 wrapper (verified against the binary)
 │           ├── svg_import.rs       SVG parse + Bezier flatten (usvg) for import_svg_logo
 │           ├── sch_components.rs   placement with lib_symbols embedding
@@ -84,6 +83,7 @@ crates/
 │       req/rep) · builders.rs (protobuf helpers, mm→nm) · transform.rs (footprint
 │       children are ABSOLUTE board coords, mixelpixx/Konnect#23) · types.rs
 └── copperpour-viewer/           # Viewer engine and loopback browser service
+    ├── src/launch.rs           # start KiCad detached; report exit during startup
     └── frontend/               # Embedded browser page and script
 plugin/      Python launcher inside KiCad: __init__.py (PCB-editor ActionPlugin settings
              dialog) · settings_dialog.py · native_bridge.py (see Plugin) · plugin.json

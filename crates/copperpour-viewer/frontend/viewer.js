@@ -232,7 +232,7 @@
   async function openInKicad() {
     try {
       await invoke('open_in_kicad');
-      statusEl.textContent = 'KiCad launch requested';
+      statusEl.textContent = 'KiCad started';
     } catch (e) {
       statusEl.textContent = 'Error: ' + e;
       flash(String(e), true);

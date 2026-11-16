@@ -27,7 +27,9 @@ selection, manual refresh and explicit KiCad launch are available.
 
 `BrowserViewer::start` takes the root path, an explicit CLI executable and a
 positive per-render timeout. It binds IPv4 loopback on an ephemeral port and
-returns a handle and credential URL; it does not launch a browser. Drop signals
+returns a handle and credential URL; it does not launch a browser.
+`BrowserViewer::start_with_kicad` also takes the KiCad executable that Open in
+KiCAD runs; `start` uses `resolve_kicad_binary()`. Drop signals
 shutdown; `request_shutdown()` signals stop while retaining the handle, and
 `shutdown().await` also waits for the render worker and HTTP service.
 Accepted HTTP/1 connections are owned tasks, with one second to drain before
@@ -51,7 +53,10 @@ an actual update or explicit refresh; revision is an opaque change marker.
 
 On viewer shutdown, in-flight CLI processes are killed and reaped. Opening KiCad is
 an explicit authenticated user action; that GUI is allowed to outlive the viewer.
-Its response establishes process spawn, not that an editor became ready.
+It reports success once KiCad has stayed up for a second, not that an editor became
+ready; a KiCad that exits sooner, such as one with no display, is a 503 quoting its
+exit status and the end of its stderr, and a second request during that second is a
+409.
 
 Only sheets discovered in the launch hierarchy and present in the SVG cache can
 be fetched. Unknown sheets return 404, and a known sheet whose rendering failed

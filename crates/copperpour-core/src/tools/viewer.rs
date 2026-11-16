@@ -11,7 +11,14 @@ use std::{
 pub(super) struct ViewerRegistry(tokio::sync::Mutex<HashMap<PathBuf, BrowserViewer>>);
 
 impl ViewerRegistry {
-    pub async fn open(&self, root: &Path, cli: &str) -> Result<(String, bool), String> {
+    /// `cli` and `kicad_binary` are the configured values; Open in KiCAD runs
+    /// the GUI `launch_kicad_ui` would.
+    pub async fn open(
+        &self,
+        root: &Path,
+        cli: &str,
+        kicad_binary: &str,
+    ) -> Result<(String, bool), String> {
         // Serialize starts as well as lookups: concurrent calls must not create
         // two instances for one root. Cancelled startup is owned by BrowserViewer.
         let mut viewers = self.0.lock().await;
@@ -21,15 +28,29 @@ impl ViewerRegistry {
         if let Some(viewer) = viewers.remove(root) {
             viewer.shutdown().await;
         }
-        let cli = if cli.is_empty() {
-            copperpour_viewer::resolve_kicad_cli(None)
-        } else {
-            cli.to_owned()
-        };
-        let viewer = BrowserViewer::start(root, &cli, Duration::from_secs(30)).await?;
+        // From the configured CLI, not the resolved one below, as `launch_kicad_ui` resolves it.
+        let kicad = crate::kicad_install::gui_or_default(kicad_binary, cli);
+        let cli = viewer_cli(cli);
+        let viewer =
+            BrowserViewer::start_with_kicad(root, &cli, kicad, Duration::from_secs(30)).await?;
         let url = viewer.url.clone();
         viewers.insert(root.to_owned(), viewer);
         Ok((url, false))
+    }
+}
+
+/// The `kicad-cli` the viewer renders with: the one the kicad-cli tools spawn.
+/// For an unset or bare-name value that is the one `get_installation_info`
+/// reports (#521). Unlike the tools, an empty value is discovered rather than
+/// meaning "no kicad-cli", with a bare `kicad-cli` as the last resort.
+fn viewer_cli(configured: &str) -> String {
+    if configured.trim().is_empty() {
+        crate::kicad_install::find_cli("")
+            .map_or_else(|| "kicad-cli".into(), |p| p.to_string_lossy().into_owned())
+    } else {
+        super::cli::resolve_cli_executable(configured)
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -58,13 +79,26 @@ pub(super) async fn launch_browser(url: &str) -> BrowserLaunch {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let mut command = tokio::process::Command::new("xdg-open");
     command.arg(url);
-    observe_browser_launch(command, Duration::from_secs(5)).await
+    let no_display = copperpour_viewer::launch::no_display_reason(|name| std::env::var_os(name));
+    observe_browser_launch(command, Duration::from_secs(5), no_display).await
 }
 
+/// `no_display` is added to an opener that failed, not one that timed out.
 async fn observe_browser_launch(
     mut command: tokio::process::Command,
     timeout: Duration,
+    no_display: Option<&str>,
 ) -> BrowserLaunch {
+    let failed = |error: String| BrowserLaunch {
+        succeeded: false,
+        error: Some(match no_display {
+            Some(reason) => format!(
+                "{error}. {reason} Open the URL in a browser on the desktop, or pass \
+                 open_browser=false."
+            ),
+            None => format!("{error}; use the returned URL manually"),
+        }),
+    };
     // Never inherit the MCP stdio stream, and never forward a token-bearing URL
     // from opener diagnostics. Exit success proves only that the opener accepted it.
     command
@@ -75,8 +109,8 @@ async fn observe_browser_launch(
     let outcome = tokio::time::timeout(timeout, command.status()).await;
     match outcome {
         Ok(Ok(status)) if status.success() => BrowserLaunch { succeeded: true, error: None },
-        Ok(Ok(status)) => BrowserLaunch { succeeded: false, error: Some(format!("OS browser opener exited with {status}; use the returned URL manually")) },
-        Ok(Err(error)) => BrowserLaunch { succeeded: false, error: Some(format!("Could not start OS browser opener: {error}; use the returned URL manually")) },
+        Ok(Ok(status)) => failed(format!("OS browser opener exited with {status}")),
+        Ok(Err(error)) => failed(format!("Could not start OS browser opener: {error}")),
         Err(_) => BrowserLaunch { succeeded: false, error: Some("OS browser opener did not finish within five seconds; a browser may still have opened. Use the returned URL if needed".into()) },
     }
 }
@@ -106,9 +140,12 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
         (dir, root, cli.to_string_lossy().into_owned())
     }
     async fn handler(cli: String) -> McpHandler {
+        handler_with_kicad(cli, String::new()).await
+    }
+    async fn handler_with_kicad(cli: String, kicad_binary: String) -> McpHandler {
         McpHandler::new(ServerConfig {
             kicad_cli: cli,
-            kicad_binary: String::new(),
+            kicad_binary,
             ipc_address: String::new(),
             project_dir: None,
             jlcpcb_db_path: None,
@@ -126,14 +163,86 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
         assert_ne!(response["result"]["isError"], true, "{response}");
         serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
     }
-    async fn state(url: &str) -> String {
+    /// One request to the viewer at `url`, with its credential; returns the raw response.
+    async fn request(url: &str, method: &str, route: &str, body: Option<Value>) -> String {
         let (base, token) = url.split_once("/#token=").unwrap();
         let address = base.strip_prefix("http://").unwrap();
+        let body = body.map(|body| body.to_string()).unwrap_or_default();
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
-        stream.write_all(format!("GET /state HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        stream.write_all(format!("{method} {route} HTTP/1.1\r\nHost: {address}\r\nOrigin: {base}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).await.unwrap();
         response
+    }
+    async fn state(url: &str) -> String {
+        request(url, "GET", "/state", None).await
+    }
+    /// #521: for an unset or bare-name `kicad_cli`, the viewer renders with the
+    /// `kicad-cli` that `get_installation_info` reports.
+    #[tokio::test]
+    async fn viewer_cli_is_the_one_get_installation_info_reports() {
+        for configured in ["", "kicad-cli"] {
+            let handler = handler(configured.into()).await;
+            let response = handler.handle_message(json!({"jsonrpc":"2.0", "id":521, "method":"tools/call", "params":{"name":"get_installation_info", "arguments":{}}})).await.unwrap();
+            let info = body(&serde_json::to_value(response).unwrap());
+            let reported = info["kicad"]["cli_path"].as_str().unwrap_or("kicad-cli");
+            assert_eq!(
+                viewer_cli(configured),
+                reported,
+                "kicad_cli = {configured:?}"
+            );
+        }
+        assert_eq!(
+            viewer_cli(" /nonexistent/kicad-cli "),
+            "/nonexistent/kicad-cli"
+        );
+    }
+    /// #521: the viewer renders with the resolved CLI, not the raw configured
+    /// name, which the OS cannot find when it is not on `PATH`.
+    #[tokio::test]
+    async fn browser_mcp_renders_with_the_resolved_kicad_cli() {
+        if crate::kicad_install::find_cli("").is_none() {
+            eprintln!("SKIP: no installed kicad-cli");
+            return;
+        }
+        let (_dir, root, _cli) = fixture();
+        let handler = handler("no-such-kicad-cli".into()).await;
+        body(&call(&handler, json!({"schematic":root,"open_browser":false})).await);
+    }
+    /// #500: Open in KiCAD runs the configured `kicad_binary`, as `launch_kicad_ui` does.
+    #[tokio::test]
+    async fn browser_mcp_open_in_kicad_runs_the_configured_kicad_binary() {
+        let (dir, root, cli) = fixture();
+        let args = dir.path().join("kicad.args");
+        let kicad = dir.path().join("configured-kicad");
+        std::fs::write(
+            &kicad,
+            format!("#!/bin/sh\necho \"$@\" > '{}'\nsleep 3\n", args.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&kicad, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let handler = handler_with_kicad(cli, kicad.to_string_lossy().into_owned()).await;
+        let opened = body(&call(&handler, json!({"schematic":root,"open_browser":false})).await);
+        let root = root.canonicalize().unwrap();
+        let response = request(
+            opened["url"].as_str().unwrap(),
+            "POST",
+            "/open-in-kicad",
+            Some(json!({ "file": root })),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let launched = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match std::fs::read_to_string(&args) {
+                    Ok(text) if text.ends_with('\n') => break text,
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("the configured kicad_binary never ran");
+        assert_eq!(launched.trim_end(), root.to_str().unwrap());
     }
     #[tokio::test]
     async fn browser_mcp_reuses_canonical_root_serves_data_and_stops_with_context() {
@@ -197,12 +306,12 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
         let (_other, other_root, _) = fixture();
         let registry = ViewerRegistry::default();
         assert!(registry
-            .open(&root, "/nonexistent/kicad-cli")
+            .open(&root, "/nonexistent/kicad-cli", "kicad")
             .await
             .is_err());
-        let (url, reused) = registry.open(&root, &cli).await.unwrap();
+        let (url, reused) = registry.open(&root, &cli, "").await.unwrap();
         assert!(!reused);
-        let (other_url, reused) = registry.open(&other_root, &cli).await.unwrap();
+        let (other_url, reused) = registry.open(&other_root, &cli, "").await.unwrap();
         assert!(!reused);
         assert_ne!(url, other_url);
     }
@@ -210,7 +319,7 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
     async fn browser_registry_replaces_stopped_service_that_remains_in_map() {
         let (_dir, root, cli) = fixture();
         let registry = ViewerRegistry::default();
-        let (url, reused) = registry.open(&root, &cli).await.unwrap();
+        let (url, reused) = registry.open(&root, &cli, "").await.unwrap();
         assert!(!reused);
         {
             let viewers = registry.0.lock().await;
@@ -232,7 +341,7 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
         .await
         .expect("stopped service releases its listener while still registered");
         assert!(registry.0.lock().await.contains_key(&root));
-        let (new_url, reused) = registry.open(&root, &cli).await.unwrap();
+        let (new_url, reused) = registry.open(&root, &cli, "").await.unwrap();
         assert!(!reused);
         assert_ne!(url, new_url);
         assert!(state(&new_url).await.starts_with("HTTP/1.1 200"));
@@ -276,20 +385,33 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
     }
     #[tokio::test]
     async fn browser_opener_reports_exit_failure_spawn_failure_and_timeout_truthfully() {
-        let success = observe_browser_launch(command("exit 0"), Duration::from_secs(1)).await;
+        const NO_DISPLAY: &str = "Neither DISPLAY nor WAYLAND_DISPLAY is set.";
+        let success = observe_browser_launch(command("exit 0"), Duration::from_secs(1), None).await;
         assert!(success.succeeded);
         assert!(success.error.is_none());
-        for c in [
-            command("exit 9"),
-            tokio::process::Command::new("/nonexistent/browser"),
-        ] {
-            let result = observe_browser_launch(c, Duration::from_secs(1)).await;
-            assert!(!result.succeeded);
-            assert!(result.error.is_some());
+        for no_display in [None, Some(NO_DISPLAY)] {
+            for c in [
+                command("exit 9"),
+                tokio::process::Command::new("/nonexistent/browser"),
+            ] {
+                let result = observe_browser_launch(c, Duration::from_secs(1), no_display).await;
+                assert!(!result.succeeded);
+                let error = result.error.unwrap();
+                assert_eq!(error.contains(NO_DISPLAY), no_display.is_some(), "{error}");
+            }
         }
-        let result =
-            observe_browser_launch(command("exec sleep 10"), Duration::from_millis(50)).await;
+        // A timeout is not blamed on the display (#225).
+        let result = observe_browser_launch(
+            command("exec sleep 10"),
+            Duration::from_millis(50),
+            Some(NO_DISPLAY),
+        )
+        .await;
         assert!(!result.succeeded);
-        assert!(result.error.unwrap().contains("did not finish"));
+        let error = result.error.unwrap();
+        assert!(
+            error.contains("did not finish") && !error.contains(NO_DISPLAY),
+            "{error}"
+        );
     }
 }

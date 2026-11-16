@@ -1,20 +1,22 @@
-//! Starting a GUI application the server does not wait for: the schematic
-//! viewer and KiCad itself.
+//! Starting a GUI application the server does not wait for: KiCad, from
+//! `launch_kicad_ui` and the browser viewer's Open in KiCAD.
 //!
 //! A successful `spawn()` only means `exec` worked. An application that cannot
 //! open a window, such as one started without a display on Linux, exits a
-//! moment later, so the caller watches it before reporting a launch (#702,
-//! #764).
+//! moment later, so the caller watches it before reporting a launch
+//! (mixelpixx/Konnect#702, mixelpixx/Konnect#764, #496).
 
 use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 
 /// How long an application must stay up before it counts as launched. One
-/// that cannot open a window exits well inside this (#702, #764).
-pub(crate) const STARTUP_WINDOW: Duration = Duration::from_secs(1);
+/// that cannot open a window exits well inside this (mixelpixx/Konnect#702,
+/// mixelpixx/Konnect#764).
+pub const STARTUP_WINDOW: Duration = Duration::from_secs(1);
 
 /// Stderr lines quoted when the application exits during startup, and the
 /// length each is cut to, so a huge panic message cannot flood the tool result.
@@ -22,12 +24,29 @@ const STDERR_TAIL_LINES: usize = 20;
 const STDERR_LINE_CHARS: usize = 500;
 
 /// How long to wait for the rest of a dead application's stderr. A process it
-/// started, such as a `kicad-cli` render, can hold the pipe open after it exits.
+/// started can hold the pipe open after it exits.
 const STDERR_DRAIN: Duration = Duration::from_millis(500);
 
+/// Why a GUI started with this environment would find no display, or `None`.
+/// `env` reads the started program's environment (Copperpour#225).
+pub fn no_display_reason(env: impl Fn(&str) -> Option<OsString>) -> Option<&'static str> {
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        return None;
+    }
+    let set = |name| env(name).is_some_and(|value| !value.is_empty());
+    (!set("DISPLAY") && !set("WAYLAND_DISPLAY")).then_some(
+        "Neither DISPLAY nor WAYLAND_DISPLAY is set in the server's environment, as when it \
+         runs from an SSH session.",
+    )
+}
+
 /// A spawned application, watched until the caller decides it is up.
-pub(crate) struct Launch {
+pub struct Launch {
     name: &'static str,
+    /// [`no_display_reason`] for the environment it was started with.
+    no_display: Option<&'static str>,
+    /// What the caller's user can do about `no_display`.
+    no_display_remedy: Option<&'static str>,
     child: tokio::process::Child,
     tail: Arc<Mutex<VecDeque<String>>>,
     forwarder: Option<tokio::task::JoinHandle<()>>,
@@ -35,13 +54,21 @@ pub(crate) struct Launch {
 
 /// Spawns `cmd` as `name`, sending each stderr line to `log`.
 ///
-/// stdin and stdout carry the stdio transport's JSON-RPC stream, so the
-/// application must not hold them. Not `kill_on_drop`: it outlives the call.
-pub(crate) fn spawn(
+/// The application gets neither the caller's stdin nor its stdout, which may
+/// carry the MCP server's stdio transport. Not `kill_on_drop`: it outlives the
+/// call.
+pub fn spawn(
     mut cmd: std::process::Command,
     name: &'static str,
     log: fn(&str),
 ) -> std::io::Result<Launch> {
+    let no_display =
+        no_display_reason(
+            |name| match cmd.get_envs().find(|(key, _)| *key == OsStr::new(name)) {
+                Some((_, value)) => value.map(OsStr::to_os_string),
+                None => std::env::var_os(name),
+            },
+        );
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -75,6 +102,8 @@ pub(crate) fn spawn(
 
     Ok(Launch {
         name,
+        no_display,
+        no_display_remedy: None,
         child,
         tail,
         forwarder,
@@ -82,9 +111,19 @@ pub(crate) fn spawn(
 }
 
 impl Launch {
+    /// Whether it was started with no display, so [`Self::exited`] says so.
+    pub fn lacks_display(&self) -> bool {
+        self.no_display.is_some()
+    }
+
+    /// A sentence [`Self::exited`] adds after saying the display is missing.
+    pub fn on_no_display(&mut self, remedy: &'static str) {
+        self.no_display_remedy = Some(remedy);
+    }
+
     /// Waits up to `window` for the application to exit. `Ok` means it is
     /// still running; an exit is reported with its status and stderr tail.
-    pub(crate) async fn watch(&mut self, window: Duration) -> Result<(), String> {
+    pub async fn watch(&mut self, window: Duration) -> Result<(), String> {
         match tokio::time::timeout(window, self.exited()).await {
             Err(_still_running) => Ok(()),
             Ok(message) => Err(message),
@@ -92,7 +131,7 @@ impl Launch {
     }
 
     /// Waits for the application to exit and describes the exit.
-    pub(crate) async fn exited(&mut self) -> String {
+    pub async fn exited(&mut self) -> String {
         let status = match self.child.wait().await {
             Ok(status) => status,
             Err(e) => return format!("Failed to check the {} process: {e}", self.name),
@@ -106,11 +145,20 @@ impl Launch {
             .map(|mut tail| tail.make_contiguous().join("\n"))
             .unwrap_or_default();
         let name = self.name;
-        if tail.is_empty() {
+        let mut message = if tail.is_empty() {
             format!("{name} exited during startup ({status}) with no stderr output.")
         } else {
             format!("{name} exited during startup ({status}). Its stderr ended with:\n{tail}")
+        };
+        if let Some(reason) = self.no_display {
+            message.push('\n');
+            message.push_str(reason);
+            if let Some(remedy) = self.no_display_remedy {
+                message.push(' ');
+                message.push_str(remedy);
+            }
         }
+        message
     }
 }
 
@@ -119,9 +167,10 @@ impl Launch {
 mod tests {
     use super::*;
 
+    /// On a display, so only the test that drops it gets the no-display line.
     fn sh(script: &str) -> std::process::Command {
         let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(script);
+        cmd.arg("-c").arg(script).env("DISPLAY", ":0");
         cmd
     }
 
@@ -134,7 +183,8 @@ mod tests {
     }
 
     /// The panic tao prints when GTK cannot open a display, then the exit
-    /// code a Rust panic gives, as #702's reproduction recorded them.
+    /// code a Rust panic gives, as mixelpixx/Konnect#702's reproduction recorded
+    /// them.
     #[tokio::test]
     async fn an_app_that_crashes_on_startup_is_a_failed_launch() {
         let err =
@@ -147,6 +197,47 @@ mod tests {
             err.contains("Failed to initialize gtk backend!"),
             "stderr missing: {err}"
         );
+    }
+
+    /// The server's environment does not matter: `cmd`'s own wins.
+    #[tokio::test]
+    async fn an_exit_with_no_display_says_so() {
+        let mut cmd = sh("echo 'cannot open display' >&2; exit 1");
+        cmd.env("DISPLAY", "").env_remove("WAYLAND_DISPLAY");
+        let mut app = spawn(cmd, "Test app", |_| {}).expect("sh spawns");
+        let missing = !cfg!(target_os = "macos");
+        assert_eq!(app.lacks_display(), missing);
+        app.on_no_display("Try a display.");
+        let err = app.watch(Duration::from_secs(10)).await.unwrap_err();
+        assert!(err.contains("cannot open display"), "{err}");
+        assert_eq!(
+            err.ends_with("Neither DISPLAY nor WAYLAND_DISPLAY is set in the server's environment, as when it runs from an SSH session. Try a display."),
+            missing,
+            "{err}"
+        );
+        // A display set in `cmd` is not a missing one.
+        assert!(!spawn(sh("exit 1"), "Test app", |_| {})
+            .unwrap()
+            .lacks_display());
+    }
+
+    #[test]
+    fn no_display_is_named_only_when_both_variables_are_unset_or_empty() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        let missing = !cfg!(target_os = "macos");
+        assert_eq!(no_display_reason(env(&[])).is_some(), missing);
+        assert_eq!(
+            no_display_reason(env(&[("DISPLAY", ""), ("WAYLAND_DISPLAY", "")])).is_some(),
+            missing
+        );
+        assert!(no_display_reason(env(&[("DISPLAY", ":0")])).is_none());
+        assert!(no_display_reason(env(&[("WAYLAND_DISPLAY", "wayland-0")])).is_none());
     }
 
     #[tokio::test]
@@ -175,8 +266,8 @@ mod tests {
         assert!(!err.contains(&"a".repeat(501)), "{err}");
     }
 
-    /// A `kicad-cli` render the viewer started can still be writing after
-    /// the viewer itself has exited.
+    /// A process the application started can still be writing after the
+    /// application itself has exited.
     #[tokio::test]
     async fn stderr_from_a_child_the_app_started_is_still_quoted() {
         let err = launch("(sleep 0.2; echo 'render failed' >&2) & exit 1")

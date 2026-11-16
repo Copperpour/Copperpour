@@ -5,6 +5,7 @@
 //! this extraction does not establish the browser service's security boundary.
 
 pub mod browser;
+pub mod launch;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -130,6 +131,8 @@ pub fn is_relevant_sch_change(path: &Path) -> bool {
 
 /// Resolve kicad-cli: explicit override → platform candidates → PATH.
 /// Candidate lists mirror `plugin/settings_dialog.py::detect_kicad_cli`.
+/// For standalone use only: the MCP server resolves through its own
+/// `kicad_install::find_cli`, so its viewer renders with the CLI it reports.
 pub fn resolve_kicad_cli(override_path: Option<String>) -> String {
     if let Some(p) = override_path {
         if !p.is_empty() {

@@ -33,6 +33,19 @@ pub fn find_gui(configured_binary: &str, configured_cli: &str) -> Option<PathBuf
         .or_else(|| gui_candidates().into_iter().find(|path| path.is_file()))
 }
 
+/// [`find_gui`], else the bare `kicad` name for the OS to look up on `PATH`.
+pub fn gui_or_default(configured_binary: &str, configured_cli: &str) -> String {
+    find_gui(configured_binary, configured_cli)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "windows") {
+                "kicad.exe".to_string()
+            } else {
+                "kicad".to_string()
+            }
+        })
+}
+
 fn cli_candidates() -> Vec<PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -57,6 +70,7 @@ fn cli_candidates() -> Vec<PathBuf> {
         vec![
             PathBuf::from("/usr/bin/kicad-cli"),
             PathBuf::from("/usr/local/bin/kicad-cli"),
+            PathBuf::from("/snap/kicad/current/usr/bin/kicad-cli"),
         ]
     }
 }
@@ -77,9 +91,10 @@ fn gui_candidates() -> Vec<PathBuf> {
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        ["kicad"]
+        // The fixed paths cover a server started with a reduced `PATH`.
+        find_on_path(Path::new("kicad"))
             .into_iter()
-            .filter_map(|name| find_on_path(Path::new(name)))
+            .chain(["/usr/bin/kicad", "/usr/local/bin/kicad"].map(PathBuf::from))
             .collect()
     }
 }

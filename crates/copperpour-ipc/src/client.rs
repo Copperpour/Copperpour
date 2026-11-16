@@ -695,8 +695,9 @@ impl UnreachableReason {
             Self::NotConfigured => "No KiCad IPC address is configured.",
             Self::NoListener => {
                 "Nothing is listening there: KiCad may be closed, its API disabled \
-                 (Preferences > Plugins > 'Enable KiCad API', or KiCad > Preferences on macOS), \
-                 or this address left behind by a closed session."
+                 (Preferences > Plugins > 'Enable KiCad API', or KiCad > Preferences on macOS; \
+                 api.enable_server in kicad_common.json, which KiCad's first-run wizard can \
+                 reset to false), or this address left behind by a closed session."
             }
             Self::AccessDenied => {
                 "The operating system refused this account access to the endpoint. Likely \
@@ -765,8 +766,11 @@ pub enum PingOutcome {
     /// explicit KiCad error status (for example `AS_NOT_READY` while an editor
     /// is still starting) proves receipt; a receive timeout, a malformed
     /// reply, or a reply without a status does not. `message` carries KiCad's
-    /// status text when there was one.
-    RequestFailed { message: String },
+    /// status text when there was one, and `status` its code.
+    RequestFailed {
+        message: String,
+        status: Option<kiapi::common::ApiStatusCode>,
+    },
 }
 
 impl PingOutcome {
@@ -789,8 +793,22 @@ impl PingOutcome {
     pub fn failure_message(&self) -> Option<&str> {
         match self {
             Self::Responsive => None,
-            Self::Unreachable { message, .. } | Self::RequestFailed { message } => Some(message),
+            Self::Unreachable { message, .. } | Self::RequestFailed { message, .. } => {
+                Some(message)
+            }
         }
+    }
+
+    /// KiCad received the Ping and answered `AS_NOT_READY`: still starting,
+    /// or held by a modal dialog such as the first-run wizard (#225).
+    pub fn kicad_not_ready(&self) -> bool {
+        matches!(
+            self,
+            Self::RequestFailed {
+                status: Some(kiapi::common::ApiStatusCode::AsNotReady),
+                ..
+            }
+        )
     }
 }
 
@@ -1679,6 +1697,9 @@ impl KiCadIpcClient {
                     },
                     None => PingOutcome::RequestFailed {
                         message: format!("{e:#}"),
+                        status: ApiStatusError::from_error(&e).and_then(|status| {
+                            kiapi::common::ApiStatusCode::try_from(status.code).ok()
+                        }),
                     },
                 }
             }
