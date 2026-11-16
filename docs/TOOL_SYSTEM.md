@@ -39,6 +39,29 @@ accepts either one name or an array; a successful change causes
 This distinction lets a client recover from an unloaded tool without confusing
 it with a misspelled or removed public API.
 
+### `call_tool`
+
+The `call_tool` meta-tool runs a named tool whether or not its toolset is
+loaded, with the target's own argument checks, and does not change
+`tools/list`. MCP clients approve tools by name, so allowing `call_tool` would
+otherwise allow every tool behind it. `router/call_tool_policy.rs` decides by
+the target's name before any part of the target runs:
+
+- tools on its reviewed read-only lists always run;
+- `call_tool` itself and `reload_server` never run;
+- every other tool, `load_toolset` and `unload_toolset` included, is refused
+  with `tool_not_permitted` unless the operator set
+  `call_tool_allow_writes = true` in the server configuration. No argument of
+  `call_tool` changes that. With the key on, a client that has allowed
+  `call_tool` may run mutating tools without their usual individual approval
+  prompts.
+
+A read-only tool is one that, for every argument it takes, writes no file that
+outlives the call, changes nothing in KiCad, changes no server state a later
+call observes, sends no network request and starts no program that stays
+running. The lists are kept by hand: `BoardAccess` and MCP annotations are not
+consulted. A test fails for a registered tool that is on no list.
+
 ## Argument Contracts
 
 `mcp/handler.rs` compiles and caches each advertised Draft 2020-12 schema and

@@ -60,6 +60,16 @@ pub struct Config {
     #[serde(default)]
     pub eager_toolsets: bool,
 
+    /// Let the `call_tool` meta-tool run every tool, not only the reviewed
+    /// read-only ones. Off by default. An MCP client asks for approval per
+    /// tool name, and a call through `call_tool` carries the name `call_tool`:
+    /// with this on, a client that has allowed `call_tool` runs mutating tools
+    /// without the approval prompt each of them has under its own name. Turn it
+    /// on only for a client that cannot call those tools directly and whose
+    /// user accepts that. `call_tool` and `reload_server` stay refused.
+    #[serde(default)]
+    pub call_tool_allow_writes: bool,
+
     /// Timeout, in seconds, of long kicad-cli operations (DRC, ERC, exports). A full DRC of a
     /// large board with creepage rules can take more than the default 600 s, all the more on a
     /// loaded machine. A timed-out kicad-cli is killed. Zero is read as one second, since zero
@@ -165,6 +175,21 @@ impl Config {
             jlcpcb_db_path: self.jlcpcb_db_path.clone(),
             auto_load_toolsets: self.auto_load_toolsets,
             eager_toolsets: self.eager_toolsets,
+        }
+    }
+}
+
+impl Config {
+    /// Apply the settings that live on the handler, not in `ServerConfig`.
+    /// Both entry points call this on the handler they built, as they call
+    /// `apply_to_process` before building it.
+    pub fn apply_to_handler(&self, handler: &copperpour_core::mcp::handler::McpHandler) {
+        if self.call_tool_allow_writes {
+            handler.allow_call_tool_writes();
+            warn!(
+                "call_tool_allow_writes is on: a client that has allowed call_tool runs \
+                 mutating tools without their individual approval prompts"
+            );
         }
     }
 }
@@ -314,6 +339,7 @@ impl Default for Config {
             log_level: default_log_level(),
             auto_load_toolsets: false,
             eager_toolsets: false,
+            call_tool_allow_writes: false,
             kicad_cli_timeout_seconds: default_kicad_cli_timeout_seconds(),
         }
     }
@@ -464,6 +490,40 @@ mod tests {
         let c = Config::load_from(f.path()).unwrap();
         assert_eq!(c.kicad_cli_timeout_seconds, 600);
         assert_eq!(Config::default().kicad_cli_timeout_seconds, 600);
+    }
+
+    /// `call_tool` stays read-only unless the configuration file says
+    /// otherwise, and the handler learns it only through `apply_to_handler`.
+    #[tokio::test]
+    async fn call_tool_allow_writes_is_off_unless_configured() {
+        let off = Config::load_from(write_temp("toml", "").path()).unwrap();
+        assert!(!off.call_tool_allow_writes);
+        assert!(!Config::default().call_tool_allow_writes);
+        let toml = write_temp("toml", "call_tool_allow_writes = true\n");
+        let json = write_temp("json", r#"{"call_tool_allow_writes": true}"#);
+        for (config, expected) in [
+            (off, false),
+            (Config::load_from(toml.path()).unwrap(), true),
+            (Config::load_from(json.path()).unwrap(), true),
+        ] {
+            assert_eq!(config.call_tool_allow_writes, expected);
+            let handler = copperpour_core::mcp::handler::McpHandler::new(
+                copperpour_core::tools::ServerConfig {
+                    kicad_cli: config.kicad_cli.clone(),
+                    kicad_binary: config.kicad_binary.clone(),
+                    ipc_address: String::new(),
+                    project_dir: None,
+                    jlcpcb_db_path: None,
+                    auto_load_toolsets: false,
+                    eager_toolsets: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!handler.call_tool_writes_allowed());
+            config.apply_to_handler(&handler);
+            assert_eq!(handler.call_tool_writes_allowed(), expected);
+        }
     }
 
     /// The only test in this crate that touches the process-wide kicad-cli timeout.

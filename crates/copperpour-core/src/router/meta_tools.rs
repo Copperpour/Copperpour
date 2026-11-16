@@ -246,6 +246,38 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
             }),
         },
         McpToolDescription {
+            name: "call_tool".to_string(),
+            description:
+                "Call a Copperpour tool by name, whether or not its toolset is loaded and \
+                 whether or not it appears in your tool list. Use it when a tool you need is \
+                 missing from your tools, e.g. after load_toolset if your client does not \
+                 refresh its tool list. arguments are the tool's own arguments; the result \
+                 is the tool's own result. By default it runs only read-only tools (queries, \
+                 listings, checks that write nothing) and refuses every other tool with \
+                 tool_not_permitted: call that tool directly under its own name. Only the \
+                 server's operator can widen this, with call_tool_allow_writes = true in the \
+                 server configuration; no argument does. Allowing call_tool in a client then \
+                 may allow mutating tools without their usual individual approval prompts. \
+                 call_tool never runs itself or reload_server."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Tool name, e.g. 'get_component_nets'"
+                    },
+                    "arguments": {
+                        "type": "object",
+                        // The target's schema checks these, not this one.
+                        "additionalProperties": true,
+                        "description": "The tool's arguments (default: {})"
+                    }
+                },
+                "required": ["name"]
+            }),
+        },
+        McpToolDescription {
             name: "unload_toolset".to_string(),
             description: "Unload a toolset to remove its tools from the active session. \
                  Use this to keep the tool list manageable when switching tasks. \

@@ -69,6 +69,9 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
         if let (Ok(handler), true) = (&handler, ipc_source.rediscovers()) {
             handler.enable_ipc_rediscovery();
         }
+        if let Ok(handler) = &handler {
+            config.apply_to_handler(handler);
+        }
         match handler {
             Ok(handler) => match config.transport {
                 TransportMode::Stdio => {

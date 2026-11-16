@@ -193,6 +193,7 @@ column comes from `extract_error_kind()`, so JSONL logs share the vocabulary.
 |--------|------|
 | `toolset_not_loaded` | Tool exists but its toolset isn't loaded |
 | `unknown_tool` | No toolset has that tool |
+| `tool_not_permitted` | `call_tool` may not run the target — carries `tool`, `reason` (`writes_not_enabled`, `never_through_call_tool`); nothing of the target ran, and it stays callable under its own name |
 | `invalid_argument` | Required argument missing/malformed |
 | `file_not_found` | Referenced file or project-discovery directory missing or unreadable |
 | `conflict` | File changed, a write would replace existing paths, or schematic project ownership is not provably unique — carries the paths; ownership conflicts include the schematic dir and all candidate roots |
@@ -297,6 +298,18 @@ meta-tools. JSONL IO failures never fail a call (`tracing::warn!`, dropped). Tes
   first list and ignore `list_changed`: they can never call a tool missing from it, since
   `load_toolset` returns names, not schemas. `auto_load_toolsets` does not help there —
   it fires on a call, which needs the name already.
+- **`call_tool(name, arguments)`** runs a tool whether or not its toolset is loaded,
+  through `run_tool_definition` like a direct call, and leaves `tools/list` alone. A
+  client approves tools by name, so `router/call_tool_policy.rs` decides by the target's
+  name, before any of it runs, what the gateway may reach: the reviewed `READ_ONLY_TOOLS`
+  and `READ_ONLY_META_TOOLS` always, `call_tool` and `reload_server` never, and
+  everything else only with the next key. A new tool must be put on a list there by
+  hand; a test names the ones that are on none.
+- **`call_tool_allow_writes`** (default `false`): lets `call_tool` run the tools that
+  are not read-only, `load_toolset` and `unload_toolset` included. A client that has
+  allowed `call_tool` then runs mutating tools without their individual approval
+  prompts. It is a server configuration key, set through `McpHandler::allow_call_tool_writes`
+  at startup; no tool argument reaches it.
 
 Router: `crates/copperpour-core/src/router/mod.rs`.
 
