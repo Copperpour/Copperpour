@@ -53,6 +53,7 @@ mod own_at_children_tests;
 mod pad_nets;
 pub mod pcb_board;
 mod pcb_board_outline;
+pub mod pcb_board_rule_area;
 mod pcb_board_zones;
 pub mod pcb_components;
 pub mod pcb_copper;

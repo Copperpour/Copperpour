@@ -436,15 +436,24 @@ fn read_settled_inventory(
     timeout: std::time::Duration,
     mut read: impl FnMut() -> anyhow::Result<ZoneInventory>,
 ) -> anyhow::Result<ZoneInventory> {
+    read_settled_by_key(timeout, &mut read, |inventory| inventory.revision.clone())
+}
+
+pub(super) fn read_settled_by_key<T, K: PartialEq>(
+    timeout: std::time::Duration,
+    mut read: impl FnMut() -> anyhow::Result<T>,
+    key: impl Fn(&T) -> K,
+) -> anyhow::Result<T> {
     let deadline = std::time::Instant::now() + timeout;
     let mut previous_revision = None;
     loop {
         match read() {
             Ok(inventory) => {
-                if previous_revision.as_ref() == Some(&inventory.revision) {
+                let current_key = key(&inventory);
+                if previous_revision.as_ref() == Some(&current_key) {
                     return Ok(inventory);
                 }
-                previous_revision = Some(inventory.revision);
+                previous_revision = Some(current_key);
             }
             Err(error) => {
                 let busy = copperpour_ipc::client::ApiStatusError::from_error(&error).is_some_and(

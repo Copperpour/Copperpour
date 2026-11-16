@@ -2837,8 +2837,13 @@ impl KiCadIpcClient {
     /// Refill zones on the board.
     pub fn refill_zones(&self) -> Result<()> {
         let doc = self.get_board_document()?;
+        self.refill_zones_in(doc)
+    }
+
+    /// As [`Self::refill_zones`], targeting a specific open document.
+    pub fn refill_zones_in(&self, document: kiapi::common::types::DocumentSpecifier) -> Result<()> {
         let cmd = kiapi::board::commands::RefillZones {
-            board: Some(doc),
+            board: Some(document),
             zones: vec![],
         };
         self.send_command(&cmd, "kiapi.board.commands.RefillZones")?;

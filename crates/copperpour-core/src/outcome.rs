@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 /// success, refusal, partial and post-mutation failure paths need evidence
 /// before it belongs here.
 pub const ADOPTED_OUTCOME_TOOLS: &[&str] = &[
+    "add_rule_area",
     "add_schematic_component",
     "annotate_schematic",
     "batch_place_components",
