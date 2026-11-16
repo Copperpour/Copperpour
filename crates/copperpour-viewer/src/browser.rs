@@ -932,6 +932,7 @@ async fn open_in_kicad(
     }
     let mut command = std::process::Command::new(&shared.kicad);
     command.arg(target);
+    let fallback_display = crate::launch::default_viewer_display(&mut command);
     let mut kicad = match crate::launch::spawn(
         command,
         "KiCad",
@@ -949,7 +950,15 @@ async fn open_in_kicad(
     // A KiCad that cannot open a window exits at once (#496).
     match kicad.watch(crate::launch::STARTUP_WINDOW).await {
         Ok(()) => Json(serde_json::json!({"spawned":true})).into_response(),
-        Err(message) => (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+        Err(mut message) => {
+            if fallback_display {
+                message.push_str(
+                    "\nTried fallback DISPLAY=:0 because neither DISPLAY nor WAYLAND_DISPLAY was configured. \
+                     Configure Copperpour with your desktop's display and XAUTHORITY if :0 is unavailable or inaccessible.",
+                );
+            }
+            (StatusCode::SERVICE_UNAVAILABLE, message).into_response()
+        }
     }
 }
 

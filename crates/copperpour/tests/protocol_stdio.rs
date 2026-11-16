@@ -741,6 +741,16 @@ fn browser_viewer_stdio_case(native_cli: bool) {
         &schematic,
     )
     .unwrap();
+    let kicad = bin.join("kicad");
+    std::fs::write(
+        &kicad,
+        format!(
+            "#!{}\nprintf 'display=%s\\n' \"$DISPLAY\" >&2\nexit 255\n",
+            shell.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&kicad, std::fs::Permissions::from_mode(0o700)).unwrap();
     let cli = if native_cli {
         std::env::var_os("COPPERPOUR_TEST_KICAD_CLI")
             .map(std::path::PathBuf::from)
@@ -751,8 +761,9 @@ fn browser_viewer_stdio_case(native_cli: bool) {
     std::fs::write(
         tmp.path().join("copperpour.toml"),
         format!(
-            "kicad_cli = {}\n",
-            serde_json::to_string(cli.to_str().unwrap()).unwrap()
+            "kicad_cli = {}\nkicad_binary = {}\n",
+            serde_json::to_string(cli.to_str().unwrap()).unwrap(),
+            serde_json::to_string(kicad.to_str().unwrap()).unwrap()
         ),
     )
     .unwrap();
@@ -811,6 +822,30 @@ fn browser_viewer_stdio_case(native_cli: bool) {
         }
     };
     assert_served(headless["url"].as_str().unwrap());
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        let (base, token) = headless["url"]
+            .as_str()
+            .unwrap()
+            .split_once("/#token=")
+            .unwrap();
+        let address = base.strip_prefix("http://").unwrap();
+        let body = json!({"file": schematic.canonicalize().unwrap()}).to_string();
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        write!(stream, "POST /open-in-kicad HTTP/1.1\r\nHost: {address}\r\nOrigin: {base}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.contains("display=:0"), "{response}");
+        assert!(response.contains("fallback DISPLAY=:0"), "{response}");
+        assert!(response.contains("XAUTHORITY"), "{response}");
+        // A second browser-opener failure below must still report no display:
+        // the fallback belongs to the KiCad child, not the server environment.
+    }
     std::fs::write(&opener, format!("#!{}\nexit 7\n", shell.display())).unwrap();
     let failed = p.call_tool("open_schematic_viewer", json!({"schematic":schematic}));
     assert_ne!(failed["isError"], true, "{failed}");
