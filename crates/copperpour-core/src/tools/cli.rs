@@ -514,10 +514,26 @@ fn export_staging_dir(destination: &Path) -> Result<tempfile::TempDir> {
         .context("failed to create an export staging directory")
 }
 
+fn ensure_file_destination(destination: &Path, artifact: &str) -> Result<()> {
+    if destination.is_dir()
+        || destination
+            .as_os_str()
+            .to_string_lossy()
+            .ends_with(['/', '\\'])
+    {
+        anyhow::bail!(
+            "{artifact} output path must name a file, not a directory: {}",
+            destination.display()
+        );
+    }
+    Ok(())
+}
+
 /// Publish a verified artifact without letting a stale destination stand in
 /// for output from the current command. The staging directory is a sibling of
 /// the destination, so every rename remains on the same filesystem.
 async fn publish_verified_file(staged: &Path, destination: &Path, artifact: &str) -> Result<u64> {
+    ensure_file_destination(destination, artifact)?;
     let size = verify_nonempty_file(staged, artifact).await?;
     if let Some(parent) = destination.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -581,16 +597,22 @@ async fn publish_verified_files(
     output_dir: &Path,
     artifact: &str,
 ) -> Result<Vec<PathBuf>> {
+    // Preflight every staged file and every mapped destination before
+    // publishing the first file, so a directory collision on a later sheet or
+    // plot leaves earlier destinations untouched.
+    let mut destinations = Vec::with_capacity(staged_files.len());
     for staged in staged_files {
         verify_nonempty_file(staged, artifact).await?;
-    }
-
-    let mut published = Vec::with_capacity(staged_files.len());
-    for staged in staged_files {
         let file_name = staged
             .file_name()
             .context("export produced a path without a file name")?;
         let destination = output_dir.join(file_name);
+        ensure_file_destination(&destination, artifact)?;
+        destinations.push((staged, destination));
+    }
+
+    let mut published = Vec::with_capacity(destinations.len());
+    for (staged, destination) in destinations {
         publish_verified_file(staged, &destination, artifact).await?;
         published.push(destination);
     }
@@ -1617,12 +1639,7 @@ pub async fn export_schematic_svg(
     output: &Path,
     options: &SchematicSvgOptions<'_>,
 ) -> Result<Vec<PathBuf>> {
-    if output.is_dir() || output.as_os_str().to_string_lossy().ends_with(['/', '\\']) {
-        anyhow::bail!(
-            "schematic SVG output path must name a file, not a directory: {}",
-            output.display()
-        );
-    }
+    ensure_file_destination(output, "schematic SVG")?;
     let output_dir = output
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -3699,6 +3716,43 @@ mod artifact_verification_tests {
             std::fs::read_to_string(stale_stem).unwrap(),
             "stale-but-nonempty",
             "a stale stem file in the output directory must not satisfy or be touched by a failed export"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_destination_is_refused_without_replacing_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_support::schematic_only_cli(dir.path());
+        let schematic = dir.path().join("clock.kicad_sch");
+        let destination = dir.path().join("clock.pdf");
+        std::fs::write(&schematic, "placeholder").unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        let sentinel = destination.join("keep.txt");
+        std::fs::write(&sentinel, "do-not-delete").unwrap();
+
+        let error = export_schematic_pdf(
+            cli.to_str().unwrap(),
+            &schematic,
+            &destination,
+            &SchematicPdfOptions::default(),
+        )
+        .await
+        .expect_err("a directory destination must be refused before publication");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must name a file, not a directory"),
+            "{error:#}"
+        );
+        assert!(
+            destination.is_dir(),
+            "existing directory at destination must survive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "do-not-delete",
+            "directory contents must survive staging cleanup"
         );
     }
 }

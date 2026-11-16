@@ -2357,4 +2357,73 @@ mod svg_output_filename_tests {
             "existing directory contents must survive"
         );
     }
+
+    /// A derived child destination (`<output stem>-<sheetname>.svg`) may
+    /// collide with an existing directory even when the requested root path is
+    /// a valid file. Preflighting all mapped destinations before publishing
+    /// any file must refuse the export while leaving both the child directory
+    /// (with its contents) and the existing root SVG untouched.
+    #[tokio::test]
+    async fn a_child_directory_destination_is_refused_without_touching_root_or_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = svg_cli(dir.path(), true);
+        let schematic = write_schematic(dir.path(), "single_pin_nets.kicad_sch");
+        let out = dir.path().join("out");
+        let output = out.join("Board.svg");
+        let child_dir = out.join("Board-Child.svg");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        std::fs::write(&output, "existing-root-svg").unwrap();
+        let sentinel = child_dir.join("keep.txt");
+        std::fs::write(&sentinel, "do-not-delete").unwrap();
+
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: cli.display().to_string(),
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "export_schematic_svg",
+                    "arguments": {
+                        "schematic": schematic.display().to_string(),
+                        "output": output.display().to_string()
+                    }
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("JSON-RPC result");
+        assert_eq!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("must name a file, not a directory") && text.contains("Board-Child.svg"),
+            "unexpected error text: {text}"
+        );
+
+        assert!(child_dir.is_dir(), "child directory must survive");
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "do-not-delete",
+            "child directory contents must survive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "existing-root-svg",
+            "existing root SVG must not be replaced when a child destination is refused"
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["Board-Child.svg", "Board.svg"]);
+    }
 }
