@@ -122,8 +122,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "net_name":  { "type": "string" },
                     "x":         { "type": "number" },
                     "y":         { "type": "number" },
-                    "drill":     { "type": "number", "description": "Drill diameter in mm", "default": 0.4 },
-                    "pad_size":  { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 }
+                    "drill":     { "type": "number", "description": "Positive drill diameter in mm, smaller than pad_size after nanometre rounding", "exclusiveMinimum": 0, "default": 0.4 },
+                    "pad_size":  { "type": "number", "description": "Positive via pad diameter in mm, larger than drill after nanometre rounding", "exclusiveMinimum": 0, "default": 0.8 }
                 },
                 "required": ["board", "net_name", "x", "y"]
             }),
@@ -741,8 +741,33 @@ async fn handle_add_via(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let drill = args["drill"].as_f64().unwrap_or(0.4);
-    let pad_size = args["pad_size"].as_f64().unwrap_or(0.8);
+    // Defaults apply only to omitted fields; null and malformed present values
+    // must not silently become a different via geometry.
+    let mut dimensions = [0.4, 0.8];
+    for (field, value) in ["drill", "pad_size"].into_iter().zip(&mut dimensions) {
+        if args.get(field).is_some() {
+            *value = match require_f64(args, field) {
+                Ok(value) => value,
+                Err(refusal) => return Ok(refusal),
+            };
+        }
+        if copperpour_ipc::builders::distance(*value).value_nm <= 0 {
+            return Ok(invalid_arg(
+                field,
+                "must be greater than zero after rounding to nanometres",
+            ));
+        }
+    }
+    let [drill, pad_size] = dimensions;
+    // KiCad compares integer diameters: distinct mm values can round equal.
+    if copperpour_ipc::builders::distance(drill).value_nm
+        >= copperpour_ipc::builders::distance(pad_size).value_nm
+    {
+        return Ok(invalid_arg(
+            "drill",
+            "must be smaller than pad_size after rounding to nanometres",
+        ));
+    }
 
     let net_ipc = net_name.clone();
     let placement = ipc!(ctx, args, |c, document| {

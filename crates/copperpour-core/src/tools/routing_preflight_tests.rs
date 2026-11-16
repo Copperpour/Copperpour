@@ -196,7 +196,7 @@ impl Scene {
         let response = response.result.unwrap();
         let body: Value = serde_json::from_str(response["content"][0]["text"].as_str().unwrap())
             .unwrap_or_else(|_| json!({"message":response["content"][0]["text"]}));
-        if tool == "get_nets_list" {
+        if matches!(tool, "get_nets_list" | "add_via") {
             assert_eq!(
                 response["isError"],
                 body.get("error").is_some(),
@@ -643,5 +643,103 @@ async fn routing_dimensions_explicit_positive_values_reach_copper() {
                 500_000
             );
         }
+    }
+}
+
+// Geometry oracle: PCB_VIA::ValidateViaParameters rejects diameter <= drill:
+// https://github.com/KiCad/kicad-source-mirror/blob/10.0.5/pcbnew/pcb_track.cpp#L1694-L1699
+fn via_geometry_invalid_cases() -> Vec<(Value, &'static str)> {
+    vec![
+        (json!({"drill": -0.2}), "drill"),
+        (json!({"drill": 0}), "drill"),
+        (json!({"pad_size": 0}), "pad_size"),
+        (json!({"pad_size": -0.8}), "pad_size"),
+        (json!({"drill": "bad"}), "drill"),
+        (json!({"pad_size": "bad"}), "pad_size"),
+        (json!({"drill": null}), "drill"),
+        (json!({"pad_size": false}), "pad_size"),
+        (json!({"drill": []}), "drill"),
+        (json!({"pad_size": {}}), "pad_size"),
+        (json!({"drill": 0.0000001}), "drill"),
+        (json!({"pad_size": 0.0000001}), "pad_size"),
+        (json!({"drill": 1, "pad_size": 0.4}), "drill"),
+        (json!({"drill": 0.4, "pad_size": 0.4}), "drill"),
+        (json!({"drill": 0.4000001, "pad_size": 0.4000002}), "drill"),
+        (json!({"drill": 0.8}), "drill"),
+        (json!({"pad_size": 0.4}), "drill"),
+    ]
+}
+
+#[tokio::test]
+async fn via_geometry_direct_refuses_before_ipc() {
+    use crate::tools::pcb_board::board_mock::ctx_talking_to;
+    let ctx = ctx_talking_to(String::new());
+    for (changes, field) in via_geometry_invalid_cases() {
+        let mut args = json!({"board":"unused.kicad_pcb","net_name":"VCC","x":1,"y":2});
+        for (key, value) in changes.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        // No endpoint exists: reaching IPC would return an error, not this refusal.
+        let result = handle_add_via(&args, &ctx).await.unwrap();
+        assert!(result.is_error, "{args}: {result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected structured refusal");
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{args}: {body}");
+        assert_eq!(body["error"]["field"], field, "{args}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn via_geometry_served_refusals_preserve_copper() {
+    for (changes, field) in via_geometry_invalid_cases() {
+        refused("add_via", changes, field, "").await;
+    }
+}
+
+#[tokio::test]
+async fn via_geometry_defaults_and_explicit_sizes_are_stored() {
+    for (changes, drill_nm, pad_nm) in [
+        (json!({}), 400_000, 800_000),
+        (json!({"drill":0.3,"pad_size":0.6}), 300_000, 600_000),
+        (json!({"drill":0.3}), 300_000, 800_000),
+        (json!({"pad_size":1}), 400_000, 1_000_000),
+        (json!({"drill":0.4,"pad_size":0.400001}), 400_000, 400_001),
+    ] {
+        let scene = Scene::new().await;
+        let body = scene.call("add_via", changes).await;
+        assert_eq!(body["source"], "ipc_readback", "{body}");
+        assert_eq!(body["net"], "VCC", "{body}");
+        assert_eq!(body["drill"], drill_nm as f64 / 1_000_000.0);
+        assert_eq!(body["pad_size"], pad_nm as f64 / 1_000_000.0);
+        let store = scene.store.lock().unwrap();
+        assert_eq!((store.creates, store.updates, store.deletes), (1, 0, 0));
+        let vias: Vec<_> = store
+            .items
+            .iter()
+            .filter(|i| i.type_url.ends_with("Via"))
+            .collect();
+        assert_eq!(vias.len(), 1);
+        let via = kiapi::board::types::Via::decode(vias[0].value.as_slice()).unwrap();
+        let stack = via.pad_stack.unwrap();
+        let drill = stack.drill.unwrap().diameter.unwrap();
+        assert_eq!((drill.x_nm, drill.y_nm), (drill_nm, drill_nm));
+        let pad = stack.copper_layers[0].size.unwrap();
+        assert_eq!((pad.x_nm, pad.y_nm), (pad_nm, pad_nm));
+    }
+}
+
+#[test]
+fn via_geometry_schema_advertises_positive_sizes_and_defaults() {
+    let definition = tools()
+        .into_iter()
+        .find(|tool| tool.name == "add_via")
+        .unwrap();
+    for (field, default) in [("drill", 0.4), ("pad_size", 0.8)] {
+        let property = &definition.input_schema["properties"][field];
+        assert_eq!(property["type"], "number");
+        assert_eq!(property["exclusiveMinimum"], 0);
+        assert_eq!(property["default"], default);
     }
 }
