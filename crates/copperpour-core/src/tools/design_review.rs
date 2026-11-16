@@ -23,7 +23,7 @@ use copperpour_sexp::{
     },
 };
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -77,7 +77,9 @@ pub fn tools() -> Vec<ToolDef> {
             "audit_power_rails",
             "Check power rail integrity: missing bulk capacitance, no test points on power rails, \
              voltage regulator output caps missing. Defaults to one file; set schematic_scope \
-             to 'hierarchy' to audit every reachable sheet instance.",
+             to 'hierarchy' to audit every reachable sheet instance. There, a rail named by a \
+             power symbol or global label is one net across the design, so its capacitors and \
+             test points are counted on every sheet and it is reported once.",
             json!({
                 "type": "object",
                 "properties": {
@@ -426,6 +428,9 @@ async fn handle_audit_power_rails_file(
     let mut graph = net_graph_for(&tree, &wires, &labels);
 
     let mut findings = Vec::new();
+    // The rail each finding is about, and whether that rail is global, so a
+    // hierarchy-wide review can judge global rails on the whole design.
+    let mut finding_rails: Vec<&PowerRail> = Vec::new();
 
     // Find all power nets (from power symbols and labels)
     let rails = power_rails(&mut graph, &labels);
@@ -449,6 +454,7 @@ async fn handle_audit_power_rails_file(
                 issue: format!("Power rail '{}' has no decoupling capacitors", net),
                 recommendation: format!("Add at least one 100nF ceramic cap on the '{}' rail", net),
             });
+            finding_rails.push(rail);
         } else if !bulk_cap_roots.contains(root) {
             findings.push(AuditFinding {
                 severity: "warning",
@@ -460,6 +466,7 @@ async fn handle_audit_power_rails_file(
                     net
                 ),
             });
+            finding_rails.push(rail);
         }
     }
 
@@ -480,18 +487,119 @@ async fn handle_audit_power_rails_file(
                 issue: format!("Power rail '{}' has no test point", net),
                 recommendation: format!("Add a test point on '{}' for debugging", net),
             });
+            finding_rails.push(rail);
         }
     }
+
+    let mut findings_json = serde_json::to_value(&findings)?;
+    for (finding, rail) in findings_json
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .zip(&finding_rails)
+    {
+        finding["rail"] = json!(rail.name);
+        finding["global_rail"] = json!(rail.global);
+    }
+    let rail_coverage: Vec<Value> = rails
+        .iter()
+        .filter(|rail| !rail.any_name_contains("GND") && !rail.any_name_contains("VSS"))
+        .map(|rail| {
+            json!({
+                "name": rail.name,
+                "global": rail.global,
+                "decoupled": cap_roots.contains(&rail.root),
+                "bulk": bulk_cap_roots.contains(&rail.root),
+                "test_point": test_point_roots.contains(&rail.root),
+            })
+        })
+        .collect();
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "audit": "power_rails",
             "power_nets": rails.iter().map(|rail| &rail.name).collect::<Vec<_>>(),
-            "findings": findings,
+            "rail_coverage": rail_coverage,
+            "findings": findings_json,
             "summary": format!("{} power rail issues found across {} rails.", findings.len(), rails.len())
         }))
         .unwrap(),
     ))
+}
+
+fn pool_global_rail_findings(findings: Vec<Value>, bodies: &[(String, Value)]) -> Vec<Value> {
+    if bodies.len() < 2 {
+        return findings;
+    }
+    #[derive(Default)]
+    struct Pooled {
+        decoupled: bool,
+        bulk: bool,
+        test_point: bool,
+        sources: BTreeSet<String>,
+    }
+    let mut pooled: BTreeMap<String, Pooled> = BTreeMap::new();
+    for (source, body) in bodies {
+        for rail in body["rail_coverage"].as_array().into_iter().flatten() {
+            if rail["global"] != true {
+                continue;
+            }
+            let entry = pooled
+                .entry(rail["name"].as_str().unwrap_or_default().to_string())
+                .or_default();
+            entry.decoupled |= rail["decoupled"] == true;
+            entry.bulk |= rail["bulk"] == true;
+            entry.test_point |= rail["test_point"] == true;
+            entry.sources.insert(source.clone());
+        }
+    }
+
+    let mut kept: Vec<Value> = findings
+        .into_iter()
+        .filter(|finding| {
+            finding["global_rail"] != true
+                || !pooled.contains_key(finding["rail"].as_str().unwrap_or_default())
+        })
+        .collect();
+    for (name, rail) in &pooled {
+        let mut push = |severity: &str, issue: String, recommendation: String| {
+            kept.push(json!({
+                "severity": severity,
+                "category": "power",
+                "component": null,
+                "issue": issue,
+                "recommendation": recommendation,
+                "audit": "power_rails",
+                "rail": name,
+                "global_rail": true,
+                "source": rail.sources.iter().next(),
+                "sources": rail.sources,
+            }));
+        };
+        if !rail.decoupled {
+            push(
+                "error",
+                format!("Power rail '{name}' has no decoupling capacitors"),
+                format!("Add at least one 100nF ceramic cap on the '{name}' rail"),
+            );
+        } else if !rail.bulk {
+            push(
+                "warning",
+                format!("Power rail '{name}' has no bulk capacitance (>= 10uF)"),
+                format!(
+                    "Add a 10uF or larger electrolytic/ceramic cap on the '{name}' rail near the power source"
+                ),
+            );
+        }
+        if !rail.test_point {
+            push(
+                "info",
+                format!("Power rail '{name}' has no test point"),
+                format!("Add a test point on '{name}' for debugging"),
+            );
+        }
+    }
+    kept
 }
 
 // ─── Manufacturing audit ─────────────────────────────────────────────────────
@@ -939,6 +1047,7 @@ async fn handle_scoped_schematic_audit(
     let mut diagnostics = traversal.diagnostics;
     let mut sheet_results = Vec::new();
     let mut findings = Vec::new();
+    let mut rail_bodies = Vec::new();
     let mut symbol_instances = 0usize;
 
     for sheet in &traversal.auditable_instances {
@@ -985,6 +1094,9 @@ async fn handle_scoped_schematic_audit(
         decorate_file_audit_result(&mut body, sheet_symbol_instances);
         body["source"] = json!(sheet.path.display().to_string());
         body["sheet_instance_path"] = json!(sheet.instance_path);
+        if matches!(audit, StandaloneSchematicAudit::PowerRails) {
+            rail_bodies.push((sheet.path.display().to_string(), body.clone()));
+        }
         if let Some(sheet_findings) = body.get_mut("findings").and_then(Value::as_array_mut) {
             for finding in sheet_findings {
                 finding["source"] = json!(sheet.path.display().to_string());
@@ -993,6 +1105,9 @@ async fn handle_scoped_schematic_audit(
             }
         }
         sheet_results.push(body);
+    }
+    if matches!(audit, StandaloneSchematicAudit::PowerRails) {
+        findings = pool_global_rail_findings(findings, &rail_bodies);
     }
 
     let status = if sheet_results.is_empty() {
@@ -1095,6 +1210,7 @@ async fn handle_run_design_review(
         AuditAggregate::new("bom_health"),
     ];
 
+    let mut rail_bodies = Vec::new();
     for schematic_path in &traversal.schematic_files {
         let sheet_args = args_for_schematic(args, schematic_path);
 
@@ -1103,10 +1219,15 @@ async fn handle_run_design_review(
         let result = handle_audit_connections_file(&sheet_args, ctx).await;
         audits[1].record(schematic_path, result, &mut diagnostics);
         let result = handle_audit_power_rails_file(&sheet_args, ctx).await;
+        if let Some(body) = result.as_ref().ok().and_then(result_body) {
+            rail_bodies.push((schematic_path.display().to_string(), body));
+        }
         audits[2].record(schematic_path, result, &mut diagnostics);
         let result = handle_check_bom_health_file(&sheet_args, ctx).await;
         audits[3].record(schematic_path, result, &mut diagnostics);
     }
+    audits[2].findings =
+        pool_global_rail_findings(std::mem::take(&mut audits[2].findings), &rail_bodies);
 
     if schematic_coverage.symbol_instances == 0 {
         diagnostics.push(json!({
@@ -1604,6 +1725,9 @@ struct PowerRail {
     /// symbol calls `GND` and a global label calls `RETURN` is still ground,
     /// even though the global label wins the name.
     names: BTreeSet<String>,
+    /// Named by a power symbol or a global label, so one net across every
+    /// sheet of the design rather than this sheet's alone.
+    global: bool,
 }
 
 impl PowerRail {
@@ -1632,11 +1756,15 @@ fn power_rails(graph: &mut NetGraph, labels: &[Label]) -> Vec<PowerRail> {
     // depend on label order: a rail claimed by the `+3V3` symbol lost the `VCC`
     // label read before it.
     let mut rail_roots: BTreeSet<NetRoot> = BTreeSet::new();
-    for label in labels
-        .iter()
-        .filter(|label| label.kind == LabelKind::PowerSymbol || is_power_net_name(&label.net))
-    {
-        rail_roots.insert(graph.root_at(label.x, label.y));
+    let mut global_roots: BTreeSet<NetRoot> = BTreeSet::new();
+    for label in labels {
+        let global = matches!(label.kind, LabelKind::PowerSymbol | LabelKind::GlobalLabel);
+        if global {
+            global_roots.insert(graph.root_at(label.x, label.y));
+        }
+        if label.kind == LabelKind::PowerSymbol || is_power_net_name(&label.net) {
+            rail_roots.insert(graph.root_at(label.x, label.y));
+        }
     }
     let mut rails: Vec<PowerRail> = rail_roots
         .into_iter()
@@ -1649,6 +1777,7 @@ fn power_rails(graph: &mut NetGraph, labels: &[Label]) -> Vec<PowerRail> {
                     .unwrap_or_default(),
                 root,
                 names,
+                global: global_roots.contains(&root),
             }
         })
         .collect();
@@ -1726,6 +1855,17 @@ fn find_design_rule_value(content: &str, rule_name: &str) -> Option<f64> {
     let after = &content[pos + pat.len()..];
     let end = after.find(')')?;
     after[..end].trim().parse().ok()
+}
+
+/// The JSON body of a successful audit result, or `None` for an error or a
+/// body that is not JSON (which `AuditAggregate::record` then reports).
+fn result_body(result: &CallToolResult) -> Option<Value> {
+    match result.content.first() {
+        Some(crate::mcp::protocol::ToolContent::Text { text }) if !result.is_error => {
+            serde_json::from_str(text).ok()
+        }
+        _ => None,
+    }
 }
 
 fn extract_findings(result: &CallToolResult) -> Result<Vec<Value>, String> {
@@ -2378,6 +2518,133 @@ mod review_completion_tests {
             .iter()
             .any(|item| item["code"] == "zero_pads"));
     }
+
+    const LOAD_SHEET: &str = r##"(kicad_sch
+  (version 20250610)
+  (generator "konnect")
+  (generator_version "10.0")
+  (uuid "55555555-5555-4555-8555-555555555555")
+  (paper "A4")
+  (lib_symbols
+    (symbol "power:+3V3"
+      (power)
+      (symbol "+3V3_0_1"
+        (pin power_in line (at 0 0 270) (length 0) (name "+3V3") (number "1"))
+      )
+    )
+    (symbol "MCU:U"
+      (symbol "U_1_1"
+        (pin power_in line (at 0 0 180) (length 2.54) (name "VCC") (number "1"))
+      )
+    )
+  )
+  (symbol
+    (lib_id "MCU:U")
+    (at 50 50 0)
+    (unit 1)
+    (uuid "66666666-6666-4666-8666-666666666661")
+    (property "Reference" "U2" (at 50 50 0))
+    (property "Value" "MCU" (at 50 50 0))
+  )
+  (symbol
+    (lib_id "power:+3V3")
+    (at 50 50 0)
+    (unit 1)
+    (uuid "66666666-6666-4666-8666-666666666662")
+    (property "Reference" "#PWR02" (at 50 50 0))
+    (property "Value" "+3V3" (at 50 50 0))
+  )
+)
+"##;
+
+    /// A root whose Power sheet decouples the global `+3V3` rail and whose Load
+    /// sheet only uses it.
+    fn power_and_load_hierarchy(tmp: &TempDir) -> PathBuf {
+        let root = tmp.path().join("root.kicad_sch");
+        let mut source = root_with_child("power.kicad_sch");
+        let insert_at = source.rfind(')').expect("blank schematic has a root close");
+        source.insert_str(
+            insert_at,
+            &format_hierarchical_sheet(HierarchicalSheetSpec {
+                name: "Load",
+                file: "load.kicad_sch",
+                x: 120.0,
+                y: 20.0,
+                width: 80.0,
+                height: 50.0,
+                project_name: "root",
+                parent_instance_path: "/11111111-1111-4111-8111-111111111111",
+                page: "3",
+            }),
+        );
+        std::fs::write(&root, source).unwrap();
+        std::fs::write(
+            tmp.path().join("power.kicad_sch"),
+            super::net_resolution_tests::WIRED_SHEET,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("load.kicad_sch"), LOAD_SHEET).unwrap();
+        root
+    }
+
+    fn rail_issues(findings: &Value) -> Vec<(String, String)> {
+        findings
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["category"] == "power")
+            .map(|finding| {
+                (
+                    finding["severity"].as_str().unwrap().to_string(),
+                    finding["issue"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Global rails are one net across the design. Audited per sheet, the Load
+    /// sheet's `+3V3` was "undecoupled" although the Power sheet decouples it,
+    /// and its missing test point was reported once per sheet.
+    #[tokio::test]
+    async fn hierarchy_scope_judges_a_global_rail_on_the_whole_design() {
+        let tmp = TempDir::new().unwrap();
+        let root = power_and_load_hierarchy(&tmp);
+
+        let audit = tool_json(
+            handle_audit_power_rails(
+                &json!({ "schematic": root.display().to_string(), "schematic_scope": "hierarchy" }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        );
+        let expected = vec![
+            (
+                "warning".to_string(),
+                "Power rail 'VBUS' has no bulk capacitance (>= 10uF)".to_string(),
+            ),
+            (
+                "info".to_string(),
+                "Power rail '+3V3' has no test point".to_string(),
+            ),
+        ];
+        assert_eq!(rail_issues(&audit["findings"]), expected, "{audit}");
+        let pooled = audit["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|finding| finding["rail"] == "+3V3")
+            .unwrap();
+        assert_eq!(pooled["sources"].as_array().unwrap().len(), 2, "{pooled}");
+
+        // The review's default severity filter (warning) leaves the info out.
+        let report = review(&root, None).await;
+        assert_eq!(
+            rail_issues(&report["design_review"]["findings"]),
+            expected[..1],
+            "{report}"
+        );
+    }
 }
 
 /// The audits used to resolve a pin's net by scanning the file for a label
@@ -2413,7 +2680,7 @@ mod net_resolution_tests {
     ///
     /// Nothing here is near enough to a label for the old scan: C1's pin is
     /// 11.8 mm from the `VBUS` label, and `+3V3` has no label at all.
-    const WIRED_SHEET: &str = r##"(kicad_sch
+    pub(super) const WIRED_SHEET: &str = r##"(kicad_sch
   (version 20250610)
   (generator "konnect")
   (generator_version "10.0")
