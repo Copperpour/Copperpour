@@ -895,6 +895,18 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "already_connected",
         "existing_reference",
         "not_joined_reason",
+        // Nested `set_teardrop_settings` target selectors and settings, not
+        // callable tools (#555).
+        "all_pads",
+        "all_vias",
+        "curved_edges",
+        "allow_multiple_track_segments",
+        "prefer_zone_connection",
+        "max_length_mm",
+        "max_width_mm",
+        "best_length_ratio",
+        "best_width_ratio",
+        "max_track_width_ratio",
     ];
 
     let mut phantom = Vec::new();
