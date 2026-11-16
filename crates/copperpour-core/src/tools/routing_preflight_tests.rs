@@ -300,6 +300,15 @@ async fn routing_preflight_valid_routes_still_create_requested_copper() {
             } else {
                 let track = kiapi::board::types::Track::decode(item.value.as_slice()).unwrap();
                 assert_eq!(track.layer, kiapi::board::types::BoardLayer::BlIn4Cu as i32);
+                // Public defaults, in KiCad's nanometres, independent of the builder.
+                assert_eq!(
+                    track.width.unwrap().value_nm,
+                    if tool == "route_differential_pair" {
+                        100_000
+                    } else {
+                        250_000
+                    }
+                );
                 nets.push(track.net.unwrap().name);
             }
         }
@@ -508,5 +517,131 @@ async fn net_reader_apply_copper_requires_response_before_planning_or_creation()
             "tracks":[{"start":{"x":10.0,"y":10.0},"end":{"x":20.0,"y":10.0},"width":0.25,"layer":"B.Cu","net":"VCC"}],
             "dry_run":dry_run,"expected_plan_revision":"unobserved"
         })).await;
+    }
+}
+
+#[tokio::test]
+async fn routing_dimensions_are_refused_before_ipc_even_without_dispatch() {
+    // An unusable address proves argument refusal happens before any IPC request.
+    let ctx = Arc::new(ToolContext::new(
+        crate::tools::ServerConfig::default(),
+        Arc::new(crate::router::ToolRouter::new()),
+    ));
+    for (name, field) in [
+        ("route_trace", "width"),
+        ("route_pad_to_pad", "width"),
+        ("modify_trace", "width"),
+        ("route_differential_pair", "width"),
+        ("route_differential_pair", "gap"),
+    ] {
+        let tool = tools().into_iter().find(|tool| tool.name == name).unwrap();
+        for value in [
+            json!(-0.2),
+            json!(0),
+            json!(0.0000001),
+            json!("bad"),
+            json!(false),
+            json!([]),
+            json!({}),
+        ] {
+            let mut args = json!({"board":"/not-open.kicad_pcb", "net_name":"VCC", "layer":"F.Cu", "x1":10,"y1":10,"x2":20,"y2":10,
+                "uuid":"track", "ref1":"R1", "pad1":"1", "ref2":"R2", "pad2":"2", "net_pos":"VCC", "net_neg":"GND"});
+            args[field] = value.clone();
+            let result = (tool.handler)(&args, ctx.clone()).await.unwrap();
+            assert!(result.is_error, "{name}.{field}={value}: {result:?}");
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text")
+            };
+            let body: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                body["error"]["kind"], "invalid_argument",
+                "{name}.{field}={value}: {body}"
+            );
+            assert_eq!(
+                body["error"]["field"], field,
+                "{name}.{field}={value}: {body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn routing_dimensions_served_refusals_preserve_copper() {
+    for (tool, field) in [
+        ("route_trace", "width"),
+        ("route_pad_to_pad", "width"),
+        ("modify_trace", "width"),
+        ("route_differential_pair", "width"),
+        ("route_differential_pair", "gap"),
+    ] {
+        for value in [json!(-0.2), json!(0), json!(0.0000001), json!("bad")] {
+            let mut changes = json!({field:value});
+            if tool == "modify_trace" {
+                changes["uuid"] = json!("track");
+            }
+            refused(tool, changes, field, field).await;
+        }
+    }
+}
+
+#[test]
+fn routing_dimensions_schema_and_rounding_boundaries() {
+    for name in [
+        "route_trace",
+        "route_pad_to_pad",
+        "modify_trace",
+        "route_differential_pair",
+    ] {
+        let tool = tools().into_iter().find(|tool| tool.name == name).unwrap();
+        assert_eq!(
+            tool.input_schema["properties"]["width"]["exclusiveMinimum"], 0,
+            "{name}"
+        );
+        if name == "route_differential_pair" {
+            assert_eq!(
+                tool.input_schema["properties"]["gap"]["exclusiveMinimum"],
+                0
+            );
+        }
+    }
+    assert_eq!(routing_dimension(&json!({}), "width", 0.25).unwrap(), 0.25);
+    assert_eq!(routing_dimension(&json!({}), "gap", 0.1).unwrap(), 0.1);
+    // Exactly half a nanometre rounds up; slightly less must be refused.
+    assert_eq!(
+        routing_dimension(&json!({"width":0.0000005}), "width", 0.25).unwrap(),
+        0.0000005
+    );
+    assert!(routing_dimension(&json!({"width":0.00000049}), "width", 0.25).is_err());
+}
+
+#[tokio::test]
+async fn routing_dimensions_explicit_positive_values_reach_copper() {
+    for tool in ["route_trace", "route_pad_to_pad", "route_differential_pair"] {
+        let scene = Scene::new().await;
+        let changes = if tool == "route_differential_pair" {
+            json!({"width":0.3,"gap":0.2})
+        } else {
+            json!({"width":0.3})
+        };
+        let body = scene.call(tool, changes).await;
+        assert!(body.get("error").is_none(), "{tool}: {body}");
+        let store = scene.store.lock().unwrap();
+        let tracks: Vec<_> = store.items[2..]
+            .iter()
+            .map(|item| kiapi::board::types::Track::decode(item.value.as_slice()).unwrap())
+            .collect();
+        assert!(!tracks.is_empty(), "{tool}");
+        for track in &tracks {
+            assert_eq!(track.width.as_ref().unwrap().value_nm, 300_000, "{tool}");
+        }
+        if tool == "route_differential_pair" {
+            assert_eq!(tracks.len(), 2);
+            // Horizontal pair: centre spacing = 0.3 mm width + 0.2 mm gap.
+            assert_eq!(
+                (tracks[0].start.as_ref().unwrap().y_nm - tracks[1].start.as_ref().unwrap().y_nm)
+                    .abs(),
+                500_000
+            );
+        }
     }
 }
