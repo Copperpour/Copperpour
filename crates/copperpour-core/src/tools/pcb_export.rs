@@ -659,32 +659,45 @@ fn footprint_has_attr(fp: &copperpour_sexp::SexpNode, flag: &str) -> bool {
 
 fn resolve_3d_model_path(model_path: &str, board_dir: Option<&Path>) -> Option<PathBuf> {
     if model_path.starts_with("${") {
-        return super::library::expand_lib_uri(model_path, board_dir);
+        return super::library::expand_lib_uri(model_path, board_dir).filter(|p| p.is_file());
     }
     let p = Path::new(model_path);
     if p.is_relative() {
         let resolved = board_dir?.join(p);
-        return resolved.exists().then_some(resolved);
+        return resolved.is_file().then_some(resolved);
     }
-    p.exists().then(|| p.to_path_buf())
+    p.is_file().then(|| p.to_path_buf())
 }
 
 async fn handle_check_3d_models(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board = get_path(args, "board")?;
-    let include_dnp = args
-        .get("include_dnp")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let include_board_only = args
-        .get("include_board_only")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let board_str = match crate::tools::require_str(args, "board") {
+        Ok(s) => s,
+        Err(e) => return Ok(e),
+    };
+    if board_str.trim().is_empty() {
+        return Ok(crate::tools::invalid_arg("board", "must not be empty"));
+    }
+    let board = PathBuf::from(board_str);
+    let include_dnp = match crate::tools::opt_bool_flag(args, "include_dnp") {
+        Ok(v) => v.unwrap_or(false),
+        Err(e) => return Ok(e),
+    };
+    let include_board_only = match crate::tools::opt_bool_flag(args, "include_board_only") {
+        Ok(v) => v.unwrap_or(false),
+        Err(e) => return Ok(e),
+    };
 
     let content = tokio::fs::read_to_string(&board).await?;
     let root = copperpour_sexp::parse_sexp(&content)?;
+    if root.head() != Some("kicad_pcb") {
+        return Ok(crate::tools::invalid_arg(
+            "board",
+            "file root is not 'kicad_pcb'",
+        ));
+    }
     let board_dir = board.parent();
 
     let footprints = root.find_all("footprint");
@@ -2634,6 +2647,20 @@ mod specctra_padstack_served_tests {
             parsed["broken_models"][0]["model_path"],
             "${KIPRJMOD}/3dmodels/does_not_exist.step"
         );
+
+        // Non-boolean flag, non-file model target (directory), and non-kicad_pcb root are refused/flagged.
+        let bad_flag =
+            handle_check_3d_models(&json!({ "board": board, "include_dnp": "yes" }), &ctx)
+                .await
+                .unwrap();
+        assert!(bad_flag.is_error);
+
+        let sch = dir.path().join("not_a_board.kicad_sch");
+        std::fs::write(&sch, "(kicad_sch (version 20240108))").unwrap();
+        let wrong_root = handle_check_3d_models(&json!({ "board": sch }), &ctx)
+            .await
+            .unwrap();
+        assert!(wrong_root.is_error);
     }
 }
 

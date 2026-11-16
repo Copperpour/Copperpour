@@ -5521,6 +5521,7 @@ fn collect_3d_models_in_dir(
         };
         let mut entries: Vec<_> = rd.filter_map(Result::ok).collect();
         entries.sort_by_key(|e| e.file_name());
+        let mut subdirs = Vec::new();
         for entry in entries {
             let Ok(ft) = entry.file_type() else {
                 continue;
@@ -5531,7 +5532,7 @@ fn collect_3d_models_in_dir(
             let path = entry.path();
             if ft.is_dir() {
                 if depth < MAX_3D_MODEL_WALK_DEPTH {
-                    stack.push((path, depth + 1));
+                    subdirs.push((path, depth + 1));
                 }
                 continue;
             }
@@ -5568,6 +5569,9 @@ fn collect_3d_models_in_dir(
                 return;
             }
         }
+        for sub in subdirs.into_iter().rev() {
+            stack.push(sub);
+        }
     }
 }
 
@@ -5580,22 +5584,32 @@ async fn handle_search_3d_models(
         Err(e) => return Ok(e),
     };
     let query_lower = raw_query.to_ascii_lowercase();
-    let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("all");
-    if !matches!(scope, "all" | "kicad" | "project") {
-        return Ok(super::invalid_arg(
-            "scope",
-            "must be one of 'all', 'kicad', or 'project'",
-        ));
-    }
+    let scope = match args.get("scope") {
+        None | Some(serde_json::Value::Null) => "all",
+        Some(serde_json::Value::String(s)) if matches!(s.as_str(), "all" | "kicad" | "project") => {
+            s.as_str()
+        }
+        Some(_) => {
+            return Ok(super::invalid_arg(
+                "scope",
+                "must be one of 'all', 'kicad', or 'project'",
+            ));
+        }
+    };
     let limit = match super::response_limit(args, 50) {
         Ok(limit) => limit,
         Err(error) => return Ok(error),
     };
-    let project_dir = args
-        .get("project_dir")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from)
-        .or_else(|| ctx.config.project_dir.clone());
+    let project_dir = match args.get("project_dir") {
+        None | Some(serde_json::Value::Null) => ctx.config.project_dir.clone(),
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Some(PathBuf::from(s)),
+        Some(_) => {
+            return Ok(super::invalid_arg(
+                "project_dir",
+                "must be a non-empty path string",
+            ));
+        }
+    };
 
     if scope == "project" && project_dir.is_none() {
         return Ok(super::invalid_arg(
@@ -11983,5 +11997,13 @@ mod required_argument_tests {
         .await;
         assert!(bad_scope.is_error);
         assert_eq!(error_field(&bad_scope), "scope");
+
+        let bad_proj_type = call(
+            "search_3d_models",
+            json!({ "query": "R", "project_dir": 123 }),
+        )
+        .await;
+        assert!(bad_proj_type.is_error);
+        assert_eq!(error_field(&bad_proj_type), "project_dir");
     }
 }
