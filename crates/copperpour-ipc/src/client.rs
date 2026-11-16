@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
+mod footprint_edit;
 mod text_edit;
 pub use text_edit::TextTargetError;
 
@@ -4574,51 +4575,6 @@ impl KiCadIpcClient {
                 })
             })
             .collect()
-    }
-
-    /// Update the visible value field of an existing footprint.
-    pub fn set_footprint_value(&self, reference: &str, value: &str) -> Result<()> {
-        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
-        for item in items {
-            if let Ok(mut footprint) =
-                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
-            {
-                let current_reference = footprint
-                    .reference_field
-                    .as_ref()
-                    .and_then(|field| field.text.as_ref())
-                    .and_then(|board_text| board_text.text.as_ref())
-                    .map(|text| text.text.as_str())
-                    .unwrap_or("");
-                if current_reference != reference {
-                    continue;
-                }
-                if let Some(text) = footprint
-                    .value_field
-                    .as_mut()
-                    .and_then(|field| field.text.as_mut())
-                    .and_then(|board_text| board_text.text.as_mut())
-                {
-                    text.text = value.to_string();
-                } else {
-                    anyhow::bail!("Footprint '{reference}' has no editable value field");
-                }
-                if let Some(text) = footprint
-                    .definition
-                    .as_mut()
-                    .and_then(|definition| definition.value_field.as_mut())
-                    .and_then(|field| field.text.as_mut())
-                    .and_then(|board_text| board_text.text.as_mut())
-                {
-                    text.text = value.to_string();
-                }
-                let any =
-                    crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
-                self.update_items(vec![any])?;
-                return Ok(());
-            }
-        }
-        anyhow::bail!("Footprint '{reference}' not found")
     }
 
     /// Delete a footprint by reference.

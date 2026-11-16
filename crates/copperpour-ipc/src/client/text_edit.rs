@@ -359,7 +359,7 @@ fn footprint_reference(footprint: &board::FootprintInstance) -> String {
         .unwrap_or_default()
 }
 
-fn footprint_kiid(footprint: &board::FootprintInstance) -> String {
+pub(super) fn footprint_kiid(footprint: &board::FootprintInstance) -> String {
     footprint
         .id
         .as_ref()
@@ -502,7 +502,7 @@ fn field_mismatches(expected: &IpcFootprintField, observed: &IpcFootprintField) 
 
 /// Every difference between two states of the same footprint that this
 /// module's edits could plausibly touch: its pose and all mandatory fields.
-fn footprint_mismatches(
+pub(super) fn footprint_mismatches(
     expected: &board::FootprintInstance,
     observed: &board::FootprintInstance,
 ) -> Vec<String> {
@@ -587,7 +587,7 @@ fn board_text_mismatches(expected: &IpcBoardTextItem, observed: &IpcBoardTextIte
 }
 
 /// What a mutation followed by a fresh read established.
-enum Settled {
+pub(super) enum Settled {
     Applied,
     /// KiCad refused and the read proved nothing changed.
     Refused(anyhow::Error),
@@ -602,7 +602,7 @@ enum Settled {
 /// `to_expected` lists differences from the requested state, `to_before`
 /// differences from the state before the edit; `None` means the readback
 /// itself failed with the given message.
-fn settle(
+pub(super) fn settle(
     mutation: Result<()>,
     readback: std::result::Result<(Vec<String>, Vec<String>), String>,
 ) -> Settled {
@@ -723,7 +723,7 @@ impl KiCadIpcClient {
             .collect()
     }
 
-    fn footprint_by_kiid_in(
+    pub(super) fn footprint_by_kiid_in(
         &self,
         document: common::DocumentSpecifier,
         kiid: &str,
