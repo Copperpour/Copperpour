@@ -205,6 +205,14 @@ pub fn tools() -> Vec<ToolDef> {
              run a conflict whose diagnostics name the footprint and every part that needs it. \
              So does an update of a footprint that owns groups, points or variants, which \
              KiCad's API would drop. \
+             A footprint the schematic names differently is replaced in place, as KiCad's \
+             Update PCB replaces it (`replace_footprint` in the change): it keeps its \
+             position, rotation, side, nets and pin functions, and takes the new library \
+             footprint's pads, artwork, texts, properties and 3D models before the \
+             schematic's fields and value are set; a locked footprint keeps its footprint, \
+             with a `footprint_locked_not_replaced` note that refuses nothing. A replacement \
+             footprint that cannot be read or rebuilt, or that lacks a connected pad or would \
+             drop a pad that carries a net, makes the dry run a conflict. \
              Added footprints are staged beside the board as KiCad measured it; `staging` \
              names the item classes KiCad would not list, so a partial or unmeasured board \
              is never reported as complete or empty. `changes` lists the first `limit` \

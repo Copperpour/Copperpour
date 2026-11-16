@@ -254,7 +254,18 @@ enum PlannedChange {
         /// The footprint differs from its symbol in its sheet alone (#237).
         #[serde(skip)]
         sheet_only: bool,
+        /// The schematic names another footprint: the placed one is rebuilt
+        /// from it in place (`pcb_footprint_update::replace_footprint`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        replace_footprint: Option<ReplacedFootprint>,
     },
+}
+
+/// The footprint a planned update replaces, and the one it replaces it with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ReplacedFootprint {
+    from: String,
+    to: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -494,6 +505,23 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 .map(UnpreparedFootprint::into_diagnostic)
                 .collect::<Vec<_>>();
             preflight.extend(additions_missing_pads(&plan, &prepared));
+            // Each replacement's new footprint is read and checked the same
+            // way, so `ready` means the apply can build it.
+            let replacing = plan.changes.iter().any(|change| {
+                matches!(change, PlannedChange::Update { replace_footprint: Some(_), .. })
+            });
+            let (replacements, copper_layers) = if replacing {
+                let kicad = client.get_kicad_version()?;
+                let (replacements, refused) =
+                    prepare_replacements(&library_board, &plan, &snapshot.state, &kicad);
+                preflight.extend(refused);
+                let copper = client
+                    .get_enabled_layers_in(snapshot.document.clone())?
+                    .copper_layer_count;
+                (replacements, copper)
+            } else {
+                (BTreeMap::new(), 0)
+            };
             let mut left_out = Vec::new();
             if plan
                 .changes
@@ -560,8 +588,14 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 return Ok(sync_response(&plan, "noop", hierarchy.len(), false, &options));
             }
 
-            let (creates, updates) =
-                build_mutation_items(&plan, &prepared, &snapshot, carry_pad_properties)?;
+            let (creates, updates) = build_mutation_items(
+                &plan,
+                &prepared,
+                &replacements,
+                copper_layers,
+                &snapshot,
+                carry_pad_properties,
+            )?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
             client.run_commit_recovering_in(snapshot.document.clone(), "Update PCB from saved schematic", |client| {
@@ -791,6 +825,9 @@ fn conflict_result(message: String) -> CallToolResult {
 
 fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) -> SyncPlan {
     let mut diagnostics = Vec::new();
+    // Reported beside the plan without refusing it, as KiCad's Update PCB
+    // reports a warning.
+    let mut notes = Vec::new();
     let mut counts = SyncCounts::default();
     let mut changes = Vec::new();
     let mut board_by_path = HashMap::new();
@@ -1039,22 +1076,38 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 continue;
             }
         }
-        if footprint.footprint_id != component.footprint_id {
-            diagnostics.push(conflict(
-                "footprint_id_changed",
+        // A different footprint in the schematic is replaced, as KiCad's
+        // Update PCB replaces it (`BOARD_NETLIST_UPDATER::replaceFootprint`).
+        // Whether the new footprint can be built, and has every pad the
+        // schematic connects, is checked against its library in the
+        // handler's preflight (`prepare_replacements`). KiCad leaves a locked
+        // footprint as it is, with a warning, and still updates the rest of
+        // it; so does this.
+        let replace_footprint = if footprint.footprint_id == component.footprint_id {
+            None
+        } else if footprint.locked {
+            notes.push(conflict(
+                "footprint_locked_not_replaced",
                 format!(
-                    "{} uses {} on the board but {} in the schematic",
+                    "{} is locked, so it keeps {} though the schematic names {}; unlock it and \
+                     sync again to replace it",
                     component.reference, footprint.footprint_id, component.footprint_id
                 ),
                 Some(&component.reference),
             ));
-            continue;
-        }
+            None
+        } else {
+            Some(ReplacedFootprint {
+                from: footprint.footprint_id.clone(),
+                to: component.footprint_id.clone(),
+            })
+        };
         // A pad the schematic connects and the live footprint lacks used to
         // reach `apply_footprint_fields` and fail the apply, after a dry run
-        // that said `ready` (#657).
+        // that said `ready` (#657). A replacement is checked against its new
+        // footprint instead.
         let missing = missing_pads(&component.pad_nets, &footprint.pad_numbers);
-        if !missing.is_empty() {
+        if replace_footprint.is_none() && !missing.is_empty() {
             diagnostics.push(pad_missing_conflict(
                 &component.reference,
                 &footprint.footprint_id,
@@ -1098,14 +1151,20 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         }
 
         // KiCad's Update PCB updates a footprint whose fields differ from the
-        // symbol's and leaves fields the symbol lacks in place (#788).
+        // symbol's and leaves fields the symbol lacks in place (#788). A
+        // replacement takes the new footprint's fields, so it gets every one
+        // of the symbol's again.
         let changed_fields = component
             .fields
             .iter()
-            .filter(|field| footprint.fields.get(&field.name) != Some(&field.value))
+            .filter(|field| {
+                replace_footprint.is_some()
+                    || footprint.fields.get(&field.name) != Some(&field.value)
+            })
             .cloned()
             .collect::<Vec<_>>();
-        let differs_beyond_sheet = footprint.reference != component.reference
+        let differs_beyond_sheet = replace_footprint.is_some()
+            || footprint.reference != component.reference
             || footprint.value != component.value
             || footprint.symbol_path.as_deref() != Some(component.symbol_path.as_str())
             || footprint.dnp != component.dnp
@@ -1130,6 +1189,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 fields: changed_fields,
                 sheet: component.sheet.clone(),
                 sheet_only: !differs_beyond_sheet,
+                replace_footprint,
             });
             counts.updated.planned += 1;
             counts.pads_reassigned.planned += changed_pads;
@@ -1151,6 +1211,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
     } else {
         PlanStatus::Ready
     };
+    diagnostics.extend(notes);
     let plan_revision = plan_revision(netlist_source, board);
     SyncPlan {
         status,
@@ -2931,6 +2992,125 @@ fn prepare_additions(
     (prepared, unprepared.into_values().collect())
 }
 
+/// Read and check every footprint a planned replacement rebuilds from, so
+/// `ready` means the apply can build each one. A replacement is refused when
+/// its new footprint does not resolve, cannot be read, or cannot be rebuilt
+/// losslessly (the codes `prepare_footprint` uses), when it needs fields this
+/// KiCad's API does not carry, when it lacks a pad the schematic connects, or
+/// when it would drop a pad that carries a net on the board now.
+fn prepare_replacements(
+    board_path: &Path,
+    plan: &SyncPlan,
+    board: &BoardState,
+    kicad: &copperpour_ipc::IpcKiCadVersion,
+) -> (
+    BTreeMap<String, super::pcb_footprint_update::ReplacementFootprint>,
+    Vec<SyncDiagnostic>,
+) {
+    let mut prepared = BTreeMap::new();
+    let mut unusable = BTreeMap::<String, (&'static str, String)>::new();
+    let mut diagnostics = Vec::new();
+    for change in &plan.changes {
+        let PlannedChange::Update {
+            kiid,
+            reference,
+            pad_nets,
+            replace_footprint: Some(replace),
+            ..
+        } = change
+        else {
+            continue;
+        };
+        if !prepared.contains_key(&replace.to) && !unusable.contains_key(&replace.to) {
+            match read_replacement(&replace.to, board_path, kicad) {
+                Ok(footprint) => {
+                    prepared.insert(replace.to.clone(), footprint);
+                }
+                Err(refusal) => {
+                    unusable.insert(replace.to.clone(), refusal);
+                }
+            }
+        }
+        if let Some((code, reason)) = unusable.get(&replace.to) {
+            diagnostics.push(footprint_conflict(
+                code,
+                format!("{reference} cannot be replaced by {}: {reason}", replace.to),
+                &replace.to,
+                vec![reference.clone()],
+            ));
+            continue;
+        }
+        let available = prepared[&replace.to].pad_numbers();
+        let missing = missing_pads(pad_nets, &available);
+        if !missing.is_empty() {
+            diagnostics.push(pad_missing_conflict(reference, &replace.to, &missing));
+            continue;
+        }
+        let dropped = board
+            .footprints
+            .iter()
+            .find(|footprint| &footprint.kiid == kiid)
+            .map(|footprint| {
+                footprint
+                    .pad_nets
+                    .iter()
+                    .filter(|(number, net)| !net.is_empty() && !available.contains(*number))
+                    .map(|(number, _)| number.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !dropped.is_empty() {
+            diagnostics.push(footprint_conflict(
+                "footprint_replacement_drops_connected_pad",
+                format!(
+                    "replacing {reference}'s {} by {} would drop pad(s) {} that carry a net \
+                     on the board",
+                    replace.from,
+                    replace.to,
+                    dropped.join(", ")
+                ),
+                &replace.to,
+                vec![reference.clone()],
+            ));
+        }
+    }
+    (prepared, diagnostics)
+}
+
+/// One replacement footprint, read as [`prepare_footprint`] reads one, or
+/// the code and reason it is refused for.
+fn read_replacement(
+    footprint_id: &str,
+    board_path: &Path,
+    kicad: &copperpour_ipc::IpcKiCadVersion,
+) -> std::result::Result<super::pcb_footprint_update::ReplacementFootprint, (&'static str, String)>
+{
+    let path = super::pcb_components::resolve_footprint_file(footprint_id, board_path)
+        .map_err(|error| ("footprint_library_resolution_failed", format!("{error:#}")))?;
+    let source = std::fs::read_to_string(&path).map_err(|error| {
+        (
+            "footprint_library_read_failed",
+            format!("failed to read {}: {error}", path.display()),
+        )
+    })?;
+    let footprint = super::pcb_footprint_update::ReplacementFootprint::parse(footprint_id, &source)
+        .map_err(|error| ("unsupported_library_footprint", format!("{error:#}")))?;
+    // An older KiCad would drop these on apply, as the refresh refuses it.
+    if let Some(what) = footprint
+        .needs_kicad_10_0_7()
+        .filter(|_| !super::library_footprint::carries_kicad_10_0_7_fields(kicad))
+    {
+        return Err((
+            "unsupported_library_footprint",
+            format!(
+                "it has {what}, which KiCad's API carries only from KiCad 10.0.7; this KiCad is {}",
+                kicad.full_version
+            ),
+        ));
+    }
+    Ok(footprint)
+}
+
 /// Additions whose schematic connects a pad the prepared library footprint
 /// does not have. The update path is checked in `plan_sync`, which holds the
 /// live footprint's pads; this is the same rule against the library's.
@@ -3318,6 +3498,8 @@ fn apply_pad_properties(
 fn build_mutation_items(
     plan: &SyncPlan,
     prepared: &BTreeMap<String, PreparedFootprint>,
+    replacements: &BTreeMap<String, super::pcb_footprint_update::ReplacementFootprint>,
+    copper_layers: u32,
     snapshot: &LiveSnapshot,
     carry_pad_properties: bool,
 ) -> Result<(Vec<prost_types::Any>, Vec<prost_types::Any>)> {
@@ -3336,11 +3518,39 @@ fn build_mutation_items(
                     carry_pad_properties,
                 )?);
             }
-            PlannedChange::Update { kiid, .. } => {
+            PlannedChange::Update {
+                kiid,
+                replace_footprint,
+                ..
+            } => {
                 let item = snapshot
                     .items
                     .get(kiid)
                     .with_context(|| format!("planned footprint {kiid} disappeared"))?;
+                let replaced;
+                let item = match replace_footprint {
+                    Some(replace) => {
+                        let library = replacements.get(&replace.to).with_context(|| {
+                            format!("no prepared footprint {} for the replacement", replace.to)
+                        })?;
+                        let current =
+                            copperpour_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+                                item.value.as_slice(),
+                            )
+                            .context("KiCad returned an invalid footprint item")?;
+                        replaced = copperpour_ipc::builders::pack_any(
+                            &super::pcb_footprint_update::replace_footprint(
+                                &current,
+                                library,
+                                copper_layers,
+                                &snapshot.net_codes,
+                            )?,
+                            "kiapi.board.types.FootprintInstance",
+                        );
+                        &replaced
+                    }
+                    None => item,
+                };
                 updates.push(update_footprint_item(item, change, &snapshot.net_codes)?);
             }
         }
@@ -4455,6 +4665,7 @@ mod tests {
             fields: Vec::new(),
             sheet: SymbolSheet::default(),
             sheet_only: false,
+            replace_footprint: None,
         };
         let updated =
             update_footprint_item(&item, &change, &BTreeMap::from([("GND".to_string(), 1)]))
@@ -4792,6 +5003,7 @@ mod tests {
             fields: Vec::new(),
             sheet: SymbolSheet::default(),
             sheet_only: false,
+            replace_footprint: None,
         };
 
         let updated =
@@ -4954,6 +5166,7 @@ mod tests {
             fields,
             sheet: board.sheet.clone(),
             sheet_only: false,
+            replace_footprint: None,
         };
         let item = copperpour_ipc::builders::pack_any(live, "kiapi.board.types.FootprintInstance");
         let updated = update_footprint_item(&item, &change, &BTreeMap::new()).unwrap();
@@ -5171,8 +5384,12 @@ mod tests {
         assert_eq!(plan.counts.conflicts.planned, 0);
     }
 
+    /// A footprint the schematic names differently is replaced, as KiCad's
+    /// Update PCB replaces it; a locked one keeps its footprint, with a note
+    /// that refuses nothing, as KiCad warns. The new footprint's pads are
+    /// checked in the handler's preflight, not here.
     #[test]
-    fn footprint_swap_conflicts_but_an_unrouted_net_change_is_planned() {
+    fn a_changed_footprint_is_replaced_unless_locked_and_an_unrouted_net_change_is_planned() {
         let design = ExportedDesign {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
@@ -5180,12 +5397,39 @@ mod tests {
         };
         let mut footprint = board_resistor("R1", Some("/sheet/existing"));
         footprint.footprint_id = "Resistor_SMD:R_0805_2012Metric".to_string();
-        let swap = plan_sync("netlist", &design, &board_with(vec![footprint]));
-        assert_eq!(swap.status, PlanStatus::Conflict);
-        assert!(swap
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "footprint_id_changed"));
+        let to = design.components[0].footprint_id.clone();
+        let swap = plan_sync("netlist", &design, &board_with(vec![footprint.clone()]));
+        assert_eq!(swap.status, PlanStatus::Ready, "{:?}", swap.diagnostics);
+        assert_eq!(swap.counts.updated.planned, 1);
+        let PlannedChange::Update {
+            replace_footprint,
+            fields,
+            ..
+        } = &swap.changes[0]
+        else {
+            panic!("a replacement is an update");
+        };
+        assert_eq!(
+            replace_footprint,
+            &Some(ReplacedFootprint {
+                from: "Resistor_SMD:R_0805_2012Metric".to_string(),
+                to: to.clone(),
+            })
+        );
+        // The new footprint's fields replace the old ones, so the symbol's
+        // are all set again.
+        assert_eq!(fields, &design.components[0].fields);
+        assert_eq!(
+            serde_json::to_value(&swap.changes[0]).unwrap()["replace_footprint"]["to"],
+            to.as_str()
+        );
+
+        footprint.locked = true;
+        let locked = plan_sync("netlist", &design, &board_with(vec![footprint]));
+        assert_eq!(locked.status, PlanStatus::Noop, "{:?}", locked.diagnostics);
+        assert_eq!(locked.counts.conflicts.planned, 0);
+        assert_eq!(locked.diagnostics.len(), 1);
+        assert_eq!(locked.diagnostics[0].code, "footprint_locked_not_replaced");
 
         let mut footprint = board_resistor("R1", Some("/sheet/existing"));
         footprint
@@ -6724,6 +6968,20 @@ mod tests {
                             "kiapi.board.commands.NetsResponse",
                         ));
                     }
+                    if command.type_url.ends_with("GetBoardEnabledLayers") {
+                        // A two-layer board, as `specctra_two_resistors` is.
+                        return Some(copperpour_ipc::builders::pack_any(
+                            &kiapi::board::commands::BoardEnabledLayersResponse {
+                                copper_layer_count: 2,
+                                layers: vec![
+                                    kiapi::board::types::BoardLayer::BlFCu as i32,
+                                    kiapi::board::types::BoardLayer::BlBCu as i32,
+                                    kiapi::board::types::BoardLayer::BlEdgeCuts as i32,
+                                ],
+                            },
+                            "kiapi.board.commands.BoardEnabledLayersResponse",
+                        ));
+                    }
                     if command.type_url.ends_with("GetBoundingBox") {
                         return Some(crate::tools::pcb_board::board_mock::kicad_bounding_boxes(
                             command,
@@ -7720,6 +7978,370 @@ mod tests {
             ),
             "{}",
             messages[1]
+        );
+    }
+
+    /// The schematic's R1 on `footprint_id`, on the captured R1's nets.
+    fn r1_on(footprint_id: &str) -> String {
+        ONE_RESISTOR
+            .replace("Resistor_SMD:R_0603_1608Metric", footprint_id)
+            .replace("/Power/VCC", "VCC")
+    }
+
+    /// KiCad's own R1 (`Resistor_SMD:R_0402`, linked to the `/Power/`
+    /// symbol), its pads given the schematic pins Update PCB writes, a custom
+    /// property its old library gave it, and the symbol's `MPN` field.
+    fn r1_with_pins_and_an_old_property(
+    ) -> copperpour_ipc::gen::kiapi::board::types::FootprintInstance {
+        use copperpour_ipc::gen::kiapi;
+        let mut footprint = kiapi::board::types::FootprintInstance::decode(
+            schematic_backed_resistor().value.as_slice(),
+        )
+        .unwrap();
+        let definition = footprint.definition.as_mut().unwrap();
+        for item in &mut definition.items {
+            if item.type_url.ends_with("kiapi.board.types.Pad") {
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                pad.symbol_pin = Some(kiapi::board::types::SymbolPinInfo {
+                    name: format!("P{}", pad.number),
+                    r#type: kiapi::common::types::ElectricalPinType::EptPassive as i32,
+                    no_connect: false,
+                });
+                item.value = pad.encode_to_vec();
+            }
+        }
+        for (name, value) in [("Old_Library_Generator", "old"), ("MPN", "RC0402")] {
+            let mut property = footprint.value_field.clone().unwrap();
+            property.id = None;
+            property.name = name.to_string();
+            if let Some(text) = property.text.as_mut() {
+                text.id = None;
+                if let Some(text) = text.text.as_mut() {
+                    text.text = value.to_string();
+                }
+            }
+            definition.items.push(copperpour_ipc::builders::pack_any(
+                &property,
+                "kiapi.board.types.Field",
+            ));
+        }
+        footprint
+    }
+
+    /// `footprint`'s custom property names.
+    fn custom_property_names(
+        footprint: &copperpour_ipc::gen::kiapi::board::types::FootprintInstance,
+    ) -> Vec<String> {
+        footprint
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| item.type_url.ends_with("kiapi.board.types.Field"))
+            .map(|item| {
+                copperpour_ipc::gen::kiapi::board::types::Field::decode(item.value.as_slice())
+                    .unwrap()
+                    .name
+            })
+            .collect()
+    }
+
+    /// The schematic names the stock 0603 for R1, which the board has as
+    /// KiCad's R_0402. As KiCad's Update PCB does, the sync replaces it in
+    /// place: same KIID, position, rotation and side, each pad's net and
+    /// schematic pin by number, the new footprint's custom properties instead
+    /// of the old library's, and the schematic's value. The next dry run has
+    /// nothing to do.
+    #[tokio::test]
+    async fn a_footprint_the_schematic_names_differently_is_replaced_in_place() {
+        use copperpour_ipc::gen::kiapi::board::types::FootprintInstance;
+        let before = r1_with_pins_and_an_old_property();
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![copperpour_ipc::builders::pack_any(
+                &before,
+                "kiapi.board.types.FootprintInstance",
+            )],
+            zones: Vec::new(),
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+        // The symbol's MPN is the board's already; the replacement drops the
+        // old fields, so it has to be set again all the same.
+        let netlist = r1_on(STOCK_0603).replace(
+            "(tstamps \"symbol-uuid\")",
+            "(tstamps \"symbol-uuid\")
+      (fields (field (name \"MPN\") \"RC0402\"))",
+        );
+
+        let plan = served.dry_run(&netlist).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["changes"][0]["kind"], "update", "{plan:#}");
+        assert_eq!(
+            plan["changes"][0]["replace_footprint"],
+            serde_json::json!({ "from": "Resistor_SMD:R_0402", "to": STOCK_0603 }),
+            "{plan:#}"
+        );
+
+        let applied = served.apply(&netlist).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+        assert_eq!(served.sent("BeginCommit"), 1);
+        let held =
+            FootprintInstance::decode(served.held.lock().unwrap()[0].value.as_slice()).unwrap();
+        let id = held.definition.as_ref().unwrap().id.clone().unwrap();
+        assert_eq!(
+            format!("{}:{}", id.library_nickname, id.entry_name),
+            STOCK_0603
+        );
+        assert_eq!(held.id, before.id);
+        assert_eq!(held.position, before.position);
+        assert_eq!(held.orientation, before.orientation);
+        assert_eq!(held.layer, before.layer);
+        assert_eq!(
+            held.symbol_path.as_ref().map(|path| &path.path),
+            before.symbol_path.as_ref().map(|path| &path.path)
+        );
+        assert_eq!(field_text(&held.value_field), "10k");
+        let pads = held
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
+            .map(|item| {
+                let pad =
+                    copperpour_ipc::gen::kiapi::board::types::Pad::decode(item.value.as_slice())
+                        .unwrap();
+                (
+                    pad.number.clone(),
+                    pad.net.map(|net| net.name).unwrap_or_default(),
+                    pad.symbol_pin.map(|pin| pin.name).unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pads,
+            vec![
+                ("1".to_string(), "VCC".to_string(), "P1".to_string()),
+                ("2".to_string(), "GND".to_string(), "P2".to_string()),
+            ]
+        );
+        let properties = custom_property_names(&held);
+        assert!(
+            !properties.contains(&"Old_Library_Generator".to_string()),
+            "{properties:?}"
+        );
+        assert!(
+            properties.contains(&"KiLib_Generator".to_string()),
+            "the stock 0603's property: {properties:?}"
+        );
+        assert!(
+            properties.contains(&"MPN".to_string()),
+            "the symbol's field, set again: {properties:?}"
+        );
+        assert_eq!(served.dry_run(&netlist).await["status"], "noop");
+    }
+
+    /// A replacement whose footprint does not resolve, or that the refresh
+    /// cannot rebuild losslessly, is refused before anything is sent, with the
+    /// code the sync uses for an addition's footprint.
+    #[tokio::test]
+    async fn a_replacement_that_cannot_be_built_is_refused_before_the_commit() {
+        for (footprint_id, code) in [
+            ("Nope:Missing", "footprint_library_resolution_failed"),
+            (TEXAS_VQFN, "unsupported_library_footprint"),
+        ] {
+            let served = ServedSync::holding(HeldBoard {
+                footprints: vec![schematic_backed_resistor()],
+                zones: Vec::new(),
+                nets: vec!["VCC", "GND"],
+            })
+            .await;
+            let plan = served.dry_run(&r1_on(footprint_id)).await;
+            assert_eq!(plan["status"], "conflict", "{plan:#}");
+            assert_eq!(plan["changes"], serde_json::json!([]), "{plan:#}");
+            assert_eq!(plan["diagnostics"][0]["code"], code, "{plan:#}");
+            assert_eq!(plan["diagnostics"][0]["reference"], "R1", "{plan:#}");
+            assert_eq!(served.sent("BeginCommit"), 0);
+        }
+    }
+
+    /// KiCad's Update PCB replaces with every reset on
+    /// (`board_netlist_updater.cpp` `replaceFootprint`), so the new
+    /// footprint's field text and fabrication attributes replace the placed
+    /// ones, where a library refresh keeps them by default (#554). R1 is given
+    /// a through-hole mounting style, a position-file exclusion and a
+    /// Datasheet of its own, none of which the schematic sets. The new
+    /// footprint is KiCad's stock 0603 with a Datasheet property added; it
+    /// replaces all three.
+    #[tokio::test]
+    async fn a_replacement_takes_the_new_footprints_text_and_attributes() {
+        use copperpour_ipc::gen::kiapi::board::types::{FootprintInstance, FootprintMountingStyle};
+        const LIBRARY_DATASHEET: &str = "https://example.com/library.pdf";
+        let mut footprint =
+            FootprintInstance::decode(schematic_backed_resistor().value.as_slice()).unwrap();
+        let attributes = footprint.attributes.get_or_insert_with(Default::default);
+        attributes.mounting_style = FootprintMountingStyle::FmsThroughHole as i32;
+        attributes.exclude_from_position_files = true;
+        set_field_text(
+            &mut footprint.datasheet_field,
+            "Datasheet",
+            "https://example.com/placed.pdf",
+        );
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![copperpour_ipc::builders::pack_any(
+                &footprint,
+                "kiapi.board.types.FootprintInstance",
+            )],
+            zones: Vec::new(),
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+        let stock = std::str::from_utf8(include_bytes!(
+            "../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod"
+        ))
+        .unwrap();
+        let with_datasheet = stock
+            .replacen(
+                "(footprint \"C_0603_1608Metric\"",
+                "(footprint \"C_0603_WithDatasheet\"",
+                1,
+            )
+            .replacen(
+                "\t(attr smd)",
+                &format!(
+                    "\t(property \"Datasheet\" \"{LIBRARY_DATASHEET}\"\n\t\t(at 0 0 0)\n\t\t\
+                     (layer \"F.Fab\")\n\t\t(hide yes)\n\t\t(effects\n\t\t\t(font\n\t\t\t\t\
+                     (size 1 1)\n\t\t\t\t(thickness 0.15)\n\t\t\t)\n\t\t)\n\t)\n\t(attr smd)"
+                ),
+                1,
+            );
+        assert_ne!(with_datasheet, stock);
+        std::fs::write(
+            served
+                ._temp
+                .path()
+                .join("Capacitor_SMD.pretty")
+                .join("C_0603_WithDatasheet.kicad_mod"),
+            with_datasheet,
+        )
+        .unwrap();
+        let netlist = r1_on("Capacitor_SMD:C_0603_WithDatasheet");
+        assert_eq!(served.dry_run(&netlist).await["status"], "ready");
+        let applied = served.apply(&netlist).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+
+        let held =
+            FootprintInstance::decode(served.held.lock().unwrap()[0].value.as_slice()).unwrap();
+        let attributes = held.attributes.clone().unwrap();
+        assert_eq!(
+            attributes.mounting_style,
+            FootprintMountingStyle::FmsSmd as i32
+        );
+        assert!(!attributes.exclude_from_position_files);
+        assert_eq!(field_text(&held.datasheet_field), LIBRARY_DATASHEET);
+    }
+
+    /// KiCad's Update PCB leaves a locked footprint's footprint as it is,
+    /// with a warning, and still updates the rest of it. So does the sync:
+    /// R1 keeps the R_0402, takes the schematic's value, and the plan notes
+    /// the replacement it left out without refusing anything.
+    #[tokio::test]
+    async fn a_locked_footprint_keeps_its_footprint_and_takes_the_rest() {
+        use copperpour_ipc::gen::kiapi::board::types::FootprintInstance;
+        let mut locked =
+            FootprintInstance::decode(schematic_backed_resistor().value.as_slice()).unwrap();
+        locked.locked = copperpour_ipc::gen::kiapi::common::types::LockedState::LsLocked as i32;
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![copperpour_ipc::builders::pack_any(
+                &locked,
+                "kiapi.board.types.FootprintInstance",
+            )],
+            zones: Vec::new(),
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+        let netlist = r1_on(STOCK_0603);
+        let plan = served.dry_run(&netlist).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(
+            plan["changes"][0].get("replace_footprint"),
+            None,
+            "{plan:#}"
+        );
+        assert_eq!(
+            plan["diagnostics"][0]["code"], "footprint_locked_not_replaced",
+            "{plan:#}"
+        );
+        assert_eq!(plan["coverage"]["conflicts"]["planned"], 0, "{plan:#}");
+
+        served.apply(&netlist).await;
+        let held =
+            FootprintInstance::decode(served.held.lock().unwrap()[0].value.as_slice()).unwrap();
+        let id = held.definition.as_ref().unwrap().id.clone().unwrap();
+        assert_eq!(id.entry_name, "R_0402");
+        assert_eq!(field_text(&held.value_field), "10k");
+    }
+
+    /// The preflight checks a replacement's pads against the new footprint:
+    /// the stock 0603 has pads 1 and 2, so a schematic connecting pad 3 is
+    /// refused, and so is a board footprint whose pad 3 carries a net the
+    /// replacement would drop.
+    #[test]
+    fn a_replacement_keeps_every_connected_pad() {
+        let (_temp, board_path) = project_with_stock_footprints();
+        let kicad = copperpour_ipc::IpcKiCadVersion {
+            major: 10,
+            minor: 0,
+            patch: 8,
+            full_version: "10.0.8".to_string(),
+        };
+        let plan_for = |component: DesignComponent, footprint: BoardFootprint| {
+            let design = ExportedDesign {
+                components: vec![component],
+                skipped: Vec::new(),
+                unassigned: Vec::new(),
+            };
+            let board = board_with(vec![footprint]);
+            let plan = plan_sync("netlist", &design, &board);
+            assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+            prepare_replacements(&board_path, &plan, &board, &kicad)
+        };
+        let mut component = resistor("R1", "/sheet/existing");
+        component.footprint_id = STOCK_0603.to_string();
+
+        let (prepared, refused) = plan_for(
+            component.clone(),
+            board_resistor("R1", Some("/sheet/existing")),
+        );
+        assert!(refused.is_empty(), "{refused:?}");
+        assert!(prepared.contains_key(STOCK_0603));
+
+        let mut connects_pad_3 = component.clone();
+        connects_pad_3
+            .pad_nets
+            .insert("3".to_string(), "EXTRA".to_string());
+        let (_, refused) = plan_for(
+            connects_pad_3,
+            board_resistor("R1", Some("/sheet/existing")),
+        );
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].code, "footprint_pad_missing");
+
+        let mut has_pad_3 = board_resistor("R1", Some("/sheet/existing"));
+        has_pad_3
+            .pad_nets
+            .insert("3".to_string(), "EXTRA".to_string());
+        has_pad_3.pad_numbers.insert("3".to_string());
+        let (_, refused) = plan_for(component, has_pad_3);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].code, "footprint_replacement_drops_connected_pad");
+        assert!(
+            refused[0].message.contains("pad(s) 3"),
+            "{}",
+            refused[0].message
         );
     }
 
