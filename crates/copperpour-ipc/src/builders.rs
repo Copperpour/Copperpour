@@ -356,6 +356,26 @@ pub struct ZoneSpec<'a> {
     pub connection: kiapi::board::types::ZoneConnectionStyle,
 }
 
+fn closed_polygon_outline(
+    points: impl Iterator<Item = kiapi::common::types::Vector2>,
+) -> kiapi::common::types::PolySet {
+    kiapi::common::types::PolySet {
+        polygons: vec![kiapi::common::types::PolygonWithHoles {
+            outline: Some(kiapi::common::types::PolyLine {
+                nodes: points
+                    .map(|point| kiapi::common::types::PolyLineNode {
+                        geometry: Some(kiapi::common::types::poly_line_node::Geometry::Point(
+                            point,
+                        )),
+                    })
+                    .collect(),
+                closed: true,
+            }),
+            holes: vec![],
+        }],
+    }
+}
+
 /// Build a copper `Zone` protobuf message for `create_items`.
 ///
 /// The zone is deliberately sent **unfilled** (`filled: false`, no
@@ -370,23 +390,7 @@ pub fn build_zone(spec: &ZoneSpec<'_>, net_code: i32) -> kiapi::board::types::Zo
         ZoneTeardropSettings, ZoneTeardropType, ZoneType,
     };
 
-    let outline = kiapi::common::types::PolySet {
-        polygons: vec![kiapi::common::types::PolygonWithHoles {
-            outline: Some(kiapi::common::types::PolyLine {
-                nodes: spec
-                    .points
-                    .iter()
-                    .map(|&(x, y)| kiapi::common::types::PolyLineNode {
-                        geometry: Some(kiapi::common::types::poly_line_node::Geometry::Point(
-                            vec2(x, y),
-                        )),
-                    })
-                    .collect(),
-                closed: true,
-            }),
-            holes: vec![],
-        }],
-    };
+    let outline = closed_polygon_outline(spec.points.iter().map(|&(x, y)| vec2(x, y)));
 
     let copper = CopperZoneSettings {
         connection: Some(ZoneConnectionSettings {
@@ -432,6 +436,65 @@ pub fn build_zone(spec: &ZoneSpec<'_>, net_code: i32) -> kiapi::board::types::Zo
         locked: kiapi::common::types::LockedState::LsUnlocked as i32,
         layer_properties: vec![],
         settings: Some(kiapi::board::types::zone::Settings::CopperSettings(copper)),
+        parent: None,
+    }
+}
+
+/// Everything a caller may choose about a KiCad rule area (keep-out zone).
+pub struct RuleAreaSpec<'a> {
+    /// Enabled copper layers (`BoardLayer`) the rule area applies to.
+    pub layers: &'a [kiapi::board::types::BoardLayer],
+    /// Outline vertices in KiCad nanometres. The loop is closed for you.
+    pub points_nm: &'a [(i64, i64)],
+    /// Rule-area name as shown in pcbnew's rule-area properties; empty leaves it unnamed.
+    pub name: &'a str,
+    pub keepout_tracks: bool,
+    pub keepout_vias: bool,
+    pub keepout_pads: bool,
+    pub keepout_copper_pours: bool,
+    pub keepout_footprints: bool,
+}
+
+/// Build a rule-area `Zone` (`ZT_RULE_AREA`) protobuf message for `CreateItems`.
+pub fn build_rule_area(spec: &RuleAreaSpec<'_>) -> kiapi::board::types::Zone {
+    use kiapi::board::types::{
+        PlacementRuleSourceType, RuleAreaSettings, ZoneBorderSettings, ZoneBorderStyle, ZoneType,
+    };
+
+    let outline = closed_polygon_outline(
+        spec.points_nm
+            .iter()
+            .map(|&(x_nm, y_nm)| kiapi::common::types::Vector2 { x_nm, y_nm }),
+    );
+    let settings = RuleAreaSettings {
+        keepout_copper: spec.keepout_copper_pours,
+        keepout_vias: spec.keepout_vias,
+        keepout_tracks: spec.keepout_tracks,
+        keepout_pads: spec.keepout_pads,
+        keepout_footprints: spec.keepout_footprints,
+        placement_enabled: false,
+        placement_source_type: PlacementRuleSourceType::PrstUnknown as i32,
+        placement_source: String::new(),
+    };
+
+    kiapi::board::types::Zone {
+        id: None, // KiCad assigns the ID
+        r#type: ZoneType::ZtRuleArea as i32,
+        layers: spec.layers.iter().map(|layer| *layer as i32).collect(),
+        outline: Some(outline),
+        name: spec.name.to_string(),
+        priority: 0,
+        filled: false,
+        filled_polygons: vec![],
+        border: Some(ZoneBorderSettings {
+            style: ZoneBorderStyle::ZbsDiagonalFull as i32,
+            pitch: Some(distance(ZONE_BORDER_PITCH_MM)),
+        }),
+        locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+        layer_properties: vec![],
+        settings: Some(kiapi::board::types::zone::Settings::RuleAreaSettings(
+            settings,
+        )),
         parent: None,
     }
 }
@@ -1016,6 +1079,77 @@ pub(crate) mod tests {
                 "{layer}"
             );
         }
+    }
+
+    #[test]
+    fn build_rule_area_carries_layers_outline_and_keepout_flags() {
+        use kiapi::board::types::{BoardLayer, ZoneBorderStyle, ZoneType};
+
+        let points = [
+            (10_000_000, 20_000_000),
+            (30_000_000, 20_000_000),
+            (30_000_000, 25_000_000),
+            (10_000_000, 25_000_000),
+        ];
+        let zone = build_rule_area(&RuleAreaSpec {
+            layers: &[BoardLayer::BlFCu, BoardLayer::BlIn1Cu, BoardLayer::BlBCu],
+            points_nm: &points,
+            name: "antenna keepout",
+            keepout_tracks: true,
+            keepout_vias: false,
+            keepout_pads: true,
+            keepout_copper_pours: true,
+            keepout_footprints: false,
+        });
+
+        assert!(zone.id.is_none(), "KiCad assigns the id");
+        assert_eq!(zone.r#type, ZoneType::ZtRuleArea as i32);
+        assert_eq!(
+            zone.layers,
+            vec![
+                BoardLayer::BlFCu as i32,
+                BoardLayer::BlIn1Cu as i32,
+                BoardLayer::BlBCu as i32,
+            ]
+        );
+        assert_eq!(zone.name, "antenna keepout");
+        assert!(!zone.filled);
+        assert!(zone.filled_polygons.is_empty());
+        assert_eq!(
+            zone.border.expect("border").style,
+            ZoneBorderStyle::ZbsDiagonalFull as i32
+        );
+
+        let line = zone
+            .outline
+            .expect("outline")
+            .polygons
+            .into_iter()
+            .next()
+            .expect("polygon")
+            .outline
+            .expect("polyline");
+        assert!(line.closed);
+        let coords: Vec<(i64, i64)> = line
+            .nodes
+            .into_iter()
+            .map(|node| match node.geometry.expect("node geometry") {
+                kiapi::common::types::poly_line_node::Geometry::Point(p) => (p.x_nm, p.y_nm),
+                other => panic!("expected point node, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(coords, points);
+
+        let settings = match zone.settings.expect("settings") {
+            kiapi::board::types::zone::Settings::RuleAreaSettings(s) => s,
+            other => panic!("rule area must carry RuleAreaSettings, got {other:?}"),
+        };
+        assert!(settings.keepout_tracks);
+        assert!(!settings.keepout_vias);
+        assert!(settings.keepout_pads);
+        assert!(settings.keepout_copper);
+        assert!(!settings.keepout_footprints);
+        assert!(!settings.placement_enabled);
     }
 
     /// `any_is` compares the whole message name, not a suffix of the URL.

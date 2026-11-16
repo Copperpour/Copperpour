@@ -170,6 +170,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "add_net",
     "add_no_connect",
     "add_power_symbol",
+    "add_rule_area",
     "add_schematic_component",
     "add_schematic_connection",
     "add_schematic_net_label",

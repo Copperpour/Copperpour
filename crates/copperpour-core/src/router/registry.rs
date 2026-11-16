@@ -76,6 +76,11 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         category: "pcb",
     },
     ToolsetMeta {
+        name: "pcb_rule_areas",
+        description: "Create and manage KiCad rule areas (keep-out zones) on live boards",
+        category: "pcb",
+    },
+    ToolsetMeta {
         name: "pcb_components",
         description: "Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics",
         category: "pcb",
@@ -188,6 +193,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "sch_hierarchy" => Some(sch_hierarchy::tools()),
         "pcb_board" => Some(pcb_board::tools()),
         "pcb_text" => Some(pcb_text::tools()),
+        "pcb_rule_areas" => Some(pcb_board_rule_area::tools()),
         "pcb_components" => Some(pcb_components::tools()),
         "pcb_routing" => Some(pcb_routing::tools()),
         "pcb_copper" => Some(pcb_copper::tools()),

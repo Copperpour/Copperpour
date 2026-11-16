@@ -388,6 +388,22 @@ add_zone(board, net_name, layer, points, clearance?, min_width?,
   limitation. A board observed live earlier in this server session fails with
   `unsafe_file_fallback` instead of writing the file.
 
+### add_rule_area
+
+Creates a KiCad rule area (keep-out zone) on one or more enabled copper layers of a live board open in KiCad (in the `pcb_rule_areas` toolset).
+
+```
+add_rule_area(board, layers, points? | rect?, name?,
+              keepout_tracks?, keepout_vias?, keepout_pads?,
+              keepout_copper_pours?, keepout_footprints?)
+```
+
+- `layers` takes enabled copper layer names (`["F.Cu", "B.Cu"]`) or `["*.Cu"]` for all enabled copper layers on the board. Disabled or non-copper layers are refused before writing.
+- Pass either `points` (`[{x, y}, ...]`) or `rect` (`{x1, y1, x2, y2}`), never both.
+- Defaults match KiCad: `keepout_tracks`, `keepout_vias`, and `keepout_pads` default to `true`; `keepout_copper_pours` and `keepout_footprints` default to `false` (for an antenna keepout, set `keepout_copper_pours: true`).
+- Live only: requires the board open in KiCad's PCB Editor; refills copper zones afterward and verifies readback.
+- **Freerouting note:** a board with a rule area cannot currently use Copperpour's Freerouting round trip (`export_specctra_dsn` refuses all zones/rule areas; tracked in #81).
+
 ### refill_zones
 
 **Must call `refill_zones` after any change that affects copper pour:**
