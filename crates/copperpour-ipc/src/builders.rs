@@ -618,14 +618,27 @@ pub fn board_circle(
     r_mm: f64,
     filled: bool,
 ) -> kiapi::board::types::BoardGraphicShape {
+    board_circle_through(layer, width_mm, (cx, cy), (cx + r_mm, cy), filled)
+}
+
+/// Build a BoardGraphicShape circle around `center` through `point`, both in
+/// mm. KiCAD stores a point on the circumference rather than a radius, and
+/// compares that point when it checks a footprint against its library, so a
+/// circle copied from a library keeps the library's point.
+pub fn board_circle_through(
+    layer: &str,
+    width_mm: f64,
+    center: (f64, f64),
+    point: (f64, f64),
+    filled: bool,
+) -> kiapi::board::types::BoardGraphicShape {
     board_shape(
         layer,
         attrs(width_mm, filled),
         kiapi::common::types::graphic_shape::Geometry::Circle(
             kiapi::common::types::GraphicCircleAttributes {
-                center: Some(vec2(cx, cy)),
-                // Point on the circumference -- KiCAD stores this rather than a radius scalar.
-                radius_point: Some(vec2(cx + r_mm, cy)),
+                center: Some(vec2(center.0, center.1)),
+                radius_point: Some(vec2(point.0, point.1)),
             },
         ),
     )

@@ -6025,13 +6025,16 @@ fn build_graphic_child(
             line_style,
             filled,
         } => {
-            let (cx, cy) = xf(*center);
-            // The radius is rotation-invariant; keep KiCAD's center +
-            // circumference-point encoding by re-deriving it from the length.
-            let radius = ((end.0 - center.0).powi(2) + (end.1 - center.1).powi(2)).sqrt();
+            // KiCad keeps the library's circumference point and turns it
+            // with the footprint, and its library parity check compares that
+            // point, not only the radius (`shapeNeedsUpdate` in
+            // `drc_test_provider_library_parity.cpp`). A point re-derived as
+            // centre + (radius, 0) reads as a changed circle wherever the
+            // library's point lies elsewhere, as on TestPoint_THTPad's
+            // silkscreen circle.
             builders::pack_any(
                 &builders::with_line_style(
-                    builders::board_circle(layer, *width, cx, cy, radius, *filled),
+                    builders::board_circle_through(layer, *width, xf(*center), xf(*end), *filled),
                     *line_style,
                 ),
                 SHAPE,
@@ -7793,10 +7796,10 @@ mod footprint_graphics_tests {
         assert!(first.y_nm.abs() < 10, "y={}", first.y_nm);
     }
 
-    /// A circle's radius survives rotation via the circumference-point
-    /// encoding.
+    /// A circle's circumference point turns with the footprint, as KiCad
+    /// turns it, so the radius and the point's direction both survive.
     #[test]
-    fn circle_center_rotates_and_radius_is_preserved() {
+    fn circle_center_and_circumference_point_rotate_together() {
         let graphics = vec![IpcGraphicDefinition::Circle {
             center: (1.0, 0.0),
             end: (1.5, 0.0),
@@ -7814,11 +7817,34 @@ mod footprint_graphics_tests {
         // Center (1,0) at 90° around (10,10): (10, 9).
         assert_eq!(c.center.unwrap().x_nm, 10_000_000);
         assert_eq!(c.center.unwrap().y_nm, 9_000_000);
-        // Radius 0.5 mm regardless of rotation.
-        assert_eq!(
-            c.radius_point.unwrap().x_nm - c.center.unwrap().x_nm,
-            500_000
-        );
+        // The point (1.5,0) turns the same way: (10, 8.5), still 0.5 mm out.
+        assert_eq!(c.radius_point.unwrap().x_nm, 10_000_000);
+        assert_eq!(c.radius_point.unwrap().y_nm, 8_500_000);
+    }
+
+    /// A library circle whose circumference point is not to the right of its
+    /// centre keeps that point, as KiCad does: TestPoint_THTPad's silkscreen
+    /// circle is `(center 0 0) (end 0 1.2)`.
+    #[test]
+    fn a_circle_keeps_its_library_circumference_point() {
+        let graphics = vec![IpcGraphicDefinition::Circle {
+            center: (0.0, 0.0),
+            end: (0.0, 1.2),
+            layer: "F.SilkS".to_string(),
+            width: 0.12,
+            line_style: crate::IpcLineStyle::Solid,
+            filled: false,
+        }];
+        let fp = build(&graphics, 122.3, 65.2, 0.0);
+        let shapes = shapes(&fp);
+        let geometry = shapes[0].shape.as_ref().unwrap().geometry.as_ref().unwrap();
+        let kiapi::common::types::graphic_shape::Geometry::Circle(c) = geometry else {
+            panic!("expected Circle geometry, got {geometry:?}");
+        };
+        assert_eq!(c.center.unwrap().x_nm, 122_300_000);
+        assert_eq!(c.center.unwrap().y_nm, 65_200_000);
+        assert_eq!(c.radius_point.unwrap().x_nm, 122_300_000);
+        assert_eq!(c.radius_point.unwrap().y_nm, 66_400_000);
     }
 
     /// #117 guard for the pad path: the same PST_NORMAL rule that broke
