@@ -8,7 +8,8 @@ KiCad-written board preserves the embedded payloads and their footprint referenc
 It has six `kicad-embed://` models, footprint-level embedded-file metadata,
 board-level embedded payloads, DNP footprints, and external KICAD8 model paths.
 
-Copied without reserialization; no hand-written board fixture is used.
+Copied without reserialization; no hand-written board fixture is used. The
+reviewer confirmed that KiCad 10.0.8 ships the same board bytes.
 
 Observed on KiCad 10.0.6:
 
@@ -16,11 +17,18 @@ Observed on KiCad 10.0.6:
 kicad-cli pcb export step --subst-models -o /tmp/royalblue.step royalblue.kicad_pcb
 ```
 
-The export succeeds. With KICAD8_3DMODEL_DIR unset, it reports 48
-`Could not add 3D model` lines for external models and none for the six
-embedded models. The tests assert those same six are present and are never
-reported broken, and remove each embedded owner in memory to test both scopes
-and absence independently. The external finding count depends on installed libraries.
+The export succeeds. The recorded KiCad 10.0.6 run reported 48 external-model
+errors; the KiCad 10.0.8 review environment without stock 3D libraries reported
+49. Neither run reported an error for an embedded model. These counts depend on
+installed libraries and path configuration and are not test expectations.
+
+The audit test asserts only library-independent facts: J4, U1, Y2, J6 and J5
+have only embedded models and are never missing or broken; no `kicad-embed://`
+path is reported broken. D3 has both an embedded model and the external
+`LED_Wurth_150044M155260.wrl`, so D3 may be broken through that WRL while its
+embedded model is present. The test does not require six fully OK footprints.
+A separate test removes each embedded owner in memory to test both scopes and
+absence independently.
 The CLI's STEP substitution and DNP export policy differ from the path-existence
 audit; a READY verdict is not a guarantee of successful model decoding/export.
 

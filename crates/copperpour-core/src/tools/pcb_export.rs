@@ -2627,9 +2627,32 @@ mod specctra_padstack_served_tests {
             };
             let parsed: Value = serde_json::from_str(text).unwrap();
             assert_eq!(parsed["verdict"], "ISSUES_FOUND");
-            assert!(parsed["ok_count"].as_u64().unwrap() >= 6, "{parsed}");
+            // Five footprints have only embedded models. D3 also has an
+            // external WRL, so its overall status depends on installed libraries.
+            assert!(parsed["ok_count"].as_u64().unwrap() >= 5, "{parsed}");
             let broken = parsed["broken_models"].as_array().unwrap();
             assert!(!broken.is_empty());
+            let missing = parsed["missing_models"].as_array().unwrap();
+            for reference in ["J4", "U1", "Y2", "J6", "J5"] {
+                assert!(
+                    !broken.iter().any(|m| m["reference"] == reference),
+                    "{reference}: {parsed}"
+                );
+                assert!(
+                    !missing.iter().any(|m| m["reference"] == reference),
+                    "{reference}: {parsed}"
+                );
+            }
+            // Whether D3's external file exists is deliberately not assumed.
+            // If D3 is broken, only that WRL may be blamed, never its embed.
+            let d3_broken: Vec<_> = broken.iter().filter(|m| m["reference"] == "D3").collect();
+            assert!(d3_broken.len() <= 1, "{parsed}");
+            for model in d3_broken {
+                assert_eq!(
+                    model["model_path"],
+                    "${KICAD8_3DMODEL_DIR}/LED_SMD.3dshapes/LED_Wurth_150044M155260.wrl"
+                );
+            }
             assert!(broken.iter().all(|m| !m["model_path"]
                 .as_str()
                 .unwrap()
