@@ -302,6 +302,22 @@ pub struct DrcReport {
     /// removed (`skip_creepage`): creepage was NOT checked. Absent otherwise.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub creepage_skipped: bool,
+    /// The checks this run had switched off (severity `ignore`), as KiCad
+    /// lists them in the report. A check in here cannot appear among the
+    /// findings however often the board breaks it, so "no violations" has to
+    /// be read beside this list. `None` when the report carries no such list,
+    /// which is not the same as "nothing is ignored".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_checks: Option<Vec<IgnoredCheck>>,
+}
+
+/// One entry of a DRC report's `ignored_checks`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IgnoredCheck {
+    /// KiCad's check key: the word a violation carries as its rule and the
+    /// project file's `rule_severities` uses.
+    pub key: String,
+    pub description: String,
 }
 
 impl DrcReport {
@@ -1546,6 +1562,20 @@ fn parse_drc_report(raw: &serde_json::Value) -> Result<DrcReport> {
         ownership_diagnostic: None,
         schematic_parity_diagnostic: None,
         creepage_skipped: false,
+        ignored_checks: raw
+            .get("ignored_checks")
+            .and_then(serde_json::Value::as_array)
+            .map(|checks| {
+                checks
+                    .iter()
+                    .filter_map(|check| {
+                        Some(IgnoredCheck {
+                            key: check["key"].as_str()?.to_string(),
+                            description: check["description"].as_str().unwrap_or("").to_string(),
+                        })
+                    })
+                    .collect()
+            }),
     })
 }
 
@@ -2559,6 +2589,29 @@ mod drc_parse_tests {
             .unwrap()
             .iter()
             .all(|v| v.severity == "error"));
+    }
+
+    /// KiCad lists the checks a run had switched off under `ignored_checks`,
+    /// each with its key and description. They are read as KiCad wrote them,
+    /// in its order.
+    #[test]
+    fn the_checks_kicad_ignored_are_read_from_the_report() {
+        let report = parse_drc_report(&real_report()).unwrap();
+
+        let ignored = report.ignored_checks.expect("KiCad 10 writes the list");
+        assert_eq!(
+            ignored
+                .iter()
+                .map(|check| check.key.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "missing_courtyard",
+                "tuning_profile_track_geometries",
+                "footprint_filters_mismatch",
+                "footprint_type_mismatch"
+            ]
+        );
+        assert_eq!(ignored[0].description, "Footprint has no courtyard defined");
     }
 
     /// The scoping control for #541: `pcb drc` has its own report writer and
