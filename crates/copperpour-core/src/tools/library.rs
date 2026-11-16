@@ -1768,15 +1768,26 @@ fn read_global_lib_table(table: Option<PathBuf>) -> Vec<serde_json::Value> {
 pub(crate) fn project_root_for(
     file: &Path,
 ) -> Result<Option<PathBuf>, crate::tools::SchematicTargetError> {
+    project_root_for_from(file, std::env::current_dir)
+}
+
+/// [`project_root_for`], with a relative `file`'s ancestors scanned from
+/// `current_dir()`.
+fn project_root_for_from(
+    file: &Path,
+    current_dir: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<Option<PathBuf>, crate::tools::SchematicTargetError> {
     let Some(start) = file.parent() else {
         return Ok(None);
     };
     if holds_lib_table(start) {
         return Ok(Some(start.to_path_buf()));
     }
-    Ok(crate::tools::resolve_schematic_ownership(file)?
-        .and_then(|ownership| ownership.project_file.parent().map(Path::to_path_buf))
-        .or_else(|| Some(start.to_path_buf())))
+    Ok(
+        crate::tools::resolve_schematic_ownership_from(file, current_dir)?
+            .and_then(|ownership| ownership.project_file.parent().map(Path::to_path_buf))
+            .or_else(|| Some(start.to_path_buf())),
+    )
 }
 
 /// Whether `dir` carries a library table of its own.
@@ -10926,12 +10937,33 @@ mod symbol_source_tests {
 
     /// `Path::new("board.kicad_sch").parent()` is `Some("")`, not `None`. The
     /// walk must leave that as-is so a bare relative path keeps resolving
-    /// against the working directory.
+    /// against the working directory. The ancestors are scanned from a fresh
+    /// directory, not cargo's cwd, whose ancestors may hold a project (#558).
     #[test]
     fn a_bare_relative_schematic_keeps_an_empty_project_dir() {
+        let cwd = tempfile::tempdir().unwrap();
+        let cwd_path = cwd.path().to_path_buf();
         assert_eq!(
-            project_root_for(Path::new("board.kicad_sch")).unwrap(),
+            project_root_for_from(Path::new("board.kicad_sch"), || Ok(cwd_path)).unwrap(),
             Some(PathBuf::new())
+        );
+    }
+
+    /// A project above the working directory is a candidate owner of a bare
+    /// relative schematic; unable to prove it owns it, the walk refuses.
+    #[test]
+    fn a_project_above_the_working_directory_makes_a_bare_relative_schematic_conflict() {
+        let outer = tempfile::tempdir().unwrap();
+        std::fs::write(outer.path().join("x.kicad_pro"), "{}").unwrap();
+        let cwd_path = outer.path().join("checkout");
+        std::fs::create_dir(&cwd_path).unwrap();
+        let result = project_root_for_from(Path::new("board.kicad_sch"), || Ok(cwd_path));
+        assert!(
+            matches!(
+                result,
+                Err(crate::tools::SchematicTargetError::ProjectConflict { .. })
+            ),
+            "got {result:?}"
         );
     }
 
