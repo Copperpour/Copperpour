@@ -399,7 +399,14 @@ impl ToolContext {
     /// caller's own `Ping` reports the failure as before. It is never used
     /// when several sockets qualify: that would be the guess #374 rules out.
     pub fn ipc_endpoint(&self) -> IpcEndpoint {
-        endpoint_for(
+        self.ipc_endpoint_with_origin().0
+    }
+
+    /// [`Self::ipc_endpoint`] and where it came from, for reporting the
+    /// endpoint the calls use (`get_installation_info`). It costs what an IPC
+    /// call's own lookup costs.
+    pub fn ipc_endpoint_with_origin(&self) -> (IpcEndpoint, IpcEndpointOrigin) {
+        endpoint_and_origin_for(
             self.ipc_rediscovery
                 .load(std::sync::atomic::Ordering::Relaxed),
             &self.config.ipc_address,
@@ -702,20 +709,45 @@ impl IpcEndpoint {
     }
 }
 
-/// [`ToolContext::ipc_endpoint`]'s decision, with detection supplied so a test
-/// can state its outcome. Detection runs only with rediscovery on.
-fn endpoint_for(
+/// Where the endpoint of [`ToolContext::ipc_endpoint_with_origin`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcEndpointOrigin {
+    /// The address resolved at startup: configured, `KICAD_API_SOCKET`, or
+    /// detected then and not replaced since.
+    Startup,
+    /// Detection on this call: one socket found, or several that could not
+    /// be told apart.
+    DetectedNow,
+}
+
+/// [`ToolContext::ipc_endpoint`]'s decision and where it came from, with
+/// detection supplied so a test can state its outcome. Detection runs only
+/// with rediscovery on. A report of the endpoint uses this too, so it is the
+/// same decision the calls make.
+fn endpoint_and_origin_for(
     rediscovery: bool,
     startup: &str,
     detect: impl FnOnce() -> copperpour_ipc::IpcDetection,
-) -> IpcEndpoint {
+) -> (IpcEndpoint, IpcEndpointOrigin) {
+    let startup_address = || {
+        (
+            IpcEndpoint::Address(startup.to_string()),
+            IpcEndpointOrigin::Startup,
+        )
+    };
     if !rediscovery {
-        return IpcEndpoint::Address(startup.to_string());
+        return startup_address();
     }
     match detect() {
-        copperpour_ipc::IpcDetection::Found(address) => IpcEndpoint::Address(address),
-        copperpour_ipc::IpcDetection::Ambiguous(candidates) => IpcEndpoint::Ambiguous(candidates),
-        copperpour_ipc::IpcDetection::NotFound => IpcEndpoint::Address(startup.to_string()),
+        copperpour_ipc::IpcDetection::Found(address) => (
+            IpcEndpoint::Address(address),
+            IpcEndpointOrigin::DetectedNow,
+        ),
+        copperpour_ipc::IpcDetection::Ambiguous(candidates) => (
+            IpcEndpoint::Ambiguous(candidates),
+            IpcEndpointOrigin::DetectedNow,
+        ),
+        copperpour_ipc::IpcDetection::NotFound => startup_address(),
     }
 }
 
@@ -4305,25 +4337,40 @@ mod ipc_rediscovery_tests {
     /// address relies on.
     #[test]
     fn without_rediscovery_the_startup_address_is_kept_and_nothing_is_detected() {
-        let endpoint = endpoint_for(false, STARTUP, || panic!("detection must not run"));
-        assert_eq!(endpoint, IpcEndpoint::Address(STARTUP.into()));
+        let endpoint = endpoint_and_origin_for(false, STARTUP, || panic!("detection must not run"));
+        assert_eq!(
+            endpoint,
+            (
+                IpcEndpoint::Address(STARTUP.into()),
+                IpcEndpointOrigin::Startup
+            )
+        );
     }
 
     #[test]
     fn with_rediscovery_the_socket_found_now_wins() {
-        let endpoint = endpoint_for(true, STARTUP, || {
+        let endpoint = endpoint_and_origin_for(true, STARTUP, || {
             IpcDetection::Found("ipc:///tmp/kicad/api-42.sock".into())
         });
         assert_eq!(
             endpoint,
-            IpcEndpoint::Address("ipc:///tmp/kicad/api-42.sock".into())
+            (
+                IpcEndpoint::Address("ipc:///tmp/kicad/api-42.sock".into()),
+                IpcEndpointOrigin::DetectedNow
+            )
         );
     }
 
     #[test]
     fn with_rediscovery_nothing_found_keeps_the_startup_address() {
-        let endpoint = endpoint_for(true, STARTUP, || IpcDetection::NotFound);
-        assert_eq!(endpoint, IpcEndpoint::Address(STARTUP.into()));
+        let endpoint = endpoint_and_origin_for(true, STARTUP, || IpcDetection::NotFound);
+        assert_eq!(
+            endpoint,
+            (
+                IpcEndpoint::Address(STARTUP.into()),
+                IpcEndpointOrigin::Startup
+            )
+        );
     }
 
     /// Several qualifying sockets never fall back to the startup one, even
@@ -4335,10 +4382,11 @@ mod ipc_rediscovery_tests {
             STARTUP.to_string(),
             "ipc:///startup/api-42.sock".to_string(),
         ];
-        let endpoint = endpoint_for(true, STARTUP, || {
+        let (endpoint, origin) = endpoint_and_origin_for(true, STARTUP, || {
             IpcDetection::Ambiguous(candidates.clone())
         });
         assert_eq!(endpoint, IpcEndpoint::Ambiguous(candidates));
+        assert_eq!(origin, IpcEndpointOrigin::DetectedNow);
         assert_eq!(endpoint.address(), "");
         let reason = endpoint.unavailable_reason().expect("refused");
         assert!(reason.contains("api-42.sock"), "{reason}");

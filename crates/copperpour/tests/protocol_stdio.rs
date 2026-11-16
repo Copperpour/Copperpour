@@ -331,6 +331,54 @@ fn installation_info_reports_the_serving_process_without_leaking_endpoint_secret
     assert!(!body["restart_guidance"].as_array().unwrap().is_empty());
 }
 
+/// #565 over real stdio: with nothing to dial at startup, the server looks
+/// for KiCad's socket on every call, and `get_installation_info` reports the
+/// socket it finds after startup, from the decision the IPC calls make.
+/// Linux only: detection there wants a real socket in the temp directory,
+/// and macOS also looks in the shared `/tmp/kicad`, where a running KiCad
+/// would change the outcome.
+#[cfg(target_os = "linux")]
+#[test]
+fn installation_info_reports_a_socket_found_after_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let temp_dir = tmp.path().join("tmp");
+    std::fs::create_dir_all(temp_dir.join("kicad")).unwrap();
+    let mut p = McpProcess::spawn_with_env_without(
+        Some(tmp.path()),
+        true,
+        &[("TMPDIR", temp_dir.to_str().unwrap())],
+        &["KICAD_API_SOCKET"],
+    );
+
+    let before = McpProcess::tool_body(&p.call_tool("get_installation_info", json!({})));
+    assert_eq!(
+        before["ipc"],
+        json!({
+            "configured": false,
+            "source": "unresolved",
+            "endpoint": null,
+            "candidates": [],
+        }),
+        "{before:#}"
+    );
+
+    // KiCad starts after the server, and its socket appears.
+    let socket = temp_dir.join("kicad").join("api.sock");
+    let _kicad = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+    let after = McpProcess::tool_body(&p.call_tool("get_installation_info", json!({})));
+    assert_eq!(
+        after["ipc"],
+        json!({
+            "configured": false,
+            "source": "detected_at_call_time",
+            "endpoint": format!("ipc://{}", socket.display()),
+            "candidates": [],
+        }),
+        "{after:#}"
+    );
+}
+
 #[test]
 fn file_based_tool_roundtrip_in_temp_project() {
     let tmp = tempfile::tempdir().unwrap();

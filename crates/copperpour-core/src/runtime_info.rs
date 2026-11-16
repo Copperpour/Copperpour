@@ -2,7 +2,7 @@
 
 use crate::config_resolution::{ConfigResolution, SEARCH_POLICY};
 use crate::guidance::GuidanceProbe;
-use crate::tools::ServerConfig;
+use crate::tools::{IpcEndpoint, IpcEndpointOrigin, ServerConfig};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ pub(crate) async fn collect(
     config: &ServerConfig,
     resolution: &ConfigResolution,
     guidance: Option<&dyn GuidanceProbe>,
+    ipc: (IpcEndpoint, IpcEndpointOrigin),
 ) -> Value {
     let running_version = env!("CARGO_PKG_VERSION");
     let executable_path = installed_executable_path().ok();
@@ -44,12 +45,6 @@ pub(crate) async fn collect(
     let kicad_probe = match kicad_cli_path.as_deref() {
         Some(path) => probe_command_version(path, VersionCommand::KiCad).await,
         None => VersionProbe::not_found(),
-    };
-
-    let ipc_endpoint = if config.ipc_address.trim().is_empty() {
-        None
-    } else {
-        Some(copperpour_ipc::redact_endpoint(config.ipc_address.trim()))
     };
 
     json!({
@@ -81,14 +76,49 @@ pub(crate) async fn collect(
             "probe_status": kicad_probe.status,
             "version": kicad_probe.version,
         },
-        "ipc": {
-            "configured": ipc_endpoint.is_some(),
-            "source": "resolved_server_config",
-            "endpoint": ipc_endpoint,
-        },
+        "ipc": ipc_block(&config.ipc_address, &ipc.0, ipc.1),
         "configuration": configuration_block(resolution),
         "guidance": guidance_block(guidance),
         "restart_guidance": restart_guidance(installation.name, newer_than_running),
+    })
+}
+
+/// The IPC endpoint the tools dial now, redacted, and where it came from:
+/// [`crate::tools::ToolContext::ipc_endpoint_with_origin`], the decision every
+/// IPC call makes. With rediscovery on, a KiCad started or restarted after
+/// the server is found per call; reporting only the startup address showed
+/// `null` while the tools were talking to it.
+///
+/// `configured` keeps its meaning: an address was resolved at startup.
+/// `source` is `resolved_server_config` for that address,
+/// `detected_at_call_time` for a socket found now, `ambiguous` when several
+/// qualify and none is dialled (`candidates` lists them), and `unresolved`
+/// when there is nothing to dial.
+fn ipc_block(startup: &str, endpoint: &IpcEndpoint, origin: IpcEndpointOrigin) -> Value {
+    let redacted = |address: &str| copperpour_ipc::redact_endpoint(address.trim());
+    let (source, address, candidates) = match endpoint {
+        IpcEndpoint::Ambiguous(candidates) => (
+            "ambiguous",
+            None,
+            candidates.iter().map(|c| redacted(c)).collect(),
+        ),
+        IpcEndpoint::Address(address) if address.trim().is_empty() => {
+            ("unresolved", None, Vec::new())
+        }
+        IpcEndpoint::Address(address) => (
+            match origin {
+                IpcEndpointOrigin::Startup => "resolved_server_config",
+                IpcEndpointOrigin::DetectedNow => "detected_at_call_time",
+            },
+            Some(redacted(address)),
+            Vec::new(),
+        ),
+    };
+    json!({
+        "configured": !startup.trim().is_empty(),
+        "source": source,
+        "endpoint": address,
+        "candidates": candidates,
     })
 }
 
@@ -373,6 +403,87 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SOCKET: &str = "ipc:///tmp/kicad/api.sock";
+
+    /// The report names the address the tools dial, also when it was found
+    /// after startup, and says where it came from. `configured` keeps its
+    /// meaning: an address was resolved at startup.
+    #[test]
+    fn the_ipc_block_reports_the_endpoint_the_calls_dial() {
+        let address = |a: &str| IpcEndpoint::Address(a.to_string());
+        // Resolved at startup (config, KICAD_API_SOCKET, or detected then),
+        // and still what the calls dial.
+        assert_eq!(
+            ipc_block(SOCKET, &address(SOCKET), IpcEndpointOrigin::Startup),
+            json!({
+                "configured": true,
+                "source": "resolved_server_config",
+                "endpoint": SOCKET,
+                "candidates": [],
+            })
+        );
+        // Nothing at startup; KiCad started later and is found per call.
+        assert_eq!(
+            ipc_block("", &address(SOCKET), IpcEndpointOrigin::DetectedNow),
+            json!({
+                "configured": false,
+                "source": "detected_at_call_time",
+                "endpoint": SOCKET,
+                "candidates": [],
+            })
+        );
+        // Nothing at startup and nothing now.
+        assert_eq!(
+            ipc_block("", &address(""), IpcEndpointOrigin::Startup),
+            json!({
+                "configured": false,
+                "source": "unresolved",
+                "endpoint": null,
+                "candidates": [],
+            })
+        );
+    }
+
+    /// Several sockets that could not be told apart: none is dialled, so no
+    /// endpoint is reported, and every candidate is listed, redacted.
+    #[test]
+    fn an_ambiguous_endpoint_lists_its_candidates_and_dials_none() {
+        let candidates = vec![
+            SOCKET.to_string(),
+            "ipc:///tmp/kicad/api-42.sock?token=secret".to_string(),
+        ];
+        assert_eq!(
+            ipc_block(
+                SOCKET,
+                &IpcEndpoint::Ambiguous(candidates),
+                IpcEndpointOrigin::DetectedNow
+            ),
+            json!({
+                "configured": true,
+                "source": "ambiguous",
+                "endpoint": null,
+                "candidates": [
+                    SOCKET,
+                    "ipc:///tmp/kicad/api-42.sock [query/fragment redacted]"
+                ],
+            })
+        );
+    }
+
+    /// The reported endpoint is redacted like every other one.
+    #[test]
+    fn the_reported_endpoint_is_redacted() {
+        let block = ipc_block(
+            "",
+            &IpcEndpoint::Address("ipc://kicad.sock?token=secret".to_string()),
+            IpcEndpointOrigin::DetectedNow,
+        );
+        assert_eq!(
+            block["endpoint"],
+            "ipc://kicad.sock [query/fragment redacted]"
+        );
+    }
 
     struct DetailProbe;
 
