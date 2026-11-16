@@ -484,6 +484,21 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_search_footprints(args, ctx).await }
         ),
         tool!(
+            "search_3d_models",
+            "Search for 3D model files (.step, .stp, .stpz, .wrl, .wrz, .obj) in KiCad's bundled 3dmodels directory and/or the project's 3dmodels/ folder.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Case-insensitive substring to match against the model path or filename (e.g. 'SOIC-8', 'C_0805', 'USB_C')" },
+                    "project_dir": { "type": "string", "description": "Project directory containing a 3dmodels/ folder. Defaults to the configured project_dir when omitted." },
+                    "scope": { "type": "string", "enum": ["all", "kicad", "project"], "description": "Where to search: 'all' (default), 'kicad' (bundled KiCad 3dmodels), or 'project' (<project_dir>/3dmodels)", "default": "all" },
+                    "limit": { "type": "integer", "minimum": 0, "description": "Maximum matches to display (0 for existence only). count/shown are returned matches; truncated means another match was found, not a full catalogue total.", "default": 50 }
+                },
+                "required": ["query"]
+            }),
+            |args, ctx| async move { handle_search_3d_models(args, ctx).await }
+        ),
+        tool!(
             "get_symbol_info",
             "Return detailed information about a schematic symbol: pins, properties, description.",
             json!({
@@ -1937,7 +1952,7 @@ fn kicad_user_path_vars() -> std::collections::HashMap<String, String> {
         .unwrap_or_default()
 }
 
-fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
     let Some(rest) = uri.strip_prefix("${") else {
         return (!uri.is_empty()).then(|| PathBuf::from(uri));
     };
@@ -5462,6 +5477,158 @@ async fn search_footprint_entries(
     }
 
     results
+}
+
+// ─── search_3d_models ────────────────────────────────────────────────────────
+
+const MODEL_3D_EXTENSIONS: &[&str] = &["step", "stp", "stpz", "wrl", "wrz", "obj"];
+const MAX_3D_MODEL_WALK_DEPTH: usize = 6;
+
+fn is_3d_model_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            let lower = ext.to_ascii_lowercase();
+            MODEL_3D_EXTENSIONS.contains(&lower.as_str())
+        })
+}
+
+fn kicad_3dmodel_env_prefix(dir: &Path) -> String {
+    for major in ["10", "9", "8"] {
+        let var = format!("KICAD{major}_3DMODEL_DIR");
+        if std::env::var_os(&var).is_some_and(|v| v == dir.as_os_str()) {
+            return format!("${{{var}}}");
+        }
+    }
+    "${KICAD10_3DMODEL_DIR}".to_string()
+}
+
+fn collect_3d_models_in_dir(
+    root: &Path,
+    source: &str,
+    prefix: &str,
+    query_lower: &str,
+    limit: usize,
+    results: &mut Vec<serde_json::Value>,
+) {
+    if !root.is_dir() || results.len() > limit {
+        return;
+    }
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<_> = rd.filter_map(Result::ok).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if ft.is_dir() {
+                if depth < MAX_3D_MODEL_WALK_DEPTH {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+            if !ft.is_file() || !is_3d_model_file(&path) {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            let rel_slash = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            if !query_lower.is_empty() && !rel_slash.to_ascii_lowercase().contains(query_lower) {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let format = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            results.push(json!({
+                "source": source,
+                "name": name,
+                "format": format,
+                "kicad_path": format!("{prefix}/{rel_slash}"),
+                "path": path.to_string_lossy(),
+            }));
+            if results.len() > limit {
+                return;
+            }
+        }
+    }
+}
+
+async fn handle_search_3d_models(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let raw_query = match require_str(args, "query") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let query_lower = raw_query.to_ascii_lowercase();
+    let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("all");
+    if !matches!(scope, "all" | "kicad" | "project") {
+        return Ok(super::invalid_arg(
+            "scope",
+            "must be one of 'all', 'kicad', or 'project'",
+        ));
+    }
+    let limit = match super::response_limit(args, 50) {
+        Ok(limit) => limit,
+        Err(error) => return Ok(error),
+    };
+    let project_dir = args
+        .get("project_dir")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .or_else(|| ctx.config.project_dir.clone());
+
+    if scope == "project" && project_dir.is_none() {
+        return Ok(super::invalid_arg(
+            "project_dir",
+            "is required when scope is 'project' and no default project_dir is configured",
+        ));
+    }
+
+    let mut results = Vec::new();
+    if matches!(scope, "all" | "project") {
+        if let Some(proj) = project_dir.as_deref() {
+            let models_dir = proj.join("3dmodels");
+            collect_3d_models_in_dir(
+                &models_dir,
+                "project",
+                "${KIPRJMOD}/3dmodels",
+                &query_lower,
+                limit,
+                &mut results,
+            );
+        }
+    }
+    if matches!(scope, "all" | "kicad") && results.len() <= limit {
+        for dir in super::find_kicad_library_dirs("3dmodels") {
+            let prefix = kicad_3dmodel_env_prefix(&dir);
+            collect_3d_models_in_dir(&dir, "kicad", &prefix, &query_lower, limit, &mut results);
+            if results.len() > limit {
+                break;
+            }
+        }
+    }
+
+    Ok(search_response(raw_query, &results, limit))
 }
 
 // ─── get_symbol_info (moved from verification toolset) ───────────────────────
@@ -11728,5 +11895,93 @@ mod required_argument_tests {
             top_level_symbol_names(&after).unwrap(),
             vec!["M\"U\\n1", "T\"P\\n1"]
         );
+    }
+
+    #[tokio::test]
+    async fn search_3d_models_finds_project_models_and_respects_scope_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("3dmodels");
+        std::fs::create_dir_all(models.join("Resistor_SMD.3dshapes")).unwrap();
+        std::fs::write(
+            models.join("Resistor_SMD.3dshapes/R_0805.step"),
+            "ISO-10303-21;",
+        )
+        .unwrap();
+        std::fs::write(models.join("Connector.wrl"), "#VRML V2.0 utf8").unwrap();
+        std::fs::write(models.join("notes.txt"), "ignored").unwrap();
+
+        let json_of = |r: &CallToolResult| -> serde_json::Value {
+            let crate::mcp::protocol::ToolContent::Text { text } = &r.content[0] else {
+                panic!("expected text result");
+            };
+            serde_json::from_str(text).unwrap()
+        };
+
+        let res = call(
+            "search_3d_models",
+            json!({
+                "query": "",
+                "project_dir": dir.path(),
+                "scope": "project"
+            }),
+        )
+        .await;
+        assert!(!res.is_error, "{:?}", res);
+        let parsed = json_of(&res);
+        assert_eq!(parsed["count"], 2);
+        assert_eq!(parsed["truncated"], false);
+        let paths: Vec<&str> = parsed["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["kicad_path"].as_str().unwrap())
+            .collect();
+        assert!(paths.contains(&"${KIPRJMOD}/3dmodels/Connector.wrl"));
+        assert!(paths.contains(&"${KIPRJMOD}/3dmodels/Resistor_SMD.3dshapes/R_0805.step"));
+
+        // Case-insensitive substring match + limit truncation
+        let filtered = call(
+            "search_3d_models",
+            json!({
+                "query": "r_0805",
+                "project_dir": dir.path(),
+                "scope": "project"
+            }),
+        )
+        .await;
+        let filtered_json = json_of(&filtered);
+        assert_eq!(filtered_json["count"], 1);
+        assert_eq!(filtered_json["results"][0]["format"], "step");
+
+        let limited = call(
+            "search_3d_models",
+            json!({
+                "query": "",
+                "project_dir": dir.path(),
+                "scope": "project",
+                "limit": 1
+            }),
+        )
+        .await;
+        let limited_json = json_of(&limited);
+        assert_eq!(limited_json["count"], 1);
+        assert_eq!(limited_json["truncated"], true);
+
+        // Missing project_dir with scope=project and invalid scope are refused.
+        let missing_proj = call(
+            "search_3d_models",
+            json!({ "query": "R", "scope": "project" }),
+        )
+        .await;
+        assert!(missing_proj.is_error);
+        assert_eq!(error_field(&missing_proj), "project_dir");
+
+        let bad_scope = call(
+            "search_3d_models",
+            json!({ "query": "R", "scope": "invalid" }),
+        )
+        .await;
+        assert!(bad_scope.is_error);
+        assert_eq!(error_field(&bad_scope), "scope");
     }
 }

@@ -240,6 +240,20 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_export_3d(args, ctx).await }
         ),
         tool!(
+            "check_3d_models",
+            "Audit placed footprints in a .kicad_pcb file for missing 3D models or broken/unresolvable model file paths before export_3d.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "include_dnp": { "type": "boolean", "description": "Include Do-Not-Populate (dnp) footprints in the check", "default": false },
+                    "include_board_only": { "type": "boolean", "description": "Include board_only mechanical footprints in the check", "default": false }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_check_3d_models(args, ctx).await }
+        ),
+        tool!(
             "export_bom",
             "Generate a Bill of Materials (BOM) CSV from the schematic's component data.",
             json!({
@@ -617,6 +631,129 @@ async fn handle_export_3d(
         }))
         .unwrap(),
     ))
+}
+
+fn footprint_reference(fp: &copperpour_sexp::SexpNode) -> String {
+    for prop in fp.find_all("property") {
+        if prop.get(1).and_then(|n| n.as_str()) == Some("Reference") {
+            if let Some(val) = prop.get(2).and_then(|n| n.as_str()) {
+                return val.to_string();
+            }
+        }
+    }
+    for text in fp.find_all("fp_text") {
+        if text.get(1).and_then(|n| n.as_str()) == Some("reference") {
+            if let Some(val) = text.get(2).and_then(|n| n.as_str()) {
+                return val.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn footprint_has_attr(fp: &copperpour_sexp::SexpNode, flag: &str) -> bool {
+    fp.find("attr")
+        .and_then(|a| a.children())
+        .is_some_and(|children| children.iter().skip(1).any(|c| c.as_str() == Some(flag)))
+}
+
+fn resolve_3d_model_path(model_path: &str, board_dir: Option<&Path>) -> Option<PathBuf> {
+    if model_path.starts_with("${") {
+        return super::library::expand_lib_uri(model_path, board_dir);
+    }
+    let p = Path::new(model_path);
+    if p.is_relative() {
+        let resolved = board_dir?.join(p);
+        return resolved.exists().then_some(resolved);
+    }
+    p.exists().then(|| p.to_path_buf())
+}
+
+async fn handle_check_3d_models(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let include_dnp = args
+        .get("include_dnp")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let include_board_only = args
+        .get("include_board_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let content = tokio::fs::read_to_string(&board).await?;
+    let root = copperpour_sexp::parse_sexp(&content)?;
+    let board_dir = board.parent();
+
+    let footprints = root.find_all("footprint");
+    let total_footprints = footprints.len();
+    let mut checked_footprints = 0usize;
+    let mut ok_count = 0usize;
+    let mut skipped_dnp = 0usize;
+    let mut skipped_board_only = 0usize;
+    let mut missing_models: Vec<serde_json::Value> = Vec::new();
+    let mut broken_models: Vec<serde_json::Value> = Vec::new();
+
+    for fp in footprints {
+        if !include_dnp && footprint_has_attr(fp, "dnp") {
+            skipped_dnp += 1;
+            continue;
+        }
+        if !include_board_only && footprint_has_attr(fp, "board_only") {
+            skipped_board_only += 1;
+            continue;
+        }
+        checked_footprints += 1;
+        let reference = footprint_reference(fp);
+        let footprint_id = fp.get(1).and_then(|n| n.as_str()).unwrap_or("").to_string();
+        let models = fp.find_all("model");
+        if models.is_empty() {
+            missing_models.push(json!({
+                "reference": reference,
+                "footprint_id": footprint_id,
+            }));
+            continue;
+        }
+        let mut any_broken = false;
+        for model in models {
+            let model_path = model.get(1).and_then(|n| n.as_str()).unwrap_or("");
+            if model_path.is_empty() || resolve_3d_model_path(model_path, board_dir).is_none() {
+                any_broken = true;
+                broken_models.push(json!({
+                    "reference": reference,
+                    "footprint_id": footprint_id,
+                    "model_path": model_path,
+                }));
+            }
+        }
+        if !any_broken {
+            ok_count += 1;
+        }
+    }
+
+    let missing_count = missing_models.len();
+    let broken_count = broken_models.len();
+    let verdict = if missing_count == 0 && broken_count == 0 {
+        "READY"
+    } else {
+        "ISSUES_FOUND"
+    };
+
+    Ok(CallToolResult::json(&json!({
+        "verdict": verdict,
+        "board": board.to_string_lossy(),
+        "total_footprints": total_footprints,
+        "checked_footprints": checked_footprints,
+        "ok_count": ok_count,
+        "missing_count": missing_count,
+        "broken_count": broken_count,
+        "skipped_dnp": skipped_dnp,
+        "skipped_board_only": skipped_board_only,
+        "missing_models": missing_models,
+        "broken_models": broken_models,
+    })))
 }
 
 async fn handle_export_bom(
@@ -2374,6 +2511,129 @@ mod specctra_padstack_served_tests {
             assert!(!output.exists(), "{mode}");
             assert!(!manifest.exists(), "{mode}");
         }
+    }
+
+    #[tokio::test]
+    async fn check_3d_models_reports_ready_and_skips_dnp_and_board_only() {
+        use crate::mcp::protocol::ToolContent;
+        use crate::tools::pcb_export::handle_check_3d_models;
+        use crate::tools::ToolContext;
+
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("3dmodels");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("R_0805.step"), "ISO-10303-21;").unwrap();
+
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(
+            &board,
+            r#"(kicad_pcb (version 20241229) (generator "pcbnew")
+  (footprint "Resistor_SMD:R_0805"
+    (property "Reference" "R1" (at 0 0 0) (layer "F.SilkS"))
+    (attr smd)
+    (model "${KIPRJMOD}/3dmodels/R_0805.step")
+  )
+  (footprint "Resistor_SMD:R_0402"
+    (property "Reference" "R2" (at 0 0 0) (layer "F.SilkS"))
+    (attr smd dnp)
+  )
+  (footprint "MountingHole:MH_3.2mm"
+    (property "Reference" "H1" (at 0 0 0) (layer "F.SilkS"))
+    (attr board_only exclude_from_pos_files exclude_from_bom)
+  )
+)"#,
+        )
+        .unwrap();
+
+        let ctx = ToolContext::new(
+            ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let res = handle_check_3d_models(&json!({ "board": board }), &ctx)
+            .await
+            .unwrap();
+        assert!(!res.is_error, "{:?}", res);
+        let ToolContent::Text { text } = &res.content[0] else {
+            panic!("expected text result");
+        };
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["verdict"], "READY");
+        assert_eq!(parsed["total_footprints"], 3);
+        assert_eq!(parsed["checked_footprints"], 1);
+        assert_eq!(parsed["ok_count"], 1);
+        assert_eq!(parsed["missing_count"], 0);
+        assert_eq!(parsed["broken_count"], 0);
+        assert_eq!(parsed["skipped_dnp"], 1);
+        assert_eq!(parsed["skipped_board_only"], 1);
+    }
+
+    #[tokio::test]
+    async fn check_3d_models_reports_missing_and_broken_models() {
+        use crate::mcp::protocol::ToolContent;
+        use crate::tools::pcb_export::handle_check_3d_models;
+        use crate::tools::ToolContext;
+
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("3dmodels");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("R_0805.step"), "ISO-10303-21;").unwrap();
+
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(
+            &board,
+            r#"(kicad_pcb (version 20241229) (generator "pcbnew")
+  (footprint "Resistor_SMD:R_0805"
+    (property "Reference" "R1" (at 0 0 0) (layer "F.SilkS"))
+    (attr smd)
+    (model "3dmodels/R_0805.step")
+  )
+  (footprint "Package_SO:SOIC-8"
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (attr smd)
+  )
+  (footprint "Connector_USB:USB_C"
+    (property "Reference" "J1" (at 0 0 0) (layer "F.SilkS"))
+    (attr smd)
+    (model "${KIPRJMOD}/3dmodels/does_not_exist.step")
+  )
+  (footprint "Resistor_SMD:R_0402"
+    (property "Reference" "R2" (at 0 0 0) (layer "F.SilkS"))
+    (attr smd dnp)
+  )
+)"#,
+        )
+        .unwrap();
+
+        let ctx = ToolContext::new(
+            ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let res = handle_check_3d_models(&json!({ "board": board, "include_dnp": true }), &ctx)
+            .await
+            .unwrap();
+        assert!(!res.is_error, "{:?}", res);
+        let ToolContent::Text { text } = &res.content[0] else {
+            panic!("expected text result");
+        };
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["verdict"], "ISSUES_FOUND");
+        assert_eq!(parsed["checked_footprints"], 4);
+        assert_eq!(parsed["ok_count"], 1);
+        assert_eq!(parsed["missing_count"], 2);
+        assert_eq!(parsed["broken_count"], 1);
+        assert_eq!(parsed["skipped_dnp"], 0);
+        let missing_refs: Vec<&str> = parsed["missing_models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["reference"].as_str().unwrap())
+            .collect();
+        assert_eq!(missing_refs, vec!["U1", "R2"]);
+        assert_eq!(parsed["broken_models"][0]["reference"], "J1");
+        assert_eq!(
+            parsed["broken_models"][0]["model_path"],
+            "${KIPRJMOD}/3dmodels/does_not_exist.step"
+        );
     }
 }
 
