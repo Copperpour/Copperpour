@@ -1770,6 +1770,23 @@ async fn export_bom_with_options(
     Ok(())
 }
 
+/// The `sch export netlist --format` value for a netlist format name, or
+/// `None` for a name KiCad 10's kicad-cli does not list. Matched without
+/// regard to case.
+pub fn netlist_cli_format(format: &str) -> Option<&'static str> {
+    Some(match format.to_lowercase().as_str() {
+        "kicad" | "kicadsexpr" | "sexp" => "kicadsexpr",
+        "xml" | "kicadxml" => "kicadxml",
+        "spice" => "spice",
+        "spicemodel" => "spicemodel",
+        "cadstar" => "cadstar",
+        "orcad" | "orcadpcb2" => "orcadpcb2",
+        "pads" => "pads",
+        "allegro" => "allegro",
+        _ => return None,
+    })
+}
+
 /// KiCAD 10: `sch export netlist --output <path> --format <fmt> <input>`
 /// Valid formats: kicadsexpr, kicadxml, cadstar, orcadpcb2, spice, spicemodel, pads, allegro
 pub async fn export_netlist(
@@ -1778,18 +1795,10 @@ pub async fn export_netlist(
     output: &Path,
     format: &str,
 ) -> Result<()> {
-    // Map friendly names to v10 format values
+    // Map friendly names to v10 format values. A name kicad-cli does not
+    // know is passed on unchanged for it to refuse.
     let lower = format.to_lowercase();
-    let v10_format = match lower.as_str() {
-        "kicad" | "kicadsexpr" | "sexp" => "kicadsexpr",
-        "xml" | "kicadxml" => "kicadxml",
-        "spice" => "spice",
-        "cadstar" => "cadstar",
-        "orcad" | "orcadpcb2" => "orcadpcb2",
-        "pads" => "pads",
-        "allegro" => "allegro",
-        _ => &lower,
-    };
+    let v10_format = netlist_cli_format(&lower).unwrap_or(&lower);
     let args = [
         "sch",
         "export",
