@@ -921,8 +921,8 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
             let identity = DsnPinIdentity {
                 padstack,
                 rotation: OrderedF64::new(rotation)?,
-                x: OrderedF64::new(dsn_number(pin, at + 1, "pin x")? + 0.0)?,
-                y: OrderedF64::new(dsn_number(pin, at + 2, "pin y")? + 0.0)?,
+                x: OrderedF64::new(dsn_number(pin, at + 1, "pin x")?)?,
+                y: OrderedF64::new(dsn_number(pin, at + 2, "pin y")?)?,
             };
             if pins.insert(number, identity).is_some() {
                 bail!("DSN image '{name}' repeats a pin number");

@@ -2,7 +2,7 @@
 
 Starts from `specctra_stock_roundrect.kicad_pcb` (`R_0603_1608Metric`,
 `C_0603_1608Metric`, `R_0402_1005Metric`) and adds KiCad's stock
-`Resistor_SMD:R_0805_2012Metric` as `R2`, whose pads sit at +/-0.9125 mm
+`Resistor_SMD:R_0805_2012Metric` as `R3`, whose pads sit at +/-0.9125 mm
 (+/-912.5 um) and whose courtyard exports as `(outline (polygon ...))`.
 """
 from pathlib import Path
