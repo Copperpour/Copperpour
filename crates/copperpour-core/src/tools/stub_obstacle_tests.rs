@@ -74,18 +74,22 @@ const BOXED: [&str; 3] = [
 ];
 const R1_DOWN: &str = "the down stub would join R2 pin 1 at (50.8, 57.15)";
 
-async fn assert_refused(path: &Path, args: Value, expected: &[&str]) {
+async fn assert_refused_tool(path: &Path, tool: &str, args: Value, expected: &[&str]) {
     let before = std::fs::read(path).unwrap();
-    let (is_error, body) = call(path, "connect_to_net", args).await;
+    let (is_error, body) = call(path, tool, args).await;
     assert!(is_error, "{body}");
     assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
-    assert_eq!(body["error"]["operation"], "connect_to_net", "{body}");
+    assert_eq!(body["error"]["operation"], tool, "{body}");
     assert_eq!(reasons(&body), expected);
     assert_eq!(
         std::fs::read(path).unwrap(),
         before,
         "a refusal writes nothing"
     );
+}
+
+async fn assert_refused(path: &Path, args: Value, expected: &[&str]) {
+    assert_refused_tool(path, "connect_to_net", args, expected).await;
 }
 
 #[tokio::test]
@@ -254,4 +258,84 @@ async fn batch_connect_to_net_with_every_stub_blocked_is_an_error_and_writes_not
     assert_eq!(body["added"], json!([]), "{body}");
     assert_eq!(body["errors"].as_array().unwrap().len(), 2, "{body}");
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn connect_passthrough_turns_away_from_a_pin_at_the_stub_end() {
+    let (_dir, path) = fixture();
+    let args = json!({ "net_name": "P", "x": 50.8, "y": 54.61 });
+    let (is_error, body) = call(&path, "connect_passthrough", args).await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["direction"], "right", "{body}");
+    assert_eq!(
+        body["label_position"],
+        json!({ "x": 53.34, "y": 54.61 }),
+        "{body}"
+    );
+    assert_eq!(body["label_rotation"], 0.0, "{body}");
+    assert_eq!(wires(&path), [[50.8, 54.61, 53.34, 54.61]]);
+    assert_eq!(junctions(&path), []);
+}
+
+#[tokio::test]
+async fn connect_passthrough_refuses_a_named_direction_that_joins_a_pin() {
+    let (_dir, path) = fixture();
+    let args = json!({ "net_name": "P", "x": 50.8, "y": 54.61, "direction": "down" });
+    assert_refused_tool(&path, "connect_passthrough", args, &[R1_DOWN]).await;
+}
+
+#[tokio::test]
+async fn connect_passthrough_refuses_when_every_direction_joins_another_net() {
+    let (_dir, path) = fixture();
+    let args = json!({ "net_name": "P", "x": 101.6, "y": 54.61 });
+    assert_refused_tool(&path, "connect_passthrough", args, &BOXED).await;
+}
+
+#[tokio::test]
+async fn connect_passthrough_may_end_on_a_pin_already_on_the_net() {
+    let (_dir, path) = fixture();
+    let args = json!({ "net_name": "N", "x": 127.0, "y": 54.61 });
+    let (is_error, body) = call(&path, "connect_passthrough", args).await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["direction"], "down", "{body}");
+    assert_eq!(wires(&path), [[127.0, 54.61, 127.0, 57.15]]);
+}
+
+#[tokio::test]
+async fn connect_passthrough_turns_away_and_keeps_label_reading_away_from_symbol() {
+    let (_dir, path) = fixture();
+    let args = json!({ "net_name": "P", "x": 148.59, "y": 50.8 });
+    let (is_error, body) = call(&path, "connect_passthrough", args).await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["direction"], "up", "{body}");
+    assert_eq!(
+        body["label_position"],
+        json!({ "x": 148.59, "y": 48.26 }),
+        "{body}"
+    );
+    assert_eq!(body["label_rotation"], 180.0, "{body}");
+    assert_eq!(wires(&path), [[148.59, 50.8, 148.59, 48.26]]);
+}
+
+#[tokio::test]
+async fn connect_passthrough_refuses_when_pins_cannot_be_resolved() {
+    let (_dir, path) = fixture();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let start = text.find("(lib_symbols").unwrap();
+    let end = copperpour_sexp::writer::find_balanced_block(&text, start)
+        .unwrap()
+        .1;
+    std::fs::write(
+        &path,
+        format!("{}(lib_symbols){}", &text[..start], &text[end..]),
+    )
+    .unwrap();
+    let args = json!({ "net_name": "P", "x": 127.0, "y": 54.61 });
+    assert_refused_tool(
+        &path,
+        "connect_passthrough",
+        args,
+        &["cannot check what the stub would join: one or more placed symbols have unresolved library pin geometry"],
+    )
+    .await;
 }
