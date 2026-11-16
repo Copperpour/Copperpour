@@ -485,7 +485,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "search_3d_models",
-            "Search for 3D model files (.step, .stp, .stpz, .wrl, .wrz, .obj) in KiCad's bundled 3dmodels directory and/or the project's 3dmodels/ folder.",
+            "Search for 3D model files (.step, .stp, .stpz, .stp.gz, .step.gz, .igs, .iges, .wrl, .wrz, .x3d, .idf, .emn) in KiCad's bundled 3dmodels directory and/or the project's 3dmodels/ folder.",
             json!({
                 "type": "object",
                 "properties": {
@@ -5481,16 +5481,21 @@ async fn search_footprint_entries(
 
 // ─── search_3d_models ────────────────────────────────────────────────────────
 
-const MODEL_3D_EXTENSIONS: &[&str] = &["step", "stp", "stpz", "wrl", "wrz", "obj"];
+const MODEL_3D_EXTENSIONS: &[&str] = &[
+    "step", "stp", "stpz", "stp.gz", "step.gz", "igs", "iges", "wrl", "wrz", "x3d", "idf", "emn",
+];
 const MAX_3D_MODEL_WALK_DEPTH: usize = 6;
 
 fn is_3d_model_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| {
-            let lower = ext.to_ascii_lowercase();
-            MODEL_3D_EXTENSIONS.contains(&lower.as_str())
-        })
+    model_3d_format(path).is_some()
+}
+
+fn model_3d_format(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    MODEL_3D_EXTENSIONS
+        .iter()
+        .copied()
+        .find(|ext| name.ends_with(&format!(".{ext}")))
 }
 
 fn kicad_3dmodel_env_prefix(dir: &Path) -> String {
@@ -5500,7 +5505,7 @@ fn kicad_3dmodel_env_prefix(dir: &Path) -> String {
             return format!("${{{var}}}");
         }
     }
-    "${KICAD10_3DMODEL_DIR}".to_string()
+    dir.to_string_lossy().into_owned()
 }
 
 fn collect_3d_models_in_dir(
@@ -5554,15 +5559,20 @@ fn collect_3d_models_in_dir(
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let format = path
-                .extension()
-                .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default();
+            let format = model_3d_format(&path).unwrap();
+            let portable = format!("{prefix}/{rel_slash}");
+            let project_dir = (source == "project").then(|| root.parent()).flatten();
+            let kicad_path =
+                if expand_lib_uri(&portable, project_dir).as_deref() == Some(path.as_path()) {
+                    portable
+                } else {
+                    path.to_string_lossy().into_owned()
+                };
             results.push(json!({
                 "source": source,
                 "name": name,
                 "format": format,
-                "kicad_path": format!("{prefix}/{rel_slash}"),
+                "kicad_path": kicad_path,
                 "path": path.to_string_lossy(),
             }));
             if results.len() > limit {
@@ -11766,6 +11776,52 @@ mod required_argument_tests {
         assert!(!path.exists(), "no library may be created on rejection");
     }
 
+    #[test]
+    fn model_search_matches_kicad_plugin_formats() {
+        for file in [
+            "a.step",
+            "a.STP",
+            "a.stpZ",
+            "a.stp.gz",
+            "a.step.gz",
+            "a.igs",
+            "a.iges",
+            "a.wrl",
+            "a.wrz",
+            "a.x3d",
+            "a.idf",
+            "a.emn",
+        ] {
+            assert!(is_3d_model_file(Path::new(file)), "{file}");
+        }
+        for file in ["a.obj", "a.step.bak", "a.gz", "notes.txt"] {
+            assert!(!is_3d_model_file(Path::new(file)), "{file}");
+        }
+    }
+
+    #[test]
+    fn model_search_paths_round_trip_for_unmapped_install_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model.step.gz"), b"model").unwrap();
+        let mut results = Vec::new();
+        collect_3d_models_in_dir(
+            dir.path(),
+            "kicad",
+            "${UNMAPPED_3DMODEL_DIR}",
+            "",
+            10,
+            &mut results,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["format"], "step.gz");
+        for result in results {
+            assert_eq!(
+                expand_lib_uri(result["kicad_path"].as_str().unwrap(), None).unwrap(),
+                PathBuf::from(result["path"].as_str().unwrap())
+            );
+        }
+    }
+
     #[tokio::test]
     async fn create_symbol_escapes_quotes_and_backslashes_in_symbol_and_unit_names() {
         let dir = tempfile::tempdir().unwrap();
@@ -11916,12 +11972,17 @@ mod required_argument_tests {
         let dir = tempfile::tempdir().unwrap();
         let models = dir.path().join("3dmodels");
         std::fs::create_dir_all(models.join("Resistor_SMD.3dshapes")).unwrap();
-        std::fs::write(
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models-3d");
+        std::fs::copy(
+            fixtures.join("resistor.step"),
             models.join("Resistor_SMD.3dshapes/R_0805.step"),
-            "ISO-10303-21;",
         )
         .unwrap();
-        std::fs::write(models.join("Connector.wrl"), "#VRML V2.0 utf8").unwrap();
+        std::fs::copy(
+            fixtures.join("adjustable_rx2v4.wrl"),
+            models.join("Connector.wrl"),
+        )
+        .unwrap();
         std::fs::write(models.join("notes.txt"), "ignored").unwrap();
 
         let json_of = |r: &CallToolResult| -> serde_json::Value {
@@ -11944,6 +12005,12 @@ mod required_argument_tests {
         let parsed = json_of(&res);
         assert_eq!(parsed["count"], 2);
         assert_eq!(parsed["truncated"], false);
+        for result in parsed["results"].as_array().unwrap() {
+            assert_eq!(
+                expand_lib_uri(result["kicad_path"].as_str().unwrap(), Some(dir.path())).unwrap(),
+                PathBuf::from(result["path"].as_str().unwrap())
+            );
+        }
         let paths: Vec<&str> = parsed["results"]
             .as_array()
             .unwrap()

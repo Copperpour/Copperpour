@@ -424,7 +424,7 @@ and Windows servers do not.
 | `list_library_footprints` | List all footprints in a specific registered library (`.pretty` directory). |
 | `get_footprint_info` | Return detailed information about a footprint. Set `include_graphics` (and optionally `graphics_layer`) to inspect supported top-level primitives, geometry, stroke, fill, and item IDs. |
 | `search_footprints` | Search registered footprint libraries by name, up to `limit` (default 50); `count`/`shown` count returned matches and `truncated` identifies an additional match. |
-| `search_3d_models` | Search KiCad's bundled `3dmodels` directory and/or a project's `3dmodels/` folder for `.step`, `.stp`, `.stpz`, `.wrl`, `.wrz`, and `.obj` files by substring, returning KiCad variable paths (`${KICAD*_3DMODEL_DIR}/...` or `${KIPRJMOD}/3dmodels/...`) and resolved paths up to `limit` (default 50). |
+| `search_3d_models` | Search KiCad's bundled `3dmodels` directory and/or a project's `3dmodels/` folder for `.step`, `.stp`, `.stpz`, `.stp.gz`, `.step.gz`, `.igs`, `.iges`, `.wrl`, `.wrz`, `.x3d`, `.idf`, and `.emn` files by substring, returning KiCad variable paths (`${KICAD*_3DMODEL_DIR}/...` or `${KIPRJMOD}/3dmodels/...`) and resolved paths up to `limit` (default 50). |
 | `get_symbol_info` | Return detailed information about a schematic symbol: pins, properties, description. |
 
 ---

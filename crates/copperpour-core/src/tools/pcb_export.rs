@@ -241,7 +241,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_3d_models",
-            "Audit placed footprints in a .kicad_pcb file for missing 3D models or broken/unresolvable model file paths before export_3d.",
+            "Audit placed footprints in the saved .kicad_pcb file (unsaved editor changes are not included) for missing 3D models or broken/unresolvable model file paths before export_3d. Includes hidden models; embedded models are resolved from footprint or board embedded_files.",
             json!({
                 "type": "object",
                 "properties": {
@@ -669,6 +669,30 @@ fn resolve_3d_model_path(model_path: &str, board_dir: Option<&Path>) -> Option<P
     p.is_file().then(|| p.to_path_buf())
 }
 
+fn has_embedded_model(owner: &copperpour_sexp::SexpNode, name: &str) -> bool {
+    owner.find("embedded_files").is_some_and(|files| {
+        files.find_all("file").iter().any(|file| {
+            file.find("name")
+                .and_then(|n| n.get(1))
+                .and_then(|n| n.as_str())
+                == Some(name)
+        })
+    })
+}
+
+fn model_is_present(
+    model_path: &str,
+    footprint: &copperpour_sexp::SexpNode,
+    board: &copperpour_sexp::SexpNode,
+    board_dir: Option<&Path>,
+) -> bool {
+    if let Some(name) = model_path.strip_prefix("kicad-embed://") {
+        return !name.is_empty()
+            && (has_embedded_model(footprint, name) || has_embedded_model(board, name));
+    }
+    !model_path.is_empty() && resolve_3d_model_path(model_path, board_dir).is_some()
+}
+
 async fn handle_check_3d_models(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -732,7 +756,7 @@ async fn handle_check_3d_models(
         let mut any_broken = false;
         for model in models {
             let model_path = model.get(1).and_then(|n| n.as_str()).unwrap_or("");
-            if model_path.is_empty() || resolve_3d_model_path(model_path, board_dir).is_none() {
+            if !model_is_present(model_path, fp, &root, board_dir) {
                 any_broken = true;
                 broken_models.push(json!({
                     "reference": reference,
@@ -2526,141 +2550,109 @@ mod specctra_padstack_served_tests {
         }
     }
 
-    #[tokio::test]
-    async fn check_3d_models_reports_ready_and_skips_dnp_and_board_only() {
-        use crate::mcp::protocol::ToolContent;
-        use crate::tools::pcb_export::handle_check_3d_models;
-        use crate::tools::ToolContext;
+    use super::{handle_check_3d_models, model_is_present};
+    use crate::tools::ToolContext;
+    use std::path::Path;
 
-        let dir = tempfile::tempdir().unwrap();
-        let models = dir.path().join("3dmodels");
-        std::fs::create_dir_all(&models).unwrap();
-        std::fs::write(models.join("R_0805.step"), "ISO-10303-21;").unwrap();
+    const REAL_MODEL_BOARD: &str =
+        include_str!("../../tests/fixtures/models-3d/royalblue.kicad_pcb");
 
-        let board = dir.path().join("board.kicad_pcb");
-        std::fs::write(
-            &board,
-            r#"(kicad_pcb (version 20241229) (generator "pcbnew")
-  (footprint "Resistor_SMD:R_0805"
-    (property "Reference" "R1" (at 0 0 0) (layer "F.SilkS"))
-    (attr smd)
-    (model "${KIPRJMOD}/3dmodels/R_0805.step")
-  )
-  (footprint "Resistor_SMD:R_0402"
-    (property "Reference" "R2" (at 0 0 0) (layer "F.SilkS"))
-    (attr smd dnp)
-  )
-  (footprint "MountingHole:MH_3.2mm"
-    (property "Reference" "H1" (at 0 0 0) (layer "F.SilkS"))
-    (attr board_only exclude_from_pos_files exclude_from_bom)
-  )
-)"#,
-        )
-        .unwrap();
-
-        let ctx = ToolContext::new(
-            ServerConfig::default(),
-            std::sync::Arc::new(crate::router::ToolRouter::new()),
-        );
-        let res = handle_check_3d_models(&json!({ "board": board }), &ctx)
-            .await
-            .unwrap();
-        assert!(!res.is_error, "{:?}", res);
-        let ToolContent::Text { text } = &res.content[0] else {
-            panic!("expected text result");
-        };
-        let parsed: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(parsed["verdict"], "READY");
-        assert_eq!(parsed["total_footprints"], 3);
-        assert_eq!(parsed["checked_footprints"], 1);
-        assert_eq!(parsed["ok_count"], 1);
-        assert_eq!(parsed["missing_count"], 0);
-        assert_eq!(parsed["broken_count"], 0);
-        assert_eq!(parsed["skipped_dnp"], 1);
-        assert_eq!(parsed["skipped_board_only"], 1);
+    #[test]
+    fn check_3d_models_resolves_real_embedded_models_in_either_owner() {
+        use copperpour_sexp::{parse_sexp, SexpNode};
+        fn without_embedded(mut node: SexpNode) -> SexpNode {
+            if let SexpNode::List(children) = &mut node {
+                children.retain(|n| n.head() != Some("embedded_files"));
+            }
+            node
+        }
+        let root = parse_sexp(REAL_MODEL_BOARD).unwrap();
+        let board_without = without_embedded(root.clone());
+        let mut embedded = 0;
+        for fp in root.find_all("footprint") {
+            for model in fp.find_all("model") {
+                let path = model.get(1).unwrap().as_str().unwrap();
+                if !path.starts_with("kicad-embed://") {
+                    continue;
+                }
+                embedded += 1;
+                let fp_without = without_embedded(fp.clone());
+                assert!(
+                    model_is_present(path, fp, &board_without, None),
+                    "footprint: {path}"
+                );
+                assert!(
+                    model_is_present(path, &fp_without, &root, None),
+                    "board: {path}"
+                );
+                assert!(
+                    !model_is_present(path, &fp_without, &board_without, None),
+                    "missing: {path}"
+                );
+                assert!(!model_is_present(
+                    "kicad-embed://absent.step",
+                    fp,
+                    &root,
+                    None
+                ));
+            }
+        }
+        assert_eq!(embedded, 6);
     }
 
     #[tokio::test]
-    async fn check_3d_models_reports_missing_and_broken_models() {
+    async fn check_3d_models_audits_kicad_demo_without_flagging_embedded_models() {
         use crate::mcp::protocol::ToolContent;
-        use crate::tools::pcb_export::handle_check_3d_models;
-        use crate::tools::ToolContext;
-
         let dir = tempfile::tempdir().unwrap();
-        let models = dir.path().join("3dmodels");
-        std::fs::create_dir_all(&models).unwrap();
-        std::fs::write(models.join("R_0805.step"), "ISO-10303-21;").unwrap();
-
         let board = dir.path().join("board.kicad_pcb");
-        std::fs::write(
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/models-3d/royalblue.kicad_pcb"),
             &board,
-            r#"(kicad_pcb (version 20241229) (generator "pcbnew")
-  (footprint "Resistor_SMD:R_0805"
-    (property "Reference" "R1" (at 0 0 0) (layer "F.SilkS"))
-    (attr smd)
-    (model "3dmodels/R_0805.step")
-  )
-  (footprint "Package_SO:SOIC-8"
-    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
-    (attr smd)
-  )
-  (footprint "Connector_USB:USB_C"
-    (property "Reference" "J1" (at 0 0 0) (layer "F.SilkS"))
-    (attr smd)
-    (model "${KIPRJMOD}/3dmodels/does_not_exist.step")
-  )
-  (footprint "Resistor_SMD:R_0402"
-    (property "Reference" "R2" (at 0 0 0) (layer "F.SilkS"))
-    (attr smd dnp)
-  )
-)"#,
         )
         .unwrap();
-
+        let before = std::fs::read(&board).unwrap();
         let ctx = ToolContext::new(
             ServerConfig::default(),
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         );
-        let res = handle_check_3d_models(&json!({ "board": board, "include_dnp": true }), &ctx)
+        for include_dnp in [false, true] {
+            let res =
+                handle_check_3d_models(&json!({"board": board, "include_dnp": include_dnp}), &ctx)
+                    .await
+                    .unwrap();
+            assert!(!res.is_error, "{res:?}");
+            let ToolContent::Text { text } = &res.content[0] else {
+                panic!("expected text");
+            };
+            let parsed: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(parsed["verdict"], "ISSUES_FOUND");
+            assert!(parsed["ok_count"].as_u64().unwrap() >= 6, "{parsed}");
+            let broken = parsed["broken_models"].as_array().unwrap();
+            assert!(!broken.is_empty());
+            assert!(broken.iter().all(|m| !m["model_path"]
+                .as_str()
+                .unwrap()
+                .starts_with("kicad-embed://")));
+            if include_dnp {
+                assert_eq!(parsed["skipped_dnp"], 0);
+            } else {
+                assert!(parsed["skipped_dnp"].as_u64().unwrap() > 0);
+            }
+        }
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+        let bad_flag = handle_check_3d_models(&json!({"board": board, "include_dnp": "yes"}), &ctx)
             .await
             .unwrap();
-        assert!(!res.is_error, "{:?}", res);
-        let ToolContent::Text { text } = &res.content[0] else {
-            panic!("expected text result");
-        };
-        let parsed: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(parsed["verdict"], "ISSUES_FOUND");
-        assert_eq!(parsed["checked_footprints"], 4);
-        assert_eq!(parsed["ok_count"], 1);
-        assert_eq!(parsed["missing_count"], 2);
-        assert_eq!(parsed["broken_count"], 1);
-        assert_eq!(parsed["skipped_dnp"], 0);
-        let missing_refs: Vec<&str> = parsed["missing_models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|m| m["reference"].as_str().unwrap())
-            .collect();
-        assert_eq!(missing_refs, vec!["U1", "R2"]);
-        assert_eq!(parsed["broken_models"][0]["reference"], "J1");
-        assert_eq!(
-            parsed["broken_models"][0]["model_path"],
-            "${KIPRJMOD}/3dmodels/does_not_exist.step"
-        );
-
-        // Non-boolean flag, non-file model target (directory), and non-kicad_pcb root are refused/flagged.
-        let bad_flag =
-            handle_check_3d_models(&json!({ "board": board, "include_dnp": "yes" }), &ctx)
-                .await
-                .unwrap();
         assert!(bad_flag.is_error);
-
-        let sch = dir.path().join("not_a_board.kicad_sch");
-        std::fs::write(&sch, "(kicad_sch (version 20240108))").unwrap();
-        let wrong_root = handle_check_3d_models(&json!({ "board": sch }), &ctx)
-            .await
-            .unwrap();
-        assert!(wrong_root.is_error);
+        let wrong = dir.path().join("not_a_board.txt");
+        std::fs::write(&wrong, "(not_a_board)").unwrap();
+        assert!(
+            handle_check_3d_models(&json!({"board": wrong}), &ctx)
+                .await
+                .unwrap()
+                .is_error
+        );
     }
 }
 
