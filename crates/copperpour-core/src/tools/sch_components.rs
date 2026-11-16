@@ -1180,6 +1180,20 @@ impl ComponentTargetUnit {
             instance_references: vec![reference.to_owned()],
         }
     }
+
+    /// Bind the set of designators the instance records carry when they differ
+    /// per instance, as on a sheet placed more than once. The readback compares
+    /// the sorted set, not which instance carries which.
+    pub(crate) fn with_instance_references<'a>(
+        mut self,
+        references: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let mut references: Vec<String> = references.into_iter().map(str::to_owned).collect();
+        references.sort();
+        references.dedup();
+        self.instance_references = references;
+        self
+    }
 }
 
 /// Inspect every record before sorting: duplicate identities and conflicting

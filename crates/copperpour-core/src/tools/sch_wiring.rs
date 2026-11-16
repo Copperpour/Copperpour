@@ -219,7 +219,10 @@ pub fn tools() -> Vec<ToolDef> {
              pin's endpoint and, unless rotation is given, turns it to face away from the body. \
              Coordinates snap to the 1.27mm grid like the other placers. Reports the placed \
              coordinates. Auto-numbers the \
-             internal #PWR reference to the lowest number free on the sheet. Preserves every \
+             internal #PWR reference to the lowest number free in the whole hierarchy, one per \
+             instance of a sheet placed more than once; a sheet no project owns is numbered \
+             against itself alone, and a sheet file that cannot be read is named in \
+             other_sheets_unreadable, its numbers unseen. Preserves every \
              saved hierarchy instance and reports committed-file readback; refuses stale \
              instance metadata before writing.",
             json!({
@@ -2639,20 +2642,141 @@ async fn handle_batch_rotate_labels(
     Ok(CallToolResult::json(&json!({ "rotated": rotated })))
 }
 
-/// The lowest `#PWR` number no symbol on the sheet is using.
+/// The `#PWR` number of a designator, when it is one.
+fn pwr_number(designator: &str) -> Option<u32> {
+    let parsed = super::sch_annotate::parse_designator(designator);
+    (parsed.prefix == "#PWR").then_some(parsed.number).flatten()
+}
+
+/// The `#PWR` numbers the hierarchy a new power symbol joins already holds,
+/// and the numbers it hands out.
 ///
-/// Counting the power symbols instead re-issues a live designator after a
-/// deletion: drop `#PWR028` from a sheet of 29 and the count is 28, so the
-/// next symbol is handed `#PWR029` — still in use, silently duplicated.
-fn next_pwr_number(sch: &cse::Schematic) -> u32 {
-    let used: std::collections::HashSet<u32> = sch
-        .symbols
-        .iter()
-        .filter_map(|s| s.reference())
-        .filter_map(|r| r.strip_prefix("#PWR"))
-        .filter_map(|n| n.parse::<u32>().ok())
-        .collect();
-    (1u32..).find(|n| !used.contains(n)).unwrap_or(1)
+/// eeschema checks annotation over the whole hierarchy with power symbols
+/// included, so a number held on any sheet is held for all of them. Taking
+/// the lowest number no symbol uses, rather than counting the power symbols,
+/// also avoids re-issuing a live designator after a deletion: drop `#PWR028`
+/// from a sheet of 29 and the count is 28, so the next symbol would be handed
+/// `#PWR029`, still in use.
+struct PwrNumbering {
+    held: std::collections::HashSet<u32>,
+    /// The file's instance paths in eeschema's hierarchy order, as it numbers
+    /// its pages. The first is the instance whose designator eeschema saves
+    /// as the file's `Reference` property.
+    hierarchy_order: Vec<String>,
+    /// The other sheet files read for their numbers, and those that could not
+    /// be, whose numbers stayed invisible. Reported like `annotate_schematic`.
+    consulted: Vec<String>,
+    unreadable: Vec<String>,
+}
+
+impl PwrNumbering {
+    /// This sheet's own designators, property and instance records, plus the
+    /// project's instance records on every other sheet file of the hierarchy
+    /// that owns it (`reserved_on_other_sheets`, as `annotate_schematic`
+    /// reads them). In a file KiCad saved the `Reference` property is one of
+    /// the instance records, so the records hold every number. A sheet no
+    /// project owns is numbered against itself alone; a file that cannot be
+    /// read is named in `unreadable`.
+    fn for_sheet(
+        sch_path: &std::path::Path,
+        sch: &cse::Schematic,
+        context: &crate::tools::SheetInstanceContext,
+    ) -> Self {
+        let mut held = std::collections::HashSet::new();
+        for symbol in &sch.symbols {
+            held.extend(symbol.reference().and_then(pwr_number));
+            for instance in symbol.instances() {
+                if instance.project.as_deref() == Some(context.project_name.as_str()) {
+                    held.extend(instance.reference.as_deref().and_then(pwr_number));
+                }
+            }
+        }
+        let mut hierarchy_order = Vec::new();
+        let mut consulted = Vec::new();
+        let mut unreadable = Vec::new();
+        if let Ok(Some(ownership)) = crate::tools::resolve_schematic_ownership(sch_path) {
+            for top_level in &ownership.top_level_sheets {
+                let (reserved, seen, missed) = super::sch_annotate::reserved_on_other_sheets(
+                    &top_level.schematic,
+                    sch_path,
+                    &context.project_name,
+                );
+                held.extend(reserved.get("#PWR").into_iter().flatten().copied());
+                consulted.extend(seen);
+                unreadable.extend(missed);
+            }
+            match crate::tools::sch_hierarchy::load_saved_hierarchy(&ownership.root_schematic) {
+                Ok(hierarchy) => {
+                    hierarchy_order = hierarchy
+                        .instances
+                        .iter()
+                        .filter(|instance| {
+                            crate::tools::same_schematic_document(
+                                &hierarchy.files[instance.file].path,
+                                sch_path,
+                            )
+                        })
+                        .map(|instance| instance.path.clone())
+                        .collect();
+                }
+                // Without the saved hierarchy there is no page order: the
+                // paths are numbered as given, and the file it stopped at is
+                // named.
+                Err(
+                    crate::tools::sch_hierarchy::SavedHierarchyError::Missing { path }
+                    | crate::tools::sch_hierarchy::SavedHierarchyError::Invalid { path, .. },
+                ) => unreadable.push(path.display().to_string()),
+            }
+            consulted.sort();
+            consulted.dedup();
+            unreadable.sort();
+            unreadable.dedup();
+        }
+        Self {
+            held,
+            hierarchy_order,
+            consulted,
+            unreadable,
+        }
+    }
+
+    /// The reply's account of what was read, in `annotate_schematic`'s keys.
+    fn disclose(&self, reply: &mut serde_json::Value) {
+        reply["other_sheets_consulted"] = json!(self.consulted);
+        reply["other_sheets_unreadable"] = json!(self.unreadable);
+    }
+
+    /// One number per instance path, each the lowest still free, in
+    /// hierarchy order (a path the walk did not see follows, in the order
+    /// given); and the `Reference` property eeschema would save for the file.
+    fn issue(&mut self, instance_paths: &[String]) -> (String, Vec<(String, String)>) {
+        let walked = self
+            .hierarchy_order
+            .iter()
+            .filter(|path| instance_paths.contains(path));
+        let unseen = instance_paths
+            .iter()
+            .filter(|path| !self.hierarchy_order.contains(path));
+        let ordered: Vec<String> = walked.chain(unseen).cloned().collect();
+        let records: Vec<(String, String)> = ordered
+            .iter()
+            .map(|path| {
+                let number = (1u32..).find(|n| !self.held.contains(n)).unwrap_or(1);
+                self.held.insert(number);
+                (
+                    path.clone(),
+                    super::sch_annotate::format_designator("#PWR", number),
+                )
+            })
+            .collect();
+        let property = records
+            .iter()
+            .find(|(path, _)| Some(path) == self.hierarchy_order.first())
+            .or_else(|| records.first())
+            .map(|(_, reference)| reference.clone())
+            .unwrap_or_default();
+        (property, records)
+    }
 }
 
 /// Where `add_power_symbol` was asked to put the symbol.
@@ -2823,11 +2947,14 @@ impl ExistingPower {
     }
 }
 
-/// Add a `power_net` symbol at (x, y), numbered with the next free `#PWR`.
-/// Returns its reference and the placement the readback is checked against.
+/// Add a `power_net` symbol at (x, y), numbered with the next free `#PWR` of
+/// each sheet instance. Returns its reference and the placement the readback
+/// is checked against.
+#[allow(clippy::too_many_arguments)]
 fn add_power_symbol_to(
     sch: &mut cse::Schematic,
     context: &crate::tools::SheetInstanceContext,
+    numbering: &mut PwrNumbering,
     lib_id: &str,
     power_net: &str,
     x: f64,
@@ -2837,7 +2964,7 @@ fn add_power_symbol_to(
     // Spelled by the rule `annotate_schematic` uses, which is eeschema's:
     // `#PWR01`, `#PWR010`, `#PWR0100`. `{:03}` put a second spelling of the
     // same number beside every eeschema-numbered symbol (#583).
-    let pwr_ref = super::sch_annotate::format_designator("#PWR", next_pwr_number(sch));
+    let (pwr_ref, records) = numbering.issue(&context.instance_paths);
     let metadata = cse::library::symbol_metadata(sch, lib_id);
     let placement_fields =
         super::sch_components::PlacementFields::resolve(lib_id, &metadata, Some(power_net), None);
@@ -2921,8 +3048,8 @@ fn add_power_symbol_to(
     // Instance entry, keyed to the root sheet UUID like eeschema writes it —
     // without a resolvable "/<root-uuid>" path KiCAD's netlister drops the
     // symbol from net formation.
-    for instance_path in &context.instance_paths {
-        sym.set_instance_path(&context.project_name, instance_path, &pwr_ref, 1);
+    for (instance_path, reference) in &records {
+        sym.set_instance_path(&context.project_name, instance_path, reference, 1);
     }
 
     let uuid = sym.uuid.clone();
@@ -2939,7 +3066,8 @@ fn add_power_symbol_to(
         &pwr_ref,
         &placement_fields,
         1,
-    );
+    )
+    .with_instance_references(records.iter().map(|(_, reference)| reference.as_str()));
     sch.add_symbol(sym);
     (pwr_ref, placement)
 }
@@ -3033,8 +3161,17 @@ async fn handle_add_power_symbol(
             power_symbol_on_point(&power_pin, endpoint, outward, requested_rotation)
         }
     };
-    let (pwr_ref, placement) =
-        add_power_symbol_to(&mut sch, &context, &lib_id, &power_net, x, y, rotation);
+    let mut numbering = PwrNumbering::for_sheet(&sch_path, &sch, &context);
+    let (pwr_ref, placement) = add_power_symbol_to(
+        &mut sch,
+        &context,
+        &mut numbering,
+        &lib_id,
+        &power_net,
+        x,
+        y,
+        rotation,
+    );
     sch.overwrite()?;
 
     // A power pin landing mid-segment on an existing wire needs a junction
@@ -3063,6 +3200,7 @@ async fn handle_add_power_symbol(
         observed = compact;
     }
     observed["added_power"] = observed["value"].clone();
+    numbering.disclose(&mut observed);
     observed["junctions_added"] = json!(junctions_added
         .iter()
         .map(|(x, y)| json!({"x": x, "y": y}))
@@ -3410,6 +3548,7 @@ pub(crate) async fn handle_batch_add_power_symbol(
     };
 
     let existing_wires = cse_wires_to_sexp(&sch);
+    let mut numbering = PwrNumbering::for_sheet(&sch_path, &sch, &context);
     let mut placed = Vec::new();
     let mut new_wires: Vec<copperpour_sexp::schematic::Wire> = Vec::new();
     for plan in &plans {
@@ -3426,8 +3565,16 @@ pub(crate) async fn handle_batch_add_power_symbol(
             });
         }
         let (x, y, rotation) = power_symbol_on_point(&power_pin, plan.pin_at, plan.outward, None);
-        let (_, placement) =
-            add_power_symbol_to(&mut sch, &context, &lib_id, &power_net, x, y, rotation);
+        let (_, placement) = add_power_symbol_to(
+            &mut sch,
+            &context,
+            &mut numbering,
+            &lib_id,
+            &power_net,
+            x,
+            y,
+            rotation,
+        );
         placed.push((placement, wire_uuids));
     }
 
@@ -3556,7 +3703,7 @@ pub(crate) async fn handle_batch_add_power_symbol(
         groups.push(group);
     }
 
-    Ok(CallToolResult::json(&json!({
+    let mut reply = json!({
         "power_net": power_net,
         "groups": groups,
         "already_connected": already_connected,
@@ -3566,7 +3713,9 @@ pub(crate) async fn handle_batch_add_power_symbol(
             .iter()
             .map(|(x, y)| json!({"x": round6(*x), "y": round6(*y)}))
             .collect::<Vec<_>>(),
-    })))
+    });
+    numbering.disclose(&mut reply);
+    Ok(CallToolResult::json(&reply))
 }
 
 async fn handle_add_no_connect(
@@ -6527,6 +6676,196 @@ mod power_symbol_tests {
         let mut refs: Vec<&str> = sch.symbols.iter().filter_map(|s| s.reference()).collect();
         refs.sort_unstable();
         assert_eq!(refs, ["#PWR001", "#PWR002", "#PWR03"]);
+    }
+
+    // ─── #PWR numbered across the hierarchy ────────────────────────────────
+    //
+    // On the KiCad-saved `annotate_nested_hierarchy` project (see its README):
+    // `#PWR01`..`#PWR016` are held across its three files, `bank` is placed
+    // twice and `cell` four times, and the pages differ from the walk and from
+    // the path strings.
+
+    const NESTED_PRO: &str =
+        include_str!("../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_pro");
+    const NESTED_ROOT: &str =
+        include_str!("../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_sch");
+    const NESTED_BANK: &str =
+        include_str!("../../tests/fixtures/annotate_nested_hierarchy/bank.kicad_sch");
+    const NESTED_CELL: &str =
+        include_str!("../../tests/fixtures/annotate_nested_hierarchy/cell.kicad_sch");
+
+    /// The instance paths of `cell.kicad_sch` in page order: under `south`
+    /// (page 2) `east` (3) and `west` (4), under `north` (page 10) `west` (11)
+    /// and `east` (12).
+    const CELL_PATHS_BY_PAGE: [&str; 4] = [
+        "/970f1adb-65bd-4ca9-bbaf-b939cab8549c/ed5b7508-65bd-450d-b053-99de75ca07ff/380650f1-fcab-4acf-8bbe-d7c7771fd834",
+        "/970f1adb-65bd-4ca9-bbaf-b939cab8549c/ed5b7508-65bd-450d-b053-99de75ca07ff/69a89bb1-464e-4f4e-948b-24cc8540975b",
+        "/970f1adb-65bd-4ca9-bbaf-b939cab8549c/8cca053b-d9dc-44e3-a2d7-e24a663aa548/69a89bb1-464e-4f4e-948b-24cc8540975b",
+        "/970f1adb-65bd-4ca9-bbaf-b939cab8549c/8cca053b-d9dc-44e3-a2d7-e24a663aa548/380650f1-fcab-4acf-8bbe-d7c7771fd834",
+    ];
+
+    /// Lay fixture files out in a fresh directory: the contents are the
+    /// KiCad-saved fixture files, nothing is composed here.
+    fn lay_out(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content) in files {
+            std::fs::write(dir.path().join(name), content).unwrap();
+        }
+        dir
+    }
+
+    fn nested_project() -> tempfile::TempDir {
+        lay_out(&[
+            ("nested_pages.kicad_pro", NESTED_PRO),
+            ("nested_pages.kicad_sch", NESTED_ROOT),
+            ("bank.kicad_sch", NESTED_BANK),
+            ("cell.kicad_sch", NESTED_CELL),
+        ])
+    }
+
+    async fn served_handler() -> crate::mcp::handler::McpHandler {
+        crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    /// The placed symbol with `uuid`: its `Reference` property and its
+    /// instance records as (path, reference), sorted by path.
+    fn property_and_records(path: &std::path::Path, uuid: &str) -> (String, Vec<(String, String)>) {
+        let sch = cse::Schematic::load(path).unwrap();
+        let symbol = sch.symbols.iter().find(|s| s.uuid == uuid).unwrap();
+        let mut records: Vec<(String, String)> = symbol
+            .instances()
+            .into_iter()
+            .map(|i| (i.path.unwrap(), i.reference.unwrap()))
+            .collect();
+        records.sort();
+        (symbol.reference().unwrap().to_string(), records)
+    }
+
+    /// The expected records of one symbol: `first`, `first + 1`, ... on
+    /// `CELL_PATHS_BY_PAGE`, sorted by path.
+    fn cell_records(first: u32) -> Vec<(String, String)> {
+        let mut records: Vec<(String, String)> = CELL_PATHS_BY_PAGE
+            .iter()
+            .zip(first..)
+            .map(|(path, number)| (path.to_string(), format!("#PWR0{number}")))
+            .collect();
+        records.sort();
+        records
+    }
+
+    #[tokio::test]
+    async fn a_sheet_placed_four_times_is_numbered_across_the_hierarchy_in_page_order() {
+        let dir = nested_project();
+        let cell = dir.path().join("cell.kicad_sch");
+        let placed = super::batch_power_tests::serve(
+            &served_handler().await,
+            "add_power_symbol",
+            &cell,
+            json!({"power_net": "+3V3", "x": 25.4, "y": 25.4}),
+        )
+        .await;
+        assert_eq!(placed["is_error"], json!(false), "{placed}");
+        // `#PWR01`..`#PWR016` are held, on this sheet and on the others, so the
+        // lowest free are 17..20, handed out in page order. The property is
+        // the file's first instance in page order, as `property_after` sets it.
+        let (property, records) = property_and_records(&cell, placed["uuid"].as_str().unwrap());
+        assert_eq!(records, cell_records(17));
+        assert_eq!(property, "#PWR017");
+        assert_eq!(placed["reference"], json!("#PWR017"), "{placed}");
+        // The other two files were read, none was unreadable.
+        assert_eq!(
+            placed["other_sheets_consulted"].as_array().map(Vec::len),
+            Some(2),
+            "{placed}"
+        );
+        assert_eq!(placed["other_sheets_unreadable"], json!([]), "{placed}");
+    }
+
+    #[tokio::test]
+    async fn a_batch_numbers_each_symbol_after_the_previous_one() {
+        let dir = nested_project();
+        let cell = dir.path().join("cell.kicad_sch");
+        let body = super::batch_power_tests::serve(
+            &served_handler().await,
+            "batch_add_power_symbol",
+            &cell,
+            json!({
+                "power_net": "+3V3",
+                "max_gap": 10,
+                "pins": [
+                    {"reference": "R6", "pin_number": "1"},
+                    {"reference": "R7", "pin_number": "1"},
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(body["is_error"], json!(false), "{body}");
+        let groups = body["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "{body}");
+        // The first symbol takes 17..20, the second 21..24, each in page order.
+        for (group, first) in groups.iter().zip([17, 21]) {
+            let uuid = group["symbol"]["uuid"].as_str().unwrap();
+            let (property, records) = property_and_records(&cell, uuid);
+            assert_eq!(records, cell_records(first), "{body}");
+            assert_eq!(property, format!("#PWR0{first}"));
+        }
+        assert_eq!(body["other_sheets_unreadable"], json!([]), "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_sheet_is_named_in_the_reply() {
+        // `cell.kicad_sch` is gone: its numbers cannot be seen, and the page
+        // order of the hierarchy cannot be loaded.
+        let dir = lay_out(&[
+            ("nested_pages.kicad_pro", NESTED_PRO),
+            ("nested_pages.kicad_sch", NESTED_ROOT),
+            ("bank.kicad_sch", NESTED_BANK),
+        ]);
+        let bank = dir.path().join("bank.kicad_sch");
+        let placed = super::batch_power_tests::serve(
+            &served_handler().await,
+            "add_power_symbol",
+            &bank,
+            json!({"power_net": "+3V3", "x": 25.4, "y": 25.4}),
+        )
+        .await;
+        assert_eq!(placed["is_error"], json!(false), "{placed}");
+        let unreadable: Vec<&str> = placed["other_sheets_unreadable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|file| file.as_str())
+            .collect();
+        assert_eq!(unreadable.len(), 1, "{placed}");
+        assert!(unreadable[0].ends_with("cell.kicad_sch"), "{placed}");
+    }
+
+    #[tokio::test]
+    async fn a_sheet_no_project_owns_is_numbered_against_itself() {
+        // The root alone, with no project file: nothing proves that it owns
+        // the sheets beside it, and `bank.kicad_sch` holds #PWR03. The root
+        // holds #PWR01 and #PWR02.
+        let dir = lay_out(&[
+            ("nested_pages.kicad_sch", NESTED_ROOT),
+            ("bank.kicad_sch", NESTED_BANK),
+            ("cell.kicad_sch", NESTED_CELL),
+        ]);
+        let root = dir.path().join("nested_pages.kicad_sch");
+        let placed = super::batch_power_tests::serve(
+            &served_handler().await,
+            "add_power_symbol",
+            &root,
+            json!({"power_net": "+3V3", "x": 25.4, "y": 25.4}),
+        )
+        .await;
+        assert_eq!(placed["is_error"], json!(false), "{placed}");
+        assert_eq!(placed["reference"], json!("#PWR03"), "{placed}");
+        assert_eq!(placed["other_sheets_consulted"], json!([]), "{placed}");
     }
 }
 
