@@ -1515,12 +1515,21 @@ fn build_updated_instance(
     }
 
     let mut old_nets = BTreeMap::<String, kiapi::board::types::Net>::new();
+    // The schematic pin each pad belongs to (pin function and type), which
+    // Update PCB from Schematic writes and the library does not carry. KiCad's
+    // own footprint exchange copies it from each old pad to its matching new
+    // one (`PCB_EDIT_FRAME::ExchangeFootprint`); the first pad with a number
+    // speaks for it, as for the net.
+    let mut old_pins = BTreeMap::<String, kiapi::board::types::SymbolPinInfo>::new();
     for item in &current_definition.items {
         if !item.type_url.ends_with("kiapi.board.types.Pad") {
             continue;
         }
         let pad = kiapi::board::types::Pad::decode(item.value.as_slice())
             .context("board footprint contains an invalid pad")?;
+        if let Some(pin) = pad.symbol_pin.clone() {
+            old_pins.entry(pad.number.clone()).or_insert(pin);
+        }
         let Some(net) = pad.net.filter(|net| !net.name.is_empty()) else {
             continue;
         };
@@ -1645,6 +1654,7 @@ fn build_updated_instance(
                         .map(|value| kiapi::board::types::NetCode { value }),
                     name: old.name.clone(),
                 });
+            pad.symbol_pin = old_pins.get(&pad.number).cloned();
             *item = copperpour_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
         } else if is_back && item.type_url.ends_with("kiapi.board.types.BoardText") {
             let mut text = kiapi::board::types::BoardText::decode(item.value.as_slice())?;
@@ -4356,6 +4366,93 @@ mod tests {
         changed_domains(current, updated)
             .unwrap()
             .contains(&ChangedDomain::Graphics)
+    }
+
+    /// `instance`'s pads as pad number -> (net name, symbol pin), sorted.
+    fn pad_pins(
+        instance: &kiapi::board::types::FootprintInstance,
+    ) -> BTreeMap<String, (String, Option<kiapi::board::types::SymbolPinInfo>)> {
+        instance
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
+            .map(|item| {
+                let pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                let net = pad.net.map(|net| net.name).unwrap_or_default();
+                (pad.number, (net, pad.symbol_pin))
+            })
+            .collect()
+    }
+
+    /// Synthetic on KiCad's own J1 (#254): the schematic pin each pad belongs
+    /// to, as Update PCB from Schematic writes it, is not in the library. The
+    /// update carries it by pad number, as KiCad's footprint exchange does, so
+    /// a refresh does not empty the pin functions `PAD::Deserialize` reads.
+    #[test]
+    fn a_refresh_keeps_each_pads_schematic_pin() {
+        let pin = |name: &str, kind: kiapi::common::types::ElectricalPinType| {
+            kiapi::board::types::SymbolPinInfo {
+                name: name.to_string(),
+                r#type: kind as i32,
+                no_connect: false,
+            }
+        };
+        let pins = BTreeMap::from([
+            (
+                "1".to_string(),
+                pin(
+                    "SDA",
+                    kiapi::common::types::ElectricalPinType::EptBidirectional,
+                ),
+            ),
+            (
+                "2".to_string(),
+                pin(
+                    "GND",
+                    kiapi::common::types::ElectricalPinType::EptPowerInput,
+                ),
+            ),
+        ]);
+        let mut current = issue_254_capture("J1");
+        for item in &mut current.definition.as_mut().unwrap().items {
+            if item.type_url.ends_with("kiapi.board.types.Pad") {
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                pad.symbol_pin = pins.get(&pad.number).cloned();
+                item.value = pad.encode_to_vec();
+            }
+        }
+        let id = current.definition.as_ref().unwrap().id.clone().unwrap();
+        let (_, _, source) = ISSUE_254_LIBRARIES
+            .into_iter()
+            .find(|(nickname, entry, _)| {
+                *nickname == id.library_nickname && *entry == id.entry_name
+            })
+            .unwrap();
+        let library = parse_library_footprint(
+            &format!("{}:{}", id.library_nickname, id.entry_name),
+            source,
+        )
+        .unwrap();
+        let prepared = build_updated_instance(
+            &current,
+            &library,
+            two_layers(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            TextReset::default(),
+        )
+        .unwrap();
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+
+        let (before, after) = (pad_pins(&current), pad_pins(&updated));
+        assert_eq!(after.len(), 20);
+        assert_eq!(after, before, "nets and pins by pad number");
+        assert_eq!(after["1"].1, pins.get("1").cloned());
+        assert_eq!(after["3"].1, None, "a pad without a pin stays without one");
     }
 
     /// H1's circles as KiCad reported them are the library build's to the
