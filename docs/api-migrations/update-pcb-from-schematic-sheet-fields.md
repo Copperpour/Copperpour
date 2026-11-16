@@ -14,6 +14,7 @@ plans an update of every footprint that sync placed. A footprint that owns
 groups, points or variants and differs only in these three leaves the plan
 instead, with a `footprint_sheet_not_updated` diagnostic that refuses nothing:
 KiCad's Update PCB sets its sheet in place. One that differs in anything else
-as well is a `footprint_children_not_carried` conflict, as before. The
+as well gets a `footprint_children_not_carried` diagnostic, and its part is
+skipped (`update-pcb-skips-unbuildable-parts.md`). The
 post-apply readback reports a sheet the board did not keep as
 `board_readback_differs`.

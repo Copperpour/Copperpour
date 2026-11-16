@@ -200,19 +200,24 @@ pub fn tools() -> Vec<ToolDef> {
              Defaults to a non-mutating dry run; apply requires its exact plan revision. \
              Preserves placement, routing, board-only footprints, and footprint artwork. \
              A symbol with no footprint assigned is reported under `unassigned_footprints` \
-             and the sync proceeds for every other component. A library footprint that \
-             cannot be placed, or a connected pad its footprint does not have, makes the dry \
-             run a conflict whose diagnostics name the footprint and every part that needs it. \
-             So does an update of a footprint that owns groups, points or variants, which \
-             KiCad's API would drop. \
+             and the sync proceeds for every other component. A part the dry run finds \
+             cannot be built is skipped and every other part is still synced, as KiCad's \
+             Update PCB reports its errors and commits the rest: a library footprint that \
+             cannot be placed, a connected pad its footprint does not have, an update of a \
+             footprint that owns groups, points or variants, which KiCad's API would drop, \
+             or a replacement footprint that cannot be read or rebuilt, lacks a connected \
+             pad or would drop a pad that carries a net. Skipped parts are listed under \
+             `skipped_footprints` in the dry run and the apply, each with its diagnostic \
+             (an added footprint's names every part that needs it), and counted as \
+             `coverage.skipped_footprint`. With nothing else to apply, or when the board \
+             KiCad wrote cannot be read for an update, the dry run is a conflict with \
+             those diagnostics. \
              A footprint the schematic names differently is replaced in place, as KiCad's \
              Update PCB replaces it (`replace_footprint` in the change): it keeps its \
              position, rotation, side, nets and pin functions, and takes the new library \
              footprint's pads, artwork, texts, properties and 3D models before the \
              schematic's fields and value are set; a locked footprint keeps its footprint, \
-             with a `footprint_locked_not_replaced` note that refuses nothing. A replacement \
-             footprint that cannot be read or rebuilt, or that lacks a connected pad or would \
-             drop a pad that carries a net, makes the dry run a conflict. \
+             with a `footprint_locked_not_replaced` note that refuses nothing. \
              A pad net change on a net routed copper uses is a `routed_pad_net_change` \
              conflict; naming its `reference` and `net_change` in `acknowledged_net_changes` \
              plans it as KiCad's Update PCB makes it, with no copper sent, and the apply of \
