@@ -34,11 +34,11 @@ const UNDO_DESCRIPTION: &str = "Add PCB rule area";
 const REFILL_SETTLE_DELAY: Duration = Duration::from_millis(500);
 const REFILL_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// User-facing warning required by #77 until #81 ships rule-area support in
-/// Copperpour's Freerouting bridge.
+/// Export-profile guidance for callers creating rule areas.
 pub(crate) const FREEROUTING_RULE_AREA_WARNING: &str =
-    "A board with a rule area cannot currently use Copperpour's Freerouting round trip: \
-     export_specctra_dsn refuses all rule areas (tracked in #81).";
+    "Freerouting supports straight, netless tracks/vias keep-outs on copper layers with \
+     whole-micrometre vertices. export_specctra_dsn refuses pour/pad/footprint-only areas, \
+     enabled placement, cutouts and arc edges.";
 
 pub(crate) fn tools() -> Vec<ToolDef> {
     vec![tool()]
@@ -53,9 +53,9 @@ pub(crate) fn tool() -> ToolDef {
          (tracks, vias, pads disallowed; copper pours and footprints allowed). Creates a typed \
          ZT_RULE_AREA in one undoable KiCad commit, reads back what KiCad stored, and refills \
          copper zones afterward. Requires the requested board open in KiCad; refuses without \
-         modifying the file when KiCad is unreachable or holds another board. Warning: a board \
-         with a rule area cannot currently use Copperpour's Freerouting round trip \
-         (export_specctra_dsn refuses rule areas; tracked in #81).",
+         modifying the file when KiCad is unreachable or holds another board. Freerouting supports \
+         straight, netless tracks/vias keep-outs on copper layers with whole-micrometre vertices; \
+         export_specctra_dsn refuses pour/pad/footprint-only areas, enabled placement, cutouts and arc edges.",
         json!({
             "type": "object",
             "properties": {
@@ -1567,12 +1567,22 @@ mod tests {
     }
 
     #[test]
-    fn catalogue_discloses_live_only_and_freerouting_limitation() {
+    fn catalogue_discloses_live_only_and_freerouting_profile() {
         let def = tool();
         assert_eq!(def.name, "add_rule_area");
         assert_eq!(def.board_access, BoardAccess::LiveOnly);
         assert!(def.description.contains("export_specctra_dsn"));
-        assert!(def.description.contains("#81"));
+        for detail in [
+            "whole-micrometre",
+            "tracks/vias",
+            "pour/pad/footprint-only",
+            "placement",
+            "cutouts",
+            "arc edges",
+        ] {
+            assert!(def.description.contains(detail), "{detail}");
+            assert!(FREEROUTING_RULE_AREA_WARNING.contains(detail), "{detail}");
+        }
         assert!(def
             .description
             .contains("refuses without modifying the file"));
@@ -1726,7 +1736,10 @@ mod tests {
         assert_eq!(json["rule_area"]["keepout_pads"], true);
         assert_eq!(json["rule_area"]["keepout_copper_pours"], true);
         assert_eq!(json["rule_area"]["keepout_footprints"], false);
-        assert!(json["warning"].as_str().unwrap().contains("#81"));
+        let guidance = json["warning"].as_str().unwrap();
+        assert!(guidance.contains("whole-micrometre"));
+        assert!(guidance.contains("tracks/vias"));
+        assert!(guidance.contains("refuses pour/pad/footprint-only areas"));
         assert!(state
             .lock()
             .unwrap()

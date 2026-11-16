@@ -324,8 +324,10 @@ Copperpour can autoroute a board with [Freerouting](https://freerouting.org):
 `route_specctra_dsn` → `plan_specctra_ses_import` → `apply_specctra_ses` exports
 the board, routes it, and imports the result.
 
-Only fixed straight tracks and through vias are supported so far; boards with arcs,
-zones or unlocked routing are refused before anything changes.
+Fixed straight tracks and through vias are preserved. Netted copper zones export
+as planes, and [supported rule areas](docs/api-migrations/specctra-rule-areas.md)
+export as keep-outs with whole-micrometre vertices. Routed arcs, unlocked routing
+and unsupported zone/rule-area forms are refused before export.
 
 Optionally, KiCad 10 can export the board itself instead of Copperpour's own
 exporter: enable the **native Specctra bridge** in Copperpour's settings dialog and

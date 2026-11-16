@@ -304,7 +304,7 @@ pub fn tools() -> Vec<ToolDef> {
              import-safety checks run first in every mode: an even 2-32-layer copper stack, \
              representable SMD and all-copper through-hole pads on either side, complete \
              effective routing rules, no custom DRC rules, only representable routing rule \
-             areas (`tracks`/`vias` keep-outs without placement or cutouts), and no unlocked \
+             areas (`tracks`/`vias` keep-outs with straight, whole-micrometre vertices and no placement or cutouts), and no unlocked \
              tracks/vias or routed arcs. Supported netted copper zones become planes, and \
              supported rule areas become keep-outs (`keepout`, `wire_keepout`, `via_keepout`); \
              locked straight tracks and through vias are preserved. The default 'disable' uses only the \

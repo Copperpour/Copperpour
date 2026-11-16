@@ -1737,7 +1737,7 @@ fn board_zones_and_rule_areas(
                 bail!("unsupported routing profile: {label} cannot belong to net '{net}'");
             }
             let kind = rule_area_kind(zone, &label)?;
-            let outline = zone_straight_outline(zone, &label, None)?;
+            let outline = zone_straight_outline(zone, &label, None, exact_rule_area_um)?;
             rule_areas.push(RuleAreaModel {
                 kind,
                 layers: covered,
@@ -1750,7 +1750,7 @@ fn board_zones_and_rule_areas(
                 .with_context(|| {
                     format!("unsupported routing profile: {label} has no net, which KiCad exports under an invented net name")
                 })?;
-            let outline = zone_straight_outline(zone, &label, Some(&net))?;
+            let outline = zone_straight_outline(zone, &label, Some(&net), finite_um)?;
             zones.push(CopperZoneModel {
                 net,
                 layers: covered,
@@ -1805,6 +1805,7 @@ fn zone_straight_outline(
     zone: &SexpNode,
     label: &str,
     net: Option<&str>,
+    coordinate_um: fn(Option<f64>, &str) -> Result<i64>,
 ) -> Result<Vec<(i64, i64)>> {
     let polygons = zone.find_all("polygon");
     if polygons.len() != 1 {
@@ -1826,8 +1827,8 @@ fn zone_straight_outline(
                 point.head().unwrap_or("?")
             );
         }
-        let x = finite_um(point.get_f64(1), "zone x")?;
-        let y = finite_um(point.get_f64(2), "zone y")?
+        let x = coordinate_um(point.get_f64(1), &format!("{label} x"))?;
+        let y = coordinate_um(point.get_f64(2), &format!("{label} y"))?
             .checked_neg()
             .context("zone y is outside the supported coordinate range")?;
         outline.push((x, y));
@@ -1836,6 +1837,20 @@ fn zone_straight_outline(
         bail!("{label} outline has fewer than three distinct points");
     }
     Ok(outline)
+}
+
+/// Schema 5 and native keep-out correlation store whole micrometres. A rounded
+/// boundary could shrink the forbidden area, so refuse anything not exactly on
+/// that grid before either writer runs. Comparing the round trip in millimetres
+/// accepts canonical KiCad decimals such as 0.009 without a floating multiply
+/// spuriously making them fractional micrometres.
+fn exact_rule_area_um(value: Option<f64>, label: &str) -> Result<i64> {
+    let mm = finite_number(value, label)?;
+    let um = finite_um(Some(mm), label)?;
+    if mm != um as f64 / UM_PER_MM {
+        bail!("unsupported routing profile: {label} must lie on the whole-micrometre grid; rule-area vertices are never rounded");
+    }
+    Ok(um)
 }
 
 fn rule_area_kind(zone: &SexpNode, label: &str) -> Result<RuleAreaKind> {
@@ -6012,15 +6027,6 @@ pub(crate) mod tests {
     const RULE_AREAS_SES: &str =
         include_str!("../tests/fixtures/specctra_rule_areas.native-kicad-10.freerouting-2.5.0.ses");
 
-    /// Without the header's courtyard polygon, as for `specctra_four_layers` and `specctra_zones`.
-    fn rule_areas_native() -> String {
-        RULE_AREAS_NATIVE_FILE
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
-            .map(|line| format!("{line}\n"))
-            .collect()
-    }
-
     #[test]
     fn rule_areas_export_as_keepouts_on_each_layer_they_cover() {
         let export = native_baseline(RULE_AREAS);
@@ -6076,7 +6082,7 @@ pub(crate) mod tests {
 
     #[test]
     fn rule_area_native_dsn_matches_the_rust_export() {
-        let native_dsn = rule_areas_native();
+        let native_dsn = RULE_AREAS_NATIVE_FILE.to_string();
         let adopted = adopt_native_dsn(native_baseline(RULE_AREAS), native_dsn.clone()).unwrap();
         assert_eq!(adopted.dsn, native_dsn);
 
@@ -6115,7 +6121,7 @@ pub(crate) mod tests {
         let board = temp.path().join("specctra_rule_areas.kicad_pcb");
         std::fs::write(&board, RULE_AREAS).unwrap();
         let baseline = export_dsn(&board, RULE_AREAS, &native_fixture_rules()).unwrap();
-        let adopted = adopt_native_dsn(baseline, rule_areas_native()).unwrap();
+        let adopted = adopt_native_dsn(baseline, RULE_AREAS_NATIVE_FILE.to_string()).unwrap();
         let plan = crate::specctra_ses::parse_import_plan(
             &board,
             RULE_AREAS,
@@ -6173,6 +6179,66 @@ pub(crate) mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains(inventory), "{error}");
+    }
+
+    #[test]
+    fn rule_area_vertices_must_be_exact_whole_micrometres() {
+        for (mm, expected_um) in [
+            (0.0, 0),
+            (0.001, 1),
+            (0.009, 9),
+            (113.001, 113001),
+            (-0.009, -9),
+            (-44.029, -44029),
+        ] {
+            assert_eq!(
+                exact_rule_area_um(Some(mm), "rule area x").unwrap(),
+                expected_um
+            );
+        }
+        for mm in [113.0006, -44.0004, 0.000001, -0.000001] {
+            assert!(exact_rule_area_um(Some(mm), "rule area x")
+                .unwrap_err()
+                .to_string()
+                .contains("whole-micrometre grid"));
+        }
+        // The review's 113.0006-mm edge must not become 113.001 mm: a
+        // 0.25-mm track at x=112.876 would then be accepted with 0.4 um of
+        // copper inside the original keep-out. Refuse the source snapshot.
+        for (from, to, axis) in [
+            ("(xy 113 44)", "(xy 113.0006 44)", "x"),
+            ("(xy 113 44)", "(xy 113 44.0004)", "y"),
+        ] {
+            let source = RULE_AREAS.replacen(from, to, 1);
+            assert_ne!(source, RULE_AREAS);
+            let error = export_dsn(
+                Path::new("board.kicad_pcb"),
+                &source,
+                &native_fixture_rules(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("whole-micrometre grid"), "{error}");
+            assert!(
+                error.contains(&format!("rule area 'antenna_keepout' {axis}")),
+                "{error}"
+            );
+            assert!(board_rule_area_inventory(&source).is_err());
+        }
+        // Millimetre fractions that are whole micrometres remain exact in
+        // both the DSN and the reverse manifest, including decimal 0.009.
+        let source = RULE_AREAS
+            .replace("(xy 113 44)", "(xy 113.009 44)")
+            .replace("(xy 113 52)", "(xy 113.009 52)");
+        let export = export_dsn(
+            Path::new("board.kicad_pcb"),
+            &source,
+            &native_fixture_rules(),
+        )
+        .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(manifest["rule_areas"][0]["outline_um"][0]["x_um"], 113009);
+        assert!(export.dsn.contains("113009 -44000"), "{}", export.dsn);
     }
 
     #[test]

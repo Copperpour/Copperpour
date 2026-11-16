@@ -14,9 +14,18 @@ refused, each with its own message: a rule area that allows both tracks and vias
 (pour-, pad- or footprint-only keep-outs, which KiCad's own exporter turns into
 full `keepout`s), a rule area with room `placement` enabled, a rule area with a
 net, an outline with a cutout or non-straight edge, a rule area off the copper
-stack, and a zone inside a footprint. With the KiCad 10 native bridge, KiCad's
+stack, a zone inside a footprint, and any vertex off the whole-micrometre grid.
+For example, `113.001` mm is supported but `113.0006` mm is refused. This check
+runs before either writer; vertices are never rounded into a smaller keep-out. With the KiCad 10 native bridge, KiCad's
 keep-outs must match the exported kinds, layers and closed outlines in any
 order, or the native DSN is refused.
+
+The DSN kinds encode the tracks/vias restrictions. Pad, copper-pour and footprint
+flags do not change the DSN kind when routing is blocked: those objects and their
+original rule-area settings remain in the revision-bound KiCad board, and SES
+import cannot move components or change zones. Original copper zones still need
+refill after routing. Areas that restrict only these non-routing objects remain
+refused because translating them to full routing keep-outs would change intent.
 
 The reverse manifest moves to schema 5. `supported_profile.rule_areas` is `true`
 when the board has rule areas, and the new `rule_areas` list records each one's

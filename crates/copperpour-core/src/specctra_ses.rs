@@ -1869,9 +1869,23 @@ mod tests {
                 "qarc crosses polygon",
                 "(wire (qarc F.Cu 2000 1020000 -500000 1040000 -480000 1040000 -500000))",
             ),
+            // Center (100,40), radius 12: start (112,40), midpoint
+            // (108.485...,48.485...), end (100,52) are all outside the
+            // polygon. The arc enters it between midpoint and end.
+            (
+                "qarc crosses between sample points",
+                "(wire (qarc F.Cu 2000 1120000 -400000 1000000 -520000 1000000 -400000))",
+            ),
+            // Radius 8.5 keeps the centerline outside the polygon. Its
+            // 0.1-mm copper radius overlaps the corner (103,48), whose
+            // distance from the circle center is sqrt(73) mm.
+            (
+                "qarc copper overlaps corner between sample points",
+                "(wire (qarc F.Cu 2000 1085000 -400000 1000000 -485000 1000000 -400000))",
+            ),
         ] {
             let err = parse_import_plan(&board, &src, &manifest, &ses_with_routes(wire, ""))
-                .unwrap_err()
+                .expect_err(label)
                 .to_string();
             assert!(
                 err.contains("violates a rule-area keep-out"),
@@ -1886,6 +1900,14 @@ mod tests {
             (
                 "uncovered B.Cu",
                 "(wire (path B.Cu 2000 1005000 -500000 1095000 -500000))",
+            ),
+            (
+                "qarc copper clears corner",
+                "(wire (qarc F.Cu 2000 1084000 -400000 1000000 -484000 1000000 -400000))",
+            ),
+            (
+                "qarc crosses on uncovered B.Cu",
+                "(wire (qarc B.Cu 2000 1120000 -400000 1000000 -520000 1000000 -400000))",
             ),
         ] {
             parse_import_plan(&board, &src, &manifest, &ses_with_routes(wire, ""))

@@ -402,7 +402,7 @@ add_rule_area(board, layers, points? | rect?, name?,
 - Pass either `points` (`[{x, y}, ...]`) or `rect` (`{x1, y1, x2, y2}`), never both.
 - Defaults match KiCad: `keepout_tracks`, `keepout_vias`, and `keepout_pads` default to `true`; `keepout_copper_pours` and `keepout_footprints` default to `false` (for an antenna keepout, set `keepout_copper_pours: true`).
 - Live only: requires the board open in KiCad's PCB Editor; refills copper zones afterward and verifies readback.
-- **Freerouting note:** a board with a rule area cannot currently use Copperpour's Freerouting round trip (`export_specctra_dsn` refuses all zones/rule areas; tracked in #81).
+- **Freerouting profile:** `export_specctra_dsn` supports netless tracks/vias keep-outs on copper layers, with straight edges and whole-micrometre vertices (for example, `113.001` mm is supported; `113.0006` mm is refused). Pour/pad/footprint-only areas, enabled placement, cutouts, arc edges and footprint-contained zones remain unsupported. The export validates this profile before either the Rust or native writer runs.
 
 ### refill_zones
 
