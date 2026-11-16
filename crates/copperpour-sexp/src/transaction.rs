@@ -427,7 +427,7 @@ pub fn abandon_file_transaction(
     if abandoned_journal.exists() {
         return Err(SexpError::InvalidValue(format!(
             "abandoned journal already exists: {}",
-            abandoned_journal.display()
+            crate::paths::display_path(&abandoned_journal)
         )));
     }
     std::fs::rename(&path, &abandoned_journal)?;

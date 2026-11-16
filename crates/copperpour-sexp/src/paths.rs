@@ -147,4 +147,21 @@ mod tests {
             assert_eq!(display_path(Path::new(text)), text);
         }
     }
+
+    /// A journal root from `canonicalize` carries the Windows verbatim prefix;
+    /// the transaction conflict message must show the ordinary spelling.
+    #[test]
+    fn transaction_conflict_message_shows_plain_journal_path() {
+        let error = crate::error::SexpError::TransactionConflict {
+            path: std::path::PathBuf::from("board.kicad_pcb"),
+            journal: std::path::PathBuf::from(r"\\?\C:\proj\.journal"),
+            reason: "content changed before the transaction committed".to_owned(),
+        };
+        let message = error.to_string();
+        assert!(!message.contains(r"\\?\"), "{message}");
+        assert_eq!(
+            message,
+            r"transaction conflict in C:\proj\.journal: board.kicad_pcb: content changed before the transaction committed"
+        );
+    }
 }

@@ -33,7 +33,7 @@ fn status(project: &Path) -> Result<()> {
     }
 
     for status in statuses {
-        println!("Transaction {} ({})", status.id, status.journal.display());
+        println!("{}", transaction_header(&status.id, &status.journal));
         for target in status.targets {
             let state = match target.state {
                 TransactionTargetState::Pending => "pending",
@@ -45,6 +45,23 @@ fn status(project: &Path) -> Result<()> {
     }
     println!("Journal contents are redacted because they contain complete schematic images.");
     Ok(())
+}
+
+/// Journal paths are shown in their ordinary spelling; a verbatim `\\?\`
+/// prefix from `canonicalize` is not something a user can paste back.
+fn transaction_header(id: &str, journal: &Path) -> String {
+    format!(
+        "Transaction {} ({})",
+        id,
+        copperpour_sexp::paths::display_path(journal)
+    )
+}
+
+fn evidence_retained_line(journal: &Path) -> String {
+    format!(
+        "Evidence retained at {}.",
+        copperpour_sexp::paths::display_path(journal)
+    )
 }
 
 fn recover(project: &Path) -> Result<()> {
@@ -79,10 +96,7 @@ fn abandon(args: &[String]) -> Result<()> {
         "Abandoned transaction {} without modifying target files.",
         outcome.id
     );
-    println!(
-        "Evidence retained at {}.",
-        outcome.abandoned_journal.display()
-    );
+    println!("{}", evidence_retained_line(&outcome.abandoned_journal));
     println!("Warning: the abandoned journal contains complete before/after schematic images.");
     Ok(())
 }
@@ -99,6 +113,19 @@ mod tests {
             "extra".to_owned(),
         ];
         assert!(exact_project_path(&args, "status").is_err());
+    }
+
+    #[test]
+    fn journal_paths_are_shown_without_the_verbatim_prefix() {
+        let journal = Path::new(r"\\?\C:\proj\.journal");
+        assert_eq!(
+            transaction_header("tx-1", journal),
+            r"Transaction tx-1 (C:\proj\.journal)"
+        );
+        assert_eq!(
+            evidence_retained_line(journal),
+            r"Evidence retained at C:\proj\.journal."
+        );
     }
 
     #[test]
