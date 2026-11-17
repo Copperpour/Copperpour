@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **24 toolsets** organized into 10 categories
+- **25 toolsets** organized into 10 categories
 - **257 registered tools** + **7 always-visible meta-tools** = **264 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<copperpour dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
@@ -35,7 +35,7 @@ and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 24 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 25 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `call_tool` | Call a tool by name, whether or not its toolset is loaded or listed. `tools/list` does not change. For clients that never see tools added after their first listing. Runs only the reviewed read-only tools unless the operator sets `call_tool_allow_writes = true` in the server configuration; anything else is refused with `tool_not_permitted` before it runs. Never runs itself or `reload_server`. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
@@ -426,6 +426,14 @@ and Windows servers do not.
 | `get_symbol_info` | Return detailed information about a schematic symbol: pins, properties, description. |
 
 ---
+
+### `model_3d`
+**Purpose:** Generate approximate package STEP geometry without an external CAD runtime.
+**Source:** [`crates/copperpour-core/src/tools/model_3d.rs`](crates/copperpour-core/src/tools/model_3d.rs)
+
+| Tool | Description |
+|------|-------------|
+| `create_3d_model` | Create a new AP214 STEP approximation from an explicit body and pin-row boxes, or a single axis-aligned saved F.Fab rectangle with F.CrtYd fallback. Reports the chosen source and independent solid bounds/colours. Requires an existing parent directory; refuses existing outputs, never attaches models or edits footprints, and is write-gated through `call_tool`. See [usage, limits and independent validation](docs/3d-model-generation.md). |
 
 ## Integration
 

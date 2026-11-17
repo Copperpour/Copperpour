@@ -110,6 +110,11 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         description: "Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models",
         category: "library",
     },
+    ToolsetMeta {
+        name: "model_3d",
+        description: "Generate approximate STEP package bodies and pin rows without external CAD tools",
+        category: "library",
+    },
     // A toolset whose tools are all compiled out isn't listed (#210).
     #[cfg(any(feature = "jlcpcb", feature = "freerouting"))]
     ToolsetMeta {
@@ -200,6 +205,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "placement" => Some(placement::tools()),
         "pcb_export" => Some(pcb_export::tools()),
         "library" => Some(library::tools()),
+        "model_3d" => Some(model_3d::tools()),
         #[cfg(any(feature = "jlcpcb", feature = "freerouting"))]
         "integration" => Some(integration::tools()),
         "verification" => Some(verification::tools()),

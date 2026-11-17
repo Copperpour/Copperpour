@@ -11,6 +11,7 @@ pub(crate) mod hex;
 pub(crate) mod java_runtime;
 pub mod kicad_install;
 pub mod mcp;
+pub(crate) mod model_3d;
 pub(crate) mod native_specctra_bridge;
 pub mod observability;
 pub mod outcome;
