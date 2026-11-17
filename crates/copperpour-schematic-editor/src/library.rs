@@ -583,18 +583,19 @@ pub fn suggest_symbols(lib_id: &str, limit: usize, src: &dyn SymbolLibrarySource
         }
         // Single-file library: scan top-level (symbol "NAME" entries.
         if let Ok(content) = std::fs::read_to_string(&base) {
-            let mut from = 0usize;
-            while let Some(rel) = content[from..].find("(symbol \"") {
-                let start = from + rel + 9;
-                if let Some(end) = content[start..].find('"') {
-                    let name = &content[start..start + end];
-                    // Skip unit sub-symbols ("R_0_1") and prefixed names.
-                    if !name.contains(':') && extract_symbol_block(&content, name).is_some() {
-                        candidates.push(name.to_string());
+            for (start, end) in
+                copperpour_sexp::writer::find_direct_child_blocks(&content, "kicad_symbol_lib")
+            {
+                let block = &content[start..end];
+                if let Some(rest) = block.strip_prefix("(symbol \"") {
+                    if let Some(name_end) = rest.find('"') {
+                        let name = &rest[..name_end];
+                        // Skip prefixed names; direct children of kicad_symbol_lib
+                        // already exclude nested unit sub-symbols ("R_0_1").
+                        if !name.contains(':') {
+                            candidates.push(name.to_string());
+                        }
                     }
-                    from = start + end;
-                } else {
-                    break;
                 }
             }
         }
@@ -676,30 +677,28 @@ fn edit_distance(a: &str, b: &str) -> usize {
     row[b.len()]
 }
 
-/// Extract a `(symbol "NAME" ...)` block from file content by balanced-paren matching.
+/// Extract a `(symbol "NAME" ...)` block from file content by balanced-paren matching,
+/// skipping quoted strings and `\"` escapes.
 fn extract_symbol_block(content: &str, symbol_name: &str) -> Option<String> {
     let pattern = format!("(symbol \"{}\"", symbol_name);
-    let start = content.find(&pattern)?;
-    let mut depth = 0i32;
-    let mut end = start;
-    for (i, ch) in content[start..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = start + i + 1;
-                    break;
-                }
+    let children = copperpour_sexp::writer::find_direct_child_blocks(content, "kicad_symbol_lib");
+    if !children.is_empty() {
+        for (start, end) in children {
+            let block = &content[start..end];
+            if block.starts_with(&pattern)
+                && block[pattern.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_whitespace() || c == ')')
+            {
+                return Some(block.to_string());
             }
-            _ => {}
         }
+        return None;
     }
-    if end > start {
-        Some(content[start..end].to_string())
-    } else {
-        None
-    }
+    let start = content.find(&pattern)?;
+    let (block_start, block_end) = copperpour_sexp::writer::find_balanced_block(content, start)?;
+    Some(content[block_start..block_end].to_string())
 }
 
 #[cfg(test)]
@@ -963,6 +962,106 @@ mod suggestion_tests {
         assert!(
             out.contains("(number \"5\""),
             "pins must come with it — a definition-less instance netlists empty (#34):\n{out}"
+        );
+    }
+
+    #[test]
+    fn resolves_symbol_with_unbalanced_parens_and_escaped_quotes_in_strings() {
+        let libdir = tempfile::tempdir().unwrap();
+        let file = libdir.path().join("Connector_Generic.kicad_sym");
+        std::fs::write(
+            &file,
+            "(kicad_symbol_lib\n\
+            \t(version 20241209)\n\
+            \t(generator \"test\")\n\
+            \t(symbol \"Conn_02x20_Row_Letter_Last\"\n\
+            \t\t(property \"Reference\" \"J\" (at 0 0 0))\n\
+            \t\t(property \"Value\" \"Conn_02x20_Row_Letter_Last\" (at 0 0 0))\n\
+            \t\t(property \"Description\" \"Generic connector, double row, 02x20, row letter last pin numbering scheme (pin 1a, 1b, ..., 20b)), script generated (quote \\\")\\\")\" (at 0 0 0))\n\
+            \t\t(symbol \"Conn_02x20_Row_Letter_Last_1_1\"\n\
+            \t\t\t(pin passive line (at -5.08 0 0) (length 2.54)\n\
+            \t\t\t\t(name \"Pin_1a\" (effects (font (size 1.27 1.27))))\n\
+            \t\t\t\t(number \"1a\" (effects (font (size 1.27 1.27))))\n\
+            \t\t\t)\n\
+            \t\t)\n\
+            \t)\n\
+            \t(symbol \"STM32H503CBTx\"\n\
+            \t\t(property \"Reference\" \"U\" (at 0 0 0))\n\
+            \t\t(property \"Value\" \"STM32H503CBTx\" (at 0 0 0))\n\
+            \t\t(symbol \"STM32H503CBTx_0_1\"\n\
+            \t\t\t(pin bidirectional line (at -5.08 0 0) (length 2.54)\n\
+            \t\t\t\t(name \"PA13(JTMS\" (effects (font (size 1.27 1.27))))\n\
+            \t\t\t\t(number \"34\" (effects (font (size 1.27 1.27))))\n\
+            \t\t\t)\n\
+            \t\t)\n\
+            \t)\n\
+            )\n",
+        )
+        .unwrap();
+
+        let target = file.clone();
+        let src = move |nick: &str| {
+            if nick == "TestLib" {
+                vec![target.clone()]
+            } else {
+                Vec::new()
+            }
+        };
+
+        let conn = resolve_lib_symbol_node("TestLib:Conn_02x20_Row_Letter_Last", &src)
+            .expect("symbol with unbalanced ')' and '\\\"' in Description must resolve");
+        assert!(conn
+            .find_all("symbol")
+            .iter()
+            .any(|s| s.value() == Some("Conn_02x20_Row_Letter_Last_1_1")));
+
+        let mcu = resolve_lib_symbol_node("TestLib:STM32H503CBTx", &src)
+            .expect("symbol with unbalanced '(' in pin name must resolve");
+        assert!(mcu
+            .find_all("symbol")
+            .iter()
+            .any(|s| s.value() == Some("STM32H503CBTx_0_1")));
+    }
+
+    #[test]
+    fn suggest_symbols_skips_unit_sub_symbols_and_handles_unbalanced_parens() {
+        let libdir = tempfile::tempdir().unwrap();
+        let file = libdir.path().join("TestLib.kicad_sym");
+        std::fs::write(
+            &file,
+            "(kicad_symbol_lib\n\
+            \t(version 20241209)\n\
+            \t(generator \"test\")\n\
+            \t(symbol \"Conn_02x20_Row_Letter_Last\"\n\
+            \t\t(property \"Description\" \"row letter last (1a, 1b, ..., 20b)), script generated\" (at 0 0 0))\n\
+            \t\t(symbol \"Conn_02x20_Row_Letter_Last_0_1\"\n\
+            \t\t\t(polyline (pts (xy 0 0) (xy 1 1)))\n\
+            \t\t)\n\
+            \t\t(symbol \"Conn_02x20_Row_Letter_Last_1_1\"\n\
+            \t\t\t(pin passive line (at -5.08 0 0) (length 2.54)\n\
+            \t\t\t\t(name \"Pin_1a\" (effects (font (size 1.27 1.27))))\n\
+            \t\t\t\t(number \"1a\" (effects (font (size 1.27 1.27))))\n\
+            \t\t\t)\n\
+            \t\t)\n\
+            \t)\n\
+            )\n",
+        )
+        .unwrap();
+
+        let target = file.clone();
+        let src = move |nick: &str| {
+            if nick == "TestLib" {
+                vec![target.clone()]
+            } else {
+                Vec::new()
+            }
+        };
+
+        let suggestions = suggest_symbols("TestLib:Conn_02x20_Row_Letter", 5, &src);
+        assert_eq!(
+            suggestions,
+            vec!["TestLib:Conn_02x20_Row_Letter_Last".to_string()],
+            "must suggest the top-level symbol and never its _0_1/_1_1 unit sub-symbols"
         );
     }
 }
