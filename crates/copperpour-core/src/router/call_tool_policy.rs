@@ -304,6 +304,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "renumber_sheet_pages",
     "repair_corrupted_footprints",
     "repair_instance_metadata",
+    "repeat_layout",
     "replace_board_outline",
     "replace_component",
     "reset_schematic_field_positions",
