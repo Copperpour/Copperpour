@@ -183,7 +183,7 @@ fn refusal(tool: &str, faults: &[Fault]) -> CallToolResult {
 
 fn optional_strings(args: &Value, field: &str, faults: &mut Vec<Fault>) -> Vec<String> {
     match args.get(field) {
-        None | Some(Value::Null) => Vec::new(),
+        None => Vec::new(),
         Some(Value::Array(items)) => items
             .iter()
             .enumerate()
@@ -207,7 +207,7 @@ fn optional_strings(args: &Value, field: &str, faults: &mut Vec<Fault>) -> Vec<S
 
 fn optional_bool(args: &Value, field: &str, faults: &mut Vec<Fault>) -> bool {
     match args.get(field) {
-        None | Some(Value::Null) => false,
+        None => false,
         Some(Value::Bool(value)) => *value,
         Some(_) => {
             faults.push(fault(field, "must be a boolean"));
@@ -374,21 +374,24 @@ fn parse_targets(value: &Value, faults: &mut Vec<Fault>) -> Selection {
     };
     let before = faults.len();
     match object.get("pads") {
-        None | Some(Value::Null) => {}
+        None => {}
         Some(Value::Array(items)) => {
             for (index, item) in items.iter().enumerate() {
                 let field = format!("targets.pads[{index}]");
-                let text = |name: &str| item.get(name).and_then(Value::as_str);
-                match (text("uuid"), text("reference"), text("pad_number")) {
-                    (Some(uuid), None, None) if !uuid.is_empty() => {
-                        selection.pads.push(PadSelector::Uuid(uuid.to_string()))
+                match (
+                    item.get("uuid"),
+                    item.get("reference"),
+                    item.get("pad_number"),
+                ) {
+                    (Some(Value::String(uuid)), None, None) if !uuid.is_empty() => {
+                        selection.pads.push(PadSelector::Uuid(uuid.clone()))
                     }
-                    (None, Some(reference), Some(pad_number))
+                    (None, Some(Value::String(reference)), Some(Value::String(pad_number)))
                         if !reference.is_empty() && !pad_number.is_empty() =>
                     {
                         selection.pads.push(PadSelector::Number {
-                            reference: reference.to_string(),
-                            pad_number: pad_number.to_string(),
+                            reference: reference.clone(),
+                            pad_number: pad_number.clone(),
                         })
                     }
                     _ => faults.push(fault(
@@ -529,16 +532,28 @@ fn resolve<'a>(
         }
         chosen.extend(matched.iter().map(|t| t.uuid.as_str()));
     }
-    if selection.all_pads {
-        chosen.extend(pads().map(|t| t.uuid.as_str()));
-    }
-    if selection.all_vias {
-        chosen.extend(
-            targets
-                .iter()
-                .filter(|t| t.kind == IpcTeardropTargetKind::Via)
-                .map(|t| t.uuid.as_str()),
-        );
+    for (enabled, kind, field) in [
+        (
+            selection.all_pads,
+            IpcTeardropTargetKind::Pad,
+            "targets.all_pads",
+        ),
+        (
+            selection.all_vias,
+            IpcTeardropTargetKind::Via,
+            "targets.all_vias",
+        ),
+    ] {
+        if enabled {
+            let mut matched = targets.iter().filter(|t| t.kind == kind).peekable();
+            if matched.peek().is_none() {
+                faults.push(fault(
+                    field,
+                    format!("no {} is on the board", kind_text(kind)),
+                ));
+            }
+            chosen.extend(matched.map(|t| t.uuid.as_str()));
+        }
     }
     if chosen.is_empty() && faults.is_empty() {
         faults.push(fault("targets", "selects no pad or via on this board"));
@@ -1884,6 +1899,18 @@ mod tests {
                 json!({ "targets": { "all_pads": true }, "settings": { "enabled": "yes" } }),
                 "settings.enabled",
             ),
+            (
+                json!({ "targets": { "pads": [{ "uuid": R1_PAD_1, "reference": null }] }, "settings": { "enabled": true } }),
+                "targets.pads[0]",
+            ),
+            (
+                json!({ "targets": { "all_pads": true }, "settings": { "enabled": true }, "dry_run": null }),
+                "dry_run",
+            ),
+            (
+                json!({ "targets": { "all_pads": true, "vias": null }, "settings": { "enabled": true } }),
+                "targets.vias",
+            ),
         ] {
             let (error, body) = scene.set(args.clone()).await;
             assert!(error, "{args}");
@@ -1913,6 +1940,22 @@ mod tests {
             assert_eq!(body["error"]["kind"], "invalid_argument");
             assert_eq!(body["error"]["field"], field, "{body}");
         }
+        assert!(scene.writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_all_vias_refuses_a_union_that_also_selects_pads() {
+        let mut kicad = fixture(Some((10, 0, 8)));
+        kicad.vias.clear();
+        let scene = scene(kicad);
+        let (error, body) = scene
+            .set(json!({
+                "targets": { "all_pads": true, "all_vias": true },
+                "settings": { "enabled": true }
+            }))
+            .await;
+        assert!(error, "{body}");
+        assert_eq!(body["error"]["field"], "targets.all_vias", "{body}");
         assert!(scene.writes().is_empty());
     }
 
