@@ -274,3 +274,84 @@ fn only_a_revision_conflict_is_classified_as_one() {
     });
     assert_eq!(revision_conflict_path(&item), None);
 }
+
+/// A KiCad editor lock that appears between the pre-write gate and the
+/// writer's final refusal point must surface through dispatch as
+/// `unsafe_file_fallback` for every closed-board footprint edit (#419).
+#[tokio::test]
+async fn a_kicad_lock_appearing_before_the_write_is_unsafe_file_fallback() {
+    let handler = handler().await;
+    let placement_fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../copperpour-sexp/tests/fixtures/placement/placement_fixture.kicad_pcb");
+    let placement_source = std::fs::read_to_string(placement_fixture).unwrap();
+    let flip_source = fixture("inner_layer_flip_front.kicad_pcb");
+
+    let board_cases: Vec<(&str, &str, Value)> = vec![
+        (
+            "move_component",
+            &flip_source,
+            json!({ "reference": "R1", "x": 120.0, "y": 110.0 }),
+        ),
+        (
+            "rotate_component",
+            &flip_source,
+            json!({ "reference": "R1", "rotation": 90.0 }),
+        ),
+        (
+            "set_component_placements",
+            &flip_source,
+            json!({ "placements": [{ "reference": "R1", "x": 120.0, "y": 110.0, "rotation": 90.0 }] }),
+        ),
+        (
+            "flip_component",
+            &flip_source,
+            json!({ "reference": "R1", "layer": "B.Cu" }),
+        ),
+        (
+            "place_decoupling_caps",
+            &placement_source,
+            json!({
+                "ic_reference": "U1",
+                "capacitor_references": ["C1", "C2"],
+                "dry_run": false,
+            }),
+        ),
+        (
+            "refine_placement_force_directed",
+            &placement_source,
+            json!({
+                "references": ["C1"],
+                "max_displacement_mm": 20.0,
+                "dry_run": false,
+            }),
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (tool, source, mut arguments) in board_cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, source).unwrap();
+        test_hooks::lock_before_replace(&path, "someone@somewhere");
+        arguments["board"] = json!(path.display().to_string());
+
+        let (result, body) = call(&handler, tool, arguments).await;
+
+        if test_hooks::armed(&path) {
+            failures.push(format!("{tool}: never reached the write: {body}"));
+            continue;
+        }
+        if std::fs::read_to_string(&path).unwrap() != source {
+            failures.push(format!("{tool}: modified the board despite the lock"));
+            continue;
+        }
+        if result["isError"] != json!(true)
+            || body["error"]["kind"] != json!("unsafe_file_fallback")
+            || body["error"]["path"] != json!(path.display().to_string())
+            || body["error"]["reason"] != json!("kicad_lock_present")
+        {
+            failures.push(format!("{tool}: unexpected response: {body}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

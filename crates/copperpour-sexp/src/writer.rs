@@ -136,6 +136,8 @@ fn write_atomic_unlocked_with(
     // A lock may have appeared while the scratch file was being written.
     // Recheck at the last refusal point before replacing the document.
     before_replace();
+    #[cfg(any(test, feature = "test-hooks"))]
+    test_hooks::run_before_replace(path);
     ensure_kicad_design_document_is_closed(path)?;
     std::fs::rename(&tmp_path, path)?;
     cleanup.disarm();
@@ -198,6 +200,7 @@ pub mod test_hooks {
     enum Moment {
         AfterReplace,
         BeforeCompare,
+        BeforeReplace,
     }
 
     static SAVES: Mutex<Vec<(PathBuf, Moment, String)>> = Mutex::new(Vec::new());
@@ -227,6 +230,12 @@ pub mod test_hooks {
         saves().push((key(path), Moment::BeforeCompare, content.into()));
     }
 
+    /// Create `path`'s KiCad editor lock file with `content` right before the
+    /// next write's final lock recheck and rename.
+    pub fn lock_before_replace(path: &Path, content: impl Into<String>) {
+        saves().push((key(path), Moment::BeforeReplace, content.into()));
+    }
+
     /// Whether a save armed for `path` is still waiting for a write.
     pub fn armed(path: &Path) -> bool {
         let key = key(path);
@@ -241,6 +250,10 @@ pub mod test_hooks {
         run_at(path, Moment::BeforeCompare);
     }
 
+    pub(super) fn run_before_replace(path: &Path) {
+        run_at(path, Moment::BeforeReplace);
+    }
+
     fn run_at(path: &Path, moment: Moment) {
         let mut saves = saves();
         if saves.is_empty() {
@@ -252,7 +265,12 @@ pub mod test_hooks {
             .position(|(armed, when, _)| *armed == key && *when == moment)
         {
             let (_, _, content) = saves.remove(index);
-            std::fs::write(path, content).unwrap();
+            let target = if moment == Moment::BeforeReplace {
+                super::kicad_editor_lock_path(path).expect("document has a KiCad lock path")
+            } else {
+                path.to_path_buf()
+            };
+            std::fs::write(target, content).unwrap();
         }
     }
 }
