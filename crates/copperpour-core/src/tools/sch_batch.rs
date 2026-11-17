@@ -5760,10 +5760,11 @@ mod batch_field_placement_tests {
         let after = std::fs::read_to_string(&path).unwrap();
         let seen = placement(&after, "R1", 1, "Value");
         assert_eq!(seen, json!({"x":12.5,"y":34.5,"rotation":90.0,"hide":true}));
-        assert_eq!(
-            body["updated"][0]["units"][0]["field_placements"]["Value"],
-            seen
-        );
+        let reported = &body["updated"][0]["units"][0]["field_placements"]["Value"];
+        for key in ["x", "y", "rotation", "hide"] {
+            assert_eq!(reported[key], seen[key], "field_placements.Value.{key}");
+        }
+        assert_eq!(reported["drawn_orientation"], "vertical");
         let units = body["updated"][1]["units"].as_array().unwrap();
         assert_eq!(units.len(), 3);
         assert_eq!(
