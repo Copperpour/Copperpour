@@ -2625,6 +2625,18 @@ mod symbol_block_tests {
         let sch = "(kicad_sch\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(property \"Reference\" \"R12\"\n\t\t\t(at 1 1 0)\n\t\t)\n\t)\n)\n";
         assert!(find_symbol_instance_block(sch, "R1").is_none());
     }
+
+    #[test]
+    fn lib_symbol_name_unescapes_quotes_and_backslashes() {
+        assert_eq!(
+            lib_symbol_name("(symbol \"Lib:A\\\"B\" (in_bom yes))").as_deref(),
+            Some("Lib:A\"B")
+        );
+        assert_eq!(
+            lib_symbol_name("(symbol\n\t\"Lib:A\\\\nB\" (in_bom yes))").as_deref(),
+            Some("Lib:A\\nB")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2762,7 +2774,7 @@ pub fn ensure_lib_symbol_in_schematic(
     // whichever line the name sits (see `lib_symbol_name`).
     if copperpour_sexp::writer::find_direct_child_blocks(content, "lib_symbols")
         .iter()
-        .any(|&(start, end)| lib_symbol_name(&content[start..end]) == Some(lib_id))
+        .any(|&(start, end)| lib_symbol_name(&content[start..end]).as_deref() == Some(lib_id))
     {
         return true;
     }
@@ -2860,7 +2872,7 @@ pub(crate) fn reembed_lib_symbols(
     for lib_id in lib_ids {
         let Some(&(start, end)) = blocks
             .iter()
-            .find(|&&(s, e)| lib_symbol_name(&content[s..e]) == Some(lib_id.as_str()))
+            .find(|&&(s, e)| lib_symbol_name(&content[s..e]).as_deref() == Some(lib_id.as_str()))
         else {
             outcomes.push(ReembedOutcome::NotEmbedded);
             continue;
@@ -2907,18 +2919,25 @@ pub(crate) fn reembed_lib_symbols(
     outcomes
 }
 
-/// The quoted name in a `(symbol "Lib:Name" …)` definition.
+/// The unescaped quoted name in a `(symbol "Lib:Name" …)` definition.
 ///
 /// The name may sit on the same line as `(symbol` or on the next one depending
-/// on which embed path wrote it, so this skips whitespace rather than
+/// on which embed path wrote it, so this parses the header token rather than
 /// pattern-matching a single layout.
-fn lib_symbol_name(block: &str) -> Option<&str> {
-    block
-        .strip_prefix("(symbol")?
-        .trim_start()
-        .strip_prefix('"')?
-        .split('"')
-        .next()
+fn lib_symbol_name(block: &str) -> Option<String> {
+    let block = block.trim_start();
+    if !block.starts_with('(') {
+        return None;
+    }
+    let (head, name) = symbol_fields::header(block, 0)?;
+    (head == "symbol")
+        .then(|| {
+            copperpour_sexp::parse_sexp(name)
+                .ok()?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .flatten()
 }
 
 /// Every pin anchor in a symbol definition: `(number, x, y)` from each

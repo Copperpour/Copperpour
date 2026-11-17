@@ -36,7 +36,9 @@ use super::sch_components::{
     validate_field_placement_unit_scope, verify_component_mutation_intents,
     ComponentDeleteTargetError, ComponentMutationIntent,
 };
-use super::sch_wiring::{add_stub_label, add_stub_wire, clear_stub_direction, route_between};
+use super::sch_wiring::{
+    add_stub_label, add_stub_wire, clear_stub_direction, route_between, route_blocked,
+};
 use super::PlacedPins;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -369,8 +371,10 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Stub direction. 'auto' (default) points it away from \
                                         the symbol body when a pin sits at (x, y), so the label \
-                                        text does not run back across the symbol; it falls back \
-                                        to 'right' on a bare point.",
+                                        text does not run back across the symbol, and falls back \
+                                        to 'right' on a bare point. An 'auto' stub that would join \
+                                        another net turns across instead; a named one, or 'auto' \
+                                        with every direction blocked, refuses with plan_blocked.",
                         "enum": ["auto", "right", "left", "up", "down"],
                         "default": "auto"
                     }
@@ -1942,11 +1946,19 @@ async fn handle_connect_passthrough(
     let direction = opt_str(args, "direction").unwrap_or("auto");
 
     let (content, tree) = read_schematic(&sch_path)?;
-    let dir = crate::tools::stub_direction(direction, crate::tools::pin_outward_at(&tree, x, y));
+    let outward = crate::tools::pin_outward_at(&tree, x, y);
+    let dirs = crate::tools::stub_directions(direction, outward);
+    let sch = cse::Schematic::from_source(&sch_path, &content)?;
+    let exits = crate::tools::junction_exit_points(&tree);
 
     // Stub is 2.54mm (2×1.27 grid units)
     let stub = 2.54_f64;
-    let (wire_end_x, wire_end_y) = (x + dir.dx * stub, y + dir.dy * stub);
+    let dir =
+        match clear_stub_direction(&sch, &exits, (x, y), &dirs, stub, "label", &net_name, &[])? {
+            Ok(dir) => dir,
+            Err(reasons) => return Ok(route_blocked("connect_passthrough", reasons)),
+        };
+    let (wire_end_x, wire_end_y) = dir.end((x, y), stub);
 
     let label_sexp = format_net_label(&net_name, wire_end_x, wire_end_y, dir.label_rotation);
 

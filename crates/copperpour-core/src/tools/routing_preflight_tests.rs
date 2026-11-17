@@ -196,7 +196,7 @@ impl Scene {
         let response = response.result.unwrap();
         let body: Value = serde_json::from_str(response["content"][0]["text"].as_str().unwrap())
             .unwrap_or_else(|_| json!({"message":response["content"][0]["text"]}));
-        if tool == "get_nets_list" {
+        if matches!(tool, "get_nets_list" | "add_via") {
             assert_eq!(
                 response["isError"],
                 body.get("error").is_some(),
@@ -300,6 +300,15 @@ async fn routing_preflight_valid_routes_still_create_requested_copper() {
             } else {
                 let track = kiapi::board::types::Track::decode(item.value.as_slice()).unwrap();
                 assert_eq!(track.layer, kiapi::board::types::BoardLayer::BlIn4Cu as i32);
+                // Public defaults, in KiCad's nanometres, independent of the builder.
+                assert_eq!(
+                    track.width.unwrap().value_nm,
+                    if tool == "route_differential_pair" {
+                        100_000
+                    } else {
+                        250_000
+                    }
+                );
                 nets.push(track.net.unwrap().name);
             }
         }
@@ -508,5 +517,229 @@ async fn net_reader_apply_copper_requires_response_before_planning_or_creation()
             "tracks":[{"start":{"x":10.0,"y":10.0},"end":{"x":20.0,"y":10.0},"width":0.25,"layer":"B.Cu","net":"VCC"}],
             "dry_run":dry_run,"expected_plan_revision":"unobserved"
         })).await;
+    }
+}
+
+#[tokio::test]
+async fn routing_dimensions_are_refused_before_ipc_even_without_dispatch() {
+    // An unusable address proves argument refusal happens before any IPC request.
+    let ctx = Arc::new(ToolContext::new(
+        crate::tools::ServerConfig::default(),
+        Arc::new(crate::router::ToolRouter::new()),
+    ));
+    for (name, field) in [
+        ("route_trace", "width"),
+        ("route_pad_to_pad", "width"),
+        ("modify_trace", "width"),
+        ("route_differential_pair", "width"),
+        ("route_differential_pair", "gap"),
+    ] {
+        let tool = tools().into_iter().find(|tool| tool.name == name).unwrap();
+        for value in [
+            json!(-0.2),
+            json!(0),
+            json!(0.0000001),
+            json!("bad"),
+            json!(false),
+            json!([]),
+            json!({}),
+        ] {
+            let mut args = json!({"board":"/not-open.kicad_pcb", "net_name":"VCC", "layer":"F.Cu", "x1":10,"y1":10,"x2":20,"y2":10,
+                "uuid":"track", "ref1":"R1", "pad1":"1", "ref2":"R2", "pad2":"2", "net_pos":"VCC", "net_neg":"GND"});
+            args[field] = value.clone();
+            let result = (tool.handler)(&args, ctx.clone()).await.unwrap();
+            assert!(result.is_error, "{name}.{field}={value}: {result:?}");
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text")
+            };
+            let body: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                body["error"]["kind"], "invalid_argument",
+                "{name}.{field}={value}: {body}"
+            );
+            assert_eq!(
+                body["error"]["field"], field,
+                "{name}.{field}={value}: {body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn routing_dimensions_served_refusals_preserve_copper() {
+    for (tool, field) in [
+        ("route_trace", "width"),
+        ("route_pad_to_pad", "width"),
+        ("modify_trace", "width"),
+        ("route_differential_pair", "width"),
+        ("route_differential_pair", "gap"),
+    ] {
+        for value in [json!(-0.2), json!(0), json!(0.0000001), json!("bad")] {
+            let mut changes = json!({field:value});
+            if tool == "modify_trace" {
+                changes["uuid"] = json!("track");
+            }
+            refused(tool, changes, field, field).await;
+        }
+    }
+}
+
+#[test]
+fn routing_dimensions_schema_and_rounding_boundaries() {
+    for name in [
+        "route_trace",
+        "route_pad_to_pad",
+        "modify_trace",
+        "route_differential_pair",
+    ] {
+        let tool = tools().into_iter().find(|tool| tool.name == name).unwrap();
+        assert_eq!(
+            tool.input_schema["properties"]["width"]["exclusiveMinimum"], 0,
+            "{name}"
+        );
+        if name == "route_differential_pair" {
+            assert_eq!(
+                tool.input_schema["properties"]["gap"]["exclusiveMinimum"],
+                0
+            );
+        }
+    }
+    assert_eq!(routing_dimension(&json!({}), "width", 0.25).unwrap(), 0.25);
+    assert_eq!(routing_dimension(&json!({}), "gap", 0.1).unwrap(), 0.1);
+    // Exactly half a nanometre rounds up; slightly less must be refused.
+    assert_eq!(
+        routing_dimension(&json!({"width":0.0000005}), "width", 0.25).unwrap(),
+        0.0000005
+    );
+    assert!(routing_dimension(&json!({"width":0.00000049}), "width", 0.25).is_err());
+}
+
+#[tokio::test]
+async fn routing_dimensions_explicit_positive_values_reach_copper() {
+    for tool in ["route_trace", "route_pad_to_pad", "route_differential_pair"] {
+        let scene = Scene::new().await;
+        let changes = if tool == "route_differential_pair" {
+            json!({"width":0.3,"gap":0.2})
+        } else {
+            json!({"width":0.3})
+        };
+        let body = scene.call(tool, changes).await;
+        assert!(body.get("error").is_none(), "{tool}: {body}");
+        let store = scene.store.lock().unwrap();
+        let tracks: Vec<_> = store.items[2..]
+            .iter()
+            .map(|item| kiapi::board::types::Track::decode(item.value.as_slice()).unwrap())
+            .collect();
+        assert!(!tracks.is_empty(), "{tool}");
+        for track in &tracks {
+            assert_eq!(track.width.as_ref().unwrap().value_nm, 300_000, "{tool}");
+        }
+        if tool == "route_differential_pair" {
+            assert_eq!(tracks.len(), 2);
+            // Horizontal pair: centre spacing = 0.3 mm width + 0.2 mm gap.
+            assert_eq!(
+                (tracks[0].start.as_ref().unwrap().y_nm - tracks[1].start.as_ref().unwrap().y_nm)
+                    .abs(),
+                500_000
+            );
+        }
+    }
+}
+
+// Geometry oracle: PCB_VIA::ValidateViaParameters rejects diameter <= drill:
+// https://github.com/KiCad/kicad-source-mirror/blob/10.0.5/pcbnew/pcb_track.cpp#L1694-L1699
+fn via_geometry_invalid_cases() -> Vec<(Value, &'static str)> {
+    vec![
+        (json!({"drill": -0.2}), "drill"),
+        (json!({"drill": 0}), "drill"),
+        (json!({"pad_size": 0}), "pad_size"),
+        (json!({"pad_size": -0.8}), "pad_size"),
+        (json!({"drill": "bad"}), "drill"),
+        (json!({"pad_size": "bad"}), "pad_size"),
+        (json!({"drill": null}), "drill"),
+        (json!({"pad_size": false}), "pad_size"),
+        (json!({"drill": []}), "drill"),
+        (json!({"pad_size": {}}), "pad_size"),
+        (json!({"drill": 0.0000001}), "drill"),
+        (json!({"pad_size": 0.0000001}), "pad_size"),
+        (json!({"drill": 1, "pad_size": 0.4}), "drill"),
+        (json!({"drill": 0.4, "pad_size": 0.4}), "drill"),
+        (json!({"drill": 0.4000001, "pad_size": 0.4000002}), "drill"),
+        (json!({"drill": 0.8}), "drill"),
+        (json!({"pad_size": 0.4}), "drill"),
+    ]
+}
+
+#[tokio::test]
+async fn via_geometry_direct_refuses_before_ipc() {
+    use crate::tools::pcb_board::board_mock::ctx_talking_to;
+    let ctx = ctx_talking_to(String::new());
+    for (changes, field) in via_geometry_invalid_cases() {
+        let mut args = json!({"board":"unused.kicad_pcb","net_name":"VCC","x":1,"y":2});
+        for (key, value) in changes.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        // No endpoint exists: reaching IPC would return an error, not this refusal.
+        let result = handle_add_via(&args, &ctx).await.unwrap();
+        assert!(result.is_error, "{args}: {result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected structured refusal");
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{args}: {body}");
+        assert_eq!(body["error"]["field"], field, "{args}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn via_geometry_served_refusals_preserve_copper() {
+    for (changes, field) in via_geometry_invalid_cases() {
+        refused("add_via", changes, field, "").await;
+    }
+}
+
+#[tokio::test]
+async fn via_geometry_defaults_and_explicit_sizes_are_stored() {
+    for (changes, drill_nm, pad_nm) in [
+        (json!({}), 400_000, 800_000),
+        (json!({"drill":0.3,"pad_size":0.6}), 300_000, 600_000),
+        (json!({"drill":0.3}), 300_000, 800_000),
+        (json!({"pad_size":1}), 400_000, 1_000_000),
+        (json!({"drill":0.4,"pad_size":0.400001}), 400_000, 400_001),
+    ] {
+        let scene = Scene::new().await;
+        let body = scene.call("add_via", changes).await;
+        assert_eq!(body["source"], "ipc_readback", "{body}");
+        assert_eq!(body["net"], "VCC", "{body}");
+        assert_eq!(body["drill"], drill_nm as f64 / 1_000_000.0);
+        assert_eq!(body["pad_size"], pad_nm as f64 / 1_000_000.0);
+        let store = scene.store.lock().unwrap();
+        assert_eq!((store.creates, store.updates, store.deletes), (1, 0, 0));
+        let vias: Vec<_> = store
+            .items
+            .iter()
+            .filter(|i| i.type_url.ends_with("Via"))
+            .collect();
+        assert_eq!(vias.len(), 1);
+        let via = kiapi::board::types::Via::decode(vias[0].value.as_slice()).unwrap();
+        let stack = via.pad_stack.unwrap();
+        let drill = stack.drill.unwrap().diameter.unwrap();
+        assert_eq!((drill.x_nm, drill.y_nm), (drill_nm, drill_nm));
+        let pad = stack.copper_layers[0].size.unwrap();
+        assert_eq!((pad.x_nm, pad.y_nm), (pad_nm, pad_nm));
+    }
+}
+
+#[test]
+fn via_geometry_schema_advertises_positive_sizes_and_defaults() {
+    let definition = tools()
+        .into_iter()
+        .find(|tool| tool.name == "add_via")
+        .unwrap();
+    for (field, default) in [("drill", 0.4), ("pad_size", 0.8)] {
+        let property = &definition.input_schema["properties"][field];
+        assert_eq!(property["type"], "number");
+        assert_eq!(property["exclusiveMinimum"], 0);
+        assert_eq!(property["default"], default);
     }
 }

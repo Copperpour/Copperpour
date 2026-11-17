@@ -88,3 +88,21 @@ as above.)
 |---|---|---|
 | `#PWR002` | `(at 50.8 167.64 0)` | `(at 45.72 167.64 0)` |
 | `R8` | `(at 59.69 139.7 90)` | `(at 54.61 139.7 90)` |
+
+## SVG export naming
+
+`kicad-cli sch export svg --output <dir>` names every file after the input
+schematic, one per sheet — measured on kicad-cli 10.0.8 against this fixture:
+
+| Input | Files written |
+|---|---|
+| `single_pin_nets.kicad_sch` (root + child) | `single_pin_nets.svg`, `single_pin_nets-Child.svg` |
+| `single_pin_nets_child.kicad_sch` (leaf alone) | `single_pin_nets_child.svg` |
+
+The child suffix is the sheet's **Sheetname** property (`Child`), not the
+child file's stem (`single_pin_nets_child`). KiCad's own `complex_hierarchy`
+demo corroborates it: two sheets both backed by `ampli_ht.kicad_sch` export as
+`complex_hierarchy-ampli_ht_horizontal.svg` and
+`complex_hierarchy-ampli_ht_vertical.svg`, named after their Sheetname fields.
+`export_schematic_svg` substitutes the caller's stem for the schematic's across
+every file, so the root lands at the requested `output` name (#25).

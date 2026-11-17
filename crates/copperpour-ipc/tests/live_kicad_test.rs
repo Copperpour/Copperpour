@@ -109,6 +109,14 @@ fn footprint_at(node: &SexpNode) -> (f64, f64, f64) {
     )
 }
 
+/// Whether two angles in degrees name the same orientation modulo 360.
+/// KiCad normalizes footprint root angles on save to (-180, 180]
+/// (`EDA_ANGLE::Normalize180`), so a requested `270.0` is written as `-90`.
+fn angles_match(a: f64, b: f64) -> bool {
+    let difference = (a - b).rem_euclid(360.0);
+    difference < 1e-6 || 360.0 - difference < 1e-6
+}
+
 fn collect_geometry(node: &SexpNode, output: &mut Vec<(String, f64, f64)>) {
     if matches!(
         node.head(),
@@ -503,7 +511,7 @@ fn moving_and_rotating_footprint_preserves_child_geometry() {
         "moving a footprint must preserve all child-relative geometry"
     );
 
-    let target_rotation = (original_at.2 + 90.0) % 360.0;
+    let target_rotation = (original_at.2 + 90.0).rem_euclid(360.0);
     client
         .rotate_footprint(&reference, target_rotation)
         .expect("footprint rotation failed");
@@ -511,7 +519,14 @@ fn moving_and_rotating_footprint_preserves_child_geometry() {
 
     let rotated_tree = load_board(Path::new(&board));
     let rotated = footprint(&rotated_tree, &reference);
-    assert!((footprint_at(rotated).2 - target_rotation).abs() < 1e-6);
+    let observed_rotation = footprint_at(rotated).2;
+    // KiCad normalizes footprint orientation on save to (-180, 180]
+    // (`EDA_ANGLE::Normalize180`), so a 180 -> 270 deg rotation writes -90.
+    assert!(
+        angles_match(observed_rotation, target_rotation),
+        "expected footprint rotation {target_rotation} deg (equivalent mod 360), \
+         observed {observed_rotation} deg in saved board"
+    );
     assert_eq!(
         child_geometry(rotated),
         original_geometry,
@@ -1247,4 +1262,14 @@ fn the_shared_reference_fixture_still_carries_a_duplicate_board_only_reference()
         "the fixture must carry exactly two board-only footprints called REF**; \
          found {pathless_by_reference:?}"
     );
+}
+
+#[test]
+fn angles_match_accepts_kicad_normalized_equivalents_and_rejects_stale_angles() {
+    assert!(angles_match(-90.0, 270.0));
+    assert!(angles_match(270.0, -90.0));
+    assert!(angles_match(0.0, 360.0));
+    assert!(angles_match(90.0, 90.0));
+    assert!(!angles_match(180.0, 270.0));
+    assert!(!angles_match(90.0, 90.5));
 }

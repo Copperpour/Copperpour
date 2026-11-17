@@ -33,12 +33,18 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "export_schematic_svg",
-            "Export a schematic sheet to an SVG file using kicad-cli. The result doubles as a              machine-readable geometry source: kicad-cli writes every string twice — visibly as              stroke paths, and again as an invisible <text opacity=\"0\"> element carrying x, y,              textLength, font-size and text-anchor — so text content, position and width are              checkable without rendering a pixel.",
+            "Export a schematic to an SVG file using kicad-cli. `output` names the root \
+             file; a hierarchy writes one file per sheet, children beside it as \
+             <output stem>-<sheetname>.svg, and every file written is reported. The result \
+             doubles as a machine-readable geometry source: kicad-cli writes every string \
+             twice — visibly as stroke paths, and again as an invisible <text opacity=\"0\"> \
+             element carrying x, y, textLength, font-size and text-anchor — so text content, \
+             position and width are checkable without rendering a pixel.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "output":    { "type": "string", "description": "Output SVG file path (directory used as output dir)" },
+                    "output":    { "type": "string", "description": "Output SVG file path; child sheets are written beside it as <stem>-<sheetname>.svg" },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false },
                     "theme": { "type": "string", "description": "KiCad colour theme name (optional)" }
                 },
@@ -237,18 +243,12 @@ async fn handle_export_svg(
         theme: args["theme"].as_str(),
     };
 
-    // kicad-cli writes to an output directory and names the file <stem>.svg
-    let output_dir = output_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .to_path_buf();
-    std::fs::create_dir_all(&output_dir)?;
-
-    let svg_path =
-        cli::export_schematic_svg(&ctx.config.kicad_cli, &sch_path, &output_dir, &options).await?;
+    let files =
+        cli::export_schematic_svg(&ctx.config.kicad_cli, &sch_path, &output_path, &options).await?;
 
     Ok(CallToolResult::json(&json!({
-        "exported": svg_path.display().to_string(),
+        "exported": files[0].display().to_string(),
+        "files": files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
         "black_and_white": options.black_and_white,
         "theme": options.theme
     })))
@@ -290,7 +290,7 @@ async fn handle_render_png(
         theme: None,
     };
     let svg_path =
-        cli::export_schematic_svg(&ctx.config.kicad_cli, &sch_path, svg_dir.path(), &options)
+        cli::render_schematic_svg(&ctx.config.kicad_cli, &sch_path, svg_dir.path(), &options)
             .await?;
     let svg_bytes = std::fs::read(&svg_path)?;
 
@@ -366,7 +366,7 @@ async fn render_sheet_png(
     width_px: u32,
 ) -> anyhow::Result<copperpour_render::Rendered> {
     let svg_dir = tempfile::tempdir()?;
-    let svg_path = cli::export_schematic_svg(
+    let svg_path = cli::render_schematic_svg(
         &ctx.config.kicad_cli,
         sch_path,
         svg_dir.path(),
@@ -2102,5 +2102,328 @@ mod image_content_tests {
 
         let without = json_with_png(&report, None);
         assert!(matches!(&without.content[..], [ToolContent::Text { .. }]));
+    }
+}
+
+#[cfg(test)]
+mod svg_output_filename_tests {
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+
+    const ROOT_SCH: &str = include_str!("../../tests/fixtures/single_pin_nets.kicad_sch");
+
+    /// A fake `kicad-cli sch export svg` that writes what KiCad writes for a
+    /// root sheet with one child named `Child`: `<stem>.svg` and
+    /// `<stem>-Child.svg` in the `--output` directory (the suffix is the
+    /// sheet's Sheetname property, measured on kicad-cli 10.0.8). Each file
+    /// carries the input path so two exports are tellable apart.
+    fn svg_cli(dir: &Path, child_sheet: bool) -> PathBuf {
+        let child_unix = if child_sheet {
+            "printf 'CHILD %s' \"$last\" > \"$out/$stem-Child.svg\"\n"
+        } else {
+            ""
+        };
+        let child_windows = if child_sheet {
+            "echo CHILD !last!> \"!out!\\!stem!-Child.svg\"\r\n"
+        } else {
+            ""
+        };
+        crate::tools::cli::test_support::write_script(
+            dir,
+            "fake-kicad-cli",
+            &format!(
+                "#!/bin/sh\nout=\"\"\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"--output\" ]; then out=\"$a\"; fi\n  prev=\"$a\"\ndone\nfor last; do :; done\nstem=$(basename \"$last\" .kicad_sch)\nprintf 'ROOT %s' \"$last\" > \"$out/$stem.svg\"\n{child_unix}exit 0\n"
+            ),
+            &format!(
+                "@echo off\r\nsetlocal enabledelayedexpansion\r\nset prev=\r\nset last=\r\n:loop\r\nif \"%~1\"==\"\" goto done\r\nif \"!prev!\"==\"--output\" set out=%~1\r\nset prev=%~1\r\nset last=%~1\r\nshift\r\ngoto loop\r\n:done\r\nfor %%F in (\"!last!\") do set stem=%%~nF\r\necho ROOT !last!> \"!out!\\!stem!.svg\"\r\n{child_windows}exit /b 0\r\n"
+            ),
+        )
+    }
+
+    async fn served_export(kicad_cli: &Path, schematic: &Path, output: &Path) -> serde_json::Value {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: kicad_cli.display().to_string(),
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "export_schematic_svg",
+                    "arguments": {
+                        "schematic": schematic.display().to_string(),
+                        "output": output.display().to_string()
+                    }
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        serde_json::from_str(text).expect("tool body is JSON")
+    }
+
+    fn write_schematic(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, ROOT_SCH).unwrap();
+        path
+    }
+
+    /// The issue's core case: `output` names a file, and that file — not one
+    /// named after the schematic — is what lands on disk and in the response,
+    /// exactly as `export_schematic_pdf` already behaves. The child sheet
+    /// keeps kicad-cli's `<root>-<sheet>` convention under the caller's stem,
+    /// and every file written is reported.
+    #[tokio::test]
+    async fn the_requested_filename_is_the_exported_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = svg_cli(dir.path(), true);
+        let schematic = write_schematic(dir.path(), "single_pin_nets.kicad_sch");
+        let out = dir.path().join("out");
+        let output = out.join("MyBoard.svg");
+
+        let body = served_export(&cli, &schematic, &output).await;
+
+        assert_eq!(body["exported"], output.display().to_string(), "{body}");
+        assert_eq!(
+            body["files"],
+            json!([
+                output.display().to_string(),
+                out.join("MyBoard-Child.svg").display().to_string()
+            ]),
+            "{body}"
+        );
+        assert!(std::fs::read_to_string(&output)
+            .unwrap()
+            .starts_with("ROOT "));
+        assert!(std::fs::read_to_string(out.join("MyBoard-Child.svg"))
+            .unwrap()
+            .starts_with("CHILD "));
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["MyBoard-Child.svg", "MyBoard.svg"]);
+    }
+
+    /// A single-sheet export behaves exactly like the PDF neighbour: one
+    /// file, the requested name, nothing else.
+    #[tokio::test]
+    async fn a_single_sheet_export_writes_only_the_requested_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = svg_cli(dir.path(), false);
+        let schematic = write_schematic(dir.path(), "leaf.kicad_sch");
+        let output = dir.path().join("named").join("Sheet.svg");
+
+        let body = served_export(&cli, &schematic, &output).await;
+
+        assert_eq!(body["exported"], output.display().to_string(), "{body}");
+        assert_eq!(
+            body["files"],
+            json!([output.display().to_string()]),
+            "{body}"
+        );
+        assert!(output.is_file());
+        assert!(!dir.path().join("named").join("leaf.svg").exists());
+    }
+
+    /// The collision the issue names: two schematics sharing a stem, exported
+    /// into one directory under different names, must both survive.
+    #[tokio::test]
+    async fn two_same_stem_schematics_keep_both_named_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = svg_cli(dir.path(), false);
+        let first_dir = dir.path().join("first");
+        let second_dir = dir.path().join("second");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let first = write_schematic(&first_dir, "board.kicad_sch");
+        let second = write_schematic(&second_dir, "board.kicad_sch");
+        let out = dir.path().join("out");
+
+        let one = served_export(&cli, &first, &out.join("First.svg")).await;
+        let two = served_export(&cli, &second, &out.join("Second.svg")).await;
+
+        assert_eq!(one["exported"], out.join("First.svg").display().to_string());
+        assert_eq!(
+            two["exported"],
+            out.join("Second.svg").display().to_string()
+        );
+        let first_bytes = std::fs::read_to_string(out.join("First.svg")).unwrap();
+        let second_bytes = std::fs::read_to_string(out.join("Second.svg")).unwrap();
+        assert!(
+            first_bytes.contains(&first.display().to_string()),
+            "{first_bytes}"
+        );
+        assert!(
+            second_bytes.contains(&second.display().to_string()),
+            "{second_bytes}"
+        );
+    }
+
+    /// The requested name may match the name kicad-cli gave a child sheet in
+    /// staging (`<stem>-<sheetname>.svg`). The root must still land there with
+    /// the root's content, and the child must keep its own content under the
+    /// substituted name — renaming in place would clobber the child first.
+    #[tokio::test]
+    async fn a_requested_name_matching_a_child_staged_name_keeps_both_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = svg_cli(dir.path(), true);
+        let schematic = write_schematic(dir.path(), "single_pin_nets.kicad_sch");
+        let out = dir.path().join("out");
+        let output = out.join("single_pin_nets-Child.svg");
+
+        let body = served_export(&cli, &schematic, &output).await;
+
+        let child = out.join("single_pin_nets-Child-Child.svg");
+        assert_eq!(body["exported"], output.display().to_string(), "{body}");
+        assert_eq!(
+            body["files"],
+            json!([output.display().to_string(), child.display().to_string()]),
+            "{body}"
+        );
+        assert!(std::fs::read_to_string(&output)
+            .unwrap()
+            .starts_with("ROOT "));
+        assert!(std::fs::read_to_string(&child)
+            .unwrap()
+            .starts_with("CHILD "));
+    }
+
+    /// Callers migrating from the old directory-only semantics may pass an
+    /// existing directory or a trailing-slash path. Both must be refused as
+    /// errors without touching or replacing the directory.
+    #[tokio::test]
+    async fn a_directory_output_path_is_refused_without_touching_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = svg_cli(dir.path(), false);
+        let schematic = write_schematic(dir.path(), "leaf.kicad_sch");
+        let existing_dir = dir.path().join("exports");
+        std::fs::create_dir_all(&existing_dir).unwrap();
+        let sentinel = existing_dir.join("keep.txt");
+        std::fs::write(&sentinel, "do-not-delete").unwrap();
+
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: cli.display().to_string(),
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+
+        for bad_output in [
+            existing_dir.display().to_string(),
+            format!("{}/", dir.path().join("trailing").display()),
+        ] {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "export_schematic_svg",
+                        "arguments": {
+                            "schematic": schematic.display().to_string(),
+                            "output": bad_output
+                        }
+                    }
+                }))
+                .await
+                .expect("request returns a response");
+            let result = response.result.expect("JSON-RPC result");
+            assert_eq!(result["isError"], json!(true), "{result}");
+            let text = result["content"][0]["text"].as_str().unwrap_or_default();
+            assert!(
+                text.contains("must name a file, not a directory"),
+                "unexpected error text: {text}"
+            );
+        }
+
+        assert!(existing_dir.is_dir(), "existing directory must survive");
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "do-not-delete",
+            "existing directory contents must survive"
+        );
+    }
+
+    /// A derived child destination (`<output stem>-<sheetname>.svg`) may
+    /// collide with an existing directory even when the requested root path is
+    /// a valid file. Preflighting all mapped destinations before publishing
+    /// any file must refuse the export while leaving both the child directory
+    /// (with its contents) and the existing root SVG untouched.
+    #[tokio::test]
+    async fn a_child_directory_destination_is_refused_without_touching_root_or_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = svg_cli(dir.path(), true);
+        let schematic = write_schematic(dir.path(), "single_pin_nets.kicad_sch");
+        let out = dir.path().join("out");
+        let output = out.join("Board.svg");
+        let child_dir = out.join("Board-Child.svg");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        std::fs::write(&output, "existing-root-svg").unwrap();
+        let sentinel = child_dir.join("keep.txt");
+        std::fs::write(&sentinel, "do-not-delete").unwrap();
+
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: cli.display().to_string(),
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "export_schematic_svg",
+                    "arguments": {
+                        "schematic": schematic.display().to_string(),
+                        "output": output.display().to_string()
+                    }
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("JSON-RPC result");
+        assert_eq!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("must name a file, not a directory") && text.contains("Board-Child.svg"),
+            "unexpected error text: {text}"
+        );
+
+        assert!(child_dir.is_dir(), "child directory must survive");
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "do-not-delete",
+            "child directory contents must survive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "existing-root-svg",
+            "existing root SVG must not be replaced when a child destination is refused"
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["Board-Child.svg", "Board.svg"]);
     }
 }

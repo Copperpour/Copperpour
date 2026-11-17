@@ -116,6 +116,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "query_traces",
     "query_vias",
     // placement
+    "get_placement_overview",
     "score_placement",
     // library
     "get_footprint_info",

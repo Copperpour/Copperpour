@@ -83,7 +83,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "layer":    { "type": "string", "description": "Copper layer: F.Cu, B.Cu or In1.Cu..In30.Cu" },
                     "x1": { "type": "number" }, "y1": { "type": "number" },
                     "x2": { "type": "number" }, "y2": { "type": "number" },
-                    "width": { "type": "number", "default": 0.25 }
+                    "width": { "type": "number", "exclusiveMinimum": 0, "default": 0.25 }
                 },
                 "required": ["board", "net_name", "layer", "x1", "y1", "x2", "y2"]
             }),
@@ -103,7 +103,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "ref2":        { "type": "string", "description": "Second component reference" },
                     "pad2":        { "type": "string", "description": "Second pad number" },
                     "layer":       { "type": "string", "description": "Copper layer: F.Cu, B.Cu or In1.Cu..In30.Cu", "default": "F.Cu" },
-                    "width":       { "type": "number", "default": 0.25 }
+                    "width":       { "type": "number", "exclusiveMinimum": 0, "default": 0.25 }
                 },
                 "required": ["board", "net_name", "ref1", "pad1", "ref2", "pad2"]
             }),
@@ -124,8 +124,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "net_name":  { "type": "string" },
                     "x":         { "type": "number" },
                     "y":         { "type": "number" },
-                    "drill":     { "type": "number", "description": "Drill diameter in mm", "default": 0.4 },
-                    "pad_size":  { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 }
+                    "drill":     { "type": "number", "description": "Positive drill diameter in mm, smaller than pad_size after nanometre rounding", "exclusiveMinimum": 0, "default": 0.4 },
+                    "pad_size":  { "type": "number", "description": "Positive via pad diameter in mm, larger than drill after nanometre rounding", "exclusiveMinimum": 0, "default": 0.8 }
                 },
                 "required": ["board", "net_name", "x", "y"]
             }),
@@ -285,7 +285,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "layer":     { "type": "string", "description": "Copper layer: F.Cu, B.Cu or In1.Cu..In30.Cu" },
                     "x1": { "type": "number" }, "y1": { "type": "number" },
                     "x2": { "type": "number" }, "y2": { "type": "number" },
-                    "width":     { "type": "number", "default": 0.25 }
+                    "width":     { "type": "number", "exclusiveMinimum": 0, "default": 0.25 }
                 },
                 "required": ["board", "uuid", "net_name", "layer", "x1", "y1", "x2", "y2"]
             }),
@@ -413,8 +413,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "layer":    { "type": "string", "description": "Copper layer: F.Cu, B.Cu or In1.Cu..In30.Cu", "default": "F.Cu" },
                     "x1": { "type": "number" }, "y1": { "type": "number" },
                     "x2": { "type": "number" }, "y2": { "type": "number" },
-                    "width": { "type": "number", "default": 0.1 },
-                    "gap":   { "type": "number", "description": "Gap between pair traces in mm", "default": 0.1 }
+                    "width": { "type": "number", "exclusiveMinimum": 0, "default": 0.1 },
+                    "gap":   { "type": "number", "exclusiveMinimum": 0, "description": "Gap between pair traces in mm", "default": 0.1 }
                 },
                 "required": ["board", "net_pos", "net_neg", "x1", "y1", "x2", "y2"]
             }),
@@ -561,6 +561,22 @@ fn routing_preflight(
     Ok(None)
 }
 
+// Track dimensions must remain positive after the conversion used by IPC builders.
+fn routing_dimension(
+    args: &serde_json::Value,
+    field: &str,
+    default: f64,
+) -> Result<f64, CallToolResult> {
+    let value = opt_positive_f64(args, field)?.unwrap_or(default);
+    if copperpour_ipc::builders::mm_to_nm(value) <= 0 {
+        return Err(invalid_arg(
+            field,
+            "must be greater than 0 mm once rounded to the nanometre",
+        ));
+    }
+    Ok(value)
+}
+
 async fn handle_route_trace(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -589,7 +605,10 @@ async fn handle_route_trace(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let width = args["width"].as_f64().unwrap_or(0.25);
+    let width = match routing_dimension(args, "width", 0.25) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     let net_ipc = net_name.clone();
     let layer_ipc = layer.clone();
@@ -639,7 +658,10 @@ async fn handle_route_pad_to_pad(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let width = args["width"].as_f64().unwrap_or(0.25);
+    let width = match routing_dimension(args, "width", 0.25) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     // Both pads come from the board open in KiCad, the one the tracks are
     // written to. The saved file lags any unsaved move, including
@@ -721,8 +743,33 @@ async fn handle_add_via(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let drill = args["drill"].as_f64().unwrap_or(0.4);
-    let pad_size = args["pad_size"].as_f64().unwrap_or(0.8);
+    // Defaults apply only to omitted fields; null and malformed present values
+    // must not silently become a different via geometry.
+    let mut dimensions = [0.4, 0.8];
+    for (field, value) in ["drill", "pad_size"].into_iter().zip(&mut dimensions) {
+        if args.get(field).is_some() {
+            *value = match require_f64(args, field) {
+                Ok(value) => value,
+                Err(refusal) => return Ok(refusal),
+            };
+        }
+        if copperpour_ipc::builders::distance(*value).value_nm <= 0 {
+            return Ok(invalid_arg(
+                field,
+                "must be greater than zero after rounding to nanometres",
+            ));
+        }
+    }
+    let [drill, pad_size] = dimensions;
+    // KiCad compares integer diameters: distinct mm values can round equal.
+    if copperpour_ipc::builders::distance(drill).value_nm
+        >= copperpour_ipc::builders::distance(pad_size).value_nm
+    {
+        return Ok(invalid_arg(
+            "drill",
+            "must be smaller than pad_size after rounding to nanometres",
+        ));
+    }
 
     let net_ipc = net_name.clone();
     let placement = ipc!(ctx, args, |c, document| {
@@ -1964,8 +2011,8 @@ async fn handle_modify_trace(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let width = match opt_positive_f64(args, "width") {
-        Ok(v) => v.unwrap_or(0.25),
+    let width = match routing_dimension(args, "width", 0.25) {
+        Ok(v) => v,
         Err(e) => return Ok(e),
     };
 
@@ -2262,7 +2309,7 @@ async fn handle_create_netclass(
 ///
 /// Iterative rather than recursive: a pattern is user data, and `*`-heavy input
 /// makes the naive recursion blow the stack on names a real board can carry.
-fn wildcard_matches(pattern: &str, name: &str) -> bool {
+pub(crate) fn wildcard_matches(pattern: &str, name: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let txt: Vec<char> = name.chars().collect();
     let (mut p, mut t) = (0usize, 0usize);
@@ -2952,8 +2999,14 @@ async fn handle_route_diff_pair(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let width = args["width"].as_f64().unwrap_or(0.1);
-    let gap = args["gap"].as_f64().unwrap_or(0.1);
+    let width = match routing_dimension(args, "width", 0.1) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let gap = match routing_dimension(args, "gap", 0.1) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let offset = (gap + width) / 2.0;
 
     // Route two parallel traces offset perpendicular to the direction
