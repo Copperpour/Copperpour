@@ -1278,8 +1278,9 @@ pub(crate) enum ClosedBoardError {
 
 impl ClosedBoardError {
     /// The result to hand back: something the caller can act on, with the
-    /// board untouched. A readback mismatch after the write is the one `Err`,
-    /// for dispatch to report as an uncertain outcome (#418).
+    /// board untouched. Read, parse, writer and I/O errors return `Err` so dispatch
+    /// classifies readback mismatches, revision conflicts, KiCad editor locks,
+    /// and remaining I/O failures the same way as for other board writers.
     pub(crate) fn into_result(self) -> anyhow::Result<CallToolResult> {
         Ok(match self {
             Self::ReferenceNotFound(reference) => CallToolResult::error_kind(
@@ -1313,14 +1314,10 @@ impl ClosedBoardError {
                 },
                 format!("Refusing to flip: {reason}. The board file was not modified."),
             ),
-            Self::Io(error) if crate::tools::readback_mismatch_path(&error).is_some() => {
-                return Err(error)
-            }
-            // Refused before the write: dispatch answers `conflict`.
-            Self::Io(error) if crate::tools::revision_conflict_path(&error).is_some() => {
-                return Err(error)
-            }
-            Self::Io(error) => CallToolResult::error(format!("{error:#}")),
+            // Writer and I/O errors go back to dispatch so it classifies
+            // readback mismatches, revision conflicts, KiCad editor locks, and
+            // remaining I/O failures uniformly (#418, #419).
+            Self::Io(error) => return Err(error),
         })
     }
 }
