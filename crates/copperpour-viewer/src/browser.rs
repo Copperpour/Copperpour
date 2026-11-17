@@ -906,23 +906,22 @@ async fn open_in_kicad(
     State(shared): State<Arc<Shared>>,
     Json(request): Json<FileRequest>,
 ) -> Response {
-    if !shared
-        .cache
-        .read()
-        .await
-        .snapshot
-        .sheets
-        .iter()
-        .any(|entry| entry.file == request.file)
-    {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let root = PathBuf::from(&shared.cache.read().await.snapshot.root_file);
-    let project = root.with_extension("kicad_pro");
-    let target = if project.is_file() {
-        project
-    } else {
-        PathBuf::from(request.file)
+    let target = {
+        let cache = shared.cache.read().await;
+        let Some(sheet) = cache
+            .snapshot
+            .sheets
+            .iter()
+            .find(|entry| entry.file == request.file)
+        else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let project = PathBuf::from(&cache.snapshot.root_file).with_extension("kicad_pro");
+        if project.is_file() {
+            project
+        } else {
+            PathBuf::from(&sheet.file)
+        }
     };
     let Ok(_launching) = shared.launching.try_lock() else {
         return (StatusCode::CONFLICT, "KiCad is already being launched").into_response();
