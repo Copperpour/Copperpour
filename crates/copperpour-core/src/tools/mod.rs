@@ -2696,22 +2696,12 @@ pub fn ensure_lib_symbol_in_schematic(
 
     // Find the closing paren of lib_symbols and insert before it
     if let Some(ls_start) = content.find("(lib_symbols") {
-        let mut depth = 0i32;
-        let mut ls_end = ls_start;
-        for (i, ch) in content[ls_start..].char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        ls_end = ls_start + i;
-                        break;
-                    }
-                }
-                _ => {}
-            }
+        if let Some((_, block_end)) =
+            copperpour_sexp::writer::find_balanced_block(content, ls_start)
+        {
+            let ls_end = block_end - 1;
+            content.insert_str(ls_end, &format!("\n{}\n\t", indent_lib_symbol(&sym_def)));
         }
-        content.insert_str(ls_end, &format!("\n{}\n\t", indent_lib_symbol(&sym_def)));
     }
     true
 }
