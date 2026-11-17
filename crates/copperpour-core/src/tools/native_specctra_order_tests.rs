@@ -105,7 +105,7 @@ async fn bridge(
 async fn scenario(
     root: &Path,
     label: &str,
-    source: &'static str,
+    source: &str,
     dsn: Option<&'static str>,
     mode: &str,
     custom_rules: bool,
@@ -129,14 +129,15 @@ async fn scenario(
         None => None,
     };
     let observed = calls.clone();
+    let ipc_source = source.to_string();
     let ipc = spawn_kicad_holding_board(&board, move |command| {
         Some(match command.type_url.rsplit('.').next().unwrap() {
             "SaveDocumentToString" => pack_any(
                 &kiapi::common::commands::SavedDocumentResponse {
                     contents: if unstable && observed.load(Ordering::SeqCst) > 0 {
-                        format!("{source}\n")
+                        format!("{ipc_source}\n")
                     } else {
-                        source.into()
+                        ipc_source.clone()
                     },
                     document: None,
                 },
@@ -355,6 +356,38 @@ fn run_isolated_native_profile(test_name: &str, group: &str) {
                     }
                 }
             }
+            "rule-area-grid" => {
+                let source = include_str!("../../tests/fixtures/specctra_rule_areas.kicad_pcb")
+                    .replacen("(xy 113 44)", "(xy 113.0006 44)", 1);
+                assert!(source.contains("(xy 113.0006 44)"));
+                for mode in ["disable", "prefer", "require"] {
+                    let (error, body, count, dsn, manifest) = scenario(
+                        &root,
+                        &format!("off-grid-{mode}"),
+                        &source,
+                        Some(include_str!(
+                            "../../tests/fixtures/specctra_rule_areas.native-kicad-10.dsn"
+                        )),
+                        mode,
+                        false,
+                        false,
+                    )
+                    .await;
+                    assert!(
+                        error && body.to_string().contains("whole-micrometre grid"),
+                        "{body}"
+                    );
+                    assert_eq!(count, 0, "bridge must not export an unsupported snapshot");
+                    assert!(!dsn && !manifest);
+                    assert_eq!(
+                        std::fs::read_to_string(
+                            root.join(format!("off-grid-{mode}/board.kicad_pcb"))
+                        )
+                        .unwrap(),
+                        source
+                    );
+                }
+            }
             "shared" => {
                 for mode in ["disable", "prefer", "require"] {
                     let (error, body, count, dsn, manifest) = scenario(
@@ -443,6 +476,13 @@ fn native_profile_common_import_safety_precedes_bridge() {
     run_isolated_native_profile(
         "native_profile_common_import_safety_precedes_bridge",
         "shared",
+    );
+}
+#[test]
+fn native_profile_rule_area_grid_refusal_precedes_bridge() {
+    run_isolated_native_profile(
+        "native_profile_rule_area_grid_refusal_precedes_bridge",
+        "rule-area-grid",
     );
 }
 #[test]

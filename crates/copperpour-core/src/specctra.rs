@@ -37,6 +37,9 @@ pub(crate) struct ExportBundle {
     /// Copper zones of the exported board, each written as one `plane` per
     /// copper layer it covers.
     pub copper_zone_count: usize,
+    /// Rule areas of the exported board, each written as one keep-out per
+    /// copper layer it covers.
+    pub rule_area_count: usize,
     /// The sides the exported footprints sit on: `front`, `back` or `both`.
     pub component_side: &'static str,
 }
@@ -154,6 +157,41 @@ struct CopperZoneModel {
     outline: Vec<(i64, i64)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RuleAreaKind {
+    /// Forbids both tracks and vias (`keepout`).
+    Keepout,
+    /// Forbids tracks while allowing vias (`wire_keepout`).
+    WireKeepout,
+    /// Forbids vias while allowing tracks (`via_keepout`).
+    ViaKeepout,
+}
+
+impl RuleAreaKind {
+    pub(crate) fn keeps_out_tracks(self) -> bool {
+        matches!(self, Self::Keepout | Self::WireKeepout)
+    }
+
+    pub(crate) fn keeps_out_vias(self) -> bool {
+        matches!(self, Self::Keepout | Self::ViaKeepout)
+    }
+
+    fn dsn_kind(self) -> dsn::KeepoutKind {
+        match self {
+            Self::Keepout => dsn::KeepoutKind::Normal,
+            Self::WireKeepout => dsn::KeepoutKind::Wire,
+            Self::ViaKeepout => dsn::KeepoutKind::Via,
+        }
+    }
+}
+
+struct RuleAreaModel {
+    kind: RuleAreaKind,
+    layers: Vec<String>,
+    outline: Vec<(i64, i64)>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct LockedRouting {
     tracks: Vec<LockedTrackModel>,
@@ -174,7 +212,8 @@ type NetClassNames = BTreeMap<String, String>;
 /// 2 adds each pin's `pad_uuid` and lets pads share a number (#338).
 /// 3 adds the copper-zone inventory, `zones` (#430).
 /// 4 adds each component's pads on no copper layer, `non_copper_pads` (#458).
-pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 4;
+/// 5 adds the rule-area keep-out inventory, `rule_areas` (#81).
+pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Manifest {
@@ -191,6 +230,9 @@ struct Manifest {
     /// Absent before schema 3, which had no copper zones (#430).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     zones: Vec<ManifestZoneCount>,
+    /// Absent before schema 5, which had no rule areas (#81).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rule_areas: Vec<ManifestRuleArea>,
 }
 
 /// How many copper zones of one net cover one copper layer.
@@ -200,6 +242,23 @@ pub(crate) struct ManifestZoneCount {
     pub layer: String,
     pub net: String,
     pub count: usize,
+}
+
+/// One DSN polygon vertex in micrometres (Specctra Y-up coordinates).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManifestPointUm {
+    pub x_um: i64,
+    pub y_um: i64,
+}
+
+/// One validated rule-area keep-out on the board, in canonical order (#81).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManifestRuleArea {
+    pub kind: RuleAreaKind,
+    pub layers: Vec<String>,
+    pub outline_um: Vec<ManifestPointUm>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -213,6 +272,9 @@ struct SupportedProfile {
     #[serde(default)]
     locked_via_count: usize,
     copper_zones: bool,
+    /// Absent before schema 5, which had no rule areas (#81).
+    #[serde(default)]
+    rule_areas: bool,
     custom_rules: bool,
     outline: String,
 }
@@ -295,6 +357,7 @@ pub(crate) struct RoutingSnapshot {
     via_names: BTreeMap<RuleKey, String>,
     locked_routing: LockedRouting,
     zones: Vec<CopperZoneModel>,
+    rule_areas: Vec<RuleAreaModel>,
 }
 
 pub(crate) fn prepare_export(
@@ -311,7 +374,7 @@ pub(crate) fn prepare_export(
     let power_layers = power_layers(&tree);
     let net_table = top_level_net_table(&tree);
     let locked_routing = locked_routing(&tree, &net_table, &copper_layers)?;
-    let zones = copper_zones(&tree, &net_table, &copper_layers)?;
+    let (zones, rule_areas) = board_zones_and_rule_areas(&tree, &net_table, &copper_layers)?;
     let footprints = footprints(&tree, &net_table, &copper_layers)?;
     if footprints.is_empty() {
         bail!("supported routing profile requires at least one footprint");
@@ -378,6 +441,7 @@ pub(crate) fn prepare_export(
         via_names,
         locked_routing,
         zones,
+        rule_areas,
     })
 }
 
@@ -409,6 +473,7 @@ impl RoutingSnapshot {
             &self.via_names,
             &self.locked_routing,
             &self.zones,
+            &self.rule_areas,
         )?;
         self.bundle(serialize_and_validate(pcb)?, RUST_OUTLINE)
     }
@@ -434,6 +499,7 @@ impl RoutingSnapshot {
             &self.via_names,
             &self.locked_routing,
             &self.zones,
+            &self.rule_areas,
             outline,
         )?;
         Ok(ExportBundle {
@@ -446,6 +512,7 @@ impl RoutingSnapshot {
             class_count: self.class_nets.len(),
             copper_layer_count: self.copper_layers.len(),
             copper_zone_count: self.zones.len(),
+            rule_area_count: self.rule_areas.len(),
             component_side: component_side(&self.footprints),
         })
     }
@@ -525,16 +592,22 @@ impl RoutingSnapshot {
                     (
                         zone.net.clone(),
                         layer.clone(),
-                        zone.outline
-                            .iter()
-                            .chain(zone.outline.first())
-                            .copied()
-                            .collect(),
+                        closed_outline(&zone.outline),
                     )
                 })
             })
             .collect::<Vec<_>>();
         planes.sort();
+        let mut keepouts = self
+            .rule_areas
+            .iter()
+            .flat_map(|area| {
+                area.layers
+                    .iter()
+                    .map(|layer| (area.kind, layer.clone(), closed_outline(&area.outline)))
+            })
+            .collect::<Vec<_>>();
+        keepouts.sort();
         Ok(DsnIdentity {
             layers: self.copper_layers.iter().cloned().enumerate().collect(),
             layer_types: self
@@ -577,6 +650,7 @@ impl RoutingSnapshot {
                 .collect(),
             padstacks,
             planes,
+            keepouts,
         })
     }
 }
@@ -633,6 +707,9 @@ fn adopt_native_with_identity(
     validate_native_nets(&baseline_identity, &native_identity)?;
     if baseline_identity.planes != native_identity.planes {
         bail!("native DSN changed the copper-zone planes");
+    }
+    if baseline_identity.keepouts != native_identity.keepouts {
+        bail!("native DSN changed the rule-area keep-outs");
     }
 
     for layer in &mut manifest.layers {
@@ -765,10 +842,38 @@ struct DsnIdentity {
     /// Every `plane`, sorted: the two exporters need not list them in the
     /// same order.
     planes: Vec<DsnPlaneIdentity>,
+    /// Every rule-area keep-out, sorted.
+    keepouts: Vec<DsnKeepoutIdentity>,
 }
 
 /// `(net, layer, closed outline)` of one DSN `plane`.
 type DsnPlaneIdentity = (String, String, Vec<(i64, i64)>);
+
+/// `(kind, layer, closed outline)` of one DSN `keepout`, `wire_keepout`, or `via_keepout`.
+type DsnKeepoutIdentity = (RuleAreaKind, String, Vec<(i64, i64)>);
+
+fn closed_outline(outline: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    outline.iter().chain(outline.first()).copied().collect()
+}
+
+fn dsn_integer_polygon(polygon: &SexpNode, label: &str) -> Result<(String, Vec<(i64, i64)>)> {
+    let DsnShapeIdentity::Polygon { layer, points } = dsn_polygon(polygon)? else {
+        unreachable!("dsn_polygon returns a polygon");
+    };
+    let points = points
+        .iter()
+        .map(|(x, y)| {
+            let integer = |value: OrderedF64| {
+                let value = value.value();
+                (value.fract() == 0.0 && value.abs() < I64_UPPER_EXCLUSIVE)
+                    .then_some(value as i64)
+                    .with_context(|| format!("{label} coordinate is not a supported integer"))
+            };
+            Ok((integer(*x)?, integer(*y)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((layer, points))
+}
 
 fn validate_dsn_syntax(source: &str, label: &str) -> Result<()> {
     let normalized = normalize_courtyard_outline_polygons(source);
@@ -884,24 +989,42 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
             .get(2)
             .filter(|polygon| polygon.head() == Some("polygon") && children == 3)
             .with_context(|| format!("DSN plane on net '{net}' is not one polygon"))?;
-        let DsnShapeIdentity::Polygon { layer, points } = dsn_polygon(polygon)? else {
-            unreachable!("dsn_polygon returns a polygon");
-        };
-        let points = points
-            .iter()
-            .map(|(x, y)| {
-                let integer = |value: OrderedF64| {
-                    let value = value.value();
-                    (value.fract() == 0.0 && value.abs() < I64_UPPER_EXCLUSIVE)
-                        .then_some(value as i64)
-                        .context("DSN plane coordinate is not a supported integer")
-                };
-                Ok((integer(*x)?, integer(*y)?))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let (layer, points) = dsn_integer_polygon(polygon, "DSN plane")?;
         planes.push((net, layer, points));
     }
     planes.sort();
+
+    let mut keepouts = Vec::new();
+    for node in structure.children().unwrap_or(&[]) {
+        let kind = match node.head() {
+            Some("keepout") => RuleAreaKind::Keepout,
+            Some("wire_keepout") => RuleAreaKind::WireKeepout,
+            Some("via_keepout") => RuleAreaKind::ViaKeepout,
+            Some(other @ ("place_keepout" | "bend_keepout" | "elongate_keepout")) => {
+                bail!("DSN contains unsupported keep-out kind '{other}'");
+            }
+            _ => continue,
+        };
+        let head = node.head().unwrap_or("keepout");
+        let _id = dsn_atom(node, 1, &format!("{head} id"))?;
+        let children = node.children().map_or(0, <[SexpNode]>::len);
+        let polygon = node
+            .get(2)
+            .filter(|polygon| polygon.head() == Some("polygon") && children == 3)
+            .with_context(|| format!("DSN {head} is not one polygon"))?;
+        // KiCad's native DSN exporter encodes internal board cutouts (`Edge.Cuts`
+        // holes/circles) as `(keepout "" (polygon signal 0 ...))` with flattened
+        // floating-point points rather than rule-area keep-outs on copper layers.
+        if kind == RuleAreaKind::Keepout
+            && dsn_atom(polygon, 1, "polygon layer").ok() == Some("signal")
+        {
+            let _ = dsn_polygon(polygon)?;
+            continue;
+        }
+        let (layer, points) = dsn_integer_polygon(polygon, &format!("DSN {head}"))?;
+        keepouts.push((kind, layer, points));
+    }
+    keepouts.sort();
 
     let library = root.find("library").context("DSN has no library")?;
     let mut image_pins = BTreeMap::<String, BTreeMap<String, DsnPinIdentity>>::new();
@@ -1066,6 +1189,7 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
         classes,
         padstacks,
         planes,
+        keepouts,
     })
 }
 
@@ -1571,17 +1695,18 @@ fn locked_routing(
     Ok(routing)
 }
 
-/// The board's copper zones (#430). Each one is exported as its outline, one
-/// `plane` per copper layer it covers, as KiCad's own exporter writes it; what
-/// that cannot say exactly is refused: a rule area (keep-outs stay with #81),
-/// a zone without a net (KiCad would invent a net for it), an outline with a
-/// cutout (a `window` in the DSN), a zone off the copper stack, and a zone
-/// inside a footprint.
-fn copper_zones(
+/// The board's copper zones (#430) and rule-area keep-outs (#81). Each zone is
+/// exported as its outline, one `plane` per copper layer it covers, and each
+/// representable rule area as one keep-out (`keepout`, `wire_keepout`, or
+/// `via_keepout`) per copper layer it covers. Anything those cannot express
+/// without approximation is refused: a zone inside a footprint, a copper zone
+/// without a net, a pour/pad/footprint-only rule area, placement zones, an
+/// outline with a cutout, an arc edge, or a layer off the copper stack.
+fn board_zones_and_rule_areas(
     tree: &SexpNode,
     net_table: &BTreeMap<String, String>,
     copper_layers: &[String],
-) -> Result<Vec<CopperZoneModel>> {
+) -> Result<(Vec<CopperZoneModel>, Vec<RuleAreaModel>)> {
     for footprint in tree.find_all("footprint") {
         if !footprint.find_all("zone").is_empty() {
             let reference = property_value(footprint, "Reference").unwrap_or("?");
@@ -1589,91 +1714,191 @@ fn copper_zones(
         }
     }
     let mut zones = Vec::new();
+    let mut rule_areas = Vec::new();
     for zone in tree.find_all("zone") {
         let name = zone.find_str("name").unwrap_or("");
+        let is_rule_area = zone.find("keepout").is_some() || zone.find("placement").is_some();
+        let prefix = if is_rule_area {
+            "rule area"
+        } else {
+            "copper zone"
+        };
         let label = if name.is_empty() {
-            "copper zone".to_string()
+            prefix.to_string()
         } else {
-            format!("copper zone '{name}'")
+            format!("{prefix} '{name}'")
         };
-        if zone.find("keepout").is_some() || zone.find("placement").is_some() {
-            bail!("unsupported routing profile: board contains a rule area, which this exporter does not write as a keep-out");
-        }
-        let named = match (zone.find("layer"), zone.find("layers")) {
-            (Some(layer), None) => layer
-                .get(1)
-                .and_then(SexpNode::as_str)
-                .map(|name| vec![name.to_string()])
-                .unwrap_or_default(),
-            (None, Some(layers)) => layers
-                .children()
-                .unwrap_or(&[])
-                .iter()
-                .skip(1)
-                .filter_map(SexpNode::as_str)
-                .map(str::to_string)
-                .collect(),
-            _ => Vec::new(),
-        };
-        if named.is_empty() {
-            bail!("{label} has no layer");
-        }
-        let covered = if named == ["*.Cu"] {
-            copper_layers.to_vec()
+        let covered = zone_copper_layers(zone, &label, copper_layers)?;
+        if is_rule_area {
+            if let Some(net) = zone
+                .find("net")
+                .and_then(|node| resolve_net(node, net_table))
+            {
+                bail!("unsupported routing profile: {label} cannot belong to net '{net}'");
+            }
+            let kind = rule_area_kind(zone, &label)?;
+            let outline = zone_straight_outline(zone, &label, None, exact_rule_area_um)?;
+            rule_areas.push(RuleAreaModel {
+                kind,
+                layers: covered,
+                outline,
+            });
         } else {
-            if let Some(layer) = named.iter().find(|name| !copper_layers.contains(name)) {
-                bail!("unsupported routing profile: {label} is on '{layer}', which is not a copper layer of the board");
-            }
-            if named.iter().collect::<BTreeSet<_>>().len() != named.len() {
-                bail!("{label} repeats a layer");
-            }
-            copper_layers
-                .iter()
-                .filter(|layer| named.contains(layer))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        let net = zone
-            .find("net")
-            .and_then(|node| resolve_net(node, net_table))
-            .with_context(|| {
-                format!("unsupported routing profile: {label} has no net, which KiCad exports under an invented net name")
-            })?;
-        let polygons = zone.find_all("polygon");
-        if polygons.len() != 1 {
+            let net = zone
+                .find("net")
+                .and_then(|node| resolve_net(node, net_table))
+                .with_context(|| {
+                    format!("unsupported routing profile: {label} has no net, which KiCad exports under an invented net name")
+                })?;
+            let outline = zone_straight_outline(zone, &label, Some(&net), finite_um)?;
+            zones.push(CopperZoneModel {
+                net,
+                layers: covered,
+                outline,
+            });
+        }
+    }
+    Ok((zones, rule_areas))
+}
+
+fn zone_copper_layers(
+    zone: &SexpNode,
+    label: &str,
+    copper_layers: &[String],
+) -> Result<Vec<String>> {
+    let named = match (zone.find("layer"), zone.find("layers")) {
+        (Some(layer), None) => layer
+            .get(1)
+            .and_then(SexpNode::as_str)
+            .map(|name| vec![name.to_string()])
+            .unwrap_or_default(),
+        (None, Some(layers)) => layers
+            .children()
+            .unwrap_or(&[])
+            .iter()
+            .skip(1)
+            .filter_map(SexpNode::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
+    if named.is_empty() {
+        bail!("{label} has no layer");
+    }
+    if named == ["*.Cu"] {
+        return Ok(copper_layers.to_vec());
+    }
+    if let Some(layer) = named.iter().find(|name| !copper_layers.contains(name)) {
+        bail!("unsupported routing profile: {label} is on '{layer}', which is not a copper layer of the board");
+    }
+    if named.iter().collect::<BTreeSet<_>>().len() != named.len() {
+        bail!("{label} repeats a layer");
+    }
+    Ok(copper_layers
+        .iter()
+        .filter(|layer| named.contains(layer))
+        .cloned()
+        .collect())
+}
+
+fn zone_straight_outline(
+    zone: &SexpNode,
+    label: &str,
+    net: Option<&str>,
+    coordinate_um: fn(Option<f64>, &str) -> Result<i64>,
+) -> Result<Vec<(i64, i64)>> {
+    let polygons = zone.find_all("polygon");
+    if polygons.len() != 1 {
+        let on_net = net.map_or_else(String::new, |net| format!(" on net '{net}'"));
+        bail!(
+            "unsupported routing profile: {label}{on_net} has {} outlines; an outline with a cutout is not exported",
+            polygons.len()
+        );
+    }
+    let points = polygons[0]
+        .find("pts")
+        .and_then(SexpNode::children)
+        .with_context(|| format!("{label} outline has no points"))?;
+    let mut outline = Vec::with_capacity(points.len());
+    for point in points.iter().skip(1) {
+        if point.head() != Some("xy") {
             bail!(
-                "unsupported routing profile: {label} on net '{net}' has {} outlines; an outline with a cutout is not exported",
-                polygons.len()
+                "unsupported routing profile: {label} outline has a '{}' point; only straight edges are exported",
+                point.head().unwrap_or("?")
             );
         }
-        let points = polygons[0]
-            .find("pts")
-            .and_then(SexpNode::children)
-            .with_context(|| format!("{label} outline has no points"))?;
-        let mut outline = Vec::with_capacity(points.len());
-        for point in points.iter().skip(1) {
-            if point.head() != Some("xy") {
+        let x = coordinate_um(point.get_f64(1), &format!("{label} x"))?;
+        let y = coordinate_um(point.get_f64(2), &format!("{label} y"))?
+            .checked_neg()
+            .context("zone y is outside the supported coordinate range")?;
+        outline.push((x, y));
+    }
+    if outline.iter().collect::<BTreeSet<_>>().len() < 3 {
+        bail!("{label} outline has fewer than three distinct points");
+    }
+    Ok(outline)
+}
+
+/// Schema 5 and native keep-out correlation store whole micrometres. A rounded
+/// boundary could shrink the forbidden area, so refuse anything not exactly on
+/// that grid before either writer runs. Comparing the round trip in millimetres
+/// accepts canonical KiCad decimals such as 0.009 without a floating multiply
+/// spuriously making them fractional micrometres.
+fn exact_rule_area_um(value: Option<f64>, label: &str) -> Result<i64> {
+    let mm = finite_number(value, label)?;
+    let um = finite_um(Some(mm), label)?;
+    if mm != um as f64 / UM_PER_MM {
+        bail!("unsupported routing profile: {label} must lie on the whole-micrometre grid; rule-area vertices are never rounded");
+    }
+    Ok(um)
+}
+
+fn rule_area_kind(zone: &SexpNode, label: &str) -> Result<RuleAreaKind> {
+    if let Some(placement) = zone.find("placement") {
+        match placement.find_str("enabled") {
+            Some("no") | None => {}
+            Some("yes") => bail!(
+                "unsupported routing profile: {label} enables room placement, which Specctra DSN keep-outs cannot represent"
+            ),
+            Some(other) => bail!(
+                "unsupported routing profile: {label} has unsupported placement mode '{other}'"
+            ),
+        }
+    }
+    let keepout = zone
+        .find("keepout")
+        .with_context(|| format!("unsupported routing profile: {label} has no keepout rules"))?;
+    let flag = |key: &str| -> Result<bool> {
+        match keepout.find_str(key) {
+            Some("not_allowed") => Ok(true),
+            Some("allowed") => Ok(false),
+            Some(other) => bail!(
+                "unsupported routing profile: {label} has unsupported keepout setting ({key} {other})"
+            ),
+            None => {
+                bail!("unsupported routing profile: {label} is missing keepout '{key}' rule")
+            }
+        }
+    };
+    let keepout_tracks = flag("tracks")?;
+    let keepout_vias = flag("vias")?;
+    for key in ["pads", "copperpour", "footprints"] {
+        if let Some(value) = keepout.find_str(key) {
+            if !matches!(value, "allowed" | "not_allowed") {
                 bail!(
-                    "unsupported routing profile: {label} outline has a '{}' point; only straight edges are exported",
-                    point.head().unwrap_or("?")
+                    "unsupported routing profile: {label} has unsupported keepout setting ({key} {value})"
                 );
             }
-            let x = finite_um(point.get_f64(1), "zone x")?;
-            let y = finite_um(point.get_f64(2), "zone y")?
-                .checked_neg()
-                .context("zone y is outside the supported coordinate range")?;
-            outline.push((x, y));
         }
-        if outline.iter().collect::<BTreeSet<_>>().len() < 3 {
-            bail!("{label} outline has fewer than three distinct points");
-        }
-        zones.push(CopperZoneModel {
-            net,
-            layers: covered,
-            outline,
-        });
     }
-    Ok(zones)
+    match (keepout_tracks, keepout_vias) {
+        (true, true) => Ok(RuleAreaKind::Keepout),
+        (true, false) => Ok(RuleAreaKind::WireKeepout),
+        (false, true) => Ok(RuleAreaKind::ViaKeepout),
+        (false, false) => bail!(
+            "unsupported routing profile: {label} allows both tracks and vias (pour/pad/footprint-only keep-outs cannot be represented in Specctra DSN without blocking routing)"
+        ),
+    }
 }
 
 /// How many copper zones of each net cover each copper layer of the board,
@@ -1697,12 +1922,40 @@ fn zone_inventory(zones: &[CopperZoneModel]) -> Vec<ManifestZoneCount> {
         .collect()
 }
 
+/// All validated rule areas of the board, canonically sorted for the manifest (#81).
+fn rule_area_inventory(rule_areas: &[RuleAreaModel]) -> Vec<ManifestRuleArea> {
+    let mut entries = rule_areas
+        .iter()
+        .map(|area| ManifestRuleArea {
+            kind: area.kind,
+            layers: area.layers.clone(),
+            outline_um: area
+                .outline
+                .iter()
+                .map(|&(x_um, y_um)| ManifestPointUm { x_um, y_um })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+
 /// The copper-zone inventory of a live board, read the way the export reads it.
 pub(crate) fn board_zone_inventory(board_source: &str) -> Result<Vec<ManifestZoneCount>> {
     let tree = parse_sexp(board_source).context("parse KiCad board for its copper zones")?;
     let copper_layers = copper_layers(&tree)?;
-    let zones = copper_zones(&tree, &top_level_net_table(&tree), &copper_layers)?;
+    let (zones, _) =
+        board_zones_and_rule_areas(&tree, &top_level_net_table(&tree), &copper_layers)?;
     Ok(zone_inventory(&zones))
+}
+
+/// The rule-area inventory of a live board, read the way the export reads it (#81).
+pub(crate) fn board_rule_area_inventory(board_source: &str) -> Result<Vec<ManifestRuleArea>> {
+    let tree = parse_sexp(board_source).context("parse KiCad board for its rule areas")?;
+    let copper_layers = copper_layers(&tree)?;
+    let (_, rule_areas) =
+        board_zones_and_rule_areas(&tree, &top_level_net_table(&tree), &copper_layers)?;
+    Ok(rule_area_inventory(&rule_areas))
 }
 
 /// The board's copper layers from top to bottom: `F.Cu`, `In1.Cu`..`In<N-2>.Cu`
@@ -2440,6 +2693,21 @@ fn normalize_rules(
     Ok((class_nets, net_classes))
 }
 
+fn dsn_closed_polygon(layer: &str, outline: &[(i64, i64)]) -> dsn::Polygon {
+    dsn::Polygon {
+        layer: layer.to_string(),
+        width: 0.0,
+        // Closed, as KiCad writes it.
+        coords: closed_outline(outline)
+            .into_iter()
+            .map(|(x, y)| dsn::Point {
+                x: x as f64,
+                y: y as f64,
+            })
+            .collect(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_pcb(
     board_path: &Path,
@@ -2454,6 +2722,7 @@ fn build_pcb(
     via_names: &BTreeMap<RuleKey, String>,
     locked_routing: &LockedRouting,
     zones: &[CopperZoneModel],
+    rule_areas: &[RuleAreaModel],
 ) -> Result<dsn::Pcb> {
     let default_rule = class_nets
         .keys()
@@ -2654,24 +2923,24 @@ fn build_pcb(
                 .flat_map(|zone| {
                     zone.layers.iter().map(|layer| dsn::Plane {
                         net: zone.net.clone(),
-                        polygon: dsn::Polygon {
-                            layer: layer.clone(),
-                            width: 0.0,
-                            // Closed, as KiCad writes it.
-                            coords: zone
-                                .outline
-                                .iter()
-                                .chain(zone.outline.first())
-                                .map(|(x, y)| dsn::Point {
-                                    x: *x as f64,
-                                    y: *y as f64,
-                                })
-                                .collect(),
-                        },
+                        polygon: dsn_closed_polygon(layer, &zone.outline),
                     })
                 })
                 .collect(),
-            keepouts: dsn::Keepouts(Vec::new()),
+            keepouts: dsn::Keepouts(
+                rule_areas
+                    .iter()
+                    .flat_map(|area| {
+                        area.layers.iter().map(|layer| dsn::Keepout {
+                            kind: area.kind.dsn_kind(),
+                            id_: String::new(),
+                            sequence_number: None,
+                            shape: dsn::Shape::Polygon(dsn_closed_polygon(layer, &area.outline)),
+                            rule: None,
+                        })
+                    })
+                    .collect(),
+            ),
             via: dsn::ViaNames {
                 names: via_names.values().cloned().collect(),
             },
@@ -2850,6 +3119,7 @@ fn build_manifest(
     via_names: &BTreeMap<RuleKey, String>,
     locked_routing: &LockedRouting,
     zones: &[CopperZoneModel],
+    rule_areas: &[RuleAreaModel],
     outline: &str,
 ) -> Result<String> {
     let components = footprints
@@ -2934,6 +3204,7 @@ fn build_manifest(
             locked_track_count: locked_routing.tracks.len(),
             locked_via_count: locked_routing.vias.len(),
             copper_zones: !zones.is_empty(),
+            rule_areas: !rule_areas.is_empty(),
             custom_rules: false,
             outline: outline.to_string(),
         },
@@ -2950,6 +3221,7 @@ fn build_manifest(
         nets,
         padstacks,
         zones: zone_inventory(zones),
+        rule_areas: rule_area_inventory(rule_areas),
     })
     .context("serialize routing manifest")
 }
@@ -3546,7 +3818,7 @@ pub(crate) mod tests {
             bundle.dsn
         );
         let manifest: serde_json::Value = serde_json::from_str(&bundle.manifest).unwrap();
-        assert_eq!(manifest["schema_version"], 4);
+        assert_eq!(manifest["schema_version"], MANIFEST_SCHEMA_VERSION);
         assert_eq!(
             j1_pins(&bundle),
             [
@@ -5020,7 +5292,7 @@ pub(crate) mod tests {
             ]
         );
         let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
-        assert_eq!(manifest["schema_version"], 4);
+        assert_eq!(manifest["schema_version"], MANIFEST_SCHEMA_VERSION);
         assert_eq!(manifest["supported_profile"]["copper_zones"], true);
         let count = |layer: &str, net: &str| (layer.to_string(), net.to_string(), 1);
         assert_eq!(
@@ -5158,9 +5430,9 @@ pub(crate) mod tests {
         let outline = "(polygon\n\t\t\t(pts\n\t\t\t\t(xy 81 31)";
         let cases = [
             (
-                "rule area",
-                ZONES.replacen("(name \"gnd_plane\")", "(name \"gnd_plane\") (keepout (tracks not_allowed))", 1),
-                "board contains a rule area",
+                "netted rule area",
+                ZONES.replacen("(name \"gnd_plane\")", "(name \"gnd_plane\") (keepout (tracks not_allowed) (vias allowed))", 1),
+                "rule area 'gnd_plane' cannot belong to net 'GND'",
             ),
             (
                 "no net",
@@ -5699,6 +5971,7 @@ pub(crate) mod tests {
             BOTTOM_SIDE,
             OVAL_PADS,
             PASTE_PADS,
+            RULE_AREAS,
         ] {
             let model =
                 prepare_export(Path::new("board.kicad_pcb"), source, &stock_rules()).unwrap();
@@ -5746,5 +6019,321 @@ pub(crate) mod tests {
             NATIVE_CIRCLE_DSN.replace("(place R1 100000 -50000", "(place R1 101000 -50000");
         assert_ne!(changed, NATIVE_CIRCLE_DSN);
         assert!(model.adopt_native(changed).is_err());
+    }
+
+    const RULE_AREAS: &str = include_str!("../tests/fixtures/specctra_rule_areas.kicad_pcb");
+    const RULE_AREAS_NATIVE_FILE: &str =
+        include_str!("../tests/fixtures/specctra_rule_areas.native-kicad-10.dsn");
+    const RULE_AREAS_SES: &str =
+        include_str!("../tests/fixtures/specctra_rule_areas.native-kicad-10.freerouting-2.5.0.ses");
+
+    #[test]
+    fn rule_areas_export_as_keepouts_on_each_layer_they_cover() {
+        let export = native_baseline(RULE_AREAS);
+        assert_eq!(export.rule_area_count, 3);
+        let identity = dsn_identity(&parse_dsn_sexp(&export.dsn).unwrap()).unwrap();
+        let antenna = vec![
+            (113_000, -44_000),
+            (117_000, -44_000),
+            (117_000, -52_000),
+            (113_000, -52_000),
+            (113_000, -44_000),
+        ];
+        let wire_block = vec![
+            (106_000, -52_000),
+            (109_000, -52_000),
+            (109_000, -57_000),
+            (106_000, -57_000),
+            (106_000, -52_000),
+        ];
+        let via_block = vec![
+            (96_000, -44_000),
+            (99_000, -44_000),
+            (99_000, -48_000),
+            (96_000, -48_000),
+            (96_000, -44_000),
+        ];
+        assert_eq!(
+            identity.keepouts,
+            [
+                (RuleAreaKind::Keepout, "B.Cu".to_string(), antenna.clone()),
+                (RuleAreaKind::Keepout, "F.Cu".to_string(), antenna),
+                (RuleAreaKind::WireKeepout, "F.Cu".to_string(), wire_block),
+                (
+                    RuleAreaKind::ViaKeepout,
+                    "B.Cu".to_string(),
+                    via_block.clone()
+                ),
+                (RuleAreaKind::ViaKeepout, "F.Cu".to_string(), via_block),
+            ]
+        );
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(manifest["schema_version"], MANIFEST_SCHEMA_VERSION);
+        assert_eq!(manifest["supported_profile"]["rule_areas"], true);
+        assert_eq!(manifest["rule_areas"].as_array().unwrap().len(), 3);
+
+        let plain = native_baseline(FOUR_LAYERS);
+        assert_eq!(plain.rule_area_count, 0);
+        assert!(!plain.dsn.contains("keepout"), "{}", plain.dsn);
+        let manifest: serde_json::Value = serde_json::from_str(&plain.manifest).unwrap();
+        assert_eq!(manifest["supported_profile"]["rule_areas"], false);
+        assert!(manifest.get("rule_areas").is_none(), "{manifest}");
+    }
+
+    #[test]
+    fn rule_area_native_dsn_matches_the_rust_export() {
+        let native_dsn = RULE_AREAS_NATIVE_FILE.to_string();
+        let adopted = adopt_native_dsn(native_baseline(RULE_AREAS), native_dsn.clone()).unwrap();
+        assert_eq!(adopted.dsn, native_dsn);
+
+        let moved = native_dsn.replacen("117000 -52000", "117000 -53000", 1);
+        assert_ne!(moved, native_dsn);
+        let retyped = native_dsn.replacen("(wire_keepout ", "(keepout ", 1);
+        assert_ne!(retyped, native_dsn);
+        let mut dropped = native_dsn.clone();
+        let start = dropped.find("    (wire_keepout ").unwrap();
+        let end = start + dropped[start..].find("))\n").unwrap() + 3;
+        dropped.replace_range(start..end, "");
+        let extra = native_dsn.replacen(
+            "    (via ",
+            "    (keepout \"\" (polygon In1.Cu 0 85000 -35000 86000 -35000 86000 -36000 85000 -35000))\n    (via ",
+            1,
+        );
+        for (name, native) in [
+            ("moved", moved),
+            ("retyped", retyped),
+            ("dropped", dropped),
+            ("extra", extra),
+        ] {
+            let error = adopt_native_dsn(native_baseline(RULE_AREAS), native)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("native DSN changed the rule-area keep-outs"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn freerouting_routes_around_rule_areas_and_the_planner_accepts_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_rule_areas.kicad_pcb");
+        std::fs::write(&board, RULE_AREAS).unwrap();
+        let baseline = export_dsn(&board, RULE_AREAS, &native_fixture_rules()).unwrap();
+        let adopted = adopt_native_dsn(baseline, RULE_AREAS_NATIVE_FILE.to_string()).unwrap();
+        let plan = crate::specctra_ses::parse_import_plan(
+            &board,
+            RULE_AREAS,
+            &adopted.manifest,
+            RULE_AREAS_SES,
+        )
+        .unwrap();
+        assert!(!plan.tracks.is_empty());
+        assert!(!plan.vias.is_empty());
+
+        let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        let inventory = "manifest rule-area inventory does not match the live board snapshot";
+        let flag = "manifest rule-area flag does not match its rule-area inventory";
+        type ManifestEdit = fn(&mut serde_json::Value);
+        let cases: [(&str, &str, ManifestEdit); 6] = [
+            ("kind", inventory, |m| {
+                m["rule_areas"][0]["kind"] = "via_keepout".into()
+            }),
+            ("layer", inventory, |m| {
+                m["rule_areas"][0]["layers"][0] = "In1.Cu".into()
+            }),
+            ("vertex", inventory, |m| {
+                m["rule_areas"][0]["outline_um"][0]["x_um"] = 999999.into()
+            }),
+            ("dropped", inventory, |m| {
+                m["rule_areas"].as_array_mut().unwrap().remove(1);
+            }),
+            ("unflagged", flag, |m| {
+                m["supported_profile"]["rule_areas"] = false.into()
+            }),
+            ("schema 4", flag, |m| m["schema_version"] = 4.into()),
+        ];
+        for (name, expected, edit) in cases {
+            let mut edited = manifest.clone();
+            edit(&mut edited);
+            let error = crate::specctra_ses::parse_import_plan(
+                &board,
+                RULE_AREAS,
+                &edited.to_string(),
+                RULE_AREAS_SES,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+        let mut emptied = manifest.clone();
+        emptied.as_object_mut().unwrap().remove("rule_areas");
+        emptied["supported_profile"]["rule_areas"] = false.into();
+        let error = crate::specctra_ses::parse_import_plan(
+            &board,
+            RULE_AREAS,
+            &emptied.to_string(),
+            RULE_AREAS_SES,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(inventory), "{error}");
+    }
+
+    #[test]
+    fn rule_area_vertices_must_be_exact_whole_micrometres() {
+        for (mm, expected_um) in [
+            (0.0, 0),
+            (0.001, 1),
+            (0.009, 9),
+            (113.001, 113001),
+            (-0.009, -9),
+            (-44.029, -44029),
+        ] {
+            assert_eq!(
+                exact_rule_area_um(Some(mm), "rule area x").unwrap(),
+                expected_um
+            );
+        }
+        for mm in [113.0006, -44.0004, 0.000001, -0.000001] {
+            assert!(exact_rule_area_um(Some(mm), "rule area x")
+                .unwrap_err()
+                .to_string()
+                .contains("whole-micrometre grid"));
+        }
+        // The review's 113.0006-mm edge must not become 113.001 mm: a
+        // 0.25-mm track at x=112.876 would then be accepted with 0.4 um of
+        // copper inside the original keep-out. Refuse the source snapshot.
+        for (from, to, axis) in [
+            ("(xy 113 44)", "(xy 113.0006 44)", "x"),
+            ("(xy 113 44)", "(xy 113 44.0004)", "y"),
+        ] {
+            let source = RULE_AREAS.replacen(from, to, 1);
+            assert_ne!(source, RULE_AREAS);
+            let error = export_dsn(
+                Path::new("board.kicad_pcb"),
+                &source,
+                &native_fixture_rules(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("whole-micrometre grid"), "{error}");
+            assert!(
+                error.contains(&format!("rule area 'antenna_keepout' {axis}")),
+                "{error}"
+            );
+            assert!(board_rule_area_inventory(&source).is_err());
+        }
+        // Millimetre fractions that are whole micrometres remain exact in
+        // both the DSN and the reverse manifest, including decimal 0.009.
+        let source = RULE_AREAS
+            .replace("(xy 113 44)", "(xy 113.009 44)")
+            .replace("(xy 113 52)", "(xy 113.009 52)");
+        let export = export_dsn(
+            Path::new("board.kicad_pcb"),
+            &source,
+            &native_fixture_rules(),
+        )
+        .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(manifest["rule_areas"][0]["outline_um"][0]["x_um"], 113009);
+        assert!(export.dsn.contains("113009 -44000"), "{}", export.dsn);
+    }
+
+    #[test]
+    fn rule_areas_that_keepouts_cannot_describe_are_refused() {
+        let cases = [
+            (
+                "allows tracks and vias (pour-only)",
+                RULE_AREAS.replacen(
+                    "(tracks not_allowed)\n\t\t\t(vias not_allowed)",
+                    "(tracks allowed)\n\t\t\t(vias allowed)",
+                    1,
+                ),
+                "allows both tracks and vias",
+            ),
+            (
+                "placement enabled",
+                RULE_AREAS.replacen("(placement\n\t\t\t(enabled no)", "(placement\n\t\t\t(enabled yes)", 1),
+                "enables room placement",
+            ),
+            (
+                "missing vias flag",
+                RULE_AREAS.replacen("(vias not_allowed)", "", 1),
+                "missing keepout 'vias' rule",
+            ),
+            (
+                "cutout polygon",
+                RULE_AREAS.replacen(
+                    "(polygon\n\t\t\t(pts\n\t\t\t\t(xy 113 44)",
+                    "(polygon (pts (xy 114 45) (xy 115 45) (xy 115 46)))\n\t\t(polygon\n\t\t\t(pts\n\t\t\t\t(xy 113 44)",
+                    1,
+                ),
+                "has 2 outlines",
+            ),
+            (
+                "arc edge",
+                RULE_AREAS.replacen(
+                    "(xy 113 44) (xy 117 44)",
+                    "(xy 113 44) (arc (start 114 44) (mid 115 43) (end 116 44)) (xy 117 44)",
+                    1,
+                ),
+                "outline has a 'arc' point",
+            ),
+            (
+                "non-copper layer",
+                RULE_AREAS.replacen(
+                    "(layers \"F.Cu\" \"B.Cu\")\n\t\t(uuid",
+                    "(layers \"F.Cu\" \"F.SilkS\")\n\t\t(uuid",
+                    1,
+                ),
+                "is on 'F.SilkS', which is not a copper layer of the board",
+            ),
+            (
+                "footprint rule area",
+                RULE_AREAS.replacen(
+                    "(property \"Reference\" \"J1\"",
+                    "(zone (layer \"F.Cu\") (keepout (tracks not_allowed) (vias allowed)) (polygon (pts (xy 0 0) (xy 1 0) (xy 1 1))))\n\t\t(property \"Reference\" \"J1\"",
+                    1,
+                ),
+                "footprint J1 contains a zone",
+            ),
+        ];
+        for (name, board, expected) in cases {
+            assert_ne!(board, RULE_AREAS, "{name}");
+            let error = export_dsn(
+                Path::new("board.kicad_pcb"),
+                &board,
+                &native_fixture_rules(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+        // `*.Cu` on a rule area expands across every copper layer in stack order.
+        let all_cu = RULE_AREAS.replacen(
+            "(zone\n\t\t(layer \"F.Cu\")",
+            "(zone\n\t\t(layers \"*.Cu\")",
+            1,
+        );
+        assert_ne!(all_cu, RULE_AREAS);
+        let export = export_dsn(
+            Path::new("board.kicad_pcb"),
+            &all_cu,
+            &native_fixture_rules(),
+        )
+        .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        let wire = manifest["rule_areas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|area| area["kind"] == "wire_keepout")
+            .unwrap();
+        assert_eq!(
+            wire["layers"],
+            serde_json::json!(["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
+        );
     }
 }
