@@ -1,6 +1,17 @@
 use copperpour_ipc::gen::kiapi;
 use prost::Message;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// `dir` as Copperpour spells a path it derived from a file under it: resolved,
+/// so a symlink or an 8.3 short name such as `RUNNER~1` in `%TEMP%` is expanded,
+/// and without Windows' `\\?\` prefix. Tests build an expected editor-lock path
+/// on it rather than on `kicad_editor_lock_path`, the code under test (#598).
+pub(crate) fn resolved_dir(dir: &Path) -> PathBuf {
+    let resolved = dir.canonicalize().unwrap();
+    let text = resolved.to_str().unwrap();
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text))
+}
 
 /// An already-listening in-process KiCad IPC double.
 ///

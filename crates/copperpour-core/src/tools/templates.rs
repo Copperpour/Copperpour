@@ -1954,8 +1954,9 @@ mod tests {
         ) {
             return;
         }
-        let (_dir, schematic) = template_fixture();
-        let lock = schematic.with_file_name("~derived_lib_name.kicad_sch.lck");
+        let (dir, schematic) = template_fixture();
+        let lock =
+            crate::test_support::resolved_dir(dir.path()).join("~derived_lib_name.kicad_sch.lck");
         std::fs::write(&lock, r#"{"hostname":"x","username":"y"}"#).unwrap();
         let before = std::fs::read(&schematic).unwrap();
 
