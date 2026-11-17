@@ -1069,6 +1069,7 @@ mod tests {
         drop_updates: bool,
         /// Refuse every item of an `UpdateItems`, keeping nothing.
         reject_updates: bool,
+        text_after_update: Option<String>,
         /// Run once, just before the second answer listing pads and vias:
         /// a change made in KiCad between the tool's read and its write.
         on_second_pad_read: Option<fn(&mut Kicad)>,
@@ -1201,6 +1202,7 @@ mod tests {
             tamper: None,
             drop_updates: false,
             reject_updates: false,
+            text_after_update: None,
             on_second_pad_read: None,
             pad_reads: 0,
             on_second_footprint_read: None,
@@ -1290,14 +1292,7 @@ mod tests {
                 }
                 if wants(Kot::KotPcbZone) {
                     if held.fail_refill_read && held.log.iter().any(|name| name == "RefillZones") {
-                        return Some(pack_any(
-                            &commands::GetItemsResponse {
-                                status: kiapi::common::types::ItemRequestStatus::IrsDocumentNotFound
-                                    as i32,
-                                ..Default::default()
-                            },
-                            "kiapi.common.commands.GetItemsResponse",
-                        ));
+                        return None;
                     }
                     items.extend(held.zones());
                 }
@@ -1317,6 +1312,9 @@ mod tests {
             )),
             "UpdateItems" => {
                 let request = commands::UpdateItems::decode(command.value.as_slice()).unwrap();
+                if let Some(text) = held.text_after_update.take() {
+                    held.text = text;
+                }
                 let mut updated = Vec::new();
                 if held.reject_updates {
                     let refused = request
@@ -1709,6 +1707,59 @@ mod tests {
         );
         assert_eq!(body["copper"]["refill"]["teardrop_zones_after"], 5);
         assert_eq!(body["copper"]["refill"]["completion_verified"], false);
+    }
+
+    #[tokio::test]
+    async fn typed_readback_does_not_override_invalid_or_changed_board_evidence() {
+        for (reject_updates, text, reason) in [
+            (
+                false,
+                "(kicad_pcb".to_string(),
+                "could not compare the board",
+            ),
+            (
+                true,
+                BOARD.replace("(thickness 1.6)", "(thickness 1.7)"),
+                "board serialization changed",
+            ),
+        ] {
+            assert_ne!(text, BOARD);
+            let mut kicad = fixture(Some((10, 0, 8)));
+            kicad.reject_updates = reject_updates;
+            kicad.text_after_update = Some(text);
+            let scene = scene(kicad);
+            let (error, body) = scene.set(enable_r1_pad_1()).await;
+            assert!(error, "{body}");
+            assert_eq!(
+                body["error"]["kind"], "mutation_outcome_uncertain",
+                "{body}"
+            );
+            assert!(
+                body["error"]["reason"].as_str().unwrap().contains(reason),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pad_footprint_missing_from_serialization_is_refused_before_writing() {
+        let mut kicad = fixture(Some((10, 0, 8)));
+        kicad.text = kicad
+            .text
+            .replace(R1, "00000000-0000-4000-8000-000000000001");
+        let scene = scene(kicad);
+        for dry_run in [false, true] {
+            let mut args = enable_r1_pad_1();
+            args["dry_run"] = json!(dry_run);
+            let (error, body) = scene.set(args).await;
+            assert!(error, "{body}");
+            assert_eq!(body["error"]["kind"], "stale_target", "{body}");
+            assert!(body["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("absent from the board serialization"));
+        }
+        assert!(scene.writes().is_empty(), "{:?}", scene.writes());
     }
 
     #[tokio::test]

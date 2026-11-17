@@ -25,11 +25,10 @@ mod teardrops;
 mod text_edit;
 pub use footprint_pads::FootprintEditTargetError;
 pub use teardrops::{
-    changes_besides_teardrops, legacy_teardrops_in_board_text, supports_teardrop_settings,
-    teardrop_targets_from_items, teardrop_zones_from_items, IpcTeardropApplied,
-    IpcTeardropApplyOutcome, IpcTeardropEdit, IpcTeardropRefusal, IpcTeardropSettings,
-    IpcTeardropTarget, IpcTeardropTargetKind, IpcTeardropZone, TeardropReadError,
-    TEARDROP_SETTINGS_MIN_KICAD_VERSION,
+    legacy_teardrops_in_board_text, supports_teardrop_settings, teardrop_targets_from_items,
+    IpcTeardropApplied, IpcTeardropApplyOutcome, IpcTeardropEdit, IpcTeardropRefusal,
+    IpcTeardropSettings, IpcTeardropTarget, IpcTeardropTargetKind, IpcTeardropZone,
+    TeardropReadError, TEARDROP_SETTINGS_MIN_KICAD_VERSION,
 };
 pub use text_edit::TextTargetError;
 
@@ -2482,12 +2481,7 @@ impl KiCadIpcClient {
         document: kiapi::common::types::DocumentSpecifier,
         item_types: &[kiapi::common::types::KiCadObjectType],
     ) -> Result<Vec<prost_types::Any>> {
-        let header = header_for(document);
-        let cmd = kiapi::common::commands::GetItems {
-            header: Some(header),
-            types: item_types.iter().map(|t| *t as i32).collect(),
-        };
-        let response_any = self.send_command(&cmd, "kiapi.common.commands.GetItems")?;
+        let response_any = self.get_items_response_in(document, item_types)?;
         if let Some(any) = response_any {
             let resp: kiapi::common::commands::GetItemsResponse = unpack_any(&any)?;
             // Without this a failed request is indistinguishable from an empty
@@ -2497,6 +2491,18 @@ impl KiCadIpcClient {
         } else {
             Ok(vec![])
         }
+    }
+
+    fn get_items_response_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        item_types: &[kiapi::common::types::KiCadObjectType],
+    ) -> Result<Option<prost_types::Any>> {
+        let cmd = kiapi::common::commands::GetItems {
+            header: Some(header_for(document)),
+            types: item_types.iter().map(|t| *t as i32).collect(),
+        };
+        self.send_command(&cmd, "kiapi.common.commands.GetItems")
     }
 
     /// The items carrying `ids` on one exact open board, as KiCad holds
@@ -5615,19 +5621,45 @@ impl KiCadIpcClient {
             });
         }
 
-        // Net codes are deprecated in KiCad 10's API: the name is what
-        // `BOARD_CONNECTED_ITEM::UnpackNet` reads.
+        let mut previous_nets = std::collections::BTreeMap::new();
+        for change in &changes {
+            let Some(id) = &change.uuid else {
+                return Ok(IpcPadNetOutcome::Stale {
+                    reason: format!("pad '{pad_number}' of '{reference}' has no KIID"),
+                });
+            };
+            if previous_nets
+                .insert(id.as_str(), change.previous_net.as_str())
+                .is_some()
+            {
+                return Ok(IpcPadNetOutcome::Stale {
+                    reason: format!("pad {id} is listed more than once"),
+                });
+            }
+        }
+        let required = previous_nets.keys().map(|id| id.to_string()).collect();
         let update = self.update_footprint_pads_in(
             document,
             "Set pad net",
             std::slice::from_ref(&kiid),
-            &BTreeSet::new(),
+            &required,
             Vec::new(),
             |_| Ok((Vec::new(), Vec::new())),
             |_, pad| {
                 if pad.number != pad_number {
                     return Ok(false);
                 }
+                let id = kiid_value(pad.id.clone());
+                let net = pad.net.as_ref().map_or("", |net| net.name.as_str());
+                if previous_nets.remove(id.as_str()) != Some(net) {
+                    return Err(FootprintEditTargetError {
+                        reason: format!(
+                            "pad '{pad_number}' of '{reference}' changed before the write"
+                        ),
+                    }
+                    .into());
+                }
+                // KiCad resolves the net by name, not by its deprecated code.
                 pad.net = Some(kiapi::board::types::Net {
                     code: None,
                     name: net_name.to_string(),
@@ -5635,8 +5667,8 @@ impl KiCadIpcClient {
                 Ok(true)
             },
         );
-        let after = match update {
-            Ok(footprint_pads::FootprintPadUpdate::Applied { after, .. }) => after,
+        match update {
+            Ok(footprint_pads::FootprintPadUpdate::Applied { .. }) => {}
             // Its pads changed between the two reads: nothing was sent.
             Ok(footprint_pads::FootprintPadUpdate::Unchanged) => {
                 return Ok(IpcPadNetOutcome::Stale {
@@ -5667,40 +5699,8 @@ impl KiCadIpcClient {
                     None => Err(error),
                 }
             }
-        };
-        // The read-back matched what was sent field for field; report each
-        // pad's net from it.
-        let pads: Vec<kiapi::board::types::Pad> = after
-            .first()
-            .and_then(|footprint| footprint.definition.as_ref())
-            .map(|definition| {
-                definition
-                    .items
-                    .iter()
-                    .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Pad"))
-                    .filter_map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-        for change in &mut changes {
-            let held = pads.iter().find(|pad| match &change.uuid {
-                Some(uuid) => kiid_value(pad.id.clone()) == *uuid,
-                None => pad.number == change.number,
-            });
-            let Some(held) = held else {
-                return Ok(IpcPadNetOutcome::Uncertain {
-                    reason: format!(
-                        "pad '{}' of '{reference}' is missing from the post-update read-back",
-                        change.number
-                    ),
-                });
-            };
-            change.net = held
-                .net
-                .as_ref()
-                .map(|net| net.name.clone())
-                .unwrap_or_default();
         }
+        // The shared readback verified the requested net on every required UUID.
         Ok(IpcPadNetOutcome::Applied {
             kiid,
             changes,

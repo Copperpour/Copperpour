@@ -531,24 +531,24 @@ fn owned_group_conflicts(board_text: &str, changes: &[PlannedUpdate]) -> Vec<Upd
         message,
         reference: reference.cloned(),
     };
-    let board = match copperpour_sexp::parse_sexp(board_text) {
-        Ok(board) => board,
+    let board = copperpour_sexp::parse_sexp(board_text);
+    let groups = match board
+        .as_ref()
+        .map_err(|error| error.to_string())
+        .and_then(|board| {
+            copperpour_sexp::board::footprint_owned_group_counts(board)
+                .map_err(|error| error.to_string())
+        }) {
+        Ok(groups) => groups,
         Err(error) => {
             return vec![conflict(
                 None,
                 format!(
-                    "the board KiCad wrote did not parse, so whether the footprints to refresh \
-                     own groups is unknown: {error}"
+                    "could not determine whether the footprints to refresh own groups: {error}"
                 ),
             )]
         }
     };
-    let mut groups = BTreeMap::<&str, usize>::new();
-    for footprint in copperpour_sexp::board::footprints(&board) {
-        if let Some(kiid) = footprint.find_str("uuid").filter(|id| !id.is_empty()) {
-            *groups.entry(kiid).or_default() += footprint.find_all("group").len();
-        }
-    }
     changes
         .iter()
         .filter_map(|change| {

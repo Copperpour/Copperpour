@@ -336,10 +336,24 @@ mod tests {
         assert!(format!("{:?}", result.content).contains("pad pad-1 position"));
     }
 
-    /// The footprint gone between the read and the write: refused as stale,
-    /// with nothing sent.
     #[tokio::test]
-    async fn a_footprint_gone_before_the_write_is_stale() {
+    async fn a_footprint_or_its_matching_pads_changed_before_write_is_stale() {
+        let mut changed =
+            kiapi::board::types::FootprintInstance::decode(footprint().value.as_slice()).unwrap();
+        let children = &mut changed.definition.as_mut().unwrap().items;
+        children[0] = pad("pad-1", "2", "VPD");
+        children[1] = pad("pad-2a", "1", "");
+        let renumbered = pack_any(&changed, "kiapi.board.types.FootprintInstance");
+        let children = &mut changed.definition.as_mut().unwrap().items;
+        children[0] = pad("pad-1", "1", "VPD");
+        children[1] = pad("pad-2a", "2", "OTHER");
+        let changed_net = pack_any(&changed, "kiapi.board.types.FootprintInstance");
+        for second_read in [vec![], vec![renumbered], vec![changed_net]] {
+            assert_stale_second_read(second_read).await;
+        }
+    }
+
+    async fn assert_stale_second_read(second_read: Vec<prost_types::Any>) {
         let dir = tempfile::tempdir().unwrap();
         let board = board_file(&dir);
         let store = Arc::new(Mutex::new(ItemStore {
@@ -360,7 +374,7 @@ mod tests {
                         &kiapi::common::commands::GetItemsResponse {
                             header: None,
                             status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                            items: vec![],
+                            items: second_read.clone(),
                         },
                         "kiapi.common.commands.GetItemsResponse",
                     )

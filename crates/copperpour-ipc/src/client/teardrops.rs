@@ -43,6 +43,10 @@ use std::collections::BTreeMap;
 const PAD: &str = "kiapi.board.types.Pad";
 const VIA: &str = "kiapi.board.types.Via";
 const ZONE: &str = "kiapi.board.types.Zone";
+const TEARDROP_TARGET_TYPES: [common::KiCadObjectType; 2] = [
+    common::KiCadObjectType::KotPcbPad,
+    common::KiCadObjectType::KotPcbVia,
+];
 
 /// The first KiCad release whose IPC API carries pad and via teardrop
 /// settings, as `(major, minor, patch)`.
@@ -326,16 +330,17 @@ impl KiCadIpcClient {
         &self,
         document: common::DocumentSpecifier,
     ) -> Result<prost_types::Any> {
-        let command = kiapi::common::commands::GetItems {
-            header: Some(header_for(document)),
-            types: vec![
-                common::KiCadObjectType::KotPcbPad as i32,
-                common::KiCadObjectType::KotPcbVia as i32,
-            ],
-        };
-        let Some(any) = self.send_command(&command, "kiapi.common.commands.GetItems")? else {
-            anyhow::bail!("KiCad returned no GetItems answer for the board's pads and vias");
-        };
+        Ok(self.teardrop_items_in(document, &TEARDROP_TARGET_TYPES)?.0)
+    }
+
+    fn teardrop_items_in(
+        &self,
+        document: common::DocumentSpecifier,
+        types: &[common::KiCadObjectType],
+    ) -> Result<(prost_types::Any, Vec<prost_types::Any>)> {
+        let any = self
+            .get_items_response_in(document, types)?
+            .context("KiCad returned no GetItems answer for teardrop readback")?;
         if !crate::builders::any_is(&any, "kiapi.common.commands.GetItemsResponse") {
             anyhow::bail!(
                 "KiCad answered GetItems with '{}', not a GetItemsResponse",
@@ -343,8 +348,8 @@ impl KiCadIpcClient {
             );
         }
         let response: kiapi::common::commands::GetItemsResponse = unpack_any(&any)?;
-        ensure_item_request_ok(response.status, "pad and via retrieval")?;
-        Ok(any)
+        ensure_item_request_ok(response.status, "teardrop item retrieval")?;
+        Ok((any, response.items))
     }
 
     /// Every pad and via on one board with its native teardrop settings.
@@ -355,10 +360,16 @@ impl KiCadIpcClient {
         &self,
         document: common::DocumentSpecifier,
     ) -> Result<Vec<IpcTeardropTarget>> {
-        let response = self.get_teardrop_items_response_in(document.clone())?;
-        let response: kiapi::common::commands::GetItemsResponse = unpack_any(&response)?;
+        let items = self.pad_and_via_listing_in(document.clone())?;
         let references = self.footprint_references_in(document)?;
-        teardrop_targets_from_items(&response.items, &references)
+        teardrop_targets_from_items(&items, &references)
+    }
+
+    fn pad_and_via_listing_in(
+        &self,
+        document: common::DocumentSpecifier,
+    ) -> Result<Vec<prost_types::Any>> {
+        Ok(self.teardrop_items_in(document, &TEARDROP_TARGET_TYPES)?.1)
     }
 
     fn footprint_references_in(
@@ -390,7 +401,8 @@ impl KiCadIpcClient {
         &self,
         document: common::DocumentSpecifier,
     ) -> Result<Vec<IpcTeardropZone>> {
-        let items = self.get_items_in(document, common::KiCadObjectType::KotPcbZone)?;
+        let (_, items) =
+            self.teardrop_items_in(document, &[common::KiCadObjectType::KotPcbZone])?;
         teardrop_zones_from_items(&items)
     }
 
@@ -422,25 +434,43 @@ impl KiCadIpcClient {
         text: &str,
         edits: &[IpcTeardropEdit],
     ) -> Result<Option<IpcTeardropRefusal>> {
-        if legacy_teardrops_in_board_text(text)? {
+        let board =
+            copperpour_sexp::parse_sexp(text).context("KiCad's board text did not parse")?;
+        if legacy_teardrops_in_board(&board)? {
             return Ok(Some(IpcTeardropRefusal::LegacyTeardrops));
         }
-        let footprints: BTreeSet<_> = edits
+        let mut footprints = edits
             .iter()
             .filter(|edit| edit.kind == IpcTeardropTargetKind::Pad)
-            .filter_map(|edit| edit.footprint_uuid.as_deref())
-            .collect();
-        if footprints.is_empty() {
+            .peekable();
+        if footprints.peek().is_none() {
             return Ok(None);
         }
-        let owned = footprint_owned_groups(text)?;
-        let grouped: Vec<_> = footprints
-            .into_iter()
-            .filter_map(|id| {
-                let count = owned.get(id).copied().unwrap_or(0);
-                (count > 0).then_some((id, count))
-            })
-            .collect();
+        let stale = |reason| Ok(Some(IpcTeardropRefusal::Stale { reason }));
+        let owned = match copperpour_sexp::board::footprint_owned_group_counts(&board) {
+            Ok(owned) => owned,
+            Err(error) => {
+                return stale(format!(
+                    "could not verify footprint group ownership: {error}"
+                ))
+            }
+        };
+        let mut grouped = BTreeMap::new();
+        for edit in footprints {
+            let Some((id, &count)) = edit
+                .footprint_uuid
+                .as_deref()
+                .and_then(|id| owned.get_key_value(id))
+            else {
+                return stale(format!(
+                    "the footprint for pad {} is absent from the board serialization",
+                    edit.uuid
+                ));
+            };
+            if count > 0 {
+                grouped.insert(*id, count);
+            }
+        }
         if grouped.is_empty() {
             return Ok(None);
         }
@@ -617,11 +647,25 @@ impl KiCadIpcClient {
                 return uncertain("the footprint update path sent nothing".to_string())
             }
             Ok(footprint_pads::FootprintPadUpdate::Refused(error)) => {
+                if error.downcast_ref::<IpcOutcomeUnknown>().is_some() {
+                    return uncertain(format!("{error:#}"));
+                }
+                let after = match self.save_document_to_string_in(document) {
+                    Ok(after) => after,
+                    Err(read_error) => return uncertain(format!(
+                        "the update returned an error and the board could not be read back: {error:#}; {read_error:#}"
+                    )),
+                };
+                if after != before_text {
+                    return uncertain(format!(
+                        "the update returned an error but the board serialization changed: {error:#}"
+                    ));
+                }
                 return Ok(IpcTeardropApplyOutcome::Refused(
                     IpcTeardropRefusal::Rejected {
                         reason: format!("{error:#}"),
                     },
-                ))
+                ));
             }
             Ok(footprint_pads::FootprintPadUpdate::Uncertain { mismatches, reason }) => {
                 return uncertain(if mismatches.is_empty() {
@@ -696,7 +740,14 @@ impl KiCadIpcClient {
                 ));
             }
         }
-        let changes = changes_besides_teardrops(&before_text, &after_text, edits)?;
+        let changes = match changes_besides_teardrops(&before_text, &after_text, edits) {
+            Ok(changes) => changes,
+            Err(error) => {
+                return uncertain(format!(
+                    "could not compare the board after the commit: {error:#}"
+                ))
+            }
+        };
         if !changes.is_empty() {
             return uncertain(format!(
                 "the commit changed more than teardrops: {}",
@@ -717,10 +768,8 @@ impl KiCadIpcClient {
         &self,
         document: common::DocumentSpecifier,
     ) -> Result<BTreeMap<String, prost_types::Any>> {
-        let response = self.get_teardrop_items_response_in(document)?;
-        let response: kiapi::common::commands::GetItemsResponse = unpack_any(&response)?;
         let mut by_id = BTreeMap::new();
-        for item in response.items {
+        for item in self.pad_and_via_listing_in(document)? {
             if !(crate::builders::any_is(&item, PAD) || crate::builders::any_is(&item, VIA)) {
                 continue;
             }
@@ -770,27 +819,6 @@ fn via_differences(expected: &board::Via, observed: &board::Via) -> Vec<String> 
     out
 }
 
-/// Groups each footprint owns directly, by footprint KIID, from KiCad's
-/// board serialization: KiCad 10 leaves them out of `FootprintInstance`.
-/// A footprint listed twice refuses rather than guessing which one.
-fn footprint_owned_groups(board_text: &str) -> Result<BTreeMap<String, usize>> {
-    let root =
-        copperpour_sexp::parse_sexp(board_text).context("KiCad's board text did not parse")?;
-    let mut owned = BTreeMap::new();
-    for footprint in root.find_all("footprint") {
-        let id = footprint
-            .find_str("uuid")
-            .context("KiCad's board text has a footprint without a uuid")?;
-        anyhow::ensure!(
-            owned
-                .insert(id.to_string(), footprint.find_all("group").len())
-                .is_none(),
-            "KiCad's board text lists footprint {id} twice"
-        );
-    }
-    Ok(owned)
-}
-
 /// Whether a node is a KiCad-generated teardrop zone: `(zone … (attr
 /// (teardrop …)))`.
 fn is_teardrop_zone(node: &copperpour_sexp::SexpNode) -> bool {
@@ -820,7 +848,7 @@ fn without_teardrops(node: &copperpour_sexp::SexpNode) -> copperpour_sexp::SexpN
 /// as readable paths; and any pad or via not among `edits` whose
 /// `(teardrops …)` settings changed. Empty when the change was teardrops
 /// only.
-pub fn changes_besides_teardrops(
+fn changes_besides_teardrops(
     before: &str,
     after: &str,
     edits: &[IpcTeardropEdit],
@@ -982,7 +1010,7 @@ pub fn teardrop_targets_from_items(
 }
 
 /// Decode the teardrop zones from a `GetItems` answer for zones.
-pub fn teardrop_zones_from_items(items: &[prost_types::Any]) -> Result<Vec<IpcTeardropZone>> {
+fn teardrop_zones_from_items(items: &[prost_types::Any]) -> Result<Vec<IpcTeardropZone>> {
     let mut zones = Vec::new();
     for item in items {
         if !crate::builders::any_is(item, ZONE) {
@@ -1063,6 +1091,10 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// absent token is a board that predates it and is read as `no` too.
 pub fn legacy_teardrops_in_board_text(text: &str) -> Result<bool> {
     let root = copperpour_sexp::parse_sexp(text).context("KiCad's board text did not parse")?;
+    legacy_teardrops_in_board(&root)
+}
+
+fn legacy_teardrops_in_board(root: &copperpour_sexp::SexpNode) -> Result<bool> {
     anyhow::ensure!(
         root.head() == Some("kicad_pcb"),
         "KiCad's board text is not a kicad_pcb document"
@@ -1122,14 +1154,16 @@ mod tests {
              \t(footprint \"B\" (uuid \"fb\"))\n\
              \t(group \"\" (uuid \"g2\") (members \"fa\" \"fb\"))\n",
         );
-        let owned = footprint_owned_groups(&text).unwrap();
+        let board = copperpour_sexp::parse_sexp(&text).unwrap();
+        let owned = copperpour_sexp::board::footprint_owned_group_counts(&board).unwrap();
         assert_eq!(owned.get("fa"), Some(&1));
         assert_eq!(owned.get("fb"), Some(&0));
         let twice = board_text(
             "",
             "\t(footprint \"A\" (uuid \"fa\"))\n\t(footprint \"A\" (uuid \"fa\"))\n",
         );
-        assert!(footprint_owned_groups(&twice).is_err());
+        let twice = copperpour_sexp::parse_sexp(&twice).unwrap();
+        assert!(copperpour_sexp::board::footprint_owned_group_counts(&twice).is_err());
     }
 
     fn edit(uuid: &str) -> IpcTeardropEdit {
