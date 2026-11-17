@@ -53,8 +53,9 @@ Each `.ipc.bin` footprint is the `Any.value` of one item of KiCad's
   10 nm, and the refresh, comparing exactly, plans `graphics` for it.
 - **H2: a real difference.** The same footprint with its position-file and
   BOM exclusions cleared on the board, as an older footprint copy or an
-  edit would leave it. An update would set them again, so it plans
-  `attributes`, and only that.
+  edit would leave it. A refresh keeps them by default, as KiCad's update
+  dialog does, and plans nothing. With `reset_fabrication_attributes` an
+  update sets them again, so it plans `attributes`, and only that.
 
 ## Redaction
 

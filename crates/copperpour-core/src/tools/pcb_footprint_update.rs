@@ -219,14 +219,23 @@ struct TextEffects {
     vertical_alignment: &'static str,
 }
 
-/// Which of KiCad's Update Footprints text options apply to Reference and
-/// Value: "Update/reset text sizes and styles" (every text attribute,
-/// angle included) and "Update/reset text positions".
+/// Which of KiCad's Update Footprints reset options apply. Each is off by
+/// default, as in KiCad's update dialog (`dialog_exchange_footprints.cpp`,
+/// update mode), so a refresh keeps what they cover:
+/// - "Update/reset text sizes and styles" (every text attribute, angle
+///   included) and "Update/reset text positions" apply to Reference and
+///   Value.
+/// - "Update/reset text content" gives Datasheet, Description and each
+///   custom field the library also has the library's text.
+/// - "Update/reset fabrication attributes" gives the footprint the
+///   library's mounting type and BOM and position-file exclusions. DNP and
+///   "not in schematic" stay with the placed footprint either way: the
+///   schematic sets them.
 ///
 /// Flattened into the plan inputs, an unset flag is left out, so a call
 /// without one keeps the revision it had before the flags existed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-struct TextReset {
+struct Resets {
     #[serde(
         rename = "reset_text_sizes_and_styles",
         skip_serializing_if = "std::ops::Not::not"
@@ -237,10 +246,21 @@ struct TextReset {
         skip_serializing_if = "std::ops::Not::not"
     )]
     positions: bool,
+    #[serde(
+        rename = "reset_text_content",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    content: bool,
+    #[serde(
+        rename = "reset_fabrication_attributes",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    fabrication_attributes: bool,
 }
 
-impl TextReset {
-    fn any(self) -> bool {
+impl Resets {
+    /// Whether a reset covers Reference and Value text effects.
+    fn reference_and_value(self) -> bool {
         self.sizes_and_styles || self.positions
     }
 }
@@ -287,7 +307,7 @@ struct UpdateFilters {
     references: Option<BTreeSet<String>>,
     library_ids: Option<BTreeSet<String>>,
     #[serde(flatten)]
-    text_reset: TextReset,
+    resets: Resets,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -407,7 +427,8 @@ pub(crate) fn tool() -> ToolDef {
         "Plan or atomically apply KiCad's Update Footprints from Library operation to placed \
          footprints on the live board. Defaults to a non-mutating dry run; apply requires its \
          exact plan revision. Preserves placed-instance state and pad nets while refreshing \
-         supported library-owned content.",
+         supported library-owned content; field text and fabrication attributes are kept \
+         unless reset_text_content or reset_fabrication_attributes is set.",
         json!({
             "type": "object",
             "properties": {
@@ -434,6 +455,16 @@ pub(crate) fn tool() -> ToolDef {
                     "type": "boolean",
                     "default": false,
                     "description": "Also move each Reference and Value field to the library's position, as KiCad's 'Update/reset text positions' option does. Either reset keeps the fields' text, layer and visibility."
+                },
+                "reset_text_content": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also give Datasheet, Description and each custom field the library also has the library's text, as KiCad's 'Update/reset text content' option does. Off by default: those fields keep their placed text. Reference and Value always keep theirs."
+                },
+                "reset_fabrication_attributes": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also give each footprint the library's mounting type and BOM and position-file exclusions, as KiCad's 'Update/reset fabrication attributes' option does. Off by default: the placed footprint keeps them. DNP and 'not in schematic' are kept either way."
                 },
                 "dry_run": {
                     "type": "boolean",
@@ -784,9 +815,11 @@ fn parse_filters(args: &serde_json::Value) -> std::result::Result<UpdateFilters,
     Ok(UpdateFilters {
         references: parse(args, "references")?,
         library_ids: parse(args, "library_ids")?,
-        text_reset: TextReset {
+        resets: Resets {
             sizes_and_styles: flag(args, "reset_text_sizes_and_styles")?,
             positions: flag(args, "reset_text_positions")?,
+            content: flag(args, "reset_text_content")?,
+            fabrication_attributes: flag(args, "reset_fabrication_attributes")?,
         },
     })
 }
@@ -1005,7 +1038,7 @@ fn plan_updates(
             stack,
             net_codes,
             routed_nets,
-            filters.text_reset,
+            filters.resets,
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -1514,7 +1547,7 @@ fn build_updated_instance(
     stack: CopperStack,
     net_codes: &BTreeMap<String, i32>,
     routed_nets: &BTreeSet<String>,
-    text_reset: TextReset,
+    resets: Resets,
 ) -> Result<PreparedUpdate> {
     let current_definition = current
         .definition
@@ -1628,14 +1661,16 @@ fn build_updated_instance(
     definition.value_field = current_definition.value_field.clone();
     definition.datasheet_field = current_definition.datasheet_field.clone();
     definition.description_field = current_definition.description_field.clone();
-    apply_field_value(
-        &mut definition.datasheet_field,
-        library.datasheet.as_deref(),
-    );
-    apply_field_value(
-        &mut definition.description_field,
-        library.description_field.as_deref(),
-    );
+    if resets.content {
+        apply_field_value(
+            &mut definition.datasheet_field,
+            library.datasheet.as_deref(),
+        );
+        apply_field_value(
+            &mut definition.description_field,
+            library.description_field.as_deref(),
+        );
+    }
     definition.items.extend(library.models.iter().map(|model| {
         copperpour_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
     }));
@@ -1698,22 +1733,31 @@ fn build_updated_instance(
         &position,
         rotation,
         is_back.then_some(stack),
+        !resets.content,
     )?;
     updated.definition = Some(definition);
-    apply_field_value(&mut updated.datasheet_field, library.datasheet.as_deref());
-    apply_field_value(
-        &mut updated.description_field,
-        library.description_field.as_deref(),
-    );
+    if resets.content {
+        apply_field_value(&mut updated.datasheet_field, library.datasheet.as_deref());
+        apply_field_value(
+            &mut updated.description_field,
+            library.description_field.as_deref(),
+        );
+    }
     let mut attributes = library.attributes.clone();
     if let Some(current_attributes) = current.attributes.as_ref() {
         attributes.not_in_schematic = current_attributes.not_in_schematic;
         attributes.do_not_populate = current_attributes.do_not_populate;
+        if !resets.fabrication_attributes {
+            attributes.mounting_style = current_attributes.mounting_style;
+            attributes.exclude_from_position_files = current_attributes.exclude_from_position_files;
+            attributes.exclude_from_bill_of_materials =
+                current_attributes.exclude_from_bill_of_materials;
+        }
     }
     updated.attributes = Some(attributes);
 
     let mut text_effects = Vec::new();
-    if text_reset.any() {
+    if resets.reference_and_value() {
         for (name, library_field, placed) in [
             (
                 FieldName::Reference,
@@ -1736,7 +1780,7 @@ fn build_updated_instance(
                 &position,
                 rotation,
                 is_back.then_some(stack),
-                text_reset,
+                resets,
             )? {
                 *placed = Some(field);
                 text_effects.push(change);
@@ -1771,7 +1815,7 @@ fn reset_field_effects(
     footprint_position: &kiapi::common::types::Vector2,
     footprint_rotation: f64,
     mirror: Option<CopperStack>,
-    text_reset: TextReset,
+    resets: Resets,
 ) -> Result<Option<(kiapi::board::types::Field, FieldEffectsChange)>> {
     let placed = placed.with_context(|| format!("placed footprint has no {name} field"))?;
     let library =
@@ -1787,10 +1831,10 @@ fn reset_field_effects(
         .as_mut()
         .and_then(|text| text.text.as_mut())
         .with_context(|| format!("placed {name} field has no text"))?;
-    if text_reset.positions {
+    if resets.positions {
         text.position = library_text.position;
     }
-    if text_reset.sizes_and_styles {
+    if resets.sizes_and_styles {
         // The deprecated per-text `visible` is visibility, which is kept.
         let visible = text
             .attributes
@@ -1904,6 +1948,9 @@ fn apply_field_value(field: &mut Option<kiapi::board::types::Field>, value: Opti
         .text = value.to_string();
 }
 
+/// The library's custom properties, plus each placed one the library does
+/// not have. With `keep_text`, a library property the placed footprint also
+/// has keeps the placed text.
 fn merge_custom_properties(
     updated: &mut kiapi::board::types::Footprint,
     current: &kiapi::board::types::Footprint,
@@ -1911,12 +1958,14 @@ fn merge_custom_properties(
     footprint_position: &kiapi::common::types::Vector2,
     footprint_rotation: f64,
     mirror: Option<CopperStack>,
+    keep_text: bool,
 ) -> Result<()> {
     let library_names = library_properties
         .iter()
         .map(|field| field.name.as_str())
         .collect::<BTreeSet<_>>();
     let mut current_names = BTreeSet::new();
+    let mut placed_text = BTreeMap::new();
     for item in current
         .items
         .iter()
@@ -1937,11 +1986,19 @@ fn merge_custom_properties(
             // A field that exists only on the placed instance belongs to that
             // instance. Preserve its complete typed representation verbatim.
             updated.items.push(item.clone());
+        } else if keep_text {
+            let text = field_text(&Some(field.clone()));
+            placed_text.insert(field.name, text);
         }
     }
     for property in library_properties {
-        let property =
+        let mut property =
             transform_library_property(property, footprint_position, footprint_rotation, mirror)?;
+        if let Some(text) = placed_text.get(&property.name) {
+            let mut field = Some(property);
+            apply_field_value(&mut field, Some(text));
+            property = field.context("a library property was lost while keeping its text")?;
+        }
         updated.items.push(copperpour_ipc::builders::pack_any(
             &property,
             "kiapi.board.types.Field",
@@ -2941,6 +2998,8 @@ mod tests {
         assert_eq!(model.rotation.as_ref().unwrap().z_nm, 45.0);
     }
 
+    /// With both resets, the library's field text and fabrication attributes
+    /// replace the placed ones; DNP and "not in schematic" stay.
     #[test]
     fn merge_preserves_instance_state_and_nets_by_logical_pad_number() {
         let current = current_instance(kiapi::board::types::BoardLayer::BlBCu);
@@ -2951,7 +3010,11 @@ mod tests {
             two_layers(),
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::from(["ROW1".to_string(), "COL1".to_string()]),
-            TextReset::default(),
+            Resets {
+                content: true,
+                fabrication_attributes: true,
+                ..Resets::default()
+            },
         )
         .unwrap();
         let updated =
@@ -3111,7 +3174,7 @@ mod tests {
                 eight,
                 &nets,
                 &BTreeSet::new(),
-                TextReset::default(),
+                Resets::default(),
             )
             .unwrap();
             let updated =
@@ -3146,7 +3209,7 @@ mod tests {
             two_layers(),
             &nets,
             &BTreeSet::new(),
-            TextReset::default(),
+            Resets::default(),
         )
         .unwrap_err();
         assert!(
@@ -3155,6 +3218,39 @@ mod tests {
                 .contains("'In2.Cu' is not on this 2-copper-layer board"),
             "{error:#}"
         );
+    }
+
+    /// Without a reset, as KiCad's update dialog starts: Datasheet and
+    /// Description keep their placed text, and the footprint keeps its
+    /// mounting type and exclusions, although the library's differ.
+    #[test]
+    fn by_default_a_refresh_keeps_field_text_and_fabrication_attributes() {
+        let current = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+        let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+        let library_attributes = library.attributes.clone();
+        assert!(library_attributes.exclude_from_position_files);
+        assert!(!library_attributes.exclude_from_bill_of_materials);
+        let prepared = build_updated_instance(
+            &current,
+            &library,
+            two_layers(),
+            &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
+            &BTreeSet::from(["ROW1".to_string(), "COL1".to_string()]),
+            Resets::default(),
+        )
+        .unwrap();
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+
+        assert_eq!(field_text(&updated.datasheet_field), "placed-datasheet");
+        assert_eq!(field_text(&updated.description_field), "placed-description");
+        let definition = updated.definition.as_ref().unwrap();
+        assert_eq!(field_text(&definition.datasheet_field), "");
+        assert_eq!(field_text(&definition.description_field), "");
+        assert_eq!(updated.attributes, current.attributes);
+        assert!(!prepared
+            .changed_domains
+            .contains(&ChangedDomain::Attributes));
     }
 
     #[test]
@@ -3168,43 +3264,52 @@ mod tests {
         ]);
         let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
 
-        let prepared = build_updated_instance(
-            &current,
-            &library,
-            two_layers(),
-            &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
-            &BTreeSet::new(),
-            TextReset::default(),
-        )
-        .unwrap();
-        let updated =
-            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
-        let properties = decoded_custom_fields(&updated);
+        // The library's property keeps the placed text unless the content is
+        // reset, as KiCad's "Update/reset text content" decides.
+        for (resets, assembly_vendor) in [
+            (Resets::default(), "old library value"),
+            (CONTENT, "Example Assembly"),
+        ] {
+            let prepared = build_updated_instance(
+                &current,
+                &library,
+                two_layers(),
+                &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
+                &BTreeSet::new(),
+                resets,
+            )
+            .unwrap();
+            let updated =
+                kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice())
+                    .unwrap();
+            let properties = decoded_custom_fields(&updated);
 
-        assert_eq!(
-            properties
-                .iter()
-                .map(|property| property.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["InstanceNote", "KiLib_Generator", "AssemblyVendor"]
-        );
-        assert_eq!(
-            properties
-                .iter()
-                .find(|property| property.name == "InstanceNote")
-                .unwrap(),
-            &instance_only
-        );
-        assert_eq!(
-            field_text_value(
+            assert_eq!(
                 properties
                     .iter()
-                    .find(|property| property.name == "AssemblyVendor")
-                    .unwrap()
-            ),
-            "Example Assembly"
-        );
-        assert!(prepared.changed_domains.contains(&ChangedDomain::Metadata));
+                    .map(|property| property.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["InstanceNote", "KiLib_Generator", "AssemblyVendor"]
+            );
+            assert_eq!(
+                properties
+                    .iter()
+                    .find(|property| property.name == "InstanceNote")
+                    .unwrap(),
+                &instance_only
+            );
+            assert_eq!(
+                field_text_value(
+                    properties
+                        .iter()
+                        .find(|property| property.name == "AssemblyVendor")
+                        .unwrap()
+                ),
+                assembly_vendor,
+                "{resets:?}"
+            );
+            assert!(prepared.changed_domains.contains(&ChangedDomain::Metadata));
+        }
     }
 
     #[test]
@@ -3222,7 +3327,7 @@ mod tests {
             two_layers(),
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::from(["COL1".to_string()]),
-            TextReset::default(),
+            Resets::default(),
         )
         .unwrap_err();
 
@@ -3374,7 +3479,7 @@ mod tests {
             two_layers(),
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
-            TextReset::default(),
+            Resets::default(),
         )
         .unwrap_err();
 
@@ -3507,7 +3612,7 @@ mod tests {
                     two_layers(),
                     &net_codes,
                     &routed,
-                    TextReset::default(),
+                    Resets::default(),
                 )
                 .unwrap();
                 let applied =
@@ -3520,7 +3625,7 @@ mod tests {
                     two_layers(),
                     &net_codes,
                     &routed,
-                    TextReset::default(),
+                    Resets::default(),
                 )
                 .unwrap();
 
@@ -3543,7 +3648,7 @@ mod tests {
             two_layers(),
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
-            TextReset::default(),
+            Resets::default(),
         )
         .unwrap();
         let mut prepared =
@@ -3921,41 +4026,38 @@ mod tests {
         assert!(second.prepared_items.is_empty());
     }
 
+    /// A library change to the Datasheet alone is `metadata` with a content
+    /// reset, and nothing without one.
     #[test]
     fn datasheet_only_library_change_is_reported_as_metadata() {
         let base = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
         let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
         let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
         let routed = BTreeSet::new();
-        let applied = build_updated_instance(
-            &current,
-            &base,
-            two_layers(),
-            &net_codes,
-            &routed,
-            TextReset::default(),
-        )
-        .unwrap();
+        let applied =
+            build_updated_instance(&current, &base, two_layers(), &net_codes, &routed, CONTENT)
+                .unwrap();
         let applied =
             kiapi::board::types::FootprintInstance::decode(applied.item.value.as_slice()).unwrap();
         let changed_source =
             LIBRARY_FOOTPRINT.replace("new-datasheet.pdf", "replacement-datasheet.pdf");
         let changed = parse_library_footprint("Test:Socket", &changed_source).unwrap();
 
-        let prepared = build_updated_instance(
-            &applied,
-            &changed,
-            two_layers(),
-            &net_codes,
-            &routed,
-            TextReset::default(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            prepared.changed_domains,
-            BTreeSet::from([ChangedDomain::Metadata])
-        );
+        for (resets, domains) in [
+            (CONTENT, BTreeSet::from([ChangedDomain::Metadata])),
+            (Resets::default(), BTreeSet::new()),
+        ] {
+            let prepared = build_updated_instance(
+                &applied,
+                &changed,
+                two_layers(),
+                &net_codes,
+                &routed,
+                resets,
+            )
+            .unwrap();
+            assert_eq!(prepared.changed_domains, domains, "{resets:?}");
+        }
     }
 
     #[test]
@@ -4157,7 +4259,7 @@ mod tests {
                 two_layers(),
                 &BTreeMap::new(),
                 &BTreeSet::new(),
-                TextReset::default(),
+                Resets::default(),
             )
             .unwrap();
             assert!(
@@ -4180,7 +4282,7 @@ mod tests {
             two_layers(),
             &BTreeMap::new(),
             &BTreeSet::new(),
-            TextReset::default(),
+            Resets::default(),
         )
         .unwrap();
         let updated =
@@ -4342,6 +4444,18 @@ mod tests {
         kiapi::board::types::FootprintInstance,
         kiapi::board::types::FootprintInstance,
     ) {
+        refresh_with(current, libraries, Resets::default())
+    }
+
+    /// [`refresh_from_library`] with `resets`.
+    fn refresh_with(
+        current: kiapi::board::types::FootprintInstance,
+        libraries: &[(&str, &str, &str)],
+        resets: Resets,
+    ) -> (
+        kiapi::board::types::FootprintInstance,
+        kiapi::board::types::FootprintInstance,
+    ) {
         let id = current.definition.as_ref().unwrap().id.as_ref().unwrap();
         let (nickname, entry, source) = libraries
             .iter()
@@ -4357,12 +4471,92 @@ mod tests {
             two_layers(),
             &BTreeMap::new(),
             &BTreeSet::new(),
-            TextReset::default(),
+            resets,
         )
         .unwrap();
         let updated =
             kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
         (current, updated)
+    }
+
+    /// KiCad's own report of H2 (#254): the stock mounting hole with its
+    /// position-file and BOM exclusions cleared on the board, here also
+    /// marked DNP and "not in schematic". A refresh keeps all of them by
+    /// default. `reset_fabrication_attributes` gives it the library's
+    /// exclusions and mounting type again, and still keeps DNP and "not in
+    /// schematic", which the schematic owns.
+    #[test]
+    fn a_refresh_keeps_kicads_placed_attributes_unless_they_are_reset() {
+        let mut current = issue_254_capture("H2");
+        let attributes = current.attributes.as_mut().unwrap();
+        assert!(!attributes.exclude_from_position_files);
+        assert!(!attributes.exclude_from_bill_of_materials);
+        attributes.do_not_populate = true;
+        attributes.not_in_schematic = true;
+
+        let (_, kept) = refresh_with(current.clone(), &ISSUE_254_LIBRARIES, Resets::default());
+        assert_eq!(kept.attributes, current.attributes);
+        assert_eq!(changed_domains(&current, &kept).unwrap(), BTreeSet::new());
+
+        let (_, reset) = refresh_with(current.clone(), &ISSUE_254_LIBRARIES, FABRICATION);
+        let attributes = reset.attributes.as_ref().unwrap();
+        assert!(attributes.exclude_from_position_files);
+        assert!(attributes.exclude_from_bill_of_materials);
+        assert!(attributes.do_not_populate);
+        assert!(attributes.not_in_schematic);
+        assert_eq!(
+            changed_domains(&current, &reset).unwrap(),
+            BTreeSet::from([ChangedDomain::Attributes])
+        );
+    }
+
+    /// KiCad's own report of J1 (#254), as the library ships it, with its
+    /// `KiLib_Generator` property changed on the board. A refresh keeps that
+    /// text and plans nothing, as KiCad's update dialog does by default;
+    /// `reset_text_content` takes the library's again.
+    #[test]
+    fn a_refresh_keeps_a_placed_property_text_unless_the_content_is_reset() {
+        const NAME: &str = "KiLib_Generator";
+        const PLACED: &str = "edited on the board";
+        let shipped = issue_254_capture("J1");
+        let text_of = |instance: &kiapi::board::types::FootprintInstance| {
+            decoded_custom_fields(instance)
+                .iter()
+                .find(|field| field.name == NAME)
+                .map(|field| field_text_value(field).to_string())
+                .unwrap()
+        };
+        let library_text = text_of(&shipped);
+        assert_eq!(library_text, "connector/pin_header_socket");
+        let mut current = shipped.clone();
+        let item = current
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .iter_mut()
+            .find(|item| {
+                item.type_url.ends_with("kiapi.board.types.Field")
+                    && kiapi::board::types::Field::decode(item.value.as_slice())
+                        .unwrap()
+                        .name
+                        == NAME
+            })
+            .unwrap();
+        let mut field = Some(kiapi::board::types::Field::decode(item.value.as_slice()).unwrap());
+        apply_field_value(&mut field, Some(PLACED));
+        *item = builders::pack_any(&field.unwrap(), "kiapi.board.types.Field");
+
+        let (_, kept) = refresh_with(current.clone(), &ISSUE_254_LIBRARIES, Resets::default());
+        assert_eq!(text_of(&kept), PLACED);
+        assert_eq!(changed_domains(&current, &kept).unwrap(), BTreeSet::new());
+
+        let (_, reset) = refresh_with(current.clone(), &ISSUE_254_LIBRARIES, CONTENT);
+        assert_eq!(text_of(&reset), library_text);
+        assert_eq!(
+            changed_domains(&current, &reset).unwrap(),
+            BTreeSet::from([ChangedDomain::Metadata])
+        );
     }
 
     /// `instance`'s circles as centre and radius point in nm, sorted.
@@ -4513,7 +4707,7 @@ mod tests {
             two_layers(),
             &BTreeMap::new(),
             &BTreeSet::new(),
-            TextReset::default(),
+            Resets::default(),
         )
         .unwrap();
         let updated =
@@ -4569,7 +4763,7 @@ mod tests {
             two_layers(),
             &BTreeMap::new(),
             &BTreeSet::new(),
-            TextReset::default(),
+            Resets::default(),
         )
         .unwrap();
         let updated =
@@ -4793,7 +4987,9 @@ mod tests {
     /// Through the served dispatch, KiCad 10.0.8's own report of four stock
     /// footprints (#254). J1, J2 and H1 are as the library ships them and
     /// plan nothing. H2 had its position-file and BOM exclusions cleared on
-    /// the board and plans exactly that.
+    /// the board. A refresh keeps them, as KiCad's update dialog does by
+    /// default, so nothing is planned; `reset_fabrication_attributes` sets
+    /// them again and plans exactly that.
     #[tokio::test]
     async fn served_dry_run_plans_only_real_library_differences() {
         // The mock answers a 2-layer stack, as KiCad did for this board.
@@ -4814,6 +5010,18 @@ mod tests {
         let handler = served(mock.kicad.address()).await;
 
         let body = result_json(&served_call(&handler, serde_json::json!({ "board": board })).await);
+        assert_eq!(body["status"], "noop", "{body}");
+        assert_eq!(body["coverage"]["selected"]["planned"], 4, "{body}");
+        assert_eq!(body["coverage"]["unchanged"]["planned"], 4, "{body}");
+        assert_eq!(body["coverage"]["changed"]["planned"], 0, "{body}");
+
+        let body = result_json(
+            &served_call(
+                &handler,
+                serde_json::json!({ "board": board, "reset_fabrication_attributes": true }),
+            )
+            .await,
+        );
         assert_eq!(body["status"], "ready", "{body}");
         assert_eq!(body["coverage"]["selected"]["planned"], 4, "{body}");
         assert_eq!(body["coverage"]["unchanged"]["planned"], 3, "{body}");
@@ -5312,23 +5520,41 @@ mod tests {
     /// `current_instance` places its fields at size 1.25 mm.
     const PLACED_SIZE_MM: [f64; 2] = [1.25, 1.25];
 
-    const BOTH: TextReset = TextReset {
+    const BOTH: Resets = Resets {
         sizes_and_styles: true,
         positions: true,
+        content: false,
+        fabrication_attributes: false,
     };
-    const STYLES: TextReset = TextReset {
+    const STYLES: Resets = Resets {
         sizes_and_styles: true,
         positions: false,
+        content: false,
+        fabrication_attributes: false,
     };
-    const POSITIONS: TextReset = TextReset {
+    const POSITIONS: Resets = Resets {
         sizes_and_styles: false,
         positions: true,
+        content: false,
+        fabrication_attributes: false,
+    };
+    const CONTENT: Resets = Resets {
+        sizes_and_styles: false,
+        positions: false,
+        content: true,
+        fabrication_attributes: false,
+    };
+    const FABRICATION: Resets = Resets {
+        sizes_and_styles: false,
+        positions: false,
+        content: false,
+        fabrication_attributes: true,
     };
 
     fn reset_with(
         current: &kiapi::board::types::FootprintInstance,
         source: &str,
-        text_reset: TextReset,
+        resets: Resets,
     ) -> Result<(PreparedUpdate, kiapi::board::types::FootprintInstance)> {
         let library = parse_library_footprint("Test:Socket", source)?;
         let prepared = build_updated_instance(
@@ -5337,7 +5563,7 @@ mod tests {
             two_layers(),
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
-            text_reset,
+            resets,
         )?;
         let updated =
             kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice())?;
@@ -5346,9 +5572,9 @@ mod tests {
 
     fn reset(
         current: &kiapi::board::types::FootprintInstance,
-        text_reset: TextReset,
+        resets: Resets,
     ) -> (PreparedUpdate, kiapi::board::types::FootprintInstance) {
-        reset_with(current, KICAD_LIBRARY_FOOTPRINT, text_reset).unwrap()
+        reset_with(current, KICAD_LIBRARY_FOOTPRINT, resets).unwrap()
     }
 
     /// The library offset, turned with `current_instance`'s 37° about
@@ -5371,9 +5597,9 @@ mod tests {
         ] {
             let is_back = layer == kiapi::board::types::BoardLayer::BlBCu;
             let current = current_instance(layer);
-            for text_reset in [BOTH, STYLES, POSITIONS] {
-                let why = format!("{layer:?} {text_reset:?}");
-                let (prepared, updated) = reset(&current, text_reset);
+            for resets in [BOTH, STYLES, POSITIONS] {
+                let why = format!("{layer:?} {resets:?}");
+                let (prepared, updated) = reset(&current, resets);
                 assert!(
                     prepared
                         .changed_domains
@@ -5402,7 +5628,7 @@ mod tests {
                     assert_eq!(Some(field), definition_field.as_ref(), "{name} {why}");
                     let effects = text_effects(field).unwrap();
                     let before = text_effects(placed).unwrap();
-                    if text_reset.sizes_and_styles {
+                    if resets.sizes_and_styles {
                         assert_eq!(effects.size_mm, LIBRARY_SIZE_MM, "{name} {why}");
                         assert_eq!(
                             effects.thickness_mm,
@@ -5413,7 +5639,7 @@ mod tests {
                         assert_eq!(effects.size_mm, PLACED_SIZE_MM, "{name} {why}");
                         assert_eq!(effects.angle_degrees, before.angle_degrees, "{name} {why}");
                     }
-                    if text_reset.positions {
+                    if resets.positions {
                         assert!(
                             near(effects.position_mm, library_position(local_y, is_back)),
                             "{name} {why}: {:?}",
@@ -5507,7 +5733,7 @@ mod tests {
     #[test]
     fn without_a_text_reset_placed_fields_are_kept() {
         let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
-        let (prepared, updated) = reset(&current, TextReset::default());
+        let (prepared, updated) = reset(&current, Resets::default());
         assert_eq!(updated.reference_field, current.reference_field);
         assert_eq!(updated.value_field, current.value_field);
         assert!(prepared.text_effects.is_empty());
@@ -5522,13 +5748,13 @@ mod tests {
             kiapi::board::types::BoardLayer::BlFCu,
             kiapi::board::types::BoardLayer::BlBCu,
         ] {
-            for text_reset in [BOTH, STYLES, POSITIONS] {
-                let (_, applied) = reset(&current_instance(layer), text_reset);
-                let (again, _) = reset(&applied, text_reset);
-                assert!(again.text_effects.is_empty(), "{layer:?} {text_reset:?}");
+            for resets in [BOTH, STYLES, POSITIONS] {
+                let (_, applied) = reset(&current_instance(layer), resets);
+                let (again, _) = reset(&applied, resets);
+                assert!(again.text_effects.is_empty(), "{layer:?} {resets:?}");
                 assert!(
                     !again.changed_domains.contains(&ChangedDomain::TextEffects),
-                    "{layer:?} {text_reset:?}: {:?}",
+                    "{layer:?} {resets:?}: {:?}",
                     again.changed_domains
                 );
             }
@@ -5546,13 +5772,13 @@ mod tests {
             format!("{error:#}").contains("library Reference field has no position"),
             "{error:#}"
         );
-        assert!(reset_with(&current, &source, TextReset::default()).is_ok());
+        assert!(reset_with(&current, &source, Resets::default()).is_ok());
     }
 
     #[test]
-    fn each_text_reset_is_part_of_the_plan_revision_and_unset_ones_are_not() {
+    fn each_reset_is_part_of_the_plan_revision_and_unset_ones_are_not() {
         let (_temp, board, items) = plan_fixture();
-        let plan = |reset_text_sizes_and_styles, reset_text_positions| {
+        let plan = |flags: u8| {
             plan_updates(
                 &board,
                 &items,
@@ -5560,9 +5786,11 @@ mod tests {
                 &BTreeMap::new(),
                 &BTreeSet::new(),
                 &UpdateFilters {
-                    text_reset: TextReset {
-                        sizes_and_styles: reset_text_sizes_and_styles,
-                        positions: reset_text_positions,
+                    resets: Resets {
+                        sizes_and_styles: flags & 1 != 0,
+                        positions: flags & 2 != 0,
+                        content: flags & 4 != 0,
+                        fabrication_attributes: flags & 8 != 0,
                     },
                     ..Default::default()
                 },
@@ -5570,13 +5798,8 @@ mod tests {
             )
             .plan_revision
         };
-        let revisions = BTreeSet::from([
-            plan(false, false),
-            plan(true, false),
-            plan(false, true),
-            plan(true, true),
-        ]);
-        assert_eq!(revisions.len(), 4);
+        let revisions = (0..16).map(plan).collect::<BTreeSet<_>>();
+        assert_eq!(revisions.len(), 16);
         // Unset flags serialize as they did before the flags existed.
         assert_eq!(
             serde_json::to_value(UpdateFilters::default()).unwrap(),
@@ -5672,7 +5895,12 @@ mod tests {
     async fn a_non_boolean_text_reset_is_refused_before_ipc() {
         let (_temp, board, _) = plan_fixture();
         let handler = served("").await;
-        for field in ["reset_text_sizes_and_styles", "reset_text_positions"] {
+        for field in [
+            "reset_text_sizes_and_styles",
+            "reset_text_positions",
+            "reset_text_content",
+            "reset_fabrication_attributes",
+        ] {
             let result = served_call(
                 &handler,
                 serde_json::json!({ "board": board, field: "yes" }),
@@ -5970,7 +6198,7 @@ mod tests {
             two_layers(),
             &BTreeMap::new(),
             &BTreeSet::new(),
-            TextReset::default(),
+            Resets::default(),
         )
         .unwrap();
         let updated =
@@ -6026,7 +6254,7 @@ mod tests {
                 two_layers(),
                 &BTreeMap::new(),
                 &BTreeSet::new(),
-                TextReset::default(),
+                Resets::default(),
             )
             .unwrap();
             assert!(
@@ -6596,7 +6824,7 @@ mod tests {
             two_layers(),
             &BTreeMap::new(),
             &BTreeSet::new(),
-            TextReset::default(),
+            Resets::default(),
         )
         .unwrap();
         let updated =
