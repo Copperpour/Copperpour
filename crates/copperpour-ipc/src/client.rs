@@ -5640,13 +5640,9 @@ impl KiCadIpcClient {
             Ok(footprint_pads::FootprintPadUpdate::Applied { after, .. }) => after,
             // Its pads changed between the two reads: nothing was sent.
             Ok(footprint_pads::FootprintPadUpdate::Unchanged) => {
-                return Err(anyhow::Error::new(
-                    footprint_pads::FootprintEditTargetError {
-                        reason: format!(
-                            "'{reference}' no longer has a pad numbered '{pad_number}'"
-                        ),
-                    },
-                ))
+                return Ok(IpcPadNetOutcome::Stale {
+                    reason: format!("'{reference}' no longer has a pad numbered '{pad_number}'"),
+                })
             }
             Ok(footprint_pads::FootprintPadUpdate::Refused(error)) => {
                 return Err(error.context(format!(
@@ -5663,9 +5659,15 @@ impl KiCadIpcClient {
                     },
                 })
             }
-            // A refusal before anything was sent stays an error, never
-            // "uncertain".
-            Err(error) => return Err(error),
+            // Nothing was sent: a refusal, never "uncertain".
+            Err(error) => {
+                return match error.downcast_ref::<FootprintEditTargetError>() {
+                    Some(stale) => Ok(IpcPadNetOutcome::Stale {
+                        reason: stale.reason.clone(),
+                    }),
+                    None => Err(error),
+                }
+            }
         };
         // The read-back matched what was sent field for field; report each
         // pad's net from it.

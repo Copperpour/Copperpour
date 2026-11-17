@@ -299,8 +299,9 @@ pub struct IpcTeardropApplied {
     /// the post-commit comparison shows them unchanged.
     pub carried_pads: usize,
     /// What the read-back differs from before in, field by field (`footprint
-    /// <kiid>: pad <kiid> teardrop`, `via <kiid> teardrop`): only teardrop
-    /// fields, or the outcome would be uncertain.
+    /// <kiid>: pad <kiid> teardrop`, `via <kiid> teardrop`). Reporting only:
+    /// the read-back already matched what was sent, which differs from before
+    /// only in the targets' teardrop settings.
     pub changed_fields: Vec<String>,
 }
 

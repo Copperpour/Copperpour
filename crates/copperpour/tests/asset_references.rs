@@ -907,6 +907,10 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "best_length_ratio",
         "best_width_ratio",
         "max_track_width_ratio",
+        // A structured error kind and a response field the teardrop guidance
+        // names, not callable tools (#555).
+        "stale_target",
+        "verified_changes",
     ];
 
     let mut phantom = Vec::new();

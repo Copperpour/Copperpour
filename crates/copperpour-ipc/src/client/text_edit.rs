@@ -609,7 +609,10 @@ pub(super) fn settle(
     match (mutation, readback) {
         (Ok(()), Ok((to_expected, _))) if to_expected.is_empty() => Settled::Applied,
         // KiCad reported an error but the board holds exactly what was asked.
-        (Err(_), Ok((to_expected, _))) if to_expected.is_empty() => Settled::Applied,
+        (Err(error), Ok((to_expected, _))) if to_expected.is_empty() => {
+            warn!("KiCad reported an error, but the board holds the request: {error:#}");
+            Settled::Applied
+        }
         (Err(error), Ok((_, to_before))) if to_before.is_empty() => Settled::Refused(error),
         (Ok(()), Ok((to_expected, _))) => Settled::Uncertain {
             mismatches: to_expected,

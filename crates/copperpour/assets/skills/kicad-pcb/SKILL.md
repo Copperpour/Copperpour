@@ -325,6 +325,7 @@ set_teardrop_settings(board, targets: {pads?: [{reference, pad_number} | {uuid}]
 - The board is not saved: `save_project` saves it
 - `unsupported_capability` means KiCad is older than 10.0.7: change teardrops in KiCad itself. `plan_blocked` names a legacy-teardrop board or a footprint that owns groups; nothing was written
 - `stale_target` means the board changed since it was read (a target moved, vanished or got other settings); nothing was written, so read again and retry
+- An error saying KiCad refused the settings and nothing was written means a fresh read proved the board unchanged; it is safe to correct and retry
 - `verified_changes` lists every field the read-back differs from before in; all are teardrop fields
 - On `mutation_outcome_uncertain`, read the board with `get_teardrop_settings` before anything else
 

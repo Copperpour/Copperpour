@@ -101,10 +101,21 @@ async fn handle_set_pad_net(
                 ),
             ))
         }
+        copperpour_ipc::IpcPadNetOutcome::Stale { reason } => Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::StaleTarget {
+                target: reference.clone(),
+                reason: reason.clone(),
+            },
+            format!(
+                "'{reference}' changed while set_pad_net ran: {reason}. Nothing was written; \
+                 read the board again and retry."
+            ),
+        )),
         copperpour_ipc::IpcPadNetOutcome::Uncertain { reason } => {
             Ok(ipc_uncertain_result(&format!(
-            "KiCad accepted the pad-net update for '{reference}' pad '{pad_number}', but {reason}"
-        )))
+                "The pad-net update for '{reference}' pad '{pad_number}' could not be \
+                 confirmed: {reason}"
+            )))
         }
     }
 }
@@ -269,5 +280,158 @@ mod tests {
         assert!(!result.is_error, "{:?}", result.content);
         assert!(format!("{:?}", result.content).contains("\\\"changed\\\":false"));
         assert_eq!(store.lock().unwrap().updates, 0);
+    }
+
+    async fn set_u4_pad_2(
+        board: &std::path::Path,
+        server: &crate::test_support::MockIpcServer,
+    ) -> CallToolResult {
+        handle_set_pad_net(
+            &json!({ "board": board.to_string_lossy(), "reference": "U4", "pad_number": "2", "net_name": "CH_GND" }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The footprint goes back whole, so the read-back must hold nothing but
+    /// the net change: KiCad moving another pad on the way is uncertain.
+    #[tokio::test]
+    async fn a_footprint_that_comes_back_changed_elsewhere_is_uncertain() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![footprint()],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec![],
+            store.clone(),
+            |item| {
+                let mut fp =
+                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+                for child in fp.definition.as_mut().unwrap().items.iter_mut() {
+                    if copperpour_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
+                        let mut pad =
+                            kiapi::board::types::Pad::decode(child.value.as_slice()).unwrap();
+                        if pad.number == "1" {
+                            pad.position = Some(copperpour_ipc::builders::vec2(5.0, 5.0));
+                            *child = pack_any(&pad, "kiapi.board.types.Pad");
+                        }
+                    }
+                }
+                *item = pack_any(&fp, "kiapi.board.types.FootprintInstance");
+            },
+            |_, _| None,
+        );
+        let result = set_u4_pad_2(&board, &server).await;
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("ipc_outcome_unknown"),
+            "{:?}",
+            result.content
+        );
+        assert!(format!("{:?}", result.content).contains("pad pad-1 position"));
+    }
+
+    /// The footprint gone between the read and the write: refused as stale,
+    /// with nothing sent.
+    #[tokio::test]
+    async fn a_footprint_gone_before_the_write_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![footprint()],
+            ..Default::default()
+        }));
+        let reads = Arc::new(Mutex::new(0));
+        let server = spawn_kicad_holding_items(&board, vec![], store.clone(), |_| {}, {
+            let reads = reads.clone();
+            move |command, _| {
+                if !command.type_url.ends_with("GetItems") {
+                    return None;
+                }
+                let mut reads = reads.lock().unwrap();
+                *reads += 1;
+                (*reads == 2).then(|| {
+                    pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items: vec![],
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    )
+                })
+            }
+        });
+        let result = set_u4_pad_2(&board, &server).await;
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("stale_target"),
+            "{:?}",
+            result.content
+        );
+        assert_eq!(store.lock().unwrap().updates, 0);
+    }
+
+    /// KiCad refusing the update, with the read-back unchanged, is a refusal
+    /// saying so, not an uncertain outcome.
+    #[tokio::test]
+    async fn an_update_kicad_refuses_is_reported_as_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![footprint()],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec![],
+            store.clone(),
+            |_| {},
+            |command, _| {
+                if !command.type_url.ends_with("UpdateItems") {
+                    return None;
+                }
+                let request =
+                    kiapi::common::commands::UpdateItems::decode(command.value.as_slice()).unwrap();
+                Some(pack_any(
+                    &kiapi::common::commands::UpdateItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        updated_items: request
+                            .items
+                            .iter()
+                            .map(|_| kiapi::common::commands::ItemUpdateResult {
+                                status: Some(kiapi::common::commands::ItemStatus {
+                                    code: kiapi::common::commands::ItemStatusCode::IscInvalidData
+                                        as i32,
+                                    error_message: "refused by the test double".into(),
+                                }),
+                                item: None,
+                            })
+                            .collect(),
+                    },
+                    "kiapi.common.commands.UpdateItemsResponse",
+                ))
+            },
+        );
+        let result = set_u4_pad_2(&board, &server).await;
+        assert!(result.is_error);
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("unchanged"), "{text}");
+        assert_ne!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("ipc_outcome_unknown"),
+            "{text}"
+        );
+        assert_eq!(
+            held_pad_nets(&store.lock().unwrap())[1],
+            ("2".to_string(), "".to_string())
+        );
     }
 }
