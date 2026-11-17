@@ -2217,6 +2217,72 @@ mod ipc_failure_dispatch_tests {
         assert_eq!(body["recovery"]["mutation_outcome"], "none", "{body}");
         assert_eq!(body["recovery"]["retry_safe"], false, "{body}");
     }
+
+    /// A KiCad refusing `GetOpenDocuments` with `AS_BUSY` is a rejected binding.
+    /// These tools reported it as `editor_unavailable` before recovery existed,
+    /// and #525 keeps existing kinds.
+    #[tokio::test]
+    async fn a_rejected_binding_keeps_editor_unavailable_and_gains_recovery() {
+        use copperpour_ipc::gen::kiapi;
+        let server = crate::test_support::MockIpcServer::spawn("busy-binding", |request| {
+            assert!(request.message.is_some(), "a command");
+            kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: kiapi::common::ApiStatusCode::AsBusy as i32,
+                    error_message: "the double is busy".to_string(),
+                }),
+                header: None,
+                message: None,
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: server.address().to_string(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+
+        for (tool, arguments) in [
+            ("list_footprint_fields", json!({"board": board})),
+            (
+                "set_placed_footprint_models",
+                json!({"board": board, "reference": "U1", "mode": "inspect"}),
+            ),
+        ] {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": tool, "arguments": arguments}
+                }))
+                .await
+                .expect("request returns a response");
+            let result = response.result.expect("JSON-RPC result");
+            assert_eq!(result["isError"], json!(true), "{tool}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            let body: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                body["error"]["kind"], "editor_unavailable",
+                "{tool}: {body}"
+            );
+            assert!(
+                body["error"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("the double is busy")),
+                "{tool}: {body}"
+            );
+            assert_eq!(body["recovery"]["cause"], "unknown", "{tool}: {body}");
+            assert_eq!(body["recovery"]["retry_safe"], false, "{tool}: {body}");
+        }
+    }
 }
 
 /// Turn a JSON Schema failure into Copperpour's stable structured argument shape.

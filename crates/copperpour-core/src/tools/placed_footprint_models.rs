@@ -143,6 +143,16 @@ async fn handle_set_placed_footprint_models(
         Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
             return Ok(ipc_target_error_result(&error))
         }
+        Err(
+            error @ (copperpour_ipc::IpcFailure::Rejected(_)
+            | copperpour_ipc::IpcFailure::Preflight(_)),
+        ) => {
+            let message =
+                format!("KiCad could not serve the requested live-board operation: {error}");
+            return Ok(crate::tools::editor_unavailable_with_recovery(
+                &error, message,
+            ));
+        }
         Err(error) => return Ok(crate::tools::ipc_failure_result(error)),
     };
 

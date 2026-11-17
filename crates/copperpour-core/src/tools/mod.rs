@@ -813,6 +813,23 @@ pub(crate) fn ipc_failure_result(failure: copperpour_ipc::IpcFailure) -> CallToo
     }
 }
 
+/// `editor_unavailable` with recovery, for a caller that reported every
+/// non-target failure under that kind before recovery guidance existed: #525
+/// keeps existing kinds.
+pub(crate) fn editor_unavailable_with_recovery(
+    failure: &copperpour_ipc::IpcFailure,
+    message: String,
+) -> CallToolResult {
+    CallToolResult::error_kind_with_recovery(
+        crate::mcp::error::ToolErrorKind::EditorUnavailable {
+            editor: "pcb".to_string(),
+            reason: failure.message().to_string(),
+        },
+        message,
+        ipc_recovery::for_ipc_failure(failure),
+    )
+}
+
 pub(crate) fn ipc_unserved_result(absence: BoardEditorAbsence, message: &str) -> CallToolResult {
     CallToolResult::error_kind_with_recovery(
         crate::mcp::error::ToolErrorKind::EditorUnavailable {

@@ -24,5 +24,16 @@ Each `recovery` object contains:
 - `troubleshooting_url`: link to the corresponding section in
   `docs/TROUBLESHOOTING.md`.
 
-Existing `error.kind`, `ipc_failure.kind`, `ipc_failure.message`, and
-`ipc_failure.note` fields remain unchanged.
+`ipc_failure.kind`, `ipc_failure.message` and `ipc_failure.note` are unchanged,
+and so is `error.kind`, with these exceptions:
+
+- `get_board_stackup`, `get_nets_list`, `set_placed_footprint_models` and the
+  live-board synchronization behind DRC and zone refill reported an IPC request with an
+  unknown outcome, or a dropped and restored batch, as `editor_unavailable`.
+  They now report `ipc_outcome_unknown` and `ipc_batch_recovered`, as every
+  other IPC caller does, because the board may have changed.
+- Tools that returned an IPC failure as plain text with no `error` object
+  (`set_footprint_field`, `set_pad_net`, `apply_copper`, `delete_trace`, the
+  `pcb_components` and `pcb_routing` IPC tools) now return a structured error:
+  `editor_unavailable` when KiCad or its board editor did not answer,
+  `handler_error` when KiCad refused the request.

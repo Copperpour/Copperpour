@@ -565,6 +565,18 @@ where
             Err(copperpour_ipc::IpcFailure::Uncertain(message)) => {
                 Err(ipc_uncertain_result(&message))
             }
+            Err(
+                failure @ (copperpour_ipc::IpcFailure::Rejected(_)
+                | copperpour_ipc::IpcFailure::Preflight(_)),
+            ) => {
+                let message = format!(
+                    "KiCad must be running with the requested board open: {}",
+                    failure.message()
+                );
+                Err(crate::tools::editor_unavailable_with_recovery(
+                    &failure, message,
+                ))
+            }
             Err(failure) => Err(crate::tools::ipc_failure_result(failure)),
         },
     )
