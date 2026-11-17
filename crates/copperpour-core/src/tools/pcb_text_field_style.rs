@@ -15,16 +15,28 @@
 //! the saved file, guarded against a concurrent save, and re-read to prove
 //! the result. Either way the response lists the old and new values of every
 //! field.
+//!
+//! The layer, visibility and mirror flag are set the way KiCad's Edit Text
+//! and Graphic Properties dialog sets them on a selection, in one undo step,
+//! on the live path only. The layer is named as on a front-side footprint;
+//! a footprint on the back gets the flipped layer, as KiCad's Flip moves a
+//! footprint's own texts, so one call puts every Reference on its own side's
+//! Fab layer.
 
-use super::{live_error_result, mm, positive_length_nm, MAX_TEXT_SIZE_MM};
+use super::{
+    live_error_result, mm, on_live_board, opt_bool, opt_string, positive_length_nm,
+    MAX_TEXT_SIZE_MM,
+};
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tools::pcb_board::{attempt_ipc_write_in, write_board_edits, BoardWrite};
 use crate::tools::{get_path, invalid_arg, ToolContext};
-use copperpour_ipc::client::{FootprintTargetError, TextTargetError};
+use copperpour_ipc::client::{FootprintTargetError, KiCadIpcClient, TextTargetError};
+use copperpour_ipc::gen::kiapi::common::types::DocumentSpecifier;
 use copperpour_ipc::{
     IpcFootprintField, IpcFootprintFieldBatchOutcome, IpcFootprintFieldSlot, IpcTextEdit,
 };
+use copperpour_sexp::layers::{flip_layer, CopperStack, FlipLayerError};
 use copperpour_sexp::parser::parse_sexp;
 use copperpour_sexp::writer::{find_direct_child_blocks, read_consistent, SexpEdit};
 use serde_json::{json, Value};
@@ -41,7 +53,10 @@ pub(super) fn input_schema() -> Value {
             "fields":     { "type": "array", "items": { "type": "string", "enum": ["reference", "value"] }, "minItems": 1, "default": ["reference"], "description": "Which fields of each footprint to restyle" },
             "size_x":     { "type": "number", "exclusiveMinimum": 0, "maximum": MAX_TEXT_SIZE_MM, "description": "Glyph width in mm" },
             "size_y":     { "type": "number", "exclusiveMinimum": 0, "maximum": MAX_TEXT_SIZE_MM, "description": "Glyph height in mm" },
-            "thickness":  { "type": "number", "exclusiveMinimum": 0, "description": "Stroke thickness in mm" }
+            "thickness":  { "type": "number", "exclusiveMinimum": 0, "description": "Stroke thickness in mm" },
+            "layer":      { "type": "string", "description": "Target layer as on a front-side footprint, e.g. 'F.Fab'. A footprint on the back gets the flipped layer ('B.Fab'), as KiCad's Flip moves a footprint's own texts. Live only" },
+            "visible":    { "type": "boolean", "description": "Show (true) or hide (false) the field. Live only" },
+            "mirror":     { "type": "string", "enum": ["keep", "auto"], "default": "keep", "description": "'auto' sets each field's mirrored flag from the side of the layer it ends on: true on a back layer (B.*), false on a front layer (F.*), unchanged on a layer with no side. Live only" }
         },
         "required": ["board"]
     })
@@ -57,6 +72,10 @@ struct Request {
     size_x_nm: Option<i64>,
     size_y_nm: Option<i64>,
     thickness_nm: Option<i64>,
+    /// As on a front-side footprint; see [`Request::back_edit`].
+    layer: Option<String>,
+    visible: Option<bool>,
+    mirror_to_match_layer: bool,
 }
 
 impl Request {
@@ -65,8 +84,30 @@ impl Request {
             size_x_nm: self.size_x_nm,
             size_y_nm: self.size_y_nm,
             stroke_width_nm: self.thickness_nm,
+            layer: self.layer.clone(),
+            visible: self.visible,
+            mirror_to_match_layer: self.mirror_to_match_layer,
             ..Default::default()
         }
+    }
+
+    /// Whether the request names a property only the live path sets.
+    fn live_only(&self) -> bool {
+        self.layer.is_some() || self.visible.is_some() || self.mirror_to_match_layer
+    }
+
+    /// The edit for footprints on the back of the board: [`Self::edit`] with
+    /// the layer flipped through `stack`, as KiCad's `FlipLayer` moves the
+    /// texts of a footprint that changes sides. `None` when no layer is
+    /// named, since every other property is the same on both sides.
+    fn back_edit(&self, stack: CopperStack) -> Result<Option<IpcTextEdit>, FlipLayerError> {
+        let Some(layer) = &self.layer else {
+            return Ok(None);
+        };
+        Ok(Some(IpcTextEdit {
+            layer: Some(flip_layer(layer, stack)?),
+            ..self.edit()
+        }))
     }
 }
 
@@ -128,11 +169,27 @@ fn parse_request(args: &Value) -> Result<Request, CallToolResult> {
         size_x_nm: positive_length_nm(args, "size_x", Some(MAX_TEXT_SIZE_MM))?,
         size_y_nm: positive_length_nm(args, "size_y", Some(MAX_TEXT_SIZE_MM))?,
         thickness_nm: positive_length_nm(args, "thickness", None)?,
+        layer: match opt_string(args, "layer")? {
+            None => None,
+            Some(layer) => {
+                if let Err(error) = copperpour_ipc::builders::try_layer_from_name(layer) {
+                    return Err(invalid_arg("layer", &format!("{error:#}")));
+                }
+                Some(layer.to_string())
+            }
+        },
+        visible: opt_bool(args, "visible")?,
+        mirror_to_match_layer: match opt_string(args, "mirror")? {
+            None | Some("keep") => false,
+            Some("auto") => true,
+            Some(_) => return Err(invalid_arg("mirror", "must be 'keep' or 'auto'")),
+        },
     };
     if request.edit().is_empty() {
         return Err(invalid_arg(
             "edit",
-            "name at least one property to change: size_x, size_y, thickness",
+            "name at least one property to change: size_x, size_y, thickness, layer, visible, \
+             mirror 'auto'",
         ));
     }
     Ok(request)
@@ -140,21 +197,28 @@ fn parse_request(args: &Value) -> Result<Request, CallToolResult> {
 
 // ─── Result ───────────────────────────────────────────────────────────────────
 
-/// The three values this tool sets, as one field holds them. `thickness_nm`
-/// is `None` only on the file path, for a font that stores no thickness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The values this tool sets, as one field holds them. `thickness_nm` is
+/// `None` only on the file path, for a font that stores no thickness, and
+/// `layer` only there for a field that names none.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Style {
     size_x_nm: i64,
     size_y_nm: i64,
     thickness_nm: Option<i64>,
+    layer: Option<String>,
+    visible: bool,
+    mirrored: bool,
 }
 
 impl Style {
-    fn json(self) -> Value {
+    fn json(&self) -> Value {
         json!({
             "size_x_mm": mm(self.size_x_nm),
             "size_y_mm": mm(self.size_y_nm),
             "thickness_mm": self.thickness_nm.map(mm),
+            "layer": self.layer,
+            "visible": self.visible,
+            "mirrored": self.mirrored,
         })
     }
 }
@@ -165,6 +229,9 @@ fn live_style(field: &IpcFootprintField) -> Value {
             size_x_nm: state.size_x_nm,
             size_y_nm: state.size_y_nm,
             thickness_nm: Some(state.stroke_width_nm),
+            layer: Some(state.layer.clone()),
+            visible: field.visible,
+            mirrored: state.mirrored,
         }
         .json(),
         None => Value::Null,
@@ -367,15 +434,42 @@ fn plan_property(
             )
         })?),
     };
+    // Read, never written here: a request that sets them takes the live path,
+    // so a field that names no layer is reported, not refused.
+    let layer = child(property, "property", "layer")
+        .and_then(|(start, end)| parse_sexp(&property[start..end]).ok())
+        .and_then(|node| {
+            node.get(1)
+                .and_then(|name| name.as_str())
+                .map(str::to_string)
+        });
+    // KiCad 10 writes a hidden field's `(hide yes)` right after its layer
+    // (`pcbnew/pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.cpp:2313-2314`) and a
+    // mirrored one's `mirror` in `(justify …)` (`common/eda_text.cpp:1079-1092`).
+    let hidden = child(property, "property", "hide")
+        .and_then(|(start, end)| parse_sexp(&property[start..end]).ok())
+        .is_some_and(|node| node.get(1).and_then(|flag| flag.as_str()) == Some("yes"));
+    let mirrored = child(effects, "effects", "justify")
+        .and_then(|(start, end)| parse_sexp(&effects[start..end]).ok())
+        .is_some_and(|node| {
+            node.children()
+                .unwrap_or_default()
+                .iter()
+                .any(|item| item.as_str() == Some("mirror"))
+        });
     let before = Style {
         size_x_nm,
         size_y_nm,
         thickness_nm,
+        layer,
+        visible: !hidden,
+        mirrored,
     };
     let after = Style {
         size_x_nm: request.size_x_nm.unwrap_or(size_x_nm),
         size_y_nm: request.size_y_nm.unwrap_or(size_y_nm),
         thickness_nm: request.thickness_nm.or(thickness_nm),
+        ..before.clone()
     };
     if before == after {
         return Ok((before, after, None));
@@ -616,7 +710,11 @@ fn edit_file(board: &Path, request: &Request) -> anyhow::Result<Result<Value, Ca
                         "",
                     )));
                 }
-                observed.fields.iter().map(|field| field.before).collect()
+                observed
+                    .fields
+                    .iter()
+                    .map(|field| field.before.clone())
+                    .collect()
             }
             Err(error) => {
                 return Ok(Err(uncertain(
@@ -629,7 +727,7 @@ fn edit_file(board: &Path, request: &Request) -> anyhow::Result<Result<Value, Ca
     } else {
         plan.fields
             .iter()
-            .map(|field| field.before)
+            .map(|field| field.before.clone())
             .collect::<Vec<_>>()
     };
 
@@ -651,6 +749,47 @@ fn edit_file(board: &Path, request: &Request) -> anyhow::Result<Result<Value, Ca
 
 // ─── Handler ──────────────────────────────────────────────────────────────────
 
+/// The live edit. A named layer is flipped for back-side footprints through
+/// the board's own copper stack, which KiCad reports beside its layers.
+fn edit_live(
+    client: &KiCadIpcClient,
+    document: DocumentSpecifier,
+    request: &Request,
+) -> anyhow::Result<IpcFootprintFieldBatchOutcome> {
+    let back_edit = match &request.layer {
+        None => None,
+        Some(_) => {
+            let copper = client
+                .get_enabled_layers_in(document.clone())?
+                .copper_layer_count;
+            request.back_edit(CopperStack::new(copper)?)?
+        }
+    };
+    client.edit_footprint_fields_in(
+        document,
+        request.references.as_deref(),
+        &request.slots,
+        &request.edit(),
+        back_edit.as_ref(),
+    )
+}
+
+/// A live refusal: a layer with no place on a back-side footprint of this
+/// board is the caller's argument, everything else maps as the other text
+/// tools map it.
+fn live_refusal(error: anyhow::Error) -> CallToolResult {
+    match error.downcast_ref::<FlipLayerError>() {
+        Some(flip) => invalid_arg(
+            "layer",
+            &format!(
+                "has no flipped counterpart for a footprint on the back of this board: {flip}. \
+                 Nothing was changed."
+            ),
+        ),
+        None => live_error_result(error, OPERATION),
+    }
+}
+
 pub(super) async fn handle_set_footprint_field_style(
     args: &Value,
     ctx: &ToolContext,
@@ -662,6 +801,22 @@ pub(super) async fn handle_set_footprint_field_style(
     };
 
     let live = request.clone();
+    if request.live_only() {
+        // The layer, visibility and mirror flag have no file path: with no
+        // live KiCad holding the board this refuses, as edit_footprint_field
+        // does.
+        return Ok(
+            match on_live_board(ctx, &board, move |client, document| {
+                edit_live(client, document, &live)
+            })
+            .await?
+            {
+                Ok(Ok(outcome)) => live_result(outcome, &board),
+                Ok(Err(error)) => live_refusal(error),
+                Err(result) => result,
+            },
+        );
+    }
     let fallback_reason = match attempt_ipc_write_in(
         ctx,
         &board,
@@ -669,19 +824,12 @@ pub(super) async fn handle_set_footprint_field_style(
         // The outcome travels inside `Ok` so a typed refusal (an unknown
         // reference, a missing field) reaches the caller as itself; the
         // transport classifier would keep only its message.
-        move |client, document| {
-            Ok(client.edit_footprint_fields_in(
-                document,
-                live.references.as_deref(),
-                &live.slots,
-                &live.edit(),
-            ))
-        },
+        move |client, document| Ok(edit_live(client, document, &live)),
     )
     .await?
     {
         BoardWrite::Ipc(Ok(outcome)) => return Ok(live_result(outcome, &board)),
-        BoardWrite::Ipc(Err(error)) => return Ok(live_error_result(error, OPERATION)),
+        BoardWrite::Ipc(Err(error)) => return Ok(live_refusal(error)),
         BoardWrite::Refused(result) => return Ok(result),
         BoardWrite::File(reason) => reason,
     };

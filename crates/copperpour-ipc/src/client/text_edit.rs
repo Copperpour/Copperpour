@@ -913,6 +913,11 @@ impl KiCadIpcClient {
     /// whole-board run a footprint without such a field is reported in
     /// `skipped` instead, so one odd footprint does not block the rest.
     ///
+    /// `back_edit`, when given, replaces `edit` for every footprint on the
+    /// back of the board (`B.Cu`); the caller uses it for a layer named as on
+    /// a front-side footprint, flipped as KiCad's Flip moves a footprint's own
+    /// texts.
+    ///
     /// Each footprint is sent back whole, as [`Self::edit_footprint_field_in`]
     /// sends it, and only footprints the edit really changes are sent.
     /// Success requires a fresh read in which every one of them holds the
@@ -924,8 +929,13 @@ impl KiCadIpcClient {
         references: Option<&[String]>,
         slots: &[IpcFootprintFieldSlot],
         edit: &IpcTextEdit,
+        back_edit: Option<&IpcTextEdit>,
     ) -> Result<IpcFootprintFieldBatchOutcome> {
         anyhow::ensure!(!edit.is_empty(), "the edit names no property to change");
+        anyhow::ensure!(
+            back_edit.is_none_or(|back| !back.is_empty()),
+            "the back-side edit names no property to change"
+        );
         anyhow::ensure!(!slots.is_empty(), "the edit names no field to change");
         let placed = self.placed_footprints_in(document.clone())?;
         let targets: Vec<&board::FootprintInstance> = match references {
@@ -968,6 +978,10 @@ impl KiCadIpcClient {
         for footprint in targets {
             let reference = footprint_reference(footprint);
             let kiid = footprint_kiid(footprint);
+            let edit = match back_edit {
+                Some(back) if footprint.layer == board::BoardLayer::BlBCu as i32 => back,
+                _ => edit,
+            };
             let mut edited = footprint.clone();
             let mut edited_slots = Vec::new();
             for &slot in slots {
