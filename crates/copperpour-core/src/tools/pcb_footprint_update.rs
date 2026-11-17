@@ -1541,6 +1541,96 @@ fn validate_pad(pad: &copperpour_sexp::SexpNode) -> Result<()> {
     Ok(())
 }
 
+/// A library footprint read for `update_pcb_from_schematic` to replace a
+/// placed footprint with, as KiCad's Update PCB does when the schematic names
+/// another footprint. It is read with the refresh's lossless checks, so a
+/// footprint the refresh would refuse is refused for a replacement too.
+#[derive(Debug, Clone)]
+pub(crate) struct ReplacementFootprint(LibraryFootprint);
+
+impl ReplacementFootprint {
+    pub(crate) fn parse(library_id: &str, source: &str) -> Result<Self> {
+        parse_library_footprint(library_id, source).map(Self)
+    }
+
+    /// The pad numbers the footprint has.
+    pub(crate) fn pad_numbers(&self) -> BTreeSet<String> {
+        self.0.pads.iter().map(|pad| pad.number.clone()).collect()
+    }
+
+    /// What the footprint has that KiCad's API carries only from 10.0.7, as
+    /// the refresh refuses it on an older KiCad.
+    pub(crate) fn needs_kicad_10_0_7(&self) -> Option<&'static str> {
+        self.0.needs_kicad_10_0_7()
+    }
+}
+
+/// `current` rebuilt from another library footprint, as KiCad's Update PCB
+/// replaces a footprint (`PCB_EDIT_FRAME::ExchangeFootprint` with its
+/// defaults): it keeps its KIID, position, rotation, side, lock, symbol link,
+/// DNP, and each pad's net and schematic pin by pad number; everything else
+/// comes from the new footprint. That includes the Reference and Value text
+/// positions and styles, the attributes and the 3D models, and the custom
+/// properties: the old ones go, whether the old library or the board gave
+/// them, and the caller sets the symbol's fields again, as Update PCB does.
+/// The text of Reference and Value is kept; the caller sets it from the
+/// schematic.
+///
+/// The caller has checked that no pad carrying a net disappears; this
+/// refuses such a replacement as the refresh does.
+pub(crate) fn replace_footprint(
+    current: &kiapi::board::types::FootprintInstance,
+    library: &ReplacementFootprint,
+    copper_layers: u32,
+    net_codes: &BTreeMap<String, i32>,
+) -> Result<kiapi::board::types::FootprintInstance> {
+    let library = &library.0;
+    let (library_nickname, entry_name) = library
+        .library_id
+        .split_once(':')
+        .context("footprint identifier must use Library:Footprint syntax")?;
+    let stack = CopperStack::new(copper_layers)?;
+    // The refresh insists on the same library id; a replacement is exactly
+    // the case where it differs, so the placed footprint is relabelled first,
+    // and its custom properties dropped so only the new footprint's remain.
+    let mut relabelled = current.clone();
+    let definition = relabelled
+        .definition
+        .as_mut()
+        .context("board footprint has no embedded definition")?;
+    definition.id = Some(kiapi::common::types::LibraryIdentifier {
+        library_nickname: library_nickname.to_string(),
+        entry_name: entry_name.to_string(),
+    });
+    definition
+        .items
+        .retain(|item| !item.type_url.ends_with("kiapi.board.types.Field"));
+    // The library reader reads Reference and Value from the `(property …)`
+    // form KiCad 8 and later write. A footprint in the older `fp_text
+    // reference` / `fp_text value` form has neither, and the placed text then
+    // keeps its position and style, as a refresh without a reset keeps it.
+    // Update PCB resets everything else (`board_netlist_updater.cpp`
+    // `replaceFootprint`): the field text and the fabrication attributes come
+    // from the new footprint, DNP and "not in schematic" kept as always.
+    let reference_and_value = library.reference_field.is_some() && library.value_field.is_some();
+    let resets = Resets {
+        sizes_and_styles: reference_and_value,
+        positions: reference_and_value,
+        content: true,
+        fabrication_attributes: true,
+    };
+    let prepared = build_updated_instance(
+        &relabelled,
+        library,
+        stack,
+        net_codes,
+        &BTreeSet::new(),
+        resets,
+    )?;
+    kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice())
+        .context("typed footprint builder returned an invalid item")
+}
+
 fn build_updated_instance(
     current: &kiapi::board::types::FootprintInstance,
     library: &LibraryFootprint,
