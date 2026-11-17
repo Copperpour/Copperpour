@@ -3133,30 +3133,28 @@ async fn handle_add_mounting_hole(
     let reference_ipc = spec.reference.clone();
     let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board_path, "mounting hole", move |c| {
-        c.place_footprint(
-            &requested_board,
-            &lib_id_ipc,
-            &reference_ipc,
-            &prepared_ipc.value,
-            &prepared_ipc.pads,
-            &prepared_ipc.graphics,
-            &prepared_ipc.fields,
-            x,
-            y,
-            0.0,
-            "F.Cu",
-        )
+        let (carry_10_0_7, kicad_before_10_0_7) = prepared_ipc.resolve_kicad_10_0_7(c)?;
+        let item = prepared_ipc.ipc_item(&lib_id_ipc, &reference_ipc, x, y, carry_10_0_7)?;
+        let fp = c.place_footprint_item(&requested_board, &reference_ipc, item)?;
+        Ok((fp, kicad_before_10_0_7))
     })
     .await?;
 
     match attempt {
-        BoardWrite::Ipc(fp) => Ok(CallToolResult::json(&json!({
-            "reference": fp.reference, "x": fp.position.x, "y": fp.position.y,
-            "drill_diameter": spec.drill_diameter_mm, "footprint": fp.footprint,
-            "geometry": geometry,
-            "geometry_note": geometry_note,
-            "source": "ipc"
-        }))),
+        BoardWrite::Ipc((fp, kicad_before_10_0_7)) => {
+            let mut response = json!({
+                "reference": fp.reference, "x": fp.position.x, "y": fp.position.y,
+                "drill_diameter": spec.drill_diameter_mm, "footprint": fp.footprint,
+                "geometry": geometry,
+                "geometry_note": geometry_note,
+                "source": "ipc"
+            });
+            let not_carried = prepared.not_carried(kicad_before_10_0_7.as_ref());
+            if !not_carried.is_empty() {
+                response["not_carried"] = json!(not_carried);
+            }
+            Ok(CallToolResult::json(&response))
+        }
         BoardWrite::Refused(err) => Ok(err),
         BoardWrite::File(reason) => {
             // No live KiCad now, and this board was not observed live during
@@ -7378,5 +7376,89 @@ mod board_revision_tests {
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_conflict("add_board_text", &text["error"], &board);
         assert_eq!(std::fs::read_to_string(&board).unwrap(), newer());
+    }
+
+    /// Sibling route (#318): `add_mounting_hole` with a resolved library
+    /// footprint carries its pad `zone_settings` (`ZcsFull` on
+    /// `MountingHole_2.2mm_M2_DIN965_Pad`).
+    #[tokio::test]
+    async fn add_mounting_hole_carries_library_pad_zone_settings() {
+        use board_mock::{spawn_kicad_holding_items, ItemStore};
+        use copperpour_ipc::builders::any_is;
+        use copperpour_ipc::gen::kiapi::board::types::{
+            FootprintInstance, Pad, ZoneConnectionStyle,
+        };
+        use prost::Message;
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let pretty = dir.path().join("MountingHole.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::fs::write(
+            pretty.join("MountingHole_2.2mm_M2.kicad_mod"),
+            include_str!("../../tests/fixtures/issue_300_mountinghole_m2_pad_kicad10.kicad_mod"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fp-lib-table"),
+            "(fp_lib_table\n  (version 7)\n  (lib (name \"MountingHole\")(type \"KiCad\")(uri \"${KIPRJMOD}/MountingHole.pretty\")(options \"\")(descr \"\")))\n",
+        )
+        .unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb (version 20241229) (generator \"pcbnew\"))\n",
+        )
+        .unwrap();
+
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let server = spawn_kicad_holding_items(&board, vec![], store.clone(), |_| {}, |_, _| None);
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            ipc_address: server.address().to_string(),
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_mounting_hole",
+                    "arguments": {
+                        "board": board.display().to_string(),
+                        "x": 10.0,
+                        "y": 10.0,
+                        "drill_diameter": 2.2,
+                        "reference": "H1"
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        let result = response.result.unwrap();
+        assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+
+        let fp =
+            FootprintInstance::decode(store.lock().unwrap().items[0].value.as_slice()).unwrap();
+        let pads: Vec<Pad> = fp
+            .definition
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| any_is(item, "kiapi.board.types.Pad"))
+            .map(|item| Pad::decode(item.value.as_slice()).unwrap())
+            .collect();
+        assert_eq!(pads.len(), 1);
+        assert_eq!(
+            pads[0]
+                .pad_stack
+                .as_ref()
+                .and_then(|s| s.zone_settings.as_ref())
+                .map(|z| z.zone_connection),
+            Some(ZoneConnectionStyle::ZcsFull as i32)
+        );
     }
 }
