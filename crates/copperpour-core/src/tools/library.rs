@@ -5391,7 +5391,10 @@ async fn handle_get_footprint_info(
                     format!("Argument '{field}' is invalid: {reason}"),
                 ));
             }
-            Err(super::footprint_graphics::FootprintGraphicsError::Conflict(reason)) => {
+            Err(super::footprint_graphics::FootprintGraphicsError::Conflict(reason))
+            | Err(super::footprint_graphics::FootprintGraphicsError::StaleTarget {
+                reason, ..
+            }) => {
                 return Ok(CallToolResult::error(reason));
             }
         };

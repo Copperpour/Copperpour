@@ -141,10 +141,11 @@ pub(super) fn graphics_schema_with_fill(fill_values: &[&str]) -> serde_json::Val
 pub(super) fn tool() -> ToolDef {
     tool!(
         "set_footprint_graphics",
-        "Atomically append, replace, or delete graphical primitives on one layer of an existing \
-         .kicad_mod footprint. Each item's type is line, arc, rect, circle or poly; rect, circle \
-         and poly also require fill (none or solid). Replacement and deletion refuse graphics \
-         referenced by a group.",
+        "Atomically append, replace, or delete graphical primitives in an existing \
+         .kicad_mod footprint, selected by layer or by a single graphic's item_id (from \
+         get_footprint_info; replace and delete only). Each item's type is line, arc, rect, \
+         circle or poly; rect, circle and poly also require fill (none or solid). Replacement \
+         and deletion refuse graphics referenced by a group.",
         json!({
             "type": "object",
             "properties": {
@@ -158,9 +159,17 @@ pub(super) fn tool() -> ToolDef {
                         "layer": {
                             "type": "string",
                             "description": "Canonical KiCad layer name, such as B.CrtYd"
+                        },
+                        "item_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "UUID (or legacy tstamp) of a single graphic from get_footprint_info; valid with replace and delete"
                         }
                     },
-                    "required": ["layer"],
+                    "oneOf": [
+                        { "required": ["layer"] },
+                        { "required": ["item_id"] }
+                    ],
                     "additionalProperties": false
                 },
                 "mode": {
@@ -174,6 +183,51 @@ pub(super) fn tool() -> ToolDef {
         }),
         |args, ctx| async move { handle_set_footprint_graphics(args, ctx).await }
     )
+}
+
+fn parse_selector(args: &serde_json::Value) -> Result<GraphicsSelector<'_>, CallToolResult> {
+    let Some(obj) = args.get("selector").and_then(serde_json::Value::as_object) else {
+        return Err(invalid_result("selector", "missing or not an object"));
+    };
+    if let Some(unknown) = obj
+        .keys()
+        .find(|key| !matches!(key.as_str(), "layer" | "item_id"))
+    {
+        return Err(invalid_result(
+            &format!("selector.{unknown}"),
+            "unknown selector key",
+        ));
+    }
+    let has_layer = obj.contains_key("layer");
+    let has_item_id = obj.contains_key("item_id");
+    match (has_layer, has_item_id) {
+        (true, true) => Err(invalid_result(
+            "selector",
+            "specify either 'layer' or 'item_id', not both",
+        )),
+        (false, false) => Err(invalid_result(
+            "selector",
+            "must specify either 'layer' or 'item_id'",
+        )),
+        (true, false) => {
+            let Some(layer) = obj["layer"].as_str() else {
+                return Err(invalid_result("selector.layer", "missing or not a string"));
+            };
+            Ok(GraphicsSelector::Layer(layer))
+        }
+        (false, true) => {
+            let Some(item_id) = obj["item_id"].as_str() else {
+                return Err(invalid_result(
+                    "selector.item_id",
+                    "missing or not a string",
+                ));
+            };
+            if item_id.trim().is_empty() {
+                return Err(invalid_result("selector.item_id", "must not be empty"));
+            }
+            Ok(GraphicsSelector::ItemId(item_id))
+        }
+    }
 }
 
 pub(crate) async fn handle_set_footprint_graphics(
@@ -203,13 +257,20 @@ pub(crate) async fn handle_set_footprint_graphics(
         return Ok(invalid_result("footprint_path", "must name a regular file"));
     }
 
-    let Some(layer) = args["selector"]["layer"].as_str() else {
-        return Ok(invalid_result("selector.layer", "missing or not a string"));
+    let selector = match parse_selector(args) {
+        Ok(selector) => selector,
+        Err(result) => return Ok(result),
     };
     let mode: GraphicsMode = match serde_json::from_value(args["mode"].clone()) {
         Ok(mode) => mode,
         Err(error) => return Ok(invalid_result("mode", error.to_string())),
     };
+    if matches!(selector, GraphicsSelector::ItemId(_)) && matches!(mode, GraphicsMode::Append) {
+        return Ok(invalid_result(
+            "mode",
+            "append is not supported with selector.item_id; use replace or delete",
+        ));
+    }
     let graphics = if matches!(mode, GraphicsMode::Delete) {
         match args.get("graphics") {
             Some(value) if value.as_array().is_some_and(Vec::is_empty) => Vec::new(),
@@ -252,13 +313,22 @@ pub(crate) async fn handle_set_footprint_graphics(
         }
         Err(error) => return Err(error.into()),
     };
-    let prepared = match prepare_mutation(&source, layer, mode, &graphics) {
+    let prepared = match prepare_mutation(&source, selector, mode, &graphics) {
         Ok(prepared) => prepared,
         Err(FootprintGraphicsError::InvalidArgument { field, reason }) => {
             return Ok(invalid_result(&field, reason));
         }
         Err(FootprintGraphicsError::Conflict(reason)) => {
             return Ok(conflict_result(&path, reason));
+        }
+        Err(FootprintGraphicsError::StaleTarget { target, reason }) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::StaleTarget {
+                    target,
+                    reason: reason.clone(),
+                },
+                reason,
+            ));
         }
     };
     if let Err(error) = persist_replacement(&path, &source, &prepared.replacement) {
@@ -271,14 +341,18 @@ pub(crate) async fn handle_set_footprint_graphics(
         };
     }
 
-    Ok(CallToolResult::json(&json!({
+    let mut response = json!({
         "success": true,
         "footprint_path": path.display().to_string(),
-        "layer": layer,
+        "layer": prepared.layer,
         "mode": args["mode"],
         "matched_count": prepared.matched_count,
         "added_count": prepared.added_count
-    })))
+    });
+    if let GraphicsSelector::ItemId(item_id) = selector {
+        response["item_id"] = json!(item_id);
+    }
+    Ok(CallToolResult::json(&response))
 }
 
 fn invalid_result(field: &str, reason: impl Into<String>) -> CallToolResult {
@@ -360,6 +434,15 @@ fn parse_fill(node: &copperpour_sexp::SexpNode) -> Result<Fill, FootprintGraphic
     }
 }
 
+fn extract_id_tag(node: &copperpour_sexp::SexpNode) -> Option<IdTag> {
+    if let Some(uuid) = node.find_str("uuid") {
+        Some(IdTag::Uuid(uuid.to_string()))
+    } else {
+        node.find_str("tstamp")
+            .map(|tstamp| IdTag::Tstamp(tstamp.to_string()))
+    }
+}
+
 fn graphic_info_base(
     graphic_type: &str,
     node: &copperpour_sexp::SexpNode,
@@ -368,10 +451,7 @@ fn graphic_info_base(
         .find_str("layer")
         .ok_or_else(|| invalid("footprint_path", "graphic layer is missing"))?
         .to_string();
-    let item_id = node
-        .find_str("uuid")
-        .or_else(|| node.find_str("tstamp"))
-        .map(str::to_string);
+    let item_id = extract_id_tag(node).map(|tag| tag.value().to_string());
     Ok(FootprintGraphicInfo {
         graphic_type: graphic_type.to_string(),
         layer,
@@ -543,6 +623,33 @@ enum FootprintGraphic {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphicsSelector<'a> {
+    Layer(&'a str),
+    ItemId(&'a str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdTag {
+    Uuid(String),
+    Tstamp(String),
+}
+
+impl IdTag {
+    fn value(&self) -> &str {
+        match self {
+            Self::Uuid(id) | Self::Tstamp(id) => id,
+        }
+    }
+
+    fn as_clause(&self) -> String {
+        match self {
+            Self::Uuid(id) => format!(r#"(uuid "{id}")"#),
+            Self::Tstamp(id) => format!("(tstamp {id})"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum GraphicsMode {
@@ -557,11 +664,14 @@ pub(super) enum FootprintGraphicsError {
     InvalidArgument { field: String, reason: String },
     #[error("{0}")]
     Conflict(String),
+    #[error("{reason}")]
+    StaleTarget { target: String, reason: String },
 }
 
 #[derive(Debug)]
 struct PreparedMutation {
     replacement: String,
+    layer: String,
     matched_count: usize,
     added_count: usize,
 }
@@ -729,8 +839,19 @@ fn stroke_clause(width_mm: f64) -> String {
     format!("(stroke (width {}) (type solid))", fmt_f64(width_mm))
 }
 
-fn serialize_graphics(layer: &str, graphics: &[FootprintGraphic], indent: &str) -> String {
+fn serialize_graphics(
+    layer: &str,
+    graphics: &[FootprintGraphic],
+    indent: &str,
+    preserved_id: Option<&IdTag>,
+) -> String {
     let mut output = String::new();
+    // Preserve the original item's uuid/tstamp only on a 1-for-1 replacement;
+    // assigning the same ID to multiple primitives would create duplicate UUIDs.
+    let id_suffix = match (preserved_id, graphics.len()) {
+        (Some(id), 1) => format!(" {}", id.as_clause()),
+        _ => String::new(),
+    };
     for graphic in graphics {
         output.push('\n');
         output.push_str(indent);
@@ -740,11 +861,10 @@ fn serialize_graphics(layer: &str, graphics: &[FootprintGraphic], indent: &str) 
                 end,
                 stroke_width_mm,
             } => output.push_str(&format!(
-                "(fp_line {} {} {} (layer \"{}\"))",
+                "(fp_line {} {} {} (layer \"{layer}\"){id_suffix})",
                 point_clause("start", *start),
                 point_clause("end", *end),
                 stroke_clause(*stroke_width_mm),
-                layer
             )),
             FootprintGraphic::Arc {
                 start,
@@ -752,12 +872,11 @@ fn serialize_graphics(layer: &str, graphics: &[FootprintGraphic], indent: &str) 
                 end,
                 stroke_width_mm,
             } => output.push_str(&format!(
-                "(fp_arc {} {} {} {} (layer \"{}\"))",
+                "(fp_arc {} {} {} {} (layer \"{layer}\"){id_suffix})",
                 point_clause("start", *start),
                 point_clause("mid", *mid),
                 point_clause("end", *end),
                 stroke_clause(*stroke_width_mm),
-                layer
             )),
             FootprintGraphic::Rect {
                 start,
@@ -765,12 +884,11 @@ fn serialize_graphics(layer: &str, graphics: &[FootprintGraphic], indent: &str) 
                 stroke_width_mm,
                 fill,
             } => output.push_str(&format!(
-                "(fp_rect {} {} {} (fill {}) (layer \"{}\"))",
+                "(fp_rect {} {} {} (fill {}) (layer \"{layer}\"){id_suffix})",
                 point_clause("start", *start),
                 point_clause("end", *end),
                 stroke_clause(*stroke_width_mm),
                 fill.as_kicad(),
-                layer
             )),
             FootprintGraphic::Circle {
                 center,
@@ -783,12 +901,11 @@ fn serialize_graphics(layer: &str, graphics: &[FootprintGraphic], indent: &str) 
                     y: center.y,
                 };
                 output.push_str(&format!(
-                    "(fp_circle {} {} {} (fill {}) (layer \"{}\"))",
+                    "(fp_circle {} {} {} (fill {}) (layer \"{layer}\"){id_suffix})",
                     point_clause("center", *center),
                     point_clause("end", end),
                     stroke_clause(*stroke_width_mm),
                     fill.as_kicad(),
-                    layer
                 ));
             }
             FootprintGraphic::Poly {
@@ -802,10 +919,9 @@ fn serialize_graphics(layer: &str, graphics: &[FootprintGraphic], indent: &str) 
                     .collect::<Vec<_>>()
                     .join(" ");
                 output.push_str(&format!(
-                    "(fp_poly (pts {points}) {} (fill {}) (layer \"{}\"))",
+                    "(fp_poly (pts {points}) {} (fill {}) (layer \"{layer}\"){id_suffix})",
                     stroke_clause(*stroke_width_mm),
                     fill.as_kicad(),
-                    layer
                 ));
             }
         }
@@ -841,14 +957,27 @@ fn child_indent(source: &str, start: usize) -> String {
     }
 }
 
+struct SelectedGraphic {
+    range: (usize, usize),
+    id_tag: Option<IdTag>,
+    layer: String,
+}
+
 fn prepare_mutation(
     source: &str,
-    layer: &str,
+    selector: GraphicsSelector<'_>,
     mode: GraphicsMode,
     graphics: &[FootprintGraphic],
 ) -> Result<PreparedMutation, FootprintGraphicsError> {
-    if !copperpour_sexp::layers::is_canonical_name(layer) {
-        return Err(invalid("selector.layer", "not a canonical KiCad layer"));
+    match selector {
+        GraphicsSelector::Layer(layer) => {
+            if !copperpour_sexp::layers::is_canonical_name(layer) {
+                return Err(invalid("selector.layer", "not a canonical KiCad layer"));
+            }
+        }
+        // handle_set_footprint_graphics refuses an empty item_id and append
+        // with item_id before the file is read.
+        GraphicsSelector::ItemId(_) => {}
     }
     let tree = copperpour_sexp::parse_sexp(source)
         .map_err(|error| invalid("footprint_path", format!("invalid S-expression: {error}")))?;
@@ -889,21 +1018,49 @@ fn prepare_mutation(
                 );
             }
         }
-        if is_supported_graphic(tag) && node.find_str("layer") == Some(layer) {
+        if !is_supported_graphic(tag) {
+            continue;
+        }
+        let id_tag = extract_id_tag(&node);
+        let matches = match selector {
+            GraphicsSelector::Layer(layer) => node.find_str("layer") == Some(layer),
+            GraphicsSelector::ItemId(target_id) => {
+                id_tag.as_ref().is_some_and(|id| id.value() == target_id)
+            }
+        };
+        if matches {
             let range = find_block_with_leading_whitespace(source, start)
                 .ok_or_else(|| invalid("footprint_path", "contains an unbalanced graphic"))?;
-            let item_id = node
-                .find_str("uuid")
-                .or_else(|| node.find_str("tstamp"))
-                .map(str::to_string);
-            selected.push((range, item_id));
+            let item_layer = node
+                .find_str("layer")
+                .ok_or_else(|| invalid("footprint_path", "graphic layer is missing"))?
+                .to_string();
+            selected.push(SelectedGraphic {
+                range,
+                id_tag,
+                layer: item_layer,
+            });
+        }
+    }
+
+    if let GraphicsSelector::ItemId(target_id) = selector {
+        if selected.is_empty() {
+            return Err(FootprintGraphicsError::StaleTarget {
+                target: target_id.to_string(),
+                reason: format!("no supported graphic with item_id '{target_id}' in footprint"),
+            });
+        }
+        if selected.len() > 1 {
+            return Err(FootprintGraphicsError::Conflict(format!(
+                "multiple graphics match item_id '{target_id}'"
+            )));
         }
     }
 
     if !matches!(mode, GraphicsMode::Append) {
         if let Some(item_id) = selected
             .iter()
-            .filter_map(|(_, item_id)| item_id.as_deref())
+            .filter_map(|item| item.id_tag.as_ref().map(IdTag::value))
             .find(|item_id| group_members.iter().any(|member| member == item_id))
         {
             return Err(FootprintGraphicsError::Conflict(format!(
@@ -912,12 +1069,21 @@ fn prepare_mutation(
         }
     }
 
+    let effective_layer = match selector {
+        GraphicsSelector::Layer(layer) => layer.to_string(),
+        GraphicsSelector::ItemId(_) => selected[0].layer.clone(),
+    };
+    let preserved_id = match (selector, selected.as_slice(), graphics.len()) {
+        (GraphicsSelector::ItemId(_), [item], 1) => item.id_tag.as_ref(),
+        _ => None,
+    };
+
     let indent = selected
         .first()
-        .map(|(range, _)| {
-            let block_start = find_balanced_block(source, range.0)
+        .map(|item| {
+            let block_start = find_balanced_block(source, item.range.0)
                 .map(|range| range.0)
-                .unwrap_or(range.0);
+                .unwrap_or(item.range.0);
             child_indent(source, block_start)
         })
         .or_else(|| {
@@ -929,7 +1095,7 @@ fn prepare_mutation(
             })
         })
         .unwrap_or_else(|| "  ".to_string());
-    let serialized = serialize_graphics(layer, graphics, &indent);
+    let serialized = serialize_graphics(&effective_layer, graphics, &indent, preserved_id);
     let matched_count = selected.len();
     let added_count = if matches!(mode, GraphicsMode::Delete) {
         0
@@ -941,11 +1107,10 @@ fn prepare_mutation(
     match mode {
         GraphicsMode::Replace => {
             if let Some((first, rest)) = selected.split_first() {
-                let (first_range, _) = first;
-                edits.push(SexpEdit::replace(first_range.0, first_range.1, serialized));
+                edits.push(SexpEdit::replace(first.range.0, first.range.1, serialized));
                 edits.extend(
                     rest.iter()
-                        .map(|(range, _)| SexpEdit::delete(range.0, range.1)),
+                        .map(|item| SexpEdit::delete(item.range.0, item.range.1)),
                 );
             } else if !serialized.is_empty() {
                 let root_end = find_balanced_block(source, 0)
@@ -964,7 +1129,7 @@ fn prepare_mutation(
                     .ok_or_else(|| invalid("footprint_path", "unbalanced footprint root"))?;
                 let offset = selected
                     .last()
-                    .map(|(range, _)| range.1)
+                    .map(|item| item.range.1)
                     .or(insertion_anchor)
                     .unwrap_or(root_end);
                 edits.push(SexpEdit::insert(offset, serialized));
@@ -974,7 +1139,7 @@ fn prepare_mutation(
             edits.extend(
                 selected
                     .iter()
-                    .map(|(range, _)| SexpEdit::delete(range.0, range.1)),
+                    .map(|item| SexpEdit::delete(item.range.0, item.range.1)),
             );
         }
     }
@@ -990,6 +1155,7 @@ fn prepare_mutation(
 
     Ok(PreparedMutation {
         replacement,
+        layer: effective_layer,
         matched_count,
         added_count,
     })
@@ -1094,7 +1260,7 @@ mod tests {
         ]))
         .expect("valid graphics");
 
-        let output = serialize_graphics("B.CrtYd", &graphics, "  ");
+        let output = serialize_graphics("B.CrtYd", &graphics, "  ", None);
 
         for tag in ["fp_line", "fp_arc", "fp_rect", "fp_circle", "fp_poly"] {
             assert!(
@@ -1214,7 +1380,7 @@ mod tests {
         }]))
         .unwrap();
 
-        let output = serialize_graphics("B.CrtYd", &graphics, "  ");
+        let output = serialize_graphics("B.CrtYd", &graphics, "  ", None);
         assert_eq!(output.matches("(xy 0 0)").count(), 1, "{output}");
     }
 
@@ -1232,8 +1398,13 @@ mod tests {
         }]))
         .unwrap();
 
-        let prepared =
-            prepare_mutation(OLD_FOOTPRINT, "B.CrtYd", GraphicsMode::Replace, &graphics).unwrap();
+        let prepared = prepare_mutation(
+            OLD_FOOTPRINT,
+            GraphicsSelector::Layer("B.CrtYd"),
+            GraphicsMode::Replace,
+            &graphics,
+        )
+        .unwrap();
 
         assert_eq!(prepared.matched_count, 2);
         assert_eq!(prepared.added_count, 1);
@@ -1294,8 +1465,13 @@ mod tests {
         ]))
         .unwrap();
 
-        let prepared =
-            prepare_mutation(OLD_FOOTPRINT, "B.CrtYd", GraphicsMode::Append, &graphics).unwrap();
+        let prepared = prepare_mutation(
+            OLD_FOOTPRINT,
+            GraphicsSelector::Layer("B.CrtYd"),
+            GraphicsMode::Append,
+            &graphics,
+        )
+        .unwrap();
 
         assert_eq!(prepared.matched_count, 2);
         assert_eq!(prepared.added_count, 2);
@@ -1311,8 +1487,13 @@ mod tests {
 
     #[test]
     fn delete_removes_only_selected_supported_graphics() {
-        let prepared =
-            prepare_mutation(OLD_FOOTPRINT, "B.CrtYd", GraphicsMode::Delete, &[]).unwrap();
+        let prepared = prepare_mutation(
+            OLD_FOOTPRINT,
+            GraphicsSelector::Layer("B.CrtYd"),
+            GraphicsMode::Delete,
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(prepared.matched_count, 2);
         assert_eq!(prepared.added_count, 0);
@@ -1343,8 +1524,13 @@ mod tests {
         }]))
         .unwrap();
 
-        let prepared =
-            prepare_mutation(source, "B.CrtYd", GraphicsMode::Replace, &graphics).unwrap();
+        let prepared = prepare_mutation(
+            source,
+            GraphicsSelector::Layer("B.CrtYd"),
+            GraphicsMode::Replace,
+            &graphics,
+        )
+        .unwrap();
 
         assert_eq!(prepared.matched_count, 0);
         assert!(
@@ -1377,8 +1563,13 @@ mod tests {
         );
 
         for source in [old_group, new_group] {
-            let error =
-                prepare_mutation(&source, "B.CrtYd", GraphicsMode::Delete, &[]).unwrap_err();
+            let error = prepare_mutation(
+                &source,
+                GraphicsSelector::Layer("B.CrtYd"),
+                GraphicsMode::Delete,
+                &[],
+            )
+            .unwrap_err();
             assert!(
                 matches!(error, FootprintGraphicsError::Conflict(_)),
                 "{error}"
@@ -1401,7 +1592,12 @@ mod tests {
             (OLD_FOOTPRINT, "BottomCourtyard"),
         ] {
             assert!(matches!(
-                prepare_mutation(source, layer, GraphicsMode::Replace, &graphics),
+                prepare_mutation(
+                    source,
+                    GraphicsSelector::Layer(layer),
+                    GraphicsMode::Replace,
+                    &graphics
+                ),
                 Err(FootprintGraphicsError::InvalidArgument { .. })
             ));
         }
@@ -1424,9 +1620,14 @@ mod tests {
             json!(["append", "replace", "delete"])
         );
         assert_eq!(
-            schema["properties"]["selector"]["required"],
-            json!(["layer"])
+            schema["properties"]["selector"]["oneOf"],
+            json!([
+                {"required": ["layer"]},
+                {"required": ["item_id"]}
+            ])
         );
+        assert!(schema["properties"]["selector"]["properties"]["layer"].is_object());
+        assert!(schema["properties"]["selector"]["properties"]["item_id"].is_object());
 
         let variants = schema["properties"]["graphics"]["items"]["oneOf"]
             .as_array()
@@ -1777,8 +1978,13 @@ mod tests {
             "fill": "none"
         }]))
         .unwrap();
-        let prepared =
-            prepare_mutation(OLD_FOOTPRINT, "B.CrtYd", GraphicsMode::Replace, &graphics).unwrap();
+        let prepared = prepare_mutation(
+            OLD_FOOTPRINT,
+            GraphicsSelector::Layer("B.CrtYd"),
+            GraphicsMode::Replace,
+            &graphics,
+        )
+        .unwrap();
 
         let externally_changed = OLD_FOOTPRINT.replace("Fixture", "ExternallyChanged");
         std::fs::write(&path, &externally_changed).unwrap();
@@ -1787,5 +1993,341 @@ mod tests {
 
         assert!(matches!(error, copperpour_sexp::SexpError::Conflict { .. }));
         assert_eq!(std::fs::read_to_string(path).unwrap(), externally_changed);
+    }
+
+    #[tokio::test]
+    async fn served_dispatch_replaces_single_graphic_by_item_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Switch.kicad_mod");
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/issue_300_omron_b3f_100x_kicad10.kicad_mod"
+            ),
+            &path,
+        )
+        .unwrap();
+
+        let mut config = test_ctx().config;
+        config.auto_load_toolsets = true;
+        let handler = crate::mcp::handler::McpHandler::new(config).await.unwrap();
+        let target_id = "f5e907b5-7390-4bf7-af24-f64dca48a7f8";
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "set_footprint_graphics",
+                "arguments": {
+                    "footprint_path": path,
+                    "selector": {"item_id": target_id},
+                    "mode": "replace",
+                    "graphics": [{
+                        "type": "line",
+                        "start": {"x": 1.0, "y": -1.0},
+                        "end": {"x": 5.0, "y": -1.0},
+                        "stroke_width_mm": 0.15
+                    }]
+                }
+            }
+        });
+
+        let response = handler.handle_message(request).await.unwrap();
+        let payload = response.result.expect("a result");
+        let result_text = payload["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(result_text).unwrap();
+
+        assert!(
+            !payload["isError"].as_bool().unwrap_or(false),
+            "expected success, got: {body}"
+        );
+        assert_eq!(body["matched_count"], 1);
+        assert_eq!(body["added_count"], 1);
+        assert_eq!(body["layer"], "F.SilkS");
+        assert_eq!(body["item_id"], target_id);
+
+        let updated = std::fs::read_to_string(&path).unwrap();
+        let after = inspect_graphics(&updated, None).unwrap();
+        let before = inspect_graphics(
+            include_str!("../../tests/fixtures/issue_300_omron_b3f_100x_kicad10.kicad_mod"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(after.len(), before.len());
+        let replaced = after
+            .iter()
+            .find(|g| g.item_id.as_deref() == Some(target_id))
+            .expect("replaced graphic must preserve its item_id");
+        assert_eq!(replaced.layer, "F.SilkS");
+        assert_eq!(replaced.start, Some(Point { x: 1.0, y: -1.0 }));
+        assert_eq!(replaced.end, Some(Point { x: 5.0, y: -1.0 }));
+        assert_eq!(replaced.stroke_width_mm, 0.15);
+        // Neighbours on the same layer are untouched
+        assert!(after
+            .iter()
+            .any(|g| g.item_id.as_deref() == Some("27fe9b6a-c6bf-49f0-b603-ec6c5d9b1ab9")));
+    }
+
+    #[tokio::test]
+    async fn served_dispatch_deletes_single_graphic_by_item_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Switch.kicad_mod");
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/issue_300_omron_b3f_100x_kicad10.kicad_mod"
+            ),
+            &path,
+        )
+        .unwrap();
+
+        let mut config = test_ctx().config;
+        config.auto_load_toolsets = true;
+        let handler = crate::mcp::handler::McpHandler::new(config).await.unwrap();
+        let target_id = "f5e907b5-7390-4bf7-af24-f64dca48a7f8";
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "set_footprint_graphics",
+                "arguments": {
+                    "footprint_path": path,
+                    "selector": {"item_id": target_id},
+                    "mode": "delete"
+                }
+            }
+        });
+
+        let response = handler.handle_message(request).await.unwrap();
+        let payload = response.result.expect("a result");
+        let result_text = payload["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(result_text).unwrap();
+
+        assert!(
+            !payload["isError"].as_bool().unwrap_or(false),
+            "expected success, got: {body}"
+        );
+        assert_eq!(body["matched_count"], 1);
+        assert_eq!(body["added_count"], 0);
+        assert_eq!(body["layer"], "F.SilkS");
+        assert_eq!(body["item_id"], target_id);
+
+        let updated = std::fs::read_to_string(&path).unwrap();
+        let after = inspect_graphics(&updated, None).unwrap();
+        let before = inspect_graphics(
+            include_str!("../../tests/fixtures/issue_300_omron_b3f_100x_kicad10.kicad_mod"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(after.len(), before.len() - 1);
+        assert!(!after
+            .iter()
+            .any(|g| g.item_id.as_deref() == Some(target_id)));
+        assert!(after
+            .iter()
+            .any(|g| g.item_id.as_deref() == Some("27fe9b6a-c6bf-49f0-b603-ec6c5d9b1ab9")));
+    }
+
+    #[tokio::test]
+    async fn handler_item_id_selector_validation_and_error_cases() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Fixture.kicad_mod");
+        std::fs::write(&path, OLD_FOOTPRINT).unwrap();
+        let duplicate_path = temp.path().join("Duplicate.kicad_mod");
+        let duplicated = OLD_FOOTPRINT.replace(
+            "20000000-0000-4000-8000-000000000002",
+            "20000000-0000-4000-8000-000000000001",
+        );
+        std::fs::write(&duplicate_path, &duplicated).unwrap();
+
+        let line = json!([{
+            "type": "line",
+            "start": {"x": 0.0, "y": 0.0},
+            "end": {"x": 1.0, "y": 0.0},
+            "stroke_width_mm": 0.1
+        }]);
+
+        let cases = [
+            (
+                json!({
+                    "footprint_path": path,
+                    "selector": {"item_id": "20000000-0000-4000-8000-000000000001"},
+                    "mode": "append",
+                    "graphics": line
+                }),
+                "invalid_argument",
+                Some("mode"),
+            ),
+            (
+                json!({
+                    "footprint_path": path,
+                    "selector": {
+                        "layer": "B.CrtYd",
+                        "item_id": "20000000-0000-4000-8000-000000000001"
+                    },
+                    "mode": "delete"
+                }),
+                "invalid_argument",
+                Some("selector"),
+            ),
+            (
+                json!({
+                    "footprint_path": path,
+                    "selector": {},
+                    "mode": "delete"
+                }),
+                "invalid_argument",
+                Some("selector"),
+            ),
+            (
+                json!({
+                    "footprint_path": path,
+                    "selector": {"item_id": "   "},
+                    "mode": "delete"
+                }),
+                "invalid_argument",
+                Some("selector.item_id"),
+            ),
+            (
+                json!({
+                    "footprint_path": path,
+                    "selector": {"unknown": "x"},
+                    "mode": "delete"
+                }),
+                "invalid_argument",
+                Some("selector.unknown"),
+            ),
+            (
+                json!({
+                    "footprint_path": path,
+                    "selector": {"item_id": "00000000-0000-4000-8000-999999999999"},
+                    "mode": "delete"
+                }),
+                "stale_target",
+                None,
+            ),
+            (
+                json!({
+                    "footprint_path": duplicate_path,
+                    "selector": {"item_id": "20000000-0000-4000-8000-000000000001"},
+                    "mode": "delete"
+                }),
+                "conflict",
+                None,
+            ),
+        ];
+
+        for (args, kind, field) in cases {
+            let result = handle_set_footprint_graphics(&args, &test_ctx())
+                .await
+                .unwrap();
+            assert!(result.is_error, "expected error for {args}");
+            let body = result_body(&result);
+            assert_eq!(body["error"]["kind"], kind, "{args}: {body}");
+            if let Some(field) = field {
+                assert_eq!(body["error"]["field"], field, "{args}: {body}");
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_FOOTPRINT);
+        assert_eq!(
+            std::fs::read_to_string(&duplicate_path).unwrap(),
+            duplicated
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_item_id_respects_group_membership_without_blocking_ungrouped_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Fixture.kicad_mod");
+        let grouped = OLD_FOOTPRINT.replace(
+            "  (model \"KEEP.step\"",
+            r#"  (group "owned" (id 50000000-0000-4000-8000-000000000001)
+    (members
+      20000000-0000-4000-8000-000000000001
+    )
+  )
+  (model "KEEP.step""#,
+        );
+        std::fs::write(&path, &grouped).unwrap();
+
+        // Grouped item is refused by item_id
+        let grouped_delete = json!({
+            "footprint_path": path,
+            "selector": {"item_id": "20000000-0000-4000-8000-000000000001"},
+            "mode": "delete"
+        });
+        let refused = handle_set_footprint_graphics(&grouped_delete, &test_ctx())
+            .await
+            .unwrap();
+        assert!(refused.is_error);
+        assert_eq!(result_body(&refused)["error"]["kind"], "conflict");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), grouped);
+
+        // Ungrouped sibling on the same layer (B.CrtYd) succeeds by item_id
+        let ungrouped_replace = json!({
+            "footprint_path": path,
+            "selector": {"item_id": "20000000-0000-4000-8000-000000000002"},
+            "mode": "replace",
+            "graphics": [{
+                "type": "rect",
+                "start": {"x": -1.0, "y": -1.0},
+                "end": {"x": 1.0, "y": 1.0},
+                "stroke_width_mm": 0.05,
+                "fill": "none"
+            }]
+        });
+        let ok = handle_set_footprint_graphics(&ungrouped_replace, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!ok.is_error, "{:?}", ok.content);
+        let body = result_body(&ok);
+        assert_eq!(body["matched_count"], 1);
+        assert_eq!(body["added_count"], 1);
+        assert_eq!(body["layer"], "B.CrtYd");
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let after = inspect_graphics(&written, Some("B.CrtYd")).unwrap();
+        assert_eq!(after.len(), 2);
+        assert!(after
+            .iter()
+            .any(|g| g.item_id.as_deref() == Some("20000000-0000-4000-8000-000000000001")));
+        assert!(after.iter().any(|g| g.graphic_type == "rect"
+            && g.item_id.as_deref() == Some("20000000-0000-4000-8000-000000000002")));
+    }
+
+    #[test]
+    fn replace_by_item_id_with_multiple_graphics_drops_id_to_avoid_duplicates() {
+        let graphics = parse_graphics(&json!([
+            {
+                "type": "line",
+                "start": {"x": 0.0, "y": 0.0},
+                "end": {"x": 1.0, "y": 0.0},
+                "stroke_width_mm": 0.1
+            },
+            {
+                "type": "line",
+                "start": {"x": 1.0, "y": 0.0},
+                "end": {"x": 1.0, "y": 1.0},
+                "stroke_width_mm": 0.1
+            }
+        ]))
+        .unwrap();
+        let prepared = prepare_mutation(
+            OLD_FOOTPRINT,
+            GraphicsSelector::ItemId("20000000-0000-4000-8000-000000000002"),
+            GraphicsMode::Replace,
+            &graphics,
+        )
+        .unwrap();
+        assert_eq!(prepared.matched_count, 1);
+        assert_eq!(prepared.added_count, 2);
+        assert_eq!(prepared.layer, "B.CrtYd");
+        assert!(!prepared
+            .replacement
+            .contains("20000000-0000-4000-8000-000000000002"));
+        assert!(prepared
+            .replacement
+            .contains("20000000-0000-4000-8000-000000000001"));
     }
 }
