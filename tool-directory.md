@@ -210,7 +210,7 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `export_schematic_svg` | Export a schematic sheet to SVG using kicad-cli, with optional monochrome rendering and colour theme. |
+| `export_schematic_svg` | Export a schematic to SVG using kicad-cli, with optional monochrome rendering and colour theme. `output` names the root file; a hierarchy writes one file per sheet beside it and reports every path. |
 | `render_schematic_png` | Render a sheet to PNG: kicad-cli SVG rasterized in-process with deterministic stroke-font rendering. Returns the path and actual pixel dimensions; `inline` adds base64 content so the caller can inspect its own output. |
 | `set_visual_baseline` | Capture the current render of a sheet as its visual baseline under the project's `.copperpour/baselines/`, recording the source hash and renderer identity. |
 | `compare_visual_baseline` | Re-render at the baseline's width and report pixel drift vs a 2% threshold, with the changed region's bounding box; "no baseline stored" is an explicit result, and a stale-renderer baseline is flagged, never silently trusted. |

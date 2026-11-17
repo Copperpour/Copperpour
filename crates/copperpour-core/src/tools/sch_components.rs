@@ -4819,8 +4819,13 @@ async fn handle_get_schematic_view(
 
     // KiCad has no schematic rasteriser: `sch export` offers no bitmap format
     // and there is no `sch render` at all. SVG is what there is.
-    let svg_path =
-        crate::tools::cli::render_schematic_svg(&ctx.config.kicad_cli, &sch_path, &out_dir).await?;
+    let svg_path = crate::tools::cli::render_schematic_svg(
+        &ctx.config.kicad_cli,
+        &sch_path,
+        &out_dir,
+        &crate::tools::cli::SchematicSvgOptions::default(),
+    )
+    .await?;
 
     // Deliberately not deleted. The previous handler rendered the file, read its
     // length, removed it, and then reported "The SVG file has been generated" —
@@ -7793,6 +7798,80 @@ mod schematic_view_tests {
             _ => panic!("expected text content"),
         };
         assert_eq!(body2["svg"], body["svg"]);
+    }
+
+    /// `render_schematic_svg` used to take `output.parent()` on the slot
+    /// directory `handle_get_schematic_view` passed in, stripping the hash
+    /// component and writing every sheet into the shared parent
+    /// `copperpour-schematic-views/<stem>.svg` (#25). Two sheets sharing a
+    /// stem must land inside their own slots and both survive.
+    #[tokio::test]
+    async fn two_same_stem_sheets_render_into_distinct_view_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = crate::tools::cli::test_support::write_script(
+            dir.path(),
+            "fake-kicad-cli",
+            "#!/bin/sh\nout=\"\"\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"--output\" ]; then out=\"$a\"; fi\n  prev=\"$a\"\ndone\nfor last; do :; done\nstem=$(basename \"$last\" .kicad_sch)\nprintf 'VIEW %s' \"$last\" > \"$out/$stem.svg\"\nexit 0\n",
+            "@echo off\r\nsetlocal enabledelayedexpansion\r\nset prev=\r\nset last=\r\n:loop\r\nif \"%~1\"==\"\" goto done\r\nif \"!prev!\"==\"--output\" set out=%~1\r\nset prev=%~1\r\nset last=%~1\r\nshift\r\ngoto loop\r\n:done\r\nfor %%F in (\"!last!\") do set stem=%%~nF\r\necho VIEW !last!> \"!out!\\!stem!.svg\"\r\nexit /b 0\r\n",
+        );
+        let alpha_dir = dir.path().join("alpha");
+        let beta_dir = dir.path().join("beta");
+        std::fs::create_dir_all(&alpha_dir).unwrap();
+        std::fs::create_dir_all(&beta_dir).unwrap();
+        let alpha = alpha_dir.join("power.kicad_sch");
+        let beta = beta_dir.join("power.kicad_sch");
+        let fixture = include_str!("../../tests/fixtures/single_pin_nets.kicad_sch");
+        std::fs::write(&alpha, fixture).unwrap();
+        std::fs::write(&beta, fixture).unwrap();
+
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: cli.display().to_string(),
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+
+        let mut bodies = Vec::new();
+        for sheet in [&alpha, &beta] {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "get_schematic_view",
+                        "arguments": { "schematic": sheet.display().to_string() }
+                    }
+                }))
+                .await
+                .expect("request returns a response");
+            let result = response.result.expect("successful JSON-RPC response");
+            let text = result["content"][0]["text"]
+                .as_str()
+                .expect("tool returns JSON text");
+            bodies.push(serde_json::from_str::<serde_json::Value>(text).unwrap());
+        }
+
+        let alpha_svg = schematic_view_dir(&alpha).join("power.svg");
+        let beta_svg = schematic_view_dir(&beta).join("power.svg");
+        assert_eq!(bodies[0]["svg"], alpha_svg.display().to_string());
+        assert_eq!(bodies[1]["svg"], beta_svg.display().to_string());
+        assert!(
+            std::fs::read_to_string(&alpha_svg)
+                .unwrap()
+                .contains(&alpha.display().to_string()),
+            "alpha slot must keep alpha's render"
+        );
+        assert!(
+            std::fs::read_to_string(&beta_svg)
+                .unwrap()
+                .contains(&beta.display().to_string()),
+            "beta slot must keep beta's render"
+        );
+        let _ = std::fs::remove_dir_all(schematic_view_dir(&alpha));
+        let _ = std::fs::remove_dir_all(schematic_view_dir(&beta));
     }
 }
 

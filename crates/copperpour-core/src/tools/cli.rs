@@ -514,10 +514,26 @@ fn export_staging_dir(destination: &Path) -> Result<tempfile::TempDir> {
         .context("failed to create an export staging directory")
 }
 
+fn ensure_file_destination(destination: &Path, artifact: &str) -> Result<()> {
+    if destination.is_dir()
+        || destination
+            .as_os_str()
+            .to_string_lossy()
+            .ends_with(['/', '\\'])
+    {
+        anyhow::bail!(
+            "{artifact} output path must name a file, not a directory: {}",
+            destination.display()
+        );
+    }
+    Ok(())
+}
+
 /// Publish a verified artifact without letting a stale destination stand in
 /// for output from the current command. The staging directory is a sibling of
 /// the destination, so every rename remains on the same filesystem.
 async fn publish_verified_file(staged: &Path, destination: &Path, artifact: &str) -> Result<u64> {
+    ensure_file_destination(destination, artifact)?;
     let size = verify_nonempty_file(staged, artifact).await?;
     if let Some(parent) = destination.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -581,16 +597,22 @@ async fn publish_verified_files(
     output_dir: &Path,
     artifact: &str,
 ) -> Result<Vec<PathBuf>> {
+    // Preflight every staged file and every mapped destination before
+    // publishing the first file, so a directory collision on a later sheet or
+    // plot leaves earlier destinations untouched.
+    let mut destinations = Vec::with_capacity(staged_files.len());
     for staged in staged_files {
         verify_nonempty_file(staged, artifact).await?;
-    }
-
-    let mut published = Vec::with_capacity(staged_files.len());
-    for staged in staged_files {
         let file_name = staged
             .file_name()
             .context("export produced a path without a file name")?;
         let destination = output_dir.join(file_name);
+        ensure_file_destination(&destination, artifact)?;
+        destinations.push((staged, destination));
+    }
+
+    let mut published = Vec::with_capacity(destinations.len());
+    for (staged, destination) in destinations {
         publish_verified_file(staged, &destination, artifact).await?;
         published.push(destination);
     }
@@ -1606,13 +1628,27 @@ fn schematic_svg_args<'a>(
 
 /// KiCAD 10: `sch export svg --output <dir> [--black-and-white]
 /// [--theme <name>] <input>`
+///
+/// kicad-cli names every file after the schematic: `<stem>.svg` for the root
+/// and `<stem>-<sheetname>.svg` per child sheet. `output` names the root file
+/// the caller asked for; every sheet is published under the caller's stem
+/// (#25). Returns every published path, root first.
 pub async fn export_schematic_svg(
     cli: &str,
     schematic: &Path,
-    output_dir: &Path,
+    output: &Path,
     options: &SchematicSvgOptions<'_>,
-) -> Result<PathBuf> {
-    let staging = export_staging_dir(output_dir)?;
+) -> Result<Vec<PathBuf>> {
+    ensure_file_destination(output, "schematic SVG")?;
+    let output_dir = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let caller_name = output
+        .file_name()
+        .context("schematic SVG output has no file name")?;
+    let caller_stem = output.file_stem().unwrap_or_default().to_string_lossy();
+    let staging = export_staging_dir(output)?;
     let args = schematic_svg_args(
         staging.path().to_str().unwrap(),
         schematic.to_str().unwrap(),
@@ -1621,6 +1657,7 @@ pub async fn export_schematic_svg(
     run_cli(cli, &args, long_timeout()).await?;
     let stem = schematic.file_stem().unwrap_or_default().to_string_lossy();
     let staged_root = staging.path().join(format!("{}.svg", stem));
+    verify_nonempty_file(&staged_root, "schematic SVG").await?;
 
     let mut staged_files = Vec::new();
     let mut entries = tokio::fs::read_dir(staging.path()).await?;
@@ -1631,9 +1668,38 @@ pub async fn export_schematic_svg(
         }
     }
     staged_files.sort();
-    verify_nonempty_file(&staged_root, "schematic SVG").await?;
-    publish_verified_files(&staged_files, output_dir, "schematic SVG").await?;
-    Ok(output_dir.join(format!("{}.svg", stem)))
+    // The root sorts after its children (`-` < `.`); report it first.
+    if let Some(position) = staged_files.iter().position(|path| path == &staged_root) {
+        let root = staged_files.remove(position);
+        staged_files.insert(0, root);
+    }
+
+    let child_prefix = format!("{}-", stem);
+    // A destination can equal another sheet's staged name (the caller may ask
+    // for `<stem>-<sheetname>.svg`), so rename into a fresh subdirectory
+    // rather than in place, where it would clobber that sheet's content.
+    let rename_dir = staging.path().join("renamed");
+    tokio::fs::create_dir(&rename_dir).await?;
+    let mut renamed = Vec::with_capacity(staged_files.len());
+    for staged in &staged_files {
+        let name = staged
+            .file_name()
+            .context("export produced a path without a file name")?;
+        let destination = if staged == &staged_root {
+            caller_name.to_os_string()
+        } else if let Some(rest) = name.to_string_lossy().strip_prefix(&child_prefix) {
+            std::ffi::OsString::from(format!("{caller_stem}-{rest}"))
+        } else {
+            anyhow::bail!(
+                "kicad-cli wrote an SVG name this export cannot place: {}",
+                staged.display()
+            );
+        };
+        let target = rename_dir.join(&destination);
+        tokio::fs::rename(staged, &target).await?;
+        renamed.push(target);
+    }
+    publish_verified_files(&renamed, output_dir, "schematic SVG").await
 }
 
 #[derive(Debug, Clone)]
@@ -2373,9 +2439,19 @@ pub async fn export_odb(
 
 /// Render schematic to SVG (no bitmap export in KiCAD 10 CLI).
 /// KiCAD 10: `sch export svg --output <dir> <input>`
-pub async fn render_schematic_svg(cli: &str, schematic: &Path, output: &Path) -> Result<PathBuf> {
-    let output_dir = output.parent().unwrap_or(Path::new("."));
-    export_schematic_svg(cli, schematic, output_dir, &SchematicSvgOptions::default()).await
+///
+/// Private render callers keep the schematic's own stem: the root lands at
+/// `<output_dir>/<stem>.svg`, child sheets beside it.
+pub async fn render_schematic_svg(
+    cli: &str,
+    schematic: &Path,
+    output_dir: &Path,
+    options: &SchematicSvgOptions<'_>,
+) -> Result<PathBuf> {
+    let stem = schematic.file_stem().unwrap_or_default().to_string_lossy();
+    let root = output_dir.join(format!("{}.svg", stem));
+    export_schematic_svg(cli, schematic, &root, options).await?;
+    Ok(root)
 }
 
 /// KiCAD 10: `pcb render --output <path> --width <w> --height <h> <input>`
@@ -3607,6 +3683,76 @@ mod artifact_verification_tests {
             std::fs::read_to_string(destination).unwrap(),
             "stale-but-nonempty",
             "a failed export must preserve the previous artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_svg_root_is_an_error_and_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_support::noop_cli(dir.path());
+        let schematic = dir.path().join("clock.kicad_sch");
+        let out_dir = dir.path().join("out");
+        let stale_stem = out_dir.join("clock.svg");
+        let destination = out_dir.join("Board.svg");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(&schematic, "placeholder").unwrap();
+        std::fs::write(&stale_stem, "stale-but-nonempty").unwrap();
+
+        let error = export_schematic_svg(
+            cli.to_str().unwrap(),
+            &schematic,
+            &destination,
+            &SchematicSvgOptions::default(),
+        )
+        .await
+        .expect_err("the current invocation produced no artifact");
+
+        assert!(error.to_string().contains("did not create"), "{error:#}");
+        assert!(
+            !destination.exists(),
+            "a failed export must publish nothing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(stale_stem).unwrap(),
+            "stale-but-nonempty",
+            "a stale stem file in the output directory must not satisfy or be touched by a failed export"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_destination_is_refused_without_replacing_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_support::schematic_only_cli(dir.path());
+        let schematic = dir.path().join("clock.kicad_sch");
+        let destination = dir.path().join("clock.pdf");
+        std::fs::write(&schematic, "placeholder").unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        let sentinel = destination.join("keep.txt");
+        std::fs::write(&sentinel, "do-not-delete").unwrap();
+
+        let error = export_schematic_pdf(
+            cli.to_str().unwrap(),
+            &schematic,
+            &destination,
+            &SchematicPdfOptions::default(),
+        )
+        .await
+        .expect_err("a directory destination must be refused before publication");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must name a file, not a directory"),
+            "{error:#}"
+        );
+        assert!(
+            destination.is_dir(),
+            "existing directory at destination must survive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "do-not-delete",
+            "directory contents must survive staging cleanup"
         );
     }
 }
