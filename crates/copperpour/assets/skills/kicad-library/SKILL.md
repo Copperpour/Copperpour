@@ -355,15 +355,17 @@ and `poly` require `fill`: `none` for courtyard, fab and silk outlines.
 ```text
 set_footprint_graphics(
   footprint path,
-  selector={layer: "B.CrtYd"},
+  selector={layer: "B.CrtYd"},   # or {item_id: "..."} for replace/delete of one graphic
   mode="replace",
   graphics=[...]
 )
 ```
 
+- `selector.layer` targets all supported graphics on that layer (`append`, `replace`, `delete`).
+- Selecting by item ID (`{item_id: "..."}` from `get_footprint_info`) targets one graphic on its existing layer (`replace` or `delete` only; `append` is refused).
 - `append` preserves existing supported graphics on the selected layer.
-- `replace` replaces all supported graphics on the selected layer in one atomic write.
-- `delete` removes all supported graphics on the selected layer.
+- `replace` replaces the selected graphic(s) in one atomic write.
+- `delete` removes the selected graphic(s).
 - Text, pads, properties, models, groups, and graphics on other layers are preserved.
 - Replacement/deletion stops with a conflict if a selected graphic belongs to a group;
   do not work around this by editing the file.

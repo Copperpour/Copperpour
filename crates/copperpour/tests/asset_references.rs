@@ -791,6 +791,7 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "project_dir",
         "lib_id",
         "lib_name",
+        "item_id",
         "sym_lib_table",
         "fp_lib_table",
         "kicad_sch",
