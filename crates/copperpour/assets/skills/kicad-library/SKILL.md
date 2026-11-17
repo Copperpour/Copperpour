@@ -53,6 +53,8 @@ update_footprints_from_library(
   library_ids?,
   reset_text_sizes_and_styles?,
   reset_text_positions?,
+  reset_text_content?,
+  reset_fabrication_attributes?,
   dry_run,
   expected_plan_revision?
 )
@@ -68,6 +70,11 @@ update_footprints_from_library(
   `reset_text_sizes_and_styles` takes the library's size, thickness and style
   (for example to meet a fab's silkscreen minimum), `reset_text_positions` its
   position. Each planned change lists the fields it resets, before and after.
+- As in KiCad's update dialog, Datasheet, Description and custom fields keep
+  their placed text, and the footprint keeps its mounting type and BOM and
+  position-file exclusions. `reset_text_content` and
+  `reset_fabrication_attributes` take the library's instead. DNP and "not in
+  schematic" are always kept.
 - A stale plan, unresolved library, removed connected pad, or unsupported
   library content returns a non-mutating conflict for the whole selection.
 
