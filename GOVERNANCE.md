@@ -43,11 +43,13 @@ settings or the `main` ruleset.
 
 `ci.yml`, `release.yml` and `e2e-kicad.yml` are disabled on GitHub and run on a
 maintainer's machine instead, as the **Copperpour Local CI** app. Other workflows
-still run on GitHub: issue self-assignment, and `macos.yml`, because Apple's
-licence allows macOS virtual machines only on Apple hardware. `macos.yml` runs
-Check & Test on `macos-latest` on each PR and each push to `main`, beside
-local CI, as an optional check. On each `v*` tag, and when a maintainer starts
-it on a release candidate, it also builds the macOS release artifacts.
+still run on GitHub: issue self-assignment, `macos.yml` and `windows.yml`.
+`macos.yml` is there because Apple's licence allows macOS virtual machines only
+on Apple hardware. It runs Check & Test on `macos-latest` on each PR and each
+push to `main`, beside local CI, as an optional check. On each `v*` tag, and
+when a maintainer starts it on a release candidate, it also builds the macOS
+release artifacts. `windows.yml` runs Check & Test on `windows-latest` the same
+way; the Windows release build and the real-KiCad gate stay on local CI.
 
 - The required checks are that app's: the same `ci.yml` jobs and check names, run
   against each PR's merge commit. A check's details show the end of its log.
@@ -66,10 +68,10 @@ it on a release candidate, it also builds the macOS release artifacts.
   `Cargo.toml` line that adds a build script, a proc macro or build
   dependencies. Its checks show as queued until a maintainer approves that exact
   head; a new push needs a new approval.
-- **Check & Test on `windows-latest` is not required yet.** It runs on every PR,
-  and becomes required once it has passed on a few. Until then, before merging a
-  change to platform-specific code, a maintainer checks its Windows result and
-  says so on the PR.
+- **Check & Test on `windows-latest` is not required yet.** It runs on every PR
+  on GitHub (`windows.yml`), and becomes required once it has passed on a few.
+  Until then, before merging a change to platform-specific code, a maintainer
+  checks its Windows result and says so on the PR.
 
 ## Branches and pull requests
 

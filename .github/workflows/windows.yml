@@ -1,0 +1,44 @@
+name: Windows
+
+# The Check & Test (windows-latest) job of ci.yml. ci.yml runs on local CI,
+# whose Windows virtual machine ran this job until now; GitHub's Windows
+# runners are faster and keep the job off that machine. It runs on PRs and
+# main beside local CI and is not a required check yet (GOVERNANCE.md, "Where
+# CI runs"). The Windows release build and the real-KiCad gate (release.yml,
+# e2e-kicad.yml) still run on local CI.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A new push to the same PR or ref supersedes the previous run.
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check & Test (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: protoc@3.23.4
+          fallback: none
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --workspace --locked
+      - name: Test (unit + integration)
+        run: cargo test --workspace --locked --lib --tests
+      - name: Doctests
+        run: cargo test --workspace --locked --doc
