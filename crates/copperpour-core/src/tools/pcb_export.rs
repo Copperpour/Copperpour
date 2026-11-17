@@ -240,6 +240,20 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_export_3d(args, ctx).await }
         ),
         tool!(
+            "check_3d_models",
+            "Audit placed footprints in the saved .kicad_pcb file (unsaved editor changes are not included) for missing 3D models or broken/unresolvable model file paths before export_3d. Includes hidden models; embedded models are resolved from footprint or board embedded_files.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "include_dnp": { "type": "boolean", "description": "Include Do-Not-Populate (dnp) footprints in the check", "default": false },
+                    "include_board_only": { "type": "boolean", "description": "Include board_only mechanical footprints in the check", "default": false }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_check_3d_models(args, ctx).await }
+        ),
+        tool!(
             "export_bom",
             "Generate a Bill of Materials (BOM) CSV from the schematic's component data.",
             json!({
@@ -617,6 +631,166 @@ async fn handle_export_3d(
         }))
         .unwrap(),
     ))
+}
+
+fn footprint_reference(fp: &copperpour_sexp::SexpNode) -> String {
+    for prop in fp.find_all("property") {
+        if prop.get(1).and_then(|n| n.as_str()) == Some("Reference") {
+            if let Some(val) = prop.get(2).and_then(|n| n.as_str()) {
+                return val.to_string();
+            }
+        }
+    }
+    for text in fp.find_all("fp_text") {
+        if text.get(1).and_then(|n| n.as_str()) == Some("reference") {
+            if let Some(val) = text.get(2).and_then(|n| n.as_str()) {
+                return val.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn footprint_has_attr(fp: &copperpour_sexp::SexpNode, flag: &str) -> bool {
+    fp.find("attr")
+        .and_then(|a| a.children())
+        .is_some_and(|children| children.iter().skip(1).any(|c| c.as_str() == Some(flag)))
+}
+
+fn resolve_3d_model_path(model_path: &str, board_dir: Option<&Path>) -> Option<PathBuf> {
+    if model_path.starts_with("${") {
+        return super::library::expand_lib_uri(model_path, board_dir).filter(|p| p.is_file());
+    }
+    let p = Path::new(model_path);
+    if p.is_relative() {
+        let resolved = board_dir?.join(p);
+        return resolved.is_file().then_some(resolved);
+    }
+    p.is_file().then(|| p.to_path_buf())
+}
+
+fn has_embedded_model(owner: &copperpour_sexp::SexpNode, name: &str) -> bool {
+    owner.find("embedded_files").is_some_and(|files| {
+        files.find_all("file").iter().any(|file| {
+            file.find("name")
+                .and_then(|n| n.get(1))
+                .and_then(|n| n.as_str())
+                == Some(name)
+        })
+    })
+}
+
+fn model_is_present(
+    model_path: &str,
+    footprint: &copperpour_sexp::SexpNode,
+    board: &copperpour_sexp::SexpNode,
+    board_dir: Option<&Path>,
+) -> bool {
+    if let Some(name) = model_path.strip_prefix("kicad-embed://") {
+        return !name.is_empty()
+            && (has_embedded_model(footprint, name) || has_embedded_model(board, name));
+    }
+    !model_path.is_empty() && resolve_3d_model_path(model_path, board_dir).is_some()
+}
+
+async fn handle_check_3d_models(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_str = match crate::tools::require_str(args, "board") {
+        Ok(s) => s,
+        Err(e) => return Ok(e),
+    };
+    if board_str.trim().is_empty() {
+        return Ok(crate::tools::invalid_arg("board", "must not be empty"));
+    }
+    let board = PathBuf::from(board_str);
+    let include_dnp = match crate::tools::opt_bool_flag(args, "include_dnp") {
+        Ok(v) => v.unwrap_or(false),
+        Err(e) => return Ok(e),
+    };
+    let include_board_only = match crate::tools::opt_bool_flag(args, "include_board_only") {
+        Ok(v) => v.unwrap_or(false),
+        Err(e) => return Ok(e),
+    };
+
+    let content = tokio::fs::read_to_string(&board).await?;
+    let root = copperpour_sexp::parse_sexp(&content)?;
+    if root.head() != Some("kicad_pcb") {
+        return Ok(crate::tools::invalid_arg(
+            "board",
+            "file root is not 'kicad_pcb'",
+        ));
+    }
+    let board_dir = board.parent();
+
+    let footprints = root.find_all("footprint");
+    let total_footprints = footprints.len();
+    let mut checked_footprints = 0usize;
+    let mut ok_count = 0usize;
+    let mut skipped_dnp = 0usize;
+    let mut skipped_board_only = 0usize;
+    let mut missing_models: Vec<serde_json::Value> = Vec::new();
+    let mut broken_models: Vec<serde_json::Value> = Vec::new();
+
+    for fp in footprints {
+        if !include_dnp && footprint_has_attr(fp, "dnp") {
+            skipped_dnp += 1;
+            continue;
+        }
+        if !include_board_only && footprint_has_attr(fp, "board_only") {
+            skipped_board_only += 1;
+            continue;
+        }
+        checked_footprints += 1;
+        let reference = footprint_reference(fp);
+        let footprint_id = fp.get(1).and_then(|n| n.as_str()).unwrap_or("").to_string();
+        let models = fp.find_all("model");
+        if models.is_empty() {
+            missing_models.push(json!({
+                "reference": reference,
+                "footprint_id": footprint_id,
+            }));
+            continue;
+        }
+        let mut any_broken = false;
+        for model in models {
+            let model_path = model.get(1).and_then(|n| n.as_str()).unwrap_or("");
+            if !model_is_present(model_path, fp, &root, board_dir) {
+                any_broken = true;
+                broken_models.push(json!({
+                    "reference": reference,
+                    "footprint_id": footprint_id,
+                    "model_path": model_path,
+                }));
+            }
+        }
+        if !any_broken {
+            ok_count += 1;
+        }
+    }
+
+    let missing_count = missing_models.len();
+    let broken_count = broken_models.len();
+    let verdict = if missing_count == 0 && broken_count == 0 {
+        "READY"
+    } else {
+        "ISSUES_FOUND"
+    };
+
+    Ok(CallToolResult::json(&json!({
+        "verdict": verdict,
+        "board": board.to_string_lossy(),
+        "total_footprints": total_footprints,
+        "checked_footprints": checked_footprints,
+        "ok_count": ok_count,
+        "missing_count": missing_count,
+        "broken_count": broken_count,
+        "skipped_dnp": skipped_dnp,
+        "skipped_board_only": skipped_board_only,
+        "missing_models": missing_models,
+        "broken_models": broken_models,
+    })))
 }
 
 async fn handle_export_bom(
@@ -2374,6 +2548,134 @@ mod specctra_padstack_served_tests {
             assert!(!output.exists(), "{mode}");
             assert!(!manifest.exists(), "{mode}");
         }
+    }
+
+    use super::{handle_check_3d_models, model_is_present};
+    use crate::tools::ToolContext;
+    use std::path::Path;
+
+    const REAL_MODEL_BOARD: &str =
+        include_str!("../../tests/fixtures/models-3d/royalblue.kicad_pcb");
+
+    #[test]
+    fn check_3d_models_resolves_real_embedded_models_in_either_owner() {
+        use copperpour_sexp::{parse_sexp, SexpNode};
+        fn without_embedded(mut node: SexpNode) -> SexpNode {
+            if let SexpNode::List(children) = &mut node {
+                children.retain(|n| n.head() != Some("embedded_files"));
+            }
+            node
+        }
+        let root = parse_sexp(REAL_MODEL_BOARD).unwrap();
+        let board_without = without_embedded(root.clone());
+        let mut embedded = 0;
+        for fp in root.find_all("footprint") {
+            for model in fp.find_all("model") {
+                let path = model.get(1).unwrap().as_str().unwrap();
+                if !path.starts_with("kicad-embed://") {
+                    continue;
+                }
+                embedded += 1;
+                let fp_without = without_embedded(fp.clone());
+                assert!(
+                    model_is_present(path, fp, &board_without, None),
+                    "footprint: {path}"
+                );
+                assert!(
+                    model_is_present(path, &fp_without, &root, None),
+                    "board: {path}"
+                );
+                assert!(
+                    !model_is_present(path, &fp_without, &board_without, None),
+                    "missing: {path}"
+                );
+                assert!(!model_is_present(
+                    "kicad-embed://absent.step",
+                    fp,
+                    &root,
+                    None
+                ));
+            }
+        }
+        assert_eq!(embedded, 6);
+    }
+
+    #[tokio::test]
+    async fn check_3d_models_audits_kicad_demo_without_flagging_embedded_models() {
+        use crate::mcp::protocol::ToolContent;
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/models-3d/royalblue.kicad_pcb"),
+            &board,
+        )
+        .unwrap();
+        let before = std::fs::read(&board).unwrap();
+        let ctx = ToolContext::new(
+            ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        for include_dnp in [false, true] {
+            let res =
+                handle_check_3d_models(&json!({"board": board, "include_dnp": include_dnp}), &ctx)
+                    .await
+                    .unwrap();
+            assert!(!res.is_error, "{res:?}");
+            let ToolContent::Text { text } = &res.content[0] else {
+                panic!("expected text");
+            };
+            let parsed: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(parsed["verdict"], "ISSUES_FOUND");
+            // Five footprints have only embedded models. D3 also has an
+            // external WRL, so its overall status depends on installed libraries.
+            assert!(parsed["ok_count"].as_u64().unwrap() >= 5, "{parsed}");
+            let broken = parsed["broken_models"].as_array().unwrap();
+            assert!(!broken.is_empty());
+            let missing = parsed["missing_models"].as_array().unwrap();
+            for reference in ["J4", "U1", "Y2", "J6", "J5"] {
+                assert!(
+                    !broken.iter().any(|m| m["reference"] == reference),
+                    "{reference}: {parsed}"
+                );
+                assert!(
+                    !missing.iter().any(|m| m["reference"] == reference),
+                    "{reference}: {parsed}"
+                );
+            }
+            // Whether D3's external file exists is deliberately not assumed.
+            // If D3 is broken, only that WRL may be blamed, never its embed.
+            let d3_broken: Vec<_> = broken.iter().filter(|m| m["reference"] == "D3").collect();
+            assert!(d3_broken.len() <= 1, "{parsed}");
+            for model in d3_broken {
+                assert_eq!(
+                    model["model_path"],
+                    "${KICAD8_3DMODEL_DIR}/LED_SMD.3dshapes/LED_Wurth_150044M155260.wrl"
+                );
+            }
+            assert!(broken.iter().all(|m| !m["model_path"]
+                .as_str()
+                .unwrap()
+                .starts_with("kicad-embed://")));
+            if include_dnp {
+                assert_eq!(parsed["skipped_dnp"], 0);
+            } else {
+                assert!(parsed["skipped_dnp"].as_u64().unwrap() > 0);
+            }
+        }
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+        let bad_flag = handle_check_3d_models(&json!({"board": board, "include_dnp": "yes"}), &ctx)
+            .await
+            .unwrap();
+        assert!(bad_flag.is_error);
+        let wrong = dir.path().join("not_a_board.txt");
+        std::fs::write(&wrong, "(not_a_board)").unwrap();
+        assert!(
+            handle_check_3d_models(&json!({"board": wrong}), &ctx)
+                .await
+                .unwrap()
+                .is_error
+        );
     }
 }
 

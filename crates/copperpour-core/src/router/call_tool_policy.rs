@@ -118,6 +118,8 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     // placement
     "get_placement_overview",
     "score_placement",
+    // pcb_export
+    "check_3d_models",
     // library
     "get_footprint_info",
     "get_symbol_info",
@@ -125,6 +127,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "list_library_footprints",
     "list_symbol_libraries",
     "list_symbols_in_library",
+    "search_3d_models",
     "search_footprints",
     "search_symbols",
     // integration
