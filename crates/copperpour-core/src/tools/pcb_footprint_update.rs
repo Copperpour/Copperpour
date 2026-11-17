@@ -398,6 +398,9 @@ impl PreservedState {
 struct PlannedUpdate {
     reference: String,
     library_id: String,
+    /// Not reported; the group guard looks the footprint up by it.
+    #[serde(skip)]
+    kiid: String,
     changed_domains: BTreeSet<ChangedDomain>,
     preserved: PreservedState,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -428,7 +431,8 @@ pub(crate) fn tool() -> ToolDef {
          footprints on the live board. Defaults to a non-mutating dry run; apply requires its \
          exact plan revision. Preserves placed-instance state and pad nets while refreshing \
          supported library-owned content; field text and fabrication attributes are kept \
-         unless reset_text_content or reset_fabrication_attributes is set.",
+         unless reset_text_content or reset_fabrication_attributes is set. Refuses to replace \
+         a footprint that owns a group, or whose groups can't be read from the live board.",
         json!({
             "type": "object",
             "properties": {
@@ -558,6 +562,8 @@ pub(crate) async fn handle_update_footprints_from_library(
                 &kicad,
             );
 
+            refuse_group_replacements(client, &document, &mut plan)?;
+
             if dry_run || plan.status == PlanStatus::Conflict {
                 return Ok(plan_response(&plan, false));
             }
@@ -624,6 +630,80 @@ pub(crate) async fn handle_update_footprints_from_library(
             preflight_conflict(message)
         }
     })
+}
+
+/// KiCad 10.0.8's API replaces a footprint with one built from the
+/// `FootprintInstance`, which carries no owned groups (`FOOTPRINT::Serialize`),
+/// so refuse the plan if a target owns one. Read on every call, so apply rechecks.
+fn refuse_group_replacements(
+    client: &copperpour_ipc::KiCadIpcClient,
+    document: &kiapi::common::types::DocumentSpecifier,
+    plan: &mut UpdatePlan,
+) -> Result<()> {
+    if plan.status != PlanStatus::Ready {
+        return Ok(());
+    }
+    let board_text = client.save_document_to_string_in(document.clone())?;
+    let conflicts = owned_group_conflicts(&board_text, &plan.changes);
+    if !conflicts.is_empty() {
+        plan.status = PlanStatus::Conflict;
+        plan.coverage.conflicts.planned += conflicts.len();
+        plan.coverage.changed.planned = 0;
+        plan.changes.clear();
+        plan.prepared_items.clear();
+        plan.diagnostics.extend(conflicts);
+    }
+    Ok(())
+}
+
+/// A conflict for each change whose footprint owns a group in `board_text`.
+fn owned_group_conflicts(board_text: &str, changes: &[PlannedUpdate]) -> Vec<UpdateDiagnostic> {
+    let conflict = |reference: Option<&String>, message: String| UpdateDiagnostic {
+        code: "footprint_children_not_carried".to_string(),
+        message,
+        reference: reference.cloned(),
+    };
+    let board = match copperpour_sexp::parse_sexp(board_text) {
+        Ok(board) => board,
+        Err(error) => {
+            return vec![conflict(
+                None,
+                format!(
+                    "the board KiCad wrote did not parse, so whether the footprints to refresh \
+                     own groups is unknown: {error}"
+                ),
+            )]
+        }
+    };
+    let mut groups = BTreeMap::<&str, usize>::new();
+    for footprint in copperpour_sexp::board::footprints(&board) {
+        if let Some(kiid) = footprint.find_str("uuid").filter(|id| !id.is_empty()) {
+            *groups.entry(kiid).or_default() += footprint.find_all("group").len();
+        }
+    }
+    changes
+        .iter()
+        .filter_map(|change| {
+            let reference = &change.reference;
+            let message = match groups.get(change.kiid.as_str()) {
+                Some(0) => return None,
+                Some(1) => format!(
+                    "{reference} owns 1 group, which KiCad drops when its API updates a \
+                     footprint; refresh {reference} with KiCad's Update Footprints from Library"
+                ),
+                Some(count) => format!(
+                    "{reference} owns {count} groups, which KiCad drops when its API updates a \
+                     footprint; refresh {reference} with KiCad's Update Footprints from Library"
+                ),
+                None => format!(
+                    "{reference} ({}) is not in the board KiCad wrote, so whether it owns \
+                     groups is unknown; run the dry run again",
+                    change.kiid
+                ),
+            };
+            Some(conflict(Some(reference), message))
+        })
+        .collect()
 }
 
 fn snapshot_routed_nets(
@@ -1062,6 +1142,12 @@ fn plan_updates(
             changes.push(PlannedUpdate {
                 reference: candidate.reference,
                 library_id: candidate.library_id,
+                kiid: candidate
+                    .instance
+                    .id
+                    .as_ref()
+                    .map(|id| id.value.clone())
+                    .unwrap_or_default(),
                 changed_domains: prepared.changed_domains,
                 preserved: prepared.preserved,
                 text_effects: prepared.text_effects,
@@ -5367,6 +5453,7 @@ mod tests {
     struct PlannerMock {
         kicad: crate::test_support::MockIpcServer,
         capture: std::sync::Arc<std::sync::Mutex<MutationCapture>>,
+        native_board: std::sync::Arc<std::sync::Mutex<String>>,
     }
 
     fn api_ok() -> kiapi::common::ApiResponse {
@@ -5427,6 +5514,25 @@ mod tests {
         let board_name = board.to_string_lossy().to_string();
         let capture = std::sync::Arc::new(std::sync::Mutex::new(MutationCapture::default()));
         let captured = capture.clone();
+        // One bare footprint per item, so existing tests pass the group guard.
+        let native_board = format!(
+            "(kicad_pcb {})",
+            footprints
+                .iter()
+                .map(|item| {
+                    let instance =
+                        kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                            .unwrap();
+                    format!(
+                        "(footprint \"Mock:Part\" (uuid \"{}\"))",
+                        instance.id.unwrap().value
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let native_board = std::sync::Arc::new(std::sync::Mutex::new(native_board));
+        let serialized_board = native_board.clone();
         let footprints = std::sync::Mutex::new(footprints);
         let kicad = crate::test_support::MockIpcServer::spawn("footprint-update", move |request| {
             let message = request.message.expect("request message");
@@ -5457,6 +5563,17 @@ mod tests {
                         }],
                     },
                     "kiapi.common.commands.GetOpenDocumentsResponse",
+                ))
+            } else if message.type_url.ends_with("SaveDocumentToString") {
+                let command =
+                    kiapi::common::commands::SaveDocumentToString::decode(message.value.as_slice())
+                        .unwrap();
+                api_reply(builders::pack_any(
+                    &kiapi::common::commands::SavedDocumentResponse {
+                        document: command.document,
+                        contents: serialized_board.lock().unwrap().clone(),
+                    },
+                    "kiapi.common.commands.SavedDocumentResponse",
                 ))
             } else if message.type_url.ends_with("GetItems") {
                 let command =
@@ -5567,7 +5684,120 @@ mod tests {
                 panic!("unexpected mock request {}", message.type_url);
             }
         });
-        PlannerMock { kicad, capture }
+        PlannerMock {
+            kicad,
+            capture,
+            native_board,
+        }
+    }
+
+    const NATIVE_CHILDREN: &str =
+        include_str!("../../tests/fixtures/footprint_children_kicad10.kicad_pcb");
+    const GROUPED_U1: &str = "c7901245-d0c4-476f-8215-85f1183d04de";
+    const UNGROUPED_R1: &str = "20a44d6b-d6bb-4ec1-ac0c-f1d3d7e20db2";
+
+    #[test]
+    fn owned_group_conflicts_name_only_footprints_that_own_a_group() {
+        let (_temp, board, _) = plan_fixture();
+        let plan = plan_updates(
+            &board,
+            &[
+                plan_item("U1", Some("Test:Socket"), GROUPED_U1),
+                plan_item("R1", Some("Test:Socket"), UNGROUPED_R1),
+                plan_item("X1", Some("Test:Socket"), "absent"),
+            ],
+            two_layers(),
+            &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
+            &BTreeSet::new(),
+            &UpdateFilters::default(),
+            &kicad_10_0_8(),
+        );
+        assert_eq!(plan.changes.len(), 3);
+        // R1 is only a member of a board-level group, which is not ownership.
+        let found = owned_group_conflicts(NATIVE_CHILDREN, &plan.changes);
+        assert_eq!(
+            found
+                .iter()
+                .map(|conflict| conflict.reference.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("U1"), Some("X1")]
+        );
+        assert!(found[0].message.contains("owns 1 group"), "{found:?}");
+        assert_eq!(owned_group_conflicts("(kicad_pcb", &plan.changes).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_refuses_owned_groups_at_preview_and_rechecks_them_at_apply() {
+        let (_temp, board, _) = plan_fixture();
+        let mock = spawn_planner_mock(
+            &board,
+            plan_item("U1", Some("Test:Socket"), GROUPED_U1),
+            false,
+        );
+        let context = &test_context(mock.kicad.address());
+        let refresh = move |args: serde_json::Value| async move {
+            result_json(
+                &handle_update_footprints_from_library(&args, context)
+                    .await
+                    .unwrap(),
+            )
+        };
+        // U1 without its group.
+        let group = "\t\t(group \"\"\n\t\t\t(uuid \"6b3f8f1e-e891-48a2-9dca-37c4a0d6ab82\")\n\t\t\t(members \"0b59daea-b25c-466e-a3c2-be0447f3dad9\" \"965d8d26-073b-410e-a23d-59d91417ce56\")\n\t\t)\n";
+        assert_eq!(NATIVE_CHILDREN.matches(group).count(), 1);
+        *mock.native_board.lock().unwrap() = NATIVE_CHILDREN.replacen(group, "", 1);
+        let planned = refresh(json!({ "board": board })).await;
+        assert_eq!(planned["status"], "ready", "{planned}");
+
+        *mock.native_board.lock().unwrap() = NATIVE_CHILDREN.to_string();
+        let preview = refresh(json!({ "board": board })).await;
+        assert_eq!(preview["status"], "conflict", "{preview}");
+        assert_eq!(
+            preview["diagnostics"][0]["code"],
+            "footprint_children_not_carried"
+        );
+        assert_eq!(preview["diagnostics"][0]["reference"], "U1");
+        let applied = refresh(json!({
+            "board": board,
+            "dry_run": false,
+            "expected_plan_revision": planned["plan_revision"],
+        }))
+        .await;
+        assert_eq!(applied["status"], "conflict", "{applied}");
+
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 0);
+        assert!(capture.update_batches.is_empty());
+        assert!(capture.commit_actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_returns_a_failed_board_read_as_an_error() {
+        let (_temp, board, _) = plan_fixture();
+        let mock = spawn_planner_mock(
+            &board,
+            plan_item("U1", Some("Test:Socket"), GROUPED_U1),
+            false,
+        );
+        // The IPC client refuses an empty snapshot as a failed read.
+        *mock.native_board.lock().unwrap() = String::new();
+        let body = result_json(
+            &handle_update_footprints_from_library(
+                &json!({ "board": board }),
+                &test_context(mock.kicad.address()),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(body["status"], "conflict", "{body}");
+        assert_eq!(
+            body["diagnostics"][0]["code"], "preflight_conflict",
+            "{body}"
+        );
+        assert!(body["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("empty PCB snapshot"));
     }
 
     #[tokio::test]
@@ -5802,6 +6032,7 @@ mod tests {
         let change = PlannedUpdate {
             reference: "SW1".to_string(),
             library_id: "Test:Socket".to_string(),
+            kiid: "instance-kiid".to_string(),
             changed_domains: prepared.changed_domains.clone(),
             preserved: prepared.preserved.clone(),
             text_effects: prepared.text_effects.clone(),
