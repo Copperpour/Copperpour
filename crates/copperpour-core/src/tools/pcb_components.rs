@@ -37,32 +37,7 @@ macro_rules! ipc {
             Ok(v) => v,
             // Only an unreachable transport justifies "KiCAD must be running".
             // This used to say it for every failure, so a tool that refused a
-            // request on its merits — "a polygon needs at least 3 points" —
-            // told the reader to start a KiCad that was already running, with
-            // the actual reason parenthesised after a false statement.
-            Err(copperpour_ipc::IpcFailure::Unreachable(msg)) => {
-                return Ok(CallToolResult::error(format!(
-                    "KiCAD must be running with the board loaded (IPC error: {})",
-                    msg
-                )))
-            }
-            Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
-                return Ok(crate::tools::ipc_target_error_result(&error))
-            }
-            // No closure given to this raises a refusal of its own (#240).
-            Err(
-                copperpour_ipc::IpcFailure::Rejected(msg)
-                | copperpour_ipc::IpcFailure::Preflight(copperpour_ipc::PreflightRefusal {
-                    reason: msg,
-                    ..
-                }),
-            ) => return Ok(CallToolResult::error(msg)),
-            Err(copperpour_ipc::IpcFailure::Recovered(msg)) => {
-                return Ok(crate::tools::ipc_recovered_result(&msg))
-            }
-            Err(copperpour_ipc::IpcFailure::Uncertain(msg)) => {
-                return Ok(crate::tools::ipc_uncertain_result(&msg))
-            }
+            Err(failure) => return Ok(crate::tools::ipc_failure_result(failure)),
         }
     }};
 }
@@ -4023,7 +3998,7 @@ async fn handle_get_component_pads(
         }
         // Unreachable, or reachable and holding some other board: either way
         // no live KiCad can be answering about this one, so read the file.
-        Err(copperpour_ipc::IpcFailure::Unreachable(_)) => {}
+        Err(copperpour_ipc::IpcFailure::Unreachable { .. }) => {}
         Err(copperpour_ipc::IpcFailure::Target { error, .. }) if error.proves_not_open() => {}
         Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
             return Ok(crate::tools::ipc_target_error_result(&error));

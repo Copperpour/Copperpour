@@ -216,6 +216,32 @@ impl ToolErrorKind {
     }
 }
 
+/// Structured recovery guidance attached to runtime IPC failures and
+/// diagnostics (#525).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RecoveryGuidance {
+    pub cause: String,
+    pub observed: String,
+    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
+    pub evidence: serde_json::Value,
+    pub mutation_outcome: String,
+    pub retry_safe: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub retry_prerequisites: Vec<String>,
+    pub next_steps: Vec<RecoveryStep>,
+    pub troubleshooting_url: String,
+}
+
+/// One concrete next step in [`RecoveryGuidance`], distinguishing agent/tool
+/// actions from steps requiring user intervention.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RecoveryStep {
+    pub actor: String,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+}
+
 impl CallToolResult {
     /// Build a structured error result: JSON body with `message` + `error: {...}`.
     /// Preferred over `CallToolResult::error(text)` whenever the error has a
@@ -224,6 +250,25 @@ impl CallToolResult {
         let body = serde_json::json!({
             "message": message.into(),
             "error": kind,
+        });
+        CallToolResult {
+            content: vec![ToolContent::Text {
+                text: body.to_string(),
+            }],
+            is_error: true,
+        }
+    }
+
+    /// Build a structured error result with additive `recovery` guidance (#525).
+    pub fn error_kind_with_recovery(
+        kind: ToolErrorKind,
+        message: impl Into<String>,
+        recovery: RecoveryGuidance,
+    ) -> Self {
+        let body = serde_json::json!({
+            "message": message.into(),
+            "error": kind,
+            "recovery": recovery,
         });
         CallToolResult {
             content: vec![ToolContent::Text {

@@ -244,7 +244,7 @@ pub(crate) async fn live_or_saved_board(
     .await?;
     let (content, source) = match live {
         Ok(content) => (content, "ipc"),
-        Err(copperpour_ipc::IpcFailure::Unreachable(_)) => match read_saved_board(&board)? {
+        Err(copperpour_ipc::IpcFailure::Unreachable { .. }) => match read_saved_board(&board)? {
             Ok(content) => (content, "saved_file"),
             Err(result) => return Ok(Err(result)),
         },

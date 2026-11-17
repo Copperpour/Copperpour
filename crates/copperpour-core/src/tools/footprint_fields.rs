@@ -88,10 +88,8 @@ async fn handle_set_footprint_field(
     .await?
     {
         Ok(BoardBinding::Bound(outcome)) => outcome,
-        Ok(BoardBinding::Unserved { message, .. }) => {
-            return Ok(CallToolResult::error(format!(
-                "KiCAD must be running with the board loaded (IPC error: {message})"
-            )))
+        Ok(BoardBinding::Unserved { absence, message }) => {
+            return Ok(crate::tools::ipc_unserved_result(absence, &message))
         }
         Err(failure) => return Ok(ipc_failure_result(failure)),
     };

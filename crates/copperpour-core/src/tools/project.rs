@@ -45,7 +45,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "open_project",
             "List PCB documents open in the running KiCad UI and optionally check whether \
-             one specific KiCad project or board is open over IPC.",
+             one specific KiCad project or board is open over IPC. When IPC does not answer, \
+             ipc_failure includes kind, message, and structured recovery guidance.",
             json!({
                 "type": "object",
                 "properties": {
@@ -374,7 +375,7 @@ async fn handle_open_project(
         "kicad_ui_running": connected,
         "ipc_available": connected,
         "ipc_address": endpoint.address(),
-        "ipc_failure": crate::tools::ipc_failure_evidence(&ping),
+        "ipc_failure": crate::tools::ipc_failure_evidence_for_endpoint(&endpoint, &ping),
         "open_board_count": open_boards.len(),
         "open_boards": open_boards,
         "open_boards_error": open_boards_error,

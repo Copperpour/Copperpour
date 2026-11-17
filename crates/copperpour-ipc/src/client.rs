@@ -592,6 +592,7 @@ pub struct TransportUnreachable;
 struct UnreachableDetail {
     reason: UnreachableReason,
     message: String,
+    candidates: Vec<String>,
 }
 
 impl std::fmt::Display for UnreachableDetail {
@@ -617,9 +618,18 @@ pub fn ambiguous_endpoint_message(candidates: &[String]) -> String {
 
 /// The error for a request that never reached KiCad, carrying `reason`.
 fn unreachable_error(reason: UnreachableReason, message: impl Into<String>) -> anyhow::Error {
+    unreachable_error_with_candidates(reason, message, Vec::new())
+}
+
+fn unreachable_error_with_candidates(
+    reason: UnreachableReason,
+    message: impl Into<String>,
+    candidates: Vec<String>,
+) -> anyhow::Error {
     anyhow::Error::new(TransportUnreachable).context(UnreachableDetail {
         reason,
         message: message.into(),
+        candidates,
     })
 }
 
@@ -750,6 +760,20 @@ pub fn unreachable_reason(error: &anyhow::Error) -> Option<UnreachableReason> {
             .downcast_ref::<UnreachableDetail>()
             .map_or(UnreachableReason::TransportError, |detail| detail.reason),
     )
+}
+
+/// Redacted endpoint candidates attached to an ambiguous-endpoint unreachable error.
+pub fn unreachable_candidates(error: &anyhow::Error) -> Vec<String> {
+    error
+        .downcast_ref::<UnreachableDetail>()
+        .map(|detail| {
+            detail
+                .candidates
+                .iter()
+                .map(|candidate| crate::redact_endpoint(candidate))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// What one bounded `Ping` established about the configured endpoint.
@@ -1046,7 +1070,11 @@ impl std::error::Error for BoardTargetError {}
 /// silently overwritten on its next save. Fail closed.
 #[derive(Debug)]
 pub enum IpcFailure {
-    Unreachable(String),
+    Unreachable {
+        reason: UnreachableReason,
+        message: String,
+        candidates: Vec<String>,
+    },
     Rejected(String),
     /// Copperpour refused the request itself, on what it read from KiCad,
     /// before KiCad kept any of it. Its message is the refusal's `reason`.
@@ -1080,8 +1108,12 @@ impl IpcFailure {
                 error: target,
                 message,
             }
-        } else if is_transport_unreachable(&error) {
-            IpcFailure::Unreachable(message)
+        } else if let Some(reason) = unreachable_reason(&error) {
+            IpcFailure::Unreachable {
+                reason,
+                message,
+                candidates: unreachable_candidates(&error),
+            }
         } else if let Some(refusal) = PreflightRefusal::from_error(&error) {
             // After every marker above: a check that failed because KiCad went
             // away or never answered keeps that classification, which governs
@@ -1095,7 +1127,7 @@ impl IpcFailure {
 
     pub fn message(&self) -> &str {
         match self {
-            IpcFailure::Unreachable(message)
+            IpcFailure::Unreachable { message, .. }
             | IpcFailure::Rejected(message)
             | IpcFailure::Uncertain(message)
             | IpcFailure::Recovered(message)
@@ -1332,9 +1364,10 @@ impl KiCadIpcClient {
             // Several sockets qualifying is the one unconfigured state the
             // user can settle in one step, so name them (#374).
             if !self.ambiguous_candidates.is_empty() {
-                return Err(unreachable_error(
+                return Err(unreachable_error_with_candidates(
                     UnreachableReason::NotConfigured,
                     ambiguous_endpoint_message(&self.ambiguous_candidates),
+                    self.ambiguous_candidates.clone(),
                 ));
             }
             return Err(unreachable_error(
@@ -7307,7 +7340,7 @@ mod diagnostic_tests {
         assert!(is_transport_unreachable(&bare));
         assert!(matches!(
             IpcFailure::from_error(anyhow::Error::new(TransportUnreachable)),
-            IpcFailure::Unreachable(_)
+            IpcFailure::Unreachable { .. }
         ));
         assert_eq!(
             unreachable_reason(&bare),
@@ -8638,7 +8671,7 @@ mod preflight_refusal_tests {
         let refusal = PreflightRefusal::check_incomplete("the check could not complete", &lost);
         assert!(matches!(
             IpcFailure::from_error(lost.context(refusal)),
-            IpcFailure::Unreachable(_)
+            IpcFailure::Unreachable { .. }
         ));
 
         let unknown = anyhow::Error::new(IpcOutcomeUnknown {

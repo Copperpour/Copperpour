@@ -137,27 +137,23 @@ async fn handle_set_placed_footprint_models(
 
     let live = match live {
         Ok(BoardBinding::Bound(value)) => value,
-        Ok(BoardBinding::Unserved { message, .. }) => {
-            return Ok(CallToolResult::error_kind(
-                ToolErrorKind::EditorUnavailable {
-                    editor: "pcb".to_string(),
-                    reason: message.clone(),
-                },
-                format!("KiCad must be running with the requested board open: {message}"),
-            ))
+        Ok(BoardBinding::Unserved { absence, message }) => {
+            return Ok(crate::tools::ipc_unserved_result(absence, &message))
         }
         Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
             return Ok(ipc_target_error_result(&error))
         }
-        Err(error) => {
-            return Ok(CallToolResult::error_kind(
-                ToolErrorKind::EditorUnavailable {
-                    editor: "pcb".to_string(),
-                    reason: error.message().to_string(),
-                },
-                format!("KiCad could not serve the requested live-board operation: {error}"),
-            ))
+        Err(
+            error @ (copperpour_ipc::IpcFailure::Rejected(_)
+            | copperpour_ipc::IpcFailure::Preflight(_)),
+        ) => {
+            let message =
+                format!("KiCad could not serve the requested live-board operation: {error}");
+            return Ok(crate::tools::editor_unavailable_with_recovery(
+                &error, message,
+            ));
         }
+        Err(error) => return Ok(crate::tools::ipc_failure_result(error)),
     };
 
     match live {

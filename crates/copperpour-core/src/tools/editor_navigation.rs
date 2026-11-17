@@ -119,7 +119,7 @@ async fn handle_get_editor_state(
 ) -> anyhow::Result<CallToolResult> {
     let endpoint = ctx.ipc_endpoint();
     if let Some(reason) = endpoint.unavailable_reason() {
-        return Ok(editor_unavailable(&reason));
+        return Ok(editor_unavailable_for_endpoint(&endpoint, &reason));
     }
 
     let result =
@@ -148,10 +148,11 @@ async fn handle_get_editor_state(
                     "The configured KiCad endpoint responded but could not provide a stable editor-state observation.",
                 ));
             }
-            match copperpour_ipc::IpcFailure::from_error(error) {
-                copperpour_ipc::IpcFailure::Unreachable(_) => Ok(editor_unavailable(
-                    "the configured KiCad IPC endpoint is unreachable",
-                )),
+            let failure = copperpour_ipc::IpcFailure::from_error(error);
+            match failure {
+                copperpour_ipc::IpcFailure::Unreachable { .. } => {
+                    Ok(editor_unavailable_for_failure(&failure))
+                }
                 _ => Ok(CallToolResult::error_kind(
                     ToolErrorKind::StaleTarget {
                         target: "configured KiCad IPC endpoint".to_string(),
@@ -191,13 +192,29 @@ fn document_identity_result(error: &anyhow::Error) -> Option<CallToolResult> {
     ))
 }
 
-fn editor_unavailable(reason: &str) -> CallToolResult {
-    CallToolResult::error_kind(
+fn editor_unavailable_for_endpoint(
+    endpoint: &crate::tools::IpcEndpoint,
+    reason: &str,
+) -> CallToolResult {
+    CallToolResult::error_kind_with_recovery(
         ToolErrorKind::EditorUnavailable {
             editor: "configured_endpoint".to_string(),
             reason: reason.to_string(),
         },
         format!("KiCad editor state is unavailable: {reason}."),
+        crate::tools::ipc_recovery::for_unavailable_endpoint(endpoint, reason),
+    )
+}
+
+fn editor_unavailable_for_failure(failure: &copperpour_ipc::IpcFailure) -> CallToolResult {
+    let reason = failure.message().to_string();
+    CallToolResult::error_kind_with_recovery(
+        ToolErrorKind::EditorUnavailable {
+            editor: "configured_endpoint".to_string(),
+            reason: reason.clone(),
+        },
+        format!("KiCad editor state is unavailable: {reason}."),
+        crate::tools::ipc_recovery::for_ipc_failure(failure),
     )
 }
 
@@ -211,7 +228,7 @@ async fn handle_get_editor_selection(
     };
     let endpoint = ctx.ipc_endpoint();
     if let Some(reason) = endpoint.unavailable_reason() {
-        return Ok(editor_unavailable(&reason));
+        return Ok(editor_unavailable_for_endpoint(&endpoint, &reason));
     }
     let result =
         tokio::task::spawn_blocking(move || endpoint.client().observe_selection(&target)).await?;
@@ -348,10 +365,9 @@ fn selection_error_result(error: anyhow::Error) -> CallToolResult {
             );
         }
     }
-    match copperpour_ipc::IpcFailure::from_error(error) {
-        copperpour_ipc::IpcFailure::Unreachable(_) => {
-            editor_unavailable("the configured KiCad IPC endpoint is unreachable")
-        }
+    let failure = copperpour_ipc::IpcFailure::from_error(error);
+    match failure {
+        copperpour_ipc::IpcFailure::Unreachable { .. } => editor_unavailable_for_failure(&failure),
         _ => CallToolResult::error_kind(
             ToolErrorKind::StaleTarget {
                 target: "requested editor selection".to_string(),
@@ -379,7 +395,7 @@ async fn handle_resolve_navigation_target(
     };
     let endpoint = ctx.ipc_endpoint();
     if let Some(reason) = endpoint.unavailable_reason() {
-        return Ok(editor_unavailable(&reason));
+        return Ok(editor_unavailable_for_endpoint(&endpoint, &reason));
     }
     let observed = tokio::task::spawn_blocking(move || {
         endpoint
@@ -527,7 +543,7 @@ async fn handle_mutate_editor_selection(
     };
     let endpoint = ctx.ipc_endpoint();
     if let Some(reason) = endpoint.unavailable_reason() {
-        return Ok(editor_unavailable(&reason));
+        return Ok(editor_unavailable_for_endpoint(&endpoint, &reason));
     }
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let resolved_targets = request
@@ -713,10 +729,9 @@ fn selection_mutation_error_result(error: anyhow::Error) -> CallToolResult {
             );
         }
     }
-    match copperpour_ipc::IpcFailure::from_error(error) {
-        copperpour_ipc::IpcFailure::Unreachable(_) => {
-            editor_unavailable("the configured KiCad IPC endpoint is unreachable")
-        }
+    let failure = copperpour_ipc::IpcFailure::from_error(error);
+    match failure {
+        copperpour_ipc::IpcFailure::Unreachable { .. } => editor_unavailable_for_failure(&failure),
         _ => CallToolResult::error_kind(
             ToolErrorKind::StaleTarget {
                 target: "requested editor selection mutation".to_string(),
@@ -738,7 +753,7 @@ async fn handle_resolve_cross_probe_target(
     };
     let endpoint = ctx.ipc_endpoint();
     if let Some(reason) = endpoint.unavailable_reason() {
-        return Ok(editor_unavailable(&reason));
+        return Ok(editor_unavailable_for_endpoint(&endpoint, &reason));
     }
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let resolution = resolve_cross_probe(&request)?;
@@ -882,10 +897,9 @@ fn cross_probe_error_result(error: anyhow::Error) -> CallToolResult {
     if copperpour_ipc::IpcSelectionObservationError::from_error(&error).is_some() {
         return selection_error_result(error);
     }
-    match copperpour_ipc::IpcFailure::from_error(error) {
-        copperpour_ipc::IpcFailure::Unreachable(_) => {
-            editor_unavailable("a requested cross-probe editor endpoint is unreachable")
-        }
+    let failure = copperpour_ipc::IpcFailure::from_error(error);
+    match failure {
+        copperpour_ipc::IpcFailure::Unreachable { .. } => editor_unavailable_for_failure(&failure),
         _ => CallToolResult::error_kind(
             ToolErrorKind::StaleTarget {
                 target: "requested cross-probe context".to_string(),

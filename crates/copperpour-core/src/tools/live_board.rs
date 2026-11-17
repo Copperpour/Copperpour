@@ -64,7 +64,11 @@ pub(crate) enum LiveBoard<T> {
     Unresolved(copperpour_ipc::BoardTargetError),
     /// The request did not reach KiCad, and no unreleased live observation
     /// remains for this board. Carries the transport failure.
-    NeverReached(String),
+    NeverReached {
+        reason: copperpour_ipc::UnreachableReason,
+        message: String,
+        candidates: Vec<String>,
+    },
     /// This process watched KiCad hold this board, and can no longer reach it
     /// — unreachable transport, or an editor that closed the board. The saved
     /// file may be older than state that was lost, so it is not current.
@@ -136,7 +140,11 @@ where
             }
         }
         copperpour_ipc::IpcFailure::Target { error, .. } => LiveBoard::Unresolved(error),
-        copperpour_ipc::IpcFailure::Unreachable(message) => {
+        copperpour_ipc::IpcFailure::Unreachable {
+            reason,
+            message,
+            candidates,
+        } => {
             if !ctx.board_session.authorize_file_fallback(board_path) {
                 LiveBoard::LostAfterObservation {
                     situation:
@@ -145,7 +153,11 @@ where
                     ipc_unreachable: true,
                 }
             } else {
-                LiveBoard::NeverReached(message)
+                LiveBoard::NeverReached {
+                    reason,
+                    message,
+                    candidates,
+                }
             }
         }
     })
@@ -306,7 +318,7 @@ mod tests {
 
         let observed = observe(&ctx, &board, |_, _| Ok(())).await.unwrap();
 
-        assert!(matches!(observed, LiveBoard::NeverReached(_)));
+        assert!(matches!(observed, LiveBoard::NeverReached { .. }));
     }
 
     fn board(dir: &Path) -> std::path::PathBuf {

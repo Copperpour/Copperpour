@@ -159,7 +159,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_kicad_ui",
-            "Check whether the KiCad GUI application is running and whether IPC responds within a bounded timeout. When IPC does not answer, ipc_failure.kind says why: not_configured, no_listener, access_denied (the operating system refused this account; likely a different account or a restrictive ACL, as with a sandboxed client), handshake_failed (the listener did not complete NNG's handshake, so it is probably not KiCad; this takes NNG's 10 s limit, so pass timeout_seconds above 10 to see it), transport_error, or request_failed (the request did not complete and may have reached the endpoint; an explicit KiCad status such as AS_NOT_READY proves receipt, a timeout or malformed reply does not). ipc_failure is null when no kind was established: the Ping succeeded with AS_OK, or this check's own timeout expired first (timed_out: true).",
+            "Check whether the KiCad GUI application is running and whether IPC responds within a bounded timeout. When IPC does not answer, ipc_failure.kind says why: not_configured, no_listener, access_denied (the operating system refused this account; likely a different account or a restrictive ACL, as with a sandboxed client), handshake_failed (the listener did not complete NNG's handshake, so it is probably not KiCad; this takes NNG's 10 s limit, so pass timeout_seconds above 10 to see it), transport_error, or request_failed (the request did not complete and may have reached the endpoint; an explicit KiCad status such as AS_NOT_READY proves receipt, a timeout or malformed reply does not), and ipc_failure.recovery provides structured cause, mutation_outcome, retry_safe, next_steps, and troubleshooting_url. ipc_failure is null when no kind was established: the Ping succeeded with AS_OK, or this check's own timeout expired first (timed_out: true).",
             json!({
                 "type": "object",
                 "properties": {
@@ -1089,10 +1089,11 @@ async fn handle_check_kicad_ui(
         Err(error) => return Ok(error),
     };
     let endpoint = ctx.ipc_endpoint();
+    let endpoint_for_check = endpoint.clone();
     let started = std::time::Instant::now();
     let check = async move {
         let process_detected = task::spawn_blocking(is_kicad_running).await?;
-        let ipc = task::spawn_blocking(move || endpoint.client().ping_outcome()).await?;
+        let ipc = task::spawn_blocking(move || endpoint_for_check.client().ping_outcome()).await?;
         Ok::<_, tokio::task::JoinError>((process_detected, ipc))
     };
 
@@ -1104,7 +1105,7 @@ async fn handle_check_kicad_ui(
                 "running": ui_running(process_detected, ipc_responsive),
                 "process_detected": process_detected,
                 "ipc_responsive": ipc_responsive,
-                "ipc_failure": crate::tools::ipc_failure_evidence(&ipc),
+                "ipc_failure": crate::tools::ipc_failure_evidence_for_endpoint(&endpoint, &ipc),
                 "timed_out": false,
                 "timeout_seconds": timeout_seconds,
                 "elapsed_ms": started.elapsed().as_millis() as u64
@@ -1665,7 +1666,7 @@ async fn handle_check_clearance(
     .await?;
     let (content, source) = match live {
         Ok(content) => (content, "ipc"),
-        Err(copperpour_ipc::IpcFailure::Unreachable(_)) => {
+        Err(copperpour_ipc::IpcFailure::Unreachable { .. }) => {
             (std::fs::read_to_string(&board)?, "saved_file")
         }
         Err(copperpour_ipc::IpcFailure::Target { error, .. }) if error.proves_not_open() => {

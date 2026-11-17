@@ -114,32 +114,40 @@ async fn handle_get_board_stackup(
                 format!("The stackup read did not complete: {error:#}"),
             ))
         }
-        Ok(BoardBinding::Unserved { message, .. }) => {
-            return Ok(CallToolResult::error_kind(
+        Ok(BoardBinding::Unserved { absence, message }) => {
+            return Ok(CallToolResult::error_kind_with_recovery(
                 ToolErrorKind::EditorUnavailable {
                     editor: "pcb".to_string(),
                     reason: message.clone(),
                 },
                 format!(
-                    "KiCad must be running with the requested board open: {message}. The \
-                     stackup is read from the live board only; there is no file fallback."
+                    "KiCad is running but {} ({message}). The stackup is read from the live board only; there is no file fallback.",
+                    absence.observed()
                 ),
+                crate::tools::ipc_recovery::for_board_editor_absence(absence, &message),
             ))
         }
         Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
             return Ok(ipc_target_error_result(&error))
         }
+        Err(copperpour_ipc::IpcFailure::Uncertain(message)) => {
+            return Ok(crate::tools::ipc_uncertain_result(&message))
+        }
+        Err(copperpour_ipc::IpcFailure::Recovered(message)) => {
+            return Ok(crate::tools::ipc_recovered_result(&message))
+        }
         Err(error) => {
-            return Ok(CallToolResult::error_kind(
+            let recovery = crate::tools::ipc_recovery::for_ipc_failure(&error);
+            return Ok(CallToolResult::error_kind_with_recovery(
                 ToolErrorKind::EditorUnavailable {
                     editor: "pcb".to_string(),
                     reason: error.message().to_string(),
                 },
                 format!(
-                    "KiCad could not serve the stackup read for this board: {error}. The \
-                     stackup is read from the live board only; there is no file fallback."
+                    "KiCad could not serve the stackup read for this board: {error}. The stackup is read from the live board only; there is no file fallback."
                 ),
-            ))
+                recovery,
+            ));
         }
     };
 
