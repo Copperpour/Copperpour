@@ -103,9 +103,12 @@ The description should state:
 [GOVERNANCE.md](GOVERNANCE.md#merging) has the rules. In short: a contributor's PR
 needs a maintainer's approving review of its exact head and green required checks,
 and a maintainer merges it with a merge commit. A push after the review needs a new
-review. A maintainer may rebase a reviewed PR that has fallen behind and resolve a
-mechanical conflict; ambiguous conflicts, copied prerequisite history, failed checks
-and substantive changes come back to you. CODEOWNERS routes JLCPCB, EasyEDA and LCSC
+review. Fold review fixes into the commit they belong to and push with
+`--force-with-lease` rather than stacking fix-up commits
+([Reviews](docs/BRANCH_AND_PULL_REQUEST_WORKFLOW.md#reviews)). A maintainer may
+rebase a reviewed PR that has fallen behind and resolve a mechanical conflict;
+ambiguous conflicts, copied prerequisite history, failed checks and substantive
+changes come back to you. CODEOWNERS routes JLCPCB, EasyEDA and LCSC
 changes to @mn89h, who decides them.
 
 You do not need personal access to every supported operating system, KiCad
