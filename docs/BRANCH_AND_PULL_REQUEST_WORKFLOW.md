@@ -30,6 +30,15 @@ exact head: `--approve` when it is ready, `--request-changes` with every
 finding when it is not. The review names the head SHA. A push after the review
 makes it stale; the new head needs its own review.
 
+Answer review findings by amending the commit they belong to and pushing with
+`--force-with-lease`, not by adding "address review" commits on top. The
+history `main` receives is then the change itself, with each commit building
+and passing on its own. Since any push needs a new review anyway, rewriting
+costs the reviewer nothing: `git range-diff <old-head-base>..<old-head>
+<new-base>..<new-head>` shows exactly what changed. Say in your reply which
+head the fix is on and whether you rebased. While a review is in progress,
+wait for it to land before rewriting the branch.
+
 GitHub does not let authors review their own PR, so a maintainer's own PR
 needs none. CODEOWNERS requests the other maintainer's review when the PR
 touches their area; that request stays until they answer it.
