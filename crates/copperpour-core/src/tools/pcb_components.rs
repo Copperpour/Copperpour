@@ -9150,6 +9150,61 @@ mod edit_component_tests {
     struct Sent {
         begins: usize,
         updates: Vec<kiapi::board::types::FootprintInstance>,
+        /// Each board command in order, with the document its header named.
+        named: Vec<(
+            &'static str,
+            Option<kiapi::common::types::DocumentSpecifier>,
+        )>,
+    }
+
+    /// The board the mock holds open, as its `GetOpenDocuments` reports it.
+    fn open_board(board: &str) -> kiapi::common::types::DocumentSpecifier {
+        kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            project: None,
+            identifier: Some(
+                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                    board.to_string(),
+                ),
+            ),
+        }
+    }
+
+    /// The command and the document named by a request that carries an
+    /// `ItemHeader`, or `None` for one that names no document.
+    fn named_document(
+        command: &prost_types::Any,
+    ) -> Option<(
+        &'static str,
+        Option<kiapi::common::types::DocumentSpecifier>,
+    )> {
+        use kiapi::common::commands as c;
+        let bytes = command.value.as_slice();
+        let url = command.type_url.as_str();
+        let (name, header) = if url.ends_with(".GetItems") {
+            ("GetItems", c::GetItems::decode(bytes).unwrap().header)
+        } else if url.ends_with(".BeginCommit") {
+            ("BeginCommit", c::BeginCommit::decode(bytes).unwrap().header)
+        } else if url.ends_with(".UpdateItems") {
+            ("UpdateItems", c::UpdateItems::decode(bytes).unwrap().header)
+        } else if url.ends_with(".EndCommit") {
+            ("EndCommit", c::EndCommit::decode(bytes).unwrap().header)
+        } else {
+            return None;
+        };
+        Some((name, header.and_then(|header| header.document)))
+    }
+
+    /// Every board command named the board the call passed.
+    fn assert_named_the_board(sent: &Sent, board: &str) {
+        let open = open_board(board);
+        for (command, document) in &sent.named {
+            assert_eq!(
+                document.as_ref(),
+                Some(&open),
+                "{command} named another document than the board"
+            );
+        }
     }
 
     fn c_0603(linked: bool) -> kiapi::board::types::FootprintInstance {
@@ -9176,6 +9231,17 @@ mod edit_component_tests {
         }
     }
 
+    fn bad_request(error_message: String) -> kiapi::common::ApiResponse {
+        kiapi::common::ApiResponse {
+            status: Some(kiapi::common::ApiResponseStatus {
+                status: kiapi::common::ApiStatusCode::AsBadRequest as i32,
+                error_message,
+            }),
+            header: None,
+            message: None,
+        }
+    }
+
     fn spawn(
         board: &Path,
         footprint: kiapi::board::types::FootprintInstance,
@@ -9183,25 +9249,25 @@ mod edit_component_tests {
     ) -> (crate::test_support::MockIpcServer, Arc<Mutex<Sent>>) {
         use copperpour_ipc::builders::pack_any;
 
-        let board = board.to_string_lossy().to_string();
+        let open = open_board(&board.to_string_lossy());
         let held = Mutex::new(footprint);
         let sent = Arc::new(Mutex::new(Sent::default()));
         let record = sent.clone();
         let server = crate::test_support::MockIpcServer::spawn("edit-component", move |request| {
             let command = request.message.expect("a command");
             let url = command.type_url.as_str();
+            // KiCad 10.0.8 refuses a request for a board it does not have open
+            // (`API_HANDLER_EDITOR::validateItemHeaderDocument`).
+            if let Some((name, document)) = named_document(&command) {
+                record.lock().unwrap().named.push((name, document.clone()));
+                if document.as_ref() != Some(&open) {
+                    return bad_request(format!("the requested document {document:?} is not open"));
+                }
+            }
             if url.ends_with("GetOpenDocuments") {
                 ok(Some(pack_any(
                     &kiapi::common::commands::GetOpenDocumentsResponse {
-                        documents: vec![kiapi::common::types::DocumentSpecifier {
-                            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-                            project: None,
-                            identifier: Some(
-                                kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                                    board.clone(),
-                                ),
-                            ),
-                        }],
+                        documents: vec![open.clone()],
                     },
                     "kiapi.common.commands.GetOpenDocumentsResponse",
                 )))
@@ -9239,14 +9305,7 @@ mod edit_component_tests {
                 .unwrap();
                 record.lock().unwrap().updates.push(footprint.clone());
                 if kicad == Kicad::Refuses {
-                    return kiapi::common::ApiResponse {
-                        status: Some(kiapi::common::ApiResponseStatus {
-                            status: kiapi::common::ApiStatusCode::AsBadRequest as i32,
-                            error_message: "mock refusal".to_string(),
-                        }),
-                        header: None,
-                        message: None,
-                    };
+                    return bad_request("mock refusal".to_string());
                 }
                 let mut held = held.lock().unwrap();
                 if kicad == Kicad::IgnoresFlags {
@@ -9334,6 +9393,7 @@ mod edit_component_tests {
         let result = handle_edit_component(&args, &context(server.address().to_string()))
             .await
             .unwrap();
+        assert_named_the_board(&sent.lock().unwrap(), &board.to_string_lossy());
         (result, sent, reference)
     }
 
@@ -9379,6 +9439,18 @@ mod edit_component_tests {
 
         let sent = sent.lock().unwrap();
         assert_eq!(sent.begins, 1, "one KiCad undo step");
+        // `edit` asserted that each of these named the board the call passed.
+        let commands: Vec<_> = sent.named.iter().map(|(command, _)| *command).collect();
+        assert_eq!(
+            commands,
+            [
+                "GetItems",
+                "BeginCommit",
+                "UpdateItems",
+                "EndCommit",
+                "GetItems"
+            ]
+        );
         assert_eq!(sent.updates.len(), 1);
         let attributes = sent.updates[0].attributes.clone().unwrap();
         assert!(attributes.do_not_populate);
@@ -9431,7 +9503,10 @@ mod edit_component_tests {
         assert_eq!(body["status"], "unchanged");
         assert_eq!(body["reference"], reference);
         assert_eq!(body["dnp"], false);
-        assert_eq!(sent.lock().unwrap().begins, 0);
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.begins, 0);
+        let commands: Vec<_> = sent.named.iter().map(|(command, _)| *command).collect();
+        assert_eq!(commands, ["GetItems"]);
     }
 
     #[tokio::test]
