@@ -261,6 +261,9 @@ pub struct IpcTeardropEdit {
     pub kind: IpcTeardropTargetKind,
     pub uuid: String,
     pub footprint_uuid: Option<String>,
+    /// The settings the caller read. A target holding others by the time it
+    /// is written was changed meanwhile, and the batch is refused as stale.
+    pub current: IpcTeardropSettings,
     pub settings: IpcTeardropSettings,
 }
 
@@ -279,6 +282,9 @@ pub enum IpcTeardropRefusal {
     FootprintOwnsGroups {
         footprints: Vec<(String, String, usize)>,
     },
+    /// KiCad refused the commit, and a fresh read showed every sent item as
+    /// it was.
+    Rejected { reason: String },
 }
 
 /// A confirmed settings change.
@@ -290,8 +296,12 @@ pub struct IpcTeardropApplied {
     pub zones_before: Vec<IpcTeardropZone>,
     pub zones_after: Vec<IpcTeardropZone>,
     /// Pads carried along in a whole-footprint update without being targeted;
-    /// the post-commit comparison shows their settings unchanged.
+    /// the post-commit comparison shows them unchanged.
     pub carried_pads: usize,
+    /// What the read-back differs from before in, field by field (`footprint
+    /// <kiid>: pad <kiid> teardrop`, `via <kiid> teardrop`): only teardrop
+    /// fields, or the outcome would be uncertain.
+    pub changed_fields: Vec<String>,
 }
 
 /// The result of [`KiCadIpcClient::set_teardrop_settings_in`].
@@ -399,14 +409,16 @@ impl KiCadIpcClient {
 
     /// Apply `edits` in one KiCad commit, then prove the result.
     ///
-    /// Vias are sent back as read with only their settings replaced; pads
-    /// inside their whole footprint as read, with only the targeted pads'
-    /// settings replaced, so every other property travels verbatim. Refuses
-    /// with nothing written for a stale target, a legacy-mode board, or a
-    /// footprint that owns groups. After the commit, a fresh enumeration must
-    /// show every target holding its request, and KiCad's serialization of
-    /// the board must differ from the one before only in teardrop settings
-    /// and generated teardrop zones.
+    /// Pads go through the shared footprint update path
+    /// ([`Self::update_footprint_pads_in`]): their whole footprint is sent
+    /// back as read with only the targeted pads' `teardrop` replaced, and the
+    /// read-back must match it field for field. Vias are sent back as read
+    /// with only their settings replaced, in the same commit, and compared the
+    /// same way. Refuses with nothing written for a stale target, a
+    /// legacy-mode board, or a footprint that owns groups (KiCad 10's
+    /// footprint message does not carry them, so the write would drop them).
+    /// Last, KiCad's serialization of the board must differ from the one
+    /// before only in teardrop settings and generated teardrop zones.
     pub fn set_teardrop_settings_in(
         &self,
         document: common::DocumentSpecifier,
@@ -425,126 +437,208 @@ impl KiCadIpcClient {
                 zones_after: zones_before.clone(),
                 zones_before,
                 carried_pads: 0,
+                changed_fields: Vec::new(),
             }));
         }
-        let vias_by_id = self.pad_and_via_items_in(document.clone())?;
-        let mut footprints = self.footprints_in(document.clone())?;
-        let references = footprint_references(&footprints);
-
-        let mut vias = Vec::new();
-        let mut pad_edits: BTreeMap<String, Vec<&IpcTeardropEdit>> = BTreeMap::new();
+        let stale = |reason: String| {
+            Ok(IpcTeardropApplyOutcome::Refused(
+                IpcTeardropRefusal::Stale { reason },
+            ))
+        };
+        let items = self.pad_and_via_items_in(document.clone())?;
+        let mut via_updates = Vec::new();
+        let mut vias_before = Vec::new();
+        let mut pad_edits: BTreeMap<&str, &IpcTeardropEdit> = BTreeMap::new();
+        let mut footprints: BTreeSet<String> = BTreeSet::new();
         for edit in edits {
-            let stale = |reason: String| {
-                Ok(IpcTeardropApplyOutcome::Refused(
-                    IpcTeardropRefusal::Stale { reason },
-                ))
+            let Some(item) = items.get(&edit.uuid) else {
+                return stale(format!("{} is no longer on the board", edit.uuid));
             };
             match edit.kind {
                 IpcTeardropTargetKind::Via => {
-                    let Some(item) = vias_by_id.get(&edit.uuid) else {
-                        return stale(format!("{} is no longer on the board", edit.uuid));
-                    };
                     if !crate::builders::any_is(item, VIA) {
                         return stale(format!("{} is no longer a via", edit.uuid));
                     }
-                    let mut via = board::Via::decode(item.value.as_slice())
+                    let original = board::Via::decode(item.value.as_slice())
                         .context("KiCad returned an unreadable via")?;
+                    if original
+                        .teardrop
+                        .as_ref()
+                        .and_then(IpcTeardropSettings::from_proto)
+                        != Some(edit.current.clone())
+                    {
+                        return stale(format!("via {} changed since it was read", edit.uuid));
+                    }
+                    let mut via = original.clone();
                     edit.settings
                         .write_to(via.teardrop.get_or_insert_with(Default::default));
-                    vias.push(crate::builders::pack_any(&via, VIA));
+                    via_updates.push(crate::builders::pack_any(&via, VIA));
+                    vias_before.push((original, via));
                 }
                 IpcTeardropTargetKind::Pad => {
-                    let Some(footprint) = edit.footprint_uuid.as_ref() else {
-                        return stale(format!("pad {} names no footprint", edit.uuid));
-                    };
-                    if !footprints.contains_key(footprint) {
-                        return stale(format!("footprint {footprint} is no longer on the board"));
+                    if !crate::builders::any_is(item, PAD) {
+                        return stale(format!("{} is no longer a pad", edit.uuid));
                     }
-                    pad_edits.entry(footprint.clone()).or_default().push(edit);
+                    let pad = board::Pad::decode(item.value.as_slice())
+                        .context("KiCad returned an unreadable pad")?;
+                    let parent = kiid_value(pad.parent.clone());
+                    if parent.is_empty() || Some(&parent) != edit.footprint_uuid.as_ref() {
+                        return stale(format!(
+                            "pad {} no longer belongs to footprint {}",
+                            edit.uuid,
+                            edit.footprint_uuid.as_deref().unwrap_or("<none>")
+                        ));
+                    }
+                    if pad
+                        .teardrop
+                        .as_ref()
+                        .and_then(IpcTeardropSettings::from_proto)
+                        != Some(edit.current.clone())
+                    {
+                        return stale(format!("pad {} changed since it was read", edit.uuid));
+                    }
+                    pad_edits.insert(&edit.uuid, edit);
+                    footprints.insert(parent);
                 }
             }
         }
 
         let owned = footprint_owned_groups(&before_text)?;
-        let mut grouped = Vec::new();
-        for footprint in pad_edits.keys() {
-            let count = owned.get(footprint).copied().unwrap_or(0);
-            if count > 0 {
-                grouped.push((
-                    footprint.clone(),
-                    references.get(footprint).cloned().unwrap_or_default(),
-                    count,
-                ));
-            }
-        }
+        let grouped: Vec<_> = footprints
+            .iter()
+            .filter_map(|footprint| {
+                let count = owned.get(footprint).copied().unwrap_or(0);
+                (count > 0).then(|| (footprint.clone(), count))
+            })
+            .collect();
         if !grouped.is_empty() {
+            let references = footprint_references(&self.footprints_in(document.clone())?);
             return Ok(IpcTeardropApplyOutcome::Refused(
                 IpcTeardropRefusal::FootprintOwnsGroups {
-                    footprints: grouped,
+                    footprints: grouped
+                        .into_iter()
+                        .map(|(id, count)| {
+                            let reference = references.get(&id).cloned().unwrap_or_default();
+                            (id, reference, count)
+                        })
+                        .collect(),
                 },
             ));
         }
 
-        let mut updates = vias;
+        let footprints: Vec<String> = footprints.into_iter().collect();
+        let required: BTreeSet<String> = pad_edits.keys().map(|id| id.to_string()).collect();
         let mut carried_pads = 0;
-        for (footprint_id, wanted) in &pad_edits {
-            let footprint = footprints
-                .get_mut(footprint_id)
-                .expect("checked present above");
-            let definition = footprint
-                .definition
-                .as_mut()
-                .with_context(|| format!("footprint {footprint_id} carries no definition"))?;
-            let mut found = BTreeSet::new();
-            for child in definition.items.iter_mut() {
-                if !crate::builders::any_is(child, PAD) {
+        // The vias go in the same commit; their read-back is part of the
+        // evidence the shared path settles on.
+        let via_evidence = |client: &Self| -> Result<(Vec<String>, Vec<String>)> {
+            let items = client.pad_and_via_items_in(document.clone())?;
+            let mut to_expected = Vec::new();
+            let mut to_before = Vec::new();
+            for (original, sent) in &vias_before {
+                let id = kiid_value(original.id.clone());
+                let Some(Ok(observed)) = items
+                    .get(&id)
+                    .map(|item| board::Via::decode(item.value.as_slice()))
+                else {
+                    to_expected.push(format!("via {id} missing"));
+                    to_before.push(format!("via {id} missing"));
                     continue;
-                }
-                let mut pad = board::Pad::decode(child.value.as_slice())
-                    .context("KiCad returned an unreadable pad")?;
+                };
+                let prefixed = |fields: Vec<String>| {
+                    fields
+                        .into_iter()
+                        .map(|field| format!("via {id} {field}"))
+                        .collect::<Vec<_>>()
+                };
+                to_expected.extend(prefixed(via_differences(sent, &observed)));
+                to_before.extend(prefixed(via_differences(original, &observed)));
+            }
+            Ok((to_expected, to_before))
+        };
+        let update = self.update_footprint_pads_in(
+            document.clone(),
+            "Set teardrop settings",
+            &footprints,
+            &required,
+            via_updates,
+            via_evidence,
+            |_, pad| {
                 let id = kiid_value(pad.id.clone());
-                let Some(edit) = wanted.iter().find(|edit| edit.uuid == id) else {
+                let Some(edit) = pad_edits.get(id.as_str()) else {
                     carried_pads += 1;
-                    continue;
+                    return Ok(false);
                 };
                 edit.settings
                     .write_to(pad.teardrop.get_or_insert_with(Default::default));
-                *child = crate::builders::pack_any(&pad, PAD);
-                found.insert(id);
-            }
-            if let Some(missing) = wanted.iter().find(|edit| !found.contains(&edit.uuid)) {
-                return Ok(IpcTeardropApplyOutcome::Refused(
-                    IpcTeardropRefusal::Stale {
-                        reason: format!(
-                            "pad {} is no longer in footprint {footprint_id}",
-                            missing.uuid
-                        ),
-                    },
-                ));
-            }
-            updates.push(crate::builders::pack_any(&*footprint, FOOTPRINT_INSTANCE));
-        }
-
-        let update_document = document.clone();
-        self.run_commit("Set teardrop settings", move |client| {
-            client.update_items_in(update_document, updates)
-        })?;
-
+                Ok(true)
+            },
+        );
         let uncertain = |reason: String| Ok(IpcTeardropApplyOutcome::Uncertain { reason });
+        let (pads_before, pads_after) = match update {
+            Ok(footprint_pads::FootprintPadUpdate::Applied { before, after }) => (before, after),
+            // Every edit changes its target, so something is always sent.
+            Ok(footprint_pads::FootprintPadUpdate::Unchanged) => {
+                return uncertain("the footprint update path sent nothing".to_string())
+            }
+            Ok(footprint_pads::FootprintPadUpdate::Refused(error)) => {
+                return Ok(IpcTeardropApplyOutcome::Refused(
+                    IpcTeardropRefusal::Rejected {
+                        reason: format!("{error:#}"),
+                    },
+                ))
+            }
+            Ok(footprint_pads::FootprintPadUpdate::Uncertain { mismatches, reason }) => {
+                return uncertain(if mismatches.is_empty() {
+                    reason
+                } else {
+                    format!("{reason}: {}", mismatches.join("; "))
+                })
+            }
+            Err(error) if error.downcast_ref::<FootprintEditTargetError>().is_some() => {
+                return stale(format!("{error:#}"))
+            }
+            Err(error) => return Err(error),
+        };
+
         let after = (|| -> Result<_> {
-            let by_id = self.pad_and_via_items_in(document.clone())?;
-            let items: Vec<prost_types::Any> = edits
-                .iter()
-                .filter_map(|edit| by_id.get(&edit.uuid).cloned())
-                .collect();
-            let references = footprint_references(&self.footprints_in(document.clone())?);
-            let readback = teardrop_targets_from_items(&items, &references)?;
+            let items = self.pad_and_via_items_in(document.clone())?;
             let zones = self.get_teardrop_zones_in(document.clone())?;
             let text = self.save_document_to_string_in(document.clone())?;
-            Ok((readback, zones, text))
+            Ok((items, zones, text))
         })();
-        let (readback, zones_after, after_text) = match after {
+        let (items_after, zones_after, after_text) = match after {
             Ok(after) => after,
+            Err(error) => return uncertain(format!("the read after the commit failed: {error:#}")),
+        };
+        // The shared path proved every sent footprint and via holds exactly
+        // what was sent, which differs from before only in the targets'
+        // teardrop settings. Report those differences as read back.
+        let mut changed_fields = Vec::new();
+        for (original, _) in &vias_before {
+            let id = kiid_value(original.id.clone());
+            if let Some(Ok(observed)) = items_after
+                .get(&id)
+                .map(|item| board::Via::decode(item.value.as_slice()))
+            {
+                changed_fields.extend(
+                    via_differences(original, &observed)
+                        .into_iter()
+                        .map(|field| format!("via {id} {field}")),
+                );
+            }
+        }
+        for (original, observed) in pads_before.iter().zip(&pads_after) {
+            changed_fields.extend(footprint_differences(original, observed));
+        }
+
+        let references = footprint_references(&self.footprints_in(document)?);
+        let targets: Vec<prost_types::Any> = edits
+            .iter()
+            .filter_map(|edit| items_after.get(&edit.uuid).cloned())
+            .collect();
+        let readback = match teardrop_targets_from_items(&targets, &references) {
+            Ok(readback) => readback,
             Err(error) => return uncertain(format!("the read after the commit failed: {error:#}")),
         };
         for edit in edits {
@@ -579,6 +673,7 @@ impl KiCadIpcClient {
             zones_before,
             zones_after,
             carried_pads,
+            changed_fields,
         }))
     }
 
@@ -616,6 +711,42 @@ fn footprint_references(
             )
         })
         .collect()
+}
+
+/// Every difference between two forms of one via, by field name. The net is
+/// compared by name and teardrop settings as KiCad means them, as for pads
+/// in [`footprint_differences`]; `zone_layer_overrides`, a KiCad-derived
+/// implementation detail, is not compared.
+pub fn via_differences(expected: &board::Via, observed: &board::Via) -> Vec<String> {
+    let mut out = Vec::new();
+    macro_rules! compare {
+        ($($field:ident),*) => {
+            $(
+                if expected.$field != observed.$field {
+                    out.push(stringify!($field).to_string());
+                }
+            )*
+        };
+    }
+    compare!(id, position, pad_stack, locked, r#type, parent, is_free);
+    let net = |via: &board::Via| {
+        via.net
+            .as_ref()
+            .map(|net| net.name.clone())
+            .unwrap_or_default()
+    };
+    if net(expected) != net(observed) {
+        out.push("net".to_string());
+    }
+    let teardrop = |via: &board::Via| {
+        via.teardrop
+            .as_ref()
+            .map(|t| IpcTeardropSettings::from_proto(t).ok_or(*t))
+    };
+    if teardrop(expected) != teardrop(observed) {
+        out.push("teardrop".to_string());
+    }
+    out
 }
 
 /// Groups each footprint owns directly, by footprint KIID, from KiCad's
@@ -985,6 +1116,17 @@ mod tests {
             kind: IpcTeardropTargetKind::Via,
             uuid: uuid.to_string(),
             footprint_uuid: None,
+            current: IpcTeardropSettings {
+                enabled: false,
+                curved_edges: false,
+                allow_multiple_track_segments: true,
+                prefer_zone_connection: true,
+                max_length_nm: None,
+                max_width_nm: None,
+                best_length_ratio: 0.5,
+                best_width_ratio: 1.0,
+                max_track_width_ratio: 0.9,
+            },
             settings: IpcTeardropSettings {
                 enabled: true,
                 curved_edges: false,

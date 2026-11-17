@@ -319,10 +319,13 @@ set_teardrop_settings(board, targets: {pads?: [{reference, pad_number} | {uuid}]
 ```
 
 - Read first: `get_teardrop_settings` gives each pad's `uuid`. A pad number can match several pads, so use `{uuid}` to change exactly one
+- `targets` entries add up (a union): `references` selects those footprints' pads, `nets` selects pads and vias. A selector that matches nothing refuses the whole call
 - Settings left out keep their value; the two length limits take `null` for no limit
 - KiCad builds the edited items' teardrops in the same undo step, so no refill is needed. `refill_zones: true` refills every zone on the board and rebuilds every teardrop; only ask for it when the pours should be refilled too
 - The board is not saved: `save_project` saves it
 - `unsupported_capability` means KiCad is older than 10.0.7: change teardrops in KiCad itself. `plan_blocked` names a legacy-teardrop board or a footprint that owns groups; nothing was written
+- `stale_target` means the board changed since it was read (a target moved, vanished or got other settings); nothing was written, so read again and retry
+- `verified_changes` lists every field the read-back differs from before in; all are teardrop fields
 - On `mutation_outcome_uncertain`, read the board with `get_teardrop_settings` before anything else
 
 ### route_differential_pair

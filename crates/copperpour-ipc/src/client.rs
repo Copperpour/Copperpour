@@ -20,8 +20,11 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 mod footprint_edit;
+mod footprint_pads;
 mod teardrops;
 mod text_edit;
+pub use footprint_pads::{footprint_differences, FootprintEditTargetError};
+pub use teardrops::via_differences;
 pub use teardrops::{
     changes_besides_teardrops, footprint_owned_groups, legacy_teardrops_in_board_text,
     supports_teardrop_settings, teardrop_targets_from_items, teardrop_zones_from_items,
@@ -5565,7 +5568,7 @@ impl KiCadIpcClient {
         pad_number: &str,
         net_name: &str,
     ) -> Result<IpcPadNetOutcome> {
-        let mut footprint = self.find_footprint_instance_in(document.clone(), reference)?;
+        let footprint = self.find_footprint_instance_in(document.clone(), reference)?;
         let kiid = footprint
             .id
             .as_ref()
@@ -5574,16 +5577,15 @@ impl KiCadIpcClient {
             .with_context(|| format!("footprint '{reference}' has no KIID"))?;
         let definition = footprint
             .definition
-            .as_mut()
+            .as_ref()
             .with_context(|| format!("footprint '{reference}' carries no definition"))?;
-        let item_count = definition.items.len();
         let mut available = BTreeSet::new();
         let mut changes = Vec::new();
-        for item in definition.items.iter_mut() {
+        for item in &definition.items {
             if !crate::builders::any_is(item, "kiapi.board.types.Pad") {
                 continue;
             }
-            let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())
+            let pad = kiapi::board::types::Pad::decode(item.value.as_slice())
                 .with_context(|| format!("footprint '{reference}' has an unreadable pad"))?;
             available.insert(pad.number.clone());
             if pad.number != pad_number {
@@ -5600,13 +5602,6 @@ impl KiCadIpcClient {
                     .unwrap_or_default(),
                 net: net_name.to_string(),
             });
-            // Net codes are deprecated in KiCad 10's API: the name is what
-            // `BOARD_CONNECTED_ITEM::UnpackNet` reads.
-            pad.net = Some(kiapi::board::types::Net {
-                code: None,
-                name: net_name.to_string(),
-            });
-            *item = crate::builders::pack_any(&pad, "kiapi.board.types.Pad");
         }
         if changes.is_empty() {
             return Ok(IpcPadNetOutcome::NoSuchPad {
@@ -5621,48 +5616,71 @@ impl KiCadIpcClient {
             });
         }
 
-        let packed = crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
-        let update_document = document.clone();
-        self.run_commit("Set pad net", move |client| {
-            client.update_items_in(update_document, vec![packed])
-        })?;
-
-        let after = match self.find_footprint_instance_in(document, reference) {
-            Ok(after) => after,
-            Err(error) => {
+        // Net codes are deprecated in KiCad 10's API: the name is what
+        // `BOARD_CONNECTED_ITEM::UnpackNet` reads.
+        let update = self.update_footprint_pads_in(
+            document,
+            "Set pad net",
+            std::slice::from_ref(&kiid),
+            &BTreeSet::new(),
+            Vec::new(),
+            |_| Ok((Vec::new(), Vec::new())),
+            |_, pad| {
+                if pad.number != pad_number {
+                    return Ok(false);
+                }
+                pad.net = Some(kiapi::board::types::Net {
+                    code: None,
+                    name: net_name.to_string(),
+                });
+                Ok(true)
+            },
+        );
+        let after = match update {
+            Ok(footprint_pads::FootprintPadUpdate::Applied { after, .. }) => after,
+            // Its pads changed between the two reads: nothing was sent.
+            Ok(footprint_pads::FootprintPadUpdate::Unchanged) => {
+                return Err(anyhow::Error::new(
+                    footprint_pads::FootprintEditTargetError {
+                        reason: format!(
+                            "'{reference}' no longer has a pad numbered '{pad_number}'"
+                        ),
+                    },
+                ))
+            }
+            Ok(footprint_pads::FootprintPadUpdate::Refused(error)) => {
+                return Err(error.context(format!(
+                    "KiCad rejected the pad-net update of '{reference}'; a fresh read confirmed \
+                     the footprint is unchanged"
+                )))
+            }
+            Ok(footprint_pads::FootprintPadUpdate::Uncertain { mismatches, reason }) => {
                 return Ok(IpcPadNetOutcome::Uncertain {
-                    reason: format!(
-                        "post-update read-back could not resolve '{reference}': {error:#}"
-                    ),
+                    reason: if mismatches.is_empty() {
+                        reason
+                    } else {
+                        format!("{reason}: {}", mismatches.join("; "))
+                    },
                 })
             }
+            // A refusal before anything was sent stays an error, never
+            // "uncertain".
+            Err(error) => return Err(error),
         };
-        if after.id.as_ref().map(|id| id.value.as_str()) != Some(kiid.as_str()) {
-            return Ok(IpcPadNetOutcome::Uncertain {
-                reason: format!("post-update read-back of '{reference}' carries a different KIID"),
-            });
-        }
-        let Some(definition) = after.definition.as_ref() else {
-            return Ok(IpcPadNetOutcome::Uncertain {
-                reason: format!("post-update read-back of '{reference}' has no definition"),
-            });
-        };
-        // The update replaces the whole footprint. A child that did not come
-        // back would be a silent loss, so the count is part of the evidence.
-        if definition.items.len() != item_count {
-            return Ok(IpcPadNetOutcome::Uncertain {
-                reason: format!(
-                    "'{reference}' held {item_count} items before the update and {} after",
-                    definition.items.len()
-                ),
-            });
-        }
-        let pads = definition
-            .items
-            .iter()
-            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Pad"))
-            .filter_map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).ok())
-            .collect::<Vec<_>>();
+        // The read-back matched what was sent field for field; report each
+        // pad's net from it.
+        let pads: Vec<kiapi::board::types::Pad> = after
+            .first()
+            .and_then(|footprint| footprint.definition.as_ref())
+            .map(|definition| {
+                definition
+                    .items
+                    .iter()
+                    .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Pad"))
+                    .filter_map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
         for change in &mut changes {
             let held = pads.iter().find(|pad| match &change.uuid {
                 Some(uuid) => kiid_value(pad.id.clone()) == *uuid,
@@ -5681,14 +5699,6 @@ impl KiCadIpcClient {
                 .as_ref()
                 .map(|net| net.name.clone())
                 .unwrap_or_default();
-            if change.net != net_name {
-                return Ok(IpcPadNetOutcome::Uncertain {
-                    reason: format!(
-                        "pad '{}' of '{reference}' reads back on net '{}', not '{net_name}'",
-                        change.number, change.net
-                    ),
-                });
-            }
         }
         Ok(IpcPadNetOutcome::Applied {
             kiid,

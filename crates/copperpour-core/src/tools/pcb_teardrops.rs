@@ -83,8 +83,8 @@ pub(crate) fn tools() -> Vec<ToolDef> {
             "Read KiCad's native teardrop settings of the pads and vias on the board open in \
              KiCad 10.0.7 or newer. Optional filters: references (pads of those footprints), \
              nets, kinds (pad, via). Returns each item's UUID, reference, pad number, net, \
-             position and settings, the board's teardrop zones by net, and whether the board \
-             uses KiCad's legacy teardrops. Older or unknown KiCad versions are refused with \
+             position and settings, total and truncated when limit cuts the list, the board's \
+             teardrop zones by net, and whether the board uses KiCad's legacy teardrops. Older or unknown KiCad versions are refused with \
              unsupported_capability.",
             json!({
                 "type": "object",
@@ -104,9 +104,10 @@ pub(crate) fn tools() -> Vec<ToolDef> {
             "set_teardrop_settings",
             "Enable, adjust or disable KiCad's native teardrops on selected pads and vias of the \
              board open in KiCad 10.0.7 or newer, in one KiCad undo step, without saving. KiCad \
-             rebuilds the teardrops of the edited items in that step. targets selects by pads \
-             ({reference, pad_number} or {uuid}), vias (UUIDs), references, nets, all_pads or \
-             all_vias; settings fields left out keep their value. refill_zones (default false) \
+             rebuilds the teardrops of the edited items in that step. targets is the union of \
+             pads ({reference, pad_number} or {uuid}), vias (UUIDs), references (their pads), \
+             nets (pads and vias), all_pads and all_vias; a selector matching nothing refuses \
+             the call. settings fields left out keep their value. refill_zones (default false) \
              then refills every zone on the board and rebuilds every teardrop. dry_run reports \
              each target's settings before and after and writes nothing. Refuses older or \
              unknown KiCad versions (unsupported_capability), boards in legacy teardrop mode \
@@ -119,7 +120,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
                     "board": { "type": "string", "description": "Path to the .kicad_pcb open in KiCad" },
                     "targets": {
                         "type": "object",
-                        "description": "Pads and vias to change: the union of every selector given",
+                        "description": "Pads and vias to change: the union of every selector given. A selector that matches nothing on the board refuses the whole call.",
                         "properties": {
                             "pads": {
                                 "type": "array",
@@ -133,8 +134,8 @@ pub(crate) fn tools() -> Vec<ToolDef> {
                                 }
                             },
                             "vias": { "type": "array", "items": { "type": "string" }, "description": "Via UUIDs" },
-                            "references": { "type": "array", "items": { "type": "string" }, "description": "Every pad of these footprints" },
-                            "nets": { "type": "array", "items": { "type": "string" }, "description": "Every pad and via on these nets" },
+                            "references": { "type": "array", "items": { "type": "string" }, "description": "Every pad of these footprints (pads only)" },
+                            "nets": { "type": "array", "items": { "type": "string" }, "description": "Every pad and via on these nets (pads and vias)" },
                             "all_pads": { "type": "boolean" },
                             "all_vias": { "type": "boolean" }
                         }
@@ -694,9 +695,9 @@ fn bound<T>(
 ) -> Result<T, CallToolResult> {
     match outcome {
         Ok(BoardBinding::Bound(value)) => Ok(value),
-        Ok(BoardBinding::Unserved { message, .. }) => Err(CallToolResult::error(format!(
-            "KiCAD must be running with the board loaded (IPC error: {message})"
-        ))),
+        Ok(BoardBinding::Unserved { absence, message }) => {
+            Err(crate::tools::ipc_unserved_result(absence, &message))
+        }
         Err(failure) => Err(ipc_failure_result(failure)),
     }
 }
@@ -776,7 +777,7 @@ fn read_live(
         "source": "ipc",
         "kicad_version": version.full_version,
         "legacy_teardrops": legacy,
-        "count": listed.count,
+        "total": listed.count,
         "shown": listed.shown,
         "truncated": listed.truncated,
         "enabled_count": wanted.iter().filter(|t| t.settings.enabled).count(),
@@ -900,37 +901,42 @@ fn set_live(
             kind: t.kind,
             uuid: t.uuid.clone(),
             footprint_uuid: t.footprint_uuid.clone(),
+            current: t.settings.clone(),
             settings: after.clone(),
         })
         .collect();
 
-    // The same refusals the apply would give, from KiCad's serialization.
-    let board_text = client.save_document_to_string_in(document.clone())?;
-    let mut reasons = Vec::new();
-    if legacy_teardrops_in_board_text(&board_text)? {
-        reasons.push(legacy_reason());
-    }
-    let owned = footprint_owned_groups(&board_text)?;
-    let edited_footprints: BTreeMap<&str, &str> = edits
-        .iter()
-        .filter_map(|e| {
-            let footprint = e.footprint_uuid.as_deref()?;
-            let reference = targets
-                .iter()
-                .find(|t| t.uuid == e.uuid)
-                .and_then(|t| t.reference.as_deref())
-                .unwrap_or("");
-            Some((footprint, reference))
-        })
-        .collect();
-    for (footprint, reference) in &edited_footprints {
-        let count = owned.get(*footprint).copied().unwrap_or(0);
-        if count > 0 {
-            reasons.push(grouped_reason(footprint, reference, count));
+    // A dry run gives the same refusals the apply would, from KiCad's
+    // serialization; an apply leaves them to `set_teardrop_settings_in`,
+    // which makes them on the same read it compares the result with.
+    if request.dry_run {
+        let board_text = client.save_document_to_string_in(document.clone())?;
+        let mut reasons = Vec::new();
+        if legacy_teardrops_in_board_text(&board_text)? {
+            reasons.push(legacy_reason());
         }
-    }
-    if !reasons.is_empty() {
-        return Ok(blocked(reasons));
+        let owned = footprint_owned_groups(&board_text)?;
+        let edited_footprints: BTreeMap<&str, &str> = edits
+            .iter()
+            .filter_map(|e| {
+                let footprint = e.footprint_uuid.as_deref()?;
+                let reference = targets
+                    .iter()
+                    .find(|t| t.uuid == e.uuid)
+                    .and_then(|t| t.reference.as_deref())
+                    .unwrap_or("");
+                Some((footprint, reference))
+            })
+            .collect();
+        for (footprint, reference) in &edited_footprints {
+            let count = owned.get(*footprint).copied().unwrap_or(0);
+            if count > 0 {
+                reasons.push(grouped_reason(footprint, reference, count));
+            }
+        }
+        if !reasons.is_empty() {
+            return Ok(blocked(reasons));
+        }
     }
 
     let listed: Vec<Value> = planned
@@ -982,6 +988,13 @@ fn set_live(
                     }
                 }
                 response["settings_source"] = json!("ipc_readback");
+                // The read-back's differences from before, field by field:
+                // only teardrop fields, or the outcome would be uncertain.
+                response["verified_changes"] = json!({
+                    "count": applied.changed_fields.len(),
+                    "fields": applied.changed_fields.iter().take(LISTED).collect::<Vec<_>>(),
+                    "carried_pads_unchanged": applied.carried_pads,
+                });
                 response["undo"] = json!(UNDO);
                 response["copper"] =
                     json!({ "commit": zone_changes(&applied.zones_before, &applied.zones_after) });
@@ -1010,6 +1023,17 @@ fn set_live(
                         .iter()
                         .map(|(id, reference, count)| grouped_reason(id, reference, *count))
                         .collect(),
+                ))
+            }
+            IpcTeardropApplyOutcome::Refused(IpcTeardropRefusal::Rejected { reason }) => {
+                return Ok(CallToolResult::error_kind(
+                    ToolErrorKind::HandlerError {
+                        reason: reason.clone(),
+                    },
+                    format!(
+                        "KiCad refused the teardrop settings ({reason}); a fresh read showed \
+                         every item unchanged. Nothing was written."
+                    ),
                 ))
             }
             IpcTeardropApplyOutcome::Uncertain { reason } => {
@@ -1104,6 +1128,17 @@ mod tests {
     ];
 
     struct Kicad {
+        /// Applied to each footprint KiCad stores from an `UpdateItems`.
+        tamper: Option<fn(&mut board::FootprintInstance)>,
+        /// Answer `UpdateItems` with `ISC_OK` but keep nothing, as KiCad does
+        /// with a pad update aimed at its stale cache.
+        drop_updates: bool,
+        /// Refuse every item of an `UpdateItems`, keeping nothing.
+        reject_updates: bool,
+        /// Run once, just before the second answer listing pads and vias:
+        /// a change made in KiCad between the tool's read and its write.
+        on_second_pad_read: Option<fn(&mut Kicad)>,
+        pad_reads: usize,
         version: Option<(u32, u32, u32)>,
         text: String,
         footprints: Vec<board::FootprintInstance>,
@@ -1226,6 +1261,11 @@ mod tests {
             .map(|item| board::Via::decode(item.value.as_slice()).unwrap())
             .collect();
         Kicad {
+            tamper: None,
+            drop_updates: false,
+            reject_updates: false,
+            on_second_pad_read: None,
+            pad_reads: 0,
             version,
             text: BOARD.to_string(),
             footprints,
@@ -1276,6 +1316,12 @@ mod tests {
                 let wants = |kind: Kot| request.types.contains(&(kind as i32));
                 let mut items = Vec::new();
                 if wants(Kot::KotPcbPad) {
+                    held.pad_reads += 1;
+                    if held.pad_reads == 2 {
+                        if let Some(change) = held.on_second_pad_read.take() {
+                            change(held);
+                        }
+                    }
                     items.extend(
                         held.pads()
                             .iter()
@@ -1316,15 +1362,43 @@ mod tests {
             "UpdateItems" => {
                 let request = commands::UpdateItems::decode(command.value.as_slice()).unwrap();
                 let mut updated = Vec::new();
+                if held.reject_updates {
+                    let refused = request
+                        .items
+                        .iter()
+                        .map(|_| commands::ItemUpdateResult {
+                            status: Some(commands::ItemStatus {
+                                code: commands::ItemStatusCode::IscInvalidData as i32,
+                                error_message: "refused by the test double".into(),
+                            }),
+                            item: None,
+                        })
+                        .collect();
+                    return Some(pack_any(
+                        &commands::UpdateItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            updated_items: refused,
+                        },
+                        "kiapi.common.commands.UpdateItemsResponse",
+                    ));
+                }
                 for item in &request.items {
                     if any_is(item, "kiapi.board.types.Via") {
                         let via = board::Via::decode(item.value.as_slice()).unwrap();
                         let slot = held.vias.iter_mut().find(|v| v.id == via.id).unwrap();
                         *slot = via;
                     } else if any_is(item, "kiapi.board.types.FootprintInstance") {
-                        let fp = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
+                        let mut fp =
+                            board::FootprintInstance::decode(item.value.as_slice()).unwrap();
+                        if let Some(tamper) = held.tamper {
+                            tamper(&mut fp);
+                        }
+                        let drop_updates = held.drop_updates;
                         let slot = held.footprints.iter_mut().find(|f| f.id == fp.id).unwrap();
-                        *slot = fp;
+                        if !drop_updates {
+                            *slot = fp;
+                        }
                     } else {
                         panic!("unexpected update of {}", item.type_url);
                     }
@@ -1464,7 +1538,7 @@ mod tests {
         let scene = scene(fixture(Some((10, 0, 7))));
         let (error, body) = scene.get(json!({})).await;
         assert!(!error, "{body}");
-        assert_eq!(body["count"], 7);
+        assert_eq!(body["total"], 7);
         assert_eq!(body["enabled_count"], 4);
         assert_eq!(body["legacy_teardrops"], false);
         let via = body["targets"]
@@ -1478,9 +1552,9 @@ mod tests {
         assert_eq!(via["settings"]["best_length_ratio"], 0.6);
 
         let (_, r1) = scene.get(json!({ "references": ["R1"] })).await;
-        assert_eq!(r1["count"], 2, "{r1}");
+        assert_eq!(r1["total"], 2, "{r1}");
         let (_, vias) = scene.get(json!({ "kinds": ["via"], "limit": 0 })).await;
-        assert_eq!(vias["count"], 1);
+        assert_eq!(vias["total"], 1);
         assert_eq!(vias["shown"], 0);
         assert_eq!(vias["truncated"], true);
         assert!(scene.writes().is_empty());
@@ -1528,11 +1602,116 @@ mod tests {
             neighbour,
             "R1 pad 2 untouched"
         );
+        assert_eq!(
+            body["verified_changes"]["fields"],
+            json!([format!("footprint {R1}: pad {R1_PAD_1} teardrop")]),
+            "{body}"
+        );
+        assert_eq!(body["verified_changes"]["carried_pads_unchanged"], 1);
         let commit = &body["copper"]["commit"];
         assert_eq!(commit["added_count"], 1, "{commit}");
         assert_eq!(commit["added"][0]["uuid"], format!("td-{R1_PAD_1}"));
         assert_eq!(body["copper"]["refill"], Value::Null);
-        let _ = R1;
+    }
+
+    /// The whole footprint goes back to KiCad, so the read-back must show
+    /// nothing but the teardrop changed: a KiCad that moves another pad on
+    /// the way makes the outcome uncertain, naming the field.
+    #[tokio::test]
+    async fn a_footprint_that_comes_back_changed_elsewhere_is_uncertain() {
+        let mut kicad = fixture(Some((10, 0, 8)));
+        kicad.tamper = Some(|footprint| {
+            let definition = footprint.definition.as_mut().unwrap();
+            for item in definition.items.iter_mut() {
+                if any_is(item, "kiapi.board.types.Pad") {
+                    let mut pad = board::Pad::decode(item.value.as_slice()).unwrap();
+                    if pad.id.as_ref().unwrap().value == R1_PAD_2 {
+                        pad.position = Some(copperpour_ipc::builders::vec2(1.0, 1.0));
+                        *item = pack_any(&pad, "kiapi.board.types.Pad");
+                    }
+                }
+            }
+        });
+        let scene = scene(kicad);
+        let (error, body) = scene.set(enable_r1_pad_1()).await;
+        assert!(error, "{body}");
+        assert_eq!(
+            body["error"]["kind"], "mutation_outcome_uncertain",
+            "{body}"
+        );
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("pad {R1_PAD_2} position")),
+            "{body}"
+        );
+    }
+
+    /// A commit KiCad refuses, with the read-back showing nothing changed, is
+    /// a refusal saying nothing was written: for a pad, and for a via alone,
+    /// whose read-back is part of the same evidence.
+    #[tokio::test]
+    async fn a_commit_kicad_refuses_is_reported_as_nothing_written() {
+        for args in [
+            enable_r1_pad_1(),
+            json!({ "targets": { "vias": [VIA] }, "settings": { "curved_edges": false } }),
+        ] {
+            let mut kicad = fixture(Some((10, 0, 8)));
+            kicad.reject_updates = true;
+            let scene = scene(kicad);
+            let (error, body) = scene.set(args.clone()).await;
+            assert!(error, "{args}: {body}");
+            assert_eq!(body["error"]["kind"], "handler_error", "{args}: {body}");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Nothing was written"),
+                "{body}"
+            );
+            assert!(!scene.writes().contains(&"RefillZones".to_string()));
+        }
+    }
+
+    /// Settings changed in KiCad between the tool's read and its write: the
+    /// batch is refused as stale before anything is sent.
+    #[tokio::test]
+    async fn settings_changed_since_the_read_are_refused_as_stale() {
+        let mut kicad = fixture(Some((10, 0, 8)));
+        kicad.on_second_pad_read = Some(|held| {
+            let via = &mut held.vias[0];
+            via.teardrop.as_mut().unwrap().curved_edges = false;
+        });
+        let scene = scene(kicad);
+        let (error, body) = scene
+            .set(json!({ "targets": { "vias": [VIA] }, "settings": { "best_length_ratio": 0.5 } }))
+            .await;
+        assert!(error, "{body}");
+        assert_eq!(body["error"]["kind"], "stale_target", "{body}");
+        assert!(scene.writes().is_empty(), "{:?}", scene.writes());
+    }
+
+    /// KiCad answering `ISC_OK` but keeping nothing, as it does for a pad
+    /// update aimed at its stale item cache, is caught by the read-back.
+    #[tokio::test]
+    async fn an_update_kicad_accepts_but_drops_is_uncertain() {
+        let mut kicad = fixture(Some((10, 0, 8)));
+        kicad.drop_updates = true;
+        let scene = scene(kicad);
+        let (error, body) = scene.set(enable_r1_pad_1()).await;
+        assert!(error, "{body}");
+        assert_eq!(
+            body["error"]["kind"], "mutation_outcome_uncertain",
+            "{body}"
+        );
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("pad {R1_PAD_1} teardrop")),
+            "{body}"
+        );
     }
 
     #[tokio::test]
@@ -1752,7 +1931,7 @@ mod tests {
             write_live_evidence(evidence);
             return;
         }
-        assert_eq!(read["count"], 7, "{read}");
+        assert_eq!(read["total"], 7, "{read}");
         evidence.insert("read".into(), read.clone());
         let gnd_teardrops = read["teardrop_zones"]["by_net"]["GND"]
             .as_u64()
@@ -1795,6 +1974,14 @@ mod tests {
             Some(gnd_teardrops),
             "{on}"
         );
+        let fields = on["verified_changes"]["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 4, "three pads and the via: {on}");
+        assert!(
+            fields
+                .iter()
+                .all(|f| f.as_str().unwrap().ends_with(" teardrop")),
+            "{on}"
+        );
         evidence.insert("enable_with_refill".into(), on);
 
         // Two more edits of the same footprint's pads, one by number and one
@@ -1829,6 +2016,72 @@ mod tests {
             .find(|t| t["uuid"] == R1_PAD_1)
             .unwrap();
         assert_eq!(r1_pad_1["settings"]["enabled"], false, "R1 pad 1 untouched");
+
+        // `set_pad_net` shares the footprint update path, and both compare the
+        // whole footprint after: a footprint KiCad rotated or flipped must
+        // still come back exactly as sent. R2 at 30 degrees, J1 on the back.
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            ipc_address: std::env::var("KICAD_API_SOCKET").unwrap(),
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let tool = |name: &'static str, arguments: Value| {
+            let handler = &handler;
+            async move {
+                let response = handler
+                    .handle_message(json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": { "name": name, "arguments": arguments }
+                    }))
+                    .await
+                    .unwrap();
+                let result = response.result.unwrap();
+                assert_eq!(result["isError"], false, "{name}: {result}");
+                serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap())
+                    .unwrap_or(Value::Null)
+            }
+        };
+        tool(
+            "rotate_component",
+            json!({ "board": board, "reference": "R2", "rotation": 30.0 }),
+        )
+        .await;
+        tool(
+            "flip_component",
+            json!({ "board": board, "reference": "J1", "layer": "B.Cu" }),
+        )
+        .await;
+        for (reference, pad, nets) in [
+            ("R1", "1", ["GND", "VCC"]),
+            ("R2", "2", ["GND", "VCC"]),
+            ("J1", "1", ["GND", "VCC"]),
+        ] {
+            for net in nets {
+                let reply = tool(
+                    "set_pad_net",
+                    json!({ "board": board, "reference": reference, "pad_number": pad, "net_name": net }),
+                )
+                .await;
+                assert_eq!(reply["pads"][0]["net"], net, "{reply}");
+                evidence.insert(format!("set_pad_net_{reference}_{pad}_{net}"), reply);
+            }
+        }
+        let (error, edit) = call(
+            json!({
+                "targets": { "pads": [{ "uuid": R1_PAD_1 }], "references": ["R2", "J1"] },
+                "settings": { "curved_edges": true }
+            }),
+            true,
+        )
+        .await;
+        assert!(!error, "{edit}");
+        // R1 pad 1 and the VCC pads of R2 and J1 change; their GND pads
+        // already have curved edges from the fixture.
+        assert_eq!(edit["selected"], 5, "{edit}");
+        assert_eq!(edit["changed"], 3, "{edit}");
+        evidence.insert("teardrop_after_pad_nets".into(), edit);
         write_live_evidence(evidence);
     }
 

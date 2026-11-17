@@ -165,8 +165,10 @@ fn native_teardrop_settings_reach_the_board_and_its_copper() {
             ),
             "unexpected read failure: {error:#}"
         );
-        // And an update carrying them is accepted, then dropped: what the
-        // tool's version gate exists to prevent.
+        // And an update cannot even be built: the via carries no settings to
+        // match the caller's read, so it is refused before anything is sent.
+        // (Sent anyway, KiCad 10.0.6 accepts the field and drops it, which is
+        // why the tools gate on the version first.)
         let response = client
             .get_teardrop_items_response_in(document.clone())
             .expect("GetItems failed");
@@ -187,14 +189,15 @@ fn native_teardrop_settings_reach_the_board_and_its_copper() {
                     kind: IpcTeardropTargetKind::Via,
                     uuid: uuid.clone(),
                     footprint_uuid: None,
+                    current: requested(),
                     settings: requested(),
                 }],
             )
             .expect("the update was refused outright");
         let after = client.save_document_to_string_in(document.clone()).unwrap();
         assert!(
-            matches!(outcome, IpcTeardropApplyOutcome::Uncertain { .. }),
-            "a pre-10.0.7 KiCad confirmed teardrop settings: {outcome:?}"
+            matches!(outcome, IpcTeardropApplyOutcome::Refused(_)),
+            "a pre-10.0.7 update was not refused before sending: {outcome:?}"
         );
         assert_eq!(
             file_settings(&before, &uuid),
@@ -248,6 +251,7 @@ fn native_teardrop_settings_reach_the_board_and_its_copper() {
             kind: target.kind,
             uuid: target.uuid.clone(),
             footprint_uuid: target.footprint_uuid.clone(),
+            current: target.settings.clone(),
             settings: requested(),
         })
         .collect();
@@ -412,6 +416,7 @@ fn native_teardrop_settings_reach_the_board_and_its_copper() {
     let disable: Vec<IpcTeardropEdit> = edits
         .iter()
         .map(|edit| IpcTeardropEdit {
+            current: edit.settings.clone(),
             settings: IpcTeardropSettings {
                 enabled: false,
                 ..edit.settings.clone()
