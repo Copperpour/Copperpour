@@ -4043,7 +4043,7 @@ mod tests {
     fn a_lock_the_transaction_refuses_is_a_conflict() {
         let (dir, root) = nested_project(|_, content| reset_designators(content, |_| true));
         let before = saved(dir.path(), &nested_names());
-        let lock = dir.path().join("~bank.kicad_sch.lck");
+        let lock = crate::test_support::resolved_dir(dir.path()).join("~bank.kicad_sch.lck");
         let result = annotate_hierarchy_with_persistence(
             &root,
             AnnotateOptions::default(),

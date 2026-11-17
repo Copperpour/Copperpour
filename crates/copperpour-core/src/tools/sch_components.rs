@@ -14145,7 +14145,8 @@ mod editor_lock_refusal_tests {
             let path = dir.path().join(format!("{project}.kicad_sch"));
             std::fs::write(&path, source).unwrap();
             std::fs::write(dir.path().join(format!("{project}.kicad_pro")), "{}\n").unwrap();
-            let lock = dir.path().join(format!("~{project}.kicad_sch.lck"));
+            let lock = crate::test_support::resolved_dir(dir.path())
+                .join(format!("~{project}.kicad_sch.lck"));
             std::fs::write(&lock, r#"{"hostname":"x","username":"y"}"#).unwrap();
             arguments["schematic"] = json!(path.display().to_string());
 
@@ -14259,7 +14260,8 @@ mod root_editor_lock_tests {
             .map(|name| std::fs::read(directory.path().join(name)).unwrap())
             .collect();
         let root = directory.path().join("nested_pages.kicad_sch");
-        let lock = directory.path().join("~nested_pages.kicad_sch.lck");
+        let lock =
+            crate::test_support::resolved_dir(directory.path()).join("~nested_pages.kicad_sch.lck");
         std::fs::write(&lock, r#"{"hostname":"x","username":"y"}"#).unwrap();
         arguments["schematic"] = json!(child);
         let refused = call(&handler, tool, arguments.clone()).await;
