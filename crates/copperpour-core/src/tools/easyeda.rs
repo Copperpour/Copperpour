@@ -5,15 +5,18 @@
 //! both in the project's library tables (`sym-lib-table` and `fp-lib-table`), and optionally
 //! places the component directly into a schematic.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::mcp::error::ToolErrorKind;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::mcp::protocol::{CallToolResult, ToolContent};
-use crate::tools::{opt_f64, opt_str, require_str, ToolContext};
+use crate::tools::{opt_bool_flag, opt_f64, opt_str, require_str, ToolContext};
 
 // The EasyEDA download moved to `sourcing::easyeda` (#209).
-use crate::sourcing::easyeda::fetch_easyeda_bundle;
+use crate::sourcing::easyeda::{fetch_easyeda_3d_assets, fetch_easyeda_bundle};
 
 pub(crate) const EASYEDA_ATTRIBUTION: &str =
     "JLCEDA/EasyEDA Official Library (https://easyeda.com / https://lceda.cn/)";
@@ -400,6 +403,22 @@ pub(crate) async fn handle_import_jlcpcb_part(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    handle_import_jlcpcb_part_with_fetch(args, ctx, |uuid| async move {
+        fetch_easyeda_3d_assets(&uuid).await
+    })
+    .await
+}
+
+async fn handle_import_jlcpcb_part_with_fetch<F, Fut>(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    fetch_model: F,
+) -> anyhow::Result<CallToolResult>
+where
+    F: FnOnce(String) -> Fut + Send,
+    Fut: std::future::Future<Output = anyhow::Result<crate::sourcing::easyeda::Easyeda3dAssets>>
+        + Send,
+{
     let project_dir = match args["project_dir"].as_str() {
         Some(d) => PathBuf::from(d),
         None => match &ctx.config.project_dir {
@@ -417,6 +436,11 @@ pub(crate) async fn handle_import_jlcpcb_part(
 
     let lcsc_id = match require_str(args, "lcsc_id") {
         Ok(v) => v.trim(),
+        Err(e) => return Ok(e),
+    };
+
+    let include_3d = match opt_bool_flag(args, "include_3d") {
+        Ok(v) => v.unwrap_or(false),
         Err(e) => return Ok(e),
     };
 
@@ -628,24 +652,28 @@ pub(crate) async fn handle_import_jlcpcb_part(
     )
     .await;
 
-    // Optional 3D Model fetch
-    if args["include_3d"].as_bool().unwrap_or(false) {
-        if let Some(uuid_3d) = pkg_head["uuid_3d"].as_str() {
-            let model_url =
-                format!("https://modules.easyeda.com/qAxj6KHrDKw4blvCG8QJPs7Y/{uuid_3d}");
-            let client = reqwest::Client::new();
-            if let Ok(resp) = client.get(&model_url).send().await {
-                if resp.status().is_success() {
-                    let models_dir = project_dir.join("3dmodels");
-                    let _ = tokio::fs::create_dir_all(&models_dir).await;
-                    let model_path = models_dir.join(format!("{footprint_name}.step"));
-                    if let Ok(bytes) = resp.bytes().await {
-                        let _ = tokio::fs::write(&model_path, bytes).await;
-                    }
-                }
-            }
+    // A failed requested model import is partial: library files already exist,
+    // but schematic placement has not started. Preserve the original error kind.
+    let model_3d_report = if include_3d {
+        match attach_easyeda_3d_model_with(
+            &pkg_shapes,
+            [pkg_head_x, pkg_head_y],
+            &project_dir,
+            &footprint_name,
+            &fp_path,
+            fetch_model,
+            |args| async move {
+                crate::tools::footprint_models::handle_set_footprint_models(&args, ctx).await
+            },
+        )
+        .await
+        {
+            Ok(report) => Some(report),
+            Err(result) => return Ok(import_3d_failure(result, &sym_lib_path, &fp_path)),
         }
-    }
+    } else {
+        None
+    };
 
     let lib_id = format!("{library_name}:{symbol_name}");
 
@@ -702,8 +730,680 @@ pub(crate) async fn handle_import_jlcpcb_part(
     if let Some(report) = lcsc_catalog {
         body["lcsc_catalog"] = report;
     }
+    if let Some(model_3d) = model_3d_report {
+        body["model_3d"] = model_3d;
+    }
 
     Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Easyeda3dSpec {
+    pub(crate) uuid: String,
+    /// Target center on the PCB in KiCad 3D coordinates (mm, X right, Y up).
+    pub(crate) target_center_mm: [f64; 2],
+    /// Vertical elevation in mm from `SVGNODE.attrs.z` (EasyEDA 10-mil units * 0.254).
+    pub(crate) z_mm: f64,
+    /// Raw EasyEDA `c_rotation` angles (CCW degrees around X, Y, Z).
+    pub(crate) c_rotation_deg: [f64; 3],
+}
+
+fn round4(v: f64) -> f64 {
+    let r = (v * 10_000.0).round() / 10_000.0;
+    if r == 0.0 {
+        0.0
+    } else {
+        r
+    }
+}
+
+fn parse_triple(s: Option<&str>) -> [f64; 3] {
+    let Some(s) = s else {
+        return [0.0; 3];
+    };
+    let mut vals = [0.0; 3];
+    for (slot, part) in vals.iter_mut().zip(s.split(',')) {
+        if let Ok(v) = part.trim().parse::<f64>() {
+            if v.is_finite() {
+                *slot = v;
+            }
+        }
+    }
+    vals
+}
+
+/// Extract the 3D model UUID and placement metadata from EasyEDA `SVGNODE` shapes.
+///
+/// EasyEDA stores the actual 3D model UUID and transform inside an `SVGNODE`
+/// with `attrs.c_etype == "outline3D"`. (`pkg_head["uuid_3d"]` is often absent
+/// or points to an internal document UUID that returns 404 from `modules.easyeda.com`.)
+pub(crate) fn parse_easyeda_3d_model(
+    shapes: &[serde_json::Value],
+    pkg_head_x: f64,
+    pkg_head_y: f64,
+) -> Option<Easyeda3dSpec> {
+    for shape_val in shapes {
+        let Some(s) = shape_val.as_str() else {
+            continue;
+        };
+        let Some(json_str) = s.strip_prefix("SVGNODE~") else {
+            continue;
+        };
+        let Ok(node) = serde_json::from_str::<serde_json::Value>(json_str) else {
+            continue;
+        };
+        let attrs = &node["attrs"];
+        if attrs["c_etype"].as_str() != Some("outline3D") {
+            continue;
+        }
+        let Some(uuid) = attrs["uuid"]
+            .as_str()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        else {
+            continue;
+        };
+
+        let c_rotation_deg = parse_triple(attrs["c_rotation"].as_str());
+        let z_raw: f64 = attrs["z"]
+            .as_str()
+            .and_then(|v| v.trim().parse().ok())
+            .or_else(|| attrs["z"].as_f64())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0);
+        let z_mm = z_raw * 0.254;
+
+        // Prefer the 2D outline polygon center from childNodes: some EasyEDA
+        // parts carry stale canvas coordinates in `c_origin` while their
+        // `childNodes` outline sits directly over the footprint pads.
+        let mut min_x = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        if let Some(children) = node["childNodes"].as_array() {
+            for child in children {
+                let Some(pts) = child["attrs"]["points"].as_str() else {
+                    continue;
+                };
+                let nums: Vec<f64> = pts
+                    .split_whitespace()
+                    .filter_map(|t| t.parse::<f64>().ok())
+                    .filter(|v| v.is_finite())
+                    .collect();
+                for pair in nums.chunks_exact(2) {
+                    min_x = min_x.min(pair[0]);
+                    max_x = max_x.max(pair[0]);
+                    min_y = min_y.min(pair[1]);
+                    max_y = max_y.max(pair[1]);
+                }
+            }
+        }
+
+        let target_center_mm =
+            if min_x.is_finite() && max_x.is_finite() && min_y.is_finite() && max_y.is_finite() {
+                let cx = ((min_x + max_x) / 2.0 - pkg_head_x) * 0.254;
+                let cy = -((min_y + max_y) / 2.0 - pkg_head_y) * 0.254;
+                [cx, cy]
+            } else if let Some(origin) = attrs["c_origin"].as_str() {
+                let mut parts = origin
+                    .split(',')
+                    .filter_map(|p| p.trim().parse::<f64>().ok());
+                match (parts.next(), parts.next()) {
+                    (Some(ox), Some(oy)) if ox.is_finite() && oy.is_finite() => {
+                        [(ox - pkg_head_x) * 0.254, -(oy - pkg_head_y) * 0.254]
+                    }
+                    _ => [0.0, 0.0],
+                }
+            } else {
+                [0.0, 0.0]
+            };
+
+        return Some(Easyeda3dSpec {
+            uuid: uuid.to_string(),
+            target_center_mm,
+            z_mm,
+            c_rotation_deg,
+        });
+    }
+    None
+}
+
+fn rotate_point_xyz(mut p: [f64; 3], rot_deg: [f64; 3]) -> [f64; 3] {
+    let (rx, ry, rz) = (
+        rot_deg[0].to_radians(),
+        rot_deg[1].to_radians(),
+        rot_deg[2].to_radians(),
+    );
+    if rx != 0.0 {
+        let (s, c) = rx.sin_cos();
+        let y = p[1] * c - p[2] * s;
+        let z = p[1] * s + p[2] * c;
+        p[1] = y;
+        p[2] = z;
+    }
+    if ry != 0.0 {
+        let (s, c) = ry.sin_cos();
+        let x = p[0] * c + p[2] * s;
+        let z = -p[0] * s + p[2] * c;
+        p[0] = x;
+        p[2] = z;
+    }
+    if rz != 0.0 {
+        let (s, c) = rz.sin_cos();
+        let x = p[0] * c - p[1] * s;
+        let y = p[0] * s + p[1] * c;
+        p[0] = x;
+        p[1] = y;
+    }
+    p
+}
+
+pub(crate) fn obj_bounds_rotated(
+    obj: &str,
+    c_rotation_deg: [f64; 3],
+) -> Option<([f64; 3], [f64; 3])> {
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    let mut count = 0usize;
+    for line in obj.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("v ") else {
+            continue;
+        };
+        let mut coords = rest.split_whitespace();
+        let x = coords.next()?.parse::<f64>().ok()?;
+        let y = coords.next()?.parse::<f64>().ok()?;
+        let z = coords.next()?.parse::<f64>().ok()?;
+        if ![x, y, z].iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let r = rotate_point_xyz([x, y, z], c_rotation_deg);
+        for i in 0..3 {
+            min[i] = min[i].min(r[i]);
+            max[i] = max[i].max(r[i]);
+        }
+        count += 1;
+    }
+    (count > 0 && min.iter().chain(max.iter()).all(|v| v.is_finite())).then_some((min, max))
+}
+
+/// Compute KiCad `(offset (xyz ...))` in mm and `(rotate (xyz ...))` in degrees.
+///
+/// KiCad's footprint `(rotate (xyz ...))` negates right-hand axis angles relative
+/// to EasyEDA's CCW `c_rotation`, and applies `(rotate ...)` before `(offset ...)`.
+pub(crate) fn compute_kicad_3d_transform(
+    spec: &Easyeda3dSpec,
+    obj_text: Option<&str>,
+) -> Option<([f64; 3], [f64; 3])> {
+    let kicad_rot = [
+        round4((-spec.c_rotation_deg[0]).rem_euclid(360.0)),
+        round4((-spec.c_rotation_deg[1]).rem_euclid(360.0)),
+        round4((-spec.c_rotation_deg[2]).rem_euclid(360.0)),
+    ];
+    let (min, max) = obj_text.and_then(|txt| obj_bounds_rotated(txt, spec.c_rotation_deg))?;
+    let offset = {
+        let model_cx = (min[0] + max[0]) / 2.0;
+        let model_cy = (min[1] + max[1]) / 2.0;
+        [
+            round4(spec.target_center_mm[0] - model_cx),
+            round4(spec.target_center_mm[1] - model_cy),
+            round4(-min[2] + spec.z_mm),
+        ]
+    };
+    Some((offset, kicad_rot))
+}
+
+pub(crate) fn is_step_bytes(bytes: &[u8]) -> bool {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |i| i + 1);
+    let bytes = &bytes[start..end];
+    bytes.starts_with(b"ISO-10303-21;")
+        && bytes.ends_with(b"END-ISO-10303-21;")
+        && bytes.windows(7).any(|w| w == b"HEADER;")
+        && bytes.windows(5).any(|w| w == b"DATA;")
+        && bytes.windows(7).filter(|w| *w == b"ENDSEC;").count() >= 2
+}
+
+#[derive(Default, Clone)]
+struct ObjMaterial {
+    diffuse: [f64; 3],
+    specular: [f64; 3],
+    transparency: f64,
+}
+
+/// Convert an EasyEDA Wavefront OBJ mesh into KiCad-compatible VRML 2.0 (`.wrl`).
+///
+/// KiCad's VRML unit is 0.1 inch (2.54 mm), so the root `Transform` applies
+/// `scale 0.3937007874` (1 / 2.54) to keep vertex coordinates in millimetres.
+pub(crate) fn obj_to_vrml(obj: &str) -> Option<String> {
+    let mut vertices: Vec<[f64; 3]> = Vec::new();
+    let mut materials: BTreeMap<String, ObjMaterial> = BTreeMap::new();
+    let mut current_def_mat: Option<String> = None;
+    let mut current_use_mat = String::from("default");
+    let mut faces_by_mat: BTreeMap<String, Vec<Vec<usize>>> = BTreeMap::new();
+
+    for raw_line in obj.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(head) = parts.next() else {
+            continue;
+        };
+        match head {
+            "v" => {
+                let (Some(x), Some(y), Some(z)) = (
+                    parts.next().and_then(|s| s.parse::<f64>().ok()),
+                    parts.next().and_then(|s| s.parse::<f64>().ok()),
+                    parts.next().and_then(|s| s.parse::<f64>().ok()),
+                ) else {
+                    return None;
+                };
+                if ![x, y, z].iter().all(|v| v.is_finite()) {
+                    return None;
+                }
+                vertices.push([x, y, z]);
+            }
+            "newmtl" => {
+                if let Some(name) = parts.next() {
+                    current_def_mat = Some(name.to_string());
+                    materials
+                        .entry(name.to_string())
+                        .or_insert_with(|| ObjMaterial {
+                            diffuse: [0.7, 0.7, 0.7],
+                            specular: [0.2, 0.2, 0.2],
+                            transparency: 0.0,
+                        });
+                }
+            }
+            "Kd" => {
+                if let Some(ref name) = current_def_mat {
+                    if let (Some(r), Some(g), Some(b)) = (
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                    ) {
+                        if ![r, g, b].iter().all(|v| v.is_finite()) {
+                            return None;
+                        }
+                        if let Some(mat) = materials.get_mut(name) {
+                            mat.diffuse = [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)];
+                        }
+                    }
+                }
+            }
+            "Ks" => {
+                if let Some(ref name) = current_def_mat {
+                    if let (Some(r), Some(g), Some(b)) = (
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                    ) {
+                        if ![r, g, b].iter().all(|v| v.is_finite()) {
+                            return None;
+                        }
+                        if let Some(mat) = materials.get_mut(name) {
+                            mat.specular =
+                                [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)];
+                        }
+                    }
+                }
+            }
+            "d" => {
+                if let Some(ref name) = current_def_mat {
+                    if let Some(alpha) = parts.next().and_then(|s| s.parse::<f64>().ok()) {
+                        if !alpha.is_finite() {
+                            return None;
+                        }
+                        if let Some(mat) = materials.get_mut(name) {
+                            mat.transparency = (1.0 - alpha).clamp(0.0, 1.0);
+                        }
+                    }
+                }
+            }
+            "usemtl" => {
+                if let Some(name) = parts.next() {
+                    current_use_mat = name.to_string();
+                }
+            }
+            "f" => {
+                let mut face = Vec::new();
+                for tok in parts {
+                    let v_str = tok.split('/').next().unwrap_or("");
+                    let idx = v_str.parse::<isize>().ok()?;
+                    let resolved = if idx > 0 {
+                        (idx - 1) as usize
+                    } else if idx < 0 {
+                        let abs = idx.unsigned_abs();
+                        vertices.len().checked_sub(abs)?
+                    } else {
+                        return None;
+                    };
+                    if resolved >= vertices.len() {
+                        return None;
+                    }
+                    face.push(resolved);
+                }
+                if face.len() < 3 {
+                    return None;
+                }
+                if face.len() >= 3 {
+                    faces_by_mat
+                        .entry(current_use_mat.clone())
+                        .or_default()
+                        .push(face);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if vertices.is_empty() || faces_by_mat.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from("#VRML V2.0 utf8\nTransform {\n  scale 0.3937007874 0.3937007874 0.3937007874\n  children [\n");
+    for (mat_name, faces) in faces_by_mat {
+        let mat = materials.get(&mat_name).cloned().unwrap_or(ObjMaterial {
+            diffuse: [0.7, 0.7, 0.7],
+            specular: [0.2, 0.2, 0.2],
+            transparency: 0.0,
+        });
+        out.push_str(&format!(
+            "    Shape {{\n      appearance Appearance {{\n        material Material {{\n          diffuseColor {:.4} {:.4} {:.4}\n          specularColor {:.4} {:.4} {:.4}\n          transparency {:.4}\n        }}\n      }}\n      geometry IndexedFaceSet {{\n        solid FALSE\n        coord Coordinate {{\n          point [\n",
+            mat.diffuse[0],
+            mat.diffuse[1],
+            mat.diffuse[2],
+            mat.specular[0],
+            mat.specular[1],
+            mat.specular[2],
+            mat.transparency
+        ));
+        let mut local_map: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut local_verts: Vec<[f64; 3]> = Vec::new();
+        let mut coord_indices: Vec<String> = Vec::with_capacity(faces.len());
+        for face in faces {
+            let mut face_str = String::new();
+            for global_idx in face {
+                let local_idx = *local_map.entry(global_idx).or_insert_with(|| {
+                    let next = local_verts.len();
+                    local_verts.push(vertices[global_idx]);
+                    next
+                });
+                face_str.push_str(&format!("{local_idx},"));
+            }
+            face_str.push_str("-1");
+            coord_indices.push(face_str);
+        }
+        for v in local_verts {
+            out.push_str(&format!("            {} {} {},\n", v[0], v[1], v[2]));
+        }
+        out.push_str("          ]\n        }\n        coordIndex [\n");
+        for idx_line in coord_indices {
+            out.push_str(&format!("          {idx_line},\n"));
+        }
+        out.push_str("        ]\n      }\n    }\n");
+    }
+    out.push_str("  ]\n}\n");
+    Some(out)
+}
+
+fn body_of(result: &CallToolResult) -> serde_json::Value {
+    result
+        .content
+        .iter()
+        .find_map(|content| match content {
+            ToolContent::Text { text } => serde_json::from_str(text).ok(),
+            _ => None,
+        })
+        .unwrap_or_else(|| json!({"message": "3D model import failed"}))
+}
+
+fn with_model_failure(
+    result: CallToolResult,
+    uuid: &str,
+    path: Option<&std::path::Path>,
+    stage: &str,
+) -> CallToolResult {
+    let mut body = body_of(&result);
+    let uncertain = body["error"]["kind"] == "mutation_outcome_uncertain";
+    body["model_3d"] = json!({
+        "status": if uncertain { "uncertain" } else { "error" },
+        "uuid": uuid,
+        "path": path.map(|p| p.display().to_string()),
+        "stage": stage,
+        "asset_state": match stage { "attach" => "published", "download" | "prepare" => "not_written", _ => "unknown" },
+        "retry_safe": false,
+        "recovery": "Inspect the reported model and footprint before retrying. Imported library files are not rolled back; do not repeat the whole import blindly."
+    });
+    let mut result = CallToolResult::json(&body);
+    result.is_error = true;
+    result
+}
+
+fn model_error(
+    message: impl Into<String>,
+    uuid: &str,
+    path: Option<&std::path::Path>,
+    stage: &str,
+) -> CallToolResult {
+    let message = message.into();
+    with_model_failure(
+        CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: message.clone(),
+            },
+            message,
+        ),
+        uuid,
+        path,
+        stage,
+    )
+}
+
+fn import_3d_failure(
+    result: CallToolResult,
+    symbol_path: &std::path::Path,
+    footprint_path: &std::path::Path,
+) -> CallToolResult {
+    let mut body = body_of(&result);
+    body["success"] = json!(false);
+    body["imported"] = json!({
+        "symbol_path": symbol_path.display().to_string(),
+        "footprint_path": footprint_path.display().to_string(),
+        "rollback_attempted": false,
+        "placement": "not_attempted"
+    });
+    let mut result = CallToolResult::json(&body);
+    result.is_error = true;
+    result
+}
+
+// Both production and tests run this orchestration. Only the external download
+// and footprint-writer boundaries are injectable; selection/publication are real.
+async fn attach_easyeda_3d_model_with<F, FFut, A, AFut>(
+    pkg_shapes: &[serde_json::Value],
+    pkg_head: [f64; 2],
+    project_dir: &std::path::Path,
+    footprint_name: &str,
+    fp_path: &std::path::Path,
+    fetch: F,
+    attach: A,
+) -> Result<serde_json::Value, CallToolResult>
+where
+    F: FnOnce(String) -> FFut,
+    FFut: std::future::Future<Output = anyhow::Result<crate::sourcing::easyeda::Easyeda3dAssets>>,
+    A: FnOnce(serde_json::Value) -> AFut,
+    AFut: std::future::Future<Output = anyhow::Result<CallToolResult>>,
+{
+    let Some(spec) = parse_easyeda_3d_model(pkg_shapes, pkg_head[0], pkg_head[1]) else {
+        return Ok(
+            json!({"status": "not_available", "reason": "no EasyEDA outline3D SVGNODE with a 3D model UUID was found for this footprint"}),
+        );
+    };
+    let assets = fetch(spec.uuid.clone()).await.map_err(|e| {
+        model_error(
+            format!("Failed to download EasyEDA 3D model: {e}"),
+            &spec.uuid,
+            None,
+            "download",
+        )
+    })?;
+    let obj_text = assets.obj.as_deref().ok();
+    // The OBJ bounds establish the EasyEDA normalization for both formats.
+    // A STEP download alone does not prove its native origin or placement.
+    let (offset_mm, rotation_deg) =
+        compute_kicad_3d_transform(&spec, obj_text).ok_or_else(|| {
+            model_error(
+                format!(
+                    "Cannot establish model placement without valid OBJ bounds: {}",
+                    assets
+                        .obj
+                        .as_ref()
+                        .err()
+                        .map(String::as_str)
+                        .unwrap_or("invalid or empty vertices")
+                ),
+                &spec.uuid,
+                None,
+                "prepare",
+            )
+        })?;
+    let (ext, bytes) = match &assets.step {
+        Ok(bytes) if is_step_bytes(bytes) => ("step", bytes.clone()),
+        _ => (
+            "wrl",
+            obj_text
+                .and_then(obj_to_vrml)
+                .ok_or_else(|| {
+                    model_error(
+                        "No complete STEP or convertible OBJ mesh was returned",
+                        &spec.uuid,
+                        None,
+                        "prepare",
+                    )
+                })?
+                .into_bytes(),
+        ),
+    };
+    let digest = crate::hex::encode_hex(&Sha256::digest(&bytes));
+    let filename = format!("{footprint_name}-{}.{ext}", &digest[..16]);
+    let models_dir = project_dir.join("3dmodels");
+    std::fs::create_dir_all(&models_dir).map_err(|e| {
+        model_error(
+            format!("Failed to create 3dmodels directory: {e}"),
+            &spec.uuid,
+            None,
+            "publish",
+        )
+    })?;
+    let model_path = models_dir.join(&filename);
+    publish_model(&model_path, &bytes)
+        .map_err(|e| with_model_failure(e, &spec.uuid, Some(&model_path), "publish"))?;
+    let kicad_model_path = format!("${{KIPRJMOD}}/3dmodels/{filename}");
+    let args = json!({
+        "footprint_path": fp_path.display().to_string(), "mode": "replace",
+        "models": [{"path": kicad_model_path,
+            "offset": {"x": offset_mm[0], "y": offset_mm[1], "z": offset_mm[2]},
+            "rotate": {"x": rotation_deg[0], "y": rotation_deg[1], "z": rotation_deg[2]}}]
+    });
+    let attached = match attach(args).await {
+        Ok(result) => result,
+        Err(error) => {
+            let result = if let Some(path) = crate::tools::readback_mismatch_path(&error) {
+                crate::tools::readback_mismatch_result(path, "Attach imported 3D model")
+            } else if let Some(path) = crate::tools::revision_conflict_path(&error) {
+                crate::tools::revision_conflict_result(path, "Attach imported 3D model")
+            } else {
+                // An unclassified error from a writer does not prove no write.
+                crate::tools::file_outcome_uncertain(
+                    fp_path,
+                    "Attach imported 3D model",
+                    error.to_string(),
+                )
+            };
+            return Err(with_model_failure(
+                result,
+                &spec.uuid,
+                Some(&model_path),
+                "attach",
+            ));
+        }
+    };
+    if attached.is_error {
+        return Err(with_model_failure(
+            attached,
+            &spec.uuid,
+            Some(&model_path),
+            "attach",
+        ));
+    }
+    Ok(
+        json!({"status": "attached", "uuid": spec.uuid, "format": ext,
+        "kicad_path": kicad_model_path, "path": model_path.display().to_string(),
+        "offset_mm": {"x": offset_mm[0], "y": offset_mm[1], "z": offset_mm[2]},
+        "rotation_degrees": {"x": rotation_deg[0], "y": rotation_deg[1], "z": rotation_deg[2]}}),
+    )
+}
+
+// STEP Part-21 payloads may contain non-UTF-8 strings. Keep their original
+// bytes; the S-expression writer's text-only create helper cannot publish them.
+fn publish_model(path: &std::path::Path, bytes: &[u8]) -> Result<(), CallToolResult> {
+    use std::io::Write;
+    let conflict = || crate::tools::revision_conflict_result(path, "Publish imported 3D model");
+    let io_error = |e: std::io::Error| {
+        CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: e.to_string(),
+            },
+            e.to_string(),
+        )
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_file() && std::fs::read(path).ok().as_deref() == Some(bytes)
+            {
+                return Ok(());
+            }
+            return Err(conflict());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_error(e)),
+    }
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".copperpour-model-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut staged = builder.tempfile_in(parent).map_err(io_error)?;
+    staged.write_all(bytes).map_err(io_error)?;
+    staged.as_file().sync_all().map_err(io_error)?;
+    staged.persist_noclobber(path).map_err(|e| {
+        if e.error.kind() == std::io::ErrorKind::AlreadyExists {
+            conflict()
+        } else {
+            io_error(e.error)
+        }
+    })?;
+    // The file has been published: every failed or mismatching readback is
+    // uncertain, never a pre-write refusal. Do not delete it to retry.
+    if std::fs::read(path).ok().as_deref() != Some(bytes) {
+        return Err(crate::tools::readback_mismatch_result(
+            path,
+            "Publish imported 3D model",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -714,7 +1414,7 @@ mod tests {
     use crate::tools::ServerConfig;
     use std::sync::Arc;
 
-    fn test_ctx() -> ToolContext {
+    pub(super) fn test_ctx() -> ToolContext {
         ToolContext::new(
             ServerConfig {
                 kicad_cli: String::new(),
@@ -1070,4 +1770,250 @@ mod tests {
         assert_eq!(u10.property("MPN"), Some("PLACED-PART"));
         assert_eq!(u10.property("Manufacturer"), Some("TestMfr"));
     }
+
+    #[test]
+    fn parse_easyeda_3d_model_prefers_child_nodes_over_stale_c_origin() {
+        // Real EasyEDA footprints like C20526 can have stale c_origin coordinates far off-pad
+        // while childNodes outline sits centered on the footprint pads.
+        let shapes = vec![
+            json!("PAD~RECT~100.0~100.0~1.0~2.0~1~~1~0~100 100~0"),
+            json!(concat!(
+                "SVGNODE~{\"attrs\":{",
+                "\"c_etype\":\"outline3D\",",
+                "\"uuid\":\"abc123def456\",",
+                "\"c_origin\":\"-3292,3420\",",
+                "\"z\":\"-3.5433\",",
+                "\"c_rotation\":\"0,0,180\"",
+                "},\"childNodes\":[{\"attrs\":{",
+                "\"points\":\"95 90 105 90 105 110 95 110\"",
+                "}}]}"
+            )),
+        ];
+
+        let spec = parse_easyeda_3d_model(&shapes, 100.0, 100.0).expect("outline3D parsed");
+        assert_eq!(spec.uuid, "abc123def456");
+        assert!((spec.target_center_mm[0] - 0.0).abs() < 1e-6);
+        assert!((spec.target_center_mm[1] - 0.0).abs() < 1e-6);
+        assert!((spec.z_mm - (-3.5433 * 0.254)).abs() < 1e-6);
+        assert_eq!(spec.c_rotation_deg, [0.0, 0.0, 180.0]);
+    }
+
+    #[test]
+    fn parse_easyeda_3d_model_falls_back_to_c_origin_and_handles_missing() {
+        let shapes_fallback = vec![json!(concat!(
+            "SVGNODE~{\"attrs\":{",
+            "\"c_etype\":\"outline3D\",",
+            "\"uuid\":\"u123\",",
+            "\"c_origin\":\"110,90\",",
+            "\"z\":0,",
+            "\"c_rotation\":\"90,0,270\"",
+            "}}"
+        ))];
+        let spec = parse_easyeda_3d_model(&shapes_fallback, 100.0, 100.0).expect("fallback origin");
+        assert!((spec.target_center_mm[0] - 2.54).abs() < 1e-6);
+        assert!((spec.target_center_mm[1] - 2.54).abs() < 1e-6);
+        assert_eq!(spec.c_rotation_deg, [90.0, 0.0, 270.0]);
+
+        let shapes_missing = vec![json!(
+            "SVGNODE~{\"attrs\":{\"c_etype\":\"outline3D\",\"uuid\":\"   \"}}"
+        )];
+        assert!(parse_easyeda_3d_model(&shapes_missing, 100.0, 100.0).is_none());
+        assert!(parse_easyeda_3d_model(&[], 100.0, 100.0).is_none());
+    }
+
+    #[test]
+    fn compute_kicad_3d_transform_applies_rotation_centering_and_z() {
+        // Off-center box spanning X:[0, 2], Y:[-3, -1], Z:[-0.4, 0.6] rotated 180 around Z
+        // -> rotated spans X:[-2, 0], Y:[1, 3], Z:[-0.4, 0.6] (center (-1, 2), min_z -0.4)
+        // With target_center (0, 0) and z_mm = 0 -> offset = (1.0, -2.0, 0.4), rot = (0, 0, 180)
+        let obj = "\
+v 0 -3 -0.4
+v 2 -1 0.6
+f 1 2 1
+";
+        let spec = Easyeda3dSpec {
+            uuid: "u".to_string(),
+            target_center_mm: [0.0, 0.0],
+            z_mm: 0.0,
+            c_rotation_deg: [0.0, 0.0, 180.0],
+        };
+        let (offset, rot) = compute_kicad_3d_transform(&spec, Some(obj)).unwrap();
+        assert_eq!(offset, [1.0, -2.0, 0.4]);
+        assert_eq!(rot, [0.0, 0.0, 180.0]);
+
+        // Positive CCW 90 -> KiCad CW 270; negative z_mm lifts pins to PCB surface
+        let spec_rot90 = Easyeda3dSpec {
+            uuid: "u".to_string(),
+            target_center_mm: [0.5, -0.5],
+            z_mm: -0.9,
+            c_rotation_deg: [0.0, 0.0, 90.0],
+        };
+        assert!(compute_kicad_3d_transform(&spec_rot90, None).is_none());
+    }
+
+    #[test]
+    fn is_step_bytes_checks_iso_10303_header() {
+        assert!(is_step_bytes(
+            b"ISO-10303-21;\nHEADER;ENDSEC;\nDATA;ENDSEC;\nEND-ISO-10303-21;"
+        ));
+        assert!(!is_step_bytes(b"  \r\n\tISO-10303-21;"));
+        assert!(!is_step_bytes(b"v 0 0 0\nf 1 2 3\n"));
+        assert!(!is_step_bytes(b"<html>404 Not Found</html>"));
+    }
+
+    #[test]
+    fn obj_to_vrml_converts_mesh_materials_and_scale() {
+        let obj = "\
+newmtl red_body
+Kd 0.8 0.1 0.1
+Ks 0.2 0.2 0.2
+d 0.75
+usemtl red_body
+v 0 0 0
+v 2 0 0
+v 2 1 0
+v 0 1 0
+f 1/1/1 2/1/1 3/1/1 4/1/1
+";
+        let wrl = obj_to_vrml(obj).expect("valid VRML output");
+        assert!(wrl.starts_with("#VRML V2.0 utf8"));
+        assert!(wrl.contains("scale 0.3937007874 0.3937007874 0.3937007874"));
+        assert!(wrl.contains("diffuseColor 0.8000 0.1000 0.1000"));
+        assert!(wrl.contains("transparency 0.2500"));
+        assert!(wrl.contains("0,1,2,3,-1"));
+
+        assert!(obj_to_vrml("v 0 0 0\n").is_none());
+        assert!(obj_to_vrml("").is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_import_jlcpcb_part_refuses_non_boolean_include_3d() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx();
+        let args = json!({
+            "project_dir": tmp.path().display().to_string(),
+            "lcsc_id": "C8888888",
+            "include_3d": "yes"
+        });
+        let res = handle_import_jlcpcb_part(&args, &ctx).await.unwrap();
+        assert!(res.is_error, "non-boolean include_3d must be refused");
+        let ToolContent::Text { text } = &res.content[0] else {
+            panic!("expected text error response");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+    }
+
+    #[tokio::test]
+    async fn handle_import_jlcpcb_part_include_3d_reports_not_available_when_missing_outline3d() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path();
+
+        let cache_dir = easyeda_cache_dir().unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let mock_lcsc_id = "C7777777";
+        let cache_file = cache_dir.join(format!("{mock_lcsc_id}.json"));
+        let mock_bundle = json!({
+            "title": "NO3D-PART",
+            "description": "Mock Part Without 3D",
+            "dataStr": {
+                "head": {
+                    "x": 400.0,
+                    "y": 290.0,
+                    "c_para": {
+                        "pre": "R?",
+                        "name": "NO3D-PART",
+                        "package": "NO3D-PKG"
+                    }
+                },
+                "shape": [
+                    "P~show~0~1~380~95~180~gge1~0^^380~95^^M380,95h10~#880000^^1~393.7~99~0~P1~start^^1~389.5~94~0~1~end"
+                ]
+            },
+            "packageDetail": {
+                "title": "NO3D-PKG",
+                "dataStr": {
+                    "head": {
+                        "x": 100.0,
+                        "y": 100.0,
+                        "c_para": { "package": "NO3D-PKG" }
+                    },
+                    "shape": [
+                        "PAD~RECT~100.0~100.0~1.0~2.0~1~~1~0~100 100~0"
+                    ]
+                }
+            }
+        });
+        std::fs::write(&cache_file, serde_json::to_string(&mock_bundle).unwrap()).unwrap();
+
+        let ctx = test_ctx();
+        let args = json!({
+            "project_dir": project_dir.display().to_string(),
+            "lcsc_id": mock_lcsc_id,
+            "library_name": "no3d_lib",
+            "include_3d": true
+        });
+        let result = handle_import_jlcpcb_part(&args, &ctx).await;
+        let _ = std::fs::remove_file(&cache_file);
+        let result = result.unwrap();
+        assert!(!result.is_error);
+
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text response");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["success"], true);
+        assert_eq!(body["model_3d"]["status"], "not_available");
+    }
+
+    #[tokio::test]
+    async fn wrl_conversion_and_footprint_attachment_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fp_path = tmp.path().join("TEST_PKG.kicad_mod");
+        std::fs::write(
+            &fp_path,
+            "(footprint \"TEST_PKG\"\n  (layer \"F.Cu\")\n  (pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\"))\n)\n",
+        )
+        .unwrap();
+
+        let obj = "newmtl body\nKd 0.2 0.2 0.2\nusemtl body\nv -1 -2 0\nv 1 2 1\nf 1 2 1\n";
+        let wrl = obj_to_vrml(obj).expect("wrl generated");
+        let models_dir = tmp.path().join("3dmodels");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("TEST_PKG.wrl"), wrl).unwrap();
+
+        let spec = Easyeda3dSpec {
+            uuid: "u".to_string(),
+            target_center_mm: [0.5, -0.5],
+            z_mm: 0.0,
+            c_rotation_deg: [0.0, 0.0, 180.0],
+        };
+        let (offset, rot) = compute_kicad_3d_transform(&spec, Some(obj)).unwrap();
+
+        let ctx = test_ctx();
+        let res = crate::tools::footprint_models::handle_set_footprint_models(
+            &json!({
+                "footprint_path": fp_path.display().to_string(),
+                "mode": "replace",
+                "models": [{
+                    "path": "${KIPRJMOD}/3dmodels/TEST_PKG.wrl",
+                    "offset": { "x": offset[0], "y": offset[1], "z": offset[2] },
+                    "rotate": { "x": rot[0], "y": rot[1], "z": rot[2] }
+                }]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error);
+
+        let updated = std::fs::read_to_string(&fp_path).unwrap();
+        assert!(updated.contains("(model \"${KIPRJMOD}/3dmodels/TEST_PKG.wrl\""));
+        assert!(updated.contains("(offset (xyz 0.5 -0.5 0))"));
+        assert!(updated.contains("(rotate (xyz 0 0 180))"));
+    }
 }
+
+#[cfg(test)]
+#[path = "easyeda_3d_tests.rs"]
+mod model_tests;
