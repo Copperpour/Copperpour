@@ -1790,3 +1790,341 @@ fn call_tool_description_states_the_approval_consequence() {
         assert!(description.contains(phrase), "{description}");
     }
 }
+
+// ─── get_placement_overview on a KiCad-saved board ───────────────────────────
+//
+// The expected values are KiCad's, not this tool's: netclasses from pcbnew's
+// `GetNetClassName`, airwires from `kicad-cli pcb drc`. The fixture's README
+// records both and the script that produced them.
+
+fn placement_overview(p: &mut McpProcess, extra: Value) -> Value {
+    let mut args = json!({
+        "board": concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../copperpour-core/tests/fixtures/placement_overview_kicad10/placement_overview.kicad_pcb"
+        ),
+    });
+    args.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let result = p.call_tool("get_placement_overview", args);
+    assert_ne!(result["isError"], json!(true), "{result}");
+    result
+}
+
+fn placement_process() -> McpProcess {
+    let mut p = McpProcess::spawn();
+    let loaded = p.call_tool("load_toolset", json!({"name": "placement"}));
+    assert_ne!(loaded["isError"], json!(true), "{loaded}");
+    p
+}
+
+fn assert_mm(actual: &Value, expected: f64, what: &str) {
+    let actual = actual
+        .as_f64()
+        .unwrap_or_else(|| panic!("{what}: {actual}"));
+    assert!(
+        (actual - expected).abs() < 0.011,
+        "{what}: {actual} != {expected}"
+    );
+}
+
+#[test]
+fn placement_overview_airwires_match_kicads_ratsnest() {
+    let mut p = placement_process();
+    let result = placement_overview(&mut p, json!({}));
+    assert_eq!(result["content"].as_array().unwrap().len(), 1, "{result}");
+    let report = McpProcess::tool_body(&result);
+
+    assert_eq!(report["source"], "saved_file", "{report}");
+    assert_eq!(report["footprints"], 9, "{report}");
+    assert_eq!(report["pads"], 18, "{report}");
+    assert_eq!(
+        report["outline_bbox"],
+        json!({"x_min": 10.0, "y_min": 10.0, "x_max": 70.0, "y_max": 50.0})
+    );
+    assert_eq!(report["outside_outline_count"], 1, "{report}");
+    assert_eq!(report["outside_outline"], json!(["R9"]));
+
+    let airwires = &report["airwires"];
+    assert_mm(&airwires["total_length_mm"], 207.08, "total");
+    assert_eq!(airwires["count"], 8, "{airwires}");
+    assert_eq!(airwires["nets"], 6, "{airwires}");
+    assert_eq!(airwires["crossings"], 4, "{airwires}");
+    assert_eq!(
+        airwires["skipped_nets"],
+        json!([{"net": "GND", "pads": 4}]),
+        "{airwires}"
+    );
+
+    // KiCad's ratsnest lines, longest first: net, the two pads, length.
+    let kicad = [
+        ("SIG_B", "R3.2", "R9.1", 61.22),
+        ("/power/VCC", "R4.2", "R5.2", 30.59),
+        ("SIG_B", "R3.2", "R4.1", 26.00),
+        ("SIG_A", "R1.1", "R3.1", 21.54),
+        ("SIG_A", "R1.1", "R2.1", 20.00),
+        ("VCC", "R5.1", "R6.1", 20.00),
+        ("/drv/HV_OUT", "R7.2", "R8.1", 15.09),
+        ("HV", "R6.2", "R7.1", 12.63),
+    ];
+    let longest = airwires["longest"].as_array().unwrap();
+    assert_eq!(longest.len(), kicad.len(), "{longest:#?}");
+    let mut reported: Vec<(String, String, String, f64)> = longest
+        .iter()
+        .map(|wire| {
+            let mut ends = [
+                wire["from"].as_str().unwrap().to_string(),
+                wire["to"].as_str().unwrap().to_string(),
+            ];
+            ends.sort();
+            let [a, b] = ends;
+            (
+                wire["net"].as_str().unwrap().to_string(),
+                a,
+                b,
+                wire["length_mm"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    for (net, a, b, length) in kicad {
+        let at = reported
+            .iter()
+            .position(|w| w.0 == net && w.1 == a && w.2 == b)
+            .unwrap_or_else(|| panic!("no airwire {net} {a}-{b} in {longest:#?}"));
+        let wire = reported.remove(at);
+        assert!((wire.3 - length).abs() < 0.011, "{net} {a}-{b}: {wire:?}");
+    }
+    let lengths: Vec<f64> = longest
+        .iter()
+        .map(|w| w["length_mm"].as_f64().unwrap())
+        .collect();
+    assert!(lengths.windows(2).all(|w| w[0] >= w[1]), "{lengths:?}");
+
+    let nets: Vec<(&str, u64, f64)> = vec![
+        ("SIG_B", 3, 87.23),
+        ("SIG_A", 3, 41.54),
+        ("/power/VCC", 2, 30.59),
+        ("VCC", 2, 20.00),
+        ("/drv/HV_OUT", 2, 15.09),
+        ("HV", 2, 12.63),
+    ];
+    let longest_nets = airwires["longest_nets"].as_array().unwrap();
+    assert_eq!(longest_nets.len(), nets.len(), "{longest_nets:#?}");
+    for (entry, (net, pads, length)) in longest_nets.iter().zip(nets) {
+        assert_eq!(entry["net"], net, "{longest_nets:#?}");
+        assert_eq!(entry["pads"], pads, "{entry}");
+        assert_mm(&entry["length_mm"], length, net);
+    }
+
+    let parts: Vec<(&str, u64, f64)> = vec![
+        ("R3", 3, 108.77),
+        ("R9", 1, 61.22),
+        ("R4", 2, 56.60),
+        ("R5", 2, 50.59),
+        ("R1", 2, 41.54),
+        ("R6", 2, 32.63),
+        ("R7", 2, 27.72),
+        ("R2", 1, 20.00),
+        ("R8", 1, 15.09),
+    ];
+    let farthest = airwires["farthest_footprints"].as_array().unwrap();
+    assert_eq!(farthest.len(), parts.len(), "{farthest:#?}");
+    for (entry, (reference, count, length)) in farthest.iter().zip(parts) {
+        assert_eq!(entry["reference"], reference, "{farthest:#?}");
+        assert_eq!(entry["airwires"], count, "{entry}");
+        assert_mm(&entry["length_mm"], length, reference);
+        assert_mm(&entry["mean_mm"], length / count as f64, reference);
+    }
+}
+
+/// The default groups are the project's netclasses, with KiCad's membership:
+/// `VCC` and `HV*` do not name the sheet-local `/power/VCC` and
+/// `/drv/HV_OUT`, `*VCC` names both VCC nets, and `VCC` is in two classes.
+/// A pattern is a regular expression too: `SIG_[AB]`, `S.G_A` and
+/// `/drv/HV_(OUT|IN)` name nets, and `IG_A` names none because the whole
+/// name has to match.
+#[test]
+fn placement_overview_netclass_groups_follow_kicads_membership() {
+    let mut p = placement_process();
+    let report = McpProcess::tool_body(&placement_overview(&mut p, json!({})));
+    assert_eq!(report["groups_source"], "netclasses", "{report}");
+    let groups = report["groups"].as_array().unwrap();
+    let summary: Vec<(&str, &Value, &Value)> = groups
+        .iter()
+        .map(|g| (g["name"].as_str().unwrap(), &g["nets"], &g["footprints"]))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("AnyChar", &json!(["SIG_A"]), &json!(["R1", "R2", "R3"])),
+            ("Drive", &json!(["/drv/HV_OUT"]), &json!(["R7", "R8"])),
+            ("HighVoltage", &json!(["HV"]), &json!(["R6", "R7"])),
+            ("Power", &json!(["VCC"]), &json!(["R5", "R6"])),
+            (
+                "Rails",
+                &json!(["/power/VCC", "VCC"]),
+                &json!(["R4", "R5", "R6"])
+            ),
+            (
+                "Signals",
+                &json!(["SIG_A", "SIG_B"]),
+                &json!(["R1", "R2", "R3", "R4", "R9"])
+            ),
+            ("Unanchored", &json!([]), &json!([])),
+        ],
+        "{groups:#?}"
+    );
+
+    // HighVoltage: pads R6.2 (60.8, 40) and R7.1 (49.2, 45).
+    assert_eq!(groups[6]["region_bbox"], Value::Null, "{groups:#?}");
+    let hv = &groups[2];
+    assert_eq!(
+        hv["region_bbox"],
+        json!({"x_min": 49.2, "y_min": 40.0, "x_max": 60.8, "y_max": 45.0})
+    );
+    assert_eq!(hv["other_parts_inside_region_count"], 0, "{hv}");
+    // 11.6 x 5 mm of the 60 x 40 mm board.
+    assert_eq!(hv["region_share_of_board"], 0.02, "{hv}");
+    // The nearest pads of other nets on other parts are two pairs at the
+    // same 11.18 mm (10 mm across, 5 mm down): R7.1 to R6.1 and R6.2 to R7.2.
+    let mut nearest: Vec<(&str, &str, &str)> = hv["closest_other_net_pads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .take(2)
+        .map(|c| {
+            assert_mm(&c["distance_mm"], 11.18, "closest");
+            assert_eq!(c["net"], "HV", "{c}");
+            (
+                c["pad"].as_str().unwrap(),
+                c["other_pad"].as_str().unwrap(),
+                c["other_net"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    nearest.sort();
+    assert_eq!(
+        nearest,
+        vec![("R6.2", "R7.2", "/drv/HV_OUT"), ("R7.1", "R6.1", "VCC")],
+        "{hv}"
+    );
+}
+
+/// A group the caller names matches a sheet-local net by its short name too,
+/// which a netclass pattern does not.
+#[test]
+fn placement_overview_net_groups_also_match_the_short_name() {
+    let mut p = placement_process();
+    let report = McpProcess::tool_body(&placement_overview(
+        &mut p,
+        json!({"net_groups": {"Supply": ["VCC"], "Drive": ["HV_*"]}}),
+    ));
+    assert_eq!(report["groups_source"], "argument", "{report}");
+    let groups = report["groups"].as_array().unwrap();
+    let nets: Vec<(&str, &Value)> = groups
+        .iter()
+        .map(|g| (g["name"].as_str().unwrap(), &g["nets"]))
+        .collect();
+    assert_eq!(
+        nets,
+        vec![
+            ("Drive", &json!(["/drv/HV_OUT"])),
+            ("Supply", &json!(["/power/VCC", "VCC"])),
+        ],
+        "{groups:#?}"
+    );
+    // Drive spans R7.2 (50.8, 45) and R8.1 (49.2, 30); R8 and R7 carry it,
+    // and no other part's courtyard centre lies in that strip.
+    assert_eq!(groups[0]["footprints"], json!(["R7", "R8"]));
+    assert_eq!(groups[0]["other_parts_inside_region_count"], 0);
+}
+
+#[test]
+fn placement_overview_skip_nets_and_max_net_pads_choose_the_airwires() {
+    let mut p = placement_process();
+
+    // skip_nets replaces the ground default: GND's 74.14 mm come in, the
+    // two SIG nets (41.54 + 87.23 mm) go out.
+    let report =
+        McpProcess::tool_body(&placement_overview(&mut p, json!({"skip_nets": ["SIG_*"]})));
+    let airwires = &report["airwires"];
+    assert_mm(
+        &airwires["total_length_mm"],
+        207.08 + 74.14 - 41.54 - 87.23,
+        "total with skip_nets",
+    );
+    assert_eq!(airwires["count"], 7, "{airwires}");
+    assert_eq!(
+        airwires["skipped_nets"],
+        json!([{"net": "SIG_A", "pads": 3}, {"net": "SIG_B", "pads": 3}]),
+        "{airwires}"
+    );
+
+    // max_net_pads 2 leaves the four two-pad nets.
+    let report = McpProcess::tool_body(&placement_overview(&mut p, json!({"max_net_pads": 2})));
+    let airwires = &report["airwires"];
+    assert_mm(
+        &airwires["total_length_mm"],
+        30.59 + 20.00 + 15.09 + 12.63,
+        "total with max_net_pads",
+    );
+    assert_eq!(airwires["count"], 4, "{airwires}");
+    assert_eq!(
+        airwires["skipped_nets"],
+        json!([
+            {"net": "GND", "pads": 4},
+            {"net": "SIG_A", "pads": 3},
+            {"net": "SIG_B", "pads": 3},
+        ]),
+        "{airwires}"
+    );
+
+    // top bounds each ranked list and leaves the totals alone.
+    let report = McpProcess::tool_body(&placement_overview(&mut p, json!({"top": 2})));
+    let airwires = &report["airwires"];
+    assert_eq!(airwires["longest"].as_array().unwrap().len(), 2);
+    assert_eq!(airwires["longest_nets"].as_array().unwrap().len(), 2);
+    assert_eq!(airwires["farthest_footprints"].as_array().unwrap().len(), 2);
+    assert_eq!(airwires["count"], 8, "{airwires}");
+}
+
+#[test]
+fn placement_overview_image_is_a_png_block_after_the_report() {
+    let mut p = placement_process();
+    let result = placement_overview(&mut p, json!({"image": true, "width_px": 400}));
+    let content = result["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2, "{result}");
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(McpProcess::tool_body(&result)["airwires"]["count"], 8);
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["mimeType"], "image/png");
+    // Base64 of the eight-byte PNG signature.
+    let data = content[1]["data"].as_str().unwrap();
+    assert!(
+        data.starts_with("iVBORw0KGgo"),
+        "{}",
+        &data[..data.len().min(40)]
+    );
+}
+
+#[test]
+fn placement_overview_refuses_bad_arguments_before_reading_the_board() {
+    let mut p = placement_process();
+    let board = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../copperpour-core/tests/fixtures/placement_overview_kicad10/placement_overview.kicad_pcb"
+    );
+    for arguments in [
+        json!({}),
+        json!({"board": board, "top": 0}),
+        json!({"board": board, "max_net_pads": 1}),
+        json!({"board": board, "net_groups": {"A": "VCC"}}),
+        json!({"board": board, "no_such_argument": true}),
+    ] {
+        let result = p.call_tool("get_placement_overview", arguments.clone());
+        assert_eq!(result["isError"], json!(true), "{arguments}: {result}");
+        let error = McpProcess::tool_body(&result)["error"].clone();
+        assert_eq!(error["kind"], "invalid_argument", "{arguments}: {error}");
+    }
+}
