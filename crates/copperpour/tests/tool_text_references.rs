@@ -21,6 +21,9 @@ const NOT_TOOLS: &[&str] = &[
     "thickness_mm",
     // An `ipc_failure.kind` value of `check_kicad_ui`.
     "timed_out",
+    // A property of `set_footprint_graphics` `selector` and `get_footprint_info` graphics,
+    // nested below the top-level properties this check reads.
+    "item_id",
 ];
 
 fn source_files() -> Vec<PathBuf> {
