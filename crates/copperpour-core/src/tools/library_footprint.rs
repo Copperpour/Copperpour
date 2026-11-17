@@ -10,8 +10,10 @@
 use super::library::PadFabricationProperty;
 use anyhow::{bail, Context, Result};
 use copperpour_ipc::gen::kiapi;
+use copperpour_sexp::layers::{flip_layer, CopperStack};
 use copperpour_sexp::SexpNode;
-use std::collections::BTreeSet;
+use prost::Message;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The instance attributes a library footprint's `(attr …)` declares.
 ///
@@ -604,6 +606,812 @@ fn property_effects(
         keep_upright: true,
         size: Some(copperpour_ipc::builders::vec2(width, height)),
     })
+}
+
+/// A library footprint's `(point …)`, in footprint-local millimetres.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LibraryPoint {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) size: f64,
+    pub(crate) layer: String,
+}
+
+/// A library footprint's `(point (at x y) (size s) (layer "L") (uuid …))`, the only
+/// clauses KiCad's `parsePCB_POINT` reads.
+pub(crate) fn library_point(point: &SexpNode) -> Result<LibraryPoint> {
+    let at = point
+        .find("at")
+        .context("footprint point is missing (at …)")?;
+    Ok(LibraryPoint {
+        x: at.get_f64(1).context("footprint point has an invalid X")?,
+        y: at.get_f64(2).context("footprint point has an invalid Y")?,
+        size: point
+            .find_f64("size")
+            .context("footprint point is missing (size …)")?,
+        layer: point
+            .find("layer")
+            .and_then(|layer| layer.get(1))
+            .and_then(SexpNode::as_str)
+            .context("footprint point is missing (layer …)")?
+            .to_string(),
+    })
+}
+
+/// All `(point …)` nodes of a footprint.
+pub(crate) fn points(root: &SexpNode) -> Result<Vec<LibraryPoint>> {
+    root.children()
+        .unwrap_or_default()
+        .iter()
+        .filter(|child| child.head() == Some("point"))
+        .map(library_point)
+        .collect()
+}
+
+/// A library point as KiCad places it: mirrored top to bottom on the back,
+/// like the pads, then turned about the anchor. A point has no angle of its
+/// own (`PCB_POINT::Rotate` turns only its position).
+pub(crate) fn build_reference_point(
+    point: &LibraryPoint,
+    footprint_position: &kiapi::common::types::Vector2,
+    footprint_rotation: f64,
+    mirror: Option<CopperStack>,
+) -> Result<kiapi::board::types::ReferencePoint> {
+    let local_y = if mirror.is_some() { -point.y } else { point.y };
+    let (x, y) = copperpour_sexp::geometry::transform_pad(
+        point.x,
+        local_y,
+        copperpour_ipc::builders::nm_to_mm(footprint_position.x_nm),
+        copperpour_ipc::builders::nm_to_mm(footprint_position.y_nm),
+        footprint_rotation,
+    );
+    let layer = match mirror {
+        Some(stack) => flip_layer(&point.layer, stack)?,
+        None => point.layer.clone(),
+    };
+    Ok(kiapi::board::types::ReferencePoint {
+        id: None,
+        layer: copperpour_ipc::builders::try_layer_from_name(&layer)? as i32,
+        position: Some(copperpour_ipc::builders::vec2(x, y)),
+        size: Some(copperpour_ipc::builders::distance(point.size)),
+        locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+        parent: None,
+    })
+}
+
+/// A library pad's zone connection and thermal relief clauses, as KiCad's
+/// `parsePAD` reads them. Each is `None` when the pad doesn't set it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct PadZoneSettings {
+    /// `(zone_connect N)`.
+    pub(crate) connection: Option<kiapi::board::types::ZoneConnectionStyle>,
+    /// `(thermal_bridge_width w)`, or the legacy `(thermal_width w)`, in mm.
+    pub(crate) spoke_width: Option<f64>,
+    /// `(thermal_gap g)`, in mm.
+    pub(crate) gap: Option<f64>,
+    /// `(thermal_bridge_angle a)`, in degrees.
+    pub(crate) spoke_angle: Option<f64>,
+}
+
+impl PadZoneSettings {
+    /// Read a library pad's clauses. A clause given twice keeps its last
+    /// value, as in KiCad's parser.
+    pub(crate) fn of_pad(pad: &SexpNode) -> Result<Self> {
+        let mut settings = Self::default();
+        for child in pad.children().unwrap_or_default().iter().skip(4) {
+            let Some(tag) = child.head() else {
+                continue;
+            };
+            if !matches!(
+                tag,
+                "zone_connect"
+                    | "thermal_bridge_width"
+                    | "thermal_width"
+                    | "thermal_gap"
+                    | "thermal_bridge_angle"
+            ) {
+                continue;
+            }
+            let text = match child.children() {
+                Some([_, value]) => value.as_str(),
+                _ => None,
+            }
+            .with_context(|| format!("pad clause '{tag}' must hold exactly one number"))?;
+            if tag == "zone_connect" {
+                settings.connection = Some(zone_connection(text)?);
+                continue;
+            }
+            let value = text
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .with_context(|| format!("pad clause '{tag}' has an invalid value '{text}'"))?;
+            match tag {
+                "thermal_bridge_width" | "thermal_width" => settings.spoke_width = Some(value),
+                "thermal_gap" => settings.gap = Some(value),
+                _ => settings.spoke_angle = Some(value),
+            }
+        }
+        Ok(settings)
+    }
+
+    /// The pad stack's zone settings for a pad of `shape`, as KiCad holds
+    /// them once it has loaded the pad from a file: the pad's connection, or
+    /// inherited, and always a spoke angle, the pad's or the parser's default
+    /// for the shape. KiCad's `PADSTACK::Deserialize` sets the spoke angle
+    /// from any `thermal_spokes` it receives, reading a missing angle as 0°,
+    /// and a pad stack built without `thermal_spokes` keeps its constructor's
+    /// 45°, so the angle is always sent.
+    pub(crate) fn zone_connection_settings(
+        &self,
+        shape: i32,
+    ) -> kiapi::board::types::ZoneConnectionSettings {
+        kiapi::board::types::ZoneConnectionSettings {
+            zone_connection: self
+                .connection
+                .unwrap_or(kiapi::board::types::ZoneConnectionStyle::ZcsInherited)
+                as i32,
+            thermal_spokes: Some(kiapi::board::types::ThermalSpokeSettings {
+                width: self.spoke_width.map(copperpour_ipc::builders::distance),
+                angle: Some(kiapi::common::types::Angle {
+                    value_degrees: self
+                        .spoke_angle
+                        .unwrap_or_else(|| default_thermal_spoke_angle(shape)),
+                }),
+                gap: self.gap.map(copperpour_ipc::builders::distance),
+            }),
+        }
+    }
+}
+
+/// Each pad's zone connection and thermal relief settings, from `pad_nodes`.
+pub(crate) fn pad_zones(pad_nodes: &[&SexpNode]) -> Result<Vec<PadZoneSettings>> {
+    pad_nodes
+        .iter()
+        .copied()
+        .map(PadZoneSettings::of_pad)
+        .collect()
+}
+
+/// KiCad's API value for `(zone_connect N)`. KiCad's parser casts N to
+/// `ZONE_CONNECTION` (`pcbnew/zones.h`), mapped as `api_pcb_enums.cpp` maps
+/// it.
+fn zone_connection(text: &str) -> Result<kiapi::board::types::ZoneConnectionStyle> {
+    use kiapi::board::types::ZoneConnectionStyle as Style;
+    Ok(match text.parse::<i64>() {
+        Ok(-1) => Style::ZcsInherited,
+        Ok(0) => Style::ZcsNone,
+        Ok(1) => Style::ZcsThermal,
+        Ok(2) => Style::ZcsFull,
+        Ok(3) => Style::ZcsPthThermal,
+        _ => bail!("pad zone_connect '{text}' is not a zone connection KiCad defines"),
+    })
+}
+
+/// The spoke angle KiCad gives a pad that doesn't set one, as
+/// `PADSTACK::DefaultThermalSpokeAngleForShape` does: 90° for ovals and
+/// rectangles, rounded or chamfered, and 45° for the rest. For the shapes
+/// typed refresh builds, KiCad's parser (`parsePAD`) gives the same.
+pub(crate) fn default_thermal_spoke_angle(shape: i32) -> f64 {
+    use kiapi::board::types::PadStackShape;
+    if [
+        PadStackShape::PssOval,
+        PadStackShape::PssRectangle,
+        PadStackShape::PssRoundrect,
+        PadStackShape::PssChamferedrect,
+    ]
+    .into_iter()
+    .any(|candidate| candidate as i32 == shape)
+    {
+        90.0
+    } else {
+        45.0
+    }
+}
+
+/// Apply library `pad_properties` (when `carry_10_0_7_fields` is true) and
+/// `pad_zones` to every `Pad` in `definition.items`. The builder emits pads
+/// in the library's order.
+pub(crate) fn apply_pad_settings(
+    definition: &mut kiapi::board::types::Footprint,
+    pad_properties: &[PadFabricationProperty],
+    pad_zones: &[PadZoneSettings],
+    carry_10_0_7_fields: bool,
+) -> Result<()> {
+    let mut pairs = pad_properties.iter().zip(pad_zones);
+    for item in &mut definition.items {
+        if copperpour_ipc::builders::any_is(item, "kiapi.board.types.Pad") {
+            let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+            let (property, zone) = pairs
+                .next()
+                .context("typed footprint builder returned more pads than the library has")?;
+            if carry_10_0_7_fields {
+                pad.fab_property = fab_property(*property) as i32;
+            }
+            let stack = pad
+                .pad_stack
+                .as_mut()
+                .context("typed footprint builder returned a pad without a pad stack")?;
+            let shape = stack
+                .copper_layers
+                .first()
+                .context("typed footprint builder returned a pad without a copper layer")?
+                .shape;
+            stack.zone_settings = Some(zone.zone_connection_settings(shape));
+            *item = copperpour_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
+        }
+    }
+    if pairs.next().is_some() {
+        bail!("typed footprint builder returned fewer pads than the library has");
+    }
+    Ok(())
+}
+
+/// Append `ReferencePoint` items for each library `(point …)` to
+/// `definition.items`.
+pub(crate) fn apply_reference_points(
+    definition: &mut kiapi::board::types::Footprint,
+    points: &[LibraryPoint],
+    footprint_position: &kiapi::common::types::Vector2,
+    footprint_rotation: f64,
+    mirror: Option<CopperStack>,
+) -> Result<()> {
+    for point in points {
+        definition.items.push(copperpour_ipc::builders::pack_any(
+            &build_reference_point(point, footprint_position, footprint_rotation, mirror)?,
+            "kiapi.board.types.ReferencePoint",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a footprint has pad fabrication properties or reference points
+/// that KiCad's API carries only from 10.0.7.
+pub(crate) fn needs_kicad_10_0_7(
+    pad_properties: &[PadFabricationProperty],
+    points: &[LibraryPoint],
+) -> bool {
+    pad_properties
+        .iter()
+        .any(|property| *property != PadFabricationProperty::None)
+        || !points.is_empty()
+}
+
+/// Describe what a footprint has that KiCad before 10.0.7 cannot carry, or
+/// `None` when it has neither.
+pub(crate) fn needs_kicad_10_0_7_summary(
+    pad_properties: &[PadFabricationProperty],
+    points: &[LibraryPoint],
+) -> Option<&'static str> {
+    let has_props = pad_properties
+        .iter()
+        .any(|property| *property != PadFabricationProperty::None);
+    match (has_props, !points.is_empty()) {
+        (false, false) => None,
+        (true, false) => Some("pad fabrication properties"),
+        (false, true) => Some("a reference point"),
+        (true, true) => Some("pad fabrication properties and a reference point"),
+    }
+}
+
+/// Pad fabrication properties for a message, one entry per pad number and
+/// property, bounded to avoid flooding diagnostics on large BGAs.
+pub(crate) fn listed_pad_properties<'a>(
+    pads: impl IntoIterator<Item = (&'a str, PadFabricationProperty)>,
+) -> String {
+    let mut counts = BTreeMap::<(&str, &str), usize>::new();
+    for (number, property) in pads {
+        *counts.entry((number, property.as_str())).or_default() += 1;
+    }
+    let formatted = counts
+        .into_iter()
+        .map(|((number, property), count)| {
+            if count == 1 {
+                format!("pad {number}: {property}")
+            } else {
+                format!("pad {number}: {property} ({count} pads)")
+            }
+        })
+        .collect::<Vec<_>>();
+    const LIMIT: usize = 6;
+    if formatted.len() <= LIMIT {
+        formatted.join(", ")
+    } else {
+        format!(
+            "{} and {} more",
+            formatted[..LIMIT].join(", "),
+            formatted.len() - LIMIT
+        )
+    }
+}
+
+/// Human-readable `not_carried` entries for pad fabrication properties and
+/// reference points when connected to a KiCad older than 10.0.7.
+pub(crate) fn not_carried_10_0_7_reasons(
+    pad_properties: &[PadFabricationProperty],
+    pads: &[copperpour_ipc::IpcPadDefinition],
+    points: &[LibraryPoint],
+    kicad: &copperpour_ipc::IpcKiCadVersion,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let fab_pads = listed_pad_properties(
+        pads.iter()
+            .zip(pad_properties)
+            .filter(|(_, property)| **property != PadFabricationProperty::None)
+            .map(|(pad, property)| (pad.number.as_str(), *property)),
+    );
+    if !fab_pads.is_empty() {
+        reasons.push(format!(
+            "pad fabrication properties ({fab_pads}) require KiCad 10.0.7 or newer \
+             (connected KiCad is {})",
+            kicad.full_version
+        ));
+    }
+    if !points.is_empty() {
+        let count = points.len();
+        let noun = if count == 1 {
+            "reference point"
+        } else {
+            "reference points"
+        };
+        reasons.push(format!(
+            "{count} {noun} require KiCad 10.0.7 or newer (connected KiCad is {})",
+            kicad.full_version
+        ));
+    }
+    reasons
+}
+
+/// Refuses any library footprint child or clause that typed library refresh
+/// cannot reproduce losslessly.
+pub(crate) fn validate_supported_children(root: &SexpNode) -> Result<()> {
+    check_supported_children(root, &mut |_placed, refresh| bail!("{refresh}"))
+}
+
+/// Lists every library footprint child or clause that typed live placement
+/// leaves out, deduplicated in order of appearance.
+pub(crate) fn unsupported_features(root: &SexpNode) -> Result<Vec<String>> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    check_supported_children(root, &mut |placed, _refresh| {
+        if seen.insert(placed.to_string()) {
+            out.push(placed.to_string());
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn check_supported_children(
+    root: &SexpNode,
+    on_unsupported: &mut dyn FnMut(&str, &str) -> Result<()>,
+) -> Result<()> {
+    for child in root.children().unwrap_or_default().iter().skip(2) {
+        let Some(tag) = child.head() else {
+            continue;
+        };
+        match tag {
+            "version" | "generator" | "generator_version" | "layer" | "descr" | "tags" | "attr"
+            | "property" | "fp_text" | "fp_line" | "fp_rect" | "fp_circle" | "fp_arc"
+            | "fp_poly" | "pad" | "model" | "point" => {}
+            // KiCad 10 writes these two flags into every footprint it saves
+            // (all 15,428 official library files carry them, every one at its
+            // default). At the default the typed rebuild loses nothing;
+            // a non-default value carries semantics it cannot represent.
+            "embedded_fonts" | "duplicate_pad_numbers_are_jumpers" => {
+                let value = child.get(1).and_then(SexpNode::as_str);
+                if value != Some("no") {
+                    let val = value.unwrap_or("");
+                    on_unsupported(
+                        &format!("footprint '{tag} {val}' is not carried by typed placement"),
+                        &format!(
+                            "footprint '{tag} {val}' is not supported by typed library refresh"
+                        ),
+                    )?;
+                }
+            }
+            unsupported => {
+                on_unsupported(
+                    &format!("footprint child '{unsupported}' is not carried by typed placement"),
+                    &format!(
+                        "footprint child '{unsupported}' is not supported by typed library refresh"
+                    ),
+                )?;
+            }
+        }
+        match tag {
+            "pad" => check_pad(child, on_unsupported)?,
+            "point" => check_point(child, on_unsupported)?,
+            "fp_line" | "fp_rect" | "fp_circle" | "fp_arc" | "fp_poly" => {
+                check_graphic(child, tag, on_unsupported)?
+            }
+            "fp_text" => {
+                let kind = child
+                    .get(1)
+                    .and_then(SexpNode::as_str)
+                    .context("fp_text is missing its kind")?;
+                match kind {
+                    "reference" | "value" => {}
+                    "user" => check_user_text(child, on_unsupported)?,
+                    _ => {
+                        on_unsupported(
+                            &format!("fp_text kind '{kind}' is not carried by typed placement"),
+                            &format!(
+                                "fp_text kind '{kind}' is not supported losslessly by typed library refresh"
+                            ),
+                        )?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_point(
+    point: &SexpNode,
+    on_unsupported: &mut dyn FnMut(&str, &str) -> Result<()>,
+) -> Result<()> {
+    for child in point.children().unwrap_or_default().iter().skip(1) {
+        let Some(tag) = child.head() else {
+            bail!("footprint point has an unexpected atom");
+        };
+        if !matches!(tag, "at" | "size" | "layer" | "uuid") {
+            on_unsupported(
+                &format!("footprint point clause '{tag}' is not carried by typed placement"),
+                &format!(
+                    "footprint point clause '{tag}' is not supported by typed library refresh"
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn check_user_text(
+    text: &SexpNode,
+    on_unsupported: &mut dyn FnMut(&str, &str) -> Result<()>,
+) -> Result<()> {
+    text.get(2)
+        .and_then(SexpNode::as_str)
+        .context("fp_text user is missing its text")?;
+
+    let mut saw_at = false;
+    let mut saw_layer = false;
+    let mut saw_effects = false;
+    let mut saw_unlocked = false;
+    let mut identifier = None;
+    for clause in text.children().unwrap_or_default().iter().skip(3) {
+        let tag = clause
+            .head()
+            .context("fp_text user contains an unsupported atom")?;
+        match tag {
+            "unlocked" => {
+                if saw_unlocked {
+                    bail!("fp_text user contains duplicate 'unlocked' clauses");
+                }
+                saw_unlocked = true;
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || !matches!(clause.get(1).and_then(SexpNode::as_str), Some("yes" | "no"))
+                {
+                    bail!("fp_text user 'unlocked' must be 'yes' or 'no'");
+                }
+            }
+            "at" => {
+                if saw_at {
+                    bail!("fp_text user contains duplicate 'at' clauses");
+                }
+                saw_at = true;
+                let count = clause.children().map_or(0, |children| children.len());
+                if !matches!(count, 3 | 4) {
+                    bail!("fp_text user 'at' must contain x, y, and optional rotation");
+                }
+                for index in 1..count {
+                    let value = clause
+                        .get_f64(index)
+                        .with_context(|| format!("fp_text user 'at' value {index} is invalid"))?;
+                    if !value.is_finite() {
+                        bail!("fp_text user 'at' values must be finite");
+                    }
+                }
+            }
+            "layer" => {
+                if saw_layer {
+                    bail!("fp_text user contains duplicate 'layer' clauses");
+                }
+                saw_layer = true;
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || clause
+                        .get(1)
+                        .and_then(SexpNode::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    bail!("fp_text user 'layer' must name exactly one layer");
+                }
+            }
+            "uuid" | "tstamp" => {
+                if let Some(previous) = identifier {
+                    bail!(
+                        "fp_text user contains multiple identifier clauses ('{previous}' and '{tag}')"
+                    );
+                }
+                identifier = Some(tag);
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || clause
+                        .get(1)
+                        .and_then(SexpNode::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    bail!("fp_text user '{tag}' must contain exactly one identifier");
+                }
+            }
+            "effects" => {
+                if saw_effects {
+                    bail!("fp_text user contains duplicate 'effects' clauses");
+                }
+                saw_effects = true;
+                check_user_text_effects(clause, on_unsupported)?;
+            }
+            unsupported => {
+                on_unsupported(
+                    &format!(
+                        "fp_text user clause '{unsupported}' is not carried by typed placement"
+                    ),
+                    &format!("fp_text user clause '{unsupported}' is not supported losslessly"),
+                )?;
+            }
+        }
+    }
+
+    if !saw_at {
+        bail!("fp_text user is missing its 'at' clause");
+    }
+    if !saw_layer {
+        bail!("fp_text user is missing its 'layer' clause");
+    }
+    if !saw_effects {
+        bail!("fp_text user is missing its 'effects' clause");
+    }
+    Ok(())
+}
+
+fn check_user_text_effects(
+    effects: &SexpNode,
+    on_unsupported: &mut dyn FnMut(&str, &str) -> Result<()>,
+) -> Result<()> {
+    let mut font = None;
+    for clause in effects.children().unwrap_or_default().iter().skip(1) {
+        let tag = clause
+            .head()
+            .context("fp_text user effects contain an unsupported atom")?;
+        if tag != "font" {
+            on_unsupported(
+                &format!("fp_text user effects clause '{tag}' is not carried by typed placement"),
+                &format!("fp_text user effects clause '{tag}' is not supported losslessly"),
+            )?;
+            continue;
+        }
+        if font.replace(clause).is_some() {
+            bail!("fp_text user contains duplicate font clauses");
+        }
+    }
+    let font = font.context("fp_text user effects are missing the font clause")?;
+
+    let mut size = None;
+    let mut thickness = None;
+    for clause in font.children().unwrap_or_default().iter().skip(1) {
+        let tag = clause
+            .head()
+            .context("fp_text user font contains an unsupported atom")?;
+        match tag {
+            "size" => {
+                if size.is_some() {
+                    bail!("fp_text user contains duplicate font size clauses");
+                }
+                if clause.children().map_or(0, |children| children.len()) != 3 {
+                    bail!("fp_text user font size must contain width and height");
+                }
+                let width = clause
+                    .get_f64(1)
+                    .context("fp_text user font width is invalid")?;
+                let height = clause
+                    .get_f64(2)
+                    .context("fp_text user font height is invalid")?;
+                if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+                    bail!("fp_text user font size must be finite and positive");
+                }
+                if width != height {
+                    on_unsupported(
+                        "fp_text user non-square font size is not carried by typed placement",
+                        "fp_text user non-square font size is not supported losslessly",
+                    )?;
+                }
+                size = Some(width);
+            }
+            "thickness" => {
+                if thickness.is_some() {
+                    bail!("fp_text user contains duplicate font thickness clauses");
+                }
+                if clause.children().map_or(0, |children| children.len()) != 2 {
+                    bail!("fp_text user font thickness must contain exactly one value");
+                }
+                let value = clause
+                    .get_f64(1)
+                    .context("fp_text user font thickness is invalid")?;
+                if !value.is_finite() || value <= 0.0 {
+                    bail!("fp_text user font thickness must be finite and positive");
+                }
+                thickness = Some(value);
+            }
+            unsupported => {
+                on_unsupported(
+                    &format!(
+                        "fp_text user font clause '{unsupported}' is not carried by typed placement"
+                    ),
+                    &format!(
+                        "fp_text user font clause '{unsupported}' is not supported losslessly"
+                    ),
+                )?;
+            }
+        }
+    }
+    size.context("fp_text user font is missing its size")?;
+    thickness.context("fp_text user font is missing its thickness")?;
+    Ok(())
+}
+
+fn check_graphic(
+    graphic: &SexpNode,
+    kind: &str,
+    on_unsupported: &mut dyn FnMut(&str, &str) -> Result<()>,
+) -> Result<()> {
+    let allowed: &[&str] = match kind {
+        "fp_line" => &["start", "end", "stroke", "layer", "uuid", "tstamp"],
+        "fp_rect" => &["start", "end", "stroke", "fill", "layer", "uuid", "tstamp"],
+        "fp_circle" => &["center", "end", "stroke", "fill", "layer", "uuid", "tstamp"],
+        "fp_arc" => &["start", "mid", "end", "stroke", "layer", "uuid", "tstamp"],
+        "fp_poly" => &["pts", "stroke", "fill", "layer", "uuid", "tstamp"],
+        _ => bail!("unsupported footprint graphic '{kind}'"),
+    };
+    for child in graphic.children().unwrap_or_default().iter().skip(1) {
+        let Some(tag) = child.head() else {
+            bail!("{kind} contains an unsupported atom");
+        };
+        if !allowed.contains(&tag) {
+            on_unsupported(
+                &format!("{kind} clause '{tag}' is not carried by typed placement"),
+                &format!("{kind} clause '{tag}' is not supported by typed library refresh"),
+            )?;
+            continue;
+        }
+        match tag {
+            "stroke" => {
+                for stroke_child in child.children().unwrap_or_default().iter().skip(1) {
+                    let stroke_tag = stroke_child
+                        .head()
+                        .context("graphic stroke contains an unsupported atom")?;
+                    match stroke_tag {
+                        "width" => {}
+                        "type" => {
+                            let stroke_type = stroke_child
+                                .get(1)
+                                .and_then(SexpNode::as_str)
+                                .context("graphic stroke type is missing")?;
+                            if !matches!(stroke_type, "solid" | "default") {
+                                on_unsupported(
+                                    &format!(
+                                        "graphic stroke type '{stroke_type}' is not carried by typed placement"
+                                    ),
+                                    &format!(
+                                        "graphic stroke type '{stroke_type}' is not supported losslessly"
+                                    ),
+                                )?;
+                            }
+                        }
+                        unsupported => {
+                            on_unsupported(
+                                &format!(
+                                    "graphic stroke clause '{unsupported}' is not carried by typed placement"
+                                ),
+                                &format!(
+                                    "graphic stroke clause '{unsupported}' is not supported losslessly"
+                                ),
+                            )?;
+                        }
+                    }
+                }
+            }
+            "fill" => {
+                let fill = child
+                    .get(1)
+                    .and_then(SexpNode::as_str)
+                    .context("graphic fill is missing")?;
+                if !matches!(fill, "none" | "no" | "solid" | "yes") {
+                    on_unsupported(
+                        &format!("graphic fill '{fill}' is not carried by typed placement"),
+                        &format!("graphic fill '{fill}' is not supported losslessly"),
+                    )?;
+                }
+            }
+            "pts"
+                if child
+                    .children()
+                    .unwrap_or_default()
+                    .iter()
+                    .skip(1)
+                    .any(|point| point.head() != Some("xy")) =>
+            {
+                bail!("fp_poly contains a non-xy point");
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_pad(
+    pad: &SexpNode,
+    on_unsupported: &mut dyn FnMut(&str, &str) -> Result<()>,
+) -> Result<()> {
+    let shape = pad
+        .get(3)
+        .and_then(SexpNode::as_str)
+        .context("footprint pad is missing its shape")?;
+    if !matches!(shape, "circle" | "rect" | "oval" | "roundrect") {
+        on_unsupported(
+            &format!("pad shape '{shape}' is not carried by typed placement"),
+            &format!("pad shape '{shape}' is not supported by typed library refresh"),
+        )?;
+    }
+    for child in pad.children().unwrap_or_default().iter().skip(4) {
+        let Some(tag) = child.head() else {
+            continue;
+        };
+        if !matches!(
+            tag,
+            "at" | "size"
+                | "layers"
+                | "drill"
+                | "roundrect_rratio"
+                | "uuid"
+                | "tstamp"
+                | "remove_unused_layers"
+                | "property"
+                | "zone_connect"
+                | "thermal_bridge_width"
+                | "thermal_width"
+                | "thermal_gap"
+                | "thermal_bridge_angle"
+        ) {
+            on_unsupported(
+                &format!("pad clause '{tag}' is not carried by typed placement"),
+                &format!("pad clause '{tag}' is not supported by typed library refresh"),
+            )?;
+            continue;
+        }
+        if tag == "remove_unused_layers" {
+            let value = child.get(1).and_then(SexpNode::as_str);
+            if value != Some("no") {
+                on_unsupported(
+                    "pad 'remove_unused_layers yes' is not carried by typed placement",
+                    "pad 'remove_unused_layers yes' is not supported by typed library refresh",
+                )?;
+            }
+        }
+        if tag == "drill" {
+            for nested in child.children().unwrap_or_default().iter().skip(1) {
+                if nested.head().is_some() {
+                    on_unsupported(
+                        "nested drill clauses are not carried by typed placement",
+                        "nested drill clauses are not supported by typed library refresh",
+                    )?;
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

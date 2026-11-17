@@ -925,8 +925,9 @@ pub(crate) struct PreparedFootprintPlacement {
     /// Whether the part belongs on B.Cu: flipped by KiCad over IPC, mirrored
     /// by [`Self::file_block`] for the closed board.
     on_back: bool,
-    /// The F.Cu board block for the closed-board path.
-    board_sexp: String,
+    /// The F.Cu board block for the closed-board path, if prepared with a
+    /// project directory.
+    board_sexp: Option<String>,
 }
 
 /// The library data `update_pcb_from_schematic` already puts on the footprints
@@ -944,6 +945,10 @@ struct LibraryFootprintData {
     /// library writes without a position, layer or effects keeps its default
     /// too, as in the sync.
     properties: Result<super::library_footprint::LibraryProperties, String>,
+    pad_properties: Vec<super::library::PadFabricationProperty>,
+    pad_zones: Vec<super::library_footprint::PadZoneSettings>,
+    points: Vec<super::library_footprint::LibraryPoint>,
+    unsupported: Vec<String>,
 }
 
 impl PreparedFootprintPlacement {
@@ -991,26 +996,37 @@ impl PreparedFootprintPlacement {
         let graphics = extract_graphic_definitions(&prepared)?;
         let fields = extract_field_placement(&prepared);
         let root = copperpour_sexp::parse_sexp(source).context("invalid footprint S-expression")?;
+        let pad_nodes = root.find_all("pad");
         let library = LibraryFootprintData {
             attributes: super::library_footprint::attributes(&root)?,
             description_and_keywords: super::library_footprint::description_and_keywords(&root),
             models: super::library_footprint::models(&root)?,
             properties: super::library_footprint::properties(&root)
                 .map_err(|error| format!("{error:#}")),
+            pad_properties: super::library_footprint::pad_properties(&pad_nodes, pads.len())?,
+            pad_zones: super::library_footprint::pad_zones(&pad_nodes)?,
+            points: super::library_footprint::points(&root)?,
+            unsupported: super::library_footprint::unsupported_features(&root)?,
         };
-        let library_path =
-            resolve_footprint_path(lib_id, project_dir).map_err(anyhow::Error::msg)?;
-        let board_sexp = board_footprint_sexp(
-            source,
-            &library_path,
-            lib_id,
-            x,
-            y,
-            front_rotation,
-            "F.Cu",
-            Some(reference),
-        )
-        .map_err(anyhow::Error::msg)?;
+        let board_sexp = if let Some(dir) = project_dir {
+            let library_path =
+                resolve_footprint_path(lib_id, Some(dir)).map_err(anyhow::Error::msg)?;
+            Some(
+                board_footprint_sexp(
+                    source,
+                    &library_path,
+                    lib_id,
+                    x,
+                    y,
+                    front_rotation,
+                    "F.Cu",
+                    Some(reference),
+                )
+                .map_err(anyhow::Error::msg)?,
+            )
+        } else {
+            None
+        };
         let value = value.map(str::to_string).unwrap_or_else(|| {
             lib_id
                 .split_once(':')
@@ -1029,6 +1045,24 @@ impl PreparedFootprintPlacement {
         })
     }
 
+    /// Prepare `source` for live IPC placement without building a closed-board
+    /// file block.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_library_for_ipc(
+        source: &str,
+        lib_id: &str,
+        reference: &str,
+        value: Option<&str>,
+        x: f64,
+        y: f64,
+        rotation: f64,
+        layer: &str,
+    ) -> anyhow::Result<Self> {
+        Self::from_library(
+            source, lib_id, reference, value, x, y, rotation, layer, None,
+        )
+    }
+
     pub(crate) fn from_inline(
         value: String,
         pads: Vec<copperpour_ipc::IpcPadDefinition>,
@@ -1044,20 +1078,71 @@ impl PreparedFootprintPlacement {
             library: None,
             front_rotation: 0.0,
             on_back: false,
-            board_sexp,
+            board_sexp: Some(board_sexp),
         }
     }
 
+    /// Whether this footprint carries pad fabrication properties or reference
+    /// points that require KiCad 10.0.7+.
+    pub(crate) fn needs_kicad_10_0_7(&self) -> bool {
+        self.library.as_ref().is_some_and(|lib| {
+            super::library_footprint::needs_kicad_10_0_7(&lib.pad_properties, &lib.points)
+        })
+    }
+
+    /// Check connected KiCad's version only when this footprint carries
+    /// 10.0.7+ fields. Returns `(carry_10_0_7_fields, kicad_if_older)`.
+    pub(crate) fn resolve_kicad_10_0_7(
+        &self,
+        client: &KiCadIpcClient,
+    ) -> anyhow::Result<(bool, Option<copperpour_ipc::IpcKiCadVersion>)> {
+        if !self.needs_kicad_10_0_7() {
+            return Ok((false, None));
+        }
+        let kicad = client.get_kicad_version()?;
+        if super::library_footprint::carries_kicad_10_0_7_fields(&kicad) {
+            Ok((true, None))
+        } else {
+            Ok((false, Some(kicad)))
+        }
+    }
+
+    /// Features of the library footprint that the typed IPC path left out.
+    pub(crate) fn not_carried(
+        &self,
+        kicad_before_10_0_7: Option<&copperpour_ipc::IpcKiCadVersion>,
+    ) -> Vec<String> {
+        let Some(library) = &self.library else {
+            return Vec::new();
+        };
+        let mut items = library.unsupported.clone();
+        if let Err(reason) = &library.properties {
+            items.push(format!(
+                "library properties (Reference and Value placed with defaults): {reason}"
+            ));
+        }
+        if let Some(kicad) = kicad_before_10_0_7 {
+            items.extend(super::library_footprint::not_carried_10_0_7_reasons(
+                &library.pad_properties,
+                &self.pads,
+                &library.points,
+                kicad,
+            ));
+        }
+        items
+    }
+
     /// The F.Cu `FootprintInstance` the IPC path creates, with the library's
-    /// 3D models, attributes, description and keywords, and its Reference and
-    /// Value fields, on it, so the part arrives complete rather than as pads
-    /// and drawings alone.
-    fn ipc_item(
+    /// 3D models, attributes, description and keywords, pad zone settings,
+    /// Reference and Value fields, and (when `carry_10_0_7_fields` is true)
+    /// pad fabrication properties and reference points on it.
+    pub(crate) fn ipc_item(
         &self,
         lib_id: &str,
         reference: &str,
         x: f64,
         y: f64,
+        carry_10_0_7_fields: bool,
     ) -> anyhow::Result<prost_types::Any> {
         let item = KiCadIpcClient::build_footprint_item(
             lib_id,
@@ -1078,6 +1163,9 @@ impl PreparedFootprintPlacement {
             item.value.as_slice(),
         )?;
         footprint.attributes = Some(library.attributes.clone());
+        let position = footprint
+            .position
+            .context("built footprint has no position")?;
         let definition = footprint
             .definition
             .as_mut()
@@ -1086,6 +1174,21 @@ impl PreparedFootprintPlacement {
         definition.items.extend(library.models.iter().map(|model| {
             copperpour_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
         }));
+        super::library_footprint::apply_pad_settings(
+            definition,
+            &library.pad_properties,
+            &library.pad_zones,
+            carry_10_0_7_fields,
+        )?;
+        if carry_10_0_7_fields {
+            super::library_footprint::apply_reference_points(
+                definition,
+                &library.points,
+                &position,
+                self.front_rotation,
+                None,
+            )?;
+        }
         if let Ok(properties) = &library.properties {
             apply_library_reference_and_value(&mut footprint, properties, reference, &self.value)?;
         }
@@ -1108,10 +1211,14 @@ impl PreparedFootprintPlacement {
     /// The block the closed-board path inserts: the prepared F.Cu block, or
     /// that block mirrored to B.Cu by the closed-board flip.
     fn file_block(&self) -> anyhow::Result<String> {
+        let board_sexp = self
+            .board_sexp
+            .as_deref()
+            .context("closed-board placement requires a board file block")?;
         if !self.on_back {
-            return Ok(self.board_sexp.clone());
+            return Ok(board_sexp.to_string());
         }
-        flip_footprint_block(&self.board_sexp, CopperStack::new(2).unwrap()).context(
+        flip_footprint_block(board_sexp, CopperStack::new(2).unwrap()).context(
             "the footprint cannot be mirrored to B.Cu in the closed board file; place it while \
              the board is open in KiCad 10.0.6 or newer, which flips it natively",
         )
@@ -2682,7 +2789,8 @@ async fn handle_place_component(
     let requested_board = board.clone();
     let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board, "placement", move |c| {
-        let item = prepared_ipc.ipc_item(&footprint_ipc, &reference_ipc, x, y)?;
+        let (carry_10_0_7, kicad_before_10_0_7) = prepared_ipc.resolve_kicad_10_0_7(c)?;
+        let item = prepared_ipc.ipc_item(&footprint_ipc, &reference_ipc, x, y, carry_10_0_7)?;
         let placed = c.place_footprint_item(&requested_board, &reference_ipc, item)?;
         let placed = if on_back {
             match flip_new_footprint_to_back(c, &reference_ipc)? {
@@ -2694,12 +2802,12 @@ async fn handle_place_component(
         };
         let document = c.find_open_board(&requested_board)?;
         let models = c.footprint_3d_model_snapshot_in(document, &reference_ipc)?;
-        Ok(Ok((placed, models.models)))
+        Ok(Ok((placed, models.models, kicad_before_10_0_7)))
     })
     .await?;
 
     match attempt {
-        BoardWrite::Ipc(Ok((fp, models))) => {
+        BoardWrite::Ipc(Ok((fp, models, kicad_before_10_0_7))) => {
             let mut response = json!({
                 "placed": fp.reference,
                 "footprint": fp.footprint,
@@ -2715,6 +2823,10 @@ async fn handle_place_component(
             });
             if let Some(warning) = prepared.library_fields_not_carried(&footprint, &reference) {
                 response["warning"] = json!(warning);
+            }
+            let not_carried = prepared.not_carried(kicad_before_10_0_7.as_ref());
+            if !not_carried.is_empty() {
+                response["not_carried"] = json!(not_carried);
             }
             Ok(CallToolResult::json(&response))
         }
@@ -3666,6 +3778,9 @@ async fn handle_repair_corrupted_footprints(
             let mut repairs = Vec::new();
             let mut source_digests = Vec::new();
             let mut diagnostics = Vec::new();
+            let mut not_carried = Vec::new();
+            let mut not_carried_seen = HashSet::new();
+            let mut kicad_version: Option<copperpour_ipc::IpcKiCadVersion> = None;
 
             for item in items {
                 let footprint = kiapi::board::types::FootprintInstance::decode(
@@ -3750,7 +3865,49 @@ async fn handle_repair_corrupted_footprints(
                     continue;
                 }
 
-                let clean = KiCadIpcClient::build_footprint_item(
+                let root = copperpour_sexp::parse_sexp(&source)
+                    .context("invalid footprint S-expression")?;
+                let pad_nodes = root.find_all("pad");
+                let pad_properties =
+                    super::library_footprint::pad_properties(&pad_nodes, pads.len())?;
+                let pad_zones = super::library_footprint::pad_zones(&pad_nodes)?;
+                let has_fab_props = pad_properties
+                    .iter()
+                    .any(|p| *p != super::library::PadFabricationProperty::None);
+                let carry_10_0_7 = if has_fab_props {
+                    let kicad = match &kicad_version {
+                        Some(v) => v,
+                        None => {
+                            let v = client.get_kicad_version()?;
+                            kicad_version.insert(v)
+                        }
+                    };
+                    let carries = super::library_footprint::carries_kicad_10_0_7_fields(kicad);
+                    if !carries {
+                        for reason in super::library_footprint::not_carried_10_0_7_reasons(
+                            &pad_properties,
+                            &pads,
+                            &[],
+                            kicad,
+                        ) {
+                            let entry = format!("{reference} ({}): {reason}", summary.footprint);
+                            if not_carried_seen.insert(entry.clone()) {
+                                not_carried.push(entry);
+                            }
+                        }
+                    }
+                    carries
+                } else {
+                    false
+                };
+                for reason in super::library_footprint::unsupported_features(&root)? {
+                    let entry = format!("{reference} ({}): {reason}", summary.footprint);
+                    if not_carried_seen.insert(entry.clone()) {
+                        not_carried.push(entry);
+                    }
+                }
+
+                let mut clean = KiCadIpcClient::build_footprint_item(
                     &summary.footprint,
                     &summary.reference,
                     &summary.value,
@@ -3762,6 +3919,21 @@ async fn handle_repair_corrupted_footprints(
                     summary.rotation,
                     &summary.layer,
                 )?;
+                let mut clean_fp = kiapi::board::types::FootprintInstance::decode(
+                    clean.value.as_slice(),
+                )?;
+                if let Some(definition) = clean_fp.definition.as_mut() {
+                    super::library_footprint::apply_pad_settings(
+                        definition,
+                        &pad_properties,
+                        &pad_zones,
+                        carry_10_0_7,
+                    )?;
+                }
+                clean = copperpour_ipc::builders::pack_any(
+                    &clean_fp,
+                    "kiapi.board.types.FootprintInstance",
+                );
                 let Some(repaired_item) = merge_corrupted_footprint_candidate(
                     &reference,
                     &item,
@@ -3825,14 +3997,18 @@ async fn handle_repair_corrupted_footprints(
                 }));
             }
             if dry_run {
-                return Ok(json!({
+                let mut response = json!({
                     "status": "ready",
                     "plan_revision": plan_revision,
                     "candidate_count": repairs.len(),
                     "candidates": candidates,
                     "diagnostics": [],
                     "applied": false
-                }));
+                });
+                if !not_carried.is_empty() {
+                    response["not_carried"] = json!(not_carried);
+                }
+                return Ok(response);
             }
             if expected_for_ipc.as_deref() != Some(plan_revision.as_str()) {
                 return Ok(json!({
@@ -3890,7 +4066,7 @@ async fn handle_repair_corrupted_footprints(
                 );
             }
 
-            Ok(json!({
+            let mut response = json!({
                 "status": "applied",
                 "plan_revision": plan_revision,
                 "candidate_count": repairs.len(),
@@ -3899,7 +4075,11 @@ async fn handle_repair_corrupted_footprints(
                 "diagnostics": [],
                 "applied": true,
                 "undo": "Ctrl-Z reverses the complete repair."
-            }))
+            });
+            if !not_carried.is_empty() {
+                response["not_carried"] = json!(not_carried);
+            }
+            Ok(response)
         },
     )
     .await?;
@@ -4374,41 +4554,24 @@ async fn handle_place_array(
         Ok(source) => source,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
-    // Graphics are footprint-local and identical for every array instance, so
-    // one extraction serves the whole batch.
-    let graphics = match extract_graphic_definitions(&source) {
-        Ok(graphics) => graphics,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
-    };
-    let fields = extract_field_placement(&source);
-
-    let value = footprint
-        .split_once(':')
-        .map(|(_, entry)| entry)
-        .unwrap_or(&footprint)
-        .to_string();
     let mut planned = Vec::with_capacity(total_count as usize);
     for row in 0..count_y {
         for col in 0..count_x {
             let x = start_x + col as f64 * spacing_x;
             let y = start_y + row as f64 * spacing_y;
             let reference = format!("{prefix}{}", ref_start + planned.len() as u64);
-            let prepared = match prepare_footprint_source(
+            let prepared = match PreparedFootprintPlacement::from_library_for_ipc(
                 &source, &footprint, &reference, None, x, y, 0.0, "F.Cu",
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => return Ok(CallToolResult::error(error.to_string())),
             };
-            let pads = match extract_pad_definitions(&prepared) {
-                Ok(pads) => pads,
-                Err(error) => return Ok(CallToolResult::error(error.to_string())),
-            };
-            planned.push((reference, pads, x, y));
+            planned.push((reference, prepared, x, y));
         }
     }
 
     let footprint_id = footprint.clone();
-    let placed = match with_board_ipc_classified(ctx, &board, move |c, _| {
+    let (placed, not_carried) = match with_board_ipc_classified(ctx, &board, move |c, _| {
         let existing = c
             .list_footprints()?
             .into_iter()
@@ -4426,22 +4589,21 @@ async fn handle_place_array(
             );
         }
 
+        let (carry_10_0_7, kicad_before_10_0_7) = match planned.first() {
+            Some((_, first, _, _)) => first.resolve_kicad_10_0_7(c)?,
+            None => (false, None),
+        };
+        let not_carried = planned
+            .first()
+            .map(|(_, first, _, _)| first.not_carried(kicad_before_10_0_7.as_ref()))
+            .unwrap_or_default();
+
         let items = planned
             .iter()
-            .map(|(reference, pads, x, y)| {
-                KiCadIpcClient::build_footprint_item(
-                    &footprint_id,
-                    reference,
-                    &value,
-                    pads,
-                    &graphics,
-                    &fields,
-                    *x,
-                    *y,
-                    0.0,
-                    "F.Cu",
-                )
-                .with_context(|| format!("failed to prepare {reference}"))
+            .map(|(reference, prepared, x, y)| {
+                prepared
+                    .ipc_item(&footprint_id, reference, *x, *y, carry_10_0_7)
+                    .with_context(|| format!("failed to prepare {reference}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         c.run_commit("Place footprint array", |c| c.create_items(items))?;
@@ -4451,7 +4613,7 @@ async fn handle_place_array(
             .into_iter()
             .map(|footprint| (footprint.reference.clone(), footprint))
             .collect::<HashMap<_, _>>();
-        planned
+        let components = planned
             .into_iter()
             .map(|(reference, _, _, _)| {
                 let footprint = created.remove(&reference).with_context(|| {
@@ -4463,16 +4625,19 @@ async fn handle_place_array(
                     "y": footprint.position.y
                 }))
             })
-            .collect::<anyhow::Result<Vec<_>>>()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok((components, not_carried))
     })
     .await?
     {
-        Ok(placed) => placed,
+        Ok(result) => result,
         Err(error) => return Ok(CallToolResult::error(format!("IPC array error: {error}"))),
     };
-    Ok(CallToolResult::json(
-        &json!({ "placed_count": placed.len(), "components": placed }),
-    ))
+    let mut response = json!({ "placed_count": placed.len(), "components": placed });
+    if !not_carried.is_empty() {
+        response["not_carried"] = json!(not_carried);
+    }
+    Ok(CallToolResult::json(&response))
 }
 
 async fn handle_align_components(
@@ -4591,7 +4756,7 @@ async fn handle_duplicate_component(
         Ok(source) => source,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
-    let prepared = match prepare_footprint_source(
+    let prepared = match PreparedFootprintPlacement::from_library_for_ipc(
         &source,
         &src.footprint,
         &new_reference,
@@ -4606,37 +4771,23 @@ async fn handle_duplicate_component(
     };
     let ipc_reference = new_reference.clone();
     let fp_id = src.footprint.clone();
-    let fp_value = src.value.clone();
-    let fp_layer = src.layer.clone();
-    let fp_rotation = src.rotation;
-    let pads = match extract_pad_definitions(&prepared) {
-        Ok(pads) => pads,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
-    };
-    let graphics = match extract_graphic_definitions(&prepared) {
-        Ok(graphics) => graphics,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
-    };
-    let fields = extract_field_placement(&prepared);
     let dup_board = board.clone();
-    let fp = ipc!(ctx, args, |c| c.place_footprint(
-        &dup_board,
-        &fp_id,
-        &ipc_reference,
-        &fp_value,
-        &pads,
-        &graphics,
-        &fields,
-        x,
-        y,
-        fp_rotation,
-        &fp_layer
-    ));
-    Ok(CallToolResult::json(&json!({
+    let (fp, not_carried) = ipc!(ctx, args, |c| {
+        let (carry_10_0_7, kicad_before_10_0_7) = prepared.resolve_kicad_10_0_7(c)?;
+        let item = prepared.ipc_item(&fp_id, &ipc_reference, x, y, carry_10_0_7)?;
+        let fp = c.place_footprint_item(&dup_board, &ipc_reference, item)?;
+        let not_carried = prepared.not_carried(kicad_before_10_0_7.as_ref());
+        Ok((fp, not_carried))
+    });
+    let mut response = json!({
         "duplicated_from": reference,
         "new_reference": fp.reference,
         "x": fp.position.x, "y": fp.position.y
-    })))
+    });
+    if !not_carried.is_empty() {
+        response["not_carried"] = json!(not_carried);
+    }
+    Ok(CallToolResult::json(&response))
 }
 
 async fn handle_get_board_2d_view(
@@ -8018,7 +8169,7 @@ mod tests {
         )
         .unwrap();
         let item = prepared
-            .ipc_item("Capacitor_SMD:C_0603_1608Metric", "C1", 10.0, 20.0)
+            .ipc_item("Capacitor_SMD:C_0603_1608Metric", "C1", 10.0, 20.0, true)
             .unwrap();
         let footprint = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
         assert_eq!(
@@ -8066,7 +8217,7 @@ mod tests {
         // KiCad's top-bottom flip negates the orientation about the anchor,
         // so the F.Cu copy is built at -30 to land at 30 on B.Cu.
         let item = prepared
-            .ipc_item("Capacitor_SMD:C_0603_1608Metric", "C1", 10.0, 20.0)
+            .ipc_item("Capacitor_SMD:C_0603_1608Metric", "C1", 10.0, 20.0, true)
             .unwrap();
         let footprint = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
         assert_eq!(footprint.layer, board::BoardLayer::BlFCu as i32);
@@ -8131,7 +8282,7 @@ mod tests {
             )
             .unwrap();
             let item = prepared
-                .ipc_item("Capacitor_SMD:C_0603_1608Metric", &reference, x, y)
+                .ipc_item("Capacitor_SMD:C_0603_1608Metric", &reference, x, y, true)
                 .unwrap();
             let built = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
             assert_eq!(
@@ -9116,6 +9267,571 @@ mod nanometre_rounding_tests {
         assert_eq!((size.x_nm, size.y_nm), (1_025_000, 1_400_000));
         let position = pads[0].position.unwrap();
         assert_eq!((position.x_nm, position.y_nm), (24_487_500, 20_000_000));
+    }
+
+    /// Helper: write a single-footprint `.pretty` library + `fp-lib-table` + empty
+    /// `.kicad_pcb` in `dir`, returning `(board_path, lib_id)`.
+    fn issue_318_fixture(
+        dir: &std::path::Path,
+        nickname: &str,
+        entry: &str,
+        mod_source: &str,
+    ) -> (std::path::PathBuf, String) {
+        let pretty = dir.join(format!("{nickname}.pretty"));
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::fs::write(pretty.join(format!("{entry}.kicad_mod")), mod_source).unwrap();
+        std::fs::write(
+            dir.join("fp-lib-table"),
+            format!(
+                "(fp_lib_table\n  (version 7)\n  (lib (name \"{nickname}\")(type \"KiCad\")(uri \"${{KIPRJMOD}}/{nickname}.pretty\")(options \"\")(descr \"\")))\n"
+            ),
+        )
+        .unwrap();
+        let board = dir.join("board.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb (version 20241229) (generator \"pcbnew\"))\n",
+        )
+        .unwrap();
+        (board, format!("{nickname}:{entry}"))
+    }
+
+    fn kicad_version_responder(
+        major: u32,
+        minor: u32,
+        patch: u32,
+    ) -> impl Fn(
+        &prost_types::Any,
+        &mut crate::tools::pcb_board::board_mock::ItemStore,
+    ) -> Option<prost_types::Any>
+           + Send
+           + 'static {
+        use copperpour_ipc::builders::{any_is, pack_any};
+        use copperpour_ipc::gen::kiapi::common::{commands, types::KiCadVersion};
+        move |cmd, _| {
+            if any_is(cmd, "kiapi.common.commands.GetVersion") {
+                Some(pack_any(
+                    &commands::GetVersionResponse {
+                        version: Some(KiCadVersion {
+                            major,
+                            minor,
+                            patch,
+                            full_version: format!("{major}.{minor}.{patch}"),
+                        }),
+                    },
+                    "kiapi.common.commands.GetVersionResponse",
+                ))
+            } else {
+                None
+            }
+        }
+    }
+
+    async fn served_with_version(
+        board: &std::path::Path,
+        store: std::sync::Arc<std::sync::Mutex<crate::tools::pcb_board::board_mock::ItemStore>>,
+        version: (u32, u32, u32),
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> (bool, String) {
+        use crate::tools::pcb_board::board_mock::spawn_kicad_holding_items;
+        let server = spawn_kicad_holding_items(
+            board,
+            vec![],
+            store,
+            |_| {},
+            kicad_version_responder(version.0, version.1, version.2),
+        );
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            ipc_address: server.address().to_string(),
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .await
+            .unwrap();
+        let result = response.result.as_ref().unwrap();
+        (
+            result["isError"].as_bool().unwrap_or(false),
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        )
+    }
+
+    /// Oracle test (#318): placing stock WSON-6 through `place_component` on
+    /// KiCad 10.0.8 carries the exact `fab_property` and `zone_settings`
+    /// recorded in `issue_300_u4.ipc.bin`.
+    #[tokio::test]
+    async fn place_component_carries_pad_properties_and_zone_settings_matching_kicad_oracle() {
+        use crate::tools::pcb_board::board_mock::ItemStore;
+        use copperpour_ipc::builders::any_is;
+        use copperpour_ipc::gen::kiapi::board::types::{FootprintInstance, Pad};
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (board, lib_id) = issue_318_fixture(
+            dir.path(),
+            "Package_SON",
+            "WSON-6-1EP_2x2mm_P0.65mm_EP1x1.6mm_ThermalVias",
+            include_str!("../../tests/fixtures/issue_300_wson6_thermalvias_kicad10.kicad_mod"),
+        );
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let (is_error, text) = served_with_version(
+            &board,
+            store.clone(),
+            (10, 0, 8),
+            "place_component",
+            json!({
+                "board": board.to_string_lossy(),
+                "footprint": lib_id,
+                "reference": "U4",
+                "x": 20.0,
+                "y": 30.0,
+            }),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(out.get("not_carried").is_none(), "{out}");
+
+        let oracle = FootprintInstance::decode(
+            include_bytes!("../../tests/fixtures/issue_300_u2.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        let placed = held_footprint(&store);
+
+        let pad_summary = |fp: &FootprintInstance| {
+            let mut v: Vec<(String, i32, Option<i32>)> = fp
+                .definition
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .filter(|item| any_is(item, "kiapi.board.types.Pad"))
+                .map(|item| {
+                    let pad = Pad::decode(item.value.as_slice()).unwrap();
+                    let zone = pad
+                        .pad_stack
+                        .as_ref()
+                        .and_then(|s| s.zone_settings.as_ref())
+                        .map(|z| z.zone_connection);
+                    (pad.number, pad.fab_property, zone)
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(pad_summary(&placed), pad_summary(&oracle));
+    }
+
+    /// Oracle test (#318): placing stock DIP-8 through `place_component` on
+    /// KiCad 10.0.8 carries the `ReferencePoint` recorded in `issue_283_u2.ipc.bin`.
+    #[tokio::test]
+    async fn place_component_carries_reference_point_matching_kicad_oracle() {
+        use crate::tools::pcb_board::board_mock::ItemStore;
+        use copperpour_ipc::builders::any_is;
+        use copperpour_ipc::gen::kiapi::board::types::{FootprintInstance, ReferencePoint};
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (board, lib_id) = issue_318_fixture(
+            dir.path(),
+            "Package_DIP",
+            "DIP-8_W7.62mm",
+            include_str!("../../tests/fixtures/issue_283_dip8_kicad10.kicad_mod"),
+        );
+        let oracle = FootprintInstance::decode(
+            include_bytes!("../../tests/fixtures/issue_283_u2.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        let oracle_pos = oracle.position.unwrap();
+        let x = copperpour_ipc::builders::nm_to_mm(oracle_pos.x_nm);
+        let y = copperpour_ipc::builders::nm_to_mm(oracle_pos.y_nm);
+
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let (is_error, text) = served_with_version(
+            &board,
+            store.clone(),
+            (10, 0, 8),
+            "place_component",
+            json!({
+                "board": board.to_string_lossy(),
+                "footprint": lib_id,
+                "reference": "U5",
+                "x": x,
+                "y": y,
+            }),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(out.get("not_carried").is_none(), "{out}");
+
+        let placed = held_footprint(&store);
+        let ref_points = |fp: &FootprintInstance| {
+            fp.definition
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .filter(|item| any_is(item, "kiapi.board.types.ReferencePoint"))
+                .map(|item| {
+                    let rp = ReferencePoint::decode(item.value.as_slice()).unwrap();
+                    (rp.layer, rp.position, rp.size)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ref_points(&placed).len(), 1);
+        assert_eq!(ref_points(&placed), ref_points(&oracle));
+    }
+
+    /// On KiCad before 10.0.7, `place_component` still places the footprint
+    /// (with `zone_settings` carried) and names pad properties / reference
+    /// points in `not_carried` with `isError: false`.
+    #[tokio::test]
+    async fn place_component_before_10_0_7_places_and_reports_not_carried() {
+        use crate::tools::pcb_board::board_mock::ItemStore;
+        use copperpour_ipc::builders::any_is;
+        use copperpour_ipc::gen::kiapi::board::types::{Pad, ZoneConnectionStyle};
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (board, lib_id) = issue_318_fixture(
+            dir.path(),
+            "Package_SON",
+            "WSON-6-1EP_2x2mm_P0.65mm_EP1x1.6mm_ThermalVias",
+            include_str!("../../tests/fixtures/issue_300_wson6_thermalvias_kicad10.kicad_mod"),
+        );
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let (is_error, text) = served_with_version(
+            &board,
+            store.clone(),
+            (10, 0, 6),
+            "place_component",
+            json!({
+                "board": board.to_string_lossy(),
+                "footprint": lib_id,
+                "reference": "U4",
+                "x": 10.0,
+                "y": 15.0,
+            }),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let not_carried = out["not_carried"].as_array().unwrap();
+        assert_eq!(not_carried.len(), 1, "{out}");
+        let msg = not_carried[0].as_str().unwrap();
+        assert!(msg.contains("10.0.7") && msg.contains("10.0.6"), "{msg}");
+
+        let placed = held_footprint(&store);
+        let pads: Vec<Pad> = placed
+            .definition
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| any_is(item, "kiapi.board.types.Pad"))
+            .map(|item| Pad::decode(item.value.as_slice()).unwrap())
+            .collect();
+        // Fab properties are omitted on 10.0.6 (`PfpUnknown` = 0), but
+        // zone_settings are still carried.
+        assert!(pads.iter().all(|p| p.fab_property == 0));
+        assert!(pads.iter().any(|p| p
+            .pad_stack
+            .as_ref()
+            .and_then(|s| s.zone_settings.as_ref())
+            .is_some_and(|z| z.zone_connection == ZoneConnectionStyle::ZcsFull as i32)));
+    }
+
+    /// A footprint with features typed placement cannot carry (footprint zone,
+    /// `solder_mask_margin`, `fp_text user` with `justify`) is still placed
+    /// (`isError: false`) and every uncarried feature is listed in `not_carried`.
+    #[tokio::test]
+    async fn place_component_with_unsupported_clauses_places_and_reports_not_carried() {
+        use crate::tools::pcb_board::board_mock::ItemStore;
+        use std::sync::{Arc, Mutex};
+
+        let source = r#"(footprint "Test_Part"
+  (version 20241229)
+  (generator "pcbnew")
+  (layer "F.Cu")
+  (solder_mask_margin 0.1)
+  (property "Reference" "REF**" (at 0 -2 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))
+  (property "Value" "Test_Part" (at 0 2 0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
+  (fp_text user "NOTE" (at 0 0 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15)) (justify left)))
+  (pad "1" smd rect (at -1 0) (size 1 1) (layers "F.Cu" "F.Mask") (solder_mask_margin 0.05))
+  (zone (net 0) (net_name "") (layer "F.Cu"))
+)"#;
+        let dir = tempfile::tempdir().unwrap();
+        let (board, lib_id) = issue_318_fixture(dir.path(), "Test", "Test_Part", source);
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let (is_error, text) = served_with_version(
+            &board,
+            store.clone(),
+            (10, 0, 8),
+            "place_component",
+            json!({
+                "board": board.to_string_lossy(),
+                "footprint": lib_id,
+                "reference": "U1",
+                "x": 5.0,
+                "y": 5.0,
+            }),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let not_carried: Vec<&str> = out["not_carried"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let joined = not_carried.join(" | ");
+        assert!(joined.contains("solder_mask_margin"), "{joined}");
+        assert!(joined.contains("justify"), "{joined}");
+        assert!(joined.contains("zone"), "{joined}");
+    }
+
+    /// Sibling routes (#318): `place_component_array` and `duplicate_component`
+    /// carry pad properties, zone settings and reference points, and report
+    /// `not_carried` when connected to KiCad < 10.0.7.
+    #[tokio::test]
+    async fn array_and_duplicate_carry_pad_properties_and_zone_settings() {
+        use crate::tools::pcb_board::board_mock::ItemStore;
+        use copperpour_ipc::builders::any_is;
+        use copperpour_ipc::gen::kiapi::board::types::{
+            FootprintInstance, Pad, PadFabricationProperty, ZoneConnectionStyle,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (board, lib_id) = issue_318_fixture(
+            dir.path(),
+            "Package_SON",
+            "WSON-6-1EP_2x2mm_P0.65mm_EP1x1.6mm_ThermalVias",
+            include_str!("../../tests/fixtures/issue_300_wson6_thermalvias_kicad10.kicad_mod"),
+        );
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let (is_error, text) = served_with_version(
+            &board,
+            store.clone(),
+            (10, 0, 8),
+            "place_component_array",
+            json!({
+                "board": board.to_string_lossy(),
+                "footprint": lib_id,
+                "start_x": 10.0,
+                "start_y": 10.0,
+                "count_x": 2,
+                "count_y": 1,
+                "spacing_x": 5.0,
+                "ref_prefix": "U",
+                "ref_start": 1,
+            }),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(out["placed_count"], 2);
+        assert!(out.get("not_carried").is_none(), "{out}");
+
+        // Now duplicate U1 as U9.
+        let (is_error, text) = served_with_version(
+            &board,
+            store.clone(),
+            (10, 0, 8),
+            "duplicate_component",
+            json!({
+                "board": board.to_string_lossy(),
+                "reference": "U1",
+                "new_reference": "U9",
+                "x": 30.0,
+                "y": 10.0,
+            }),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(out.get("not_carried").is_none(), "{out}");
+
+        let items = store.lock().unwrap().items.clone();
+        assert_eq!(items.len(), 3);
+        for item in &items {
+            let fp = FootprintInstance::decode(item.value.as_slice()).unwrap();
+            let pads: Vec<Pad> = fp
+                .definition
+                .unwrap()
+                .items
+                .iter()
+                .filter(|child| any_is(child, "kiapi.board.types.Pad"))
+                .map(|child| Pad::decode(child.value.as_slice()).unwrap())
+                .collect();
+            assert_eq!(
+                pads.iter()
+                    .filter(|p| p.fab_property == PadFabricationProperty::PfpHeatsink as i32)
+                    .count(),
+                4
+            );
+            assert_eq!(
+                pads.iter()
+                    .filter(|p| p
+                        .pad_stack
+                        .as_ref()
+                        .and_then(|s| s.zone_settings.as_ref())
+                        .is_some_and(|z| z.zone_connection == ZoneConnectionStyle::ZcsFull as i32))
+                    .count(),
+                2
+            );
+        }
+    }
+
+    /// Sibling route (#318): `repair_corrupted_footprints` preserves/restores
+    /// pad fabrication properties and pad zone settings from the library.
+    #[tokio::test]
+    async fn repair_corrupted_footprints_carries_pad_properties_and_zone_settings() {
+        use crate::tools::pcb_board::board_mock::{spawn_kicad_holding_items, ItemStore};
+        use copperpour_ipc::builders::{any_is, pack_any};
+        use copperpour_ipc::gen::kiapi::board::types::{
+            FootprintInstance, Pad, PadFabricationProperty, ZoneConnectionStyle,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (board, lib_id) = issue_318_fixture(
+            dir.path(),
+            "Package_SON",
+            "WSON-6-1EP_2x2mm_P0.65mm_EP1x1.6mm_ThermalVias",
+            include_str!("../../tests/fixtures/issue_300_wson6_thermalvias_kicad10.kicad_mod"),
+        );
+        // Build a corrupted U4 from the oracle by turning one BoardGraphicShape
+        // into an anonymous layerless Pad (issue #244 signature).
+        let mut corrupted = FootprintInstance::decode(
+            include_bytes!("../../tests/fixtures/issue_300_u2.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        corrupted.id = Some(copperpour_ipc::gen::kiapi::common::types::Kiid {
+            value: "fp-u4".to_string(),
+        });
+        let def = corrupted.definition.as_mut().unwrap();
+        let shape_idx = def
+            .items
+            .iter()
+            .position(|item| any_is(item, "kiapi.board.types.BoardGraphicShape"))
+            .unwrap();
+        def.items.remove(shape_idx);
+        let phantom = Pad {
+            id: Some(copperpour_ipc::gen::kiapi::common::types::Kiid {
+                value: "phantom-1".to_string(),
+            }),
+            number: String::new(),
+            pad_stack: Some(copperpour_ipc::gen::kiapi::board::types::PadStack {
+                copper_layers: vec![],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        def.items.push(pack_any(&phantom, "kiapi.board.types.Pad"));
+
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![pack_any(&corrupted, "kiapi.board.types.FootprintInstance")],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec![],
+            store.clone(),
+            |_| {},
+            kicad_version_responder(10, 0, 8),
+        );
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            ipc_address: server.address().to_string(),
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let dry = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "repair_corrupted_footprints",
+                    "arguments": { "board": board.to_string_lossy(), "dry_run": true }
+                }
+            }))
+            .await
+            .unwrap();
+        let dry_out: serde_json::Value = serde_json::from_str(
+            dry.result.as_ref().unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(dry_out["status"], "ready", "{dry_out}");
+        let rev = dry_out["plan_revision"].as_str().unwrap();
+
+        let applied = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "repair_corrupted_footprints",
+                    "arguments": {
+                        "board": board.to_string_lossy(),
+                        "dry_run": false,
+                        "expected_plan_revision": rev
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        let applied_out: serde_json::Value = serde_json::from_str(
+            applied.result.as_ref().unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(applied_out["status"], "applied", "{applied_out}");
+        let _ = lib_id;
+
+        let repaired = held_footprint(&store);
+        let pads: Vec<Pad> = repaired
+            .definition
+            .unwrap()
+            .items
+            .iter()
+            .filter(|child| any_is(child, "kiapi.board.types.Pad"))
+            .map(|child| Pad::decode(child.value.as_slice()).unwrap())
+            .collect();
+        assert_eq!(
+            pads.iter()
+                .filter(|p| p.fab_property == PadFabricationProperty::PfpHeatsink as i32)
+                .count(),
+            4
+        );
+        assert_eq!(
+            pads.iter()
+                .filter(|p| p
+                    .pad_stack
+                    .as_ref()
+                    .and_then(|s| s.zone_settings.as_ref())
+                    .is_some_and(|z| z.zone_connection == ZoneConnectionStyle::ZcsFull as i32))
+                .count(),
+            2
+        );
     }
 }
 

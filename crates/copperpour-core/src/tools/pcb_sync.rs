@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::library::PadFabricationProperty;
-use super::library_footprint::{carries_kicad_10_0_7_fields, fab_property, reported_fab_property};
+use super::library_footprint::{carries_kicad_10_0_7_fields, reported_fab_property};
 use crate::hex::encode_hex;
 use crate::mcp::protocol::{CallToolResult, ToolContent};
 use crate::tools::{
@@ -375,19 +375,14 @@ struct PreparedFootprint {
     library_fields: std::result::Result<super::library_footprint::LibraryProperties, String>,
     /// Each pad's fabrication property, in the order of `pads` (#149).
     pad_properties: Vec<PadFabricationProperty>,
+    /// Each pad's zone connection and thermal relief settings, in the order of `pads`.
+    pad_zones: Vec<super::library_footprint::PadZoneSettings>,
+    /// Reference points declared in the library footprint.
+    points: Vec<super::library_footprint::LibraryPoint>,
+    /// Library footprint clauses or children that typed placement leaves out.
+    unsupported: Vec<String>,
     width: f64,
     height: f64,
-}
-
-impl PreparedFootprint {
-    /// Each pad that has a fabrication property, by number.
-    fn fabricated_pads(&self) -> impl Iterator<Item = (&str, PadFabricationProperty)> {
-        self.pads
-            .iter()
-            .zip(&self.pad_properties)
-            .filter(|(_, property)| **property != PadFabricationProperty::None)
-            .map(|(pad, property)| (pad.number.as_str(), *property))
-    }
 }
 
 pub(crate) async fn handle_update_pcb_from_schematic(
@@ -549,26 +544,29 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             refresh_revision_with_staging(&mut plan);
             plan.diagnostics
                 .extend(library_fields_not_carried(&plan, &prepared));
-            // Asked only when a part has a pad property, so every other sync
-            // sends what it sent before #149.
-            let carry_pad_properties =
-                if prepared.values().any(|part| part.fabricated_pads().next().is_some()) {
-                    let kicad = client.get_kicad_version()?;
-                    let carried = carries_kicad_10_0_7_fields(&kicad);
-                    if !carried {
-                        plan.diagnostics
-                            .extend(pad_properties_not_carried(&plan, &prepared, &kicad));
-                        // The apply sends something else then, so a plan made
-                        // on one side of 10.0.7 is stale on the other.
-                        let mut hasher = Sha256::new();
-                        hasher.update(plan.plan_revision.as_bytes());
-                        hasher.update(b"pad_properties_not_carried");
-                        plan.plan_revision = encode_hex(&hasher.finalize());
-                    }
-                    carried
-                } else {
-                    false
-                };
+            plan.diagnostics
+                .extend(unsupported_features_not_carried(&plan, &prepared));
+            // Asked only when a part has a pad property or reference point,
+            // so every other sync sends what it sent before #149.
+            let carry_pad_properties = if prepared.values().any(|part| {
+                super::library_footprint::needs_kicad_10_0_7(&part.pad_properties, &part.points)
+            }) {
+                let kicad = client.get_kicad_version()?;
+                let carried = carries_kicad_10_0_7_fields(&kicad);
+                if !carried {
+                    plan.diagnostics
+                        .extend(kicad_10_0_7_not_carried(&plan, &prepared, &kicad));
+                    // The apply sends something else then, so a plan made
+                    // on one side of 10.0.7 is stale on the other.
+                    let mut hasher = Sha256::new();
+                    hasher.update(plan.plan_revision.as_bytes());
+                    hasher.update(b"pad_properties_not_carried");
+                    plan.plan_revision = encode_hex(&hasher.finalize());
+                }
+                carried
+            } else {
+                false
+            };
 
             if dry_run || plan.status == PlanStatus::Conflict {
                 let status = match plan.status {
@@ -1737,6 +1735,10 @@ struct FootprintShape {
     /// Each pad with a fabrication property, by number, sorted (#149). A pad
     /// KiCad reports as `PFP_NONE`, or before 10.0.7 not at all, has none.
     pad_properties: Vec<(String, PadFabricationProperty)>,
+    /// Each pad's zone connection style, by number, sorted.
+    pad_zones: Vec<(String, i32)>,
+    /// Number of reference points on the footprint.
+    reference_points: usize,
     /// Its sheet name, sheet file and footprint filters (#237).
     sheet: SymbolSheet,
 }
@@ -1883,10 +1885,18 @@ fn footprint_shapes<'a>(
                     shape.pads += 1;
                     if let Ok(pad) = kiapi::board::types::Pad::decode(child.value.as_slice()) {
                         if let Some(property) = reported_fab_property(pad.fab_property) {
-                            shape.pad_properties.push((pad.number, property));
+                            shape.pad_properties.push((pad.number.clone(), property));
+                        }
+                        if let Some(zone) = pad
+                            .pad_stack
+                            .as_ref()
+                            .and_then(|stack| stack.zone_settings.as_ref())
+                        {
+                            shape.pad_zones.push((pad.number, zone.zone_connection));
                         }
                     }
                 }
+                "kiapi.board.types.ReferencePoint" => shape.reference_points += 1,
                 "kiapi.board.types.BoardGraphicShape" | "kiapi.board.types.BoardText" => {
                     shape.drawings += 1
                 }
@@ -1909,6 +1919,7 @@ fn footprint_shapes<'a>(
         }
         shape.model_files.sort();
         shape.pad_properties.sort();
+        shape.pad_zones.sort();
         out.insert(reference, shape);
     }
     out
@@ -1986,6 +1997,19 @@ fn verify_board_matches_what_was_sent(
                  on the board but not sent [{}]",
                 listed_pad_properties(lost),
                 listed_pad_properties(gained)
+            ));
+        }
+        if got.pad_zones != want.pad_zones {
+            suspicious.push(format!(
+                "{reference}: sent {} pad zone settings, board now has {}",
+                want.pad_zones.len(),
+                got.pad_zones.len()
+            ));
+        }
+        if got.reference_points != want.reference_points {
+            suspicious.push(format!(
+                "{reference}: sent {} reference point(s), board now has {}",
+                want.reference_points, got.reference_points
             ));
         }
         if got.model_files != want.model_files {
@@ -2570,9 +2594,13 @@ fn prepare_footprint_source(
         .context("invalid footprint S-expression")
         .map_err(unsupported)?;
     let attributes = super::library_footprint::attributes(&root).map_err(unsupported)?;
+    let pad_nodes = root.find_all("pad");
     let pad_properties =
-        super::library_footprint::pad_properties(&root.find_all("pad"), pads.len())
-            .map_err(unsupported)?;
+        super::library_footprint::pad_properties(&pad_nodes, pads.len()).map_err(unsupported)?;
+    let pad_zones = super::library_footprint::pad_zones(&pad_nodes).map_err(unsupported)?;
+    let points = super::library_footprint::points(&root).map_err(unsupported)?;
+    let unsupported_features =
+        super::library_footprint::unsupported_features(&root).map_err(unsupported)?;
     let description_and_keywords = super::library_footprint::description_and_keywords(&root);
     let models = super::library_footprint::models(&root).map_err(unsupported)?;
     let library_fields =
@@ -2596,6 +2624,9 @@ fn prepare_footprint_source(
         models,
         library_fields,
         pad_properties,
+        pad_zones,
+        points,
+        unsupported: unsupported_features,
         width,
         height,
     })
@@ -2862,13 +2893,39 @@ fn library_fields_not_carried(
         .collect()
 }
 
-/// Footprints the plan adds whose pads have fabrication properties a KiCad
-/// before 10.0.7 cannot take over its API (#149). They are placed without
-/// them, as KiCad's own Update Footprints from Library can still restore,
-/// rather than refusing every board with a QFN exposed pad or a BGA. The
-/// refresh refuses instead, because there the board's pads already have the
-/// property and replacing them would remove it; an added pad loses nothing.
-fn pad_properties_not_carried(
+/// Footprints the plan adds that carry library clauses or children the typed
+/// placement path leaves out.
+fn unsupported_features_not_carried(
+    plan: &SyncPlan,
+    prepared: &BTreeMap<String, PreparedFootprint>,
+) -> Vec<SyncDiagnostic> {
+    additions_by_footprint(plan)
+        .into_iter()
+        .filter_map(|(footprint_id, references)| {
+            let part = prepared.get(footprint_id)?;
+            (!part.unsupported.is_empty()).then(|| {
+                footprint_conflict(
+                    "not_carried",
+                    format!(
+                        "{footprint_id} has library features not carried by typed placement ({}), \
+                         so {} will be placed without them.",
+                        part.unsupported.join("; "),
+                        listed(&references)
+                    ),
+                    footprint_id,
+                    references,
+                )
+            })
+        })
+        .collect()
+}
+
+/// Footprints the plan adds whose pads have fabrication properties or reference
+/// points a KiCad before 10.0.7 cannot take over its API (#149, #318). They
+/// are placed without them, as KiCad's own Update Footprints from Library can
+/// still restore, rather than refusing every board with a QFN exposed pad or a
+/// BGA.
+fn kicad_10_0_7_not_carried(
     plan: &SyncPlan,
     prepared: &BTreeMap<String, PreparedFootprint>,
     kicad: &copperpour_ipc::IpcKiCadVersion,
@@ -2876,16 +2933,21 @@ fn pad_properties_not_carried(
     additions_by_footprint(plan)
         .into_iter()
         .filter_map(|(footprint_id, references)| {
-            let pads = listed_pad_properties(prepared.get(footprint_id)?.fabricated_pads());
-            (!pads.is_empty()).then(|| {
+            let part = prepared.get(footprint_id)?;
+            let reasons = super::library_footprint::not_carried_10_0_7_reasons(
+                &part.pad_properties,
+                &part.pads,
+                &part.points,
+                kicad,
+            );
+            (!reasons.is_empty()).then(|| {
                 footprint_conflict(
-                    "pad_properties_not_carried",
+                    "not_carried",
                     format!(
-                        "{footprint_id} has pad fabrication properties ({pads}), which \
-                         KiCad's API carries only from KiCad 10.0.7; this KiCad is {}, so {} \
-                         will be placed without them. KiCad's Tools > Update Footprints from \
-                         Library restores them.",
-                        kicad.full_version,
+                        "{footprint_id} ({}): {}; {} will be placed without them. KiCad's \
+                         Tools > Update Footprints from Library restores them.",
+                        listed(&references),
+                        reasons.join("; "),
                         listed(&references)
                     ),
                     footprint_id,
@@ -3508,8 +3570,27 @@ fn build_added_footprint(
     )?;
     let mut footprint =
         copperpour_ipc::gen::kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+    let footprint_pos = footprint
+        .position
+        .context("built footprint has no position")?;
+    let definition = footprint
+        .definition
+        .as_mut()
+        .context("built footprint has no definition")?;
+    super::library_footprint::apply_pad_settings(
+        definition,
+        &part.pad_properties,
+        &part.pad_zones,
+        carry_pad_properties,
+    )?;
     if carry_pad_properties {
-        apply_pad_properties(&mut footprint, &part.pad_properties)?;
+        super::library_footprint::apply_reference_points(
+            definition,
+            &part.points,
+            &footprint_pos,
+            0.0,
+            None,
+        )?;
     }
     apply_library_data(&mut footprint, part)?;
     apply_symbol_fields(&mut footprint, fields)?;
@@ -3528,34 +3609,6 @@ fn build_added_footprint(
         &footprint,
         "kiapi.board.types.FootprintInstance",
     ))
-}
-
-/// Give each built pad its library fabrication property, as KiCad loads it.
-/// The builder emits the pads in the library's order.
-fn apply_pad_properties(
-    footprint: &mut copperpour_ipc::gen::kiapi::board::types::FootprintInstance,
-    properties: &[PadFabricationProperty],
-) -> Result<()> {
-    use copperpour_ipc::gen::kiapi::board::types::Pad;
-    let definition = footprint
-        .definition
-        .as_mut()
-        .context("built footprint has no definition")?;
-    let mut properties = properties.iter();
-    for item in &mut definition.items {
-        if copperpour_ipc::builders::any_is(item, "kiapi.board.types.Pad") {
-            let mut pad = Pad::decode(item.value.as_slice())?;
-            let property = properties
-                .next()
-                .context("typed footprint builder returned more pads than the library has")?;
-            pad.fab_property = fab_property(*property) as i32;
-            *item = copperpour_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
-        }
-    }
-    if properties.next().is_some() {
-        bail!("typed footprint builder returned fewer pads than the library has");
-    }
-    Ok(())
 }
 
 fn build_mutation_items(
@@ -8874,7 +8927,7 @@ mod tests {
         for response in [&plan, &applied] {
             let diagnostics = response["diagnostics"].as_array().unwrap();
             assert_eq!(diagnostics.len(), 1, "{response:#}");
-            assert_eq!(diagnostics[0]["code"], "pad_properties_not_carried");
+            assert_eq!(diagnostics[0]["code"], "not_carried");
             assert_eq!(diagnostics[0]["footprint_id"], THERMAL_DFN);
             assert_eq!(diagnostics[0]["references"], serde_json::json!(["U1"]));
             let message = diagnostics[0]["message"].as_str().unwrap();
@@ -9834,5 +9887,159 @@ mod tests {
             assert_eq!(refused["error"]["field"], field, "{refused:#}");
         }
         assert!(served.sent_footprints().is_empty());
+    }
+
+    /// Added footprints in `update_pcb_from_schematic` carry pad zone
+    /// settings and reference points on KiCad 10.0.7+, and report
+    /// `not_carried` on KiCad < 10.0.7 or when the footprint has clauses
+    /// typed placement leaves out (#318).
+    #[tokio::test]
+    async fn added_footprint_carries_zone_settings_and_reference_point_and_reports_not_carried() {
+        use copperpour_ipc::builders::any_is;
+        use copperpour_ipc::gen::kiapi::board::types::{Pad, ReferencePoint, ZoneConnectionStyle};
+
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        let project_dir = served.board.parent().unwrap();
+        let pretty = project_dir.join("Test_318.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::fs::write(
+            pretty.join("WSON6.kicad_mod"),
+            include_str!("../../tests/fixtures/issue_300_wson6_thermalvias_kicad10.kicad_mod"),
+        )
+        .unwrap();
+        std::fs::write(
+            pretty.join("DIP8.kicad_mod"),
+            include_str!("../../tests/fixtures/issue_283_dip8_kicad10.kicad_mod"),
+        )
+        .unwrap();
+        std::fs::write(
+            pretty.join("WithZone.kicad_mod"),
+            r#"(footprint "WithZone"
+  (version 20241229)
+  (generator "pcbnew")
+  (layer "F.Cu")
+  (property "Reference" "REF**" (at 0 -2 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))
+  (property "Value" "WithZone" (at 0 2 0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
+  (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (zone_connect 2))
+  (zone (net 0) (net_name "") (layer "F.Cu"))
+)"#,
+        )
+        .unwrap();
+        let fp_table = project_dir.join("fp-lib-table");
+        let existing_table = std::fs::read_to_string(&fp_table)
+            .unwrap_or_else(|_| "(fp_lib_table\n  (version 7)\n)\n".to_string());
+        let updated_table = existing_table.replacen(
+            "\n)",
+            "\n  (lib (name \"Test_318\")(type \"KiCad\")(uri \"${KIPRJMOD}/Test_318.pretty\")(options \"\")(descr \"\"))\n)",
+            1,
+        );
+        std::fs::write(&fp_table, updated_table).unwrap();
+
+        let netlist = exported_netlist(&[
+            ("U1", "Test_318:WSON6", &["1", "7"]),
+            ("U2", "Test_318:DIP8", &["1", "2"]),
+            ("U3", "Test_318:WithZone", &["1"]),
+        ]);
+
+        let applied = served.apply(&netlist).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        let diagnostics = applied["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1, "{applied:#}");
+        assert_eq!(diagnostics[0]["code"], "not_carried");
+        assert_eq!(diagnostics[0]["footprint_id"], "Test_318:WithZone");
+        assert!(diagnostics[0]["message"].as_str().unwrap().contains("zone"));
+
+        let sent = served.sent_footprints();
+        assert_eq!(sent.len(), 3);
+        let wson = sent
+            .iter()
+            .find(|fp| {
+                fp.reference_field
+                    .as_ref()
+                    .unwrap()
+                    .text
+                    .as_ref()
+                    .unwrap()
+                    .text
+                    .as_ref()
+                    .unwrap()
+                    .text
+                    == "U1"
+            })
+            .unwrap();
+        let wson_full = wson
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| any_is(item, "kiapi.board.types.Pad"))
+            .map(|item| Pad::decode(item.value.as_slice()).unwrap())
+            .filter(|p| {
+                p.pad_stack
+                    .as_ref()
+                    .and_then(|s| s.zone_settings.as_ref())
+                    .is_some_and(|z| z.zone_connection == ZoneConnectionStyle::ZcsFull as i32)
+            })
+            .count();
+        assert_eq!(wson_full, 2);
+
+        let dip = sent
+            .iter()
+            .find(|fp| {
+                fp.reference_field
+                    .as_ref()
+                    .unwrap()
+                    .text
+                    .as_ref()
+                    .unwrap()
+                    .text
+                    .as_ref()
+                    .unwrap()
+                    .text
+                    == "U2"
+            })
+            .unwrap();
+        let rps: Vec<ReferencePoint> = dip
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| any_is(item, "kiapi.board.types.ReferencePoint"))
+            .map(|item| ReferencePoint::decode(item.value.as_slice()).unwrap())
+            .collect();
+        assert_eq!(rps.len(), 1);
+
+        // On KiCad < 10.0.7, DIP8's reference point is reported in `not_carried`.
+        let older = ServedSync::reading_back(Readback::AsSent).await;
+        older.report_kicad_version(10, 0, 6);
+        let older_dir = older.board.parent().unwrap();
+        let older_pretty = older_dir.join("Test_318.pretty");
+        std::fs::create_dir_all(&older_pretty).unwrap();
+        std::fs::write(
+            older_pretty.join("DIP8.kicad_mod"),
+            include_str!("../../tests/fixtures/issue_283_dip8_kicad10.kicad_mod"),
+        )
+        .unwrap();
+        let older_fp_table = older_dir.join("fp-lib-table");
+        let older_table = std::fs::read_to_string(&older_fp_table)
+            .unwrap_or_else(|_| "(fp_lib_table\n  (version 7)\n)\n".to_string())
+            .replacen(
+                "\n)",
+                "\n  (lib (name \"Test_318\")(type \"KiCad\")(uri \"${KIPRJMOD}/Test_318.pretty\")(options \"\")(descr \"\"))\n)",
+                1,
+            );
+        std::fs::write(&older_fp_table, older_table).unwrap();
+        let dip_only = exported_netlist(&[("U2", "Test_318:DIP8", &["1", "2"])]);
+        let older_applied = older.apply(&dip_only).await;
+        assert_eq!(older_applied["status"], "applied", "{older_applied:#}");
+        let older_diags = older_applied["diagnostics"].as_array().unwrap();
+        assert_eq!(older_diags.len(), 1, "{older_applied:#}");
+        assert_eq!(older_diags[0]["code"], "not_carried");
+        assert!(older_diags[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("reference point"));
     }
 }
