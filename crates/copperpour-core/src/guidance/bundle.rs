@@ -19,10 +19,16 @@ pub const SKILLS: &[SkillManifest] = &[
     SkillManifest {
         name: OPERATING_RULES_SKILL,
         content: include_str!("../../../copperpour/assets/skills/copperpour/SKILL.md"),
-        references: &[(
-            "reliability-contract.md",
-            include_str!("../../../../docs/RELIABILITY_CONTRACT.md"),
-        )],
+        references: &[
+            (
+                "reliability-contract.md",
+                include_str!("../../../../docs/RELIABILITY_CONTRACT.md"),
+            ),
+            (
+                "troubleshooting.md",
+                include_str!("../../../copperpour/assets/skills/copperpour/references/troubleshooting.md"),
+            ),
+        ],
     },
     SkillManifest {
         name: "kicad-schematic",

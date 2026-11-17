@@ -1460,7 +1460,7 @@ fn server_guidance_works_over_stdio_without_init_or_profile_skill_writes() {
         .contains("Never hand-edit"));
     assert_eq!(init["capabilities"]["resources"], json!({}));
     let listed = McpProcess::tool_body(&process.call_tool("get_guidance", json!({})));
-    assert_eq!(listed["count"], 16);
+    assert_eq!(listed["count"], 17);
     let uri = "copperpour://guidance/copperpour/references/reliability-contract.md";
     let resource = process.request("resources/read", json!({"uri":uri}));
     let tool = McpProcess::tool_body(&process.call_tool(
@@ -1471,6 +1471,17 @@ fn server_guidance_works_over_stdio_without_init_or_profile_skill_writes() {
     assert_eq!(
         tool["contents"][0]["text"],
         include_str!("../../../docs/RELIABILITY_CONTRACT.md")
+    );
+    let ts_uri = "copperpour://guidance/copperpour/references/troubleshooting.md";
+    let ts_resource = process.request("resources/read", json!({"uri":ts_uri}));
+    let ts_tool = McpProcess::tool_body(&process.call_tool(
+        "get_guidance",
+        json!({"path":"copperpour/references/troubleshooting.md"}),
+    ));
+    assert_eq!(ts_resource["result"], ts_tool);
+    assert_eq!(
+        ts_tool["contents"][0]["text"],
+        include_str!("../assets/skills/copperpour/references/troubleshooting.md")
     );
     assert!(!profile.path().join(".claude").exists());
     assert!(!profile.path().join(".agents").exists());

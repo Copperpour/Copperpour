@@ -1664,6 +1664,12 @@ mod tests {
         );
         let skill = fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
         assert!(skill.contains("](references/reliability-contract.md)"));
+        assert!(skill.contains("](references/troubleshooting.md)"));
+        let troubleshooting = fs::read(skill_dir.join("references/troubleshooting.md")).unwrap();
+        assert_eq!(
+            troubleshooting,
+            include_bytes!("../assets/skills/copperpour/references/troubleshooting.md")
+        );
         for filename in [
             "kicad-schematic-build-agent.md",
             "kicad-design-review-agent.md",
@@ -2419,9 +2425,9 @@ mod tests {
         run_install_at(InstallClient::Claude, &paths, false).unwrap();
 
         let claude = inspect_guidance(InstallClient::Claude, &paths, &this_exe());
-        // 6 SKILL.md + 10 reference files + 2 agents, and 4 hooks: the counts
+        // 6 SKILL.md + 11 reference files + 2 agents, and 4 hooks: the counts
         // `konnect init` reports, restated rather than read from the manifest.
-        assert_eq!(claude.files.len(), 18);
+        assert_eq!(claude.files.len(), 19);
         assert_eq!(claude.hooks.len(), 4);
         for file in &claude.files {
             assert_eq!(file.status, ItemStatus::Current, "{}", file.name);
@@ -2771,7 +2777,7 @@ mod tests {
         .unwrap();
         let codex = inspect_guidance(InstallClient::Codex, &paths, &this_exe());
         assert!(codex.hooks.is_empty());
-        assert_eq!(codex.files.len(), 16);
+        assert_eq!(codex.files.len(), 17);
         assert_eq!(file_status(&codex, "kicad-library/SKILL.md"), "missing");
         let notice = codex.notice().unwrap();
         assert!(notice.starts_with("Copperpour Codex guidance"), "{notice}");

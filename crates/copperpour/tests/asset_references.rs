@@ -317,6 +317,61 @@ fn schematic_guidance_offers_the_live_viewer_link_safely() {
     );
 }
 
+/// Operating guidance teaches a compact troubleshooting workflow and points to
+/// the on-demand reference covering setup, IPC, client visibility, and safe
+/// recovery (#526).
+#[test]
+fn troubleshooting_guidance_covers_recovery_workflow_and_boundaries() {
+    let root = assets_root();
+    let skill = std::fs::read_to_string(root.join("skills/copperpour/SKILL.md")).unwrap();
+    let reference =
+        std::fs::read_to_string(root.join("skills/copperpour/references/troubleshooting.md"))
+            .unwrap();
+
+    for marker in [
+        "Troubleshooting and Recovery",
+        "references/troubleshooting.md",
+        "copperpour/references/troubleshooting.md",
+        "get_installation_info",
+        "get_recent_calls",
+        "check_kicad_ui",
+        "copperpour init",
+    ] {
+        assert!(
+            skill.contains(marker),
+            "skills/copperpour/SKILL.md is missing `{marker}`"
+        );
+    }
+
+    for marker in [
+        "get_installation_info",
+        "get_recent_calls",
+        "check_kicad_ui",
+        "retry_safe",
+        "next_steps",
+        "troubleshooting_url",
+        "board_state",
+        "drop_confirmed",
+        "browser_launch_error",
+        "AS_NOT_READY",
+        "eager_toolsets",
+        "invalid_configuration",
+        "unsafe_file_fallback",
+        "ipc_outcome_unknown",
+        "ipc_batch_recovered",
+        "mutation_outcome_uncertain",
+        "copperpour init",
+        "1. Successful Safe Recovery",
+        "2. Setup Failure Requiring User Action",
+        "3. Uncertain Mutation Requiring Inspection Before Retry",
+    ] {
+        assert!(
+            reference.contains(marker),
+            "skills/copperpour/references/troubleshooting.md is missing `{marker}`"
+        );
+    }
+}
+
 /// Manufacturing guidance must describe evidence the released tools actually
 /// return, and it must remain safe while artifact verification is implemented
 /// independently in #270. v0.10.0 claimed four validations the handler did not
@@ -727,6 +782,7 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "get_recent_calls",
         "server_stats",
         "get_installation_info",
+        "get_guidance",
         "auto_load_toolsets",
         "eager_toolsets",
         "kicad_cli",
@@ -776,6 +832,25 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "unsafe_file_fallback",
         "unsupported_capability",
         "mutation_outcome_uncertain",
+        "ipc_outcome_unknown",
+        "ipc_batch_recovered",
+        "invalid_configuration",
+        "file_not_found",
+        "ipc_failure",
+        // Structured recovery and diagnostic response fields, not callable tools (#526).
+        "retry_safe",
+        "board_state",
+        "drop_confirmed",
+        "mutation_outcome",
+        "retry_prerequisites",
+        "next_steps",
+        "troubleshooting_url",
+        "browser_launch_error",
+        "absolute_path",
+        "binary_on_disk",
+        "newer_than_running",
+        "working_directory",
+        "out_of_sync",
         // Structured manufacturing response field, not a callable tool.
         "files_generated",
         "placement_orientation",
