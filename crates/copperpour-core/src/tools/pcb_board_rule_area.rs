@@ -36,9 +36,10 @@ const REFILL_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Export-profile guidance for callers creating rule areas.
 pub(crate) const FREEROUTING_RULE_AREA_WARNING: &str =
-    "Freerouting supports straight, netless tracks/vias keep-outs on copper layers with \
-     whole-micrometre vertices. export_specctra_dsn refuses pour/pad/footprint-only areas, \
-     enabled placement, cutouts and arc edges.";
+    "Freerouting supports straight, netless rule areas on copper layers with whole-micrometre \
+     vertices: tracks/vias keep-outs become DSN keep-outs, and pour/pad/footprint-only areas \
+     are left out of the DSN and enforced by refill and DRC after apply. export_specctra_dsn \
+     refuses enabled placement, cutouts and arc edges.";
 
 pub(crate) fn tools() -> Vec<ToolDef> {
     vec![tool()]
@@ -54,8 +55,10 @@ pub(crate) fn tool() -> ToolDef {
          ZT_RULE_AREA in one undoable KiCad commit, reads back what KiCad stored, and refills \
          copper zones afterward. Requires the requested board open in KiCad; refuses without \
          modifying the file when KiCad is unreachable or holds another board. Freerouting supports \
-         straight, netless tracks/vias keep-outs on copper layers with whole-micrometre vertices; \
-         export_specctra_dsn refuses pour/pad/footprint-only areas, enabled placement, cutouts and arc edges.",
+         straight, netless rule areas on copper layers with whole-micrometre vertices: tracks/vias \
+         keep-outs become DSN keep-outs, and pour/pad/footprint-only areas are left out of the DSN \
+         and enforced by refill and DRC after apply. export_specctra_dsn refuses enabled placement, \
+         cutouts and arc edges.",
         json!({
             "type": "object",
             "properties": {
@@ -1710,7 +1713,7 @@ mod tests {
         let guidance = json["warning"].as_str().unwrap();
         assert!(guidance.contains("whole-micrometre"));
         assert!(guidance.contains("tracks/vias"));
-        assert!(guidance.contains("refuses pour/pad/footprint-only areas"));
+        assert!(guidance.contains("pour/pad/footprint-only areas are left out of the DSN"));
         assert!(state
             .lock()
             .unwrap()

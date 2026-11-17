@@ -2812,6 +2812,121 @@ fn freerouting_routes_around_rule_areas_and_the_planner_accepts_it() {
     assert!(error.contains(inventory), "{error}");
 }
 
+const FILL_ONLY: &str = include_str!("../../tests/fixtures/specctra_fill_only_rule_area.kicad_pcb");
+const FILL_ONLY_NATIVE_FILE: &str =
+    include_str!("../../tests/fixtures/specctra_fill_only_rule_area.native-kicad-10.dsn");
+const FILL_ONLY_SES: &str = include_str!(
+    "../../tests/fixtures/specctra_fill_only_rule_area.native-kicad-10.freerouting-master.ses"
+);
+
+fn fill_only_snapshot(board: &Path, source: &str) -> RoutingSnapshot {
+    prepare_export(board, source, &native_fixture_rules()).unwrap()
+}
+
+#[test]
+fn fill_only_rule_areas_are_recorded_but_not_written_to_the_dsn() {
+    let export = native_baseline(FILL_ONLY);
+    assert_eq!(export.rule_area_count, 1);
+    assert!(!export.dsn.contains("keepout"), "{}", export.dsn);
+    assert_eq!(
+        export.rule_areas_not_exported,
+        [NotExportedRuleArea {
+            label: "rule area 'no_pour'".to_string(),
+            layers: vec!["F.Cu".to_string(), "B.Cu".to_string()],
+            reason: FILL_ONLY_REASON,
+        }]
+    );
+    let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+    assert_eq!(manifest["supported_profile"]["rule_areas"], true);
+    let areas = manifest["rule_areas"].as_array().unwrap();
+    assert_eq!(areas.len(), 1);
+    assert_eq!(areas[0]["kind"], "fill_only");
+    assert_eq!(areas[0]["layers"], serde_json::json!(["F.Cu", "B.Cu"]));
+    assert_eq!(areas[0]["outline_um"][2]["x_um"], 118000);
+    assert_eq!(areas[0]["outline_um"][2]["y_um"], -53000);
+
+    // The same area with tracks forbidden is a keep-out again.
+    let blocking =
+        native_baseline(&FILL_ONLY.replacen("(tracks allowed)", "(tracks not_allowed)", 1));
+    assert!(blocking.rule_areas_not_exported.is_empty());
+    assert_eq!(
+        blocking.dsn.matches("(wire_keepout ").count(),
+        2,
+        "{}",
+        blocking.dsn
+    );
+}
+
+#[test]
+fn native_dsn_keepouts_of_fill_only_rule_areas_are_dropped() {
+    let snapshot = fill_only_snapshot(Path::new("board.kicad_pcb"), FILL_ONLY);
+    assert_eq!(FILL_ONLY_NATIVE_FILE.matches("(keepout ").count(), 2);
+    let adopted = snapshot
+        .adopt_native(FILL_ONLY_NATIVE_FILE.to_string())
+        .unwrap();
+    assert_eq!(adopted.native_keepouts_dropped, 2);
+    assert!(!adopted.dsn.contains("keepout"), "{}", adopted.dsn);
+    validate_dsn_syntax(&adopted.dsn, "adopted DSN").unwrap();
+    // Nothing else of KiCad's DSN changes.
+    let kept: Vec<&str> = FILL_ONLY_NATIVE_FILE
+        .lines()
+        .filter(|line| !line.contains("(keepout ") && !line.trim().starts_with("112000 -42000))"))
+        .collect();
+    assert_eq!(adopted.dsn.lines().collect::<Vec<_>>(), kept);
+    assert_eq!(adopted.rule_areas_not_exported.len(), 1);
+
+    // A KiCad that no longer writes them (10.0.9, KiCad#25959): nothing to drop.
+    let again = snapshot.adopt_native(adopted.dsn.clone()).unwrap();
+    assert_eq!(again.native_keepouts_dropped, 0);
+    assert_eq!(again.dsn, adopted.dsn);
+
+    // Only the exact outline and layer of a fill-only area is dropped.
+    let moved = FILL_ONLY_NATIVE_FILE.replacen("118000 -53000", "118000 -54000", 1);
+    assert_ne!(moved, FILL_ONLY_NATIVE_FILE);
+    let error = snapshot.adopt_native(moved).unwrap_err().to_string();
+    assert!(
+        error.contains("native DSN changed the rule-area keep-outs"),
+        "{error}"
+    );
+    let retyped = FILL_ONLY_NATIVE_FILE.replacen("(keepout ", "(wire_keepout ", 1);
+    let error = snapshot.adopt_native(retyped).unwrap_err().to_string();
+    assert!(
+        error.contains("native DSN changed the rule-area keep-outs"),
+        "{error}"
+    );
+}
+
+#[test]
+fn freerouting_routes_across_fill_only_rule_areas_and_the_planner_accepts_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = temp.path().join("specctra_fill_only_rule_area.kicad_pcb");
+    std::fs::write(&board, FILL_ONLY).unwrap();
+    let adopted = fill_only_snapshot(&board, FILL_ONLY)
+        .adopt_native(FILL_ONLY_NATIVE_FILE.to_string())
+        .unwrap();
+    let plan =
+        crate::specctra_ses::parse_import_plan(&board, FILL_ONLY, &adopted.manifest, FILL_ONLY_SES)
+            .unwrap();
+    assert!(!plan.tracks.is_empty());
+
+    // Control: the same session crosses the area, so a board where the area
+    // forbids tracks and vias refuses it. KiCad's native DSN then matches it.
+    let blocking = FILL_ONLY
+        .replacen("(tracks allowed)", "(tracks not_allowed)", 1)
+        .replacen("(vias allowed)", "(vias not_allowed)", 1);
+    assert_ne!(blocking, FILL_ONLY);
+    std::fs::write(&board, &blocking).unwrap();
+    let adopted = fill_only_snapshot(&board, &blocking)
+        .adopt_native(FILL_ONLY_NATIVE_FILE.to_string())
+        .unwrap();
+    assert_eq!(adopted.native_keepouts_dropped, 0);
+    let error =
+        crate::specctra_ses::parse_import_plan(&board, &blocking, &adopted.manifest, FILL_ONLY_SES)
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("violates a rule-area keep-out"), "{error}");
+}
+
 #[test]
 fn rule_area_vertices_must_be_exact_whole_micrometres() {
     for (mm, expected_um) in [
@@ -2875,15 +2990,6 @@ fn rule_area_vertices_must_be_exact_whole_micrometres() {
 #[test]
 fn rule_areas_that_keepouts_cannot_describe_are_refused() {
     let cases = [
-        (
-            "allows tracks and vias (pour-only)",
-            RULE_AREAS.replacen(
-                "(tracks not_allowed)\n\t\t\t(vias not_allowed)",
-                "(tracks allowed)\n\t\t\t(vias allowed)",
-                1,
-            ),
-            "allows both tracks and vias",
-        ),
         (
             "placement enabled",
             RULE_AREAS.replacen("(placement\n\t\t\t(enabled no)", "(placement\n\t\t\t(enabled yes)", 1),
