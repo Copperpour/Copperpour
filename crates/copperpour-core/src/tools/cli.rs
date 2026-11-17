@@ -4793,6 +4793,7 @@ mod creepage_view_tests {
         assert!(creepage_free_view(&pcb).unwrap().is_none());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn drc_report_never_touches_the_project_directory() {
         let project = tempfile::tempdir().unwrap();
@@ -4815,7 +4816,6 @@ mod creepage_view_tests {
             "@exit /b 1\r\n",
         );
 
-        #[cfg(unix)]
         let original_permissions = {
             use std::os::unix::fs::PermissionsExt;
             let original = std::fs::metadata(project.path()).unwrap().permissions();
@@ -4827,7 +4827,6 @@ mod creepage_view_tests {
 
         let result = run_drc(cli.to_str().unwrap(), &board, false).await;
 
-        #[cfg(unix)]
         std::fs::set_permissions(project.path(), original_permissions).unwrap();
 
         assert!(result.unwrap().violations.is_empty());
