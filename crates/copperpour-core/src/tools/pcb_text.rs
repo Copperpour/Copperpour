@@ -187,12 +187,19 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         .with_board_access(BoardAccess::LiveOnly),
         tool!(
             "set_footprint_field_style",
-            "Set the glyph size and/or stroke thickness of the reference or value field on \
-             placed footprints: the ones named in 'references', or every footprint when it is \
-             omitted. Use it to repair fields below a fabricator's minimum text thickness (DRC \
+            "Set the glyph size, stroke thickness, layer, visibility or mirror flag of the \
+             reference or value field on placed footprints: the ones named in 'references', or \
+             every footprint when it is omitted, as KiCad's Edit Text and Graphic Properties \
+             does. Use it to repair fields below a fabricator's minimum text thickness (DRC \
              text_thickness), for example Reference fields placed without their library's \
-             thickness. Name at least one of size_x, size_y, thickness; position, angle, layer, \
-             font and visibility are not touched. With KiCad running on the board the edit is \
+             thickness, or to move or hide every Reference or Value at once. Name at least one \
+             of size_x, size_y, thickness, layer, visible, mirror 'auto'; position, angle and \
+             font are not touched. 'layer' is named as on a front-side footprint: a footprint \
+             on the back gets the flipped layer (F.Fab becomes B.Fab), as KiCad's Flip moves a \
+             footprint's own texts. Changing the layer alone keeps the mirror flag; mirror \
+             'auto' sets it from the side of the layer each field ends on. 'layer', 'visible' \
+             and 'mirror' need KiCad running with the board open and are refused otherwise. \
+             With KiCad running on the board the edit is \
              live, in one undo step, and each changed footprint is sent back whole, as \
              edit_footprint_field sends it: on KiCad 10 that drops its symbol-unit mapping \
              until Update PCB from Schematic, and a rule area inside it may be rewritten, which \
@@ -203,7 +210,8 @@ pub(crate) fn tools() -> Vec<ToolDef> {
              its values before and after, read back from the board or the file, and 'skipped' \
              the fields a whole-board run could not edit; a result that does not hold the \
              request is an error. On the file path 'thickness_mm' is null where the file stores \
-             none and KiCad derives it from the size. Does not save a live board.",
+             none and KiCad derives it from the size, and 'layer' where it stores no layer. \
+             Does not save a live board.",
             field_style::input_schema(),
             |args, ctx| async move {
                 field_style::handle_set_footprint_field_style(args, ctx).await
@@ -1495,6 +1503,10 @@ mod tests {
         /// Items received in `UpdateItems`, and commits begun.
         pub(super) updates: usize,
         pub(super) commits: usize,
+        /// The copper layer count `GetBoardEnabledLayers` reports; 0 means 2.
+        pub(super) copper_layers: u32,
+        /// `GetBoardEnabledLayers` requests received.
+        pub(super) layer_queries: usize,
     }
 
     fn held_text(
@@ -1604,6 +1616,30 @@ mod tests {
                     &commands::EndCommitResponse {},
                     "kiapi.common.commands.EndCommitResponse",
                 )),
+                "GetBoardEnabledLayers" => {
+                    use kiapi::board::types::BoardLayer;
+                    held.layer_queries += 1;
+                    let copper = held.copper_layers.max(2);
+                    let inner = [BoardLayer::BlIn1Cu, BoardLayer::BlIn2Cu];
+                    let layers = std::iter::once(BoardLayer::BlFCu)
+                        .chain(inner.into_iter().take(copper as usize - 2))
+                        .chain([
+                            BoardLayer::BlBCu,
+                            BoardLayer::BlFSilkS,
+                            BoardLayer::BlBSilkS,
+                            BoardLayer::BlFFab,
+                            BoardLayer::BlBFab,
+                        ])
+                        .map(|layer| layer as i32)
+                        .collect();
+                    Some(copperpour_ipc::builders::pack_any(
+                        &kiapi::board::commands::BoardEnabledLayersResponse {
+                            copper_layer_count: copper,
+                            layers,
+                        },
+                        "kiapi.board.commands.BoardEnabledLayersResponse",
+                    ))
+                }
                 "UpdateItems" => {
                     let request = commands::UpdateItems::decode(command.value.as_slice()).unwrap();
                     held.updates += request.items.len();

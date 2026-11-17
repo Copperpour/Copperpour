@@ -1228,3 +1228,195 @@ fn footprint_field_style_round_trips_through_live_kicad() {
         );
     }
 }
+
+/// `set_footprint_field_style` with a layer, visibility and the mirror flag
+/// against a real KiCad: R931 on the front and R932 placed on the back. One
+/// call names `F.Fab` as on a front-side footprint, so R931's Reference lands
+/// on `F.Fab` and R932's on `B.Fab`, as KiCad's Flip puts a back footprint's
+/// texts, each keeping its mirror flag. Mirror 'auto' then has nothing to
+/// change, a second call hides both Values, KiCad's own readback must show
+/// all of it with the footprints' pose and pads unmoved, and a KiCad save
+/// must write it.
+///
+/// It places two resistors, so run it against a fresh disposable board:
+///
+/// ```text
+/// KICAD_API_SOCKET=… COPPERPOUR_LIVE_KICAD_BOARD=… \
+///   cargo test -p copperpour --test live_kicad_tools -- --ignored --nocapture \
+///   footprint_field_layer_and_visibility_round_trip_through_live_kicad
+/// ```
+#[test]
+#[ignore = "requires a running KiCad GUI, API socket, disposable open board, and standard footprint libraries"]
+fn footprint_field_layer_and_visibility_round_trip_through_live_kicad() {
+    use kiapi::board::types::BoardLayer;
+    let board = std::path::PathBuf::from(
+        test_env("LIVE_KICAD_BOARD")
+            .expect("COPPERPOUR_LIVE_KICAD_BOARD must name the disposable open board"),
+    );
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let placements = [("R931", "F.Cu"), ("R932", "B.Cu")];
+    let references = placements.map(|(reference, _)| reference);
+
+    let ipc = KiCadIpcClient::new(&socket);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match ipc.find_open_board(&board) {
+            Ok(_) => break,
+            Err(error)
+                if error.to_string().contains("AS_NOT_READY")
+                    && std::time::Instant::now() < deadline => {}
+            Err(error) => panic!("KiCad did not open the disposable board: {error:#}"),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let mut mcp = McpProcess::spawn(&socket);
+    for toolset in ["pcb_components", "pcb_text"] {
+        mcp.tool("load_toolset", json!({"name": toolset}));
+    }
+    for (index, (reference, layer)) in placements.iter().enumerate() {
+        let placed = tool_body(&mcp.tool(
+            "place_component",
+            json!({
+                "board": board,
+                "footprint": "Resistor_SMD:R_0402_1005Metric",
+                "reference": reference,
+                "x": 70.0 + 5.0 * index as f64,
+                "y": 50.0,
+                "rotation": 0.0,
+                "layer": layer
+            }),
+        ));
+        assert_eq!(placed["placed"], *reference, "{placed}");
+    }
+    let pristine: Vec<_> = references
+        .iter()
+        .map(|reference| live_footprint(&ipc, &board, reference))
+        .collect();
+    let text = |field: Option<&kiapi::board::types::Field>| {
+        field
+            .and_then(|field| field.text.clone())
+            .expect("the field has no text")
+    };
+    let mirrored = |text: &kiapi::board::types::BoardText| {
+        text.text
+            .as_ref()
+            .and_then(|body| body.attributes.as_ref())
+            .expect("the field has no text attributes")
+            .mirrored
+    };
+    // As KiCad places them: the back footprint's Reference on B.SilkS,
+    // mirrored.
+    assert_eq!(
+        pristine
+            .iter()
+            .map(|footprint| {
+                let reference = text(footprint.reference_field.as_ref());
+                (reference.layer, mirrored(&reference))
+            })
+            .collect::<Vec<_>>(),
+        [
+            (BoardLayer::BlFSilkS as i32, false),
+            (BoardLayer::BlBSilkS as i32, true)
+        ]
+    );
+
+    let request = json!({
+        "board": board, "references": references, "fields": ["reference"],
+        "layer": "F.Fab"
+    });
+    let body = tool_body(&mcp.tool("set_footprint_field_style", request.clone()));
+    println!("set_footprint_field_style layer: {body}");
+    assert_eq!(body["status"], "applied", "{body}");
+    assert_eq!(body["source"], "ipc", "{body}");
+    assert_eq!(body["undo"], "one KiCad undo step", "{body}");
+    assert_eq!(body["changed_count"], 2, "{body}");
+    for (field, (reference, layer, mirrored)) in body["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip([("R931", "F.Fab", false), ("R932", "B.Fab", true)])
+    {
+        assert_eq!(field["footprint"], reference, "{body}");
+        assert_eq!(field["after"]["layer"], layer, "{body}");
+        assert_eq!(field["after"]["mirrored"], mirrored, "{body}");
+        assert_eq!(field["after"]["visible"], field["before"]["visible"]);
+    }
+    let again = tool_body(&mcp.tool("set_footprint_field_style", request));
+    assert_eq!(again["status"], "unchanged", "asking again: {again}");
+    let auto = tool_body(&mcp.tool(
+        "set_footprint_field_style",
+        json!({ "board": board, "references": references, "mirror": "auto" }),
+    ));
+    assert_eq!(
+        auto["status"], "unchanged",
+        "each flag already matches its side: {auto}"
+    );
+
+    let hidden = tool_body(&mcp.tool(
+        "set_footprint_field_style",
+        json!({
+            "board": board, "references": references, "fields": ["value"],
+            "visible": false
+        }),
+    ));
+    println!("set_footprint_field_style visible: {hidden}");
+    assert_eq!(hidden["status"], "applied", "{hidden}");
+    for field in hidden["fields"].as_array().unwrap() {
+        assert_eq!(field["after"]["visible"], false, "{hidden}");
+    }
+
+    // KiCad's own readback.
+    for ((reference, before), (layer, mirror)) in references
+        .iter()
+        .zip(&pristine)
+        .zip([(BoardLayer::BlFFab, false), (BoardLayer::BlBFab, true)])
+    {
+        let live = live_footprint(&ipc, &board, reference);
+        let live_reference = text(live.reference_field.as_ref());
+        assert_eq!(
+            live_reference.layer, layer as i32,
+            "{reference}'s Reference"
+        );
+        assert_eq!(mirrored(&live_reference), mirror, "{reference}'s Reference");
+        let value = live.value_field.as_ref().unwrap();
+        assert!(!value.visible, "{reference}'s Value is still shown");
+        assert_eq!(
+            value.text,
+            before.value_field.as_ref().unwrap().text,
+            "{reference}'s Value text changed beyond its visibility"
+        );
+        assert_eq!(live.id, before.id, "{reference}'s KIID changed");
+        assert_eq!(live.position, before.position);
+        assert_eq!(live.orientation, before.orientation);
+        assert_eq!(live.layer, before.layer);
+        assert_eq!(footprint_pads(&live), footprint_pads(before));
+    }
+
+    // A KiCad save writes the layers and the hidden Values.
+    ipc.save_board().expect("failed to save live board");
+    let tree = parse_sexp(&std::fs::read_to_string(&board).unwrap()).unwrap();
+    for (reference, layer) in references.iter().zip(["F.Fab", "B.Fab"]) {
+        let saved = footprint(&tree, reference);
+        let property = |name: &str| {
+            saved
+                .find_all("property")
+                .into_iter()
+                .find(|property| property.get(1).and_then(SexpNode::as_str) == Some(name))
+                .unwrap_or_else(|| panic!("{reference} has no saved {name}"))
+        };
+        assert_eq!(
+            property("Reference")
+                .find("layer")
+                .and_then(|layer| layer.get(1).and_then(SexpNode::as_str).map(str::to_string)),
+            Some(layer.to_string())
+        );
+        assert_eq!(
+            property("Value")
+                .find("hide")
+                .and_then(|hide| hide.get(1).and_then(SexpNode::as_str).map(str::to_string)),
+            Some("yes".to_string()),
+            "{reference}'s saved Value is not hidden"
+        );
+    }
+}
