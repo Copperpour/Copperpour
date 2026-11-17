@@ -205,17 +205,7 @@ impl KiCadIpcClient {
         document: kiapi::common::types::DocumentSpecifier,
     ) -> Result<BTreeMap<String, Vec<board::FootprintInstance>>> {
         let mut by_kiid: BTreeMap<String, Vec<board::FootprintInstance>> = BTreeMap::new();
-        for item in self.get_items_in(
-            document,
-            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
-        )? {
-            anyhow::ensure!(
-                crate::builders::any_is(&item, FOOTPRINT_INSTANCE),
-                "KiCad answered a request for footprints with a {}",
-                item.type_url
-            );
-            let footprint = board::FootprintInstance::decode(item.value.as_slice())
-                .context("KiCad sent an unreadable footprint")?;
+        for footprint in self.placed_footprints_in(document)? {
             by_kiid
                 .entry(kiid_value(footprint.id.clone()))
                 .or_default()
@@ -236,7 +226,7 @@ impl KiCadIpcClient {
 /// absent or zero length limit is the same "no limit". A pad's
 /// `zone_layer_overrides` is not compared: the proto marks it an unstable
 /// KiCad implementation detail, and KiCad derives it from zone fills.
-pub fn footprint_differences(
+pub(super) fn footprint_differences(
     expected: &board::FootprintInstance,
     observed: &board::FootprintInstance,
 ) -> Vec<String> {

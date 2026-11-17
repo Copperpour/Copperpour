@@ -2,7 +2,9 @@
 
 use super::{cli, ipc_target_error_result, with_board_ipc_classified, ToolContext};
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
-use copperpour_ipc::IpcFailure;
+use copperpour_ipc::{
+    client::KiCadIpcClient, gen::kiapi::common::types::DocumentSpecifier, IpcFailure,
+};
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
 
@@ -102,16 +104,24 @@ fn target_failure(failure: IpcFailure) -> CallToolResult {
     }
 }
 
-/// Complete a requested live refill without saving or switching to another board.
+/// Request fill-all on the bound document and wait for KiCad to accept reads.
+/// Readiness is not an acknowledgment that the queued fill finished.
+pub(crate) fn request_refill_and_wait(
+    client: &KiCadIpcClient,
+    document: DocumentSpecifier,
+) -> anyhow::Result<()> {
+    client.refill_zones_in(document)?;
+    client.wait_for_board_ready(READY_TIMEOUT)
+}
+
+/// Request a live refill without saving or switching to another board.
 pub(crate) async fn refill(
     ctx: &ToolContext,
     board: &Path,
 ) -> anyhow::Result<Result<(), CallToolResult>> {
     let path = board.to_path_buf();
-    let result = with_board_ipc_classified(ctx, board, move |client, _| {
-        Ok(client
-            .refill_zones()
-            .and_then(|()| client.wait_for_board_ready(READY_TIMEOUT))
+    let result = with_board_ipc_classified(ctx, board, move |client, document| {
+        Ok(request_refill_and_wait(client, document)
             .map_err(|error| uncertain(&path, "refill_zones", error)))
     })
     .await?;
@@ -164,11 +174,10 @@ pub(crate) async fn run(
     let mut saved_snapshot = None;
     if sync {
         let path = board.to_path_buf();
-        let synchronized = with_board_ipc_classified(ctx, board, move |client, _| {
+        let synchronized = with_board_ipc_classified(ctx, board, move |client, document| {
             let operation = || -> anyhow::Result<String> {
                 if refill {
-                    client.refill_zones()?;
-                    client.wait_for_board_ready(READY_TIMEOUT)?;
+                    request_refill_and_wait(client, document)?;
                 }
                 client.save_board()?;
                 client.wait_for_board_ready(READY_TIMEOUT)?;

@@ -12,7 +12,7 @@
 //! vias, in the same undo step. `refill_zones` is the opt-in, board-wide step:
 //! KiCad's fill-all refills every zone and rebuilds every teardrop. The
 //! response reports the settings, the commit's teardrop copper and the
-//! refill's teardrop copper separately.
+//! teardrop copper observed after the refill request separately.
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::{CallToolResult, ToolContent};
@@ -23,9 +23,8 @@ use crate::tools::{
 };
 use copperpour_ipc::builders::{mm_to_nm, nm_to_mm};
 use copperpour_ipc::client::{
-    footprint_owned_groups, legacy_teardrops_in_board_text, supports_teardrop_settings,
-    IpcTeardropApplyOutcome, IpcTeardropEdit, IpcTeardropRefusal, IpcTeardropSettings,
-    IpcTeardropTarget, IpcTeardropTargetKind, IpcTeardropZone, KiCadIpcClient,
+    supports_teardrop_settings, IpcTeardropApplyOutcome, IpcTeardropEdit, IpcTeardropRefusal,
+    IpcTeardropSettings, IpcTeardropTarget, IpcTeardropTargetKind, IpcTeardropZone, KiCadIpcClient,
     TEARDROP_SETTINGS_MIN_KICAD_VERSION,
 };
 use copperpour_ipc::gen::kiapi::common::types::DocumentSpecifier;
@@ -33,14 +32,9 @@ use copperpour_ipc::IpcKiCadVersion;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 /// How many targets and zones a `set_teardrop_settings` response lists.
 const LISTED: usize = 200;
-/// How long a refill may take before the board must accept reads again.
-const REFILL_READY_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long the teardrop zones may keep changing after a refill reports ready.
-const REFILL_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 const UNDO: &str = "One KiCad undo step reverts the settings and the teardrops KiCad rebuilt \
                     with them. A refill is a separate KiCad operation.";
 
@@ -108,7 +102,8 @@ pub(crate) fn tools() -> Vec<ToolDef> {
              pads ({reference, pad_number} or {uuid}), vias (UUIDs), references (their pads), \
              nets (pads and vias), all_pads and all_vias; a selector matching nothing refuses \
              the call. settings fields left out keep their value. refill_zones (default false) \
-             then refills every zone on the board and rebuilds every teardrop. dry_run reports \
+             then requests a board-wide refill and reports observed teardrop copper, not \
+             confirmation that the queued refill completed. dry_run reports \
              each target's settings before and after and writes nothing. Refuses older or \
              unknown KiCad versions (unsupported_capability), boards in legacy teardrop mode \
              and pads whose footprint owns groups (plan_blocked), with nothing written. Pads \
@@ -141,7 +136,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
                         }
                     },
                     "settings": settings_schema(),
-                    "refill_zones": { "type": "boolean", "default": false, "description": "After the settings, refill every zone on the board and rebuild every teardrop" },
+                    "refill_zones": { "type": "boolean", "default": false, "description": "After the settings, request a board-wide refill" },
                     "dry_run": { "type": "boolean", "default": false }
                 },
                 "required": ["board", "targets", "settings"]
@@ -853,6 +848,37 @@ fn grouped_reason(footprint: &str, reference: &str, count: usize) -> String {
     )
 }
 
+fn apply_refusal(board: &Path, refusal: IpcTeardropRefusal) -> CallToolResult {
+    match refusal {
+        IpcTeardropRefusal::LegacyTeardrops => blocked(vec![legacy_reason()]),
+        IpcTeardropRefusal::FootprintOwnsGroups { footprints } => blocked(
+            footprints
+                .iter()
+                .map(|(id, reference, count)| grouped_reason(id, reference, *count))
+                .collect(),
+        ),
+        IpcTeardropRefusal::Stale { reason } => CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: board.display().to_string(),
+                reason: reason.clone(),
+            },
+            format!(
+                "The board changed while set_teardrop_settings ran: {reason}. Nothing \
+                 was written; read the board again and retry."
+            ),
+        ),
+        IpcTeardropRefusal::Rejected { reason } => CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: reason.clone(),
+            },
+            format!(
+                "KiCad refused the teardrop settings ({reason}); a fresh read showed \
+                 every item unchanged. Nothing was written."
+            ),
+        ),
+    }
+}
+
 fn uncertain(board: &Path, reason: &str, applied: Option<Value>) -> CallToolResult {
     let body = json!({
         "message": format!(
@@ -906,36 +932,9 @@ fn set_live(
         })
         .collect();
 
-    // A dry run gives the same refusals the apply would, from KiCad's
-    // serialization; an apply leaves them to `set_teardrop_settings_in`,
-    // which makes them on the same read it compares the result with.
     if request.dry_run {
-        let board_text = client.save_document_to_string_in(document.clone())?;
-        let mut reasons = Vec::new();
-        if legacy_teardrops_in_board_text(&board_text)? {
-            reasons.push(legacy_reason());
-        }
-        let owned = footprint_owned_groups(&board_text)?;
-        let edited_footprints: BTreeMap<&str, &str> = edits
-            .iter()
-            .filter_map(|e| {
-                let footprint = e.footprint_uuid.as_deref()?;
-                let reference = targets
-                    .iter()
-                    .find(|t| t.uuid == e.uuid)
-                    .and_then(|t| t.reference.as_deref())
-                    .unwrap_or("");
-                Some((footprint, reference))
-            })
-            .collect();
-        for (footprint, reference) in &edited_footprints {
-            let count = owned.get(*footprint).copied().unwrap_or(0);
-            if count > 0 {
-                reasons.push(grouped_reason(footprint, reference, count));
-            }
-        }
-        if !reasons.is_empty() {
-            return Ok(blocked(reasons));
+        if let Some(refusal) = client.teardrop_preflight_in(document.clone(), &edits)? {
+            return Ok(apply_refusal(board, refusal));
         }
     }
 
@@ -969,126 +968,61 @@ fn set_live(
         return Ok(CallToolResult::json(&response));
     }
 
-    let zones_before = client.get_teardrop_zones_in(document.clone())?;
-    let zones_after_commit = if edits.is_empty() {
-        response["copper"] = json!({ "commit": null });
-        zones_before
-    } else {
-        match client.set_teardrop_settings_in(document.clone(), &edits)? {
-            IpcTeardropApplyOutcome::Applied(applied) => {
-                let readback: BTreeMap<&str, &IpcTeardropSettings> = applied
-                    .readback
-                    .iter()
-                    .map(|t| (t.uuid.as_str(), &t.settings))
-                    .collect();
-                // The listed `after` is the request; prove it is what KiCad holds.
-                for item in response["targets"].as_array_mut().into_iter().flatten() {
-                    if let Some(held) = item["uuid"].as_str().and_then(|u| readback.get(u)) {
-                        item["after"] = settings_json(held);
-                    }
-                }
-                response["settings_source"] = json!("ipc_readback");
-                // The read-back's differences from before, field by field:
-                // only teardrop fields, or the outcome would be uncertain.
-                response["verified_changes"] = json!({
-                    "count": applied.changed_fields.len(),
-                    "fields": applied.changed_fields.iter().take(LISTED).collect::<Vec<_>>(),
-                    "carried_pads_unchanged": applied.carried_pads,
-                });
-                response["undo"] = json!(UNDO);
-                response["copper"] =
-                    json!({ "commit": zone_changes(&applied.zones_before, &applied.zones_after) });
-                applied.zones_after
-            }
-            IpcTeardropApplyOutcome::Refused(IpcTeardropRefusal::Stale { reason }) => {
-                return Ok(CallToolResult::error_kind(
-                    ToolErrorKind::StaleTarget {
-                        target: board.display().to_string(),
-                        reason: reason.clone(),
-                    },
-                    format!(
-                        "The board changed while set_teardrop_settings ran: {reason}. Nothing \
-                         was written; read the board again and retry."
-                    ),
-                ))
-            }
-            IpcTeardropApplyOutcome::Refused(IpcTeardropRefusal::LegacyTeardrops) => {
-                return Ok(blocked(vec![legacy_reason()]))
-            }
-            IpcTeardropApplyOutcome::Refused(IpcTeardropRefusal::FootprintOwnsGroups {
-                footprints,
-            }) => {
-                return Ok(blocked(
-                    footprints
-                        .iter()
-                        .map(|(id, reference, count)| grouped_reason(id, reference, *count))
-                        .collect(),
-                ))
-            }
-            IpcTeardropApplyOutcome::Refused(IpcTeardropRefusal::Rejected { reason }) => {
-                return Ok(CallToolResult::error_kind(
-                    ToolErrorKind::HandlerError {
-                        reason: reason.clone(),
-                    },
-                    format!(
-                        "KiCad refused the teardrop settings ({reason}); a fresh read showed \
-                         every item unchanged. Nothing was written."
-                    ),
-                ))
-            }
-            IpcTeardropApplyOutcome::Uncertain { reason } => {
-                return Ok(uncertain(board, &reason, None))
-            }
+    // Even an unchanged request must pass preflight before it can refill.
+    let applied = match client.set_teardrop_settings_in(document.clone(), &edits)? {
+        IpcTeardropApplyOutcome::Applied(applied) => applied,
+        IpcTeardropApplyOutcome::Refused(refusal) => return Ok(apply_refusal(board, refusal)),
+        IpcTeardropApplyOutcome::Uncertain { reason } => {
+            return Ok(uncertain(board, &reason, None))
         }
     };
-
+    if edits.is_empty() {
+        response["copper"] = json!({ "commit": null });
+    } else {
+        let readback: BTreeMap<&str, &IpcTeardropSettings> = applied
+            .readback
+            .iter()
+            .map(|t| (t.uuid.as_str(), &t.settings))
+            .collect();
+        for item in response["targets"].as_array_mut().into_iter().flatten() {
+            if let Some(held) = item["uuid"].as_str().and_then(|u| readback.get(u)) {
+                item["after"] = settings_json(held);
+            }
+        }
+        response["settings_source"] = json!("ipc_readback");
+        response["verified_changes"] = json!({
+            "count": applied.changed_fields.len(),
+            "fields": applied.changed_fields.iter().take(LISTED).collect::<Vec<_>>(),
+            "carried_pads_unchanged": applied.carried_pads,
+        });
+        response["undo"] = json!(UNDO);
+        response["copper"] =
+            json!({ "commit": zone_changes(&applied.zones_before, &applied.zones_after) });
+    }
+    response["copper"]["refill"] = Value::Null;
     if !request.refill {
-        response["copper"]["refill"] = Value::Null;
         return Ok(CallToolResult::json(&response));
     }
-    match refill(client, document) {
+    let observation = super::drc::request_refill_and_wait(client, document.clone())
+        .and_then(|()| client.get_teardrop_zones_in(document));
+    match observation {
         Ok(zones) => {
-            response["copper"]["refill"] = zone_changes(&zones_after_commit, &zones);
+            response["copper"]["refill"] = zone_changes(&applied.zones_after, &zones);
+            response["copper"]["refill"]["completion_verified"] = json!(false);
             Ok(CallToolResult::json(&response))
         }
         Err(error) => Ok(uncertain(
             board,
             &format!(
-                "the settings were applied{}, but the refill that followed failed: {error:#}",
+                "{}, but the board-wide refill or its copper read could not be confirmed: {error:#}",
                 if edits.is_empty() {
-                    " (none needed changing)"
+                    "no settings needed changing"
                 } else {
-                    " and read back"
+                    "the settings were applied and read back"
                 }
             ),
             Some(response),
         )),
-    }
-}
-
-/// KiCad's fill-all, then the teardrop zones once two reads agree.
-/// `RefillZones` answers before the fill KiCad queues has run, so a quiet
-/// board right after it is not proof the fill finished.
-fn refill(
-    client: &KiCadIpcClient,
-    document: DocumentSpecifier,
-) -> anyhow::Result<Vec<IpcTeardropZone>> {
-    client.refill_zones()?;
-    let deadline = Instant::now() + REFILL_SETTLE_TIMEOUT;
-    let mut previous: Option<Vec<IpcTeardropZone>> = None;
-    loop {
-        std::thread::sleep(Duration::from_millis(300));
-        client.wait_for_board_ready(REFILL_READY_TIMEOUT)?;
-        let zones = client.get_teardrop_zones_in(document.clone())?;
-        if previous.as_ref() == Some(&zones) {
-            return Ok(zones);
-        }
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "the board's teardrop zones were still changing {} s after the refill",
-            REFILL_SETTLE_TIMEOUT.as_secs()
-        );
-        previous = Some(zones);
     }
 }
 
@@ -1139,6 +1073,9 @@ mod tests {
         /// a change made in KiCad between the tool's read and its write.
         on_second_pad_read: Option<fn(&mut Kicad)>,
         pad_reads: usize,
+        on_second_footprint_read: Option<fn(&mut Kicad)>,
+        footprint_reads: usize,
+        fail_refill_read: bool,
         version: Option<(u32, u32, u32)>,
         text: String,
         footprints: Vec<board::FootprintInstance>,
@@ -1266,6 +1203,9 @@ mod tests {
             reject_updates: false,
             on_second_pad_read: None,
             pad_reads: 0,
+            on_second_footprint_read: None,
+            footprint_reads: 0,
+            fail_refill_read: false,
             version,
             text: BOARD.to_string(),
             footprints,
@@ -1336,6 +1276,12 @@ mod tests {
                     );
                 }
                 if wants(Kot::KotPcbFootprint) {
+                    held.footprint_reads += 1;
+                    if held.footprint_reads == 2 {
+                        if let Some(change) = held.on_second_footprint_read.take() {
+                            change(held);
+                        }
+                    }
                     items.extend(
                         held.footprints
                             .iter()
@@ -1343,6 +1289,16 @@ mod tests {
                     );
                 }
                 if wants(Kot::KotPcbZone) {
+                    if held.fail_refill_read && held.log.iter().any(|name| name == "RefillZones") {
+                        return Some(pack_any(
+                            &commands::GetItemsResponse {
+                                status: kiapi::common::types::ItemRequestStatus::IrsDocumentNotFound
+                                    as i32,
+                                ..Default::default()
+                            },
+                            "kiapi.common.commands.GetItemsResponse",
+                        ));
+                    }
                     items.extend(held.zones());
                 }
                 Some(items_response(items))
@@ -1692,6 +1648,32 @@ mod tests {
         assert!(scene.writes().is_empty(), "{:?}", scene.writes());
     }
 
+    #[tokio::test]
+    async fn pad_settings_changed_before_the_footprint_read_are_refused_as_stale() {
+        let mut kicad = fixture(Some((10, 0, 8)));
+        kicad.on_second_footprint_read = Some(|held| {
+            for item in held
+                .footprints
+                .iter_mut()
+                .flat_map(|fp| fp.definition.iter_mut().flat_map(|d| d.items.iter_mut()))
+            {
+                if any_is(item, "kiapi.board.types.Pad") {
+                    let mut pad = board::Pad::decode(item.value.as_slice()).unwrap();
+                    if pad.id.as_ref().unwrap().value == R1_PAD_1 {
+                        pad.teardrop.as_mut().unwrap().curved_edges = true;
+                        *item = pack_any(&pad, "kiapi.board.types.Pad");
+                    }
+                }
+            }
+        });
+        let scene = scene(kicad);
+        let (error, body) = scene.set(enable_r1_pad_1()).await;
+        assert!(error, "{body}");
+        assert_eq!(body["error"]["kind"], "stale_target", "{body}");
+        assert!(scene.writes().is_empty(), "{:?}", scene.writes());
+        assert!(scene.pad(R1_PAD_1).teardrop.unwrap().curved_edges);
+    }
+
     /// KiCad answering `ISC_OK` but keeping nothing, as it does for a pad
     /// update aimed at its stale item cache, is caught by the read-back.
     #[tokio::test]
@@ -1726,6 +1708,33 @@ mod tests {
             ["BeginCommit", "UpdateItems", "EndCommit", "RefillZones"]
         );
         assert_eq!(body["copper"]["refill"]["teardrop_zones_after"], 5);
+        assert_eq!(body["copper"]["refill"]["completion_verified"], false);
+    }
+
+    #[tokio::test]
+    async fn a_failed_refill_read_keeps_the_applied_settings_evidence() {
+        let mut kicad = fixture(Some((10, 0, 8)));
+        kicad.fail_refill_read = true;
+        let scene = scene(kicad);
+        let mut args = enable_r1_pad_1();
+        args["refill_zones"] = json!(true);
+        let (error, body) = scene.set(args).await;
+        assert!(error, "{body}");
+        assert_eq!(
+            body["error"]["kind"], "mutation_outcome_uncertain",
+            "{body}"
+        );
+        assert_eq!(body["applied"]["settings_source"], "ipc_readback", "{body}");
+        assert_eq!(body["applied"]["verified_changes"]["count"], 1, "{body}");
+        assert_eq!(
+            body["applied"]["copper"]["commit"]["added_count"], 1,
+            "{body}"
+        );
+        assert!(body["applied"]["copper"]["refill"].is_null(), "{body}");
+        assert_eq!(
+            scene.writes(),
+            ["BeginCommit", "UpdateItems", "EndCommit", "RefillZones"]
+        );
     }
 
     #[tokio::test]
@@ -1753,6 +1762,18 @@ mod tests {
         let (error, body) = scene.set(enable_r1_pad_1()).await;
         assert!(error);
         assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+        for dry_run in [true, false] {
+            let (error, unchanged) = scene
+                .set(json!({
+                    "targets": { "vias": [VIA] },
+                    "settings": { "enabled": true, "best_length_ratio": 0.6 },
+                    "refill_zones": true,
+                    "dry_run": dry_run,
+                }))
+                .await;
+            assert!(error, "{unchanged}");
+            assert_eq!(unchanged, body);
+        }
         assert!(scene.writes().is_empty());
         let (_, read) = scene.get(json!({})).await;
         assert_eq!(read["legacy_teardrops"], true);
@@ -1953,7 +1974,7 @@ mod tests {
         assert_eq!(off["copper"]["refill"], Value::Null);
         evidence.insert("disable".into(), off);
 
-        // Enable them again, with a refill: the commit builds, the refill rebuilds.
+        // Enable them again and request a refill. The next copper read is an observation.
         let (error, on) = call(
             json!({
                 "targets": { "nets": ["GND"] },
@@ -1969,11 +1990,11 @@ mod tests {
             Some(gnd_teardrops),
             "{on}"
         );
-        assert_eq!(
-            on["copper"]["refill"]["teardrop_zones_after"].as_u64(),
-            Some(gnd_teardrops),
+        assert!(
+            on["copper"]["refill"]["teardrop_zones_after"].is_u64(),
             "{on}"
         );
+        assert_eq!(on["copper"]["refill"]["completion_verified"], false, "{on}");
         let fields = on["verified_changes"]["fields"].as_array().unwrap();
         assert_eq!(fields.len(), 4, "three pads and the via: {on}");
         assert!(

@@ -23,14 +23,13 @@ mod footprint_edit;
 mod footprint_pads;
 mod teardrops;
 mod text_edit;
-pub use footprint_pads::{footprint_differences, FootprintEditTargetError};
-pub use teardrops::via_differences;
+pub use footprint_pads::FootprintEditTargetError;
 pub use teardrops::{
-    changes_besides_teardrops, footprint_owned_groups, legacy_teardrops_in_board_text,
-    supports_teardrop_settings, teardrop_targets_from_items, teardrop_zones_from_items,
-    IpcTeardropApplied, IpcTeardropApplyOutcome, IpcTeardropEdit, IpcTeardropRefusal,
-    IpcTeardropSettings, IpcTeardropTarget, IpcTeardropTargetKind, IpcTeardropZone,
-    TeardropReadError, TEARDROP_SETTINGS_MIN_KICAD_VERSION,
+    changes_besides_teardrops, legacy_teardrops_in_board_text, supports_teardrop_settings,
+    teardrop_targets_from_items, teardrop_zones_from_items, IpcTeardropApplied,
+    IpcTeardropApplyOutcome, IpcTeardropEdit, IpcTeardropRefusal, IpcTeardropSettings,
+    IpcTeardropTarget, IpcTeardropTargetKind, IpcTeardropZone, TeardropReadError,
+    TEARDROP_SETTINGS_MIN_KICAD_VERSION,
 };
 pub use text_edit::TextTargetError;
 

@@ -33,6 +33,7 @@
 //! Every read here enumerates with `GetItems`, never `GetItemsById`, for the
 //! same cache reason.
 
+use super::footprint_pads::footprint_differences;
 use super::*;
 use crate::gen::kiapi::board::types as board;
 use crate::gen::kiapi::common::types as common;
@@ -42,7 +43,6 @@ use std::collections::BTreeMap;
 const PAD: &str = "kiapi.board.types.Pad";
 const VIA: &str = "kiapi.board.types.Via";
 const ZONE: &str = "kiapi.board.types.Zone";
-const FOOTPRINT_INSTANCE: &str = "kiapi.board.types.FootprintInstance";
 
 /// The first KiCad release whose IPC API carries pad and via teardrop
 /// settings, as `(major, minor, patch)`.
@@ -357,34 +357,32 @@ impl KiCadIpcClient {
     ) -> Result<Vec<IpcTeardropTarget>> {
         let response = self.get_teardrop_items_response_in(document.clone())?;
         let response: kiapi::common::commands::GetItemsResponse = unpack_any(&response)?;
-        let references = footprint_references(&self.footprints_in(document)?);
+        let references = self.footprint_references_in(document)?;
         teardrop_targets_from_items(&response.items, &references)
     }
 
-    /// Every placed footprint, decoded, by KIID.
-    fn footprints_in(
+    fn footprint_references_in(
         &self,
         document: common::DocumentSpecifier,
-    ) -> Result<BTreeMap<String, board::FootprintInstance>> {
-        let items = self.get_items_in(document, common::KiCadObjectType::KotPcbFootprint)?;
-        let mut footprints = BTreeMap::new();
-        for item in &items {
-            if !crate::builders::any_is(item, FOOTPRINT_INSTANCE) {
-                continue;
-            }
-            let footprint = board::FootprintInstance::decode(item.value.as_slice())
-                .context("KiCad returned an unreadable footprint instance")?;
+    ) -> Result<BTreeMap<String, String>> {
+        let mut references = BTreeMap::new();
+        for footprint in self.placed_footprints_in(document)? {
             let kiid = kiid_value(footprint.id.clone());
             anyhow::ensure!(
                 !kiid.is_empty(),
                 "KiCad returned a footprint without a KIID"
             );
             anyhow::ensure!(
-                footprints.insert(kiid.clone(), footprint).is_none(),
+                references
+                    .insert(
+                        kiid.clone(),
+                        crate::builders::footprint_reference(&footprint).to_string()
+                    )
+                    .is_none(),
                 "KiCad listed footprint {kiid} twice"
             );
         }
-        Ok(footprints)
+        Ok(references)
     }
 
     /// Every teardrop zone KiCad has generated on one board.
@@ -408,6 +406,56 @@ impl KiCadIpcClient {
         legacy_teardrops_in_board_text(&text)
     }
 
+    /// Check board-level restrictions for a preview without writing anything.
+    pub fn teardrop_preflight_in(
+        &self,
+        document: common::DocumentSpecifier,
+        edits: &[IpcTeardropEdit],
+    ) -> Result<Option<IpcTeardropRefusal>> {
+        let text = self.save_document_to_string_in(document.clone())?;
+        self.teardrop_preflight(document, &text, edits)
+    }
+
+    fn teardrop_preflight(
+        &self,
+        document: common::DocumentSpecifier,
+        text: &str,
+        edits: &[IpcTeardropEdit],
+    ) -> Result<Option<IpcTeardropRefusal>> {
+        if legacy_teardrops_in_board_text(text)? {
+            return Ok(Some(IpcTeardropRefusal::LegacyTeardrops));
+        }
+        let footprints: BTreeSet<_> = edits
+            .iter()
+            .filter(|edit| edit.kind == IpcTeardropTargetKind::Pad)
+            .filter_map(|edit| edit.footprint_uuid.as_deref())
+            .collect();
+        if footprints.is_empty() {
+            return Ok(None);
+        }
+        let owned = footprint_owned_groups(text)?;
+        let grouped: Vec<_> = footprints
+            .into_iter()
+            .filter_map(|id| {
+                let count = owned.get(id).copied().unwrap_or(0);
+                (count > 0).then_some((id, count))
+            })
+            .collect();
+        if grouped.is_empty() {
+            return Ok(None);
+        }
+        let references = self.footprint_references_in(document)?;
+        Ok(Some(IpcTeardropRefusal::FootprintOwnsGroups {
+            footprints: grouped
+                .into_iter()
+                .map(|(id, count)| {
+                    let reference = references.get(id).cloned().unwrap_or_default();
+                    (id.to_string(), reference, count)
+                })
+                .collect(),
+        }))
+    }
+
     /// Apply `edits` in one KiCad commit, then prove the result.
     ///
     /// Pads go through the shared footprint update path
@@ -426,10 +474,8 @@ impl KiCadIpcClient {
         edits: &[IpcTeardropEdit],
     ) -> Result<IpcTeardropApplyOutcome> {
         let before_text = self.save_document_to_string_in(document.clone())?;
-        if legacy_teardrops_in_board_text(&before_text)? {
-            return Ok(IpcTeardropApplyOutcome::Refused(
-                IpcTeardropRefusal::LegacyTeardrops,
-            ));
+        if let Some(refusal) = self.teardrop_preflight(document.clone(), &before_text, edits)? {
+            return Ok(IpcTeardropApplyOutcome::Refused(refusal));
         }
         let zones_before = self.get_teardrop_zones_in(document.clone())?;
         if edits.is_empty() {
@@ -490,45 +536,15 @@ impl KiCadIpcClient {
                             edit.footprint_uuid.as_deref().unwrap_or("<none>")
                         ));
                     }
-                    if pad
-                        .teardrop
-                        .as_ref()
-                        .and_then(IpcTeardropSettings::from_proto)
-                        != Some(edit.current.clone())
-                    {
-                        return stale(format!("pad {} changed since it was read", edit.uuid));
-                    }
                     pad_edits.insert(&edit.uuid, edit);
                     footprints.insert(parent);
                 }
             }
         }
 
-        let owned = footprint_owned_groups(&before_text)?;
-        let grouped: Vec<_> = footprints
-            .iter()
-            .filter_map(|footprint| {
-                let count = owned.get(footprint).copied().unwrap_or(0);
-                (count > 0).then(|| (footprint.clone(), count))
-            })
-            .collect();
-        if !grouped.is_empty() {
-            let references = footprint_references(&self.footprints_in(document.clone())?);
-            return Ok(IpcTeardropApplyOutcome::Refused(
-                IpcTeardropRefusal::FootprintOwnsGroups {
-                    footprints: grouped
-                        .into_iter()
-                        .map(|(id, count)| {
-                            let reference = references.get(&id).cloned().unwrap_or_default();
-                            (id, reference, count)
-                        })
-                        .collect(),
-                },
-            ));
-        }
-
         let footprints: Vec<String> = footprints.into_iter().collect();
         let required: BTreeSet<String> = pad_edits.keys().map(|id| id.to_string()).collect();
+        let mut found = BTreeSet::new();
         let mut carried_pads = 0;
         // The vias go in the same commit; their read-back is part of the
         // evidence the shared path settles on.
@@ -564,12 +580,30 @@ impl KiCadIpcClient {
             &required,
             via_updates,
             via_evidence,
-            |_, pad| {
+            |footprint, pad| {
                 let id = kiid_value(pad.id.clone());
                 let Some(edit) = pad_edits.get(id.as_str()) else {
                     carried_pads += 1;
                     return Ok(false);
                 };
+                if edit.footprint_uuid.as_deref() != Some(footprint) || !found.insert(id.clone()) {
+                    return Err(FootprintEditTargetError {
+                        reason: format!("pad {id} is no longer unique in its expected footprint"),
+                    }
+                    .into());
+                }
+                if pad
+                    .teardrop
+                    .as_ref()
+                    .and_then(IpcTeardropSettings::from_proto)
+                    .as_ref()
+                    != Some(&edit.current)
+                {
+                    return Err(FootprintEditTargetError {
+                        reason: format!("pad {id} changed since it was read"),
+                    }
+                    .into());
+                }
                 edit.settings
                     .write_to(pad.teardrop.get_or_insert_with(Default::default));
                 Ok(true)
@@ -606,9 +640,10 @@ impl KiCadIpcClient {
             let items = self.pad_and_via_items_in(document.clone())?;
             let zones = self.get_teardrop_zones_in(document.clone())?;
             let text = self.save_document_to_string_in(document.clone())?;
-            Ok((items, zones, text))
+            let references = self.footprint_references_in(document)?;
+            Ok((items, zones, text, references))
         })();
-        let (items_after, zones_after, after_text) = match after {
+        let (items_after, zones_after, after_text, references) = match after {
             Ok(after) => after,
             Err(error) => return uncertain(format!("the read after the commit failed: {error:#}")),
         };
@@ -633,7 +668,6 @@ impl KiCadIpcClient {
             changed_fields.extend(footprint_differences(original, observed));
         }
 
-        let references = footprint_references(&self.footprints_in(document)?);
         let targets: Vec<prost_types::Any> = edits
             .iter()
             .filter_map(|edit| items_after.get(&edit.uuid).cloned())
@@ -700,25 +734,11 @@ impl KiCadIpcClient {
     }
 }
 
-fn footprint_references(
-    footprints: &BTreeMap<String, board::FootprintInstance>,
-) -> BTreeMap<String, String> {
-    footprints
-        .iter()
-        .map(|(id, footprint)| {
-            (
-                id.clone(),
-                crate::builders::footprint_reference(footprint).to_string(),
-            )
-        })
-        .collect()
-}
-
 /// Every difference between two forms of one via, by field name. The net is
 /// compared by name and teardrop settings as KiCad means them, as for pads
 /// in [`footprint_differences`]; `zone_layer_overrides`, a KiCad-derived
 /// implementation detail, is not compared.
-pub fn via_differences(expected: &board::Via, observed: &board::Via) -> Vec<String> {
+fn via_differences(expected: &board::Via, observed: &board::Via) -> Vec<String> {
     let mut out = Vec::new();
     macro_rules! compare {
         ($($field:ident),*) => {
@@ -753,7 +773,7 @@ pub fn via_differences(expected: &board::Via, observed: &board::Via) -> Vec<Stri
 /// Groups each footprint owns directly, by footprint KIID, from KiCad's
 /// board serialization: KiCad 10 leaves them out of `FootprintInstance`.
 /// A footprint listed twice refuses rather than guessing which one.
-pub fn footprint_owned_groups(board_text: &str) -> Result<BTreeMap<String, usize>> {
+fn footprint_owned_groups(board_text: &str) -> Result<BTreeMap<String, usize>> {
     let root =
         copperpour_sexp::parse_sexp(board_text).context("KiCad's board text did not parse")?;
     let mut owned = BTreeMap::new();

@@ -708,7 +708,7 @@ impl KiCadIpcClient {
     }
 
     /// Every placed footprint, decoded, refusing anything that is not one.
-    fn placed_footprints_in(
+    pub(super) fn placed_footprints_in(
         &self,
         document: common::DocumentSpecifier,
     ) -> Result<Vec<board::FootprintInstance>> {
