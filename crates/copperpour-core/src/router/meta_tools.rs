@@ -343,8 +343,9 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
             description:
                 "Report read-only provenance for the Copperpour process serving this call: build \
                  version and commit when available, executable path, conservatively detected \
-                 install source, on-disk binary version, KiCad CLI version, redacted IPC \
-                 endpoint, proven newer-binary state, platform-specific restart guidance, and \
+                 install source, on-disk binary version, KiCad CLI version, the redacted IPC \
+                 endpoint the tools dial now and where it came from, proven newer-binary \
+                 state, platform-specific restart guidance, and \
                  whether installed skills, agents, and hooks match this build's bundle."
                     .to_string(),
             input_schema: json!({
@@ -739,6 +740,7 @@ async fn handle_get_installation_info(ctx: &std::sync::Arc<ToolContext>) -> Call
         &ctx.config,
         &ctx.config_resolution,
         ctx.guidance.get().map(|probe| probe.as_ref()),
+        ctx.ipc_endpoint_with_origin(),
     )
     .await;
     CallToolResult::json(&info)

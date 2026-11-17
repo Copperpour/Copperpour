@@ -14,5 +14,5 @@ found at startup is never used in its place, and `open_project` then reports
 an empty `ipc_address`. Telling several candidates apart costs one Ping each
 before the call's own request, each bounded by the 30 s reply timeout, and a
 candidate that times out counts as not answering. A configured or `KICAD_API_SOCKET`
-address is never replaced. `get_installation_info` still reports the address
-chosen at startup.
+address is never replaced. `get_installation_info` reports the address the
+calls dial now (`get-installation-info-ipc-endpoint.md`).
