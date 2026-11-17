@@ -1218,7 +1218,8 @@ pub enum IpcFootprintFieldBatchOutcome {
     },
 }
 
-/// Readback-derived result of editing one text item in place.
+/// Readback-derived result of editing one text item in place, or one placed
+/// footprint's value and assembly flags ([`IpcFootprintEdit`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IpcTextEditOutcome<T> {
     /// The item already held every requested value; nothing was sent.
@@ -1235,4 +1236,41 @@ pub enum IpcTextEditOutcome<T> {
         mismatches: Vec<String>,
         reason: String,
     },
+}
+
+/// What [`crate::client::KiCadIpcClient::edit_footprint_in`] changes on one
+/// placed footprint. `None` leaves a property as KiCad holds it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IpcFootprintEdit {
+    pub value: Option<String>,
+    /// Do not populate.
+    pub dnp: Option<bool>,
+    pub exclude_from_bom: Option<bool>,
+    pub exclude_from_pos_files: Option<bool>,
+}
+
+impl IpcFootprintEdit {
+    /// Whether the edit names no property at all.
+    pub fn is_empty(&self) -> bool {
+        self.value.is_none()
+            && self.dnp.is_none()
+            && self.exclude_from_bom.is_none()
+            && self.exclude_from_pos_files.is_none()
+    }
+}
+
+/// A placed footprint's value and assembly flags, as KiCad reports them on
+/// the instance, which is where KiCad reads them (`FOOTPRINT::Deserialize`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcFootprintState {
+    pub reference: String,
+    pub value: String,
+    /// `Library:Footprint`, empty for a footprint without a library id.
+    pub footprint: String,
+    pub dnp: bool,
+    pub exclude_from_bom: bool,
+    pub exclude_from_pos_files: bool,
+    /// Whether the footprint belongs to a schematic symbol, whose DNP and
+    /// BOM exclusion `update_pcb_from_schematic` carries to the board.
+    pub linked_to_schematic: bool,
 }

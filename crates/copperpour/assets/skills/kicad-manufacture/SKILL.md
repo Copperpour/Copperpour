@@ -166,7 +166,9 @@ from the automated result alone.
    custom field named DNP is not that attribute: a BOM export with DNP exclusion
    keeps the part, and the field can even fill the BOM's DNP column. A board
    footprint carries its own flag and follows the schematic only after the
-   board is updated from it.
+   board is updated from it. `edit_component` sets the board's flags directly,
+   but for a footprint linked to a symbol the next update sets `dnp` and
+   `exclude_from_bom` from the symbol again.
 
 The `files` field is derived from regular, non-empty artifacts verified at the
 export boundary; `files_generated` describes each successful export. That
