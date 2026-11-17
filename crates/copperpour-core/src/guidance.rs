@@ -246,8 +246,8 @@ mod tests {
             .iter()
             .any(|t| t["name"] == "get_guidance"));
         let listed = tool(&handler, json!({})).await;
-        assert_eq!(listed["count"], 16);
-        assert_eq!(listed["resources"].as_array().unwrap().len(), 16);
+        assert_eq!(listed["count"], 17);
+        assert_eq!(listed["resources"].as_array().unwrap().len(), 17);
         let contents = tool(&handler, json!({"path":"copperpour/SKILL.md"})).await;
         assert_eq!(
             contents["contents"][0]["text"],
@@ -293,7 +293,7 @@ mod tests {
             .result
             .unwrap();
         let resources = listed["resources"].as_array().unwrap();
-        assert_eq!(resources.len(), 16);
+        assert_eq!(resources.len(), 17);
         let tool_list = tool(&handler, json!({})).await;
         // Independent on-disk inventory catches an omitted or stale embedded asset.
         let assets =

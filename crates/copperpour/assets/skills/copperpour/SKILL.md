@@ -51,6 +51,21 @@ does not establish that a missing server-side check ran.
 5. **Execute** — use Copperpour MCP tools only
 6. **Verify** — re-query the design to confirm the change landed correctly
 
+## Troubleshooting and Recovery
+
+When a call fails, returns partial/uncertain results, or tools/KiCad behave unexpectedly:
+
+1. **Classify before acting** — inspect the complete response (`error.kind` or status, target, source, and mutation outcome). Consume structured recovery fields when present (the `recovery` block on IPC failures, `retry_safe`, `board_state`, `drop_confirmed`, `browser_launch_error`, `absolute_path`) without inventing missing fields on older responses.
+2. **Diagnose read-only** — use `get_installation_info`, `get_recent_calls`, `check_kicad_ui`, or target inspection to resolve uncertainty. Avoid repeatedly running full installation assessments (`guidance.checked` is `"earlier"` when cached; refresh is explicit via `copperpour status` / `copperpour init`).
+3. **Take safe, already-authorized steps** — e.g. `load_toolset` when discovery is supported, pass absolute paths, or share the returned `url` when `open_schematic_viewer` reports `browser_launch_error`.
+4. **Retry only when safe** — fix the cause first and retry only when outcome semantics allow it; never loop, replay applied batch items, or auto-replay `ipc_batch_recovered`.
+5. **Escalate with exact context** — state what happened, what changed or remains uncertain, and the exact next command, config change, or reference; ask only for what cannot be resolved from evidence.
+6. **Verify recovery** — confirm with a fresh observation before resuming dependent work.
+
+Never delete locks/endpoints, relax permissions, overwrite config files, terminate apps, abandon transaction journals, restart the server, or run `copperpour init` silently to bypass safety checks. Read-only and mutation outcomes stay distinct; unavailable checks never become passes.
+
+For scenario-specific playbooks (CLI/binary/guidance drift, IPC/endpoints/`AS_NOT_READY`, viewer URLs, missing client tools, invalid config, locks, divergent journals, `unsafe_file_fallback`, `ipc_outcome_unknown`, `mutation_outcome_uncertain`) and worked examples, read [the troubleshooting reference](references/troubleshooting.md) (`copperpour/references/troubleshooting.md` via `get_guidance`).
+
 ## Decision Tree
 
 | User Request | Channel | Tool / Action |
