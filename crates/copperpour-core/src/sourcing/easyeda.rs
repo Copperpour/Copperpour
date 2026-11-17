@@ -95,12 +95,18 @@ pub(crate) async fn fetch_easyeda_3d_assets(uuid: &str) -> anyhow::Result<Easyed
     if clean_uuid.is_empty() {
         anyhow::bail!("EasyEDA 3D model UUID cannot be empty");
     }
-    let client = easyeda_http_client()?;
     let step_url = format!("https://modules.easyeda.com/qAxj6KHrDKw4blvCG8QJPs7Y/{clean_uuid}");
     let obj_url = format!("https://modules.easyeda.com/3dmodel/{clean_uuid}");
 
-    let (step_res, obj_res) =
-        tokio::join!(client.get(&step_url).send(), client.get(&obj_url).send());
+    fetch_easyeda_3d_assets_at(&step_url, &obj_url).await
+}
+
+async fn fetch_easyeda_3d_assets_at(
+    step_url: &str,
+    obj_url: &str,
+) -> anyhow::Result<Easyeda3dAssets> {
+    let client = easyeda_http_client()?;
+    let (step_res, obj_res) = tokio::join!(client.get(step_url).send(), client.get(obj_url).send());
 
     let step = match step_res {
         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
@@ -121,4 +127,60 @@ pub(crate) async fn fetch_easyeda_3d_assets(uuid: &str) -> anyhow::Result<Easyed
     };
 
     Ok(Easyeda3dAssets { step, obj })
+}
+
+#[cfg(test)]
+mod model_download_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn model_download_preserves_payloads_and_reports_endpoint_failure() {
+        let obj = include_str!("../../tests/fixtures/easyeda-3d/placement.obj");
+        let step = include_bytes!("../../tests/fixtures/easyeda-3d/resistor.step");
+        for step_status in [200, 404] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let mut handlers = Vec::new();
+                for _ in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    handlers.push(tokio::spawn(async move {
+                        let mut request = [0u8; 4096];
+                        let n = socket.read(&mut request).await.unwrap();
+                        let is_step = request[..n].starts_with(b"GET /step ");
+                        let status = if is_step { step_status } else { 200 };
+                        let body: &[u8] = if is_step && status == 200 {
+                            step
+                        } else if is_step {
+                            b"missing"
+                        } else {
+                            obj.as_bytes()
+                        };
+                        let header = format!(
+                        "HTTP/1.1 {status} test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                        socket.write_all(header.as_bytes()).await.unwrap();
+                        socket.write_all(body).await.unwrap();
+                        socket.shutdown().await.unwrap();
+                    }));
+                }
+                for handler in handlers {
+                    handler.await.unwrap();
+                }
+            });
+            let assets =
+                fetch_easyeda_3d_assets_at(&format!("{base}/step"), &format!("{base}/obj"))
+                    .await
+                    .unwrap();
+            assert_eq!(assets.obj.unwrap(), obj);
+            if step_status == 200 {
+                assert_eq!(assets.step.unwrap(), step);
+            } else {
+                assert!(assets.step.unwrap_err().contains("404"));
+            }
+            server.await.unwrap();
+        }
+    }
 }

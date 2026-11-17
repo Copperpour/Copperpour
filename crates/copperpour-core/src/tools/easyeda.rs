@@ -8,7 +8,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::mcp::error::ToolErrorKind;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::mcp::protocol::{CallToolResult, ToolContent};
 use crate::tools::{opt_bool_flag, opt_f64, opt_str, require_str, ToolContext};
@@ -401,6 +403,22 @@ pub(crate) async fn handle_import_jlcpcb_part(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    handle_import_jlcpcb_part_with_fetch(args, ctx, |uuid| async move {
+        fetch_easyeda_3d_assets(&uuid).await
+    })
+    .await
+}
+
+async fn handle_import_jlcpcb_part_with_fetch<F, Fut>(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    fetch_model: F,
+) -> anyhow::Result<CallToolResult>
+where
+    F: FnOnce(String) -> Fut + Send,
+    Fut: std::future::Future<Output = anyhow::Result<crate::sourcing::easyeda::Easyeda3dAssets>>
+        + Send,
+{
     let project_dir = match args["project_dir"].as_str() {
         Some(d) => PathBuf::from(d),
         None => match &ctx.config.project_dir {
@@ -634,22 +652,28 @@ pub(crate) async fn handle_import_jlcpcb_part(
     )
     .await;
 
-    // Optional 3D model download, format handling, transform conversion, and attachment
-    let mut model_3d_report = None;
-    if include_3d {
-        model_3d_report = Some(
-            attach_easyeda_3d_model(
-                &pkg_shapes,
-                pkg_head_x,
-                pkg_head_y,
-                &project_dir,
-                &footprint_name,
-                &fp_path,
-                ctx,
-            )
-            .await,
-        );
-    }
+    // A failed requested model import is partial: library files already exist,
+    // but schematic placement has not started. Preserve the original error kind.
+    let model_3d_report = if include_3d {
+        match attach_easyeda_3d_model_with(
+            &pkg_shapes,
+            [pkg_head_x, pkg_head_y],
+            &project_dir,
+            &footprint_name,
+            &fp_path,
+            fetch_model,
+            |args| async move {
+                crate::tools::footprint_models::handle_set_footprint_models(&args, ctx).await
+            },
+        )
+        .await
+        {
+            Ok(report) => Some(report),
+            Err(result) => return Ok(import_3d_failure(result, &sym_lib_path, &fp_path)),
+        }
+    } else {
+        None
+    };
 
     let lib_id = format!("{library_name}:{symbol_name}");
 
@@ -886,13 +910,13 @@ pub(crate) fn obj_bounds_rotated(
         let Some(rest) = trimmed.strip_prefix("v ") else {
             continue;
         };
-        let mut coords = rest
-            .split_whitespace()
-            .filter_map(|t| t.parse::<f64>().ok())
-            .filter(|v| v.is_finite());
-        let (Some(x), Some(y), Some(z)) = (coords.next(), coords.next(), coords.next()) else {
-            continue;
-        };
+        let mut coords = rest.split_whitespace();
+        let x = coords.next()?.parse::<f64>().ok()?;
+        let y = coords.next()?.parse::<f64>().ok()?;
+        let z = coords.next()?.parse::<f64>().ok()?;
+        if ![x, y, z].iter().all(|v| v.is_finite()) {
+            return None;
+        }
         let r = rotate_point_xyz([x, y, z], c_rotation_deg);
         for i in 0..3 {
             min[i] = min[i].min(r[i]);
@@ -900,7 +924,7 @@ pub(crate) fn obj_bounds_rotated(
         }
         count += 1;
     }
-    (count > 0).then_some((min, max))
+    (count > 0 && min.iter().chain(max.iter()).all(|v| v.is_finite())).then_some((min, max))
 }
 
 /// Compute KiCad `(offset (xyz ...))` in mm and `(rotate (xyz ...))` in degrees.
@@ -910,15 +934,14 @@ pub(crate) fn obj_bounds_rotated(
 pub(crate) fn compute_kicad_3d_transform(
     spec: &Easyeda3dSpec,
     obj_text: Option<&str>,
-) -> ([f64; 3], [f64; 3]) {
+) -> Option<([f64; 3], [f64; 3])> {
     let kicad_rot = [
         round4((-spec.c_rotation_deg[0]).rem_euclid(360.0)),
         round4((-spec.c_rotation_deg[1]).rem_euclid(360.0)),
         round4((-spec.c_rotation_deg[2]).rem_euclid(360.0)),
     ];
-    let offset = if let Some((min, max)) =
-        obj_text.and_then(|txt| obj_bounds_rotated(txt, spec.c_rotation_deg))
-    {
+    let (min, max) = obj_text.and_then(|txt| obj_bounds_rotated(txt, spec.c_rotation_deg))?;
+    let offset = {
         let model_cx = (min[0] + max[0]) / 2.0;
         let model_cy = (min[1] + max[1]) / 2.0;
         [
@@ -926,19 +949,25 @@ pub(crate) fn compute_kicad_3d_transform(
             round4(spec.target_center_mm[1] - model_cy),
             round4(-min[2] + spec.z_mm),
         ]
-    } else {
-        [
-            round4(spec.target_center_mm[0]),
-            round4(spec.target_center_mm[1]),
-            round4(spec.z_mm),
-        ]
     };
-    (offset, kicad_rot)
+    Some((offset, kicad_rot))
 }
 
 pub(crate) fn is_step_bytes(bytes: &[u8]) -> bool {
-    let prefix = std::str::from_utf8(&bytes[..bytes.len().min(64)]).unwrap_or("");
-    prefix.trim_start().starts_with("ISO-10303-21")
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |i| i + 1);
+    let bytes = &bytes[start..end];
+    bytes.starts_with(b"ISO-10303-21;")
+        && bytes.ends_with(b"END-ISO-10303-21;")
+        && bytes.windows(7).any(|w| w == b"HEADER;")
+        && bytes.windows(5).any(|w| w == b"DATA;")
+        && bytes.windows(7).filter(|w| *w == b"ENDSEC;").count() >= 2
 }
 
 #[derive(Default, Clone)]
@@ -960,7 +989,7 @@ pub(crate) fn obj_to_vrml(obj: &str) -> Option<String> {
     let mut faces_by_mat: BTreeMap<String, Vec<Vec<usize>>> = BTreeMap::new();
 
     for raw_line in obj.lines() {
-        let line = raw_line.trim();
+        let line = raw_line.split('#').next().unwrap_or("").trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -975,11 +1004,12 @@ pub(crate) fn obj_to_vrml(obj: &str) -> Option<String> {
                     parts.next().and_then(|s| s.parse::<f64>().ok()),
                     parts.next().and_then(|s| s.parse::<f64>().ok()),
                 ) else {
-                    continue;
+                    return None;
                 };
-                if x.is_finite() && y.is_finite() && z.is_finite() {
-                    vertices.push([x, y, z]);
+                if ![x, y, z].iter().all(|v| v.is_finite()) {
+                    return None;
                 }
+                vertices.push([x, y, z]);
             }
             "newmtl" => {
                 if let Some(name) = parts.next() {
@@ -1000,6 +1030,9 @@ pub(crate) fn obj_to_vrml(obj: &str) -> Option<String> {
                         parts.next().and_then(|s| s.parse::<f64>().ok()),
                         parts.next().and_then(|s| s.parse::<f64>().ok()),
                     ) {
+                        if ![r, g, b].iter().all(|v| v.is_finite()) {
+                            return None;
+                        }
                         if let Some(mat) = materials.get_mut(name) {
                             mat.diffuse = [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)];
                         }
@@ -1013,6 +1046,9 @@ pub(crate) fn obj_to_vrml(obj: &str) -> Option<String> {
                         parts.next().and_then(|s| s.parse::<f64>().ok()),
                         parts.next().and_then(|s| s.parse::<f64>().ok()),
                     ) {
+                        if ![r, g, b].iter().all(|v| v.is_finite()) {
+                            return None;
+                        }
                         if let Some(mat) = materials.get_mut(name) {
                             mat.specular =
                                 [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)];
@@ -1023,6 +1059,9 @@ pub(crate) fn obj_to_vrml(obj: &str) -> Option<String> {
             "d" => {
                 if let Some(ref name) = current_def_mat {
                     if let Some(alpha) = parts.next().and_then(|s| s.parse::<f64>().ok()) {
+                        if !alpha.is_finite() {
+                            return None;
+                        }
                         if let Some(mat) = materials.get_mut(name) {
                             mat.transparency = (1.0 - alpha).clamp(0.0, 1.0);
                         }
@@ -1038,20 +1077,22 @@ pub(crate) fn obj_to_vrml(obj: &str) -> Option<String> {
                 let mut face = Vec::new();
                 for tok in parts {
                     let v_str = tok.split('/').next().unwrap_or("");
-                    let Ok(idx) = v_str.parse::<isize>() else {
-                        continue;
-                    };
+                    let idx = v_str.parse::<isize>().ok()?;
                     let resolved = if idx > 0 {
                         (idx - 1) as usize
                     } else if idx < 0 {
-                        let abs = (-idx) as usize;
+                        let abs = idx.unsigned_abs();
                         vertices.len().checked_sub(abs)?
                     } else {
-                        continue;
+                        return None;
                     };
-                    if resolved < vertices.len() {
-                        face.push(resolved);
+                    if resolved >= vertices.len() {
+                        return None;
                     }
+                    face.push(resolved);
+                }
+                if face.len() < 3 {
+                    return None;
                 }
                 if face.len() >= 3 {
                     faces_by_mat
@@ -1114,124 +1155,255 @@ pub(crate) fn obj_to_vrml(obj: &str) -> Option<String> {
     Some(out)
 }
 
-async fn attach_easyeda_3d_model(
+fn body_of(result: &CallToolResult) -> serde_json::Value {
+    result
+        .content
+        .iter()
+        .find_map(|content| match content {
+            ToolContent::Text { text } => serde_json::from_str(text).ok(),
+            _ => None,
+        })
+        .unwrap_or_else(|| json!({"message": "3D model import failed"}))
+}
+
+fn with_model_failure(
+    result: CallToolResult,
+    uuid: &str,
+    path: Option<&std::path::Path>,
+    stage: &str,
+) -> CallToolResult {
+    let mut body = body_of(&result);
+    let uncertain = body["error"]["kind"] == "mutation_outcome_uncertain";
+    body["model_3d"] = json!({
+        "status": if uncertain { "uncertain" } else { "error" },
+        "uuid": uuid,
+        "path": path.map(|p| p.display().to_string()),
+        "stage": stage,
+        "asset_state": match stage { "attach" => "published", "download" | "prepare" => "not_written", _ => "unknown" },
+        "retry_safe": false,
+        "recovery": "Inspect the reported model and footprint before retrying. Imported library files are not rolled back; do not repeat the whole import blindly."
+    });
+    let mut result = CallToolResult::json(&body);
+    result.is_error = true;
+    result
+}
+
+fn model_error(
+    message: impl Into<String>,
+    uuid: &str,
+    path: Option<&std::path::Path>,
+    stage: &str,
+) -> CallToolResult {
+    let message = message.into();
+    with_model_failure(
+        CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: message.clone(),
+            },
+            message,
+        ),
+        uuid,
+        path,
+        stage,
+    )
+}
+
+fn import_3d_failure(
+    result: CallToolResult,
+    symbol_path: &std::path::Path,
+    footprint_path: &std::path::Path,
+) -> CallToolResult {
+    let mut body = body_of(&result);
+    body["success"] = json!(false);
+    body["imported"] = json!({
+        "symbol_path": symbol_path.display().to_string(),
+        "footprint_path": footprint_path.display().to_string(),
+        "rollback_attempted": false,
+        "placement": "not_attempted"
+    });
+    let mut result = CallToolResult::json(&body);
+    result.is_error = true;
+    result
+}
+
+// Both production and tests run this orchestration. Only the external download
+// and footprint-writer boundaries are injectable; selection/publication are real.
+async fn attach_easyeda_3d_model_with<F, FFut, A, AFut>(
     pkg_shapes: &[serde_json::Value],
-    pkg_head_x: f64,
-    pkg_head_y: f64,
+    pkg_head: [f64; 2],
     project_dir: &std::path::Path,
     footprint_name: &str,
     fp_path: &std::path::Path,
-    ctx: &ToolContext,
-) -> serde_json::Value {
-    let Some(spec) = parse_easyeda_3d_model(pkg_shapes, pkg_head_x, pkg_head_y) else {
-        return json!({
-            "status": "not_available",
-            "reason": "no EasyEDA outline3D SVGNODE with a 3D model UUID was found for this footprint"
-        });
+    fetch: F,
+    attach: A,
+) -> Result<serde_json::Value, CallToolResult>
+where
+    F: FnOnce(String) -> FFut,
+    FFut: std::future::Future<Output = anyhow::Result<crate::sourcing::easyeda::Easyeda3dAssets>>,
+    A: FnOnce(serde_json::Value) -> AFut,
+    AFut: std::future::Future<Output = anyhow::Result<CallToolResult>>,
+{
+    let Some(spec) = parse_easyeda_3d_model(pkg_shapes, pkg_head[0], pkg_head[1]) else {
+        return Ok(
+            json!({"status": "not_available", "reason": "no EasyEDA outline3D SVGNODE with a 3D model UUID was found for this footprint"}),
+        );
     };
-
-    let assets = match fetch_easyeda_3d_assets(&spec.uuid).await {
-        Ok(a) => a,
-        Err(e) => {
-            return json!({
-                "status": "error",
-                "uuid": spec.uuid,
-                "reason": format!("failed to download EasyEDA 3D model: {e}")
-            });
-        }
-    };
-
+    let assets = fetch(spec.uuid.clone()).await.map_err(|e| {
+        model_error(
+            format!("Failed to download EasyEDA 3D model: {e}"),
+            &spec.uuid,
+            None,
+            "download",
+        )
+    })?;
     let obj_text = assets.obj.as_deref().ok();
-    let (ext, file_bytes, format_name) =
-        match &assets.step {
-            Ok(bytes) if is_step_bytes(bytes) => ("step", bytes.clone(), "step"),
-            _ => match obj_text.and_then(obj_to_vrml) {
-                Some(wrl) => ("wrl", wrl.into_bytes(), "wrl"),
-                None => {
-                    let step_err =
-                        assets.step.as_ref().err().cloned().unwrap_or_else(|| {
-                            "STEP response was not valid ISO-10303-21".to_string()
-                        });
-                    let obj_err = assets.obj.as_ref().err().cloned().unwrap_or_else(|| {
-                        "OBJ response contained no convertible mesh".to_string()
-                    });
-                    return json!({
-                        "status": "error",
-                        "uuid": spec.uuid,
-                        "reason": format!("no usable 3D model returned ({step_err}; {obj_err})")
-                    });
-                }
-            },
-        };
-
+    // The OBJ bounds establish the EasyEDA normalization for both formats.
+    // A STEP download alone does not prove its native origin or placement.
+    let (offset_mm, rotation_deg) =
+        compute_kicad_3d_transform(&spec, obj_text).ok_or_else(|| {
+            model_error(
+                format!(
+                    "Cannot establish model placement without valid OBJ bounds: {}",
+                    assets
+                        .obj
+                        .as_ref()
+                        .err()
+                        .map(String::as_str)
+                        .unwrap_or("invalid or empty vertices")
+                ),
+                &spec.uuid,
+                None,
+                "prepare",
+            )
+        })?;
+    let (ext, bytes) = match &assets.step {
+        Ok(bytes) if is_step_bytes(bytes) => ("step", bytes.clone()),
+        _ => (
+            "wrl",
+            obj_text
+                .and_then(obj_to_vrml)
+                .ok_or_else(|| {
+                    model_error(
+                        "No complete STEP or convertible OBJ mesh was returned",
+                        &spec.uuid,
+                        None,
+                        "prepare",
+                    )
+                })?
+                .into_bytes(),
+        ),
+    };
+    let digest = crate::hex::encode_hex(&Sha256::digest(&bytes));
+    let filename = format!("{footprint_name}-{}.{ext}", &digest[..16]);
     let models_dir = project_dir.join("3dmodels");
-    if let Err(e) = tokio::fs::create_dir_all(&models_dir).await {
-        return json!({
-            "status": "error",
-            "uuid": spec.uuid,
-            "reason": format!("failed to create 3dmodels directory: {e}")
-        });
-    }
-    let filename = format!("{footprint_name}.{ext}");
+    std::fs::create_dir_all(&models_dir).map_err(|e| {
+        model_error(
+            format!("Failed to create 3dmodels directory: {e}"),
+            &spec.uuid,
+            None,
+            "publish",
+        )
+    })?;
     let model_path = models_dir.join(&filename);
-    if let Err(e) = tokio::fs::write(&model_path, &file_bytes).await {
-        return json!({
-            "status": "error",
-            "uuid": spec.uuid,
-            "reason": format!("failed to write 3D model '{}': {e}", model_path.display())
-        });
-    }
-
-    let (offset_mm, rotation_deg) = compute_kicad_3d_transform(&spec, obj_text);
+    publish_model(&model_path, &bytes)
+        .map_err(|e| with_model_failure(e, &spec.uuid, Some(&model_path), "publish"))?;
     let kicad_model_path = format!("${{KIPRJMOD}}/3dmodels/{filename}");
-
-    let attach_res = crate::tools::footprint_models::handle_set_footprint_models(
-        &json!({
-            "footprint_path": fp_path.display().to_string(),
-            "mode": "replace",
-            "models": [{
-                "path": kicad_model_path,
-                "offset": { "x": offset_mm[0], "y": offset_mm[1], "z": offset_mm[2] },
-                "rotate": { "x": rotation_deg[0], "y": rotation_deg[1], "z": rotation_deg[2] }
-            }]
-        }),
-        ctx,
-    )
-    .await;
-
-    match attach_res {
-        Ok(res) if !res.is_error => json!({
-            "status": "attached",
-            "uuid": spec.uuid,
-            "format": format_name,
-            "kicad_path": kicad_model_path,
-            "path": model_path.display().to_string(),
-            "offset_mm": { "x": offset_mm[0], "y": offset_mm[1], "z": offset_mm[2] },
-            "rotation_degrees": { "x": rotation_deg[0], "y": rotation_deg[1], "z": rotation_deg[2] }
-        }),
-        Ok(res) => {
-            let err_msg = res
-                .content
-                .first()
-                .and_then(|c| match c {
-                    ToolContent::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .unwrap_or("unknown set_footprint_models error");
-            json!({
-                "status": "error",
-                "uuid": spec.uuid,
-                "path": model_path.display().to_string(),
-                "reason": format!("downloaded model but failed to attach to footprint: {err_msg}")
-            })
+    let args = json!({
+        "footprint_path": fp_path.display().to_string(), "mode": "replace",
+        "models": [{"path": kicad_model_path,
+            "offset": {"x": offset_mm[0], "y": offset_mm[1], "z": offset_mm[2]},
+            "rotate": {"x": rotation_deg[0], "y": rotation_deg[1], "z": rotation_deg[2]}}]
+    });
+    let attached = match attach(args).await {
+        Ok(result) => result,
+        Err(error) => {
+            let result = if let Some(path) = crate::tools::readback_mismatch_path(&error) {
+                crate::tools::readback_mismatch_result(path, "Attach imported 3D model")
+            } else if let Some(path) = crate::tools::revision_conflict_path(&error) {
+                crate::tools::revision_conflict_result(path, "Attach imported 3D model")
+            } else {
+                // An unclassified error from a writer does not prove no write.
+                crate::tools::file_outcome_uncertain(
+                    fp_path,
+                    "Attach imported 3D model",
+                    error.to_string(),
+                )
+            };
+            return Err(with_model_failure(
+                result,
+                &spec.uuid,
+                Some(&model_path),
+                "attach",
+            ));
         }
-        Err(e) => json!({
-            "status": "error",
-            "uuid": spec.uuid,
-            "path": model_path.display().to_string(),
-            "reason": format!("downloaded model but failed to attach to footprint: {e}")
-        }),
+    };
+    if attached.is_error {
+        return Err(with_model_failure(
+            attached,
+            &spec.uuid,
+            Some(&model_path),
+            "attach",
+        ));
     }
+    Ok(
+        json!({"status": "attached", "uuid": spec.uuid, "format": ext,
+        "kicad_path": kicad_model_path, "path": model_path.display().to_string(),
+        "offset_mm": {"x": offset_mm[0], "y": offset_mm[1], "z": offset_mm[2]},
+        "rotation_degrees": {"x": rotation_deg[0], "y": rotation_deg[1], "z": rotation_deg[2]}}),
+    )
+}
+
+// STEP Part-21 payloads may contain non-UTF-8 strings. Keep their original
+// bytes; the S-expression writer's text-only create helper cannot publish them.
+fn publish_model(path: &std::path::Path, bytes: &[u8]) -> Result<(), CallToolResult> {
+    use std::io::Write;
+    let conflict = || crate::tools::revision_conflict_result(path, "Publish imported 3D model");
+    let io_error = |e: std::io::Error| {
+        CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: e.to_string(),
+            },
+            e.to_string(),
+        )
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_file() && std::fs::read(path).ok().as_deref() == Some(bytes)
+            {
+                return Ok(());
+            }
+            return Err(conflict());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_error(e)),
+    }
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".copperpour-model-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut staged = builder.tempfile_in(parent).map_err(io_error)?;
+    staged.write_all(bytes).map_err(io_error)?;
+    staged.as_file().sync_all().map_err(io_error)?;
+    staged.persist_noclobber(path).map_err(|e| {
+        if e.error.kind() == std::io::ErrorKind::AlreadyExists {
+            conflict()
+        } else {
+            io_error(e.error)
+        }
+    })?;
+    // The file has been published: every failed or mismatching readback is
+    // uncertain, never a pre-write refusal. Do not delete it to retry.
+    if std::fs::read(path).ok().as_deref() != Some(bytes) {
+        return Err(crate::tools::readback_mismatch_result(
+            path,
+            "Publish imported 3D model",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1242,7 +1414,7 @@ mod tests {
     use crate::tools::ServerConfig;
     use std::sync::Arc;
 
-    fn test_ctx() -> ToolContext {
+    pub(super) fn test_ctx() -> ToolContext {
         ToolContext::new(
             ServerConfig {
                 kicad_cli: String::new(),
@@ -1665,7 +1837,7 @@ f 1 2 1
             z_mm: 0.0,
             c_rotation_deg: [0.0, 0.0, 180.0],
         };
-        let (offset, rot) = compute_kicad_3d_transform(&spec, Some(obj));
+        let (offset, rot) = compute_kicad_3d_transform(&spec, Some(obj)).unwrap();
         assert_eq!(offset, [1.0, -2.0, 0.4]);
         assert_eq!(rot, [0.0, 0.0, 180.0]);
 
@@ -1676,15 +1848,15 @@ f 1 2 1
             z_mm: -0.9,
             c_rotation_deg: [0.0, 0.0, 90.0],
         };
-        let (offset2, rot2) = compute_kicad_3d_transform(&spec_rot90, None);
-        assert_eq!(offset2, [0.5, -0.5, -0.9]);
-        assert_eq!(rot2, [0.0, 0.0, 270.0]);
+        assert!(compute_kicad_3d_transform(&spec_rot90, None).is_none());
     }
 
     #[test]
     fn is_step_bytes_checks_iso_10303_header() {
-        assert!(is_step_bytes(b"ISO-10303-21;\nHEADER;\n"));
-        assert!(is_step_bytes(b"  \r\n\tISO-10303-21;"));
+        assert!(is_step_bytes(
+            b"ISO-10303-21;\nHEADER;ENDSEC;\nDATA;ENDSEC;\nEND-ISO-10303-21;"
+        ));
+        assert!(!is_step_bytes(b"  \r\n\tISO-10303-21;"));
         assert!(!is_step_bytes(b"v 0 0 0\nf 1 2 3\n"));
         assert!(!is_step_bytes(b"<html>404 Not Found</html>"));
     }
@@ -1816,7 +1988,7 @@ f 1/1/1 2/1/1 3/1/1 4/1/1
             z_mm: 0.0,
             c_rotation_deg: [0.0, 0.0, 180.0],
         };
-        let (offset, rot) = compute_kicad_3d_transform(&spec, Some(obj));
+        let (offset, rot) = compute_kicad_3d_transform(&spec, Some(obj)).unwrap();
 
         let ctx = test_ctx();
         let res = crate::tools::footprint_models::handle_set_footprint_models(
@@ -1841,3 +2013,7 @@ f 1/1/1 2/1/1 3/1/1 4/1/1
         assert!(updated.contains("(rotate (xyz 0 0 180))"));
     }
 }
+
+#[cfg(test)]
+#[path = "easyeda_3d_tests.rs"]
+mod model_tests;
