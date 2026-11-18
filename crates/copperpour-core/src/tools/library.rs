@@ -500,14 +500,17 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_symbol_info",
-            "Return detailed information about a schematic symbol: pins, properties, description.",
+            "Return detailed information about a schematic symbol: pins, properties, description. \
+             Name it by lib_id through the symbol library tables, or by library_path and \
+             symbol_name in a .kicad_sym file, registered or not.",
             json!({
                 "type": "object",
                 "properties": {
-                    "lib_id": { "type": "string", "description": "Library:Symbol identifier (e.g. 'Device:R')" },
-                    "project_dir": { "type": "string", "description": "Project directory to resolve project-scoped libraries. Defaults to the configured project_dir." }
-                },
-                "required": ["lib_id"]
+                    "lib_id": { "type": "string", "description": "Library:Symbol identifier (e.g. 'Device:R'), resolved through the project and global symbol library tables. Not with library_path." },
+                    "project_dir": { "type": "string", "description": "Project directory to resolve project-scoped libraries. Defaults to the configured project_dir." },
+                    "library_path": { "type": "string", "description": "Path to a .kicad_sym library file, read directly whether or not it is registered. Takes symbol_name; not with lib_id." },
+                    "symbol_name": { "type": "string", "description": "Name of the symbol in library_path" }
+                }
             }),
             |args, ctx| async move { handle_get_symbol_info(args, ctx).await }
         ),
@@ -5664,35 +5667,77 @@ async fn handle_get_symbol_info(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let lib_id = match require_str(args, "lib_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-
-    let parts: Vec<&str> = lib_id.splitn(2, ':').collect();
-    if parts.len() != 2 {
-        return Ok(CallToolResult::error(
-            "lib_id must be in 'Library:Symbol' format (e.g. 'Device:R')",
-        ));
-    }
-    let (lib_nick, sym_name) = (parts[0], parts[1]);
-
-    // Project dir is optional: an explicit arg wins, else the server default.
-    let project_dir = args["project_dir"]
-        .as_str()
-        .map(PathBuf::from)
-        .or_else(|| ctx.config.project_dir.clone());
-
-    let lib_path = match resolve_symbol_lib_path(lib_nick, sym_name, project_dir.as_deref()) {
-        Some(p) => p,
-        None => {
-            return Ok(CallToolResult::error(format!(
-                "Symbol '{}' not found: no library '{}' in the project or global \
-                 sym-lib-table, nor in the installed KiCad symbol libraries",
-                lib_id, lib_nick
-            )));
+    let given = |name: &str| args.get(name).is_some_and(|value| !value.is_null());
+    // The library, the symbol's name in it, how the library is named in
+    // messages, and the keys that identify the symbol in the answer.
+    let (lib_path, sym_name, lib_label, identity) = if given("library_path") {
+        if given("lib_id") {
+            return Ok(super::invalid_arg(
+                "library_path",
+                "name the symbol by lib_id, or by library_path with symbol_name, not both",
+            ));
         }
+        let path = get_path(args, "library_path")?;
+        let sym_name = match require_str(args, "symbol_name") {
+            Ok(name) => name,
+            Err(error) => return Ok(error),
+        };
+        if path.extension().and_then(|extension| extension.to_str()) != Some("kicad_sym") {
+            return Ok(super::invalid_arg(
+                "library_path",
+                &format!("'{}' is not a .kicad_sym library file", path.display()),
+            ));
+        }
+        if !path.is_file() {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::file_not_found(&path),
+                format!("Symbol library not found: {}", path.display()),
+            ));
+        }
+        let label = path.display().to_string();
+        let identity = json!({ "library_path": label });
+        (path, sym_name, label, identity)
+    } else {
+        if given("symbol_name") {
+            return Ok(super::invalid_arg(
+                "symbol_name",
+                "symbol_name names a symbol in library_path; with lib_id, the symbol is its \
+                 'Library:Symbol' suffix",
+            ));
+        }
+        let lib_id = match require_str(args, "lib_id") {
+            Ok(v) => v,
+            Err(e) => return Ok(e),
+        };
+
+        let parts: Vec<&str> = lib_id.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            return Ok(CallToolResult::error(
+                "lib_id must be in 'Library:Symbol' format (e.g. 'Device:R')",
+            ));
+        }
+        let (lib_nick, sym_name) = (parts[0], parts[1]);
+
+        // Project dir is optional: an explicit arg wins, else the server default.
+        let project_dir = args["project_dir"]
+            .as_str()
+            .map(PathBuf::from)
+            .or_else(|| ctx.config.project_dir.clone());
+
+        let lib_path = match resolve_symbol_lib_path(lib_nick, sym_name, project_dir.as_deref()) {
+            Some(p) => p,
+            None => {
+                return Ok(CallToolResult::error(format!(
+                    "Symbol '{}' not found: no library '{}' in the project or global \
+                     sym-lib-table, nor in the installed KiCad symbol libraries",
+                    lib_id, lib_nick
+                )));
+            }
+        };
+        let identity = json!({ "lib_id": lib_id, "library": lib_nick });
+        (lib_path, sym_name, lib_nick.to_string(), identity)
     };
+    let lib_nick = lib_label.as_str();
 
     let content = tokio::fs::read_to_string(&lib_path).await?;
     let root = parse_sexp(&content)
@@ -5746,16 +5791,13 @@ async fn handle_get_symbol_info(
         }
     }
 
+    let mut answer = identity;
+    answer["name"] = json!(sym_name);
+    answer["pin_count"] = json!(pins.len());
+    answer["pins"] = json!(pins);
+    answer["properties"] = json!(properties);
     Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "lib_id": lib_id,
-            "name": sym_name,
-            "library": lib_nick,
-            "pin_count": pins.len(),
-            "pins": pins,
-            "properties": properties
-        }))
-        .unwrap(),
+        serde_json::to_string(&answer).unwrap(),
     ))
 }
 
@@ -9756,6 +9798,113 @@ mod tests {
         assert!(numbers.contains(&"1"), "pins: {out}");
         assert!(numbers.contains(&"3"), "pins: {out}");
         assert_eq!(out["properties"]["Reference"], "U", "{out}");
+    }
+
+    /// A `.kicad_sym` file no table registers is read by `library_path` and
+    /// `symbol_name`, with the pins and properties `lib_id` gives for the same
+    /// file through a table, extends chain included; the answer names the
+    /// file instead of a library nickname.
+    #[tokio::test]
+    async fn get_symbol_info_reads_an_unregistered_library_by_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = write_project_sym_lib(&tmp, "testlib", EXTENDS_DERIVED_LIB);
+        let registered = handle_get_symbol_info(
+            &json!({ "lib_id": "testlib:Derived", "project_dir": proj.to_string_lossy() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let registered: serde_json::Value =
+            serde_json::from_str(&result_text(&registered)).unwrap();
+
+        let unregistered = tempfile::tempdir().unwrap();
+        let path = unregistered.path().join("loose.kicad_sym");
+        std::fs::write(&path, EXTENDS_DERIVED_LIB).unwrap();
+        let res = handle_get_symbol_info(
+            &json!({ "library_path": path.to_string_lossy(), "symbol_name": "Derived" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(out["library_path"], path.display().to_string(), "{out}");
+        assert_eq!(out["name"], "Derived", "{out}");
+        assert!(out.get("lib_id").is_none(), "{out}");
+        assert!(out.get("library").is_none(), "{out}");
+        for key in ["pin_count", "pins", "properties"] {
+            assert_eq!(out[key], registered[key], "{key}: {out}");
+        }
+        assert_eq!(out["pin_count"], 2, "{out}");
+    }
+
+    /// The symbol is named one way, by `lib_id` or by `library_path` with
+    /// `symbol_name`, and a path must be an existing `.kicad_sym` holding it.
+    #[tokio::test]
+    async fn get_symbol_info_refuses_a_mixed_or_unusable_library_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("loose.kicad_sym");
+        std::fs::write(&path, EXTENDS_DERIVED_LIB).unwrap();
+        let path = path.to_string_lossy().to_string();
+        let missing = tmp
+            .path()
+            .join("missing.kicad_sym")
+            .to_string_lossy()
+            .to_string();
+        let wrong_type = tmp
+            .path()
+            .join("loose.kicad_mod")
+            .to_string_lossy()
+            .to_string();
+        for (args, kind, field) in [
+            (
+                json!({ "lib_id": "Device:R", "library_path": path, "symbol_name": "Derived" }),
+                "invalid_argument",
+                Some("library_path"),
+            ),
+            (
+                json!({ "library_path": path }),
+                "invalid_argument",
+                Some("symbol_name"),
+            ),
+            (
+                json!({ "lib_id": "Device:R", "symbol_name": "R" }),
+                "invalid_argument",
+                Some("symbol_name"),
+            ),
+            (
+                json!({ "library_path": wrong_type, "symbol_name": "Derived" }),
+                "invalid_argument",
+                Some("library_path"),
+            ),
+            (
+                json!({ "library_path": missing, "symbol_name": "Derived" }),
+                "file_not_found",
+                None,
+            ),
+        ] {
+            let res = handle_get_symbol_info(&args, &test_ctx()).await.unwrap();
+            assert!(res.is_error, "{args}");
+            let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+            assert_eq!(out["error"]["kind"], kind, "{args}: {out}");
+            if let Some(field) = field {
+                assert_eq!(out["error"]["field"], field, "{args}: {out}");
+            }
+        }
+
+        let res = handle_get_symbol_info(
+            &json!({ "library_path": path, "symbol_name": "Nope" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(res.is_error);
+        assert!(
+            result_text(&res).contains("Symbol 'Nope' not found in library"),
+            "{}",
+            result_text(&res)
+        );
     }
 
     #[test]

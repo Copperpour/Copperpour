@@ -130,7 +130,9 @@ Before creating or wiring a package-sensitive part:
 5. Reconcile three counts: datasheet leads, symbol pins, footprint pads.
    Document any intentional duplicate or mechanical-only pad.
 6. Read the result back with `get_symbol_info` and `get_footprint_info`
-   rather than trusting what you just wrote.
+   rather than trusting what you just wrote. Both read a library file by path
+   (`library_path` and `symbol_name`, or a `.kicad_mod` path), so the library
+   need not be registered yet.
 7. **Refuse to use the part in a real schematic** while any mirror,
    reversal, duplicate, missing lead or view ambiguity is unresolved.
 
