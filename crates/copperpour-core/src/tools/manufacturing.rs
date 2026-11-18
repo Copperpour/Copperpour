@@ -279,7 +279,10 @@ pub(crate) async fn build_package(
     // Establish native geometry before creating/publishing any output. Keep the
     // staging owner alive for every CLI board export, not just CPL.
     let snapshot = match assembly.capture(ctx, &board, include_assembly).await? {
-        Ok(snapshot) => snapshot,
+        Ok(super::BoardBinding::Bound(snapshot)) => snapshot,
+        Ok(super::BoardBinding::Unserved { absence, message }) => {
+            return Ok(Err(midpoint_binding_refusal(absence, &message)))
+        }
         Err(error) => return Ok(Err(midpoint_failure(error))),
     };
     let gerber_layers = if requested_gerber_layers.is_empty() {
@@ -905,6 +908,24 @@ fn drc_refusal(report: &cli::DrcReport) -> Option<CallToolResult> {
         ),
         json!({ "drc_errors": shown, "drc_error_count": errors.len() }),
     ))
+}
+
+fn midpoint_binding_refusal(absence: super::BoardEditorAbsence, reason: &str) -> CallToolResult {
+    let mut recovery = super::ipc_recovery::for_board_editor_absence(absence, reason);
+    recovery.troubleshooting_url = Some(super::ipc_recovery::troubleshooting_url(
+        "jlcpcb-assembly-cannot-obtain-native-midpoint-geometry",
+    ));
+    CallToolResult::error_kind_with_recovery(
+        crate::mcp::error::ToolErrorKind::EditorUnavailable {
+            editor: "pcbnew".into(),
+            reason: reason.into(),
+        },
+        format!(
+            "KiCad {} ({reason}). JLCPCB assembly needs native midpoint geometry from the exact board open in KiCad with IPC enabled. No package was exported or uploaded. For fabrication only, set include_assembly to false.",
+            absence.observed()
+        ),
+        recovery,
+    )
 }
 
 fn midpoint_failure(error: copperpour_ipc::IpcFailure) -> CallToolResult {
@@ -1966,6 +1987,112 @@ mod package_export_option_tests {
             .as_str()
             .unwrap()
             .starts_with("Do not upload"));
+    }
+
+    #[tokio::test]
+    async fn served_jlcpcb_export_preserves_unserved_binding_evidence() {
+        assert_unserved_midpoint_binding("export_manufacturing_package").await;
+    }
+
+    #[cfg(feature = "jlcpcb")]
+    #[tokio::test]
+    async fn served_jlcpcb_order_link_preserves_unserved_binding_evidence() {
+        assert_unserved_midpoint_binding("generate_jlcpcb_order_link").await;
+    }
+
+    async fn assert_unserved_midpoint_binding(tool: &str) {
+        use copperpour_ipc::gen::kiapi::common::{ApiResponse, ApiResponseStatus, ApiStatusCode};
+        use std::sync::{Arc, Mutex};
+
+        for (status, cause) in [
+            (ApiStatusCode::AsUnhandled, "no_pcb_editor_at_endpoint"),
+            (ApiStatusCode::AsUnimplemented, "unknown"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("live_ipc.kicad_pcb");
+            let original =
+                include_str!("../../../copperpour-ipc/tests/fixtures/live_ipc.kicad_pcb");
+            std::fs::write(&board, original).unwrap();
+            let output = dir.path().join("package");
+            let launched = dir.path().join("cli-started");
+            let cli = crate::tools::cli::test_support::write_script(
+                dir.path(),
+                "midpoint-start-probe",
+                &format!("#!/bin/sh\n: > '{}'\nexit 1\n", launched.display()),
+                &format!(
+                    "@echo off\r\ntype nul > \"{}\"\r\nexit /b 1\r\n",
+                    launched.display()
+                ),
+            );
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let log = seen.clone();
+            let server =
+                crate::test_support::MockIpcServer::spawn("midpoint-binding", move |req| {
+                    log.lock().unwrap().push(req.message.unwrap().type_url);
+                    ApiResponse {
+                        header: None,
+                        status: Some(ApiResponseStatus {
+                            status: status as i32,
+                            error_message: String::new(),
+                        }),
+                        message: None,
+                    }
+                });
+            let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+                ipc_address: server.address().into(),
+                kicad_cli: cli.display().to_string(),
+                eager_toolsets: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let arguments = if tool == "export_manufacturing_package" {
+                json!({"board":board,"output_dir":output,"fab_house":"jlcpcb",
+                       "include_assembly":true,"gerber_layers":["F.Cu"]})
+            } else {
+                json!({"board":board,"schematic":dir.path().join("board.kicad_sch"),
+                       "include_assembly":true})
+            };
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc":"2.0","id":589,"method":"tools/call","params":{
+                        "name":tool,"arguments":arguments
+                    }
+                }))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+            let log = seen.lock().unwrap();
+            assert_eq!(log.len(), 1, "{log:?}");
+            assert!(
+                log[0].ends_with("/kiapi.common.commands.GetOpenDocuments"),
+                "{log:?}"
+            );
+            assert!(
+                !launched.exists(),
+                "{tool} started the CLI after refusing binding"
+            );
+            assert!(!output.exists());
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), original);
+            assert_eq!(response["isError"], true, "{body}");
+            assert_eq!(body["error"]["kind"], "editor_unavailable", "{body}");
+            assert_eq!(body["error"]["editor"], "pcbnew", "{body}");
+            assert_eq!(body["recovery"]["cause"], cause, "{body}");
+            assert_eq!(body["recovery"]["mutation_outcome"], "none", "{body}");
+            assert_eq!(body["recovery"]["retry_safe"], false, "{body}");
+            assert_eq!(body["recovery"]["evidence"]["status"], status.as_str_name());
+            assert!(body["message"]
+                .as_str()
+                .unwrap()
+                .contains("No package was exported or uploaded"));
+            assert!(body["recovery"]["troubleshooting_url"]
+                .as_str()
+                .unwrap()
+                .ends_with("#jlcpcb-assembly-cannot-obtain-native-midpoint-geometry"));
+        }
     }
 
     #[tokio::test]

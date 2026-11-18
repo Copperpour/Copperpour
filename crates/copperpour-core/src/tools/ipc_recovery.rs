@@ -17,7 +17,7 @@ use serde_json::json;
 const TROUBLESHOOTING_BASE: &str =
     "https://github.com/Copperpour/Copperpour/blob/main/docs/TROUBLESHOOTING.md";
 
-fn troubleshooting_url(anchor: &str) -> String {
+pub(crate) fn troubleshooting_url(anchor: &str) -> String {
     format!("{TROUBLESHOOTING_BASE}#{anchor}")
 }
 
@@ -462,6 +462,7 @@ pub(crate) fn for_board_editor_absence(
             observed: "KiCad IPC is reachable, but no PCB editor is open at this endpoint.".to_string(),
             evidence: json!({
                 "reason": message,
+                "status": "AS_UNHANDLED",
             }),
             mutation_outcome: "none".to_string(),
             retry_safe: false,
@@ -479,6 +480,7 @@ pub(crate) fn for_board_editor_absence(
             observed: "KiCad IPC answered, but this KiCad build does not implement GetOpenDocuments, so whether a PCB editor holds the board was not established.".to_string(),
             evidence: json!({
                 "reason": message,
+                "status": "AS_UNIMPLEMENTED",
             }),
             mutation_outcome: "none".to_string(),
             retry_safe: false,
