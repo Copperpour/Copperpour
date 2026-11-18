@@ -911,6 +911,10 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // names, not callable tools (#555).
         "stale_target",
         "verified_changes",
+        // Update PCB's skipped-part response field and count, not callable
+        // tools (#596).
+        "skipped_footprints",
+        "skipped_footprint",
     ];
 
     let mut phantom = Vec::new();

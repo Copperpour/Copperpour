@@ -208,6 +208,10 @@ struct SyncCounts {
     /// Schematic components with no footprint assigned: reported, never
     /// planned, never fatal (#507).
     unassigned_footprint: CountPair,
+    /// Parts left out because the preflight found their footprint cannot be
+    /// built or updated; listed in `skipped_footprints`, never fatal to the
+    /// rest (`skip_parts`).
+    skipped_footprint: CountPair,
     conflicts: CountPair,
 }
 
@@ -334,6 +338,10 @@ struct SyncPlan {
     /// Survives a conflict: it is a report about the schematic, not a change
     /// the plan would make.
     unassigned: Vec<UnassignedFootprint>,
+    /// Why each skipped part was left out of the plan (`skip_parts`), with
+    /// the preflight's own diagnostic. Part of the plan's identity: what was
+    /// left out is part of what was reviewed.
+    skipped: Vec<SyncDiagnostic>,
     /// What the live board's measured extent was, set from the snapshot the
     /// plan was made against, so the dry run and the apply report the same.
     /// Not part of the plan's identity: `sync_response` reports it.
@@ -562,7 +570,8 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             // means ready: each footprint that cannot be prepared, named with
             // the parts that need it, and each connected pad a prepared
             // footprint does not have. So is each updated footprint that would
-            // lose what it owns, which the apply would not report.
+            // lose what it owns, which the apply would not report. The parts
+            // these name are skipped (`skip_parts`), not applied.
             let mut preflight = unprepared
                 .into_iter()
                 .map(UnpreparedFootprint::into_diagnostic)
@@ -598,14 +607,25 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 .any(|change| matches!(change, PlannedChange::Update { .. }))
             {
                 let board_text = client.save_document_to_string_in(snapshot.document.clone())?;
-                let (refused, sheet_only) =
-                    updates_not_carried(&plan, &snapshot.state.footprints, &board_text);
-                preflight.extend(refused);
-                left_out = sheet_only;
+                let found = updates_not_carried(&plan, &snapshot.state.footprints, &board_text);
+                preflight.extend(found.refused);
+                if found.unknown {
+                    refuse_plan(&mut plan, preflight);
+                    return Ok(sync_response(&plan, "conflict", hierarchy.len(), false, &options));
+                }
+                left_out = found.left_out;
             }
+            // A part the preflight refuses is skipped, as KiCad's Update PCB
+            // reports a part it cannot build and updates the rest; a plan
+            // left with nothing to apply is refused whole, as before.
             if !preflight.is_empty() {
-                refuse_plan(&mut plan, preflight);
-                return Ok(sync_response(&plan, "conflict", hierarchy.len(), false, &options));
+                let left_out_kiids = left_out
+                    .iter()
+                    .map(|(kiid, _)| kiid.as_str())
+                    .collect::<BTreeSet<_>>();
+                if !skip_parts(&mut plan, preflight, &snapshot.state, &left_out_kiids) {
+                    return Ok(sync_response(&plan, "conflict", hierarchy.len(), false, &options));
+                }
             }
             leave_out_updates(&mut plan, left_out);
             restage_additions(&mut plan, &prepared, snapshot.state.bounds);
@@ -694,7 +714,15 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 plan.counts.board_only_preserved.planned;
             plan.counts.skipped_by_flag.applied = plan.counts.skipped_by_flag.planned;
             plan.counts.unassigned_footprint.applied = plan.counts.unassigned_footprint.planned;
-            if acknowledged.is_empty() {
+            plan.counts.skipped_footprint.applied = plan.counts.skipped_footprint.planned;
+            // Checked only when an acknowledged change is still planned: one
+            // whose part was skipped went with the part, so nothing was made
+            // that this would report on.
+            if !plan
+                .diagnostics
+                .iter()
+                .any(|note| note.code == "routed_pad_net_change_acknowledged")
+            {
                 return Ok(sync_response(&plan, "applied", hierarchy.len(), true, &options));
             }
             // The commit stands whatever this finds, so a check that cannot
@@ -820,6 +848,9 @@ struct SyncResponse<'a> {
     /// collection takes a plural noun (docs/NAMING_CONVENTIONS.md); the
     /// `coverage` entry beside it is a count category and stays singular.
     unassigned_footprints: &'a [UnassignedFootprint],
+    /// Parts the preflight left out, each with the diagnostic that says why;
+    /// every other part is synced. Counted in `coverage.skipped_footprint`.
+    skipped_footprints: &'a [SyncDiagnostic],
     /// Bounded as rendered only: `plan.changes` stays whole, since the plan
     /// revision hashes it and the apply sends it.
     changes: &'a [PlannedChange],
@@ -852,6 +883,7 @@ impl<'a> SyncResponse<'a> {
                 "board_only_preserved": plan.counts.board_only_preserved,
                 "skipped_by_flag": plan.counts.skipped_by_flag,
                 "unassigned_footprint": plan.counts.unassigned_footprint,
+                "skipped_footprint": plan.counts.skipped_footprint,
                 "conflicts": plan.counts.conflicts
             }),
             staging: plan.staging.as_ref().map(StagingEvidence::json),
@@ -863,6 +895,7 @@ impl<'a> SyncResponse<'a> {
             drc: plan.acknowledged_apply.as_ref().map(|apply| &apply.drc),
             diagnostics: Cow::Borrowed(&plan.diagnostics),
             unassigned_footprints: &plan.unassigned,
+            skipped_footprints: &plan.skipped,
         }
     }
 }
@@ -923,6 +956,7 @@ fn conflict_result(message: String) -> CallToolResult {
             "board_only_preserved": CountPair::default(),
             "skipped_by_flag": CountPair::default(),
             "unassigned_footprint": CountPair::default(),
+            "skipped_footprint": CountPair::default(),
             "conflicts": CountPair { planned: 1, applied: 0 }
         },
         "diagnostics": [conflict("preflight_conflict", message, None)]
@@ -1391,6 +1425,8 @@ fn plan_sync_acknowledging(
         changes,
         diagnostics,
         unassigned,
+        // Set by the handler's preflight, which reads the library.
+        skipped: Vec::new(),
         // Set by the handler from the snapshot this plan was made against.
         staging: None,
         acknowledged_apply: None,
@@ -1560,6 +1596,8 @@ fn refresh_revision_with_staging(plan: &mut SyncPlan) {
     let mut hasher = Sha256::new();
     hasher.update(plan.plan_revision.as_bytes());
     hasher.update(serde_json::to_vec(&plan.changes).expect("planned changes serialize"));
+    // What was left out is part of what was reviewed.
+    hasher.update(serde_json::to_vec(&plan.skipped).expect("skipped parts serialize"));
     plan.plan_revision = encode_hex(&hasher.finalize());
 }
 
@@ -3608,7 +3646,7 @@ fn updates_not_carried(
     plan: &SyncPlan,
     footprints: &[BoardFootprint],
     board_text: &str,
-) -> (Vec<SyncDiagnostic>, Vec<(String, SyncDiagnostic)>) {
+) -> UpdatesNotCarried {
     let owned = not_carried_by_kiid(board_text);
     let footprint_id = |kiid: &str| {
         // The plan was made from these footprints, so the update's is among them.
@@ -3619,6 +3657,7 @@ fn updates_not_carried(
     };
     let mut diagnostics = Vec::new();
     let mut left_out = Vec::new();
+    let mut unknown = false;
     for change in &plan.changes {
         let PlannedChange::Update {
             kiid,
@@ -3629,7 +3668,9 @@ fn updates_not_carried(
         else {
             continue;
         };
-        let message = match owned.as_ref().map(|owned| owned.get(kiid)) {
+        let found = owned.as_ref().map(|owned| owned.get(kiid));
+        unknown |= !matches!(found, Ok(Some(_)));
+        let message = match found {
             Ok(Some(found)) if *found == NotCarried::default() => continue,
             Ok(Some(found)) if *sheet_only => {
                 left_out.push((
@@ -3668,22 +3709,132 @@ fn updates_not_carried(
             vec![reference.clone()],
         ));
     }
-    (diagnostics, left_out)
+    UpdatesNotCarried {
+        refused: diagnostics,
+        left_out,
+        unknown,
+    }
+}
+
+/// What [`updates_not_carried`] found in the board KiCad wrote.
+struct UpdatesNotCarried {
+    /// A `footprint_children_not_carried` conflict per update it refuses.
+    refused: Vec<SyncDiagnostic>,
+    /// The sheet-only updates to leave out, by KIID.
+    left_out: Vec<(String, SyncDiagnostic)>,
+    /// The board text could not be read, or lacks a footprint the plan
+    /// updates. What an update would drop is then unknown for a reason that
+    /// is not the part's, so the plan is refused whole rather than skipping
+    /// each update.
+    unknown: bool,
 }
 
 /// Take each update [`updates_not_carried`] leaves out off the plan, with its
 /// diagnostic; a plan left with no change is a no-op.
 fn leave_out_updates(plan: &mut SyncPlan, left_out: Vec<(String, SyncDiagnostic)>) {
     for (kiid, diagnostic) in left_out {
+        let planned = plan.changes.len();
         plan.changes.retain(
             |change| !matches!(change, PlannedChange::Update { kiid: planned, .. } if *planned == kiid),
         );
-        plan.counts.updated.planned -= 1;
-        plan.diagnostics.push(diagnostic);
+        // `skip_parts` may have taken it off already.
+        if plan.changes.len() < planned {
+            plan.counts.updated.planned -= 1;
+            plan.diagnostics.push(diagnostic);
+        }
     }
     if plan.changes.is_empty() && plan.status == PlanStatus::Ready {
         plan.status = PlanStatus::Noop;
     }
+}
+
+/// Take the parts these preflight diagnostics name off the plan and report
+/// them in `skipped`, so one footprint that cannot be built or updated no
+/// longer stops the sync of every other part. KiCad's Update PCB does the
+/// same: a part it cannot add or replace is reported as an error and the rest
+/// is committed (`BOARD_NETLIST_UPDATER`, KiCad 10.0.8).
+///
+/// Only the named parts are left out: a net a skipped part shares still
+/// reaches every other part's pads. The plan is refused whole instead, as
+/// before, and `false` returned, when a diagnostic names no part, or when
+/// nothing but the skipped parts and the updates in `left_out` (which
+/// `leave_out_updates` takes off next) would be applied: a no-op would hide
+/// that the schematic asked for changes.
+fn skip_parts(
+    plan: &mut SyncPlan,
+    diagnostics: Vec<SyncDiagnostic>,
+    board: &BoardState,
+    left_out: &BTreeSet<&str>,
+) -> bool {
+    let skipped: BTreeSet<String> = diagnostics
+        .iter()
+        .flat_map(|diagnostic| diagnostic.references.iter().cloned())
+        .collect();
+    let applies_something = plan.changes.iter().any(|change| match change {
+        PlannedChange::Add { reference, .. } => !skipped.contains(reference),
+        PlannedChange::Update {
+            kiid, reference, ..
+        } => !skipped.contains(reference) && !left_out.contains(kiid.as_str()),
+    });
+    let names_its_parts = diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.references.is_empty());
+    if !applies_something || !names_its_parts {
+        refuse_plan(plan, diagnostics);
+        return false;
+    }
+    plan.changes
+        .retain(|change| !skipped.contains(change_reference(change)));
+    // A note about a skipped part (a locked footprint kept, say) no longer
+    // describes anything this sync does.
+    plan.diagnostics.retain(|note| {
+        note.references.is_empty()
+            || !note
+                .references
+                .iter()
+                .all(|reference| skipped.contains(reference))
+    });
+    plan.counts.added.planned = 0;
+    plan.counts.updated.planned = 0;
+    plan.counts.pads_reassigned.planned = 0;
+    for change in &plan.changes {
+        match change {
+            PlannedChange::Add { .. } => plan.counts.added.planned += 1,
+            PlannedChange::Update { kiid, pad_nets, .. } => {
+                plan.counts.updated.planned += 1;
+                plan.counts.pads_reassigned.planned += board
+                    .footprints
+                    .iter()
+                    .find(|footprint| &footprint.kiid == kiid)
+                    .map_or(0, |footprint| {
+                        changed_pad_count(pad_nets, &footprint.pad_nets)
+                    });
+            }
+        }
+    }
+    plan.counts.skipped_footprint.planned += skipped.len();
+    plan.skipped.extend(diagnostics);
+    true
+}
+
+fn change_reference(change: &PlannedChange) -> &str {
+    match change {
+        PlannedChange::Add { reference, .. } | PlannedChange::Update { reference, .. } => reference,
+    }
+}
+
+/// How many pads change net, as `plan_sync` counts them for an update,
+/// including a routed change the caller acknowledged (#38).
+fn changed_pad_count(new: &BTreeMap<String, String>, old: &BTreeMap<String, String>) -> usize {
+    new.keys()
+        .chain(old.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|number| {
+            new.get(*number).map_or("", String::as_str)
+                != old.get(*number).map_or("", String::as_str)
+        })
+        .count()
 }
 
 /// Turn a plan into a conflict the way `plan_sync` does for its own
@@ -4741,6 +4892,253 @@ mod tests {
                 max_y: 10.0,
             },
         }
+    }
+
+    /// R1 and R2 on the board, both to be updated (R1 with a pad moving to
+    /// another net), and R3 and R4 to be added.
+    fn two_updates_and_two_additions() -> (SyncPlan, BoardState) {
+        let mut r1 = resistor("R1", "/r1");
+        r1.value = "4k7".to_string();
+        r1.pad_nets.insert("1".to_string(), "VDD".to_string());
+        let mut r2 = resistor("R2", "/r2");
+        r2.value = "1k".to_string();
+        let design = ExportedDesign {
+            components: vec![r1, r2, resistor("R3", "/r3"), resistor("R4", "/r4")],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        };
+        let board = board_with(vec![
+            board_resistor("R1", Some("/r1")),
+            board_resistor("R2", Some("/r2")),
+        ]);
+        let plan = plan_sync("", &design, &board);
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.counts.added.planned, 2);
+        assert_eq!(plan.counts.updated.planned, 2);
+        assert_eq!(plan.counts.pads_reassigned.planned, 1);
+        (plan, board)
+    }
+
+    fn planned_references(plan: &SyncPlan) -> Vec<&str> {
+        let mut references: Vec<&str> = plan.changes.iter().map(change_reference).collect();
+        references.sort_unstable();
+        references
+    }
+
+    fn cannot_build(code: &str, references: &[&str]) -> SyncDiagnostic {
+        footprint_conflict(
+            code,
+            format!("{} cannot be built", references.join(", ")),
+            "Resistor_SMD:R_0603_1608Metric",
+            references
+                .iter()
+                .map(|reference| reference.to_string())
+                .collect(),
+        )
+    }
+
+    /// A part whose footprint cannot be built, and an update that would lose
+    /// what its footprint owns, are skipped; every other part stays planned,
+    /// the counts follow (R1's net change goes with R1), the skipped parts are
+    /// reported with their own diagnostics, and a note about a skipped part
+    /// goes while one about a planned part stays.
+    #[test]
+    fn a_part_that_cannot_be_built_is_skipped_and_the_rest_stays_planned() {
+        let (mut plan, board) = two_updates_and_two_additions();
+        plan.diagnostics.push(conflict(
+            "footprint_locked_not_replaced",
+            "R1".to_string(),
+            Some("R1"),
+        ));
+        plan.diagnostics.push(conflict(
+            "footprint_locked_not_replaced",
+            "R2".to_string(),
+            Some("R2"),
+        ));
+        let preflight = vec![
+            cannot_build("unsupported_library_footprint", &["R3"]),
+            cannot_build("footprint_children_not_carried", &["R1"]),
+        ];
+
+        assert!(skip_parts(
+            &mut plan,
+            preflight.clone(),
+            &board,
+            &BTreeSet::new()
+        ));
+
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(planned_references(&plan), ["R2", "R4"]);
+        assert_eq!(plan.counts.added.planned, 1);
+        assert_eq!(plan.counts.updated.planned, 1);
+        assert_eq!(plan.counts.pads_reassigned.planned, 0);
+        assert_eq!(plan.counts.skipped_footprint.planned, 2);
+        assert_eq!(plan.counts.conflicts.planned, 0);
+        assert_eq!(plan.skipped, preflight);
+        let notes: Vec<_> = plan
+            .diagnostics
+            .iter()
+            .map(|note| note.message.as_str())
+            .collect();
+        assert_eq!(notes, ["R2"]);
+    }
+
+    /// Skipping only R2 keeps R1's net change counted.
+    #[test]
+    fn skipping_a_part_keeps_the_net_changes_of_the_rest() {
+        let (mut plan, board) = two_updates_and_two_additions();
+        assert!(skip_parts(
+            &mut plan,
+            vec![cannot_build("footprint_children_not_carried", &["R2"])],
+            &board,
+            &BTreeSet::new(),
+        ));
+        assert_eq!(planned_references(&plan), ["R1", "R3", "R4"]);
+        assert_eq!(plan.counts.pads_reassigned.planned, 1);
+    }
+
+    /// An acknowledged routed pad net change (#38) goes with its part when
+    /// the part is skipped: its note is dropped, so the apply neither makes
+    /// nor reports it, and the rest of the plan stays.
+    #[test]
+    fn skipping_a_part_drops_its_acknowledged_net_changes() {
+        let (mut design, mut board) = routed_r1_moving_both_pads();
+        let mut r2 = resistor("R2", "/r2");
+        r2.value = "1k".to_string();
+        design.components.push(r2);
+        board.footprints.push(board_resistor("R2", Some("/r2")));
+        let acknowledged = BTreeSet::from([
+            acknowledging("R1", "1", "VCC", "VCC_A"),
+            acknowledging("R1", "2", "GND", "GND_A"),
+        ]);
+        let mut plan = plan_sync_acknowledging("netlist", &design, &board, &acknowledged);
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        assert_eq!(plan.counts.pads_reassigned.planned, 2);
+        let skipped = vec![cannot_build("unsupported_library_footprint", &["R1"])];
+
+        assert!(skip_parts(
+            &mut plan,
+            skipped.clone(),
+            &board,
+            &BTreeSet::new()
+        ));
+
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(planned_references(&plan), ["R2"]);
+        assert_eq!(plan.counts.pads_reassigned.planned, 0);
+        assert_eq!(plan.skipped, skipped);
+        assert!(
+            plan.diagnostics
+                .iter()
+                .all(|note| note.code != "routed_pad_net_change_acknowledged"),
+            "{:?}",
+            plan.diagnostics
+        );
+    }
+
+    /// When every planned part would be skipped there is nothing to apply,
+    /// and the plan is refused whole with the diagnostics as conflicts, as it
+    /// was before parts were skipped.
+    #[test]
+    fn skipping_every_part_refuses_the_plan() {
+        let (mut plan, board) = two_updates_and_two_additions();
+        let all = cannot_build("footprint_pad_missing", &["R1", "R2", "R3", "R4"]);
+
+        assert!(!skip_parts(
+            &mut plan,
+            vec![all.clone()],
+            &board,
+            &BTreeSet::new()
+        ));
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.changes.is_empty());
+        assert_eq!(plan.counts.added.planned, 0);
+        assert_eq!(plan.counts.updated.planned, 0);
+        assert_eq!(plan.counts.conflicts.planned, 1);
+        assert_eq!(plan.counts.skipped_footprint.planned, 0);
+        assert!(plan.skipped.is_empty());
+        assert_eq!(plan.diagnostics, [all]);
+    }
+
+    /// An update that `leave_out_updates` takes off next counts as nothing to
+    /// apply: a plan left with only that would read `noop` and hide the parts
+    /// the schematic asked for. It is refused instead.
+    #[test]
+    fn a_plan_left_with_only_left_out_updates_is_refused_not_a_noop() {
+        let (mut plan, board) = two_updates_and_two_additions();
+        let skipped = cannot_build("unsupported_library_footprint", &["R1", "R3", "R4"]);
+
+        assert!(!skip_parts(
+            &mut plan,
+            vec![skipped],
+            &board,
+            &BTreeSet::from(["R2-kiid"]),
+        ));
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.changes.is_empty());
+    }
+
+    /// A preflight diagnostic that names no part cannot be skipped by part,
+    /// so it refuses the whole plan, the named ones with it.
+    #[test]
+    fn a_diagnostic_without_parts_refuses_the_whole_plan() {
+        let (mut plan, board) = two_updates_and_two_additions();
+        let preflight = vec![
+            cannot_build("unsupported_library_footprint", &["R3"]),
+            conflict("library_unreadable", "no parts".to_string(), None),
+        ];
+
+        assert!(!skip_parts(&mut plan, preflight, &board, &BTreeSet::new()));
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.changes.is_empty());
+        assert_eq!(plan.counts.conflicts.planned, 2);
+        assert!(plan.skipped.is_empty());
+    }
+
+    /// `leave_out_updates` counts and reports only an update still planned,
+    /// so one `skip_parts` already took off is not taken off twice.
+    #[test]
+    fn leaving_out_a_skipped_update_changes_nothing() {
+        let (mut plan, board) = two_updates_and_two_additions();
+        assert!(skip_parts(
+            &mut plan,
+            vec![cannot_build("unsupported_library_footprint", &["R2"])],
+            &board,
+            &BTreeSet::new(),
+        ));
+        let diagnostic = cannot_build("footprint_sheet_not_updated", &["R2"]);
+
+        leave_out_updates(&mut plan, vec![("R2-kiid".to_string(), diagnostic)]);
+
+        assert_eq!(plan.counts.updated.planned, 1);
+        assert!(plan.diagnostics.is_empty());
+        assert_eq!(plan.status, PlanStatus::Ready);
+    }
+
+    /// What was skipped, and why, is part of the reviewed plan: the same
+    /// changes with another part skipped, or the same part skipped for
+    /// another reason, are another plan revision.
+    #[test]
+    fn the_skipped_parts_are_part_of_the_plan_revision() {
+        let revision = |skipped: Vec<SyncDiagnostic>| {
+            let (mut plan, board) = two_updates_and_two_additions();
+            assert!(skip_parts(&mut plan, skipped, &board, &BTreeSet::new()));
+            refresh_revision_with_staging(&mut plan);
+            plan.plan_revision
+        };
+        let unsupported = revision(vec![cannot_build("unsupported_library_footprint", &["R3"])]);
+        let unresolved = revision(vec![cannot_build(
+            "footprint_library_resolution_failed",
+            &["R3"],
+        )]);
+        assert_ne!(unsupported, unresolved);
+        assert_eq!(
+            unsupported,
+            revision(vec![cannot_build("unsupported_library_footprint", &["R3"])])
+        );
     }
 
     #[test]
@@ -7067,6 +7465,7 @@ mod tests {
             changes,
             diagnostics: Vec::new(),
             unassigned: Vec::new(),
+            skipped: Vec::new(),
             staging: None,
             acknowledged_apply: None,
         }
@@ -8556,15 +8955,43 @@ mod tests {
         assert_eq!(body["staging"], serde_json::Value::Null);
     }
 
+    /// The two diagnostics for the unusable VQFN footprints, as #657 names
+    /// them: every part and both footprints.
+    fn unusable_vqfn_diagnostics() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "code": "unsupported_library_footprint",
+                "message": format!(
+                    "{TEXAS_VQFN} cannot be placed (needed by U1, U2): custom-shape pads \
+                     are not supported by KiCad 10's typed placement path"
+                ),
+                "reference": null,
+                "references": ["U1", "U2"],
+                "footprint_id": TEXAS_VQFN
+            },
+            {
+                "code": "unsupported_library_footprint",
+                "message": format!(
+                    "{GENERIC_VQFN} cannot be placed (needed by U3): custom-shape pads \
+                     are not supported by KiCad 10's typed placement path"
+                ),
+                "reference": "U3",
+                "references": ["U3"],
+                "footprint_id": GENERIC_VQFN
+            }
+        ])
+    }
+
     /// #657 through the served boundary. The run that found it needed two
     /// unusable footprints and was told of one, with `reference: null` and no
-    /// footprint: every part and both footprints are named now, nothing is
-    /// planned, and a plan that can be placed still says `ready`.
+    /// footprint: every part and both footprints are named now. Those parts
+    /// are skipped, as KiCad's Update PCB skips a part it cannot add, and the
+    /// part that can be placed is still planned.
     #[tokio::test]
-    async fn two_unusable_footprints_are_both_named_through_the_served_dispatch() {
+    async fn two_unusable_footprints_are_both_named_and_skipped_through_the_served_dispatch() {
         let served = ServedSync::new().await;
 
-        let refused = served
+        let plan = served
             .dry_run(&exported_netlist(&[
                 ("U1", TEXAS_VQFN, &["1", "2"]),
                 ("C1", STOCK_0603, &["1", "2"]),
@@ -8573,71 +9000,84 @@ mod tests {
             ]))
             .await;
 
-        assert_eq!(refused["status"], "conflict", "{refused:#}");
-        assert_eq!(refused["changes"], serde_json::json!([]));
-        assert_eq!(refused["coverage"]["footprints_added"]["planned"], 0);
-        assert_eq!(refused["coverage"]["conflicts"]["planned"], 2);
-        assert_eq!(
-            refused["diagnostics"],
-            serde_json::json!([
-                {
-                    "code": "unsupported_library_footprint",
-                    "message": format!(
-                        "{TEXAS_VQFN} cannot be placed (needed by U1, U2): custom-shape pads \
-                         are not supported by KiCad 10's typed placement path"
-                    ),
-                    "reference": null,
-                    "references": ["U1", "U2"],
-                    "footprint_id": TEXAS_VQFN
-                },
-                {
-                    "code": "unsupported_library_footprint",
-                    "message": format!(
-                        "{GENERIC_VQFN} cannot be placed (needed by U3): custom-shape pads \
-                         are not supported by KiCad 10's typed placement path"
-                    ),
-                    "reference": "U3",
-                    "references": ["U3"],
-                    "footprint_id": GENERIC_VQFN
-                }
-            ])
-        );
-
-        let placeable = served
-            .dry_run(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
-            .await;
-        assert_eq!(placeable["status"], "ready", "{placeable:#}");
-        assert_eq!(placeable["coverage"]["footprints_added"]["planned"], 1);
-        assert_eq!(placeable["diagnostics"], serde_json::json!([]));
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["changes_count"], 1, "{plan:#}");
+        assert_eq!(plan["changes"][0]["reference"], "C1", "{plan:#}");
+        assert_eq!(plan["coverage"]["footprints_added"]["planned"], 1);
+        assert_eq!(plan["coverage"]["skipped_footprint"]["planned"], 3);
+        assert_eq!(plan["coverage"]["conflicts"]["planned"], 0);
+        assert_eq!(plan["skipped_footprints"], unusable_vqfn_diagnostics());
+        assert_eq!(plan["diagnostics"], serde_json::json!([]));
     }
 
-    /// A dry run said `ready` for a part whose schematic connects a pad its
-    /// footprint does not have, and the apply then failed its preflight. The
-    /// dry run is where it is refused now, by name.
+    /// With nothing left that can be placed there is nothing to apply, and the
+    /// plan is refused whole, as it was before parts were skipped: the same
+    /// diagnostics, as conflicts.
     #[tokio::test]
-    async fn a_missing_pad_refuses_the_dry_run_through_the_served_dispatch() {
+    async fn a_plan_of_only_unusable_footprints_is_still_refused() {
         let served = ServedSync::new().await;
 
         let refused = served
             .dry_run(&exported_netlist(&[
-                ("C1", STOCK_0603, &["1", "2", "3"]),
-                ("C2", STOCK_0603, &["1", "2"]),
+                ("U1", TEXAS_VQFN, &["1", "2"]),
+                ("U3", GENERIC_VQFN, &["1", "2"]),
+                ("U2", TEXAS_VQFN, &["1", "2"]),
             ]))
             .await;
 
         assert_eq!(refused["status"], "conflict", "{refused:#}");
         assert_eq!(refused["changes"], serde_json::json!([]));
         assert_eq!(refused["coverage"]["footprints_added"]["planned"], 0);
-        let diagnostics = refused["diagnostics"].as_array().unwrap();
-        assert_eq!(diagnostics.len(), 1, "{refused:#}");
-        assert_eq!(diagnostics[0]["code"], "footprint_pad_missing");
-        assert_eq!(diagnostics[0]["reference"], "C1");
-        assert_eq!(diagnostics[0]["references"], serde_json::json!(["C1"]));
-        assert_eq!(diagnostics[0]["footprint_id"], STOCK_0603);
+        assert_eq!(refused["coverage"]["skipped_footprint"]["planned"], 0);
+        assert_eq!(refused["coverage"]["conflicts"]["planned"], 2);
+        assert_eq!(refused["skipped_footprints"], serde_json::json!([]));
+        assert_eq!(refused["diagnostics"], unusable_vqfn_diagnostics());
+    }
+
+    /// A dry run said `ready` for a part whose schematic connects a pad its
+    /// footprint does not have, and the apply then failed its preflight. The
+    /// dry run finds it by name, and that part is skipped: the apply places
+    /// the other part alone and counts the skipped one.
+    #[tokio::test]
+    async fn a_part_missing_a_pad_is_skipped_and_the_rest_applied_through_the_served_dispatch() {
+        let served = ServedSync::new().await;
+        let netlist = exported_netlist(&[
+            ("C1", STOCK_0603, &["1", "2", "3"]),
+            ("C2", STOCK_0603, &["1", "2"]),
+        ]);
+
+        let plan = served.dry_run(&netlist).await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["changes_count"], 1, "{plan:#}");
+        assert_eq!(plan["changes"][0]["reference"], "C2", "{plan:#}");
+        assert_eq!(plan["diagnostics"], serde_json::json!([]), "{plan:#}");
+        let skipped = plan["skipped_footprints"].as_array().unwrap();
+        assert_eq!(skipped.len(), 1, "{plan:#}");
+        assert_eq!(skipped[0]["code"], "footprint_pad_missing");
+        assert_eq!(skipped[0]["reference"], "C1");
+        assert_eq!(skipped[0]["references"], serde_json::json!(["C1"]));
+        assert_eq!(skipped[0]["footprint_id"], STOCK_0603);
         assert_eq!(
-            diagnostics[0]["message"],
+            skipped[0]["message"],
             format!("the schematic connects C1 pad 3, which footprint {STOCK_0603} does not have")
         );
+
+        let applied = served.apply(&netlist).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(
+            applied["coverage"]["skipped_footprint"],
+            serde_json::json!({ "planned": 1, "applied": 1 })
+        );
+        // The apply answer lists the skipped part as the dry run did (#596).
+        assert_eq!(
+            applied["skipped_footprints"], plan["skipped_footprints"],
+            "{applied:#}"
+        );
+        assert_eq!(applied["coverage"]["footprints_added"]["applied"], 1);
+        let sent = served.sent_footprints();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(field_text(&sent[0].reference_field), "C2");
     }
 
     /// A refusal before any plan exists (saved hierarchy, netlist export, IPC
@@ -9280,6 +9720,111 @@ mod tests {
             "the build's own refusal: {plan:#}"
         );
         assert_eq!(served.sent("BeginCommit"), 0);
+    }
+
+    /// R1 to be replaced by `footprint_id`, beside a C1 to be added.
+    fn r1_on_beside_c1(footprint_id: &str) -> String {
+        let netlist = r1_on(footprint_id);
+        let closing = "(pin (num \"2\")))))))\n  (nets";
+        assert!(netlist.contains(closing), "ONE_RESISTOR changed shape");
+        netlist.replace(
+            closing,
+            &format!(
+                "(pin (num \"2\"))))))\n    (comp\n      (ref \"C1\")\n      (value \"100n\")\n      \
+                 (footprint \"{STOCK_0603}\")\n      (sheetpath (names \"/\") (tstamps \"/\"))\n      \
+                 (tstamps \"C1-uuid\")\n      (units (unit (name \"A\") (pins (pin (num \"1\")) \
+                 (pin (num \"2\")))))))\n  (nets"
+            ),
+        )
+    }
+
+    /// A replacement that cannot be built skips its part, not the sync: C1 is
+    /// added beside it, and R1 stays as it was, footprint and value. (KiCad
+    /// keeps the old footprint there and updates the rest of it; the sync
+    /// leaves the whole part to a later run.)
+    #[tokio::test]
+    async fn a_replacement_that_cannot_be_built_skips_only_its_part() {
+        use copperpour_ipc::gen::kiapi::board::types::FootprintInstance;
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![schematic_backed_resistor()],
+            zones: Vec::new(),
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+        let netlist = r1_on_beside_c1(TEXAS_VQFN);
+
+        let plan = served.dry_run(&netlist).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["changes_count"], 1, "{plan:#}");
+        assert_eq!(plan["changes"][0]["reference"], "C1", "{plan:#}");
+        assert_eq!(plan["coverage"]["footprints_updated"]["planned"], 0);
+        assert_eq!(
+            plan["skipped_footprints"][0]["code"], "unsupported_library_footprint",
+            "{plan:#}"
+        );
+        assert_eq!(plan["skipped_footprints"][0]["reference"], "R1");
+
+        served.apply(&netlist).await;
+        let sent = served.sent_footprints();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(field_text(&sent[0].reference_field), "C1");
+        let held =
+            FootprintInstance::decode(served.held.lock().unwrap()[0].value.as_slice()).unwrap();
+        let id = held.definition.as_ref().unwrap().id.clone().unwrap();
+        assert_eq!(id.entry_name, "R_0402");
+        assert_eq!(field_text(&held.value_field), "1k");
+    }
+
+    /// An acknowledged routed pad net change (#38) on a part that is then
+    /// skipped goes with the part: the apply adds C1, leaves R1's pad on its
+    /// net, and runs no post-apply check for a change it did not make. The
+    /// stand-in DRC has no report, so a check that ran would flag the apply.
+    #[tokio::test]
+    async fn an_acknowledged_change_on_a_skipped_part_is_neither_made_nor_checked() {
+        let served = served_r1_under_the_gnd_pour().await;
+        std::fs::remove_file(&served.drc_report).unwrap();
+        let netlist = r1_on_beside_c1(TEXAS_VQFN).replace("(name \"GND\")", "(name \"NEW_NET\")");
+        let refused = served.dry_run(&netlist).await;
+        assert_eq!(refused["status"], "conflict", "{refused:#}");
+        let acknowledged = acknowledging_each(&refused);
+        assert_eq!(
+            acknowledged.as_array().map(Vec::len),
+            Some(1),
+            "{refused:#}"
+        );
+
+        let (_, plan) = served
+            .sync(
+                &netlist,
+                serde_json::json!({ "acknowledged_net_changes": acknowledged }),
+            )
+            .await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["changes_count"], 1, "{plan:#}");
+        assert_eq!(plan["changes"][0]["reference"], "C1", "{plan:#}");
+        assert_eq!(plan["skipped_footprints"][0]["reference"], "R1", "{plan:#}");
+        assert_eq!(plan["diagnostics"], serde_json::json!([]), "{plan:#}");
+
+        let (is_error, applied) = served
+            .sync(
+                &netlist,
+                serde_json::json!({
+                    "dry_run": false,
+                    "expected_plan_revision": plan["plan_revision"],
+                    "acknowledged_net_changes": acknowledged,
+                }),
+            )
+            .await;
+
+        assert!(!is_error, "{applied:#}");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert!(applied.get("routed_copper").is_none(), "{applied:#}");
+        assert!(applied.get("drc").is_none(), "{applied:#}");
+        assert_eq!(applied["skipped_footprints"], plan["skipped_footprints"]);
+        assert_eq!(held_r1_pad_2(&served).as_deref(), Some("GND"));
+        let sent = served.sent_footprints();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(field_text(&sent[0].reference_field), "C1");
     }
 
     /// KiCad's Update PCB leaves a locked footprint's footprint as it is,
@@ -10219,6 +10764,44 @@ mod tests {
 
         assert_refused(&plan, "what an update of R1 would drop is unknown");
         assert_eq!(served.sent("UpdateItems"), 0);
+    }
+
+    /// A board text that cannot be read, or that lacks a footprint the plan
+    /// updates, says nothing about the part: the plan is refused whole, as
+    /// before parts were skipped, and C1's addition beside R1's update is not
+    /// planned alone.
+    #[tokio::test]
+    async fn an_unknown_board_text_refuses_the_whole_plan_not_each_update() {
+        for (board_text, because) in [
+            (
+                "(kicad_pcb (footprint",
+                "what an update of R1 would drop is unknown",
+            ),
+            ("(kicad_pcb (version 20241229))", "R1 ("),
+        ] {
+            let served = ServedSync::holding(HeldBoard {
+                footprints: vec![schematic_backed_resistor()],
+                zones: Vec::new(),
+                nets: vec!["VCC", "GND"],
+            })
+            .await;
+            served.hold_board_text(board_text);
+
+            let plan = served
+                .dry_run(&r1_on_beside_c1("Resistor_SMD:R_0402"))
+                .await;
+
+            assert_refused(&plan, because);
+            assert_eq!(
+                plan["skipped_footprints"],
+                serde_json::json!([]),
+                "{plan:#}"
+            );
+            assert_eq!(
+                plan["coverage"]["footprints_added"]["planned"], 0,
+                "{plan:#}"
+            );
+        }
     }
 
     /// R1 and R2 at 10k on `/Power/`, each on the captured footprint's nets.

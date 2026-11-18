@@ -101,16 +101,19 @@ Follow this sequence for a clean PCB workflow:
    deletes the old Edge.Cuts shapes itself. Take its dimensions from a drawing or the
    user, never from memory.
 2. **Update from schematic** — call `update_pcb_from_schematic` first with
-   `dry_run: true`. Review `status`, `coverage`, `diagnostics`, and staged positions.
-   Apply only with `dry_run: false` and the exact returned
+   `dry_run: true`. Review `status`, `coverage`, `diagnostics`, `skipped_footprints`,
+   and staged positions. Apply only with `dry_run: false` and the exact returned
    `expected_plan_revision` value. The saved schematic hierarchy must be closed in the
    schematic editor, and the target board must be open in KiCad. A conflict is
-   non-mutating; resolve it and rerun the dry run. A diagnostic about a library
-   footprint names that footprint and every part that needs it: when the footprint
-   cannot be placed (custom-shape pads are not supported), assign those parts a
-   footprint without them; when the schematic connects a pad the footprint does not
-   have, fix the symbol or the footprint choice. A successful apply is one KiCad
-   undo entry, so Ctrl-Z reverses the whole update.
+   non-mutating; resolve it and rerun the dry run. A part the sync cannot build is
+   skipped, and every other part is still synced: a `ready` plan lists those parts
+   under `skipped_footprints` (counted in `coverage.skipped_footprint`), and so does
+   the apply. Tell the user which parts were skipped and why, before applying and
+   after. A skipped part stays as it is on the board until its cause is fixed and the
+   sync runs again: when its footprint cannot be placed (custom-shape pads are not
+   supported), assign the part a footprint without them; when the schematic connects
+   a pad the footprint does not have, fix the symbol or the footprint choice. A
+   successful apply is one KiCad undo entry, so Ctrl-Z reverses the whole update.
 3. **Refresh changed libraries** — when a linked footprint library changed, use
    `update_footprints_from_library`, the MCP equivalent of KiCad **Tools → Update
    Footprints from Library**. This is distinct from `update_pcb_from_schematic`:
