@@ -47,9 +47,10 @@ pub(super) fn tool() -> ToolDef {
         "edit_symbol_pin",
         "Set the electrical type, graphic style, name, number, position, angle or length of \
          one pin of an existing library symbol. A pin number found in more than one unit or \
-         body style needs unit or body_style to choose the pin. Everything else, and the rest \
-         of the library, is left as written. Reports each changed part's previous and current \
-         value.",
+         body style needs unit or body_style to choose the pin; pins sharing a number in one \
+         unit and body style are chosen by their current name (pin_name) or connection point \
+         (pin_x, pin_y). Everything else, and the rest of the library, is left as written. \
+         Reports each changed part's previous and current value.",
         json!({
             "type": "object",
             "properties": {
@@ -58,6 +59,9 @@ pub(super) fn tool() -> ToolDef {
                 "pin_number": { "type": "string", "description": "Number of the pin to change, as written in the symbol (for example '1' or 'A3')" },
                 "unit": { "type": "integer", "minimum": 0, "description": "Unit holding the pin; 0 for a pin common to all units" },
                 "body_style": { "type": "integer", "minimum": 0, "description": "Body style holding the pin: 1 for the first, 2 and up for alternates such as De Morgan, 0 for a pin common to all" },
+                "pin_name": { "type": "string", "description": "Current name of the pin to change, to choose between pins that share pin_number in one unit and body style. It only selects the pin; name sets a new name" },
+                "pin_x": { "type": "number", "description": "Current X of the pin's connection point in mm, with pin_y, to choose between pins that share pin_number and name. It only selects the pin; x sets a new position" },
+                "pin_y": { "type": "number", "description": "Current Y of the pin's connection point in mm, with pin_x. It only selects the pin; y sets a new position" },
                 "type": {
                     "type": "string",
                     "enum": ALLOWED_PIN_ELECTRICAL_TYPES,
@@ -98,6 +102,10 @@ struct Request<'a> {
     number: String,
     unit: Option<u32>,
     body_style: Option<u32>,
+    /// The pin's current name, as KiCad reads it, and its current connection
+    /// point in KiCad's units: they choose the pin and change nothing.
+    pin_name: Option<String>,
+    pin_at: Option<(i64, i64)>,
     pin_type: Option<String>,
     style: Option<String>,
     name: Option<String>,
@@ -328,11 +336,24 @@ fn parse_request(args: &serde_json::Value) -> Result<Request<'_>, CallToolResult
             "must be 0, 90, 180 or 270, the directions KiCad reads",
         ));
     }
+    let together = "give pin_x and pin_y together: the pin's current connection point";
+    let pin_at = match (
+        measure_arg(args, "pin_x", f64::NEG_INFINITY)?,
+        measure_arg(args, "pin_y", f64::NEG_INFINITY)?,
+    ) {
+        (Some(x), Some(y)) => Some((x, y)),
+        (None, None) => None,
+        (Some(_), None) => return Err(invalid_arg("pin_y", together)),
+        (None, Some(_)) => return Err(invalid_arg("pin_x", together)),
+    };
     let request = Request {
         symbol: super::require_str(args, "symbol_name")?,
         number: super::require_str(args, "pin_number")?.replace(' ', "_"),
         unit: super::opt_u32(args, "unit")?,
         body_style: super::opt_u32(args, "body_style")?,
+        // As a pin's name is read: a space as '_'.
+        pin_name: opt_string(args, "pin_name")?.map(|name| name.replace(' ', "_")),
+        pin_at,
         pin_type: enum_arg(args, "type", &ALLOWED_PIN_ELECTRICAL_TYPES)?,
         style: enum_arg(args, "style", PIN_STYLES)?,
         // As eeschema's SCH_PIN::SetName and SetNumber store them, so KiCad
@@ -401,6 +422,7 @@ async fn handle_edit_symbol_pin(
         "library_path": path.display().to_string(),
         "symbol": request.symbol,
         "pin_number": request.number,
+        "pin_name": target.name,
         "unit": target.unit,
         "body_style": target.body_style,
         "changes": changes
@@ -579,10 +601,9 @@ fn choose_pin<'p>(
     }
     let places = |pins: &[&Pin]| pins.iter().map(|pin| pin.place()).collect::<Vec<_>>();
     let in_unit = in_place(numbered.clone(), request.unit, |pin| pin.unit);
-    let chosen = in_place(in_unit.clone(), request.body_style, |pin| pin.body_style);
-    match chosen.as_slice() {
-        [pin] => Ok(pin),
-        [] => Err(invalid_arg(
+    let in_style = in_place(in_unit.clone(), request.body_style, |pin| pin.body_style);
+    if in_style.is_empty() {
+        return Err(invalid_arg(
             if in_unit.is_empty() {
                 "unit"
             } else {
@@ -592,16 +613,99 @@ fn choose_pin<'p>(
                 "pin '{number}' of symbol '{symbol}' is in {}",
                 places(&numbered).join(", ")
             ),
-        )),
-        [first, rest @ ..] if rest.iter().all(|pin| pin.place() == first.place()) => Err(unusable(
+        ));
+    }
+    // A pin as the selectors see it: its place, current name and connection point.
+    let described = |pins: &[&Pin]| {
+        pins.iter()
+            .map(|pin| {
+                let mm = |text: &str| units_of(text).map_or(text.to_string(), mm_text);
+                format!(
+                    "{} named '{}' at ({}, {})",
+                    pin.place(),
+                    pin.name,
+                    mm(&pin.x),
+                    mm(&pin.y)
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let named: Vec<&Pin> = match &request.pin_name {
+        Some(name) => in_style
+            .iter()
+            .copied()
+            .filter(|pin| pin.name == *name)
+            .collect(),
+        None => in_style.clone(),
+    };
+    if named.is_empty() {
+        return Err(invalid_arg(
+            "pin_name",
+            &format!(
+                "no pin numbered '{number}' of symbol '{symbol}' is named '{}'; the pins are {}",
+                request.pin_name.as_deref().unwrap_or_default(),
+                described(&in_style).join(", ")
+            ),
+        ));
+    }
+    let chosen: Vec<&Pin> = match request.pin_at {
+        Some((x, y)) => named
+            .iter()
+            .copied()
+            .filter(|pin| units_of(&pin.x) == Some(x) && units_of(&pin.y) == Some(y))
+            .collect(),
+        None => named.clone(),
+    };
+    if chosen.is_empty() {
+        let (x, y) = request.pin_at.unwrap_or_default();
+        return Err(invalid_arg(
+            "pin_x",
+            &format!(
+                "no pin numbered '{number}' of symbol '{symbol}' has its connection point at \
+                 ({}, {}); the pins are {}",
+                mm_text(x),
+                mm_text(y),
+                described(&named).join(", ")
+            ),
+        ));
+    }
+    let one_point = |pins: &[&Pin]| {
+        pins.iter().all(|pin| {
+            pin.place() == pins[0].place()
+                && pin.name == pins[0].name
+                && units_of(&pin.x) == units_of(&pins[0].x)
+                && units_of(&pin.y) == units_of(&pins[0].y)
+        })
+    };
+    match chosen.as_slice() {
+        [pin] => Ok(pin),
+        // Pins that share number, name and connection point: nothing tells them
+        // apart, so they stay refused.
+        [first, ..] if one_point(&chosen) => Err(unusable(
             path,
             &format!(
-                "symbol '{symbol}' has {} pins numbered '{number}' in {}, which \
-                     edit_symbol_pin cannot tell apart",
+                "symbol '{symbol}' has {} pins numbered '{number}' named '{}' at one point in \
+                 {}, which edit_symbol_pin cannot tell apart",
                 chosen.len(),
+                first.name,
                 first.place()
             ),
         )),
+        [first, rest @ ..] if rest.iter().all(|pin| pin.place() == first.place()) => {
+            Err(CallToolResult::error_kind(
+                ToolErrorKind::AmbiguousTarget {
+                    target: number.to_string(),
+                    candidates: described(&chosen),
+                },
+                format!(
+                    "Symbol '{symbol}' has {} pins numbered '{number}' in {}: {}; give pin_name, \
+                     or pin_x and pin_y, to choose one.",
+                    chosen.len(),
+                    first.place(),
+                    described(&chosen).join(", ")
+                ),
+            ))
+        }
         _ => Err(CallToolResult::error_kind(
             ToolErrorKind::AmbiguousTarget {
                 target: number.to_string(),
@@ -1318,19 +1422,209 @@ mod tests {
         assert_ne!(body["is_error"], true, "{body}");
         assert_eq!((&body["unit"], &body["body_style"]), (&json!(2), &json!(1)));
 
+        // Two pins numbered 1 in one place, both unnamed: their connection
+        // points tell them apart (#626).
         let (_dir, path) = library_with(&twice_in_one);
         let body = call(json!({
             "library_path": path, "symbol_name": "74LS00", "pin_number": "1",
             "unit": 1, "body_style": 1, "name": "A"
         }))
         .await;
-        assert_eq!(body["error"]["kind"], "handler_error", "{body}");
+        assert_eq!(body["error"]["kind"], "ambiguous_target", "{body}");
+        assert_eq!(
+            body["error"]["candidates"],
+            json!([
+                "unit 1 body style 1 named '' at (-7.62, 2.54)",
+                "unit 1 body style 1 named '' at (-7.62, -2.54)"
+            ]),
+            "{body}"
+        );
         assert!(
             body.to_string()
-                .contains("has 2 pins numbered '1' in unit 1 body style 1"),
+                .contains("give pin_name, or pin_x and pin_y"),
             "{body}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), twice_in_one);
+
+        let body = call(json!({
+            "library_path": path, "symbol_name": "74LS00", "pin_number": "1",
+            "unit": 1, "body_style": 1, "pin_x": -7.62, "pin_y": -2.54, "new_number": "2"
+        }))
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(
+            body["changes"],
+            json!({"number": {"previous": "1", "current": "2"}}),
+            "{body}"
+        );
+        let written = std::fs::read_to_string(&path).unwrap();
+        let changed = changed_lines(&twice_in_one, &written);
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert_eq!(
+            (changed[0].1.trim(), changed[0].2.trim()),
+            ("(number \"1\"", "(number \"2\"")
+        );
+        let at = pin_line(&twice_in_one, "74LS00_1_1", "1", "at");
+        assert!(
+            changed[0].0 > at,
+            "the second pin numbered 1 is the one renumbered"
+        );
+    }
+
+    /// KiCad's stock `Video` library, read from the installed KiCad as
+    /// [`stock_74xx`] reads its library. Its TDA1950 has two pins numbered 14
+    /// in its one unit, `C` and `+12`, and none numbered 15: the duplicate
+    /// KiCad's symbol checker reports. `None`, and the test skips, without an
+    /// installed KiCad or when the library no longer draws TDA1950 so.
+    fn stock_video() -> Option<String> {
+        let Some(dir) = super::super::symbol_fields::tests::installed_symbol_dir() else {
+            eprintln!("SKIP: no installed KiCad symbol library");
+            return None;
+        };
+        let path = dir.join("Video.kicad_sym");
+        let Ok(library) = std::fs::read_to_string(&path) else {
+            eprintln!("SKIP: {} is not installed", path.display());
+            return None;
+        };
+        let (start, end) = symbol_block(&library, "TDA1950").ok()?;
+        let tda1950 = &library[start..end];
+        if tda1950.matches("(number \"14\"").count() != 2
+            || tda1950.contains("(number \"15\"")
+            || !tda1950.contains("(name \"+12\"")
+        {
+            eprintln!("SKIP: {} no longer draws TDA1950 so", path.display());
+            return None;
+        }
+        Some(library)
+    }
+
+    /// #626: stock TDA1950's two pins numbered 14 differ in name, so
+    /// `pin_name` chooses one. Renumbering `+12` to the free 15 changes that
+    /// number and no other byte, and the answer names the pin chosen.
+    #[tokio::test]
+    async fn a_pin_name_chooses_between_pins_sharing_a_number() {
+        let Some(stock) = stock_video() else { return };
+        let (_dir, path) = library_with(&stock);
+        let body = call(json!({
+            "library_path": path, "symbol_name": "TDA1950", "pin_number": "14",
+            "new_number": "15"
+        }))
+        .await;
+        assert_eq!(body["error"]["kind"], "ambiguous_target", "{body}");
+        assert_eq!(
+            body["error"]["candidates"],
+            json!([
+                "unit 1 body style 1 named 'C' at (12.7, 24.13)",
+                "unit 1 body style 1 named '+12' at (30.48, 13.97)"
+            ]),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), stock);
+
+        let body = call(json!({
+            "library_path": path, "symbol_name": "TDA1950", "pin_number": "14",
+            "pin_name": "+12", "new_number": "15"
+        }))
+        .await;
+
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(body["pin_name"], "+12", "{body}");
+        assert_eq!(
+            body["changes"],
+            json!({"number": {"previous": "14", "current": "15"}}),
+            "{body}"
+        );
+        let written = std::fs::read_to_string(&path).unwrap();
+        let changed = changed_lines(&stock, &written);
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert_eq!(changed[0].1.trim(), "(number \"14\"");
+        assert_eq!(changed[0].2.trim(), "(number \"15\"");
+        let lines: Vec<&str> = stock.lines().collect();
+        let name = lines[..changed[0].0]
+            .iter()
+            .rev()
+            .find(|line| line.trim_start().starts_with("(name "))
+            .unwrap();
+        assert_eq!(name.trim(), "(name \"+12\"", "the renumbered pin is +12");
+    }
+
+    /// Pins that share number, name and connection point stay refused: no
+    /// selector tells them apart (#626).
+    #[tokio::test]
+    async fn pins_at_one_point_with_one_name_stay_refused() {
+        let Some(stock) = stock_74xx() else { return };
+        let twice_in_one = stock.replace("(number \"2\"", "(number \"1\"");
+        // The pin numbered 2 in the stock library is the second pin numbered 1
+        // here; its (at …) line is moved onto the first's. The replacement keeps
+        // every line where it was.
+        let first = pin_line(&stock, "74LS00_1_1", "1", "at");
+        let second = pin_line(&stock, "74LS00_1_1", "2", "at");
+        let lines: Vec<&str> = twice_in_one.lines().collect();
+        let indent = &lines[second][..lines[second].len() - lines[second].trim_start().len()];
+        let one_point = with_line(
+            &twice_in_one,
+            second,
+            &format!("{indent}{}", lines[first].trim()),
+        );
+        let (_dir, path) = library_with(&one_point);
+
+        let body = call(json!({
+            "library_path": path, "symbol_name": "74LS00", "pin_number": "1",
+            "unit": 1, "body_style": 1, "pin_name": "", "new_number": "2"
+        }))
+        .await;
+
+        assert_eq!(body["error"]["kind"], "handler_error", "{body}");
+        assert!(
+            body.to_string()
+                .contains("has 2 pins numbered '1' named '' at one point in unit 1 body style 1"),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), one_point);
+    }
+
+    /// A selector that matches no pin, or a connection point given by half,
+    /// is refused naming its argument, and nothing is written.
+    #[tokio::test]
+    async fn selectors_that_match_no_pin_are_refused() {
+        let Some(stock) = stock_video() else { return };
+        let (_dir, path) = library_with(&stock);
+        for (selectors, field, says) in [
+            (
+                json!({"pin_name": "VCC"}),
+                "pin_name",
+                "no pin numbered '14' of symbol 'TDA1950' is named 'VCC'",
+            ),
+            (
+                json!({"pin_name": "+12", "pin_x": 12.7, "pin_y": 24.13}),
+                "pin_x",
+                "has its connection point at (12.7, 24.13)",
+            ),
+            (
+                json!({"pin_x": 12.7}),
+                "pin_y",
+                "give pin_x and pin_y together",
+            ),
+            (
+                json!({"pin_y": 24.13}),
+                "pin_x",
+                "give pin_x and pin_y together",
+            ),
+        ] {
+            let mut arguments = selectors.clone();
+            arguments["library_path"] = json!(path);
+            arguments["symbol_name"] = json!("TDA1950");
+            arguments["pin_number"] = json!("14");
+            arguments["new_number"] = json!("15");
+            let body = call(arguments).await;
+            assert_eq!(
+                body["error"]["kind"], "invalid_argument",
+                "{selectors}: {body}"
+            );
+            assert_eq!(body["error"]["field"], field, "{selectors}: {body}");
+            assert!(body.to_string().contains(says), "{selectors}: {body}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), stock);
+        }
     }
 
     #[tokio::test]
