@@ -130,7 +130,9 @@ Before creating or wiring a package-sensitive part:
 5. Reconcile three counts: datasheet leads, symbol pins, footprint pads.
    Document any intentional duplicate or mechanical-only pad.
 6. Read the result back with `get_symbol_info` and `get_footprint_info`
-   rather than trusting what you just wrote.
+   rather than trusting what you just wrote. Both read a library file by path
+   (`library_path` and `symbol_name`, or a `.kicad_mod` path), so the library
+   need not be registered yet.
 7. **Refuse to use the part in a real schematic** while any mirror,
    reversal, duplicate, missing lead or view ambiguity is unresolved.
 
@@ -245,8 +247,9 @@ set_symbol_properties(
 It changes only the fields you pass. An empty `keywords` or `fp_filters`
 removes that property.
 `rename_fields={"MANUFACTURER": "Manufacturer"}` renames a custom field in place,
-keeping its value and layout, `remove_fields=["LCSC"]` deletes one, and `value`
-sets the Value field.
+keeping its value and layout, `remove_fields=["LCSC"]` deletes one, `value`
+sets the Value field, `datasheet` the Datasheet field, and `reference_prefix` the
+Reference field.
 
 ### Symbol Layout Guidelines
 

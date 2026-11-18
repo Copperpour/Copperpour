@@ -418,7 +418,7 @@ and Windows servers do not.
 | `list_footprint_libraries` | List all registered footprint libraries (global and/or project). |
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library, with optional footprint, description, keywords, footprint filters and custom fields. |
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
-| `set_symbol_properties` | Set the Value, Footprint, Description, keywords, footprint filters or custom fields of an existing library symbol, or rename or remove its custom fields, with a revision-checked write, reporting each field's previous and current value. Empty keywords or filters remove their property. |
+| `set_symbol_properties` | Set the Reference prefix, Value, Footprint, Datasheet, Description, keywords, footprint filters or custom fields of an existing library symbol, or rename or remove its custom fields, with a revision-checked write, reporting each field's previous and current value. Empty keywords or filters remove their property. |
 | `edit_symbol_pin` | Set the electrical type, graphic style, name, number, position, angle or length of one pin of an existing library symbol, chosen by number, by unit or body style where the number is in more than one, and by its current name or connection point where it shares a number in one place, refusing a number KiCad's symbol checker would call a duplicate, with a revision-checked write, reporting each changed part's previous and current value. |
 | `list_symbols_in_library` | List symbol names in a `.kicad_sym` file, up to `limit` (default 100), with full `count` and `shown`/`truncated`. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |
@@ -428,7 +428,7 @@ and Windows servers do not.
 | `get_footprint_info` | Return detailed information about a footprint. Set `include_graphics` (and optionally `graphics_layer`) to inspect supported top-level primitives, geometry, stroke, fill, and item IDs. |
 | `search_footprints` | Search registered footprint libraries by name, up to `limit` (default 50); `count`/`shown` count returned matches and `truncated` identifies an additional match. |
 | `search_3d_models` | Search KiCad's bundled `3dmodels` directory and/or a project's `3dmodels/` folder for `.step`, `.stp`, `.stpz`, `.stp.gz`, `.step.gz`, `.igs`, `.iges`, `.wrl`, `.wrz`, `.x3d`, `.idf`, and `.emn` files by substring, returning KiCad variable paths (`${KICAD*_3DMODEL_DIR}/...` or `${KIPRJMOD}/3dmodels/...`) and resolved paths up to `limit` (default 50). |
-| `get_symbol_info` | Return detailed information about a schematic symbol: pins, properties, description. |
+| `get_symbol_info` | Return detailed information about a schematic symbol: pins, properties, description. Name it by `lib_id` through the library tables, or by `library_path` and `symbol_name` in a `.kicad_sym` file, registered or not. |
 
 ---
 
