@@ -1168,9 +1168,36 @@ pub(crate) fn reserved_on_other_sheets(
     project: &str,
 ) -> (Reserved, Vec<String>, Vec<String>) {
     let mut reserved = Reserved::new();
+    let (placements, consulted, unreadable) =
+        placements_on_other_sheets([root.to_path_buf()], target);
+    for (_, symbol) in &placements {
+        for entry in symbol.paths.iter().filter(|p| p.project == project) {
+            let designator = parse_designator(&entry.reference);
+            if let Some(number) = designator.number {
+                reserved
+                    .entry(designator.prefix)
+                    .or_default()
+                    .insert(number);
+            }
+        }
+    }
+    (reserved, consulted, unreadable)
+}
+
+/// Placed symbols, each with the file it is on.
+type SheetPlacements = Vec<(String, PlacedSymbol)>;
+
+/// Every placed symbol on the sheets of the trees under `roots` except
+/// `target` itself, each file read once, plus the files consulted and those
+/// that could not be read.
+fn placements_on_other_sheets(
+    roots: impl IntoIterator<Item = std::path::PathBuf>,
+    target: &Path,
+) -> (SheetPlacements, Vec<String>, Vec<String>) {
+    let mut placements = Vec::new();
     let mut consulted = Vec::new();
     let mut unreadable = Vec::new();
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut stack: Vec<_> = roots.into_iter().map(|root| (root, 0usize)).collect();
     let mut seen: BTreeSet<std::path::PathBuf> = BTreeSet::new();
     let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let target_canonical = canonical(target);
@@ -1205,20 +1232,157 @@ pub(crate) fn reserved_on_other_sheets(
             unreadable.push(file.display().to_string());
             continue;
         };
-        consulted.push(file.display().to_string());
-        for symbol in &symbols {
-            for entry in symbol.paths.iter().filter(|p| p.project == project) {
-                let designator = parse_designator(&entry.reference);
-                if let Some(number) = designator.number {
-                    reserved
-                        .entry(designator.prefix)
-                        .or_default()
-                        .insert(number);
-                }
+        let name = file.display().to_string();
+        consulted.push(name.clone());
+        placements.extend(symbols.into_iter().map(|symbol| (name.clone(), symbol)));
+    }
+    (placements, consulted, unreadable)
+}
+
+/// The numbered designators a placement may not take: those the project's
+/// placements already hold, on the sheet it joins and on every other sheet of
+/// the hierarchy that owns it.
+///
+/// eeschema's annotation check reports two placements of one designator as
+/// duplicate items unless they are distinct units of one multi-unit part
+/// (`SCH_REFERENCE_LIST::CheckAnnotation`, `eeschema/sch_reference_list.cpp`
+/// 681-740 at 10.0.6). A placement may join a designator only when it and the
+/// placements holding it are one package by [`package_identity`], the rule by
+/// which this annotator keeps a designator. The other sheets are read once, at
+/// the first numbered designator a call places, as `add_power_symbol` reads
+/// them for its numbers; a sheet no project owns is checked against itself.
+pub(crate) struct DesignatorsInUse {
+    schematic: std::path::PathBuf,
+    project: String,
+    /// The argument that named the designator, which a refusal names.
+    argument: &'static str,
+    /// The other sheets' placements, and the files that could not be read.
+    other_sheets: Option<(SheetPlacements, Vec<String>)>,
+}
+
+impl DesignatorsInUse {
+    pub(crate) fn new(schematic: &Path, project: &str, argument: &'static str) -> Self {
+        Self {
+            schematic: schematic.to_path_buf(),
+            project: project.to_string(),
+            argument,
+            other_sheets: None,
+        }
+    }
+
+    /// Refuse a placement of `lib_id` unit `unit` under `reference` when the
+    /// designator is numbered and a placement holds it that the new one would
+    /// not be another unit of. `sheet` is the schematic the placement joins,
+    /// with the library definition embedded and the call's earlier placements
+    /// in it.
+    pub(crate) fn check(
+        &mut self,
+        sheet: &copperpour_schematic_editor::Schematic,
+        lib_id: &str,
+        unit: u32,
+        value: &str,
+        reference: &str,
+    ) -> Result<(), CallToolResult> {
+        if parse_designator(reference).number.is_none() {
+            return Ok(());
+        }
+        let tree = parse_sexp(&sheet.to_source()).map_err(|error| {
+            CallToolResult::error(format!(
+                "the schematic could not be read for its designators: {error}"
+            ))
+        })?;
+        let own = placed_symbols(&tree).map_err(|error| {
+            CallToolResult::error(format!(
+                "the schematic could not be read for its designators: {error}"
+            ))
+        })?;
+        let (others, _) =
+            self.other_sheets.get_or_insert_with(
+                || match crate::tools::resolve_schematic_ownership(&self.schematic) {
+                    Ok(Some(ownership)) => {
+                        let roots = ownership
+                            .top_level_sheets
+                            .iter()
+                            .map(|top_level| top_level.schematic.clone());
+                        let (placements, _, unreadable) =
+                            placements_on_other_sheets(roots, &self.schematic);
+                        (placements, unreadable)
+                    }
+                    _ => (Vec::new(), Vec::new()),
+                },
+            );
+        let file = self.schematic.display().to_string();
+        // A placement holds the designator once, however many of its instance
+        // records carry it: on a sheet placed more than once each does.
+        let holders: Vec<(&str, &PlacedSymbol)> = own
+            .iter()
+            .map(|symbol| (file.as_str(), symbol))
+            .chain(others.iter().map(|(file, symbol)| (file.as_str(), symbol)))
+            .filter(|(_, symbol)| {
+                symbol
+                    .paths
+                    .iter()
+                    .any(|entry| entry.project == self.project && entry.reference == reference)
+            })
+            .collect();
+        if holders.is_empty() {
+            return Ok(());
+        }
+        let candidate = PlacedSymbol {
+            uuid: String::new(),
+            lib_symbol: lib_id.to_string(),
+            lib_item: lib_id
+                .split_once(':')
+                .map_or(lib_id, |(_, item)| item)
+                .to_string(),
+            unit,
+            unit_count: lib_symbol_units(&tree).get(lib_id).copied(),
+            value: value.to_string(),
+            x: 0.0,
+            y: 0.0,
+            property_reference: reference.to_string(),
+            paths: Vec::new(),
+        };
+        let mut members: Vec<&PlacedSymbol> = holders.iter().map(|(_, symbol)| *symbol).collect();
+        members.push(&candidate);
+        if package_identity(&members) == Identity::OnePackage {
+            return Ok(());
+        }
+        let held = crate::tools::join_bounded(&holders, 3, |(file, symbol)| {
+            format!(
+                "{} unit {} value '{}' at ({}, {}) in {file}",
+                symbol.lib_symbol, symbol.unit, symbol.value, symbol.x, symbol.y
+            )
+        });
+        let remedy = match self.argument {
+            "reference" => format!(
+                "Omit reference to place it as '{}?' for annotate_schematic to number",
+                parse_designator(reference).prefix
+            ),
+            argument => format!(
+                "Give a {argument} whose designators no placement holds; left out, it is one \
+                 above the highest number on this sheet alone"
+            ),
+        };
+        Err(crate::tools::invalid_arg(
+            self.argument,
+            &format!(
+                "'{reference}' is already placed: {held}. Only another unit of that multi-unit \
+                 part, with its value, may share it, and {lib_id} unit {unit} value '{value}' is \
+                 not one. {remedy}"
+            ),
+        ))
+    }
+
+    /// Name the sheet files whose designators could not be read, in
+    /// `annotate_schematic`'s key, when there are any.
+    pub(crate) fn disclose(&self, reply: &mut Value) {
+        if let Some((_, unreadable)) = &self.other_sheets {
+            if !unreadable.is_empty() {
+                reply["other_sheets_unreadable"] = json!(unreadable);
             }
         }
     }
-    (reserved, consulted, unreadable)
 }
 
 fn parse_file(path: &Path, content: &str) -> Result<Vec<PlacedSymbol>, String> {

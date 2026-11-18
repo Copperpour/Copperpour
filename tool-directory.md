@@ -100,7 +100,7 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid, copies the library Value and Footprint unless explicitly overridden, preserves every saved hierarchy instance, and reports committed-file readback. Refuses stale instance metadata before writing. |
+| `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid, copies the library Value and Footprint unless explicitly overridden, preserves every saved hierarchy instance, and reports committed-file readback. Refuses stale instance metadata, and a numbered reference another placement in the hierarchy holds, before writing. |
 | `delete_schematic_component` | Remove a component and all of its placed units by reference designator. |
 | `edit_schematic_component` | Update or remove shared fields, and set KiCad's native `dnp`, `in_bom` and `on_board` flags, consistently across every placed unit of a component, and move or hide any field's text. |
 | `get_schematic_component` | Get shared properties, the `dnp` state and every placed unit's position for a component. |
@@ -201,7 +201,7 @@ and Windows servers do not.
 | `get_schematic_layout` | Return component positions and transformed drawing/pin bounds (excluding free text), reporting unresolved geometry; optionally include wires and labels. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
-| `batch_place_components` | Place multiple symbols from KiCAD libraries in one write with committed-file readback. Copies each library Value and Footprint unless that entry explicitly overrides it, preserves every saved hierarchy instance, and preflights stale metadata before any placement. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
+| `batch_place_components` | Place multiple symbols from KiCAD libraries in one write with committed-file readback. Copies each library Value and Footprint unless that entry explicitly overrides it, preserves every saved hierarchy instance, and preflights stale metadata before any placement. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. An entry under a numbered reference already held is refused, and the others are placed. |
 | `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. A pair whose route would join another net is skipped and listed in `errors`. |
 
 ### `sch_export` · 11 tools

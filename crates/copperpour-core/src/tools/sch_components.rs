@@ -81,7 +81,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "y": { "type": "number", "description": "Y position in mm" },
                     "rotation": { "type": "number", "description": "Rotation in degrees (0/90/180/270)", "default": 0 },
                     "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric." },
-                    "reference": { "type": "string", "description": "Optional reference designator. Default: the library prefix plus '?' (e.g. 'R?', '#FLG?'), which annotate_schematic numbers" },
+                    "reference": { "type": "string", "description": "Optional reference designator. Default: the library prefix plus '?' (e.g. 'R?', '#FLG?'), which annotate_schematic numbers. A numbered one already placed on any sheet of the hierarchy is refused as invalid_argument, unless this is another unit of that part with its value" },
                     "value": { "type": "string", "description": "Optional override for the library symbol's Value" },
                     "footprint": { "type": "string", "description": "Optional override for the library symbol's Footprint" },
                     "unit": { "type": "integer", "minimum": 1, "description": "Unit number for multi-unit symbols (gate/part selection). Default 1.", "default": 1 },
@@ -587,6 +587,8 @@ pub(crate) async fn handle_add_schematic_component(
         fields,
         catalog: Some(&catalog),
     };
+    let mut in_use =
+        super::sch_annotate::DesignatorsInUse::new(&sch_path, &context.project_name, "reference");
 
     let placed = match place_one_component(
         &mut sch,
@@ -603,6 +605,7 @@ pub(crate) async fn handle_add_schematic_component(
         unit,
         &source,
         extras,
+        &mut in_use,
     ) {
         Ok(placed) => placed,
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
@@ -735,6 +738,7 @@ pub(crate) async fn handle_add_schematic_component(
     if let Some(report) = &placed.lcsc_catalog {
         result["lcsc_catalog"] = report.clone();
     }
+    in_use.disclose(&mut result);
 
     Ok(crate::outcome::attach(
         CallToolResult::json(&result),
@@ -829,6 +833,7 @@ pub(crate) fn place_one_component(
     unit: u32,
     src: &dyn cse::library::SymbolLibrarySource,
     extras: ComponentPlacementExtras<'_>,
+    in_use: &mut super::sch_annotate::DesignatorsInUse,
 ) -> Result<PlacedComponent, CallToolResult> {
     // Snap to 1.27mm grid
     let (x, y) = snap_point(x, y, 1.27);
@@ -857,6 +862,7 @@ pub(crate) fn place_one_component(
             unit, lib_id, unit_count, unit_count
         )));
     }
+    in_use.check(sch, lib_id, unit, &fields.value, &reference)?;
 
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(lib_id, x, y);
@@ -6201,6 +6207,62 @@ mod tests {
         );
     }
 
+    /// The units of one multi-unit part share its designator. A unit already
+    /// placed, another value or another part under it is refused, and nothing
+    /// is written.
+    #[tokio::test]
+    async fn only_another_unit_of_the_part_with_its_value_joins_a_designator() {
+        let (dir, _env) = stub_symbol_dir();
+        let path = dir.path().join("units.kicad_sch");
+        let ctx = test_ctx();
+
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        for (unit, x) in [(1, 100.0), (2, 150.0)] {
+            let placed = handle_add_schematic_component(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "lib_id": "Device:OPAMP_DUAL",
+                    "x": x, "y": 80.0,
+                    "reference": "U1",
+                    "unit": unit
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!placed.is_error, "unit {unit}: {}", content_text(&placed));
+        }
+        let before = std::fs::read_to_string(&path).unwrap();
+        for (lib_id, unit, value) in [
+            ("Device:OPAMP_DUAL", 2, None),
+            ("Device:OPAMP_DUAL", 3, Some("LM358")),
+            ("Device:R", 1, None),
+        ] {
+            let mut args = json!({
+                "schematic": path.display().to_string(),
+                "lib_id": lib_id,
+                "x": 200.0, "y": 80.0,
+                "reference": "U1",
+                "unit": unit
+            });
+            if let Some(value) = value {
+                args["value"] = json!(value);
+            }
+            let refused = handle_add_schematic_component(&args, &ctx).await.unwrap();
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&refused).as_deref(),
+                Some("invalid_argument"),
+                "{lib_id} unit {unit}: {}",
+                content_text(&refused)
+            );
+            let body: serde_json::Value = serde_json::from_str(&content_text(&refused)).unwrap();
+            assert_eq!(body["error"]["field"], "reference");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
     #[tokio::test]
     async fn pin_locations_are_unit_aware() {
         // The #35 repro: an LM2904-style dual op-amp placed as unit 1 and as
@@ -9435,10 +9497,11 @@ mod multi_unit_component_tests {
         }
     }
 
-    /// `add_schematic_component` can write a second placement of a unit that
-    /// is already placed, a state KiCad reports as duplicate items. A move
-    /// that names that unit is refused as an ambiguous target, as every
-    /// component edit refuses it, and writes nothing.
+    /// A second placement of a unit that is already placed, a state KiCad
+    /// reports as duplicate items, placed unannotated and renamed, since a
+    /// placement under the designator is refused. A move that names that unit
+    /// is refused as an ambiguous target, as every component edit refuses it,
+    /// and writes nothing.
     #[tokio::test]
     async fn move_with_a_unit_on_two_placements_is_ambiguous_and_writes_nothing() {
         let (_directory, path) = eeschema_placement_fixture();
@@ -9448,7 +9511,6 @@ mod multi_unit_component_tests {
                 "lib_id": "ecc83-pp:ECC83",
                 "x": 101.6,
                 "y": 25.4,
-                "reference": "U1",
                 "unit": 1
             }),
             &context(),
@@ -9456,6 +9518,13 @@ mod multi_unit_component_tests {
         .await
         .unwrap();
         assert!(!placed.is_error, "{placed:?}");
+        let renamed = handle_edit_schematic_component(
+            &json!({ "schematic": path, "reference": "U?", "new_reference": "U1" }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!renamed.is_error, "{renamed:?}");
         let before = std::fs::read_to_string(&path).unwrap();
         let result = handle_move_schematic_component(
             &json!({
@@ -11355,6 +11424,236 @@ mod multi_unit_component_tests {
             .as_str()
             .unwrap()
             .contains("may have changed"));
+    }
+}
+
+/// A placement under a numbered designator that another placement of the
+/// project holds is refused before anything is written, unless it is another
+/// unit of that multi-unit part, as eeschema's annotation check reports it
+/// (`eeschema/sch_reference_list.cpp` 681-740 at 10.0.6). Every call is served
+/// through `tools/call` on KiCad-saved fixtures: `ecc83_multiunit.kicad_sch`,
+/// whose `R1` is a 1.5K, and the `annotate_nested_hierarchy` project (see its
+/// README), whose `bank.kicad_sch` holds `R10` and whose `cell.kicad_sch` holds
+/// `R13`. The units of a multi-unit part are in
+/// `only_another_unit_of_the_part_with_its_value_joins_a_designator`, which
+/// needs a library that resolves their count.
+#[cfg(test)]
+mod designator_in_use_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::path::Path;
+
+    const ECC83: &str = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+    const NESTED_PRO: &str =
+        include_str!("../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_pro");
+    const NESTED_ROOT: &str =
+        include_str!("../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_sch");
+    const NESTED_BANK: &str =
+        include_str!("../../tests/fixtures/annotate_nested_hierarchy/bank.kicad_sch");
+    const NESTED_CELL: &str =
+        include_str!("../../tests/fixtures/annotate_nested_hierarchy/cell.kicad_sch");
+
+    /// Lay fixture files out in a fresh directory, as KiCad saved them.
+    fn lay_out(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content) in files {
+            std::fs::write(dir.path().join(name), content).unwrap();
+        }
+        dir
+    }
+
+    fn ecc83() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = lay_out(&[("ecc83-pp.kicad_sch", ECC83)]);
+        let path = dir.path().join("ecc83-pp.kicad_sch");
+        (dir, path)
+    }
+
+    fn nested() -> tempfile::TempDir {
+        lay_out(&[
+            ("nested_pages.kicad_pro", NESTED_PRO),
+            ("nested_pages.kicad_sch", NESTED_ROOT),
+            ("bank.kicad_sch", NESTED_BANK),
+            ("cell.kicad_sch", NESTED_CELL),
+        ])
+    }
+
+    /// One `tools/call` through the served dispatch: the JSON body, with
+    /// `is_error` from the result.
+    async fn serve(tool: &str, path: &Path, mut arguments: serde_json::Value) -> serde_json::Value {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+        arguments["schematic"] = json!(path.display().to_string());
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        let mut body: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        body["is_error"] = json!(result["isError"] == json!(true));
+        body
+    }
+
+    async fn place(
+        path: &Path,
+        lib_id: &str,
+        reference: &str,
+        unit: u32,
+        x: f64,
+    ) -> serde_json::Value {
+        serve(
+            "add_schematic_component",
+            path,
+            json!({"lib_id": lib_id, "reference": reference, "unit": unit, "x": x, "y": 25.4}),
+        )
+        .await
+    }
+
+    fn refused_on(body: &serde_json::Value, field: &str) -> String {
+        assert_eq!(body["is_error"], json!(true), "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], field, "{body}");
+        body["error"]["reason"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_designator_on_the_sheet_is_refused_and_nothing_is_written() {
+        let (_dir, path) = ecc83();
+        let before = std::fs::read(&path).unwrap();
+        let reason = refused_on(
+            &place(&path, "ecc83-pp:R", "R1", 1, 101.6).await,
+            "reference",
+        );
+        assert!(
+            reason.contains("'R1' is already placed: ecc83-pp:R unit 1 value '1.5K'"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("Omit reference to place it as 'R?'"),
+            "{reason}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// `R?` is what `annotate_schematic` numbers; it never meets the check.
+    #[tokio::test]
+    async fn an_unannotated_designator_is_never_refused() {
+        let (_dir, path) = ecc83();
+        for x in [101.6, 127.0] {
+            let placed = serve(
+                "add_schematic_component",
+                &path,
+                json!({"lib_id": "ecc83-pp:R", "x": x, "y": 25.4}),
+            )
+            .await;
+            assert_eq!(placed["is_error"], json!(false), "{placed}");
+        }
+        let sch = cse::Schematic::load(&path).unwrap();
+        let unannotated = sch.symbols.iter().filter(|s| s.reference() == Some("R?"));
+        assert_eq!(unannotated.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_designator_held_on_another_sheet_is_refused_and_names_it() {
+        let dir = nested();
+        let root = dir.path().join("nested_pages.kicad_sch");
+        let before = std::fs::read(&root).unwrap();
+        for (reference, holder) in [("R10", "bank.kicad_sch"), ("R13", "cell.kicad_sch")] {
+            let reason = refused_on(
+                &place(&root, "Device:R", reference, 1, 25.4).await,
+                "reference",
+            );
+            assert!(reason.contains(holder), "{reason}");
+        }
+        assert_eq!(std::fs::read(&root).unwrap(), before);
+        let placed = place(&root, "Device:R", "R17", 1, 25.4).await;
+        assert_eq!(placed["is_error"], json!(false), "{placed}");
+        assert!(placed.get("other_sheets_unreadable").is_none(), "{placed}");
+    }
+
+    /// `bank.kicad_sch` is placed twice, so a placement on it carries its
+    /// designator in both instance records; it holds the designator once.
+    #[tokio::test]
+    async fn a_placement_on_a_sheet_placed_twice_holds_its_designator_once() {
+        let dir = nested();
+        let bank = dir.path().join("bank.kicad_sch");
+        let placed = place(&bank, "Device:R", "R17", 1, 25.4).await;
+        assert_eq!(placed["is_error"], json!(false), "{placed}");
+        let reason = refused_on(&place(&bank, "Device:R", "R17", 1, 50.8).await, "reference");
+        assert_eq!(reason.matches("bank.kicad_sch").count(), 1, "{reason}");
+    }
+
+    /// A sheet file that cannot be read is named, its designators unseen; an
+    /// unannotated placement reads no other sheet.
+    #[tokio::test]
+    async fn an_unreadable_sheet_is_named_in_the_reply() {
+        let dir = nested();
+        let root = dir.path().join("nested_pages.kicad_sch");
+        std::fs::remove_file(dir.path().join("cell.kicad_sch")).unwrap();
+        let placed = place(&root, "Device:R", "R13", 1, 25.4).await;
+        assert_eq!(placed["is_error"], json!(false), "{placed}");
+        let unreadable = placed["other_sheets_unreadable"].as_array().unwrap();
+        assert_eq!(unreadable.len(), 1, "{placed}");
+        assert!(
+            unreadable[0].as_str().unwrap().ends_with("cell.kicad_sch"),
+            "{placed}"
+        );
+        let unannotated = serve(
+            "add_schematic_component",
+            &root,
+            json!({"lib_id": "Device:R", "x": 50.8, "y": 25.4}),
+        )
+        .await;
+        assert_eq!(unannotated["is_error"], json!(false), "{unannotated}");
+        assert!(
+            unannotated.get("other_sheets_unreadable").is_none(),
+            "{unannotated}"
+        );
+    }
+
+    /// An earlier item of the same batch holds its designator too.
+    #[tokio::test]
+    async fn a_batch_refuses_only_its_items_under_a_designator_in_use() {
+        let (_dir, path) = ecc83();
+        let body = serve(
+            "batch_place_components",
+            &path,
+            json!({"components": [
+                {"lib_id": "ecc83-pp:R", "reference": "R1", "x": 101.6, "y": 25.4},
+                {"lib_id": "ecc83-pp:R", "reference": "R20", "x": 127.0, "y": 25.4},
+                {"lib_id": "ecc83-pp:R", "reference": "R20", "x": 152.4, "y": 25.4}
+            ]}),
+        )
+        .await;
+        assert_eq!(body["placed_count"], 1, "{body}");
+        let failures: Vec<(u64, &str)> = body["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| (f["index"].as_u64().unwrap(), f["kind"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            failures,
+            [(0, "invalid_argument"), (2, "invalid_argument")],
+            "{body}"
+        );
+        let sch = cse::Schematic::load(&path).unwrap();
+        for (reference, count) in [("R1", 1), ("R20", 1)] {
+            let placed = sch
+                .symbols
+                .iter()
+                .filter(|s| s.reference() == Some(reference));
+            assert_eq!(placed.count(), count, "{reference}");
+        }
     }
 }
 
