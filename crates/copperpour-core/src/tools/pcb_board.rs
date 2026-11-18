@@ -4043,6 +4043,7 @@ pub(crate) mod board_mock {
                             || (wants(Kot::KotPcbArc) && any_is(item, "kiapi.board.types.Arc"))
                             || (wants(Kot::KotPcbFootprint)
                                 && any_is(item, "kiapi.board.types.FootprintInstance"))
+                            || (wants(Kot::KotPcbGroup) && any_is(item, "kiapi.board.types.Group"))
                     })
                     .cloned()
                     .collect();

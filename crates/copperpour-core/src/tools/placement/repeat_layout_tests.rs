@@ -782,9 +782,20 @@ const ROUTED: &str = "repeat_layout_routing_kicad10.kicad_pcb";
 /// OUT, and R10 pad 2 and R11 pad 1 on Channel 3's MID (README).
 const ROUTED_MISMATCH: &str = "repeat_layout_routing_mismatch_kicad10.kicad_pcb";
 
-/// Channel 2's MID stub and OUT track, which the copies replace.
+/// Channel 2's MID stub, OUT track and IN stub, in its area, which the copies
+/// replace.
 const MID_STUB: &str = "08cf5053-ed54-4206-b23a-3d693ed67fa3";
 const OUT_TRACK: &str = "6c43e0b0-05cb-4524-9a73-d44fe83ec0b8";
+const IN_STUB: &str = "83f7bbfe-51d3-426c-9c8e-3125fda56377";
+
+/// The routed board with routing on nets Channel 1 shares, a VCC track, R4
+/// grouped with a rectangle on Dwgs.User, and GND vias (README).
+const AREA: &str = "repeat_layout_area_kicad10.kicad_pcb";
+/// KiCad's own box of every item of the area board, which holds every item of
+/// the routed board under its uuid there (README).
+const BOXES: &str = "repeat_layout_area_kicad10.boxes.tsv";
+/// The area board's GND via inside Channel 2's area.
+const CHANNEL_2_VIA: &str = "71cf95d9-e20c-4b21-b757-6f5468516b03";
 
 /// Channel 3's footprints where pcbnew 10.0.6 puts them with R9 at 45°.
 const CHANNEL_3_AT_45: [Placed; 3] = [
@@ -917,8 +928,92 @@ const COPIES: [Copy; 14] = [
     ),
 ];
 
+/// pcbnew's copies of the area board's routing on nets Channel 1 shares, and
+/// on VCC, which no pad of it is on, onto Channels 2 and 3: three GND vias,
+/// the GND track, the VCC track and the IN stub each.
+const AREA_COPIES: [Copy; 12] = [
+    ("via", "GND", "F.Cu", false, &[(142_800_000, 94_400_000)]),
+    ("via", "GND", "F.Cu", false, &[(141_500_000, 100_500_000)]),
+    ("via", "GND", "F.Cu", false, &[(141_000_000, 95_600_000)]),
+    (
+        "segment",
+        "GND",
+        "B.Cu",
+        false,
+        &[(142_500_000, 100_500_000), (141_500_000, 100_500_000)],
+    ),
+    (
+        "segment",
+        "VCC",
+        "F.Cu",
+        false,
+        &[(141_600_000, 99_000_000), (142_000_000, 99_000_000)],
+    ),
+    (
+        "segment",
+        "/Channel 2/IN",
+        "F.Cu",
+        false,
+        &[(140_000_000, 100_500_000), (140_800_000, 100_500_000)],
+    ),
+    ("via", "GND", "F.Cu", false, &[(166_439_697, 118_270_101)]),
+    ("via", "GND", "F.Cu", false, &[(161_207_107, 121_664_214)]),
+    ("via", "GND", "F.Cu", false, &[(164_318_377, 117_845_837)]),
+    (
+        "segment",
+        "GND",
+        "B.Cu",
+        false,
+        &[(161_914_214, 122_371_321), (161_207_107, 121_664_214)],
+    ),
+    (
+        "segment",
+        "VCC",
+        "F.Cu",
+        false,
+        &[(162_338_478, 120_674_264), (162_621_320, 120_957_107)],
+    ),
+    (
+        "segment",
+        "/Channel 3/IN",
+        "F.Cu",
+        false,
+        &[(160_146_447, 120_603_554), (160_712_132, 121_169_239)],
+    ),
+];
+
+/// Every copy the area board takes: the routed board's and [`AREA_COPIES`].
+fn expected_area_copies() -> Vec<Routed> {
+    let mut copies = expected_copies();
+    copies.extend(routed_copies(&AREA_COPIES));
+    copies.sort();
+    copies
+}
+
+/// KiCad's own box of each item of the area board, by uuid, as `(left, top,
+/// right, bottom)` in nm.
+fn kicad_boxes() -> BTreeMap<String, (i64, i64, i64, i64)> {
+    std::fs::read_to_string(Path::new(FIXTURE_DIR).join(BOXES))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            let nm = |index: usize| fields[index].parse::<i64>().unwrap();
+            let (x, y) = (nm(1), nm(2));
+            (fields[0].to_string(), (x, y, x + nm(3), y + nm(4)))
+        })
+        .collect()
+}
+
 fn expected_copies() -> Vec<Routed> {
-    let mut copies: Vec<Routed> = COPIES
+    let mut copies = routed_copies(&COPIES);
+    copies.sort();
+    copies
+}
+
+fn routed_copies(table: &[Copy]) -> Vec<Routed> {
+    table
         .iter()
         .map(|(kind, net, layer, locked, points)| {
             let width = if *kind == "via" { 600_000 } else { 200_000 };
@@ -931,9 +1026,7 @@ fn expected_copies() -> Vec<Routed> {
                 width,
             )
         })
-        .collect();
-    copies.sort();
-    copies
+        .collect()
 }
 
 /// Each top-level track, arc and via of a board's text, by uuid.
@@ -1014,12 +1107,12 @@ fn reported(body: &Value) -> Value {
 fn routing_report() -> Value {
     json!({
         "copied_count": 14,
-        "removed_count": 2,
+        "removed_count": 3,
         "targets": [
             {
                 "target_reference": "R5",
                 "copied_count": 7,
-                "removed_count": 2,
+                "removed_count": 3,
                 "nets": { "/Channel 1/MID": "/Channel 2/MID", "/Channel 1/OUT": "/Channel 2/OUT" },
             },
             {
@@ -1032,8 +1125,28 @@ fn routing_report() -> Value {
     })
 }
 
+fn area_report() -> Value {
+    let nets = |channel: &str| {
+        json!({
+            "/Channel 1/IN": format!("/Channel {channel}/IN"),
+            "/Channel 1/MID": format!("/Channel {channel}/MID"),
+            "/Channel 1/OUT": format!("/Channel {channel}/OUT"),
+            "GND": "GND",
+            "VCC": "VCC",
+        })
+    };
+    json!({
+        "copied_count": 26,
+        "removed_count": 4,
+        "targets": [
+            { "target_reference": "R5", "copied_count": 13, "removed_count": 4, "nets": nets("2") },
+            { "target_reference": "R9", "copied_count": 13, "removed_count": 0, "nets": nets("3") },
+        ],
+    })
+}
+
 #[tokio::test]
-async fn routing_on_the_references_own_nets_is_copied_where_kicad_puts_it() {
+async fn routing_in_the_references_area_is_copied_where_kicad_puts_it() {
     let board = Board::new(ROUTED);
     let (is_error, body) = call(&board, json!({ "anchor_reference": "R1" })).await;
     assert!(!is_error, "{body:#}");
@@ -1044,25 +1157,197 @@ async fn routing_on_the_references_own_nets_is_copied_where_kicad_puts_it() {
         expected(&[&CHANNEL_2, &CHANNEL_3_AT_45])
     );
     let (before, after) = (routing(&board.original), routing(&after));
-    // Channel 1's IN and GND reach other sheets, and Channel 2's IN is the
-    // counterpart of no net of Channel 1's own, so only MID and OUT move.
-    assert_eq!(gone(&before, &after), [MID_STUB, OUT_TRACK]);
+    // Channel 1's IN and GND tracks leave its area, so only MID and OUT
+    // move; Channel 2's three stubs lie in its area.
+    assert_eq!(gone(&before, &after), [MID_STUB, OUT_TRACK, IN_STUB]);
     assert_eq!(added(&before, &after), expected_copies());
+}
+
+/// The area board: Channel 1's area takes the routing on GND, IN and VCC that
+/// lies in it, and R4's group's rectangle brings in one more GND via, as does
+/// the corner of the hull KiCad 10.0.8's outline cuts off. The GND track and
+/// via that leave the area stay. Channel 2's GND via, in its area, goes.
+#[tokio::test]
+async fn routing_on_shared_nets_in_the_area_is_copied_where_kicad_puts_it() {
+    let board = Board::new(AREA);
+    let (is_error, body) = call(&board, json!({ "anchor_reference": "R1" })).await;
+    assert!(!is_error, "{body:#}");
+    assert_eq!(reported(&body), area_report(), "{body:#}");
+    let after = board.now();
+    assert_eq!(
+        moved(&board.original, &after),
+        expected(&[&CHANNEL_2, &CHANNEL_3_AT_45])
+    );
+    let (before, after) = (routing(&board.original), routing(&after));
+    assert_eq!(
+        gone(&before, &after),
+        [MID_STUB, OUT_TRACK, CHANNEL_2_VIA, IN_STUB]
+    );
+    assert_eq!(added(&before, &after), expected_area_copies());
+}
+
+/// The area board with R9 at 0° beside R1 and R10 above Channel 2's GND via
+/// (README): R9's areas hold nine of the items Channel 1 copies and Channel
+/// 2's IN stub, which R5's area takes first.
+#[tokio::test]
+async fn a_target_area_never_takes_the_references_routing_or_an_item_twice() {
+    let board = Board::new("repeat_layout_area_overlap_kicad10.kicad_pcb");
+    let (is_error, body) = call(&board, json!({ "anchor_reference": "R1" })).await;
+    assert!(!is_error, "{body:#}");
+    assert_eq!(body["routing"]["copied_count"], 26, "{body:#}");
+    let (before, after) = (routing(&board.original), routing(&board.now()));
+    // R5's four, then Channel 1's GND track and via that leave its area and
+    // lie in R9's.
+    assert_eq!(
+        gone(&before, &after),
+        [
+            MID_STUB,
+            OUT_TRACK,
+            CHANNEL_2_VIA,
+            IN_STUB,
+            "8d01e129-399b-4e09-b0c2-ea9ef9e38fbc",
+            "dc645c8a-d064-4193-b992-b0d145b9b575",
+        ]
+    );
+    assert_eq!(added(&before, &after).len(), 26);
+}
+
+/// A closed board's text has no box without KiCad's fonts, so an area that
+/// holds one, here in R4's group, is refused naming it.
+#[tokio::test]
+async fn a_group_member_a_closed_board_cannot_measure_is_refused_by_name() {
+    let board = Board::new("repeat_layout_area_text_kicad10.kicad_pcb");
+    let (is_error, body) = call(&board, json!({ "anchor_reference": "R1" })).await;
+    assert!(is_error, "{body:#}");
+    assert_eq!(body["error"]["kind"], "plan_blocked", "{body:#}");
+    assert_eq!(
+        reasons(&body),
+        [
+            "ca7bc0ed-7ddc-4e33-ad1c-e2469afedf9b, in group 'R4 block' with R4, has no box in \
+             this read: KiCad measures it, so open the board in KiCad, or pass copy_routing false"
+        ],
+        "{body:#}"
+    );
+    board.assert_untouched();
+}
+
+/// The outline of Channel 1's area on the area board and of Channel 2's before
+/// it is laid out, from KiCad's own boxes of the items the README's `oracle`
+/// takes for each, rectified by KiCad's own `SHAPE_LINE_CHAIN` with the hull
+/// closed, and the first carried onto Channel 3 at 45° as
+/// `SHAPE_LINE_CHAIN::Rotate` and `Move` carry it.
+#[test]
+fn the_area_is_the_outline_kicad_draws() {
+    use super::repeat_layout::{area_outline, carried, rotate_point, Rect};
+    let boxes = kicad_boxes();
+    let outline = |items: &[&str]| {
+        let rects: Vec<Rect> = items.iter().map(|item| boxes[*item]).collect();
+        area_outline(&rects)
+    };
+    // R1 to R4, R4's group's rectangle, and the seven items on MID and OUT.
+    let channel_1 = outline(&[
+        "1a59d96d-1d8c-460f-b863-40f1564308b8",
+        "246a3eb1-5e9f-4ed5-bad3-9272659c1bb9",
+        "2cc52ae4-bbf6-4b08-a654-5db627f89247",
+        "34dfb1e3-9223-4dfe-ba56-b3dda1c8ee37",
+        "492a8b98-88c6-4604-b847-3075ac91ad54",
+        "6fdea30f-eba7-49e8-9d98-743aad07239f",
+        "7504bdfe-53d7-4dc8-b2ca-4930bc02258a",
+        "9ec35771-89a8-4ce1-b44d-a258d752a8b5",
+        "b0e8547a-c751-474c-80fc-b203686b4441",
+        "bb6ccaed-e077-4848-ae97-d1aa1c7267af",
+        "c2329086-ba61-43d7-b777-9ff680866189",
+        "e9fd3d26-9ffa-48a2-9d4a-615f6c52eee0",
+    ]);
+    // KiCad 10.0.8's own outline cuts off the corner (113.6, 99.1) to
+    // (116.75, 101.85) of the hull, and (111.7, 103.7) to (109.1, 102.85).
+    assert_eq!(
+        channel_1,
+        [
+            (109_100_000, 99_650_000),
+            (109_100_000, 99_100_000),
+            (116_750_000, 99_100_000),
+            (116_750_000, 103_750_000),
+            (111_699_999, 103_750_000),
+            (111_699_999, 103_703_555),
+            (109_100_000, 103_703_555),
+        ]
+    );
+    // R5 to R8 where they are, and Channel 2's MID stub, OUT track and IN stub.
+    let channel_2 = outline(&[
+        "08cf5053-ed54-4206-b23a-3d693ed67fa3",
+        "31600868-f704-4c68-9771-b5d6939a409c",
+        "4185e791-a0e4-41b0-9ec4-ee2d350ea060",
+        "6c43e0b0-05cb-4524-9a73-d44fe83ec0b8",
+        "83c5914a-6a09-43cf-847c-d4e8240c7e79",
+        "83f7bbfe-51d3-426c-9c8e-3125fda56377",
+        "cdd253fc-bf55-419f-9443-b5d59173f748",
+    ]);
+    assert_eq!(
+        channel_2,
+        [
+            (134_100_000, 109_650_000),
+            (134_100_000, 97_800_000),
+            (140_900_001, 97_800_000),
+            (140_900_001, 110_350_000),
+            (139_900_000, 110_350_000),
+            (139_900_000, 111_700_001),
+            (134_100_000, 111_700_001),
+        ]
+    );
+    // R1 at (110, 100) 0° onto R9 at (160.5, 120.25) 45°.
+    let (x, y) = rotate_point(110_000_000, 100_000_000, 45.0);
+    let offset = (160_500_000 - x, 120_250_000 - y);
+    assert_eq!(
+        carried(&channel_1, 45.0, offset),
+        [
+            (159_616_117, 120_638_909),
+            (159_227_208, 120_250_000),
+            (164_636_575, 114_840_633),
+            (167_924_621, 118_128_680),
+            (164_353_731, 121_699_570),
+            (164_320_890, 121_666_728),
+            (162_482_413, 123_505_205),
+        ]
+    );
+}
+
+/// R4's group inside another group, whose second rectangle brings one more
+/// GND via inside Channel 1's area (README). The wider hull's slanted edge is
+/// where KiCad 10.0.8's own outline would cut off Channel 1's MID track and
+/// arc, on its own net; both are copied.
+#[tokio::test]
+async fn a_group_inside_a_group_widens_the_area() {
+    let board = Board::new("repeat_layout_area_nested_kicad10.kicad_pcb");
+    let (is_error, body) = call(&board, json!({ "anchor_reference": "R1" })).await;
+    assert!(!is_error, "{body:#}");
+    assert_eq!(body["routing"]["copied_count"], 28, "{body:#}");
+    let (before, after) = (routing(&board.original), routing(&board.now()));
+    let mut copies = expected_area_copies();
+    copies.extend(routed_copies(&[
+        ("via", "GND", "F.Cu", false, &[(144_600_000, 94_400_000)]),
+        ("via", "GND", "F.Cu", false, &[(167_712_489, 119_542_893)]),
+    ]));
+    copies.sort();
+    assert_eq!(added(&before, &after), copies);
 }
 
 #[tokio::test]
 async fn a_second_call_replaces_the_copies_with_the_same_copies() {
-    let board = Board::new(ROUTED);
+    // On the area board, R4's group widens Channel 1's area and not the
+    // targets', so a copy can lie outside a target's own area; the
+    // reference's area carried onto it holds every copy.
+    let board = Board::new(AREA);
     let (is_error, body) = call(&board, json!({ "anchor_reference": "R1" })).await;
     assert!(!is_error, "{body:#}");
     let first = board.now();
     let (is_error, body) = call(&board, json!({ "anchor_reference": "R1" })).await;
     assert!(!is_error, "{body:#}");
-    assert_eq!(body["routing"]["removed_count"], 14, "{body:#}");
+    assert_eq!(body["routing"]["removed_count"], 26, "{body:#}");
     let second = board.now();
     assert!(moved(&first, &second).is_empty());
     let (first, second) = (routing(&first), routing(&second));
-    assert_eq!(gone(&first, &second).len(), 14);
+    assert_eq!(gone(&first, &second).len(), 26);
     let mut kept: Vec<Routed> = first.into_values().collect();
     let mut again: Vec<Routed> = second.into_values().collect();
     kept.sort();
@@ -1155,6 +1440,22 @@ async fn a_net_that_does_not_become_one_net_of_the_target_is_refused() {
     )
     .await;
     assert!(!is_error, "{body:#}");
+}
+
+/// The area board with R7's and R8's pad 2 on VCC (README): Channel 1's GND
+/// becomes VCC on R5's placement, which the copied VCC track keeps as its own.
+#[tokio::test]
+async fn a_net_kept_as_its_own_is_one_of_two_that_cannot_become_one() {
+    let board = Board::new("repeat_layout_area_merge_kicad10.kicad_pcb");
+    let (is_error, body) = call(&board, json!({ "anchor_reference": "R1" })).await;
+    assert!(is_error, "{body:#}");
+    assert_eq!(body["error"]["kind"], "plan_blocked", "{body:#}");
+    assert_eq!(
+        reasons(&body),
+        ["GND and VCC both become VCC on R5's placement"],
+        "{body:#}"
+    );
+    board.assert_untouched();
 }
 
 /// `models-3d/royalblue.kicad_pcb` is a board KiCad 9's pcbnew wrote (its
@@ -1319,10 +1620,41 @@ fn as_kicad_sends_routed(content: &str) -> Vec<prost_types::Any> {
                     "kiapi.board.types.Via",
                 ));
             }
+            Some("group") => items.push(pack_any(
+                &board::Group {
+                    id: kiid(node),
+                    name: node.get(1).and_then(SexpNode::as_str).unwrap().to_string(),
+                    items: node.find("members").unwrap().children().unwrap()[1..]
+                        .iter()
+                        .map(|member| common::Kiid {
+                            value: member.as_str().unwrap().to_string(),
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                "kiapi.board.types.Group",
+            )),
             _ => {}
         }
     }
     items
+}
+
+/// KiCad's answer to `GetBoundingBox`: its own boxes of the area board's items
+/// ([`BOXES`]).
+fn answer_with_kicads_boxes(command: &prost_types::Any) -> Option<prost_types::Any> {
+    if any_type_name(command) != "kiapi.common.commands.GetBoundingBox" {
+        return None;
+    }
+    let boxes = kicad_boxes();
+    let mm = |nm: i64| nm as f64 / 1e6;
+    Some(crate::tools::pcb_board::board_mock::kicad_bounding_boxes(
+        command,
+        |id| {
+            let (left, top, right, bottom) = boxes[id];
+            (mm(left), mm(top), mm(right - left), mm(bottom - top))
+        },
+    ))
 }
 
 /// What the copper check asks KiCad, answered for two copper layers and a
@@ -1420,7 +1752,7 @@ impl Kicad {
                         return Some(answer);
                     }
                 }
-                answer_the_copper_check(command)
+                answer_the_copper_check(command).or_else(|| answer_with_kicads_boxes(command))
             }
         });
         let handler = handler_talking_to(server.address()).await;
@@ -1523,9 +1855,9 @@ async fn a_live_board_takes_the_routing_in_the_layouts_one_commit() {
     assert!(!is_error, "{body:#}");
     assert_eq!(body["source"], "ipc", "{body:#}");
     assert_eq!(body["copper_check"]["status"], "clear", "{body:#}");
-    // The board's ten tracks less the two the same commit removes.
+    // The board's ten tracks less the three the same commit removes.
     assert_eq!(
-        body["copper_check"]["coverage"]["track_count"], 8,
+        body["copper_check"]["coverage"]["track_count"], 7,
         "{body:#}"
     );
     assert_eq!(reported(&body), routing_report(), "{body:#}");
@@ -1537,7 +1869,7 @@ async fn a_live_board_takes_the_routing_in_the_layouts_one_commit() {
         .collect();
     assert_eq!(moved, expected(&[&CHANNEL_2, &CHANNEL_3_AT_45]));
     let after = kicad.routing();
-    assert_eq!(gone(&before, &after), [MID_STUB, OUT_TRACK]);
+    assert_eq!(gone(&before, &after), [MID_STUB, OUT_TRACK, IN_STUB]);
     assert_eq!(added(&before, &after), expected_copies());
     // The deletion and the copies go inside the placements' commit.
     let sent = kicad.sent();
@@ -1778,6 +2110,7 @@ async fn a_live_routing_dry_run_only_reads() {
                 "GetOpenDocuments"
                     | "GetItems"
                     | "GetVersion"
+                    | "GetBoundingBox"
                     | "GetBoardEnabledLayers"
                     | "CheckPadstackPresenceOnLayers"
                     | "GetPadShapeAsPolygon"
@@ -1785,4 +2118,29 @@ async fn a_live_routing_dry_run_only_reads() {
             "{name} reached KiCad"
         );
     }
+}
+
+/// The area board on a live board: KiCad lists R4's group and measures every
+/// item, and the copies are those of the closed board.
+#[tokio::test]
+async fn a_live_board_draws_the_area_from_kicads_groups_and_boxes() {
+    let kicad = Kicad::routed(AREA, |_| {}, as_kicad).await;
+    let before = kicad.routing();
+    let (is_error, body) = call_with(
+        &kicad.handler,
+        &kicad.board,
+        json!({ "anchor_reference": "R1" }),
+    )
+    .await;
+    assert!(!is_error, "{body:#}");
+    assert_eq!(body["source"], "ipc", "{body:#}");
+    assert_eq!(reported(&body), area_report(), "{body:#}");
+    let after = kicad.routing();
+    assert_eq!(
+        gone(&before, &after),
+        [MID_STUB, OUT_TRACK, CHANNEL_2_VIA, IN_STUB]
+    );
+    assert_eq!(added(&before, &after), expected_area_copies());
+    let sent = kicad.sent();
+    assert!(sent.iter().any(|name| name == "GetBoundingBox"), "{sent:?}");
 }
