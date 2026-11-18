@@ -2470,6 +2470,8 @@ struct RepointedSheetRelinks {
     parent_base: String,
     transitions: Vec<FileTransition>,
     links: Vec<(PathBuf, ChildLink)>,
+    /// Symbol instance records the relinked files change.
+    changed: usize,
 }
 
 fn plan_repointed_sheet_relinks(
@@ -2572,6 +2574,7 @@ fn plan_repointed_sheet_relinks(
 
     let mut transitions = Vec::new();
     let mut links = Vec::new();
+    let mut changed = 0;
     for entry in entries {
         let added: Vec<String> = located
             .instance_paths
@@ -2613,9 +2616,10 @@ fn plan_repointed_sheet_relinks(
                 Err(_) => continue,
             }
         };
-        let Some((after_child, _)) = prepared else {
+        let Some((after_child, count)) = prepared else {
             continue;
         };
+        changed += count;
         transitions.push(FileTransition::replace(
             &entry.file,
             before_child,
@@ -2629,6 +2633,7 @@ fn plan_repointed_sheet_relinks(
         parent_base,
         transitions,
         links,
+        changed,
     }))
 }
 
@@ -2753,6 +2758,7 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         (project_name, None)
     };
 
+    let relinked = relinks.as_ref().map_or(0, |relinks| relinks.changed);
     let summary = {
         let sheet = sch
             .sheets
@@ -2790,7 +2796,8 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         "changed": !changed.is_empty(),
         "changed_fields": changed,
         "requested_fields": requested,
-        "sheet": summary
+        "sheet": summary,
+        "relinked_symbol_instances": relinked
     })))
 }
 
@@ -7790,6 +7797,8 @@ mod instance_path_lifecycle_tests {
         assert!(!failed, "{body}");
         assert_eq!(body["changed"], json!(true), "{body}");
         assert_eq!(body["sheet"]["file"], json!("leaf.kicad_sch"), "{body}");
+        // R2 loses its Shared A path and R3 takes it in place of the deleted sheet.
+        assert_eq!(body["relinked_symbol_instances"], json!(2), "{body}");
 
         assert_eq!(
             recorded(&shared),
@@ -7935,6 +7944,7 @@ mod instance_path_lifecycle_tests {
         assert!(!failed, "{body}");
 
         assert_eq!(std::fs::read(&child).unwrap(), child_before);
+        assert_eq!(body["relinked_symbol_instances"], json!(1), "{body}");
         assert_eq!(
             recorded(&leaf),
             vec![("R3".to_owned(), demo(&[format!("/{ROOT}/{child_uuid}")]))]
