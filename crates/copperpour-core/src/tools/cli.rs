@@ -464,9 +464,12 @@ async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Re
     }
 
     if !output.status.success() {
+        let termination = match output.status.code() {
+            Some(code) => format!("exited with {code}"),
+            None => format!("was terminated ({})", output.status),
+        };
         anyhow::bail!(
-            "kicad-cli exited with {}:\n{}",
-            output.status.code().unwrap_or(-1),
+            "kicad-cli {termination}:\n{}",
             cli_failure_diagnostics(&output.stdout, &output.stderr)
         );
     }
@@ -697,6 +700,25 @@ pub(crate) mod test_support {
             "#!/bin/sh\nif [ \"$1\" = \"sch\" ]; then\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"--output\" ]; then\n      shift\n      printf '%s' 'PDF-test' > \"$1\"\n      break\n    fi\n    shift\n  done\nfi\nexit 0\n",
             "@echo off\r\nif not \"%1\"==\"sch\" exit /b 0\r\n:loop\r\nif \"%1\"==\"\" goto done\r\nif not \"%1\"==\"--output\" goto next\r\nshift\r\necho PDF-test>\"%1\"\r\ngoto done\r\n:next\r\nshift\r\ngoto loop\r\n:done\r\nexit /b 0\r\n",
         )
+    }
+
+    #[tokio::test]
+    async fn cli_failure_preserves_exit_code_and_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = write_script(
+            dir.path(),
+            "fake-kicad-cli",
+            "#!/bin/sh\nprintf 'fake failure\\n' >&2\nexit 3\n",
+            "@echo off\r\necho fake failure 1>&2\r\nexit /b 3\r\n",
+        );
+
+        let error = run_cli(cli.to_str().unwrap(), &[], Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "kicad-cli exited with 3:\nstderr:\nfake failure"
+        );
     }
 
     #[test]

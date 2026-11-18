@@ -280,6 +280,57 @@ fn installation_info_cli_probes_the_explicit_executable() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn cli_failure_reports_signal_termination() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cli = tmp.path().join("fake-kicad-cli");
+    std::fs::write(
+        &cli,
+        "#!/bin/sh\nprintf 'interrupted export\\n' >&2\nkill -TERM \"$$\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        tmp.path().join("copperpour.toml"),
+        format!(
+            "kicad_cli = {}\nkicad_cli_timeout_seconds = 5\nipc_address = {}\n",
+            json!(cli),
+            json!(format!(
+                "ipc://{}",
+                tmp.path().join("unused.sock").display()
+            ))
+        ),
+    )
+    .unwrap();
+
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let loaded = p.call_tool("load_toolset", json!({"name": "sch_export"}));
+    assert_ne!(loaded["isError"], true, "{loaded}");
+    let result = p.call_tool(
+        "generate_netlist",
+        json!({
+            "schematic": concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../copperpour-core/tests/fixtures/single_pin_nets.kicad_sch"
+            ),
+            "output": tmp.path().join("board.net")
+        }),
+    );
+    assert_eq!(result["isError"], true, "{result}");
+    let body = McpProcess::tool_body(&result);
+    assert_eq!(body["error"]["kind"], "handler_error", "{body}");
+    let reason = body["error"]["reason"].as_str().unwrap();
+    assert!(reason.starts_with("kicad-cli was terminated"), "{reason}");
+    assert!(reason.contains("15 (SIGTERM)"), "{reason}");
+    assert!(
+        reason.ends_with(":\nstderr:\ninterrupted export"),
+        "{reason}"
+    );
+}
+
 #[test]
 fn installation_info_reports_the_serving_process_without_leaking_endpoint_secrets() {
     let tmp = tempfile::tempdir().unwrap();
