@@ -352,12 +352,14 @@ and Windows servers do not.
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
 
 ### `pcb_copper` · 1 tool
-**Purpose:** Batched copper edits on the board open in KiCad: create a planned set of tracks and through vias in one commit.
+**Purpose:** Copper edits on the board open in KiCad: create a planned set of tracks and through vias in one commit; read and set native pad and via teardrops.
 **Source:** [`crates/copperpour-core/src/tools/pcb_copper.rs`](crates/copperpour-core/src/tools/pcb_copper.rs)
 
 | Tool | Description |
 |------|-------------|
 | `apply_copper` | Create a batch of straight tracks and vias (through, blind, buried or micro, with `start_layer` and `end_layer`) on the live board in one KiCad commit (one undo step), without saving. Dry run by default: checks every item (nets and copper layers the board has, sizes above zero, drill smaller than size, a via span that is its type's, no zero-length track) and returns the plan rounded to the nanometre with a `plan_revision`; apply needs it as `expected_plan_revision`. One commit plus a read-back by UUID, not an atomic transaction: a batch KiCad stores partly on other nets is removed again in a second commit and refused with `plan_blocked`; a partial create is dropped; an unconfirmed removal is `mutation_outcome_uncertain` with the UUIDs. |
+| `get_teardrop_settings` | Read KiCad's native teardrop settings of the pads and vias on the board open in KiCad 10.0.7 or newer, with each item's UUID, reference, pad number, net and position, the board's teardrop zones by net, and whether it uses legacy teardrops. Filters: `references` (pads only), `nets`, `kinds`; `limit` bounds the list, with `total` and `truncated`. Older or unknown KiCad versions are `unsupported_capability`. |
+| `set_teardrop_settings` | Enable, adjust or disable native teardrops on selected pads and vias in one KiCad undo step, without saving. `targets` is the union of `pads` (`{reference, pad_number}` or `{uuid}`), `vias` (UUIDs), `references` (their pads), `nets` (pads and vias), `all_pads` and `all_vias`; a selector that matches nothing refuses the call. Omitted `settings` fields keep their value; both length limits take `null` for no limit. KiCad rebuilds the edited items' teardrops in that step. `refill_zones` (default `false`) requests a board-wide refill afterwards; the copper read after the request does not prove the queued fill finished. Pads go through the shared footprint update path (as `set_pad_net`): the whole footprint is sent back and the read-back must differ from before only in teardrop fields, listed in `verified_changes`; anything else is `mutation_outcome_uncertain`. Reports commit copper and copper observed after the refill request separately; `dry_run` writes nothing. Refuses KiCad before 10.0.7 or of unknown version (`unsupported_capability`), legacy-teardrop boards and pads of footprints that own groups (`plan_blocked`), with nothing written. |
 
 ### `placement` · 5 tools
 **Purpose:** Placement quality and automation — score, plan decoupling rows, plan BGA fanouts; every plan reports its own before/after score.

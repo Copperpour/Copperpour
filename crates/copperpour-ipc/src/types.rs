@@ -553,6 +553,9 @@ pub enum IpcPadNetOutcome {
     },
     /// The footprint has no pad with that number. Nothing was sent.
     NoSuchPad { available: Vec<String> },
+    /// The footprint or its pads changed between the read and the write
+    /// (gone, listed twice, or no longer numbered so). Nothing was sent.
+    Stale { reason: String },
     /// The update was sent but a fresh read-back did not confirm it. The
     /// board may or may not have changed.
     Uncertain { reason: String },

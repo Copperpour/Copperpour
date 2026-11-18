@@ -115,6 +115,8 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "plan_specctra_ses_import",
     "query_traces",
     "query_vias",
+    // pcb_copper
+    "get_teardrop_settings",
     // placement
     "get_placement_overview",
     "score_placement",
@@ -343,6 +345,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "set_schematic_page",
     "set_schematic_title_block",
     "set_symbol_properties",
+    "set_teardrop_settings",
     "set_visual_baseline",
     "snapshot_project",
     "split_wire_at_point",
@@ -493,5 +496,15 @@ mod tests {
             assert_eq!(refusal(target, false), Some(Refusal::WritesNotEnabled));
             assert_eq!(refusal(target, true), None);
         }
+    }
+
+    #[test]
+    fn teardrop_reads_are_allowed_but_settings_need_write_permission() {
+        assert_eq!(refusal("get_teardrop_settings", false), None);
+        assert_eq!(
+            refusal("set_teardrop_settings", false),
+            Some(Refusal::WritesNotEnabled)
+        );
+        assert_eq!(refusal("set_teardrop_settings", true), None);
     }
 }

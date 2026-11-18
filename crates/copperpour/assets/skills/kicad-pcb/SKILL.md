@@ -61,7 +61,7 @@ Before any PCB work, load the required toolsets:
 load_toolset('pcb_board')        # board outline, layers, setup, stackup
 load_toolset('pcb_components')   # place, refresh, move, rotate, align footprints
 load_toolset('pcb_routing')      # traces, vias, differential pairs
-load_toolset('pcb_copper')       # apply_copper: a planned batch of tracks and vias
+load_toolset('pcb_copper')       # apply_copper: a planned batch of tracks and vias; teardrops
 load_toolset('sch_export')       # update PCB from the saved schematic hierarchy
 ```
 
@@ -260,6 +260,7 @@ geometry field is unavailable evidence, not a zero-size pad.
 | `route_differential_pair` | Matched-length USB/LVDS/Ethernet pairs      |
 | `add_via`                 | Layer transition                            |
 | `apply_copper` (`pcb_copper`) | Planned batch of tracks and vias, one undo |
+| `set_teardrop_settings` (`pcb_copper`) | Native pad and via teardrops, one undo |
 | `create_netclass`         | Define width/clearance rules for net groups |
 
 ### route_pad_to_pad
@@ -307,6 +308,26 @@ apply_copper(board, tracks?: [{start, end, width, layer, net}], vias?: [{positio
   with `plan_blocked`, naming each item; on `mutation_outcome_uncertain`, inspect
   the listed UUIDs first
 - Copper already on the board is not skipped, so applying a plan twice adds it twice
+
+### get_teardrop_settings / set_teardrop_settings
+
+In the `pcb_copper` toolset. KiCad's own pad and via teardrops on the board open in KiCad 10.0.7 or newer.
+
+```
+get_teardrop_settings(board, references?, nets?, kinds?, limit?)
+set_teardrop_settings(board, targets: {pads?: [{reference, pad_number} | {uuid}], vias?, references?, nets?, all_pads?, all_vias?}, settings: {enabled?, curved_edges?, allow_multiple_track_segments?, prefer_zone_connection?, max_length_mm?, max_width_mm?, best_length_ratio?, best_width_ratio?, max_track_width_ratio?}, refill_zones?, dry_run?)
+```
+
+- Read first: `get_teardrop_settings` gives each pad's `uuid`. A pad number can match several pads, so use `{uuid}` to change exactly one
+- `targets` entries add up (a union): `references` selects those footprints' pads, `nets` selects pads and vias. A selector that matches nothing refuses the whole call
+- Settings left out keep their value; the two length limits take `null` for no limit
+- KiCad builds the edited items' teardrops in the same undo step. Use `refill_zones: true` only to request a board-wide refill. The copper read after the request does not prove the queued refill finished
+- The board is not saved: `save_project` saves it
+- `unsupported_capability` means KiCad is older than 10.0.7: change teardrops in KiCad itself. `plan_blocked` names a legacy-teardrop board or a footprint that owns groups; nothing was written
+- `stale_target` means the board changed since it was read (a target moved, vanished or got other settings); nothing was written, so read again and retry
+- An error saying KiCad refused the settings and nothing was written means a fresh read proved the board unchanged; it is safe to correct and retry
+- `verified_changes` lists every field the read-back differs from before in; all are teardrop fields
+- On `mutation_outcome_uncertain`, read the board with `get_teardrop_settings` before anything else
 
 ### route_differential_pair
 

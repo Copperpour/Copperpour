@@ -43,6 +43,30 @@ pub fn footprints(tree: &SexpNode) -> Vec<&SexpNode> {
     tree.find_all("footprint")
 }
 
+/// Count each placed footprint's direct groups, not board-level memberships.
+/// A missing lookup is distinct from a footprint with zero groups. Refuse an
+/// inventory without unique, nonempty footprint UUIDs.
+pub fn footprint_owned_group_counts(
+    tree: &SexpNode,
+) -> Result<BTreeMap<&str, usize>, crate::SexpError> {
+    let mut counts = BTreeMap::new();
+    for footprint in footprints(tree) {
+        let id = footprint
+            .find_str("uuid")
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| crate::SexpError::MissingNode("placed footprint UUID".into()))?;
+        if counts
+            .insert(id, footprint.find_all("group").len())
+            .is_some()
+        {
+            return Err(crate::SexpError::InvalidValue(format!(
+                "footprint UUID {id} appears twice"
+            )));
+        }
+    }
+    Ok(counts)
+}
+
 /// Every pad on the board, across all footprints.
 ///
 /// Pads live one level down, inside each `(footprint …)`. Call this rather
