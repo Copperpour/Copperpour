@@ -1166,20 +1166,14 @@ async fn handle_apply_specctra_ses(
             }
         },
     };
-    let drc_output = candidate.with_extension("drc.json");
-    let conflicts = [&candidate, &drc_output]
-        .into_iter()
-        .filter(|path| path.exists())
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>();
-    if !conflicts.is_empty() {
+    if candidate.exists() {
         return Ok(CallToolResult::error_kind(
             ToolErrorKind::Conflict {
-                paths: conflicts.clone(),
+                paths: vec![candidate.display().to_string()],
             },
             format!(
-                "Specctra import is non-destructive; candidate or DRC output already exists: {}",
-                conflicts.join(", ")
+                "Specctra import is non-destructive; candidate already exists: {}",
+                candidate.display()
             ),
         ));
     }
@@ -1198,7 +1192,6 @@ async fn handle_apply_specctra_ses(
         .with_context(|| format!("resolve board {}", board.display()))?;
     let board_for_ipc = board.clone();
     let candidate_for_ipc = candidate.clone();
-    let drc_output_for_ipc = drc_output.clone();
     let cli_path = ctx.config.kicad_cli.clone();
     let runtime = tokio::runtime::Handle::current();
 
@@ -1385,14 +1378,6 @@ async fn handle_apply_specctra_ses(
                         format!(
                             "SES import failed ({error}); also failed to remove candidate {}",
                             candidate_for_ipc.display()
-                        )
-                    })?;
-                }
-                if drc_output_for_ipc.exists() {
-                    std::fs::remove_file(&drc_output_for_ipc).with_context(|| {
-                        format!(
-                            "SES import failed ({error}); also failed to remove DRC output {}",
-                            drc_output_for_ipc.display()
                         )
                     })?;
                 }

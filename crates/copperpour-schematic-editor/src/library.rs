@@ -161,7 +161,7 @@ fn merge_parent_into_child(
     let child_props: std::collections::HashSet<String> = child
         .find_all("property")
         .iter()
-        .filter_map(|p| p.value())
+        .filter_map(|p| crate::types::parse_property_header(p).map(|(_, name, _, _)| name))
         .map(String::from)
         .collect();
 
@@ -186,7 +186,9 @@ fn merge_parent_into_child(
                 inherited.push(cloned);
             }
             Some("property") => {
-                let Some(key) = item.value() else { continue };
+                let Some((_, key, _, _)) = crate::types::parse_property_header(item) else {
+                    continue;
+                };
                 if !child_props.contains(key) {
                     inherited.push(item.clone());
                 }
@@ -429,17 +431,32 @@ pub struct SymbolMetadata {
     pub footprint: String,
     pub datasheet: String,
     pub description: String,
+    /// The symbol's `(exclude_from_sim …)`, `(in_bom …)`, `(on_board …)` and
+    /// `(in_pos_files …)`, `None` where the library omits one. eeschema copies
+    /// all four onto a symbol it places.
+    pub exclude_from_sim: Option<bool>,
+    pub in_bom: Option<bool>,
+    pub on_board: Option<bool>,
+    pub in_pos_files: Option<bool>,
+}
+
+/// A custom property read from an embedded library symbol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolCustomProperty {
+    pub name: String,
+    pub value: String,
+    pub private: bool,
 }
 
 /// Read all custom properties (excluding standard KiCad fields and internal `ki_*` fields)
 /// defined on `lib_id`'s embedded library symbol.
-pub fn symbol_custom_properties(schematic: &Schematic, lib_id: &str) -> Vec<(String, String)> {
+pub fn symbol_custom_properties(schematic: &Schematic, lib_id: &str) -> Vec<SymbolCustomProperty> {
     let Some(symbol) = embedded_lib_symbol(schematic, lib_id) else {
         return Vec::new();
     };
     let mut customs = Vec::new();
     for property in symbol.find_all("property") {
-        let Some(name) = property.value() else {
+        let Some((private, name, value, _)) = crate::types::parse_property_header(property) else {
             continue;
         };
         if matches!(
@@ -451,13 +468,11 @@ pub fn symbol_custom_properties(schematic: &Schematic, lib_id: &str) -> Vec<(Str
         if name.starts_with("ki_") {
             continue;
         }
-        let value = property
-            .args()
-            .get(1)
-            .and_then(SexpNode::text)
-            .unwrap_or_default()
-            .to_string();
-        customs.push((name.to_string(), value));
+        customs.push(SymbolCustomProperty {
+            name: name.to_string(),
+            value: value.unwrap_or_default().to_string(),
+            private,
+        });
     }
     customs
 }
@@ -473,11 +488,11 @@ pub fn symbol_metadata(schematic: &Schematic, lib_id: &str) -> SymbolMetadata {
         symbol
             .find_all("property")
             .into_iter()
-            .find(|property| property.value() == Some(name))
-            .and_then(|property| property.args().get(1))
-            .and_then(SexpNode::text)
+            .find_map(|property| {
+                let (_, prop_name, prop_val, _) = crate::types::parse_property_header(property)?;
+                (prop_name == name).then(|| prop_val.unwrap_or_default().to_string())
+            })
             .unwrap_or_default()
-            .to_string()
     };
     SymbolMetadata {
         reference: value("Reference"),
@@ -485,6 +500,10 @@ pub fn symbol_metadata(schematic: &Schematic, lib_id: &str) -> SymbolMetadata {
         footprint: value("Footprint"),
         datasheet: value("Datasheet"),
         description: value("Description"),
+        exclude_from_sim: symbol.get_bool("exclude_from_sim"),
+        in_bom: symbol.get_bool("in_bom"),
+        on_board: symbol.get_bool("on_board"),
+        in_pos_files: symbol.get_bool("in_pos_files"),
     }
 }
 
@@ -495,7 +514,9 @@ pub fn symbol_metadata(schematic: &Schematic, lib_id: &str) -> SymbolMetadata {
 pub fn field_anchors_of(symbol: &SexpNode) -> FieldAnchors {
     let mut anchors = FieldAnchors::default();
     for prop in symbol.find_all("property") {
-        let Some(name) = prop.value() else { continue };
+        let Some((_, name, _, _)) = crate::types::parse_property_header(prop) else {
+            continue;
+        };
         let Some(at) = prop.find("at") else { continue };
         let s = at.scalar_args();
         let num = |i: usize| s.get(i).and_then(|v| v.parse::<f64>().ok());
@@ -1109,6 +1130,10 @@ mod field_anchor_tests {
                 footprint: "Resistor_THT:R_Axial".to_string(),
                 datasheet: "~".to_string(),
                 description: "Resistor".to_string(),
+                exclude_from_sim: None,
+                in_bom: None,
+                on_board: None,
+                in_pos_files: None,
             }
         );
         assert_eq!(symbol_metadata(&sch, "Device:C"), SymbolMetadata::default());
@@ -1125,12 +1150,56 @@ mod field_anchor_tests {
         assert_eq!(
             symbol_custom_properties(&sch, "Custom:Part"),
             vec![
-                ("LCSC".to_string(), "C12345".to_string()),
-                ("MPN".to_string(), "PART-1".to_string()),
-                ("Manufacturer".to_string(), "Acme".to_string()),
+                SymbolCustomProperty {
+                    name: "LCSC".to_string(),
+                    value: "C12345".to_string(),
+                    private: false,
+                },
+                SymbolCustomProperty {
+                    name: "MPN".to_string(),
+                    value: "PART-1".to_string(),
+                    private: false,
+                },
+                SymbolCustomProperty {
+                    name: "Manufacturer".to_string(),
+                    value: "Acme".to_string(),
+                    private: false,
+                },
             ]
         );
         assert!(symbol_custom_properties(&sch, "Custom:Unknown").is_empty());
+    }
+
+    #[test]
+    fn reads_private_custom_properties_with_their_names_and_flags() {
+        let (sch, _dir) = schematic_with(
+            "(symbol \"Device:Crystal_GND24\" \
+             (property \"Reference\" \"Y\" (at 0 0 0)) \
+             (property \"Value\" \"Crystal_GND24\" (at 0 0 0)) \
+             (property private \"KLC_S3.3\" \"The rectangle is not a symbol body\" (at 0 -12.7 0)) \
+             (property private \"KLC_S4.1\" \"Some pins are on 50mil grid\" (at 0 -15.24 0)) \
+             (property \"private\" \"literal-field\" (at 0 0 0)))",
+        );
+        assert_eq!(
+            symbol_custom_properties(&sch, "Device:Crystal_GND24"),
+            vec![
+                SymbolCustomProperty {
+                    name: "KLC_S3.3".to_string(),
+                    value: "The rectangle is not a symbol body".to_string(),
+                    private: true,
+                },
+                SymbolCustomProperty {
+                    name: "KLC_S4.1".to_string(),
+                    value: "Some pins are on 50mil grid".to_string(),
+                    private: true,
+                },
+                SymbolCustomProperty {
+                    name: "private".to_string(),
+                    value: "literal-field".to_string(),
+                    private: false,
+                },
+            ]
+        );
     }
 
     #[test]

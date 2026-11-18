@@ -21,9 +21,11 @@ the solder-mask flag from `AllowSolderMaskBridges()`.
 | C_0603 | `["exclude_from_bom"]` | **unspecified** | False | footprint type dropped |
 | C_0603 | `["smd", "exclude_from_bom"]` | smd | False | none |
 | solder jumper, stock | — | unspecified | True | — |
-| solder jumper | `["exclude_from_pos_files", "exclude_from_bom"]` | unspecified | **False** | `allow_soldermask_bridges` dropped (not accepted by `attributes`) |
+| solder jumper | `["exclude_from_pos_files", "exclude_from_bom"]` | unspecified | **False** | none |
+| solder jumper | `["exclude_from_bom", "allow_soldermask_bridges"]` | unspecified | True | none |
 
-`main` @ `9488e5f` wrote byte-identical files for every call and answered only
-`{"success":true,"changed_fields":["attributes"],…}`. `allow_soldermask_bridges`
-cannot be sent back, because the `attributes` enum refuses it
-([#119](https://github.com/Copperpour/Copperpour/issues/119)).
+`main` @ `9488e5f` wrote byte-identical files for the calls it accepted and
+answered only `{"success":true,"changed_fields":["attributes"],…}`; its
+`attributes` enum refused `allow_soldermask_bridges`
+([#119](https://github.com/Copperpour/Copperpour/issues/119)). Listed, it is kept;
+left out, it is dropped without a warning, as any accepted attribute is.

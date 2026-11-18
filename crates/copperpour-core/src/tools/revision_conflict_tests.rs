@@ -85,6 +85,13 @@ fn cases() -> Vec<(
             "board",
             json!({"reference": "R1", "x": 120.0, "y": 110.0}),
         ),
+        (
+            "repeat_layout",
+            "repeat_layout_kicad10.kicad_pcb",
+            "repeat_layout_mismatch_kicad10.kicad_pcb",
+            "board",
+            json!({"anchor_reference": "R1"}),
+        ),
     ]
 }
 
@@ -285,6 +292,7 @@ async fn a_kicad_lock_appearing_before_the_write_is_unsafe_file_fallback() {
         .join("../copperpour-sexp/tests/fixtures/placement/placement_fixture.kicad_pcb");
     let placement_source = std::fs::read_to_string(placement_fixture).unwrap();
     let flip_source = fixture("inner_layer_flip_front.kicad_pcb");
+    let repeat_source = fixture("repeat_layout_kicad10.kicad_pcb");
 
     let board_cases: Vec<(&str, &str, Value)> = vec![
         (
@@ -324,6 +332,11 @@ async fn a_kicad_lock_appearing_before_the_write_is_unsafe_file_fallback() {
                 "max_displacement_mm": 20.0,
                 "dry_run": false,
             }),
+        ),
+        (
+            "repeat_layout",
+            &repeat_source,
+            json!({ "anchor_reference": "R1" }),
         ),
     ];
 

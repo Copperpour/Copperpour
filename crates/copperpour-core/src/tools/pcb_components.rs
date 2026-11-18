@@ -775,7 +775,7 @@ fn rotate_at_block(block: &str, rotation: f64, readable: bool) -> Option<String>
 /// because KiCad itself does it.
 ///
 /// Deliberately not applied to children: KiCad does not normalise those.
-fn normalize_root_angle(degrees: f64) -> f64 {
+pub(crate) fn normalize_root_angle(degrees: f64) -> f64 {
     let wrapped = degrees.rem_euclid(360.0);
     if wrapped > 180.0 {
         wrapped - 360.0
@@ -1302,7 +1302,7 @@ fn board_contains_reference(board_path: &Path, reference: &str) -> anyhow::Resul
     Ok(footprint_references(&content)?.contains(reference))
 }
 
-fn footprint_reference(footprint: &copperpour_sexp::SexpNode) -> Option<String> {
+pub(super) fn footprint_reference(footprint: &copperpour_sexp::SexpNode) -> Option<String> {
     footprint
         .find_all("property")
         .into_iter()
@@ -1426,7 +1426,19 @@ pub(crate) fn update_closed_board_footprints(
 ) -> Result<Vec<copperpour_ipc::types::IpcFootprintPlacement>, ClosedBoardError> {
     let content =
         read_consistent(board_path).map_err(|error| ClosedBoardError::Io(error.into()))?;
-    let mut updated = content.clone();
+    let (updated, applied) = place_closed_board_footprints(&content, placements)?;
+    persist_board_replacement(board_path, &content, &updated)
+        .map_err(|error| ClosedBoardError::Io(error.into()))?;
+    Ok(applied)
+}
+
+/// The board text `content` with each footprint set to its placement, and
+/// the placements as that text holds them. Nothing is read or written.
+pub(super) fn place_closed_board_footprints(
+    content: &str,
+    placements: &[copperpour_ipc::types::IpcFootprintPlacement],
+) -> Result<(String, Vec<copperpour_ipc::types::IpcFootprintPlacement>), ClosedBoardError> {
+    let mut updated = content.to_string();
     for placement in placements {
         updated = prepare_closed_board_footprint_update(
             &updated,
@@ -1438,8 +1450,6 @@ pub(crate) fn update_closed_board_footprints(
             },
         )?;
     }
-    persist_board_replacement(board_path, &content, &updated)
-        .map_err(|error| ClosedBoardError::Io(error.into()))?;
     // Report what was written, not what was asked: the file path normalizes
     // the root angle to KiCad's (-180, 180] (a requested 270 is stored as
     // -90), and the response has to say the number the file now holds.
@@ -1447,7 +1457,7 @@ pub(crate) fn update_closed_board_footprints(
     for placement in placements {
         let root_at = footprint_root_at(&updated, &placement.reference).ok_or_else(|| {
             ClosedBoardError::Unusable(format!(
-                "footprint '{}' was updated but cannot be read back from the written board",
+                "footprint '{}' was updated but cannot be read back from the updated board",
                 placement.reference
             ))
         })?;
@@ -1458,7 +1468,7 @@ pub(crate) fn update_closed_board_footprints(
             rotation: root_at.2,
         });
     }
-    Ok(applied)
+    Ok((updated, applied))
 }
 
 /// The root `(at x y angle)` of the footprint `reference` in a board's text.

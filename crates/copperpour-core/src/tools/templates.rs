@@ -292,7 +292,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "ref_start": {
                         "type": "integer",
-                        "description": "Starting reference number (e.g. 10 → R10, C10, U10). Auto-detected if omitted."
+                        "description": "Starting reference number (e.g. 10 → R10, C10, U10). Auto-detected from this sheet if omitted. Refused as invalid_argument, before anything is written, when a designator it gives is already placed on any sheet of the hierarchy."
                     }
                 },
                 "required": ["schematic", "template_id"]
@@ -493,6 +493,11 @@ async fn handle_apply_template(
             .collect();
 
     let components = tmpl["components"].as_array().cloned().unwrap_or_default();
+    let mut in_use = crate::tools::sch_annotate::DesignatorsInUse::new(
+        &sch_path,
+        &context.project_name,
+        "ref_start",
+    );
     let mut placed = Vec::new();
     let mut placed_targets = Vec::new();
     let mut ref_counters: std::collections::HashMap<String, usize> =
@@ -532,6 +537,7 @@ async fn handle_apply_template(
                 1,
                 &source,
                 crate::tools::sch_components::ComponentPlacementExtras::default(),
+                &mut in_use,
             ) {
                 Ok(placement) => placement,
                 Err(error) => return Ok(error),
@@ -713,6 +719,7 @@ async fn handle_apply_template(
              connect_pins."
         );
     }
+    in_use.disclose(&mut response);
     Ok(CallToolResult::text(serde_json::to_string(&response)?))
 }
 
@@ -1986,6 +1993,45 @@ mod tests {
         assert!(message.contains("wrote nothing"), "{text}");
         assert_eq!(std::fs::read(&schematic).unwrap(), before);
         assert!(lock.exists(), "the lock is KiCad's to remove");
+    }
+
+    /// The fixture holds `R1`, so a `ref_start` of 1 would place a second one.
+    #[tokio::test]
+    async fn apply_template_refuses_a_ref_start_in_use_without_writing() {
+        if !in_isolated_home(
+            "tools::templates::tests::apply_template_refuses_a_ref_start_in_use_without_writing",
+        ) {
+            return;
+        }
+        let (_dir, schematic) = template_fixture();
+        let before = std::fs::read(&schematic).unwrap();
+
+        let refused = call_registered(
+            tools(),
+            "apply_template",
+            json!({
+                "schematic": schematic.display().to_string(),
+                "template_id": "test_one_resistor",
+                "ref_start": 1
+            }),
+            test_ctx(),
+        )
+        .await;
+        let crate::mcp::protocol::ToolContent::Text { text } = &refused.content[0] else {
+            panic!("expected text content: {refused:?}");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(refused.is_error, "{text}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{text}");
+        assert_eq!(body["error"]["field"], "ref_start", "{text}");
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("'R1' is already placed"),
+            "{text}"
+        );
+        assert_eq!(std::fs::read(&schematic).unwrap(), before);
     }
 
     /// Every name a pin answers to: its number, its name and its alternate

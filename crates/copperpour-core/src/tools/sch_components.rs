@@ -9,7 +9,9 @@ use crate::mcp::{
     protocol::{CallToolResult, ToolContent},
 };
 use crate::tool;
+use crate::tools::footprint_metadata::{indent_before, quote_string};
 use crate::tools::reference_hint::component_not_found;
+use crate::tools::symbol_fields;
 use crate::tools::{
     find_all_symbol_instance_blocks, get_path, invalid_arg, opt_f64, opt_str, opt_u32,
     reembed_lib_symbols, require_array, require_f64, require_str,
@@ -27,8 +29,8 @@ use copperpour_sexp::{
     geometry::snap_point,
     parse_sexp, prepare_command,
     schematic::{
-        extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
-        pin_outward_direction, read_schematic,
+        extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, parse_at,
+        pin_endpoint, pin_outward_direction, read_schematic,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, read_consistent,
@@ -42,13 +44,13 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) fn field_placements_schema() -> serde_json::Value {
     json!({
         "type": "object",
-        "description": "Move or hide a field's text, keyed by field name (Reference, Value, Footprint, or a custom property). Each entry may set x, y, rotation and hide; an omitted part is left as the file has it. Coordinates are absolute schematic millimetres, as KiCad stores them — not offsets from the body.",
+        "description": "Move or hide a field's text, keyed by field name (Reference, Value, Footprint, or a custom property). Each entry may set x, y, rotation and hide; an omitted part is left as the file has it. Coordinates are absolute schematic millimetres, as KiCad stores them — not offsets from the body; rotation is stored relative to the parent symbol (so on a 90° or 270° symbol, rotation: 90 draws horizontally).",
         "additionalProperties": {
             "type": "object",
             "properties": {
                 "x": { "type": "number" },
                 "y": { "type": "number" },
-                "rotation": { "type": "number" },
+                "rotation": { "type": "number", "description": "Field text rotation in degrees, stored relative to the parent symbol as KiCad does (not an absolute sheet angle — on a 90° or 270° symbol, rotation: 0 draws vertically and rotation: 90 draws horizontally; see units[].field_placements.<name>.drawn_orientation in the response)." },
                 "hide": { "type": "boolean", "description": "true hides the field's text on the sheet; false shows it." }
             }
         }
@@ -81,7 +83,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "y": { "type": "number", "description": "Y position in mm" },
                     "rotation": { "type": "number", "description": "Rotation in degrees (0/90/180/270)", "default": 0 },
                     "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric." },
-                    "reference": { "type": "string", "description": "Optional reference designator. Default: the library prefix plus '?' (e.g. 'R?', '#FLG?'), which annotate_schematic numbers" },
+                    "reference": { "type": "string", "description": "Optional reference designator. Default: the library prefix plus '?' (e.g. 'R?', '#FLG?'), which annotate_schematic numbers. A numbered one already placed on any sheet of the hierarchy is refused as invalid_argument, unless this is another unit of that part with its value" },
                     "value": { "type": "string", "description": "Optional override for the library symbol's Value" },
                     "footprint": { "type": "string", "description": "Optional override for the library symbol's Footprint" },
                     "unit": { "type": "integer", "minimum": 1, "description": "Unit number for multi-unit symbols (gate/part selection). Default 1.", "default": 1 },
@@ -587,6 +589,8 @@ pub(crate) async fn handle_add_schematic_component(
         fields,
         catalog: Some(&catalog),
     };
+    let mut in_use =
+        super::sch_annotate::DesignatorsInUse::new(&sch_path, &context.project_name, "reference");
 
     let placed = match place_one_component(
         &mut sch,
@@ -603,6 +607,7 @@ pub(crate) async fn handle_add_schematic_component(
         unit,
         &source,
         extras,
+        &mut in_use,
     ) {
         Ok(placed) => placed,
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
@@ -735,6 +740,7 @@ pub(crate) async fn handle_add_schematic_component(
     if let Some(report) = &placed.lcsc_catalog {
         result["lcsc_catalog"] = report.clone();
     }
+    in_use.disclose(&mut result);
 
     Ok(crate::outcome::attach(
         CallToolResult::json(&result),
@@ -829,6 +835,7 @@ pub(crate) fn place_one_component(
     unit: u32,
     src: &dyn cse::library::SymbolLibrarySource,
     extras: ComponentPlacementExtras<'_>,
+    in_use: &mut super::sch_annotate::DesignatorsInUse,
 ) -> Result<PlacedComponent, CallToolResult> {
     // Snap to 1.27mm grid
     let (x, y) = snap_point(x, y, 1.27);
@@ -857,12 +864,19 @@ pub(crate) fn place_one_component(
             unit, lib_id, unit_count, unit_count
         )));
     }
+    in_use.check(sch, lib_id, unit, &fields.value, &reference)?;
 
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(lib_id, x, y);
     sym.at.rotation = Some(rotation);
     sym.set_mirror(mirror);
     sym.unit = unit;
+    // eeschema copies the library symbol's exclusions onto a symbol it
+    // places, so a mounting hole stays out of the BOM (#124).
+    sym.exclude_from_sim = metadata.exclude_from_sim;
+    sym.in_bom = fields.in_bom;
+    sym.on_board = fields.on_board;
+    sym.in_pos_files = metadata.in_pos_files;
 
     // Reference and Value go where the library anchors them, carried through
     // the placement transform so they follow a rotated body (#101);
@@ -939,9 +953,10 @@ pub(crate) fn place_one_component(
 
     // Carry all custom properties from the library symbol (excluding standard 5 and ki_*)
     let lib_custom_props = cse::library::symbol_custom_properties(sch, lib_id);
-    for (prop_name, prop_val) in lib_custom_props {
-        sym.properties
-            .push(positioned(&prop_name, &prop_val, x, y, 0.0, true, centred));
+    for custom in lib_custom_props {
+        let mut prop = positioned(&custom.name, &custom.value, x, y, 0.0, true, centred);
+        prop.private = custom.private;
+        sym.properties.push(prop);
     }
 
     // Determine if an LCSC ID is specified or present in library properties
@@ -1072,6 +1087,10 @@ fn placement_catalog_report(
 pub(crate) struct PlacementFields {
     pub(crate) value: String,
     pub(crate) footprint: String,
+    /// `(in_bom …)` and `(on_board …)` as the library sets them, `yes` where
+    /// it omits one.
+    pub(crate) in_bom: bool,
+    pub(crate) on_board: bool,
 }
 
 impl PlacementFields {
@@ -1093,6 +1112,8 @@ impl PlacementFields {
         Self {
             value: value.unwrap_or(library_value).to_owned(),
             footprint: footprint.unwrap_or(&metadata.footprint).to_owned(),
+            in_bom: metadata.in_bom.unwrap_or(true),
+            on_board: metadata.on_board.unwrap_or(true),
         }
     }
 }
@@ -1166,9 +1187,9 @@ impl ComponentTargetUnit {
             mirror: mirror.map(str::to_owned),
             // Placement writes `(dnp no)`: a new part is fitted.
             dnp: false,
-            // And `(in_bom yes)` and `(on_board yes)`, as `Symbol::new` sets them.
-            in_bom: true,
-            on_board: true,
+            // And `(in_bom …)` and `(on_board …)` as the library sets them.
+            in_bom: fields.in_bom,
+            on_board: fields.on_board,
             fields: BTreeMap::from([
                 ("Reference".to_owned(), reference.to_owned()),
                 ("Value".to_owned(), fields.value.clone()),
@@ -1740,12 +1761,18 @@ fn component_mutation_readback_from_schematic(
                 .filter(|node| node.tag() == Some("at"))
                 .find_map(cse::At::from_sexp)
             {
+                let field_rotation = at.rotation.unwrap_or(0.0);
+                let symbol_rotation = symbol.at.rotation.unwrap_or(0.0);
                 field_placements.insert(
                     property.name.clone(),
                     json!({
                         "x": at.x,
                         "y": at.y,
-                        "rotation": at.rotation.unwrap_or(0.0),
+                        "rotation": field_rotation,
+                        "drawn_orientation": copperpour_sexp::text_bounds::field_drawn_orientation(
+                            field_rotation,
+                            symbol_rotation,
+                        ),
                         "hide": hidden
                     }),
                 );
@@ -2922,46 +2949,36 @@ fn closing_quote(content: &str, value_start: usize) -> Option<usize> {
 fn property_insert_edit(
     content: &str,
     reference: &str,
-    start: usize,
-    end: usize,
+    (start, end): (usize, usize),
     name: &str,
     value: &str,
+    private: bool,
 ) -> Result<SexpEdit, String> {
     let block = &content[start..end];
 
-    // The symbol's placement, to anchor the new property on.
-    let (x, y) = block
-        .find("(at ")
-        .and_then(|at| {
-            let rest = &block[at + 4..];
-            let close = rest.find(')')?;
-            let mut parts = rest[..close].split_whitespace();
-            Some((
-                parts.next()?.parse::<f64>().ok()?,
-                parts.next()?.parse::<f64>().ok()?,
-            ))
-        })
+    let (x, y, _) = parse_sexp(block)
+        .ok()
+        .and_then(|node| parse_at(&node))
         .ok_or_else(|| format!("'{reference}' has no readable (at …) placement"))?;
 
     // Match the block's own indentation rather than assuming: eeschema saves
     // with tabs, this crate's writer uses two spaces.
-    let indent = block
-        .find("(property ")
-        .map(|p| {
-            let line_start = block[..p].rfind('\n').map_or(0, |n| n + 1);
-            block[line_start..p].to_string()
+    let indent = find_direct_child_blocks(block, "symbol")
+        .into_iter()
+        .find(|&(from, _)| {
+            symbol_fields::header(block, from).is_some_and(|(tag, _)| tag == "property")
         })
+        .and_then(|(from, _)| indent_before(content, start + from))
         .unwrap_or_else(|| "\t\t".to_string());
 
-    let escaped_name = escape_property_text(name);
-    let escaped_value = escape_property_text(value);
+    let flag = if private { "private " } else { "" };
     let newline = if content.contains("\r\n") {
         "\r\n"
     } else {
         "\n"
     };
     let prop = format!(
-        "{newline}{indent}(property \"{escaped_name}\" \"{escaped_value}\"{newline}\
+        "{newline}{indent}(property {flag}{} {}{newline}\
          {indent}\t(at {x} {y} 0){newline}\
          {indent}\t(hide yes){newline}\
          {indent}\t(effects{newline}\
@@ -2969,7 +2986,9 @@ fn property_insert_edit(
          {indent}\t\t\t(size 1.27 1.27){newline}\
          {indent}\t\t){newline}\
          {indent}\t){newline}\
-         {indent})"
+         {indent})",
+        quote_string(name),
+        quote_string(value)
     );
 
     // Insert before the block's closing paren so the property stays inside it.
@@ -2993,63 +3012,102 @@ pub(crate) fn set_property_value(
     new_value: &str,
     add_missing: bool,
 ) -> Result<(String, PropertyWriteCounts), String> {
-    let blocks = find_all_symbol_instance_blocks(content, reference);
+    let blocks: Vec<_> = find_direct_child_blocks(content, "kicad_sch")
+        .into_iter()
+        .filter(|&(start, end)| {
+            let block = &content[start..end];
+            block_tag(block) == "symbol"
+                && parse_sexp(block).is_ok_and(|node| {
+                    node.find_str("lib_id").is_some()
+                        && node.find_all("property").into_iter().any(|property| {
+                            property.get(1).and_then(|name| name.as_str()) == Some("Reference")
+                                && property.get(2).and_then(|value| value.as_str())
+                                    == Some(reference)
+                        })
+                })
+        })
+        .collect();
+    set_property_value_in_blocks(content, &blocks, reference, field, new_value, add_missing)
+}
+
+fn set_property_value_in_blocks(
+    content: &str,
+    blocks: &[(usize, usize)],
+    reference: &str,
+    field: &str,
+    new_value: &str,
+    add_missing: bool,
+) -> Result<(String, PropertyWriteCounts), String> {
     if blocks.is_empty() {
         return Err(format!("symbol '{reference}' not found in this schematic"));
     }
 
-    let escaped_field = escape_property_text(field);
-    let field_search = format!(r#"(property "{escaped_field}" ""#);
-    let escaped_value = escape_property_text(new_value);
+    let value = quote_string(new_value);
     let mut edits = Vec::new();
-    let mut updated = 0;
-    let mut added = 0;
+    let mut missing = Vec::new();
+    let (mut has_private, mut has_public) = (false, false);
 
-    for (start, end) in blocks {
-        let block = &content[start..end];
-        if let Some(relative) = block.find(&field_search) {
-            let value_start = start + relative + field_search.len();
-            let value_end = closing_quote(content, value_start)
-                .ok_or_else(|| format!("'{field}' property on '{reference}' is malformed"))?;
+    for &(start, end) in blocks {
+        let properties = symbol_fields::symbol_properties(content, start, end)
+            .map_err(|error| format!("'{reference}': {error}"))?;
+        if let Some(property) = properties
+            .into_iter()
+            .find(|property| property.name == field)
+        {
+            has_private |= property.private;
+            has_public |= !property.private;
             edits.push(SexpEdit::replace(
-                value_start,
-                value_end,
-                escaped_value.clone(),
+                property.value_span.0,
+                property.value_span.1,
+                value.clone(),
             ));
-            updated += 1;
-        } else if add_missing {
-            edits.push(property_insert_edit(
-                content, reference, start, end, field, new_value,
-            )?);
-            added += 1;
         } else {
+            missing.push((start, end));
+        }
+    }
+    if !missing.is_empty() {
+        if !add_missing {
+            if edits.is_empty() {
+                return Err(format!("Field '{field}' not found on '{reference}'"));
+            }
             return Err(format!(
                 "'{reference}' is missing the shared '{field}' property on one of its placed units"
             ));
         }
+        if has_private && has_public {
+            return Err(format!(
+                "'{reference}' has both private and public copies of '{field}'; \
+                 cannot choose which to add to the missing units"
+            ));
+        }
     }
 
-    Ok((
-        apply_edits(content.to_string(), edits),
-        PropertyWriteCounts { updated, added },
-    ))
+    let counts = PropertyWriteCounts {
+        updated: edits.len(),
+        added: missing.len(),
+    };
+    for block in missing {
+        edits.push(property_insert_edit(
+            content,
+            reference,
+            block,
+            field,
+            new_value,
+            has_private,
+        )?);
+    }
+
+    Ok((apply_edits(content.to_string(), edits), counts))
 }
 
 /// Plan the deletion of one property from every placed unit: the edits, and
 /// how many units carried it. A unit without it is left alone, so removing a
 /// field that is already gone plans nothing.
 ///
-/// The name is matched whole, closing quote included, so removing `MP` leaves
-/// `MPN` alone.
-///
-/// KiCad writes a private field as `(property private "NAME" …)`. This
-/// module's reader takes that field's name to be `private`, so it could not
-/// confirm the removal; such a field is refused by name rather than reported
-/// absent. The handler plans every name before its first edit, so this
-/// refusal, like a block that cannot be deleted, refuses the whole call and
-/// nothing is written.
+/// Private fields cannot be removed through `remove_fields`.
 fn plan_property_removal(
     content: &str,
+    blocks: &[(usize, usize)],
     reference: &str,
     field: &str,
 ) -> Result<(Vec<SexpEdit>, usize), CallToolResult> {
@@ -3058,25 +3116,23 @@ fn plan_property_removal(
             "No fields were updated on '{reference}': {field}: {why}"
         ))
     };
-    let blocks = find_all_symbol_instance_blocks(content, reference);
     if blocks.is_empty() {
         return Err(unchanged(format!(
             "symbol '{reference}' not found in this schematic"
         )));
     }
 
-    let escaped = escape_property_text(field);
-    let opening = format!(r#"(property "{escaped}""#);
-    let private = format!(r#"(property private "{escaped}""#);
     let mut edits = Vec::new();
-    let mut units = 0;
 
-    for (start, end) in blocks {
-        let block = &content[start..end];
-        let mut carried = false;
-        for (child, _) in find_direct_child_blocks(block, "symbol") {
-            if block[child..].starts_with(&private) {
-                return Err(crate::tools::invalid_arg(
+    for &(start, end) in blocks {
+        let properties =
+            symbol_fields::symbol_properties(content, start, end).map_err(unchanged)?;
+        if let Some(property) = properties
+            .into_iter()
+            .find(|property| property.name == field)
+        {
+            if property.private {
+                return Err(invalid_arg(
                     "remove_fields",
                     &format!(
                         "'{field}' is a private field on '{reference}', which this tool does \
@@ -3084,23 +3140,15 @@ fn plan_property_removal(
                     ),
                 ));
             }
-            if !block[child..].starts_with(&opening) {
-                continue;
-            }
-            // With its own line's indentation and newline, so the block closes
-            // up as eeschema would have written it without the field.
-            let (from, to) = find_block_with_leading_whitespace(content, start + child)
+            let (from, to) = find_block_with_leading_whitespace(content, property.block.0)
                 .ok_or_else(|| {
                     unchanged(format!("'{field}' property on '{reference}' is malformed"))
                 })?;
             edits.push(SexpEdit::delete(from, to));
-            carried = true;
-        }
-        if carried {
-            units += 1;
         }
     }
 
+    let units = edits.len();
     Ok((edits, units))
 }
 
@@ -3550,10 +3598,10 @@ fn set_property_placement(
 /// designator.
 fn rewrite_instance_references(
     content: &str,
+    blocks: &[(usize, usize)],
     old_ref: &str,
     new_ref: &str,
 ) -> Result<(String, usize), String> {
-    let blocks = find_all_symbol_instance_blocks(content, new_ref);
     if blocks.is_empty() {
         return Err(format!("symbol '{old_ref}' not found after the rename"));
     }
@@ -3561,7 +3609,7 @@ fn rewrite_instance_references(
     let search = format!(r#"(reference "{old_ref}")"#);
     let replacement = format!(r#"(reference "{new_ref}")"#);
     let mut edits = Vec::new();
-    for (start, end) in &blocks {
+    for (start, end) in blocks {
         let block = &content[*start..*end];
         let mut from = 0usize;
         while let Some(rel) = block[from..].find(&search) {
@@ -3662,6 +3710,7 @@ async fn handle_edit_schematic_component(
     let mut applied_dnp = None;
     let (mut applied_in_bom, mut applied_on_board) = (None, None);
     let mut edit_reference = reference.as_str();
+    let uuids = target.uuids();
 
     let mut errors: Vec<String> = Vec::new();
     // A macro rather than a closure: the body also needs `changed`/`errors`
@@ -3669,7 +3718,14 @@ async fn handle_edit_schematic_component(
     // and a closure capturing them mutably would lock both for its lifetime.
     macro_rules! apply {
         ($field:expr, $new_val:expr) => {
-            match set_property_value(&content, edit_reference, $field, $new_val, false) {
+            match set_property_value_in_blocks(
+                &content,
+                &symbol_blocks_by_uuid(&content, &uuids),
+                edit_reference,
+                $field,
+                $new_val,
+                false,
+            ) {
                 Ok((updated, counts)) => {
                     content = updated;
                     expected_fields.insert($field.to_owned(), $new_val.to_owned());
@@ -3693,7 +3749,12 @@ async fn handle_edit_schematic_component(
     let mut removed_fields = Vec::new();
     let mut absent_fields = Vec::new();
     for name in &remove_names {
-        match plan_property_removal(&content, &reference, name) {
+        match plan_property_removal(
+            &content,
+            &symbol_blocks_by_uuid(&content, &uuids),
+            &reference,
+            name,
+        ) {
             Ok((_, 0)) => absent_fields.push(name.clone()),
             Ok((edits, units)) => {
                 removal_edits.extend(edits);
@@ -3715,7 +3776,12 @@ async fn handle_edit_schematic_component(
         // reads when it builds the netlist. Rewriting only the property leaves
         // the netlist on the old designator, so the rename appears to work in
         // eeschema and is ignored everywhere it matters (#157).
-        match rewrite_instance_references(&content, &reference, new_ref) {
+        match rewrite_instance_references(
+            &content,
+            &symbol_blocks_by_uuid(&content, &uuids),
+            &reference,
+            new_ref,
+        ) {
             Ok((updated, count)) => {
                 content = updated;
                 edit_reference = new_ref;
@@ -3744,7 +3810,7 @@ async fn handle_edit_schematic_component(
     if let Some(dnp) = requested_dnp {
         // Bound by UUID; a unit missed here fails the prospective readback,
         // before anything is committed.
-        let blocks = symbol_blocks_by_uuid(&content, &target.uuids());
+        let blocks = symbol_blocks_by_uuid(&content, &uuids);
         match set_flag_in_blocks(&content, &blocks, &reference, "dnp", dnp) {
             Ok(updated) => {
                 content = updated;
@@ -3770,7 +3836,7 @@ async fn handle_edit_schematic_component(
     // KiCad keeps these per unit too, and the board sync refuses a part
     // whose units disagree on them.
     for (flag, value) in requested_flags {
-        let blocks = symbol_blocks_by_uuid(&content, &target.uuids());
+        let blocks = symbol_blocks_by_uuid(&content, &uuids);
         match set_flag_in_blocks(&content, &blocks, &reference, flag, value) {
             Ok(updated) => {
                 content = updated;
@@ -3813,7 +3879,14 @@ async fn handle_edit_schematic_component(
                 ));
                 continue;
             }
-            match set_property_value(&content, edit_reference, name, value, true) {
+            match set_property_value_in_blocks(
+                &content,
+                &symbol_blocks_by_uuid(&content, &uuids),
+                edit_reference,
+                name,
+                value,
+                true,
+            ) {
                 Ok((updated, counts)) => {
                     content = updated;
                     expected_fields.insert(name.clone(), value.to_owned());
@@ -6199,6 +6272,62 @@ mod tests {
             before,
             "rejected placements must not modify the schematic"
         );
+    }
+
+    /// The units of one multi-unit part share its designator. A unit already
+    /// placed, another value or another part under it is refused, and nothing
+    /// is written.
+    #[tokio::test]
+    async fn only_another_unit_of_the_part_with_its_value_joins_a_designator() {
+        let (dir, _env) = stub_symbol_dir();
+        let path = dir.path().join("units.kicad_sch");
+        let ctx = test_ctx();
+
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        for (unit, x) in [(1, 100.0), (2, 150.0)] {
+            let placed = handle_add_schematic_component(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "lib_id": "Device:OPAMP_DUAL",
+                    "x": x, "y": 80.0,
+                    "reference": "U1",
+                    "unit": unit
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!placed.is_error, "unit {unit}: {}", content_text(&placed));
+        }
+        let before = std::fs::read_to_string(&path).unwrap();
+        for (lib_id, unit, value) in [
+            ("Device:OPAMP_DUAL", 2, None),
+            ("Device:OPAMP_DUAL", 3, Some("LM358")),
+            ("Device:R", 1, None),
+        ] {
+            let mut args = json!({
+                "schematic": path.display().to_string(),
+                "lib_id": lib_id,
+                "x": 200.0, "y": 80.0,
+                "reference": "U1",
+                "unit": unit
+            });
+            if let Some(value) = value {
+                args["value"] = json!(value);
+            }
+            let refused = handle_add_schematic_component(&args, &ctx).await.unwrap();
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&refused).as_deref(),
+                Some("invalid_argument"),
+                "{lib_id} unit {unit}: {}",
+                content_text(&refused)
+            );
+            let body: serde_json::Value = serde_json::from_str(&content_text(&refused)).unwrap();
+            assert_eq!(body["error"]["field"], "reference");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     #[tokio::test]
@@ -9435,10 +9564,11 @@ mod multi_unit_component_tests {
         }
     }
 
-    /// `add_schematic_component` can write a second placement of a unit that
-    /// is already placed, a state KiCad reports as duplicate items. A move
-    /// that names that unit is refused as an ambiguous target, as every
-    /// component edit refuses it, and writes nothing.
+    /// A second placement of a unit that is already placed, a state KiCad
+    /// reports as duplicate items, placed unannotated and renamed, since a
+    /// placement under the designator is refused. A move that names that unit
+    /// is refused as an ambiguous target, as every component edit refuses it,
+    /// and writes nothing.
     #[tokio::test]
     async fn move_with_a_unit_on_two_placements_is_ambiguous_and_writes_nothing() {
         let (_directory, path) = eeschema_placement_fixture();
@@ -9448,7 +9578,6 @@ mod multi_unit_component_tests {
                 "lib_id": "ecc83-pp:ECC83",
                 "x": 101.6,
                 "y": 25.4,
-                "reference": "U1",
                 "unit": 1
             }),
             &context(),
@@ -9456,6 +9585,13 @@ mod multi_unit_component_tests {
         .await
         .unwrap();
         assert!(!placed.is_error, "{placed:?}");
+        let renamed = handle_edit_schematic_component(
+            &json!({ "schematic": path, "reference": "U?", "new_reference": "U1" }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!renamed.is_error, "{renamed:?}");
         let before = std::fs::read_to_string(&path).unwrap();
         let result = handle_move_schematic_component(
             &json!({
@@ -9509,6 +9645,108 @@ mod multi_unit_component_tests {
             after[..after.find("(property \"Reference\" \"P3\"").unwrap()],
             body_at,
             "nothing before the edited symbol may change"
+        );
+    }
+
+    /// KiCad stores field `(at x y rot)` relative to the parent symbol, so on
+    /// a 90° or 270° symbol `rotation: 90` draws horizontally and `rotation: 0`
+    /// draws vertically. Both `edit_schematic_component` and
+    /// `batch_edit_schematic_components` keep the stored symbol-relative angle,
+    /// report `drawn_orientation` (`horizontal`/`vertical`) in each unit's
+    /// `field_placements`, and document that contract in the schema.
+    #[tokio::test]
+    async fn field_placement_rotation_is_symbol_relative_and_reports_drawn_orientation() {
+        let (_directory, path) = eeschema_fixture();
+        let handler = served_handler().await;
+
+        let schema = field_placements_schema();
+        let rot_desc = schema["additionalProperties"]["properties"]["rotation"]["description"]
+            .as_str()
+            .expect("rotation schema description");
+        assert!(rot_desc.contains("relative to the parent symbol"));
+        assert!(rot_desc.contains("drawn_orientation"));
+
+        async fn call_json(
+            handler: &crate::mcp::handler::McpHandler,
+            tool: &str,
+            arguments: serde_json::Value,
+        ) -> serde_json::Value {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": { "name": tool, "arguments": arguments }
+                }))
+                .await
+                .expect("tools/call receives a response");
+            let result = response.result.expect("a JSON-RPC result");
+            assert_ne!(result["isError"], json!(true), "{tool}: {result}");
+            let text = result["content"][0]["text"].as_str().expect("text body");
+            serde_json::from_str(text).expect("json body")
+        }
+
+        // C2 is placed at 270° in ecc83_multiunit.kicad_sch.
+        for (rot, expected_orientation) in [(90.0, "horizontal"), (0.0, "vertical")] {
+            let res = call_json(
+                &handler,
+                "edit_schematic_component",
+                json!({
+                    "schematic": path,
+                    "reference": "C2",
+                    "field_placements": { "Value": { "rotation": rot } }
+                }),
+            )
+            .await;
+            let val = &res["units"][0]["field_placements"]["Value"];
+            assert_eq!(val["rotation"], rot);
+            assert_eq!(val["drawn_orientation"], expected_orientation);
+        }
+
+        // Rotate P3 (initially 0°) to 90° and verify the same swap.
+        call_json(
+            &handler,
+            "rotate_schematic_component",
+            json!({ "schematic": path, "reference": "P3", "rotation": 90 }),
+        )
+        .await;
+        for (rot, expected_orientation) in [(90.0, "horizontal"), (0.0, "vertical")] {
+            let res = call_json(
+                &handler,
+                "edit_schematic_component",
+                json!({
+                    "schematic": path,
+                    "reference": "P3",
+                    "field_placements": { "Value": { "rotation": rot } }
+                }),
+            )
+            .await;
+            let val = &res["units"][0]["field_placements"]["Value"];
+            assert_eq!(val["rotation"], rot);
+            assert_eq!(val["drawn_orientation"], expected_orientation);
+        }
+
+        // Sibling caller: batch_edit_schematic_components on 180° R1 and 270° C2.
+        let batch_res = call_json(
+            &handler,
+            "batch_edit_schematic_components",
+            json!({
+                "schematic": path,
+                "edits": [
+                    { "reference": "R1", "field_placements": { "Value": { "rotation": 90 } } },
+                    { "reference": "C2", "field_placements": { "Reference": { "rotation": 90 } } }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            batch_res["updated"][0]["units"][0]["field_placements"]["Value"]["drawn_orientation"],
+            "vertical"
+        );
+        assert_eq!(
+            batch_res["updated"][1]["units"][0]["field_placements"]["Reference"]
+                ["drawn_orientation"],
+            "horizontal"
         );
     }
 
@@ -10459,6 +10697,143 @@ mod multi_unit_component_tests {
     }
 
     #[tokio::test]
+    async fn a_private_field_value_is_updated_in_place_and_stays_private() {
+        let (_directory, path, private) = private_mpn_fixture();
+        let spaced = private
+            .replacen(
+                r#"(property "Reference" "R1""#,
+                "(property \"Reference\"\n\t\t\t\"R1\"",
+                1,
+            )
+            .replacen(
+                r#"property private "MPN""#,
+                "property private\t\n\t\t\t\"MPN\"",
+                1,
+            );
+        assert_ne!(spaced, private);
+        std::fs::write(&path, &spaced).unwrap();
+        let result = handle_edit_schematic_component(
+            &json!({ "schematic": path, "reference": "R1", "fields": { "MPN": "NEW \"PART\"" } }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let expected = spaced.replacen("\"MPN-679-R1\"", r#""NEW \"PART\"""#, 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn a_name_both_public_and_private_on_one_unit_is_refused() {
+        let (_directory, path, private) = private_mpn_fixture();
+        let doubled = private.replacen(
+            "(property private \"MPN\" \"MPN-679-R1\"",
+            "(property \"MPN\" \"PUBLIC\" (at 0 0 0))\n\t\t(property private \"MPN\" \"MPN-679-R1\"",
+            1,
+        );
+        std::fs::write(&path, &doubled).unwrap();
+        let (refused, body) = call_served_edit(
+            &served_edit_handler().await,
+            json!({ "schematic": path, "reference": "R1", "fields": { "MPN": "NEW-PART" } }),
+        )
+        .await;
+        assert!(refused, "{body}");
+        assert_eq!(body["error"]["kind"], "ambiguous_target", "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), doubled);
+    }
+
+    fn multi_unit_private_mpn_source(source: &str, keep_public_copy: bool) -> String {
+        let public = r#"(property "MPN" "MPN-679-U1""#;
+        let mut copies = source.match_indices(public);
+        let (first, _) = copies.next().unwrap();
+        let (second, _) = copies.next().unwrap();
+        let (third, _) = copies.next().unwrap();
+        assert!(copies.next().is_none());
+        let remove = if keep_public_copy {
+            &[third][..]
+        } else {
+            &[second, third][..]
+        };
+        let mut edits = vec![SexpEdit::insert(first + "(property ".len(), "private ")];
+        for &start in remove {
+            let (start, end) = find_block_with_leading_whitespace(source, start).unwrap();
+            edits.push(SexpEdit::delete(start, end));
+        }
+        apply_edits(source.to_string(), edits)
+    }
+
+    #[tokio::test]
+    async fn missing_unit_copies_of_a_private_field_are_added_as_private() {
+        let (_directory, path) = fields_fixture();
+        let before = multi_unit_private_mpn_source(&std::fs::read_to_string(&path).unwrap(), false);
+        let (start, end) = find_all_symbol_instance_blocks(&before, "U1")
+            .into_iter()
+            .find(|&(start, end)| !before[start..end].contains(r#"property private "MPN""#))
+            .unwrap();
+        let block = &before[start..end];
+        let node = parse_sexp(block).unwrap();
+        let uuid = node.find_str("uuid").unwrap().to_owned();
+        let (x, y, _) = parse_at(&node).unwrap();
+        let spaced_block = block.replacen("(at ", "(at\t", 1);
+        assert_ne!(spaced_block, block);
+        let before = apply_edits(before, vec![SexpEdit::replace(start, end, spaced_block)]);
+        std::fs::write(&path, &before).unwrap();
+        let result = handle_edit_schematic_component(
+            &json!({ "schematic": path, "reference": "U1", "fields": { "MPN": "NEW-PART" } }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let saved = cse::Schematic::load(&path).unwrap();
+        let units: Vec<_> = saved
+            .symbols
+            .iter()
+            .filter(|unit| unit.reference() == Some("U1"))
+            .collect();
+        assert_eq!(units.len(), 3);
+        for unit in units {
+            let mut mpns = unit.properties.iter().filter(|field| field.name == "MPN");
+            let mpn = mpns.next().unwrap();
+            assert!(mpn.private);
+            assert_eq!(mpn.value, "NEW-PART");
+            assert!(mpns.next().is_none());
+        }
+        let tree = parse_sexp(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let unit = tree
+            .find_all("symbol")
+            .into_iter()
+            .find(|node| node.find_str("uuid") == Some(uuid.as_str()))
+            .unwrap();
+        let mpn = unit
+            .find_all("property")
+            .into_iter()
+            .find(|node| node.get(2).and_then(|name| name.as_str()) == Some("MPN"))
+            .unwrap();
+        assert_eq!(parse_at(mpn), Some((x, y, 0.0)));
+    }
+
+    #[tokio::test]
+    async fn a_missing_unit_copy_with_mixed_privacy_is_refused_without_writing() {
+        let (_directory, path) = fields_fixture();
+        let before = multi_unit_private_mpn_source(&std::fs::read_to_string(&path).unwrap(), true);
+        std::fs::write(&path, &before).unwrap();
+        let result = handle_edit_schematic_component(
+            &json!({ "schematic": path, "reference": "U1", "fields": { "MPN": "NEW-PART" } }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            matches!(&result.content[..], [ToolContent::Text { text }]
+                if text.contains("private and public copies of 'MPN'")),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
     async fn a_name_is_matched_whole_not_as_a_prefix() {
         let (_directory, path) = fields_fixture();
         let before = std::fs::read_to_string(&path).unwrap();
@@ -10536,16 +10911,8 @@ mod multi_unit_component_tests {
         }
     }
 
-    /// `remove_fields` through served `tools/call`, as a client sends it. The
-    /// advertised schema refuses `null`, a string and a non-string entry before
-    /// the handler runs, so those refusals are dispatch's, each naming the
-    /// field the schema failed on. A mandatory name passes the schema, and its
-    /// refusal is the handler's.
-    #[tokio::test]
-    async fn served_remove_fields_removes_refuses_and_stays_out_of_other_replies() {
-        let (_directory, path) = fields_fixture();
-        let schematic = path.display().to_string();
-        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+    async fn served_edit_handler() -> crate::mcp::handler::McpHandler {
+        crate::mcp::handler::McpHandler::new(ServerConfig {
             kicad_cli: String::new(),
             kicad_binary: String::new(),
             ipc_address: String::new(),
@@ -10555,26 +10922,31 @@ mod multi_unit_component_tests {
             eager_toolsets: false,
         })
         .await
-        .unwrap();
-        let call = |arguments: serde_json::Value| {
-            let message = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": {"name": "edit_schematic_component", "arguments": arguments}});
-            let handler = &handler;
-            async move {
-                let result = handler
-                    .handle_message(message)
-                    .await
-                    .unwrap()
-                    .result
-                    .unwrap();
-                let body = serde_json::from_str::<serde_json::Value>(
-                    result["content"][0]["text"].as_str().unwrap(),
-                )
-                .unwrap();
-                (result["isError"] == true, body)
-            }
-        };
+        .unwrap()
+    }
 
+    async fn call_served_edit(
+        handler: &crate::mcp::handler::McpHandler,
+        arguments: serde_json::Value,
+    ) -> (bool, serde_json::Value) {
+        let message = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "edit_schematic_component", "arguments": arguments}});
+        let result = handler
+            .handle_message(message)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        (result["isError"] == true, body)
+    }
+
+    #[tokio::test]
+    async fn served_remove_fields_removes_refuses_and_stays_out_of_other_replies() {
+        let (_directory, path) = fields_fixture();
+        let schematic = path.display().to_string();
+        let handler = served_edit_handler().await;
+        let call = |arguments| call_served_edit(&handler, arguments);
         let before = std::fs::read_to_string(&path).unwrap();
         for (remove_fields, field) in [
             (json!(null), "remove_fields"),
@@ -11355,6 +11727,236 @@ mod multi_unit_component_tests {
             .as_str()
             .unwrap()
             .contains("may have changed"));
+    }
+}
+
+/// A placement under a numbered designator that another placement of the
+/// project holds is refused before anything is written, unless it is another
+/// unit of that multi-unit part, as eeschema's annotation check reports it
+/// (`eeschema/sch_reference_list.cpp` 681-740 at 10.0.6). Every call is served
+/// through `tools/call` on KiCad-saved fixtures: `ecc83_multiunit.kicad_sch`,
+/// whose `R1` is a 1.5K, and the `annotate_nested_hierarchy` project (see its
+/// README), whose `bank.kicad_sch` holds `R10` and whose `cell.kicad_sch` holds
+/// `R13`. The units of a multi-unit part are in
+/// `only_another_unit_of_the_part_with_its_value_joins_a_designator`, which
+/// needs a library that resolves their count.
+#[cfg(test)]
+mod designator_in_use_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::path::Path;
+
+    const ECC83: &str = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+    const NESTED_PRO: &str =
+        include_str!("../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_pro");
+    const NESTED_ROOT: &str =
+        include_str!("../../tests/fixtures/annotate_nested_hierarchy/nested_pages.kicad_sch");
+    const NESTED_BANK: &str =
+        include_str!("../../tests/fixtures/annotate_nested_hierarchy/bank.kicad_sch");
+    const NESTED_CELL: &str =
+        include_str!("../../tests/fixtures/annotate_nested_hierarchy/cell.kicad_sch");
+
+    /// Lay fixture files out in a fresh directory, as KiCad saved them.
+    fn lay_out(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content) in files {
+            std::fs::write(dir.path().join(name), content).unwrap();
+        }
+        dir
+    }
+
+    fn ecc83() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = lay_out(&[("ecc83-pp.kicad_sch", ECC83)]);
+        let path = dir.path().join("ecc83-pp.kicad_sch");
+        (dir, path)
+    }
+
+    fn nested() -> tempfile::TempDir {
+        lay_out(&[
+            ("nested_pages.kicad_pro", NESTED_PRO),
+            ("nested_pages.kicad_sch", NESTED_ROOT),
+            ("bank.kicad_sch", NESTED_BANK),
+            ("cell.kicad_sch", NESTED_CELL),
+        ])
+    }
+
+    /// One `tools/call` through the served dispatch: the JSON body, with
+    /// `is_error` from the result.
+    async fn serve(tool: &str, path: &Path, mut arguments: serde_json::Value) -> serde_json::Value {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+        arguments["schematic"] = json!(path.display().to_string());
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        let mut body: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        body["is_error"] = json!(result["isError"] == json!(true));
+        body
+    }
+
+    async fn place(
+        path: &Path,
+        lib_id: &str,
+        reference: &str,
+        unit: u32,
+        x: f64,
+    ) -> serde_json::Value {
+        serve(
+            "add_schematic_component",
+            path,
+            json!({"lib_id": lib_id, "reference": reference, "unit": unit, "x": x, "y": 25.4}),
+        )
+        .await
+    }
+
+    fn refused_on(body: &serde_json::Value, field: &str) -> String {
+        assert_eq!(body["is_error"], json!(true), "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], field, "{body}");
+        body["error"]["reason"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_designator_on_the_sheet_is_refused_and_nothing_is_written() {
+        let (_dir, path) = ecc83();
+        let before = std::fs::read(&path).unwrap();
+        let reason = refused_on(
+            &place(&path, "ecc83-pp:R", "R1", 1, 101.6).await,
+            "reference",
+        );
+        assert!(
+            reason.contains("'R1' is already placed: ecc83-pp:R unit 1 value '1.5K'"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("Omit reference to place it as 'R?'"),
+            "{reason}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// `R?` is what `annotate_schematic` numbers; it never meets the check.
+    #[tokio::test]
+    async fn an_unannotated_designator_is_never_refused() {
+        let (_dir, path) = ecc83();
+        for x in [101.6, 127.0] {
+            let placed = serve(
+                "add_schematic_component",
+                &path,
+                json!({"lib_id": "ecc83-pp:R", "x": x, "y": 25.4}),
+            )
+            .await;
+            assert_eq!(placed["is_error"], json!(false), "{placed}");
+        }
+        let sch = cse::Schematic::load(&path).unwrap();
+        let unannotated = sch.symbols.iter().filter(|s| s.reference() == Some("R?"));
+        assert_eq!(unannotated.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_designator_held_on_another_sheet_is_refused_and_names_it() {
+        let dir = nested();
+        let root = dir.path().join("nested_pages.kicad_sch");
+        let before = std::fs::read(&root).unwrap();
+        for (reference, holder) in [("R10", "bank.kicad_sch"), ("R13", "cell.kicad_sch")] {
+            let reason = refused_on(
+                &place(&root, "Device:R", reference, 1, 25.4).await,
+                "reference",
+            );
+            assert!(reason.contains(holder), "{reason}");
+        }
+        assert_eq!(std::fs::read(&root).unwrap(), before);
+        let placed = place(&root, "Device:R", "R17", 1, 25.4).await;
+        assert_eq!(placed["is_error"], json!(false), "{placed}");
+        assert!(placed.get("other_sheets_unreadable").is_none(), "{placed}");
+    }
+
+    /// `bank.kicad_sch` is placed twice, so a placement on it carries its
+    /// designator in both instance records; it holds the designator once.
+    #[tokio::test]
+    async fn a_placement_on_a_sheet_placed_twice_holds_its_designator_once() {
+        let dir = nested();
+        let bank = dir.path().join("bank.kicad_sch");
+        let placed = place(&bank, "Device:R", "R17", 1, 25.4).await;
+        assert_eq!(placed["is_error"], json!(false), "{placed}");
+        let reason = refused_on(&place(&bank, "Device:R", "R17", 1, 50.8).await, "reference");
+        assert_eq!(reason.matches("bank.kicad_sch").count(), 1, "{reason}");
+    }
+
+    /// A sheet file that cannot be read is named, its designators unseen; an
+    /// unannotated placement reads no other sheet.
+    #[tokio::test]
+    async fn an_unreadable_sheet_is_named_in_the_reply() {
+        let dir = nested();
+        let root = dir.path().join("nested_pages.kicad_sch");
+        std::fs::remove_file(dir.path().join("cell.kicad_sch")).unwrap();
+        let placed = place(&root, "Device:R", "R13", 1, 25.4).await;
+        assert_eq!(placed["is_error"], json!(false), "{placed}");
+        let unreadable = placed["other_sheets_unreadable"].as_array().unwrap();
+        assert_eq!(unreadable.len(), 1, "{placed}");
+        assert!(
+            unreadable[0].as_str().unwrap().ends_with("cell.kicad_sch"),
+            "{placed}"
+        );
+        let unannotated = serve(
+            "add_schematic_component",
+            &root,
+            json!({"lib_id": "Device:R", "x": 50.8, "y": 25.4}),
+        )
+        .await;
+        assert_eq!(unannotated["is_error"], json!(false), "{unannotated}");
+        assert!(
+            unannotated.get("other_sheets_unreadable").is_none(),
+            "{unannotated}"
+        );
+    }
+
+    /// An earlier item of the same batch holds its designator too.
+    #[tokio::test]
+    async fn a_batch_refuses_only_its_items_under_a_designator_in_use() {
+        let (_dir, path) = ecc83();
+        let body = serve(
+            "batch_place_components",
+            &path,
+            json!({"components": [
+                {"lib_id": "ecc83-pp:R", "reference": "R1", "x": 101.6, "y": 25.4},
+                {"lib_id": "ecc83-pp:R", "reference": "R20", "x": 127.0, "y": 25.4},
+                {"lib_id": "ecc83-pp:R", "reference": "R20", "x": 152.4, "y": 25.4}
+            ]}),
+        )
+        .await;
+        assert_eq!(body["placed_count"], 1, "{body}");
+        let failures: Vec<(u64, &str)> = body["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| (f["index"].as_u64().unwrap(), f["kind"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            failures,
+            [(0, "invalid_argument"), (2, "invalid_argument")],
+            "{body}"
+        );
+        let sch = cse::Schematic::load(&path).unwrap();
+        for (reference, count) in [("R1", 1), ("R20", 1)] {
+            let placed = sch
+                .symbols
+                .iter()
+                .filter(|s| s.reference() == Some(reference));
+            assert_eq!(placed.count(), count, "{reference}");
+        }
     }
 }
 
@@ -12252,6 +12854,235 @@ mod private_field_tests {
         );
         let committed = std::fs::read_to_string(&path).unwrap();
         assert!(committed.contains("(property private \"MPN\" \"MPN-679-R1\""));
+    }
+
+    /// Reproduces #571: placing a symbol with KiCad `private` properties
+    /// (`Device:Crystal_GND24` has `KLC_S3.3` and `KLC_S4.1`) must write them
+    /// as `(property private "NAME" "VALUE" …)`, not `(property "private" "NAME" …)`.
+    #[tokio::test]
+    async fn placing_symbol_with_private_properties_preserves_names_and_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let sym_path = dir.path().join("Device.kicad_sym");
+        std::fs::write(
+            &sym_path,
+            "(kicad_symbol_lib\n\
+             \t(version 20251024)\n\
+             \t(generator \"kicad_symbol_editor\")\n\
+             \t(generator_version \"10.0\")\n\
+             \t(symbol \"Crystal_GND24\"\n\
+             \t\t(property \"Reference\" \"Y\" (at 3.175 5.08 0) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Value\" \"Crystal_GND24\" (at 3.175 3.175 0) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Footprint\" \"\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Datasheet\" \"\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Description\" \"Four pin crystal, GND on pins 2 and 4\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property private \"KLC_S3.3\" \"The rectangle is not a symbol body but a graphical element\" (at 0 -12.7 0) (show_name yes) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property private \"KLC_S4.1\" \"Some pins are on 50mil grid to make the symbol small\" (at 0 -15.24 0) (show_name yes) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"ki_keywords\" \"quartz\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(symbol \"Crystal_GND24_0_1\"\n\
+             \t\t\t(polyline (pts (xy -2.54 2.286) (xy 2.54 2.286)) (stroke (width 0) (type default)) (fill (type none)))\n\
+             \t\t)\n\
+             \t)\n\
+             )\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("sym-lib-table"),
+            format!(
+                "(sym_lib_table (version 7) (lib (name \"Device\") (type \"KiCad\") (uri {}) (options \"\") (descr \"\")))",
+                crate::tools::library::quote_lib_table_string(&sym_path.display().to_string())
+            ),
+        )
+        .unwrap();
+        let sch_path = dir.path().join("test.kicad_sch");
+        std::fs::write(
+            &sch_path,
+            "(kicad_sch (version 20250114) (generator \"eeschema\") (generator_version \"10.0\") (uuid \"00000000-0000-0000-0000-000000000001\") (paper \"A4\") (lib_symbols) (sheet_instances (path \"/\" (page \"1\"))))\n",
+        )
+        .unwrap();
+
+        let ctx = context();
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": sch_path,
+                "lib_id": "Device:Crystal_GND24",
+                "x": 100.33,
+                "y": 100.33,
+                "reference": "Y1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let committed = std::fs::read_to_string(&sch_path).unwrap();
+        // One in the embedded lib_symbols copy, one on the placed instance.
+        assert_eq!(
+            committed
+                .matches("(property private \"KLC_S3.3\" \"The rectangle is not a symbol body but a graphical element\"")
+                .count(),
+            2,
+            "KLC_S3.3 missing or lost private flag on the instance: {committed}"
+        );
+        // One in the embedded lib_symbols copy, one on the placed instance.
+        assert_eq!(
+            committed
+                .matches("(property private \"KLC_S4.1\" \"Some pins are on 50mil grid to make the symbol small\"")
+                .count(),
+            2,
+            "KLC_S4.1 missing or lost private flag on the instance: {committed}"
+        );
+        assert!(
+            !committed.contains("(property \"private\""),
+            "wrote bogus \"private\" field: {committed}"
+        );
+
+        let edit = handle_edit_schematic_component(
+            &json!({
+                "schematic": sch_path,
+                "reference": "Y1",
+                "value": "16MHz"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!edit.is_error, "edit after placement failed: {edit:?}");
+    }
+
+    #[tokio::test]
+    async fn batch_place_and_served_dispatch_preserve_private_properties_and_literal_private_name()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let sym_path = dir.path().join("Device.kicad_sym");
+        std::fs::write(
+            &sym_path,
+            "(kicad_symbol_lib\n\
+             \t(version 20251024)\n\
+             \t(generator \"kicad_symbol_editor\")\n\
+             \t(generator_version \"10.0\")\n\
+             \t(symbol \"Crystal_GND24\"\n\
+             \t\t(property \"Reference\" \"Y\" (at 3.175 5.08 0) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Value\" \"Crystal_GND24\" (at 3.175 3.175 0) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Footprint\" \"\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Datasheet\" \"\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Description\" \"Four pin crystal\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property private \"KLC_S3.3\" \"The rectangle is not a symbol body\" (at 0 -12.7 0) (show_name yes) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property private \"KLC_S4.1\" \"Some pins are on 50mil grid\" (at 0 -15.24 0) (show_name yes) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"private\" \"literal-value\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(symbol \"Crystal_GND24_0_1\"\n\
+             \t\t\t(polyline (pts (xy -2.54 2.286) (xy 2.54 2.286)) (stroke (width 0) (type default)) (fill (type none)))\n\
+             \t\t)\n\
+             \t)\n\
+             \t(symbol \"R\"\n\
+             \t\t(property \"Reference\" \"R\" (at 2.032 0 90) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Value\" \"R\" (at 0 0 90) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Footprint\" \"\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Datasheet\" \"~\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Description\" \"Resistor\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(symbol \"R_0_1\"\n\
+             \t\t\t(rectangle (start -1.016 -2.54) (end 1.016 2.54) (stroke (width 0.254) (type default)) (fill (type none)))\n\
+             \t\t)\n\
+             \t)\n\
+             )\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("sym-lib-table"),
+            format!(
+                "(sym_lib_table (version 7) (lib (name \"Device\") (type \"KiCad\") (uri {}) (options \"\") (descr \"\")))",
+                crate::tools::library::quote_lib_table_string(&sym_path.display().to_string())
+            ),
+        )
+        .unwrap();
+        let sch_path = dir.path().join("test.kicad_sch");
+        std::fs::write(
+            &sch_path,
+            "(kicad_sch (version 20250114) (generator \"eeschema\") (generator_version \"10.0\") (uuid \"00000000-0000-0000-0000-000000000001\") (paper \"A4\") (lib_symbols) (sheet_instances (path \"/\" (page \"1\"))))\n",
+        )
+        .unwrap();
+
+        // Served dispatch via McpHandler::handle_message for add_schematic_component.
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            project_dir: Some(dir.path().to_path_buf()),
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        let served_resp = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_schematic_component",
+                    "arguments": {
+                        "schematic": sch_path,
+                        "lib_id": "Device:Crystal_GND24",
+                        "x": 100.33,
+                        "y": 100.33,
+                        "reference": "Y1"
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        let served_result = served_resp.result.as_ref().unwrap();
+        let is_err = served_result["isError"].as_bool().unwrap_or(false);
+        assert!(
+            !is_err,
+            "served add_schematic_component failed: {served_resp:?}"
+        );
+
+        // Sibling route: batch_place_components with Crystal_GND24 and R.
+        let batch_resp = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "batch_place_components",
+                    "arguments": {
+                        "schematic": sch_path,
+                        "components": [
+                            { "lib_id": "Device:Crystal_GND24", "x": 120.65, "y": 100.33, "reference": "Y2" },
+                            { "lib_id": "Device:R", "x": 140.97, "y": 100.33, "reference": "R1", "value": "10k" }
+                        ]
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        let batch_result = batch_resp.result.as_ref().unwrap();
+        let batch_err = batch_result["isError"].as_bool().unwrap_or(false);
+        assert!(
+            !batch_err,
+            "served batch_place_components failed: {batch_resp:?}"
+        );
+
+        let committed = std::fs::read_to_string(&sch_path).unwrap();
+        assert_eq!(
+            committed
+                .matches("(property private \"KLC_S3.3\" \"The rectangle is not a symbol body\"")
+                .count(),
+            3,
+            "expected 1 lib_symbols + 2 placed instances for KLC_S3.3: {committed}"
+        );
+        assert_eq!(
+            committed
+                .matches("(property private \"KLC_S4.1\" \"Some pins are on 50mil grid\"")
+                .count(),
+            3,
+            "expected 1 lib_symbols + 2 placed instances for KLC_S4.1: {committed}"
+        );
+        assert_eq!(
+            committed
+                .matches("(property \"private\" \"literal-value\"")
+                .count(),
+            3,
+            "quoted \"private\" field name must stay non-private: {committed}"
+        );
     }
 }
 
@@ -13624,6 +14455,112 @@ mod native_dnp_tests {
             listed(&std::fs::read_to_string(&bom).unwrap()),
             "R1 listed again"
         );
+    }
+
+    // A placed symbol takes its library symbol's exclusions, as eeschema's
+    // placement does (#124).
+
+    /// Four symbols, each excluded from one thing, so every flag is read both
+    /// ways and no two flags read alike across them. See its README.
+    const EXCLUSIONS: &str =
+        include_str!("../../tests/fixtures/placement_exclusions_kicad10.kicad_sym");
+    const EXCLUSION_FLAGS: [&str; 4] = ["exclude_from_sim", "in_bom", "on_board", "in_pos_files"];
+    const EXCLUDED_SYMBOLS: [&str; 4] = [
+        "EXCLUDED_FROM_SIM",
+        "EXCLUDED_FROM_BOM",
+        "EXCLUDED_FROM_BOARD",
+        "EXCLUDED_FROM_POS_FILES",
+    ];
+
+    /// `symbol`'s own value of each of `EXCLUSION_FLAGS` in `library`.
+    fn library_flags(library: &str, symbol: &str) -> Vec<String> {
+        let tree = parse_sexp(library).unwrap();
+        let symbol = tree
+            .children()
+            .unwrap()
+            .iter()
+            .find(|node| {
+                node.head() == Some("symbol")
+                    && node.get(1).and_then(SexpNode::as_str) == Some(symbol)
+            })
+            .unwrap();
+        EXCLUSION_FLAGS
+            .iter()
+            .map(|flag| symbol.find_str(flag).unwrap().to_owned())
+            .collect()
+    }
+
+    /// The fixture sheet, under the project name its instances record so a
+    /// placement takes it, beside a project table that names EXCLUSIONS
+    /// `Exclusions`, and `power` too, since `add_power_symbol` places
+    /// whatever `power:<net>` resolves to.
+    fn exclusions_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dnp_kicad10.kicad_sch");
+        std::fs::write(&path, SHEET).unwrap();
+        std::fs::write(dir.path().join("exclusions.kicad_sym"), EXCLUSIONS).unwrap();
+        let lib = |name: &str| {
+            format!("  (lib (name \"{name}\") (type \"KiCad\") (uri \"${{KIPRJMOD}}/exclusions.kicad_sym\") (options \"\") (descr \"\"))\n")
+        };
+        std::fs::write(
+            dir.path().join("sym-lib-table"),
+            format!(
+                "(sym_lib_table\n  (version 7)\n{}{})\n",
+                lib("Exclusions"),
+                lib("power")
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    /// Every placer writes the library's four flags on the symbol it places,
+    /// and its readback holds `in_bom` and `on_board`, so the call succeeds.
+    #[tokio::test]
+    async fn a_placed_symbol_takes_its_library_symbols_exclusions() {
+        for tool in [
+            "add_schematic_component",
+            "batch_place_components",
+            "add_power_symbol",
+        ] {
+            let (_dir, path) = exclusions_fixture();
+            let placed = |index: usize| {
+                let mut args = json!({ "x": 101.6 + 25.4 * index as f64, "y": 101.6 });
+                if tool == "add_power_symbol" {
+                    args["power_net"] = json!(EXCLUDED_SYMBOLS[index]);
+                } else {
+                    args["lib_id"] = json!(format!("Exclusions:{}", EXCLUDED_SYMBOLS[index]));
+                    args["reference"] = json!(format!("H{}", 10 + index));
+                }
+                args
+            };
+            let mut references = Vec::new();
+            if tool == "batch_place_components" {
+                let components = (0..EXCLUDED_SYMBOLS.len()).map(placed).collect::<Vec<_>>();
+                let result = body(&call(tool, &path, json!({ "components": components })).await);
+                assert_eq!(result["placed_count"], 4, "{result}");
+                references
+                    .extend((0..EXCLUDED_SYMBOLS.len()).map(|index| format!("H{}", 10 + index)));
+            } else {
+                for index in 0..EXCLUDED_SYMBOLS.len() {
+                    let result = body(&call(tool, &path, placed(index)).await);
+                    references.push(result["reference"].as_str().unwrap().to_owned());
+                }
+            }
+            let sheet = std::fs::read_to_string(&path).unwrap();
+            for (symbol, reference) in EXCLUDED_SYMBOLS.iter().zip(&references) {
+                for (flag, value) in EXCLUSION_FLAGS
+                    .iter()
+                    .zip(library_flags(EXCLUSIONS, symbol))
+                {
+                    assert_eq!(
+                        native_flag(&sheet, reference, flag),
+                        [(1, Some(value))],
+                        "{tool}: {symbol} as {reference}, ({flag} …)"
+                    );
+                }
+            }
+        }
     }
 }
 

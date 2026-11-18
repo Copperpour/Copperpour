@@ -159,23 +159,12 @@ impl Property {
     }
 
     pub fn from_sexp(node: &SexpNode) -> Option<Self> {
-        let mut args = node.args();
-        // Only a bare atom is the flag; a quoted "private" is a field name.
-        let private = matches!(args.first(), Some(SexpNode::Atom(token)) if token == "private");
-        if private {
-            args = &args[1..];
-        }
-        let name = args.first()?.text()?.to_owned();
-        let value = args.get(1)?.text()?.to_owned();
-        let sub_nodes = args
-            .iter()
-            .skip(2)
-            .filter(|n| n.is_list())
-            .cloned()
-            .collect();
+        let (private, name, value, rest) = parse_property_header(node)?;
+        let value = value?.to_owned();
+        let sub_nodes = rest.iter().filter(|n| n.is_list()).cloned().collect();
         Some(Property {
             private,
-            name,
+            name: name.to_owned(),
             value,
             sub_nodes,
         })
@@ -191,6 +180,23 @@ impl Property {
         children.extend(self.sub_nodes.iter().cloned());
         SexpNode::List(children)
     }
+}
+
+/// Parse a `(property [private] "NAME" ["VALUE"] ...)` node's header, stepping
+/// over a bare `private` atom (a quoted `"private"` is a field name).
+pub(crate) fn parse_property_header(
+    node: &SexpNode,
+) -> Option<(bool, &str, Option<&str>, &[SexpNode])> {
+    let mut args = node.args();
+    // Only a bare atom is the flag; a quoted "private" is a field name.
+    let private = matches!(args.first(), Some(SexpNode::Atom(token)) if token == "private");
+    if private {
+        args = &args[1..];
+    }
+    let name = args.first()?.text()?;
+    let value = args.get(1).and_then(SexpNode::text);
+    let rest = args.get(2..).unwrap_or(&[]);
+    Some((private, name, value, rest))
 }
 
 // ---- Effects (preserved verbatim) ------------------------------------------

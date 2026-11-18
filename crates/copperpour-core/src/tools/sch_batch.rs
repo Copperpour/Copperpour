@@ -190,7 +190,9 @@ pub fn tools() -> Vec<ToolDef> {
              junctions_added_count and junctions_pruned_count. \
              There is no auto-numbering: an omitted reference becomes the library prefix \
              plus '?' (e.g. 'R?', '#FLG?'), like an eeschema-unannotated symbol, same as \
-             add_schematic_component; annotate_schematic numbers it.",
+             add_schematic_component; annotate_schematic numbers it. An entry under a \
+             numbered reference already held, by an earlier entry too, is refused as \
+             add_schematic_component refuses it, and the others are placed.",
             super::placement_schema(json!({
                 "type": "object",
                 "properties": {
@@ -494,29 +496,6 @@ fn find_symbol_blocks(content: &str, reference: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Return `(val_start, val_end)` byte offsets in `content` for the *value* portion
-/// of a `(property "FieldName" "VALUE" ...)` node, once per placed instance of
-/// `reference`. Only the bytes inside the opening quote are included (i.e. the
-/// replacement does NOT need to include surrounding quotes).
-///
-/// Multi-unit parts repeat their fields in every unit's block and KiCad expects
-/// those copies to agree, so a field edit has to rewrite all of them.
-fn field_value_ranges(content: &str, reference: &str, field: &str) -> Vec<(usize, usize)> {
-    find_all_symbol_instance_blocks(content, reference)
-        .into_iter()
-        .filter_map(|(sym_start, sym_end)| {
-            let sym_block = &content[sym_start..sym_end];
-
-            let field_search = format!(r#"(property "{field}" ""#);
-            let field_rel = sym_block.find(&field_search)?;
-            let val_start = sym_start + field_rel + field_search.len();
-            // find the closing quote of the current value
-            let val_end = val_start + content[val_start..].find('"')?;
-            Some((val_start, val_end))
-        })
-        .collect()
-}
-
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 /// The net a `batch_connect_to_net` call names: `net_name`, or `net` as
@@ -778,6 +757,8 @@ async fn handle_batch_place_components(
     let catalog = crate::sourcing::LcscCatalog::resolve(args, _ctx);
     let mut errors: Vec<String> = Vec::new();
     let mut failures: Vec<Value> = Vec::new();
+    let mut in_use =
+        super::sch_annotate::DesignatorsInUse::new(&sch_path, &context.project_name, "reference");
 
     for (index, comp) in components.iter().enumerate() {
         let Some(lib_id) = comp["lib_id"].as_str() else {
@@ -844,6 +825,7 @@ async fn handle_batch_place_components(
             unit,
             &src,
             extras,
+            &mut in_use,
         ) {
             Ok(placed) => {
                 let (expected_x, expected_y) = snap_point(x, y, 1.27);
@@ -989,14 +971,16 @@ async fn handle_batch_place_components(
         crate::outcome::OutcomeStatus::Failed => Some(crate::outcome::retry_whole_request()),
         crate::outcome::OutcomeStatus::Uncertain => unreachable!(),
     };
-    let mut result = CallToolResult::json(&json!({
+    let mut reply = json!({
         "placed": placed,
         "placed_count": placed.len(),
         "junctions_added_count": junctions_added,
         "junctions_pruned_count": junctions_pruned,
         "errors": errors,
         "failures": failures
-    }));
+    });
+    in_use.disclose(&mut reply);
+    let mut result = CallToolResult::json(&reply);
     result.is_error = placed.is_empty() && !errors.is_empty();
     Ok(crate::outcome::attach(
         result,
@@ -1468,11 +1452,6 @@ async fn handle_batch_edit(
                 errors.push(format!(
                     "Duplicate assignment for field '{field}' on '{reference}'"
                 ));
-                continue;
-            }
-
-            if !may_create && field_value_ranges(&content, reference, &field).is_empty() {
-                errors.push(format!("Field '{}' not found on '{}'", field, reference));
                 continue;
             }
 
@@ -3723,7 +3702,7 @@ mod multi_unit_pin_tests {
 
 #[cfg(test)]
 mod multi_unit_field_tests {
-    use super::{field_value_ranges, find_symbol_blocks};
+    use super::{find_symbol_blocks, set_property_value};
     use copperpour_sexp::writer::{apply_edits, SexpEdit};
 
     /// A 3-unit part plus an unrelated single-unit part. Every unit repeats the
@@ -3777,18 +3756,9 @@ mod multi_unit_field_tests {
     /// one part claiming two different footprints.
     #[test]
     fn field_edit_reaches_every_unit() {
-        let ranges = field_value_ranges(SCH, "U6", "Footprint");
-        assert_eq!(
-            ranges.len(),
-            3,
-            "expected one Footprint per unit: {ranges:?}"
-        );
-
-        let edits = ranges
-            .iter()
-            .map(|&(s, e)| SexpEdit::replace(s, e, "Package_SO:SOIC-14".to_string()))
-            .collect();
-        let out = apply_edits(SCH.to_string(), edits);
+        let (out, counts) =
+            set_property_value(SCH, "U6", "Footprint", "Package_SO:SOIC-14", false).unwrap();
+        assert_eq!(counts.updated, 3);
         assert_eq!(
             out.matches(r#"(property "Footprint" "Package_SO:SOIC-14""#)
                 .count(),
@@ -3804,14 +3774,9 @@ mod multi_unit_field_tests {
 
     #[test]
     fn single_unit_part_still_edits_once() {
-        let ranges = field_value_ranges(SCH, "R1", "Value");
-        assert_eq!(ranges.len(), 1);
-    }
-
-    #[test]
-    fn missing_field_yields_no_ranges() {
-        assert!(field_value_ranges(SCH, "U6", "Datasheet").is_empty());
-        assert!(field_value_ranges(SCH, "U99", "Value").is_empty());
+        let (out, counts) = set_property_value(SCH, "R1", "Value", "15k", false).unwrap();
+        assert_eq!(counts.updated, 1);
+        assert_eq!(out, SCH.replacen(r#""Value" "10k""#, r#""Value" "15k""#, 1));
     }
 
     /// Deleting one unit's block used to leave the other six behind as orphans
@@ -3968,6 +3933,40 @@ mod multi_unit_handler_tests {
         assert_eq!(result["created_unit_copies"], 0);
         assert_eq!(result["updated"][0]["fields"][0]["updated_units"], 3);
         assert_eq!(result["updated"][0]["fields"][1]["updated_units"], 3);
+    }
+
+    #[tokio::test]
+    async fn batch_edit_updates_an_existing_private_field_without_create_missing() {
+        let schematic = fixture_file();
+        let fixture = include_str!("../../tests/fixtures/component_fields_kicad10.kicad_sch");
+        let private = r#"(property private "MPN" "MPN-679-U1""#;
+        let before = fixture
+            .replace(r#"(property "MPN" "MPN-679-U1""#, private)
+            .replacen(
+                r#"(property "Reference" "U1""#,
+                "(property \"Reference\"\n\t\t\t\"U1\"",
+                1,
+            );
+        let (start, end) = find_all_symbol_instance_blocks(&before, "U1")[0];
+        let block = &before[start..end];
+        let malformed = block.replacen("(at ", "(at bad-", 1);
+        assert_ne!(malformed, block);
+        let before = apply_edits(before, vec![SexpEdit::replace(start, end, malformed)]);
+        assert_eq!(before.matches(private).count(), 3);
+        std::fs::write(schematic.path(), &before).unwrap();
+
+        let result = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({"edits": [{"reference": "U1", "fields": {"MPN": "NEW-PART"}}]}),
+        )
+        .await;
+        assert_eq!(result["updated_unit_copies"], 3, "{result}");
+        assert_eq!(result["created_unit_copies"], 0, "{result}");
+        assert_eq!(
+            std::fs::read_to_string(schematic.path()).unwrap(),
+            before.replace(private, r#"(property private "MPN" "NEW-PART""#)
+        );
     }
 
     #[tokio::test]
@@ -5760,10 +5759,11 @@ mod batch_field_placement_tests {
         let after = std::fs::read_to_string(&path).unwrap();
         let seen = placement(&after, "R1", 1, "Value");
         assert_eq!(seen, json!({"x":12.5,"y":34.5,"rotation":90.0,"hide":true}));
-        assert_eq!(
-            body["updated"][0]["units"][0]["field_placements"]["Value"],
-            seen
-        );
+        let reported = &body["updated"][0]["units"][0]["field_placements"]["Value"];
+        for key in ["x", "y", "rotation", "hide"] {
+            assert_eq!(reported[key], seen[key], "field_placements.Value.{key}");
+        }
+        assert_eq!(reported["drawn_orientation"], "vertical");
         let units = body["updated"][1]["units"].as_array().unwrap();
         assert_eq!(units.len(), 3);
         assert_eq!(
