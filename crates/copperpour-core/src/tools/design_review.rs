@@ -8,16 +8,17 @@
 use super::cli;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::sch_connectivity::{net_graph_for, NetGraph, NetRoot};
+use crate::tools::sch_connectivity::{net_graph_for, NetGraph, NetRoot, COINCIDENT_TOLERANCE};
 use crate::tools::{
-    get_path, invalid_arg, placed_pins_by_reference, project_name_for, sch_hierarchy, ToolContext,
-    ToolDef,
+    get_path, invalid_arg, is_power_symbol_reference, placed_pins_by_reference, project_name_for,
+    sch_hierarchy, ToolContext, ToolDef,
 };
 use copperpour_schematic_editor as cse;
 use copperpour_sexp::{
+    geometry::points_coincident,
     parser::parse_sexp,
     schematic::{
-        extract_all_net_labels, extract_lib_pins, extract_lib_pins_for_unit,
+        extract_all_net_labels, extract_lib_pins, extract_lib_pins_for_unit, extract_no_connects,
         extract_symbol_instances, extract_wires, find_lib_symbol, pin_endpoint, read_schematic,
         Label, LabelKind,
     },
@@ -239,7 +240,9 @@ async fn handle_audit_decoupling_file(
 
     let placed = placed_pins_by_reference(&tree);
     let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
+    let mut labels = extract_all_net_labels(&tree);
+    labels.extend(hidden_power_pin_labels(&placed));
+    let no_connects = extract_no_connects(&tree);
     let mut graph = net_graph_for(&tree, &wires, &labels);
 
     let mut findings = Vec::new();
@@ -259,23 +262,42 @@ async fn handle_audit_decoupling_file(
             || inst.lib_id.contains("Jack")
             || inst.lib_id.contains("Header");
 
-        if is_passive || is_connector {
+        // A power symbol's pin is `power_in` too, but it names a rail; it is
+        // not a part's supply input.
+        if is_passive || is_connector || is_power_symbol_reference(&inst.reference) {
             continue;
         }
 
-        // Find power pins (power_in type, or named VCC/VDD/VBUS/3V3/etc.)
         for (pin, transform) in pins {
-            let is_power_pin = is_power_pin_name(&pin.name);
-            if !is_power_pin {
+            if !is_supply_pin(pin) {
                 continue;
             }
-            total_power_pins += 1;
 
             // Get the endpoint position of this power pin
             let (px, py) = pin_endpoint(pin, *transform);
 
+            // A no-connect flag on the pin leaves it unused on purpose.
+            if no_connects
+                .iter()
+                .any(|&(nx, ny)| points_coincident(px, py, nx, ny, COINCIDENT_TOLERANCE))
+            {
+                continue;
+            }
+
             // Check if there's a capacitor connected to a net that this pin is on
             let pin_root = graph.root_at(px, py);
+
+            // A ground pin is the return the capacitors share, not a supply,
+            // whether its own name or a name of its net says so.
+            if is_ground_name(&pin.name)
+                || graph
+                    .aliases_of_root(pin_root)
+                    .iter()
+                    .any(|net| is_ground_name(net))
+            {
+                continue;
+            }
+            total_power_pins += 1;
 
             if cap_roots.contains(&pin_root) {
                 pass_count += 1;
@@ -1573,6 +1595,32 @@ async fn handle_check_bom_health_file(
 
 // ─── Helper functions ────────────────────────────────────────────────────────
 
+/// A pin the decoupling audit treats as a supply input.
+///
+/// KiCad's electrical type decides: a `power_in` pin is one, whatever it is
+/// called (`IOVDD`, `VREG_IN`). The name list is only for pins typed
+/// `unspecified` or `passive`, as many imported symbols' supply pins are. Any
+/// other type is not one, so a bidirectional `3V3_EN` or a module's
+/// `power_out` `3V3` is not audited (#120).
+fn is_supply_pin(pin: &copperpour_sexp::schematic::LibPin) -> bool {
+    match pin.electrical_type.as_str() {
+        "power_in" => true,
+        "unspecified" | "passive" | "" => is_power_pin_name(&pin.name),
+        _ => false,
+    }
+}
+
+/// A ground name, as KiCad's ERC reads a power pin's name and its net's
+/// (`ERC_TESTER::TestGroundPins`, `eeschema/erc/erc.cpp`).
+fn is_ground_name(name: &str) -> bool {
+    let upper = name.to_uppercase();
+    upper.contains("GND")
+        || upper == "EARTH"
+        || upper.starts_with("EARTH_")
+        || upper == "VSS"
+        || upper == "VSSA"
+}
+
 fn is_power_pin_name(name: &str) -> bool {
     let upper = name.to_uppercase();
     upper.starts_with("VCC")
@@ -1630,6 +1678,36 @@ fn pin_net_roots(graph: &mut NetGraph, pins: &[PlacedPin]) -> HashSet<NetRoot> {
         .map(|(pin, transform)| {
             let (px, py) = pin_endpoint(pin, *transform);
             graph.root_at(px, py)
+        })
+        .collect()
+}
+
+/// The net each hidden `power_in` pin names, as a power symbol's label.
+///
+/// KiCad makes such a pin of a symbol that is not a power symbol a global net
+/// of the pin's name (`SCH_PIN::IsGlobalPower`, `eeschema/sch_pin.cpp:357-373`),
+/// so a hidden `+3V3` pin is on the `+3V3` rail with nothing drawn to it. Without
+/// these the pin sits alone at its own end and is reported undecoupled.
+fn hidden_power_pin_labels(placed: &[PlacedUnit]) -> Vec<Label> {
+    placed
+        .iter()
+        .filter(|(inst, _)| !is_power_symbol_reference(&inst.reference))
+        .flat_map(|(inst, pins)| {
+            pins.iter()
+                .filter(|(pin, _)| {
+                    pin.hidden && pin.electrical_type == "power_in" && !pin.name.is_empty()
+                })
+                .map(move |(pin, transform)| {
+                    let (x, y) = pin_endpoint(pin, *transform);
+                    Label {
+                        kind: LabelKind::PowerSymbol,
+                        net: pin.name.clone(),
+                        x,
+                        y,
+                        rotation: 0.0,
+                        uuid: inst.uuid.clone(),
+                    }
+                })
         })
         .collect()
 }
@@ -2779,6 +2857,107 @@ mod net_resolution_tests {
         assert_eq!(body["total_power_pins"], 1, "{body}");
         assert_eq!(body["pass_count"], 1, "{body}");
         assert_eq!(body["findings"].as_array().unwrap().len(), 0, "{body}");
+    }
+
+    /// The pins audited are chosen by electrical type (#120). Of U1's nine,
+    /// `IOVDD` (power_in, on nothing), `VREG_IN` (power_in) and `VCC`
+    /// (unspecified, by name) are, the last two on C1's `+3V3`. The bidirectional
+    /// `3V3_EN`, the `power_out` `3V3`, the flagged `VBUS`, the ground pins `GND`
+    /// and `VSS`, `EP` on `GNDA`, and the `#PWR` symbols are not. Of U2's four,
+    /// the passive `VDD` (by name) and the hidden `power_in` `+3V3`, on the rail
+    /// its name joins, are; the flagged passive `VCC` and the hidden `GND` are not.
+    /// `tests/fixtures/decoupling_pin_types_kicad10.README.md` says how it was made.
+    #[tokio::test]
+    async fn supply_pins_are_chosen_by_electrical_type() {
+        let file = sheet(include_str!(
+            "../../tests/fixtures/decoupling_pin_types_kicad10.kicad_sch"
+        ));
+        let body = audit_json(
+            handle_audit_decoupling(
+                &json!({ "schematic": file.path().to_str().unwrap() }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        assert_eq!(body["total_power_pins"], 5, "{body}");
+        assert_eq!(body["pass_count"], 4, "{body}");
+        let findings = body["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 1, "{body}");
+        assert_eq!(findings[0]["component"], "U1", "{body}");
+        assert_eq!(findings[0]["severity"], "error", "{body}");
+        assert!(
+            findings[0]["issue"]
+                .as_str()
+                .unwrap()
+                .starts_with("Power pin 'IOVDD' on U1"),
+            "{body}"
+        );
+    }
+
+    /// A pin with no electrical type is read by its name, as an `unspecified`
+    /// one is. KiCad writes a type on every pin, so no sheet it saves has one;
+    /// the parser leaves `electrical_type` empty only for such a pin.
+    #[test]
+    fn a_pin_with_no_type_is_read_by_its_name() {
+        let pin = |name: &str| copperpour_sexp::schematic::LibPin {
+            number: "1".into(),
+            name: name.into(),
+            electrical_type: String::new(),
+            local_x: 0.0,
+            local_y: 0.0,
+            rotation: 0.0,
+            length: 2.54,
+            hidden: false,
+        };
+        assert!(is_supply_pin(&pin("VCC")));
+        assert!(!is_supply_pin(&pin("SDA")));
+    }
+
+    /// Only an ordinary symbol's hidden `power_in` pin names a net. A power
+    /// symbol's net is its Value's, which `extract_power_symbol_labels` gives,
+    /// and a pin with no name names nothing. KiCad 10's power symbols name their
+    /// pin `""`; one from an older library can name it after a rail its Value no
+    /// longer says, so the parts are built here rather than saved.
+    #[test]
+    fn only_an_ordinary_symbols_named_hidden_power_pin_names_a_net() {
+        use copperpour_sexp::schematic::{LibPin, SymbolInstance};
+        let pin = |name: &str| LibPin {
+            number: "1".into(),
+            name: name.into(),
+            electrical_type: "power_in".into(),
+            local_x: 0.0,
+            local_y: 0.0,
+            rotation: 0.0,
+            length: 0.0,
+            hidden: true,
+        };
+        let placed = |reference: &str, name: &str| {
+            let inst = SymbolInstance {
+                reference: reference.into(),
+                value: "+5V".into(),
+                footprint: String::new(),
+                lib_name: None,
+                lib_id: "power:VCC".into(),
+                x: 10.0,
+                y: 20.0,
+                rotation: 0.0,
+                mirror_x: false,
+                mirror_y: false,
+                uuid: None,
+                unit: 1,
+            };
+            let transform = inst.pin_transform();
+            vec![(inst, vec![(pin(name), transform)])]
+        };
+
+        let named = hidden_power_pin_labels(&placed("U1", "VCC"));
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].net, "VCC");
+        assert_eq!((named[0].x, named[0].y), (10.0, 20.0));
+        assert!(hidden_power_pin_labels(&placed("#PWR01", "VCC")).is_empty());
+        assert!(hidden_power_pin_labels(&placed("U1", "")).is_empty());
     }
 
     /// A rail named by a power symbol is a rail, and the caps, bulk caps and
