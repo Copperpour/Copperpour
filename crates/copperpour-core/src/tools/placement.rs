@@ -40,6 +40,9 @@
 
 mod overview;
 mod plan_status;
+mod repeat_layout;
+#[cfg(test)]
+mod repeat_layout_tests;
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -111,6 +114,7 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_place_decoupling(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
+        repeat_layout::tool(),
         tool!(
             "plan_bga_fanout",
             "Plan a BGA fanout: outer-ring pads escape directly; each inner pad gets a via \
