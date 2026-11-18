@@ -17,6 +17,7 @@ const SUPPORTED_ATTRIBUTES: &[&str] = &[
     "exclude_from_bom",
     "allow_missing_courtyard",
     "dnp",
+    "allow_soldermask_bridges",
 ];
 
 pub(super) fn tool() -> ToolDef {
@@ -612,7 +613,8 @@ mod tests {
                 "exclude_from_pos_files",
                 "exclude_from_bom",
                 "allow_missing_courtyard",
-                "dnp"
+                "dnp",
+                "allow_soldermask_bridges"
             ])
         );
     }
@@ -855,12 +857,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_an_attribute_the_tool_cannot_write_is_warned() {
-        let (body, _) = served(
+    async fn an_attributes_edit_keeps_solder_mask_bridges_when_listed() {
+        let (body, written) = served(
+            SOLDER_JUMPER,
+            json!({ "attributes": ["exclude_from_bom", "allow_soldermask_bridges"] }),
+        )
+        .await;
+        assert!(written.contains("(attr exclude_from_bom allow_soldermask_bridges)"));
+        assert_eq!(
+            body["changes"]["attributes"],
+            json!({
+                "previous": [
+                    "exclude_from_pos_files",
+                    "exclude_from_bom",
+                    "allow_soldermask_bridges"
+                ],
+                "current": ["exclude_from_bom", "allow_soldermask_bridges"]
+            })
+        );
+        assert_eq!(body["warnings"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn leaving_out_solder_mask_bridges_drops_it_without_warning() {
+        let (body, written) = served(
             SOLDER_JUMPER,
             json!({ "attributes": ["exclude_from_pos_files", "exclude_from_bom"] }),
         )
         .await;
+        assert!(written.contains("(attr exclude_from_pos_files exclude_from_bom)"));
         assert_eq!(
             body["changes"]["attributes"]["previous"],
             json!([
@@ -869,11 +894,7 @@ mod tests {
                 "allow_soldermask_bridges"
             ])
         );
-        assert_eq!(
-            body["warnings"],
-            json!(["attributes dropped 'allow_soldermask_bridges', which the \
-                    attributes argument does not accept"])
-        );
+        assert_eq!(body["warnings"], json!([]), "the caller left it out");
     }
 
     #[tokio::test]
@@ -946,7 +967,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_description_edit_keeps_an_unaccepted_attribute_without_warning() {
+    async fn a_description_edit_keeps_solder_mask_bridges_without_warning() {
         let (body, written) = served(SOLDER_JUMPER, json!({ "description": "open jumper" })).await;
         assert!(written.contains("allow_soldermask_bridges"));
         assert_eq!(body["warnings"], json!([]), "nothing was dropped");
