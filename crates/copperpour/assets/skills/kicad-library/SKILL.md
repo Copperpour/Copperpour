@@ -24,6 +24,7 @@ load_toolset('library')    # search_symbols, search_footprints, create_symbol, c
                            # set_footprint_models, get_footprint_info, register_symbol_library,
                            # register_footprint_library, get_symbol_info,
                            # set_symbol_properties
+load_toolset('library_maintenance') # upgrade_library
 load_toolset('pcb_components') # update_footprints_from_library for placed instances
 ```
 
@@ -470,6 +471,18 @@ Use `global` scope only for reusable personal libraries used across multiple pro
 - Symbol libraries: `*.kicad_sym` files
 - Footprint libraries: directories containing `*.kicad_mod` files
 - Project-level tables: `sym-lib-table` and `fp-lib-table` in project directory
+
+### Upgrade a Library's File Format
+
+`upgrade_library(library_path)`, in the `library_maintenance` toolset, checks whether
+a `.kicad_sym` or `.pretty` library is older than the running KiCad's format, upgrades
+a copy with `kicad-cli`, and reports whether each file's content was kept. Review the
+dry run, then call it with `dry_run=false` to replace the older files, all in one
+transaction. It refuses (`plan_blocked`) when any file's content differs; fix what
+`differences` names first. `notes` are not blockers, but worth fixing, such as a
+footprint whose name inside the file is not its file name. Older KiCad versions cannot
+open an upgraded file, so upgrade a shared library only when everyone uses the newer
+KiCad.
 
 ---
 

@@ -1,0 +1,68 @@
+(footprint "NetTie_Legacy"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(descr "A hand-written KiCad 6 net tie: the pad group came from the keywords")
+	(tags "net tie")
+	(property "Reference" "NT**"
+		(at 0 -1.2 0)
+		(layer "F.SilkS")
+		(uuid "84cb5025-139b-465c-a23f-b73bf2481665")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Value" "NetTie_Legacy"
+		(at 0 1.2 0)
+		(layer "F.Fab")
+		(uuid "f5d5cb20-e8c9-4a69-b50f-769f4c1998b4")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "e4f21215-fc18-4bac-a8e2-c9dfe5934786")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "1473c4f4-53c8-4439-a311-d9dcc67a4199")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(attr exclude_from_pos_files exclude_from_bom)
+	(net_tie_pad_groups "1, 2")
+	(duplicate_pad_numbers_are_jumpers no)
+	(pad "1" smd circle
+		(at -0.5 0)
+		(size 0.5 0.5)
+		(layers "F.Cu")
+		(uuid "27ffff58-ffe2-40dc-ba13-e43488f045c9")
+	)
+	(pad "2" smd circle
+		(at 0.5 0)
+		(size 0.5 0.5)
+		(layers "F.Cu")
+		(uuid "6325d0ad-02d1-42af-a641-53e485da67fc")
+	)
+	(embedded_fonts no)
+)
