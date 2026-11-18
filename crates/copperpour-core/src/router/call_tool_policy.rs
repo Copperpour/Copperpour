@@ -215,6 +215,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "connect_pins_to_bus",
     "connect_to_net",
     "copy_routing_pattern",
+    "create_3d_model",
     "create_footprint",
     "create_netclass",
     "create_project",

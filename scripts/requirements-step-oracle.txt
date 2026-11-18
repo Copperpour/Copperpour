@@ -1,0 +1,2 @@
+# Development-only independent OCCT reader; never required by Copperpour runtime.
+cadquery-ocp==7.7.2
