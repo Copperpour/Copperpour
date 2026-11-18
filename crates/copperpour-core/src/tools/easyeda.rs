@@ -1693,7 +1693,8 @@ mod tests {
 
         let cache_dir = easyeda_cache_dir().unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
-        let mock_lcsc_id = "C9999998";
+        // Its own cache entry: tests run in parallel and the bundles differ.
+        let mock_lcsc_id = "C6666666";
         let mock_bundle = mock_bundle("https://example.com/mock.pdf");
         std::fs::write(
             cache_dir.join(format!("{mock_lcsc_id}.json")),
