@@ -2379,13 +2379,25 @@ mod bounded_issue_tests {
             )
             .unwrap();
             let row = |n: usize| json!({"severity": "error", "type": "clearance", "description": format!("clearance {n}"), "items": []});
+            let fixture_report = dir.path().join("fixture-report.json");
             std::fs::write(
-                board.with_extension("drc.json"),
+                &fixture_report,
                 json!({ "violations": (0..ERRORS).map(row).collect::<Vec<_>>(), "unconnected_items": [] })
                     .to_string(),
             )
             .unwrap();
-            let cli = cli::test_support::noop_cli(dir.path());
+            let fixture_path = fixture_report.display();
+            let cli = cli::test_support::write_script(
+                dir.path(),
+                "drc-fixture",
+                &format!(
+                    "#!/bin/sh\nprev=\nfor a; do [ \"$prev\" = --output ] && out=\"$a\"; prev=\"$a\"; done\n\
+                     cp '{fixture_path}' \"$out\"\nexit 0\n"
+                ),
+                &format!(
+                    "@echo off\r\nset prev=\r\n:loop\r\nif \"%~1\"==\"\" goto done\r\nif \"%prev%\"==\"--output\" set out=%~1\r\nset prev=%~1\r\nshift\r\ngoto loop\r\n:done\r\ncopy /y \"{fixture_path}\" \"%out%\" >nul\r\nexit /b 0\r\n"
+                ),
+            );
             let handler = McpHandler::new(crate::tools::ServerConfig {
                 kicad_cli: cli.display().to_string(),
                 eager_toolsets: true,
@@ -2480,12 +2492,12 @@ mod bounded_issue_tests {
         assert_eq!(written["verdict"], body["verdict"]);
     }
 
-    /// Refused before DRC runs: the stand-in's report, which a DRC run reads
-    /// and deletes, is still there.
+    /// Refused before DRC runs: an existing `<board>.drc.json` is untouched.
     #[tokio::test]
     async fn an_output_over_the_board_a_directory_or_a_file_is_refused_first() {
         let served = Served::new().await;
         let before = std::fs::read(&served.board).unwrap();
+        std::fs::write(served.board.with_extension("drc.json"), b"OLD-REPORT").unwrap();
         for output in [
             served.board.clone(),
             served.dir.path().to_path_buf(),
@@ -2497,7 +2509,10 @@ mod bounded_issue_tests {
             assert_eq!(refused["error"]["kind"], "invalid_argument", "{refused:#}");
             assert_eq!(refused["error"]["field"], "output", "{refused:#}");
         }
-        assert!(served.board.with_extension("drc.json").exists());
+        assert_eq!(
+            std::fs::read(served.board.with_extension("drc.json")).unwrap(),
+            b"OLD-REPORT"
+        );
         assert_eq!(std::fs::read(&served.board).unwrap(), before);
     }
 
@@ -2534,7 +2549,7 @@ mod bounded_issue_tests {
         };
         assert_eq!(refused["error"]["kind"], "invalid_argument", "{refused:#}");
         assert_eq!(refused["error"]["field"], "limit", "{refused:#}");
-        assert!(served.board.with_extension("drc.json").exists());
+        assert!(served.dir.path().join("fixture-report.json").exists());
     }
 
     /// A destination the check passes but the write cannot take, as on a

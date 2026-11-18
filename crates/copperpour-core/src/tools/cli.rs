@@ -1219,42 +1219,63 @@ async fn run_drc_checking(
     parity_board: &Path,
     refill_zones: bool,
 ) -> Result<DrcReport> {
-    let out_path = checked_pcb.with_extension("drc.json");
-    let args = drc_args(
-        out_path.to_str().unwrap(),
-        refill_zones,
-        checked_pcb.to_str().unwrap(),
-    );
-    let output = run_cli_captured(cli, &args, long_timeout()).await?;
+    let report_dir = tempfile::Builder::new()
+        .prefix("copperpour-drc-report-")
+        .tempdir()
+        .context("failed to create temporary DRC report directory")?;
+    let out_path = report_dir.path().join("report.json");
 
-    let json_str = tokio::fs::read_to_string(&out_path)
-        .await
-        .context("DRC output file not found")?;
-    let raw: serde_json::Value = serde_json::from_str(&json_str)?;
-    let _ = tokio::fs::remove_file(&out_path).await;
+    let operation = async {
+        let args = drc_args(
+            out_path
+                .to_str()
+                .context("temporary DRC path is not UTF-8")?,
+            refill_zones,
+            checked_pcb.to_str().context("board path is not UTF-8")?,
+        );
+        let output = run_cli_captured(cli, &args, long_timeout()).await?;
 
-    let mut report = parse_drc_report(&raw)?;
-    apply_parity_evidence(&mut report, &output.stderr, parity_board);
+        let json_str = tokio::fs::read_to_string(&out_path)
+            .await
+            .context("DRC output file not found")?;
+        let raw: serde_json::Value = serde_json::from_str(&json_str)?;
 
-    // Ownership comes from the exact board this DRC ran on, and it is attached
-    // here — the one path `run_drc` and `get_drc_violations` share — so the two
-    // tools cannot report different ownership for the same violation (#413).
-    //
-    // A report with nothing to annotate does not pay for the board re-read and
-    // parse: a clean board is the common case, and `run_drc` is called once per
-    // candidate inside the routing loop.
-    if report.all().any(|violation| !violation.items.is_empty()) {
-        match tokio::fs::read_to_string(pcb).await {
-            Ok(source) => enrich_drc_items(&mut report, &source),
-            Err(error) => {
-                let reason = format!("could not re-read {}: {error}", pcb.display());
-                warn!("[BETA] DRC ownership enrichment unavailable: {reason}");
-                report.mark_ownership_unavailable(reason);
+        let mut report = parse_drc_report(&raw)?;
+        apply_parity_evidence(&mut report, &output.stderr, parity_board);
+
+        // Ownership comes from the exact board this DRC ran on, and it is attached
+        // here — the one path `run_drc` and `get_drc_violations` share — so the two
+        // tools cannot report different ownership for the same violation (#413).
+        //
+        // A report with nothing to annotate does not pay for the board re-read and
+        // parse: a clean board is the common case, and `run_drc` is called once per
+        // candidate inside the routing loop.
+        if report.all().any(|violation| !violation.items.is_empty()) {
+            match tokio::fs::read_to_string(pcb).await {
+                Ok(source) => enrich_drc_items(&mut report, &source),
+                Err(error) => {
+                    let reason = format!("could not re-read {}: {error}", pcb.display());
+                    warn!("[BETA] DRC ownership enrichment unavailable: {reason}");
+                    report.mark_ownership_unavailable(reason);
+                }
             }
         }
-    }
 
-    Ok(report)
+        Ok(report)
+    }
+    .await;
+
+    let cleanup = report_dir
+        .close()
+        .context("failed to clean up temporary DRC report directory");
+    match (operation, cleanup) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(operation_error), Err(cleanup_error)) => Err(operation_error.context(format!(
+            "also failed to clean up the temporary DRC report: {cleanup_error:#}"
+        ))),
+    }
 }
 
 /// A temporary view of `pcb`'s directory in which the sibling `.kicad_dru`
@@ -4770,5 +4791,99 @@ mod creepage_view_tests {
         assert!(creepage_free_view(&pcb).unwrap().is_none());
         std::fs::write(dir.path().join("b.kicad_dru"), "(version 1)\n").unwrap();
         assert!(creepage_free_view(&pcb).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drc_report_never_touches_the_project_directory() {
+        let project = tempfile::tempdir().unwrap();
+        let seen = tempfile::tempdir().unwrap();
+        let board = project.path().join("b.kicad_pcb");
+        let existing_report = board.with_extension("drc.json");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        std::fs::write(&existing_report, b"OLD-REPORT").unwrap();
+
+        let observed = seen.path().join("observed.txt");
+        let cli = test_support::write_script(
+            seen.path(),
+            "drc-output-probe",
+            &format!(
+                "#!/bin/sh\nprev=\nfor a; do [ \"$prev\" = --output ] && out=\"$a\"; prev=\"$a\"; done\n\
+                 printf '%s' \"$out\" > '{observed}'\n\
+                 printf '%s' '{{\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]}}' > \"$out\"\nexit 0\n",
+                observed = observed.display()
+            ),
+            "@exit /b 1\r\n",
+        );
+
+        let original_permissions = {
+            use std::os::unix::fs::PermissionsExt;
+            let original = std::fs::metadata(project.path()).unwrap().permissions();
+            let mut read_only = original.clone();
+            read_only.set_mode(0o555);
+            std::fs::set_permissions(project.path(), read_only).unwrap();
+            original
+        };
+
+        let result = run_drc(cli.to_str().unwrap(), &board, false).await;
+
+        std::fs::set_permissions(project.path(), original_permissions).unwrap();
+
+        assert!(result.unwrap().violations.is_empty());
+        assert_eq!(std::fs::read(&existing_report).unwrap(), b"OLD-REPORT");
+        let report_path = PathBuf::from(std::fs::read_to_string(observed).unwrap().trim());
+        assert_ne!(report_path.parent(), Some(project.path()));
+        assert!(!report_path.exists(), "temporary report should be removed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_view_drc_never_overwrites_existing_project_drc_json() {
+        let project = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let seen = tempfile::tempdir().unwrap();
+        let board = project.path().join("b.kicad_pcb");
+        let dru = project.path().join("b.kicad_dru");
+        let existing_report = board.with_extension("drc.json");
+        std::fs::write(&board, "(kicad_pcb source)").unwrap();
+        std::fs::write(
+            &dru,
+            "(version 1)\n(rule \"hv\"\n\t(constraint creepage (min 8mm)))\n",
+        )
+        .unwrap();
+        std::fs::write(&existing_report, b"OLD-REPORT").unwrap();
+
+        let candidate = elsewhere.path().join("routed.kicad_pcb");
+        std::fs::write(&candidate, "(kicad_pcb candidate)").unwrap();
+
+        let cli = test_support::write_script(
+            seen.path(),
+            "drc-view-probe",
+            "#!/bin/sh\nprev=\nfor a; do [ \"$prev\" = --output ] && out=\"$a\"; prev=\"$a\"; done\n\
+             printf '%s' '{\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]}' > \"$out\"\nexit 0\n",
+            "@exit /b 1\r\n",
+        );
+
+        let (report, applied) =
+            run_drc_as_project(cli.to_str().unwrap(), &candidate, &board, false)
+                .await
+                .unwrap();
+        assert!(applied);
+        assert!(report.violations.is_empty());
+        assert_eq!(
+            std::fs::read(&existing_report).unwrap(),
+            b"OLD-REPORT",
+            "run_drc_as_project must not overwrite project <board>.drc.json"
+        );
+
+        let report = run_drc_with(cli.to_str().unwrap(), &board, false, true)
+            .await
+            .unwrap();
+        assert!(report.creepage_skipped);
+        assert_eq!(
+            std::fs::read(&existing_report).unwrap(),
+            b"OLD-REPORT",
+            "skip_creepage view must not overwrite project <board>.drc.json"
+        );
     }
 }

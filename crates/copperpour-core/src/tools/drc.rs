@@ -318,15 +318,26 @@ mod tests {
         body
     }
 
-    fn cli_fixture(dir: &Path, board: &Path) -> std::path::PathBuf {
+    fn cli_fixture(dir: &Path, _board: &Path) -> std::path::PathBuf {
+        let report_fixture = dir.join("fixture-report.json");
         std::fs::write(
-            board.with_extension("drc.json"),
+            &report_fixture,
             r#"{"violations":[],"unconnected_items":[],"schematic_parity":[]}"#,
         )
         .unwrap();
-        cli::test_support::write_script(dir, "drc-probe",
-            "#!/bin/sh\nfor last; do :; done\ncp \"$last\" \"$last.observed\"\nexit 0\n",
-            "@echo off\r\n:loop\r\nset last=%1\r\nshift\r\nif not \"%1\"==\"\" goto loop\r\ncopy /y %last% %last%.observed >nul\r\nexit /b 0\r\n")
+        let fixture_path = report_fixture.display();
+        cli::test_support::write_script(
+            dir,
+            "drc-probe",
+            &format!(
+                "#!/bin/sh\nprev=\nfor a; do [ \"$prev\" = --output ] && out=\"$a\"; prev=\"$a\"; last=\"$a\"; done\n\
+                 cp '{fixture_path}' \"$out\"\n\
+                 cp \"$last\" \"$last.observed\"\nexit 0\n"
+            ),
+            &format!(
+                "@echo off\r\nset prev=\r\n:loop\r\nif \"%~1\"==\"\" goto done\r\nif \"%prev%\"==\"--output\" set out=%~1\r\nset prev=%~1\r\nset last=%~1\r\nshift\r\ngoto loop\r\n:done\r\ncopy /y \"{fixture_path}\" \"%out%\" >nul\r\ncopy /y \"%last%\" \"%last%.observed\" >nul\r\nexit /b 0\r\n"
+            ),
+        )
     }
 
     fn mock(board: &Path, commands: Arc<Mutex<Vec<String>>>, mode: &'static str) -> MockIpcServer {
@@ -458,7 +469,7 @@ mod tests {
             std::fs::write(&board, OLD).unwrap();
             let executable = cli_fixture(dir.path(), &board);
             std::fs::write(
-                board.with_extension("drc.json"),
+                dir.path().join("fixture-report.json"),
                 drc_rule_report().to_string(),
             )
             .unwrap();
@@ -509,7 +520,7 @@ mod tests {
             if let Some(listed) = listed {
                 report["ignored_checks"] = listed;
             }
-            std::fs::write(board.with_extension("drc.json"), report.to_string()).unwrap();
+            std::fs::write(dir.path().join("fixture-report.json"), report.to_string()).unwrap();
 
             let body = call("run_drc", &board, "", &executable, json!({})).await;
 
@@ -577,7 +588,7 @@ mod tests {
             std::fs::write(&board, OLD).unwrap();
             let executable = cli_fixture(dir.path(), &board);
             std::fs::write(
-                board.with_extension("drc.json"),
+                dir.path().join("fixture-report.json"),
                 drc_rule_report().to_string(),
             )
             .unwrap();
@@ -641,7 +652,7 @@ mod tests {
             std::fs::write(&board, OLD).unwrap();
             let executable = cli_fixture(dir.path(), &board);
             std::fs::write(
-                board.with_extension("drc.json"),
+                dir.path().join("fixture-report.json"),
                 drc_rule_report().to_string(),
             )
             .unwrap();
@@ -667,7 +678,11 @@ mod tests {
         let board = dir.path().join("clock.kicad_pcb");
         std::fs::write(&board, OLD).unwrap();
         let executable = cli_fixture(dir.path(), &board);
-        std::fs::write(board.with_extension("drc.json"), r#"{"violations":[]}"#).unwrap();
+        std::fs::write(
+            dir.path().join("fixture-report.json"),
+            r#"{"violations":[]}"#,
+        )
+        .unwrap();
         let body = call("run_drc", &board, "", &executable, json!({"limit":0})).await;
         assert_eq!(body["isError"], false, "{body}");
         assert_eq!(body["by_rule"], json!({}));
@@ -801,7 +816,7 @@ mod tests {
                     "unconnected_items": [row("warning", "unconnected")],
                     "schematic_parity": [row("error", "parity"), row("info", "detail")]
                 });
-                std::fs::write(board.with_extension("drc.json"), raw.to_string()).unwrap();
+                std::fs::write(dir.path().join("fixture-report.json"), raw.to_string()).unwrap();
                 let output = dir.path().join("reports/full.json");
                 let mut args = extra;
                 args["output"] = json!(output);
@@ -910,7 +925,11 @@ mod tests {
             let board = dir.path().join("clock.kicad_pcb");
             std::fs::write(&board, OLD).unwrap();
             let executable = cli_fixture(dir.path(), &board);
-            std::fs::write(board.with_extension("drc.json"), r#"{"violations":[]}"#).unwrap();
+            std::fs::write(
+                dir.path().join("fixture-report.json"),
+                r#"{"violations":[]}"#,
+            )
+            .unwrap();
             let body = call(tool, &board, "", &executable, json!({"limit": 0})).await;
             assert_eq!(body["isError"], false, "{body}");
             assert_eq!(body["shown"], 0);
@@ -1202,9 +1221,17 @@ mod tests {
                         "@exit /b 1\r\n",
                     )
                 } else {
+                    let fixture_path = dir.path().join("fixture-report.json");
+                    let fixture_path = fixture_path.display();
                     cli::test_support::write_script(dir.path(), "changing-drc",
-                        "#!/bin/sh\nfor last; do :; done\ncp \"$last.replacement\" \"$last\"\nexit 0\n",
-                        "@echo off\r\n:loop\r\nset last=%1\r\nshift\r\nif not \"%1\"==\"\" goto loop\r\ncopy /y %last%.replacement %last% >nul\r\nexit /b 0\r\n")
+                        &format!(
+                            "#!/bin/sh\nprev=\nfor a; do [ \"$prev\" = --output ] && out=\"$a\"; prev=\"$a\"; last=\"$a\"; done\n\
+                             cp '{fixture_path}' \"$out\"\n\
+                             cp \"$last.replacement\" \"$last\"\nexit 0\n"
+                        ),
+                        &format!(
+                            "@echo off\r\nset prev=\r\n:loop\r\nif \"%~1\"==\"\" goto done\r\nif \"%prev%\"==\"--output\" set out=%~1\r\nset prev=%~1\r\nset last=%~1\r\nshift\r\ngoto loop\r\n:done\r\ncopy /y \"{fixture_path}\" \"%out%\" >nul\r\ncopy /y \"%last%.replacement\" \"%last%\" >nul\r\nexit /b 0\r\n"
+                        ))
                 };
                 let commands = Arc::new(Mutex::new(Vec::new()));
                 let server = mock(&board, commands.clone(), "ok");
@@ -1480,6 +1507,26 @@ mod tests {
             assert!(
                 observed.filled && !observed.filled_polygons.is_empty(),
                 "refill must actually compute copper"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn served_drc_never_overwrites_or_deletes_existing_drc_json() {
+        for tool in ["run_drc", "get_drc_violations"] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("clock.kicad_pcb");
+            std::fs::write(&board, OLD).unwrap();
+            let existing_report = board.with_extension("drc.json");
+            std::fs::write(&existing_report, b"OLD-REPORT").unwrap();
+            let executable = cli_fixture(dir.path(), &board);
+
+            let body = call(tool, &board, "", &executable, json!({})).await;
+            assert_eq!(body["isError"], false, "{body}");
+            assert_eq!(
+                std::fs::read(&existing_report).unwrap(),
+                b"OLD-REPORT",
+                "{tool} must not overwrite or delete existing <board>.drc.json"
             );
         }
     }
