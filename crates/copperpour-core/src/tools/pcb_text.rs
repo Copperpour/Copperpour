@@ -102,9 +102,10 @@ pub(crate) fn tools() -> Vec<ToolDef> {
             "Move, rotate, resize, hide/show, restyle (mirrored, alignment, bold, italic, \
              keep_upright, knockout, locked, font), or change the layer of a placed footprint's \
              reference or value field in place. Name at least one property; every property not \
-             named is sent back exactly as KiCad holds it. KiCad 10 replaces the whole \
-             footprint, though: its symbol-unit mapping is lost until Update PCB from \
-             Schematic, and a rule area inside it may be rewritten; the readback sees neither. \
+             named is sent back exactly as KiCad holds it. This edit sends the whole footprint \
+             over IPC and can drop symbol-unit mappings on KiCad 10.0–10.0.7. Rule areas \
+             inside footprints can also change. Readback verifies neither. See 'Footprint \
+             unit metadata disappears after a live PCB edit' in Troubleshooting. \
              x/y are board-absolute mm (both or \
              neither); rotation is the field's absolute angle in degrees, the same frame \
              list_footprint_fields reports. Changing the layer alone does not mirror the text: \
@@ -200,10 +201,11 @@ pub(crate) fn tools() -> Vec<ToolDef> {
              'auto' sets it from the side of the layer each field ends on. 'layer', 'visible' \
              and 'mirror' need KiCad running with the board open and are refused otherwise. \
              With KiCad running on the board the edit is \
-             live, in one undo step, and each changed footprint is sent back whole, as \
-             edit_footprint_field sends it: on KiCad 10 that drops its symbol-unit mapping \
-             until Update PCB from Schematic, and a rule area inside it may be rewritten, which \
-             the live 'warning' repeats whenever a footprint was sent. With no live KiCad \
+             live, in one undo step, and sends each changed footprint whole over IPC. This \
+             can drop symbol-unit mappings on KiCad 10.0–10.0.7. Rule areas inside footprints \
+             can also change. Readback verifies neither. See 'Footprint unit metadata \
+             disappears after a live PCB edit' in Troubleshooting. The live \
+             'warning' repeats these caveats whenever a footprint was sent. With no live KiCad \
              holding the board the saved file is edited instead, which has no such side effect. \
              Both paths answer with the same fields: 'source' says which ran (ipc or file), and \
              'fallback_reason' is null on the live path. The response lists every field with \
@@ -1366,6 +1368,18 @@ mod tests {
                 .collect();
             assert_eq!(got, required, "{name}");
         }
+    }
+
+    #[test]
+    fn edit_footprint_field_describes_the_unit_mapping_risk() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "edit_footprint_field")
+            .unwrap();
+        assert!(tool
+            .description
+            .contains("drop symbol-unit mappings on KiCad 10.0–10.0.7"));
+        assert!(tool.description.contains("Troubleshooting"));
     }
 
     fn test_context() -> std::sync::Arc<ToolContext> {

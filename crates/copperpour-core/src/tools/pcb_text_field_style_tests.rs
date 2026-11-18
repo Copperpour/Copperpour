@@ -520,6 +520,10 @@ fn the_tool_prefers_the_live_board_and_requires_only_the_board() {
         .expect("set_footprint_field_style is registered");
     assert_eq!(def.board_access, BoardAccess::LivePreferredWithFallback);
     assert_eq!(def.input_schema["required"], json!(["board"]));
+    assert!(def
+        .description
+        .contains("drop symbol-unit mappings on KiCad 10.0–10.0.7"));
+    assert!(def.description.contains("Troubleshooting"));
 }
 
 // ─── Live path, through served `tools/call` ───────────────────────────────────
@@ -547,8 +551,18 @@ async fn the_live_path_sets_every_reference_in_one_undo_step() {
     assert_eq!(body["changed_count"], 2);
     assert_eq!(body["skipped"], json!([]));
     assert_eq!(body["fallback_reason"], Value::Null, "{body}");
-    // Sending a footprint whole has a cost the result itself must name.
-    assert_eq!(body["warning"], WHOLE_FOOTPRINT_WARNING, "{body}");
+    let warning = body["warning"].as_str().unwrap();
+    for expected in [
+        "drop symbol-unit mappings on KiCad 10.0–10.0.7.",
+        "rewrite rule areas inside footprints",
+        "Readback verifies neither",
+        "TROUBLESHOOTING.md#footprint-unit-metadata-disappears-after-a-live-pcb-edit",
+    ] {
+        assert!(
+            warning.contains(expected),
+            "missing {expected:?}: {warning}"
+        );
+    }
     assert_eq!(
         body["fields"],
         json!([

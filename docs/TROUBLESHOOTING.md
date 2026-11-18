@@ -270,9 +270,9 @@ KiCad 10 releases before 10.0.8 can drop a footprint's `(units ...)` block, whic
 
 The requested edit can succeed without a warning. The affected versions leave the mapping out of typed IPC footprint replies, so those replies cannot reveal the loss. A tool that compares the full board text, such as `set_teardrop_settings`, can detect it after the edit and report `mutation_outcome_uncertain`. That does not undo the edit.
 
-Upgrade to KiCad 10.0.8 or later before making these live edits, or make them directly in PCB Editor instead. Some Copperpour warnings still say "KiCad 10" and can appear on 10.0.8. See [KiCad issue #25859](https://gitlab.com/kicad/code/kicad/-/work_items/25859) and the [10.0.8 IPC fix](https://gitlab.com/kicad/code/kicad/-/commit/b7c0b5206f3f5cb9b5fb062be441bcaad6ef135c).
+Upgrade to KiCad 10.0.8 or later before making these live edits, or make them directly in PCB Editor instead. See [KiCad issue #25859](https://gitlab.com/kicad/code/kicad/-/work_items/25859) and the [10.0.8 IPC fix](https://gitlab.com/kicad/code/kicad/-/commit/b7c0b5206f3f5cb9b5fb062be441bcaad6ef135c).
 
-Upgrading does not restore missing metadata. If you already edited the board on an affected version, compare the saved `.kicad_pcb` with your backup or previous revision and check the edited footprints for missing `(units ...)` blocks before committing the board.
+Upgrading does not restore missing metadata. If you already edited the board on an affected version, save the edit before comparing the `.kicad_pcb` with your backup or previous revision. Check the edited footprints for missing `(units ...)` blocks before committing the board. If a linked footprint's mapping is missing, run KiCad's **Update PCB from Schematic** using the matching schematic.
 
 ## `launch_kicad_ui` from an SSH session
 
