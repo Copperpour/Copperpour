@@ -1288,6 +1288,24 @@ fn build_updated_instance(
                 .collect::<Result<Vec<_>>>()?,
         )
     } else {
+        for pad in &library.pads {
+            for layer in &pad.layers {
+                stack.checked_inner_copper_index(layer)?;
+            }
+        }
+        for graphic in &library.graphics {
+            stack.checked_inner_copper_index(graphic.layer())?;
+        }
+        for property in &library.properties {
+            let text = property
+                .text
+                .as_ref()
+                .with_context(|| format!("property '{}' has no board text", property.name))?;
+            stack.checked_inner_copper_index(property_layer_name(&property.name, text.layer)?)?;
+        }
+        for point in &library.points {
+            stack.checked_inner_copper_index(&point.layer)?;
+        }
         (library.pads.clone(), library.graphics.clone())
     };
     let packed = copperpour_ipc::KiCadIpcClient::build_footprint_item(
@@ -1661,6 +1679,13 @@ fn merge_custom_properties(
     Ok(())
 }
 
+fn property_layer_name(name: &str, layer: i32) -> Result<&'static str> {
+    let layer = kiapi::board::types::BoardLayer::try_from(layer)
+        .with_context(|| format!("property '{name}' has an invalid layer"))?;
+    copperpour_ipc::builders::layer_name(layer)
+        .with_context(|| format!("property '{name}' has an unnamed layer"))
+}
+
 pub(super) fn transform_library_property(
     property: &kiapi::board::types::Field,
     footprint_position: &kiapi::common::types::Vector2,
@@ -1716,10 +1741,7 @@ pub(super) fn transform_library_property(
     });
     if let Some(stack) = mirror {
         attributes.mirrored = !attributes.mirrored;
-        let layer = kiapi::board::types::BoardLayer::try_from(board_text.layer)
-            .with_context(|| format!("property '{}' has an invalid layer", property.name))?;
-        let layer_name = copperpour_ipc::builders::layer_name(layer)
-            .with_context(|| format!("property '{}' has an unnamed layer", property.name))?;
+        let layer_name = property_layer_name(&property.name, board_text.layer)?;
         board_text.layer =
             copperpour_ipc::builders::try_layer_from_name(&flip_layer(layer_name, stack)?)? as i32;
     }
@@ -2781,10 +2803,10 @@ mod tests {
     /// puts its pads and text on In5.Cu and mirrors the text, as KiCad's own
     /// flip of it does.
     #[test]
-    fn back_side_refresh_mirrors_inner_copper_through_the_board_stack() {
+    fn refresh_checks_inner_copper_and_mirrors_it_on_the_back() {
         use kiapi::board::types::BoardLayer;
 
-        let library = parse_library_footprint("Test:Socket", INNER_PAD_R0402).unwrap();
+        let mut library = parse_library_footprint("Test:Socket", INNER_PAD_R0402).unwrap();
         let eight = CopperStack::new(8).unwrap();
         let nets = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
         for (side, inner) in [
@@ -2826,21 +2848,52 @@ mod tests {
             );
         }
 
-        let error = build_updated_instance(
-            &current_instance(BoardLayer::BlBCu),
-            &library,
-            two_layers(),
-            &nets,
-            &BTreeSet::new(),
-            Resets::default(),
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("'In2.Cu' is not on this 2-copper-layer board"),
-            "{error:#}"
-        );
+        library
+            .graphics
+            .retain(|graphic| graphic.layer() != "In2.Cu");
+        for side in [BoardLayer::BlFCu, BoardLayer::BlBCu] {
+            let error = build_updated_instance(
+                &current_instance(side),
+                &library,
+                two_layers(),
+                &nets,
+                &BTreeSet::new(),
+                Resets::default(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "layer 'In2.Cu' is not on this 2-copper-layer board",
+                "{side:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_refuses_graphics_on_missing_inner_copper() {
+        use kiapi::board::types::BoardLayer;
+
+        let mut library = parse_library_footprint("Test:Socket", INNER_PAD_R0402).unwrap();
+        for pad in &mut library.pads {
+            pad.layers = vec!["F.Cu".to_string()];
+        }
+        let nets = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        for side in [BoardLayer::BlFCu, BoardLayer::BlBCu] {
+            let error = build_updated_instance(
+                &current_instance(side),
+                &library,
+                two_layers(),
+                &nets,
+                &BTreeSet::new(),
+                Resets::default(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "layer 'In2.Cu' is not on this 2-copper-layer board",
+                "{side:?}"
+            );
+        }
     }
 
     /// Without a reset, as KiCad's update dialog starts: Datasheet and
@@ -3092,7 +3145,8 @@ mod tests {
 
     #[test]
     fn refresh_refuses_an_unrepresentable_layer_before_building_the_update() {
-        let unsupported = LIBRARY_FOOTPRINT.replace("(layer \"F.SilkS\"))", "(layer \"In99.Cu\"))");
+        let unsupported =
+            LIBRARY_FOOTPRINT.replace("(layer \"F.SilkS\"))", "(layer \"User.999\"))");
         let library = parse_library_footprint("Test:Socket", &unsupported).unwrap();
         let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
 
@@ -3107,7 +3161,7 @@ mod tests {
         .unwrap_err();
 
         let message = format!("{error:#}");
-        assert!(message.contains("In99.Cu"), "{message}");
+        assert!(message.contains("User.999"), "{message}");
         assert!(message.contains("request was not sent"), "{message}");
     }
 
@@ -5272,6 +5326,90 @@ mod tests {
         let stale = result_json(&stale);
         assert_eq!(stale["status"], "conflict");
         assert_eq!(stale["diagnostics"][0]["code"], "stale_plan_revision");
+
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 0);
+        assert!(capture.update_batches.is_empty());
+        assert!(capture.commit_actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_refuses_missing_front_pad_layers_before_any_write() {
+        assert_front_layer_conflict_without_writes(
+            &INNER_PAD_R0402.replace("(layer \"In2.Cu\")", "(layer \"F.SilkS\")"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn refresh_refuses_missing_front_graphic_layers_before_any_write() {
+        assert_front_layer_conflict_without_writes(
+            &INNER_PAD_R0402.replace("(layers \"In2.Cu\")", "(layers \"F.Cu\")"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn refresh_refuses_missing_front_property_layers_before_any_write() {
+        let source = KICAD_LIBRARY_FOOTPRINT.replace(
+            "(at 0.5 0.75 15)\n\t\t(layer \"F.Fab\")\n\t\t(hide yes)",
+            "(at 0.5 0.75 15)\n\t\t(layer \"In2.Cu\")",
+        );
+        assert_front_layer_conflict_without_writes(&source).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_refuses_missing_front_reference_point_layers_before_any_write() {
+        let source = ISSUE_283_DIP8.replace(
+            "\t\t(layer \"F.Fab\")\n\t)\n\t(embedded_fonts",
+            "\t\t(layer \"In2.Cu\")\n\t)\n\t(embedded_fonts",
+        );
+        assert_front_layer_conflict_without_writes(&source).await;
+    }
+
+    async fn assert_front_layer_conflict_without_writes(source: &str) {
+        let (temp, board) = libraries_project(&[
+            ("Test", "Socket", KICAD_LIBRARY_FOOTPRINT),
+            ("Other", "Socket", KICAD_LIBRARY_FOOTPRINT),
+        ]);
+        let mock = spawn_planner_mock_keeping(
+            &board,
+            vec![
+                plan_item("SW1", Some("Test:Socket"), "kiid-1"),
+                plan_item("SW2", Some("Other:Socket"), "kiid-2"),
+            ],
+            false,
+            true,
+        );
+        let handler = served(mock.kicad.address()).await;
+        let ready = result_json(&served_call(&handler, json!({ "board": board })).await);
+        assert_eq!(ready["status"], "ready", "{ready}");
+        assert_eq!(ready["coverage"]["changed"]["planned"], 2);
+
+        std::fs::write(temp.path().join("Other.pretty/Socket.kicad_mod"), source).unwrap();
+        for args in [
+            json!({ "board": board }),
+            json!({
+                "board": board,
+                "dry_run": false,
+                "expected_plan_revision": ready["plan_revision"],
+            }),
+        ] {
+            let result = served_call(&handler, args).await;
+            assert!(!result.is_error, "{result:?}");
+            let body = result_json(&result);
+            assert_eq!(body["status"], "conflict", "{body}");
+            assert_eq!(body["coverage"]["changed"]["planned"], 0);
+            assert_eq!(body["coverage"]["changed"]["applied"], 0);
+            assert_eq!(
+                body["diagnostics"],
+                json!([{
+                    "code": "footprint_update_conflict",
+                    "message": "layer 'In2.Cu' is not on this 2-copper-layer board",
+                    "reference": "SW2",
+                }])
+            );
+        }
 
         let capture = mock.capture.lock().unwrap();
         assert_eq!(capture.begin_count, 0);
