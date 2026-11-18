@@ -275,7 +275,7 @@ fn unsupported_status_is_typed_without_changing_existing_rejection_classificatio
     assert_eq!(status.code_name, "AS_UNIMPLEMENTED");
     assert!(matches!(
         copperpour_ipc::IpcFailure::from_error(error),
-        copperpour_ipc::IpcFailure::Rejected(_)
+        copperpour_ipc::IpcFailure::Rejected { .. }
     ));
 }
 
@@ -1200,7 +1200,7 @@ fn a_live_kicad_that_says_no_classifies_as_rejected() {
     let client = KiCadIpcClient::new(&mock.url);
     let failure = copperpour_ipc::IpcFailure::from_error(client.get_open_documents().unwrap_err());
     assert!(
-        matches!(failure, copperpour_ipc::IpcFailure::Rejected(_)),
+        matches!(failure, copperpour_ipc::IpcFailure::Rejected { .. }),
         "a completed round-trip must never classify as unreachable: {failure:?}"
     );
     assert!(failure.message().contains("no board open"), "{failure:?}");

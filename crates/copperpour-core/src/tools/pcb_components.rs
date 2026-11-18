@@ -14,7 +14,7 @@ use crate::tools::pcb_board::{
 use crate::tools::pcb_copper_check::{self, CheckOptions, Checked, PoseRequest};
 use crate::tools::{
     get_path, require_array, require_f64, require_str, require_u64, with_board_ipc_classified,
-    ToolContext, ToolDef,
+    with_bound_board_ipc_classified, BoardBinding, ToolContext, ToolDef,
 };
 use anyhow::Context;
 use copperpour_ipc::client::KiCadIpcClient;
@@ -37,10 +37,12 @@ macro_rules! ipc {
     // The closure also receives the document KiCad resolved for the board.
     ($ctx:expr, $args:expr, |$c:ident, $doc:pat_param| $body:expr) => {{
         let requested_board = get_path($args, "board")?;
-        match with_board_ipc_classified($ctx, &requested_board, move |$c, $doc| $body).await? {
-            Ok(v) => v,
-            // Only an unreachable transport justifies "KiCAD must be running".
-            // This used to say it for every failure, so a tool that refused a
+        match with_bound_board_ipc_classified($ctx, &requested_board, move |$c, $doc| $body).await?
+        {
+            Ok(BoardBinding::Bound(v)) => v,
+            Ok(BoardBinding::Unserved { absence, message }) => {
+                return Ok(crate::tools::ipc_unserved_handler_error(absence, message));
+            }
             Err(failure) => return Ok(crate::tools::ipc_failure_result(failure)),
         }
     }};
@@ -4115,7 +4117,7 @@ async fn handle_find_component(
     };
     let fp = ipc!(ctx, args, |c| {
         c.get_footprint(&reference)?
-            .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", reference))
+            .ok_or_else(|| copperpour_ipc::PreflightRefusal::missing_footprint(&reference).into())
     });
     Ok(CallToolResult::json(&json!({
         "reference": fp.reference,
@@ -4343,7 +4345,7 @@ async fn handle_get_component_pads(
         }
         // Reading the pads raises no refusal of Copperpour's own (#240).
         Err(
-            copperpour_ipc::IpcFailure::Rejected(message)
+            copperpour_ipc::IpcFailure::Rejected { message, .. }
             | copperpour_ipc::IpcFailure::Preflight(copperpour_ipc::PreflightRefusal {
                 reason: message,
                 ..
@@ -4757,7 +4759,7 @@ async fn handle_duplicate_component(
     let ref_ipc = reference.clone();
     let src = ipc!(ctx, args, |c| {
         c.get_footprint(&ref_ipc)?
-            .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", ref_ipc))
+            .ok_or_else(|| copperpour_ipc::PreflightRefusal::missing_footprint(&ref_ipc).into())
     });
     if let Some(rejection) = back_side_layer_error(&src.layer) {
         return Ok(rejection);
@@ -9867,10 +9869,16 @@ mod edit_component_tests {
         Refuses,
         /// Lists the footprint twice, as a board with a repeated reference.
         ListsTwice,
+        MissingItemsResponse,
+        WrongItemsResponse,
+        UnreadableFootprint,
+        RefusesItemsRequest,
+        RefusesItemUpdate,
     }
 
     #[derive(Default)]
     struct Sent {
+        commands: Vec<String>,
         begins: usize,
         updates: Vec<kiapi::board::types::FootprintInstance>,
         /// Each board command in order, with the document its header named.
@@ -9979,6 +9987,11 @@ mod edit_component_tests {
         let server = crate::test_support::MockIpcServer::spawn("edit-component", move |request| {
             let command = request.message.expect("a command");
             let url = command.type_url.as_str();
+            record
+                .lock()
+                .unwrap()
+                .commands
+                .push(url.rsplit('.').next().unwrap_or(url).to_owned());
             // KiCad 10.0.8 refuses a request for a board it does not have open
             // (`API_HANDLER_EDITOR::validateItemHeaderDocument`).
             if let Some((name, document)) = named_document(&command) {
@@ -9995,17 +10008,38 @@ mod edit_component_tests {
                     "kiapi.common.commands.GetOpenDocumentsResponse",
                 )))
             } else if url.ends_with("GetItems") {
+                if kicad == Kicad::MissingItemsResponse {
+                    return ok(None);
+                }
+                if kicad == Kicad::WrongItemsResponse {
+                    return ok(Some(pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.CreateItemsResponse",
+                    )));
+                }
+                let item = if kicad == Kicad::UnreadableFootprint {
+                    prost_types::Any {
+                        type_url: "type.googleapis.com/kiapi.board.types.FootprintInstance".into(),
+                        value: vec![0xff],
+                    }
+                } else {
+                    pack_any(
+                        &*held.lock().unwrap(),
+                        "kiapi.board.types.FootprintInstance",
+                    )
+                };
                 ok(Some(pack_any(
                     &kiapi::common::commands::GetItemsResponse {
                         header: None,
-                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                        items: vec![
-                            pack_any(
-                                &*held.lock().unwrap(),
-                                "kiapi.board.types.FootprintInstance",
-                            );
-                            if kicad == Kicad::ListsTwice { 2 } else { 1 }
-                        ],
+                        status: if kicad == Kicad::RefusesItemsRequest {
+                            kiapi::common::types::ItemRequestStatus::IrsDocumentNotFound as i32
+                        } else {
+                            kiapi::common::types::ItemRequestStatus::IrsOk as i32
+                        },
+                        items: vec![item; if kicad == Kicad::ListsTwice { 2 } else { 1 }],
                     },
                     "kiapi.common.commands.GetItemsResponse",
                 )))
@@ -10029,6 +10063,23 @@ mod edit_component_tests {
                 record.lock().unwrap().updates.push(footprint.clone());
                 if kicad == Kicad::Refuses {
                     return bad_request("mock refusal".to_string());
+                }
+                if kicad == Kicad::RefusesItemUpdate {
+                    return ok(Some(pack_any(
+                        &kiapi::common::commands::UpdateItemsResponse {
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            updated_items: vec![kiapi::common::commands::ItemUpdateResult {
+                                status: Some(kiapi::common::commands::ItemStatus {
+                                    code: kiapi::common::commands::ItemStatusCode::IscInvalidData
+                                        as i32,
+                                    error_message: "mock item refusal".into(),
+                                }),
+                                item: None,
+                            }],
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.UpdateItemsResponse",
+                    )));
                 }
                 let mut held = held.lock().unwrap();
                 if kicad == Kicad::IgnoresFlags {
@@ -10087,14 +10138,24 @@ mod edit_component_tests {
             .collect()
     }
 
-    /// The `message` and `error.kind` of a refusal. The `recovery` block is
-    /// not checked: for a refusal made before any commit it currently says
-    /// the outcome is unknown, which #589 changes.
-    fn refusal(result: &CallToolResult) -> (String, String) {
+    fn assert_preflight(body: &serde_json::Value, reason: &str, sent: &Mutex<Sent>) {
+        assert_eq!(
+            sent.lock().unwrap().commands,
+            ["GetOpenDocuments", "GetItems"]
+        );
+        assert_eq!(body["message"], reason);
+        assert_eq!(body["error"]["kind"], "handler_error");
+        let recovery = &body["recovery"];
+        assert_eq!(recovery["cause"], "preflight_refusal", "{body}");
+        assert_eq!(recovery["mutation_outcome"], "none");
+        assert_eq!(recovery["retry_safe"], false);
+        assert_eq!(recovery["evidence"]["reason"], reason);
+        assert!(recovery.get("troubleshooting_url").is_none());
+    }
+
+    fn assert_edit_preflight(result: &CallToolResult, reason: &str, sent: &Mutex<Sent>) {
         assert!(result.is_error, "{}", text(result));
-        let body: serde_json::Value = serde_json::from_str(&text(result)).unwrap();
-        let field = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_string();
-        (field(&body["message"]), field(&body["error"]["kind"]))
+        assert_preflight(&serde_json::from_str(&text(result)).unwrap(), reason, sent);
     }
 
     /// Run `edit_component` with `arguments` (beside `board` and the
@@ -10260,6 +10321,47 @@ mod edit_component_tests {
             text(&result)
         );
         assert!(text(&result).contains("rejected"), "{}", text(&result));
+        let body: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
+        assert_eq!(body["recovery"]["cause"], "kicad_api_rejection", "{body}");
+        assert_eq!(body["recovery"]["evidence"]["status"], "AS_BAD_REQUEST");
+        assert_eq!(body["recovery"]["mutation_outcome"], "unknown");
+        assert_eq!(body["recovery"]["retry_safe"], false);
+    }
+
+    #[tokio::test]
+    async fn an_item_request_rejection_is_from_kicad_not_copperpour() {
+        let (result, sent, _) = edit(
+            c_0603(false),
+            Kicad::RefusesItemsRequest,
+            json!({ "dnp": true }),
+        )
+        .await;
+        assert!(result.is_error);
+        let body: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
+        assert_eq!(body["recovery"]["cause"], "kicad_api_rejection", "{body}");
+        assert_eq!(
+            body["recovery"]["evidence"]["status"],
+            "IRS_DOCUMENT_NOT_FOUND"
+        );
+        assert_eq!(
+            sent.lock().unwrap().commands,
+            ["GetOpenDocuments", "GetItems"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_item_update_rejection_is_from_kicad_not_copperpour() {
+        let (result, sent, _) = edit(
+            c_0603(false),
+            Kicad::RefusesItemUpdate,
+            json!({ "dnp": true }),
+        )
+        .await;
+        assert!(result.is_error);
+        let body: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
+        assert_eq!(body["recovery"]["cause"], "kicad_api_rejection", "{body}");
+        assert_eq!(body["recovery"]["evidence"]["status"], "ISC_INVALID_DATA");
+        assert_eq!(sent.lock().unwrap().updates.len(), 1);
     }
 
     #[tokio::test]
@@ -10288,24 +10390,63 @@ mod edit_component_tests {
     async fn a_missing_reference_is_refused_before_a_commit() {
         let temp = tempfile::tempdir().unwrap();
         let board = temp.path().join("board.kicad_pcb");
-        std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
+        let saved = b"(kicad_pcb (version 20240108))";
+        std::fs::write(&board, saved).unwrap();
         let (server, sent) = spawn(&board, c_0603(false), Kicad::Keeps);
-        let result = handle_edit_component(
-            &json!({ "board": board.to_string_lossy(), "reference": "R99", "dnp": true }),
-            &context(server.address().to_string()),
-        )
-        .await
-        .unwrap();
-        // The text `edit_component` refused a missing reference with before.
-        assert_eq!(
-            refusal(&result),
-            (
-                "Footprint 'R99' not found".to_string(),
-                "handler_error".to_string()
-            )
+        let mut config = context(server.address().to_string()).config;
+        config.eager_toolsets = true;
+        let handler = crate::mcp::handler::McpHandler::new(config).await.unwrap();
+        let result = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "edit_component",
+                    "arguments": { "board": board, "reference": "R99", "dnp": true },
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(result["isError"], true);
+        let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_preflight(&body, "Footprint 'R99' not found", &sent);
+        assert_eq!(std::fs::read(board).unwrap(), saved);
+    }
+
+    #[tokio::test]
+    async fn a_missing_reference_is_reported_when_no_edit_is_requested() {
+        let (result, sent, _) =
+            edit(c_0603(false), Kicad::Keeps, json!({ "reference": "R99" })).await;
+        assert_edit_preflight(&result, "Footprint 'R99' not found", &sent);
+    }
+
+    async fn assert_incomplete_footprint_inventory(kicad: Kicad) {
+        let (result, sent, _) = edit(c_0603(false), kicad, json!({ "dnp": true })).await;
+        let body: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
+        let reason = body["message"].as_str().unwrap();
+        assert!(
+            reason.starts_with("Cannot read footprint inventory:"),
+            "{body}"
         );
-        let sent = sent.lock().unwrap();
-        assert_eq!((sent.begins, sent.updates.len()), (0, 0));
+        assert_edit_preflight(&result, reason, &sent);
+    }
+
+    #[tokio::test]
+    async fn a_missing_inventory_payload_is_not_a_missing_reference() {
+        assert_incomplete_footprint_inventory(Kicad::MissingItemsResponse).await;
+    }
+
+    #[tokio::test]
+    async fn an_unexpected_inventory_reply_type_is_not_a_missing_reference() {
+        assert_incomplete_footprint_inventory(Kicad::WrongItemsResponse).await;
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_footprint_is_not_a_missing_reference() {
+        assert_incomplete_footprint_inventory(Kicad::UnreadableFootprint).await;
     }
 
     /// Current callers keep their answer: `reference`, `value` and
@@ -10354,36 +10495,41 @@ mod edit_component_tests {
         footprint.value_field = None;
         let (result, sent, reference) =
             edit(footprint, Kicad::Keeps, json!({ "value": "1u" })).await;
-        assert_eq!(
-            refusal(&result),
-            (
-                format!("Footprint '{reference}' has no editable value field"),
-                "handler_error".to_string()
-            )
+        assert_edit_preflight(
+            &result,
+            &format!("Footprint '{reference}' has no editable value field"),
+            &sent,
         );
-        let sent = sent.lock().unwrap();
-        assert_eq!((sent.begins, sent.updates.len()), (0, 0));
     }
 
-    /// A reference two footprints carry is refused, whether a property is
-    /// named or not, and nothing is sent: before, the first was used.
+    #[tokio::test]
+    async fn a_footprint_without_a_kiid_refuses_an_edit() {
+        let mut footprint = c_0603(false);
+        footprint.id = None;
+        let (result, sent, reference) = edit(footprint, Kicad::Keeps, json!({ "dnp": true })).await;
+        assert_edit_preflight(
+            &result,
+            &format!("footprint '{reference}' has no KIID"),
+            &sent,
+        );
+    }
+
+    async fn assert_repeated_reference(arguments: serde_json::Value) {
+        let (result, sent, reference) = edit(c_0603(false), Kicad::ListsTwice, arguments).await;
+        assert_edit_preflight(
+            &result,
+            &format!("Footprint reference '{reference}' is ambiguous: KiCad returned 2 matches"),
+            &sent,
+        );
+    }
+
     #[tokio::test]
     async fn a_repeated_reference_is_refused_before_a_commit() {
-        for arguments in [json!({}), json!({ "dnp": true })] {
-            let (result, sent, reference) =
-                edit(c_0603(false), Kicad::ListsTwice, arguments.clone()).await;
-            assert_eq!(
-                refusal(&result),
-                (
-                    format!(
-                        "Footprint reference '{reference}' is ambiguous: KiCad returned 2 matches"
-                    ),
-                    "handler_error".to_string()
-                ),
-                "{arguments}"
-            );
-            let sent = sent.lock().unwrap();
-            assert_eq!((sent.begins, sent.updates.len()), (0, 0));
-        }
+        assert_repeated_reference(json!({ "dnp": true })).await;
+    }
+
+    #[tokio::test]
+    async fn a_repeated_reference_is_refused_when_no_edit_is_requested() {
+        assert_repeated_reference(json!({})).await;
     }
 }

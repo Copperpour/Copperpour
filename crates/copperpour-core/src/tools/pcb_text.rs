@@ -574,11 +574,11 @@ where
                 Err(ipc_uncertain_result(&message))
             }
             Err(
-                failure @ (copperpour_ipc::IpcFailure::Rejected(_)
+                failure @ (copperpour_ipc::IpcFailure::Rejected { .. }
                 | copperpour_ipc::IpcFailure::Preflight(_)),
             ) => {
                 let message = format!(
-                    "KiCad must be running with the requested board open: {}",
+                    "Could not identify the requested live board: {}",
                     failure.message()
                 );
                 Err(crate::tools::editor_unavailable_with_recovery(
@@ -686,28 +686,13 @@ fn live_error_result(error: anyhow::Error, operation: &str) -> CallToolResult {
         failure @ copperpour_ipc::IpcFailure::Unreachable { .. } => {
             crate::tools::ipc_failure_result(failure)
         }
-        // A refusal Copperpour made before KiCad kept anything is worded as
-        // the rejection it was before the variant existed.
-        copperpour_ipc::IpcFailure::Rejected(message) => {
-            let recovery = crate::tools::ipc_recovery::for_ipc_failure(
-                &copperpour_ipc::IpcFailure::Rejected(message.clone()),
-            );
+        failure @ (copperpour_ipc::IpcFailure::Rejected { .. }
+        | copperpour_ipc::IpcFailure::Preflight(_)) => {
+            let message = failure.message();
+            let recovery = crate::tools::ipc_recovery::for_ipc_failure(&failure);
             CallToolResult::error_kind_with_recovery(
                 ToolErrorKind::HandlerError {
-                    reason: message.clone(),
-                },
-                format!("{operation} failed: {message}"),
-                recovery,
-            )
-        }
-        copperpour_ipc::IpcFailure::Preflight(refusal) => {
-            let message = refusal.reason.clone();
-            let recovery = crate::tools::ipc_recovery::for_ipc_failure(
-                &copperpour_ipc::IpcFailure::Preflight(refusal),
-            );
-            CallToolResult::error_kind_with_recovery(
-                ToolErrorKind::HandlerError {
-                    reason: message.clone(),
+                    reason: message.to_owned(),
                 },
                 format!("{operation} failed: {message}"),
                 recovery,

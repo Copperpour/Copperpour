@@ -12,8 +12,7 @@ Each `recovery` object contains:
   `no_listener`, `access_denied`, `handshake_failed`, `kicad_not_ready`,
   `no_open_documents`, `wrong_document`, `ambiguous_document`,
   `unresolved_document_identities`, `stale_document`, `ipc_outcome_unknown`,
-  `ipc_batch_recovered`, `no_pcb_editor_at_endpoint`, `preflight_refusal`, or
-  `unknown` when unclassified);
+  `ipc_batch_recovered`, `no_pcb_editor_at_endpoint`, `preflight_refusal`, `kicad_api_rejection`, or `unknown` when unclassified);
 - `observed` and `evidence`: what was actually observed without guessing from
   message text;
 - `mutation_outcome`: `"none"`, `"unchanged"`, or `"unknown"`;
@@ -21,8 +20,7 @@ Each `recovery` object contains:
   prerequisites apply or outcome/safety is unknown;
 - `next_steps`: ordered steps tagged with `actor` (`"agent"` or `"user"`) and
   optional `tool`;
-- `troubleshooting_url`: link to the corresponding section in
-  `docs/TROUBLESHOOTING.md`.
+- `troubleshooting_url`: optional link to `docs/TROUBLESHOOTING.md` when an IPC troubleshooting step applies.
 
 `ipc_failure.kind`, `ipc_failure.message` and `ipc_failure.note` are unchanged,
 and so is `error.kind`, with these exceptions:
@@ -36,4 +34,4 @@ and so is `error.kind`, with these exceptions:
   (`set_footprint_field`, `set_pad_net`, `apply_copper`, `delete_trace`, the
   `pcb_components` and `pcb_routing` IPC tools) now return a structured error:
   `editor_unavailable` when KiCad or its board editor did not answer,
-  `handler_error` when KiCad refused the request.
+  other failures retain a specific error kind when one applies (for example, `ipc_outcome_unknown` after an accepted write whose verification request fails) or use `handler_error` at the generic boundary. Use `recovery` to distinguish an explicit KiCad rejection, a Copperpour refusal, and an unclassified failure.

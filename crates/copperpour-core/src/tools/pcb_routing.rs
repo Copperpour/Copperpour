@@ -34,18 +34,6 @@ macro_rules! ipc {
             Ok(BoardBinding::Unserved { absence, message }) => {
                 return Ok(crate::tools::ipc_unserved_result(absence, &message))
             }
-            Err(copperpour_ipc::IpcFailure::Rejected(message)) => {
-                let recovery = crate::tools::ipc_recovery::for_ipc_failure(
-                    &copperpour_ipc::IpcFailure::Rejected(message.clone()),
-                );
-                return Ok(CallToolResult::error_kind_with_recovery(
-                    ToolErrorKind::HandlerError {
-                        reason: message.clone(),
-                    },
-                    format!("KiCad IPC error: {message}"),
-                    recovery,
-                ));
-            }
             Err(failure) => return Ok(crate::tools::ipc_failure_result(failure)),
         }
     }};
@@ -532,7 +520,10 @@ fn routing_preflight(
         let id = copperpour_ipc::builders::try_layer_from_name(layer)? as i32;
         let enabled = client.get_layers_in(document.clone())?;
         if enabled.is_empty() {
-            anyhow::bail!("KiCad returned an empty enabled-layer set for the requested board");
+            return Err(copperpour_ipc::PreflightRefusal::check_failed(
+                "KiCad returned an empty enabled-layer set for the requested board",
+            )
+            .into());
         }
         if !enabled.iter().any(|enabled| enabled.id == id) {
             let copper: Vec<_> = enabled
@@ -549,7 +540,15 @@ fn routing_preflight(
             )));
         }
     }
-    let available = client.get_nets_required_in(document.clone())?;
+    let available = client
+        .get_nets_required_in(document.clone())
+        .map_err(|error| {
+            let refusal = copperpour_ipc::PreflightRefusal::check_incomplete(
+                "Could not read the live nets before routing",
+                &error,
+            );
+            error.context(refusal)
+        })?;
     for &(field, name) in nets {
         if !available.iter().any(|net| net.name == name) {
             return Ok(Some(invalid_arg(
@@ -1453,12 +1452,15 @@ async fn handle_delete_trace(
 
     let board_ipc = board.clone();
     let uuid_ipc = uuid.clone();
-    let deleted = match with_board_ipc_classified(ctx, &board, move |client, _| {
+    let deleted = match with_bound_board_ipc_classified(ctx, &board, move |client, _| {
         client.delete_trace_segment_verified(&board_ipc, &uuid_ipc)
     })
     .await?
     {
-        Ok(deleted) => deleted,
+        Ok(BoardBinding::Bound(deleted)) => deleted,
+        Ok(BoardBinding::Unserved { absence, message }) => {
+            return Ok(crate::tools::ipc_unserved_handler_error(absence, message));
+        }
         Err(error) => return Ok(crate::tools::ipc_failure_result(error)),
     };
 
@@ -1548,8 +1550,9 @@ mod delete_trace_tests {
         assert_eq!(std::fs::read(&board).unwrap(), original);
     }
 
-    #[tokio::test]
-    async fn success_reports_the_observed_trace_and_verified_postcondition() {
+    async fn served_delete_trace(
+        readback_status: kiapi::common::types::ItemRequestStatus,
+    ) -> (serde_json::Value, bool) {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("target.kicad_pcb");
         std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
@@ -1571,7 +1574,11 @@ mod delete_trace_tests {
                 return Some(copperpour_ipc::builders::pack_any(
                     &kiapi::common::commands::GetItemsResponse {
                         header: None,
-                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        status: if *deleted_in_mock.lock().unwrap() {
+                            readback_status as i32
+                        } else {
+                            kiapi::common::types::ItemRequestStatus::IrsOk as i32
+                        },
                         items,
                     },
                     "kiapi.common.commands.GetItemsResponse",
@@ -1591,19 +1598,32 @@ mod delete_trace_tests {
             None
         });
 
-        let result = handle_delete_trace(
-            &json!({ "board": board.to_string_lossy(), "uuid": "segment-1" }),
-            &ctx_talking_to(server.address().to_string()),
-        )
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            ipc_address: server.address().to_string(),
+            eager_toolsets: true,
+            ..Default::default()
+        })
         .await
         .unwrap();
+        let result = handler.handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "delete_trace", "arguments": { "board": board, "uuid": "segment-1" } },
+        })).await.unwrap().result.unwrap();
+        assert!(
+            *deleted.lock().unwrap(),
+            "the mock must accept the delete before readback"
+        );
+        let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        (body, result["isError"] == true)
+    }
 
-        assert!(!result.is_error);
-        let text = match result.content.first() {
-            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
-            other => panic!("expected text result, got {other:?}"),
-        };
-        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+    #[tokio::test]
+    async fn success_reports_the_observed_trace_and_verified_postcondition() {
+        let (body, is_error) =
+            served_delete_trace(kiapi::common::types::ItemRequestStatus::IrsOk).await;
+        assert!(!is_error, "{body}");
         assert_eq!(body["deleted_uuid"], json!("segment-1"));
         assert_eq!(body["deleted_type"], json!("trace_segment"));
         assert_eq!(body["preimage"]["net"], json!("GND"));
@@ -1612,6 +1632,16 @@ mod delete_trace_tests {
         assert_eq!(body["preimage"]["from"], json!({ "x": 1.0, "y": 2.0 }));
         assert_eq!(body["preimage"]["to"], json!({ "x": 3.0, "y": 4.0 }));
         assert_eq!(body["postcondition"], json!("absent_from_trace_readback"));
+    }
+
+    #[tokio::test]
+    async fn accepted_delete_with_failed_readback_is_uncertain() {
+        let (body, is_error) =
+            served_delete_trace(kiapi::common::types::ItemRequestStatus::IrsDocumentNotFound).await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "ipc_outcome_unknown", "{body}");
+        assert_eq!(body["recovery"]["mutation_outcome"], "unknown");
+        assert_eq!(body["recovery"]["retry_safe"], false);
     }
 }
 
@@ -1941,7 +1971,7 @@ async fn handle_get_nets_list(
         Err(failure) => {
             let recovery = crate::tools::ipc_recovery::for_ipc_failure(&failure);
             let message = format!(
-                "KiCad did not complete the net list query for '{}': {}. Retry the live query; no saved-file or empty-list substitute was used.",
+                "Could not read the live net list for '{}': {}. No saved-file or empty-list substitute was used.",
                 board_path.display(),
                 failure.message()
             );
@@ -2003,7 +2033,7 @@ async fn handle_modify_trace(
 
     let board = get_path(args, "board")?;
     let (uuid_ipc, net_ipc, layer_ipc) = (uuid.clone(), net_name.clone(), layer.clone());
-    let outcome = match with_board_ipc_classified(ctx, &board, move |client, document| {
+    let outcome = match with_bound_board_ipc_classified(ctx, &board, move |client, document| {
         let edit = copperpour_ipc::types::IpcTrackEdit {
             net_name: &net_ipc,
             layer: &layer_ipc,
@@ -2015,7 +2045,10 @@ async fn handle_modify_trace(
     })
     .await?
     {
-        Ok(outcome) => outcome,
+        Ok(BoardBinding::Bound(outcome)) => outcome,
+        Ok(BoardBinding::Unserved { absence, message }) => {
+            return Ok(crate::tools::ipc_unserved_handler_error(absence, message));
+        }
         Err(failure) => return Ok(crate::tools::ipc_failure_result(failure)),
     };
     let unchanged = "The board is unchanged.";

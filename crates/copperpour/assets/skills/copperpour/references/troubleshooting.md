@@ -12,7 +12,7 @@ uncertain outcome, or behaves unexpectedly in the client or KiCad.
    structured recovery fields when present: the top-level `recovery` block on
    IPC failures (`ipc_failure.recovery` in `check_kicad_ui` and `open_project`),
    with `cause`, `mutation_outcome`, `retry_safe`, `retry_prerequisites`,
-   `next_steps` (each marked `agent` or `user`) and `troubleshooting_url`, and
+   `next_steps` (each marked `agent` or `user`) and an optional `troubleshooting_url`, and
    kind-specific fields such as `board_state`, `drop_confirmed`,
    `browser_launch_error` or `absolute_path`. When an older server omits those
    fields, handle the response conservatively without inventing missing fields

@@ -394,15 +394,20 @@ where
             absence: crate::tools::BoardEditorAbsence::NoPcbEditor,
             ..
         } => BoardWrite::Refused(CallToolResult::error(no_pcb_editor_write_refusal(what))),
-        // `OpenDocumentsUnimplemented` establishes nothing about the editors,
-        // so it keeps the rejection's cautious wording.
-        LiveBoard::Rejected(message) | LiveBoard::Unserved { message, .. } => {
+        LiveBoard::Rejected { message, status } => {
+            let what_failed = if status.is_some() {
+                format!("KiCAD rejected the {what} over IPC: {message}. The board file was not modified — KiCAD is reachable and may hold this board open")
+            } else {
+                format!("The live {what} failed: {message}. The board file was not modified — KiCad may hold this board open")
+            };
             BoardWrite::Refused(CallToolResult::error(format!(
-                "KiCAD rejected the {what} over IPC: {message}. \
-                 The board file was not modified — KiCAD is reachable and may hold this \
-                 board open, so editing the file directly could be silently overwritten."
+                "{what_failed}, so editing the file directly could be silently overwritten."
             )))
         }
+        LiveBoard::Unserved { message, .. } => BoardWrite::Refused(CallToolResult::error(format!(
+            "The live {what} failed: {message}. The board file was not modified — KiCad may \
+                 hold this board open, so editing the file directly could be silently overwritten."
+        ))),
         LiveBoard::NotOpen { message, .. } => BoardWrite::File(NoLiveBoard::NotOpen(message)),
         LiveBoard::Unresolved(error) => {
             BoardWrite::Refused(crate::tools::ipc_target_error_result(&error))
@@ -437,6 +442,11 @@ pub(crate) fn preflight_refusal_result(
         refusal.reason
     );
     match kind {
+        Some(kind) if refusal.kicad_status.is_some() => CallToolResult::error_kind_with_recovery(
+            kind,
+            message,
+            super::ipc_recovery::for_preflight_refusal(refusal),
+        ),
         Some(kind) => CallToolResult::error_kind(kind, message),
         None => CallToolResult::error(message),
     }
@@ -674,7 +684,7 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
             // it does in `attempt_ipc_write`: preserved as it was before those
             // cases had names, not decided. These two gates disagree about what
             // it permits, and that disagreement is #577's to settle.
-            LiveBoard::Rejected(_)
+            LiveBoard::Rejected { .. }
             | LiveBoard::Preflight(_)
             | LiveBoard::Unserved { .. }
             | LiveBoard::NotOpen { .. } => None,
@@ -4914,7 +4924,7 @@ mod board_session_safety_tests {
         .unwrap();
         assert!(matches!(
             rejected,
-            Err(copperpour_ipc::IpcFailure::Rejected(_))
+            Err(copperpour_ipc::IpcFailure::Rejected { .. })
         ));
         drop(server);
 
@@ -5007,7 +5017,7 @@ mod board_session_safety_tests {
 
         assert!(matches!(
             result,
-            Err(copperpour_ipc::IpcFailure::Rejected(_))
+            Err(copperpour_ipc::IpcFailure::Rejected { .. })
         ));
         assert!(!ctx.board_session.was_observed_live(&board));
     }
