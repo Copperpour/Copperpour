@@ -86,12 +86,14 @@ pub(super) fn with_field_schema(mut schema: serde_json::Value) -> serde_json::Va
 pub(super) struct SymbolFields {
     pub(super) value: Option<String>,
     pub(super) footprint: Option<String>,
+    pub(super) datasheet: Option<String>,
     pub(super) description: Option<String>,
     pub(super) keywords: Option<String>,
     pub(super) fp_filters: Option<String>,
     pub(super) custom: Vec<(String, String)>,
     /// Custom fields renamed, current name to new, and removed. Only
-    /// `set_symbol_properties` takes these, and `value`.
+    /// `set_symbol_properties` takes these, and `value` and `datasheet`
+    /// (`create_symbol` writes its own Value and Datasheet).
     pub(super) renames: Vec<(String, String)>,
     pub(super) removals: Vec<String>,
 }
@@ -106,6 +108,9 @@ impl SymbolFields {
         }
         if let Some(value) = &self.footprint {
             out.push(("Footprint", value.as_str()));
+        }
+        if let Some(value) = &self.datasheet {
+            out.push(("Datasheet", value.as_str()));
         }
         if let Some(value) = &self.description {
             out.push(("Description", value.as_str()));
@@ -195,16 +200,16 @@ pub(super) fn parse_symbol_fields(
 
 /// Why a custom field may not take `name`, or `None` when it may.
 fn reserved_owner(name: &str) -> Option<&'static str> {
-    if ["Value", "Footprint", "Description"]
+    if ["Value", "Footprint", "Datasheet", "Description"]
         .iter()
         .any(|field| field.eq_ignore_ascii_case(name))
     {
-        Some("use the value, footprint or description argument")
+        Some("use the value, footprint, datasheet or description argument")
     } else if MANDATORY_FIELDS
         .iter()
         .any(|field| field.eq_ignore_ascii_case(name))
     {
-        Some("Reference and Datasheet are mandatory fields")
+        Some("Reference is a mandatory field")
     } else if name.to_ascii_lowercase().starts_with("ki_") {
         Some("ki_* names are reserved by KiCad; use keywords or fp_filters")
     } else {
@@ -220,6 +225,15 @@ fn parse_symbol_edits(
     fields: &mut SymbolFields,
 ) -> Result<(), CallToolResult> {
     fields.value = opt_string(args, "value")?;
+    // `~` is KiCad's legacy "no datasheet" placeholder, written as the empty
+    // string, as `create_symbol` writes it.
+    fields.datasheet = opt_string(args, "datasheet")?.map(|datasheet| {
+        if datasheet == "~" {
+            String::new()
+        } else {
+            datasheet
+        }
+    });
     fields.renames = parse_rename_fields(args, fields)?;
     fields.removals = parse_remove_fields(args, fields)?;
     Ok(())
@@ -392,7 +406,7 @@ fn is_generated_name(name: &str) -> bool {
 pub(super) fn tool() -> ToolDef {
     tool!(
         "set_symbol_properties",
-        "Set the Value, Footprint, Description, keywords, footprint filters or custom fields \
+        "Set the Value, Footprint, Datasheet, Description, keywords, footprint filters or custom fields \
          (MPN, LCSC, ...) of an existing library symbol, and rename or remove its custom \
          fields. Only the supplied fields change; an existing or renamed field keeps its position \
          and visibility. Reports each changed field's previous and current value.",
@@ -402,6 +416,7 @@ pub(super) fn tool() -> ToolDef {
                 "library_path": { "type": "string", "description": "Path to an existing .kicad_sym library file" },
                 "symbol_name": { "type": "string", "description": "Name of the symbol to change" },
                 "value": { "type": "string", "description": "Symbol value (the Value field)" },
+                "datasheet": { "type": "string", "description": "Datasheet URL or path (the Datasheet field). A '~' is written as an empty string, as create_symbol writes it." },
                 "rename_fields": {
                     "type": "object",
                     "description": "Custom fields to rename, as current name: new name. A renamed field keeps its value, position, visibility and text effects. Names match whole and case-sensitively, as KiCad's custom field names do; a new name the symbol already carries is refused.",
@@ -442,8 +457,8 @@ async fn handle_set_symbol_properties(
     if fields.is_empty() {
         return Ok(invalid_arg(
             "symbol_properties",
-            "supply at least one of value, footprint, description, keywords, fp_filters, \
-             fields, rename_fields or remove_fields",
+            "supply at least one of value, footprint, datasheet, description, keywords, \
+             fp_filters, fields, rename_fields or remove_fields",
         ));
     }
     let source = match read_consistent(&path) {
@@ -1584,6 +1599,72 @@ pub(super) mod tests {
         );
     }
 
+    /// The Datasheet field is a mandatory field like Value: `datasheet`
+    /// replaces its value token alone, so it keeps its position, visibility and
+    /// effects, on a symbol with a link and on one with an empty field.
+    #[tokio::test]
+    async fn a_datasheet_edit_replaces_only_the_datasheet_token() {
+        let handler = handler().await;
+        let old = "https://www.ti.com/lit/ds/symlink/tps7a02.pdf";
+        let new = "https://www.ti.com/lit/gpn/tps7a02";
+        for (symbol, previous, current, before) in [
+            (
+                "FIELDS_FULL",
+                old,
+                new,
+                format!("(property \"Datasheet\" \"{old}\""),
+            ),
+            (
+                "FIELDS_BARE",
+                "",
+                old,
+                "(property \"Datasheet\" \"\"".to_string(),
+            ),
+        ] {
+            let (_dir, path) = library_with(FIXTURE);
+            assert_eq!(FIXTURE.matches(&before).count(), 1, "{symbol}");
+
+            let body = edit_symbol(&handler, &path, symbol, json!({"datasheet": current})).await;
+
+            assert_eq!(
+                body["changes"],
+                json!({"Datasheet": {"previous": previous, "current": current}}),
+                "{symbol}: {body}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                FIXTURE.replacen(
+                    &before,
+                    &format!("(property \"Datasheet\" \"{current}\""),
+                    1
+                ),
+                "{symbol}"
+            );
+        }
+    }
+
+    /// `~`, KiCad's legacy "no datasheet" placeholder, is written as the empty
+    /// string, as `create_symbol` writes it; on a symbol whose Datasheet is
+    /// already empty it changes nothing.
+    #[tokio::test]
+    async fn a_tilde_datasheet_is_written_empty() {
+        let handler = handler().await;
+        let (_dir, path) = library_with(FIXTURE);
+        let link = "(property \"Datasheet\" \"https://www.ti.com/lit/ds/symlink/tps7a02.pdf\"";
+
+        let body = edit_symbol(&handler, &path, "FIELDS_FULL", json!({"datasheet": "~"})).await;
+        assert_eq!(body["changes"]["Datasheet"]["current"], "", "{body}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            FIXTURE.replacen(link, "(property \"Datasheet\" \"\"", 1)
+        );
+
+        let (_dir, path) = library_with(FIXTURE);
+        let body = edit_symbol(&handler, &path, "FIELDS_BARE", json!({"datasheet": "~"})).await;
+        assert_eq!(body["changes"], json!({}), "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE);
+    }
+
     /// KiCad's stock `Regulator_Current` library, in which `HV101K5-G` extends
     /// `HV100K5-G` and carries its own Value. Read from the installed library
     /// rather than committed, because the library is CC BY-SA, as the footprint
@@ -2030,7 +2111,7 @@ pub(super) mod tests {
             (
                 json!({"rename_fields": {}, "remove_fields": []}),
                 "symbol_properties",
-                "supply at least one of value, footprint, description, keywords, fp_filters, fields, rename_fields or remove_fields",
+                "supply at least one of value, footprint, datasheet, description, keywords, fp_filters, fields, rename_fields or remove_fields",
             ),
         ] {
             let (_dir, path) = library_with(FIXTURE);
@@ -2119,12 +2200,19 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn fields_names_the_value_argument() {
+    async fn fields_names_the_value_and_datasheet_arguments() {
         let handler = handler().await;
         let (_dir, path) = library_with(FIXTURE);
         for (name, reason) in [
-            ("Value", "use the value, footprint or description argument"),
-            ("Datasheet", "Reference and Datasheet are mandatory fields"),
+            (
+                "Value",
+                "use the value, footprint, datasheet or description argument",
+            ),
+            (
+                "Datasheet",
+                "use the value, footprint, datasheet or description argument",
+            ),
+            ("Reference", "Reference is a mandatory field"),
         ] {
             let body = edit_symbol(
                 &handler,
