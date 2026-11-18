@@ -33,6 +33,7 @@ pub(crate) enum LiveBoard<T> {
         message: String,
         status: Option<String>,
     },
+    ItemRejected(copperpour_ipc::IpcFailure),
     /// KiCad named the board, and Copperpour refused the request itself on
     /// what it read, before KiCad kept any of it (#240). KiCad rejected
     /// nothing, so this is not [`Self::Rejected`].
@@ -127,6 +128,9 @@ where
     Ok(match failure {
         copperpour_ipc::IpcFailure::Rejected { message, status } => {
             LiveBoard::Rejected { message, status }
+        }
+        failure @ copperpour_ipc::IpcFailure::ItemRejected { .. } => {
+            LiveBoard::ItemRejected(failure)
         }
         copperpour_ipc::IpcFailure::Preflight(refusal) => LiveBoard::Preflight(refusal),
         copperpour_ipc::IpcFailure::Uncertain(message) => LiveBoard::Uncertain(message),

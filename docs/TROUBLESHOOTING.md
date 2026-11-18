@@ -56,6 +56,10 @@ available for schematic-to-PCB sync when the original operation answers within
 its additional recovery window. An unknown result does not establish that an
 undo will reverse a pending, unpublished commit.
 
+## KiCad rejected items during an IPC write
+
+Check `recovery.evidence.rejected_items` for the item statuses KiCad reported. `rollback: "confirmed"` means KiCad acknowledged dropping the named commit. It does not verify the overall board outcome. Inspect the live board and reconcile any changes, then correct the rejection before retrying. Do not edit the saved board as a workaround.
+
 ## Schematic sync returned `ipc_batch_recovered`
 
 The apply was aborted after a late IPC reply, not published. Copperpour confirmed

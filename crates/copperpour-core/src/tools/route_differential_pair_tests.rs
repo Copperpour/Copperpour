@@ -45,6 +45,8 @@ enum Kicad {
     /// As `RefusesNegative`, then answers the drop with KiCad's busy refusal
     /// (`checkForBusy` in `common/api/api_handler_editor.cpp`).
     RefusesNegativeThenTheDrop,
+    /// Returns an unrelated but decodable empty protobuf instead of a drop acknowledgement.
+    RefusesNegativeThenWrongDropReply,
 }
 
 #[derive(Default)]
@@ -238,6 +240,20 @@ fn kicad_holding(board: &Path, kicad: Kicad, held: Arc<Mutex<Board>>) -> MockIpc
                         None,
                     );
                 }
+                if action == cmd::CommitAction::CmaDrop
+                    && kicad == Kicad::RefusesNegativeThenWrongDropReply
+                {
+                    return reply(
+                        ApiStatusCode::AsOk,
+                        "",
+                        Some(prost_types::Any {
+                            type_url:
+                                "type.googleapis.com/kiapi.common.commands.SaveDocumentResponse"
+                                    .into(),
+                            value: vec![],
+                        }),
+                    );
+                }
                 let staged = held.staged.take().unwrap_or_default();
                 if action == cmd::CommitAction::CmaCommit {
                     held.tracks.extend(staged);
@@ -342,6 +358,69 @@ async fn a_drop_kicad_refuses_is_ipc_outcome_unknown() {
         scene.sent(),
         ["BeginCommit", "CreateItems 2", "EndCommit CMA_DROP"]
     );
+}
+
+#[tokio::test]
+async fn differential_pair_retains_item_evidence_independently_of_drop_outcome() {
+    for (kicad, rollback, outcome, cause) in [
+        (
+            Kicad::RefusesNegative,
+            "confirmed",
+            "unknown",
+            "kicad_api_rejection",
+        ),
+        (
+            Kicad::RefusesNegativeThenTheDrop,
+            "unconfirmed",
+            "unknown",
+            "ipc_outcome_unknown",
+        ),
+        (
+            Kicad::RefusesNegativeThenWrongDropReply,
+            "unconfirmed",
+            "unknown",
+            "ipc_outcome_unknown",
+        ),
+    ] {
+        let scene = Scene::new(kicad).await;
+        let before = std::fs::read(&scene.board).unwrap();
+        let response = scene.call(json!({})).await;
+        assert!(response.is_error);
+        let response = body(&response);
+        let recovery = &response["recovery"];
+        let evidence = &recovery["evidence"];
+        assert_eq!(recovery["cause"], cause, "{response}");
+        assert_eq!(recovery["mutation_outcome"], outcome);
+        assert_eq!(recovery["retry_safe"], false);
+        assert_eq!(evidence["rollback"], rollback);
+        assert_eq!(evidence["command"], "CreateItems");
+        assert_eq!(evidence["requested_count"], 2);
+        assert_eq!(evidence["reported_created_count"], 1);
+        assert_eq!(
+            evidence["rejected_items"],
+            json!([{
+            "reply_index": 1, "status": "ISC_INVALID_DATA",
+                "error_message": "the double refuses the negative trace",
+            }])
+        );
+        let held = scene.held.lock().unwrap();
+        assert_eq!(
+            held.sent,
+            ["BeginCommit", "CreateItems 2", "EndCommit CMA_DROP"]
+        );
+        assert!(held.tracks.is_empty());
+        if rollback == "confirmed" {
+            assert_eq!(evidence["commit_id"], "pair-commit");
+            assert!(held.staged.is_none());
+        } else {
+            assert_eq!(response["error"]["kind"], "ipc_outcome_unknown");
+            assert_eq!(evidence["reason"], response["error"]["reason"]);
+            let staged = held.staged.as_ref().unwrap();
+            assert_eq!(staged.len(), 1);
+            assert_eq!(staged[0].net.as_ref().unwrap().name, "USB_DP");
+        }
+        assert_eq!(std::fs::read(&scene.board).unwrap(), before);
+    }
 }
 
 /// The refusal comes before the board is bound: KiCad is asked nothing.

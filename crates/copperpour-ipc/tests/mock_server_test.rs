@@ -842,6 +842,226 @@ fn update_items_rejects_missing_per_item_results() {
 }
 
 #[test]
+fn create_item_rejection_is_distinct_from_request_and_unknown_statuses() {
+    use copperpour_ipc::client::{ItemRejection, ItemRejectionRollback};
+    use copperpour_ipc::IpcFailure;
+    use kiapi::common::{commands::*, types::ItemRequestStatus};
+
+    for (request_status, row_code, exact_type, expected) in [
+        (
+            ItemRequestStatus::IrsOk,
+            Some(ItemStatusCode::IscExisting as i32),
+            true,
+            Some(ItemStatusCode::IscExisting),
+        ),
+        (
+            ItemRequestStatus::IrsOk,
+            Some(ItemStatusCode::IscInvalidType as i32),
+            true,
+            Some(ItemStatusCode::IscInvalidType),
+        ),
+        (
+            ItemRequestStatus::IrsOk,
+            Some(ItemStatusCode::IscUnknown as i32),
+            true,
+            None,
+        ),
+        (ItemRequestStatus::IrsOk, Some(12345), true, None),
+        (ItemRequestStatus::IrsOk, None, true, None),
+        (
+            ItemRequestStatus::IrsOk,
+            Some(ItemStatusCode::IscExisting as i32),
+            false,
+            None,
+        ),
+        (
+            ItemRequestStatus::IrsDocumentNotFound,
+            Some(ItemStatusCode::IscExisting as i32),
+            true,
+            None,
+        ),
+    ] {
+        let mock = spawn_mock(move |request| {
+            assert!(request.message.unwrap().type_url.ends_with("CreateItems"));
+            Some(reply_with(builders::pack_any(
+                &CreateItemsResponse {
+                    status: request_status as i32,
+                    created_items: vec![ItemCreationResult {
+                        status: row_code.map(|code| ItemStatus {
+                            code,
+                            error_message: "create detail".into(),
+                        }),
+                        item: None,
+                    }],
+                    ..Default::default()
+                },
+                if exact_type {
+                    "kiapi.common.commands.CreateItemsResponse"
+                } else {
+                    "kiapi.common.commands.UpdateItemsResponse"
+                },
+            )))
+        });
+        let error = KiCadIpcClient::new(mock.url.clone())
+            .create_items_in(doc_for("test.kicad_pcb"), vec![prost_types::Any::default()])
+            .unwrap_err();
+        let failure = IpcFailure::from_error(error);
+        if let Some(expected) = expected {
+            let IpcFailure::ItemRejected {
+                rejection,
+                rollback: ItemRejectionRollback::NotEstablished,
+                ..
+            } = failure
+            else {
+                panic!("expected item rejection without rollback evidence: {failure:?}");
+            };
+            let ItemRejection::Create {
+                requested_count: 1,
+                reported_created_count: 0,
+                rejected_items,
+                ..
+            } = *rejection
+            else {
+                panic!("expected create rejection");
+            };
+            assert_eq!(rejected_items.len(), 1);
+            assert_eq!(rejected_items[0].reply_index, 0);
+            assert_eq!(rejected_items[0].status, expected);
+            assert_eq!(rejected_items[0].error_message, "create detail");
+        } else {
+            let IpcFailure::Rejected { status, .. } = failure else {
+                panic!("unexpected item classification: {failure:?}");
+            };
+            assert_eq!(
+                status.as_deref(),
+                (request_status != ItemRequestStatus::IrsOk)
+                    .then_some(request_status.as_str_name())
+            );
+        }
+    }
+}
+
+#[test]
+fn delete_item_rejection_preserves_the_failed_kiid_after_an_accepted_row() {
+    use copperpour_ipc::client::{ItemRejection, ItemRejectionRollback};
+    use copperpour_ipc::IpcFailure;
+    use kiapi::common::{
+        commands::*,
+        types::{ItemRequestStatus, Kiid},
+    };
+
+    for (code, expected, short_reply, exact_type) in [
+        (
+            ItemDeletionStatus::IdsImmutable as i32,
+            Some(ItemDeletionStatus::IdsImmutable),
+            false,
+            true,
+        ),
+        (
+            ItemDeletionStatus::IdsImmutable as i32,
+            Some(ItemDeletionStatus::IdsImmutable),
+            true,
+            true,
+        ),
+        (
+            ItemDeletionStatus::IdsNonexistent as i32,
+            Some(ItemDeletionStatus::IdsNonexistent),
+            false,
+            true,
+        ),
+        (ItemDeletionStatus::IdsUnknown as i32, None, false, true),
+        (12345, None, false, true),
+        (ItemDeletionStatus::IdsImmutable as i32, None, false, false),
+    ] {
+        let mock = spawn_mock(move |request| {
+            assert!(request.message.unwrap().type_url.ends_with("DeleteItems"));
+            Some(reply_with(builders::pack_any(
+                &DeleteItemsResponse {
+                    status: ItemRequestStatus::IrsOk as i32,
+                    deleted_items: vec![
+                        ItemDeletionResult {
+                            id: Some(Kiid {
+                                value: "indeterminate".into(),
+                            }),
+                            status: ItemDeletionStatus::IdsUnknown as i32,
+                        },
+                        ItemDeletionResult {
+                            id: Some(Kiid {
+                                value: "accepted".into(),
+                            }),
+                            status: ItemDeletionStatus::IdsOk as i32,
+                        },
+                        ItemDeletionResult {
+                            id: Some(Kiid {
+                                value: "refused".into(),
+                            }),
+                            status: code,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                if exact_type {
+                    "kiapi.common.commands.DeleteItemsResponse"
+                } else {
+                    "kiapi.common.commands.UpdateItemsResponse"
+                },
+            )))
+        });
+        let mut requested = vec!["refused".into(), "accepted".into(), "indeterminate".into()];
+        if short_reply {
+            requested.extend(["omitted-z".into(), "omitted-a".into()]);
+        }
+        let error = KiCadIpcClient::new(mock.url.clone())
+            .delete_items_in(doc_for("test.kicad_pcb"), requested)
+            .unwrap_err();
+        if short_reply {
+            assert!(error
+                .to_string()
+                .contains("3 deletion results for 5 requested"));
+        }
+        let failure = IpcFailure::from_error(error);
+        if let Some(expected) = expected {
+            let IpcFailure::ItemRejected {
+                rejection,
+                rollback: ItemRejectionRollback::NotEstablished,
+                ..
+            } = failure
+            else {
+                panic!("expected item rejection without rollback evidence: {failure:?}");
+            };
+            let ItemRejection::Delete {
+                reported_deleted_kiids,
+                rejected_items,
+                unclassified_kiids,
+                unreported_kiids,
+                ..
+            } = *rejection
+            else {
+                panic!("expected delete rejection");
+            };
+            assert_eq!(reported_deleted_kiids, ["accepted"]);
+            assert_eq!(unclassified_kiids, ["indeterminate"]);
+            assert_eq!(
+                unreported_kiids,
+                if short_reply {
+                    &["omitted-a", "omitted-z"][..]
+                } else {
+                    &[]
+                }
+            );
+            assert_eq!(rejected_items.len(), 1);
+            assert_eq!(rejected_items[0].kiid, "refused");
+            assert_eq!(rejected_items[0].status, expected);
+        } else {
+            assert!(
+                matches!(failure, IpcFailure::Rejected { status: None, .. }),
+                "{failure:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn delete_items_surfaces_per_item_failure() {
     let mock = spawn_mock(|request| {
         let message = request.message.expect("request message");

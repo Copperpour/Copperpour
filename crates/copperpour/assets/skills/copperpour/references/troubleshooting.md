@@ -64,6 +64,11 @@ uncertain outcome, or behaves unexpectedly in the client or KiCad.
 
 ## Scenario Playbook
 
+### KiCad item rejections
+
+- For `kicad_api_rejection` or `ipc_outcome_unknown`, look for per-item statuses in `recovery.evidence.rejected_items`. In a failed Specctra cleanup, look under `recovery.evidence.compensating_deletion`.
+- `rollback: "confirmed"` records KiCad's acknowledgement that it dropped the named commit. It does not prove the overall board state is unchanged. Inspect the live board before retrying or proceeding with dependent work.
+
 ### Setup, Binary, CLI, and Guidance Drift
 
 - **Missing `kicad-cli` ("kicad-cli not found"):** Call `get_installation_info`
