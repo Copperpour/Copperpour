@@ -190,7 +190,9 @@ pub fn tools() -> Vec<ToolDef> {
              junctions_added_count and junctions_pruned_count. \
              There is no auto-numbering: an omitted reference becomes the library prefix \
              plus '?' (e.g. 'R?', '#FLG?'), like an eeschema-unannotated symbol, same as \
-             add_schematic_component; annotate_schematic numbers it.",
+             add_schematic_component; annotate_schematic numbers it. An entry under a \
+             numbered reference already held, by an earlier entry too, is refused as \
+             add_schematic_component refuses it, and the others are placed.",
             super::placement_schema(json!({
                 "type": "object",
                 "properties": {
@@ -755,6 +757,8 @@ async fn handle_batch_place_components(
     let catalog = crate::sourcing::LcscCatalog::resolve(args, _ctx);
     let mut errors: Vec<String> = Vec::new();
     let mut failures: Vec<Value> = Vec::new();
+    let mut in_use =
+        super::sch_annotate::DesignatorsInUse::new(&sch_path, &context.project_name, "reference");
 
     for (index, comp) in components.iter().enumerate() {
         let Some(lib_id) = comp["lib_id"].as_str() else {
@@ -821,6 +825,7 @@ async fn handle_batch_place_components(
             unit,
             &src,
             extras,
+            &mut in_use,
         ) {
             Ok(placed) => {
                 let (expected_x, expected_y) = snap_point(x, y, 1.27);
@@ -966,14 +971,16 @@ async fn handle_batch_place_components(
         crate::outcome::OutcomeStatus::Failed => Some(crate::outcome::retry_whole_request()),
         crate::outcome::OutcomeStatus::Uncertain => unreachable!(),
     };
-    let mut result = CallToolResult::json(&json!({
+    let mut reply = json!({
         "placed": placed,
         "placed_count": placed.len(),
         "junctions_added_count": junctions_added,
         "junctions_pruned_count": junctions_pruned,
         "errors": errors,
         "failures": failures
-    }));
+    });
+    in_use.disclose(&mut reply);
+    let mut result = CallToolResult::json(&reply);
     result.is_error = placed.is_empty() && !errors.is_empty();
     Ok(crate::outcome::attach(
         result,
