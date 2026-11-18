@@ -770,7 +770,7 @@ pub(crate) fn zone_schema() -> serde_json::Value {
             "points": {
                 "type": "array",
                 "description": "Polygon vertices as [{x, y}], in mm",
-                "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } } }
+                "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "required": ["x", "y"] }
             },
             "clearance":  { "type": "number", "description": "Zone clearance in mm", "default": DEFAULT_ZONE_CLEARANCE_MM },
             "min_width":  { "type": "number", "description": "Minimum fill width in mm", "default": DEFAULT_ZONE_MIN_WIDTH_MM },
@@ -3411,10 +3411,18 @@ pub(crate) async fn add_zone_impl(
         None => return Ok(CallToolResult::error("Missing 'points' array")),
     };
 
-    let points: Vec<(f64, f64)> = pts_arr
-        .iter()
-        .filter_map(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?)))
-        .collect();
+    // A polygon is not a batch: a zone without one of its vertices covers
+    // other copper than asked, so a vertex missing `x` or `y` refuses the call.
+    let mut points: Vec<(f64, f64)> = Vec::with_capacity(pts_arr.len());
+    for (i, p) in pts_arr.iter().enumerate() {
+        let coordinate = |key: &str| p[key].as_f64().ok_or(format!("points[{i}].{key}"));
+        match (coordinate("x"), coordinate("y")) {
+            (Ok(x), Ok(y)) => points.push((x, y)),
+            (Err(field), _) | (_, Err(field)) => {
+                return Ok(crate::tools::invalid_arg(&field, "missing or not a number"));
+            }
+        }
+    }
 
     if points.len() < 3 {
         return Ok(CallToolResult::error("Zone requires at least 3 points"));
@@ -6463,6 +6471,87 @@ mod zone_net_format_tests {
             text_of(&result)
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), KICAD_10);
+    }
+
+    /// A vertex missing `x` or `y` is refused by name at the schema gate, on
+    /// both tools that share the zone schema, and nothing is written.
+    #[tokio::test]
+    async fn a_vertex_missing_a_coordinate_is_refused_at_the_gate() {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+        for tool in ["add_zone", "add_copper_pour"] {
+            for (points, field, reason) in [
+                (
+                    json!([{"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 10.0}, {"y": 10.0}]),
+                    "points[3].x",
+                    "\"x\" is a required property",
+                ),
+                (
+                    json!([{"x": 0.0, "y": 0.0}, {"x": 10.0}, {"x": 10.0, "y": 10.0}]),
+                    "points[1].y",
+                    "\"y\" is a required property",
+                ),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("board.kicad_pcb");
+                std::fs::write(&path, KICAD_10).unwrap();
+                let result = crate::tools::project_file_writer_tests::served_call(
+                    &handler,
+                    tool,
+                    json!({
+                        "board": path.to_str().unwrap(), "net_name": "GND", "layer": "B.Cu",
+                        "points": points
+                    }),
+                )
+                .await;
+                let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+                assert_eq!(
+                    body["error"]["kind"],
+                    json!("invalid_argument"),
+                    "{tool}: {body}"
+                );
+                assert_eq!(body["error"]["field"], json!(field), "{tool}: {body}");
+                assert_eq!(body["error"]["reason"], json!(reason), "{tool}: {body}");
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), KICAD_10, "{tool}");
+            }
+        }
+    }
+
+    /// The handler refuses the same vertices when the schema gate is not in
+    /// front of it, and a coordinate that is not a number as well.
+    #[tokio::test]
+    async fn the_handler_checks_every_vertex_first() {
+        for (points, field) in [
+            (
+                json!([{"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 10.0}, {"y": 10.0}]),
+                "points[3].x",
+            ),
+            (
+                json!([{"x": 0.0, "y": 0.0}, {"x": 10.0, "y": "0"}, {"x": 10.0, "y": 10.0}]),
+                "points[1].y",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("board.kicad_pcb");
+            std::fs::write(&path, KICAD_10).unwrap();
+            let result = handle_add_zone(
+                &json!({
+                    "board": path.to_str().unwrap(), "net_name": "GND", "layer": "B.Cu",
+                    "points": points
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{}", text_of(&result));
+            let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+            assert_eq!(body["error"]["field"], json!(field), "{body}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), KICAD_10, "{field}");
+        }
     }
 }
 
