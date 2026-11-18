@@ -3245,6 +3245,7 @@ pub(crate) fn key_top_level_sheets(
 fn paths_under_each(
     sheets: &[TopLevelSheet],
     target: &std::path::Path,
+    override_schematic: Option<(&std::path::Path, &copperpour_schematic_editor::Schematic)>,
 ) -> Vec<Option<Vec<String>>> {
     sheets
         .iter()
@@ -3252,20 +3253,22 @@ fn paths_under_each(
             if same_schematic_document(&sheet.schematic, target) {
                 Some(vec![format!("/{}", sheet.uuid)])
             } else {
-                sheet_file_instance_paths(&sheet.schematic, &sheet.uuid, target)
+                sheet_file_instance_paths(&sheet.schematic, &sheet.uuid, target, override_schematic)
             }
         })
         .collect()
 }
 
 /// Every path at which the top-level `sheets` place `target`, sorted; `None`
-/// when a sheet on the way cannot be read.
+/// when a sheet on the way cannot be read. Reads `override_schematic` in
+/// memory when the walk visits that path instead of reloading it from disk.
 pub(crate) fn top_level_instance_paths(
     sheets: &[TopLevelSheet],
     target: &std::path::Path,
+    override_schematic: Option<(&std::path::Path, &copperpour_schematic_editor::Schematic)>,
 ) -> Option<Vec<String>> {
     let mut paths = Vec::new();
-    for found in paths_under_each(sheets, target) {
+    for found in paths_under_each(sheets, target, override_schematic) {
         paths.extend(found?);
     }
     paths.sort();
@@ -3395,7 +3398,7 @@ pub(crate) fn resolve_schematic_ownership_from(
             continue;
         };
 
-        let found = paths_under_each(&top_level_sheets, target);
+        let found = paths_under_each(&top_level_sheets, target, None);
         complete &= found.iter().all(Option::is_some);
         let places = |index: &usize| {
             found[*index]
@@ -3482,80 +3485,88 @@ fn candidate_project_files_from(
     Ok(project_files)
 }
 
+struct PathCollect<'a> {
+    target: &'a std::path::Path,
+    root_uuid: &'a str,
+    override_schematic: Option<(
+        &'a std::path::Path,
+        &'a copperpour_schematic_editor::Schematic,
+    )>,
+    suffix: Vec<String>,
+    stack: std::collections::HashSet<std::path::PathBuf>,
+    found: Vec<String>,
+}
+
 fn collect_sheet_instance_paths(
+    collect: &mut PathCollect<'_>,
     current: &std::path::Path,
-    target: &std::path::Path,
-    suffix: &mut Vec<String>,
-    stack: &mut std::collections::HashSet<std::path::PathBuf>,
     depth: usize,
-    root_uuid: &str,
-    found: &mut Vec<String>,
 ) -> bool {
     if depth > crate::tools::sch_hierarchy::MAX_HIERARCHY_DEPTH {
         return false;
     }
     let canonical = canonical_schematic_path(current);
-    if !stack.insert(canonical.clone()) {
+    if !collect.stack.insert(canonical.clone()) {
         return true;
     }
 
     let mut complete = true;
-    if let Ok(schematic) = copperpour_schematic_editor::Schematic::load(current) {
+    let loaded;
+    let schematic = match collect.override_schematic {
+        Some((path, sch)) if same_schematic_document(current, path) => Ok(sch),
+        _ => {
+            loaded = copperpour_schematic_editor::Schematic::load(current);
+            loaded.as_ref().map_err(|_| ())
+        }
+    };
+    if let Ok(schematic) = schematic {
         let directory = current
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
         for sheet in &schematic.sheets {
             let child = directory.join(sheet.file());
-            suffix.push(sheet.uuid.clone());
-            if same_schematic_document(&child, target) {
-                let mut path = format!("/{root_uuid}");
-                for uuid in suffix.iter() {
+            collect.suffix.push(sheet.uuid.clone());
+            if same_schematic_document(&child, collect.target) {
+                let mut path = format!("/{}", collect.root_uuid);
+                for uuid in collect.suffix.iter() {
                     path.push('/');
                     path.push_str(uuid);
                 }
-                found.push(path);
+                collect.found.push(path);
             } else {
-                complete &= collect_sheet_instance_paths(
-                    &child,
-                    target,
-                    suffix,
-                    stack,
-                    depth + 1,
-                    root_uuid,
-                    found,
-                );
+                complete &= collect_sheet_instance_paths(collect, &child, depth + 1);
             }
-            suffix.pop();
+            collect.suffix.pop();
         }
     } else {
         complete = false;
     }
 
-    stack.remove(&canonical);
+    collect.stack.remove(&canonical);
     complete
 }
 
 /// Every hierarchy path at which the root `root_schematic` instantiates
 /// `target`, sorted. `None` when a sheet on the way cannot be read, so the
 /// set is not known to be complete.
-pub(crate) fn sheet_file_instance_paths(
+fn sheet_file_instance_paths(
     root_schematic: &std::path::Path,
     root_uuid: &str,
     target: &std::path::Path,
+    override_schematic: Option<(&std::path::Path, &copperpour_schematic_editor::Schematic)>,
 ) -> Option<Vec<String>> {
-    let mut found = Vec::new();
-    let complete = collect_sheet_instance_paths(
-        root_schematic,
+    let mut collect = PathCollect {
         target,
-        &mut Vec::new(),
-        &mut std::collections::HashSet::new(),
-        0,
         root_uuid,
-        &mut found,
-    );
-    found.sort();
-    found.dedup();
-    complete.then_some(found)
+        override_schematic,
+        suffix: Vec::new(),
+        stack: std::collections::HashSet::new(),
+        found: Vec::new(),
+    };
+    let complete = collect_sheet_instance_paths(&mut collect, root_schematic, 0);
+    collect.found.sort();
+    collect.found.dedup();
+    complete.then_some(collect.found)
 }
 
 pub(crate) fn same_schematic_document(left: &std::path::Path, right: &std::path::Path) -> bool {
