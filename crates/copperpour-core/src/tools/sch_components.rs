@@ -9,7 +9,9 @@ use crate::mcp::{
     protocol::{CallToolResult, ToolContent},
 };
 use crate::tool;
+use crate::tools::footprint_metadata::{indent_before, quote_string};
 use crate::tools::reference_hint::component_not_found;
+use crate::tools::symbol_fields;
 use crate::tools::{
     find_all_symbol_instance_blocks, get_path, invalid_arg, opt_f64, opt_str, opt_u32,
     reembed_lib_symbols, require_array, require_f64, require_str,
@@ -27,8 +29,8 @@ use copperpour_sexp::{
     geometry::snap_point,
     parse_sexp, prepare_command,
     schematic::{
-        extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
-        pin_outward_direction, read_schematic,
+        extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, parse_at,
+        pin_endpoint, pin_outward_direction, read_schematic,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, read_consistent,
@@ -2928,46 +2930,36 @@ fn closing_quote(content: &str, value_start: usize) -> Option<usize> {
 fn property_insert_edit(
     content: &str,
     reference: &str,
-    start: usize,
-    end: usize,
+    (start, end): (usize, usize),
     name: &str,
     value: &str,
+    private: bool,
 ) -> Result<SexpEdit, String> {
     let block = &content[start..end];
 
-    // The symbol's placement, to anchor the new property on.
-    let (x, y) = block
-        .find("(at ")
-        .and_then(|at| {
-            let rest = &block[at + 4..];
-            let close = rest.find(')')?;
-            let mut parts = rest[..close].split_whitespace();
-            Some((
-                parts.next()?.parse::<f64>().ok()?,
-                parts.next()?.parse::<f64>().ok()?,
-            ))
-        })
+    let (x, y, _) = parse_sexp(block)
+        .ok()
+        .and_then(|node| parse_at(&node))
         .ok_or_else(|| format!("'{reference}' has no readable (at …) placement"))?;
 
     // Match the block's own indentation rather than assuming: eeschema saves
     // with tabs, this crate's writer uses two spaces.
-    let indent = block
-        .find("(property ")
-        .map(|p| {
-            let line_start = block[..p].rfind('\n').map_or(0, |n| n + 1);
-            block[line_start..p].to_string()
+    let indent = find_direct_child_blocks(block, "symbol")
+        .into_iter()
+        .find(|&(from, _)| {
+            symbol_fields::header(block, from).is_some_and(|(tag, _)| tag == "property")
         })
+        .and_then(|(from, _)| indent_before(content, start + from))
         .unwrap_or_else(|| "\t\t".to_string());
 
-    let escaped_name = escape_property_text(name);
-    let escaped_value = escape_property_text(value);
+    let flag = if private { "private " } else { "" };
     let newline = if content.contains("\r\n") {
         "\r\n"
     } else {
         "\n"
     };
     let prop = format!(
-        "{newline}{indent}(property \"{escaped_name}\" \"{escaped_value}\"{newline}\
+        "{newline}{indent}(property {flag}{} {}{newline}\
          {indent}\t(at {x} {y} 0){newline}\
          {indent}\t(hide yes){newline}\
          {indent}\t(effects{newline}\
@@ -2975,7 +2967,9 @@ fn property_insert_edit(
          {indent}\t\t\t(size 1.27 1.27){newline}\
          {indent}\t\t){newline}\
          {indent}\t){newline}\
-         {indent})"
+         {indent})",
+        quote_string(name),
+        quote_string(value)
     );
 
     // Insert before the block's closing paren so the property stays inside it.
@@ -2999,63 +2993,102 @@ pub(crate) fn set_property_value(
     new_value: &str,
     add_missing: bool,
 ) -> Result<(String, PropertyWriteCounts), String> {
-    let blocks = find_all_symbol_instance_blocks(content, reference);
+    let blocks: Vec<_> = find_direct_child_blocks(content, "kicad_sch")
+        .into_iter()
+        .filter(|&(start, end)| {
+            let block = &content[start..end];
+            block_tag(block) == "symbol"
+                && parse_sexp(block).is_ok_and(|node| {
+                    node.find_str("lib_id").is_some()
+                        && node.find_all("property").into_iter().any(|property| {
+                            property.get(1).and_then(|name| name.as_str()) == Some("Reference")
+                                && property.get(2).and_then(|value| value.as_str())
+                                    == Some(reference)
+                        })
+                })
+        })
+        .collect();
+    set_property_value_in_blocks(content, &blocks, reference, field, new_value, add_missing)
+}
+
+fn set_property_value_in_blocks(
+    content: &str,
+    blocks: &[(usize, usize)],
+    reference: &str,
+    field: &str,
+    new_value: &str,
+    add_missing: bool,
+) -> Result<(String, PropertyWriteCounts), String> {
     if blocks.is_empty() {
         return Err(format!("symbol '{reference}' not found in this schematic"));
     }
 
-    let escaped_field = escape_property_text(field);
-    let field_search = format!(r#"(property "{escaped_field}" ""#);
-    let escaped_value = escape_property_text(new_value);
+    let value = quote_string(new_value);
     let mut edits = Vec::new();
-    let mut updated = 0;
-    let mut added = 0;
+    let mut missing = Vec::new();
+    let (mut has_private, mut has_public) = (false, false);
 
-    for (start, end) in blocks {
-        let block = &content[start..end];
-        if let Some(relative) = block.find(&field_search) {
-            let value_start = start + relative + field_search.len();
-            let value_end = closing_quote(content, value_start)
-                .ok_or_else(|| format!("'{field}' property on '{reference}' is malformed"))?;
+    for &(start, end) in blocks {
+        let properties = symbol_fields::symbol_properties(content, start, end)
+            .map_err(|error| format!("'{reference}': {error}"))?;
+        if let Some(property) = properties
+            .into_iter()
+            .find(|property| property.name == field)
+        {
+            has_private |= property.private;
+            has_public |= !property.private;
             edits.push(SexpEdit::replace(
-                value_start,
-                value_end,
-                escaped_value.clone(),
+                property.value_span.0,
+                property.value_span.1,
+                value.clone(),
             ));
-            updated += 1;
-        } else if add_missing {
-            edits.push(property_insert_edit(
-                content, reference, start, end, field, new_value,
-            )?);
-            added += 1;
         } else {
+            missing.push((start, end));
+        }
+    }
+    if !missing.is_empty() {
+        if !add_missing {
+            if edits.is_empty() {
+                return Err(format!("Field '{field}' not found on '{reference}'"));
+            }
             return Err(format!(
                 "'{reference}' is missing the shared '{field}' property on one of its placed units"
             ));
         }
+        if has_private && has_public {
+            return Err(format!(
+                "'{reference}' has both private and public copies of '{field}'; \
+                 cannot choose which to add to the missing units"
+            ));
+        }
     }
 
-    Ok((
-        apply_edits(content.to_string(), edits),
-        PropertyWriteCounts { updated, added },
-    ))
+    let counts = PropertyWriteCounts {
+        updated: edits.len(),
+        added: missing.len(),
+    };
+    for block in missing {
+        edits.push(property_insert_edit(
+            content,
+            reference,
+            block,
+            field,
+            new_value,
+            has_private,
+        )?);
+    }
+
+    Ok((apply_edits(content.to_string(), edits), counts))
 }
 
 /// Plan the deletion of one property from every placed unit: the edits, and
 /// how many units carried it. A unit without it is left alone, so removing a
 /// field that is already gone plans nothing.
 ///
-/// The name is matched whole, closing quote included, so removing `MP` leaves
-/// `MPN` alone.
-///
-/// KiCad writes a private field as `(property private "NAME" …)`. This
-/// module's reader takes that field's name to be `private`, so it could not
-/// confirm the removal; such a field is refused by name rather than reported
-/// absent. The handler plans every name before its first edit, so this
-/// refusal, like a block that cannot be deleted, refuses the whole call and
-/// nothing is written.
+/// Private fields cannot be removed through `remove_fields`.
 fn plan_property_removal(
     content: &str,
+    blocks: &[(usize, usize)],
     reference: &str,
     field: &str,
 ) -> Result<(Vec<SexpEdit>, usize), CallToolResult> {
@@ -3064,25 +3097,23 @@ fn plan_property_removal(
             "No fields were updated on '{reference}': {field}: {why}"
         ))
     };
-    let blocks = find_all_symbol_instance_blocks(content, reference);
     if blocks.is_empty() {
         return Err(unchanged(format!(
             "symbol '{reference}' not found in this schematic"
         )));
     }
 
-    let escaped = escape_property_text(field);
-    let opening = format!(r#"(property "{escaped}""#);
-    let private = format!(r#"(property private "{escaped}""#);
     let mut edits = Vec::new();
-    let mut units = 0;
 
-    for (start, end) in blocks {
-        let block = &content[start..end];
-        let mut carried = false;
-        for (child, _) in find_direct_child_blocks(block, "symbol") {
-            if block[child..].starts_with(&private) {
-                return Err(crate::tools::invalid_arg(
+    for &(start, end) in blocks {
+        let properties =
+            symbol_fields::symbol_properties(content, start, end).map_err(unchanged)?;
+        if let Some(property) = properties
+            .into_iter()
+            .find(|property| property.name == field)
+        {
+            if property.private {
+                return Err(invalid_arg(
                     "remove_fields",
                     &format!(
                         "'{field}' is a private field on '{reference}', which this tool does \
@@ -3090,23 +3121,15 @@ fn plan_property_removal(
                     ),
                 ));
             }
-            if !block[child..].starts_with(&opening) {
-                continue;
-            }
-            // With its own line's indentation and newline, so the block closes
-            // up as eeschema would have written it without the field.
-            let (from, to) = find_block_with_leading_whitespace(content, start + child)
+            let (from, to) = find_block_with_leading_whitespace(content, property.block.0)
                 .ok_or_else(|| {
                     unchanged(format!("'{field}' property on '{reference}' is malformed"))
                 })?;
             edits.push(SexpEdit::delete(from, to));
-            carried = true;
-        }
-        if carried {
-            units += 1;
         }
     }
 
+    let units = edits.len();
     Ok((edits, units))
 }
 
@@ -3556,10 +3579,10 @@ fn set_property_placement(
 /// designator.
 fn rewrite_instance_references(
     content: &str,
+    blocks: &[(usize, usize)],
     old_ref: &str,
     new_ref: &str,
 ) -> Result<(String, usize), String> {
-    let blocks = find_all_symbol_instance_blocks(content, new_ref);
     if blocks.is_empty() {
         return Err(format!("symbol '{old_ref}' not found after the rename"));
     }
@@ -3567,7 +3590,7 @@ fn rewrite_instance_references(
     let search = format!(r#"(reference "{old_ref}")"#);
     let replacement = format!(r#"(reference "{new_ref}")"#);
     let mut edits = Vec::new();
-    for (start, end) in &blocks {
+    for (start, end) in blocks {
         let block = &content[*start..*end];
         let mut from = 0usize;
         while let Some(rel) = block[from..].find(&search) {
@@ -3668,6 +3691,7 @@ async fn handle_edit_schematic_component(
     let mut applied_dnp = None;
     let (mut applied_in_bom, mut applied_on_board) = (None, None);
     let mut edit_reference = reference.as_str();
+    let uuids = target.uuids();
 
     let mut errors: Vec<String> = Vec::new();
     // A macro rather than a closure: the body also needs `changed`/`errors`
@@ -3675,7 +3699,14 @@ async fn handle_edit_schematic_component(
     // and a closure capturing them mutably would lock both for its lifetime.
     macro_rules! apply {
         ($field:expr, $new_val:expr) => {
-            match set_property_value(&content, edit_reference, $field, $new_val, false) {
+            match set_property_value_in_blocks(
+                &content,
+                &symbol_blocks_by_uuid(&content, &uuids),
+                edit_reference,
+                $field,
+                $new_val,
+                false,
+            ) {
                 Ok((updated, counts)) => {
                     content = updated;
                     expected_fields.insert($field.to_owned(), $new_val.to_owned());
@@ -3699,7 +3730,12 @@ async fn handle_edit_schematic_component(
     let mut removed_fields = Vec::new();
     let mut absent_fields = Vec::new();
     for name in &remove_names {
-        match plan_property_removal(&content, &reference, name) {
+        match plan_property_removal(
+            &content,
+            &symbol_blocks_by_uuid(&content, &uuids),
+            &reference,
+            name,
+        ) {
             Ok((_, 0)) => absent_fields.push(name.clone()),
             Ok((edits, units)) => {
                 removal_edits.extend(edits);
@@ -3721,7 +3757,12 @@ async fn handle_edit_schematic_component(
         // reads when it builds the netlist. Rewriting only the property leaves
         // the netlist on the old designator, so the rename appears to work in
         // eeschema and is ignored everywhere it matters (#157).
-        match rewrite_instance_references(&content, &reference, new_ref) {
+        match rewrite_instance_references(
+            &content,
+            &symbol_blocks_by_uuid(&content, &uuids),
+            &reference,
+            new_ref,
+        ) {
             Ok((updated, count)) => {
                 content = updated;
                 edit_reference = new_ref;
@@ -3750,7 +3791,7 @@ async fn handle_edit_schematic_component(
     if let Some(dnp) = requested_dnp {
         // Bound by UUID; a unit missed here fails the prospective readback,
         // before anything is committed.
-        let blocks = symbol_blocks_by_uuid(&content, &target.uuids());
+        let blocks = symbol_blocks_by_uuid(&content, &uuids);
         match set_flag_in_blocks(&content, &blocks, &reference, "dnp", dnp) {
             Ok(updated) => {
                 content = updated;
@@ -3776,7 +3817,7 @@ async fn handle_edit_schematic_component(
     // KiCad keeps these per unit too, and the board sync refuses a part
     // whose units disagree on them.
     for (flag, value) in requested_flags {
-        let blocks = symbol_blocks_by_uuid(&content, &target.uuids());
+        let blocks = symbol_blocks_by_uuid(&content, &uuids);
         match set_flag_in_blocks(&content, &blocks, &reference, flag, value) {
             Ok(updated) => {
                 content = updated;
@@ -3819,7 +3860,14 @@ async fn handle_edit_schematic_component(
                 ));
                 continue;
             }
-            match set_property_value(&content, edit_reference, name, value, true) {
+            match set_property_value_in_blocks(
+                &content,
+                &symbol_blocks_by_uuid(&content, &uuids),
+                edit_reference,
+                name,
+                value,
+                true,
+            ) {
                 Ok((updated, counts)) => {
                     content = updated;
                     expected_fields.insert(name.clone(), value.to_owned());
@@ -10567,6 +10615,143 @@ mod multi_unit_component_tests {
     }
 
     #[tokio::test]
+    async fn a_private_field_value_is_updated_in_place_and_stays_private() {
+        let (_directory, path, private) = private_mpn_fixture();
+        let spaced = private
+            .replacen(
+                r#"(property "Reference" "R1""#,
+                "(property \"Reference\"\n\t\t\t\"R1\"",
+                1,
+            )
+            .replacen(
+                r#"property private "MPN""#,
+                "property private\t\n\t\t\t\"MPN\"",
+                1,
+            );
+        assert_ne!(spaced, private);
+        std::fs::write(&path, &spaced).unwrap();
+        let result = handle_edit_schematic_component(
+            &json!({ "schematic": path, "reference": "R1", "fields": { "MPN": "NEW \"PART\"" } }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let expected = spaced.replacen("\"MPN-679-R1\"", r#""NEW \"PART\"""#, 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn a_name_both_public_and_private_on_one_unit_is_refused() {
+        let (_directory, path, private) = private_mpn_fixture();
+        let doubled = private.replacen(
+            "(property private \"MPN\" \"MPN-679-R1\"",
+            "(property \"MPN\" \"PUBLIC\" (at 0 0 0))\n\t\t(property private \"MPN\" \"MPN-679-R1\"",
+            1,
+        );
+        std::fs::write(&path, &doubled).unwrap();
+        let (refused, body) = call_served_edit(
+            &served_edit_handler().await,
+            json!({ "schematic": path, "reference": "R1", "fields": { "MPN": "NEW-PART" } }),
+        )
+        .await;
+        assert!(refused, "{body}");
+        assert_eq!(body["error"]["kind"], "ambiguous_target", "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), doubled);
+    }
+
+    fn multi_unit_private_mpn_source(source: &str, keep_public_copy: bool) -> String {
+        let public = r#"(property "MPN" "MPN-679-U1""#;
+        let mut copies = source.match_indices(public);
+        let (first, _) = copies.next().unwrap();
+        let (second, _) = copies.next().unwrap();
+        let (third, _) = copies.next().unwrap();
+        assert!(copies.next().is_none());
+        let remove = if keep_public_copy {
+            &[third][..]
+        } else {
+            &[second, third][..]
+        };
+        let mut edits = vec![SexpEdit::insert(first + "(property ".len(), "private ")];
+        for &start in remove {
+            let (start, end) = find_block_with_leading_whitespace(source, start).unwrap();
+            edits.push(SexpEdit::delete(start, end));
+        }
+        apply_edits(source.to_string(), edits)
+    }
+
+    #[tokio::test]
+    async fn missing_unit_copies_of_a_private_field_are_added_as_private() {
+        let (_directory, path) = fields_fixture();
+        let before = multi_unit_private_mpn_source(&std::fs::read_to_string(&path).unwrap(), false);
+        let (start, end) = find_all_symbol_instance_blocks(&before, "U1")
+            .into_iter()
+            .find(|&(start, end)| !before[start..end].contains(r#"property private "MPN""#))
+            .unwrap();
+        let block = &before[start..end];
+        let node = parse_sexp(block).unwrap();
+        let uuid = node.find_str("uuid").unwrap().to_owned();
+        let (x, y, _) = parse_at(&node).unwrap();
+        let spaced_block = block.replacen("(at ", "(at\t", 1);
+        assert_ne!(spaced_block, block);
+        let before = apply_edits(before, vec![SexpEdit::replace(start, end, spaced_block)]);
+        std::fs::write(&path, &before).unwrap();
+        let result = handle_edit_schematic_component(
+            &json!({ "schematic": path, "reference": "U1", "fields": { "MPN": "NEW-PART" } }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let saved = cse::Schematic::load(&path).unwrap();
+        let units: Vec<_> = saved
+            .symbols
+            .iter()
+            .filter(|unit| unit.reference() == Some("U1"))
+            .collect();
+        assert_eq!(units.len(), 3);
+        for unit in units {
+            let mut mpns = unit.properties.iter().filter(|field| field.name == "MPN");
+            let mpn = mpns.next().unwrap();
+            assert!(mpn.private);
+            assert_eq!(mpn.value, "NEW-PART");
+            assert!(mpns.next().is_none());
+        }
+        let tree = parse_sexp(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let unit = tree
+            .find_all("symbol")
+            .into_iter()
+            .find(|node| node.find_str("uuid") == Some(uuid.as_str()))
+            .unwrap();
+        let mpn = unit
+            .find_all("property")
+            .into_iter()
+            .find(|node| node.get(2).and_then(|name| name.as_str()) == Some("MPN"))
+            .unwrap();
+        assert_eq!(parse_at(mpn), Some((x, y, 0.0)));
+    }
+
+    #[tokio::test]
+    async fn a_missing_unit_copy_with_mixed_privacy_is_refused_without_writing() {
+        let (_directory, path) = fields_fixture();
+        let before = multi_unit_private_mpn_source(&std::fs::read_to_string(&path).unwrap(), true);
+        std::fs::write(&path, &before).unwrap();
+        let result = handle_edit_schematic_component(
+            &json!({ "schematic": path, "reference": "U1", "fields": { "MPN": "NEW-PART" } }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            matches!(&result.content[..], [ToolContent::Text { text }]
+                if text.contains("private and public copies of 'MPN'")),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
     async fn a_name_is_matched_whole_not_as_a_prefix() {
         let (_directory, path) = fields_fixture();
         let before = std::fs::read_to_string(&path).unwrap();
@@ -10644,16 +10829,8 @@ mod multi_unit_component_tests {
         }
     }
 
-    /// `remove_fields` through served `tools/call`, as a client sends it. The
-    /// advertised schema refuses `null`, a string and a non-string entry before
-    /// the handler runs, so those refusals are dispatch's, each naming the
-    /// field the schema failed on. A mandatory name passes the schema, and its
-    /// refusal is the handler's.
-    #[tokio::test]
-    async fn served_remove_fields_removes_refuses_and_stays_out_of_other_replies() {
-        let (_directory, path) = fields_fixture();
-        let schematic = path.display().to_string();
-        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+    async fn served_edit_handler() -> crate::mcp::handler::McpHandler {
+        crate::mcp::handler::McpHandler::new(ServerConfig {
             kicad_cli: String::new(),
             kicad_binary: String::new(),
             ipc_address: String::new(),
@@ -10663,26 +10840,31 @@ mod multi_unit_component_tests {
             eager_toolsets: false,
         })
         .await
-        .unwrap();
-        let call = |arguments: serde_json::Value| {
-            let message = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": {"name": "edit_schematic_component", "arguments": arguments}});
-            let handler = &handler;
-            async move {
-                let result = handler
-                    .handle_message(message)
-                    .await
-                    .unwrap()
-                    .result
-                    .unwrap();
-                let body = serde_json::from_str::<serde_json::Value>(
-                    result["content"][0]["text"].as_str().unwrap(),
-                )
-                .unwrap();
-                (result["isError"] == true, body)
-            }
-        };
+        .unwrap()
+    }
 
+    async fn call_served_edit(
+        handler: &crate::mcp::handler::McpHandler,
+        arguments: serde_json::Value,
+    ) -> (bool, serde_json::Value) {
+        let message = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "edit_schematic_component", "arguments": arguments}});
+        let result = handler
+            .handle_message(message)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        (result["isError"] == true, body)
+    }
+
+    #[tokio::test]
+    async fn served_remove_fields_removes_refuses_and_stays_out_of_other_replies() {
+        let (_directory, path) = fields_fixture();
+        let schematic = path.display().to_string();
+        let handler = served_edit_handler().await;
+        let call = |arguments| call_served_edit(&handler, arguments);
         let before = std::fs::read_to_string(&path).unwrap();
         for (remove_fields, field) in [
             (json!(null), "remove_fields"),
