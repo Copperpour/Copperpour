@@ -245,8 +245,9 @@ set_symbol_properties(
 It changes only the fields you pass. An empty `keywords` or `fp_filters`
 removes that property.
 `rename_fields={"MANUFACTURER": "Manufacturer"}` renames a custom field in place,
-keeping its value and layout, `remove_fields=["LCSC"]` deletes one, and `value`
-sets the Value field.
+keeping its value and layout, `remove_fields=["LCSC"]` deletes one, `value`
+sets the Value field, `datasheet` the Datasheet field, and `reference_prefix` the
+Reference field.
 
 ### Symbol Layout Guidelines
 
