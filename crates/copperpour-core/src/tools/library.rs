@@ -13,7 +13,7 @@ use copperpour_sexp::geometry::round6;
 use copperpour_sexp::parser::{parse_sexp, SexpNode};
 use copperpour_sexp::writer::{
     apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks, read_consistent,
-    write_atomic, write_atomic_if_unchanged, write_new_atomic, SexpEdit,
+    write_atomic_if_unchanged, write_new_atomic, SexpEdit,
 };
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -211,6 +211,11 @@ pub fn tools() -> Vec<ToolDef> {
                             "rotate": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" }, "z": { "type": "number" } }, "description": "{x,y,z} in degrees (default 0,0,0)" }
                         },
                         "required": ["path"]
+                    },
+                    "replace_existing": {
+                        "type": "boolean",
+                        "description": "Replace an existing .kicad_mod file at output instead of refusing with conflict",
+                        "default": false
                     }
                 },
                 "required": ["output", "name", "pads"]
@@ -825,6 +830,19 @@ pub(crate) async fn handle_create_footprint(
     };
     let description = args["description"].as_str().unwrap_or("");
 
+    let replace_existing = match args.get("replace_existing") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => {
+                return Ok(invalid_library_argument(
+                    "replace_existing",
+                    "must be a boolean when supplied",
+                ))
+            }
+        },
+    };
+
     let pads_val = match require_array(args, "pads") {
         Ok(v) => v.clone(),
         Err(e) => return Ok(e),
@@ -832,6 +850,24 @@ pub(crate) async fn handle_create_footprint(
     if let Err(error) = validate_footprint_pad_items(&pads_val) {
         return Ok(error);
     }
+
+    if !replace_existing && output.exists() {
+        let shown = copperpour_sexp::paths::display_path(&output);
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::Conflict {
+                paths: vec![shown.clone()],
+            },
+            format!(
+                "Footprint '{shown}' already exists; pass replace_existing=true to replace it, \
+                 or choose a different output path."
+            ),
+        ));
+    }
+    let read = if replace_existing && output.exists() {
+        Some(read_consistent(&output)?)
+    } else {
+        None
+    };
     let mut pad_geoms: Vec<PadGeom> = Vec::new();
     let mut pad_sexp = String::new();
     let mut warnings = Vec::new();
@@ -959,7 +995,15 @@ pub(crate) async fn handle_create_footprint(
     if let Some(parent) = output.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    write_atomic(&output, &content)?;
+    if let Some(refusal) = super::write_if_unchanged(
+        &output,
+        "footprint",
+        "create_footprint",
+        read.as_deref(),
+        content,
+    )? {
+        return Ok(refusal);
+    }
 
     let mut response = json!({
         "success": true,
@@ -12075,5 +12119,175 @@ mod required_argument_tests {
         .await;
         assert!(bad_proj_type.is_error);
         assert_eq!(error_field(&bad_proj_type), "project_dir");
+    }
+}
+
+#[cfg(test)]
+mod create_footprint_replace_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    const KICAD10_FIXTURE: &str =
+        include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+
+    fn one_pad(name: &str) -> serde_json::Value {
+        json!({
+            "output": "",
+            "name": name,
+            "pads": [{
+                "number": "1",
+                "type": "smd",
+                "shape": "rect",
+                "x": 0.0,
+                "y": 0.0,
+                "width": 1.0,
+                "height": 1.0
+            }]
+        })
+    }
+
+    fn error_json(result: &CallToolResult) -> serde_json::Value {
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text content, got {other:?}"),
+        };
+        serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}: {text}"))
+    }
+
+    #[tokio::test]
+    async fn create_footprint_refuses_existing_file_by_default_and_leaves_it_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("C_0603_1608Metric.kicad_mod");
+        std::fs::write(&path, KICAD10_FIXTURE).unwrap();
+
+        let mut args = one_pad("Other");
+        args["output"] = json!(path.display().to_string());
+        let result = handle_create_footprint(&args, &test_ctx()).await.unwrap();
+
+        assert!(
+            result.is_error,
+            "existing footprint must be refused by default"
+        );
+        let parsed = error_json(&result);
+        assert_eq!(parsed["error"]["kind"], "conflict");
+        assert!(
+            parsed["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("already exists"),
+            "{parsed}"
+        );
+        assert_eq!(
+            parsed["error"]["paths"],
+            json!([path.display().to_string()])
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            KICAD10_FIXTURE.as_bytes(),
+            "existing fixture must stay byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_footprint_replaces_existing_file_when_replace_existing_is_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("C_0603_1608Metric.kicad_mod");
+        std::fs::write(&path, KICAD10_FIXTURE).unwrap();
+
+        let mut args = one_pad("Replaced");
+        args["output"] = json!(path.display().to_string());
+        args["replace_existing"] = json!(true);
+        let result = handle_create_footprint(&args, &test_ctx()).await.unwrap();
+
+        assert!(
+            !result.is_error,
+            "replace_existing=true must succeed: {result:?}"
+        );
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with("(footprint \"Replaced\""), "{written}");
+    }
+
+    #[tokio::test]
+    async fn create_footprint_rejects_non_boolean_replace_existing_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("C_0603_1608Metric.kicad_mod");
+        std::fs::write(&path, KICAD10_FIXTURE).unwrap();
+
+        let mut args = one_pad("Other");
+        args["output"] = json!(path.display().to_string());
+        args["replace_existing"] = json!("yes");
+        let result = handle_create_footprint(&args, &test_ctx()).await.unwrap();
+
+        assert!(result.is_error);
+        let parsed = error_json(&result);
+        assert_eq!(parsed["error"]["kind"], "invalid_argument");
+        assert_eq!(parsed["error"]["field"], "replace_existing");
+        assert_eq!(std::fs::read(&path).unwrap(), KICAD10_FIXTURE.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn create_footprint_replace_existing_refuses_concurrent_external_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("C_0603_1608Metric.kicad_mod");
+        std::fs::write(&path, KICAD10_FIXTURE).unwrap();
+
+        let editor_save = "(footprint \"FromFootprintEditor\"\n  (layer \"F.Cu\")\n)\n";
+        crate::tools::write_hook::set(editor_save.to_string());
+
+        let mut args = one_pad("Replaced");
+        args["output"] = json!(path.display().to_string());
+        args["replace_existing"] = json!(true);
+        let result = handle_create_footprint(&args, &test_ctx()).await.unwrap();
+
+        assert!(!crate::tools::write_hook::armed(), "write_hook must fire");
+        assert!(result.is_error, "concurrent external save must be refused");
+        let parsed = error_json(&result);
+        assert_eq!(parsed["error"]["kind"], "conflict");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            editor_save,
+            "the concurrent editor save must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_footprint_refuses_concurrent_creation_before_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("appeared.kicad_mod");
+
+        let external = "(footprint \"Appeared\"\n  (layer \"F.Cu\")\n)\n";
+        crate::tools::write_hook::set(external.to_string());
+
+        let mut args = one_pad("New");
+        args["output"] = json!(path.display().to_string());
+        let result = handle_create_footprint(&args, &test_ctx()).await.unwrap();
+
+        assert!(!crate::tools::write_hook::armed(), "write_hook must fire");
+        assert!(result.is_error, "concurrent file creation must be refused");
+        let parsed = error_json(&result);
+        assert_eq!(parsed["error"]["kind"], "conflict");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            external,
+            "the concurrently created file must be preserved"
+        );
     }
 }

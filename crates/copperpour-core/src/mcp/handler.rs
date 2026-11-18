@@ -3010,6 +3010,85 @@ mod schema_validation_dispatch_tests {
     }
 
     #[tokio::test]
+    async fn create_footprint_refuses_existing_file_and_allows_explicit_replace_over_json_rpc() {
+        let handler = handler().await;
+        let load = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 3770, "method": "tools/call",
+                "params": {"name": "load_toolset", "arguments": {"name": ["library"]}}
+            }))
+            .await
+            .unwrap();
+        assert!(load.error.is_none(), "{load:?}");
+
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("existing.kicad_mod");
+        let original = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+        std::fs::write(&output, original).unwrap();
+
+        let pad = json!({
+            "number": "1",
+            "type": "smd",
+            "shape": "rect",
+            "x": 0.0,
+            "y": 0.0,
+            "width": 1.0,
+            "height": 1.0
+        });
+
+        let refused = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 3771, "method": "tools/call",
+                "params": {
+                    "name": "create_footprint",
+                    "arguments": {
+                        "output": output.display().to_string(),
+                        "name": "Other",
+                        "pads": [pad]
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        let refused_result: CallToolResult =
+            serde_json::from_value(refused.result.unwrap()).unwrap();
+        assert!(refused_result.is_error);
+        let refused_body = error_json(&refused_result);
+        assert_eq!(refused_body["error"]["kind"], "conflict");
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), original);
+
+        let replaced = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 3772, "method": "tools/call",
+                "params": {
+                    "name": "create_footprint",
+                    "arguments": {
+                        "output": output.display().to_string(),
+                        "name": "Other",
+                        "pads": [{
+                            "number": "1",
+                            "type": "smd",
+                            "shape": "rect",
+                            "x": 0.0,
+                            "y": 0.0,
+                            "width": 1.0,
+                            "height": 1.0
+                        }],
+                        "replace_existing": true
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        let replaced_result: CallToolResult =
+            serde_json::from_value(replaced.result.unwrap()).unwrap();
+        assert!(!replaced_result.is_error, "{replaced_result:?}");
+        assert!(std::fs::read_to_string(&output)
+            .unwrap()
+            .starts_with("(footprint \"Other\""));
+    }
+
+    #[tokio::test]
     async fn a_search_argument_typo_is_refused_over_json_rpc() {
         let handler = handler().await;
         let response = handler

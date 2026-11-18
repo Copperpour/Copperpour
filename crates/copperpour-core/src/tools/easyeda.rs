@@ -591,7 +591,8 @@ where
         "output": fp_path.display().to_string(),
         "name": footprint_name,
         "description": fp_desc,
-        "pads": pads
+        "pads": pads,
+        "replace_existing": true
     });
 
     let fp_res = crate::tools::library::handle_create_footprint(&fp_args, ctx).await?;
@@ -1683,6 +1684,40 @@ mod tests {
         // Verify library tables exist
         assert!(project_dir.join("sym-lib-table").is_file());
         assert!(project_dir.join("fp-lib-table").is_file());
+    }
+
+    #[tokio::test]
+    async fn handle_import_jlcpcb_part_reimport_replaces_existing_footprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path();
+
+        let cache_dir = easyeda_cache_dir().unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        // Its own cache entry: tests run in parallel and the bundles differ.
+        let mock_lcsc_id = "C6666666";
+        let mock_bundle = mock_bundle("https://example.com/mock.pdf");
+        std::fs::write(
+            cache_dir.join(format!("{mock_lcsc_id}.json")),
+            serde_json::to_string(&mock_bundle).unwrap(),
+        )
+        .unwrap();
+
+        let ctx = test_ctx();
+        let args = json!({
+            "project_dir": project_dir.display().to_string(),
+            "lcsc_id": mock_lcsc_id,
+            "library_name": "test_jlc"
+        });
+
+        let first = handle_import_jlcpcb_part(&args, &ctx).await.unwrap();
+        assert!(!first.is_error, "{:?}", first.content);
+
+        let second = handle_import_jlcpcb_part(&args, &ctx).await.unwrap();
+        assert!(
+            !second.is_error,
+            "re-importing an existing JLCPCB part must replace its footprint: {:?}",
+            second.content
+        );
     }
 
     #[tokio::test]
