@@ -71,7 +71,7 @@ pub(super) fn tool() -> ToolDef {
 /// `CTX_NETNAME`, `common/string_utils.cpp:196-203`): `/` as `{slash}`, line
 /// breaks dropped. Names are compared in this form, so a label written with a
 /// raw `/` is the same name as one KiCad wrote.
-fn stored_name(name: &str) -> String {
+pub(super) fn stored_name(name: &str) -> String {
     let mut stored = String::with_capacity(name.len());
     for c in name.chars() {
         match c {

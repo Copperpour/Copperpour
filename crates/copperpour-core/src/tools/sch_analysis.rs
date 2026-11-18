@@ -6,7 +6,9 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::reference_hint::component_not_found;
-use crate::tools::sch_connectivity::{label_roots, net_graph_for, pt_key, ConnectivityIndex};
+use crate::tools::sch_connectivity::{
+    label_roots, net_graph_for, pt_key, ConnectivityIndex, PinNetNames, UnitNotation,
+};
 use crate::tools::{
     get_path, invalid_arg, is_power_symbol_reference, opt_f64, opt_positive_f64,
     placed_pins_by_reference, require_f64, require_str, resolved_placed_pins_by_reference,
@@ -441,8 +443,8 @@ async fn handle_get_pin_connections(
         Err(e) => return Ok(e),
     };
     let (_, tree) = read_schematic(&sch_path)?;
-    let (px, py) = match PlacedPins::new(&tree).resolve(&reference, &pin_number) {
-        Ok(pin) => pin.endpoint(),
+    let pin = match PlacedPins::new(&tree).resolve(&reference, &pin_number) {
+        Ok(pin) => pin,
         Err(refusal) => {
             return Ok(refusal.result(
                 "inspect",
@@ -450,11 +452,14 @@ async fn handle_get_pin_connections(
             ))
         }
     };
+    let (px, py) = pin.endpoint();
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
     let mut g = net_graph_for(&tree, &wires, &labels);
+    let pin_nets = PinNetNames::build(&tree, &mut g, UnitNotation::for_schematic(&sch_path));
+    let net = pin_nets.net_of_pin(&mut g, &pin.pin, px, py);
     Ok(CallToolResult::json(
-        &json!({ "reference": reference, "pin": pin_number, "pin_x": px, "pin_y": py, "net": g.net_at(px, py) }),
+        &json!({ "reference": reference, "pin": pin_number, "pin_x": px, "pin_y": py, "net": net }),
     ))
 }
 
@@ -478,13 +483,15 @@ async fn handle_get_component_nets(
         return Err(anyhow::anyhow!(component_not_found(&sch_path, &reference)));
     }
     let mut g = net_graph_for(&tree, &wires, &labels);
+    let pin_nets = PinNetNames::build(&tree, &mut g, UnitNotation::for_schematic(&sch_path));
     let pins: Vec<serde_json::Value> = placed_pins_by_reference(&tree)
         .into_iter()
         .filter(|(instance, _)| instance.reference == reference)
         .flat_map(|(_, pins)| pins)
         .map(|(pin, transform)| {
             let (px, py) = copperpour_sexp::schematic::pin_endpoint(&pin, transform);
-            json!({ "pin": pin.number, "name": pin.name, "x": px, "y": py, "net": g.net_at(px, py) })
+            let net = pin_nets.net_of_pin(&mut g, &pin, px, py);
+            json!({ "pin": pin.number, "name": pin.name, "x": px, "y": py, "net": net })
         })
         .collect();
     Ok(CallToolResult::json(
@@ -3015,6 +3022,179 @@ mod multi_unit_tool_tests {
                 .any(|net| net == "HEATER_TEST"),
             "heater unit net missing: {result}"
         );
+    }
+}
+
+/// A pin's net that no label names, named as KiCad's netlist names it.
+///
+/// Provenance and KiCad's netlist of the fixture are in
+/// `pin_net_names_kicad10.README.md`; every expectation below is that table.
+#[cfg(test)]
+mod pin_net_name_tests {
+    use super::tool_call_support::{call, call_at};
+    use super::*;
+
+    const SCH: &str = include_str!("../../tests/fixtures/pin_net_names_kicad10.kicad_sch");
+    const CHILD: &str = include_str!("../../tests/fixtures/pin_net_names_sub_kicad10.kicad_sch");
+
+    /// The `net` `get_component_nets` gives `REF.pin`.
+    async fn net(sch: &str, pin: &str) -> Option<String> {
+        let (reference, number) = pin.split_once('.').unwrap();
+        let body = call(sch, "get_component_nets", json!({ "reference": reference })).await;
+        let found = body["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["pin"] == number)
+            .unwrap_or_else(|| panic!("no pin {pin}: {body}"));
+        found["net"].as_str().map(str::to_string)
+    }
+
+    #[tokio::test]
+    async fn a_net_no_label_names_takes_kicads_name_for_it() {
+        for (name, pins) in [
+            ("Net-(U1-VIN)", &["U1.1", "R1.1"][..]),
+            ("Net-(J1-CC1)", &["J1.A5", "R2.1"]),
+            ("Net-(J1-D+-PadA6)", &["J1.A6", "R3.1"]),
+            (
+                "Net-(J1-GND-PadA1)",
+                &["J1.A1", "J1.A12", "J1.B1", "J1.B12"],
+            ),
+            ("Net-(J1-VBUS-PadA4)", &["J1.A4", "J1.A9", "J1.B4", "J1.B9"]),
+            ("Net-(U2A-+)", &["U2.3", "R4.1"]),
+            ("Net-(R10-Pad1)", &["R9.2", "R10.1"]),
+            ("Net-(R7-Pad1)", &["R7.1"]),
+            ("unconnected-(R5-Pad2)", &["R5.2", "R6.1"]),
+            ("unconnected-(J2-GND-Pad2)", &["J2.[2,5,8,11,16]", "R15.1"]),
+            ("Net-(U3-C{slash}B)", &["U3.8", "R19.2"]),
+            ("Net-(R14-Pad1)", &["R14.1", "R20.1"]),
+            ("Net-(R8-Pad1)", &["R8.1", "R16.1"]),
+            ("Net-(#R1-Pad1)", &["#R1.1", "R18.1"]),
+            ("Net-(R13-Pad2)", &["R13.2", "R?.1"]),
+        ] {
+            for pin in pins {
+                assert_eq!(net(SCH, pin).await.as_deref(), Some(name), "{pin}");
+            }
+        }
+    }
+
+    /// `null` is a pin KiCad nets with no other, or one whose net the sheet
+    /// below names (`/SUB/IN`).
+    #[tokio::test]
+    async fn a_pin_kicad_nets_alone_has_no_name() {
+        for pin in ["J1.B6", "U1.4", "R11.1", "R12.2", "R15.2", "U4.1", "U4.3"] {
+            assert_eq!(net(SCH, pin).await, None, "{pin}");
+        }
+    }
+
+    /// `R?` sorts before `TP1`, so KiCad names their net after `R?`'s pin,
+    /// with a hash of its UUID no tool here computes: `null`.
+    #[tokio::test]
+    async fn a_net_named_after_an_unannotated_pin_has_no_name() {
+        for pin in ["R?.2", "TP1.1"] {
+            assert_eq!(net(SCH, pin).await, None, "{pin}");
+        }
+    }
+
+    /// A pin named as it is numbered is written by its number, as
+    /// `two_name_nets.README.md`'s `Net-(TP8-Pad1)` is.
+    #[tokio::test]
+    async fn a_pin_named_its_number_is_written_by_the_number() {
+        let sch = include_str!("../../tests/fixtures/two_name_nets.kicad_sch");
+        for pin in ["TP8.1", "TP9.1"] {
+            assert_eq!(
+                net(sch, pin).await.as_deref(),
+                Some("Net-(TP8-Pad1)"),
+                "{pin}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_one_pin_tools_give_the_same_name() {
+        for tool in ["get_pin_connections", "get_pin_net_name"] {
+            let named = call(SCH, tool, json!({ "reference": "R4", "pin_number": "1" })).await;
+            assert_eq!(named["net"], "Net-(U2A-+)", "{tool}: {named}");
+            let alone = call(SCH, tool, json!({ "reference": "U1", "pin_number": "4" })).await;
+            assert!(alone["net"].is_null(), "{tool}: {alone}");
+        }
+    }
+
+    /// The project's unit notation, here `.` and `1`, as KiCad's Preferences
+    /// write it; no Copperpour tool sets it, so the project file is written
+    /// here.
+    #[tokio::test]
+    async fn a_unit_is_written_in_the_projects_notation() {
+        let dir = tempfile::tempdir().unwrap();
+        let sch = dir.path().join("pin_net_names_kicad10.kicad_sch");
+        std::fs::write(&sch, SCH).unwrap();
+        std::fs::write(
+            dir.path().join("pin_net_names_sub_kicad10.kicad_sch"),
+            CHILD,
+        )
+        .unwrap();
+        let project = json!({
+            "meta": { "filename": "pin_net_names_kicad10.kicad_pro", "version": 1 },
+            "schematic": { "subpart_id_separator": 46, "subpart_first_id": 49 }
+        });
+        std::fs::write(
+            dir.path().join("pin_net_names_kicad10.kicad_pro"),
+            project.to_string(),
+        )
+        .unwrap();
+
+        let body = call_at(
+            &sch,
+            "get_pin_net_name",
+            json!({ "reference": "R4", "pin_number": "1" }),
+        )
+        .await;
+        assert_eq!(body["net"], "Net-(U2.1-+)", "{body}");
+    }
+
+    /// A unit's display name, which KiCad's symbol editor writes as
+    /// `(unit_name …)` and no Copperpour tool does, so it is written here.
+    #[tokio::test]
+    async fn a_unit_with_a_display_name_is_written_by_it() {
+        let named = SCH.replacen(
+            "\t\t\t(symbol \"LM358_1_1\"\n",
+            "\t\t\t(symbol \"LM358_1_1\"\n\t\t\t\t(unit_name \"OPA\")\n",
+            1,
+        );
+        assert_ne!(named, SCH, "fixture insertion point changed");
+        assert_eq!(net(&named, "R4.1").await.as_deref(), Some("Net-(U2OPA-+)"));
+    }
+
+    /// A file older than KiCad 10's format reads a pin named `~` as unnamed.
+    /// KiCad 10.0.6's netlist of each fixture names these nets.
+    #[tokio::test]
+    async fn an_older_file_reads_a_tilde_pin_name_as_none() {
+        let off_grid = include_str!("../../tests/fixtures/power_on_off_grid_pin.kicad_sch");
+        for pin in ["L1.2", "RESR1.1"] {
+            assert_eq!(
+                net(off_grid, pin).await.as_deref(),
+                Some("Net-(L1-Pad2)"),
+                "{pin}"
+            );
+        }
+        let ecc83 = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+        for (pin, name) in [
+            ("R1.1", "Net-(U1A-G)"),
+            ("U1.7", "Net-(U1A-G)"),
+            ("R2.1", "Net-(U1B-K)"),
+            ("P1.2", "Net-(P1-PM)"),
+        ] {
+            assert_eq!(net(ecc83, pin).await.as_deref(), Some(name), "{pin}");
+        }
+    }
+
+    /// A hidden `power_in` pin of an ordinary symbol is a global net of its
+    /// name even alone: `hidden_power_pin/README.md`'s `HIDDEN` on U99.1.
+    #[tokio::test]
+    async fn a_hidden_power_pin_names_its_net() {
+        let sch = include_str!("../../tests/fixtures/hidden_power_pin/single_pin_nets.kicad_sch");
+        assert_eq!(net(sch, "U99.1").await.as_deref(), Some("HIDDEN"));
+        assert_eq!(net(sch, "U99.2").await, None);
     }
 }
 

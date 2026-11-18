@@ -1291,6 +1291,34 @@ pub fn extract_lib_pins_for_unit(sym_node: &SexpNode, unit: u32) -> Vec<LibPin> 
     out
 }
 
+/// [`extract_lib_pins_for_unit`] of one body style too: eeschema places only
+/// the pins of sub-symbols whose `M` is `0` or the placed symbol's body style
+/// (`SCH_SYMBOL::UpdatePins`), so a De Morgan symbol's other style puts no
+/// second copy of each pin on the sheet.
+pub fn extract_lib_pins_for_unit_and_body_style(
+    sym_node: &SexpNode,
+    unit: u32,
+    body_style: u32,
+) -> Vec<LibPin> {
+    let mut out = Vec::new();
+    for pin in sym_node.find_all("pin") {
+        if let Some(lib_pin) = parse_lib_pin(pin) {
+            out.push(lib_pin);
+        }
+    }
+    for sub in sym_node.find_all("symbol") {
+        let name = sub.get(1).and_then(|n| n.as_str()).unwrap_or_default();
+        let sub_unit = parse_subsymbol_unit(name);
+        let sub_style = sub_unit.and_then(|_| name.rsplit('_').next()?.parse::<u32>().ok());
+        match (sub_unit, sub_style) {
+            (Some(n), _) if n != 0 && n != unit => {}
+            (_, Some(m)) if m != 0 && m != body_style => {}
+            _ => collect_pins_recursive(sub, &mut out),
+        }
+    }
+    out
+}
+
 /// Parse the unit number `N` out of a `Name_N_M` sub-symbol name. Returns
 /// `None` when the name doesn't end in two `_`-separated integers (base names
 /// may themselves contain underscores and digits, e.g. `R_Small_1_1` → 1).
