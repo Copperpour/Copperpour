@@ -197,9 +197,24 @@ impl CopperStack {
     pub fn count(self) -> u32 {
         self.count
     }
+
+    /// Return the index of an explicit inner copper layer, or `None` for other layers.
+    /// Refuse inner copper layers that are not on this stack.
+    pub fn checked_inner_copper_index(self, layer: &str) -> Result<Option<u32>, FlipLayerError> {
+        if !layer.starts_with("In") || !layer.ends_with(".Cu") {
+            return Ok(None);
+        }
+        match inner_copper_index(layer) {
+            Some(k) if k + 1 < self.count => Ok(Some(k)),
+            _ => Err(FlipLayerError::InnerLayerNotOnBoard {
+                layer: layer.to_string(),
+                copper_layers: self.count,
+            }),
+        }
+    }
 }
 
-/// Why a layer has no place on the other side of the board.
+/// Why a layer cannot be used on this stack or flipped to the other side.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FlipLayerError {
     #[error("unsupported side-specific layer '{0}'")]
@@ -236,16 +251,12 @@ pub fn flip_layer(layer: &str, stack: CopperStack) -> Result<String, FlipLayerEr
         other if other.starts_with("F.") || other.starts_with("B.") => {
             return Err(FlipLayerError::UnsupportedSideLayer(other.to_string()))
         }
-        other if other.starts_with("In") && other.ends_with(".Cu") => {
-            return match inner_copper_index(other) {
-                Some(k) if k + 1 < stack.count => Ok(format!("In{}.Cu", stack.count - 1 - k)),
-                _ => Err(FlipLayerError::InnerLayerNotOnBoard {
-                    layer: other.to_string(),
-                    copper_layers: stack.count,
-                }),
-            };
+        other => {
+            if let Some(k) = stack.checked_inner_copper_index(other)? {
+                return Ok(format!("In{}.Cu", stack.count - 1 - k));
+            }
+            other
         }
-        other => other,
     };
     Ok(flipped.to_string())
 }
