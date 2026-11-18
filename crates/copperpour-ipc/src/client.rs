@@ -4460,7 +4460,18 @@ impl KiCadIpcClient {
         if placements.is_empty() {
             return Ok(Vec::new());
         }
+        self.set_footprint_placements_then(placements, |_| Ok(()))
+            .map(|(applied, ())| applied)
+    }
 
+    /// As [`Self::set_footprint_placements`], running `then` in the same
+    /// commit once the footprints are updated, so one undo step reverses
+    /// both.
+    pub fn set_footprint_placements_then<T>(
+        &self,
+        placements: &[IpcFootprintPlacement],
+        then: impl FnOnce(&Self) -> Result<T>,
+    ) -> Result<(Vec<IpcFootprintPlacement>, T)> {
         let mut requested = std::collections::HashSet::new();
         for placement in placements {
             if !requested.insert(placement.reference.as_str()) {
@@ -4471,7 +4482,7 @@ impl KiCadIpcClient {
             }
         }
 
-        self.run_commit("Set component placements", |client| {
+        let then_value = self.run_commit("Set component placements", |client| {
             let items = client.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
             let mut matched = std::collections::HashSet::new();
             let mut updates = Vec::with_capacity(placements.len());
@@ -4547,7 +4558,8 @@ impl KiCadIpcClient {
                 .into());
             }
 
-            client.update_items(updates)
+            client.update_items(updates)?;
+            then(client)
         })?;
 
         // Post-commit read-back: report what the board holds, in request order.
@@ -4590,7 +4602,8 @@ impl KiCadIpcClient {
                     )
                 })
             })
-            .collect()
+            .collect::<Result<_>>()
+            .map(|applied| (applied, then_value))
     }
 
     /// Delete a footprint by reference.

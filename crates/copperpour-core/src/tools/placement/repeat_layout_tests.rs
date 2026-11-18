@@ -129,7 +129,7 @@ struct Board {
 impl Board {
     fn new(fixture: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(fixture);
+        let path = dir.path().join(Path::new(fixture).file_name().unwrap());
         std::fs::copy(Path::new(FIXTURE_DIR).join(fixture), &path).unwrap();
         let original = std::fs::read_to_string(&path).unwrap();
         Self {
@@ -766,4 +766,1023 @@ async fn a_target_footprint_that_cannot_turn_is_named_and_nothing_moves() {
     );
     assert_eq!(kicad.held(), before);
     assert_eq!(kicad.store.lock().unwrap().updates, 0);
+}
+
+// ─── Routing ──────────────────────────────────────────────────────────────────
+//
+// `repeat_layout_routing_kicad10.kicad_pcb` is the board above with Channel 1
+// routed, Channel 2 routed where a sync left it, and R9 turned to 45°; its
+// README says how pcbnew 10.0.6 made it. The expected copies are pcbnew's
+// own: each of Channel 1's items on its own nets duplicated, given the net of
+// the matched pad and turned and moved by the calls `copyRuleAreaContents`
+// makes (the README's `oracle`).
+
+const ROUTED: &str = "repeat_layout_routing_kicad10.kicad_pcb";
+/// The routed board with R8 pad 1 and R17, on the root sheet, on Channel 2's
+/// OUT, and R10 pad 2 and R11 pad 1 on Channel 3's MID (README).
+const ROUTED_MISMATCH: &str = "repeat_layout_routing_mismatch_kicad10.kicad_pcb";
+
+/// Channel 2's MID stub and OUT track, which the copies replace.
+const MID_STUB: &str = "08cf5053-ed54-4206-b23a-3d693ed67fa3";
+const OUT_TRACK: &str = "6c43e0b0-05cb-4524-9a73-d44fe83ec0b8";
+
+/// Channel 3's footprints where pcbnew 10.0.6 puts them with R9 at 45°.
+const CHANNEL_3_AT_45: [Placed; 3] = [
+    ("R10", 161_914_214, 118_835_787, 135.0, "F.Cu"),
+    ("R11", 162_267_767, 122_017_767, -135.0, "B.Cu"),
+    ("R12", 164_742_641, 119_896_447, 90.0, "F.Cu"),
+];
+
+/// A track, arc or via: its tag, net, layer (a via's first), whether it is
+/// locked, its points in nm (start, mid, end; a via's position), and its
+/// width, a via's size.
+type Routed = (String, String, String, bool, Vec<(i64, i64)>, i64);
+
+type Copy = (
+    &'static str,
+    &'static str,
+    &'static str,
+    bool,
+    &'static [(i64, i64)],
+);
+
+/// pcbnew's copies of Channel 1's routing on MID and OUT, onto Channel 2
+/// (R5, 90°) and Channel 3 (R9, 45°). Every track is 0.2 mm, every via 0.6 mm.
+const COPIES: [Copy; 14] = [
+    (
+        "segment",
+        "/Channel 2/MID",
+        "F.Cu",
+        false,
+        &[(140_500_000, 98_000_000), (143_103_553, 98_000_000)],
+    ),
+    (
+        "segment",
+        "/Channel 2/MID",
+        "F.Cu",
+        true,
+        &[(140_000_000, 99_500_000), (140_500_000, 98_000_000)],
+    ),
+    (
+        "arc",
+        "/Channel 2/MID",
+        "F.Cu",
+        false,
+        &[
+            (143_103_553, 98_000_000),
+            (143_403_553, 97_551_777),
+            (143_103_553, 97_103_553),
+        ],
+    ),
+    (
+        "segment",
+        "/Channel 2/OUT",
+        "F.Cu",
+        false,
+        &[(139_500_000, 98_000_000), (139_500_000, 96_800_000)],
+    ),
+    (
+        "via",
+        "/Channel 2/OUT",
+        "F.Cu",
+        false,
+        &[(139_500_000, 96_800_000)],
+    ),
+    (
+        "segment",
+        "/Channel 2/OUT",
+        "B.Cu",
+        false,
+        &[(142_500_000, 96_800_000), (142_500_000, 99_500_000)],
+    ),
+    (
+        "segment",
+        "/Channel 2/OUT",
+        "B.Cu",
+        false,
+        &[(139_500_000, 96_800_000), (142_500_000, 96_800_000)],
+    ),
+    (
+        "segment",
+        "/Channel 3/MID",
+        "F.Cu",
+        false,
+        &[(162_267_767, 119_189_340), (164_108_757, 121_030_330)],
+    ),
+    (
+        "segment",
+        "/Channel 3/MID",
+        "F.Cu",
+        true,
+        &[(160_853_553, 119_896_447), (162_267_767, 119_189_340)],
+    ),
+    (
+        "arc",
+        "/Channel 3/MID",
+        "F.Cu",
+        false,
+        &[
+            (164_108_757, 121_030_330),
+            (164_637_831, 120_925_521),
+            (164_742_641, 120_396_446),
+        ],
+    ),
+    (
+        "segment",
+        "/Channel 3/OUT",
+        "F.Cu",
+        false,
+        &[(161_560_660, 118_482_233), (162_409_188, 117_633_705)],
+    ),
+    (
+        "via",
+        "/Channel 3/OUT",
+        "F.Cu",
+        false,
+        &[(162_409_188, 117_633_705)],
+    ),
+    (
+        "segment",
+        "/Channel 3/OUT",
+        "B.Cu",
+        false,
+        &[(164_530_509, 119_755_025), (162_621_320, 121_664_214)],
+    ),
+    (
+        "segment",
+        "/Channel 3/OUT",
+        "B.Cu",
+        false,
+        &[(162_409_188, 117_633_705), (164_530_509, 119_755_025)],
+    ),
+];
+
+fn expected_copies() -> Vec<Routed> {
+    let mut copies: Vec<Routed> = COPIES
+        .iter()
+        .map(|(kind, net, layer, locked, points)| {
+            let width = if *kind == "via" { 600_000 } else { 200_000 };
+            (
+                kind.to_string(),
+                net.to_string(),
+                layer.to_string(),
+                *locked,
+                points.to_vec(),
+                width,
+            )
+        })
+        .collect();
+    copies.sort();
+    copies
+}
+
+/// Each top-level track, arc and via of a board's text, by uuid.
+fn routing(content: &str) -> BTreeMap<String, Routed> {
+    let nm = |node: &SexpNode| {
+        (
+            mm_to_nm(node.get_f64(1).unwrap()),
+            mm_to_nm(node.get_f64(2).unwrap()),
+        )
+    };
+    parse_sexp(content)
+        .unwrap()
+        .children()
+        .unwrap()
+        .iter()
+        .filter_map(|node| {
+            let kind = node.head()?;
+            let points: &[&str] = match kind {
+                "segment" => &["start", "end"],
+                "arc" => &["start", "mid", "end"],
+                "via" => &["at"],
+                _ => return None,
+            };
+            let layer = match kind {
+                "via" => node.find("layers").unwrap().get(1).unwrap().as_str(),
+                _ => node.find_str("layer"),
+            };
+            let width = node.find(if kind == "via" { "size" } else { "width" });
+            Some((
+                node.find_str("uuid").unwrap().to_string(),
+                (
+                    kind.to_string(),
+                    copperpour_sexp::net::net_name(node.find("net").unwrap())
+                        .unwrap()
+                        .to_string(),
+                    layer.unwrap().to_string(),
+                    node.find_str("locked") == Some("yes"),
+                    points.iter().map(|p| nm(node.find(p).unwrap())).collect(),
+                    mm_to_nm(width.unwrap().get_f64(1).unwrap()),
+                ),
+            ))
+        })
+        .collect()
+}
+
+/// The items `after` holds that `before` did not, sorted.
+fn added(before: &BTreeMap<String, Routed>, after: &BTreeMap<String, Routed>) -> Vec<Routed> {
+    let mut added: Vec<Routed> = after
+        .iter()
+        .filter(|(id, _)| !before.contains_key(*id))
+        .map(|(_, item)| item.clone())
+        .collect();
+    added.sort();
+    added
+}
+
+/// The uuids `before` holds that `after` does not.
+fn gone<'a>(
+    before: &'a BTreeMap<String, Routed>,
+    after: &BTreeMap<String, Routed>,
+) -> Vec<&'a str> {
+    before
+        .keys()
+        .filter(|id| !after.contains_key(*id))
+        .map(String::as_str)
+        .collect()
+}
+
+/// A response's `routing`, its targets sorted: they come in board order.
+fn reported(body: &Value) -> Value {
+    let mut routing = body["routing"].clone();
+    if let Some(targets) = routing["targets"].as_array_mut() {
+        targets.sort_by_key(|target| target["target_reference"].to_string());
+    }
+    routing
+}
+
+fn routing_report() -> Value {
+    json!({
+        "copied_count": 14,
+        "removed_count": 2,
+        "targets": [
+            {
+                "target_reference": "R5",
+                "copied_count": 7,
+                "removed_count": 2,
+                "nets": { "/Channel 1/MID": "/Channel 2/MID", "/Channel 1/OUT": "/Channel 2/OUT" },
+            },
+            {
+                "target_reference": "R9",
+                "copied_count": 7,
+                "removed_count": 0,
+                "nets": { "/Channel 1/MID": "/Channel 3/MID", "/Channel 1/OUT": "/Channel 3/OUT" },
+            },
+        ],
+    })
+}
+
+#[tokio::test]
+async fn routing_on_the_references_own_nets_is_copied_where_kicad_puts_it() {
+    let board = Board::new(ROUTED);
+    let (is_error, body) = call(&board, json!({ "anchor_reference": "R1" })).await;
+    assert!(!is_error, "{body:#}");
+    assert_eq!(reported(&body), routing_report(), "{body:#}");
+    let after = board.now();
+    assert_eq!(
+        moved(&board.original, &after),
+        expected(&[&CHANNEL_2, &CHANNEL_3_AT_45])
+    );
+    let (before, after) = (routing(&board.original), routing(&after));
+    // Channel 1's IN and GND reach other sheets, and Channel 2's IN is the
+    // counterpart of no net of Channel 1's own, so only MID and OUT move.
+    assert_eq!(gone(&before, &after), [MID_STUB, OUT_TRACK]);
+    assert_eq!(added(&before, &after), expected_copies());
+}
+
+#[tokio::test]
+async fn a_second_call_replaces_the_copies_with_the_same_copies() {
+    let board = Board::new(ROUTED);
+    let (is_error, body) = call(&board, json!({ "anchor_reference": "R1" })).await;
+    assert!(!is_error, "{body:#}");
+    let first = board.now();
+    let (is_error, body) = call(&board, json!({ "anchor_reference": "R1" })).await;
+    assert!(!is_error, "{body:#}");
+    assert_eq!(body["routing"]["removed_count"], 14, "{body:#}");
+    let second = board.now();
+    assert!(moved(&first, &second).is_empty());
+    let (first, second) = (routing(&first), routing(&second));
+    assert_eq!(gone(&first, &second).len(), 14);
+    let mut kept: Vec<Routed> = first.into_values().collect();
+    let mut again: Vec<Routed> = second.into_values().collect();
+    kept.sort();
+    again.sort();
+    assert_eq!(again, kept);
+}
+
+#[tokio::test]
+async fn named_targets_alone_take_the_routing() {
+    let board = Board::new(ROUTED);
+    let (is_error, body) = call(
+        &board,
+        json!({ "anchor_reference": "R1", "target_references": ["R9"] }),
+    )
+    .await;
+    assert!(!is_error, "{body:#}");
+    assert_eq!(body["routing"]["copied_count"], 7, "{body:#}");
+    assert_eq!(body["routing"]["removed_count"], 0, "{body:#}");
+    let after = board.now();
+    assert_eq!(
+        moved(&board.original, &after),
+        expected(&[&CHANNEL_3_AT_45])
+    );
+    let (before, after) = (routing(&board.original), routing(&after));
+    assert!(gone(&before, &after).is_empty());
+    let channel_3: Vec<Routed> = expected_copies()
+        .into_iter()
+        .filter(|(_, net, ..)| net.starts_with("/Channel 3/"))
+        .collect();
+    assert_eq!(added(&before, &after), channel_3);
+}
+
+#[tokio::test]
+async fn copy_routing_false_places_the_footprints_alone() {
+    let board = Board::new(ROUTED);
+    let (is_error, body) = call(
+        &board,
+        json!({ "anchor_reference": "R1", "copy_routing": false }),
+    )
+    .await;
+    assert!(!is_error, "{body:#}");
+    assert!(body.get("routing").is_none(), "{body:#}");
+    let after = board.now();
+    assert_eq!(
+        moved(&board.original, &after),
+        expected(&[&CHANNEL_2, &CHANNEL_3_AT_45])
+    );
+    assert_eq!(routing(&after), routing(&board.original));
+
+    let (is_error, body) = call(
+        &board,
+        json!({ "anchor_reference": "R1", "copy_routing": "yes" }),
+    )
+    .await;
+    assert!(is_error, "{body:#}");
+    assert_eq!(body["error"]["field"], "copy_routing", "{body:#}");
+}
+
+#[tokio::test]
+async fn a_dry_run_reports_the_routing_and_writes_nothing() {
+    let board = Board::new(ROUTED);
+    let (is_error, body) = call(&board, json!({ "anchor_reference": "R1", "dry_run": true })).await;
+    assert!(!is_error, "{body:#}");
+    assert_eq!(body["dry_run"], true, "{body:#}");
+    assert_eq!(reported(&body), routing_report(), "{body:#}");
+    board.assert_untouched();
+}
+
+#[tokio::test]
+async fn a_net_that_does_not_become_one_net_of_the_target_is_refused() {
+    let board = Board::new(ROUTED_MISMATCH);
+    let (is_error, body) = call(&board, json!({ "anchor_reference": "R1" })).await;
+    assert!(is_error, "{body:#}");
+    assert_eq!(body["error"]["kind"], "plan_blocked", "{body:#}");
+    assert_eq!(
+        reasons(&body),
+        [
+            "/Channel 1/MID and /Channel 1/OUT both become /Channel 3/MID on R9's placement",
+            "/Channel 1/MID becomes /Channel 2/MID and /Channel 2/OUT on R5's placement",
+            "/Channel 1/OUT becomes /Channel 2/OUT, which has pads off R5's placement",
+        ],
+        "{body:#}"
+    );
+    board.assert_untouched();
+
+    // Without the routing, the footprints alone match.
+    let (is_error, body) = call(
+        &board,
+        json!({ "anchor_reference": "R1", "copy_routing": false, "dry_run": true }),
+    )
+    .await;
+    assert!(!is_error, "{body:#}");
+}
+
+/// `models-3d/royalblue.kicad_pcb` is a board KiCad 9's pcbnew wrote (its
+/// README): its tracks name their nets by number, which KiCad 10 never
+/// writes, so their nets cannot be read by name.
+#[tokio::test]
+async fn a_board_naming_track_nets_by_number_is_refused_unless_routing_is_left() {
+    let board = Board::new("models-3d/royalblue.kicad_pcb");
+    let (is_error, body) = call(&board, json!({ "anchor_reference": "R5" })).await;
+    assert!(is_error, "{body:#}");
+    let text = body.to_string();
+    assert!(
+        text.contains("names its net by number") && text.contains("copy_routing false"),
+        "{body:#}"
+    );
+    board.assert_untouched();
+
+    // Without the routing the call reaches the plan, which refuses the
+    // anchor: this board has no sheet placed more than once.
+    let (is_error, body) = call(
+        &board,
+        json!({ "anchor_reference": "R5", "copy_routing": false }),
+    )
+    .await;
+    assert!(is_error, "{body:#}");
+    assert_eq!(body["error"]["field"], "anchor_reference", "{body:#}");
+    board.assert_untouched();
+}
+
+/// pcbnew 10.0.6 turns these points by 45° with `EDA_ANGLE`'s `M_SQRT1_2`,
+/// which puts `y` a nanometre from where the sine of 45° in radians would:
+/// the README's `rotate_45`, through `PCB_TRACK::Rotate`.
+#[test]
+fn a_45_degree_turn_rounds_as_kicad_rounds_it() {
+    use super::repeat_layout::rotate_point;
+    assert_eq!(
+        rotate_point(150_000_000, 111_386_035, 45.0),
+        (184_827_838, -27_304_197)
+    );
+    assert_eq!(
+        rotate_point(150_000_001, 134_005_573, 45.0),
+        (200_822_267, -11_309_769)
+    );
+}
+
+// ─── Routing on a live board ──────────────────────────────────────────────────
+
+/// The routed fixture as KiCad sends it: [`as_kicad_sends`]' footprints with
+/// each pad's KIID, number and net, and every track, arc and via, a via's
+/// padstack its one size on every layer.
+fn as_kicad_sends_routed(content: &str) -> Vec<prost_types::Any> {
+    use kiapi::board::types as board;
+    use kiapi::common::types as common;
+    let kiid = |node: &SexpNode| {
+        Some(common::Kiid {
+            value: node.find_str("uuid").unwrap().to_string(),
+        })
+    };
+    let net = |node: &SexpNode| {
+        node.find("net")
+            .and_then(copperpour_sexp::net::net_name)
+            .map(|name| board::Net {
+                code: None,
+                name: name.to_string(),
+            })
+    };
+    let point = |node: &SexpNode, tag: &str| {
+        let at = node.find(tag).unwrap();
+        Some(common::Vector2 {
+            x_nm: mm_to_nm(at.get_f64(1).unwrap()),
+            y_nm: mm_to_nm(at.get_f64(2).unwrap()),
+        })
+    };
+    let nm = |node: &SexpNode, tag: &str| mm_to_nm(node.find(tag).unwrap().get_f64(1).unwrap());
+    let locked = |node: &SexpNode| {
+        if node.find_str("locked") == Some("yes") {
+            common::LockedState::LsLocked as i32
+        } else {
+            common::LockedState::LsUnlocked as i32
+        }
+    };
+    let layer = |name: &str| copperpour_ipc::builders::layer_from_name(name) as i32;
+    let mut items: Vec<prost_types::Any> = as_kicad_sends(content)
+        .into_iter()
+        .zip(footprint_nodes(content))
+        .map(|(item, node)| {
+            let mut fp = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            let definition = fp.definition.as_mut().unwrap();
+            for pad in node.find_all("pad") {
+                let pad = board::Pad {
+                    id: kiid(pad),
+                    number: pad.get(1).and_then(SexpNode::as_str).unwrap().to_string(),
+                    net: net(pad),
+                    ..Default::default()
+                };
+                definition
+                    .items
+                    .push(pack_any(&pad, "kiapi.board.types.Pad"));
+            }
+            pack_any(&fp, "kiapi.board.types.FootprintInstance")
+        })
+        .collect();
+    for node in parse_sexp(content).unwrap().children().unwrap() {
+        match node.head() {
+            Some("segment") => items.push(pack_any(
+                &board::Track {
+                    id: kiid(node),
+                    start: point(node, "start"),
+                    end: point(node, "end"),
+                    width: Some(common::Distance {
+                        value_nm: nm(node, "width"),
+                    }),
+                    locked: locked(node),
+                    layer: layer(node.find_str("layer").unwrap()),
+                    net: net(node),
+                    ..Default::default()
+                },
+                "kiapi.board.types.Track",
+            )),
+            Some("arc") => items.push(pack_any(
+                &board::Arc {
+                    id: kiid(node),
+                    start: point(node, "start"),
+                    mid: point(node, "mid"),
+                    end: point(node, "end"),
+                    width: Some(common::Distance {
+                        value_nm: nm(node, "width"),
+                    }),
+                    locked: locked(node),
+                    layer: layer(node.find_str("layer").unwrap()),
+                    net: net(node),
+                    ..Default::default()
+                },
+                "kiapi.board.types.Arc",
+            )),
+            Some("via") => {
+                let size = nm(node, "size");
+                let copper = [board::BoardLayer::BlFCu, board::BoardLayer::BlBCu].map(|layer| {
+                    board::PadStackLayer {
+                        layer: layer as i32,
+                        size: Some(common::Vector2 {
+                            x_nm: size,
+                            y_nm: size,
+                        }),
+                        ..Default::default()
+                    }
+                });
+                items.push(pack_any(
+                    &board::Via {
+                        id: kiid(node),
+                        position: point(node, "at"),
+                        pad_stack: Some(board::PadStack {
+                            r#type: board::PadStackType::PstNormal as i32,
+                            copper_layers: copper.to_vec(),
+                            ..Default::default()
+                        }),
+                        locked: locked(node),
+                        net: net(node),
+                        r#type: board::ViaType::VtThrough as i32,
+                        ..Default::default()
+                    },
+                    "kiapi.board.types.Via",
+                ));
+            }
+            _ => {}
+        }
+    }
+    items
+}
+
+/// What the copper check asks KiCad, answered for two copper layers and a
+/// 0.1 mm square at the origin for every pad: an outline the moves carry far
+/// from any copper, so the check passes and the routing is what is tested.
+fn answer_the_copper_check(command: &prost_types::Any) -> Option<prost_types::Any> {
+    use kiapi::board::commands;
+    use kiapi::common::types as common;
+    match any_type_name(command) {
+        "kiapi.board.commands.GetBoardEnabledLayers" => Some(pack_any(
+            &commands::BoardEnabledLayersResponse {
+                copper_layer_count: 2,
+                layers: vec![
+                    kiapi::board::types::BoardLayer::BlFCu as i32,
+                    kiapi::board::types::BoardLayer::BlBCu as i32,
+                ],
+            },
+            "kiapi.board.commands.BoardEnabledLayersResponse",
+        )),
+        "kiapi.board.commands.CheckPadstackPresenceOnLayers" => Some(pack_any(
+            &commands::PadstackPresenceResponse::default(),
+            "kiapi.board.commands.PadstackPresenceResponse",
+        )),
+        "kiapi.board.commands.GetPadShapeAsPolygon" => {
+            let request = commands::GetPadShapeAsPolygon::decode(command.value.as_slice()).unwrap();
+            let corner = |x_nm, y_nm| common::PolyLineNode {
+                geometry: Some(common::poly_line_node::Geometry::Point(common::Vector2 {
+                    x_nm,
+                    y_nm,
+                })),
+            };
+            let square = common::PolygonWithHoles {
+                outline: Some(common::PolyLine {
+                    nodes: vec![
+                        corner(0, 0),
+                        corner(100_000, 0),
+                        corner(100_000, 100_000),
+                        corner(0, 100_000),
+                    ],
+                    closed: true,
+                }),
+                holes: vec![],
+            };
+            Some(pack_any(
+                &commands::PadShapeAsPolygonResponse {
+                    polygons: vec![square; request.pads.len()],
+                    pads: request.pads,
+                },
+                "kiapi.board.commands.PadShapeAsPolygonResponse",
+            ))
+        }
+        _ => None,
+    }
+}
+
+impl Kicad {
+    /// A KiCad holding the routed fixture. `settle` stands in for what KiCad
+    /// does to an item on the commit's push; `create`, when it answers, for
+    /// its answer to `CreateItems`. The log names an `EndCommit` by what it
+    /// did, `EndCommit(commit)` or `EndCommit(drop)`.
+    async fn routed(
+        fixture: &str,
+        settle: impl Fn(&mut prost_types::Any) + Send + 'static,
+        create: impl Fn(&prost_types::Any, &mut ItemStore) -> Option<prost_types::Any> + Send + 'static,
+    ) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join(fixture);
+        std::fs::copy(Path::new(FIXTURE_DIR).join(fixture), &board).unwrap();
+        let content = std::fs::read_to_string(&board).unwrap();
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: as_kicad_sends_routed(&content),
+            ..Default::default()
+        }));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let log = sent.clone();
+        let server = spawn_kicad_holding_items(&board, vec![], store.clone(), settle, {
+            move |command, store| {
+                use kiapi::common::commands::{CommitAction, EndCommit};
+                let mut name = any_type_name(command)
+                    .rsplit('.')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                if name == "EndCommit" {
+                    let end = EndCommit::decode(command.value.as_slice()).unwrap();
+                    name = match CommitAction::try_from(end.action) {
+                        Ok(CommitAction::CmaDrop) => "EndCommit(drop)",
+                        _ => "EndCommit(commit)",
+                    }
+                    .to_string();
+                }
+                log.lock().unwrap().push(name);
+                if any_type_name(command) == "kiapi.common.commands.CreateItems" {
+                    if let Some(answer) = create(command, store) {
+                        return Some(answer);
+                    }
+                }
+                answer_the_copper_check(command)
+            }
+        });
+        let handler = handler_talking_to(server.address()).await;
+        Self {
+            _dir: dir,
+            board,
+            store,
+            sent,
+            handler,
+            _server: server,
+        }
+    }
+
+    /// Each track, arc and via KiCad now holds, by KIID.
+    fn routing(&self) -> BTreeMap<String, Routed> {
+        use kiapi::board::types as board;
+        let layer = |layer: i32| {
+            copperpour_ipc::builders::layer_name(board::BoardLayer::try_from(layer).unwrap())
+                .unwrap()
+                .to_string()
+        };
+        let xy = |point: &Option<kiapi::common::types::Vector2>| {
+            let point = point.unwrap();
+            (point.x_nm, point.y_nm)
+        };
+        let locked = |state: i32| state == kiapi::common::types::LockedState::LsLocked as i32;
+        let mut held = BTreeMap::new();
+        for item in &self.store.lock().unwrap().items {
+            let bytes = item.value.as_slice();
+            let (id, routed) = if any_is(item, "kiapi.board.types.Track") {
+                let t = board::Track::decode(bytes).unwrap();
+                let routed = (
+                    "segment",
+                    t.net,
+                    layer(t.layer),
+                    locked(t.locked),
+                    vec![xy(&t.start), xy(&t.end)],
+                    t.width.unwrap().value_nm,
+                );
+                (t.id, routed)
+            } else if any_is(item, "kiapi.board.types.Arc") {
+                let a = board::Arc::decode(bytes).unwrap();
+                let points = vec![xy(&a.start), xy(&a.mid), xy(&a.end)];
+                let routed = (
+                    "arc",
+                    a.net,
+                    layer(a.layer),
+                    locked(a.locked),
+                    points,
+                    a.width.unwrap().value_nm,
+                );
+                (a.id, routed)
+            } else if any_is(item, "kiapi.board.types.Via") {
+                let v = board::Via::decode(bytes).unwrap();
+                let size = v.pad_stack.unwrap().copper_layers[0].size.unwrap().x_nm;
+                let routed = (
+                    "via",
+                    v.net,
+                    "F.Cu".to_string(),
+                    locked(v.locked),
+                    vec![xy(&v.position)],
+                    size,
+                );
+                (v.id, routed)
+            } else {
+                continue;
+            };
+            let (kind, net, layer, locked, points, width) = routed;
+            held.insert(
+                id.unwrap().value,
+                (
+                    kind.to_string(),
+                    net.unwrap().name,
+                    layer,
+                    locked,
+                    points,
+                    width,
+                ),
+            );
+        }
+        held
+    }
+}
+
+/// KiCad's own answer to `CreateItems`: the mock's.
+fn as_kicad(_: &prost_types::Any, _: &mut ItemStore) -> Option<prost_types::Any> {
+    None
+}
+
+#[tokio::test]
+async fn a_live_board_takes_the_routing_in_the_layouts_one_commit() {
+    let kicad = Kicad::routed(ROUTED, |_| {}, as_kicad).await;
+    let (before, footprints) = (kicad.routing(), kicad.held());
+    let (is_error, body) = call_with(
+        &kicad.handler,
+        &kicad.board,
+        json!({ "anchor_reference": "R1" }),
+    )
+    .await;
+    assert!(!is_error, "{body:#}");
+    assert_eq!(body["source"], "ipc", "{body:#}");
+    assert_eq!(body["copper_check"]["status"], "clear", "{body:#}");
+    // The board's ten tracks less the two the same commit removes.
+    assert_eq!(
+        body["copper_check"]["coverage"]["track_count"], 8,
+        "{body:#}"
+    );
+    assert_eq!(reported(&body), routing_report(), "{body:#}");
+    assert!(body.get("warning").is_none(), "{body:#}");
+    let moved: BTreeMap<String, Pose> = kicad
+        .held()
+        .into_iter()
+        .filter(|(reference, pose)| footprints.get(reference) != Some(pose))
+        .collect();
+    assert_eq!(moved, expected(&[&CHANNEL_2, &CHANNEL_3_AT_45]));
+    let after = kicad.routing();
+    assert_eq!(gone(&before, &after), [MID_STUB, OUT_TRACK]);
+    assert_eq!(added(&before, &after), expected_copies());
+    // The deletion and the copies go inside the placements' commit.
+    let sent = kicad.sent();
+    let writes: Vec<&str> = sent
+        .iter()
+        .map(String::as_str)
+        .filter(|name| {
+            name.starts_with("EndCommit")
+                || matches!(
+                    *name,
+                    "BeginCommit" | "UpdateItems" | "DeleteItems" | "CreateItems"
+                )
+        })
+        .collect();
+    assert_eq!(
+        writes,
+        [
+            "BeginCommit",
+            "UpdateItems",
+            "DeleteItems",
+            "CreateItems",
+            "EndCommit(commit)"
+        ],
+        "{sent:?}"
+    );
+    assert!(sent.iter().any(|name| name == "GetItemsById"), "{sent:?}");
+}
+
+#[tokio::test]
+async fn a_copy_kicad_refuses_drops_the_whole_commit() {
+    use kiapi::common::commands;
+    let kicad = Kicad::routed(
+        ROUTED,
+        |_| {},
+        |command, _| {
+            let request = commands::CreateItems::decode(command.value.as_slice()).unwrap();
+            let results = (0..request.items.len())
+                .map(|index| commands::ItemCreationResult {
+                    status: Some(commands::ItemStatus {
+                        code: if index == 3 {
+                            commands::ItemStatusCode::IscInvalidData
+                        } else {
+                            commands::ItemStatusCode::IscOk
+                        } as i32,
+                        error_message: String::new(),
+                    }),
+                    item: None,
+                })
+                .collect();
+            Some(pack_any(
+                &commands::CreateItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    created_items: results,
+                },
+                "kiapi.common.commands.CreateItemsResponse",
+            ))
+        },
+    )
+    .await;
+    let (is_error, body) = call_with(
+        &kicad.handler,
+        &kicad.board,
+        json!({ "anchor_reference": "R1" }),
+    )
+    .await;
+    assert!(is_error, "{body:#}");
+    assert!(
+        body.to_string().contains("refused 1 of the routing copies"),
+        "{body:#}"
+    );
+    let sent = kicad.sent();
+    assert!(
+        sent.iter().any(|name| name == "EndCommit(drop)"),
+        "{sent:?}"
+    );
+    assert!(
+        !sent.iter().any(|name| name == "EndCommit(commit)"),
+        "{sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_copy_kicad_gives_no_kiid_for_is_named() {
+    // KiCad may answer a created item without echoing it; the copy is made
+    // but cannot be read back by KIID.
+    use kiapi::common::commands;
+    let kicad = Kicad::routed(
+        ROUTED,
+        |_| {},
+        |command, store| {
+            let request = commands::CreateItems::decode(command.value.as_slice()).unwrap();
+            let mut results = Vec::new();
+            for (index, item) in request.items.into_iter().enumerate() {
+                use kiapi::board::types as board;
+                store.next_id += 1;
+                let id = Some(kiapi::common::types::Kiid {
+                    value: format!("created-{}", store.next_id),
+                });
+                let bytes = item.value.as_slice();
+                let item = match any_type_name(&item) {
+                    "kiapi.board.types.Track" => {
+                        let mut track = board::Track::decode(bytes).unwrap();
+                        track.id = id;
+                        pack_any(&track, "kiapi.board.types.Track")
+                    }
+                    "kiapi.board.types.Arc" => {
+                        let mut arc = board::Arc::decode(bytes).unwrap();
+                        arc.id = id;
+                        pack_any(&arc, "kiapi.board.types.Arc")
+                    }
+                    _ => {
+                        let mut via = board::Via::decode(bytes).unwrap();
+                        via.id = id;
+                        pack_any(&via, "kiapi.board.types.Via")
+                    }
+                };
+                store.items.push(item.clone());
+                results.push(commands::ItemCreationResult {
+                    status: Some(commands::ItemStatus {
+                        code: commands::ItemStatusCode::IscOk as i32,
+                        error_message: String::new(),
+                    }),
+                    item: (index != 0).then_some(item),
+                });
+            }
+            Some(pack_any(
+                &commands::CreateItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    created_items: results,
+                },
+                "kiapi.common.commands.CreateItemsResponse",
+            ))
+        },
+    )
+    .await;
+    let (is_error, body) = call_with(
+        &kicad.handler,
+        &kicad.board,
+        json!({ "anchor_reference": "R1" }),
+    )
+    .await;
+    assert!(!is_error, "{body:#}");
+    // The first copy came back without its KIID; the other 13 are read back.
+    let unconfirmed = body["routing"]["unconfirmed"].as_array().unwrap();
+    assert_eq!(unconfirmed.len(), 1, "{body:#}");
+    assert!(unconfirmed[0]["kiid"].is_null(), "{body:#}");
+    assert!(unconfirmed[0]["held_net"].is_null(), "{body:#}");
+    assert!(unconfirmed[0]["net"].is_string(), "{body:#}");
+    assert!(
+        body["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("routing.unconfirmed")),
+        "{body:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_live_board_without_copy_routing_takes_the_footprints_alone() {
+    let kicad = Kicad::routed(ROUTED, |_| {}, as_kicad).await;
+    let before = kicad.routing();
+    let (is_error, body) = call_with(
+        &kicad.handler,
+        &kicad.board,
+        json!({ "anchor_reference": "R1", "copy_routing": false, "allow_copper_conflicts": true }),
+    )
+    .await;
+    assert!(!is_error, "{body:#}");
+    assert!(body.get("routing").is_none(), "{body:#}");
+    assert_eq!(kicad.routing(), before);
+    let store = kicad.store.lock().unwrap();
+    assert_eq!((store.updates, store.creates, store.deletes), (1, 0, 0));
+}
+
+#[tokio::test]
+async fn a_copy_kicad_holds_on_another_net_is_named() {
+    // KiCad puts an item on the net of a pad it touches when the commit is
+    // pushed, and answers the create with the net it was asked for.
+    let kicad = Kicad::routed(
+        ROUTED,
+        |item| {
+            if any_is(item, "kiapi.board.types.Via") {
+                let mut via = kiapi::board::types::Via::decode(item.value.as_slice()).unwrap();
+                if via
+                    .net
+                    .as_ref()
+                    .is_some_and(|net| net.name == "/Channel 3/OUT")
+                {
+                    via.net = Some(copperpour_ipc::builders::net("GND", 0));
+                    *item = pack_any(&via, "kiapi.board.types.Via");
+                }
+            }
+        },
+        as_kicad,
+    )
+    .await;
+    let (is_error, body) = call_with(
+        &kicad.handler,
+        &kicad.board,
+        json!({ "anchor_reference": "R1" }),
+    )
+    .await;
+    assert!(!is_error, "{body:#}");
+    let unconfirmed = body["routing"]["unconfirmed"].as_array().unwrap();
+    assert_eq!(unconfirmed.len(), 1, "{body:#}");
+    assert!(unconfirmed[0]["kiid"].is_string(), "{body:#}");
+    assert_eq!(unconfirmed[0]["net"], "/Channel 3/OUT", "{body:#}");
+    assert_eq!(unconfirmed[0]["held_net"], "GND", "{body:#}");
+    assert!(
+        body["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.starts_with("1 of the copied")),
+        "{body:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_live_routing_dry_run_only_reads() {
+    let kicad = Kicad::routed(ROUTED, |_| {}, as_kicad).await;
+    let before = kicad.routing();
+    let (is_error, body) = call_with(
+        &kicad.handler,
+        &kicad.board,
+        json!({ "anchor_reference": "R1", "dry_run": true }),
+    )
+    .await;
+    assert!(!is_error, "{body:#}");
+    assert_eq!(body["dry_run"], true, "{body:#}");
+    assert_eq!(reported(&body), routing_report(), "{body:#}");
+    assert_eq!(kicad.routing(), before);
+    let store = kicad.store.lock().unwrap();
+    assert_eq!((store.updates, store.creates, store.deletes), (0, 0, 0));
+    for name in kicad.sent() {
+        assert!(
+            matches!(
+                name.as_str(),
+                "GetOpenDocuments"
+                    | "GetItems"
+                    | "GetVersion"
+                    | "GetBoardEnabledLayers"
+                    | "CheckPadstackPresenceOnLayers"
+                    | "GetPadShapeAsPolygon"
+            ),
+            "{name} reached KiCad"
+        );
+    }
 }
