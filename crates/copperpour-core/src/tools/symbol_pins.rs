@@ -31,7 +31,7 @@ const PIN_STYLES: &[&str] = &[
 
 /// The first library version in which a pin named or numbered `~` is not
 /// empty (KiCad's `sch_file_versions.h`).
-const TILDE_IS_TEXT: u32 = 20250318;
+pub(super) const TILDE_IS_TEXT: u32 = 20250318;
 
 /// The pin directions KiCad reads in `(at x y angle)`; any other angle stops it
 /// loading the library.
@@ -208,7 +208,7 @@ fn parts_as_asked(pin: &Pin, request: &Request) -> [String; 8] {
 /// One element of a pin number in KiCad's stacked notation: a number, or a
 /// run `prefix first..=last` such as `A1-A3`.
 #[derive(Debug, PartialEq)]
-enum Stacked {
+pub(super) enum Stacked {
     One(String),
     Run(String, i64, i64),
 }
@@ -224,7 +224,7 @@ fn alphanumeric(number: &str) -> (&str, Option<i64>) {
 /// A pin number as KiCad's `ExpandStackedPinNotation` reads it
 /// (`common/string_utils.cpp:1672-1757`), its runs kept as runs so that a
 /// long range costs nothing; anything else is the number itself.
-fn stacked(number: &str) -> Vec<Stacked> {
+pub(super) fn stacked(number: &str) -> Vec<Stacked> {
     let whole = || vec![Stacked::One(number.to_string())];
     let Some(inner) = number
         .strip_prefix('[')
