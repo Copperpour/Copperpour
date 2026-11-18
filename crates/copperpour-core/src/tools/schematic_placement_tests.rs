@@ -1122,6 +1122,8 @@ fn native_placement_readback_refuses_wrong_document_and_missing_evidence() {
         let fields = sch_components::PlacementFields {
             value: symbol.value_str().unwrap_or_default().to_string(),
             footprint: symbol.footprint().unwrap_or_default().to_string(),
+            in_bom: symbol.in_bom,
+            on_board: symbol.on_board,
         };
         let expected = sch_components::ComponentTargetUnit::placement(
             &uuid,
@@ -1216,6 +1218,8 @@ fn native_placement_readback_requires_requested_values() {
             } else {
                 symbol.footprint().unwrap_or_default().to_string()
             },
+            in_bom: symbol.in_bom,
+            on_board: symbol.on_board,
         };
         let expected = sch_components::ComponentTargetUnit::placement(
             &symbol.uuid,

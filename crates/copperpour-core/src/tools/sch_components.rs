@@ -865,6 +865,12 @@ pub(crate) fn place_one_component(
     sym.at.rotation = Some(rotation);
     sym.set_mirror(mirror);
     sym.unit = unit;
+    // eeschema copies the library symbol's exclusions onto a symbol it
+    // places, so a mounting hole stays out of the BOM (#124).
+    sym.exclude_from_sim = metadata.exclude_from_sim;
+    sym.in_bom = fields.in_bom;
+    sym.on_board = fields.on_board;
+    sym.in_pos_files = metadata.in_pos_files;
 
     // Reference and Value go where the library anchors them, carried through
     // the placement transform so they follow a rotated body (#101);
@@ -1074,6 +1080,10 @@ fn placement_catalog_report(
 pub(crate) struct PlacementFields {
     pub(crate) value: String,
     pub(crate) footprint: String,
+    /// `(in_bom …)` and `(on_board …)` as the library sets them, `yes` where
+    /// it omits one.
+    pub(crate) in_bom: bool,
+    pub(crate) on_board: bool,
 }
 
 impl PlacementFields {
@@ -1095,6 +1105,8 @@ impl PlacementFields {
         Self {
             value: value.unwrap_or(library_value).to_owned(),
             footprint: footprint.unwrap_or(&metadata.footprint).to_owned(),
+            in_bom: metadata.in_bom.unwrap_or(true),
+            on_board: metadata.on_board.unwrap_or(true),
         }
     }
 }
@@ -1168,9 +1180,9 @@ impl ComponentTargetUnit {
             mirror: mirror.map(str::to_owned),
             // Placement writes `(dnp no)`: a new part is fitted.
             dnp: false,
-            // And `(in_bom yes)` and `(on_board yes)`, as `Symbol::new` sets them.
-            in_bom: true,
-            on_board: true,
+            // And `(in_bom …)` and `(on_board …)` as the library sets them.
+            in_bom: fields.in_bom,
+            on_board: fields.on_board,
             fields: BTreeMap::from([
                 ("Reference".to_owned(), reference.to_owned()),
                 ("Value".to_owned(), fields.value.clone()),
@@ -13914,6 +13926,112 @@ mod native_dnp_tests {
             listed(&std::fs::read_to_string(&bom).unwrap()),
             "R1 listed again"
         );
+    }
+
+    // A placed symbol takes its library symbol's exclusions, as eeschema's
+    // placement does (#124).
+
+    /// Four symbols, each excluded from one thing, so every flag is read both
+    /// ways and no two flags read alike across them. See its README.
+    const EXCLUSIONS: &str =
+        include_str!("../../tests/fixtures/placement_exclusions_kicad10.kicad_sym");
+    const EXCLUSION_FLAGS: [&str; 4] = ["exclude_from_sim", "in_bom", "on_board", "in_pos_files"];
+    const EXCLUDED_SYMBOLS: [&str; 4] = [
+        "EXCLUDED_FROM_SIM",
+        "EXCLUDED_FROM_BOM",
+        "EXCLUDED_FROM_BOARD",
+        "EXCLUDED_FROM_POS_FILES",
+    ];
+
+    /// `symbol`'s own value of each of `EXCLUSION_FLAGS` in `library`.
+    fn library_flags(library: &str, symbol: &str) -> Vec<String> {
+        let tree = parse_sexp(library).unwrap();
+        let symbol = tree
+            .children()
+            .unwrap()
+            .iter()
+            .find(|node| {
+                node.head() == Some("symbol")
+                    && node.get(1).and_then(SexpNode::as_str) == Some(symbol)
+            })
+            .unwrap();
+        EXCLUSION_FLAGS
+            .iter()
+            .map(|flag| symbol.find_str(flag).unwrap().to_owned())
+            .collect()
+    }
+
+    /// The fixture sheet, under the project name its instances record so a
+    /// placement takes it, beside a project table that names EXCLUSIONS
+    /// `Exclusions`, and `power` too, since `add_power_symbol` places
+    /// whatever `power:<net>` resolves to.
+    fn exclusions_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dnp_kicad10.kicad_sch");
+        std::fs::write(&path, SHEET).unwrap();
+        std::fs::write(dir.path().join("exclusions.kicad_sym"), EXCLUSIONS).unwrap();
+        let lib = |name: &str| {
+            format!("  (lib (name \"{name}\") (type \"KiCad\") (uri \"${{KIPRJMOD}}/exclusions.kicad_sym\") (options \"\") (descr \"\"))\n")
+        };
+        std::fs::write(
+            dir.path().join("sym-lib-table"),
+            format!(
+                "(sym_lib_table\n  (version 7)\n{}{})\n",
+                lib("Exclusions"),
+                lib("power")
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    /// Every placer writes the library's four flags on the symbol it places,
+    /// and its readback holds `in_bom` and `on_board`, so the call succeeds.
+    #[tokio::test]
+    async fn a_placed_symbol_takes_its_library_symbols_exclusions() {
+        for tool in [
+            "add_schematic_component",
+            "batch_place_components",
+            "add_power_symbol",
+        ] {
+            let (_dir, path) = exclusions_fixture();
+            let placed = |index: usize| {
+                let mut args = json!({ "x": 101.6 + 25.4 * index as f64, "y": 101.6 });
+                if tool == "add_power_symbol" {
+                    args["power_net"] = json!(EXCLUDED_SYMBOLS[index]);
+                } else {
+                    args["lib_id"] = json!(format!("Exclusions:{}", EXCLUDED_SYMBOLS[index]));
+                    args["reference"] = json!(format!("H{}", 10 + index));
+                }
+                args
+            };
+            let mut references = Vec::new();
+            if tool == "batch_place_components" {
+                let components = (0..EXCLUDED_SYMBOLS.len()).map(placed).collect::<Vec<_>>();
+                let result = body(&call(tool, &path, json!({ "components": components })).await);
+                assert_eq!(result["placed_count"], 4, "{result}");
+                references
+                    .extend((0..EXCLUDED_SYMBOLS.len()).map(|index| format!("H{}", 10 + index)));
+            } else {
+                for index in 0..EXCLUDED_SYMBOLS.len() {
+                    let result = body(&call(tool, &path, placed(index)).await);
+                    references.push(result["reference"].as_str().unwrap().to_owned());
+                }
+            }
+            let sheet = std::fs::read_to_string(&path).unwrap();
+            for (symbol, reference) in EXCLUDED_SYMBOLS.iter().zip(&references) {
+                for (flag, value) in EXCLUSION_FLAGS
+                    .iter()
+                    .zip(library_flags(EXCLUSIONS, symbol))
+                {
+                    assert_eq!(
+                        native_flag(&sheet, reference, flag),
+                        [(1, Some(value))],
+                        "{tool}: {symbol} as {reference}, ({flag} …)"
+                    );
+                }
+            }
+        }
     }
 }
 

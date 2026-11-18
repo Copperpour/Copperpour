@@ -2973,8 +2973,11 @@ fn add_power_symbol_to(
     let mut sym = cse::Symbol::new(format!("power:{}", power_net), x, y);
     sym.at.rotation = Some(rotation);
     sym.unit = 1;
-    sym.in_bom = true;
-    sym.on_board = true;
+    // The library's exclusions, copied as `place_one_component` copies them.
+    sym.exclude_from_sim = metadata.exclude_from_sim;
+    sym.in_bom = placement_fields.in_bom;
+    sym.on_board = placement_fields.on_board;
+    sym.in_pos_files = metadata.in_pos_files;
     sym.uuid = uuid::Uuid::new_v4().to_string();
 
     // Property (at …) is absolute sheet coords — same as add_schematic_component.

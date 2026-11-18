@@ -429,6 +429,13 @@ pub struct SymbolMetadata {
     pub footprint: String,
     pub datasheet: String,
     pub description: String,
+    /// The symbol's `(exclude_from_sim …)`, `(in_bom …)`, `(on_board …)` and
+    /// `(in_pos_files …)`, `None` where the library omits one. eeschema copies
+    /// all four onto a symbol it places.
+    pub exclude_from_sim: Option<bool>,
+    pub in_bom: Option<bool>,
+    pub on_board: Option<bool>,
+    pub in_pos_files: Option<bool>,
 }
 
 /// Read all custom properties (excluding standard KiCad fields and internal `ki_*` fields)
@@ -485,6 +492,10 @@ pub fn symbol_metadata(schematic: &Schematic, lib_id: &str) -> SymbolMetadata {
         footprint: value("Footprint"),
         datasheet: value("Datasheet"),
         description: value("Description"),
+        exclude_from_sim: symbol.get_bool("exclude_from_sim"),
+        in_bom: symbol.get_bool("in_bom"),
+        on_board: symbol.get_bool("on_board"),
+        in_pos_files: symbol.get_bool("in_pos_files"),
     }
 }
 
@@ -1109,6 +1120,10 @@ mod field_anchor_tests {
                 footprint: "Resistor_THT:R_Axial".to_string(),
                 datasheet: "~".to_string(),
                 description: "Resistor".to_string(),
+                exclude_from_sim: None,
+                in_bom: None,
+                on_board: None,
+                in_pos_files: None,
             }
         );
         assert_eq!(symbol_metadata(&sch, "Device:C"), SymbolMetadata::default());
