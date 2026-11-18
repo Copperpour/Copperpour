@@ -508,6 +508,17 @@ fn is_vertical(degrees: f64) -> bool {
     ((degrees / 90.0).round() as i64).rem_euclid(2) == 1
 }
 
+/// How KiCad draws a symbol field on the sheet (`"horizontal"` or
+/// `"vertical"`), matching `SCH_FIELD::GetDrawRotation`: horizontal and
+/// vertical swap when the parent symbol is rotated 90° or 270°.
+pub fn field_drawn_orientation(field_rotation_deg: f64, symbol_rotation_deg: f64) -> &'static str {
+    if is_vertical(field_rotation_deg) != is_vertical(symbol_rotation_deg) {
+        "vertical"
+    } else {
+        "horizontal"
+    }
+}
+
 /// Turn a point about the origin by a multiple of 90°, as `RotatePoint` does
 /// in Y-down space: 90° takes (x, y) to (y, −x).
 fn turn((x, y): (f64, f64), degrees: f64) -> (f64, f64) {
@@ -678,7 +689,7 @@ fn field_run(
         ..*style
     };
     let upright = centred.drawn(&drawn, Justify::Center);
-    let upright = if is_vertical(angle) != is_vertical(t.rotation_deg) {
+    let upright = if field_drawn_orientation(angle, t.rotation_deg) == "vertical" {
         turned(upright, 90.0)
     } else {
         upright

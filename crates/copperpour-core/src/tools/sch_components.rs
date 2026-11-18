@@ -42,13 +42,13 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) fn field_placements_schema() -> serde_json::Value {
     json!({
         "type": "object",
-        "description": "Move or hide a field's text, keyed by field name (Reference, Value, Footprint, or a custom property). Each entry may set x, y, rotation and hide; an omitted part is left as the file has it. Coordinates are absolute schematic millimetres, as KiCad stores them — not offsets from the body.",
+        "description": "Move or hide a field's text, keyed by field name (Reference, Value, Footprint, or a custom property). Each entry may set x, y, rotation and hide; an omitted part is left as the file has it. Coordinates are absolute schematic millimetres, as KiCad stores them — not offsets from the body; rotation is stored relative to the parent symbol (so on a 90° or 270° symbol, rotation: 90 draws horizontally).",
         "additionalProperties": {
             "type": "object",
             "properties": {
                 "x": { "type": "number" },
                 "y": { "type": "number" },
-                "rotation": { "type": "number" },
+                "rotation": { "type": "number", "description": "Field text rotation in degrees, stored relative to the parent symbol as KiCad does (not an absolute sheet angle — on a 90° or 270° symbol, rotation: 0 draws vertically and rotation: 90 draws horizontally; see units[].field_placements.<name>.drawn_orientation in the response)." },
                 "hide": { "type": "boolean", "description": "true hides the field's text on the sheet; false shows it." }
             }
         }
@@ -1740,12 +1740,18 @@ fn component_mutation_readback_from_schematic(
                 .filter(|node| node.tag() == Some("at"))
                 .find_map(cse::At::from_sexp)
             {
+                let field_rotation = at.rotation.unwrap_or(0.0);
+                let symbol_rotation = symbol.at.rotation.unwrap_or(0.0);
                 field_placements.insert(
                     property.name.clone(),
                     json!({
                         "x": at.x,
                         "y": at.y,
-                        "rotation": at.rotation.unwrap_or(0.0),
+                        "rotation": field_rotation,
+                        "drawn_orientation": copperpour_sexp::text_bounds::field_drawn_orientation(
+                            field_rotation,
+                            symbol_rotation,
+                        ),
                         "hide": hidden
                     }),
                 );
@@ -9509,6 +9515,108 @@ mod multi_unit_component_tests {
             after[..after.find("(property \"Reference\" \"P3\"").unwrap()],
             body_at,
             "nothing before the edited symbol may change"
+        );
+    }
+
+    /// KiCad stores field `(at x y rot)` relative to the parent symbol, so on
+    /// a 90° or 270° symbol `rotation: 90` draws horizontally and `rotation: 0`
+    /// draws vertically. Both `edit_schematic_component` and
+    /// `batch_edit_schematic_components` keep the stored symbol-relative angle,
+    /// report `drawn_orientation` (`horizontal`/`vertical`) in each unit's
+    /// `field_placements`, and document that contract in the schema.
+    #[tokio::test]
+    async fn field_placement_rotation_is_symbol_relative_and_reports_drawn_orientation() {
+        let (_directory, path) = eeschema_fixture();
+        let handler = served_handler().await;
+
+        let schema = field_placements_schema();
+        let rot_desc = schema["additionalProperties"]["properties"]["rotation"]["description"]
+            .as_str()
+            .expect("rotation schema description");
+        assert!(rot_desc.contains("relative to the parent symbol"));
+        assert!(rot_desc.contains("drawn_orientation"));
+
+        async fn call_json(
+            handler: &crate::mcp::handler::McpHandler,
+            tool: &str,
+            arguments: serde_json::Value,
+        ) -> serde_json::Value {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": { "name": tool, "arguments": arguments }
+                }))
+                .await
+                .expect("tools/call receives a response");
+            let result = response.result.expect("a JSON-RPC result");
+            assert_ne!(result["isError"], json!(true), "{tool}: {result}");
+            let text = result["content"][0]["text"].as_str().expect("text body");
+            serde_json::from_str(text).expect("json body")
+        }
+
+        // C2 is placed at 270° in ecc83_multiunit.kicad_sch.
+        for (rot, expected_orientation) in [(90.0, "horizontal"), (0.0, "vertical")] {
+            let res = call_json(
+                &handler,
+                "edit_schematic_component",
+                json!({
+                    "schematic": path,
+                    "reference": "C2",
+                    "field_placements": { "Value": { "rotation": rot } }
+                }),
+            )
+            .await;
+            let val = &res["units"][0]["field_placements"]["Value"];
+            assert_eq!(val["rotation"], rot);
+            assert_eq!(val["drawn_orientation"], expected_orientation);
+        }
+
+        // Rotate P3 (initially 0°) to 90° and verify the same swap.
+        call_json(
+            &handler,
+            "rotate_schematic_component",
+            json!({ "schematic": path, "reference": "P3", "rotation": 90 }),
+        )
+        .await;
+        for (rot, expected_orientation) in [(90.0, "horizontal"), (0.0, "vertical")] {
+            let res = call_json(
+                &handler,
+                "edit_schematic_component",
+                json!({
+                    "schematic": path,
+                    "reference": "P3",
+                    "field_placements": { "Value": { "rotation": rot } }
+                }),
+            )
+            .await;
+            let val = &res["units"][0]["field_placements"]["Value"];
+            assert_eq!(val["rotation"], rot);
+            assert_eq!(val["drawn_orientation"], expected_orientation);
+        }
+
+        // Sibling caller: batch_edit_schematic_components on 180° R1 and 270° C2.
+        let batch_res = call_json(
+            &handler,
+            "batch_edit_schematic_components",
+            json!({
+                "schematic": path,
+                "edits": [
+                    { "reference": "R1", "field_placements": { "Value": { "rotation": 90 } } },
+                    { "reference": "C2", "field_placements": { "Reference": { "rotation": 90 } } }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            batch_res["updated"][0]["units"][0]["field_placements"]["Value"]["drawn_orientation"],
+            "vertical"
+        );
+        assert_eq!(
+            batch_res["updated"][1]["units"][0]["field_placements"]["Reference"]
+                ["drawn_orientation"],
+            "horizontal"
         );
     }
 
