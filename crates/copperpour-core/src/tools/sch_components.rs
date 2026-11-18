@@ -947,9 +947,10 @@ pub(crate) fn place_one_component(
 
     // Carry all custom properties from the library symbol (excluding standard 5 and ki_*)
     let lib_custom_props = cse::library::symbol_custom_properties(sch, lib_id);
-    for (prop_name, prop_val) in lib_custom_props {
-        sym.properties
-            .push(positioned(&prop_name, &prop_val, x, y, 0.0, true, centred));
+    for custom in lib_custom_props {
+        let mut prop = positioned(&custom.name, &custom.value, x, y, 0.0, true, centred);
+        prop.private = custom.private;
+        sym.properties.push(prop);
     }
 
     // Determine if an LCSC ID is specified or present in library properties
@@ -12554,6 +12555,235 @@ mod private_field_tests {
         );
         let committed = std::fs::read_to_string(&path).unwrap();
         assert!(committed.contains("(property private \"MPN\" \"MPN-679-R1\""));
+    }
+
+    /// Reproduces #571: placing a symbol with KiCad `private` properties
+    /// (`Device:Crystal_GND24` has `KLC_S3.3` and `KLC_S4.1`) must write them
+    /// as `(property private "NAME" "VALUE" …)`, not `(property "private" "NAME" …)`.
+    #[tokio::test]
+    async fn placing_symbol_with_private_properties_preserves_names_and_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let sym_path = dir.path().join("Device.kicad_sym");
+        std::fs::write(
+            &sym_path,
+            "(kicad_symbol_lib\n\
+             \t(version 20251024)\n\
+             \t(generator \"kicad_symbol_editor\")\n\
+             \t(generator_version \"10.0\")\n\
+             \t(symbol \"Crystal_GND24\"\n\
+             \t\t(property \"Reference\" \"Y\" (at 3.175 5.08 0) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Value\" \"Crystal_GND24\" (at 3.175 3.175 0) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Footprint\" \"\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Datasheet\" \"\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Description\" \"Four pin crystal, GND on pins 2 and 4\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property private \"KLC_S3.3\" \"The rectangle is not a symbol body but a graphical element\" (at 0 -12.7 0) (show_name yes) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property private \"KLC_S4.1\" \"Some pins are on 50mil grid to make the symbol small\" (at 0 -15.24 0) (show_name yes) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"ki_keywords\" \"quartz\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(symbol \"Crystal_GND24_0_1\"\n\
+             \t\t\t(polyline (pts (xy -2.54 2.286) (xy 2.54 2.286)) (stroke (width 0) (type default)) (fill (type none)))\n\
+             \t\t)\n\
+             \t)\n\
+             )\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("sym-lib-table"),
+            format!(
+                "(sym_lib_table (version 7) (lib (name \"Device\") (type \"KiCad\") (uri {}) (options \"\") (descr \"\")))",
+                crate::tools::library::quote_lib_table_string(&sym_path.display().to_string())
+            ),
+        )
+        .unwrap();
+        let sch_path = dir.path().join("test.kicad_sch");
+        std::fs::write(
+            &sch_path,
+            "(kicad_sch (version 20250114) (generator \"eeschema\") (generator_version \"10.0\") (uuid \"00000000-0000-0000-0000-000000000001\") (paper \"A4\") (lib_symbols) (sheet_instances (path \"/\" (page \"1\"))))\n",
+        )
+        .unwrap();
+
+        let ctx = context();
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": sch_path,
+                "lib_id": "Device:Crystal_GND24",
+                "x": 100.33,
+                "y": 100.33,
+                "reference": "Y1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let committed = std::fs::read_to_string(&sch_path).unwrap();
+        // One in the embedded lib_symbols copy, one on the placed instance.
+        assert_eq!(
+            committed
+                .matches("(property private \"KLC_S3.3\" \"The rectangle is not a symbol body but a graphical element\"")
+                .count(),
+            2,
+            "KLC_S3.3 missing or lost private flag on the instance: {committed}"
+        );
+        // One in the embedded lib_symbols copy, one on the placed instance.
+        assert_eq!(
+            committed
+                .matches("(property private \"KLC_S4.1\" \"Some pins are on 50mil grid to make the symbol small\"")
+                .count(),
+            2,
+            "KLC_S4.1 missing or lost private flag on the instance: {committed}"
+        );
+        assert!(
+            !committed.contains("(property \"private\""),
+            "wrote bogus \"private\" field: {committed}"
+        );
+
+        let edit = handle_edit_schematic_component(
+            &json!({
+                "schematic": sch_path,
+                "reference": "Y1",
+                "value": "16MHz"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!edit.is_error, "edit after placement failed: {edit:?}");
+    }
+
+    #[tokio::test]
+    async fn batch_place_and_served_dispatch_preserve_private_properties_and_literal_private_name()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let sym_path = dir.path().join("Device.kicad_sym");
+        std::fs::write(
+            &sym_path,
+            "(kicad_symbol_lib\n\
+             \t(version 20251024)\n\
+             \t(generator \"kicad_symbol_editor\")\n\
+             \t(generator_version \"10.0\")\n\
+             \t(symbol \"Crystal_GND24\"\n\
+             \t\t(property \"Reference\" \"Y\" (at 3.175 5.08 0) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Value\" \"Crystal_GND24\" (at 3.175 3.175 0) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Footprint\" \"\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Datasheet\" \"\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Description\" \"Four pin crystal\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property private \"KLC_S3.3\" \"The rectangle is not a symbol body\" (at 0 -12.7 0) (show_name yes) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property private \"KLC_S4.1\" \"Some pins are on 50mil grid\" (at 0 -15.24 0) (show_name yes) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"private\" \"literal-value\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(symbol \"Crystal_GND24_0_1\"\n\
+             \t\t\t(polyline (pts (xy -2.54 2.286) (xy 2.54 2.286)) (stroke (width 0) (type default)) (fill (type none)))\n\
+             \t\t)\n\
+             \t)\n\
+             \t(symbol \"R\"\n\
+             \t\t(property \"Reference\" \"R\" (at 2.032 0 90) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Value\" \"R\" (at 0 0 90) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Footprint\" \"\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Datasheet\" \"~\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(property \"Description\" \"Resistor\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n\
+             \t\t(symbol \"R_0_1\"\n\
+             \t\t\t(rectangle (start -1.016 -2.54) (end 1.016 2.54) (stroke (width 0.254) (type default)) (fill (type none)))\n\
+             \t\t)\n\
+             \t)\n\
+             )\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("sym-lib-table"),
+            format!(
+                "(sym_lib_table (version 7) (lib (name \"Device\") (type \"KiCad\") (uri {}) (options \"\") (descr \"\")))",
+                crate::tools::library::quote_lib_table_string(&sym_path.display().to_string())
+            ),
+        )
+        .unwrap();
+        let sch_path = dir.path().join("test.kicad_sch");
+        std::fs::write(
+            &sch_path,
+            "(kicad_sch (version 20250114) (generator \"eeschema\") (generator_version \"10.0\") (uuid \"00000000-0000-0000-0000-000000000001\") (paper \"A4\") (lib_symbols) (sheet_instances (path \"/\" (page \"1\"))))\n",
+        )
+        .unwrap();
+
+        // Served dispatch via McpHandler::handle_message for add_schematic_component.
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            project_dir: Some(dir.path().to_path_buf()),
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        let served_resp = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_schematic_component",
+                    "arguments": {
+                        "schematic": sch_path,
+                        "lib_id": "Device:Crystal_GND24",
+                        "x": 100.33,
+                        "y": 100.33,
+                        "reference": "Y1"
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        let served_result = served_resp.result.as_ref().unwrap();
+        let is_err = served_result["isError"].as_bool().unwrap_or(false);
+        assert!(
+            !is_err,
+            "served add_schematic_component failed: {served_resp:?}"
+        );
+
+        // Sibling route: batch_place_components with Crystal_GND24 and R.
+        let batch_resp = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "batch_place_components",
+                    "arguments": {
+                        "schematic": sch_path,
+                        "components": [
+                            { "lib_id": "Device:Crystal_GND24", "x": 120.65, "y": 100.33, "reference": "Y2" },
+                            { "lib_id": "Device:R", "x": 140.97, "y": 100.33, "reference": "R1", "value": "10k" }
+                        ]
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        let batch_result = batch_resp.result.as_ref().unwrap();
+        let batch_err = batch_result["isError"].as_bool().unwrap_or(false);
+        assert!(
+            !batch_err,
+            "served batch_place_components failed: {batch_resp:?}"
+        );
+
+        let committed = std::fs::read_to_string(&sch_path).unwrap();
+        assert_eq!(
+            committed
+                .matches("(property private \"KLC_S3.3\" \"The rectangle is not a symbol body\"")
+                .count(),
+            3,
+            "expected 1 lib_symbols + 2 placed instances for KLC_S3.3: {committed}"
+        );
+        assert_eq!(
+            committed
+                .matches("(property private \"KLC_S4.1\" \"Some pins are on 50mil grid\"")
+                .count(),
+            3,
+            "expected 1 lib_symbols + 2 placed instances for KLC_S4.1: {committed}"
+        );
+        assert_eq!(
+            committed
+                .matches("(property \"private\" \"literal-value\"")
+                .count(),
+            3,
+            "quoted \"private\" field name must stay non-private: {committed}"
+        );
     }
 }
 
