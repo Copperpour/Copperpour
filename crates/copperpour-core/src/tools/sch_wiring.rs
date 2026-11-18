@@ -1893,7 +1893,24 @@ async fn handle_split_wire_at_point(
         }
     };
 
-    // Delete the original wire and insert two halves + junction. Not through
+    // A dot only where the point is a T and has none (#570): KiCad keeps a
+    // second dot, or one where only the halves meet, and reports neither. A T
+    // is a wire end or exit at the point. Where none is, a dot would only join
+    // a wire crossing there, which is apart from this one. The wire through
+    // the point is two exits, as its halves will be.
+    let exits = crate::tools::junction_exit_points(&tree);
+    let at_point =
+        |x: f64, y: f64| copperpour_sexp::geometry::points_coincident(px, py, x, y, TOLERANCE);
+    let dotted = copperpour_sexp::schematic::extract_junctions(&tree)
+        .iter()
+        .any(|&(x, y)| at_point(x, y));
+    let tee = exits.iter().any(|&(x, y)| at_point(x, y))
+        || wires
+            .iter()
+            .any(|o| at_point(o.x1, o.y1) || at_point(o.x2, o.y2));
+    let add_junction = !dotted && tee && wire_end_needs_junction(&wires, &exits, px, py, TOLERANCE);
+
+    // Delete the original wire and insert two halves and that dot. Not through
     // `handle_delete_wire`: the two halves cover the same segment, so the
     // wire's junctions stay justified and must not be pruned in between.
     let block = match &w.uuid {
@@ -1911,7 +1928,11 @@ async fn handle_split_wire_at_point(
 
     let w1 = format_wire(w.x1, w.y1, px, py);
     let w2 = format_wire(px, py, w.x2, w.y2);
-    let junc = format_junction(px, py);
+    let junc = if add_junction {
+        format_junction(px, py)
+    } else {
+        String::new()
+    };
     let insert = format!("{w1}{w2}{junc}");
     let new_content = insert_before_close(&content, &insert);
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
@@ -1919,7 +1940,8 @@ async fn handle_split_wire_at_point(
     Ok(CallToolResult::json(&json!({
         "split_at": { "x": px, "y": py },
         "wire_a": { "x1": w.x1, "y1": w.y1, "x2": px, "y2": py },
-        "wire_b": { "x1": px, "y1": py, "x2": w.x2, "y2": w.y2 }
+        "wire_b": { "x1": px, "y1": py, "x2": w.x2, "y2": w.y2 },
+        "junctions_added_count": usize::from(add_junction)
     })))
 }
 
@@ -6215,9 +6237,10 @@ mod wire_delete_tests {
         .unwrap();
         assert!(!result.is_error);
 
+        // Only the two halves meet at the split point, so it gets no dot (#570).
         let mut juncs = junctions_in(&path);
         juncs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        assert_eq!(juncs, vec![(25.4, 25.4), (63.5, 50.8), (68.58, 50.8)]);
+        assert_eq!(juncs, vec![(25.4, 25.4), (63.5, 50.8)]);
     }
 
     #[tokio::test]
@@ -6246,7 +6269,7 @@ mod wire_delete_tests {
         let parsed = copperpour_sexp::parse_sexp(&after).unwrap();
         let wires = extract_wires(&parsed);
         assert_eq!(wires.len(), 2);
-        assert!(after.contains("(junction"));
+        assert!(!after.contains("(junction"));
         assert!(!wires.iter().any(|wire| wire.x1 == 0.0 && wire.x2 == 10.0));
     }
 }
@@ -7783,7 +7806,8 @@ mod wire_end_junction_tests {
     //! #897: a dot where three or more wire exits meet at a wire end. The
     //! expected dots are KiCad's rule (`JUNCTION_HELPERS::AnalyzePoint`),
     //! corroborated by its demo corpus; see the fixture README. #136: a move
-    //! and a wire delete judge their dots by the same count.
+    //! and a wire delete judge their dots by the same count. #570: so does a
+    //! split.
     use super::*;
     use crate::router::ToolRouter;
     use crate::tools::ServerConfig;
@@ -7805,6 +7829,16 @@ mod wire_end_junction_tests {
     /// A `connect_passthrough` case: its name, the wires drawn first, the
     /// stub's direction from `T`, and the dots KiCad would draw.
     type StubCase = (&'static str, Vec<Segment>, &'static str, Vec<(f64, f64)>);
+    /// A `split_wire_at_point` case: its name, the wires drawn, whether their
+    /// dot is taken out, the split point, the dots after, and how many it adds.
+    type SplitCase = (
+        &'static str,
+        Vec<Segment>,
+        bool,
+        (f64, f64),
+        Vec<(f64, f64)>,
+        usize,
+    );
 
     fn cases() -> Vec<Case> {
         vec![
@@ -8331,6 +8365,101 @@ mod wire_end_junction_tests {
             .await;
             assert_eq!(text, "Wire deleted.", "{case}");
             assert_dots(case, &file(&path), &[(x, y)]);
+        }
+    }
+
+    /// #570: a split dots its point only where it is a T with no dot, and
+    /// counts the dot it writes. The two halves are two exits, as the wire
+    /// through the point was. A bare crossing stays apart: the halves end
+    /// mid-span on the other wire, which a dot would join. A T on a crossing
+    /// gets its dot, as `add_wire` gives it one.
+    #[tokio::test]
+    async fn split_wire_at_point_dots_only_a_point_that_needs_one() {
+        let handler = served().await;
+        let rail = ((101.6, 101.6), (127.0, 101.6));
+        let branch = (T, (114.3, 88.9));
+        let crossing = ((114.3, 88.9), (114.3, 114.3));
+        let diagonal = (T, (124.46, 91.44));
+        let through_pin_1 = ((139.7, 97.79), (165.1, 97.79));
+        let cases: [SplitCase; 8] = [
+            (
+                "mid-span, nothing else there",
+                vec![rail],
+                false,
+                T,
+                vec![],
+                0,
+            ),
+            (
+                "a T's through wire",
+                vec![rail, branch],
+                false,
+                T,
+                vec![T],
+                0,
+            ),
+            (
+                "a T with its dot taken out",
+                vec![rail, branch],
+                true,
+                T,
+                vec![T],
+                1,
+            ),
+            (
+                "a collinear wire ending at the point",
+                vec![rail, (T, (139.7, 101.6))],
+                false,
+                T,
+                vec![],
+                0,
+            ),
+            ("a bare crossing", vec![rail, crossing], false, T, vec![], 0),
+            (
+                "a T on a crossing with its dot taken out",
+                vec![rail, crossing, diagonal],
+                true,
+                T,
+                vec![T],
+                1,
+            ),
+            (
+                "a wire through pin 1",
+                vec![through_pin_1],
+                false,
+                PIN_1,
+                vec![PIN_1],
+                0,
+            ),
+            (
+                "a wire through pin 1 with its dot taken out",
+                vec![through_pin_1],
+                true,
+                PIN_1,
+                vec![PIN_1],
+                1,
+            ),
+        ];
+        for (case, wires, undotted, (x, y), dots, added) in cases {
+            let (_dir, path) = sheet();
+            draw(&handler, &path, &wires).await;
+            if undotted {
+                take_out_the_dot(&path);
+            }
+
+            let text = call(
+                &handler,
+                "split_wire_at_point",
+                &path,
+                json!({ "x": x, "y": y }),
+            )
+            .await;
+            let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["junctions_added_count"], json!(added), "{case}");
+            let after = file(&path);
+            assert_dots(case, &after, &dots);
+            let split = extract_wires(&parse_sexp(&after).unwrap());
+            assert_eq!(split.len(), wires.len() + 1, "{case}");
         }
     }
 }
