@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 enum NetReply {
     Normal,
     Malformed,
+    WrongType,
     Empty,
     Missing,
 }
@@ -47,9 +48,15 @@ fn metadata_reply(
     );
     if command.type_url.ends_with("GetNets") && matches!(net_reply, NetReply::Malformed) {
         return Some(prost_types::Any {
-            type_url: "malformed.net.evidence".into(),
+            type_url: "type.googleapis.com/kiapi.board.commands.NetsResponse".into(),
             value: vec![0xff],
         });
+    }
+    if command.type_url.ends_with("GetNets") && matches!(net_reply, NetReply::WrongType) {
+        return Some(pack_any(
+            &kiapi::common::commands::EndCommitResponse {},
+            "kiapi.common.commands.EndCommitResponse",
+        ));
     }
     if command.type_url.ends_with("GetNets") && matches!(net_reply, NetReply::Empty) {
         return Some(pack_any(
@@ -353,6 +360,16 @@ async fn evidence_failure(net_reply: NetReply, empty_layers: bool, message: &str
     assert_eq!(store.items, items);
     assert_eq!(std::fs::read(&scene.board).unwrap(), before);
 }
+#[tokio::test]
+async fn routing_wrong_type_net_payload_never_sends_a_write() {
+    evidence_failure(
+        NetReply::WrongType,
+        false,
+        "unexpected GetNets response type",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn routing_preflight_requires_a_net_response_body() {
     evidence_failure(NetReply::Missing, false, "no GetNets response payload").await;

@@ -32,6 +32,35 @@ fn ok_response() -> kiapi::common::ApiResponse {
     }
 }
 
+#[test]
+fn get_nets_distinguishes_a_typed_empty_list_from_an_unrelated_empty_reply() {
+    for kind in [
+        "kiapi.board.commands.NetsResponse",
+        "kiapi.common.commands.EndCommitResponse",
+    ] {
+        let mock = spawn_mock(move |request| {
+            let command = request.message.unwrap();
+            if command.type_url.ends_with("GetOpenDocuments") {
+                return Some(open_board_response());
+            }
+            assert!(command.type_url.ends_with("GetNets"));
+            Some(reply_with(builders::pack_any(
+                &kiapi::board::commands::NetsResponse::default(),
+                kind,
+            )))
+        });
+        let result = KiCadIpcClient::new(&mock.url).get_nets();
+        if kind.ends_with("NetsResponse") {
+            assert!(result.unwrap().is_empty());
+        } else {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected GetNets response type"));
+        }
+    }
+}
+
 fn reply_with(inner: prost_types::Any) -> kiapi::common::ApiResponse {
     kiapi::common::ApiResponse {
         message: Some(inner),
@@ -683,8 +712,15 @@ fn place_footprint_sends_graphics_children() {
             )))
         } else {
             assert!(message.type_url.ends_with("CreateItems"));
-            let create =
+            let mut create =
                 kiapi::common::commands::CreateItems::decode(message.value.as_slice()).unwrap();
+            let item = &mut create.items[0];
+            let mut footprint =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            footprint.id = Some(kiapi::common::types::Kiid {
+                value: "placed-footprint".into(),
+            });
+            *item = builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
             let created_items = create
                 .items
                 .iter()
@@ -790,6 +826,97 @@ fn place_footprint_sends_graphics_children() {
     assert_eq!(pads_sent, 1, "pad child missing");
     assert_eq!(shapes_sent, 2, "courtyard rect + silk line must be sent");
     assert_eq!(texts_sent, 1, "fab text must be sent");
+}
+
+#[test]
+fn footprint_placement_does_not_accept_a_matching_pose_under_another_kiid() {
+    assert_unverified_footprint_creation(
+        |footprint| footprint.id.as_mut().unwrap().value = "replacement".into(),
+        "readback does not list the created footprint KIID",
+    );
+}
+
+#[test]
+fn footprint_placement_does_not_accept_an_omitted_zero_angle() {
+    assert_unverified_footprint_creation(
+        |footprint| footprint.orientation = None,
+        "footprint has no readable orientation",
+    );
+}
+
+#[test]
+fn footprint_placement_does_not_accept_a_changed_reference_or_pose() {
+    assert_unverified_footprint_creation(
+        |footprint| footprint.reference_field = None,
+        "readback has an unexpected footprint reference",
+    );
+    assert_unverified_footprint_creation(
+        |footprint| footprint.position = Some(builders::vec2(55.0, 65.0)),
+        "readback has an unexpected footprint pose",
+    );
+}
+
+fn assert_unverified_footprint_creation(
+    alter_readback: impl Fn(&mut kiapi::board::types::FootprintInstance) + Send + 'static,
+    expected_reason: &str,
+) {
+    use kiapi::common::{commands, types::ItemRequestStatus};
+    let placed = Mutex::new(None::<prost_types::Any>);
+    let mock = spawn_mock(move |request| {
+        let command = request.message.unwrap();
+        match builders::any_type_name(&command) {
+            "kiapi.common.commands.GetOpenDocuments" => Some(open_board_response()),
+            "kiapi.common.commands.GetItems" => Some(reply_with(builders::pack_any(
+                &commands::GetItemsResponse {
+                    header: None,
+                    status: ItemRequestStatus::IrsOk as i32,
+                    items: placed.lock().unwrap().iter().cloned().collect(),
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            ))),
+            "kiapi.common.commands.CreateItems" => {
+                let request = commands::CreateItems::decode(command.value.as_slice()).unwrap();
+                let mut footprint = kiapi::board::types::FootprintInstance::decode(
+                    request.items[0].value.as_slice(),
+                )
+                .unwrap();
+                let item = |footprint: &kiapi::board::types::FootprintInstance| {
+                    builders::pack_any(footprint, "kiapi.board.types.FootprintInstance")
+                };
+                footprint.id = Some(kiapi::common::types::Kiid {
+                    value: "created-kiid".into(),
+                });
+                let mut result = creation_result(commands::ItemStatusCode::IscOk, "");
+                result.item = Some(item(&footprint));
+                alter_readback(&mut footprint);
+                *placed.lock().unwrap() = Some(item(&footprint));
+                Some(reply_with(builders::pack_any(
+                    &commands::CreateItemsResponse {
+                        header: None,
+                        status: ItemRequestStatus::IrsOk as i32,
+                        created_items: vec![result],
+                    },
+                    "kiapi.common.commands.CreateItemsResponse",
+                )))
+            }
+            other => panic!("unexpected {other}"),
+        }
+    });
+    let mut sent = kicad_footprint("sent", "R1");
+    sent.orientation = Some(Default::default());
+    let item = builders::pack_any(&sent, "kiapi.board.types.FootprintInstance");
+    let error = KiCadIpcClient::new(&mock.url)
+        .place_footprint_item(&mock_board("test.kicad_pcb"), "R1", item)
+        .unwrap_err();
+    let unknown = error
+        .downcast_ref::<copperpour_ipc::client::IpcOutcomeUnknown>()
+        .unwrap();
+    assert!(
+        unknown.reason.contains("created-kiid")
+            && unknown.reason.contains("test.kicad_pcb")
+            && unknown.reason.contains(expected_reason),
+        "{unknown}"
+    );
 }
 
 #[test]
@@ -2227,11 +2354,12 @@ fn verified_trace_delete_refuses_a_non_trace_before_delete_items() {
     });
 
     let client = KiCadIpcClient::new(&mock.url);
-    let deleted = client
+    let error = client
         .delete_trace_segment_verified(&mock_board("test.kicad_pcb"), "via-or-zone")
-        .expect("a non-trace is an observed outcome, not an IPC failure");
+        .expect_err("a wrong-kind inventory is not evidence of an absent trace");
 
-    assert!(deleted.is_none());
+    let refusal = copperpour_ipc::PreflightRefusal::from_error(&error).unwrap();
+    assert!(refusal.reason.contains("unexpected inventory item type"));
     assert!(!*delete_was_sent.lock().unwrap());
 }
 
@@ -2367,7 +2495,177 @@ fn verified_trace_delete_refuses_success_when_readback_still_contains_the_segmen
         .unwrap_err()
         .to_string();
 
-    assert!(error.contains("read-back still reports it"), "{error}");
+    assert!(
+        error.contains("trace is still present") && error.contains("segment-1"),
+        "{error}"
+    );
+}
+
+#[test]
+fn footprint_delete_distinguishes_a_failed_second_lookup_from_absence() {
+    use kiapi::common::{commands, types::ItemRequestStatus};
+    for (valid_before, valid_after, deletes_expected) in
+        [(true, true, 1), (true, false, 1), (false, true, 0)]
+    {
+        let deletes = Arc::new(Mutex::new(0));
+        let calls = deletes.clone();
+        let mock = spawn_mock(move |request| {
+            let command = request.message.unwrap();
+            match builders::any_type_name(&command) {
+                "kiapi.common.commands.GetOpenDocuments" => Some(open_board_response()),
+                "kiapi.common.commands.GetItems" => {
+                    let after = *calls.lock().unwrap() > 0;
+                    if !(if after { valid_after } else { valid_before }) {
+                        return Some(ok_response());
+                    }
+                    Some(reply_with(builders::pack_any(
+                        &commands::GetItemsResponse {
+                            header: None,
+                            status: ItemRequestStatus::IrsOk as i32,
+                            items: if after {
+                                vec![]
+                            } else {
+                                vec![builders::pack_any(
+                                    &kicad_footprint("original-kiid", "R1"),
+                                    "kiapi.board.types.FootprintInstance",
+                                )]
+                            },
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    )))
+                }
+                "kiapi.common.commands.DeleteItems" => {
+                    let delete = commands::DeleteItems::decode(command.value.as_slice()).unwrap();
+                    assert_eq!(delete.item_ids[0].value, "original-kiid");
+                    *calls.lock().unwrap() += 1;
+                    Some(reply_with(builders::pack_any(
+                        &commands::DeleteItemsResponse {
+                            status: ItemRequestStatus::IrsOk as i32,
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.DeleteItemsResponse",
+                    )))
+                }
+                other => panic!("unexpected {other}"),
+            }
+        });
+        let result = KiCadIpcClient::new(&mock.url).delete_footprint("R1");
+        assert_eq!(*deletes.lock().unwrap(), deletes_expected);
+        match (valid_before, valid_after) {
+            (true, true) => result.unwrap(),
+            (false, _) => {
+                let error = result.unwrap_err();
+                let refusal = copperpour_ipc::PreflightRefusal::from_error(&error).unwrap();
+                assert!(refusal.reason.contains("no delete was sent"), "{error:#}");
+            }
+            (true, false) => {
+                let error = result.unwrap_err();
+                let unknown = error
+                    .downcast_ref::<copperpour_ipc::client::IpcOutcomeUnknown>()
+                    .unwrap();
+                assert!(
+                    unknown.reason.contains("original-kiid")
+                        && unknown.reason.contains("test.kicad_pcb")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn footprint_delete_preserves_kicads_inventory_rejection_without_sending_delete() {
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let observed = commands.clone();
+    let mock = spawn_mock(move |request| {
+        let command = request.message.unwrap();
+        let name = builders::any_type_name(&command);
+        observed.lock().unwrap().push(name.to_owned());
+        match name {
+            "kiapi.common.commands.GetOpenDocuments" => Some(open_board_response()),
+            "kiapi.common.commands.GetItems" => {
+                Some(unsupported_response(kiapi::common::ApiStatusCode::AsBusy))
+            }
+            other => panic!("unexpected command {other}"),
+        }
+    });
+    let error = KiCadIpcClient::new(&mock.url)
+        .delete_footprint("R1")
+        .unwrap_err();
+    let status = copperpour_ipc::client::ApiStatusError::from_error(&error).unwrap();
+    assert_eq!(status.code, kiapi::common::ApiStatusCode::AsBusy as i32);
+    let classified = copperpour_ipc::IpcFailure::from_error(error);
+    let copperpour_ipc::IpcFailure::Preflight(refusal) = classified else {
+        panic!("expected a preflight refusal, got {classified:?}");
+    };
+    assert_eq!(refusal.kicad_status.as_deref(), Some("AS_BUSY"));
+    assert!(refusal.reason.contains("no delete was sent"), "{refusal:?}");
+    assert_eq!(
+        *commands.lock().unwrap(),
+        [
+            "kiapi.common.commands.GetOpenDocuments",
+            "kiapi.common.commands.GetItems"
+        ]
+    );
+}
+
+#[test]
+fn footprint_delete_checks_the_original_kiid_not_the_reference() {
+    use kiapi::common::{commands, types::ItemRequestStatus};
+    for (id, reference, absent) in [("original", "R2", false), ("replacement", "R1", true)] {
+        let deletes = Arc::new(Mutex::new(0));
+        let observed = deletes.clone();
+        let mock = spawn_mock(move |request| {
+            let command = request.message.unwrap();
+            match builders::any_type_name(&command) {
+                "kiapi.common.commands.GetOpenDocuments" => Some(open_board_response()),
+                "kiapi.common.commands.GetItems" => {
+                    let (id, reference) = if *observed.lock().unwrap() == 0 {
+                        ("original", "R1")
+                    } else {
+                        (id, reference)
+                    };
+                    Some(reply_with(builders::pack_any(
+                        &commands::GetItemsResponse {
+                            status: ItemRequestStatus::IrsOk as i32,
+                            items: vec![builders::pack_any(
+                                &kicad_footprint(id, reference),
+                                "kiapi.board.types.FootprintInstance",
+                            )],
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    )))
+                }
+                "kiapi.common.commands.DeleteItems" => {
+                    let delete = commands::DeleteItems::decode(command.value.as_slice()).unwrap();
+                    assert_eq!(delete.item_ids[0].value, "original");
+                    *observed.lock().unwrap() += 1;
+                    Some(reply_with(builders::pack_any(
+                        &commands::DeleteItemsResponse {
+                            status: ItemRequestStatus::IrsOk as i32,
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.DeleteItemsResponse",
+                    )))
+                }
+                other => panic!("unexpected {other}"),
+            }
+        });
+        let result = KiCadIpcClient::new(&mock.url).delete_footprint("R1");
+        assert_eq!(*deletes.lock().unwrap(), 1);
+        if absent {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            let unknown = error
+                .downcast_ref::<copperpour_ipc::client::IpcOutcomeUnknown>()
+                .unwrap();
+            assert!(
+                unknown.reason.contains("original") && unknown.reason.contains("still present"),
+                "{unknown}"
+            );
+        }
+    }
 }
 
 #[test]

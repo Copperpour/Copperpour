@@ -597,6 +597,25 @@ fn accepted_update_without_matching_readback_is_uncertain() {
     ));
 }
 
+#[test]
+fn accepted_move_with_stale_anchor_is_uncertain() {
+    let (mock, captured) =
+        spawn_footprints_mock_with_behavior(vec![mk_footprint_r1()], UpdateBehavior::Ignore);
+    let client = KiCadIpcClient::new(&mock.url);
+    let error = client
+        .move_footprint_verified_in(model_document(&client), "R1", 50.0, 50.0)
+        .unwrap_err();
+    assert!(captured.lock().unwrap().is_some());
+    let unknown = error
+        .downcast_ref::<copperpour_ipc::client::IpcOutcomeUnknown>()
+        .unwrap();
+    assert!(
+        unknown.reason.contains("r1-kiid")
+            && unknown.reason.contains("unexpected footprint position"),
+        "{unknown}"
+    );
+}
+
 fn placement(reference: &str) -> copperpour_ipc::types::IpcFootprintPlacement {
     copperpour_ipc::types::IpcFootprintPlacement {
         reference: reference.to_string(),

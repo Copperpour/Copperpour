@@ -1642,6 +1642,11 @@ mod delete_trace_tests {
         assert_eq!(body["error"]["kind"], "ipc_outcome_unknown", "{body}");
         assert_eq!(body["recovery"]["mutation_outcome"], "unknown");
         assert_eq!(body["recovery"]["retry_safe"], false);
+        let text = body["error"]["reason"].as_str().unwrap();
+        assert!(
+            text.contains("segment-1") && text.contains("target.kicad_pcb"),
+            "{text}"
+        );
     }
 }
 
@@ -1720,6 +1725,39 @@ mod via_tests {
         assert_eq!(body["uuid"], json!("created-1"));
         assert_eq!(body["source"], json!("ipc_readback"));
         assert_eq!(store.lock().unwrap().items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_via_with_matching_net_at_wrong_position_is_uncertain() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec!["", "GND"],
+            store.clone(),
+            |item| {
+                let mut settled = via_of(item);
+                settled.position = Some(copperpour_ipc::builders::vec2(3.0, 4.0));
+                *item = copperpour_ipc::builders::pack_any(&settled, "kiapi.board.types.Via");
+            },
+            |_, _| None,
+        );
+        let result = handle_add_via(
+            &json!({ "board": board, "net_name": "GND", "x": 1.0, "y": 2.0 }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        let body = body(&result);
+        assert_eq!(body["error"]["kind"], "ipc_outcome_unknown", "{body}");
+        let reason = body["error"]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("created-1") && reason.contains("unexpected via position"),
+            "{body}"
+        );
+        let held = store.lock().unwrap();
+        assert_eq!((held.creates, held.deletes), (1, 0));
     }
 
     #[tokio::test]
@@ -1848,6 +1886,90 @@ mod via_tests {
     }
 
     #[tokio::test]
+    async fn wrong_type_via_inventory_refuses_before_delete() {
+        use kiapi::common::{commands, types::ItemRequestStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let original = std::fs::read(&board).unwrap();
+        let target = via("target-via", "GND", 1.0, 2.0);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![target],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec![],
+            store.clone(),
+            |_| {},
+            |command, held| {
+                command.type_url.ends_with("GetItems").then(|| {
+                    copperpour_ipc::builders::pack_any(
+                        &commands::GetItemsResponse {
+                            status: ItemRequestStatus::IrsOk as i32,
+                            items: held.items.clone(),
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.UnrelatedResponse",
+                    )
+                })
+            },
+        );
+        let result = handle_delete_via(
+            &json!({"board": board, "uuid": "target-via"}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        let body = body(&result);
+        assert_eq!(body["recovery"]["cause"], "preflight_refusal", "{body}");
+        assert_eq!(body["recovery"]["mutation_outcome"], "none", "{body}");
+        assert_eq!(store.lock().unwrap().deletes, 0);
+        assert_eq!(std::fs::read(&board).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn wrong_type_via_inventory_does_not_prove_deletion() {
+        use kiapi::common::{commands, types::ItemRequestStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![via("target-via", "GND", 1.0, 2.0)],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec![],
+            store.clone(),
+            |_| {},
+            |command, held| {
+                (command.type_url.ends_with("GetItems") && held.deletes > 0).then(|| {
+                    copperpour_ipc::builders::pack_any(
+                        &commands::GetItemsResponse {
+                            status: ItemRequestStatus::IrsOk as i32,
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.UnrelatedResponse",
+                    )
+                })
+            },
+        );
+        let result = handle_delete_via(
+            &json!({"board": board, "uuid": "target-via"}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        let body = body(&result);
+        assert_eq!(body["error"]["kind"], "ipc_outcome_unknown", "{body}");
+        let reason = body["error"]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("target-via") && reason.contains("target.kicad_pcb"),
+            "{body}"
+        );
+        assert_eq!(store.lock().unwrap().deletes, 1);
+    }
+
+    #[tokio::test]
     async fn move_via_moves_a_via_and_reads_back_its_position() {
         let dir = tempfile::tempdir().unwrap();
         let board = board_file(&dir);
@@ -1879,6 +2001,41 @@ mod via_tests {
             held.position,
             Some(copperpour_ipc::builders::vec2(5.0, 6.0))
         );
+    }
+
+    #[tokio::test]
+    async fn moved_via_at_destination_without_net_is_uncertain() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![via("v-1", "GND", 1.0, 2.0)],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec![],
+            store.clone(),
+            |item| {
+                let mut settled = via_of(item);
+                settled.net = None;
+                *item = copperpour_ipc::builders::pack_any(&settled, "kiapi.board.types.Via");
+            },
+            |_, _| None,
+        );
+        let result = handle_move_via(
+            &json!({ "board": board, "uuid": "v-1", "x": 5.0, "y": 6.0 }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        let body = body(&result);
+        assert_eq!(body["error"]["kind"], "ipc_outcome_unknown", "{body}");
+        let reason = body["error"]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("v-1") && reason.contains("no via net"),
+            "{body}"
+        );
+        assert_eq!(store.lock().unwrap().updates, 1);
     }
 
     #[tokio::test]

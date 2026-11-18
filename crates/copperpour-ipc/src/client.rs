@@ -517,6 +517,21 @@ fn unpack_required<M: Message + Default>(
     unpack_any(&response)
 }
 
+fn unpack_typed<M: Message + Default>(
+    response: Option<prost_types::Any>,
+    command: &str,
+    expected: &str,
+) -> Result<M> {
+    let response =
+        response.with_context(|| format!("KiCad returned no {command} response payload"))?;
+    anyhow::ensure!(
+        crate::builders::any_is(&response, expected),
+        "unexpected {command} response type {}",
+        response.type_url
+    );
+    unpack_any(&response)
+}
+
 /// What one per-item result of `CreateItems` says: KiCad's status code, and
 /// whether the item counts as created.
 ///
@@ -1304,15 +1319,30 @@ impl std::fmt::Display for IpcOutcomeUnknown {
 
 impl std::error::Error for IpcOutcomeUnknown {}
 
-fn verify_after_write<T>(command: &str, result: Result<T>) -> Result<T> {
+fn verify_after_write<T>(
+    command: &str,
+    document: &kiapi::common::types::DocumentSpecifier,
+    target: &str,
+    result: Result<T>,
+) -> Result<T> {
     result.map_err(|error| {
-        let reason = format!("KiCad accepted the write, but readback failed: {error:#}");
         IpcOutcomeUnknown {
             command: command.into(),
-            reason,
+            reason: format!(
+                "{target} on {:?}: KiCad accepted the write, but readback failed: {error:#}",
+                board_document_path(document)
+            ),
         }
         .into()
     })
+}
+
+fn delete_inventory_refusal(error: anyhow::Error) -> anyhow::Error {
+    let refusal = PreflightRefusal::check_incomplete(
+        "Cannot verify the deletion target; no delete was sent",
+        &error,
+    );
+    error.context(refusal)
 }
 
 #[derive(Debug)]
@@ -2373,9 +2403,10 @@ impl KiCadIpcClient {
             board: Some(doc),
             netclass_filter: vec![],
         };
-        let resp: kiapi::board::commands::NetsResponse = unpack_required(
+        let resp: kiapi::board::commands::NetsResponse = unpack_typed(
             self.send_command(&cmd, "kiapi.board.commands.GetNets")?,
             "GetNets",
+            "kiapi.board.commands.NetsResponse",
         )?;
         Ok(resp
             .nets
@@ -2576,6 +2607,48 @@ impl KiCadIpcClient {
         self.send_command(&cmd, "kiapi.common.commands.GetItems")
     }
 
+    fn read_item_inventory<M: Message + Default>(
+        &self,
+        document: &kiapi::common::types::DocumentSpecifier,
+        kind: kiapi::common::types::KiCadObjectType,
+        expected: &str,
+        kiid: impl Fn(&M) -> Option<&kiapi::common::types::Kiid>,
+    ) -> Result<std::collections::BTreeMap<String, M>> {
+        let reply = self.get_items_response_in(document.clone(), &[kind])?;
+        let response: kiapi::common::commands::GetItemsResponse =
+            unpack_typed(reply, "GetItems", "kiapi.common.commands.GetItemsResponse")?;
+        ensure_item_request_ok(response.status, "item retrieval")?;
+        if let Some(observed) = response.header.and_then(|header| header.document) {
+            anyhow::ensure!(
+                &observed == document
+                    || matches!(
+                        (board_document_path(&observed), board_document_path(document)),
+                        (Some(observed), Some(expected)) if observed == expected
+                    ),
+                "GetItems response names a different board"
+            );
+        }
+        let mut inventory = std::collections::BTreeMap::new();
+        for item in response.items {
+            anyhow::ensure!(
+                crate::builders::any_is(&item, expected),
+                "unexpected inventory item type {}",
+                item.type_url
+            );
+            let item = unpack_any(&item)?;
+            let id = kiid(&item)
+                .map(|id| id.value.as_str())
+                .filter(|id| !id.is_empty())
+                .with_context(|| format!("{expected} has no readable KIID"))?;
+            anyhow::ensure!(
+                !inventory.contains_key(id),
+                "duplicate KIID '{id}' in inventory"
+            );
+            inventory.insert(id.to_owned(), item);
+        }
+        Ok(inventory)
+    }
+
     /// The items carrying `ids` on one exact open board, as KiCad holds
     /// them, through `GetItemsById`.
     ///
@@ -2629,50 +2702,77 @@ impl KiCadIpcClient {
         &self,
         document: kiapi::common::types::DocumentSpecifier,
     ) -> Result<Vec<IpcFootprint>> {
-        let items = self.get_items_in(
-            document,
-            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
-        )?;
+        self.read_footprints_in(document, None)
+    }
+
+    fn read_footprints_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        created_id: Option<&str>,
+    ) -> Result<Vec<IpcFootprint>> {
+        let kind = kiapi::common::types::KiCadObjectType::KotPcbFootprint;
+        let items: Vec<kiapi::board::types::FootprintInstance> = if let Some(id) = created_id {
+            let mut inventory = self.read_item_inventory(
+                &document,
+                kind,
+                "kiapi.board.types.FootprintInstance",
+                |fp: &kiapi::board::types::FootprintInstance| fp.id.as_ref(),
+            )?;
+            vec![inventory
+                .remove(id)
+                .context("readback does not list the created footprint KIID")?]
+        } else {
+            self.get_items_in(document, kind)?
+                .into_iter()
+                .filter_map(|item| unpack_any(&item).ok())
+                .collect()
+        };
         let mut footprints = Vec::new();
-        for item in &items {
-            if let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) {
-                let pos = fp.position.as_ref();
-                let ref_text = fp
-                    .reference_field
+        for fp in items {
+            anyhow::ensure!(
+                created_id.is_none() || fp.position.is_some(),
+                "footprint has no readable position"
+            );
+            anyhow::ensure!(
+                created_id.is_none() || fp.orientation.is_some(),
+                "footprint has no readable orientation"
+            );
+            let pos = fp.position.as_ref();
+            let ref_text = fp
+                .reference_field
+                .as_ref()
+                .and_then(|f| f.text.as_ref())
+                .and_then(|bt| bt.text.as_ref())
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
+            let val_text = fp
+                .value_field
+                .as_ref()
+                .and_then(|f| f.text.as_ref())
+                .and_then(|bt| bt.text.as_ref())
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
+            let lib_id = fp
+                .definition
+                .as_ref()
+                .and_then(|d| d.id.as_ref())
+                .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
+                .unwrap_or_default();
+            footprints.push(IpcFootprint {
+                reference: ref_text,
+                value: val_text,
+                footprint: lib_id,
+                position: IpcVector2 {
+                    x: pos.map(|p| nm_to_mm(p.x_nm)).unwrap_or(0.0),
+                    y: pos.map(|p| nm_to_mm(p.y_nm)).unwrap_or(0.0),
+                },
+                rotation: fp
+                    .orientation
                     .as_ref()
-                    .and_then(|f| f.text.as_ref())
-                    .and_then(|bt| bt.text.as_ref())
-                    .map(|t| t.text.clone())
-                    .unwrap_or_default();
-                let val_text = fp
-                    .value_field
-                    .as_ref()
-                    .and_then(|f| f.text.as_ref())
-                    .and_then(|bt| bt.text.as_ref())
-                    .map(|t| t.text.clone())
-                    .unwrap_or_default();
-                let lib_id = fp
-                    .definition
-                    .as_ref()
-                    .and_then(|d| d.id.as_ref())
-                    .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
-                    .unwrap_or_default();
-                footprints.push(IpcFootprint {
-                    reference: ref_text,
-                    value: val_text,
-                    footprint: lib_id,
-                    position: IpcVector2 {
-                        x: pos.map(|p| nm_to_mm(p.x_nm)).unwrap_or(0.0),
-                        y: pos.map(|p| nm_to_mm(p.y_nm)).unwrap_or(0.0),
-                    },
-                    rotation: fp
-                        .orientation
-                        .as_ref()
-                        .map(|a| a.value_degrees)
-                        .unwrap_or(0.0),
-                    layer: layer_enum_to_name(fp.layer).to_string(),
-                });
-            }
+                    .map(|a| a.value_degrees)
+                    .unwrap_or(0.0),
+                layer: layer_enum_to_name(fp.layer).to_string(),
+            });
         }
         Ok(footprints)
     }
@@ -2748,9 +2848,9 @@ impl KiCadIpcClient {
             let (code, is_created) = creation_outcome(result);
             if is_created {
                 created += 1;
-                // KiCad echoes the created item back with the KIID it
-                // assigned. It is allowed to omit it (an IscOk with no item),
-                // so this is best-effort and never gates success.
+                // An IscOk result may omit the echoed item. The create
+                // acknowledgement still counts it; callers that verify the
+                // assigned KIID must check the returned items separately.
                 if let Some(item) = result.item.clone() {
                     created_items.push(item);
                 }
@@ -3524,34 +3624,6 @@ impl KiCadIpcClient {
         Ok(())
     }
 
-    /// Find a footprint's KIID by reference.
-    fn find_footprint_kiid(&self, reference: &str) -> Result<String> {
-        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
-        for item in &items {
-            if let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) {
-                let ref_text = fp
-                    .reference_field
-                    .as_ref()
-                    .and_then(|f| f.text.as_ref())
-                    .and_then(|bt| bt.text.as_ref())
-                    .map(|t| t.text.as_str())
-                    .unwrap_or("");
-                if ref_text == reference {
-                    if let Some(id) = &fp.id {
-                        return Ok(id.value.clone());
-                    }
-                }
-            }
-        }
-        Err(PreflightRefusal::new(
-            PreflightCause::MissingReferences {
-                references: vec![reference.to_owned()],
-            },
-            format!("Footprint '{reference}' not found on board"),
-        )
-        .into())
-    }
-
     /// Add a track segment to the board.
     #[allow(clippy::too_many_arguments)]
     pub fn add_track(
@@ -3686,21 +3758,28 @@ impl KiCadIpcClient {
         uuid: &str,
     ) -> Result<Option<IpcTrack>> {
         let document = self.find_open_board(requested)?;
-        let before = self.get_tracks_in(document.clone(), None, None)?;
+        let before = self
+            .read_tracks_in(document.clone(), None, None, true)
+            .map_err(delete_inventory_refusal)?;
         let Some(track) = before.into_iter().find(|track| track.uuid == uuid) else {
             return Ok(None);
         };
 
         self.delete_items_in(document.clone(), vec![uuid.to_string()])?;
-        let remains = verify_after_write("DeleteItems", self.get_tracks_in(document, None, None))?
-            .into_iter()
-            .any(|candidate| candidate.uuid == uuid);
-        if remains {
-            anyhow::bail!(
-                "KiCad accepted deletion of trace segment '{}' but read-back still reports it",
-                uuid
+        let readback = (|| {
+            let tracks = self.read_tracks_in(document.clone(), None, None, true)?;
+            anyhow::ensure!(
+                !tracks.iter().any(|track| track.uuid == uuid),
+                "trace is still present"
             );
-        }
+            Ok(())
+        })();
+        verify_after_write(
+            "DeleteItems",
+            &document,
+            &format!("trace '{uuid}'"),
+            readback,
+        )?;
         Ok(Some(track))
     }
 
@@ -3796,76 +3875,153 @@ impl KiCadIpcClient {
         net_filter: Option<&str>,
         layer_filter: Option<&str>,
     ) -> Result<Vec<IpcTrack>> {
-        let items =
-            self.get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbTrace)?;
+        self.read_tracks_in(document, net_filter, layer_filter, false)
+    }
+
+    fn read_tracks_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        net_filter: Option<&str>,
+        layer_filter: Option<&str>,
+        strict: bool,
+    ) -> Result<Vec<IpcTrack>> {
+        let kind = kiapi::common::types::KiCadObjectType::KotPcbTrace;
+        let items = if strict {
+            self.read_item_inventory::<kiapi::board::types::Track>(
+                &document,
+                kind,
+                "kiapi.board.types.Track",
+                |track| track.id.as_ref(),
+            )?
+            .into_values()
+            .collect()
+        } else {
+            self.get_items_in(document, kind)?
+                .into_iter()
+                .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Track"))
+                .filter_map(|item| unpack_any::<kiapi::board::types::Track>(&item).ok())
+                .collect::<Vec<_>>()
+        };
         let mut tracks = Vec::new();
-        for item in &items {
-            // KOT_PCB_TRACE is a family selector. KiCad may return vias or
-            // other routing members beside straight Track messages, and
-            // protobuf decoding is permissive enough to accept compatible
-            // bytes under the wrong declared type. Type-check before decode.
-            if !crate::builders::any_is(item, "kiapi.board.types.Track") {
-                continue;
+        for track in &items {
+            let net_name = track.net.as_ref().map(|n| n.name.as_str()).unwrap_or("");
+            let layer_name = layer_enum_to_name(track.layer);
+
+            // Apply net filter
+            if let Some(nf) = net_filter {
+                if net_name != nf {
+                    continue;
+                }
             }
-            if let Ok(track) = kiapi::board::types::Track::decode(item.value.as_slice()) {
-                let net_name = track.net.as_ref().map(|n| n.name.as_str()).unwrap_or("");
-                let layer_name = layer_enum_to_name(track.layer);
-
-                // Apply net filter
-                if let Some(nf) = net_filter {
-                    if net_name != nf {
-                        continue;
-                    }
+            // Apply layer filter
+            if let Some(lf) = layer_filter {
+                if layer_name != lf {
+                    continue;
                 }
-                // Apply layer filter
-                if let Some(lf) = layer_filter {
-                    if layer_name != lf {
-                        continue;
-                    }
-                }
+            }
 
-                let start = track.start.as_ref();
-                let end = track.end.as_ref();
-                let uuid = track
-                    .id
+            let start = track.start.as_ref();
+            let end = track.end.as_ref();
+            let uuid = track
+                .id
+                .as_ref()
+                .map(|id| id.value.clone())
+                .unwrap_or_default();
+            tracks.push(IpcTrack {
+                uuid,
+                net_name: net_name.to_string(),
+                layer: layer_name.to_string(),
+                width: track
+                    .width
                     .as_ref()
-                    .map(|id| id.value.clone())
-                    .unwrap_or_default();
-                tracks.push(IpcTrack {
-                    uuid,
-                    net_name: net_name.to_string(),
-                    layer: layer_name.to_string(),
-                    width: track
-                        .width
-                        .as_ref()
-                        .map(|w| crate::builders::nm_to_mm(w.value_nm))
-                        .unwrap_or(0.25),
-                    start: IpcVector2 {
-                        x: start
-                            .map(|p| crate::builders::nm_to_mm(p.x_nm))
-                            .unwrap_or(0.0),
-                        y: start
-                            .map(|p| crate::builders::nm_to_mm(p.y_nm))
-                            .unwrap_or(0.0),
-                    },
-                    end: IpcVector2 {
-                        x: end
-                            .map(|p| crate::builders::nm_to_mm(p.x_nm))
-                            .unwrap_or(0.0),
-                        y: end
-                            .map(|p| crate::builders::nm_to_mm(p.y_nm))
-                            .unwrap_or(0.0),
-                    },
-                });
-            }
+                    .map(|w| crate::builders::nm_to_mm(w.value_nm))
+                    .unwrap_or(0.25),
+                start: IpcVector2 {
+                    x: start
+                        .map(|p| crate::builders::nm_to_mm(p.x_nm))
+                        .unwrap_or(0.0),
+                    y: start
+                        .map(|p| crate::builders::nm_to_mm(p.y_nm))
+                        .unwrap_or(0.0),
+                },
+                end: IpcVector2 {
+                    x: end
+                        .map(|p| crate::builders::nm_to_mm(p.x_nm))
+                        .unwrap_or(0.0),
+                    y: end
+                        .map(|p| crate::builders::nm_to_mm(p.y_nm))
+                        .unwrap_or(0.0),
+                },
+            });
         }
         Ok(tracks)
     }
 
     /// Move a footprint to a new position.
     pub fn move_footprint(&self, reference: &str, x: f64, y: f64) -> Result<()> {
+        self.send_footprint_move_in(self.get_board_document()?, reference, x, y)
+            .map(|_| ())
+    }
+
+    /// Move one footprint and verify that KiCad holds the original KIID at the new anchor.
+    pub fn move_footprint_verified_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+        x: f64,
+        y: f64,
+    ) -> Result<IpcVector2> {
+        let sent = self.send_footprint_move_in(document.clone(), reference, x, y)?;
+        let target = format!(
+            "footprint '{reference}', KIID {:?}",
+            sent.id.as_ref().map(|id| &id.value)
+        );
+        let readback = (|| {
+            let id = sent
+                .id
+                .as_ref()
+                .map(|id| id.value.as_str())
+                .filter(|id| !id.is_empty())
+                .context("the moved footprint has no readable KIID")?;
+            let held = self
+                .read_item_inventory::<kiapi::board::types::FootprintInstance>(
+                    &document,
+                    kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+                    "kiapi.board.types.FootprintInstance",
+                    |fp| fp.id.as_ref(),
+                )?
+                .remove(id)
+                .context("readback does not list the moved footprint")?;
+            anyhow::ensure!(
+                crate::builders::footprint_reference(&held) == reference
+                    && held.layer == sent.layer
+                    && held.orientation == sent.orientation,
+                "readback has an unexpected footprint reference, layer, or rotation"
+            );
+            let position = held
+                .position
+                .context("readback has no footprint position")?;
+            anyhow::ensure!(
+                Some(position) == sent.position,
+                "readback has an unexpected footprint position"
+            );
+            Ok(point_in_mm(position))
+        })();
+        verify_after_write("UpdateItems", &document, &target, readback)
+    }
+
+    fn send_footprint_move_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+        x: f64,
+        y: f64,
+    ) -> Result<kiapi::board::types::FootprintInstance> {
         // Find the footprint, update position, send UpdateItems
-        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        let items = self.get_items_in(
+            document.clone(),
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )?;
         for item in &items {
             if let Ok(mut fp) =
                 kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
@@ -3893,8 +4049,8 @@ impl KiCadIpcClient {
                         },
                     )?;
                     let any = crate::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
-                    self.update_items(vec![any])?;
-                    return Ok(());
+                    self.update_items_in(document.clone(), vec![any])?;
+                    return Ok(fp);
                 }
             }
         }
@@ -4122,15 +4278,11 @@ impl KiCadIpcClient {
             document,
             &[kiapi::common::types::KiCadObjectType::KotPcbFootprint],
         )?;
-        let inventory = (|| -> Result<kiapi::common::commands::GetItemsResponse> {
-            let reply = reply.context("KiCad returned no GetItems response payload")?;
-            anyhow::ensure!(
-                crate::builders::any_is(&reply, "kiapi.common.commands.GetItemsResponse"),
-                "unexpected GetItems response type {}",
-                reply.type_url
-            );
-            unpack_any(&reply)
-        })()
+        let inventory: kiapi::common::commands::GetItemsResponse = unpack_typed(
+            reply,
+            "GetItems",
+            "kiapi.common.commands.GetItemsResponse",
+        )
         .map_err(|error| {
             PreflightRefusal::check_failed(format!("Cannot read footprint inventory: {error:#}"))
         })?;
@@ -4722,18 +4874,63 @@ impl KiCadIpcClient {
 
     /// Delete a footprint by reference.
     pub fn delete_footprint(&self, reference: &str) -> Result<()> {
-        let kiid = self.find_footprint_kiid(reference)?;
-        self.delete_items(vec![kiid])?;
-        // KiCad returns no per-item deletion results (#116), so the response
-        // alone cannot distinguish "deleted" from "silently skipped". Ask the
-        // board instead — reporting success without evidence is the failure
-        // mode #99 was closed to eliminate.
-        match self.find_footprint_kiid(reference) {
-            Err(_) => Ok(()),
-            Ok(_) => anyhow::bail!(
-                "KiCad reported no error but footprint '{reference}' is still on the board"
-            ),
+        self.delete_footprint_in(self.get_board_document()?, reference)
+    }
+
+    /// Delete a footprint on the bound board and verify absence by its original KIID.
+    pub fn delete_footprint_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+    ) -> Result<()> {
+        if reference.is_empty() {
+            return Err(PreflightRefusal::missing_footprint(reference).into());
         }
+        let inventory = || {
+            self.read_item_inventory::<kiapi::board::types::FootprintInstance>(
+                &document,
+                kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+                "kiapi.board.types.FootprintInstance",
+                |fp| fp.id.as_ref(),
+            )
+        };
+        let before = inventory().map_err(delete_inventory_refusal)?;
+        if before
+            .values()
+            .any(|fp| crate::builders::footprint_reference(fp).is_empty())
+        {
+            return Err(PreflightRefusal::new(
+                PreflightCause::CheckIncomplete,
+                "Footprint inventory has an unreadable reference; no delete was sent",
+            )
+            .into());
+        }
+        let mut matches = before
+            .iter()
+            .filter(|(_, fp)| crate::builders::footprint_reference(fp) == reference);
+        let (id, _) = matches
+            .next()
+            .ok_or_else(|| PreflightRefusal::missing_footprint(reference))?;
+        if matches.next().is_some() {
+            return Err(PreflightRefusal::new(
+                PreflightCause::DuplicateReference {
+                    reference: reference.to_owned(),
+                },
+                format!("footprint reference '{reference}' is ambiguous"),
+            )
+            .into());
+        }
+        self.delete_items_in(document.clone(), vec![id.clone()])?;
+        let readback = inventory().and_then(|after| {
+            anyhow::ensure!(!after.contains_key(id), "footprint is still present");
+            Ok(())
+        });
+        verify_after_write(
+            "DeleteItems",
+            &document,
+            &format!("footprint '{reference}', KIID '{id}'"),
+            readback,
+        )
     }
 
     /// Build a typed footprint item suitable for [`Self::create_items`].
@@ -5044,22 +5241,58 @@ impl KiCadIpcClient {
         reference: &str,
         item: prost_types::Any,
     ) -> Result<IpcFootprint> {
-        self.create_items_in(document.clone(), vec![item])?;
-        let footprints = verify_after_write("CreateItems", self.list_footprints_in(document))?;
-        footprints
-            .iter()
-            .find(|footprint| footprint.reference == reference)
-            .cloned()
-            .with_context(|| {
-                let references = footprints
-                    .iter()
-                    .map(|footprint| footprint.reference.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(
-                    "KiCad created the footprint but reference '{reference}' was not found (board references: {references})"
-                )
-            })
+        let sent: kiapi::board::types::FootprintInstance = unpack_any(&item)?;
+        let created = self.create_items_in_returning(document.clone(), vec![item])?;
+        let id = verify_after_write(
+            "CreateItems",
+            &document,
+            reference,
+            (|| {
+                let [item] = created.as_slice() else {
+                    anyhow::bail!("creation did not identify exactly one footprint");
+                };
+                anyhow::ensure!(
+                    crate::builders::any_is(item, "kiapi.board.types.FootprintInstance"),
+                    "creation returned an unexpected item type"
+                );
+                let footprint: kiapi::board::types::FootprintInstance = unpack_any(item)?;
+                footprint
+                    .id
+                    .map(|id| id.value)
+                    .filter(|id| !id.is_empty())
+                    .context("creation did not report the footprint KIID")
+            })(),
+        )?;
+        let readback = self
+            .read_footprints_in(document.clone(), Some(&id))
+            .and_then(|footprints| {
+                let footprint = footprints
+                    .into_iter()
+                    .next()
+                    .context("readback does not list the created footprint")?;
+                anyhow::ensure!(
+                    footprint.reference == reference,
+                    "readback has an unexpected footprint reference"
+                );
+                let expected_position =
+                    point_in_mm(sent.position.context("the placement has no position")?);
+                let expected_rotation = sent.orientation.unwrap_or_default().value_degrees;
+                let rotation_delta = (footprint.rotation - expected_rotation).rem_euclid(360.0);
+                anyhow::ensure!(
+                    footprint.position.x == expected_position.x
+                        && footprint.position.y == expected_position.y
+                        && footprint.layer == layer_enum_to_name(sent.layer)
+                        && rotation_delta.min(360.0 - rotation_delta) < 1e-9,
+                    "readback has an unexpected footprint pose"
+                );
+                Ok(footprint)
+            });
+        verify_after_write(
+            "CreateItems",
+            &document,
+            &format!("footprint '{reference}', KIID '{id}'"),
+            readback,
+        )
     }
 
     /// Measure every item of an exact open board (#688).
@@ -5524,19 +5757,14 @@ impl KiCadIpcClient {
         document: kiapi::common::types::DocumentSpecifier,
         uuid: &str,
     ) -> Result<Option<kiapi::board::types::Via>> {
-        let items =
-            self.get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbVia)?;
-        for item in &items {
-            if !crate::builders::any_is(item, "kiapi.board.types.Via") {
-                continue;
-            }
-            let via = kiapi::board::types::Via::decode(item.value.as_slice())
-                .context("KiCad returned an unreadable via")?;
-            if via.id.as_ref().map(|id| id.value.as_str()) == Some(uuid) {
-                return Ok(Some(via));
-            }
-        }
-        Ok(None)
+        Ok(self
+            .read_item_inventory::<kiapi::board::types::Via>(
+                &document,
+                kiapi::common::types::KiCadObjectType::KotPcbVia,
+                "kiapi.board.types.Via",
+                |via| via.id.as_ref(),
+            )?
+            .remove(uuid))
     }
 
     /// Add a through via on `net_name` to an exact open board, then report
@@ -5563,22 +5791,41 @@ impl KiCadIpcClient {
             document.clone(),
             vec![crate::builders::pack_any(&via, "kiapi.board.types.Via")],
         )?;
-        let kiid = created
-            .iter()
-            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Via"))
-            .find_map(|item| kiapi::board::types::Via::decode(item.value.as_slice()).ok())
-            .and_then(|via| via.id)
-            .map(|id| id.value)
-            .filter(|id| !id.is_empty())
-            .context(
-                "KiCad created the via but did not report its KIID, so the net it stored \
+        let kiid = verify_after_write(
+            "CreateItems",
+            &document,
+            &format!("via at ({x}, {y}) on net '{net_name}'"),
+            created
+                .iter()
+                .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Via"))
+                .find_map(|item| kiapi::board::types::Via::decode(item.value.as_slice()).ok())
+                .and_then(|via| via.id)
+                .map(|id| id.value)
+                .filter(|id| !id.is_empty())
+                .context(
+                    "KiCad created the via but did not report its KIID, so the net it stored \
                  cannot be read back",
-            )?;
-        let stored = verify_after_write("CreateItems", self.find_via_in(document.clone(), &kiid))?
-            .map(|via| ipc_via(&via))
-            .with_context(|| {
-                format!("KiCad created via '{kiid}' but read-back does not list it")
-            })?;
+                ),
+        )?;
+        let readback = self.find_via_in(document.clone(), &kiid).and_then(|item| {
+            let held = item.context("readback does not list the created via")?;
+            let net = held.net.as_ref().context("readback has no via net")?;
+            if net.name == net_name {
+                anyhow::ensure!(
+                    held.position == via.position,
+                    "readback has an unexpected via position"
+                );
+            } else {
+                anyhow::ensure!(held.position.is_some(), "readback has no via position");
+            }
+            Ok(ipc_via(&held))
+        });
+        let stored = verify_after_write(
+            "CreateItems",
+            &document,
+            &format!("via '{kiid}' at ({x}, {y})"),
+            readback,
+        )?;
         if stored.net_name == net_name {
             return Ok(IpcViaPlacement::Placed(stored));
         }
@@ -5601,15 +5848,18 @@ impl KiCadIpcClient {
     /// nothing was sent.
     pub fn delete_via_verified(&self, requested: &Path, uuid: &str) -> Result<Option<IpcVia>> {
         let document = self.find_open_board(requested)?;
-        let Some(via) = self.find_via_in(document.clone(), uuid)? else {
+        let Some(via) = self
+            .find_via_in(document.clone(), uuid)
+            .map_err(delete_inventory_refusal)?
+        else {
             return Ok(None);
         };
         self.delete_items_in(document.clone(), vec![uuid.to_string()])?;
-        let remains =
-            verify_after_write("DeleteItems", self.find_via_in(document, uuid))?.is_some();
-        if remains {
-            anyhow::bail!("KiCad accepted deletion of via '{uuid}' but read-back still lists it");
-        }
+        let readback = self.find_via_in(document.clone(), uuid).and_then(|held| {
+            anyhow::ensure!(held.is_none(), "via is still present");
+            Ok(())
+        });
+        verify_after_write("DeleteItems", &document, &format!("via '{uuid}'"), readback)?;
         Ok(Some(ipc_via(&via)))
     }
 
@@ -5637,21 +5887,21 @@ impl KiCadIpcClient {
             document.clone(),
             vec![crate::builders::pack_any(&moved, "kiapi.board.types.Via")],
         )?;
-        let after = verify_after_write("UpdateItems", self.find_via_in(document.clone(), uuid))?
-            .map(|via| ipc_via(&via))
-            .with_context(|| {
-                format!("KiCad accepted the move of via '{uuid}' but read-back no longer lists it")
-            })?;
-        let target = crate::builders::vec2(x, y);
-        let held = &after.position;
-        if crate::builders::vec2(held.x, held.y) != target {
-            anyhow::bail!(
-                "KiCad accepted the move of via '{uuid}' but read-back places it at ({}, {}), \
-                 not ({x}, {y})",
-                held.x,
-                held.y
+        let readback = self.find_via_in(document.clone(), uuid).and_then(|via| {
+            let via = via.context("readback does not list the moved via")?;
+            anyhow::ensure!(
+                via.position == moved.position,
+                "readback has an unexpected via position"
             );
-        }
+            anyhow::ensure!(via.net.is_some(), "readback has no via net");
+            Ok(ipc_via(&via))
+        });
+        let after = verify_after_write(
+            "UpdateItems",
+            &document,
+            &format!("via '{uuid}' toward ({x}, {y})"),
+            readback,
+        )?;
         if after.net_name == before.net_name {
             return Ok(IpcViaMove::Moved { before, after });
         }
@@ -8804,8 +9054,13 @@ mod preflight_refusal_tests {
 
     #[test]
     fn a_readback_dial_failure_after_an_accepted_write_is_uncertain() {
-        let error =
-            verify_after_write::<()>("DeleteItems", Err(TransportUnreachable.into())).unwrap_err();
+        let error = verify_after_write::<()>(
+            "DeleteItems",
+            &Default::default(),
+            "trace 'test-kiid'",
+            Err(TransportUnreachable.into()),
+        )
+        .unwrap_err();
         assert!(matches!(
             IpcFailure::from_error(error),
             IpcFailure::Uncertain(_)
