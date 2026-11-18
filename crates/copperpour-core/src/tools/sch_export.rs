@@ -213,6 +213,11 @@ pub fn tools() -> Vec<ToolDef> {
              with a `footprint_locked_not_replaced` note that refuses nothing. A replacement \
              footprint that cannot be read or rebuilt, or that lacks a connected pad or would \
              drop a pad that carries a net, makes the dry run a conflict. \
+             A pad net change on a net routed copper uses is a `routed_pad_net_change` \
+             conflict; naming its `reference` and `net_change` in `acknowledged_net_changes` \
+             plans it as KiCad's Update PCB makes it, with no copper sent, and the apply of \
+             that dry run's plan then reports `routed_copper`, each named net's copper before \
+             and after as KiCad's commit left it, and `drc` of the result. \
              Added footprints are staged beside the board as KiCad measured it; `staging` \
              names the item classes KiCad would not list, so a partial or unmeasured board \
              is never reported as complete or empty. `changes` lists the first `limit` \
@@ -225,6 +230,20 @@ pub fn tools() -> Vec<ToolDef> {
                     "board": { "type": "string", "description": "Matching .kicad_pcb path currently open in KiCad" },
                     "dry_run": { "type": "boolean", "description": "Plan without changing the board", "default": true },
                     "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" },
+                    "acknowledged_net_changes": {
+                        "type": "array",
+                        "description": "Routed pad net changes to plan anyway, each a routed_pad_net_change diagnostic's reference and net_change; one the plan does not report is a conflict",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reference": { "type": "string" },
+                                "pad": { "type": "string" },
+                                "from": { "type": "string" },
+                                "to": { "type": "string" }
+                            },
+                            "required": ["reference", "pad", "from", "to"]
+                        }
+                    },
                     "limit": { "type": "integer", "minimum": 0, "description": "Maximum planned changes to list; the plan and its revision stay whole", "default": 50 },
                     "output": { "type": "string", "minLength": 1, "description": "Optional path to write the whole response JSON, every change listed" }
                 },

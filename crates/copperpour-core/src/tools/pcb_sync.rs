@@ -281,6 +281,47 @@ struct SyncDiagnostic {
     references: Vec<String>,
     /// The library footprint the diagnostic is about, when it is about one.
     footprint_id: Option<String>,
+    /// The pad net change a `routed_pad_net_change` diagnostic is about, or
+    /// that an acknowledgement let through (#38). Absent from every other
+    /// diagnostic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    net_change: Option<NetChange>,
+}
+
+/// One pad's net change on a footprint the diagnostic names (#38).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct NetChange {
+    pad: String,
+    from: String,
+    to: String,
+}
+
+/// A routed pad net change the caller accepts: a `routed_pad_net_change`
+/// diagnostic's `reference` and its `net_change` (#38).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcknowledgedNetChange {
+    reference: String,
+    pad: String,
+    from: String,
+    to: String,
+}
+
+/// The routed copper on one net an acknowledged change names: tracks, arcs,
+/// vias and copper zones carrying it before the commit, and after it as KiCad
+/// reads it back (#38).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RoutedCopper {
+    net: String,
+    before_count: usize,
+    after_count: usize,
+}
+
+/// What an apply that took acknowledged net changes leaves for DRC (#38).
+#[derive(Debug, Clone, PartialEq)]
+struct AcknowledgedApply {
+    routed_copper: Vec<RoutedCopper>,
+    drc: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -298,6 +339,10 @@ struct SyncPlan {
     /// Not part of the plan's identity: `sync_response` reports it.
     #[serde(skip)]
     staging: Option<StagingEvidence>,
+    /// Set by an apply that took acknowledged net changes; `sync_response`
+    /// reports it.
+    #[serde(skip)]
+    acknowledged_apply: Option<AcknowledgedApply>,
 }
 
 /// What added footprints were staged beside (#688).
@@ -356,6 +401,9 @@ struct LiveSnapshot {
     staging: StagingEvidence,
     items: BTreeMap<String, prost_types::Any>,
     net_codes: BTreeMap<String, i32>,
+    /// Each net's routed copper as counted, before an unreadable zone marks
+    /// every net routed in `state.routed_nets`.
+    routed_copper: BTreeMap<String, usize>,
     document: copperpour_ipc::gen::kiapi::common::types::DocumentSpecifier,
 }
 
@@ -403,6 +451,22 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             "Apply requires the plan revision returned by a current dry run.",
         ));
     }
+    let acknowledged = match &args["acknowledged_net_changes"] {
+        serde_json::Value::Null => BTreeSet::new(),
+        value => match serde_json::from_value::<Vec<AcknowledgedNetChange>>(value.clone()) {
+            Ok(changes) => changes.into_iter().collect::<BTreeSet<_>>(),
+            Err(error) => {
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::InvalidArgument {
+                        field: "acknowledged_net_changes".to_string(),
+                        reason: error.to_string(),
+                    },
+                    "Each acknowledged net change names a reference, pad, from and to, copied \
+                     from a routed_pad_net_change diagnostic. Nothing was planned or applied.",
+                ))
+            }
+        },
+    };
     if !schematic.exists() || !board.exists() {
         let missing = if !schematic.exists() {
             &schematic
@@ -481,13 +545,17 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     };
     let ipc_board = board.clone();
     let library_board = board.clone();
+    let drc_board = board.clone();
+    let cli = ctx.config.kicad_cli.clone();
+    let runtime = tokio::runtime::Handle::current();
     let result = attempt_ipc_write(
         ctx,
         &board,
         what,
         move |client| {
             let snapshot = snapshot_board(client, &ipc_board)?;
-            let mut plan = plan_sync(&netlist_source, &design, &snapshot.state);
+            let mut plan =
+                plan_sync_acknowledging(&netlist_source, &design, &snapshot.state, &acknowledged);
             plan.staging = Some(snapshot.staging.clone());
             let (prepared, unprepared) = prepare_additions(&library_board, &plan);
             // Everything that would fail the apply is found here, so `ready`
@@ -626,7 +694,33 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 plan.counts.board_only_preserved.planned;
             plan.counts.skipped_by_flag.applied = plan.counts.skipped_by_flag.planned;
             plan.counts.unassigned_footprint.applied = plan.counts.unassigned_footprint.planned;
-            Ok(sync_response(&plan, "applied", hierarchy.len(), true, &options))
+            if acknowledged.is_empty() {
+                return Ok(sync_response(&plan, "applied", hierarchy.len(), true, &options));
+            }
+            // The commit stands whatever this finds, so a check that cannot
+            // finish is reported on the applied response, never as a refusal.
+            match acknowledged_apply_evidence(client, &snapshot, &plan, &runtime, &cli, &drc_board)
+            {
+                Ok(evidence) => {
+                    plan.acknowledged_apply = Some(evidence);
+                    Ok(sync_response(&plan, "applied", hierarchy.len(), true, &options))
+                }
+                Err(error) => {
+                    plan.diagnostics.push(conflict(
+                        "acknowledged_apply_unchecked",
+                        format!(
+                            "the commit was applied, but reading back its copper or running DRC \
+                             failed: {error:#}. Do not apply this plan again; check the board \
+                             with run_drc and sync_live_board."
+                        ),
+                        None,
+                    ));
+                    let mut result =
+                        sync_response(&plan, "applied", hierarchy.len(), true, &options);
+                    result.is_error = true;
+                    Ok(result)
+                }
+            }
         },
     )
     .await?;
@@ -711,6 +805,15 @@ struct SyncResponse<'a> {
     /// the plan never reached the board.
     staging: Option<serde_json::Value>,
     undo: Option<&'static str>,
+    /// After an apply that took acknowledged net changes, each net they name
+    /// with its routed copper before the commit and as KiCad reads it back
+    /// after (#38). Absent from every other response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routed_copper: Option<&'a [RoutedCopper]>,
+    /// After such an apply, kicad-cli's DRC of the board KiCad then holds,
+    /// under the project's rules (#38). Absent from every other response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drc: Option<&'a serde_json::Value>,
     diagnostics: Cow<'a, [SyncDiagnostic]>,
     /// Schematic components with no footprint: reported per part with what
     /// the board holds for them, never planned and never fatal (#507). A
@@ -753,6 +856,11 @@ impl<'a> SyncResponse<'a> {
             }),
             staging: plan.staging.as_ref().map(StagingEvidence::json),
             undo: applied.then_some("Ctrl-Z reverses the whole schematic-to-PCB update."),
+            routed_copper: plan
+                .acknowledged_apply
+                .as_ref()
+                .map(|apply| apply.routed_copper.as_slice()),
+            drc: plan.acknowledged_apply.as_ref().map(|apply| &apply.drc),
             diagnostics: Cow::Borrowed(&plan.diagnostics),
             unassigned_footprints: &plan.unassigned,
         }
@@ -827,8 +935,25 @@ fn conflict_result(message: String) -> CallToolResult {
     }
 }
 
+/// [`plan_sync_acknowledging`] with no routed pad net change acknowledged.
+#[cfg(test)]
 fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) -> SyncPlan {
+    plan_sync_acknowledging(netlist_source, design, board, &BTreeSet::new())
+}
+
+/// The plan. A pad net change on a net that routed copper uses is a
+/// `routed_pad_net_change` conflict unless `acknowledged` names it exactly;
+/// then it is planned as KiCad's Update PCB makes it, with no copper sent,
+/// and noted. An acknowledgement the plan has no such change for is a
+/// conflict, so a stale or widened one refuses (#38).
+fn plan_sync_acknowledging(
+    netlist_source: &str,
+    design: &ExportedDesign,
+    board: &BoardState,
+    acknowledged: &BTreeSet<AcknowledgedNetChange>,
+) -> SyncPlan {
     let mut diagnostics = Vec::new();
+    let mut acknowledgements_used = BTreeSet::new();
     // Reported beside the plan without refusing it, as KiCad's Update PCB
     // reports a warning.
     let mut notes = Vec::new();
@@ -1141,14 +1266,44 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 continue;
             }
             if board.routed_nets.contains_key(old_net) || board.routed_nets.contains_key(new_net) {
-                diagnostics.push(conflict(
-                    "routed_pad_net_change",
-                    format!(
-                        "{} pad {} would change from '{}' to '{}' while routed copper uses that net",
-                        component.reference, number, old_net, new_net
-                    ),
-                    Some(&component.reference),
-                ));
+                let change = NetChange {
+                    pad: number.clone(),
+                    from: old_net.to_string(),
+                    to: new_net.to_string(),
+                };
+                let acknowledgement = AcknowledgedNetChange {
+                    reference: component.reference.clone(),
+                    pad: change.pad.clone(),
+                    from: change.from.clone(),
+                    to: change.to.clone(),
+                };
+                if acknowledged.contains(&acknowledgement) {
+                    changed_pads += 1;
+                    let mut note = conflict(
+                        "routed_pad_net_change_acknowledged",
+                        format!(
+                            "{} pad {} changes from '{}' to '{}' as acknowledged; Copperpour \
+                             changes no copper, and the apply reports the routed copper on both \
+                             nets and runs DRC",
+                            component.reference, number, old_net, new_net
+                        ),
+                        Some(&component.reference),
+                    );
+                    note.net_change = Some(change);
+                    notes.push(note);
+                    acknowledgements_used.insert(acknowledgement);
+                } else {
+                    let mut diagnostic = conflict(
+                        "routed_pad_net_change",
+                        format!(
+                            "{} pad {} would change from '{}' to '{}' while routed copper uses that net",
+                            component.reference, number, old_net, new_net
+                        ),
+                        Some(&component.reference),
+                    );
+                    diagnostic.net_change = Some(change);
+                    diagnostics.push(diagnostic);
+                }
             } else {
                 changed_pads += 1;
             }
@@ -1200,6 +1355,18 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         }
     }
 
+    for unused in acknowledged.difference(&acknowledgements_used) {
+        diagnostics.push(conflict(
+            "net_change_acknowledgement_unmatched",
+            format!(
+                "{} pad {} from '{}' to '{}' is acknowledged, but this plan makes no such routed \
+                 pad net change; dry run again and acknowledge what it reports",
+                unused.reference, unused.pad, unused.from, unused.to
+            ),
+            Some(&unused.reference),
+        ));
+    }
+
     counts.board_only_preserved.planned = board.footprints.len() - matched.len();
     counts.conflicts.planned = diagnostics.len();
     if !diagnostics.is_empty() {
@@ -1226,6 +1393,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         unassigned,
         // Set by the handler from the snapshot this plan was made against.
         staging: None,
+        acknowledged_apply: None,
     }
 }
 
@@ -1236,6 +1404,7 @@ fn conflict(code: &str, message: String, reference: Option<&str>) -> SyncDiagnos
         reference: reference.map(str::to_string),
         references: reference.map(str::to_string).into_iter().collect(),
         footprint_id: None,
+        net_change: None,
     }
 }
 
@@ -1257,6 +1426,7 @@ fn footprint_conflict(
         },
         references,
         footprint_id: Some(footprint_id.to_string()),
+        net_change: None,
     }
 }
 
@@ -2054,6 +2224,68 @@ fn verify_board_matches_what_was_sent(
     Ok(suspicious)
 }
 
+/// What an apply that took acknowledged net changes leaves for DRC (#38): the
+/// routed copper on each net they name, counted before the commit and read
+/// back after it, and kicad-cli's DRC of the board KiCad now holds under the
+/// project's rules, checked as `apply_specctra_ses` checks its candidate. The
+/// board file is not saved.
+fn acknowledged_apply_evidence(
+    client: &copperpour_ipc::KiCadIpcClient,
+    snapshot: &LiveSnapshot,
+    plan: &SyncPlan,
+    runtime: &tokio::runtime::Handle,
+    cli: &str,
+    board: &Path,
+) -> Result<AcknowledgedApply> {
+    let nets = plan
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "routed_pad_net_change_acknowledged")
+        .filter_map(|diagnostic| diagnostic.net_change.as_ref())
+        .flat_map(|change| [change.from.as_str(), change.to.as_str()])
+        .filter(|net| !net.is_empty())
+        .collect::<BTreeSet<_>>();
+    let (after, unreadable_zone) = read_routed_copper(client, &snapshot.document)?;
+    if unreadable_zone {
+        bail!(
+            "KiCad read back a copper zone whose net cannot be read, so the copper on the \
+             named nets is not known"
+        );
+    }
+    let routed_copper = nets
+        .into_iter()
+        .map(|net| RoutedCopper {
+            net: net.to_string(),
+            before_count: snapshot.routed_copper.get(net).copied().unwrap_or(0),
+            after_count: after.get(net).copied().unwrap_or(0),
+        })
+        .collect();
+
+    let text = client.save_document_to_string_in(snapshot.document.clone())?;
+    let dir = tempfile::tempdir()?;
+    let candidate = dir.path().join("synced.kicad_pcb");
+    std::fs::write(&candidate, text).with_context(|| format!("write {}", candidate.display()))?;
+    let (report, project_rules_applied) = runtime.block_on(super::cli::run_drc_as_project(
+        cli, &candidate, board, false,
+    ))?;
+    let violations = report.violations.len();
+    let unconnected_items = report.unconnected_items.as_ref().map_or(0, Vec::len);
+    let schematic_parity_violations = report.schematic_parity.as_ref().map_or(0, Vec::len);
+    Ok(AcknowledgedApply {
+        routed_copper,
+        drc: serde_json::json!({
+            "clean": violations == 0
+                && unconnected_items == 0
+                && schematic_parity_violations == 0,
+            "violations": violations,
+            "unconnected_items": unconnected_items,
+            "schematic_parity_violations": schematic_parity_violations,
+            "project_rules_applied": project_rules_applied,
+            "creepage_skipped": report.creepage_skipped
+        }),
+    })
+}
+
 fn set_field_text(
     field: &mut Option<copperpour_ipc::gen::kiapi::board::types::Field>,
     name: &str,
@@ -2275,30 +2507,8 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
         .iter()
         .map(|net| (net.name.clone(), net.netcode))
         .collect::<BTreeMap<_, _>>();
-    let mut routed_nets = BTreeMap::new();
-    for item in client.get_items_in(document.clone(), ObjectType::KotPcbTrace)? {
-        if let Ok(track) = kiapi::board::types::Track::decode(item.value.as_slice()) {
-            record_routed_net(&mut routed_nets, track.net.as_ref());
-        }
-    }
-    for item in client.get_items_in(document.clone(), ObjectType::KotPcbArc)? {
-        if let Ok(arc) = kiapi::board::types::Arc::decode(item.value.as_slice()) {
-            record_routed_net(&mut routed_nets, arc.net.as_ref());
-        }
-    }
-    for item in client.get_items_in(document.clone(), ObjectType::KotPcbVia)? {
-        if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
-            record_routed_net(&mut routed_nets, via.net.as_ref());
-        }
-    }
-    let mut unreadable_zone = false;
-    for item in client.get_items_in(document.clone(), ObjectType::KotPcbZone)? {
-        match zone_net(item.value.as_slice()) {
-            ZoneNet::Copper(net) => record_routed_net(&mut routed_nets, Some(&net)),
-            ZoneNet::RuleArea => {}
-            ZoneNet::Unreadable => unreadable_zone = true,
-        }
-    }
+    let (routed_copper, unreadable_zone) = read_routed_copper(client, &document)?;
+    let mut routed_nets = routed_copper.clone();
     if unreadable_zone {
         // A zone whose net cannot be read could pour any net, so every pad-net
         // reassignment fails closed.
@@ -2330,8 +2540,45 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
         staging,
         items,
         net_codes,
+        routed_copper,
         document,
     })
+}
+
+/// Each net's routed copper: how many tracks, arcs, vias and copper zones
+/// carry it, and whether a zone's net could not be read.
+fn read_routed_copper(
+    client: &copperpour_ipc::KiCadIpcClient,
+    document: &copperpour_ipc::gen::kiapi::common::types::DocumentSpecifier,
+) -> Result<(BTreeMap<String, usize>, bool)> {
+    use copperpour_ipc::gen::kiapi;
+    use kiapi::common::types::KiCadObjectType as ObjectType;
+
+    let mut routed_nets = BTreeMap::new();
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbTrace)? {
+        if let Ok(track) = kiapi::board::types::Track::decode(item.value.as_slice()) {
+            record_routed_net(&mut routed_nets, track.net.as_ref());
+        }
+    }
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbArc)? {
+        if let Ok(arc) = kiapi::board::types::Arc::decode(item.value.as_slice()) {
+            record_routed_net(&mut routed_nets, arc.net.as_ref());
+        }
+    }
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbVia)? {
+        if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
+            record_routed_net(&mut routed_nets, via.net.as_ref());
+        }
+    }
+    let mut unreadable_zone = false;
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbZone)? {
+        match zone_net(item.value.as_slice()) {
+            ZoneNet::Copper(net) => record_routed_net(&mut routed_nets, Some(&net)),
+            ZoneNet::RuleArea => {}
+            ZoneNet::Unreadable => unreadable_zone = true,
+        }
+    }
+    Ok((routed_nets, unreadable_zone))
 }
 
 /// Convert one live KiCad footprint into the planner's board-side view.
@@ -5482,6 +5729,185 @@ mod tests {
             .any(|diagnostic| diagnostic.code == "routed_pad_net_change"));
     }
 
+    /// `R1` with pad 1 on `VCC` and pad 2 on `GND`, both nets routed, and a
+    /// schematic that moves pad 1 to `VCC_A` and pad 2 to `GND_A`: two
+    /// `routed_pad_net_change` conflicts (#38).
+    fn routed_r1_moving_both_pads() -> (ExportedDesign, BoardState) {
+        let design = ExportedDesign {
+            components: vec![DesignComponent {
+                pad_nets: BTreeMap::from([
+                    ("1".to_string(), "VCC_A".to_string()),
+                    ("2".to_string(), "GND_A".to_string()),
+                ]),
+                ..resistor("R1", "/sheet/existing")
+            }],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        };
+        let mut board = board_with(vec![board_resistor("R1", Some("/sheet/existing"))]);
+        board.routed_nets = BTreeMap::from([("VCC".to_string(), 1), ("GND".to_string(), 3)]);
+        (design, board)
+    }
+
+    fn acknowledging(reference: &str, pad: &str, from: &str, to: &str) -> AcknowledgedNetChange {
+        AcknowledgedNetChange {
+            reference: reference.to_string(),
+            pad: pad.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+        }
+    }
+
+    /// The codes of a plan's diagnostics that refuse it.
+    fn refusing_codes(plan: &SyncPlan) -> Vec<&str> {
+        plan.diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code != "routed_pad_net_change_acknowledged")
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect()
+    }
+
+    /// #38: each routed pad net change named exactly, as its diagnostic
+    /// reports it, is planned as an ordinary pad change and noted.
+    #[test]
+    fn acknowledged_routed_pad_net_changes_are_planned_and_noted() {
+        let (design, board) = routed_r1_moving_both_pads();
+        let refused = plan_sync("netlist", &design, &board);
+        assert_eq!(refused.status, PlanStatus::Conflict);
+        let reported = refused
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "routed_pad_net_change")
+            .map(|diagnostic| {
+                (
+                    diagnostic.reference.clone().unwrap(),
+                    diagnostic.net_change.clone().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let change = |pad: &str, from: &str, to: &str| NetChange {
+            pad: pad.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+        };
+        assert_eq!(
+            reported,
+            vec![
+                ("R1".to_string(), change("1", "VCC", "VCC_A")),
+                ("R1".to_string(), change("2", "GND", "GND_A")),
+            ]
+        );
+        let acknowledged = reported
+            .iter()
+            .map(|(reference, change)| {
+                acknowledging(reference, &change.pad, &change.from, &change.to)
+            })
+            .collect();
+
+        let plan = plan_sync_acknowledging("netlist", &design, &board, &acknowledged);
+
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        assert_eq!(refusing_codes(&plan), Vec::<&str>::new());
+        assert_eq!(plan.counts.updated.planned, 1);
+        assert_eq!(plan.counts.pads_reassigned.planned, 2);
+        let PlannedChange::Update { pad_nets, .. } = &plan.changes[0] else {
+            panic!("the acknowledged change is an update");
+        };
+        assert_eq!(pad_nets, &design.components[0].pad_nets);
+        let noted = plan
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.code.as_str(),
+                    diagnostic.net_change.clone().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            noted,
+            vec![
+                (
+                    "routed_pad_net_change_acknowledged",
+                    change("1", "VCC", "VCC_A")
+                ),
+                (
+                    "routed_pad_net_change_acknowledged",
+                    change("2", "GND", "GND_A")
+                ),
+            ]
+        );
+    }
+
+    /// #38: an acknowledgement lets through only the change it names. The
+    /// other routed change and any other conflict still refuse the plan, and
+    /// an acknowledgement of a change the plan does not make refuses it too.
+    #[test]
+    fn an_acknowledgement_lets_through_only_the_change_it_names() {
+        let (design, board) = routed_r1_moving_both_pads();
+        let pad_1 = acknowledging("R1", "1", "VCC", "VCC_A");
+        let pad_2 = acknowledging("R1", "2", "GND", "GND_A");
+        let unmatched = "net_change_acknowledgement_unmatched";
+        for (acknowledged, codes) in [
+            (vec![pad_1.clone()], vec!["routed_pad_net_change"]),
+            // Another target net, another pad, another part.
+            (
+                vec![pad_1.clone(), acknowledging("R1", "2", "GND", "GND_B")],
+                vec!["routed_pad_net_change", unmatched],
+            ),
+            (
+                vec![
+                    pad_1.clone(),
+                    pad_2.clone(),
+                    acknowledging("R1", "3", "GND", "GND_A"),
+                ],
+                vec![unmatched],
+            ),
+            (
+                vec![
+                    pad_1.clone(),
+                    pad_2.clone(),
+                    acknowledging("R2", "1", "VCC", "VCC_A"),
+                ],
+                vec![unmatched],
+            ),
+        ] {
+            let plan = plan_sync_acknowledging(
+                "netlist",
+                &design,
+                &board,
+                &acknowledged.iter().cloned().collect(),
+            );
+            assert_eq!(plan.status, PlanStatus::Conflict, "{acknowledged:?}");
+            assert!(plan.changes.is_empty(), "{acknowledged:?}");
+            assert_eq!(refusing_codes(&plan), codes, "{acknowledged:?}");
+        }
+
+        // With no routed copper the changes need no acknowledgement, so one
+        // given for them matches nothing.
+        let unrouted = board_with(board.footprints.clone());
+        let plan = plan_sync_acknowledging(
+            "netlist",
+            &design,
+            &unrouted,
+            &BTreeSet::from([pad_1.clone(), pad_2.clone()]),
+        );
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert_eq!(refusing_codes(&plan), vec![unmatched, unmatched]);
+
+        // A conflict of another kind is not waived.
+        let mut duplicated = board.clone();
+        duplicated.footprints.push(board_resistor("R1", None));
+        let plan = plan_sync_acknowledging(
+            "netlist",
+            &design,
+            &duplicated,
+            &BTreeSet::from([pad_1, pad_2]),
+        );
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert_eq!(refusing_codes(&plan), vec!["duplicate_board_reference"]);
+    }
+
     #[test]
     fn already_synchronized_design_is_noop() {
         let design = ExportedDesign {
@@ -6233,6 +6659,18 @@ mod tests {
         copperpour_ipc::builders::pack_any(&zone, "kiapi.board.types.Zone")
     }
 
+    /// The captured pour on `net` instead of `GND`.
+    fn pour_on(net: &str) -> prost_types::Any {
+        use copperpour_ipc::gen::kiapi::board::types::{zone::Settings, Zone};
+        use prost::Message;
+        let mut zone = Zone::decode(GND_POUR).expect("the captured pour decodes");
+        let Some(Settings::CopperSettings(copper)) = zone.settings.as_mut() else {
+            panic!("the captured pour is a copper zone");
+        };
+        copper.net.as_mut().expect("the captured pour's net").name = net.to_string();
+        copperpour_ipc::builders::pack_any(&zone, "kiapi.board.types.Zone")
+    }
+
     /// A complete #474 sync through the registered tool, not just the pure
     /// planner. The mock speaks KiCad's real protobuf protocol and retains the
     /// live board between requests, so the assertions below are an independent
@@ -6630,6 +7068,7 @@ mod tests {
             diagnostics: Vec::new(),
             unassigned: Vec::new(),
             staging: None,
+            acknowledged_apply: None,
         }
     }
 
@@ -6865,6 +7304,11 @@ mod tests {
         schematic: PathBuf,
         board: PathBuf,
         exported: PathBuf,
+        /// The report the stand-in `kicad-cli pcb drc` writes; it fails while
+        /// no test has written one.
+        drc_report: PathBuf,
+        /// The zones the mock lists once a commit has ended, when set.
+        zones_after_commit: std::sync::Arc<std::sync::Mutex<Option<Vec<prost_types::Any>>>>,
         created: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
         /// The held footprints as the mock's board now has them.
         held: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
@@ -6976,6 +7420,10 @@ mod tests {
             let held_footprints = std::sync::Arc::new(std::sync::Mutex::new(held.footprints));
             let board_held = held_footprints.clone();
             let held_zones = held.zones;
+            let zones_after_commit =
+                std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<prost_types::Any>>));
+            let after_commit = zones_after_commit.clone();
+            let committed = std::sync::atomic::AtomicBool::new(false);
             let held_nets = held.nets;
             let board_text = std::sync::Arc::new(std::sync::Mutex::new(
                 String::from_utf8_lossy(include_bytes!(
@@ -6999,14 +7447,17 @@ mod tests {
             let exported = temp.path().join("carrier.net");
             let unix_source = exported.to_string_lossy().replace('\'', "'\\''");
             let windows_source = exported.to_string_lossy();
+            let drc_report = temp.path().join("drc-report.json");
+            let unix_drc = drc_report.to_string_lossy().replace('\'', "'\\''");
+            let windows_drc = drc_report.to_string_lossy();
             let cli = write_script(
                 temp.path(),
                 "fake-kicad-cli-657",
                 &format!(
-                    "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then\n    shift\n    cp '{unix_source}' \"$1\"\n    exit $?\n  fi\n  shift\ndone\nexit 2\n"
+                    "#!/bin/sh\nsource='{unix_source}'\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"drc\" ]; then\n    source='{unix_drc}'\n  fi\n  if [ \"$1\" = \"--output\" ]; then\n    shift\n    cp \"$source\" \"$1\"\n    exit $?\n  fi\n  shift\ndone\nexit 2\n"
                 ),
                 &format!(
-                    "@echo off\r\n:loop\r\nif \"%~1\"==\"\" exit /b 2\r\nif \"%~1\"==\"--output\" goto found\r\nshift\r\ngoto loop\r\n:found\r\nshift\r\ncopy /Y \"{windows_source}\" \"%~1\" >nul\r\nexit /b %ERRORLEVEL%\r\n"
+                    "@echo off\r\nset \"source={windows_source}\"\r\n:loop\r\nif \"%~1\"==\"\" exit /b 2\r\nif \"%~1\"==\"drc\" set \"source={windows_drc}\"\r\nif \"%~1\"==\"--output\" goto found\r\nshift\r\ngoto loop\r\n:found\r\nshift\r\ncopy /Y \"%source%\" \"%~1\" >nul\r\nexit /b %ERRORLEVEL%\r\n"
                 ),
             );
             let kicad = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board_refusing(
@@ -7057,7 +7508,16 @@ mod tests {
                                         .map(|item| read_back(item, readback)),
                                 )
                                 .collect(),
-                            _ if request.types.contains(&zones) => held_zones.clone(),
+                            _ if request.types.contains(&zones) => {
+                                match &*after_commit.lock().unwrap() {
+                                    Some(after)
+                                        if committed.load(std::sync::atomic::Ordering::SeqCst) =>
+                                    {
+                                        after.clone()
+                                    }
+                                    _ => held_zones.clone(),
+                                }
+                            }
                             _ => Vec::new(),
                         };
                         return Some(copperpour_ipc::builders::pack_any(
@@ -7200,6 +7660,7 @@ mod tests {
                         ));
                     }
                     if command.type_url.ends_with("EndCommit") {
+                        committed.store(true, std::sync::atomic::Ordering::SeqCst);
                         return Some(copperpour_ipc::builders::pack_any(
                             &kiapi::common::commands::EndCommitResponse {},
                             "kiapi.common.commands.EndCommitResponse",
@@ -7226,6 +7687,8 @@ mod tests {
                 schematic,
                 board,
                 exported,
+                drc_report,
+                zones_after_commit,
                 created,
                 held: held_footprints,
                 board_text,
@@ -7242,6 +7705,16 @@ mod tests {
         /// Have `SaveDocumentToString` answer with `text` from now on.
         fn hold_board_text(&self, text: &str) {
             *self.board_text.lock().unwrap() = text.to_string();
+        }
+
+        /// Have the stand-in `kicad-cli pcb drc` write `report` from now on.
+        fn hold_drc_report(&self, report: &str) {
+            std::fs::write(&self.drc_report, report).unwrap();
+        }
+
+        /// Have the mock list `zones` once a commit has ended.
+        fn list_zones_after_commit(&self, zones: Vec<prost_types::Any>) {
+            *self.zones_after_commit.lock().unwrap() = Some(zones);
         }
 
         /// How many requests carried `command`.
@@ -7644,6 +8117,338 @@ mod tests {
             vec!["R1 pad 1 would change from 'VCC' to 'NEW_NET' while routed copper uses that net"],
             "{plan:#}"
         );
+    }
+
+    /// KiCad's captured `R1` under its `GND` pour, with the stand-in DRC
+    /// reporting one short.
+    async fn served_r1_under_the_gnd_pour() -> ServedSync {
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![schematic_backed_resistor()],
+            zones: vec![zone_item(GND_POUR)],
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+        served.hold_drc_report(
+            r#"{"violations":[{"type":"shorting_items","severity":"error","description":"Items shorting two nets"}],"unconnected_items":[],"schematic_parity":[]}"#,
+        );
+        served
+    }
+
+    /// Each `routed_pad_net_change` of a served dry run, as an entry of
+    /// `acknowledged_net_changes`.
+    fn acknowledging_each(plan: &serde_json::Value) -> serde_json::Value {
+        plan["diagnostics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|diagnostic| diagnostic["code"] == "routed_pad_net_change")
+            .map(|diagnostic| {
+                let change = &diagnostic["net_change"];
+                serde_json::json!({
+                    "reference": diagnostic["reference"],
+                    "pad": change["pad"],
+                    "from": change["from"],
+                    "to": change["to"],
+                })
+            })
+            .collect()
+    }
+
+    /// R1's pad 2 net on the mock's board.
+    fn held_r1_pad_2(served: &ServedSync) -> Option<String> {
+        let held = served.held.lock().unwrap();
+        let footprint = copperpour_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+            held[0].value.as_slice(),
+        )
+        .expect("the board's R1");
+        board_footprint_from_instance(&footprint)
+            .expect("R1 identity")
+            .pad_nets
+            .get("2")
+            .cloned()
+    }
+
+    /// #38 through `tools/call`: the conflict names the change; a dry run
+    /// that acknowledges it plans the update; the apply of that plan moves
+    /// R1's pad 2 off the pour's net and reports the copper on both nets and
+    /// DRC of the board KiCad then holds. The mock lists the pour on the new
+    /// net once the commit ends, so only a readback after it reports that.
+    #[tokio::test]
+    async fn an_acknowledged_routed_pad_net_change_is_applied_and_checked() {
+        let served = served_r1_under_the_gnd_pour().await;
+        served.list_zones_after_commit(vec![pour_on("NEW_NET")]);
+        let netlist = netlist_moving_off("GND");
+
+        let refused = served.dry_run(&netlist).await;
+        assert_eq!(refused["status"], "conflict", "{refused:#}");
+        let diagnostic = &refused["diagnostics"][0];
+        assert_eq!(diagnostic["code"], "routed_pad_net_change", "{refused:#}");
+        assert_eq!(diagnostic["reference"], "R1", "{refused:#}");
+        assert_eq!(
+            diagnostic["net_change"],
+            serde_json::json!({ "pad": "2", "from": "GND", "to": "NEW_NET" }),
+            "{refused:#}"
+        );
+        let acknowledged = acknowledging_each(&refused);
+
+        let (_, plan) = served
+            .sync(
+                &netlist,
+                serde_json::json!({ "acknowledged_net_changes": acknowledged }),
+            )
+            .await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["changes"][0]["kind"], "update", "{plan:#}");
+        assert_eq!(plan["changes"][0]["pad_nets"]["2"], "NEW_NET", "{plan:#}");
+        let noted = &plan["diagnostics"][0];
+        assert_eq!(noted["code"], "routed_pad_net_change_acknowledged");
+        assert_eq!(noted["net_change"], diagnostic["net_change"]);
+        assert!(plan.get("routed_copper").is_none(), "{plan:#}");
+        assert!(plan.get("drc").is_none(), "{plan:#}");
+
+        let (is_error, applied) = served
+            .sync(
+                &netlist,
+                serde_json::json!({
+                    "dry_run": false,
+                    "expected_plan_revision": plan["plan_revision"],
+                    "acknowledged_net_changes": acknowledged,
+                }),
+            )
+            .await;
+
+        assert!(!is_error, "{applied:#}");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(held_r1_pad_2(&served).as_deref(), Some("NEW_NET"));
+        assert_eq!(
+            applied["routed_copper"],
+            serde_json::json!([
+                { "net": "GND", "before_count": 1, "after_count": 0 },
+                { "net": "NEW_NET", "before_count": 0, "after_count": 1 },
+            ]),
+            "{applied:#}"
+        );
+        assert_eq!(
+            applied["drc"],
+            serde_json::json!({
+                "clean": false,
+                "violations": 1,
+                "unconnected_items": 0,
+                "schematic_parity_violations": 0,
+                "project_rules_applied": cfg!(unix),
+                "creepage_skipped": false,
+            }),
+            "{applied:#}"
+        );
+    }
+
+    /// #38: the acknowledged plan applies only with its own revision and its
+    /// acknowledgement. The conflict's revision is stale for it, and its
+    /// revision without the acknowledgement is the conflict again; neither
+    /// opens a commit.
+    #[tokio::test]
+    async fn an_acknowledged_plan_applies_only_with_its_revision_and_acknowledgement() {
+        let served = served_r1_under_the_gnd_pour().await;
+        let netlist = netlist_moving_off("GND");
+        let refused = served.dry_run(&netlist).await;
+        let acknowledged = acknowledging_each(&refused);
+        let (_, plan) = served
+            .sync(
+                &netlist,
+                serde_json::json!({ "acknowledged_net_changes": acknowledged }),
+            )
+            .await;
+        assert_ne!(plan["plan_revision"], refused["plan_revision"]);
+
+        for (arguments, code) in [
+            (
+                serde_json::json!({
+                    "dry_run": false,
+                    "expected_plan_revision": refused["plan_revision"],
+                    "acknowledged_net_changes": acknowledged,
+                }),
+                "stale_plan_revision",
+            ),
+            (
+                serde_json::json!({
+                    "dry_run": false,
+                    "expected_plan_revision": plan["plan_revision"],
+                }),
+                "routed_pad_net_change",
+            ),
+        ] {
+            let (_, body) = served.sync(&netlist, arguments).await;
+            assert_eq!(body["status"], "conflict", "{body:#}");
+            assert!(
+                body["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|diagnostic| diagnostic["code"] == code),
+                "{body:#}"
+            );
+        }
+        assert_eq!(served.sent("BeginCommit"), 0);
+        assert_eq!(held_r1_pad_2(&served).as_deref(), Some("GND"));
+    }
+
+    /// #38: the commit stands when DRC cannot run after it. The response is
+    /// `applied`, flagged as an error, and says not to apply the plan again.
+    #[tokio::test]
+    async fn a_check_that_fails_after_the_commit_is_reported_on_the_applied_response() {
+        let served = served_r1_under_the_gnd_pour().await;
+        std::fs::remove_file(&served.drc_report).unwrap();
+        let netlist = netlist_moving_off("GND");
+        let acknowledged = acknowledging_each(&served.dry_run(&netlist).await);
+        let (_, plan) = served
+            .sync(
+                &netlist,
+                serde_json::json!({ "acknowledged_net_changes": acknowledged }),
+            )
+            .await;
+
+        let (is_error, applied) = served
+            .sync(
+                &netlist,
+                serde_json::json!({
+                    "dry_run": false,
+                    "expected_plan_revision": plan["plan_revision"],
+                    "acknowledged_net_changes": acknowledged,
+                }),
+            )
+            .await;
+
+        assert!(is_error, "{applied:#}");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(served.sent("EndCommit"), 1);
+        assert_eq!(held_r1_pad_2(&served).as_deref(), Some("NEW_NET"));
+        let last = applied["diagnostics"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["code"], "acknowledged_apply_unchecked", "{applied:#}");
+        assert!(
+            last["message"]
+                .as_str()
+                .unwrap()
+                .contains("Do not apply this plan again"),
+            "{applied:#}"
+        );
+        assert!(applied.get("drc").is_none(), "{applied:#}");
+    }
+
+    /// #38: a copper zone whose net KiCad cannot serve could carry either
+    /// net, so the readback after the commit cannot count them. The apply
+    /// stands and is reported unchecked, never with counts that leave it out.
+    #[tokio::test]
+    async fn a_zone_read_back_without_a_net_leaves_the_apply_unchecked() {
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![schematic_backed_resistor()],
+            zones: vec![pour_without_a_net()],
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+        served.hold_drc_report(r#"{"violations":[],"unconnected_items":[],"schematic_parity":[]}"#);
+        let netlist = netlist_moving_off("VCC");
+        let acknowledged = acknowledging_each(&served.dry_run(&netlist).await);
+        assert_eq!(acknowledged.as_array().map(Vec::len), Some(1));
+        let (_, plan) = served
+            .sync(
+                &netlist,
+                serde_json::json!({ "acknowledged_net_changes": acknowledged }),
+            )
+            .await;
+
+        let (is_error, applied) = served
+            .sync(
+                &netlist,
+                serde_json::json!({
+                    "dry_run": false,
+                    "expected_plan_revision": plan["plan_revision"],
+                    "acknowledged_net_changes": acknowledged,
+                }),
+            )
+            .await;
+
+        assert!(is_error, "{applied:#}");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        let last = applied["diagnostics"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["code"], "acknowledged_apply_unchecked", "{applied:#}");
+        assert!(applied.get("routed_copper").is_none(), "{applied:#}");
+    }
+
+    /// #38: an acknowledgement missing a field, or carrying one it does not
+    /// have, is refused before anything is read.
+    #[tokio::test]
+    async fn a_malformed_acknowledgement_is_an_invalid_argument() {
+        let served = served_r1_under_the_gnd_pour().await;
+        for acknowledged in [
+            serde_json::json!([{ "reference": "R1", "pad": "2", "from": "GND" }]),
+            serde_json::json!([{
+                "reference": "R1", "pad": "2", "from": "GND", "to": "NEW_NET", "code": "x"
+            }]),
+            serde_json::json!({ "reference": "R1" }),
+        ] {
+            let (is_error, refused) = served
+                .sync(
+                    &netlist_moving_off("GND"),
+                    serde_json::json!({ "acknowledged_net_changes": acknowledged }),
+                )
+                .await;
+            assert!(is_error, "{refused:#}");
+            assert_eq!(refused["error"]["kind"], "invalid_argument", "{refused:#}");
+            assert!(
+                refused["error"]["field"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("acknowledged_net_changes"),
+                "{refused:#}"
+            );
+        }
+        assert_eq!(served.sent("GetItems"), 0);
+    }
+
+    /// The handler refuses a malformed acknowledgement itself, for a caller
+    /// that reaches it without the served schema.
+    #[tokio::test]
+    async fn the_handler_refuses_a_malformed_acknowledgement_itself() {
+        let context = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::tools::ToolRouter::new()),
+        );
+        for acknowledged in [
+            serde_json::json!([{ "reference": "R1", "pad": "2" }]),
+            serde_json::json!([{
+                "reference": "R1", "pad": "2", "from": "GND", "to": "NEW_NET", "code": "x"
+            }]),
+        ] {
+            let result = handle_update_pcb_from_schematic(
+                &serde_json::json!({
+                    "schematic": "/absent/carrier.kicad_sch",
+                    "board": "/absent/carrier.kicad_pcb",
+                    "acknowledged_net_changes": acknowledged,
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+
+            assert!(result.is_error);
+            let ToolContent::Text { text } = &result.content[0] else {
+                panic!("the refusal is JSON text");
+            };
+            let refused: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(refused["error"]["kind"], "invalid_argument", "{refused:#}");
+            assert_eq!(
+                refused["error"]["field"], "acknowledged_net_changes",
+                "{refused:#}"
+            );
+        }
     }
 
     /// The classes KiCad 10.0.5 refuses to list on every board.
