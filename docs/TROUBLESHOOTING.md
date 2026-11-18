@@ -264,6 +264,16 @@ in KiCAD" — and it names what to change about the request.
 reachable. An older, reachable KiCad makes `flip_component` refuse rather than
 silently edit the file underneath it.
 
+## Footprint unit metadata disappears after a live PCB edit
+
+KiCad 10 releases before 10.0.8 can drop a footprint's `(units ...)` block, which records which pins belong to each symbol unit. This can happen whenever Copperpour sends an existing footprint back whole through IPC `UpdateItems`. That includes moves, rotations, batch placements, library refresh, schematic sync updates, and some field and pad edits. Closed-board placement edits and native `FlipItems` do not replace the footprint through `UpdateItems`.
+
+The requested edit can succeed without a warning. The affected versions leave the mapping out of typed IPC footprint replies, so those replies cannot reveal the loss. A tool that compares the full board text, such as `set_teardrop_settings`, can detect it after the edit and report `mutation_outcome_uncertain`. That does not undo the edit.
+
+Upgrade to KiCad 10.0.8 or later before making these live edits, or make them directly in PCB Editor instead. Some Copperpour warnings still say "KiCad 10" and can appear on 10.0.8. See [KiCad issue #25859](https://gitlab.com/kicad/code/kicad/-/work_items/25859) and the [10.0.8 IPC fix](https://gitlab.com/kicad/code/kicad/-/commit/b7c0b5206f3f5cb9b5fb062be441bcaad6ef135c).
+
+Upgrading does not restore missing metadata. If you already edited the board on an affected version, compare the saved `.kicad_pcb` with your backup or previous revision and check the edited footprints for missing `(units ...)` blocks before committing the board.
+
 ## `launch_kicad_ui` from an SSH session
 
 A server started from an SSH session inherits no `DISPLAY` or `WAYLAND_DISPLAY`,

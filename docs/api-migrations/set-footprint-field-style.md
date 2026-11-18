@@ -15,9 +15,9 @@ Both paths answer with the same fields: `source` says which ran (`ipc` or
 `file`), `undo` is set on the live path only, and `fallback_reason` (why the
 file was edited) is null on the live path. `warning` says why the file was
 edited on the file path; on the live path it is set only when footprints were
-sent, because each goes back to KiCad whole, which on KiCad 10 drops its
-symbol-unit mapping until Update PCB from Schematic. The response lists every
-field's values before and after, and a whole-board run reports a field it
-could not edit in `skipped`.
+sent. The response lists each field's values before and after, and a whole-board
+run reports fields it could not edit in `skipped`.
+
+The live path sends each footprint back whole. See [footprint unit metadata loss before KiCad 10.0.8](../TROUBLESHOOTING.md#footprint-unit-metadata-disappears-after-a-live-pcb-edit).
 
 No existing call changes.
