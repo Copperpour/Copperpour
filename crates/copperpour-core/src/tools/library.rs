@@ -7,6 +7,7 @@ use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::footprint_metadata::quote_string;
+use crate::tools::solder_margins;
 use crate::tools::{get_path, require_array, require_str, ToolContext, ToolDef};
 use copperpour_schematic_editor::types::fmt_f64;
 use copperpour_sexp::geometry::round6;
@@ -224,7 +225,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_footprint_pad",
-            "Edit the size, shape, position, drill, zone connection, or fabrication property of a pad in an existing .kicad_mod footprint file.",
+            "Edit the size, shape, position, drill, zone connection, fabrication property, or solder mask and paste margins of a pad in an existing .kicad_mod footprint file. Each margin set is reported with its previous and current value.",
             json!({
                 "type": "object",
                 "properties": {
@@ -251,7 +252,10 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "enum": PadFabricationProperty::names(),
                         "description": "KiCad's pad fabrication property (optional; omit it to leave the pad as it is). KiCad's DRC skips the copper-to-edge check for a 'castellated' pad; 'none' removes the property. A property KiCad flags for this pad type is still written, with KiCad's warning in 'warnings'."
-                    }
+                    },
+                    "solder_mask_margin": solder_margins::Margin::Mask.schema("pad"),
+                    "solder_paste_margin": solder_margins::Margin::Paste.schema("pad"),
+                    "solder_paste_margin_ratio": solder_margins::Margin::PasteRatio.schema("pad")
                 },
                 "required": ["footprint_path", "pad_number"]
             }),
@@ -1163,10 +1167,14 @@ async fn handle_edit_footprint_pad(
         Ok(property) => property,
         Err(reason) => return Ok(invalid_library_argument("fabrication_property", reason)),
     };
+    let margins = match solder_margins::requested(args) {
+        Ok(margins) => margins,
+        Err(refusal) => return Ok(invalid_library_argument(refusal.field, refusal.reason)),
+    };
 
     let content = read_consistent(&path)?;
-    match parse_sexp(&content) {
-        Ok(root) if root.head() == Some("footprint") => {}
+    let file_version = match parse_sexp(&content) {
+        Ok(root) if root.head() == Some("footprint") => solder_margins::file_version(&root),
         Ok(root) => {
             return Ok(invalid_library_argument(
                 "footprint_path",
@@ -1179,10 +1187,14 @@ async fn handle_edit_footprint_pad(
                 format!("footprint is malformed: {error}"),
             ))
         }
+    };
+    if let Err(refusal) = solder_margins::refuse_zero_in_older_file(file_version, &margins) {
+        return Ok(invalid_library_argument(refusal.field, refusal.reason));
     }
 
     let mut edits = Vec::new();
     let mut matched_count = 0usize;
+    let mut observed_margins = vec![Vec::new(); margins.len()];
     let mut observed_zone_connects = Vec::new();
     let mut observed_fabrication_properties = Vec::new();
     let mut warnings = Vec::new();
@@ -1228,6 +1240,14 @@ async fn handle_edit_footprint_pad(
             }
             observed_fabrication_properties.push(observed.as_str());
         }
+        for ((margin, setting), observed) in margins.iter().zip(&mut observed_margins) {
+            edited = set_pad_child(edited, margin.name(), setting.child(*margin));
+            // Both sides read as KiCad reads them, `current` off the pad as written.
+            let written = parse_sexp(&edited).unwrap_or_else(|_| node.clone());
+            let read =
+                |pad: &SexpNode| solder_margins::read(pad, *margin, &[margin.name()], file_version);
+            observed.push(json!({ "previous": read(&node), "current": read(&written) }));
+        }
         edits.push(SexpEdit::replace(start, end, edited));
         if !match_all {
             break;
@@ -1258,6 +1278,9 @@ async fn handle_edit_footprint_pad(
         "fabrication_property",
         observed_fabrication_properties,
     );
+    for ((margin, _), observed) in margins.iter().zip(observed_margins) {
+        solder_margins::report(&mut response, *margin, observed);
+    }
     if !warnings.is_empty() {
         response["warnings"] = json!(warnings);
     }
@@ -7231,6 +7254,156 @@ mod tests {
             r#"(pad "1" smd rect (at 0 0) (size 2 1) (layers "F.Cu") (zone_connect 2))"#
         );
         assert_eq!(set_pad_zone_connect(solid, PadZoneConnect::Inherited), pad);
+    }
+
+    // KiCad 10.0.8 wrote each of these from the stock Winbond USON-8; provenance
+    // in tests/fixtures/solder_margins_kicad10.README.md.
+    const MARGINS_NONE: &str =
+        include_str!("../../tests/fixtures/solder_margins_none_kicad10.kicad_mod");
+    const MARGINS_EP: &str =
+        include_str!("../../tests/fixtures/solder_margins_ep_kicad10.kicad_mod");
+    const MARGINS_EP_ZERO: &str =
+        include_str!("../../tests/fixtures/solder_margins_ep_zero_kicad10.kicad_mod");
+    const MARGINS_FOOTPRINT_NAME: &str = "Winbond_USON-8-1EP_3x2mm_P0.5mm_EP0.2x1.6mm.kicad_mod";
+
+    async fn edit_margins(
+        source: &str,
+        arguments: serde_json::Value,
+    ) -> (serde_json::Value, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(MARGINS_FOOTPRINT_NAME);
+        std::fs::write(&path, source).unwrap();
+        let mut arguments = arguments;
+        arguments["footprint_path"] = json!(path);
+        let result = handle_edit_footprint_pad(&arguments, &test_ctx())
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        (body, std::fs::read_to_string(&path).unwrap())
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_pad_writes_solder_margins_as_kicad_does() {
+        let set = json!({
+            "solder_mask_margin": -0.05,
+            "solder_paste_margin": -0.1,
+            "solder_paste_margin_ratio": -0.2
+        });
+        let zero = json!({
+            "solder_mask_margin": 0,
+            "solder_paste_margin": 0,
+            "solder_paste_margin_ratio": 0
+        });
+        let inherited = json!({
+            "solder_mask_margin": "inherited",
+            "solder_paste_margin": "inherited",
+            "solder_paste_margin_ratio": "inherited"
+        });
+        let cases = [
+            ("set on the exposed pad", MARGINS_NONE, &set, MARGINS_EP),
+            ("an override of 0", MARGINS_NONE, &zero, MARGINS_EP_ZERO),
+            ("a value replaced by 0", MARGINS_EP, &zero, MARGINS_EP_ZERO),
+            ("values removed", MARGINS_EP, &inherited, MARGINS_NONE),
+            ("zeros removed", MARGINS_EP_ZERO, &inherited, MARGINS_NONE),
+            ("nothing to remove", MARGINS_NONE, &inherited, MARGINS_NONE),
+        ];
+        for (case, source, margins, kicad) in cases {
+            let mut arguments = margins.clone();
+            arguments["pad_number"] = json!("9");
+            let (body, written) = edit_margins(source, arguments).await;
+            assert_eq!(body["updated_count"], 1, "{case}: {body}");
+            assert_eq!(
+                solder_margins::without_uuids(&written),
+                solder_margins::without_uuids(kicad),
+                "{case}: the pad must match KiCad's and nothing else may change"
+            );
+        }
+
+        let mut arguments = set.clone();
+        arguments["pad_number"] = json!("9");
+        let (body, _) = edit_margins(MARGINS_EP_ZERO, arguments).await;
+        assert_eq!(
+            body["solder_mask_margin"],
+            json!({ "previous": 0.0, "current": -0.05 })
+        );
+        assert_eq!(
+            body["solder_paste_margin"],
+            json!({ "previous": 0.0, "current": -0.1 })
+        );
+        assert_eq!(
+            body["solder_paste_margin_ratio"],
+            json!({ "previous": 0.0, "current": -0.2 })
+        );
+        assert_eq!(
+            body.get("zone_connect"),
+            None,
+            "only what was asked is reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn pads_that_disagree_report_each_previous_margin() {
+        let (_, first) = edit_margins(
+            ZONE_CONNECT_SOLID,
+            json!({ "pad_number": "1", "solder_mask_margin": 0.2 }),
+        )
+        .await;
+        let (body, written) = edit_margins(
+            &first,
+            json!({ "pad_number": "1", "match_all": true, "solder_mask_margin": 0.1 }),
+        )
+        .await;
+        assert_eq!(body["updated_count"], 3, "{body}");
+        assert_eq!(
+            body["solder_mask_margin"],
+            json!([
+                { "previous": 0.2, "current": 0.1 },
+                { "previous": "inherited", "current": 0.1 }
+            ])
+        );
+        assert_eq!(written.matches("(solder_mask_margin 0.1)").count(), 3);
+        assert!(!written.contains("(solder_mask_margin 0.2)"));
+    }
+
+    /// Up to format 20240201 KiCad reads a margin of 0 as "inherited": an
+    /// override of 0 is refused there, and an existing 0 reads as inherited.
+    #[tokio::test]
+    async fn a_pad_margin_of_zero_is_refused_in_an_older_file() {
+        let older = MARGINS_EP_ZERO.replace("(version 20260206)", "(version 20240108)");
+        for field in [
+            "solder_mask_margin",
+            "solder_paste_margin",
+            "solder_paste_margin_ratio",
+        ] {
+            let (body, written) =
+                edit_margins(&older, json!({ "pad_number": "9", field: 0 })).await;
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], field, "{body}");
+            assert_eq!(written, older);
+        }
+        let (body, _) = edit_margins(
+            &older,
+            json!({ "pad_number": "9", "solder_mask_margin": -0.05 }),
+        )
+        .await;
+        assert_eq!(
+            body["solder_mask_margin"],
+            json!({ "previous": "inherited", "current": -0.05 })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pad_margin_that_is_not_a_number_is_refused_on_its_argument() {
+        for (field, value) in [
+            ("solder_mask_margin", json!(null)),
+            ("solder_paste_margin", json!("-0.1")),
+            ("solder_paste_margin_ratio", json!(false)),
+        ] {
+            let (body, written) =
+                edit_margins(MARGINS_NONE, json!({ "pad_number": "9", field: value })).await;
+            assert_eq!(body["error"]["field"], field, "{body}");
+            assert_eq!(written, MARGINS_NONE);
+        }
     }
 
     // KiCad 10.0.6 wrote every one of these; provenance in
