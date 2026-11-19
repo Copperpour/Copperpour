@@ -1,8 +1,10 @@
 """Tests for the Copperpour settings dialog and window parenting behavior."""
 
+import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -210,6 +212,37 @@ class SettingsDialogFocusTests(unittest.TestCase):
                 mock.patch.object(self.plugin.pcbnew, "GetBoard", return_value=fake_board):
             found = self.plugin.find_pcb_editor_window()
             self.assertIs(found, pcb_editor)
+
+    def test_dialog_actions_preserve_settings_without_controls(self):
+        saved_settings = {
+            "eager_toolsets": True,
+            "future_setting": {"enabled": False, "items": ["example"]},
+            "kicad_cli": "/fake/kicad-cli",
+            "log_level": "info",
+        }
+
+        for action, handler, server_running in (
+            ("Save", "_on_save", False),
+            ("Start Server", "_on_start_stop", False),
+            ("Stop Server", "_on_start_stop", True),
+        ):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as plugin_dir:
+                settings_path = Path(plugin_dir) / "settings.json"
+                settings_path.write_text(json.dumps(saved_settings), encoding="utf-8")
+                dlg = self.dialog_mod.CopperpourSettingsDialog(
+                    parent=None,
+                    plugin_dir=plugin_dir,
+                    binary_path="/fake/copperpour",
+                    server_running=server_running,
+                )
+                dlg.log_level_ctrl.SetSelection(3)  # debug
+
+                getattr(dlg, handler)(None)
+
+                persisted = json.loads(settings_path.read_text(encoding="utf-8"))
+                self.assertIs(persisted.get("eager_toolsets"), True)
+                self.assertEqual(persisted.get("future_setting"), saved_settings["future_setting"])
+                self.assertEqual(persisted["log_level"], "debug")
 
     def test_on_save_passes_parent_self_to_messagebox(self):
         dlg = self.dialog_mod.CopperpourSettingsDialog(
