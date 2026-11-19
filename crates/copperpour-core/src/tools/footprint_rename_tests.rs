@@ -125,6 +125,12 @@ async fn a_rename_that_changes_only_the_case_is_allowed() {
     let (_dir, library) = library(&[("ffc_fh12", &lower)]);
     let (is_error, body) = rename(&library, "ffc_fh12", "FFC_FH12").await;
     assert!(!is_error, "{body}");
+    assert!(body.get("finished_earlier_rename").is_none(), "{body}");
+    assert_eq!(
+        body["value"],
+        json!({ "previous": "ffc_fh12", "current": "FFC_FH12" }),
+        "{body}"
+    );
     // The name and the Value change; the 3D model path, which holds the old
     // name too, does not.
     let expected = lower
@@ -242,6 +248,83 @@ async fn an_interrupted_rename_is_finished() {
     let (_other_dir, taken) = self::library(&[(OLD, SOURCE), (NEW, OTHER)]);
     let (_, body) = rename(&taken, OLD, NEW).await;
     assert_eq!(body["error"]["field"], "new_name", "{body}");
+}
+
+/// The stock footprint as `ffc_fh12`, and as KiCad renames it to `FFC_FH12`:
+/// the name and the Value change, the 3D model path does not.
+fn lower_and_upper() -> (String, String) {
+    let lower = SOURCE.replace(OLD, "ffc_fh12");
+    let upper = lower
+        .replacen("(footprint \"ffc_fh12\"", "(footprint \"FFC_FH12\"", 1)
+        .replacen(
+            "(property \"Value\" \"ffc_fh12\"",
+            "(property \"Value\" \"FFC_FH12\"",
+            1,
+        );
+    (lower, upper)
+}
+
+/// A case-only rename renames the file before rewriting it, so one that
+/// stopped in between leaves the original text under the new file name. The
+/// next call finishes it from that text and reports the Value it changed, as
+/// an uninterrupted rename does (#668 review).
+#[tokio::test]
+async fn an_interrupted_case_only_rename_is_finished_with_its_value() {
+    let (lower, upper) = lower_and_upper();
+    let (_dir, library) = library(&[("FFC_FH12", &lower)]);
+    let (is_error, body) = rename(&library, "ffc_fh12", "FFC_FH12").await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["finished_earlier_rename"], true, "{body}");
+    assert_eq!(
+        body["value"],
+        json!({ "previous": "ffc_fh12", "current": "FFC_FH12" }),
+        "{body}"
+    );
+    let files = files(&library);
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].0, "FFC_FH12.kicad_mod");
+    assert!(files[0].1 == upper, "the finished file differs");
+
+    // A file under the new name that holds some other name is not taken for
+    // an interrupted rename.
+    let (_other_dir, other) = self::library(&[("FFC_FH12", OTHER)]);
+    let (_, body) = rename(&other, "ffc_fh12", "FFC_FH12").await;
+    assert_eq!(body["error"]["field"], "footprint_name", "{body}");
+}
+
+/// A case-only rename that an earlier version stopped after rewriting the
+/// file, before renaming it, is finished too. Its old Value is gone, so the
+/// answer has none.
+#[tokio::test]
+async fn a_case_only_rename_rewritten_before_its_rename_is_finished() {
+    let (_, upper) = lower_and_upper();
+    let (_dir, library) = library(&[("ffc_fh12", &upper)]);
+    let (is_error, body) = rename(&library, "ffc_fh12", "FFC_FH12").await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["finished_earlier_rename"], true, "{body}");
+    assert!(body.get("value").is_none(), "{body}");
+    let files = files(&library);
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].0, "FFC_FH12.kicad_mod");
+    assert!(files[0].1 == upper, "the finished file differs");
+}
+
+/// A footprint saved while a case-only rename has renamed its file but not
+/// yet rewritten it keeps what was saved, and its file gets its old name
+/// back, so nothing is renamed.
+#[tokio::test]
+async fn a_footprint_saved_during_a_case_only_rename_keeps_its_name() {
+    let (lower, _) = lower_and_upper();
+    let (_dir, library) = library(&[("ffc_fh12", &lower)]);
+    let saved = lower.replace("(layer \"F.Cu\")", "(layer \"B.Cu\")");
+    copperpour_sexp::writer::test_hooks::save_before_compare(
+        &library.join("FFC_FH12.kicad_mod"),
+        saved.clone(),
+    );
+    let (is_error, body) = rename(&library, "ffc_fh12", "FFC_FH12").await;
+    assert!(is_error);
+    assert_eq!(body["error"]["kind"], "conflict", "{body}");
+    assert_eq!(files(&library), [("ffc_fh12.kicad_mod".to_string(), saved)]);
 }
 
 #[test]

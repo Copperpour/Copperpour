@@ -94,6 +94,22 @@ async fn handle_rename_footprint(
     let names = footprint_names(&library)?;
     let old_path = library.join(format!("{old_name}.kicad_mod"));
     let new_path = library.join(format!("{new_name}.kicad_mod"));
+    let case_only = same_ignoring_case(old_name, new_name);
+    if case_only
+        && !names.iter().any(|name| name == old_name)
+        && names.iter().any(|name| name == new_name)
+    {
+        // A case-only rename interrupted after renaming the file: it still
+        // holds the old name and the original text, so finish it from there.
+        let source = copperpour_sexp::read_consistent(&new_path)?;
+        if footprint_name(&source).as_deref() == Some(old_name) {
+            let renamed = match renamed_source(&source, old_name, new_name) {
+                Ok(renamed) => renamed,
+                Err(reason) => return Ok(unusable(&new_path, &reason)),
+            };
+            return rewrite_case_only(&library, None, &new_path, &source, old_name, &renamed, true);
+        }
+    }
     if !names.iter().any(|name| name == old_name) {
         let hint = if names.iter().any(|name| name == new_name) {
             format!(" A footprint '{new_name}' is in the library: it may be renamed already.")
@@ -115,7 +131,6 @@ async fn handle_rename_footprint(
         Err(reason) => return Ok(unusable(&old_path, &reason)),
     };
 
-    let case_only = same_ignoring_case(old_name, new_name);
     if let Some(taken) = names
         .iter()
         .find(|name| *name != old_name && same_ignoring_case(name, new_name))
@@ -138,28 +153,23 @@ async fn handle_rename_footprint(
     }
 
     if case_only {
-        // One file on a case-insensitive filesystem: rewrite it, then rename it.
-        match copperpour_sexp::write_atomic_if_unchanged(&old_path, &source, &renamed.text) {
-            Ok(()) => {}
-            Err(SexpError::Conflict { path }) => {
-                return Ok(super::revision_conflict_result(&path, OPERATION))
-            }
-            Err(SexpError::ReadbackMismatch { path }) => {
-                return Ok(super::readback_mismatch_result(&path, OPERATION))
-            }
-            Err(error) => return Err(error.into()),
-        }
-        if let Err(error) = std::fs::rename(&old_path, &new_path) {
-            return Ok(super::mutation_outcome_uncertain(
-                &old_path,
-                OPERATION,
-                format!(
-                    "the footprint now holds the name '{new_name}', but its file could not be \
-                     renamed ({error}); call rename_footprint again to finish"
-                ),
-            ));
-        }
-        return Ok(answer(&library, old_name, new_name, &renamed));
+        // One file on a case-insensitive filesystem. Rename it first, then
+        // rewrite it: if the rewrite does not happen, the file keeps its
+        // original text, and the next call finishes from that with the same
+        // answer, the Value included. A file that already holds the new name
+        // was rewritten before its rename by an earlier version of this tool;
+        // its old Value is gone, so that answer cannot report one.
+        let finished_earlier = footprint_name(&source).as_deref() == Some(new_name);
+        std::fs::rename(&old_path, &new_path)?;
+        return rewrite_case_only(
+            &library,
+            Some(&old_path),
+            &new_path,
+            &source,
+            old_name,
+            &renamed,
+            finished_earlier,
+        );
     }
 
     match copperpour_sexp::write_new_atomic_verified(&new_path, &renamed.text) {
@@ -230,6 +240,70 @@ fn finish_interrupted(
     let mut body = answer_body(library, old_name, &renamed.name, renamed);
     body["finished_earlier_rename"] = json!(true);
     Ok(CallToolResult::json(&body))
+}
+
+/// Rewrite a case-only rename's file, already at `new_path`, with the new
+/// name. `rename_back` is the file's old path when this call renamed it: if
+/// the footprint was saved in between, the file gets its old name back, so
+/// nothing is renamed.
+fn rewrite_case_only(
+    library: &Path,
+    rename_back: Option<&Path>,
+    new_path: &Path,
+    source: &str,
+    old_name: &str,
+    renamed: &Renamed,
+    finished_earlier: bool,
+) -> anyhow::Result<CallToolResult> {
+    let new_name = &renamed.name;
+    match copperpour_sexp::write_atomic_if_unchanged(new_path, source, &renamed.text) {
+        Ok(()) => {}
+        Err(SexpError::Conflict { path }) => {
+            let Some(old_path) = rename_back else {
+                return Ok(super::revision_conflict_result(&path, OPERATION));
+            };
+            return Ok(match std::fs::rename(new_path, old_path) {
+                Ok(()) => super::revision_conflict_result(old_path, OPERATION),
+                Err(error) => super::mutation_outcome_uncertain(
+                    new_path,
+                    OPERATION,
+                    format!(
+                        "'{old_name}' changed after rename_footprint read it, so its file, \
+                         already renamed to '{new_name}.kicad_mod', was to get its old name \
+                         back, but that failed ({error}); it holds what was saved, under the \
+                         new file name"
+                    ),
+                ),
+            });
+        }
+        Err(SexpError::ReadbackMismatch { path }) => {
+            return Ok(super::readback_mismatch_result(&path, OPERATION))
+        }
+        Err(error) => {
+            return Ok(super::mutation_outcome_uncertain(
+                new_path,
+                OPERATION,
+                format!(
+                    "the file is renamed to '{new_name}.kicad_mod', but it still holds the name \
+                     '{old_name}' ({error}); call rename_footprint again to finish"
+                ),
+            ))
+        }
+    }
+    let mut body = answer_body(library, old_name, new_name, renamed);
+    if finished_earlier {
+        body["finished_earlier_rename"] = json!(true);
+    }
+    Ok(CallToolResult::json(&body))
+}
+
+/// The name in a footprint file's header, if it reads as one.
+fn footprint_name(source: &str) -> Option<String> {
+    let root = parse_sexp(source).ok()?;
+    if root.head() != Some("footprint") {
+        return None;
+    }
+    root.get(1)?.as_str().map(str::to_string)
 }
 
 struct Renamed {
