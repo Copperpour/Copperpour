@@ -590,6 +590,15 @@ async fn handle_list_toolboxes(ctx: &std::sync::Arc<ToolContext>) -> CallToolRes
     }))
 }
 
+/// Returned with every load that adds tools. The server has sent
+/// `notifications/tools/list_changed`, but a client that caches its first
+/// `tools/list` never sees the new tools, and the server cannot tell (#50).
+const LOAD_TOOLSET_HINT: &str = "These tools are loaded on the server, which has sent \
+     notifications/tools/list_changed. If your client still rejects them as unknown \
+     (e.g. \"No such tool available\"), it caches its first tools/list: set \
+     \"eager_toolsets\": true in the server configuration and restart the client session. \
+     See docs/TROUBLESHOOTING.md, \"Tools don't appear after load_toolset\".";
+
 async fn handle_load_toolset(args: &Value, ctx: &std::sync::Arc<ToolContext>) -> CallToolResult {
     match &args["name"] {
         // Legacy single-name form: `loaded` is a string and `tools` echoes
@@ -614,7 +623,8 @@ async fn handle_load_toolset(args: &Value, ctx: &std::sync::Arc<ToolContext>) ->
                     CallToolResult::json(&json!({
                         "loaded": name,
                         "tools_added": tools.len(),
-                        "tools": tool_list
+                        "tools": tool_list,
+                        "hint": LOAD_TOOLSET_HINT,
                     }))
                 }
                 None => CallToolResult::error(format!(
@@ -691,6 +701,9 @@ async fn handle_load_toolset(args: &Value, ctx: &std::sync::Arc<ToolContext>) ->
             });
             if !already_loaded.is_empty() {
                 body["already_loaded"] = json!(already_loaded);
+            }
+            if already_loaded.len() < loaded.len() {
+                body["hint"] = json!(LOAD_TOOLSET_HINT);
             }
             CallToolResult::json(&body)
         }
@@ -1074,6 +1087,10 @@ mod load_toolset_tests {
         assert!(added > 0);
         assert_eq!(body["tools"].as_array().unwrap().len() as u64, added);
         assert!(body.get("already_loaded").is_none(), "{body}");
+        assert!(
+            body["hint"].as_str().unwrap().contains("eager_toolsets"),
+            "{body}"
+        );
     }
 
     /// Reloading a loaded toolset by name says so and repeats no
@@ -1087,6 +1104,7 @@ mod load_toolset_tests {
         assert_eq!(again["already_loaded"], true);
         assert_eq!(again["tools_added"], first["tools_added"]);
         assert_eq!(again["tools"], json!([]));
+        assert!(again.get("hint").is_none(), "{again}");
     }
 
     /// In the array form only the newly loaded toolsets contribute
@@ -1098,6 +1116,7 @@ mod load_toolset_tests {
         let body = load(&ctx, json!(["templates", "sch_wiring"])).await;
         assert_eq!(body["loaded"], json!(["templates", "sch_wiring"]));
         assert_eq!(body["already_loaded"], json!(["templates"]));
+        assert!(body["hint"].is_string(), "{body}");
 
         let wiring = registry::tools_for("sch_wiring").unwrap();
         let listed: Vec<&str> = body["tools"]
@@ -1116,5 +1135,6 @@ mod load_toolset_tests {
         let body = load(&ctx, json!(["templates", "sch_wiring"])).await;
         assert_eq!(body["tools"], json!([]));
         assert_eq!(body["already_loaded"], json!(["templates", "sch_wiring"]));
+        assert!(body.get("hint").is_none(), "{body}");
     }
 }
