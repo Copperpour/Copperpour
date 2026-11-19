@@ -48,3 +48,12 @@ re-adds Child, the netlist resolves R3 at `/Mid/Leaf/` (`tstamps`
 `/5c0eb261-…/<new Leaf uuid>/`), R2 at `/Shared B/` and R1 at the new Child.
 Each symbol then records exactly `/d0dc0cde-…` plus that `tstamps`, and nothing
 else.
+
+## Sheet rename serialization (#639)
+
+On a copy of this fixture, run `edit_sheet` with `sheet_name: "Shared A"`
+and `new_name: "Shared X"`, then run
+`kicad-cli sch upgrade --force demo.kicad_sch` with KiCad 10.0.8. The
+resaved root differs from the original only in the `Sheetname` value.
+In particular, `(fields_autoplaced yes)` follows `(dnp no)` in the renamed
+sheet, as it does in the original.
