@@ -1378,7 +1378,7 @@ fn publish_model(path: &std::path::Path, bytes: &[u8]) -> Result<(), CallToolRes
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(io_error(e)),
     }
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let parent = copperpour_sexp::writer::parent_directory(path);
     let mut builder = tempfile::Builder::new();
     builder.prefix(".copperpour-model-");
     #[cfg(unix)]

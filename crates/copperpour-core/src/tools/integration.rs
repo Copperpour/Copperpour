@@ -391,7 +391,7 @@ async fn handle_download_jlcpcb(
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
 
-    let db_parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let db_parent = copperpour_sexp::writer::parent_directory(&db_path);
     let work_dir = tempfile::Builder::new()
         .prefix("copperpour-jlcpcb-")
         .tempdir_in(db_parent)?;

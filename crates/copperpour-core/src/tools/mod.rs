@@ -3314,10 +3314,7 @@ impl std::fmt::Display for SchematicTargetError {
                  Candidate root schematics: {}. Restore the saved sheet hierarchy or \
                  separate the independent document from unrelated projects before retrying.",
                 target.display(),
-                target
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new("."))
-                    .display(),
+                copperpour_sexp::writer::parent_directory(target).display(),
                 roots
                     .iter()
                     .map(|root| root.display().to_string())
@@ -3346,7 +3343,7 @@ impl SchematicTargetError {
                 message,
             ),
             Self::ProjectConflict { target, roots } => {
-                let directory = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+                let directory = copperpour_sexp::writer::parent_directory(&target);
                 let mut paths = vec![directory.display().to_string()];
                 paths.extend(roots.iter().map(|root| root.display().to_string()));
                 CallToolResult::error_kind(

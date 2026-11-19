@@ -141,7 +141,7 @@ fn write_atomic_unlocked_with(
     ensure_kicad_design_document_is_closed(path)?;
     std::fs::rename(&tmp_path, path)?;
     cleanup.disarm();
-    sync_parent_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    sync_parent_directory(parent_directory(path))?;
     Ok(())
 }
 
@@ -212,8 +212,8 @@ pub mod test_hooks {
     }
 
     /// The directory is canonical whether or not the file exists yet.
-    fn key(path: &Path) -> PathBuf {
-        let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    pub(super) fn key(path: &Path) -> PathBuf {
+        let directory = super::parent_directory(path);
         let directory = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.into());
         directory.join(path.file_name().unwrap_or_default())
     }
@@ -441,8 +441,9 @@ pub fn kicad_project_lock_path(path: &Path) -> Option<PathBuf> {
 
 fn kicad_sibling_lock_path(path: &Path, extensions: &[&str]) -> Option<PathBuf> {
     let resolved = path.canonicalize().unwrap_or_else(|_| {
-        path.parent()
-            .and_then(|parent| parent.canonicalize().ok())
+        parent_directory(path)
+            .canonicalize()
+            .ok()
             .and_then(|parent| path.file_name().map(|name| parent.join(name)))
             .unwrap_or_else(|| path.to_path_buf())
     });
@@ -525,7 +526,7 @@ fn document_lock_path(path: &Path) -> Result<PathBuf, SexpError> {
 }
 
 fn document_lock_path_in(state_root: &Path, path: &Path) -> Result<PathBuf, SexpError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_directory(path);
     let canonical_parent = parent.canonicalize()?;
     let file_name = path.file_name().ok_or_else(|| {
         SexpError::InvalidValue(format!("document path has no filename: {}", path.display()))
@@ -630,7 +631,7 @@ fn write_new_atomic_unlocked_with_mode(
     _mode: NewFileMode,
 ) -> Result<(), SexpError> {
     ensure_kicad_design_document_is_closed(path)?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_directory(path);
     let mut builder = tempfile::Builder::new();
     builder.prefix(".copperpour-");
     // `tempfile` creates at 0o600 by design, which then survives the rename
@@ -667,6 +668,14 @@ fn write_new_atomic_unlocked_with_mode(
         .map_err(|error| SexpError::Io(error.error))?;
     sync_parent_directory(parent)?;
     Ok(())
+}
+
+/// The directory containing `path`, falling back to `.` for a bare file name
+/// (whose [`Path::parent`] is `Some("")`, not `None`).
+pub fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 pub(crate) fn sync_parent_directory(_parent: &Path) -> Result<(), SexpError> {
@@ -749,7 +758,7 @@ fn scratch_path_for(path: &Path) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     name.push(format!(".{}.{n}.kicad_tmp", std::process::id()));
 
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = parent_directory(path);
     dir.join(name)
 }
 
@@ -1489,8 +1498,44 @@ mod atomic_write_tests {
     fn a_bare_filename_lands_in_the_current_directory() {
         assert_eq!(
             scratch_path_for(Path::new("board.kicad_pcb")).parent(),
-            Some(Path::new(""))
+            Some(Path::new("."))
         );
+    }
+
+    #[test]
+    fn parent_directory_resolves_bare_and_rooted_paths() {
+        assert_eq!(
+            parent_directory(Path::new("board.kicad_pcb")),
+            Path::new(".")
+        );
+        assert_eq!(
+            parent_directory(Path::new("./board.kicad_pcb")),
+            Path::new(".")
+        );
+        assert_eq!(
+            parent_directory(Path::new("sub/board.kicad_pcb")),
+            Path::new("sub")
+        );
+        assert_eq!(
+            parent_directory(Path::new("/board.kicad_pcb")),
+            Path::new("/")
+        );
+        assert_eq!(parent_directory(Path::new("/")), Path::new("."));
+        assert_eq!(parent_directory(Path::new("")), Path::new("."));
+    }
+
+    #[test]
+    fn bare_filename_shares_lock_and_hook_identity_with_absolute_cwd_path() {
+        let state = tempfile::tempdir().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let bare = Path::new("copperpour_bare_identity_test.kicad_pcb");
+        let absolute = cwd.join(bare);
+
+        assert_eq!(
+            document_lock_path_in(state.path(), bare).unwrap(),
+            document_lock_path_in(state.path(), &absolute).unwrap()
+        );
+        assert_eq!(test_hooks::key(bare), test_hooks::key(&absolute));
     }
 
     #[test]
