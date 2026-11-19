@@ -151,6 +151,7 @@ async fn main() -> Result<()> {
             path.display(),
         ),
         (_, Some(path)) => info!(
+            skipped_existing_paths = ?config_resolution.skipped_existing_paths(),
             "configuration: {} from {} ({} later candidate(s) exist and were not merged)",
             config_resolution.source().as_str(),
             path.display(),

@@ -677,6 +677,44 @@ fn configuration_block(p: &mut McpProcess) -> Value {
 }
 
 #[test]
+fn startup_logs_selected_and_skipped_config_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let selected = tmp.path().join("copperpour.toml");
+    let skipped = [
+        tmp.path().join("konnect.toml"),
+        tmp.path().join("settings.json"),
+    ];
+    std::fs::write(&selected, "log_level = \"info\"\n").unwrap();
+    for path in &skipped {
+        std::fs::write(path, "invalid configuration").unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_copperpour"))
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .env("APPDATA", tmp.path())
+        .env("RUST_LOG", "info")
+        .output()
+        .expect("failed to run copperpour binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        output.stdout.is_empty(),
+        "startup logs must stay off stdout"
+    );
+
+    let log = stderr
+        .lines()
+        .find(|line| line.contains("configuration: search_path from"))
+        .expect("missing startup configuration log");
+    assert!(log.contains(&canonical(&selected)), "{log}");
+    for path in skipped {
+        let path = path.canonicalize().unwrap();
+        assert!(log.contains(&format!("{path:?}")), "{log}");
+    }
+}
+
+#[test]
 fn installation_info_names_the_config_file_that_configured_startup() {
     let tmp = tempfile::tempdir().unwrap();
     let selected = tmp.path().join("konnect.toml");
