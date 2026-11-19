@@ -92,7 +92,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_copper",
-        description: "Copper edits on the board open in KiCad: create a planned set of tracks and through vias in one commit; read and set native pad and via teardrops",
+        description: "Copper edits on the board open in KiCad: create tracks and vias, batch-move existing vias, and read or set native pad and via teardrops",
         category: "pcb",
     },
     ToolsetMeta {

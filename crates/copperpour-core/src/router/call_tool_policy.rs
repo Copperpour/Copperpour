@@ -352,6 +352,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "set_schematic_title_block",
     "set_symbol_properties",
     "set_teardrop_settings",
+    "set_via_positions",
     "set_visual_baseline",
     "snapshot_project",
     "split_wire_at_point",
