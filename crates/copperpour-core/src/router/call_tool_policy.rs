@@ -304,6 +304,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "rename_footprint",
     "rename_project",
     "rename_schematic_net_label",
+    "rename_symbol",
     "render_schematic_png",
     "renumber_sheet_pages",
     "repair_corrupted_footprints",
