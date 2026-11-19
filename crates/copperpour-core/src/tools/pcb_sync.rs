@@ -2952,7 +2952,9 @@ fn apply_library_data(
 ///
 /// They are placed with the library refresh's own transform, so both tools
 /// put a library field in the same place. The sync places on the front only.
-fn apply_library_fields(
+/// Live placement (`PreparedFootprintPlacement::ipc_item`) gives its parts the
+/// same fields.
+pub(super) fn apply_library_fields(
     footprint: &mut copperpour_ipc::gen::kiapi::board::types::FootprintInstance,
     fields: &super::library_footprint::LibraryProperties,
 ) -> Result<()> {

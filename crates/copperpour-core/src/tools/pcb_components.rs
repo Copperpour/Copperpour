@@ -1120,7 +1120,8 @@ impl PreparedFootprintPlacement {
         let mut items = library.unsupported.clone();
         if let Err(reason) = &library.properties {
             items.push(format!(
-                "library properties (Reference and Value placed with defaults): {reason}"
+                "library properties (Reference and Value placed with defaults; Datasheet, \
+                 Description and custom properties left out): {reason}"
             ));
         }
         if let Some(kicad) = kicad_before_10_0_7 {
@@ -1136,8 +1137,9 @@ impl PreparedFootprintPlacement {
 
     /// The F.Cu `FootprintInstance` the IPC path creates, with the library's
     /// 3D models, attributes, description and keywords, pad zone settings,
-    /// Reference and Value fields, and (when `carry_10_0_7_fields` is true)
-    /// pad fabrication properties and reference points on it.
+    /// fields (Reference, Value, Datasheet, Description and custom
+    /// properties), and (when `carry_10_0_7_fields` is true) pad fabrication
+    /// properties and reference points on it.
     pub(crate) fn ipc_item(
         &self,
         lib_id: &str,
@@ -1192,7 +1194,7 @@ impl PreparedFootprintPlacement {
             )?;
         }
         if let Ok(properties) = &library.properties {
-            apply_library_reference_and_value(&mut footprint, properties, reference, &self.value)?;
+            apply_library_properties(&mut footprint, properties, reference, &self.value)?;
         }
         Ok(copperpour_ipc::builders::pack_any(
             &footprint,
@@ -1201,12 +1203,13 @@ impl PreparedFootprintPlacement {
     }
 
     /// Why [`Self::ipc_item`] gave the part default Reference and Value
-    /// fields, not the library's, if it did.
+    /// fields and none of the library's other properties, if it did.
     fn library_fields_not_carried(&self, lib_id: &str, reference: &str) -> Option<String> {
         let reason = self.library.as_ref()?.properties.as_ref().err()?;
         Some(format!(
             "{lib_id}'s library properties could not be read, so {reference} was placed with \
-             default Reference and Value fields, not the library's: {reason}"
+             default Reference and Value fields, not the library's, and without its Datasheet, \
+             Description and custom properties: {reason}"
         ))
     }
 
@@ -1233,47 +1236,42 @@ impl PreparedFootprintPlacement {
     }
 }
 
-/// Give a built footprint the library's Reference and Value fields, with the
-/// library's layer, visibility, font and keep-upright, as the sync gives the
-/// footprints it adds (#157). They are placed with the library refresh's own
-/// transform, and their text is the placement's.
-fn apply_library_reference_and_value(
+/// Give a built footprint the library's fields, as the sync gives the
+/// footprints it adds (`pcb_sync::apply_library_fields`, #789): Reference and
+/// Value with the library's layer, visibility, font and keep-upright (#157),
+/// Datasheet and Description where the library has them, and every custom
+/// property, such as `KiLib_Generator`. They are placed with the library
+/// refresh's own transform. The Reference and Value text is the placement's.
+fn apply_library_properties(
     footprint: &mut copperpour_ipc::gen::kiapi::board::types::FootprintInstance,
     properties: &super::library_footprint::LibraryProperties,
     reference: &str,
     value: &str,
 ) -> anyhow::Result<()> {
-    let position = footprint
-        .position
-        .context("built footprint has no position")?;
-    let rotation = footprint
-        .orientation
-        .as_ref()
-        .map_or(0.0, |angle| angle.value_degrees);
-    let place = |field: &copperpour_ipc::gen::kiapi::board::types::Field, text: &str| {
-        let mut placed = super::pcb_footprint_update::transform_library_property(
-            field, &position, rotation, None,
-        )?;
-        if let Some(shown) = placed.text.as_mut().and_then(|text| text.text.as_mut()) {
-            shown.text = text.to_string();
-        }
-        anyhow::Ok(placed)
-    };
+    super::pcb_sync::apply_library_fields(footprint, properties)?;
     let definition = footprint
         .definition
         .as_mut()
         .context("built footprint has no definition")?;
-    if let Some(field) = &properties.reference {
-        let placed = place(field, reference)?;
-        definition.reference_field = Some(placed.clone());
-        footprint.reference_field = Some(placed);
+    if properties.reference.is_some() {
+        set_shown_text(&mut footprint.reference_field, reference);
+        set_shown_text(&mut definition.reference_field, reference);
     }
-    if let Some(field) = &properties.value {
-        let placed = place(field, value)?;
-        definition.value_field = Some(placed.clone());
-        footprint.value_field = Some(placed);
+    if properties.value.is_some() {
+        set_shown_text(&mut footprint.value_field, value);
+        set_shown_text(&mut definition.value_field, value);
     }
     Ok(())
+}
+
+fn set_shown_text(field: &mut Option<copperpour_ipc::gen::kiapi::board::types::Field>, text: &str) {
+    if let Some(shown) = field
+        .as_mut()
+        .and_then(|field| field.text.as_mut())
+        .and_then(|text| text.text.as_mut())
+    {
+        shown.text = text.to_string();
+    }
 }
 
 fn footprint_references(content: &str) -> anyhow::Result<HashSet<String>> {
@@ -8316,6 +8314,132 @@ mod tests {
             assert_eq!(definition.reference_field, built.reference_field);
             assert_eq!(definition.value_field, built.value_field);
         }
+    }
+
+    /// The library's custom property (`KiLib_Generator` on the stock C_0603)
+    /// reaches the IPC item as KiCad 10.0.6 places it from the library at 0°
+    /// and 180° on F.Cu (`c_0603_ipc.README.md`). Without it, a library
+    /// refresh right after placing reports `metadata` changed.
+    #[test]
+    fn the_ipc_item_carries_the_custom_properties_kicad_places() {
+        use copperpour_ipc::gen::kiapi::board::types as board;
+        let tmp = tempfile::tempdir().unwrap();
+        capacitor_fixture(tmp.path(), C_0603);
+        let custom_fields = |definition: &board::Footprint| {
+            definition
+                .items
+                .iter()
+                .filter(|item| copperpour_ipc::builders::any_is(item, "kiapi.board.types.Field"))
+                .map(|item| {
+                    let mut field = board::Field::decode(item.value.as_slice()).unwrap();
+                    field.id = None;
+                    let text = field.text.as_mut().unwrap();
+                    text.id = None;
+                    text.parent = None;
+                    field
+                })
+                .collect::<Vec<_>>()
+        };
+        for capture in [
+            &include_bytes!("../../tests/fixtures/c_0603_loaded_front_0.ipc.bin")[..],
+            &include_bytes!("../../tests/fixtures/c_0603_loaded_front_180.ipc.bin")[..],
+        ] {
+            let kicad = board::FootprintInstance::decode(capture).unwrap();
+            let position = kicad.position.unwrap();
+            let x = copperpour_ipc::builders::nm_to_mm(position.x_nm);
+            let y = copperpour_ipc::builders::nm_to_mm(position.y_nm);
+            let rotation = kicad.orientation.unwrap().value_degrees;
+            let expected = custom_fields(kicad.definition.as_ref().unwrap());
+            assert_eq!(
+                expected
+                    .iter()
+                    .map(|field| field.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["KiLib_Generator"],
+                "the capture holds the library's one custom property"
+            );
+            let prepared = PreparedFootprintPlacement::from_library(
+                C_0603,
+                "Capacitor_SMD:C_0603_1608Metric",
+                "C1",
+                None,
+                x,
+                y,
+                rotation,
+                "F.Cu",
+                Some(tmp.path()),
+            )
+            .unwrap();
+            let item = prepared
+                .ipc_item("Capacitor_SMD:C_0603_1608Metric", "C1", x, y, true)
+                .unwrap();
+            let built = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            assert_eq!(
+                custom_fields(built.definition.as_ref().unwrap()),
+                expected,
+                "custom properties at {rotation}°"
+            );
+        }
+    }
+
+    /// A library Datasheet reaches the IPC item, on the instance and its
+    /// definition, as the sync gives it to the footprints it adds. Read from
+    /// the installed library (CC BY-SA), whose
+    /// `Package_SO:Texas_S-PDSO-G8_3x3mm_P0.65mm` has a Datasheet URL; skips
+    /// without one.
+    #[test]
+    fn the_ipc_item_carries_the_librarys_datasheet() {
+        use copperpour_ipc::gen::kiapi::board::types as board;
+        const NAME: &str = "Texas_S-PDSO-G8_3x3mm_P0.65mm";
+        let Some(pretty) = crate::tools::find_kicad_library_dirs("footprints")
+            .into_iter()
+            .map(|dir| dir.join("Package_SO.pretty"))
+            .find(|pretty| pretty.join(format!("{NAME}.kicad_mod")).is_file())
+        else {
+            eprintln!("SKIP: no installed Package_SO.pretty/{NAME}.kicad_mod");
+            return;
+        };
+        let source = std::fs::read_to_string(pretty.join(format!("{NAME}.kicad_mod"))).unwrap();
+        let Some(url) = source
+            .split("(property \"Datasheet\" \"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .filter(|url| !url.is_empty())
+            .map(str::to_string)
+        else {
+            eprintln!("SKIP: the installed {NAME} has no Datasheet");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        library_fixture(tmp.path(), "Package_SO", &pretty);
+        let lib_id = format!("Package_SO:{NAME}");
+        let prepared = PreparedFootprintPlacement::from_library(
+            &source,
+            &lib_id,
+            "U1",
+            None,
+            10.0,
+            20.0,
+            0.0,
+            "F.Cu",
+            Some(tmp.path()),
+        )
+        .unwrap();
+        let item = prepared.ipc_item(&lib_id, "U1", 10.0, 20.0, true).unwrap();
+        let built = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        let shown = |field: &Option<board::Field>| {
+            field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.clone())
+        };
+        assert_eq!(shown(&built.datasheet_field), Some(url));
+        assert_eq!(
+            built.definition.as_ref().unwrap().datasheet_field,
+            built.datasheet_field
+        );
+        assert_eq!(shown(&built.reference_field).as_deref(), Some("U1"));
     }
 
     /// The issue's reproduction, served: a stock C_0603 placed live at 180°
