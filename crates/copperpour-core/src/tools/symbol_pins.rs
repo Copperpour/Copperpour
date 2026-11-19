@@ -1,6 +1,6 @@
 //! `edit_symbol_pin`: change one pin's electrical type, graphic style, name,
-//! number, position, angle or length in an existing `.kicad_sym` symbol,
-//! leaving everything else as written.
+//! number, position, angle, length or visibility in an existing `.kicad_sym`
+//! symbol, leaving everything else as written.
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -33,6 +33,11 @@ const PIN_STYLES: &[&str] = &[
 /// empty (KiCad's `sch_file_versions.h`).
 pub(super) const TILDE_IS_TEXT: u32 = 20250318;
 
+/// The first file version in which KiCad writes a hidden pin as `(hide yes)`
+/// rather than a bare `hide` ("Use booleans for 'hide' in symbols",
+/// `sch_file_versions.h`). KiCad 8, at 20231120, reads only the bare form.
+const BOOLEAN_HIDE: u32 = 20241004;
+
 /// The pin directions KiCad reads in `(at x y angle)`; any other angle stops it
 /// loading the library.
 const PIN_ANGLES: [u32; 4] = [0, 90, 180, 270];
@@ -45,8 +50,8 @@ const PARTS: [&str; 8] = [
 pub(super) fn tool() -> ToolDef {
     tool!(
         "edit_symbol_pin",
-        "Set the electrical type, graphic style, name, number, position, angle or length of \
-         one pin of an existing library symbol. A pin number found in more than one unit or \
+        "Set the electrical type, graphic style, name, number, position, angle, length or \
+         visibility of one pin of an existing library symbol. A pin number found in more than one unit or \
          body style needs unit or body_style to choose the pin; pins sharing a number in one \
          unit and body style are chosen by their current name (pin_name) or connection point \
          (pin_x, pin_y). Everything else, and the rest of the library, is left as written. \
@@ -77,7 +82,8 @@ pub(super) fn tool() -> ToolDef {
                 "x": { "type": "number", "description": "New X of the pin's connection point in mm, in the symbol's coordinates as create_symbol writes them" },
                 "y": { "type": "number", "description": "New Y of the pin's connection point in mm, as for x" },
                 "angle": { "type": "integer", "enum": PIN_ANGLES, "description": "New pin direction in degrees, from the connection point toward the body" },
-                "length": { "type": "number", "minimum": 0, "description": "New pin length in mm" }
+                "length": { "type": "number", "minimum": 0, "description": "New pin length in mm" },
+                "hidden": { "type": "boolean", "description": "Hide the pin (true) or show it (false), as KiCad's pin dialog does. Written as (hide yes) in the pin, or as a bare hide in a library older than format 20241004, which KiCad 8 can still open. A pin shown where another pin stands, such as a stacked exposed pad, is drawn over it; move it with x and y" }
             },
             "required": ["library_path", "symbol_name", "pin_number"],
             "additionalProperties": false
@@ -115,6 +121,7 @@ struct Request<'a> {
     y: Option<i64>,
     angle: Option<u32>,
     length: Option<i64>,
+    hidden: Option<bool>,
 }
 
 /// One `(pin TYPE STYLE (at X Y ANGLE) (length L) (name "N" …) (number "NUM" …))`
@@ -136,6 +143,15 @@ struct Pin {
     length: String,
     /// The spans of the parts, in [`PARTS`] order.
     spans: [Option<(usize, usize)>; 8],
+    /// Whether KiCad reads the pin as hidden: a bare `hide`, or the last
+    /// `(hide yes|no)` (`parseSymbolPin`).
+    hidden: bool,
+    /// The spans of every bare `hide` and `(hide …)` of the pin.
+    hide_spans: Vec<(usize, usize)>,
+    /// Where KiCad writes the hide marker, after `(length …)`, and the
+    /// whitespace that leads the pin's items there.
+    hide_at: usize,
+    hide_separator: String,
 }
 
 impl Pin {
@@ -364,6 +380,11 @@ fn parse_request(args: &serde_json::Value) -> Result<Request<'_>, CallToolResult
         y: measure_arg(args, "y", f64::NEG_INFINITY)?,
         angle,
         length: measure_arg(args, "length", 0.0)?,
+        hidden: match args.get("hidden") {
+            None => None,
+            Some(serde_json::Value::Bool(hidden)) => Some(*hidden),
+            Some(_) => return Err(invalid_arg("hidden", "must be true or false")),
+        },
     };
     if request.pin_type.is_none()
         && request.style.is_none()
@@ -373,10 +394,11 @@ fn parse_request(args: &serde_json::Value) -> Result<Request<'_>, CallToolResult
         && request.y.is_none()
         && request.angle.is_none()
         && request.length.is_none()
+        && request.hidden.is_none()
     {
         return Err(invalid_arg(
             "pin_change",
-            "supply at least one of type, style, name, new_number, x, y, angle or length",
+            "supply at least one of type, style, name, new_number, x, y, angle, length or hidden",
         ));
     }
     Ok(request)
@@ -495,8 +517,39 @@ fn read_pin(
     let mut number = None;
     let mut at = None;
     let mut length = None;
-    for (child_start, _) in find_direct_child_blocks(&source[start..end], "pin") {
-        let child_start = start + child_start;
+    let lists: Vec<(usize, usize)> = find_direct_child_blocks(&source[start..end], "pin")
+        .into_iter()
+        .map(|(from, to)| (start + from, start + to))
+        .collect();
+    // The pin's items after its style, in order: KiCad reads a bare `hide`
+    // and each `(hide yes|no)` as it meets them.
+    let mut hidden = false;
+    let mut hide_spans = Vec::new();
+    let mut index = style_span.1;
+    loop {
+        let rest = &source[index..end];
+        let skipped = rest.len() - rest.trim_start().len();
+        index += skipped;
+        if index >= end || source[index..].starts_with(')') {
+            break;
+        }
+        if let Some(&(from, to)) = lists.iter().find(|(from, _)| *from == index) {
+            if header(source, from).map(|(head, _)| head) == Some("hide") {
+                let value = header(source, from).map(|(_, value)| value);
+                hidden = value != Some("no");
+                hide_spans.push((from, to));
+            }
+            index = to;
+        } else {
+            let (from, to) = skip_sexp_token(source, index).ok_or(BAD)?;
+            if &source[from..to] == "hide" {
+                hidden = true;
+                hide_spans.push((from, to));
+            }
+            index = to;
+        }
+    }
+    for &(child_start, _) in &lists {
         let (_, after_head) = skip_sexp_token(source, child_start + 1).ok_or(BAD)?;
         let first = skip_sexp_token(source, after_head).ok_or(BAD)?;
         // As SCH_PIN::SetName and SetNumber store what the parser hands them.
@@ -520,6 +573,19 @@ fn read_pin(
             _ => {}
         }
     }
+    // After `(length …)`, else `(at …)`, else the style, as the pin is written.
+    let anchor = ["length", "at"].iter().find_map(|wanted| {
+        lists
+            .iter()
+            .find(|(from, _)| header(source, *from).is_some_and(|(head, _)| head == *wanted))
+    });
+    let (hide_at, hide_separator) = match anchor {
+        Some(&(from, to)) => {
+            let lead = source[..from].trim_end_matches(|c: char| c.is_ascii_whitespace());
+            (to, source[lead.len()..from].to_string())
+        }
+        None => (style_span.1, " ".to_string()),
+    };
     let ((name, name_span), (number, number_span)) = name.zip(number).ok_or(BAD)?;
     let at = at.map_or([None; 3], |at| at.map(Some));
     let spans = [
@@ -550,6 +616,10 @@ fn read_pin(
         angle: text(6),
         length: text(7),
         spans,
+        hidden,
+        hide_spans,
+        hide_at,
+        hide_separator,
     })
 }
 
@@ -830,6 +900,25 @@ fn prepare_edit(
             json!({"previous": value(old), "current": value(new)}),
         );
     }
+    if let Some(hidden) = request.hidden.filter(|hidden| *hidden != pin.hidden) {
+        // Every marker goes, then one is written in the library's own form.
+        for &(from, to) in &pin.hide_spans {
+            let lead = source[..from].trim_end_matches(|c: char| c.is_ascii_whitespace());
+            edits.push(SexpEdit::delete(lead.len(), to));
+        }
+        if hidden {
+            let boolean = library_version(source).is_none_or(|version| version >= BOOLEAN_HIDE);
+            let marker = if boolean { "(hide yes)" } else { "hide" };
+            edits.push(SexpEdit::insert(
+                pin.hide_at,
+                format!("{}{marker}", pin.hide_separator),
+            ));
+        }
+        changes.insert(
+            "hidden".into(),
+            json!({"previous": pin.hidden, "current": hidden}),
+        );
+    }
     Ok((
         pin,
         apply_edits(source.to_string(), edits),
@@ -861,12 +950,19 @@ fn readback_mismatch(
         return Some("the pin count changed".to_string());
     }
     for (was, now) in original.iter().zip(&after) {
-        let expected = if was == target {
-            parts_as_asked(was, request)
+        let (expected, hidden) = if was == target {
+            (
+                parts_as_asked(was, request),
+                request.hidden.unwrap_or(was.hidden),
+            )
         } else {
-            was.parts().map(str::to_string)
+            (was.parts().map(str::to_string), was.hidden)
         };
-        if now.unit != was.unit || now.body_style != was.body_style || now.parts() != expected {
+        if now.unit != was.unit
+            || now.body_style != was.body_style
+            || now.parts() != expected
+            || now.hidden != hidden
+        {
             return Some(format!(
                 "pin '{}' of {} does not read as asked",
                 was.number,
@@ -1902,5 +1998,148 @@ mod tests {
             body["changes"]["type"],
             json!({ "previous": "input", "current": "output" })
         );
+    }
+
+    /// KiCad 10 writes a hidden pin's `(hide yes)` after its length. Showing
+    /// stock 74ALVC164245's hidden GND pin 10 removes that line alone, and
+    /// hiding it again gives back KiCad's own library byte for byte.
+    #[tokio::test]
+    async fn a_stock_hidden_pin_is_shown_and_hidden_again_as_kicad_writes_it() {
+        let Some(stock) = stock_74xx() else { return };
+        let (_dir, path) = library_with(&stock);
+        let pin = json!({
+            "library_path": path, "symbol_name": "74ALVC164245", "pin_number": "10"
+        });
+        let mut show = pin.clone();
+        show["hidden"] = json!(false);
+        let body = call(show).await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(
+            body["changes"],
+            json!({ "hidden": { "previous": true, "current": false } })
+        );
+        let shown = std::fs::read_to_string(&path).unwrap();
+        let start = stock.find("(symbol \"74ALVC164245_1_1\"").unwrap();
+        let number = start + stock[start..].find("(number \"10\"").unwrap();
+        let hide = stock[..number].rfind("(hide yes)").unwrap();
+        // The line break before it goes too, LF or CRLF as the library has it.
+        let line_start = stock[..hide].trim_end().len();
+        let mut expected = stock.clone();
+        expected.replace_range(line_start..hide + "(hide yes)".len(), "");
+        assert!(shown == expected, "only the pin's (hide yes) line may go");
+
+        let mut hide = pin;
+        hide["hidden"] = json!(true);
+        let body = call(hide).await;
+        assert_eq!(
+            body["changes"],
+            json!({ "hidden": { "previous": false, "current": true } })
+        );
+        assert!(
+            std::fs::read_to_string(&path).unwrap() == stock,
+            "hiding it again must give back KiCad's library"
+        );
+    }
+
+    /// A library older than format 20241004 keeps KiCad 8's bare `hide`: the
+    /// stacked, hidden pin 8 of the KiCad 7 library is shown and moved off pin
+    /// 5, then put back, which restores the file.
+    #[tokio::test]
+    async fn a_stacked_hidden_pin_in_an_older_library_is_shown_and_moved() {
+        const HIDDEN: &str = "(pin passive line (at -2.54 -10.16 90) (length 2.54) hide\n        (name \"HP\" (effects (font (size 1.27 1.27))))\n        (number \"8\"";
+        const SHOWN: &str = "(pin passive line (at -5.08 -10.16 90) (length 2.54)\n        (name \"HP\" (effects (font (size 1.27 1.27))))\n        (number \"8\"";
+        let (_dir, path) = library_with(KICAD7);
+        let body = call(json!({
+            "library_path": path, "symbol_name": "AFBR-1624Z", "pin_number": "8",
+            "hidden": false, "x": -5.08
+        }))
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(
+            body["changes"]["hidden"],
+            json!({ "previous": true, "current": false })
+        );
+        assert_eq!(
+            body["changes"]["x"],
+            json!({ "previous": -2.54, "current": -5.08 })
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            KICAD7.replacen(HIDDEN, SHOWN, 1)
+        );
+
+        let body = call(json!({
+            "library_path": path, "symbol_name": "AFBR-1624Z", "pin_number": "8",
+            "hidden": true, "x": -2.54
+        }))
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), KICAD7);
+    }
+
+    /// Asking for the visibility a pin already has writes nothing.
+    #[tokio::test]
+    async fn a_pin_already_as_asked_is_left_alone() {
+        let (_dir, path) = library_with(KICAD7);
+        for (number, hidden) in [("8", true), ("5", false)] {
+            let body = call(json!({
+                "library_path": path, "symbol_name": "AFBR-1624Z", "pin_number": number,
+                "hidden": hidden
+            }))
+            .await;
+            assert_ne!(body["is_error"], true, "{body}");
+            assert_eq!(body["changes"], json!({}), "{number}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), KICAD7);
+    }
+
+    /// KiCad reads the pin's markers in order, so the last one decides, and
+    /// a hidden pin keeps one `(hide yes)` in place of all of them.
+    #[tokio::test]
+    async fn the_last_hide_marker_decides_and_all_are_replaced() {
+        let library = "(kicad_symbol_lib (version 20251024)\n  (symbol \"P\"\n    (symbol \"P_1_1\"\n      (pin passive line\n        (at 0 0 0)\n        (length 2.54)\n        hide\n        (hide no)\n        (name \"A\")\n        (number \"1\")\n      )\n    )\n  )\n)\n";
+        let (_dir, path) = library_with(library);
+        let body = call(json!({
+            "library_path": path, "symbol_name": "P", "pin_number": "1", "hidden": true
+        }))
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(body["changes"]["hidden"]["previous"], false, "{body}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            library.replace("        hide\n        (hide no)\n", "        (hide yes)\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_that_is_not_a_boolean_is_refused() {
+        let (_dir, path) = library_with(KICAD7);
+        for hidden in [json!("yes"), json!(1), json!(null)] {
+            let body = call(json!({
+                "library_path": path, "symbol_name": "AFBR-1624Z", "pin_number": "8",
+                "hidden": hidden
+            }))
+            .await;
+            assert_eq!(body["error"]["field"], "hidden", "{hidden}: {body}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), KICAD7);
+    }
+
+    /// The handler refuses a non-boolean itself, not only the schema.
+    #[test]
+    fn the_request_refuses_a_hidden_that_is_not_a_boolean() {
+        for hidden in [json!("yes"), json!(1), json!(null)] {
+            let args = json!({
+                "library_path": "x.kicad_sym", "symbol_name": "S", "pin_number": "1",
+                "length": 2.54, "hidden": hidden
+            });
+            let Err(refusal) = parse_request(&args) else {
+                panic!("{hidden} must be refused");
+            };
+            assert!(
+                format!("{refusal:?}").contains("must be true or false"),
+                "{refusal:?}"
+            );
+        }
     }
 }
