@@ -24,3 +24,6 @@ pub(crate) mod specctra_ses;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tools;
+#[cfg(all(test, unix))]
+#[path = "../../test-support/write_executable_script.rs"]
+mod write_executable_script;
