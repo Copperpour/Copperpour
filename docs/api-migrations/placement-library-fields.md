@@ -1,0 +1,5 @@
+### Live placement gives a footprint its library's Datasheet, Description and custom properties (patch release)
+
+`place_component`, `place_component_array`, `duplicate_component` and `add_mounting_hole` (with a library footprint), placing while the board is open in KiCad, now give the footprint every field its library footprint has: Datasheet and Description where the library has them, and every custom property, such as `KiLib_Generator`. They are placed as `update_pcb_from_schematic` places them on the footprints it adds. Before, these fields were left out without saying so, and a library refresh dry run right after placing reported `metadata` changed.
+
+When the library's properties cannot be read, the part is still placed with default Reference and Value fields, and the existing warning and `not_carried` entry now also say that Datasheet, Description and custom properties were left out. Tool inputs and response fields are unchanged; closed-board placement already copied the whole library footprint. Callers need not change their calls.
