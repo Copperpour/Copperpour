@@ -176,39 +176,23 @@ where
         LiveBoard::Uncertain(message) => BoardRead::Refused(super::ipc_uncertain_result(&message)),
         LiveBoard::Recovered(message) => BoardRead::Refused(super::ipc_recovered_result(&message)),
 
-        // KiCad is on the other end and refused the request, or never finished
-        // answering it. Nothing here explains the live board away, so the saved
-        // file cannot stand in for it under any automatic mode. No read raises
-        // a refusal of its own (#240); one would be kept with these.
-        LiveBoard::Rejected(message) => {
-            let recovery = super::ipc_recovery::for_ipc_failure(
-                &copperpour_ipc::IpcFailure::Rejected(message.clone()),
-            );
+        result @ (LiveBoard::Rejected { .. } | LiveBoard::Preflight(_)) => {
+            let failure = match result {
+                LiveBoard::Rejected { message, status } => {
+                    copperpour_ipc::IpcFailure::Rejected { message, status }
+                }
+                LiveBoard::Preflight(refusal) => copperpour_ipc::IpcFailure::Preflight(refusal),
+                _ => unreachable!(),
+            };
+            let message = failure.message();
+            let recovery = super::ipc_recovery::for_ipc_failure(&failure);
             BoardRead::Refused(CallToolResult::error_kind_with_recovery(
                 ToolErrorKind::EditorUnavailable {
                     editor: "pcb".to_string(),
-                    reason: message.clone(),
+                    reason: message.to_owned(),
                 },
                 format!(
-                    "KiCad did not complete the {what} for this board: {message}. Copperpour did not \
-                     substitute the saved board file, which may be older than the editor's state. \
-                     Retry, or ask for board_source='saved' to inspect the last saved snapshot."
-                ),
-                recovery,
-            ))
-        }
-        LiveBoard::Preflight(refusal) => {
-            let message = refusal.reason.clone();
-            let recovery = super::ipc_recovery::for_ipc_failure(
-                &copperpour_ipc::IpcFailure::Preflight(refusal),
-            );
-            BoardRead::Refused(CallToolResult::error_kind_with_recovery(
-                ToolErrorKind::EditorUnavailable {
-                    editor: "pcb".to_string(),
-                    reason: message.clone(),
-                },
-                format!(
-                    "KiCad did not complete the {what} for this board: {message}. Copperpour did not \
+                    "Could not complete the live {what} for this board: {message}. Copperpour did not \
                      substitute the saved board file, which may be older than the editor's state. \
                      Retry, or ask for board_source='saved' to inspect the last saved snapshot."
                 ),

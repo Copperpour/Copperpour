@@ -1,0 +1,5 @@
+### IPC recovery distinguishes Copperpour refusals from KiCad errors (minor release)
+
+A typed Copperpour refusal reports `recovery.cause: "preflight_refusal"` and `mutation_outcome: "none"`. Address the reported problem before retrying. An explicit KiCad error status that is not part of a typed preflight refusal reports `cause: "kicad_api_rejection"` and includes the status in `recovery.evidence.status`. An unclassified failure still reports `cause: "unknown"` and does not say KiCad rejected the request. Neither an error status nor an unclassified error, by itself, proves that the board is unchanged.
+
+Treat `recovery.troubleshooting_url` as optional. It is omitted when IPC troubleshooting would not address the failure. Existing editor, transport and uncertain-outcome diagnostics still include their applicable links. If a KiCad status prevents the placement copper check from completing, the existing `plan_blocked` error includes that status in `recovery.evidence.status`; no placement was written. A write whose verification request fails now reports `ipc_outcome_unknown` on the affected trace, via and footprint paths. No tool arguments changed.

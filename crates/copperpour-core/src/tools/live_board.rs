@@ -27,10 +27,12 @@ pub(crate) const PREVIOUSLY_OBSERVED_LIVE: &str = "board_previously_observed_liv
 pub(crate) enum LiveBoard<T> {
     /// KiCad holds the requested board and `f` ran against it.
     Answered(T),
-    /// KiCad is reachable and refused, or never finished answering, *after*
-    /// naming the board. It may hold it, so the saved file is not
-    /// authoritative.
-    Rejected(String),
+    /// An API error status or an unclassified error does not establish that
+    /// the requested board can be used from disk.
+    Rejected {
+        message: String,
+        status: Option<String>,
+    },
     /// KiCad named the board, and Copperpour refused the request itself on
     /// what it read, before KiCad kept any of it (#240). KiCad rejected
     /// nothing, so this is not [`Self::Rejected`].
@@ -123,7 +125,9 @@ where
     // file answer for a board KiCad had just proven it was holding.
 
     Ok(match failure {
-        copperpour_ipc::IpcFailure::Rejected(message) => LiveBoard::Rejected(message),
+        copperpour_ipc::IpcFailure::Rejected { message, status } => {
+            LiveBoard::Rejected { message, status }
+        }
         copperpour_ipc::IpcFailure::Preflight(refusal) => LiveBoard::Preflight(refusal),
         copperpour_ipc::IpcFailure::Uncertain(message) => LiveBoard::Uncertain(message),
         copperpour_ipc::IpcFailure::Recovered(message) => LiveBoard::Recovered(message),

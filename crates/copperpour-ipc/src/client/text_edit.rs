@@ -846,7 +846,9 @@ impl KiCadIpcClient {
         anyhow::ensure!(!edit.is_empty(), "the edit names no property to change");
         let footprint = self.find_footprint_instance_in(document.clone(), reference)?;
         let kiid = footprint_kiid(&footprint);
-        anyhow::ensure!(!kiid.is_empty(), "footprint '{reference}' has no KIID");
+        if kiid.is_empty() {
+            return Err(PreflightRefusal::missing_footprint_kiid(reference).into());
+        }
         let before = slot_view(&footprint, slot).ok_or_else(|| TextTargetError::MissingField {
             reference: reference.to_string(),
             field: slot.as_str().to_string(),

@@ -569,16 +569,36 @@ pub struct IpcItemCreation {
 /// "none of these items exist"; no other refusal is.
 pub const GET_ITEMS_BY_ID_NONE_FOUND: &str = "none of the requested IDs were found or valid";
 
-fn ensure_item_request_ok(status: i32, operation: &str) -> Result<()> {
-    let status = kiapi::common::types::ItemRequestStatus::try_from(status)
-        .unwrap_or(kiapi::common::types::ItemRequestStatus::IrsUnknown);
-    if status != kiapi::common::types::ItemRequestStatus::IrsOk {
-        anyhow::bail!(
-            "KiCad {operation} request failed with {}",
-            status.as_str_name()
-        );
+#[derive(Debug)]
+struct ItemStatusError {
+    code_name: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for ItemStatusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
     }
-    Ok(())
+}
+
+impl std::error::Error for ItemStatusError {}
+
+fn ensure_item_request_ok(status: i32, operation: &str) -> Result<()> {
+    use kiapi::common::types::ItemRequestStatus;
+    match ItemRequestStatus::try_from(status) {
+        Ok(ItemRequestStatus::IrsOk) => Ok(()),
+        Ok(ItemRequestStatus::IrsUnknown) | Err(_) => {
+            anyhow::bail!("KiCad {operation} request failed with IRS_UNKNOWN")
+        }
+        Ok(status) => Err(ItemStatusError {
+            code_name: status.as_str_name(),
+            message: format!(
+                "KiCad {operation} request failed with {}",
+                status.as_str_name()
+            ),
+        }
+        .into()),
+    }
 }
 
 /// Marker error carried (via anyhow's error chain) by every failure where no
@@ -998,15 +1018,24 @@ impl std::fmt::Display for FootprintTargetError {
 
 impl std::error::Error for FootprintTargetError {}
 
-/// `move_footprint`'s and `rotate_footprint`'s refusal of a reference no
-/// footprint on the board carries.
+impl FootprintTargetError {
+    fn into_preflight(self) -> PreflightRefusal {
+        let reason = self.to_string();
+        let cause = match self {
+            Self::Missing { reference } => PreflightCause::MissingReferences {
+                references: vec![reference],
+            },
+            Self::Ambiguous { reference, .. } => PreflightCause::DuplicateReference { reference },
+        };
+        PreflightRefusal::new(cause, reason)
+    }
+}
+
 fn missing_footprint(reference: &str) -> PreflightRefusal {
-    PreflightRefusal::new(
-        PreflightCause::MissingReferences {
-            references: vec![reference.to_string()],
-        },
-        format!("Footprint '{reference}' not found"),
-    )
+    FootprintTargetError::Missing {
+        reference: reference.to_owned(),
+    }
+    .into_preflight()
 }
 
 impl BoardTargetError {
@@ -1085,7 +1114,10 @@ pub enum IpcFailure {
         message: String,
         candidates: Vec<String>,
     },
-    Rejected(String),
+    Rejected {
+        message: String,
+        status: Option<String>,
+    },
     /// Copperpour refused the request itself, on what it read from KiCad,
     /// before KiCad kept any of it. Its message is the refusal's `reason`.
     Preflight(PreflightRefusal),
@@ -1124,21 +1156,33 @@ impl IpcFailure {
                 message,
                 candidates: unreachable_candidates(&error),
             }
-        } else if let Some(refusal) = PreflightRefusal::from_error(&error) {
-            // After every marker above: a check that failed because KiCad went
-            // away or never answered keeps that classification, which governs
-            // the file fallback and retry advice; only what would otherwise be
-            // read as KiCad's rejection is Copperpour's own refusal.
-            IpcFailure::Preflight(refusal.clone())
         } else {
-            IpcFailure::Rejected(message)
+            let status = ApiStatusError::from_error(&error)
+                .map(|status| status.code_name.as_str())
+                .or_else(|| {
+                    error
+                        .downcast_ref::<ItemStatusError>()
+                        .map(|status| status.code_name)
+                });
+            if let Some(refusal) = PreflightRefusal::from_error(&error) {
+                let mut refusal = refusal.clone();
+                refusal.kicad_status = status.map(str::to_owned);
+                IpcFailure::Preflight(refusal)
+            } else if let Some(target) = error.downcast_ref::<FootprintTargetError>() {
+                IpcFailure::Preflight(target.clone().into_preflight())
+            } else {
+                IpcFailure::Rejected {
+                    message,
+                    status: status.map(str::to_owned),
+                }
+            }
         }
     }
 
     pub fn message(&self) -> &str {
         match self {
             IpcFailure::Unreachable { message, .. }
-            | IpcFailure::Rejected(message)
+            | IpcFailure::Rejected { message, .. }
             | IpcFailure::Uncertain(message)
             | IpcFailure::Recovered(message)
             | IpcFailure::Target { message, .. } => message,
@@ -1164,6 +1208,8 @@ pub struct PreflightRefusal {
     /// The whole refusal in Copperpour's words, including any failure it
     /// rests on.
     pub reason: String,
+    /// An explicit KiCad status that prevented this check from completing.
+    pub kicad_status: Option<String>,
     /// What this layer of an error chain says: `reason`, or for a refusal
     /// raised as context over the failure it rests on, only its own sentence,
     /// so the chain does not say that failure twice.
@@ -1187,18 +1233,31 @@ pub enum PreflightCause {
         reference: String,
         item_type: String,
     },
-    /// A check the write depends on could not complete. No argument of the
-    /// request is at fault.
+    /// A prerequisite could not be established. This may include a lookup
+    /// that failed without a more specific cause naming the argument.
     CheckIncomplete,
 }
 
 impl PreflightRefusal {
+    pub fn missing_footprint(reference: &str) -> Self {
+        missing_footprint(reference)
+    }
+
+    pub fn check_failed(reason: impl Into<String>) -> Self {
+        Self::new(PreflightCause::CheckIncomplete, reason)
+    }
+
+    fn missing_footprint_kiid(reference: &str) -> Self {
+        Self::check_failed(format!("footprint '{reference}' has no KIID"))
+    }
+
     pub fn new(cause: PreflightCause, reason: impl Into<String>) -> Self {
         let reason = reason.into();
         Self {
             cause,
             headline: reason.clone(),
             reason,
+            kicad_status: None,
         }
     }
 
@@ -1212,6 +1271,7 @@ impl PreflightRefusal {
             cause: PreflightCause::CheckIncomplete,
             reason: format!("{headline}: {error:#}"),
             headline,
+            kicad_status: None,
         }
     }
 
@@ -1243,6 +1303,17 @@ impl std::fmt::Display for IpcOutcomeUnknown {
 }
 
 impl std::error::Error for IpcOutcomeUnknown {}
+
+fn verify_after_write<T>(command: &str, result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        let reason = format!("KiCad accepted the write, but readback failed: {error:#}");
+        IpcOutcomeUnknown {
+            command: command.into(),
+            reason,
+        }
+        .into()
+    })
+}
 
 #[derive(Debug)]
 pub struct IpcBatchRecovered {
@@ -2794,12 +2865,26 @@ impl KiCadIpcClient {
             let Some(status) = result.status else {
                 anyhow::bail!("KiCad returned an update result without item status");
             };
-            if status.code() != kiapi::common::commands::ItemStatusCode::IscOk {
-                anyhow::bail!(
-                    "KiCad item update failed: {} ({})",
-                    status.error_message,
-                    status.code().as_str_name()
-                );
+            use kiapi::common::commands::ItemStatusCode;
+            match ItemStatusCode::try_from(status.code) {
+                Ok(ItemStatusCode::IscOk) => {}
+                Ok(ItemStatusCode::IscUnknown) | Err(_) => {
+                    anyhow::bail!(
+                        "KiCad item update failed: {} (ISC_UNKNOWN)",
+                        status.error_message
+                    );
+                }
+                Ok(code) => {
+                    return Err(ItemStatusError {
+                        code_name: code.as_str_name(),
+                        message: format!(
+                            "KiCad item update failed: {} ({})",
+                            status.error_message,
+                            code.as_str_name()
+                        ),
+                    }
+                    .into());
+                }
             }
         }
         Ok(())
@@ -3105,7 +3190,10 @@ impl KiCadIpcClient {
             .iter()
             .find(|n| n.name == net_name)
             .map(|n| n.netcode)
-            .ok_or_else(|| anyhow::anyhow!("Net '{}' not found on board", net_name))
+            .ok_or_else(|| {
+                PreflightRefusal::check_failed(format!("Net '{net_name}' not found on board"))
+                    .into()
+            })
     }
 
     /// Find a footprint by reference and return its IpcFootprint + KIID.
@@ -3141,10 +3229,15 @@ impl KiCadIpcClient {
                 continue;
             }
             if found.is_some() {
-                anyhow::bail!(
-                    "footprint reference '{}' appears more than once on the board",
-                    reference
-                );
+                return Err(PreflightRefusal::new(
+                    PreflightCause::DuplicateReference {
+                        reference: reference.to_owned(),
+                    },
+                    format!(
+                        "footprint reference '{reference}' appears more than once on the board"
+                    ),
+                )
+                .into());
             }
 
             let definition = fp
@@ -3450,7 +3543,13 @@ impl KiCadIpcClient {
                 }
             }
         }
-        anyhow::bail!("Footprint '{}' not found on board", reference)
+        Err(PreflightRefusal::new(
+            PreflightCause::MissingReferences {
+                references: vec![reference.to_owned()],
+            },
+            format!("Footprint '{reference}' not found on board"),
+        )
+        .into())
     }
 
     /// Add a track segment to the board.
@@ -3593,14 +3692,7 @@ impl KiCadIpcClient {
         };
 
         self.delete_items_in(document.clone(), vec![uuid.to_string()])?;
-        let remains = self
-            .get_tracks_in(document, None, None)
-            .with_context(|| {
-                format!(
-                    "KiCad accepted deletion of trace segment '{}' but post-delete read-back failed; the deletion may have committed",
-                    uuid
-                )
-            })?
+        let remains = verify_after_write("DeleteItems", self.get_tracks_in(document, None, None))?
             .into_iter()
             .any(|candidate| candidate.uuid == uuid);
         if remains {
@@ -3891,10 +3983,9 @@ impl KiCadIpcClient {
             delta_deg: angle,
         };
 
-        let definition = fp
-            .definition
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("footprint '{}' carries no definition", reference))?;
+        let definition = fp.definition.as_mut().ok_or_else(|| {
+            PreflightRefusal::check_failed(format!("footprint '{reference}' carries no definition"))
+        })?;
 
         for any in definition.items.iter_mut() {
             // Discriminate before decoding. A pad decodes happily as a
@@ -3922,7 +4013,8 @@ impl KiCadIpcClient {
             }
 
             let kind =
-                replace_polygon_outline(&mut shape, reference, uuid, points_mm, anchor, &to_board)?;
+                replace_polygon_outline(&mut shape, reference, uuid, points_mm, anchor, &to_board)
+                    .map_err(|error| PreflightRefusal::check_failed(error.to_string()))?;
 
             *any = pack_any(&shape, "kiapi.board.types.BoardGraphicShape");
             let packed = pack_any(&fp, "kiapi.board.types.FootprintInstance");
@@ -3930,12 +4022,12 @@ impl KiCadIpcClient {
             return Ok(kind.to_string());
         }
 
-        anyhow::bail!(
+        Err(PreflightRefusal::check_failed(format!(
             "graphic '{}' not found on footprint '{}' — call list_board_footprint_graphics \
              for the UUIDs it does have",
-            uuid,
-            reference
-        )
+            uuid, reference
+        ))
+        .into())
     }
 
     /// The placed footprint carrying `reference`, and its index among items.
@@ -3958,7 +4050,7 @@ impl KiCadIpcClient {
                 }
             }
         }
-        anyhow::bail!("Footprint '{}' not found", reference)
+        Err(missing_footprint(reference).into())
     }
 
     /// The 3D models a placed footprint carries, read straight off its
@@ -4026,25 +4118,47 @@ impl KiCadIpcClient {
         document: kiapi::common::types::DocumentSpecifier,
         reference: &str,
     ) -> Result<kiapi::board::types::FootprintInstance> {
-        let mut matches = self
-            .get_items_in(
-                document,
-                kiapi::common::types::KiCadObjectType::KotPcbFootprint,
-            )?
-            .into_iter()
-            .filter_map(|item| {
-                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).ok()
-            })
-            .filter(|footprint| {
-                footprint
-                    .reference_field
-                    .as_ref()
-                    .and_then(|field| field.text.as_ref())
-                    .and_then(|text| text.text.as_ref())
-                    .map(|text| text.text.as_str())
-                    == Some(reference)
-            })
-            .collect::<Vec<_>>();
+        let reply = self.get_items_response_in(
+            document,
+            &[kiapi::common::types::KiCadObjectType::KotPcbFootprint],
+        )?;
+        let inventory = (|| -> Result<kiapi::common::commands::GetItemsResponse> {
+            let reply = reply.context("KiCad returned no GetItems response payload")?;
+            anyhow::ensure!(
+                crate::builders::any_is(&reply, "kiapi.common.commands.GetItemsResponse"),
+                "unexpected GetItems response type {}",
+                reply.type_url
+            );
+            unpack_any(&reply)
+        })()
+        .map_err(|error| {
+            PreflightRefusal::check_failed(format!("Cannot read footprint inventory: {error:#}"))
+        })?;
+        ensure_item_request_ok(inventory.status, "item retrieval")?;
+        let mut matches = Vec::new();
+        for item in inventory.items {
+            let footprint = (|| -> Result<_> {
+                anyhow::ensure!(
+                    crate::builders::any_is(&item, "kiapi.board.types.FootprintInstance"),
+                    "unexpected inventory item type {}",
+                    item.type_url
+                );
+                let fp = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+                anyhow::ensure!(
+                    !crate::builders::footprint_reference(&fp).is_empty(),
+                    "footprint has no readable reference"
+                );
+                Ok(fp)
+            })()
+            .map_err(|error| {
+                PreflightRefusal::check_failed(format!(
+                    "Cannot read footprint inventory: {error:#}"
+                ))
+            })?;
+            if crate::builders::footprint_reference(&footprint) == reference {
+                matches.push(footprint);
+            }
+        }
         match matches.len() {
             0 => Err(FootprintTargetError::Missing {
                 reference: reference.to_string(),
@@ -4878,13 +4992,7 @@ impl KiCadIpcClient {
         // in KiCad's open list — with several boards open, first-document
         // targeting mutates the wrong one (caught in live verification).
         let document = self.find_open_board(board)?;
-        if self
-            .list_footprints_in(document.clone())?
-            .iter()
-            .any(|footprint| footprint.reference == reference)
-        {
-            anyhow::bail!("footprint reference '{reference}' already exists on the board");
-        }
+        self.refuse_existing_footprint_in(&document, reference)?;
         let item = Self::build_footprint_item(
             lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
         )?;
@@ -4905,14 +5013,29 @@ impl KiCadIpcClient {
         item: prost_types::Any,
     ) -> Result<IpcFootprint> {
         let document = self.find_open_board(board)?;
+        self.refuse_existing_footprint_in(&document, reference)?;
+        self.create_placed_footprint_in(document, reference, item)
+    }
+
+    fn refuse_existing_footprint_in(
+        &self,
+        document: &kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+    ) -> Result<()> {
         if self
             .list_footprints_in(document.clone())?
             .iter()
             .any(|footprint| footprint.reference == reference)
         {
-            anyhow::bail!("footprint reference '{reference}' already exists on the board");
+            return Err(PreflightRefusal::new(
+                PreflightCause::DuplicateReference {
+                    reference: reference.to_owned(),
+                },
+                format!("footprint reference '{reference}' already exists on the board"),
+            )
+            .into());
         }
-        self.create_placed_footprint_in(document, reference, item)
+        Ok(())
     }
 
     fn create_placed_footprint_in(
@@ -4922,7 +5045,7 @@ impl KiCadIpcClient {
         item: prost_types::Any,
     ) -> Result<IpcFootprint> {
         self.create_items_in(document.clone(), vec![item])?;
-        let footprints = self.list_footprints_in(document)?;
+        let footprints = verify_after_write("CreateItems", self.list_footprints_in(document))?;
         footprints
             .iter()
             .find(|footprint| footprint.reference == reference)
@@ -5451,8 +5574,7 @@ impl KiCadIpcClient {
                 "KiCad created the via but did not report its KIID, so the net it stored \
                  cannot be read back",
             )?;
-        let stored = self
-            .find_via_in(document.clone(), &kiid)?
+        let stored = verify_after_write("CreateItems", self.find_via_in(document.clone(), &kiid))?
             .map(|via| ipc_via(&via))
             .with_context(|| {
                 format!("KiCad created via '{kiid}' but read-back does not list it")
@@ -5483,15 +5605,8 @@ impl KiCadIpcClient {
             return Ok(None);
         };
         self.delete_items_in(document.clone(), vec![uuid.to_string()])?;
-        let remains = self
-            .find_via_in(document, uuid)
-            .with_context(|| {
-                format!(
-                    "KiCad accepted deletion of via '{uuid}' but post-delete read-back failed; \
-                     the deletion may have committed"
-                )
-            })?
-            .is_some();
+        let remains =
+            verify_after_write("DeleteItems", self.find_via_in(document, uuid))?.is_some();
         if remains {
             anyhow::bail!("KiCad accepted deletion of via '{uuid}' but read-back still lists it");
         }
@@ -5522,14 +5637,7 @@ impl KiCadIpcClient {
             document.clone(),
             vec![crate::builders::pack_any(&moved, "kiapi.board.types.Via")],
         )?;
-        let after = self
-            .find_via_in(document.clone(), uuid)
-            .with_context(|| {
-                format!(
-                    "KiCad accepted the move of via '{uuid}' but read-back failed; the move \
-                     may have committed"
-                )
-            })?
+        let after = verify_after_write("UpdateItems", self.find_via_in(document.clone(), uuid))?
             .map(|via| ipc_via(&via))
             .with_context(|| {
                 format!("KiCad accepted the move of via '{uuid}' but read-back no longer lists it")
@@ -5592,19 +5700,21 @@ impl KiCadIpcClient {
             .as_ref()
             .map(|id| id.value.clone())
             .filter(|value| !value.is_empty())
-            .with_context(|| format!("footprint '{reference}' has no KIID"))?;
-        let definition = footprint
-            .definition
-            .as_ref()
-            .with_context(|| format!("footprint '{reference}' carries no definition"))?;
+            .ok_or_else(|| PreflightRefusal::missing_footprint_kiid(reference))?;
+        let definition = footprint.definition.as_ref().ok_or_else(|| {
+            PreflightRefusal::check_failed(format!("footprint '{reference}' carries no definition"))
+        })?;
         let mut available = BTreeSet::new();
         let mut changes = Vec::new();
         for item in &definition.items {
             if !crate::builders::any_is(item, "kiapi.board.types.Pad") {
                 continue;
             }
-            let pad = kiapi::board::types::Pad::decode(item.value.as_slice())
-                .with_context(|| format!("footprint '{reference}' has an unreadable pad"))?;
+            let pad = kiapi::board::types::Pad::decode(item.value.as_slice()).map_err(|error| {
+                PreflightRefusal::check_failed(format!(
+                    "footprint '{reference}' has an unreadable pad: {error}"
+                ))
+            })?;
             available.insert(pad.number.clone());
             if pad.number != pad_number {
                 continue;
@@ -5758,13 +5868,12 @@ impl KiCadIpcClient {
             .as_ref()
             .map(|id| id.value.clone())
             .filter(|value| !value.is_empty())
-            .with_context(|| format!("footprint '{reference}' has no KIID"))?;
+            .ok_or_else(|| PreflightRefusal::missing_footprint_kiid(reference))?;
         let anchor = footprint.position.unwrap_or_default();
         let on_back = footprint.layer == kiapi::board::types::BoardLayer::BlBCu as i32;
-        let definition = footprint
-            .definition
-            .as_mut()
-            .with_context(|| format!("footprint '{reference}' carries no definition"))?;
+        let definition = footprint.definition.as_mut().ok_or_else(|| {
+            PreflightRefusal::check_failed(format!("footprint '{reference}' carries no definition"))
+        })?;
         let item_count = definition.items.len();
 
         let mut previous: Option<(String, bool)> = None;
@@ -5772,19 +5881,30 @@ impl KiCadIpcClient {
             if !crate::builders::any_is(item, "kiapi.board.types.Field") {
                 continue;
             }
-            let mut field = kiapi::board::types::Field::decode(item.value.as_slice())
-                .with_context(|| format!("footprint '{reference}' has an unreadable field"))?;
+            let mut field =
+                kiapi::board::types::Field::decode(item.value.as_slice()).map_err(|error| {
+                    PreflightRefusal::check_failed(format!(
+                        "footprint '{reference}' has an unreadable field: {error}"
+                    ))
+                })?;
             if field.name != name {
                 continue;
             }
             if previous.is_some() {
-                anyhow::bail!("footprint '{reference}' carries more than one field named '{name}'");
+                return Err(PreflightRefusal::check_failed(format!(
+                    "footprint '{reference}' carries more than one field named '{name}'"
+                ))
+                .into());
             }
             let text = field
                 .text
                 .as_mut()
                 .and_then(|board_text| board_text.text.as_mut())
-                .with_context(|| format!("field '{name}' of '{reference}' carries no text"))?;
+                .ok_or_else(|| {
+                    PreflightRefusal::check_failed(format!(
+                        "field '{name}' of '{reference}' carries no text"
+                    ))
+                })?;
             previous = Some((text.text.clone(), field.visible));
             text.text = value.to_string();
             if let Some(visible) = visible {
@@ -8647,7 +8767,48 @@ mod preflight_refusal_tests {
         let error = anyhow::anyhow!("cannot rotate footprint 'Y1' by a non-90° angle");
         assert!(matches!(
             IpcFailure::from_error(error),
-            IpcFailure::Rejected(_)
+            IpcFailure::Rejected { status: None, .. }
+        ));
+    }
+
+    fn rejected_status() -> anyhow::Error {
+        ApiStatusError {
+            code: kiapi::common::ApiStatusCode::AsBusy as i32,
+            code_name: "AS_BUSY".into(),
+            message: "busy".into(),
+        }
+        .into()
+    }
+
+    #[test]
+    fn a_kicad_error_status_is_evidence_for_a_preflight_refusal() {
+        let error = rejected_status();
+        let context = PreflightRefusal::check_incomplete("the check could not complete", &error);
+        let IpcFailure::Preflight(refusal) = IpcFailure::from_error(error.context(context)) else {
+            panic!("the server's error status must survive Copperpour's check context");
+        };
+        assert_eq!(refusal.kicad_status.as_deref(), Some("AS_BUSY"));
+    }
+
+    #[test]
+    fn an_unconfirmed_rollback_outranks_a_kicad_error_status() {
+        let error = rejected_status().context(IpcOutcomeUnknown {
+            command: "EndCommit".into(),
+            reason: "the rollback was not confirmed".into(),
+        });
+        assert!(matches!(
+            IpcFailure::from_error(error),
+            IpcFailure::Uncertain(_)
+        ));
+    }
+
+    #[test]
+    fn a_readback_dial_failure_after_an_accepted_write_is_uncertain() {
+        let error =
+            verify_after_write::<()>("DeleteItems", Err(TransportUnreachable.into())).unwrap_err();
+        assert!(matches!(
+            IpcFailure::from_error(error),
+            IpcFailure::Uncertain(_)
         ));
     }
 

@@ -229,7 +229,8 @@ pub struct RecoveryGuidance {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub retry_prerequisites: Vec<String>,
     pub next_steps: Vec<RecoveryStep>,
-    pub troubleshooting_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub troubleshooting_url: Option<String>,
 }
 
 /// One concrete next step in [`RecoveryGuidance`], distinguishing agent/tool

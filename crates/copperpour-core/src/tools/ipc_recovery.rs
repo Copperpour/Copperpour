@@ -88,7 +88,7 @@ pub(crate) fn for_unreachable(
                 user_step("Inspect KiCad Preferences > Plugins ('Enable KiCad API') and configure ipc_address to the intended endpoint (or quit extra KiCad instances), then restart the MCP client session if configuration changed."),
                 agent_step("check_kicad_ui", "Call check_kicad_ui after the endpoint is selected to confirm IPC readiness."),
             ],
-            troubleshooting_url: troubleshooting_url("kicad-ipc-socket-path-not-configured"),
+            troubleshooting_url: Some(troubleshooting_url("kicad-ipc-socket-path-not-configured")),
         },
         UnreachableReason::NotConfigured => RecoveryGuidance {
             cause: "not_configured".to_string(),
@@ -106,7 +106,7 @@ pub(crate) fn for_unreachable(
                 user_step("In KiCad, enable Preferences > Plugins > 'Enable KiCad API' and either leave auto-discovery active or paste the listed ipc:// address into Copperpour's settings."),
                 agent_step("check_kicad_ui", "Call check_kicad_ui once KiCad is running and configured to verify IPC responsiveness."),
             ],
-            troubleshooting_url: troubleshooting_url("kicad-ipc-socket-path-not-configured"),
+            troubleshooting_url: Some(troubleshooting_url("kicad-ipc-socket-path-not-configured")),
         },
         UnreachableReason::NoListener => {
             let mut evidence = json!({
@@ -129,7 +129,7 @@ pub(crate) fn for_unreachable(
                     user_step("Verify KiCad is open, check Preferences > Plugins > 'Enable KiCad API', and compare KiCad's 'Listening on' address against the configured endpoint."),
                     agent_step("check_kicad_ui", "Call check_kicad_ui (or launch_kicad_ui if KiCad is not running) to verify editor and API readiness."),
                 ],
-                troubleshooting_url: troubleshooting_url("kicad-is-running-but-ipc_failure-says-it-did-not-answer"),
+                troubleshooting_url: Some(troubleshooting_url("kicad-is-running-but-ipc_failure-says-it-did-not-answer")),
             }
         }
         UnreachableReason::AccessDenied => {
@@ -153,7 +153,7 @@ pub(crate) fn for_unreachable(
                     user_step("Run Copperpour under the same OS account as KiCad (a sandboxed client or restrictive ACL may be blocking access). If your client runs in a separate-account sandbox, run Copperpour outside the sandbox over loopback HTTP (127.0.0.1)."),
                     agent_step("get_installation_info", "Call get_installation_info if needed to inspect the server runtime and redacted endpoint, then call check_kicad_ui after restarting under the matching account."),
                 ],
-                troubleshooting_url: troubleshooting_url("access_denied-from-a-sandboxed-ai-client"),
+                troubleshooting_url: Some(troubleshooting_url("access_denied-from-a-sandboxed-ai-client")),
             }
         }
         UnreachableReason::HandshakeFailed => {
@@ -177,7 +177,7 @@ pub(crate) fn for_unreachable(
                     user_step("Check which process holds the configured IPC address, close any conflicting listener, and restart KiCad if needed so KiCad can bind the endpoint (do not delete active endpoint files automatically)."),
                     agent_step("check_kicad_ui", "Call check_kicad_ui with timeout_seconds above 10 to verify whether handshake negotiation completes."),
                 ],
-                troubleshooting_url: troubleshooting_url("kicad-is-running-but-ipc_failure-says-it-did-not-answer"),
+                troubleshooting_url: Some(troubleshooting_url("kicad-is-running-but-ipc_failure-says-it-did-not-answer")),
             }
         }
         UnreachableReason::TransportError => {
@@ -201,7 +201,7 @@ pub(crate) fn for_unreachable(
                     agent_step("check_kicad_ui", "Call check_kicad_ui to re-check endpoint responsiveness."),
                     user_step("Inspect the reported transport error and verify the KiCad IPC endpoint configuration."),
                 ],
-                troubleshooting_url: troubleshooting_url("kicad-is-running-but-ipc_failure-says-it-did-not-answer"),
+                troubleshooting_url: Some(troubleshooting_url("kicad-is-running-but-ipc_failure-says-it-did-not-answer")),
             }
         }
     }
@@ -251,7 +251,7 @@ pub(crate) fn for_ping_outcome(
                     user_step("If KiCad is not still starting, check the KiCad window and close any blocking modal dialog."),
                     agent_step("check_kicad_ui", "Wait briefly and call check_kicad_ui to verify KiCad becomes ready."),
                 ],
-                troubleshooting_url: troubleshooting_url("kicad-is-running-but-ipc_failure-says-it-did-not-answer"),
+                troubleshooting_url: Some(troubleshooting_url("kicad-is-running-but-ipc_failure-says-it-did-not-answer")),
             })
         }
         PingOutcome::RequestFailed { message, status } => {
@@ -278,7 +278,7 @@ pub(crate) fn for_ping_outcome(
                     agent_step("check_kicad_ui", "Call check_kicad_ui with a sufficient timeout to re-check endpoint responsiveness."),
                     user_step("If the failure persists, inspect KiCad and verify what process holds the configured IPC address."),
                 ],
-                troubleshooting_url: troubleshooting_url("kicad-is-running-but-ipc_failure-says-it-did-not-answer"),
+                troubleshooting_url: Some(troubleshooting_url("kicad-is-running-but-ipc_failure-says-it-did-not-answer")),
             })
         }
     }
@@ -319,7 +319,7 @@ pub(crate) fn for_board_target_error(error: &BoardTargetError) -> RecoveryGuidan
                 user_step("Open the requested .kicad_pcb file in KiCad's PCB Editor."),
                 agent_step("open_project", "Call open_project to confirm the requested board appears in open_boards before retrying."),
             ],
-            troubleshooting_url: troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded"),
+            troubleshooting_url: Some(troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded")),
         },
         BoardTargetError::WrongDocument {
             requested,
@@ -340,7 +340,7 @@ pub(crate) fn for_board_target_error(error: &BoardTargetError) -> RecoveryGuidan
                 user_step("Open the requested board in KiCad's PCB Editor, or confirm which open document should be targeted instead."),
                 agent_step("open_project", "Do not switch targets automatically; call open_project to verify the target board is open before retrying."),
             ],
-            troubleshooting_url: troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded"),
+            troubleshooting_url: Some(troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded")),
         },
         BoardTargetError::AmbiguousDocument {
             requested,
@@ -361,7 +361,7 @@ pub(crate) fn for_board_target_error(error: &BoardTargetError) -> RecoveryGuidan
                 agent_step("get_editor_state", "Do not switch targets automatically; call get_editor_state to inspect the open document identities."),
                 user_step("Close duplicate open boards or specify the exact unambiguous board path."),
             ],
-            troubleshooting_url: troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded"),
+            troubleshooting_url: Some(troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded")),
         },
         BoardTargetError::UnresolvedDocumentIdentities { requested, reasons } => RecoveryGuidance {
             cause: "unresolved_document_identities".to_string(),
@@ -379,7 +379,7 @@ pub(crate) fn for_board_target_error(error: &BoardTargetError) -> RecoveryGuidan
                 agent_step("get_editor_state", "Call get_editor_state to inspect reported document identities without modifying any file."),
                 user_step("Verify the board is saved to disk and open in KiCad's PCB Editor."),
             ],
-            troubleshooting_url: troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded"),
+            troubleshooting_url: Some(troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded")),
         },
         BoardTargetError::StaleDocument {
             requested,
@@ -402,7 +402,7 @@ pub(crate) fn for_board_target_error(error: &BoardTargetError) -> RecoveryGuidan
                 user_step("Reopen the requested board in KiCad's PCB Editor."),
                 agent_step("open_project", "Call open_project to confirm the requested board is uniquely open before retrying."),
             ],
-            troubleshooting_url: troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded"),
+            troubleshooting_url: Some(troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded")),
         },
     }
 }
@@ -424,7 +424,7 @@ pub(crate) fn for_ipc_outcome_unknown(reason: &str) -> RecoveryGuidance {
             user_step("Inspect the requested board in KiCad's PCB Editor and reconcile what was applied; do not edit the saved file as a workaround."),
             agent_step("get_board_info", "Do not retry the mutation automatically. Preserve this diagnostic and inspect the live board state once reviewed."),
         ],
-        troubleshooting_url: troubleshooting_url("ipc-operation-returned-ipc_outcome_unknown"),
+        troubleshooting_url: Some(troubleshooting_url("ipc-operation-returned-ipc_outcome_unknown")),
     }
 }
 
@@ -446,7 +446,7 @@ pub(crate) fn for_ipc_batch_recovered(reason: &str) -> RecoveryGuidance {
             user_step("Review the live board in KiCad to confirm its state before re-applying."),
             agent_note("Do not replay the previous apply automatically; run a fresh dry run first."),
         ],
-        troubleshooting_url: troubleshooting_url("schematic-sync-returned-ipc_batch_recovered"),
+        troubleshooting_url: Some(troubleshooting_url("schematic-sync-returned-ipc_batch_recovered")),
     }
 }
 
@@ -472,7 +472,7 @@ pub(crate) fn for_board_editor_absence(
                 user_step("Open the requested .kicad_pcb board in KiCad's PCB Editor."),
                 agent_step("open_project", "Call open_project to confirm the board is open before retrying."),
             ],
-            troubleshooting_url: troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded"),
+            troubleshooting_url: Some(troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded")),
         },
         BoardEditorAbsence::OpenDocumentsUnimplemented => RecoveryGuidance {
             cause: "unknown".to_string(),
@@ -489,7 +489,7 @@ pub(crate) fn for_board_editor_absence(
                 user_step("Verify KiCad version and open editors at the configured IPC endpoint."),
                 agent_step("check_kicad_ui", "Call check_kicad_ui to inspect endpoint responsiveness."),
             ],
-            troubleshooting_url: troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded"),
+            troubleshooting_url: Some(troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded")),
         },
     }
 }
@@ -505,39 +505,48 @@ pub(crate) fn for_ipc_failure(failure: &IpcFailure) -> RecoveryGuidance {
         IpcFailure::Target { error, .. } => for_board_target_error(error),
         IpcFailure::Uncertain(message) => for_ipc_outcome_unknown(message),
         IpcFailure::Recovered(message) => for_ipc_batch_recovered(message),
-        IpcFailure::Preflight(refusal) => RecoveryGuidance {
-            cause: "preflight_refusal".to_string(),
-            observed: "Copperpour refused the request before applying any change.".to_string(),
-            evidence: json!({
-                "reason": refusal.reason,
-            }),
-            mutation_outcome: "none".to_string(),
-            retry_safe: false,
-            retry_prerequisites: vec![
-                "Adjust the request parameters to address the preflight refusal before retrying.".to_string(),
-            ],
-            next_steps: vec![
-                agent_note("Correct the request based on the preflight refusal reason; nothing was applied."),
-            ],
-            troubleshooting_url: troubleshooting_url("pcb-tools-return-kicad-must-be-running-with-the-board-loaded"),
-        },
-        IpcFailure::Rejected(message) => RecoveryGuidance {
-            cause: "unknown".to_string(),
-            observed: "KiCad did not complete the request and returned an unclassified failure or rejection.".to_string(),
-            evidence: json!({
-                "message": message,
-            }),
+        IpcFailure::Preflight(refusal) => for_preflight_refusal(refusal),
+        IpcFailure::Rejected { message, status } => RecoveryGuidance {
+            cause: if status.is_some() { "kicad_api_rejection" } else { "unknown" }.to_string(),
+            observed: if status.is_some() {
+                "KiCad answered with an IPC error status."
+            } else {
+                "The operation failed, but the source of the failure and what was applied are not known."
+            }.to_string(),
+            evidence: match status {
+                Some(status) => json!({ "message": message, "status": status }),
+                None => json!({ "message": message }),
+            },
             mutation_outcome: "unknown".to_string(),
             retry_safe: false,
             retry_prerequisites: vec![
                 "Inspect the failure message and live board state before deciding whether to retry.".to_string(),
             ],
             next_steps: vec![
-                agent_step("check_kicad_ui", "Call check_kicad_ui if endpoint readiness is in doubt, and inspect the live board before retrying."),
-                user_step("Review the reported error message in KiCad."),
+                agent_note("Inspect the reported error and the live board before retrying."),
             ],
-            troubleshooting_url: troubleshooting_url("kicad-is-running-but-ipc_failure-says-it-did-not-answer"),
+            troubleshooting_url: None,
         },
+    }
+}
+
+pub(crate) fn for_preflight_refusal(
+    refusal: &copperpour_ipc::PreflightRefusal,
+) -> RecoveryGuidance {
+    RecoveryGuidance {
+        cause: "preflight_refusal".to_string(),
+        observed: "Copperpour refused the request before applying any change.".to_string(),
+        evidence: match &refusal.kicad_status {
+            Some(status) => json!({ "reason": refusal.reason, "status": status }),
+            None => json!({ "reason": refusal.reason }),
+        },
+        mutation_outcome: "none".to_string(),
+        retry_safe: false,
+        retry_prerequisites: vec!["Address the reported reason before retrying.".to_string()],
+        next_steps: vec![agent_note(
+            "Use the reported reason to correct the request or board state. Nothing was applied.",
+        )],
+        troubleshooting_url: None,
     }
 }
 
@@ -635,8 +644,11 @@ mod tests {
             assert!(!guidance.retry_safe, "{reason:?}");
             assert!(!guidance.retry_prerequisites.is_empty(), "{reason:?}");
             assert!(
-                guidance.troubleshooting_url.ends_with(expected_anchor),
-                "{reason:?}: {}",
+                guidance
+                    .troubleshooting_url
+                    .as_deref()
+                    .is_some_and(|url| url.ends_with(expected_anchor)),
+                "{reason:?}: {:?}",
                 guidance.troubleshooting_url
             );
             assert!(
@@ -788,13 +800,21 @@ mod tests {
         assert_eq!(recovered["recovery"]["cause"], "ipc_batch_recovered");
         assert_eq!(recovered["recovery"]["mutation_outcome"], "unchanged");
         assert_eq!(recovered["recovery"]["retry_safe"], false);
+    }
 
-        let rejected = parse_result(&ipc_failure_result(IpcFailure::Rejected(
-            "some error".to_string(),
-        )));
-        assert_eq!(rejected["recovery"]["cause"], "unknown");
-        assert_eq!(rejected["recovery"]["mutation_outcome"], "unknown");
-        assert_eq!(rejected["recovery"]["retry_safe"], false);
+    #[test]
+    fn unclassified_error_does_not_infer_a_kicad_rejection_from_its_text() {
+        let error = anyhow::anyhow!("KiCad IPC error: mock refusal (AS_BAD_REQUEST)");
+        let body = parse_result(&ipc_failure_result(IpcFailure::from_error(error)));
+        let recovery = &body["recovery"];
+        assert_eq!(recovery["cause"], "unknown");
+        assert_eq!(recovery["mutation_outcome"], "unknown");
+        assert_eq!(recovery["retry_safe"], false);
+        assert_eq!(
+            recovery["observed"],
+            "The operation failed, but the source of the failure and what was applied are not known."
+        );
+        assert!(recovery.get("troubleshooting_url").is_none());
     }
 
     #[test]

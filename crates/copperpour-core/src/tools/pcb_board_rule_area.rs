@@ -595,7 +595,10 @@ fn execute_live(
     let enabled = client.get_enabled_layers_in(document.clone())?;
     let enabled_copper = enabled_copper_layers(&enabled.layers);
     if enabled_copper.is_empty() {
-        anyhow::bail!("KiCad reported no enabled copper layers for the requested board");
+        return Err(copperpour_ipc::PreflightRefusal::check_failed(
+            "KiCad reported no enabled copper layers for the requested board",
+        )
+        .into());
     }
 
     let resolved_layers = match resolve_enabled_layers(&request.layers, &enabled_copper) {

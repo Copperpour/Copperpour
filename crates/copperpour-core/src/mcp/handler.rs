@@ -2279,9 +2279,87 @@ mod ipc_failure_dispatch_tests {
                     .is_some_and(|reason| reason.contains("the double is busy")),
                 "{tool}: {body}"
             );
-            assert_eq!(body["recovery"]["cause"], "unknown", "{tool}: {body}");
+            assert_eq!(
+                body["recovery"]["cause"], "kicad_api_rejection",
+                "{tool}: {body}"
+            );
+            assert_eq!(body["recovery"]["evidence"]["status"], "AS_BUSY");
+            assert!(body["recovery"].get("troubleshooting_url").is_none());
             assert_eq!(body["recovery"]["retry_safe"], false, "{tool}: {body}");
         }
+    }
+
+    async fn assert_unserved_edit_binding(
+        status: copperpour_ipc::gen::kiapi::common::ApiStatusCode,
+        cause: &str,
+    ) {
+        use copperpour_ipc::gen::kiapi;
+        use std::sync::{Arc, Mutex};
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let record = sent.clone();
+        let server = crate::test_support::MockIpcServer::spawn("unserved-edit", move |request| {
+            record
+                .lock()
+                .unwrap()
+                .push(request.message.unwrap().type_url);
+            kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: status as i32,
+                    error_message: "mock status".into(),
+                }),
+                header: None,
+                message: None,
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: server.address().to_string(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .unwrap();
+        let result = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "edit_component",
+                    "arguments": { "board": board, "reference": "R99", "dnp": true },
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(result["isError"], true);
+        let body: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["error"]["kind"], "handler_error", "{body}");
+        assert_eq!(body["recovery"]["cause"], cause, "{body}");
+        assert_eq!(body["recovery"]["mutation_outcome"], "none", "{body}");
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].ends_with(".GetOpenDocuments"), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn an_edit_without_a_pcb_editor_keeps_binding_evidence() {
+        use copperpour_ipc::gen::kiapi::common::ApiStatusCode;
+        assert_unserved_edit_binding(ApiStatusCode::AsUnhandled, "no_pcb_editor_at_endpoint").await;
+    }
+
+    #[tokio::test]
+    async fn an_edit_without_implemented_board_discovery_keeps_binding_evidence() {
+        use copperpour_ipc::gen::kiapi::common::ApiStatusCode;
+        assert_unserved_edit_binding(ApiStatusCode::AsUnimplemented, "unknown").await;
     }
 }
 

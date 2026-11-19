@@ -1677,7 +1677,7 @@ async fn handle_check_clearance(
         }
         // Reading the board raises no refusal of Copperpour's own (#240).
         Err(
-            copperpour_ipc::IpcFailure::Rejected(message)
+            copperpour_ipc::IpcFailure::Rejected { message, .. }
             | copperpour_ipc::IpcFailure::Preflight(copperpour_ipc::PreflightRefusal {
                 reason: message,
                 ..

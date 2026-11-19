@@ -818,23 +818,10 @@ pub(crate) fn ipc_failure_result(failure: copperpour_ipc::IpcFailure) -> CallToo
             )
         }
         copperpour_ipc::IpcFailure::Target { error, .. } => ipc_target_error_result(&error),
-        // No caller of this raises a refusal of its own (#240).
-        copperpour_ipc::IpcFailure::Rejected(message) => {
-            let recovery = ipc_recovery::for_ipc_failure(&copperpour_ipc::IpcFailure::Rejected(
-                message.clone(),
-            ));
-            CallToolResult::error_kind_with_recovery(
-                crate::mcp::error::ToolErrorKind::HandlerError {
-                    reason: message.clone(),
-                },
-                message,
-                recovery,
-            )
-        }
-        copperpour_ipc::IpcFailure::Preflight(refusal) => {
-            let message = refusal.reason.clone();
-            let recovery =
-                ipc_recovery::for_ipc_failure(&copperpour_ipc::IpcFailure::Preflight(refusal));
+        failure @ (copperpour_ipc::IpcFailure::Rejected { .. }
+        | copperpour_ipc::IpcFailure::Preflight(_)) => {
+            let message = failure.message().to_owned();
+            let recovery = ipc_recovery::for_ipc_failure(&failure);
             CallToolResult::error_kind_with_recovery(
                 crate::mcp::error::ToolErrorKind::HandlerError {
                     reason: message.clone(),
@@ -876,6 +863,20 @@ pub(crate) fn ipc_unserved_result(absence: BoardEditorAbsence, message: &str) ->
             absence.observed()
         ),
         ipc_recovery::for_board_editor_absence(absence, message),
+    )
+}
+
+pub(crate) fn ipc_unserved_handler_error(
+    absence: BoardEditorAbsence,
+    message: String,
+) -> CallToolResult {
+    let recovery = ipc_recovery::for_board_editor_absence(absence, &message);
+    CallToolResult::error_kind_with_recovery(
+        crate::mcp::error::ToolErrorKind::HandlerError {
+            reason: message.clone(),
+        },
+        message,
+        recovery,
     )
 }
 
@@ -923,7 +924,10 @@ where
             // cases were given names, and this does not change what any of
             // them do with it.
             Ok(BoardBinding::Unserved { message, .. }) => {
-                Err(copperpour_ipc::IpcFailure::Rejected(message))
+                Err(copperpour_ipc::IpcFailure::Rejected {
+                    message,
+                    status: None,
+                })
             }
             Err(failure) => Err(failure),
         },

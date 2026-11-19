@@ -61,7 +61,11 @@ fn apply_footprint_edit(
             .as_mut()
             .and_then(|field| field.text.as_mut())
             .and_then(|board_text| board_text.text.as_mut())
-            .with_context(|| format!("Footprint '{reference}' has no editable value field"))?;
+            .ok_or_else(|| {
+                PreflightRefusal::check_failed(format!(
+                    "Footprint '{reference}' has no editable value field"
+                ))
+            })?;
         text.text = value.clone();
         if let Some(text) = footprint
             .definition
@@ -154,7 +158,9 @@ impl KiCadIpcClient {
         anyhow::ensure!(!edit.is_empty(), "the edit names no property to change");
         let footprint = self.find_footprint_instance_in(document.clone(), reference)?;
         let kiid = footprint_kiid(&footprint);
-        anyhow::ensure!(!kiid.is_empty(), "footprint '{reference}' has no KIID");
+        if kiid.is_empty() {
+            return Err(PreflightRefusal::missing_footprint_kiid(reference).into());
+        }
         let before = footprint_state(&footprint);
 
         let mut edited = footprint.clone();

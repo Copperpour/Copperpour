@@ -1,6 +1,8 @@
 //! One ordering and source-evidence contract for both CLI DRC surfaces.
 
-use super::{cli, ipc_target_error_result, with_board_ipc_classified, ToolContext};
+use super::{
+    cli, ipc_target_error_result, with_bound_board_ipc_classified, BoardBinding, ToolContext,
+};
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use copperpour_ipc::{
     client::KiCadIpcClient, gen::kiapi::common::types::DocumentSpecifier, IpcFailure,
@@ -97,7 +99,9 @@ fn target_failure(failure: IpcFailure) -> CallToolResult {
                     editor: "pcb".into(),
                     reason: other.to_string(),
                 },
-                format!("Cannot synchronize the requested board: {other}. CLI DRC was not started; open that board with IPC enabled and retry."),
+                format!(
+                    "Cannot synchronize the requested board: {other}. CLI DRC was not started."
+                ),
                 recovery,
             )
         }
@@ -120,13 +124,16 @@ pub(crate) async fn refill(
     board: &Path,
 ) -> anyhow::Result<Result<(), CallToolResult>> {
     let path = board.to_path_buf();
-    let result = with_board_ipc_classified(ctx, board, move |client, document| {
+    let result = with_bound_board_ipc_classified(ctx, board, move |client, document| {
         Ok(request_refill_and_wait(client, document)
             .map_err(|error| uncertain(&path, "refill_zones", error)))
     })
     .await?;
     Ok(match result {
-        Ok(result) => result,
+        Ok(BoardBinding::Bound(result)) => result,
+        Ok(BoardBinding::Unserved { absence, message }) => {
+            Err(crate::tools::ipc_unserved_result(absence, &message))
+        }
         Err(error) => Err(target_failure(error)),
     })
 }
@@ -174,7 +181,7 @@ pub(crate) async fn run(
     let mut saved_snapshot = None;
     if sync {
         let path = board.to_path_buf();
-        let synchronized = with_board_ipc_classified(ctx, board, move |client, document| {
+        let synchronized = with_bound_board_ipc_classified(ctx, board, move |client, document| {
             let operation = || -> anyhow::Result<String> {
                 if refill {
                     request_refill_and_wait(client, document)?;
@@ -196,8 +203,21 @@ pub(crate) async fn run(
         })
         .await?;
         match synchronized {
-            Ok(Ok(snapshot)) => saved_snapshot = Some(snapshot),
-            Ok(Err(error)) => return Ok(Err(error)),
+            Ok(BoardBinding::Bound(Ok(snapshot))) => saved_snapshot = Some(snapshot),
+            Ok(BoardBinding::Bound(Err(error))) => return Ok(Err(error)),
+            Ok(BoardBinding::Unserved { absence, message }) => {
+                return Ok(Err(CallToolResult::error_kind_with_recovery(
+                    ToolErrorKind::EditorUnavailable {
+                        editor: "pcb".into(),
+                        reason: message.clone(),
+                    },
+                    format!(
+                        "KiCad is running but {} ({message}). The board file was not modified. CLI DRC was not started.",
+                        absence.observed()
+                    ),
+                    super::ipc_recovery::for_board_editor_absence(absence, &message),
+                )));
+            }
             Err(error) => return Ok(Err(target_failure(error))),
         }
     }
@@ -356,6 +376,15 @@ mod tests {
             let command = request.message.unwrap();
             let name = command.type_url.rsplit('/').next().unwrap().to_string();
             commands.lock().unwrap().push(name.clone());
+            if mode == "no-pcb-editor" && name == "kiapi.common.commands.GetOpenDocuments" {
+                return kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsUnhandled as i32,
+                        error_message: "No PCB editor serves this command".into(),
+                    }),
+                    ..Default::default()
+                };
+            }
             // Like KiCad 10.0.8: GetOpenDocuments never reports AS_BUSY, the
             // item reads (and saves) do. The readiness probe must see this.
             if *busy.lock().unwrap() && name == "kiapi.common.commands.GetItems" {
@@ -1032,6 +1061,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn served_drc_reports_that_cli_did_not_start_without_a_pcb_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("clock.kicad_pcb");
+        std::fs::write(&board, OLD).unwrap();
+        let executable = cli_fixture(dir.path(), &board);
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let server = mock(&board, commands.clone(), "no-pcb-editor");
+        let result = call(
+            "run_drc",
+            &board,
+            server.address(),
+            &executable,
+            json!({"sync_live_board":true,"refill_zones":true}),
+        )
+        .await;
+
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(result["error"]["kind"], "editor_unavailable", "{result}");
+        assert_eq!(
+            result["recovery"]["cause"], "no_pcb_editor_at_endpoint",
+            "{result}"
+        );
+        assert_eq!(result["recovery"]["mutation_outcome"], "none", "{result}");
+        assert_eq!(
+            *commands.lock().unwrap(),
+            ["kiapi.common.commands.GetOpenDocuments"]
+        );
+        assert!(!board.with_extension("kicad_pcb.observed").exists());
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), OLD);
+        assert!(
+            result["message"]
+                .as_str()
+                .unwrap()
+                .contains("CLI DRC was not started."),
+            "{result}"
+        );
     }
 
     #[tokio::test]

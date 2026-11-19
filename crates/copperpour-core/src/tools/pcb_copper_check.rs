@@ -2302,6 +2302,60 @@ mod served_tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_kicad_status_in_the_copper_check_preserves_the_plan_block() {
+        use crate::tools::pcb_board::board_mock::spawn_kicad_holding_board_refusing;
+        use kiapi::common::types::KiCadObjectType as Kot;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join(ISSUE_96.board_name);
+        std::fs::write(&board, ISSUE_96.board).unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let log = sent.clone();
+        let server =
+            spawn_kicad_holding_board_refusing(&board, vec![Kot::KotPcbVia], move |command| {
+                log.lock().unwrap().push(command_name(command));
+                if any_type_name(command) == "kiapi.common.commands.GetItems" {
+                    return Some(pack_any(
+                        &kiapi::common::commands::GetItemsResponse::decode(FOOTPRINTS).unwrap(),
+                        "kiapi.common.commands.GetItemsResponse",
+                    ));
+                }
+                replay(command)
+            });
+        let handler = McpHandler::new(crate::tools::ServerConfig {
+            ipc_address: server.address().to_string(),
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let result = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 96,
+                "method": "tools/call",
+                "params": {
+                    "name": "move_component",
+                    "arguments": { "board": board, "reference": "R1", "x": 110.0, "y": 90.0 }
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(result["isError"], true, "{result:#}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let body: Value = serde_json::from_str(text).unwrap_or_else(|_| json!(text));
+        assert_eq!(*sent.lock().unwrap(), ["GetItems", "GetBoardEnabledLayers"]);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), ISSUE_96.board);
+        assert_eq!(body["error"]["kind"], "plan_blocked", "{body:#}");
+        assert_eq!(body["error"]["operation"], "move_component");
+        assert_eq!(body["recovery"]["evidence"]["status"], "AS_BAD_REQUEST");
+        assert_eq!(body["recovery"]["cause"], "preflight_refusal");
+        assert_eq!(body["recovery"]["mutation_outcome"], "none");
+    }
+
     /// With no live KiCad the file is still edited, but the check is reported
     /// as not run, never as clear; a dry run there writes nothing.
     #[tokio::test]

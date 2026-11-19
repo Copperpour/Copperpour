@@ -326,14 +326,7 @@ async fn routing_preflight_valid_routes_still_create_requested_copper() {
 
 #[tokio::test]
 async fn routing_preflight_unreadable_net_evidence_is_not_a_missing_net() {
-    let scene = Scene::with_evidence(NetReply::Malformed, false).await;
-    let body = scene.call("route_trace", json!({})).await;
-    assert_ne!(body["error"]["kind"], "invalid_argument", "{body}");
-    assert!(
-        body["message"].as_str().unwrap().contains("IPC error"),
-        "{body}"
-    );
-    assert_eq!(scene.store.lock().unwrap().creates, 0);
+    evidence_failure(NetReply::Malformed, false, "Failed to decode protobuf").await;
 }
 
 async fn evidence_failure(net_reply: NetReply, empty_layers: bool, message: &str) {
@@ -341,9 +334,18 @@ async fn evidence_failure(net_reply: NetReply, empty_layers: bool, message: &str
     let before = std::fs::read(&scene.board).unwrap();
     let items = scene.store.lock().unwrap().items.clone();
     let body = scene.call("route_trace", json!({})).await;
-    assert_ne!(body["error"]["kind"], "invalid_argument", "{body}");
+    assert_eq!(body["error"]["kind"], "handler_error", "{body}");
     assert!(
         body["message"].as_str().unwrap().contains(message),
+        "{body}"
+    );
+    assert_eq!(body["recovery"]["cause"], "preflight_refusal", "{body}");
+    assert_eq!(body["recovery"]["mutation_outcome"], "none", "{body}");
+    assert!(
+        !body["recovery"]
+            .as_object()
+            .unwrap()
+            .contains_key("troubleshooting_url"),
         "{body}"
     );
     let store = scene.store.lock().unwrap();
