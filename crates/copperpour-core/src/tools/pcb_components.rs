@@ -2913,16 +2913,16 @@ async fn handle_move_component(
         "move",
         move |refusal| pcb_copper_check::refusal_kind("move_component", &named, refusal),
         move |c, document| {
-            pcb_copper_check::check_then_apply(c, document, &requests, options, |c| {
-                c.move_footprint(&ref_ipc, x, y)
+            pcb_copper_check::check_then_apply(c, document.clone(), &requests, options, |c| {
+                c.move_footprint_verified_in(document, &ref_ipc, x, y)
             })
         },
     )
     .await?
     {
-        BoardWrite::Ipc(Checked::Applied { check, .. }) => Ok(
-            check.applied_result(json!({ "moved": reference, "x": x, "y": y, "source": "ipc" }))
-        ),
+        BoardWrite::Ipc(Checked::Applied { check, applied }) => Ok(check.applied_result(
+            json!({ "moved": reference, "x": applied.x, "y": applied.y, "source": "ipc" }),
+        )),
         BoardWrite::Ipc(Checked::Blocked(check)) => Ok(check.blocked_result("move_component")),
         BoardWrite::Ipc(Checked::DryRun(check)) => Ok(check.dry_run_result()),
         BoardWrite::Refused(result) => Ok(result),
@@ -3337,9 +3337,13 @@ async fn handle_delete_component(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    if reference.is_empty() {
+        return Ok(crate::tools::invalid_arg("reference", "must not be empty"));
+    }
 
     let ref_ipc = reference.clone();
-    ipc!(ctx, args, |c| c.delete_footprint(&ref_ipc));
+    ipc!(ctx, args, |c, document| c
+        .delete_footprint_in(document, &ref_ipc));
     Ok(CallToolResult::json(&json!({ "deleted": reference })))
 }
 
@@ -8369,6 +8373,72 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn served_placement_reports_uncertainty_for_a_missing_live_angle() {
+        use crate::tools::pcb_board::board_mock::{spawn_kicad_holding_items, ItemStore};
+        use copperpour_ipc::{builders, gen::kiapi};
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = capacitor_fixture(dir.path(), C_0603);
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec![],
+            store.clone(),
+            |_| {},
+            |command, held| {
+                if !command.type_url.ends_with("GetItems") || held.creates == 0 {
+                    return None;
+                }
+                let mut footprint =
+                    kiapi::board::types::FootprintInstance::decode(held.items[0].value.as_slice())
+                        .unwrap();
+                footprint.orientation = None;
+                Some(builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: vec![builders::pack_any(
+                            &footprint,
+                            "kiapi.board.types.FootprintInstance",
+                        )],
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ))
+            },
+        );
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            ipc_address: server.address().to_string(),
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let reply = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "place_component", "arguments": {
+                    "board": board, "footprint": "Capacitor_SMD:C_0603_1608Metric",
+                    "reference": "C11", "x": 20.0, "y": 30.0
+                }}
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["error"]["kind"], "ipc_outcome_unknown", "{body}");
+        let reason = body["error"]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("C11") && reason.contains("no readable orientation"),
+            "{body}"
+        );
+        let held = store.lock().unwrap();
+        assert_eq!((held.creates, held.updates, held.deletes), (1, 0, 0));
+    }
+
     /// KiCad 10's stock M.2 edge connectors write Reference and Value twice
     /// each, and which copy KiCad keeps is not to be guessed. Such a part is
     /// placed with the fields every footprint gets, and the response says so,
@@ -9025,6 +9095,161 @@ mod off_axis_rotation_tests {
             },
             "kiapi.board.types.FootprintInstance",
         )
+    }
+
+    #[tokio::test]
+    async fn served_delete_refuses_ambiguous_or_unreadable_inventory_without_a_write() {
+        use crate::tools::pcb_board::board_mock::board_document;
+        use kiapi::common::{commands, types};
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        let original = b"(kicad_pcb (version 20260206))";
+        std::fs::write(&board, original).unwrap();
+        let target = footprint("target-kiid", "R1", vec![]);
+        for (items, wrong_board, status, reason) in [
+            (vec![], false, types::ItemRequestStatus::IrsOk, "not found"),
+            (
+                vec![target.clone(), footprint("other-kiid", "R1", vec![])],
+                false,
+                types::ItemRequestStatus::IrsOk,
+                "ambiguous",
+            ),
+            (
+                vec![target.clone(), footprint("other-kiid", "", vec![])],
+                false,
+                types::ItemRequestStatus::IrsOk,
+                "unreadable reference",
+            ),
+            (
+                vec![target.clone(), footprint("", "R2", vec![])],
+                false,
+                types::ItemRequestStatus::IrsOk,
+                "no readable KIID",
+            ),
+            (
+                vec![target.clone(), footprint("target-kiid", "R2", vec![])],
+                false,
+                types::ItemRequestStatus::IrsOk,
+                "duplicate KIID",
+            ),
+            (
+                vec![target.clone()],
+                true,
+                types::ItemRequestStatus::IrsOk,
+                "different board",
+            ),
+            (
+                vec![target.clone()],
+                false,
+                types::ItemRequestStatus::IrsDocumentNotFound,
+                "IRS_DOCUMENT_NOT_FOUND",
+            ),
+        ] {
+            let store = Arc::new(Mutex::new(ItemStore {
+                items,
+                ..Default::default()
+            }));
+            let wrong_document =
+                board_document(&dir.path().join("other.kicad_pcb").to_string_lossy());
+            let server = spawn_kicad_holding_items(
+                &board,
+                vec![],
+                store.clone(),
+                |_| {},
+                move |command, held| {
+                    command.type_url.ends_with("GetItems").then(|| {
+                        pack_any(
+                            &commands::GetItemsResponse {
+                                header: wrong_board.then(|| types::ItemHeader {
+                                    document: Some(wrong_document.clone()),
+                                    ..Default::default()
+                                }),
+                                status: status as i32,
+                                items: held.items.clone(),
+                            },
+                            "kiapi.common.commands.GetItemsResponse",
+                        )
+                    })
+                },
+            );
+            let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+                ipc_address: server.address().to_string(),
+                eager_toolsets: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let result = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "delete_component", "arguments": {
+                        "board": board, "reference": "R1"
+                    }}
+                }))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(store.lock().unwrap().deletes, 0, "{reason}: {body}");
+            assert_eq!(result["isError"], true, "{reason}: {body}");
+            assert_eq!(body["recovery"]["mutation_outcome"], "none", "{body}");
+            assert!(body["message"].as_str().unwrap().contains(reason), "{body}");
+            if status != types::ItemRequestStatus::IrsOk {
+                assert_eq!(body["recovery"]["evidence"]["status"], reason, "{body}");
+            }
+            assert_eq!(std::fs::read(&board).unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
+    async fn served_move_reports_uncertainty_when_kiid_stays_at_the_old_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        let original = b"(kicad_pcb (version 20260206))";
+        std::fs::write(&board, original).unwrap();
+        let fixed = footprint("target-kiid", "R1", vec![]);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![fixed.clone()],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec![],
+            store.clone(),
+            move |item| *item = fixed.clone(),
+            |_, _| None,
+        );
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            ipc_address: server.address().to_string(),
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let reply = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "move_component", "arguments": {
+                    "board": board, "reference": "R1", "x": 120.0, "y": 130.0
+                }}
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["error"]["kind"], "ipc_outcome_unknown", "{body}");
+        let reason = body["error"]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("target-kiid") && reason.contains("target.kicad_pcb"),
+            "{body}"
+        );
+        assert_eq!(store.lock().unwrap().updates, 1);
+        assert_eq!(std::fs::read(&board).unwrap(), original);
     }
 
     /// Serves the issue's batch, Y1 at -45° and U1 at 45°, to a KiCad
