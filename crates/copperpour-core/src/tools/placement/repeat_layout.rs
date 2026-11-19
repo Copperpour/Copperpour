@@ -16,13 +16,15 @@
 //! is not exact away from right angles; this turns the unmoved anchor.
 //!
 //! Routing goes with them, unless `copy_routing` is false: the reference's
-//! tracks, arcs and vias on the nets every pad of which is on the reference
-//! placement, KiCad's nets local to a channel (`AutogenerateRuleAreas`,
-//! `multichannel_tool.cpp` 2396-2414). Each is turned and moved as its
-//! footprints are, and takes the net its pads' counterparts are on, as
-//! `fixupNet` maps it; the copies replace the target's own items on those
-//! nets. A net whose routing is copied must become one net local to the
-//! target placement, or the call is refused.
+//! tracks, arcs and vias that lie in its area, the outline KiCad's
+//! `AutogenerateRuleAreas` builds for a placement (`multichannel_tool.cpp`
+//! 2430-2473 at 10.0.8), as Repeat Layout copies what lies in a rule area.
+//! Each is turned and moved as its footprints are, and takes the net its pads'
+//! counterparts are on, as `fixupNet` maps it, or keeps its own when no pad of
+//! the placement is on it. The copies replace the routing that lies in the
+//! target's own area or in the reference's area carried onto it. A net local
+//! to the reference must become one net local to the target, and every copied
+//! net one net there, or the call is refused.
 //!
 //! The poses go through `set_component_placements`' writers: on a live board
 //! its copper check and one KiCad commit, which the routing joins, otherwise
@@ -39,7 +41,10 @@ use crate::tools::pcb_board_outline::mm_text;
 use crate::tools::pcb_components::{
     escape_sexp_string, footprint_reference, normalize_root_angle, place_closed_board_footprints,
 };
-use crate::tools::pcb_copper_check::{self, CheckOptions, Checked, PoseRequest};
+use crate::tools::pcb_copper_check::{
+    self, flatten_arc, segment_distance, via_diameter_nm, CheckOptions, Checked, Point,
+    PoseRequest, ARC_CHORD_ERROR_NM,
+};
 use crate::tools::{get_path, invalid_arg, require_str, ToolContext, ToolDef};
 use anyhow::Context;
 use copperpour_ipc::builders::{any_is, mm_to_nm, nm_to_mm, pack_any};
@@ -48,6 +53,7 @@ use copperpour_ipc::gen::kiapi;
 use copperpour_ipc::types::IpcFootprintPlacement;
 use copperpour_ipc::PreflightCause;
 use copperpour_sexp::board::exact_coordinate_pair;
+use copperpour_sexp::bounds::board_item_bounds;
 use copperpour_sexp::net::net_name;
 use copperpour_sexp::writer::{
     apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, new_uuid,
@@ -70,9 +76,10 @@ pub(super) fn tool() -> ToolDef {
          sheets below it, and each target takes its counterpart's pose turned by the anchors' \
          rotation difference and moved onto its anchor. A target whose footprints differ in \
          number, library footprint, pad count or side is refused, moving nothing. Unless \
-         copy_routing is false, the reference's tracks, arcs and vias on nets whose every pad is \
-         on its placement are copied the same way onto each target, on the nets the matched \
-         pads give them there, replacing the target's own routing on those nets. Uses one live \
+         copy_routing is false, the reference's tracks, arcs and vias inside the area KiCad's \
+         Generate Placement Rule Areas would draw around it are copied the same way onto each \
+         target, on the nets the matched pads give them there, replacing the routing inside the \
+         target's area. Uses one live \
          KiCad update and one undo step after set_component_placements' copper check when \
          reachable; otherwise edits a closed board file once with revision checks. The \
          closed-file path cannot run the check and reports copper_check.status not_run. Zones \
@@ -94,7 +101,7 @@ pub(super) fn tool() -> ToolDef {
                 "copy_routing": {
                     "type": "boolean",
                     "default": true,
-                    "description": "Copy the reference placement's routing on its own nets onto each target, replacing the target's own routing on the nets the copies take. False places footprints only."
+                    "description": "Copy the routing inside the reference placement's area onto each target, replacing the routing inside the target's area. False places footprints only."
                 },
                 "dry_run": {
                     "type": "boolean",
@@ -119,6 +126,8 @@ pub(super) fn tool() -> ToolDef {
 /// A footprint as the plan reads it, from KiCad or from the saved file.
 #[derive(Debug, Clone)]
 struct Footprint {
+    /// Its KIID, the saved board's `(uuid …)`.
+    id: String,
     reference: String,
     /// The symbol's instance path, sheet UUIDs then the symbol's own; empty
     /// for a footprint with no symbol.
@@ -152,12 +161,45 @@ struct Pad {
     net: String,
 }
 
-/// A track, arc or via as the plan reads it: its KIID and net, `""` for no
-/// net.
+/// A track, arc or via as the plan reads it: its KIID, its net, `""` for no
+/// net, and its copper on F.Cu, the layer an area's test reads it on.
 #[derive(Debug, Clone)]
 struct Wire {
     id: String,
     net: String,
+    copper: Vec<Swept>,
+}
+
+/// Copper as a segment swept by a disk: a track one, an arc one per chord, a
+/// via one of no length.
+#[derive(Debug, Clone, Copy)]
+struct Swept {
+    a: Point,
+    b: Point,
+    radius: f64,
+}
+
+/// A group's KIID, name and members' KIIDs, a member group among them.
+#[derive(Debug, Clone)]
+struct Group {
+    id: String,
+    name: String,
+    members: Vec<String>,
+}
+
+/// A box as KiCad gives one, in nm: left, top, right and bottom, the right
+/// and bottom its position plus its size, as `GetRight` and `GetBottom` read.
+pub(super) type Rect = (i64, i64, i64, i64);
+
+/// A vertex of an area's outline, in nm.
+pub(super) type Vertex = (i64, i64);
+
+/// What the area reads besides the footprints: the routing, each board item's
+/// box by KIID, a footprint's without its text, and the groups.
+struct Routing<'a> {
+    wires: &'a [Wire],
+    boxes: &'a HashMap<String, Rect>,
+    groups: &'a [Group],
 }
 
 /// What a call lays out: the target footprints' poses and, when routing is
@@ -199,7 +241,7 @@ fn carry(x: i64, y: i64, rotation: f64, (dx, dy): (i64, i64)) -> (i64, i64) {
 
 /// The nets every pad of which is on a footprint of `members`, as KiCad finds
 /// the nets local to a channel (`AutogenerateRuleAreas`,
-/// `multichannel_tool.cpp` 2396-2414 at 10.0.6).
+/// `multichannel_tool.cpp` 2452-2471 at 10.0.8).
 fn local_nets<'a>(
     footprints: &'a [Footprint],
     members: &[(&[String], &Footprint)],
@@ -218,91 +260,373 @@ fn local_nets<'a>(
     inside
 }
 
-/// A target's nets for the reference's, its copies and its removed items, as
-/// [`TargetRouting`] holds them.
-type Route = (BTreeMap<String, String>, Vec<(usize, String)>, Vec<usize>);
+/// A net as a reason names it.
+fn shown(net: &str) -> &str {
+    if net.is_empty() {
+        "no net"
+    } else {
+        net
+    }
+}
 
-/// The routing a target placement takes: each reference item on a net in
-/// `reference_nets`, with the net the pads matched to that net's pads are on
-/// (`fixupNet`), and the target's own items on the nets the copies go on. A
-/// net whose routing is copied must become one net local to the target, or
-/// the reason goes in `reasons`.
+/// A target's nets for the reference's, and its copies, as
+/// [`TargetRouting`] holds them.
+type Route = (BTreeMap<String, String>, Vec<(usize, String)>);
+
+/// A target placement as the plan pairs it: its anchor, its footprints with
+/// their paths below its sheet, and each reference footprint with its
+/// counterpart there.
+type Paired<'a> = (
+    &'a Footprint,
+    Vec<(&'a [String], &'a Footprint)>,
+    Vec<(&'a Footprint, &'a Footprint)>,
+);
+
+/// The nets the `copied` items take on a target placement, as `fixupNet`
+/// gives them (`multichannel_tool.cpp` 1941-1977 at 10.0.8): the net of the
+/// pads matched to the pads of the reference placement on the item's net, or
+/// the item's own when no such pad is on it. A net those pads put on more
+/// than one net, or a named net they put on none, is a reason in `reasons`,
+/// as are two nets that become one, a net kept as its own among them, and a
+/// net local to the reference that becomes a net with pads off the target.
 fn route(
     footprints: &[Footprint],
     wires: &[Wire],
-    reference_nets: &HashSet<&str>,
-    target_members: &[(&[String], &Footprint)],
-    matched: &[(&Footprint, &Footprint)],
-    target_anchor: &Footprint,
+    copied: &[usize],
+    reference: &[(&[String], &Footprint)],
+    (target_anchor, target_members, matched): &Paired,
     reasons: &mut Vec<String>,
 ) -> Route {
+    let reference_nets = local_nets(footprints, reference);
     let target_nets = local_nets(footprints, target_members);
     let mut images: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for (from, to) in matched {
         for pad in &from.pads {
-            if reference_nets.contains(pad.net.as_str()) {
-                let image = to
-                    .pads
-                    .iter()
-                    .find(|counterpart| counterpart.number == pad.number)
-                    .map_or("", |counterpart| counterpart.net.as_str());
-                images.entry(pad.net.as_str()).or_default().insert(image);
-            }
+            let image = to
+                .pads
+                .iter()
+                .find(|counterpart| counterpart.number == pad.number)
+                .map_or("", |counterpart| counterpart.net.as_str());
+            images.entry(pad.net.as_str()).or_default().insert(image);
         }
     }
-    let routed: HashSet<&str> = wires.iter().map(|wire| wire.net.as_str()).collect();
+    let routed: BTreeSet<&str> = copied
+        .iter()
+        .map(|&index| wires[index].net.as_str())
+        .collect();
     let placement = format!("{}'s placement", target_anchor.reference);
     let mut nets: BTreeMap<&str, &str> = BTreeMap::new();
     let mut taken: HashMap<&str, &str> = HashMap::new();
-    for (net, on_target) in &images {
-        if !routed.contains(net) {
-            continue;
-        }
-        let image = match on_target.iter().collect::<Vec<_>>().as_slice() {
-            [image] if !image.is_empty() => **image,
-            several => {
-                let names: Vec<&str> = several
-                    .iter()
-                    .map(|image| if image.is_empty() { "no net" } else { image })
-                    .collect();
-                reasons.push(format!(
-                    "{net} becomes {} on {placement}",
-                    names.join(" and ")
-                ));
-                continue;
-            }
+    for net in routed {
+        let image = match images
+            .get(net)
+            .map(|on_target| on_target.iter().collect::<Vec<_>>())
+        {
+            None => net,
+            Some(on_target) => match on_target.as_slice() {
+                [image] if !image.is_empty() || net.is_empty() => **image,
+                several => {
+                    let names: Vec<&str> = several.iter().map(|image| shown(image)).collect();
+                    reasons.push(format!(
+                        "{} becomes {} on {placement}",
+                        shown(net),
+                        names.join(" and ")
+                    ));
+                    continue;
+                }
+            },
         };
-        if !target_nets.contains(image) {
+        if reference_nets.contains(net) && !target_nets.contains(image) {
             reasons.push(format!(
                 "{net} becomes {image}, which has pads off {placement}"
             ));
         } else if let Some(other) = taken.insert(image, net) {
             reasons.push(format!(
-                "{other} and {net} both become {image} on {placement}"
+                "{} and {} both become {} on {placement}",
+                shown(other),
+                shown(net),
+                shown(image)
             ));
         } else {
             nets.insert(net, image);
         }
     }
-    let copies = wires
+    let copies = copied
         .iter()
-        .enumerate()
-        .filter_map(|(index, wire)| {
-            let net = nets.get(wire.net.as_str())?;
+        .filter_map(|&index| {
+            let net = nets.get(wires[index].net.as_str())?;
             Some((index, net.to_string()))
         })
-        .collect();
-    let removed = wires
-        .iter()
-        .enumerate()
-        .filter(|(_, wire)| taken.contains_key(wire.net.as_str()))
-        .map(|(index, _)| index)
         .collect();
     let nets = nets
         .into_iter()
         .map(|(from, to)| (from.to_string(), to.to_string()))
         .collect();
-    (nets, copies, removed)
+    (nets, copies)
+}
+
+// ─── The area ─────────────────────────────────────────────────────────────────
+
+/// `buildRAOutline`'s margin in `AutogenerateRuleAreas`
+/// (`multichannel_tool.cpp` 2473 at 10.0.8).
+const AREA_MARGIN_NM: i64 = 100_000;
+
+/// The area KiCad's `AutogenerateRuleAreas` draws around a placement
+/// (`multichannel_tool.cpp` 2431-2473 at 10.0.8): the box of each of its
+/// footprints, of every item in the groups above them
+/// (`collectGroupBoardItems`, 429-439), and of each track, arc and via on its
+/// own nets, each grown by 0.1 mm, then their convex hull rectified
+/// (`buildRAOutline`, 515-537). A box the read lacks is a reason in
+/// `reasons`.
+fn area(
+    footprints: &[Footprint],
+    members: &[(&[String], &Footprint)],
+    routing: &Routing,
+    reasons: &mut Vec<String>,
+) -> Vec<Vertex> {
+    let groups: HashMap<&str, &Group> = routing
+        .groups
+        .iter()
+        .map(|group| (group.id.as_str(), group))
+        .collect();
+    let parents: HashMap<&str, &Group> = routing
+        .groups
+        .iter()
+        .flat_map(|group| {
+            group
+                .members
+                .iter()
+                .map(move |member| (member.as_str(), group))
+        })
+        .collect();
+    let mut items: BTreeMap<&str, String> = BTreeMap::new();
+    let mut above: Vec<(&Group, &str)> = Vec::new();
+    for (_, fp) in members {
+        items.insert(&fp.id, fp.reference.clone());
+        let mut at = fp.id.as_str();
+        while let Some(group) = parents.get(at) {
+            if above.iter().any(|(seen, _)| seen.id == group.id) {
+                break;
+            }
+            above.push((group, &fp.reference));
+            at = &group.id;
+        }
+    }
+    let mut stack = above;
+    let mut opened: HashSet<&str> = HashSet::new();
+    while let Some((group, reference)) = stack.pop() {
+        if !opened.insert(&group.id) {
+            continue;
+        }
+        for member in &group.members {
+            match groups.get(member.as_str()) {
+                Some(inner) => stack.push((inner, reference)),
+                None => {
+                    items.entry(member).or_insert_with(|| {
+                        format!("{member}, in group '{}' with {reference},", group.name)
+                    });
+                }
+            }
+        }
+    }
+    let own = local_nets(footprints, members);
+    for wire in routing.wires {
+        if own.contains(wire.net.as_str()) {
+            items.insert(&wire.id, format!("{} {}", wire.net, wire.id));
+        }
+    }
+    let mut boxes = Vec::with_capacity(items.len());
+    for (id, what) in items {
+        match routing.boxes.get(id) {
+            Some(&rect) => boxes.push(rect),
+            None => reasons.push(format!(
+                "{what} has no box in this read: KiCad measures it, so open the board in \
+                 KiCad, or pass copy_routing false"
+            )),
+        }
+    }
+    area_outline(&boxes)
+}
+
+/// `buildRAOutline` (`multichannel_tool.cpp` 515-537 at 10.0.8): each box
+/// grown by [`AREA_MARGIN_NM`], the convex hull of their corners, rectified.
+pub(super) fn area_outline(boxes: &[Rect]) -> Vec<Vertex> {
+    let m = AREA_MARGIN_NM;
+    let corners = boxes
+        .iter()
+        .flat_map(|&(left, top, right, bottom)| {
+            let (left, top, right, bottom) = (left - m, top - m, right + m, bottom + m);
+            [(left, top), (right, top), (right, bottom), (left, bottom)]
+        })
+        .collect();
+    rectify(&convex_hull(corners))
+}
+
+/// `BuildConvexHull` (`libs/kimath/src/geometry/convex_hull.cpp` 87-131 at
+/// 10.0.8): Andrew's monotone chain over the points sorted by x then y,
+/// collinear points left out, counter-clockwise.
+fn convex_hull(mut points: Vec<Vertex>) -> Vec<Vertex> {
+    if points.len() < 2 {
+        return Vec::new();
+    }
+    points.sort_unstable();
+    let cross = |o: Vertex, a: Vertex, b: Vertex| {
+        i128::from(a.0 - o.0) * i128::from(b.1 - o.1)
+            - i128::from(a.1 - o.1) * i128::from(b.0 - o.0)
+    };
+    let mut hull: Vec<Vertex> = Vec::with_capacity(points.len() * 2);
+    for &p in &points {
+        while hull.len() >= 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0 {
+            hull.pop();
+        }
+        hull.push(p);
+    }
+    let lower = hull.len() + 1;
+    for &p in points.iter().rev().skip(1) {
+        while hull.len() >= lower && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0 {
+            hull.pop();
+        }
+        hull.push(p);
+    }
+    if hull.len() > 1 && hull.first() == hull.last() {
+        hull.pop();
+    }
+    hull
+}
+
+/// `KIGEOM::RectifyPolygon` (`libs/kimath/src/geometry/shape_utils.cpp`
+/// 362-393 at 10.0.8) as its header says it works, the whole hull inside the
+/// outline (`shape_utils.h` 160-171): after each vertex `A`, toward the next
+/// vertex `B`, the corner `(A.x, B.y)`, or `(B.x, A.y)` where the first lies
+/// inside the hull, left of the counter-clockwise edge. `buildRAOutline`
+/// hands it the hull as a chain that is not closed, and `PointInside` answers
+/// false on such a chain (`shape_line_chain.cpp` 2000-2001), so KiCad takes
+/// `(A.x, B.y)` on every edge and can cut a corner of the hull off, and with
+/// it routing on the placement's own nets. Points go in as
+/// `SHAPE_LINE_CHAIN::Append` puts them, a repeat of the last left out;
+/// closing drops a last point equal to the first (`SetClosed`), and the
+/// outline is then simplified.
+fn rectify(hull: &[Vertex]) -> Vec<Vertex> {
+    if hull.len() < 2 {
+        return Vec::new();
+    }
+    let mut outline: Vec<Vertex> = Vec::with_capacity(hull.len() * 2);
+    for (index, &a) in hull.iter().enumerate() {
+        let b = hull[(index + 1) % hull.len()];
+        let corner = (a.0, b.1);
+        let left = i128::from(b.0 - a.0) * i128::from(corner.1 - a.1)
+            - i128::from(b.1 - a.1) * i128::from(corner.0 - a.0);
+        let corner = if left > 0 { (b.0, a.1) } else { corner };
+        for point in [a, corner] {
+            if outline.last() != Some(&point) {
+                outline.push(point);
+            }
+        }
+    }
+    if outline.len() > 1 && outline.first() == outline.last() {
+        outline.pop();
+    }
+    simplify(&outline)
+}
+
+/// `SHAPE_LINE_CHAIN::Simplify` at no tolerance on a closed chain
+/// (`shape_line_chain.cpp` 2749-2841 at 10.0.8): from each kept point, the
+/// points lying on the segment to a later one are dropped, as many in a row as
+/// lie on it. The first point is kept. `TestSegmentHit` at no distance is a
+/// point less than 1 nm from the segment, which on an outline of horizontal
+/// and vertical edges is a point on it.
+fn simplify(points: &[Vertex]) -> Vec<Vertex> {
+    let n = points.len();
+    if n < 3 {
+        return points.to_vec();
+    }
+    let on = |p: Vertex, a: Vertex, b: Vertex| {
+        let cross = i128::from(b.0 - a.0) * i128::from(p.1 - a.1)
+            - i128::from(b.1 - a.1) * i128::from(p.0 - a.0);
+        cross == 0
+            && p.0 >= a.0.min(b.0)
+            && p.0 <= a.0.max(b.0)
+            && p.1 >= a.1.min(b.1)
+            && p.1 <= a.1.max(b.1)
+    };
+    let mut kept = Vec::with_capacity(n);
+    let mut start = 0;
+    while start < n {
+        kept.push(points[start]);
+        let mut end = (start + 2) % n;
+        let mut simplifies = true;
+        while simplifies && end != start {
+            let mut test = (start + 1) % n;
+            while test != end {
+                if !on(points[test], points[start], points[end]) {
+                    simplifies = false;
+                    break;
+                }
+                test = (test + 1) % n;
+            }
+            if simplifies {
+                end = (end + 1) % n;
+            }
+        }
+        if end == (start + 2) % n {
+            start += 1;
+        } else {
+            let next = (end + n - 1) % n;
+            if next <= start {
+                break;
+            }
+            start = next;
+        }
+    }
+    if kept.len() == 1 {
+        kept.push(points[n - 1]);
+    }
+    kept
+}
+
+/// An outline turned and moved as the copies are: `newTargetOutline`, the
+/// reference's area carried onto a target, which KiCad makes the target's
+/// area once it has copied (`multichannel_tool.cpp` 1338-1341 and
+/// 1929-1930 at 10.0.8).
+pub(super) fn carried(outline: &[Vertex], rotation: f64, offset: (i64, i64)) -> Vec<Vertex> {
+    outline
+        .iter()
+        .map(|&(x, y)| carry(x, y, rotation, offset))
+        .collect()
+}
+
+/// Whether `outline` encloses `copper`, as `enclosedByArea` tests an item
+/// (`pcbnew/pcbexpr_functions.cpp` 919-1032 at 10.0.8): every part of the
+/// copper inside the outline, read here as each swept segment's start inside
+/// it and no edge of it nearer than the segment's radius. KiCad tests the
+/// item's polygon, drawn up to the board's maximum error outside the copper
+/// (`ERROR_OUTSIDE`), so an item that close to the outline can be taken here
+/// where KiCad leaves it.
+fn encloses(outline: &[Vertex], copper: &[Swept]) -> bool {
+    if outline.len() < 3 || copper.is_empty() {
+        return false;
+    }
+    let vertices: Vec<Point> = outline.iter().map(|&(x, y)| (x as f64, y as f64)).collect();
+    let edges = || {
+        vertices
+            .iter()
+            .zip(vertices.iter().cycle().skip(1))
+            .map(|(&p, &q)| (p, q))
+    };
+    let inside = |(x, y): Point| {
+        edges()
+            .filter(|&((x1, y1), (x2, y2))| {
+                (y1 > y) != (y2 > y) && x < x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+            })
+            .count()
+            % 2
+            == 1
+    };
+    copper.iter().all(|swept| {
+        swept.radius > 0.0
+            && inside(swept.a)
+            && edges().all(|(p, q)| segment_distance(swept.a, swept.b, p, q) >= swept.radius)
+    })
 }
 
 /// The one footprint `reference` names, or the refusal naming `field`.
@@ -360,7 +684,7 @@ fn members<'a>(
 /// anchor's counterparts to lay out; `None` is every one on the board.
 fn plan(
     footprints: &[Footprint],
-    routing: Option<&[Wire]>,
+    routing: Option<&Routing>,
     anchor: &str,
     targets: Option<&[String]>,
 ) -> Result<Layout, CallToolResult> {
@@ -437,7 +761,7 @@ fn plan(
             ),
         ));
     }
-    let mut paired = Vec::new();
+    let mut paired: Vec<Paired> = Vec::new();
     for target_anchor in &target_anchors {
         let target_members = members(footprints, target_anchor.sheet(), &mut reasons);
         let target: HashMap<&[String], &Footprint> = target_members.iter().copied().collect();
@@ -499,19 +823,50 @@ fn plan(
     if !reasons.is_empty() {
         return Err(mismatch(reasons));
     }
+    let transforms: Vec<(f64, (i64, i64))> = paired
+        .iter()
+        .map(|(target_anchor, ..)| {
+            let rotation = target_anchor.rotation - anchor.rotation;
+            let (ax, ay) = rotate_point(anchor.x_nm, anchor.y_nm, rotation);
+            (rotation, (target_anchor.x_nm - ax, target_anchor.y_nm - ay))
+        })
+        .collect();
     let mut routes = Vec::new();
-    if let Some(wires) = routing {
-        let reference_nets = local_nets(footprints, &reference);
-        for (target_anchor, target_members, matched) in &paired {
-            routes.push(route(
-                footprints,
-                wires,
-                &reference_nets,
-                target_members,
-                matched,
-                target_anchor,
-                &mut reasons,
-            ));
+    if let Some(routing) = routing {
+        let wires = routing.wires;
+        // With nothing to copy or remove, no area is drawn.
+        let draw = |members: &[(&[String], &Footprint)], reasons: &mut Vec<String>| {
+            if wires.is_empty() {
+                Vec::new()
+            } else {
+                area(footprints, members, routing, reasons)
+            }
+        };
+        let outline = draw(&reference, &mut reasons);
+        let copied: Vec<usize> = (0..wires.len())
+            .filter(|&index| encloses(&outline, &wires[index].copper))
+            .collect();
+        // A target's routing is what lies in its own area, which KiCad's
+        // first Repeat Layout replaces, or in the reference's area carried
+        // onto it, which its later ones replace: both, so that a second call
+        // replaces the first one's copies. An item in two targets' areas is
+        // removed once, as KiCad's one commit removes it (1479-1481). KiCad
+        // also removes a reference item in a target's area; here an item the
+        // reference copies is never removed.
+        let mut taken: HashSet<usize> = copied.iter().copied().collect();
+        for (target, &(rotation, offset)) in paired.iter().zip(&transforms) {
+            let own = draw(&target.1, &mut reasons);
+            let moved = carried(&outline, rotation, offset);
+            let removed: Vec<usize> = (0..wires.len())
+                .filter(|&index| {
+                    let copper = &wires[index].copper;
+                    !taken.contains(&index) && (encloses(&own, copper) || encloses(&moved, copper))
+                })
+                .collect();
+            taken.extend(&removed);
+            let (nets, copies) =
+                route(footprints, wires, &copied, &reference, target, &mut reasons);
+            routes.push((nets, copies, removed));
         }
         if !reasons.is_empty() {
             return Err(mismatch(reasons));
@@ -519,11 +874,9 @@ fn plan(
     }
 
     let mut placements = Vec::new();
-    let mut transforms = Vec::new();
-    for (target_anchor, _, matched) in paired {
-        let rotation = target_anchor.rotation - anchor.rotation;
-        let (ax, ay) = rotate_point(anchor.x_nm, anchor.y_nm, rotation);
-        let (dx, dy) = (target_anchor.x_nm - ax, target_anchor.y_nm - ay);
+    let mut targets_moved = Vec::new();
+    for ((target_anchor, _, matched), &(rotation, (dx, dy))) in paired.into_iter().zip(&transforms)
+    {
         for (from, to) in matched {
             if to.reference == target_anchor.reference {
                 continue;
@@ -536,9 +889,9 @@ fn plan(
                 rotation: normalize_root_angle(from.rotation + rotation),
             });
         }
-        transforms.push((target_anchor.reference.clone(), rotation, (dx, dy)));
+        targets_moved.push((target_anchor.reference.clone(), rotation, (dx, dy)));
     }
-    let routing = transforms
+    let routing = targets_moved
         .into_iter()
         .zip(routes)
         .map(
@@ -639,6 +992,11 @@ fn live_footprints(
         let position = fp.position.unwrap_or_default();
         let definition = fp.definition.as_ref();
         footprints.push(Footprint {
+            id: fp
+                .id
+                .as_ref()
+                .map(|id| id.value.clone())
+                .unwrap_or_default(),
             reference: fp
                 .reference_field
                 .as_ref()
@@ -694,6 +1052,7 @@ fn file_footprints(content: &str) -> Result<Vec<Footprint>, String> {
                 })
                 .ok_or_else(|| format!("{reference} has no readable (at x y) placement"))?;
             Ok(Footprint {
+                id: node.find_str("uuid").unwrap_or_default().to_string(),
                 path: node
                     .find_str("path")
                     .map(|path| {
@@ -759,6 +1118,7 @@ impl LiveWire {
         }))
     }
 
+    /// The item's KIID and net, its copper left empty.
     fn wire(&self) -> Wire {
         let (id, net) = match self {
             Self::Track(track) => (&track.id, &track.net),
@@ -768,7 +1128,56 @@ impl LiveWire {
         Wire {
             id: id.as_ref().map(|id| id.value.clone()).unwrap_or_default(),
             net: net.as_ref().map(|net| net.name.clone()).unwrap_or_default(),
+            copper: Vec::new(),
         }
+    }
+
+    /// The item with its copper on F.Cu, as `PCB_TRACK::TransformShapeToPolygon`
+    /// draws it there (`pcbnew/pcb_track.cpp` 2901-2942 at 10.0.8): a track
+    /// its width, an arc its chords, a via a disk of half its F.Cu diameter,
+    /// halved in whole nanometres.
+    fn planned(&self) -> anyhow::Result<Wire> {
+        let mut wire = self.wire();
+        let at = |point: Option<kiapi::common::types::Vector2>| {
+            point
+                .map(|point| (point.x_nm as f64, point.y_nm as f64))
+                .with_context(|| format!("KiCad sent routing item {} without its points", wire.id))
+        };
+        let half = |width: Option<kiapi::common::types::Distance>| {
+            width
+                .map(|width| width.value_nm as f64 / 2.0)
+                .with_context(|| format!("KiCad sent routing item {} without its width", wire.id))
+        };
+        let copper = match self {
+            Self::Track(track) => vec![Swept {
+                a: at(track.start)?,
+                b: at(track.end)?,
+                radius: half(track.width)?,
+            }],
+            Self::Arc(arc) => {
+                let radius = half(arc.width)? + ARC_CHORD_ERROR_NM;
+                flatten_arc(at(arc.start)?, at(arc.mid)?, at(arc.end)?)
+                    .windows(2)
+                    .map(|chord| Swept {
+                        a: chord[0],
+                        b: chord[1],
+                        radius,
+                    })
+                    .collect()
+            }
+            Self::Via(via) => {
+                let centre = at(via.position)?;
+                let diameter = via_diameter_nm(via, kiapi::board::types::BoardLayer::BlFCu)
+                    .with_context(|| format!("via {}", wire.id))?;
+                vec![Swept {
+                    a: centre,
+                    b: centre,
+                    radius: ((diameter as i64) / 2) as f64,
+                }]
+            }
+        };
+        wire.copper = copper;
+        Ok(wire)
     }
 
     /// The copy `copyRuleAreaContents` makes: turned, moved and put on
@@ -823,6 +1232,67 @@ fn live_routing(
     Ok(wires)
 }
 
+/// The groups KiCad holds.
+fn live_groups(
+    client: &KiCadIpcClient,
+    document: kiapi::common::types::DocumentSpecifier,
+) -> anyhow::Result<Vec<Group>> {
+    use kiapi::common::types::KiCadObjectType as Kot;
+    let mut groups = Vec::new();
+    for item in client.get_items_in(document, Kot::KotPcbGroup)? {
+        if !any_is(&item, "kiapi.board.types.Group") {
+            continue;
+        }
+        let group = kiapi::board::types::Group::decode(item.value.as_slice())
+            .context("KiCad returned an unreadable group")?;
+        groups.push(Group {
+            id: group.id.map(|id| id.value).unwrap_or_default(),
+            name: group.name,
+            members: group.items.into_iter().map(|id| id.value).collect(),
+        });
+    }
+    Ok(groups)
+}
+
+/// KiCad's box of each footprint, routing item and group member, by KIID:
+/// `GetBoundingBox` in `BBM_ITEM_ONLY` mode, a footprint's without its text,
+/// as an area takes them (`pcbnew/api/api_handler_pcb.cpp` 1330-1361 at
+/// 10.0.8).
+fn live_boxes(
+    client: &KiCadIpcClient,
+    document: kiapi::common::types::DocumentSpecifier,
+    footprints: &[Footprint],
+    wires: &[Wire],
+    groups: &[Group],
+) -> anyhow::Result<HashMap<String, Rect>> {
+    let nested: HashSet<&str> = groups.iter().map(|group| group.id.as_str()).collect();
+    let ids: BTreeSet<&str> = footprints
+        .iter()
+        .map(|fp| fp.id.as_str())
+        .chain(wires.iter().map(|wire| wire.id.as_str()))
+        .chain(
+            groups
+                .iter()
+                .flat_map(|group| group.members.iter().map(String::as_str))
+                .filter(|member| !nested.contains(member)),
+        )
+        .filter(|id| !id.is_empty())
+        .collect();
+    let ids: Vec<String> = ids.into_iter().map(str::to_string).collect();
+    Ok(client
+        .get_item_boxes_in(document, &ids)?
+        .into_iter()
+        .map(|(id, bounds)| {
+            let (at, size) = (
+                bounds.position.unwrap_or_default(),
+                bounds.size.unwrap_or_default(),
+            );
+            let rect = (at.x_nm, at.y_nm, at.x_nm + size.x_nm, at.y_nm + size.y_nm);
+            (id, rect)
+        })
+        .collect())
+}
+
 /// A saved board's top-level track, arc or via: its tag, its block's span,
 /// and the plan's view of it.
 struct FileWire {
@@ -871,10 +1341,106 @@ fn file_routing(content: &str) -> Result<Vec<FileWire>, String> {
             wire: Wire {
                 id: id.to_string(),
                 net: net.to_string(),
+                copper: file_copper(&node, kind, id)?,
             },
         });
     }
     Ok(wires)
+}
+
+/// A saved routing item's copper on F.Cu, as [`LiveWire::planned`] reads
+/// KiCad's: a via's `(size …)` is its F.Cu diameter, which KiCad writes
+/// there (`pcb_io_kicad_sexpr.cpp` 2647-2649 at 10.0.8).
+fn file_copper(
+    node: &copperpour_sexp::SexpNode,
+    kind: &str,
+    id: &str,
+) -> Result<Vec<Swept>, String> {
+    let at = |tag: &str| {
+        node.find(tag)
+            .and_then(exact_coordinate_pair)
+            .map(|(x, y)| (mm_to_nm(x) as f64, mm_to_nm(y) as f64))
+            .ok_or_else(|| format!("{kind} {id} has no readable ({tag} x y)"))
+    };
+    let size = |tag: &str| {
+        node.find(tag)
+            .and_then(|value| value.get_f64(1))
+            .filter(|value| value.is_finite())
+            .map(mm_to_nm)
+            .ok_or_else(|| format!("{kind} {id} has no readable ({tag} …)"))
+    };
+    Ok(match kind {
+        "segment" => vec![Swept {
+            a: at("start")?,
+            b: at("end")?,
+            radius: size("width")? as f64 / 2.0,
+        }],
+        "arc" => {
+            let radius = size("width")? as f64 / 2.0 + ARC_CHORD_ERROR_NM;
+            flatten_arc(at("start")?, at("mid")?, at("end")?)
+                .windows(2)
+                .map(|chord| Swept {
+                    a: chord[0],
+                    b: chord[1],
+                    radius,
+                })
+                .collect()
+        }
+        _ => {
+            let centre = at("at")?;
+            vec![Swept {
+                a: centre,
+                b: centre,
+                radius: (size("size")? / 2) as f64,
+            }]
+        }
+    })
+}
+
+/// The groups of a saved board: `(group "name" (uuid …) (members …))`.
+fn file_groups(root: &copperpour_sexp::SexpNode) -> Vec<Group> {
+    root.find_all("group")
+        .into_iter()
+        .map(|node| Group {
+            id: node.find_str("uuid").unwrap_or_default().to_string(),
+            name: node
+                .get(1)
+                .and_then(copperpour_sexp::SexpNode::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            members: node
+                .find("members")
+                .and_then(copperpour_sexp::SexpNode::children)
+                .map_or(&[][..], |members| members)
+                .iter()
+                .skip(1)
+                .filter_map(copperpour_sexp::SexpNode::as_str)
+                .map(str::to_string)
+                .collect(),
+        })
+        .collect()
+}
+
+/// Each top-level item's box, by uuid, as `copperpour_sexp::bounds` measures
+/// a saved board to within 10 nm of KiCad's own. An item it does not measure,
+/// such as a text, has none, and an area that needs it is refused. A
+/// footprint whose pads have per-layer shapes, or that holds only text, gets
+/// the box that module documents, not KiCad's.
+fn file_boxes(root: &copperpour_sexp::SexpNode) -> HashMap<String, Rect> {
+    board_item_bounds(root)
+        .items
+        .into_iter()
+        .filter_map(|item| {
+            let (left, top, right, bottom) = item.bbox;
+            let rect = (
+                mm_to_nm(left),
+                mm_to_nm(top),
+                mm_to_nm(right),
+                mm_to_nm(bottom),
+            );
+            Some((item.uuid?, rect))
+        })
+        .collect()
 }
 
 /// The board text with each target's routing replaced by its copies. A copy
@@ -1117,9 +1683,31 @@ async fn handle_repeat_layout(args: &Value, ctx: &ToolContext) -> anyhow::Result
                 true => live_routing(client, document.clone())?,
                 false => Vec::new(),
             };
-            let planned: Vec<Wire> = wires.iter().map(LiveWire::wire).collect();
-            let routing = copy_routing.then_some(planned.as_slice());
-            let layout = match plan(&footprints, routing, &live_anchor, live_targets.as_deref()) {
+            let planned: Vec<Wire> = wires
+                .iter()
+                .map(LiveWire::planned)
+                .collect::<anyhow::Result<_>>()?;
+            // With no routing on the board there is no area to draw.
+            let (groups, boxes) = match planned.is_empty() {
+                true => (Vec::new(), HashMap::new()),
+                false => {
+                    let groups = live_groups(client, document.clone())?;
+                    let boxes =
+                        live_boxes(client, document.clone(), &footprints, &planned, &groups)?;
+                    (groups, boxes)
+                }
+            };
+            let routing = copy_routing.then_some(Routing {
+                wires: &planned,
+                boxes: &boxes,
+                groups: &groups,
+            });
+            let layout = match plan(
+                &footprints,
+                routing.as_ref(),
+                &live_anchor,
+                live_targets.as_deref(),
+            ) {
                 Ok(layout) => layout,
                 Err(refusal) => return Ok(Live::Refused(refusal)),
             };
@@ -1250,8 +1838,22 @@ fn repeat_in_file(
         Err(reason) => return refuse(ClosedBoardError::Unusable(reason)),
     };
     let planned: Vec<Wire> = wires.iter().map(|wire| wire.wire.clone()).collect();
-    let routing = copy_routing.then_some(planned.as_slice());
-    let layout = plan(&footprints, routing, anchor, targets).map_err(Ok)?;
+    let (boxes, groups) = match !planned.is_empty() {
+        true => match copperpour_sexp::parse_sexp(&content) {
+            Ok(root) => (file_boxes(&root), file_groups(&root)),
+            Err(error) => {
+                let reason = format!("the board does not parse: {error}");
+                return refuse(ClosedBoardError::Unusable(reason));
+            }
+        },
+        false => (HashMap::new(), Vec::new()),
+    };
+    let routing = copy_routing.then_some(Routing {
+        wires: &planned,
+        boxes: &boxes,
+        groups: &groups,
+    });
+    let layout = plan(&footprints, routing.as_ref(), anchor, targets).map_err(Ok)?;
     let routed = match route_in_file(&content, &wires, &layout.routing) {
         Ok(routed) => routed,
         Err(reason) => return refuse(ClosedBoardError::Unusable(reason)),

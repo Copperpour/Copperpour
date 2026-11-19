@@ -30,7 +30,7 @@ use std::collections::HashSet;
 /// test widens by the same distance wherever it flattened one, so a chord
 /// never hides an overlap the arc has. KiCad's own pad outlines are
 /// approximated to 5 µm by default.
-const ARC_CHORD_ERROR_NM: f64 = 100.0;
+pub(crate) const ARC_CHORD_ERROR_NM: f64 = 100.0;
 
 /// Float rounding allowance, below KiCad's 1 nm grid: a gap of a whole
 /// nanometre is never read as touching.
@@ -710,7 +710,7 @@ fn same_net(pad_net: &str, item_net: &str) -> bool {
     !pad_net.is_empty() && pad_net == item_net
 }
 
-type Point = (f64, f64);
+pub(crate) type Point = (f64, f64);
 
 fn point(vector: Vector2) -> Point {
     (vector.x_nm as f64, vector.y_nm as f64)
@@ -761,7 +761,10 @@ fn via_obstacle(via: &kiapi::board::types::Via, layer: BoardLayer) -> anyhow::Re
 /// The via's pad diameter on `layer`: that layer's entry, the one shape of a
 /// normal padstack, or the inner-layer entry (`In1.Cu`) of a front/inner/back
 /// one. Failing those, the largest it has, which can only over-report.
-fn via_diameter_nm(via: &kiapi::board::types::Via, layer: BoardLayer) -> anyhow::Result<f64> {
+pub(crate) fn via_diameter_nm(
+    via: &kiapi::board::types::Via,
+    layer: BoardLayer,
+) -> anyhow::Result<f64> {
     use kiapi::board::types::PadStackType;
     let stack = via.pad_stack.as_ref().context("no padstack")?;
     let entry_for = |wanted: BoardLayer| {
@@ -841,7 +844,7 @@ fn arc_obstacle(arc: &kiapi::board::types::Arc) -> anyhow::Result<Obstacle> {
 
 /// The points of the arc from `start` through `mid` to `end`, chords no
 /// further than [`ARC_CHORD_ERROR_NM`] from it. Both ends are exact.
-fn flatten_arc(start: Point, mid: Point, end: Point) -> Vec<Point> {
+pub(crate) fn flatten_arc(start: Point, mid: Point, end: Point) -> Vec<Point> {
     use std::f64::consts::{FRAC_PI_2, TAU};
 
     // Work relative to `start`, so the products stay small.
@@ -1030,7 +1033,7 @@ fn point_segment_distance(p: Point, a: Point, b: Point) -> f64 {
 /// The distance between two segments: zero when they cross, else the
 /// nearest an end of one comes to the other. Touching ends and collinear
 /// overlaps land in the second case, at zero.
-fn segment_distance(p1: Point, p2: Point, q1: Point, q2: Point) -> f64 {
+pub(crate) fn segment_distance(p1: Point, p2: Point, q1: Point, q2: Point) -> f64 {
     let (d1, d2) = (cross(q1, q2, p1), cross(q1, q2, p2));
     let (d3, d4) = (cross(p1, p2, q1), cross(p1, p2, q2));
     if d1 * d2 < 0.0 && d3 * d4 < 0.0 {
