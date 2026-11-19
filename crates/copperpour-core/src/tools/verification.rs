@@ -280,14 +280,6 @@ pub fn tools() -> Vec<ToolDef> {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
-fn severity_rank(s: &str) -> u8 {
-    match s {
-        "error" => 2,
-        "warning" => 1,
-        _ => 0,
-    }
-}
-
 #[derive(Default, serde::Serialize)]
 struct DrcRuleCounts {
     errors: usize,
@@ -323,7 +315,7 @@ async fn handle_run_drc(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let severity_filter = args["severity"].as_str().unwrap_or("warning");
-    let min_rank = severity_rank(severity_filter);
+    let min_rank = super::drc::drc_severity_rank(severity_filter);
     let limit = match super::response_limit(args, 50) {
         Ok(limit) => limit,
         Err(error) => return Ok(error),
@@ -352,7 +344,7 @@ async fn handle_run_drc(
     // KiCad called unrouted came back from here clean (#245).
     let filtered: Vec<_> = report
         .all()
-        .filter(|v| severity_rank(&v.severity) >= min_rank)
+        .filter(|v| super::drc::drc_severity_rank(&v.severity) >= min_rank)
         .filter(|v| {
             rules_filter
                 .as_ref()
@@ -407,13 +399,7 @@ async fn handle_run_drc(
             "by_rule": by_rule,
             "shown": bounded.shown,
             "truncated": bounded.truncated,
-            "violations": bounded.items.iter().map(|v| json!({
-                "severity": v.severity,
-                "rule": v.rule,
-                "description": v.description,
-                "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
-                "items": v.items
-            })).collect::<Vec<_>>()
+            "violations": bounded.items.iter().copied().map(super::drc::drc_finding_json).collect::<Vec<_>>()
         }))
         .unwrap(),
     ))

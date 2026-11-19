@@ -55,6 +55,24 @@ pub(crate) struct DrcSourceEvidence {
     pub zone_refill_source: Option<&'static str>,
 }
 
+pub(crate) fn drc_severity_rank(severity: &str) -> u8 {
+    match severity {
+        "error" => 2,
+        "warning" => 1,
+        _ => 0,
+    }
+}
+
+pub(crate) fn drc_finding_json(v: &cli::DrcViolation) -> Value {
+    json!({
+        "severity": v.severity,
+        "rule": v.rule,
+        "description": v.description,
+        "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
+        "items": v.items
+    })
+}
+
 /// Preserve completed work when optional report publication fails afterwards.
 pub(crate) fn report_write_failure(
     evidence: &DrcSourceEvidence,
