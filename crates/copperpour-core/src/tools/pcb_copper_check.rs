@@ -24,6 +24,7 @@ use kiapi::common::types::{DocumentSpecifier, Vector2};
 use prost::Message;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 /// Arcs are flattened into chords no further than this from the arc, and the
 /// test widens by the same distance wherever it flattened one, so a chord
@@ -272,28 +273,38 @@ impl PlacementCheck {
     /// A dry run's answer: the check, and each footprint's current and
     /// target pose. Nothing was moved.
     pub(crate) fn dry_run_result(&self) -> CallToolResult {
+        CallToolResult::json(&self.dry_run_body())
+    }
+
+    /// The body of [`Self::dry_run_result`], for a tool that adds to it.
+    pub(crate) fn dry_run_body(&self) -> Value {
         let placements = self.placements();
-        CallToolResult::json(&json!({
+        json!({
             "dry_run": true,
             "count": placements.len(),
             "placements": placements,
             "source": "ipc",
             "copper_check": self.report(),
-        }))
+        })
     }
 
-    /// An applied response with the check added, and a warning when the
-    /// caller allowed conflicts that are now on the board.
+    /// An applied response with the check added, and a warning, before any
+    /// `response` carries, when the caller allowed conflicts that are now on
+    /// the board.
     pub(crate) fn applied_result(&self, mut response: Value) -> CallToolResult {
         response["copper_check"] = self.report();
         if self.has_conflicts() {
-            response["warning"] = json!(format!(
+            let mut warning = format!(
                 "Applied with {} copper conflict{} because allow_copper_conflicts was set. KiCad \
                  does not report them: a via under another net's pad is re-netted silently and a \
                  pad on a track shorts it. Remove or reroute that copper next.",
                 self.conflicts.len(),
                 if self.conflicts.len() == 1 { "" } else { "s" }
-            ));
+            );
+            if let Some(more) = response["warning"].as_str() {
+                warning = format!("{warning} {more}");
+            }
+            response["warning"] = json!(warning);
         }
         CallToolResult::json(&response)
     }
@@ -331,7 +342,20 @@ pub(crate) fn check_then_apply<T>(
     options: CheckOptions,
     apply: impl FnOnce(&KiCadIpcClient) -> anyhow::Result<T>,
 ) -> anyhow::Result<Checked<T>> {
-    let check = check_live(client, document, requests)?;
+    check_then_apply_ignoring(client, document, requests, &HashSet::new(), options, apply)
+}
+
+/// As [`check_then_apply`], leaving out of the test the vias, tracks and arcs
+/// whose KIIDs are in `ignored`: those `apply` removes in the same commit.
+pub(crate) fn check_then_apply_ignoring<T>(
+    client: &KiCadIpcClient,
+    document: DocumentSpecifier,
+    requests: &[PoseRequest],
+    ignored: &HashSet<String>,
+    options: CheckOptions,
+    apply: impl FnOnce(&KiCadIpcClient) -> anyhow::Result<T>,
+) -> anyhow::Result<Checked<T>> {
+    let check = check_live(client, document, requests, ignored)?;
     if options.dry_run {
         return Ok(Checked::DryRun(check));
     }
@@ -343,11 +367,13 @@ pub(crate) fn check_then_apply<T>(
 }
 
 /// Resolve `requests` against the footprints KiCad holds and test the moved
-/// pads against the board's vias, tracks and arcs. Reads only.
+/// pads against the board's vias, tracks and arcs, less those in `ignored`.
+/// Reads only.
 pub(crate) fn check_live(
     client: &KiCadIpcClient,
     document: DocumentSpecifier,
     requests: &[PoseRequest],
+    ignored: &HashSet<String>,
 ) -> anyhow::Result<PlacementCheck> {
     use kiapi::common::types::KiCadObjectType as Kot;
 
@@ -361,7 +387,7 @@ pub(crate) fn check_live(
         }
     }
     let poses = plan_poses(&footprints, requests)?;
-    test_copper(client, document, poses).map_err(|error| {
+    test_copper(client, document, poses, ignored).map_err(|error| {
         // Copperpour's refusal, over the failure it rests on (#240).
         let refusal = PreflightRefusal::check_incomplete(
             "the copper check could not complete, so nothing was moved",
@@ -394,11 +420,13 @@ pub(crate) fn refusal_kind(
     crate::tools::pcb_board::preflight_refusal_kind(tool, refusal, argument)
 }
 
-/// Test the planned pads against the board's vias, tracks and arcs.
+/// Test the planned pads against the board's vias, tracks and arcs, less
+/// those in `ignored`.
 fn test_copper(
     client: &KiCadIpcClient,
     document: DocumentSpecifier,
     poses: Vec<PlannedPose>,
+    ignored: &HashSet<String>,
 ) -> anyhow::Result<PlacementCheck> {
     use kiapi::common::types::KiCadObjectType as Kot;
 
@@ -427,18 +455,21 @@ fn test_copper(
         "KiCad reported no enabled copper layer on this board"
     );
 
-    let vias = decode_all::<kiapi::board::types::Via>(
+    let mut vias = decode_all::<kiapi::board::types::Via>(
         client.get_items_in(document.clone(), Kot::KotPcbVia)?,
         "kiapi.board.types.Via",
     )?;
-    let tracks = decode_all::<kiapi::board::types::Track>(
+    let mut tracks = decode_all::<kiapi::board::types::Track>(
         client.get_items_in(document.clone(), Kot::KotPcbTrace)?,
         "kiapi.board.types.Track",
     )?;
-    let arcs = decode_all::<kiapi::board::types::Arc>(
+    let mut arcs = decode_all::<kiapi::board::types::Arc>(
         client.get_items_in(document.clone(), Kot::KotPcbArc)?,
         "kiapi.board.types.Arc",
     )?;
+    vias.retain(|via| !ignored.contains(&kiid(&via.id)));
+    tracks.retain(|track| !ignored.contains(&kiid(&track.id)));
+    arcs.retain(|arc| !ignored.contains(&kiid(&arc.id)));
     check.via_count = vias.len();
     check.track_count = tracks.len();
     check.arc_count = arcs.len();
@@ -1334,6 +1365,45 @@ mod geometry_tests {
         assert_eq!(body["error"]["kind"], "invalid_argument");
         assert_eq!(body["error"]["field"], "allow_copper_conflicts");
     }
+
+    /// An applied response's own warning follows the allowed conflicts'.
+    #[test]
+    fn an_allowed_conflict_keeps_the_responses_own_warning() {
+        let check = PlacementCheck {
+            poses: Vec::new(),
+            conflicts: vec![CopperConflict {
+                reference: "R1".to_string(),
+                pad: "1".to_string(),
+                pad_net: "NET_A".to_string(),
+                layer: "F.Cu".to_string(),
+                item_kind: "track",
+                item_uuid: "t".to_string(),
+                item_net: "NET_B".to_string(),
+            }],
+            pad_count: 1,
+            layers: vec!["F.Cu".to_string()],
+            via_count: 0,
+            track_count: 1,
+            arc_count: 0,
+        };
+        let warning = |response: Value| {
+            let result = check.applied_result(response);
+            let ToolContent::Text { text } = &result.content[0] else {
+                panic!("{result:?}");
+            };
+            let body: Value = serde_json::from_str(text).unwrap();
+            body["warning"].as_str().unwrap().to_string()
+        };
+        let alone = warning(json!({}));
+        assert!(
+            alone.starts_with("Applied with 1 copper conflict "),
+            "{alone}"
+        );
+        assert_eq!(
+            warning(json!({ "warning": "And more." })),
+            format!("{alone} And more.")
+        );
+    }
 }
 
 /// The transform the check moves KiCad's `before` outlines by, against
@@ -1996,6 +2066,38 @@ mod served_tests {
                 conflict("R1", "2", "NET_B", "track", STUB),
             ],
         );
+        kicad.assert_untouched();
+    }
+
+    /// Case 3 with the stub among the items a caller's commit removes: the
+    /// check leaves it out and tests the rest of the board as before.
+    #[tokio::test]
+    async fn copper_the_same_commit_removes_is_left_out() {
+        let kicad = kicad().await;
+        let check = |ignored: &[&str]| {
+            let address = kicad._server.address().to_string();
+            let document =
+                crate::tools::pcb_board::board_mock::board_document(&kicad.board.to_string_lossy());
+            let ignored: std::collections::HashSet<String> =
+                ignored.iter().map(|id| id.to_string()).collect();
+            tokio::task::spawn_blocking(move || {
+                let request =
+                    super::PoseRequest::Set(copperpour_ipc::types::IpcFootprintPlacement {
+                        reference: "R1".to_string(),
+                        x: 125.825,
+                        y: 100.0,
+                        rotation: 0.0,
+                    });
+                let client = copperpour_ipc::client::KiCadIpcClient::new(address);
+                super::check_live(&client, document, &[request], &ignored).unwrap()
+            })
+        };
+        let all = check(&[]).await.unwrap();
+        assert_eq!(all.conflicts.len(), 2, "{:#}", all.report());
+        let rest = check(&[STUB]).await.unwrap();
+        assert_eq!(rest.report()["status"], "clear", "{:#}", rest.report());
+        assert_eq!(rest.track_count, all.track_count - 1);
+        assert_eq!(rest.via_count, all.via_count);
         kicad.assert_untouched();
     }
 

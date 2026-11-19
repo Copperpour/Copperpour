@@ -3930,7 +3930,7 @@ pub(crate) mod board_mock {
         pub next_id: usize,
     }
 
-    /// The KIID of a via, track or footprint message.
+    /// The KIID of a via, track, arc or footprint message.
     pub fn item_kiid(item: &prost_types::Any) -> Option<String> {
         use kiapi::board::types as board;
         use prost::Message;
@@ -3938,6 +3938,8 @@ pub(crate) mod board_mock {
             board::Via::decode(item.value.as_slice()).ok()?.id
         } else if copperpour_ipc::builders::any_is(item, "kiapi.board.types.Track") {
             board::Track::decode(item.value.as_slice()).ok()?.id
+        } else if copperpour_ipc::builders::any_is(item, "kiapi.board.types.Arc") {
+            board::Arc::decode(item.value.as_slice()).ok()?.id
         } else if copperpour_ipc::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
             board::FootprintInstance::decode(item.value.as_slice())
                 .ok()?
@@ -3979,6 +3981,10 @@ pub(crate) mod board_mock {
                 let mut track = board::Track::decode(item.value.as_slice()).unwrap();
                 track.id = kiid;
                 *item = pack_any(&track, "kiapi.board.types.Track");
+            } else if any_is(item, "kiapi.board.types.Arc") {
+                let mut arc = board::Arc::decode(item.value.as_slice()).unwrap();
+                arc.id = kiid;
+                *item = pack_any(&arc, "kiapi.board.types.Arc");
             } else if any_is(item, "kiapi.board.types.FootprintInstance") {
                 let mut fp = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
                 fp.id = kiid;
@@ -4034,9 +4040,28 @@ pub(crate) mod board_mock {
                     .filter(|item| {
                         (wants(Kot::KotPcbVia) && any_is(item, "kiapi.board.types.Via"))
                             || (wants(Kot::KotPcbTrace) && any_is(item, "kiapi.board.types.Track"))
+                            || (wants(Kot::KotPcbArc) && any_is(item, "kiapi.board.types.Arc"))
                             || (wants(Kot::KotPcbFootprint)
                                 && any_is(item, "kiapi.board.types.FootprintInstance"))
                     })
+                    .cloned()
+                    .collect();
+                return Some(pack_any(
+                    &commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items,
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if url.ends_with("GetItemsById") {
+                let request = commands::GetItemsById::decode(command.value.as_slice()).unwrap();
+                let ids: Vec<String> = request.items.into_iter().map(|id| id.value).collect();
+                let items = held
+                    .items
+                    .iter()
+                    .filter(|item| item_kiid(item).is_some_and(|id| ids.contains(&id)))
                     .cloned()
                     .collect();
                 return Some(pack_any(
