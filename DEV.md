@@ -89,12 +89,14 @@ plugin/      Python launcher inside KiCad: __init__.py (PCB-editor ActionPlugin 
              dialog) · settings_dialog.py · native_bridge.py (see Plugin) · plugin.json
 packaging/   build-pcm.{ps1,sh} (one platform) · merge-pcm.py + pcm-launcher.sh (all
              platforms, #398) · metadata.json · validate-pcm.py · schema/ · resources/
-.github/workflows/  disabled on GitHub; local CI runs their jobs (GOVERNANCE.md)
-    ci.yml        check+test (Linux, Windows), clippy, fmt, Python plugin,
-                  Nix, PCM validation, licenses, offline build — per PR
-    e2e-kicad.yml real KiCad 10.0.5: e2e suite, demo-corpus conformance, PCM;
-                  release gate, on request for a PR
-    release.yml   real-KiCad gate, build, PCM (the local job: Linux x86_64, Windows)
+.github/workflows/  where each runs: GOVERNANCE.md, "Where CI runs"
+    ci.yml        GitHub, per PR: check+test (Linux), clippy, fmt, Python plugin,
+                  Nix, PCM validation, licenses, offline build
+    windows.yml   GitHub, per PR: check+test (Windows)
+    macos.yml     GitHub, per PR: check+test (macOS); macOS release artifacts
+    e2e-kicad.yml local CI: real KiCad 10.0.5: e2e suite, demo-corpus
+                  conformance, PCM; release gate, on request for a PR
+    release.yml   local CI: real-KiCad gate, build, PCM (Linux x86_64, Windows)
 ```
 
 ## KiCad 10 Integration

@@ -29,9 +29,9 @@ settings or the `main` ruleset.
 - **Merge commits only** (`gh pr merge N --merge`), so authorship survives.
 - **The `main` ruleset enforces the rest:** pull requests only, resolved review
   conversations, merge commits only, no force-push or deletion, and these
-  required checks: Check & Test on `ubuntu-latest`, Clippy, Format, Schematic
-  viewer, Plugin (Python), Nix flake, PCM packaging validation and Dependency
-  licenses. Check & Test on `windows-latest` joins them later (see
+  required checks: Check & Test on `ubuntu-latest`, Clippy, Format, Plugin
+  (Python), Nix flake, PCM packaging validation and Dependency licenses.
+  Check & Test on `windows-latest` joins them later (see
   [Where CI runs](#where-ci-runs)). Check & Test on `macos-latest` runs on
   each PR but is not required, because GitHub's macOS runners are often busy
   and the run fails or is cancelled for capacity, not for the code.
@@ -41,33 +41,24 @@ settings or the `main` ruleset.
 
 ### Where CI runs
 
-`ci.yml`, `release.yml` and `e2e-kicad.yml` are disabled on GitHub and run on a
-maintainer's machine instead, as the **Copperpour Local CI** app. Other workflows
-still run on GitHub: issue self-assignment, `macos.yml` and `windows.yml`.
-`macos.yml` is there because Apple's licence allows macOS virtual machines only
-on Apple hardware. It runs Check & Test on `macos-latest` on each PR and each
-push to `main`, beside local CI, as an optional check. On each `v*` tag, and
-when a maintainer starts it on a release candidate, it also builds the macOS
-release artifacts. `windows.yml` runs Check & Test on `windows-latest` the same
-way; the Windows release build and the real-KiCad gate stay on local CI.
+PR CI runs on GitHub Actions: `ci.yml`, plus `windows.yml` and `macos.yml`,
+which run Check & Test on `windows-latest` and `macos-latest`. All three run on
+each PR and each push to `main`; a new push to a PR cancels its older runs.
+The required checks are the GitHub Actions app's `ci.yml` checks.
 
-- The required checks are that app's: the same `ci.yml` jobs and check names, run
-  against each PR's merge commit. A check's details show the end of its log.
-- Nix flake shows as skipped (neutral) on a PR that changes nothing it builds
-  from, and also runs on `main` after each merge. The standalone Schematic viewer
-  job has been retired. Its required-check entry must be removed from the live
-  ruleset and Local CI configuration by a maintainer before the retirement PR
-  can merge; repository settings are not changed by the source PR.
-- PR builds other than Nix flake have no network access: crates are downloaded
-  first with `cargo vendor --locked`, then the jobs build from that copy. Nix
-  flake has network access, so on a contributor's PR it waits for a maintainer to
-  approve that exact head; the other checks run meanwhile.
-- PRs run automatically, except a contributor's PR that changes CI or build
-  configuration: anything under `.github/` or `.cargo/`, `rust-toolchain.toml`,
-  `flake.nix`, `flake.lock`, `deny.toml`, a `build.rs`, a `Cargo.lock`, or a
-  `Cargo.toml` line that adds a build script, a proc macro or build
-  dependencies. Its checks show as queued until a maintainer approves that exact
-  head; a new push needs a new approval.
+`release.yml` and `e2e-kicad.yml` are disabled on GitHub and run on a
+maintainer's machine instead, as the **Copperpour Local CI** app: the Linux and
+Windows release builds and the real-KiCad gate, which needs KiCad installed.
+`macos.yml` builds the macOS release artifacts on each `v*` tag, and when a
+maintainer starts it on a release candidate, because Apple's licence allows
+macOS virtual machines only on Apple hardware.
+
+- A contributor's first PR waits for a maintainer to approve its workflow runs
+  (GitHub's setting for first-time contributors). Fork PRs run with a read-only
+  token and no secrets.
+- If GitHub Actions becomes unavailable, local CI can post the same check names
+  again as the Copperpour Local CI app; a maintainer then points the ruleset's
+  required checks at that app.
 - **Check & Test on `windows-latest` is not required yet.** It runs on every PR
   on GitHub (`windows.yml`), and becomes required once it has passed on a few.
   Until then, before merging a change to platform-specific code, a maintainer

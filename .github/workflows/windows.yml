@@ -1,11 +1,9 @@
 name: Windows
 
-# The Check & Test (windows-latest) job of ci.yml. ci.yml runs on local CI,
-# whose Windows virtual machine ran this job until now; GitHub's Windows
-# runners are faster and keep the job off that machine. It runs on PRs and
-# main beside local CI and is not a required check yet (GOVERNANCE.md, "Where
-# CI runs"). The Windows release build and the real-KiCad gate (release.yml,
-# e2e-kicad.yml) still run on local CI.
+# Check & Test on windows-latest, kept out of ci.yml so it has its own
+# concurrency group and is not a required check yet (GOVERNANCE.md, "Where CI
+# runs"). The Windows release build and the real-KiCad gate (release.yml,
+# e2e-kicad.yml) run on local CI.
 on:
   push:
     branches: [main]
