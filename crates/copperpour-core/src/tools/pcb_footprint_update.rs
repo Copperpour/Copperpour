@@ -1517,7 +1517,7 @@ fn reset_field_effects(
             attributes.visible = visible;
         }
     }
-    if field == *placed {
+    if normalized_field_for_compare(&field) == normalized_field_for_compare(placed) {
         return Ok(None);
     }
     let change = FieldEffectsChange {
@@ -1590,11 +1590,17 @@ fn text_effects_not_held(
     missing
 }
 
-/// Equal at KiCad's nm resolution, with angles compared modulo 360°.
+/// Equal at KiCad's nm resolution, with angles compared modulo 360° (modulo
+/// 180° when both sides keep upright).
 fn effects_match(observed: &TextEffects, expected: &TextEffects) -> bool {
     let nm = |mm: f64| (mm * 1e6).round();
     let same = |a: &[f64], b: &[f64]| a.iter().zip(b).all(|(a, b)| nm(*a) == nm(*b));
-    let angle = |degrees: f64| (degrees.rem_euclid(360.0) * 1e6).round();
+    let period = if observed.keep_upright && expected.keep_upright {
+        180.0
+    } else {
+        360.0
+    };
+    let angle = |degrees: f64| (degrees_modulo(degrees, period) * 1e6).round();
     same(&observed.position_mm, &expected.position_mm)
         && same(&observed.size_mm, &expected.size_mm)
         && observed.thickness_mm.map(nm) == expected.thickness_mm.map(nm)
@@ -2022,6 +2028,7 @@ fn normalized_items(
                 if let Some(text) = field.text.as_mut() {
                     text.id = None;
                     text.parent = None;
+                    normalize_board_text_angle(text);
                 }
                 Ok(field.encode_to_vec())
             } else {
@@ -2097,6 +2104,7 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                         |mut text| {
                             text.id = None;
                             text.parent = None;
+                            normalize_board_text_angle(&mut text);
                             text.encode_to_vec()
                         },
                     ),
@@ -2123,15 +2131,55 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
     Ok(graphics)
 }
 
-/// `degrees` in [0°, 360°). `rem_euclid` alone rounds a tiny negative angle up
-/// to 360°.
-fn degrees_in_turn(degrees: f64) -> f64 {
-    let degrees = degrees.rem_euclid(360.0);
-    if degrees >= 360.0 {
+/// `degrees` in [0°, `period`). `rem_euclid` alone rounds a tiny negative angle
+/// up to `period`.
+fn degrees_modulo(degrees: f64, period: f64) -> f64 {
+    let degrees = degrees.rem_euclid(period);
+    if degrees >= period {
         0.0
     } else {
         degrees
     }
+}
+
+/// `degrees` in [0°, 360°).
+fn degrees_in_turn(degrees: f64) -> f64 {
+    degrees_modulo(degrees, 360.0)
+}
+
+/// `degrees` in [0°, 180°).
+fn degrees_in_half_turn(degrees: f64) -> f64 {
+    degrees_modulo(degrees, 180.0)
+}
+
+/// Fold a text's angle for comparison: modulo 180° when `keep_upright` is set
+/// (KiCad draws keep-upright text the same at θ and θ + 180° and can store
+/// either depending on flip direction, #319), modulo 360° otherwise.
+fn normalize_board_text_angle(board_text: &mut kiapi::board::types::BoardText) {
+    let Some(attributes) = board_text
+        .text
+        .as_mut()
+        .and_then(|text| text.attributes.as_mut())
+    else {
+        return;
+    };
+    let degrees = attributes.angle.map_or(0.0, |angle| angle.value_degrees);
+    let normalized = if attributes.keep_upright {
+        degrees_in_half_turn(degrees)
+    } else {
+        degrees_in_turn(degrees)
+    };
+    attributes.angle = Some(kiapi::common::types::Angle {
+        value_degrees: normalized,
+    });
+}
+
+fn normalized_field_for_compare(field: &kiapi::board::types::Field) -> kiapi::board::types::Field {
+    let mut normalized = field.clone();
+    if let Some(text) = normalized.text.as_mut() {
+        normalize_board_text_angle(text);
+    }
+    normalized
 }
 
 fn normalize_polyset(polyset: &mut kiapi::common::types::PolySet) {
@@ -3921,6 +3969,10 @@ mod tests {
         assert_eq!(degrees_in_turn(-90.0), 270.0);
         assert_eq!(degrees_in_turn(450.0), 90.0);
         assert_eq!(degrees_in_turn(-1e-14), 0.0);
+        assert_eq!(degrees_in_half_turn(-90.0), 90.0);
+        assert_eq!(degrees_in_half_turn(180.0), 0.0);
+        assert_eq!(degrees_in_half_turn(270.0), 90.0);
+        assert_eq!(degrees_in_half_turn(-1e-14), 0.0);
     }
 
     /// A footprint that matches its library plans no change, whether KiCad
@@ -6221,20 +6273,7 @@ mod tests {
             ("U3", ISSUE_283_DIP8),
         ] {
             let (current, updated, changed) = issue_283_refresh(reference, source);
-            if reference == "U3" {
-                // U3's `${REFERENCE}` text differs for a reason outside #283
-                // (see the fixture README), so only its pads and point are
-                // compared.
-                let definition = |instance: &kiapi::board::types::FootprintInstance| {
-                    instance.definition.clone().unwrap()
-                };
-                assert_eq!(
-                    normalized_items(&definition(&updated), "Pad").unwrap(),
-                    normalized_items(&definition(&current), "Pad").unwrap()
-                );
-            } else {
-                assert!(changed.is_empty(), "{reference}: {changed:?}");
-            }
+            assert!(changed.is_empty(), "{reference}: {changed:?}");
             // What the update sends is what KiCad reported, not just equal
             // after normalizing.
             assert_eq!(
@@ -6353,11 +6392,9 @@ mod tests {
 
     #[tokio::test]
     async fn served_dry_run_of_stock_footprints_with_a_pad_property_or_a_point_is_noop() {
-        // U3 is left out: its `${REFERENCE}` text differs for a reason
-        // outside #283 (see the fixture README).
-        let body = issue_283_served_dry_run((10, 0, 8), &["U1", "U2"]).await;
+        let body = issue_283_served_dry_run((10, 0, 8), &["U1", "U2", "U3"]).await;
         assert_eq!(body["status"], "noop", "{body}");
-        assert_eq!(body["coverage"]["unchanged"]["planned"], 2, "{body}");
+        assert_eq!(body["coverage"]["unchanged"]["planned"], 3, "{body}");
     }
 
     #[tokio::test]
@@ -6984,5 +7021,354 @@ mod tests {
         let body = issue_300_served_dry_run((10, 0, 6), &["U1", "U3", "U4", "U5"]).await;
         assert_eq!(body["status"], "noop", "{body}");
         assert_eq!(body["coverage"]["unchanged"]["planned"], 4, "{body}");
+    }
+
+    // ─── #319: keep-upright text angles on back-side footprints ─────────────
+
+    fn board_text_angles(
+        instance: &kiapi::board::types::FootprintInstance,
+    ) -> Vec<(String, bool, f64)> {
+        instance
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| item.type_url.ends_with("kiapi.board.types.BoardText"))
+            .map(|item| {
+                let bt = kiapi::board::types::BoardText::decode(item.value.as_slice()).unwrap();
+                let text = bt.text.unwrap();
+                let attributes = text.attributes.unwrap();
+                (
+                    text.text,
+                    attributes.keep_upright,
+                    attributes.angle.map_or(0.0, |angle| angle.value_degrees),
+                )
+            })
+            .collect()
+    }
+
+    fn mutate_board_text(
+        instance: &mut kiapi::board::types::FootprintInstance,
+        mut f: impl FnMut(&mut kiapi::board::types::BoardText),
+    ) {
+        for item in &mut instance.definition.as_mut().unwrap().items {
+            if item.type_url.ends_with("kiapi.board.types.BoardText") {
+                let mut bt = kiapi::board::types::BoardText::decode(item.value.as_slice()).unwrap();
+                f(&mut bt);
+                *item = copperpour_ipc::builders::pack_any(&bt, "kiapi.board.types.BoardText");
+            }
+        }
+    }
+
+    fn mutate_custom_field(
+        instance: &mut kiapi::board::types::FootprintInstance,
+        name: &str,
+        mut f: impl FnMut(&mut kiapi::board::types::Field),
+    ) {
+        for item in &mut instance.definition.as_mut().unwrap().items {
+            if item.type_url.ends_with("kiapi.board.types.Field") {
+                let mut field = kiapi::board::types::Field::decode(item.value.as_slice()).unwrap();
+                if field.name == name {
+                    f(&mut field);
+                    *item = copperpour_ipc::builders::pack_any(&field, "kiapi.board.types.Field");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn back_side_keep_upright_user_text_matches_modulo_180_and_non_upright_exact() {
+        // U3 is DIP-8 flipped left-to-right to B.Cu and turned to 90°.
+        // KiCad 10.0.8 reports its keep-upright `${REFERENCE}` text at 0°,
+        // while refresh builds 180°. Both draw the same, so no change is planned.
+        let (current, updated, changed) = issue_283_refresh("U3", ISSUE_283_DIP8);
+        assert_eq!(
+            board_text_angles(&current),
+            vec![("${REFERENCE}".to_string(), true, 0.0)]
+        );
+        assert_eq!(
+            board_text_angles(&updated),
+            vec![("${REFERENCE}".to_string(), true, 180.0)]
+        );
+        assert!(changed.is_empty(), "{changed:?}");
+
+        // A 90° difference on a keep-upright text still plans graphics.
+        let rotated_90 = ISSUE_283_DIP8.replace("(at 3.81 3.81 90)", "(at 3.81 3.81 0)");
+        assert_ne!(rotated_90, ISSUE_283_DIP8);
+        let (_, _, changed) = issue_283_refresh("U3", &rotated_90);
+        assert_eq!(changed, BTreeSet::from([ChangedDomain::Graphics]));
+
+        // A non-keep-upright text (`(unlocked yes)`) still compares modulo 360°,
+        // so 0° vs 180° plans graphics.
+        let unlocked_lib = ISSUE_283_DIP8.replace(
+            "(fp_text user \"${REFERENCE}\"\n\t\t(at 3.81 3.81 90)",
+            "(fp_text user \"${REFERENCE}\"\n\t\t(at 3.81 3.81 90)\n\t\t(unlocked yes)",
+        );
+        assert_ne!(unlocked_lib, ISSUE_283_DIP8);
+        let mut unlocked_current = current.clone();
+        mutate_board_text(&mut unlocked_current, |bt| {
+            bt.text
+                .as_mut()
+                .unwrap()
+                .attributes
+                .as_mut()
+                .unwrap()
+                .keep_upright = false;
+        });
+        let library = parse_library_footprint("Package_DIP:DIP-8_W7.62mm", &unlocked_lib).unwrap();
+        let prepared = build_updated_instance(
+            &unlocked_current,
+            &library,
+            two_layers(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            Resets::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.changed_domains,
+            BTreeSet::from([ChangedDomain::Graphics])
+        );
+    }
+
+    #[test]
+    fn back_side_keep_upright_custom_property_matches_modulo_180_and_non_upright_exact() {
+        let library = parse_library_footprint("Package_DIP:DIP-8_W7.62mm", ISSUE_283_DIP8).unwrap();
+        let mut flipped_180 = issue_283_capture("U3");
+        mutate_custom_field(&mut flipped_180, "KiLib_Generator", |field| {
+            let attrs = field
+                .text
+                .as_mut()
+                .unwrap()
+                .text
+                .as_mut()
+                .unwrap()
+                .attributes
+                .as_mut()
+                .unwrap();
+            assert!(attrs.keep_upright);
+            let old = attrs.angle.map_or(0.0, |a| a.value_degrees);
+            attrs.angle = Some(kiapi::common::types::Angle {
+                value_degrees: degrees_in_turn(old + 180.0),
+            });
+        });
+        let prepared = build_updated_instance(
+            &flipped_180,
+            &library,
+            two_layers(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            Resets::default(),
+        )
+        .unwrap();
+        assert!(
+            prepared.changed_domains.is_empty(),
+            "{:?}",
+            prepared.changed_domains
+        );
+
+        // 90° difference on a keep-upright custom property still plans metadata.
+        let mut rotated_90 = issue_283_capture("U3");
+        mutate_custom_field(&mut rotated_90, "KiLib_Generator", |field| {
+            let attrs = field
+                .text
+                .as_mut()
+                .unwrap()
+                .text
+                .as_mut()
+                .unwrap()
+                .attributes
+                .as_mut()
+                .unwrap();
+            let old = attrs.angle.map_or(0.0, |a| a.value_degrees);
+            attrs.angle = Some(kiapi::common::types::Angle {
+                value_degrees: degrees_in_turn(old + 90.0),
+            });
+        });
+        let prepared = build_updated_instance(
+            &rotated_90,
+            &library,
+            two_layers(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            Resets::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.changed_domains,
+            BTreeSet::from([ChangedDomain::Metadata])
+        );
+
+        // Non-keep-upright custom property differing by 180° still plans metadata.
+        let unlocked_lib = ISSUE_283_DIP8.replace(
+            "(property \"KiLib_Generator\" \"package/DIP/legacy\"",
+            "(property \"KiLib_Generator\" \"package/DIP/legacy\"\n\t\t(unlocked yes)",
+        );
+        assert_ne!(unlocked_lib, ISSUE_283_DIP8);
+        let unlocked_library =
+            parse_library_footprint("Package_DIP:DIP-8_W7.62mm", &unlocked_lib).unwrap();
+        let mut unlocked_180 = flipped_180;
+        mutate_custom_field(&mut unlocked_180, "KiLib_Generator", |field| {
+            field
+                .text
+                .as_mut()
+                .unwrap()
+                .text
+                .as_mut()
+                .unwrap()
+                .attributes
+                .as_mut()
+                .unwrap()
+                .keep_upright = false;
+        });
+        let prepared = build_updated_instance(
+            &unlocked_180,
+            &unlocked_library,
+            two_layers(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            Resets::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.changed_domains,
+            BTreeSet::from([ChangedDomain::Metadata])
+        );
+    }
+
+    #[test]
+    fn reset_field_effects_and_readback_compare_keep_upright_modulo_180() {
+        let resets = Resets {
+            sizes_and_styles: true,
+            ..Default::default()
+        };
+        let library = parse_library_footprint("Package_DIP:DIP-8_W7.62mm", ISSUE_283_DIP8).unwrap();
+        // Start from U3 after a reset so Reference and Value match the library
+        // exactly, then shift Reference's angle by 180° (as a left-to-right flip
+        // can leave it).
+        let base_prepared = build_updated_instance(
+            &issue_283_capture("U3"),
+            &library,
+            two_layers(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            resets,
+        )
+        .unwrap();
+        let aligned =
+            kiapi::board::types::FootprintInstance::decode(base_prepared.item.value.as_slice())
+                .unwrap();
+
+        let shift_ref =
+            |mut fp: kiapi::board::types::FootprintInstance, delta: f64, keep_upright: bool| {
+                let attrs = fp
+                    .reference_field
+                    .as_mut()
+                    .unwrap()
+                    .text
+                    .as_mut()
+                    .unwrap()
+                    .text
+                    .as_mut()
+                    .unwrap()
+                    .attributes
+                    .as_mut()
+                    .unwrap();
+                attrs.keep_upright = keep_upright;
+                let old = attrs.angle.map_or(0.0, |a| a.value_degrees);
+                attrs.angle = Some(kiapi::common::types::Angle {
+                    value_degrees: degrees_in_turn(old + delta),
+                });
+                fp
+            };
+
+        // Keep-upright Reference shifted by 180° plans no TextEffects.
+        let prepared = build_updated_instance(
+            &shift_ref(aligned.clone(), 180.0, true),
+            &library,
+            two_layers(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            resets,
+        )
+        .unwrap();
+        assert!(
+            !prepared
+                .changed_domains
+                .contains(&ChangedDomain::TextEffects),
+            "{:?}",
+            prepared.changed_domains
+        );
+        assert!(prepared.text_effects.is_empty());
+
+        // Keep-upright Reference shifted by 90° still plans TextEffects.
+        let prepared = build_updated_instance(
+            &shift_ref(aligned.clone(), 90.0, true),
+            &library,
+            two_layers(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            resets,
+        )
+        .unwrap();
+        assert!(prepared
+            .changed_domains
+            .contains(&ChangedDomain::TextEffects));
+
+        // Non-keep-upright Reference shifted by 180° still plans TextEffects.
+        let unlocked_lib = ISSUE_283_DIP8.replace(
+            "(property \"Reference\" \"REF**\"",
+            "(property \"Reference\" \"REF**\"\n\t\t(unlocked yes)",
+        );
+        assert_ne!(unlocked_lib, ISSUE_283_DIP8);
+        let unlocked_library =
+            parse_library_footprint("Package_DIP:DIP-8_W7.62mm", &unlocked_lib).unwrap();
+        let prepared = build_updated_instance(
+            &shift_ref(aligned, 180.0, false),
+            &unlocked_library,
+            two_layers(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            resets,
+        )
+        .unwrap();
+        assert!(prepared
+            .changed_domains
+            .contains(&ChangedDomain::TextEffects));
+
+        // Readback comparison (`effects_match`) follows the same rule.
+        let base_effects = TextEffects {
+            position_mm: [145.0, 95.0],
+            angle_degrees: 0.0,
+            size_mm: [1.0, 1.0],
+            thickness_mm: Some(0.15),
+            bold: false,
+            italic: false,
+            mirrored: true,
+            keep_upright: true,
+            horizontal_alignment: "HA_CENTER",
+            vertical_alignment: "VA_CENTER",
+        };
+        let rotated_180 = TextEffects {
+            angle_degrees: 180.0,
+            ..base_effects.clone()
+        };
+        let rotated_90 = TextEffects {
+            angle_degrees: 90.0,
+            ..base_effects.clone()
+        };
+        assert!(effects_match(&base_effects, &rotated_180));
+        assert!(!effects_match(&base_effects, &rotated_90));
+        assert!(!effects_match(
+            &TextEffects {
+                keep_upright: false,
+                ..base_effects
+            },
+            &TextEffects {
+                keep_upright: false,
+                ..rotated_180
+            }
+        ));
     }
 }
