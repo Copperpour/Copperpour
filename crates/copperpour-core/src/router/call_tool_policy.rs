@@ -353,6 +353,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "update_footprints_from_library",
     "update_pcb_from_schematic",
     "update_symbols_from_library",
+    "upgrade_library",
     "validate_for_manufacturing",
 ];
 

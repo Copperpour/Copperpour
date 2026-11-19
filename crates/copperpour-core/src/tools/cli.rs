@@ -480,6 +480,28 @@ async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Re
     })
 }
 
+/// Run `kicad-cli <command> upgrade -o <output> <input>`, `command` being `sym`
+/// or `fp`, into an `output` that must not exist yet, as kicad-cli refuses one
+/// that does (`JobUpgrade`/`JobFpUpgrade`, ERR_INVALID_OUTPUT_CONFLICT).
+/// `Ok(false)` when kicad-cli wrote nothing: it saves only a library holding
+/// something older than its own format, and otherwise says "… library was not
+/// updated" and exits 0.
+pub(crate) async fn upgrade_library_into(
+    cli: &str,
+    command: &str,
+    input: &Path,
+    output: &Path,
+) -> Result<bool> {
+    let (input, output_arg) = (input.to_string_lossy(), output.to_string_lossy());
+    run_cli_captured(
+        cli,
+        &[command, "upgrade", "-o", &output_arg, &input],
+        long_timeout(),
+    )
+    .await?;
+    Ok(output.exists())
+}
+
 /// An export command returning success is necessary but not sufficient: KiCad
 /// can exit successfully without creating the path a caller asked for. Every
 /// path Copperpour reports as an artifact passes this check first (#252).

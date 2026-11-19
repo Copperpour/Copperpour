@@ -44,6 +44,7 @@ mod kicad10_schematic_identity_tests;
 pub(crate) mod lcsc_packages;
 pub mod library;
 mod library_footprint;
+pub(crate) mod library_upgrade;
 pub(crate) mod live_board;
 pub mod manufacturing;
 pub mod model_3d;

@@ -113,7 +113,7 @@ unload_toolset("name")  → Remove a toolset when done
 | Project | project |
 | Schematic | sch_components, sch_wiring, sch_bus, sch_analysis, sch_batch, sch_export, sch_hierarchy |
 | PCB | pcb_board, pcb_text, pcb_rule_areas, pcb_components, pcb_routing, pcb_copper, pcb_export, placement |
-| Library | library, model_3d |
+| Library | library, library_maintenance, model_3d |
 | Integration | integration (JLCPCB parts, Freerouting installation checks, datasheets) |
 | Verification & Review | verification, design_review |
 | Config | config |

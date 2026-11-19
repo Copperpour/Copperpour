@@ -1,0 +1,117 @@
+(footprint "THT_Legacy"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(descr "A hand-written KiCad 5 footprint exercising the legacy forms KiCad 10 converts on load")
+	(tags "legacy test")
+	(property "Reference" "REF**"
+		(at 0 -2.5 0)
+		(layer "F.SilkS")
+		(uuid "2cd173a4-e9be-4137-abe6-18a9cb183196")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Value" "~{RST}_N"
+		(at 0 2.5 0)
+		(layer "F.Fab")
+		(uuid "adf02d44-5883-45ac-a0b4-6b0c39f1f0a1")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "396f5a6d-a9b1-4356-a09d-fc15501cc034")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "66560b89-6ead-4b3d-8f68-53401490ffdf")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property "Field4" "${REFERENCE}"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "1d257301-24d3-48c9-89d2-338ac4c60d5e")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(attr through_hole)
+	(duplicate_pad_numbers_are_jumpers no)
+	(fp_line
+		(start -2 -1.5)
+		(end 2 -1.5)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "dea4f25e-e560-4fcf-8a23-7330119e03d6")
+	)
+	(pad "" np_thru_hole circle
+		(at 0 1)
+		(size 1 1)
+		(drill 1)
+		(layers "*.Cu" "*.Mask")
+		(uuid "f96e6627-3217-4b24-afaf-29375d0fc224")
+	)
+	(pad "1" thru_hole oval
+		(at -1.27 0)
+		(size 1.2 1.8)
+		(drill oval 0.8)
+		(layers "*.Cu" "*.Mask")
+		(remove_unused_layers no)
+		(uuid "55e21e01-1849-4ed2-96a5-b491dd3392b3")
+	)
+	(pad "2" thru_hole circle
+		(at 1.27 0)
+		(size 1.2 1.2)
+		(drill 0.8)
+		(layers "*.Cu" "*.Mask")
+		(remove_unused_layers no)
+		(uuid "ebc6413a-6afa-4942-9249-ef4decf404e0")
+	)
+	(pad "3" smd rect
+		(at 3 0)
+		(size 1 1)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(uuid "116fb165-6b0c-4227-b945-e706737543bd")
+	)
+	(embedded_fonts no)
+	(model "${KISYS3DMOD}/Legacy.3dshapes/THT_Legacy.wrl"
+		(offset
+			(xyz 0 0 1.015999985)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz 0 0 0)
+		)
+	)
+)

@@ -111,6 +111,11 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         category: "library",
     },
     ToolsetMeta {
+        name: "library_maintenance",
+        description: "Upgrade a symbol or footprint library's file format with kicad-cli, replacing files only when their content is kept",
+        category: "library",
+    },
+    ToolsetMeta {
         name: "model_3d",
         description: "Generate approximate STEP package bodies and pin rows without external CAD tools",
         category: "library",
@@ -205,6 +210,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "placement" => Some(placement::tools()),
         "pcb_export" => Some(pcb_export::tools()),
         "library" => Some(library::tools()),
+        "library_maintenance" => Some(library_upgrade::tools()),
         "model_3d" => Some(model_3d::tools()),
         #[cfg(any(feature = "jlcpcb", feature = "freerouting"))]
         "integration" => Some(integration::tools()),
