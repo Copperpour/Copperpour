@@ -24,10 +24,14 @@
 //! - `gr_poly_outline.kicad_pcb` — KiCad 10-saved minimal board holding a
 //!   single 12-vertex, non-rectangular `gr_poly` Edge.Cuts outline copied from
 //!   a real project board (#593); see `gr_poly_outline.README.md`.
+//! - `footprint_outline_kicad10/` — fifteen boards whose only Edge.Cuts graphics
+//!   are footprints', built, turned and flipped by KiCad 10.0.8's pcbnew
+//!   (#27); see its README.
 
 use copperpour_sexp::board::{
-    board_outline_bbox, count_pads, footprint_courtyards, footprints, lossless_zone_outlines,
-    tracks, vias, zones, CourtyardSource, FootprintCourtyard, PcbConnectivityIndex, Side,
+    board_outline_bbox, count_pads, footprint_courtyards, footprint_outline, footprints,
+    lossless_zone_outlines, tracks, vias, zones, ContourRole, CourtyardSource, FootprintCourtyard,
+    FootprintOutline, OutlineContour, OutlineOwner, OutlineShape, PcbConnectivityIndex, Side,
     ZoneOutlineElement,
 };
 use copperpour_sexp::parse_sexp;
@@ -175,6 +179,367 @@ fn gr_poly_outline_bbox_matches_hand_computed_extrema() {
         (103.42, 78.96, 154.48, 116.96),
         "gr_poly_outline bbox",
     );
+}
+
+/// KiCad rounds each transformed point to a nanometre, and the arc extrema
+/// here come from a circumcentre computed in floating point; ten nanometres
+/// covers both, as in `board_bounds.rs`.
+const KICAD_NM: f64 = 1e-5;
+
+fn assert_bbox_near(got: (f64, f64, f64, f64), expected: (f64, f64, f64, f64), label: &str) {
+    let off = (got.0 - expected.0)
+        .abs()
+        .max((got.1 - expected.1).abs())
+        .max((got.2 - expected.2).abs())
+        .max((got.3 - expected.3).abs());
+    assert!(
+        off < KICAD_NM,
+        "{label}: got {got:?}, expected {expected:?}"
+    );
+}
+
+/// One of the boards `footprint_outline_kicad10/generate.py` builds with
+/// KiCad 10.0.8's pcbnew; the expected values are KiCad's reading of each, in
+/// that directory's README.
+fn footprint_outline_fixture(name: &str) -> FootprintOutline {
+    footprint_outline(&fixture(&format!(
+        "footprint_outline_kicad10/{name}.kicad_pcb"
+    )))
+}
+
+fn recognized(name: &str) -> (OutlineShape, Vec<OutlineOwner>, Vec<OutlineContour>) {
+    match footprint_outline_fixture(name) {
+        FootprintOutline::Recognized {
+            shape,
+            owners,
+            contours,
+        } => (shape, owners, contours),
+        other => panic!("{name}: expected a recognized outline, got {other:?}"),
+    }
+}
+
+fn owner<'a>(owners: &'a [OutlineOwner], reference: &str) -> &'a OutlineOwner {
+    owners
+        .iter()
+        .find(|o| o.reference.as_deref() == Some(reference))
+        .unwrap_or_else(|| panic!("no owner {reference} in {owners:?}"))
+}
+
+/// Issue #27's MECH1: a padless footprint at (100, 100), 0°, whose 27
+/// Edge.Cuts primitives are the whole outline, beside SLOT1, whose rectangle
+/// KiCad cuts as a hole because its pads lie outside it.
+#[test]
+fn mech1_outline_is_read_from_its_footprint_as_kicad_reads_it() {
+    let (shape, owners, contours) = recognized("mech1");
+
+    let mech1 = owner(&owners, "MECH1");
+    assert_eq!(
+        (
+            mech1.pads,
+            mech1.primitives,
+            mech1.cutouts_only,
+            mech1.draws_external
+        ),
+        (0, 27, false, true)
+    );
+    let slot = owner(&owners, "SLOT1");
+    assert_eq!(
+        (slot.pads, slot.primitives, slot.cutouts_only),
+        (2, 1, true)
+    );
+
+    let roles: Vec<_> = contours.iter().map(|c| (c.role, c.primitives)).collect();
+    assert_eq!(
+        roles,
+        vec![
+            (ContourRole::External, 19),
+            (ContourRole::Cutout, 8),
+            (ContourRole::Cutout, 1),
+        ]
+    );
+    assert_bbox_near(contours[0].bbox, (30.0, 50.0, 170.0, 150.0), "MECH1 outer");
+    assert_bbox_near(
+        contours[1].bbox,
+        (67.875, 111.3335, 92.125, 118.6665),
+        "MECH1 cutout",
+    );
+    let (x0, y0, x1, y1) = contours[1].bbox;
+    assert!((x1 - x0 - 24.25).abs() < KICAD_NM && (y1 - y0 - 7.333).abs() < KICAD_NM);
+    assert_bbox_near(contours[2].bbox, (137.0, 69.0, 143.0, 71.0), "SLOT1");
+
+    let OutlineShape::Unproven { bbox } = shape else {
+        panic!("arcs and cut-outs cannot be a proven rectangle: {shape:?}");
+    };
+    assert_bbox_near(bbox, (30.0, 50.0, 170.0, 150.0), "outline");
+}
+
+/// The same MECH1 turned 30°, and flipped to the back and turned 150°, by
+/// pcbnew. Neither contour is symmetric, so a wrong rotation sense or a
+/// mirror applied twice moves the cut-out away from where KiCad put it. The
+/// flipped one holds two mounting holes, which are pads but not electrical.
+#[test]
+fn a_turned_and_a_flipped_mech1_land_where_kicad_puts_them() {
+    let (_, owners, _) = recognized("mech1_back");
+    let mech1 = owner(&owners, "MECH1");
+    assert_eq!(
+        (mech1.pads, mech1.electrical_pads, mech1.cutouts_only),
+        (2, 0, false)
+    );
+    for (name, outer, cutout) in [
+        (
+            "mech1_rotated",
+            (15.476298, 22.796806, 184.523702, 177.203194),
+            (78.21171, 114.118624, 102.147274, 131.862137),
+        ),
+        (
+            "mech1_back",
+            (15.476298, 22.796806, 184.523701, 177.203193),
+            (97.852725, 114.118624, 121.788291, 131.862136),
+        ),
+    ] {
+        let (_, owners, contours) = recognized(name);
+        assert_eq!(owner(&owners, "MECH1").primitives, 27, "{name}");
+        let roles: Vec<_> = contours.iter().map(|c| (c.role, c.primitives)).collect();
+        assert_eq!(
+            roles,
+            vec![(ContourRole::External, 19), (ContourRole::Cutout, 8)],
+            "{name}"
+        );
+        assert_bbox_near(contours[0].bbox, outer, &format!("{name} outer"));
+        assert_bbox_near(contours[1].bbox, cutout, &format!("{name} cutout"));
+    }
+}
+
+/// MECH1 without its right edge: KiCad builds no outline and its DRC reports
+/// `invalid_outline`. The reading refuses, and says where the gap is.
+#[test]
+fn an_open_footprint_outline_is_refused_with_its_open_end() {
+    let FootprintOutline::Refused { owners, reason } = footprint_outline_fixture("open_outline")
+    else {
+        panic!("an open outline must not be recognized");
+    };
+    assert_eq!(owner(&owners, "MECH1").primitives, 26);
+    assert!(reason.contains("open end at (170.000, "), "{reason}");
+}
+
+/// Ends within KiCad's 0.01 mm chaining tolerance meet: every MECH1 board's
+/// cut-out has a 0.005 mm gap, and closes. `gap_outline`'s is 0.02 mm, and
+/// KiCad builds no outline and reports `invalid_outline`.
+#[test]
+fn ends_meet_within_kicads_chaining_tolerance_and_not_beyond() {
+    let (_, _, contours) = recognized("mech1");
+    assert_eq!(
+        (contours[1].role, contours[1].primitives),
+        (ContourRole::Cutout, 8),
+        "a 0.005 mm gap closes"
+    );
+    let FootprintOutline::Refused { reason, .. } = footprint_outline_fixture("gap_outline") else {
+        panic!("a 0.02 mm gap must not close");
+    };
+    assert!(reason.contains("open end at (67.875, "), "{reason}");
+}
+
+/// MECH1 with a 0.004 mm segment cut off its top edge: both of its ends lie
+/// within the tolerance of the next piece's, and KiCad chains on to the
+/// nearest end, closing the outline. So does this reading.
+#[test]
+fn a_segment_shorter_than_the_tolerance_still_chains() {
+    let (_, owners, contours) = recognized("short_segment");
+    assert_eq!(owner(&owners, "MECH1").primitives, 28);
+    let roles: Vec<_> = contours.iter().map(|c| (c.role, c.primitives)).collect();
+    assert_eq!(
+        roles,
+        vec![(ContourRole::External, 20), (ContourRole::Cutout, 8)]
+    );
+    assert_bbox_near(contours[0].bbox, (30.0, 50.0, 170.0, 150.0), "outer");
+}
+
+/// SLOT1 alone: KiCad cuts it as a hole and builds no outline, so a slot with
+/// pads around it never becomes the board.
+#[test]
+fn a_slot_whose_pads_lie_outside_it_is_not_an_outline() {
+    let FootprintOutline::Refused { owners, reason } = footprint_outline_fixture("slot_only")
+    else {
+        panic!("a hole alone must not be recognized as an outline");
+    };
+    assert!(owner(&owners, "SLOT1").cutouts_only);
+    assert!(reason.contains("cut-outs only"), "{reason}");
+}
+
+/// SLOTPAD alone, a slot inside its own pad: the pad's copper meets the slot,
+/// so KiCad keeps the slot in contention, and with nothing else it is the
+/// outline. No corner or centre of the pad lies in the slot; the slot's own
+/// points lie in the pad.
+#[test]
+fn a_slot_inside_its_pad_is_not_a_hole() {
+    let (shape, owners, _) = recognized("slot_in_pad");
+    assert!(!owner(&owners, "SLOTPAD").cutouts_only);
+    let OutlineShape::Rectangular { bbox } = shape else {
+        panic!("one rectangle is a proven rectangle: {shape:?}");
+    };
+    assert_bbox_near(bbox, (101.0, 99.5, 102.5, 100.5), "slot");
+}
+
+/// SLOTX alone, a slot across its own pad: neither holds a corner of the
+/// other, yet the slot's edges cross the pad, so KiCad keeps the slot, and
+/// it is the outline.
+#[test]
+fn a_slot_across_its_pad_is_not_a_hole() {
+    let (shape, owners, _) = recognized("slot_across_pad");
+    assert!(!owner(&owners, "SLOTX").cutouts_only);
+    let OutlineShape::Rectangular { bbox } = shape else {
+        panic!("one rectangle is a proven rectangle: {shape:?}");
+    };
+    assert_bbox_near(bbox, (95.0, 100.5, 105.0, 101.0), "slot");
+}
+
+/// SLOTB alone, flipped and turned 30°: a slot beside its pad, off the
+/// footprint's origin. KiCad cuts it as a hole. A pad placed by a mirror or a
+/// half turn too many would land in the slot and keep it.
+#[test]
+fn a_flipped_slot_whose_pad_lies_outside_it_is_not_an_outline() {
+    let FootprintOutline::Refused { owners, reason } = footprint_outline_fixture("slot_back")
+    else {
+        panic!("a hole alone must not be recognized as an outline");
+    };
+    assert!(owner(&owners, "SLOTB").cutouts_only);
+    assert!(reason.contains("cut-outs only"), "{reason}");
+}
+
+/// SLOTS2 alone, a circle and a polygon and no pads: more than one outline,
+/// which KiCad cuts as holes, building none.
+#[test]
+fn a_footprint_with_two_outlines_cuts_holes() {
+    let FootprintOutline::Refused { owners, reason } = footprint_outline_fixture("two_slots_only")
+    else {
+        panic!("two slots alone must not be recognized as an outline");
+    };
+    let slots = owner(&owners, "SLOTS2");
+    assert_eq!(
+        (slots.pads, slots.primitives, slots.cutouts_only),
+        (0, 2, true)
+    );
+    assert!(reason.contains("cut-outs only"), "{reason}");
+}
+
+/// CURVE1, a square with a Bézier side: KiCad builds it as an outline, and
+/// this reading, which does not chain curves, refuses it by name.
+#[test]
+fn a_curve_on_edge_cuts_is_refused_by_name() {
+    let FootprintOutline::Refused { reason, .. } = footprint_outline_fixture("curve_outline")
+    else {
+        panic!("a curve must not be read as a straight edge or skipped");
+    };
+    assert_eq!(
+        reason,
+        "CURVE1 draws an fp_curve, which this reading does not chain"
+    );
+}
+
+/// A card-edge connector whose four Edge.Cuts lines are the card, its fingers
+/// inside them, flipped to the back and turned 90°: KiCad's one outline, and a
+/// provable rectangle.
+#[test]
+fn a_card_edge_footprint_with_pads_inside_is_a_rectangular_outline() {
+    let (shape, owners, contours) = recognized("card_edge");
+    let j1 = owner(&owners, "J1");
+    assert_eq!(
+        (j1.electrical_pads, j1.primitives, j1.draws_external),
+        (5, 4, true)
+    );
+    // SLOT1 lies off the card: KiCad drops a hole outside every outline.
+    let slot = owner(&owners, "SLOT1");
+    assert!(slot.cutouts_only && !slot.draws_external);
+    assert_eq!(contours.len(), 1);
+    let OutlineShape::Rectangular { bbox } = shape else {
+        panic!("four sides of a turned rectangle are still a rectangle: {shape:?}");
+    };
+    assert_bbox_near(bbox, (80.0, 85.0, 120.0, 115.0), "card");
+}
+
+/// The same card with SLOT1 inside it: KiCad keeps the hole, one outline
+/// with one hole. A part over the hole lies inside the card's bbox, so a
+/// rectangle with a hole in it is not a proven rectangle.
+#[test]
+fn a_card_edge_outline_with_a_hole_in_it_is_not_a_proven_rectangle() {
+    let (shape, owners, contours) = recognized("card_edge_hole");
+    let slot = owner(&owners, "SLOT1");
+    assert!(slot.cutouts_only && !slot.draws_external);
+    let roles: Vec<_> = contours.iter().map(|c| (c.role, c.primitives)).collect();
+    assert_eq!(
+        roles,
+        vec![(ContourRole::External, 4), (ContourRole::Cutout, 1)]
+    );
+    assert_bbox_near(contours[1].bbox, (97.0, 91.0, 103.0, 93.0), "SLOT1");
+    let OutlineShape::Unproven { bbox } = shape else {
+        panic!("a rectangle with a hole in it cannot be a proven rectangle: {shape:?}");
+    };
+    assert_bbox_near(bbox, (80.0, 85.0, 120.0, 115.0), "card");
+}
+
+/// HALF_A draws the top and right of a 40 x 30 mm outline and HALF_B its
+/// bottom and left; neither closes alone, so KiCad chains them together.
+/// SLOTN, a padless slot inside, closes alone and becomes the outline's hole:
+/// it draws no part of the board's edge.
+#[test]
+fn an_outline_drawn_by_two_footprints_chains_across_them() {
+    let (_, owners, contours) = recognized("split_outline");
+    let index = |reference: &str| {
+        owners
+            .iter()
+            .position(|o| o.reference.as_deref() == Some(reference))
+            .unwrap()
+    };
+    let mut halves = vec![index("HALF_A"), index("HALF_B")];
+    halves.sort_unstable();
+    assert_eq!(contours.len(), 2);
+    assert_eq!(
+        (
+            contours[0].role,
+            contours[0].primitives,
+            &contours[0].owners
+        ),
+        (ContourRole::External, 4, &halves)
+    );
+    assert_bbox_near(contours[0].bbox, (80.0, 85.0, 120.0, 115.0), "halves");
+    assert_eq!(
+        (contours[1].role, &contours[1].owners),
+        (ContourRole::Cutout, &vec![index("SLOTN")])
+    );
+    assert!(owner(&owners, "HALF_A").draws_external && owner(&owners, "HALF_B").draws_external);
+    let slot = owner(&owners, "SLOTN");
+    assert!(!slot.draws_external && !slot.cutouts_only);
+}
+
+/// RRECT1, one `fp_rect` with 3 mm corners, turned 90°: KiCad's one outline.
+/// Its corners are arcs, so it is not a proven rectangle.
+#[test]
+fn a_rectangle_with_rounded_corners_is_not_a_proven_rectangle() {
+    let (shape, _, contours) = recognized("rounded_rect");
+    assert_eq!(contours.len(), 1);
+    let OutlineShape::Unproven { bbox } = shape else {
+        panic!("rounded corners cannot be a proven rectangle: {shape:?}");
+    };
+    assert_bbox_near(bbox, (85.0, 80.0, 115.0, 120.0), "rounded rectangle");
+}
+
+/// A board that draws its own Edge.Cuts keeps `board_outline_shape`'s
+/// reading; the footprint reading does not apply. `board_outline_kicad10`
+/// draws its outline and also holds U1, whose Edge.Cuts rectangle closes
+/// around its pad, which alone would be read as an outline.
+#[test]
+fn a_board_with_its_own_edge_cuts_is_not_read_from_footprints() {
+    let both = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../copperpour-core/tests/fixtures/board_outline_kicad10.kicad_pcb");
+    let both = parse_sexp(&std::fs::read_to_string(&both).unwrap()).unwrap();
+    assert_eq!(footprint_outline(&both), FootprintOutline::NotApplicable);
+    for name in ["gr_poly_outline.kicad_pcb", "pic_programmer.kicad_pcb"] {
+        assert_eq!(
+            footprint_outline(&fixture(name)),
+            FootprintOutline::NotApplicable,
+            "{name}"
+        );
+    }
 }
 
 #[test]

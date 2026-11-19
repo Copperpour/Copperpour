@@ -968,6 +968,646 @@ fn transform_local_bbox(
     acc.expect("four corners were merged")
 }
 
+// ─── Footprint-owned outline (#27) ───────────────────────────────────────────
+
+/// How close two ends must be to join, in mm: KiCad's default outline
+/// chaining tolerance (`DEFAULT_CHAINING_EPSILON_MM`, `pcbnew/board.h`).
+pub const OUTLINE_CHAINING_EPSILON_MM: f64 = 0.01;
+
+/// The largest gap, in mm, between an arc and the chords that stand in for it
+/// when a point is tested against a contour.
+const ARC_CHORD_TOLERANCE_MM: f64 = 0.001;
+
+/// Whether a closed contour bounds the board or cuts a hole in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ContourRole {
+    External,
+    Cutout,
+}
+
+/// One closed contour of footprint-owned Edge.Cuts graphics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutlineContour {
+    pub role: ContourRole,
+    /// The footprint graphics it is made of; an `fp_rect`, `fp_circle` or
+    /// `fp_poly` counts once.
+    pub primitives: usize,
+    /// `(min_x, min_y, max_x, max_y)` in board coordinates, arcs by their
+    /// exact extrema.
+    pub bbox: (f64, f64, f64, f64),
+    /// The footprints whose graphics make it, as indices into the owners.
+    pub owners: Vec<usize>,
+}
+
+/// A footprint that draws Edge.Cuts graphics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutlineOwner {
+    pub reference: Option<String>,
+    /// The footprint anchor, `None` when it is unreadable.
+    pub at: Option<(f64, f64)>,
+    pub pads: usize,
+    /// Pads other than `np_thru_hole`: a mechanical footprint's mounting
+    /// holes are not electrical.
+    pub electrical_pads: usize,
+    pub primitives: usize,
+    /// KiCad takes its graphics as cut-outs, not as outline: they close, and
+    /// a pad lies outside them or they make more than one external contour.
+    pub cutouts_only: bool,
+    /// Its graphics make part of an external contour: it draws the board.
+    pub draws_external: bool,
+}
+
+/// The board outline as footprints' Edge.Cuts graphics draw it.
+///
+/// KiCad builds the outline from every Edge.Cuts graphic, a footprint's as
+/// well as the board's, and first chains each footprint's own: those that
+/// close, with a pad outside them or more than one outline, are holes, kept
+/// where they lie in an outline; the rest join the outline [KiCad 10.0.6
+/// `pcbnew/convert_shape_list_to_polygon.cpp`, `BuildBoardPolygonOutlines`].
+/// This reading follows that rule where it matters, on a board that draws no
+/// Edge.Cuts graphic of its own; a pad is judged by its box (`pad_outside`).
+///
+/// Footprint children are stored in the footprint's frame, so each point goes
+/// through the same rigid-body transform as a courtyard
+/// ([`FootprintCourtyard`]); a back-side footprint's are stored mirrored.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FootprintOutline {
+    /// The board draws Edge.Cuts graphics of its own, or no footprint draws any.
+    NotApplicable,
+    /// The footprints' graphics close, and at least one contour is external.
+    /// `shape` classifies the external contours as [`board_outline_shape`]
+    /// does a board's own. Owners are in file order, contours external first.
+    Recognized {
+        shape: OutlineShape,
+        owners: Vec<OutlineOwner>,
+        contours: Vec<OutlineContour>,
+    },
+    /// The footprints' graphics make no outline; `reason` says why.
+    Refused {
+        owners: Vec<OutlineOwner>,
+        reason: String,
+    },
+}
+
+type Point = (f64, f64);
+
+/// A line (`mid: None`) or an arc, in board coordinates, and the index of the
+/// footprint that draws it.
+#[derive(Debug, Clone, Copy)]
+struct Piece {
+    start: Point,
+    mid: Option<Point>,
+    end: Point,
+    owner: usize,
+}
+
+impl Piece {
+    fn reversed(self) -> Self {
+        Piece {
+            start: self.end,
+            end: self.start,
+            ..self
+        }
+    }
+
+    fn bbox(&self) -> (f64, f64, f64, f64) {
+        match self.mid {
+            Some(mid) => crate::geometry::arc_bbox(self.start, mid, self.end),
+            None => (
+                self.start.0.min(self.end.0),
+                self.start.1.min(self.end.1),
+                self.start.0.max(self.end.0),
+                self.start.1.max(self.end.1),
+            ),
+        }
+    }
+}
+
+/// A closed contour and the number of graphics it is made of; a circle and
+/// the index of its footprint.
+#[derive(Debug, Clone)]
+enum Loop {
+    Pieces(Vec<Piece>, usize),
+    Circle(Point, f64, usize),
+}
+
+impl Loop {
+    fn primitives(&self) -> usize {
+        match self {
+            Loop::Pieces(_, n) => *n,
+            Loop::Circle(..) => 1,
+        }
+    }
+
+    fn owners(&self) -> Vec<usize> {
+        let mut owners: Vec<usize> = match self {
+            Loop::Pieces(pieces, _) => pieces.iter().map(|p| p.owner).collect(),
+            Loop::Circle(_, _, owner) => vec![*owner],
+        };
+        owners.sort_unstable();
+        owners.dedup();
+        owners
+    }
+
+    fn bbox(&self) -> (f64, f64, f64, f64) {
+        match self {
+            Loop::Pieces(pieces, _) => pieces
+                .iter()
+                .fold(None, |acc, p| Some(merge_bbox(acc, p.bbox())))
+                .expect("a loop has pieces"),
+            Loop::Circle((cx, cy), r, _) => (cx - r, cy - r, cx + r, cy + r),
+        }
+    }
+
+    /// The contour as a polygon, arcs as chords no further than
+    /// [`ARC_CHORD_TOLERANCE_MM`] from them.
+    fn polygon(&self) -> Vec<Point> {
+        match self {
+            Loop::Pieces(pieces, _) => {
+                let mut points = Vec::new();
+                for piece in pieces {
+                    points.push(piece.start);
+                    if let Some(mid) = piece.mid {
+                        points.extend(arc_interior(piece.start, mid, piece.end));
+                    }
+                }
+                points
+            }
+            Loop::Circle(centre, r, _) => {
+                let n = chord_count(*r, std::f64::consts::TAU);
+                (0..n)
+                    .map(|i| {
+                        let t = std::f64::consts::TAU * i as f64 / n as f64;
+                        (centre.0 + r * t.cos(), centre.1 + r * t.sin())
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+/// How many chords stand in for `sweep` radians of a circle of radius `r`.
+fn chord_count(r: f64, sweep: f64) -> usize {
+    let step = if r > ARC_CHORD_TOLERANCE_MM {
+        2.0 * (1.0 - ARC_CHORD_TOLERANCE_MM / r).acos()
+    } else {
+        std::f64::consts::FRAC_PI_2
+    };
+    ((sweep.abs() / step).ceil() as usize).max(2)
+}
+
+/// The points strictly between an arc's ends, along the sweep through `mid`.
+/// A straight "arc" has none.
+fn arc_interior(start: Point, mid: Point, end: Point) -> Vec<Point> {
+    let (x1, y1) = start;
+    let (x2, y2) = mid;
+    let (x3, y3) = end;
+    let d = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2));
+    if !d.is_finite() || d.abs() < 1e-12 {
+        return Vec::new();
+    }
+    let q1 = x1 * x1 + y1 * y1;
+    let q2 = x2 * x2 + y2 * y2;
+    let q3 = x3 * x3 + y3 * y3;
+    let ux = (q1 * (y2 - y3) + q2 * (y3 - y1) + q3 * (y1 - y2)) / d;
+    let uy = (q1 * (x3 - x2) + q2 * (x1 - x3) + q3 * (x2 - x1)) / d;
+    let r = (x1 - ux).hypot(y1 - uy);
+    let tau = std::f64::consts::TAU;
+    let a_s = (y1 - uy).atan2(x1 - ux);
+    let d_e = ((y3 - uy).atan2(x3 - ux) - a_s).rem_euclid(tau);
+    let d_m = ((y2 - uy).atan2(x2 - ux) - a_s).rem_euclid(tau);
+    let sweep = if d_m <= d_e { d_e } else { d_e - tau };
+    let n = chord_count(r, sweep);
+    (1..n)
+        .map(|i| {
+            let t = a_s + sweep * i as f64 / n as f64;
+            (ux + r * t.cos(), uy + r * t.sin())
+        })
+        .collect()
+}
+
+/// Even-odd: whether `p` lies inside `polygon`.
+fn inside_polygon(p: Point, polygon: &[Point]) -> bool {
+    let mut inside = false;
+    for (i, &a) in polygon.iter().enumerate() {
+        let b = polygon[(i + 1) % polygon.len()];
+        if (a.1 > p.1) != (b.1 > p.1) && p.0 < a.0 + (p.1 - a.1) * (b.0 - a.0) / (b.1 - a.1) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// Each loop's role by how many of the others enclose it: an even number,
+/// external; odd, a cut-out.
+fn contour_roles(polygons: &[Vec<Point>]) -> Vec<ContourRole> {
+    (0..polygons.len())
+        .map(|i| {
+            let probe = polygons[i][0];
+            let depth = (0..polygons.len())
+                .filter(|&j| j != i && inside_polygon(probe, &polygons[j]))
+                .count();
+            if depth % 2 == 0 {
+                ContourRole::External
+            } else {
+                ContourRole::Cutout
+            }
+        })
+        .collect()
+}
+
+/// Chain pieces end to end into closed loops. From each end the chain goes on
+/// to the nearest end closer than [`OUTLINE_CHAINING_EPSILON_MM`], and closes
+/// when that is its own start, as KiCad's `findNext` chooses
+/// (`pcbnew/convert_shape_list_to_polygon.cpp`). Where two ends are equally
+/// near, the first in file order is taken; KiCad's DRC reports such a touch.
+/// `Err` names the first end that meets none.
+fn chain_pieces(pieces: &[Piece]) -> Result<Vec<Loop>, String> {
+    let gap = |a: Point, b: Point| (a.0 - b.0).hypot(a.1 - b.1);
+    let mut used = vec![false; pieces.len()];
+    let mut loops = Vec::new();
+    for first in 0..pieces.len() {
+        if used[first] {
+            continue;
+        }
+        used[first] = true;
+        let mut chain = vec![pieces[first]];
+        loop {
+            let end = chain.last().expect("a chain has a piece").end;
+            let next = (0..pieces.len())
+                .filter(|&j| !used[j])
+                .map(|j| (j, gap(pieces[j].start, end).min(gap(pieces[j].end, end))))
+                .filter(|&(_, d)| d < OUTLINE_CHAINING_EPSILON_MM)
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            let closing = gap(end, chain[0].start);
+            if chain.len() > 1
+                && closing < OUTLINE_CHAINING_EPSILON_MM
+                && next.is_none_or(|(_, d)| closing <= d)
+            {
+                break;
+            }
+            let Some((j, _)) = next else {
+                return Err(format!("an open end at ({:.3}, {:.3})", end.0, end.1));
+            };
+            used[j] = true;
+            let piece = pieces[j];
+            chain.push(if gap(piece.start, end) <= gap(piece.end, end) {
+                piece
+            } else {
+                piece.reversed()
+            });
+        }
+        let n = chain.len();
+        loops.push(Loop::Pieces(chain, n));
+    }
+    Ok(loops)
+}
+
+/// A footprint shape on Edge.Cuts; KiCad builds the outline from shapes, not
+/// text.
+fn is_footprint_edge_shape(child: &SexpNode) -> bool {
+    child
+        .head()
+        .is_some_and(|head| FP_SHAPE_TAGS.contains(&head) || head == "fp_curve")
+        && child.find_str("layer") == Some("Edge.Cuts")
+}
+
+/// One footprint's Edge.Cuts graphics in board coordinates: the lines and
+/// arcs that chain, and the shapes that close by themselves, each marked with
+/// `owner`. `Err` names a graphic this reading cannot take.
+fn footprint_edge_graphics(
+    fp: &SexpNode,
+    (fx, fy, rot): (f64, f64, f64),
+    owner: usize,
+) -> Result<(Vec<Piece>, Vec<Loop>), String> {
+    let board = |(x, y): Point| crate::geometry::transform_pad(x, y, fx, fy, rot);
+    let line = |a: Point, b: Point| Piece {
+        start: board(a),
+        mid: None,
+        end: board(b),
+        owner,
+    };
+    let closed = |corners: Vec<Point>| {
+        let n = corners.len();
+        let pieces = (0..n)
+            .map(|i| line(corners[i], corners[(i + 1) % n]))
+            .collect();
+        Loop::Pieces(pieces, 1)
+    };
+    let mut pieces = Vec::new();
+    let mut loops = Vec::new();
+    for child in fp.children().unwrap_or(&[]) {
+        if !is_footprint_edge_shape(child) {
+            continue;
+        }
+        let head = child.head().expect("a shape has a head");
+        let unreadable = || format!("an unreadable {head}");
+        match head {
+            "fp_line" | "fp_arc" => {
+                let start = point(child, "start").ok_or_else(unreadable)?;
+                let end = point(child, "end").ok_or_else(unreadable)?;
+                let mid = if head == "fp_arc" {
+                    Some(board(point(child, "mid").ok_or_else(unreadable)?))
+                } else {
+                    None
+                };
+                pieces.push(Piece {
+                    start: board(start),
+                    mid,
+                    end: board(end),
+                    owner,
+                });
+            }
+            "fp_rect" => {
+                let (sx, sy) = point(child, "start").ok_or_else(unreadable)?;
+                let (ex, ey) = point(child, "end").ok_or_else(unreadable)?;
+                let (x0, y0, x1, y1) = (sx.min(ex), sy.min(ey), sx.max(ex), sy.max(ey));
+                // KiCad writes `(radius r)` for a rectangle with rounded
+                // corners, and holds it to half the shorter side
+                // (`EDA_SHAPE::SetCornerRadius`, `common/eda_shape.cpp`).
+                let r = match child.find("radius") {
+                    Some(radius) => radius
+                        .get_f64(1)
+                        .filter(|r| r.is_finite())
+                        .ok_or_else(unreadable)?,
+                    None => 0.0,
+                }
+                .clamp(0.0, (x1 - x0).min(y1 - y0) / 2.0);
+                if r > 0.0 {
+                    let k = r * std::f64::consts::FRAC_1_SQRT_2;
+                    let corner = |(cx, cy): Point, (dx, dy): Point| Piece {
+                        start: board((cx + dy * r, cy - dx * r)),
+                        mid: Some(board((cx + (dx + dy) * k, cy + (dy - dx) * k))),
+                        end: board((cx + dx * r, cy + dy * r)),
+                        owner,
+                    };
+                    let pieces = vec![
+                        line((x0 + r, y0), (x1 - r, y0)),
+                        corner((x1 - r, y0 + r), (1.0, 0.0)),
+                        line((x1, y0 + r), (x1, y1 - r)),
+                        corner((x1 - r, y1 - r), (0.0, 1.0)),
+                        line((x1 - r, y1), (x0 + r, y1)),
+                        corner((x0 + r, y1 - r), (-1.0, 0.0)),
+                        line((x0, y1 - r), (x0, y0 + r)),
+                        corner((x0 + r, y0 + r), (0.0, -1.0)),
+                    ];
+                    loops.push(Loop::Pieces(pieces, 1));
+                } else {
+                    loops.push(closed(vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1)]));
+                }
+            }
+            "fp_circle" => {
+                let (cx, cy) = point(child, "center").ok_or_else(unreadable)?;
+                let (ex, ey) = point(child, "end").ok_or_else(unreadable)?;
+                loops.push(Loop::Circle(
+                    board((cx, cy)),
+                    (ex - cx).hypot(ey - cy),
+                    owner,
+                ));
+            }
+            "fp_poly" => {
+                let pts = child.find("pts").ok_or_else(unreadable)?;
+                let mut corners: Vec<Point> = Vec::new();
+                for vertex in pts.children().unwrap_or(&[]).iter().skip(1) {
+                    if vertex.head() != Some("xy") {
+                        return Err(
+                            "an fp_poly with arcs, which this reading does not chain".into()
+                        );
+                    }
+                    corners.push(coordinate_pair(vertex).ok_or_else(unreadable)?);
+                }
+                if corners.len() > 1 && corners.first() == corners.last() {
+                    corners.pop();
+                }
+                if corners.len() < 3 {
+                    return Err(unreadable());
+                }
+                loops.push(closed(corners));
+            }
+            _ => return Err(format!("an {head}, which this reading does not chain")),
+        }
+    }
+    Ok((pieces, loops))
+}
+
+/// Whether the segment from `a` to `b` meets the box `(x0, y0, x1, y1)`
+/// (Liang-Barsky clipping).
+fn segment_meets_box(a: Point, b: Point, (x0, y0, x1, y1): (f64, f64, f64, f64)) -> bool {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+    for (p, q) in [
+        (-dx, a.0 - x0),
+        (dx, x1 - a.0),
+        (-dy, a.1 - y0),
+        (dy, y1 - a.1),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return false;
+            }
+        } else if p < 0.0 {
+            t0 = t0.max(q / p);
+        } else {
+            t1 = t1.min(q / p);
+        }
+    }
+    t0 <= t1
+}
+
+/// Whether a pad lies wholly outside the region `polygons` enclose, judged by
+/// its board-frame box ([`crate::bounds::pad_bbox`]): no contour edge meets
+/// the box, so the box lies wholly in or out, and its centre lies out. KiCad
+/// intersects the pad's own shape, so a round pad's box can reach a contour
+/// the pad does not. `None` when the pad's position or size is unreadable.
+fn pad_outside(
+    pad: &SexpNode,
+    (fx, fy, rot): (f64, f64, f64),
+    polygons: &[Vec<Point>],
+) -> Option<bool> {
+    let (lx, ly) = point(pad, "at")?;
+    let centre = crate::geometry::transform_pad(lx, ly, fx, fy, rot);
+    let pad_box = crate::bounds::pad_bbox(pad, fx, fy, rot)?;
+    let edge_meets = polygons.iter().any(|poly| {
+        (0..poly.len()).any(|i| segment_meets_box(poly[i], poly[(i + 1) % poly.len()], pad_box))
+    });
+    let depth = polygons
+        .iter()
+        .filter(|poly| inside_polygon(centre, poly))
+        .count();
+    Some(!edge_meets && depth % 2 == 0)
+}
+
+/// Read the board outline from footprints' Edge.Cuts graphics — see
+/// [`FootprintOutline`].
+pub fn footprint_outline(tree: &SexpNode) -> FootprintOutline {
+    let board_draws_edges = tree.children().unwrap_or(&[]).iter().any(|child| {
+        child.head().is_some_and(|head| EDGE_TAGS.contains(&head))
+            && child.find_str("layer") == Some("Edge.Cuts")
+    });
+    if board_draws_edges {
+        return FootprintOutline::NotApplicable;
+    }
+
+    let mut owners = Vec::new();
+    let mut refusal: Option<String> = None;
+    let mut outline_pieces: Vec<Piece> = Vec::new();
+    let mut outline_loops: Vec<Loop> = Vec::new();
+    let mut hole_loops: Vec<Loop> = Vec::new();
+    for fp in footprints(tree) {
+        if !fp
+            .children()
+            .unwrap_or(&[])
+            .iter()
+            .any(is_footprint_edge_shape)
+        {
+            continue;
+        }
+        let reference = footprint_reference(fp);
+        let name = reference.clone().unwrap_or_else(|| "a footprint".into());
+        let pads = fp.find_all("pad");
+        let mut owner = OutlineOwner {
+            reference,
+            at: None,
+            pads: pads.len(),
+            electrical_pads: pads
+                .iter()
+                .filter(|pad| pad.get(2).and_then(|t| t.as_str()) != Some("np_thru_hole"))
+                .count(),
+            primitives: 0,
+            cutouts_only: false,
+            draws_external: false,
+        };
+        let Some(transform) = footprint_root_at(fp) else {
+            refusal.get_or_insert(format!("{name} has no readable (at …)"));
+            owners.push(owner);
+            continue;
+        };
+        owner.at = Some((transform.0, transform.1));
+        let (pieces, loops) = match footprint_edge_graphics(fp, transform, owners.len()) {
+            Ok(graphics) => graphics,
+            Err(what) => {
+                refusal.get_or_insert(format!("{name} draws {what}"));
+                owners.push(owner);
+                continue;
+            }
+        };
+        owner.primitives = pieces.len() + loops.len();
+
+        // KiCad's pass over this footprint alone: closed graphics with a pad
+        // outside them, or more than one external contour, are holes. Graphics
+        // that do not close stay in contention for the outline, as in KiCad.
+        if let Ok(chained) = chain_pieces(&pieces) {
+            let own: Vec<Loop> = loops.iter().cloned().chain(chained).collect();
+            let polygons: Vec<Vec<Point>> = own.iter().map(Loop::polygon).collect();
+            let externals = contour_roles(&polygons)
+                .into_iter()
+                .filter(|role| *role == ContourRole::External)
+                .count();
+            let mut pad_out = false;
+            for pad in &pads {
+                match pad_outside(pad, transform, &polygons) {
+                    Some(out) => pad_out |= out,
+                    None => {
+                        refusal.get_or_insert(format!("{name} has an unreadable pad"));
+                    }
+                }
+            }
+            if externals > 1 || pad_out {
+                owner.cutouts_only = true;
+                hole_loops.extend(own);
+                owners.push(owner);
+                continue;
+            }
+        }
+        outline_pieces.extend(pieces);
+        outline_loops.extend(loops);
+        owners.push(owner);
+    }
+
+    if owners.is_empty() {
+        return FootprintOutline::NotApplicable;
+    }
+    if let Some(reason) = refusal {
+        return FootprintOutline::Refused { owners, reason };
+    }
+    let chained = match chain_pieces(&outline_pieces) {
+        Ok(chained) => chained,
+        Err(at) => return FootprintOutline::Refused { owners, reason: at },
+    };
+    outline_loops.extend(chained);
+    let polygons: Vec<Vec<Point>> = outline_loops.iter().map(Loop::polygon).collect();
+    let roles = contour_roles(&polygons);
+    if !roles.contains(&ContourRole::External) {
+        return FootprintOutline::Refused {
+            owners,
+            reason: "they are cut-outs only; none bounds the board".into(),
+        };
+    }
+
+    // KiCad keeps a footprint's hole only where its first point lies inside
+    // an outline (`BuildBoardPolygonOutlines`, its `fpHoles` loop).
+    let external_polygons: Vec<&Vec<Point>> = polygons
+        .iter()
+        .zip(&roles)
+        .filter(|(_, role)| **role == ContourRole::External)
+        .map(|(polygon, _)| polygon)
+        .collect();
+    let holes = hole_loops.iter().filter(|lp| {
+        let first = lp.polygon()[0];
+        external_polygons
+            .iter()
+            .any(|polygon| inside_polygon(first, polygon))
+    });
+    let contour = |lp: &Loop, role: ContourRole| OutlineContour {
+        role,
+        primitives: lp.primitives(),
+        bbox: lp.bbox(),
+        owners: lp.owners(),
+    };
+    let mut contours: Vec<OutlineContour> = outline_loops
+        .iter()
+        .zip(&roles)
+        .map(|(lp, role)| contour(lp, *role))
+        .chain(holes.map(|lp| contour(lp, ContourRole::Cutout)))
+        .collect();
+    contours.sort_by_key(|contour| contour.role);
+    for contour in contours.iter().filter(|c| c.role == ContourRole::External) {
+        for &index in &contour.owners {
+            owners[index].draws_external = true;
+        }
+    }
+    let bbox = contours
+        .iter()
+        .filter(|contour| contour.role == ContourRole::External)
+        .fold(None, |acc, contour| Some(merge_bbox(acc, contour.bbox)))
+        .expect("an external contour was found");
+
+    // Provably rectangular as a board's own outline is: one contour, four
+    // straight sides, each a side of its bbox.
+    let rectangular = match outline_loops.as_slice() {
+        [Loop::Pieces(pieces, _)]
+            if contours.len() == 1 && pieces.iter().all(|p| p.mid.is_none()) =>
+        {
+            let (x0, y0, x1, y1) = bbox;
+            let sides: Vec<Segment> = pieces.iter().map(|p| (p.start, p.end)).collect();
+            x0 < x1
+                && y0 < y1
+                && is_bbox_perimeter(&sides, &[(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+        }
+        _ => false,
+    };
+    let shape = if rectangular {
+        OutlineShape::Rectangular { bbox }
+    } else {
+        OutlineShape::Unproven { bbox }
+    };
+    FootprintOutline::Recognized {
+        shape,
+        owners,
+        contours,
+    }
+}
+
 // ─── Connectivity index ──────────────────────────────────────────────────────
 
 /// One pad, located in board coordinates.
