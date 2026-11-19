@@ -301,6 +301,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "refine_placement_force_directed",
     "register_footprint_library",
     "register_symbol_library",
+    "rename_footprint",
     "rename_project",
     "rename_schematic_net_label",
     "render_schematic_png",

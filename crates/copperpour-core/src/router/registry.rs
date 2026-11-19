@@ -112,7 +112,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "library_maintenance",
-        description: "Upgrade a symbol or footprint library's file format with kicad-cli, replacing files only when their content is kept",
+        description: "Maintain symbol and footprint libraries as a whole: upgrade a library's file format with kicad-cli, replacing files only when their content is kept, and rename a library footprint",
         category: "library",
     },
     ToolsetMeta {
@@ -210,7 +210,12 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "placement" => Some(placement::tools()),
         "pcb_export" => Some(pcb_export::tools()),
         "library" => Some(library::tools()),
-        "library_maintenance" => Some(library_upgrade::tools()),
+        "library_maintenance" => Some(
+            library_upgrade::tools()
+                .into_iter()
+                .chain([footprint_rename::tool()])
+                .collect(),
+        ),
         "model_3d" => Some(model_3d::tools()),
         #[cfg(any(feature = "jlcpcb", feature = "freerouting"))]
         "integration" => Some(integration::tools()),
