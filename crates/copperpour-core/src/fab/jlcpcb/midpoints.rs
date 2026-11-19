@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use copperpour_ipc::{gen::kiapi, KiCadIpcClient};
 use prost::Message;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Midpoint {
@@ -31,6 +31,12 @@ pub(crate) struct Midpoint {
 pub(crate) struct Snapshot {
     pub contents: String,
     pub midpoints: BTreeMap<String, Midpoint>,
+    /// The parts fitted by hand (#681): footprints KiCad keeps out of position
+    /// files while they are still fitted (not DNP) and still bought (in the
+    /// BOM, in the schematic). The JLCPCB BOM leaves them to their own list,
+    /// as the CPL already leaves them out. A designator the CPL places too
+    /// stays with the assembler.
+    pub hand_fitted: BTreeSet<String>,
 }
 
 pub(crate) fn capture(
@@ -43,14 +49,28 @@ pub(crate) fn capture(
         kiapi::common::types::KiCadObjectType::KotPcbFootprint,
     )?;
     let mut midpoints = BTreeMap::new();
+    let mut hand_fitted = BTreeSet::new();
     for item in items {
         let fp = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
-        if fp
-            .attributes
-            .as_ref()
-            .is_some_and(|attrs| attrs.do_not_populate || attrs.exclude_from_position_files)
-        {
-            continue;
+        if let Some(attrs) = fp.attributes.as_ref() {
+            if attrs.do_not_populate {
+                continue;
+            }
+            if attrs.exclude_from_position_files {
+                let reference = fp
+                    .reference_field
+                    .as_ref()
+                    .and_then(|field| field.text.as_ref())
+                    .and_then(|text| text.text.as_ref())
+                    .map(|text| text.text.as_str())
+                    .filter(|reference| !reference.is_empty());
+                if let Some(reference) = reference
+                    .filter(|_| !attrs.exclude_from_bill_of_materials && !attrs.not_in_schematic)
+                {
+                    hand_fitted.insert(reference.to_string());
+                }
+                continue;
+            }
         }
         let reference = fp
             .reference_field
@@ -120,9 +140,11 @@ pub(crate) fn capture(
         client.save_document_to_string_in(document)? == contents,
         "board changed while reading JLCPCB midpoint geometry; retry after edits stop"
     );
+    hand_fitted.retain(|reference| !midpoints.contains_key(reference));
     Ok(Snapshot {
         contents,
         midpoints,
+        hand_fitted,
     })
 }
 
@@ -322,6 +344,30 @@ mod tests {
                         item.value = fp.encode_to_vec();
                     }
                 }
+                if matches!(mode, "hand-fitted" | "hand-fitted-hole") {
+                    // JF3 and JF4 are fitted by hand: out of position files
+                    // only. In "hand-fitted-hole" JF4 is out of the BOM too,
+                    // as a mounting hole is.
+                    for item in &mut items.items {
+                        let mut fp =
+                            kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                                .unwrap();
+                        let reference = fp
+                            .reference_field
+                            .as_ref()
+                            .and_then(|field| field.text.as_ref())
+                            .and_then(|text| text.text.as_ref())
+                            .map(|text| text.text.clone())
+                            .unwrap();
+                        if reference == "JF3" || reference == "JF4" {
+                            let attrs = fp.attributes.get_or_insert_default();
+                            attrs.exclude_from_position_files = true;
+                            attrs.exclude_from_bill_of_materials =
+                                mode == "hand-fitted-hole" && reference == "JF4";
+                            item.value = fp.encode_to_vec();
+                        }
+                    }
+                }
                 pack_any(&items, "kiapi.common.commands.GetItemsResponse")
             } else if command.type_url.ends_with("GetBoundingBox") {
                 let requested =
@@ -378,6 +424,9 @@ mod tests {
             let (converted, evidence) = convert_positions(positions, &snapshot.midpoints).unwrap();
             assert!(converted.contains("20.000000,-21.270000"), "{mode}");
             assert_eq!(evidence.len(), 1, "{mode}");
+            // A footprint left out of positions under a placed part's
+            // reference does not take that part away from the assembler.
+            assert!(snapshot.hand_fitted.is_empty(), "{mode}");
             assert_eq!(
                 snapshot.contents,
                 include_str!("../../../tests/fixtures/jlcpcb_midpoints/midpoints.kicad_pcb")
@@ -391,6 +440,36 @@ mod tests {
             assert!(
                 error.to_string().contains("duplicate footprint designator"),
                 "{mode}: {error}"
+            );
+        }
+    }
+
+    /// #681: a footprint out of position files but fitted, bought and in
+    /// the schematic is fitted by hand; one also out of the BOM is not.
+    #[test]
+    fn hand_fitted_parts_are_left_out_of_positions_only() {
+        let board = std::path::Path::new("midpoints.kicad_pcb");
+        let document =
+            crate::tools::pcb_board::board_mock::board_document(&board.to_string_lossy());
+        for (mode, expected) in [
+            ("hand-fitted", vec!["JF3", "JF4"]),
+            ("hand-fitted-hole", vec!["JF3"]),
+            ("good", vec![]),
+        ] {
+            let mock = fixture_server(board, mode);
+            let snapshot = capture(&KiCadIpcClient::new(mock.address()), document.clone()).unwrap();
+            let expected = expected
+                .into_iter()
+                .map(String::from)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(snapshot.hand_fitted, expected, "{mode}");
+            let placed = if mode == "good" { 11 } else { 9 };
+            assert_eq!(snapshot.midpoints.len(), placed, "{mode}");
+            assert!(
+                expected
+                    .iter()
+                    .all(|part| !snapshot.midpoints.contains_key(part)),
+                "{mode}"
             );
         }
     }
@@ -508,6 +587,18 @@ mod tests {
     /// schematic. Unix only: the stand-in is a shell script.
     #[cfg(unix)]
     async fn served_package(dir: &std::path::Path, stem: &str) -> (String, std::path::PathBuf) {
+        served_package_in(dir, stem, "good").await
+    }
+
+    /// [`served_package`] with the IPC fixture's `mode`. In the
+    /// "hand-fitted" modes the stand-in's positions leave out JF3 and JF4,
+    /// as KiCad does for `exclude_from_pos_files`.
+    #[cfg(unix)]
+    async fn served_package_in(
+        dir: &std::path::Path,
+        stem: &str,
+        mode: &'static str,
+    ) -> (String, std::path::PathBuf) {
         use crate::mcp::handler::McpHandler;
         use crate::tools::ServerConfig;
         let board = dir.join(format!("{stem}.kicad_pcb"));
@@ -517,9 +608,17 @@ mod tests {
         )
         .unwrap();
         let positions = dir.join("positions.csv");
+        let all_positions = include_str!("../../../tests/fixtures/jlcpcb_midpoints/positions.csv");
         std::fs::write(
             &positions,
-            include_str!("../../../tests/fixtures/jlcpcb_midpoints/positions.csv"),
+            all_positions
+                .lines()
+                .filter(|line| {
+                    !mode.starts_with("hand-fitted")
+                        || !(line.starts_with("\"JF3\"") || line.starts_with("\"JF4\""))
+                })
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
         )
         .unwrap();
         // The board is the last argument of each export.
@@ -563,7 +662,7 @@ mod tests {
         )
         .unwrap();
         let output = dir.join("package");
-        let mock = fixture_server(&board, "good");
+        let mock = fixture_server(&board, mode);
         let handler = McpHandler::new(ServerConfig {
             kicad_cli: cli.display().to_string(),
             kicad_binary: String::new(),
@@ -652,6 +751,55 @@ mod tests {
             orientation["applied_corrections"][0]
         );
         assert_eq!(evidence["policies"], orientation["policies"]);
+    }
+
+    /// #681: parts fitted by hand leave the BOM as they leave the CPL, so
+    /// the package is complete, and get a list of their own for purchase,
+    /// which is not uploaded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn served_jlcpcb_package_lists_hand_fitted_parts_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (text, output) = served_package_in(dir.path(), "midpoints", "hand-fitted").await;
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["complete"], true, "{body:#}");
+        assert_eq!(body["placement_orientation"]["geometry_count"], 9);
+        let hand = body["files_generated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["type"] == "bom_hand_fitted")
+            .unwrap_or_else(|| panic!("{body:#}"));
+        assert_eq!(hand["designators"], serde_json::json!(["JF3", "JF4"]));
+        let path = output.join("BOM-hand-fitted-midpoints.csv");
+        assert_eq!(hand["path"], path.to_str().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "\"Reference\"\n\"JF3,JF4\"\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(output.join("BOM-midpoints.csv")).unwrap(),
+            "\"Reference\"\n\"JB0,JB1,JB2,JB3,JB4,JF0,JF1,JF2\"\n\"R1\"\n"
+        );
+        let uploads = body["files"].as_array().unwrap();
+        assert!(
+            uploads.contains(&serde_json::json!("BOM-midpoints.csv")),
+            "{uploads:?}"
+        );
+        assert!(
+            !uploads.contains(&serde_json::json!("BOM-hand-fitted-midpoints.csv")),
+            "{uploads:?}"
+        );
+
+        // Without a hand-fitted part, the BOM is KiCad's, byte for byte.
+        let dir = tempfile::tempdir().unwrap();
+        let (text, output) = served_package(dir.path(), "midpoints").await;
+        assert!(!text.contains("bom_hand_fitted"), "{text}");
+        assert!(!output.join("BOM-hand-fitted-midpoints.csv").exists());
+        assert_eq!(
+            std::fs::read_to_string(output.join("BOM-midpoints.csv")).unwrap(),
+            "Reference\n\"JB0,JB1,JB2,JB3,JB4,JF0,JF1,JF2,JF3,JF4\"\nR1\n"
+        );
     }
 
     /// #69: evidence that cannot be written leaves a warning, no path and

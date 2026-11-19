@@ -898,6 +898,97 @@ fn is_kicad_reference_range(token: &str) -> bool {
     })
 }
 
+/// A JLCPCB BOM split between the assembler and the hands (#681).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HandFittedSplit {
+    /// The BOM the assembler receives: every row, less the hand-fitted parts.
+    pub assembly: String,
+    /// The same columns, for the hand-fitted parts only.
+    pub hand_fitted: String,
+    /// The hand-fitted parts the BOM listed.
+    pub designators: BTreeSet<String>,
+}
+
+/// Moves the `hand_fitted` parts of a JLCPCB BOM into a list of their own,
+/// with the same columns, so the assembler's BOM names what its CPL places
+/// and the parts fitted by hand are still bought. A group holding both kinds
+/// is cut in two, each half with its own quantity. `fields` is the BOM's
+/// `bom_fields`: it says which column is the quantity (KiCad's `Qty` without
+/// it). `None` when the BOM lists none of the hand-fitted parts.
+pub(crate) fn split_hand_fitted_bom(
+    source: &str,
+    hand_fitted: &BTreeSet<String>,
+    fields: Option<&str>,
+) -> anyhow::Result<Option<HandFittedSplit>> {
+    if hand_fitted.is_empty() {
+        return Ok(None);
+    }
+    let mut reader = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .from_reader(source.as_bytes());
+    let headers = reader.headers()?.clone();
+    let reference = headers
+        .iter()
+        .position(|header| matches!(header, "Designator" | "Reference" | "Refs"))
+        .context("JLCPCB BOM has no Designator/Reference/Refs column")?;
+    let quantity = match fields {
+        Some(fields) => fields.split(',').position(|field| {
+            let field = field.trim();
+            let field = field
+                .strip_prefix("${")
+                .and_then(|field| field.strip_suffix('}'))
+                .unwrap_or(field);
+            field.eq_ignore_ascii_case("QUANTITY")
+        }),
+        None => headers.iter().position(|header| header == "Qty"),
+    };
+    let writer = || {
+        csv::WriterBuilder::new()
+            .quote_style(csv::QuoteStyle::Always)
+            .from_writer(Vec::new())
+    };
+    let (mut assembly, mut hand) = (writer(), writer());
+    assembly.write_record(&headers)?;
+    hand.write_record(&headers)?;
+    let mut designators = BTreeSet::new();
+    for row in reader.records() {
+        let row = row?;
+        let group = row.get(reference).unwrap_or_default();
+        let (by_hand, by_machine): (Vec<&str>, Vec<&str>) = group
+            .split(',')
+            .map(str::trim)
+            .partition(|designator| hand_fitted.contains(*designator));
+        if by_hand.is_empty() {
+            assembly.write_record(&row)?;
+            continue;
+        }
+        designators.extend(by_hand.iter().map(|designator| designator.to_string()));
+        for (part, out) in [(&by_hand, &mut hand), (&by_machine, &mut assembly)] {
+            if part.is_empty() {
+                continue;
+            }
+            let fields = row.iter().enumerate().map(|(column, value)| {
+                if column == reference {
+                    part.join(",")
+                } else if Some(column) == quantity {
+                    part.len().to_string()
+                } else {
+                    value.to_string()
+                }
+            });
+            out.write_record(fields.collect::<Vec<_>>())?;
+        }
+    }
+    if designators.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(HandFittedSplit {
+        assembly: String::from_utf8(assembly.into_inner()?)?,
+        hand_fitted: String::from_utf8(hand.into_inner()?)?,
+        designators,
+    }))
+}
+
 pub(crate) fn jlcpcb_designator_mismatch(
     cpl: &BTreeSet<String>,
     bom: &BTreeSet<String>,
@@ -1503,6 +1594,61 @@ mod jlcpcb_assembly_tests {
 
     /// A reference containing `-` is one part (#121); only KiCad's range
     /// shape is refused, and not when the CPL names it as a part.
+    /// #681: hand-fitted parts leave the assembler's BOM for a list of their
+    /// own, a mixed group is cut in two with a quantity each, and the
+    /// assembler's BOM then matches a CPL that left them out.
+    #[test]
+    fn hand_fitted_parts_leave_the_assembly_bom_with_their_quantity() {
+        let hand = BTreeSet::from(["J1".to_string(), "R3".to_string()]);
+        let fields = Some("Reference,Value,Footprint,LCSC,${QUANTITY}");
+        let bom = "\"Designator\",\"Value\",\"Footprint\",\"LCSC\",\"Quantity\"\n\
+                   \"R1,R2,R3\",\"10k\",\"R_0805\",\"C17414\",\"3\"\n\
+                   \"J1\",\"Conn\",\"PinHeader_1x02\",\"C492401\",\"1\"\n\
+                   \"U1\",\"MCU\",\"QFN-32\",\"C8734\",\"1\"\n";
+        let split = split_hand_fitted_bom(bom, &hand, fields).unwrap().unwrap();
+        assert_eq!(
+            split.assembly,
+            "\"Designator\",\"Value\",\"Footprint\",\"LCSC\",\"Quantity\"\n\
+             \"R1,R2\",\"10k\",\"R_0805\",\"C17414\",\"2\"\n\
+             \"U1\",\"MCU\",\"QFN-32\",\"C8734\",\"1\"\n"
+        );
+        assert_eq!(
+            split.hand_fitted,
+            "\"Designator\",\"Value\",\"Footprint\",\"LCSC\",\"Quantity\"\n\
+             \"R3\",\"10k\",\"R_0805\",\"C17414\",\"1\"\n\
+             \"J1\",\"Conn\",\"PinHeader_1x02\",\"C492401\",\"1\"\n"
+        );
+        assert_eq!(split.designators, hand);
+
+        let cpl = BTreeSet::from(["R1".to_string(), "R2".to_string(), "U1".to_string()]);
+        assert!(
+            jlcpcb_designator_mismatch(&cpl, &jlcpcb_bom_designators(bom, None).unwrap()).is_some()
+        );
+        let assembly = jlcpcb_bom_designators(&split.assembly, Some(&cpl)).unwrap();
+        assert_eq!(jlcpcb_designator_mismatch(&cpl, &assembly), None);
+
+        // KiCad's default columns name the quantity `Qty`.
+        let default = "\"Refs\",\"Value\",\"Footprint\",\"Qty\",\"DNP\"\n\
+                       \"J1,J2\",\"Conn\",\"PinHeader_1x02\",\"2\",\"\"\n";
+        let split = split_hand_fitted_bom(default, &hand, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            split.assembly,
+            "\"Refs\",\"Value\",\"Footprint\",\"Qty\",\"DNP\"\n\
+             \"J2\",\"Conn\",\"PinHeader_1x02\",\"1\",\"\"\n"
+        );
+        assert_eq!(split.designators, BTreeSet::from(["J1".to_string()]));
+
+        // Nothing to move: no split, the BOM stays KiCad's.
+        let none = BTreeSet::from(["J9".to_string()]);
+        assert_eq!(split_hand_fitted_bom(bom, &none, fields).unwrap(), None);
+        assert_eq!(
+            split_hand_fitted_bom(bom, &BTreeSet::new(), fields).unwrap(),
+            None
+        );
+    }
+
     #[test]
     fn hyphenated_references_are_parts_and_only_unknown_ranges_are_refused() {
         let bom = "\"Refs\",\"Value\"\n\"SMB-19-A1,SMB-19-K1\",\"clip\"\n\"R1\",\"10k\"\n\"C1-1\",\"1u\"\n";
