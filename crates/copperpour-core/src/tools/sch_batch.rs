@@ -146,9 +146,11 @@ pub fn tools() -> Vec<ToolDef> {
              a pin already carrying this net's power symbol is skipped. A group whose stubs \
              or bar would touch any other pin, wire, label or junction is not joined; its \
              pins get a symbol each and the group reports why. Unresolvable pins refuse \
-             the whole call before writing. Each symbol's #PWR number is the lowest free in the \
-             whole hierarchy, after the previous symbol's (one per instance of a sheet placed \
-             more than once; a sheet no project owns is numbered against itself alone; a \
+             the whole call before writing. Each symbol takes the library symbol's reference \
+             prefix (#PWR, or #FLG for PWR_FLAG; each prefix its own series) and the lowest \
+             number free in it in the whole hierarchy, after the previous symbol's (one per \
+             instance of a sheet placed more than once; a sheet no project owns is numbered \
+             against itself alone; a \
              sheet file that cannot be read is named in other_sheets_unreadable, its numbers \
              unseen). One \
              file write with committed-file readback.",
