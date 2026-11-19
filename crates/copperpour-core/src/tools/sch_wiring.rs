@@ -219,7 +219,8 @@ pub fn tools() -> Vec<ToolDef> {
              pin's endpoint and, unless rotation is given, turns it to face away from the body. \
              Coordinates snap to the 1.27mm grid like the other placers. Reports the placed \
              coordinates. Auto-numbers the \
-             internal #PWR reference to the lowest number free in the whole hierarchy, one per \
+             internal reference in the library symbol's prefix (#PWR, or #FLG for PWR_FLAG; each \
+             prefix its own series) to the lowest number free in the whole hierarchy, one per \
              instance of a sheet placed more than once; a sheet no project owns is numbered \
              against itself alone, and a sheet file that cannot be read is named in \
              other_sheets_unreadable, its numbers unseen. Preserves every \
@@ -2664,14 +2665,20 @@ async fn handle_batch_rotate_labels(
     Ok(CallToolResult::json(&json!({ "rotated": rotated })))
 }
 
-/// The `#PWR` number of a designator, when it is one.
-fn pwr_number(designator: &str) -> Option<u32> {
+/// The number of a designator in the `prefix` series, when it is one.
+fn number_in_series(designator: &str, prefix: &str) -> Option<u32> {
     let parsed = super::sch_annotate::parse_designator(designator);
-    (parsed.prefix == "#PWR").then_some(parsed.number).flatten()
+    (parsed.prefix == prefix).then_some(parsed.number).flatten()
 }
 
-/// The `#PWR` numbers the hierarchy a new power symbol joins already holds,
-/// and the numbers it hands out.
+/// The numbers of a new power symbol's prefix series that the hierarchy it
+/// joins already holds, and the numbers it hands out.
+///
+/// The prefix is the library symbol's, as eeschema takes it when it places
+/// one (`SCH_SYMBOL`'s constructor, `eeschema/sch_symbol.cpp:104` in KiCad
+/// 10.0.8): `#PWR` for a rail, `#FLG` for `PWR_FLAG`. Annotation numbers each
+/// prefix on its own, so a flag neither takes nor skips a `#PWR` number
+/// (#110).
 ///
 /// eeschema checks annotation over the whole hierarchy with power symbols
 /// included, so a number held on any sheet is held for all of them. Taking
@@ -2680,6 +2687,8 @@ fn pwr_number(designator: &str) -> Option<u32> {
 /// from a sheet of 29 and the count is 28, so the next symbol would be handed
 /// `#PWR029`, still in use.
 struct PwrNumbering {
+    /// The series numbered, such as `#PWR` or `#FLG`.
+    prefix: String,
     held: std::collections::HashSet<u32>,
     /// The file's instance paths in eeschema's hierarchy order, as it numbers
     /// its pages. The first is the instance whose designator eeschema saves
@@ -2692,24 +2701,39 @@ struct PwrNumbering {
 }
 
 impl PwrNumbering {
-    /// This sheet's own designators, property and instance records, plus the
-    /// project's instance records on every other sheet file of the hierarchy
-    /// that owns it (`reserved_on_other_sheets`, as `annotate_schematic`
-    /// reads them). In a file KiCad saved the `Reference` property is one of
-    /// the instance records, so the records hold every number. A sheet no
-    /// project owns is numbered against itself alone; a file that cannot be
-    /// read is named in `unreadable`.
+    /// The series of `lib_id`, whose definition `sch` must already embed:
+    /// this sheet's own designators in it, property and instance records,
+    /// plus the project's instance records on every other sheet file of the
+    /// hierarchy that owns it (`reserved_on_other_sheets`, as
+    /// `annotate_schematic` reads them). In a file KiCad saved the
+    /// `Reference` property is one of the instance records, so the records
+    /// hold every number. A sheet no project owns is numbered against itself
+    /// alone; a file that cannot be read is named in `unreadable`.
     fn for_sheet(
         sch_path: &std::path::Path,
         sch: &cse::Schematic,
+        lib_id: &str,
         context: &crate::tools::SheetInstanceContext,
     ) -> Self {
+        // Split as eeschema's `GetRefDesPrefix` splits it, trailing digits
+        // and `?` dropped. A library symbol with no prefix keeps `#PWR`, the
+        // series this tool always used, whose `#` keeps the symbol out of the
+        // netlist.
+        let prefix = match super::sch_annotate::parse_designator(
+            &cse::library::symbol_metadata(sch, lib_id).reference,
+        )
+        .prefix
+        {
+            prefix if prefix.is_empty() => "#PWR".to_owned(),
+            prefix => prefix,
+        };
+        let numbered = |designator: &str| number_in_series(designator, &prefix);
         let mut held = std::collections::HashSet::new();
         for symbol in &sch.symbols {
-            held.extend(symbol.reference().and_then(pwr_number));
+            held.extend(symbol.reference().and_then(numbered));
             for instance in symbol.instances() {
                 if instance.project.as_deref() == Some(context.project_name.as_str()) {
-                    held.extend(instance.reference.as_deref().and_then(pwr_number));
+                    held.extend(instance.reference.as_deref().and_then(numbered));
                 }
             }
         }
@@ -2723,7 +2747,7 @@ impl PwrNumbering {
                     sch_path,
                     &context.project_name,
                 );
-                held.extend(reserved.get("#PWR").into_iter().flatten().copied());
+                held.extend(reserved.get(&prefix).into_iter().flatten().copied());
                 consulted.extend(seen);
                 unreadable.extend(missed);
             }
@@ -2755,6 +2779,7 @@ impl PwrNumbering {
             unreadable.dedup();
         }
         Self {
+            prefix,
             held,
             hierarchy_order,
             consulted,
@@ -2787,7 +2812,7 @@ impl PwrNumbering {
                 self.held.insert(number);
                 (
                     path.clone(),
-                    super::sch_annotate::format_designator("#PWR", number),
+                    super::sch_annotate::format_designator(&self.prefix, number),
                 )
             })
             .collect();
@@ -2969,9 +2994,9 @@ impl ExistingPower {
     }
 }
 
-/// Add a `power_net` symbol at (x, y), numbered with the next free `#PWR` of
-/// each sheet instance. Returns its reference and the placement the readback
-/// is checked against.
+/// Add a `power_net` symbol at (x, y), numbered with the next free number of
+/// its prefix series (`#PWR`, `#FLG`) for each sheet instance. Returns its
+/// reference and the placement the readback is checked against.
 #[allow(clippy::too_many_arguments)]
 fn add_power_symbol_to(
     sch: &mut cse::Schematic,
@@ -3186,7 +3211,7 @@ async fn handle_add_power_symbol(
             power_symbol_on_point(&power_pin, endpoint, outward, requested_rotation)
         }
     };
-    let mut numbering = PwrNumbering::for_sheet(&sch_path, &sch, &context);
+    let mut numbering = PwrNumbering::for_sheet(&sch_path, &sch, &lib_id, &context);
     let (pwr_ref, placement) = add_power_symbol_to(
         &mut sch,
         &context,
@@ -3573,7 +3598,7 @@ pub(crate) async fn handle_batch_add_power_symbol(
     };
 
     let existing_wires = cse_wires_to_sexp(&sch);
-    let mut numbering = PwrNumbering::for_sheet(&sch_path, &sch, &context);
+    let mut numbering = PwrNumbering::for_sheet(&sch_path, &sch, &lib_id, &context);
     let mut placed = Vec::new();
     let mut new_wires: Vec<copperpour_sexp::schematic::Wire> = Vec::new();
     for plan in &plans {
@@ -6523,10 +6548,14 @@ mod power_symbol_tests {
     }
 
     async fn add_gnd(path: &std::path::Path, x: f64) -> serde_json::Value {
+        add_power(path, "GND", x).await
+    }
+
+    async fn add_power(path: &std::path::Path, power_net: &str, x: f64) -> serde_json::Value {
         let result = handle_add_power_symbol(
             &json!({
                 "schematic": path.display().to_string(),
-                "power_net": "GND",
+                "power_net": power_net,
                 "x": x,
                 "y": 25.4
             }),
@@ -6772,13 +6801,13 @@ mod power_symbol_tests {
         (symbol.reference().unwrap().to_string(), records)
     }
 
-    /// The expected records of one symbol: `first`, `first + 1`, ... on
-    /// `CELL_PATHS_BY_PAGE`, sorted by path.
-    fn cell_records(first: u32) -> Vec<(String, String)> {
+    /// The expected records of one symbol: `prefix` numbered `first`,
+    /// `first + 1`, ... on `CELL_PATHS_BY_PAGE`, sorted by path.
+    fn cell_records(prefix: &str, first: u32) -> Vec<(String, String)> {
         let mut records: Vec<(String, String)> = CELL_PATHS_BY_PAGE
             .iter()
             .zip(first..)
-            .map(|(path, number)| (path.to_string(), format!("#PWR0{number}")))
+            .map(|(path, number)| (path.to_string(), format!("{prefix}0{number}")))
             .collect();
         records.sort();
         records
@@ -6800,7 +6829,7 @@ mod power_symbol_tests {
         // lowest free are 17..20, handed out in page order. The property is
         // the file's first instance in page order, as `property_after` sets it.
         let (property, records) = property_and_records(&cell, placed["uuid"].as_str().unwrap());
-        assert_eq!(records, cell_records(17));
+        assert_eq!(records, cell_records("#PWR", 17));
         assert_eq!(property, "#PWR017");
         assert_eq!(placed["reference"], json!("#PWR017"), "{placed}");
         // The other two files were read, none was unreadable.
@@ -6837,7 +6866,7 @@ mod power_symbol_tests {
         for (group, first) in groups.iter().zip([17, 21]) {
             let uuid = group["symbol"]["uuid"].as_str().unwrap();
             let (property, records) = property_and_records(&cell, uuid);
-            assert_eq!(records, cell_records(first), "{body}");
+            assert_eq!(records, cell_records("#PWR", first), "{body}");
             assert_eq!(property, format!("#PWR0{first}"));
         }
         assert_eq!(body["other_sheets_unreadable"], json!([]), "{body}");
@@ -6892,6 +6921,148 @@ mod power_symbol_tests {
         assert_eq!(placed["is_error"], json!(false), "{placed}");
         assert_eq!(placed["reference"], json!("#PWR03"), "{placed}");
         assert_eq!(placed["other_sheets_consulted"], json!([]), "{placed}");
+    }
+
+    // ─── Each library prefix is its own series (#110) ──────────────────────
+    //
+    // `stock_reference_prefix_libraries` resolves `power:PWR_FLAG` to KiCad's
+    // own definition, whose `Reference` is `#FLG`; nothing here embeds it
+    // beforehand. The tests hold its env guard across awaits on purpose; see
+    // the note on `sch_components::tests`.
+
+    /// The issue's reproduction, `PWR_FLAG` then `GND` on a fresh sheet,
+    /// carried on. The flag takes the library's `#FLG` and its own numbers,
+    /// so the first `GND` is still `#PWR01`; the two flags after it continue
+    /// from the flag on the sheet, not from the `GND`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn pwr_flag_takes_the_librarys_flg_in_a_series_of_its_own() {
+        let (dir, _env) = crate::tools::stock_reference_prefix_libraries();
+        let path = dir.path().join("flags.kicad_sch");
+        std::fs::write(&path, sheet_with_power_symbols("flags", &[])).unwrap();
+
+        let mut reported = Vec::new();
+        for (power_net, x) in [
+            ("PWR_FLAG", 25.4),
+            ("GND", 38.1),
+            ("PWR_FLAG", 50.8),
+            ("PWR_FLAG", 63.5),
+            ("GND", 76.2),
+        ] {
+            let placed = add_power(&path, power_net, x).await;
+            reported.push(placed["reference"].as_str().unwrap().to_string());
+        }
+        assert_eq!(reported, ["#FLG01", "#PWR01", "#FLG02", "#FLG03", "#PWR02"]);
+        let placed = |lib_id: &str, designator: &str| {
+            (
+                lib_id.to_string(),
+                designator.to_string(),
+                vec![designator.to_string()],
+            )
+        };
+        assert_eq!(
+            crate::tools::placed_references(&path),
+            vec![
+                placed("power:GND", "#PWR01"),
+                placed("power:GND", "#PWR02"),
+                placed("power:PWR_FLAG", "#FLG01"),
+                placed("power:PWR_FLAG", "#FLG02"),
+                placed("power:PWR_FLAG", "#FLG03"),
+            ]
+        );
+    }
+
+    /// The nested project as KiCad saved it, laid out beside the stock
+    /// `sym-lib-table`.
+    fn nested_project_with_stock_libraries(dir: &std::path::Path) {
+        for (name, content) in [
+            ("nested_pages.kicad_pro", NESTED_PRO),
+            ("nested_pages.kicad_sch", NESTED_ROOT),
+            ("bank.kicad_sch", NESTED_BANK),
+            ("cell.kicad_sch", NESTED_CELL),
+        ] {
+            std::fs::write(dir.join(name), content).unwrap();
+        }
+    }
+
+    /// No sheet of the nested project holds a `#FLG`, so its `#PWR01`..
+    /// `#PWR016` do not push a flag to 17. A flag on `bank.kicad_sch` takes
+    /// `#FLG01` under `south` (page 2) and `#FLG02` under `north` (page 10);
+    /// one on `cell.kicad_sch` then reads those from the other file and
+    /// takes `#FLG03`..`#FLG06` in page order.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn pwr_flag_is_numbered_across_the_hierarchy_apart_from_pwr() {
+        let (dir, _env) = crate::tools::stock_reference_prefix_libraries();
+        nested_project_with_stock_libraries(dir.path());
+        let handler = served_handler().await;
+        let flag = json!({"power_net": "PWR_FLAG", "x": 25.4, "y": 25.4});
+
+        let bank = dir.path().join("bank.kicad_sch");
+        let placed =
+            super::batch_power_tests::serve(&handler, "add_power_symbol", &bank, flag.clone())
+                .await;
+        assert_eq!(placed["is_error"], json!(false), "{placed}");
+        assert_eq!(placed["reference"], json!("#FLG01"), "{placed}");
+        let (property, records) = property_and_records(&bank, placed["uuid"].as_str().unwrap());
+        assert_eq!(
+            records,
+            [
+                (
+                    "/970f1adb-65bd-4ca9-bbaf-b939cab8549c/8cca053b-d9dc-44e3-a2d7-e24a663aa548"
+                        .to_string(),
+                    "#FLG02".to_string()
+                ),
+                (
+                    "/970f1adb-65bd-4ca9-bbaf-b939cab8549c/ed5b7508-65bd-450d-b053-99de75ca07ff"
+                        .to_string(),
+                    "#FLG01".to_string()
+                ),
+            ]
+        );
+        assert_eq!(property, "#FLG01");
+
+        let cell = dir.path().join("cell.kicad_sch");
+        let placed =
+            super::batch_power_tests::serve(&handler, "add_power_symbol", &cell, flag).await;
+        assert_eq!(placed["is_error"], json!(false), "{placed}");
+        let (property, records) = property_and_records(&cell, placed["uuid"].as_str().unwrap());
+        assert_eq!(records, cell_records("#FLG", 3));
+        assert_eq!(property, "#FLG03");
+        assert_eq!(placed["other_sheets_unreadable"], json!([]), "{placed}");
+    }
+
+    /// `batch_add_power_symbol` numbers its flags in the same series: the
+    /// first takes `#FLG01`..`#FLG04`, the second `#FLG05`..`#FLG08`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_batch_of_pwr_flags_is_numbered_in_the_flg_series() {
+        let (dir, _env) = crate::tools::stock_reference_prefix_libraries();
+        nested_project_with_stock_libraries(dir.path());
+        let cell = dir.path().join("cell.kicad_sch");
+        let body = super::batch_power_tests::serve(
+            &served_handler().await,
+            "batch_add_power_symbol",
+            &cell,
+            json!({
+                "power_net": "PWR_FLAG",
+                "max_gap": 10,
+                "pins": [
+                    {"reference": "R6", "pin_number": "1"},
+                    {"reference": "R7", "pin_number": "1"},
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(body["is_error"], json!(false), "{body}");
+        let groups = body["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "{body}");
+        for (group, first) in groups.iter().zip([1, 5]) {
+            let uuid = group["symbol"]["uuid"].as_str().unwrap();
+            let (property, records) = property_and_records(&cell, uuid);
+            assert_eq!(records, cell_records("#FLG", first), "{body}");
+            assert_eq!(property, format!("#FLG0{first}"));
+        }
     }
 }
 
