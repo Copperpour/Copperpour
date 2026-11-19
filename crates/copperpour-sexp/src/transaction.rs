@@ -7,8 +7,8 @@
 //! explicit resolution.
 
 use crate::writer::{
-    ensure_kicad_design_document_is_closed, lock_document_exclusive, read_string_unlocked,
-    sync_parent_directory, write_atomic_unlocked, write_new_atomic_unlocked,
+    ensure_kicad_design_document_is_closed, lock_document_exclusive, parent_directory,
+    read_string_unlocked, sync_parent_directory, write_atomic_unlocked, write_new_atomic_unlocked,
     write_new_atomic_unlocked_private, ExclusiveDocumentLock,
 };
 use crate::SexpError;
@@ -736,7 +736,7 @@ fn persist_journal(path: &Path, journal: &Journal) -> Result<(), SexpError> {
 
 fn remove_journal(path: &Path) -> Result<(), SexpError> {
     std::fs::remove_file(path)?;
-    sync_parent_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+    sync_parent_directory(parent_directory(path))
 }
 
 fn journal_path(root: &Path, id: &str) -> PathBuf {

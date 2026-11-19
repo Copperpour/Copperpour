@@ -25,11 +25,11 @@ pub(crate) async fn export_jlcpcb_cpl(
     project_policy_path: Option<&Path>,
     midpoints: &std::collections::BTreeMap<String, midpoints::Midpoint>,
 ) -> anyhow::Result<JlcpcbCplExport> {
-    let staging = tempfile::tempdir_in(
-        output
-            .parent()
-            .context("JLCPCB CPL output has no parent directory")?,
-    )?;
+    let staging_parent = output
+        .parent()
+        .map(|_| copperpour_sexp::writer::parent_directory(output))
+        .context("JLCPCB CPL output has no parent directory")?;
+    let staging = tempfile::tempdir_in(staging_parent)?;
     let native = staging.path().join("kicad-positions.csv");
     cli::export_position_file_excluding_dnp(cli_path, board, &native, "csv", "mm", side).await?;
     let source = tokio::fs::read_to_string(&native).await?;

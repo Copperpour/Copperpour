@@ -1032,10 +1032,7 @@ fn sheet_pin_edge_is_full(
 }
 
 fn parent_dir(sch_path: &Path) -> PathBuf {
-    sch_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."))
+    copperpour_sexp::writer::parent_directory(sch_path).to_path_buf()
 }
 
 #[cfg(test)]
@@ -2307,7 +2304,7 @@ async fn handle_add_hierarchical_sheet(
             "The child sheet directory does not exist",
         ));
     }
-    if child_path == parent_path {
+    if super::same_schematic_document(&child_path, &parent_path) {
         return Ok(CallToolResult::error(
             "A hierarchical sheet cannot reference its parent file",
         ));

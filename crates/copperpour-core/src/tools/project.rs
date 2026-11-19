@@ -1548,7 +1548,10 @@ async fn handle_rename_project(
             format!("Project file not found: {}", pro_path.display()),
         ));
     }
-    let Some(dir) = pro_path.parent().map(std::path::Path::to_path_buf) else {
+    let Some(dir) = pro_path
+        .parent()
+        .map(|_| copperpour_sexp::writer::parent_directory(&pro_path).to_path_buf())
+    else {
         return Ok(CallToolResult::error(
             "project path has no parent directory",
         ));

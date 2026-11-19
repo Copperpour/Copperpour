@@ -2238,3 +2238,104 @@ fn placement_overview_refuses_bad_arguments_before_reading_the_board() {
         assert_eq!(error["kind"], "invalid_argument", "{arguments}: {error}");
     }
 }
+
+#[test]
+fn closed_file_move_component_accepts_a_bare_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../copperpour-core/tests/fixtures/specctra_two_resistors.kicad_pcb"
+    );
+    let board = dir.path().join("m.kicad_pcb");
+    std::fs::copy(fixture, &board).unwrap();
+
+    let mut p =
+        McpProcess::spawn_with_env_without(Some(dir.path()), true, &[], &["KICAD_API_SOCKET"]);
+    let load = p.call_tool("load_toolset", json!({"name": "pcb_components"}));
+    assert_ne!(load["isError"], json!(true), "{load}");
+
+    let moved = p.call_tool(
+        "move_component",
+        json!({"board": "m.kicad_pcb", "reference": "R1", "x": 120, "y": 95}),
+    );
+    assert_ne!(moved["isError"], json!(true), "{moved}");
+    let body = McpProcess::tool_body(&moved);
+    assert_eq!(body["moved"], "R1");
+    assert_eq!(body["source"], "file");
+    assert_eq!(body["x"], json!(120.0));
+    assert_eq!(body["y"], json!(95.0));
+
+    let disk = std::fs::read_to_string(&board).unwrap();
+    assert!(
+        disk.contains("(at 120 95"),
+        "expected updated R1 coordinates on disk"
+    );
+}
+
+#[test]
+fn closed_file_sibling_writers_accept_a_bare_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_dir = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../copperpour-core/tests/fixtures/title_block_hierarchy"
+    ));
+    for name in [
+        "complex_hierarchy.kicad_sch",
+        "ampli_ht.kicad_sch",
+        "complex_hierarchy.kicad_pro",
+    ] {
+        std::fs::copy(fixture_dir.join(name), dir.path().join(name)).unwrap();
+    }
+
+    let mut p =
+        McpProcess::spawn_with_env_without(Some(dir.path()), true, &[], &["KICAD_API_SOCKET"]);
+    let load_sch = p.call_tool("load_toolset", json!({"name": "sch_hierarchy"}));
+    assert_ne!(load_sch["isError"], json!(true), "{load_sch}");
+    let load_proj = p.call_tool("load_toolset", json!({"name": "project"}));
+    assert_ne!(load_proj["isError"], json!(true), "{load_proj}");
+
+    let tb = p.call_tool(
+        "set_schematic_title_block",
+        json!({
+            "schematic": "complex_hierarchy.kicad_sch",
+            "title": "Bare Filename Title",
+            "scope": "hierarchy"
+        }),
+    );
+    assert_ne!(tb["isError"], json!(true), "{tb}");
+    for name in ["complex_hierarchy.kicad_sch", "ampli_ht.kicad_sch"] {
+        let content = std::fs::read_to_string(dir.path().join(name)).unwrap();
+        assert!(
+            content.contains("(title \"Bare Filename Title\")"),
+            "{name} missing updated title"
+        );
+    }
+
+    let self_ref = p.call_tool(
+        "add_hierarchical_sheet",
+        json!({
+            "schematic": "complex_hierarchy.kicad_sch",
+            "sheet_name": "Loop",
+            "sheet_file": "complex_hierarchy.kicad_sch",
+            "x": 100.0,
+            "y": 100.0
+        }),
+    );
+    assert_eq!(self_ref["isError"], json!(true), "{self_ref}");
+    assert!(
+        self_ref["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cannot reference its parent file"),
+        "{self_ref}"
+    );
+
+    let rp = p.call_tool(
+        "rename_project",
+        json!({"project": "complex_hierarchy.kicad_pro", "new_name": "renamed"}),
+    );
+    assert_ne!(rp["isError"], json!(true), "{rp}");
+    assert!(dir.path().join("renamed.kicad_pro").is_file());
+    assert!(dir.path().join("renamed.kicad_sch").is_file());
+    assert!(!dir.path().join("complex_hierarchy.kicad_pro").exists());
+}
