@@ -1,5 +1,8 @@
 name: CI
 
+# The required checks (GOVERNANCE.md, "Where CI runs"). Check & Test runs here
+# on ubuntu-latest only: windows.yml and macos.yml run it on the other two
+# operating systems, each with its own concurrency group.
 on:
   push:
     branches: [main]
@@ -24,7 +27,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

@@ -1,11 +1,10 @@
 name: macOS
 
-# The macOS jobs of ci.yml and release.yml (#392). Those workflows run on local
+# The macOS jobs of ci.yml and release.yml (#392). release.yml runs on local
 # CI, which can't run macOS: Apple's licence allows macOS virtual machines only
-# on Apple hardware. This workflow stays enabled on GitHub. On PRs and main it
-# runs only Check & Test (macos-latest), beside local CI; it is not a required
-# check, because macOS runners are often busy. The build jobs run only for a
-# release. It publishes nothing; the maintainer cutting a release downloads its
+# on Apple hardware. On PRs and main this runs only Check & Test
+# (macos-latest), beside ci.yml; it is not a required check, because macOS
+# runners are often busy. The build jobs run only for a release. It publishes nothing; the maintainer cutting a release downloads its
 # artifacts.
 on:
   push:

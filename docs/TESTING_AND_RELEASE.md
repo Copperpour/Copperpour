@@ -99,11 +99,13 @@ saved zones, footprints/pads, tracks/vias, and drawing identities with pcbnew.
 
 ## CI And Live Validation
 
-CI runs on a maintainer's machine, not on GitHub Actions
-([GOVERNANCE.md](../GOVERNANCE.md#where-ci-runs)). It runs `.github/workflows/ci.yml`'s
-jobs on every PR: the Rust workspace, formatting, clippy, documentation tests,
-viewer, plugin, Nix, and PCM validation. The real-KiCad job runs
-`e2e-kicad.yml`'s steps against KiCad 10.0.5 in a Windows VM. It is not a per-PR
+PR CI runs on GitHub Actions ([GOVERNANCE.md](../GOVERNANCE.md#where-ci-runs)):
+`ci.yml` runs on every PR: the Rust workspace on Linux, formatting, clippy,
+documentation tests, plugin, Nix, licenses, PCM validation and the offline
+build; `windows.yml` and `macos.yml` run Check & Test on those systems. The
+release build and the real-KiCad job run on a maintainer's machine (local CI).
+The real-KiCad job runs `e2e-kicad.yml`'s steps against KiCad 10.0.5 in a
+Windows VM. It is not a per-PR
 check, because it takes over half an hour. Ask a maintainer to run it on a pull
 request when KiCad-facing behavior needs that evidence. The `run:e2e-kicad`
 label no longer triggers anything.
