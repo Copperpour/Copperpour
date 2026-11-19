@@ -44,8 +44,9 @@ Each `.ipc.bin` footprint is the `Any.value` of one item of KiCad's
 U3's `${REFERENCE}` text on B.Fab is reported at 0°, where refresh builds
 180°. The text is keep-upright, so both draw the same. The angle KiCad keeps
 depends on the flip direction: flipped top to bottom instead, KiCad keeps
-180°. That difference is not part of #283, so the tests compare only U3's
-pads and point.
+180°. [#319](https://github.com/Copperpour/Copperpour/issues/319) folds
+keep-upright text angles modulo 180° when comparing, so U3 matches its library
+in full.
 
 ## Redaction
 
