@@ -116,8 +116,24 @@ In the all-platforms package, `bin/copperpour` is a small `sh` launcher that run
 the macOS or Linux server beside it, so the path is the same in both packages.
 
 <a id="setup-with-claude-desktop"></a>
-**Claude Desktop**: add to `claude_desktop_config.json`
-(`%APPDATA%\Claude\` on Windows, `~/Library/Application Support/Claude/` on macOS)
+**Claude Desktop (recommended — `.mcpb` extension)**: download the `.mcpb`
+package for your OS from [Releases](https://github.com/Copperpour/Copperpour/releases)
+(`copperpour-v<version>-windows-x86_64.mcpb`,
+`copperpour-v<version>-macos-universal.mcpb`, or
+`copperpour-v<version>-linux-x86_64.mcpb`), then install it via
+**Settings → Extensions → Advanced settings → Install Extension…** (or
+double-click on Windows/macOS). The `.mcpb` bundle is self-contained — no manual
+JSON editing or PCM binary path lookup is needed. KiCad 10 (with **Enable KiCad
+API** for PCB tools) is still required; operating guidance is served
+automatically via MCP instructions/resources and `get_guidance` (Claude Desktop
+skill ZIP uploads remain separate). See the
+[Claude Desktop extension guide](docs/CLAUDE_DESKTOP_EXTENSION.md) for upgrade,
+uninstall, and Linux/Fedora notes.
+
+**Claude Desktop (manual fallback)**: if you prefer manual registration or your
+Linux/Fedora Claude Desktop build does not support `.mcpb` installs, add to
+`claude_desktop_config.json` (`%APPDATA%\Claude\` on Windows,
+`~/Library/Application Support/Claude/` on macOS, `~/.config/Claude/` on Linux)
 and restart Claude Desktop:
 
 ```json

@@ -28,6 +28,7 @@ cargo fmt --all -- --check
 | Viewer engine and browser service | `crates/copperpour-viewer` engine and HTTP/SSE tests, included in workspace checks |
 | Python plugin | `plugin/tests` and the plugin CI job |
 | PCM package | `packaging/validate-pcm.py` and packaging CI jobs |
+| Claude Desktop extension (`.mcpb`) | `packaging/build-mcpb.py`, `packaging/validate-mcpb.py`, `packaging/tests/test_mcpb.py`, and packaging/release CI jobs |
 
 Run the engine tests without GUI prerequisites using
 `cargo test -p copperpour-viewer --locked`. Workspace commands compile the

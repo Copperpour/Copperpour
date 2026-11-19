@@ -231,11 +231,50 @@ jobs:
           python packaging/validate-pcm.py \
             --zip "dist/copperpour-pcm-v$version-${{ matrix.platform }}.zip"
 
-      - name: Upload artifact
+      - name: Assemble and validate Claude Desktop (.mcpb) package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_VERSION#v}"
+          case "${{ matrix.platform }}" in
+            windows)
+              binary="target/release/copperpour.exe"
+              suffix="windows-x86_64"
+              ;;
+            macos)
+              binary="dist/universal/copperpour"
+              suffix="macos-universal"
+              ;;
+            linux)
+              binary="target/release/copperpour"
+              suffix="linux-x86_64"
+              ;;
+          esac
+          python packaging/build-mcpb.py --version "$version" \
+            --binary "$binary" --platform "${{ matrix.platform }}" --out dist-mcpb
+          if [ "${{ github.event_name }}" = "push" ]; then
+            python packaging/validate-mcpb.py \
+              --bundle "dist-mcpb/copperpour-v$version-$suffix.mcpb" \
+              --expected-version "$version" \
+              --smoke-test --check-binary-version
+          else
+            python packaging/validate-mcpb.py \
+              --bundle "dist-mcpb/copperpour-v$version-$suffix.mcpb" \
+              --expected-version "$version" \
+              --smoke-test
+          fi
+
+      - name: Upload PCM artifact
         uses: actions/upload-artifact@v7
         with:
           name: copperpour-pcm-${{ matrix.platform }}
           path: dist/copperpour-pcm-*.zip
+
+      - name: Upload Claude Desktop (.mcpb) artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: copperpour-mcpb-${{ matrix.platform }}
+          path: dist-mcpb/copperpour-*.mcpb
 
   # The zip and metadata for a KiCad addon repository submission: the three
   # platform zips merged into one, and its version entry with the

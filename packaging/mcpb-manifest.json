@@ -1,0 +1,44 @@
+{
+  "manifest_version": "0.3",
+  "name": "copperpour",
+  "display_name": "Copperpour",
+  "version": "0.16.1",
+  "description": "AI-assisted KiCad schematic and PCB design via the Model Context Protocol.",
+  "long_description": "Copperpour gives Claude Desktop direct access to KiCad 10 schematics and PCBs through a self-contained local MCP server. Edit schematics with revision-checked atomic writes, lay out and route PCBs in real time over KiCad's IPC API, run ERC/DRC and design reviews, search JLCPCB parts, and export manufacturing outputs.\n\nPrerequisites: KiCad 10 installed locally. PCB layout tools require KiCad running with the board open and Preferences -> Plugins -> Enable KiCad API turned on. Operating guidance is served automatically through MCP instructions, resources, and get_guidance.",
+  "author": {
+    "name": "Copperpour",
+    "url": "https://github.com/Copperpour"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Copperpour/Copperpour.git"
+  },
+  "homepage": "https://github.com/Copperpour/Copperpour",
+  "documentation": "https://github.com/Copperpour/Copperpour/blob/main/docs/CLAUDE_DESKTOP_EXTENSION.md",
+  "support": "https://github.com/Copperpour/Copperpour/issues",
+  "icon": "icon.png",
+  "server": {
+    "type": "binary",
+    "entry_point": "server/copperpour",
+    "mcp_config": {
+      "command": "${__dirname}/server/copperpour",
+      "args": []
+    }
+  },
+  "tools_generated": true,
+  "keywords": [
+    "kicad",
+    "pcb",
+    "schematic",
+    "eda",
+    "electronics",
+    "mcp"
+  ],
+  "license": "AGPL-3.0-only",
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": [
+      "darwin"
+    ]
+  }
+}
