@@ -91,7 +91,8 @@ pub(crate) async fn collect(
 ///
 /// `configured` keeps its meaning: an address was resolved at startup.
 /// `source` is `resolved_server_config` for that address,
-/// `detected_at_call_time` for a socket found now, `ambiguous` when several
+/// `detected_at_call_time` for a socket found now, `selected_by_open_board`
+/// for the one `open_board` found holding its board, `ambiguous` when several
 /// qualify and none is dialled (`candidates` lists them), and `unresolved`
 /// when there is nothing to dial.
 fn ipc_block(startup: &str, endpoint: &IpcEndpoint, origin: IpcEndpointOrigin) -> Value {
@@ -109,6 +110,7 @@ fn ipc_block(startup: &str, endpoint: &IpcEndpoint, origin: IpcEndpointOrigin) -
             match origin {
                 IpcEndpointOrigin::Startup => "resolved_server_config",
                 IpcEndpointOrigin::DetectedNow => "detected_at_call_time",
+                IpcEndpointOrigin::Selected => "selected_by_open_board",
             },
             Some(redacted(address)),
             Vec::new(),
@@ -429,6 +431,16 @@ mod tests {
             json!({
                 "configured": false,
                 "source": "detected_at_call_time",
+                "endpoint": SOCKET,
+                "candidates": [],
+            })
+        );
+        // The endpoint open_board found holding its board.
+        assert_eq!(
+            ipc_block("", &address(SOCKET), IpcEndpointOrigin::Selected),
+            json!({
+                "configured": false,
+                "source": "selected_by_open_board",
                 "endpoint": SOCKET,
                 "candidates": [],
             })

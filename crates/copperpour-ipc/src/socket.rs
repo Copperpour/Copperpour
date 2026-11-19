@@ -90,27 +90,42 @@ pub enum IpcDetection {
 /// performs: exactly one answering is evidence, not a guess. Otherwise the
 /// result is [`IpcDetection::Ambiguous`].
 pub fn detect_ipc_endpoint() -> IpcDetection {
+    choose_endpoint(&adoptable_candidates(), |address| {
+        crate::KiCadIpcClient::new(address)
+            .ping_outcome()
+            .is_responsive()
+    })
+}
+
+/// Every endpoint [`detect_ipc_endpoint`] chooses among, as addresses, before
+/// any is dialled: a caller that can tell them apart by what they hold, rather
+/// than by whether they answer, looks at each.
+pub fn candidate_endpoints() -> Vec<String> {
+    adoptable_candidates()
+        .iter()
+        .map(|path| format_address(path))
+        .collect()
+}
+
+fn adoptable_candidates() -> Vec<PathBuf> {
     #[cfg(unix)]
-    let candidates = {
+    {
         let defaults = candidate_socket_paths();
         let fallbacks = pid_socket_fallbacks(&defaults, pid_is_alive);
         defaults
             .into_iter()
             .chain(fallbacks)
             .filter(|path| is_adoptable(path))
-            .collect::<Vec<_>>()
-    };
+            .collect()
+    }
     #[cfg(not(unix))]
-    let candidates = candidate_socket_paths()
-        .into_iter()
-        .filter(|path| is_adoptable(path))
-        .take(1)
-        .collect::<Vec<_>>();
-    choose_endpoint(&candidates, |address| {
-        crate::KiCadIpcClient::new(address)
-            .ping_outcome()
-            .is_responsive()
-    })
+    {
+        candidate_socket_paths()
+            .into_iter()
+            .filter(|path| is_adoptable(path))
+            .take(1)
+            .collect()
+    }
 }
 
 /// [`detect_ipc_endpoint`]'s decision with the Ping supplied, so a test can

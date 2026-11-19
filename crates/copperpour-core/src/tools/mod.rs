@@ -341,6 +341,12 @@ pub struct ToolContext {
     /// `KICAD_API_SOCKET` address stays authoritative, and test contexts keep
     /// the address they set.
     ipc_rediscovery: std::sync::atomic::AtomicBool,
+    /// The endpoint `open_board` last found holding its board (#23). With
+    /// rediscovery on, it decides between several sockets that qualify.
+    selected_ipc_endpoint: std::sync::Mutex<Option<String>>,
+    /// Held for the whole of an `open_board` call: two at once would each see
+    /// no editor holding the board and each start one.
+    pub(crate) opening_board: tokio::sync::Mutex<()>,
 }
 
 impl ToolContext {
@@ -358,6 +364,8 @@ impl ToolContext {
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
             ipc_rediscovery: std::sync::atomic::AtomicBool::new(false),
+            selected_ipc_endpoint: std::sync::Mutex::new(None),
+            opening_board: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -379,6 +387,8 @@ impl ToolContext {
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
             ipc_rediscovery: std::sync::atomic::AtomicBool::new(false),
+            selected_ipc_endpoint: std::sync::Mutex::new(None),
+            opening_board: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -405,6 +415,10 @@ impl ToolContext {
     /// The startup address is kept only when detection finds nothing, so the
     /// caller's own `Ping` reports the failure as before. It is never used
     /// when several sockets qualify: that would be the guess #374 rules out.
+    ///
+    /// When several sockets qualify and the endpoint `open_board` last found
+    /// holding its board is one of them, that one is used: it is the evidence
+    /// the Pings lack, such as a Project Manager beside a PCB editor (#23).
     pub fn ipc_endpoint(&self) -> IpcEndpoint {
         self.ipc_endpoint_with_origin().0
     }
@@ -413,12 +427,33 @@ impl ToolContext {
     /// endpoint the calls use (`get_installation_info`). It costs what an IPC
     /// call's own lookup costs.
     pub fn ipc_endpoint_with_origin(&self) -> (IpcEndpoint, IpcEndpointOrigin) {
-        endpoint_and_origin_for(
-            self.ipc_rediscovery
-                .load(std::sync::atomic::Ordering::Relaxed),
-            &self.config.ipc_address,
-            copperpour_ipc::detect_ipc_endpoint,
+        with_selection(
+            &self.selected_ipc_endpoint,
+            endpoint_and_origin_for(
+                self.rediscovers_ipc(),
+                &self.config.ipc_address,
+                copperpour_ipc::detect_ipc_endpoint,
+            ),
+            copperpour_ipc::candidate_endpoints,
         )
+    }
+
+    /// Whether the endpoint is looked for on each call, rather than configured.
+    pub(crate) fn rediscovers_ipc(&self) -> bool {
+        self.ipc_rediscovery
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Let `address` decide between several qualifying sockets for the calls
+    /// that follow (see [`Self::ipc_endpoint`]). Only with rediscovery on: a
+    /// configured address stays the one the calls use.
+    pub(crate) fn select_ipc_endpoint(&self, address: String) {
+        if self.rediscovers_ipc() {
+            *self
+                .selected_ipc_endpoint
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(address);
+        }
     }
 
     /// Attach the startup configuration decision. Separate from the constructors
@@ -725,6 +760,40 @@ pub enum IpcEndpointOrigin {
     /// Detection on this call: one socket found, or several that could not
     /// be told apart.
     DetectedNow,
+    /// Several sockets qualify, and `open_board` found its board on this one.
+    Selected,
+}
+
+/// Detection's `decided` endpoint, with the one `open_board` selected
+/// deciding between several that qualify when it is among them. Detection
+/// that settles on one socket is kept for this call, as it would be without a
+/// selection. The selection is forgotten once it is no longer a `candidates`
+/// socket, as an exited editor's `api-<pid>.sock` stops being one; a busy
+/// editor that missed one Ping keeps it.
+fn with_selection(
+    selected: &std::sync::Mutex<Option<String>>,
+    decided: (IpcEndpoint, IpcEndpointOrigin),
+    candidates: impl FnOnce() -> Vec<String>,
+) -> (IpcEndpoint, IpcEndpointOrigin) {
+    let mut selected = selected
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(address) = selected.clone() else {
+        return decided;
+    };
+    let listed = match &decided {
+        (IpcEndpoint::Ambiguous(candidates), _) => {
+            if candidates.contains(&address) {
+                return (IpcEndpoint::Address(address), IpcEndpointOrigin::Selected);
+            }
+            false
+        }
+        _ => candidates().contains(&address),
+    };
+    if !listed {
+        *selected = None;
+    }
+    decided
 }
 
 /// [`ToolContext::ipc_endpoint`]'s decision and where it came from, with
@@ -4537,6 +4606,103 @@ mod ipc_rediscovery_tests {
         assert_eq!(
             ctx.ipc_endpoint(),
             IpcEndpoint::Address("ipc:///configured/api.sock".into())
+        );
+    }
+
+    /// `open_board`'s endpoint decides only between sockets that qualify, and
+    /// is kept while it is a candidate: a busy editor whose Ping timed out,
+    /// so detection settled on the other KiCad, decides again once it answers.
+    /// An editor that has exited stops being a candidate and is forgotten.
+    #[test]
+    fn a_selection_decides_only_between_sockets_that_qualify() {
+        let editor = "ipc:///tmp/kicad/api-42.sock".to_string();
+        let other = "ipc:///tmp/kicad/api.sock".to_string();
+        let both = || vec![other.clone(), editor.clone()];
+        let ambiguous = || {
+            (
+                IpcEndpoint::Ambiguous(both()),
+                IpcEndpointOrigin::DetectedNow,
+            )
+        };
+        let found = |address: &str| {
+            (
+                IpcEndpoint::Address(address.to_string()),
+                IpcEndpointOrigin::DetectedNow,
+            )
+        };
+        let chosen = (
+            IpcEndpoint::Address(editor.clone()),
+            IpcEndpointOrigin::Selected,
+        );
+        let unlisted = || -> Vec<String> { panic!("an ambiguous detection lists every candidate") };
+        let selected = std::sync::Mutex::new(Some(editor.clone()));
+        assert_eq!(with_selection(&selected, ambiguous(), unlisted), chosen);
+        // Detection settled on one socket: its answer, the selection kept
+        // while the editor is a candidate.
+        assert_eq!(
+            with_selection(&selected, found(&editor), both),
+            found(&editor)
+        );
+        assert_eq!(
+            with_selection(&selected, found(&other), both),
+            found(&other)
+        );
+        assert_eq!(with_selection(&selected, ambiguous(), unlisted), chosen);
+        // The editor gone: forgotten for good.
+        let only_other = || vec![other.clone()];
+        assert_eq!(
+            with_selection(&selected, found(&other), only_other),
+            found(&other)
+        );
+        assert_eq!(*selected.lock().unwrap(), None);
+        assert_eq!(
+            with_selection(&selected, ambiguous(), unlisted),
+            ambiguous()
+        );
+
+        // Nothing detected, so the startup address: forgotten too.
+        let selected = std::sync::Mutex::new(Some(editor.clone()));
+        let startup = (
+            IpcEndpoint::Address(STARTUP.to_string()),
+            IpcEndpointOrigin::Startup,
+        );
+        assert_eq!(
+            with_selection(&selected, startup.clone(), Vec::new),
+            startup
+        );
+        assert_eq!(*selected.lock().unwrap(), None);
+
+        // An ambiguous detection without it: forgotten.
+        let selected = std::sync::Mutex::new(Some(editor.clone()));
+        let others = (
+            IpcEndpoint::Ambiguous(vec![other.clone(), STARTUP.to_string()]),
+            IpcEndpointOrigin::DetectedNow,
+        );
+        assert_eq!(with_selection(&selected, others.clone(), unlisted), others);
+        assert_eq!(*selected.lock().unwrap(), None);
+    }
+
+    /// A configured address stays the one the calls use.
+    #[test]
+    fn a_selection_is_made_only_with_rediscovery_on() {
+        let ctx = ToolContext::new(
+            ServerConfig {
+                ipc_address: "ipc:///configured/api.sock".to_string(),
+                ..ServerConfig::default()
+            },
+            Arc::new(ToolRouter::new()),
+        );
+        ctx.select_ipc_endpoint("ipc:///tmp/kicad/api-42.sock".into());
+        assert_eq!(*ctx.selected_ipc_endpoint.lock().unwrap(), None);
+        assert_eq!(
+            ctx.ipc_endpoint(),
+            IpcEndpoint::Address("ipc:///configured/api.sock".into())
+        );
+        ctx.enable_ipc_rediscovery();
+        ctx.select_ipc_endpoint("ipc:///tmp/kicad/api-42.sock".into());
+        assert_eq!(
+            ctx.selected_ipc_endpoint.lock().unwrap().as_deref(),
+            Some("ipc:///tmp/kicad/api-42.sock")
         );
     }
 }
