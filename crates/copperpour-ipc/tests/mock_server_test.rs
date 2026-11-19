@@ -3109,8 +3109,13 @@ mod layer_name_budget {
     /// would name both layers.
     #[test]
     fn the_budget_is_spent_across_the_lookups_not_renewed_by_each() {
-        const KICAD_TAKES: Duration = Duration::from_millis(300);
-        const BUDGET: Duration = Duration::from_millis(500);
+        // Leave a wide gap between the budget left after the first lookup
+        // (<= 300 ms) and the second answer (1000 ms) so loaded CI runners
+        // cannot let the second reply beat the remaining timeout, while still
+        // keeping each individual reply comfortably under BUDGET so a budget
+        // renewed per call would name both layers.
+        const KICAD_TAKES: Duration = Duration::from_millis(1_000);
+        const BUDGET: Duration = Duration::from_millis(1_300);
 
         let asked = Arc::new(Mutex::new(0));
         let server = spawn_kicad_naming_layers_after(asked.clone(), KICAD_TAKES);
