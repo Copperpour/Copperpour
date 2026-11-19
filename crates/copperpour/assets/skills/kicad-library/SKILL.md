@@ -24,7 +24,7 @@ load_toolset('library')    # search_symbols, search_footprints, create_symbol, c
                            # set_footprint_models, get_footprint_info, register_symbol_library,
                            # register_footprint_library, get_symbol_info,
                            # set_symbol_properties
-load_toolset('library_maintenance') # upgrade_library
+load_toolset('library_maintenance') # upgrade_library, rename_footprint
 load_toolset('pcb_components') # update_footprints_from_library for placed instances
 ```
 
@@ -493,6 +493,16 @@ transaction. It refuses (`plan_blocked`) when any file's content differs; fix wh
 footprint whose name inside the file is not its file name. Older KiCad versions cannot
 open an upgraded file, so upgrade a shared library only when everyone uses the newer
 KiCad.
+
+### Rename a Library Footprint
+
+`rename_footprint(library_path, footprint_name, new_name)`, in the
+`library_maintenance` toolset, renames a footprint in its `.pretty` library as KiCad's
+footprint editor does: the file and the name inside it change, and the Value too when
+it equals the old name. It refuses a name already in the library, including one that
+differs only in case. Symbols whose Footprint field names the old footprint keep it, as
+in KiCad: update them with `set_symbol_properties(footprint=…)`. Footprints placed on
+boards keep the old library id until they are changed from the library.
 
 ---
 

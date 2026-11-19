@@ -435,12 +435,13 @@ Live `move_component`, `rotate_component`, `set_component_placements`, `align_co
 ---
 
 ### `library_maintenance`
-**Purpose:** Maintain library files as a whole: upgrade their file format with content checked.
-**Source:** [`crates/copperpour-core/src/tools/library_upgrade.rs`](crates/copperpour-core/src/tools/library_upgrade.rs)
+**Purpose:** Maintain library files as a whole: upgrade their file format with content checked, and rename a library footprint.
+**Source:** [`crates/copperpour-core/src/tools/library_upgrade.rs`](crates/copperpour-core/src/tools/library_upgrade.rs), [`crates/copperpour-core/src/tools/footprint_rename.rs`](crates/copperpour-core/src/tools/footprint_rename.rs)
 
 | Tool | Description |
 |------|-------------|
 | `upgrade_library` | Upgrade a `.kicad_sym` symbol library or a `.pretty` footprint library to the running KiCad's file format with `kicad-cli`, comparing each older file with its upgraded copy as KiCad reads both, and replacing the older files in one journalled transaction only when none differs; a dry run, the default, reports counts and the files that differ or carry notes. |
+| `rename_footprint` | Rename a footprint in its `.pretty` library as KiCad's footprint editor does: `NEW_NAME.kicad_mod` with the new name inside, and the Value too when it equals the old name. Refuses a name in use, including one that differs only in case, and names KiCad cannot use; a case-only rename of the same footprint is allowed. Symbols' Footprint fields and placed footprints keep the old library id. |
 
 ---
 

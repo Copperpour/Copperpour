@@ -35,6 +35,7 @@ mod footprint_fields;
 mod footprint_graphics;
 mod footprint_metadata;
 mod footprint_models;
+pub(crate) mod footprint_rename;
 #[cfg(any(feature = "jlcpcb", feature = "freerouting"))]
 pub mod integration;
 pub(crate) mod ipc_recovery;

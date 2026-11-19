@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use copperpour_sexp::writer::{
-    kicad_editor_lock_path, write_atomic, write_atomic_if_unchanged, write_new_atomic,
-    write_new_atomic_verified,
+    kicad_editor_lock_path, remove_if_unchanged, write_atomic, write_atomic_if_unchanged,
+    write_new_atomic, write_new_atomic_verified,
 };
 use copperpour_sexp::{commit_file_transaction, FileTransition, SexpError};
 
@@ -114,4 +114,25 @@ fn commit_file_transaction_accepts_a_bare_target_filename() {
     )
     .unwrap();
     assert_eq!(std::fs::read_to_string(bare).unwrap(), after);
+}
+
+#[test]
+fn remove_if_unchanged_accepts_a_bare_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    let _cwd = CwdGuard::enter(dir.path());
+
+    let bare = Path::new("Old.kicad_mod");
+    std::fs::write(
+        bare,
+        "(footprint \"Old\")
+",
+    )
+    .unwrap();
+    remove_if_unchanged(
+        bare,
+        "(footprint \"Old\")
+",
+    )
+    .unwrap();
+    assert!(!bare.exists());
 }

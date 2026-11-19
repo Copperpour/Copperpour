@@ -173,6 +173,26 @@ pub fn write_atomic_if_unchanged(
     read_back(path, content)
 }
 
+/// Delete `path` if it still holds `expected`, under the same lock and
+/// comparison as [`write_atomic_if_unchanged`].
+///
+/// `Conflict` means the file changed after the caller read it, and nothing
+/// was deleted.
+pub fn remove_if_unchanged(path: &Path, expected: &str) -> Result<(), SexpError> {
+    let _lock = lock_document_exclusive(path)?;
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    test_hooks::run_before_compare(path);
+    let current = read_string_unlocked(path)?;
+    if current != expected {
+        return Err(SexpError::Conflict {
+            path: path.to_path_buf(),
+        });
+    }
+    std::fs::remove_file(path)?;
+    sync_parent_directory(parent_directory(path))
+}
+
 /// `ReadbackMismatch` unless `path` holds `written`, read after the rename
 /// under the same lock. A failed read is one too: the file was replaced.
 fn read_back(path: &Path, written: &str) -> Result<(), SexpError> {
@@ -1094,6 +1114,28 @@ pub(crate) mod mode_probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_is_removed_only_while_it_holds_what_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("R.kicad_mod");
+        std::fs::write(&path, "(footprint \"R\")").unwrap();
+
+        test_hooks::save_before_compare(&path, "(footprint \"R\" (layer \"F.Cu\"))");
+        let error = remove_if_unchanged(&path, "(footprint \"R\")").unwrap_err();
+        assert!(matches!(error, SexpError::Conflict { .. }), "{error:?}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "(footprint \"R\" (layer \"F.Cu\"))"
+        );
+
+        remove_if_unchanged(&path, "(footprint \"R\" (layer \"F.Cu\"))").unwrap();
+        assert!(!path.exists());
+        assert!(matches!(
+            remove_if_unchanged(&path, "anything"),
+            Err(SexpError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
 
     /// A write that resolves its document's owners reads that document while
     /// holding its exclusive lock (#428); a shared lock there never returns.
