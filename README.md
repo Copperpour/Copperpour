@@ -128,10 +128,10 @@ API** for PCB tools) is still required; operating guidance is served
 automatically via MCP instructions/resources and `get_guidance` (Claude Desktop
 skill ZIP uploads remain separate). See the
 [Claude Desktop extension guide](docs/CLAUDE_DESKTOP_EXTENSION.md) for upgrade,
-uninstall, and Linux/Fedora notes.
+uninstall, and Linux notes.
 
 **Claude Desktop (manual fallback)**: if you prefer manual registration or your
-Linux/Fedora Claude Desktop build does not support `.mcpb` installs, add to
+Linux Claude Desktop build does not support `.mcpb` installs, add to
 `claude_desktop_config.json` (`%APPDATA%\Claude\` on Windows,
 `~/Library/Application Support/Claude/` on macOS, `~/.config/Claude/` on Linux)
 and restart Claude Desktop:

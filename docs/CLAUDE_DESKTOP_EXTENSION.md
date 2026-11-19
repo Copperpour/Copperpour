@@ -12,7 +12,7 @@ or locating the KiCad PCM plugin's version-dependent installation path.
 | --- | --- | --- |
 | Windows (`x86_64`) | `copperpour-v<version>-windows-x86_64.mcpb` | Official `.mcpb` install (`>=0.10.0`) |
 | macOS (Apple Silicon & Intel) | `copperpour-v<version>-macos-universal.mcpb` | Official `.mcpb` install (`>=0.10.0`) |
-| Linux (`x86_64`) | `copperpour-v<version>-linux-x86_64.mcpb` | Beta / community builds (see [Linux and Fedora notes](#linux-and-fedora-notes)) |
+| Linux (`x86_64`) | `copperpour-v<version>-linux-x86_64.mcpb` | Beta / community builds (see [Linux notes](#linux-notes)) |
 
 Each bundle carries the compiled `copperpour` binary for its target platform,
 an MCPB `v0.3` `manifest.json` declaring `server.type: "binary"`, and the
@@ -88,16 +88,15 @@ Start a new chat in Claude Desktop and ask:
   in `claude_desktop_config.json`, your KiCad projects, and your per-user
   Copperpour configuration (`config.toml`) intact.
 
-## Linux and Fedora notes
+## Linux notes
 
 Anthropic's official desktop builds target macOS and Windows, with Linux support
-distributed through beta/community packages (there is no official Anthropic
-`.rpm` for Fedora). Depending on the Linux build you run, the GUI
-**Install Extension…** picker for `.mcpb` files may be missing, hidden, or
-unable to register binary extensions.
+distributed through beta/community packages. Depending on the Linux build you
+run, the GUI **Install Extension…** picker for `.mcpb` files may be missing,
+hidden, or unable to register binary extensions.
 
-If your Linux or Fedora Claude Desktop build does not install `.mcpb` files
-directly, use the manual fallback:
+If your Linux Claude Desktop build does not install `.mcpb` files directly, use
+the manual fallback:
 
 1. Either download the standalone Linux archive
    (`copperpour-v<version>-x86_64-unknown-linux-gnu.tar.gz`) or unzip the
