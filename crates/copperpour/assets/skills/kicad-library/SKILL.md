@@ -405,6 +405,13 @@ set_footprint_metadata(
   renumber one or every matching direct-child pad atomically.
 - Use `edit_footprint_pad` with `zone_connect` (`solid`, `thermal`, `none`) to
   override how zones connect to one pad, or `inherited` to remove the override.
+- Use `edit_footprint_pad` with `solder_mask_margin` and `solder_paste_margin`
+  (mm) or `solder_paste_margin_ratio` (a fraction, `-0.1` for -10 %) for a
+  pad's own mask and stencil openings, such as a mask-defined pad or a reduced
+  paste opening on an exposed pad. `set_footprint_metadata` takes the same three
+  for the whole footprint. `0` is an override like any other value;
+  `inherited` removes it. A file older than KiCad's format 20240202 reads 0 as
+  inherited, so 0 is refused there.
 - Use `edit_footprint_pad` with `fabrication_property` to set KiCad's pad
   fabrication property, such as `castellated`, `heatsink` or `testpoint` (the
   schema lists all of KiCad's values), or `none` to remove it.

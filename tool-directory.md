@@ -412,9 +412,9 @@ Live `move_component`, `rotate_component`, `set_component_placements`, `align_co
 | Tool | Description |
 |------|-------------|
 | `create_footprint` | Create a new footprint (`.kicad_mod`) file from a pad layout description. |
-| `edit_footprint_pad` | Atomically edit or renumber matching pads, including valid circle/rect/oval/roundrect shape transitions, independent dimensions, the pad's zone connection override, and its fabrication property (castellated, heatsink, testpoint, …). |
+| `edit_footprint_pad` | Atomically edit or renumber matching pads, including valid circle/rect/oval/roundrect shape transitions, independent dimensions, the pad's zone connection override, its fabrication property (castellated, heatsink, testpoint, …), and its own solder mask and paste margins, each reported with its previous and current value. |
 | `set_footprint_graphics` | Atomically append, replace, or delete `line`, `arc`, `rect`, `circle` and `poly` primitives on one footprint layer; `rect`, `circle` and `poly` require `fill`. Replacement/deletion preserves unrelated source and rejects graphics referenced by a group. |
-| `set_footprint_metadata` | Atomically replace a footprint description, tags, or supported attributes while preserving unrelated source. Empty tags or attributes remove their block. Reports each changed field's previous and current value, and warns when attributes drop the footprint type or an attribute it does not accept. |
+| `set_footprint_metadata` | Atomically replace a footprint description, tags, supported attributes, or its own solder mask and paste margins while preserving unrelated source. Empty tags or attributes remove their block. Reports each changed field's previous and current value, and warns when attributes drop the footprint type or an attribute it does not accept. |
 | `set_footprint_models` | Atomically append, replace, or delete one or more top-level 3D model blocks with optional offset, scale, and rotation transforms. |
 | `register_footprint_library` | Register a local footprint library directory in the KiCAD global or project library table. Set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `list_footprint_libraries` | List all registered footprint libraries (global and/or project). |

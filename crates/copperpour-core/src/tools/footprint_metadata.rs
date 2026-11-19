@@ -1,6 +1,7 @@
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::solder_margins::{self, Margin, Setting};
 use crate::tools::{ToolContext, ToolDef};
 use copperpour_sexp::writer::{
     apply_edits, find_balanced_block, find_block_with_leading_whitespace, find_direct_child_blocks,
@@ -23,10 +24,11 @@ const SUPPORTED_ATTRIBUTES: &[&str] = &[
 pub(super) fn tool() -> ToolDef {
     tool!(
         "set_footprint_metadata",
-        "Atomically replace a footprint's description, tags, or supported attributes while \
-         preserving pads, graphics, properties, groups, and models. Reports each changed \
-         field's previous and current value, and warns when attributes drop the footprint \
-         type (smd/through_hole) or an attribute it does not accept.",
+        "Atomically replace a footprint's description, tags, supported attributes, or its own \
+         solder mask and paste margins while preserving pads, graphics, properties, groups, \
+         and models. Reports each changed field's previous and current value, and warns when \
+         attributes drop the footprint type (smd/through_hole) or an attribute it does not \
+         accept.",
         json!({
             "type": "object",
             "properties": {
@@ -50,7 +52,10 @@ pub(super) fn tool() -> ToolDef {
                         "type": "string",
                         "enum": SUPPORTED_ATTRIBUTES
                     }
-                }
+                },
+                "solder_mask_margin": Margin::Mask.schema("footprint"),
+                "solder_paste_margin": Margin::Paste.schema("footprint"),
+                "solder_paste_margin_ratio": Margin::PasteRatio.schema("footprint")
             },
             "required": ["footprint_path"],
             "additionalProperties": false
@@ -64,6 +69,8 @@ struct MetadataUpdate {
     description: Option<String>,
     tags: Option<Vec<String>>,
     attributes: Option<Vec<String>>,
+    /// The footprint's own margins to set, in KiCad's order.
+    margins: Vec<(Margin, Setting)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -168,16 +175,20 @@ fn parse_update(args: &serde_json::Value) -> Result<MetadataUpdate, MetadataErro
             ));
         }
     }
-    if description.is_none() && tags.is_none() && attributes.is_none() {
+    let margins = solder_margins::requested(args)
+        .map_err(|refusal| invalid(refusal.field, refusal.reason))?;
+    if description.is_none() && tags.is_none() && attributes.is_none() && margins.is_empty() {
         return Err(invalid(
             "metadata",
-            "at least one of description, tags, or attributes must be supplied",
+            "at least one of description, tags, attributes, solder_mask_margin, \
+             solder_paste_margin or solder_paste_margin_ratio must be supplied",
         ));
     }
     Ok(MetadataUpdate {
         description,
         tags,
         attributes,
+        margins,
     })
 }
 
@@ -225,6 +236,9 @@ fn prepare_mutation(
             crate::tools::footprint_root_reason(root.head()),
         ));
     }
+    let file_version = solder_margins::file_version(&root);
+    solder_margins::refuse_zero_in_older_file(file_version, &update.margins)
+        .map_err(|refusal| invalid(refusal.field, refusal.reason))?;
 
     let mut description = None;
     let mut tags = None;
@@ -316,7 +330,11 @@ fn prepare_mutation(
         edits.push(SexpEdit::insert(anchor, serialized));
     }
 
-    let replacement = apply_edits(source.to_string(), edits);
+    let mut replacement = apply_edits(source.to_string(), edits);
+    // The margins go in a second pass, placed among the children as written so far.
+    for (margin, setting) in &update.margins {
+        replacement = solder_margins::set_footprint_margin(replacement, *margin, setting);
+    }
     let parsed = copperpour_sexp::parse_sexp(&replacement)
         .map_err(|error| invalid("metadata", format!("replacement does not parse: {error}")))?;
     if parsed.head() != Some("footprint") {
@@ -346,6 +364,27 @@ fn prepare_mutation(
             changes.insert(
                 field.to_string(),
                 json!({ "previous": previous, "current": current }),
+            );
+        }
+    }
+    for (margin, _) in &update.margins {
+        let tokens = margin.footprint_tokens();
+        let written = |node: &copperpour_sexp::SexpNode| -> Vec<String> {
+            node.children()
+                .unwrap_or(&[])
+                .iter()
+                .filter(|child| child.head().is_some_and(|head| tokens.contains(&head)))
+                .map(|child| format!("{child:?}"))
+                .collect()
+        };
+        if written(&root) != written(&parsed) {
+            changed_fields.push(margin.name());
+            changes.insert(
+                margin.name().to_string(),
+                json!({
+                    "previous": solder_margins::read(&root, *margin, tokens, file_version),
+                    "current": solder_margins::read(&parsed, *margin, tokens, file_version),
+                }),
             );
         }
     }
@@ -972,4 +1011,178 @@ mod tests {
         assert!(written.contains("allow_soldermask_bridges"));
         assert_eq!(body["warnings"], json!([]), "nothing was dropped");
     }
+
+    // KiCad 10.0.8 wrote each of these from the stock Winbond USON-8; provenance
+    // in tests/fixtures/solder_margins_kicad10.README.md.
+    const MARGINS_NONE: &str = "solder_margins_none_kicad10.kicad_mod";
+    const MARGINS_NONE_TEXT: &str =
+        include_str!("../../tests/fixtures/solder_margins_none_kicad10.kicad_mod");
+    const MARGINS_FOOTPRINT: &str =
+        include_str!("../../tests/fixtures/solder_margins_footprint_kicad10.kicad_mod");
+    const MARGINS_FOOTPRINT_ZERO: &str =
+        include_str!("../../tests/fixtures/solder_margins_footprint_zero_kicad10.kicad_mod");
+
+    #[tokio::test]
+    async fn footprint_margins_are_written_as_kicad_writes_them() {
+        let (body, written) = served(
+            MARGINS_NONE,
+            json!({
+                "solder_mask_margin": 0.05,
+                "solder_paste_margin": -0.03,
+                "solder_paste_margin_ratio": -0.1
+            }),
+        )
+        .await;
+        assert_eq!(
+            without_uuids(&written),
+            without_uuids(MARGINS_FOOTPRINT),
+            "the margins go where KiCad writes them, and nothing else changes"
+        );
+        assert_eq!(
+            body["changed_fields"],
+            json!([
+                "solder_mask_margin",
+                "solder_paste_margin",
+                "solder_paste_margin_ratio"
+            ])
+        );
+        assert_eq!(
+            body["changes"],
+            json!({
+                "solder_mask_margin": { "previous": "inherited", "current": 0.05 },
+                "solder_paste_margin": { "previous": "inherited", "current": -0.03 },
+                "solder_paste_margin_ratio": { "previous": "inherited", "current": -0.1 }
+            })
+        );
+    }
+
+    /// Since format 20240201 a 0 is an override like any other value; only
+    /// "inherited" removes one.
+    #[test]
+    fn a_footprint_margin_of_zero_is_written_and_inherited_removes_it() {
+        let zero = parse_update(&json!({
+            "solder_mask_margin": 0,
+            "solder_paste_margin": 0,
+            "solder_paste_margin_ratio": 0
+        }))
+        .unwrap();
+        let prepared = prepare_mutation(MARGINS_NONE_TEXT, &zero).unwrap();
+        assert_eq!(
+            without_uuids(&prepared.replacement),
+            without_uuids(MARGINS_FOOTPRINT_ZERO)
+        );
+        assert_eq!(
+            prepared.changes["solder_paste_margin_ratio"],
+            json!({ "previous": "inherited", "current": 0.0 })
+        );
+
+        let inherited = parse_update(&json!({
+            "solder_mask_margin": "inherited",
+            "solder_paste_margin": "inherited",
+            "solder_paste_margin_ratio": "inherited"
+        }))
+        .unwrap();
+        for source in [MARGINS_FOOTPRINT, MARGINS_FOOTPRINT_ZERO] {
+            let prepared = prepare_mutation(source, &inherited).unwrap();
+            assert_eq!(
+                without_uuids(&prepared.replacement),
+                without_uuids(MARGINS_NONE_TEXT)
+            );
+            assert_eq!(prepared.changed_fields.len(), 3);
+        }
+        let prepared = prepare_mutation(MARGINS_NONE_TEXT, &inherited).unwrap();
+        assert_eq!(prepared.replacement, MARGINS_NONE_TEXT);
+        assert!(prepared.changed_fields.is_empty());
+    }
+
+    #[test]
+    fn a_footprint_margin_goes_after_the_metadata_written_in_the_same_call() {
+        let update = parse_update(&json!({
+            "description": "socket",
+            "attributes": ["through_hole"],
+            "solder_mask_margin": 0.1
+        }))
+        .unwrap();
+        let mut source = BARE_FOOTPRINT.replace("20240108", "20260206");
+        let prepared = prepare_mutation(&source, &update).unwrap();
+        let at = |token: &str| prepared.replacement.find(token).unwrap();
+        assert!(at("(layer \"F.Cu\")") < at("(descr \"socket\")"));
+        assert!(at("(descr \"socket\")") < at("(solder_mask_margin 0.1)"));
+        assert!(at("(solder_mask_margin 0.1)") < at("(attr through_hole)"));
+        assert!(at("(attr through_hole)") < at("(pad \"1\""));
+
+        // A second call replaces it in place.
+        source = prepared.replacement;
+        let update = parse_update(&json!({ "solder_mask_margin": -0.02 })).unwrap();
+        let prepared = prepare_mutation(&source, &update).unwrap();
+        assert_eq!(
+            prepared.replacement,
+            source.replace("(solder_mask_margin 0.1)", "(solder_mask_margin -0.02)")
+        );
+        assert_eq!(
+            prepared.changes["solder_mask_margin"],
+            json!({ "previous": 0.1, "current": -0.02 })
+        );
+    }
+
+    /// Up to format 20240201 KiCad reads a 0 as "inherited", so it cannot be
+    /// written as an override there, and an existing 0 reads as inherited.
+    #[tokio::test]
+    async fn a_footprint_margin_of_zero_is_refused_in_an_older_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Socket.kicad_mod");
+        let older = BARE_FOOTPRINT.replace(
+            "(layer \"F.Cu\")",
+            "(layer \"F.Cu\")\n  (solder_paste_margin 0)",
+        );
+        std::fs::write(&path, &older).unwrap();
+        for field in [
+            "solder_mask_margin",
+            "solder_paste_margin",
+            "solder_paste_margin_ratio",
+        ] {
+            let result = handle_set_footprint_metadata(
+                &json!({ "footprint_path": path, field: 0 }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{field}");
+            let body: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], field, "{body}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), older);
+        }
+
+        let update = parse_update(&json!({ "solder_paste_margin": -0.05 })).unwrap();
+        let prepared = prepare_mutation(&older, &update).unwrap();
+        assert_eq!(
+            prepared.changes["solder_paste_margin"],
+            json!({ "previous": "inherited", "current": -0.05 })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_footprint_margin_that_is_not_a_number_is_refused_on_its_argument() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Socket.kicad_mod");
+        std::fs::write(&path, BARE_FOOTPRINT).unwrap();
+        for (field, value) in [
+            ("solder_mask_margin", json!(null)),
+            ("solder_paste_margin", json!("-0.1")),
+            ("solder_paste_margin_ratio", json!("none")),
+        ] {
+            let result = handle_set_footprint_metadata(
+                &json!({ "footprint_path": path, field: value }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            let body: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+            assert_eq!(body["error"]["field"], field, "{body}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), BARE_FOOTPRINT);
+        }
+    }
+
+    use solder_margins::without_uuids;
 }
