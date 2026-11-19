@@ -225,6 +225,10 @@ fn parse_symbol_edits(
     // KiCad's Symbol Properties dialog refuses a Reference with no prefix
     // left once trailing digits and '?' are taken off
     // (`DIALOG_LIB_SYMBOL_PROPERTIES::Validate`, `UTIL::GetRefDesPrefix`).
+    // It checks only a root symbol, since a derived one may leave its
+    // Reference empty to inherit it; this refuses one on a derived symbol
+    // too, writing nothing, as no value without a prefix is a usable
+    // Reference there either.
     if let Some(reference) = &fields.reference {
         if reference
             .trim_end_matches(|c: char| c == '?' || c.is_ascii_digit())
@@ -430,7 +434,7 @@ pub(super) fn tool() -> ToolDef {
             "properties": {
                 "library_path": { "type": "string", "description": "Path to an existing .kicad_sym library file" },
                 "symbol_name": { "type": "string", "description": "Name of the symbol to change" },
-                "reference_prefix": { "type": "string", "description": "Reference prefix such as 'U' or 'J' (the Reference field), as create_symbol takes it. Refused, as KiCad refuses it, when nothing is left once trailing digits and '?' are removed." },
+                "reference_prefix": { "type": "string", "description": "Reference prefix such as 'U' or 'J' (the Reference field), as create_symbol takes it. Refused when nothing is left once trailing digits and '?' are removed, as KiCad refuses it on a root symbol; also on a derived symbol, which KiCad does not check." },
                 "value": { "type": "string", "description": "Symbol value (the Value field)" },
                 "datasheet": { "type": "string", "description": "Datasheet URL or path (the Datasheet field). A '~' is written as an empty string, as create_symbol writes it." },
                 "rename_fields": {

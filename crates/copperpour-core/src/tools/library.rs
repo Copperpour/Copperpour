@@ -512,7 +512,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "lib_id": { "type": "string", "description": "Library:Symbol identifier (e.g. 'Device:R'), resolved through the project and global symbol library tables. Not with library_path." },
-                    "project_dir": { "type": "string", "description": "Project directory to resolve project-scoped libraries. Defaults to the configured project_dir." },
+                    "project_dir": { "type": "string", "description": "Project directory to resolve project-scoped libraries for lib_id. Defaults to the configured project_dir. Not with library_path." },
                     "library_path": { "type": "string", "description": "Path to a .kicad_sym library file, read directly whether or not it is registered. Takes symbol_name; not with lib_id." },
                     "symbol_name": { "type": "string", "description": "Name of the symbol in library_path" }
                 }
@@ -5721,6 +5721,13 @@ async fn handle_get_symbol_info(
                 "name the symbol by lib_id, or by library_path with symbol_name, not both",
             ));
         }
+        if given("project_dir") {
+            return Ok(super::invalid_arg(
+                "project_dir",
+                "project_dir resolves a lib_id's library through the project's symbol table; \
+                 library_path names the file itself, so it takes no project_dir",
+            ));
+        }
         let path = get_path(args, "library_path")?;
         let sym_name = match require_str(args, "symbol_name") {
             Ok(name) => name,
@@ -9926,6 +9933,11 @@ mod tests {
                 json!({ "library_path": missing, "symbol_name": "Derived" }),
                 "file_not_found",
                 None,
+            ),
+            (
+                json!({ "library_path": path, "symbol_name": "Derived", "project_dir": "." }),
+                "invalid_argument",
+                Some("project_dir"),
             ),
         ] {
             let res = handle_get_symbol_info(&args, &test_ctx()).await.unwrap();
