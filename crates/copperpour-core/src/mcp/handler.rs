@@ -3400,6 +3400,35 @@ mod client_adaptation_tests {
         assert_eq!(result["serverInfo"]["name"], "copperpour");
     }
 
+    /// #50: Claude Code stays on the starter kit, so a `load_toolset` it
+    /// sends through `tools/call` says how to recover if its client never
+    /// refreshes the list.
+    #[tokio::test]
+    async fn claude_code_stays_lazy_and_load_toolset_names_the_recovery() {
+        let handler = lazy_handler().await;
+        let starter = listed_tool_count(&handler).await;
+        handler
+            .dispatch(&request("initialize", initialize_from("claude-code")))
+            .await
+            .expect("initialize dispatches");
+        assert_eq!(listed_tool_count(&handler).await, starter);
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "load_toolset", "arguments": {"name": "templates"}}
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let body: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        let hint = body["hint"].as_str().expect("load_toolset carries a hint");
+        assert!(hint.contains("eager_toolsets"), "{hint}");
+        assert!(listed_tool_count(&handler).await > starter);
+    }
+
     /// Claude Code honours list_changed and must not be swept up by a loose
     /// "claude" match: the cost is ~23K tokens on every listing.
     #[test]

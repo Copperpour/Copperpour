@@ -625,7 +625,10 @@ schemas, so a model can see a tool named in the reply and still be unable to
 call it. That is the symptom in
 [#134](https://github.com/mixelpixx/Konnect/issues/134) and
 [#169](https://github.com/mixelpixx/Konnect/issues/169) — reported against
-Claude Desktop.
+Claude Desktop, and in [#50](https://github.com/Copperpour/Copperpour/issues/50)
+against some Claude Code setups, although Claude Code 2.1.327 over stdio has been
+seen to refresh. The server cannot tell whether a client refreshed, so every
+`load_toolset` reply that adds tools carries a `hint` pointing here.
 
 For clients that cache the initial list but do not also cap the number of
 callable tools, the fix is to make the *first* listing complete:
