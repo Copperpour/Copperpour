@@ -118,9 +118,10 @@ async fn observe_browser_launch(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::write_executable_script::write_executable_script;
     use crate::{mcp::handler::McpHandler, tools::ServerConfig};
     use serde_json::{json, Value};
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::symlink;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn fixture() -> (tempfile::TempDir, PathBuf, String) {
@@ -132,11 +133,13 @@ mod tests {
         )
         .unwrap();
         let cli = dir.path().join("cli");
-        std::fs::write(&cli, r##"#!/bin/sh
+        write_executable_script(
+            &cli,
+            r##"#!/bin/sh
 mkdir -p "$5"
 printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved</text></svg>' > "$5/$(basename "$6" .kicad_sch).svg"
-"##).unwrap();
-        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+"##,
+        );
         (dir, root, cli.to_string_lossy().into_owned())
     }
     async fn handler(cli: String) -> McpHandler {
@@ -215,12 +218,10 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>saved
         let (dir, root, cli) = fixture();
         let args = dir.path().join("kicad.args");
         let kicad = dir.path().join("configured-kicad");
-        std::fs::write(
+        write_executable_script(
             &kicad,
             format!("#!/bin/sh\necho \"$@\" > '{}'\nsleep 3\n", args.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&kicad, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let handler = handler_with_kicad(cli, kicad.to_string_lossy().into_owned()).await;
         let opened = body(&call(&handler, json!({"schematic":root,"open_browser":false})).await);
         let root = root.canonicalize().unwrap();

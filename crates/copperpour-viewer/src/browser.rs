@@ -964,7 +964,7 @@ async fn open_in_kicad(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::write_executable_script::write_executable_script;
     use tempfile::TempDir;
     struct Fixture {
         _dir: TempDir,
@@ -985,12 +985,15 @@ mod tests {
             )
             .unwrap();
             let cli = base.join("cli");
-            std::fs::write(&cli, r##"#!/bin/sh
+            write_executable_script(
+                &cli,
+                r##"#!/bin/sh
 mkdir -p "$5"
 printf '%s\n' "$(basename "$6")" >> "$0.calls"
 printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</text></svg>' "$(wc -c < "$6")" > "$5/$(basename "$6" .kicad_sch).svg"
-"##).unwrap();
-            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+"##,
+            );
+
             Self {
                 _dir: dir,
                 root,
@@ -1009,8 +1012,8 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</t
         /// Starts a viewer whose Open in KiCAD runs `script` as KiCad.
         async fn start_with_kicad(&self, script: &str) -> BrowserViewer {
             let kicad = self.root.with_file_name("kicad");
-            std::fs::write(&kicad, format!("#!/bin/sh\n{script}\n")).unwrap();
-            std::fs::set_permissions(&kicad, std::fs::Permissions::from_mode(0o700)).unwrap();
+            write_executable_script(&kicad, format!("#!/bin/sh\n{script}\n"));
+
             BrowserViewer::start_with_kicad(
                 &self.root,
                 self.cli.to_str().unwrap(),
@@ -1296,7 +1299,7 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</t
             "mkdir -p",
             "touch \"$0.started\"\nwhile [ ! -f \"$0.continue\" ]; do sleep 0.02; done\nmkdir -p",
         );
-        std::fs::write(&fixture.cli, script).unwrap();
+        write_executable_script(&fixture.cli, script);
         let root = fixture.root.clone();
         let cli = fixture.cli.to_string_lossy().into_owned();
         let starting = tokio::spawn(async move {
@@ -1854,11 +1857,10 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</t
         let viewer = fixture.start().await;
         let client = Client::new(&viewer);
         client.quiet().await;
-        std::fs::write(
+        write_executable_script(
             &fixture.cli,
             "#!/bin/sh\necho 'known renderer diagnostic' >&2\nexit 1\n",
-        )
-        .unwrap();
+        );
         let response = client.post("/refresh", &fixture.root).send().await.unwrap();
         assert_eq!(response.status(), 503);
         let error = response.text().await.unwrap();
@@ -1887,7 +1889,7 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</t
         let viewer = fixture.start().await;
         let client = Client::new(&viewer);
         client.quiet().await;
-        std::fs::write(&fixture.cli, "#!/bin/sh\nmkdir -p \"$5\"\nprintf '<html/>' > \"$5/$(basename \"$6\" .kicad_sch).svg\"\n").unwrap();
+        write_executable_script(&fixture.cli, "#!/bin/sh\nmkdir -p \"$5\"\nprintf '<html/>' > \"$5/$(basename \"$6\" .kicad_sch).svg\"\n");
         assert_eq!(
             client
                 .post("/refresh", &fixture.root)
@@ -2076,11 +2078,10 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</t
         let viewer = fixture.start().await;
         let client = Client::new(&viewer);
         client.quiet().await;
-        std::fs::write(
+        write_executable_script(
             &fixture.cli,
             "#!/bin/sh\necho $$ > \"$0.pid\"\nexec sleep 60\n",
-        )
-        .unwrap();
+        );
         let http = client.post("/refresh", &fixture.root);
         let request = tokio::spawn(async move { http.send().await });
         let pidfile = fixture.cli.with_extension("pid");
@@ -2114,11 +2115,10 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</t
             }
         }
         let fixture = Fixture::new();
-        std::fs::write(
+        write_executable_script(
             &fixture.cli,
             "#!/bin/sh\necho $$ > \"$0.pid\"\nexec sleep 60\n",
-        )
-        .unwrap();
+        );
         let root = fixture.root.clone();
         let cli = fixture.cli.clone();
         let startup = tokio::spawn(async move {
@@ -2188,7 +2188,7 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>%d</t
     #[tokio::test]
     async fn browser_renderer_timeout_is_reported_and_cancels_child() {
         let fixture = Fixture::new();
-        std::fs::write(&fixture.cli, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        write_executable_script(&fixture.cli, "#!/bin/sh\nexec sleep 60\n");
         let error = tokio::time::timeout(
             Duration::from_secs(2),
             BrowserViewer::start(

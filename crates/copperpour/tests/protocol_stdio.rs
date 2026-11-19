@@ -8,6 +8,12 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+#[cfg(unix)]
+#[path = "../../test-support/write_executable_script.rs"]
+mod write_executable_script;
+#[cfg(unix)]
+use write_executable_script::write_executable_script;
+
 struct McpProcess {
     child: Child,
     stdin: ChildStdin,
@@ -283,16 +289,12 @@ fn installation_info_cli_probes_the_explicit_executable() {
 #[cfg(unix)]
 #[test]
 fn cli_failure_reports_signal_termination() {
-    use std::os::unix::fs::PermissionsExt;
-
     let tmp = tempfile::tempdir().unwrap();
     let cli = tmp.path().join("fake-kicad-cli");
-    std::fs::write(
+    write_executable_script(
         &cli,
         "#!/bin/sh\nprintf 'interrupted export\\n' >&2\nkill -TERM \"$$\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     std::fs::write(
         tmp.path().join("copperpour.toml"),
         format!(
@@ -835,7 +837,6 @@ fn browser_viewer_stdio_native_without_display_serves_svg_despite_opener_failure
 
 #[cfg(unix)]
 fn browser_viewer_stdio_case(native_cli: bool) {
-    use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let bin = tmp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
@@ -848,22 +849,19 @@ fn browser_viewer_stdio_case(native_cli: bool) {
     let shell = executable("sh");
     let mkdir = executable("mkdir");
     let cli = bin.join("cli");
-    std::fs::write(&cli, format!("#!{}\n{} -p \"$5\"\nprintf '<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><text>saved</text></svg>' > \"$5/root.svg\"\n", shell.display(), mkdir.display())).unwrap();
-    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable_script(&cli, format!("#!{}\n{} -p \"$5\"\nprintf '<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><text>saved</text></svg>' > \"$5/root.svg\"\n", shell.display(), mkdir.display()));
     #[cfg(not(target_os = "macos"))]
     let opener = bin.join("xdg-open");
     // macOS uses `open`; Windows uses rundll32 and is tested separately.
     #[cfg(target_os = "macos")]
     let opener = bin.join("open");
-    std::fs::write(
+    write_executable_script(
         &opener,
         format!(
             "#!{}\nprintf '%s' \"$1\" > \"$0.called\"\nprintf 'garbage-on-stdout\\n'\n",
             shell.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     std::fs::write(
         tmp.path().join("schematic-viewer"),
         "must never be launched",
@@ -879,15 +877,13 @@ fn browser_viewer_stdio_case(native_cli: bool) {
     )
     .unwrap();
     let kicad = bin.join("kicad");
-    std::fs::write(
+    write_executable_script(
         &kicad,
         format!(
             "#!{}\nprintf 'display=%s\\n' \"$DISPLAY\" >&2\nexit 255\n",
             shell.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&kicad, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let cli = if native_cli {
         std::env::var_os("COPPERPOUR_TEST_KICAD_CLI")
             .map(std::path::PathBuf::from)
@@ -983,7 +979,7 @@ fn browser_viewer_stdio_case(native_cli: bool) {
         // A second browser-opener failure below must still report no display:
         // the fallback belongs to the KiCad child, not the server environment.
     }
-    std::fs::write(&opener, format!("#!{}\nexit 7\n", shell.display())).unwrap();
+    write_executable_script(&opener, format!("#!{}\nexit 7\n", shell.display()));
     let failed = p.call_tool("open_schematic_viewer", json!({"schematic":schematic}));
     assert_ne!(failed["isError"], true, "{failed}");
     let failed = McpProcess::tool_body(&failed);

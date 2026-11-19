@@ -852,10 +852,30 @@ mod reload_tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn an_open_executable_handle_can_be_invoked_after_its_path_is_irrelevant() {
+        use std::os::unix::fs::MetadataExt;
+
         let directory = tempfile::tempdir().unwrap();
         let copied_path = directory.path().join("reload-candidate");
-        std::fs::copy(std::env::current_exe().unwrap(), &copied_path).unwrap();
+        let running_path = std::env::current_exe().unwrap();
+        // Copy in a subprocess so no concurrent test fork can inherit the
+        // writer. A private copy keeps the running binary outside the test.
+        let copied = std::process::Command::new("cp")
+            .arg("-p")
+            .arg(&running_path)
+            .arg(&copied_path)
+            .status()
+            .unwrap();
+        assert!(
+            copied.success(),
+            "copying the test executable failed: {copied}"
+        );
         let executable = File::open(&copied_path).unwrap();
+        let candidate = executable.metadata().unwrap();
+        let running = std::fs::metadata(&running_path).unwrap();
+        assert_ne!(
+            (candidate.dev(), candidate.ino()),
+            (running.dev(), running.ino())
+        );
         std::fs::remove_file(&copied_path).unwrap();
         let output = std::process::Command::new(executable_handle_path(&executable))
             .arg("--list")
@@ -957,8 +977,8 @@ mod reload_tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn tools_follow_the_installed_path_after_the_running_binary_is_replaced() {
+        use crate::write_executable_script::write_executable_script;
         use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::fs::PermissionsExt;
 
         if let Some(installed_path) = std::env::var_os(REPLACED_BINARY_CHILD) {
             println!("ready");
@@ -1042,8 +1062,7 @@ mod reload_tests {
 
         // Replace the file the way install(1) or a package manager does.
         let staged_path = directory.path().join("konnect.new");
-        std::fs::write(&staged_path, "#!/bin/sh\necho 'konnect 99.0.0'\n").unwrap();
-        std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable_script(&staged_path, "#!/bin/sh\necho 'konnect 99.0.0'\n");
         std::fs::rename(&staged_path, &installed_path).unwrap();
         child.stdin.take().unwrap().write_all(b"\n").unwrap();
 

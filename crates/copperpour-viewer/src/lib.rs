@@ -489,6 +489,10 @@ pub fn files_needing_render(
     need
 }
 
+#[cfg(all(test, unix))]
+#[path = "../../test-support/write_executable_script.rs"]
+mod write_executable_script;
+
 #[cfg(test)]
 mod tests {
     use super::*;
