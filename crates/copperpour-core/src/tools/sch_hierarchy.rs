@@ -7105,6 +7105,33 @@ mod instance_path_lifecycle_tests {
         (result["isError"] == json!(true), body)
     }
 
+    #[tokio::test]
+    async fn edit_sheet_rename_keeps_kicad_fields_autoplaced() {
+        let (_tmp, root) = project();
+        let before = std::fs::read_to_string(&root).unwrap();
+        let (error, body) = served(
+            "edit_sheet",
+            json!({"schematic": root, "sheet_name": "Shared A", "new_name": "Shared X"}),
+        )
+        .await;
+        assert!(!error, "{body}");
+        assert_eq!(body["changed_fields"], json!(["name"]), "{body}");
+        // KiCad's forced resave keeps the rest of the file byte-for-byte.
+        let expected = before.replace(
+            r#"(property "Sheetname" "Shared A""#,
+            r#"(property "Sheetname" "Shared X""#,
+        );
+        let written = std::fs::read_to_string(&root).unwrap();
+        let first_difference = written
+            .lines()
+            .zip(expected.lines())
+            .find(|(written, expected)| written != expected);
+        assert!(
+            written == expected,
+            "rename must preserve KiCad serialization; first differing lines (written, expected): {first_difference:?}"
+        );
+    }
+
     /// Every `(project, path)` each placed symbol records, sorted, by
     /// reference. Read from the raw file rather than the editor model the
     /// code under test uses.
@@ -7870,6 +7897,11 @@ mod instance_path_lifecycle_tests {
         )
         .await;
         assert!(!failed, "{renumbered}");
+        let written = std::fs::read_to_string(&mid).unwrap();
+        assert!(
+            written.contains("(dnp no)\n\t\t(fields_autoplaced yes)"),
+            "renumber_sheet_pages must keep the KiCad sheet flag after dnp"
+        );
         let leaf_uuid = sheet_uuid(&mid, "Leaf Renamed");
         assert_eq!(
             renumbered["pages"][0]["path"],
@@ -8666,6 +8698,12 @@ mod sheet_pin_resize_tests {
         assert_eq!(out["changed_fields"], json!(["position", "side"]), "{out}");
         assert_eq!(out["pin"]["side"], "right", "{out}");
         assert_eq!(at_in_file(&path, "L"), (132.08, 81.28, 0.0));
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("(dnp no)\n\t\t(fields_autoplaced yes)"),
+            "edit_sheet_pin must keep the KiCad sheet flag after dnp"
+        );
     }
 
     /// Sliding along its own edge moves the pin and nothing else.

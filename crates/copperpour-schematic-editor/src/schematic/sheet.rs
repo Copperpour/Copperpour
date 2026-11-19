@@ -285,10 +285,19 @@ impl Sheet {
             "size",
             vec![atom(fmt_f64(self.width)), atom(fmt_f64(self.height))],
         ));
+        // KiCad writes this flag after the sheet attributes (ending in dnp)
+        // and before the sheet's stroke and fill.
+        let style_start = self
+            .raw_sub_nodes
+            .iter()
+            .position(|node| matches!(node.tag(), Some("stroke" | "fill")))
+            .unwrap_or(self.raw_sub_nodes.len());
+        let (attributes, style) = self.raw_sub_nodes.split_at(style_start);
+        c.extend(attributes.iter().cloned());
         if self.fields_autoplaced {
-            c.push(SexpNode::List(vec![atom("fields_autoplaced")]));
+            c.push(tagged("fields_autoplaced", vec![atom("yes")]));
         }
-        c.extend(self.raw_sub_nodes.iter().cloned());
+        c.extend(style.iter().cloned());
         c.push(tagged("uuid", vec![qstr(self.uuid.clone())]));
         for p in &self.properties {
             c.push(p.to_sexp());

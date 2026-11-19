@@ -850,6 +850,16 @@ mod tests {
             "a9a16ec1-d102-41c0-b24c-f8bf2ba99f68",
             (124.46, 99.06),
         );
+        let tree = copperpour_sexp::parse_sexp(&written).unwrap();
+        let sheet = tree.find("sheet").unwrap();
+        assert!(
+            sheet.children().unwrap().windows(2).any(|pair| {
+                pair[0].head() == Some("dnp")
+                    && pair[1].head() == Some("fields_autoplaced")
+                    && pair[1].get(1).and_then(|node| node.as_str()) == Some("yes")
+            }),
+            "move_region must keep the KiCad sheet flag after dnp"
+        );
         // The pin rides on the sheet's edge, still on the end of its wire.
         let pin = written.find("(pin \"SP\" bidirectional").unwrap();
         assert!(
