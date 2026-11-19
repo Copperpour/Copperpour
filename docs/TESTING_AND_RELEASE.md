@@ -104,7 +104,7 @@ PR CI runs on GitHub Actions ([GOVERNANCE.md](../GOVERNANCE.md#where-ci-runs)):
 documentation tests, plugin, Nix, licenses, PCM validation and the offline
 build; `windows.yml` and `macos.yml` run Check & Test on those systems. The
 release build and the real-KiCad job run on a maintainer's machine (local CI).
-The real-KiCad job runs `e2e-kicad.yml`'s steps against KiCad 10.0.5 in a
+The real-KiCad job runs `e2e-kicad.yml`'s steps against KiCad 10.0.8 in a
 Windows VM. It is not a per-PR
 check, because it takes over half an hour. Ask a maintainer to run it on a pull
 request when KiCad-facing behavior needs that evidence. The `run:e2e-kicad`
