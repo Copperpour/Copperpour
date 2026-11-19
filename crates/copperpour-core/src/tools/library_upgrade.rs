@@ -1475,16 +1475,32 @@ async fn handle_upgrade_library(
         )));
     }
 
+    // kicad-cli upgrades a copy of exactly the text read and compared, so a
+    // save to the library in between cannot reach the comparison; the
+    // transaction still refuses to replace a file that changed.
     let staging = tempfile::tempdir()?;
-    let output = staging.path().join(
-        path.file_name()
-            .map(|name| name.to_os_string())
-            .unwrap_or_default(),
-    );
+    let library_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    let input = staging.path().join("read").join(&library_name);
+    match kind {
+        Kind::Symbol => {
+            std::fs::create_dir_all(staging.path().join("read"))?;
+            std::fs::write(&input, &files[0].text)?;
+        }
+        Kind::Footprint => {
+            std::fs::create_dir_all(&input)?;
+            for file in &files {
+                std::fs::write(input.join(&file.name), &file.text)?;
+            }
+        }
+    }
+    let output = staging.path().join(&library_name);
     let written = match super::cli::upgrade_library_into(
         &ctx.config.kicad_cli,
         kind.command(),
-        &path,
+        &input,
         &output,
     )
     .await
@@ -2261,17 +2277,24 @@ mod tests {
             FOOTPRINT_KICAD10.replace("\"R_X\"", "\"R_Y\""),
         )
         .unwrap();
-        // The stand-in changes R_Y while it upgrades: after the read.
+        // The stand-in changes R_Y in the library while it upgrades, after
+        // the read, then keeps a copy of what it was given to upgrade.
+        let seen = dir.path().join("seen.pretty");
         let script = write_script(
             dir.path(),
             "fake-kicad-cli",
             &format!(
-                "#!/bin/sh\ncp -r '{}' \"$4\"\nprintf ' ' >> \"$5/R_Y.kicad_mod\"\n",
-                upgraded.display()
+                "#!/bin/sh\ncp -r '{}' \"$4\"\nprintf ' ' >> '{}'\ncp -r \"$5\" '{}'\n",
+                upgraded.display(),
+                library.join("R_Y.kicad_mod").display(),
+                seen.display()
             ),
             &format!(
-                "@xcopy /e /i /q /y \"{}\" \"%~4\" >nul\r\n@echo.>> \"%~5\\R_Y.kicad_mod\"\r\n",
-                upgraded.display()
+                "@xcopy /e /i /q /y \"{}\" \"%~4\" >nul\r\n@echo.>> \"{}\"\r\n\
+                 @xcopy /e /i /q /y \"%~5\" \"{}\" >nul\r\n",
+                upgraded.display(),
+                library.join("R_Y.kicad_mod").display(),
+                seen.display()
             ),
         );
 
@@ -2289,6 +2312,11 @@ mod tests {
                 .unwrap()
                 .ends_with("R_Y.kicad_mod"),
             "{body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(seen.join("R_Y.kicad_mod")).unwrap(),
+            second,
+            "kicad-cli upgrades the text as read, not the later save"
         );
         assert_eq!(
             std::fs::read_to_string(library.join("R_X.kicad_mod")).unwrap(),

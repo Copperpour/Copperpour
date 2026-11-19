@@ -1885,4 +1885,22 @@ mod tests {
             assert_eq!(field_of(error), field, "{arguments}");
         }
     }
+
+    /// KiCad stores a space in a pin name as '_', so pin_name is read the
+    /// same way: "Data in" selects the pin named Data_in.
+    #[tokio::test]
+    async fn a_pin_name_with_a_space_selects_the_pin_named_with_an_underscore() {
+        let (_dir, path) = library_with(KICAD7);
+        let body = call(json!({
+            "library_path": path, "symbol_name": "AFBR-1624Z", "pin_number": "4",
+            "pin_name": "Data in", "type": "output"
+        }))
+        .await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(body["pin_name"], "Data_in", "{body}");
+        assert_eq!(
+            body["changes"]["type"],
+            json!({ "previous": "input", "current": "output" })
+        );
+    }
 }
