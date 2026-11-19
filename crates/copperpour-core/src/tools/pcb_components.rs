@@ -2403,9 +2403,10 @@ pub fn tools() -> Vec<ToolDef> {
              populate), exclude_from_bom and exclude_from_pos_files. Every property not named \
              is kept. One KiCad undo step; the result is a fresh readback of what the board \
              holds, and a readback that does not match the request is reported as an error \
-             rather than success. KiCad 10 replaces the whole footprint, though: its \
-             symbol-unit mapping is lost until Update PCB from Schematic, and a rule area \
-             inside it may be rewritten; the readback sees neither. update_pcb_from_schematic \
+             rather than success. This edit sends the whole footprint over IPC and can drop \
+             symbol-unit mappings on KiCad 10.0–10.0.7. Rule areas inside footprints can also \
+             change. Readback verifies neither. See 'Footprint unit metadata disappears after \
+             a live PCB edit' in Troubleshooting. update_pcb_from_schematic \
              sets dnp and exclude_from_bom from a linked footprint's symbol again. With no \
              property named, reports the footprint without changing it. Does not save. \
              Requires KiCad running with the board open.",
@@ -3376,9 +3377,9 @@ async fn handle_edit_component(
 }
 
 /// Sent with every footprint `edit_component` sent back to KiCad.
-const WHOLE_FOOTPRINT_WARNING: &str = "The footprint was sent back to KiCad whole. On KiCad 10 \
-     that drops its symbol-unit mapping until Update PCB from Schematic, and a rule area inside \
-     it may be rewritten; the readback sees neither.";
+const WHOLE_FOOTPRINT_WARNING: &str = "Whole-footprint IPC edits can drop symbol-unit mappings \
+     on KiCad 10.0–10.0.7. They can also rewrite rule areas inside footprints. Readback verifies \
+     neither. See https://github.com/Copperpour/Copperpour/blob/main/docs/TROUBLESHOOTING.md#footprint-unit-metadata-disappears-after-a-live-pcb-edit";
 
 /// The flags `update_pcb_from_schematic` sets from a linked footprint's
 /// symbol, as they would undo an edit of them on the board.
@@ -9857,6 +9858,18 @@ mod edit_component_tests {
 
     const C_0603: &[u8] = include_bytes!("../../tests/fixtures/c_0603_loaded_front_0.ipc.bin");
 
+    #[test]
+    fn edit_component_describes_the_unit_mapping_risk() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "edit_component")
+            .unwrap();
+        assert!(tool
+            .description
+            .contains("drop symbol-unit mappings on KiCad 10.0–10.0.7"));
+        assert!(tool.description.contains("Troubleshooting"));
+    }
+
     /// What the mock does with an `UpdateItems`.
     #[derive(Clone, Copy, PartialEq)]
     enum Kicad {
@@ -10209,15 +10222,20 @@ mod edit_component_tests {
         );
         assert_eq!(body["before"]["dnp"], false);
         assert_eq!(body["undo"], "one KiCad undo step");
+        let warning = body["warning"].as_str().unwrap();
+        for expected in [
+            "drop symbol-unit mappings on KiCad 10.0–10.0.7.",
+            "rewrite rule areas inside footprints",
+            "Readback verifies neither",
+            "TROUBLESHOOTING.md#footprint-unit-metadata-disappears-after-a-live-pcb-edit",
+        ] {
+            assert!(
+                warning.contains(expected),
+                "missing {expected:?}: {warning}"
+            );
+        }
         assert!(
-            body["warning"].as_str().unwrap().contains("whole"),
-            "{body}"
-        );
-        assert!(
-            !body["warning"]
-                .as_str()
-                .unwrap()
-                .contains("update_pcb_from_schematic"),
+            !warning.contains("update_pcb_from_schematic"),
             "the capture is not linked to a symbol: {body}"
         );
 

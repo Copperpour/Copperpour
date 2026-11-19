@@ -9,12 +9,11 @@
 //!
 //! This tool is live-first with a file fallback. On a live board the fields
 //! go through the same whole-footprint update `edit_footprint_field` uses, in
-//! one undo step, and the response's `warning` names what sending a footprint
-//! whole costs on KiCad 10. With no live KiCad holding the board, the
-//! `(size …)` and `(thickness …)` of each field's `(font …)` are rewritten in
-//! the saved file, guarded against a concurrent save, and re-read to prove
-//! the result. Either way the response lists the old and new values of every
-//! field.
+//! one undo step. The response warns when it sends footprints whole. With no
+//! live KiCad holding the board, the `(size …)` and `(thickness …)` of each
+//! field's `(font …)` are rewritten in the saved file, guarded against a
+//! concurrent save, and re-read to prove the result. Either way the response
+//! lists the old and new values of every field.
 //!
 //! The layer, visibility and mirror flag are set the way KiCad's Edit Text
 //! and Graphic Properties dialog sets them on a selection, in one undo step,
@@ -251,10 +250,9 @@ fn entry(footprint: &str, field: &str, before: Value, after: Value) -> Value {
 /// The live `warning` when footprints were sent. The same caveat as
 /// `edit_footprint_field`'s description, in the result itself so a caller
 /// that reads only the result still sees it.
-const WHOLE_FOOTPRINT_WARNING: &str =
-    "Each footprint whose field changed was sent back to KiCad whole. On KiCad 10 that \
-     drops its symbol-unit mapping until Update PCB from Schematic, and a rule area inside \
-     it may be rewritten; the readback sees neither.";
+const WHOLE_FOOTPRINT_WARNING: &str = "Whole-footprint IPC edits can drop symbol-unit mappings \
+     on KiCad 10.0–10.0.7. They can also rewrite rule areas inside footprints. Readback verifies \
+     neither. See https://github.com/Copperpour/Copperpour/blob/main/docs/TROUBLESHOOTING.md#footprint-unit-metadata-disappears-after-a-live-pcb-edit";
 
 /// The success body both paths share, so a caller reads one shape whichever
 /// ran and `source` names it. `wrote` is whether anything was sent or
