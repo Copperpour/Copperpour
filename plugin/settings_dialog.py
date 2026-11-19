@@ -311,15 +311,17 @@ class CopperpourSettingsDialog(wx.Dialog):
         )
 
     def _collect_settings(self):
-        """Read current field values into a settings dict."""
-        return {
+        """Update dialog fields while preserving other settings."""
+        settings = dict(self.settings)
+        settings.update({
             "kicad_cli": self.kicad_cli_ctrl.GetValue().strip(),
             "ipc_socket_path": self.ipc_ctrl.GetValue().strip(),
             "jlcpcb_db_path": self.jlcpcb_ctrl.GetValue().strip(),
             "log_level": LOG_LEVELS[self.log_level_ctrl.GetSelection()],
             "transport": TRANSPORTS[self.transport_ctrl.GetSelection()],
             "native_specctra_bridge": self.native_bridge_ctrl.GetValue(),
-        }
+        })
+        return settings
 
     def _update_server_status(self):
         """Update the server status display."""
