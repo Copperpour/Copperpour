@@ -152,3 +152,20 @@ mid-span only through a junction there, or a label over two or more wires
 So at the crossing, the overlap and the T
 without its dot, a dot is what joins the wires, and moving a pin there or away
 neither adds nor removes one.
+
+## Splits
+
+The #570 test draws wires the same way, then calls `split_wire_at_point`
+through the served tools. Where a case's dot is taken out, the dot the draw
+wrote is removed before the split.
+
+| Case | Wires | Split at | Dots after | Added |
+|---|---|---|---|---|
+| mid-span, nothing else there | `(101.6,101.6)→(127,101.6)` | `(114.3, 101.6)` | none | 0 |
+| a T's through wire | that wire and `(114.3,101.6)→(114.3,88.9)` | `(114.3, 101.6)` | `(114.3, 101.6)` | 0 |
+| a T with its dot taken out | as above | `(114.3, 101.6)` | `(114.3, 101.6)` | 1 |
+| a collinear wire ending at the point | `(101.6,101.6)→(127,101.6)`, `(114.3,101.6)→(139.7,101.6)` | `(114.3, 101.6)` | none | 0 |
+| a bare crossing | `(101.6,101.6)→(127,101.6)`, `(114.3,88.9)→(114.3,114.3)` | `(114.3, 101.6)` | none | 0 |
+| a T on a crossing with its dot taken out | those two and `(114.3,101.6)→(124.46,91.44)` | `(114.3, 101.6)` | `(114.3, 101.6)` | 1 |
+| a wire through pin 1 | `(139.7,97.79)→(165.1,97.79)` | `(152.4, 97.79)` | `(152.4, 97.79)` | 0 |
+| a wire through pin 1 with its dot taken out | as above | `(152.4, 97.79)` | `(152.4, 97.79)` | 1 |
