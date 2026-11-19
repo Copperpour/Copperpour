@@ -50,7 +50,7 @@ jobs:
       # day KiCAD 11 ships, while metadata.json still declares kicad_version
       # 10.x. Bump deliberately alongside the supported-version claim.
       - name: Install KiCAD
-        run: choco install kicad --version=10.0.5 --no-progress --yes
+        run: choco install kicad --version=10.0.8 --no-progress --yes
 
       - name: Locate kicad-cli and demos
         id: kicad

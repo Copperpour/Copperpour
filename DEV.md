@@ -94,7 +94,7 @@ packaging/   build-pcm.{ps1,sh} (one platform) · merge-pcm.py + pcm-launcher.sh
                   Nix, PCM validation, licenses, offline build
     windows.yml   GitHub, per PR: check+test (Windows)
     macos.yml     GitHub, per PR: check+test (macOS); macOS release artifacts
-    e2e-kicad.yml local CI: real KiCad 10.0.5: e2e suite, demo-corpus
+    e2e-kicad.yml local CI: real KiCad 10.0.8: e2e suite, demo-corpus
                   conformance, PCM; release gate, on request for a PR
     release.yml   local CI: real-KiCad gate, build, PCM (Linux x86_64, Windows)
 ```
