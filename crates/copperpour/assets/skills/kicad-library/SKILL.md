@@ -24,7 +24,7 @@ load_toolset('library')    # search_symbols, search_footprints, create_symbol, c
                            # set_footprint_models, get_footprint_info, register_symbol_library,
                            # register_footprint_library, get_symbol_info,
                            # set_symbol_properties
-load_toolset('library_maintenance') # upgrade_library, rename_footprint
+load_toolset('library_maintenance') # upgrade_library, rename_footprint, rename_symbol
 load_toolset('pcb_components') # update_footprints_from_library for placed instances
 ```
 
@@ -503,6 +503,15 @@ it equals the old name. It refuses a name already in the library, including one 
 differs only in case. Symbols whose Footprint field names the old footprint keep it, as
 in KiCad: update them with `set_symbol_properties(footprint=…)`. Footprints placed on
 boards keep the old library id until they are changed from the library.
+
+### Rename a Library Symbol
+
+`rename_symbol(library_path, symbol_name, new_name)`, in the `library_maintenance`
+toolset, renames a symbol in its `.kicad_sym` library as KiCad's symbol editor does:
+its unit blocks follow, symbols derived from it extend the new name, and its Value
+changes when it equals the old name. KiCad stores `\ < > : "` escaped (`{colon}` for
+`:`), so use the `name` the answer gives in a library id. It refuses a name already in
+the library. Symbols placed in schematics keep the old library id, as in KiCad.
 
 ---
 
