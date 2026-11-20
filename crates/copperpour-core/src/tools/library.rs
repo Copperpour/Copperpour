@@ -168,7 +168,7 @@ pub fn tools() -> Vec<ToolDef> {
                             "properties": {
                                 "number": { "type": "string" },
                                 "type": { "type": "string", "description": "'smd', 'thru_hole', 'np_thru_hole'" },
-                                "shape": { "type": "string", "description": "'rect', 'oval', 'circle', 'roundrect'" },
+                                "shape": { "type": "string", "description": "'rect', 'oval', 'circle', 'roundrect', or 'custom' with custom_shape" },
                                 "x": { "type": "number" },
                                 "y": { "type": "number" },
                                 "width": { "type": "number" },
@@ -189,6 +189,7 @@ pub fn tools() -> Vec<ToolDef> {
                                     "maximum": 0.5,
                                     "description": "Rounded-rectangle corner radius ratio (0..0.5)"
                                 },
+                                "custom_shape": super::pad_primitives::custom_shape_schema(),
                                 "fabrication_property": {
                                     "type": "string",
                                     "enum": PadFabricationProperty::names(),
@@ -225,7 +226,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_footprint_pad",
-            "Edit the size, shape, position, drill, zone connection, fabrication property, or solder mask and paste margins of a pad in an existing .kicad_mod footprint file. Each margin set is reported with its previous and current value.",
+            "Edit the size, shape, corner ratio, custom shape, position, drill, zone connection, fabrication property, or solder mask and paste margins of a pad in an existing .kicad_mod footprint file. Each margin and the corner ratio are reported with their previous and current value; a custom shape is reported as read back from the pad as written.",
             json!({
                 "type": "object",
                 "properties": {
@@ -239,9 +240,16 @@ pub fn tools() -> Vec<ToolDef> {
                     "height": { "type": "number", "description": "New pad height in mm (optional)" },
                     "shape": {
                         "type": "string",
-                        "enum": ["circle", "rect", "oval", "roundrect"],
-                        "description": "New standard pad shape (optional). roundrect gets a valid default corner ratio when needed."
+                        "enum": ["circle", "rect", "oval", "roundrect", "custom"],
+                        "description": "New pad shape (optional). roundrect gets a valid default corner ratio when needed. custom needs custom_shape. Changing a custom pad to another shape removes its primitives."
                     },
+                    "roundrect_rratio": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 0.5,
+                        "description": "Corner radius as a fraction of the pad's smaller side (0..0.5), as KiCad's roundrect_rratio (optional). Only for a roundrect pad, or with shape roundrect in the same call."
+                    },
+                    "custom_shape": super::pad_primitives::custom_shape_schema(),
                     "drill": footprint_drill_schema(),
                     "zone_connect": {
                         "type": "string",
@@ -471,7 +479,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "footprint_path": { "type": "string", "description": "Path to .kicad_mod file, OR 'Library:Footprint' identifier" },
                     "project": { "type": "string", "description": "Path to a .kicad_pro used to resolve project libraries (optional)" },
-                    "include_pads": { "type": "boolean", "description": "Include typed pad geometry in footprint-local coordinates", "default": false },
+                    "include_pads": { "type": "boolean", "description": "Include typed pad geometry in footprint-local coordinates. A custom pad also gets custom_shape (anchor, clearance and primitives, the form edit_footprint_pad takes), or custom_shape_unreadable with the reason.", "default": false },
                     "include_graphics": { "type": "boolean", "description": "Include supported top-level footprint graphics in the response", "default": false },
                     "graphics_layer": { "type": "string", "description": "Return graphics only from this canonical KiCad layer; implies include_graphics" }
                 },
@@ -949,6 +957,19 @@ pub(crate) async fn handle_create_footprint(
         } else {
             String::new()
         };
+        // On the pad's one line, after everything else, where KiCad writes them.
+        let custom_shape = match pad.get("custom_shape").filter(|value| !value.is_null()) {
+            Some(value) => {
+                let custom = super::pad_primitives::CustomPadShape::from_json(value)
+                    .expect("validated custom shape");
+                format!(
+                    " {} {}",
+                    super::pad_primitives::inline(&custom.options_sexp(0)),
+                    super::pad_primitives::inline(&custom.primitives_sexp(0))
+                )
+            }
+            None => String::new(),
+        };
 
         // KiCad writes the property just before the layers.
         let fabrication_property = pad["fabrication_property"]
@@ -966,8 +987,18 @@ pub(crate) async fn handle_create_footprint(
             .map_or_else(String::new, |token| format!("(property {token}) "));
 
         pad_sexp.push_str(&format!(
-            "\n  (pad \"{}\" {} {} {} (size {} {}) {}{} {} {})",
-            number, pad_type, shape, at, w, h, property, layers, drill_sexp, roundrect_ratio
+            "\n  (pad \"{}\" {} {} {} (size {} {}) {}{} {} {}{})",
+            number,
+            pad_type,
+            shape,
+            at,
+            w,
+            h,
+            property,
+            layers,
+            drill_sexp,
+            roundrect_ratio,
+            custom_shape
         ));
         pad_geoms.push(PadGeom {
             number,
@@ -1065,6 +1096,37 @@ fn validate_footprint_pad_items(pads: &[serde_json::Value]) -> Result<(), CallTo
             )
             .map_err(|reason| invalid_library_argument(&format!("pads[{index}].drill"), reason))?;
         }
+        let shape = pad["shape"].as_str().expect("validated");
+        match (
+            shape,
+            pad.get("custom_shape").filter(|value| !value.is_null()),
+        ) {
+            ("custom", None) => {
+                return Err(invalid_library_argument(
+                    &format!("pads[{index}].custom_shape"),
+                    "shape 'custom' needs custom_shape, the pad's anchor and primitives",
+                ))
+            }
+            ("custom", Some(value)) => {
+                if let Err((field, reason)) =
+                    super::pad_primitives::CustomPadShape::from_json(value)
+                {
+                    let field = if field.is_empty() {
+                        format!("pads[{index}].custom_shape")
+                    } else {
+                        format!("pads[{index}].custom_shape.{field}")
+                    };
+                    return Err(invalid_library_argument(&field, reason));
+                }
+            }
+            (other, Some(_)) => {
+                return Err(invalid_library_argument(
+                    &format!("pads[{index}].custom_shape"),
+                    format!("applies to a custom pad, but shape is '{other}'"),
+                ))
+            }
+            _ => {}
+        }
         if let Some(value) = pad
             .get("fabrication_property")
             .filter(|value| !value.is_null())
@@ -1116,14 +1178,16 @@ async fn handle_edit_footprint_pad(
     let shape = match args.get("shape") {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => match value.as_str() {
-            Some(shape) if matches!(shape, "circle" | "rect" | "oval" | "roundrect") => {
+            Some(shape)
+                if matches!(shape, "circle" | "rect" | "oval" | "roundrect" | "custom") =>
+            {
                 Some(shape)
             }
             Some(shape) => {
                 return Ok(invalid_library_argument(
                     "shape",
                     format!(
-                        "unsupported standard shape '{shape}'; expected circle, rect, oval, or roundrect"
+                        "unsupported shape '{shape}'; expected circle, rect, oval, roundrect, or custom"
                     ),
                 ))
             }
@@ -1171,6 +1235,48 @@ async fn handle_edit_footprint_pad(
         Ok(margins) => margins,
         Err(refusal) => return Ok(invalid_library_argument(refusal.field, refusal.reason)),
     };
+    let roundrect_rratio = match args.get("roundrect_rratio").map(corner_ratio).transpose() {
+        Ok(ratio) => ratio,
+        Err(reason) => return Ok(invalid_library_argument("roundrect_rratio", reason)),
+    };
+    let custom_shape = match args
+        .get("custom_shape")
+        .map(super::pad_primitives::CustomPadShape::from_json)
+        .transpose()
+    {
+        Ok(custom_shape) => custom_shape,
+        Err((field, reason)) => {
+            let field = if field.is_empty() {
+                "custom_shape".to_string()
+            } else {
+                format!("custom_shape.{field}")
+            };
+            return Ok(invalid_library_argument(&field, reason));
+        }
+    };
+    match (shape, &custom_shape) {
+        (Some("custom"), None) => {
+            return Ok(invalid_library_argument(
+                "custom_shape",
+                "shape 'custom' needs custom_shape, the pad's anchor and primitives",
+            ))
+        }
+        (Some(shape), Some(_)) if shape != "custom" => {
+            return Ok(invalid_library_argument(
+                "custom_shape",
+                format!("applies to a custom pad, but shape is '{shape}'"),
+            ))
+        }
+        _ => {}
+    }
+    if let (Some(shape), Some(_)) = (shape, roundrect_rratio) {
+        if shape != "roundrect" {
+            return Ok(invalid_library_argument(
+                "roundrect_rratio",
+                format!("applies to a roundrect pad, but shape is '{shape}'"),
+            ));
+        }
+    }
 
     let content = read_consistent(&path)?;
     let file_version = match parse_sexp(&content) {
@@ -1197,6 +1303,8 @@ async fn handle_edit_footprint_pad(
     let mut observed_margins = vec![Vec::new(); margins.len()];
     let mut observed_zone_connects = Vec::new();
     let mut observed_fabrication_properties = Vec::new();
+    let mut observed_ratios = Vec::new();
+    let mut observed_custom_shapes = Vec::new();
     let mut warnings = Vec::new();
     for (start, end) in find_direct_child_blocks(&content, "footprint") {
         let block = &content[start..end];
@@ -1212,10 +1320,59 @@ async fn handle_edit_footprint_pad(
         }
 
         matched_count += 1;
+        // Without a new shape, the ratio and the custom shape need a pad that
+        // already has that shape: KiCad writes the ratio only for roundrect
+        // (and chamfered) pads, and primitives only for custom ones.
+        let current_shape = node.get(3).and_then(SexpNode::as_str).unwrap_or("?");
+        if shape.is_none() && roundrect_rratio.is_some() && current_shape != "roundrect" {
+            return Ok(invalid_library_argument(
+                "roundrect_rratio",
+                format!(
+                    "pad '{pad_number}' is {current_shape}, not roundrect; pass shape 'roundrect' to change it"
+                ),
+            ));
+        }
+        if shape.is_none() && custom_shape.is_some() && current_shape != "custom" {
+            return Ok(invalid_library_argument(
+                "custom_shape",
+                format!(
+                    "pad '{pad_number}' is {current_shape}, not custom; pass shape 'custom' to change it"
+                ),
+            ));
+        }
         let mut edited = match edit_footprint_pad_block(block, args, new_number, shape) {
             Ok(edited) => edited,
             Err(reason) => return Ok(invalid_library_argument("shape", reason)),
         };
+        if let Some(custom) = &custom_shape {
+            edited = set_pad_custom_shape(edited, custom);
+            let written = parse_sexp(&edited)?;
+            let read_back =
+                super::pad_primitives::CustomPadShape::from_pad(&written).map_err(|reason| {
+                    anyhow::anyhow!("the custom shape does not read back: {reason}")
+                })?;
+            anyhow::ensure!(
+                &read_back == custom,
+                "the custom shape reads back differently from what was asked"
+            );
+            push_distinct(&mut observed_custom_shapes, read_back.to_json());
+        }
+        if let Some(ratio) = roundrect_rratio {
+            edited = set_pad_child(
+                edited,
+                "roundrect_rratio",
+                Some(format!("(roundrect_rratio {})", format_ratio(ratio))),
+            );
+            let written = parse_sexp(&edited)?;
+            let ratio_of = |pad: &SexpNode| {
+                pad.find("roundrect_rratio")
+                    .and_then(|ratio| ratio.get_f64(1))
+            };
+            push_distinct(
+                &mut observed_ratios,
+                json!({ "previous": ratio_of(&node), "current": ratio_of(&written) }),
+            );
+        }
         if let Some(zone_connect) = zone_connect {
             edited = set_pad_zone_connect(edited, zone_connect);
             observed_zone_connects.push(
@@ -1281,6 +1438,16 @@ async fn handle_edit_footprint_pad(
     for ((margin, _), observed) in margins.iter().zip(observed_margins) {
         solder_margins::report(&mut response, *margin, observed);
     }
+    for (key, observed) in [
+        ("roundrect_rratio", observed_ratios),
+        ("custom_shape", observed_custom_shapes),
+    ] {
+        match observed.as_slice() {
+            [] => {}
+            [one] => response[key] = one.clone(),
+            several => response[key] = json!(several),
+        }
+    }
     if !warnings.is_empty() {
         response["warnings"] = json!(warnings);
     }
@@ -1307,6 +1474,79 @@ fn push_distinct<T: PartialEq>(values: &mut Vec<T>, value: T) {
     if !values.contains(&value) {
         values.push(value);
     }
+}
+
+/// A corner ratio argument: a fraction of the pad's smaller side, 0..0.5, as
+/// KiCad's `roundrect_rratio` and `chamfer_ratio` are (#107 can reuse it).
+fn corner_ratio(value: &serde_json::Value) -> Result<f64, String> {
+    let ratio = value
+        .as_f64()
+        .ok_or_else(|| "must be a number when supplied".to_string())?;
+    if !(0.0..=0.5).contains(&ratio) {
+        return Err(format!("{ratio} is outside 0..0.5"));
+    }
+    Ok(ratio)
+}
+
+/// A ratio as KiCad's writer formats it (`FormatDouble2Str`,
+/// `common/string_utils.cpp`, 10.0.8): ten significant digits, or sixteen
+/// decimals at or below 0.0001, trailing zeros removed.
+fn format_ratio(ratio: f64) -> String {
+    if ratio == 0.0 {
+        return "0".to_string();
+    }
+    let text = if ratio.abs() <= 0.0001 {
+        format!("{ratio:.16}")
+    } else {
+        let integer_digits = ratio.abs().log10().floor() as i32 + 1;
+        let decimals = (10 - integer_digits).max(0) as usize;
+        format!("{ratio:.decimals$}")
+    };
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        text
+    }
+}
+
+/// Give a pad block `custom`'s `(options …)` and `(primitives …)`, in
+/// KiCad's order and layout: on their own lines at the pad's indentation and
+/// line ending, or inline for a pad written on one line.
+fn set_pad_custom_shape(
+    pad_block: String,
+    custom: &super::pad_primitives::CustomPadShape,
+) -> String {
+    let separator = find_direct_child_blocks(&pad_block, "pad")
+        .first()
+        .map(|&(start, _)| {
+            pad_block[leading_whitespace_start(&pad_block, start)..start].to_string()
+        })
+        .unwrap_or_default();
+    let (options, primitives) = match separator.rfind('\n') {
+        Some(newline) => {
+            let indent = &separator[newline + 1..];
+            let depth = if indent.chars().all(|c| c == '\t') {
+                indent.len()
+            } else {
+                2
+            };
+            let line_ending = if pad_block.contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            (
+                custom.options_sexp(depth).replace('\n', line_ending),
+                custom.primitives_sexp(depth).replace('\n', line_ending),
+            )
+        }
+        None => (
+            super::pad_primitives::inline(&custom.options_sexp(0)),
+            super::pad_primitives::inline(&custom.primitives_sexp(0)),
+        ),
+    };
+    let pad_block = set_pad_child(pad_block, "options", Some(options));
+    set_pad_child(pad_block, "primitives", Some(primitives))
 }
 
 /// A pad's `(zone_connect N)` override. The numbers are KiCad's
@@ -5453,10 +5693,19 @@ async fn handle_get_footprint_info(
                     )))
                 }
             };
+            let mut info = serde_json::to_value(info)?;
+            // A custom pad's anchor, clearance and primitives, in the form
+            // edit_footprint_pad and create_footprint take as custom_shape.
+            if pad.get(3).and_then(SexpNode::as_str) == Some("custom") {
+                match super::pad_primitives::CustomPadShape::from_pad(pad) {
+                    Ok(custom) => info["custom_shape"] = custom.to_json(),
+                    Err(reason) => info["custom_shape_unreadable"] = json!(reason),
+                }
+            }
             pads.push(info);
         }
         response["coordinate_space"] = json!("footprint_local");
-        response["pads"] = serde_json::to_value(pads)?;
+        response["pads"] = json!(pads);
     }
     let graphics_layer = args["graphics_layer"].as_str();
     let include_graphics =
@@ -5874,6 +6123,10 @@ async fn handle_get_symbol_info(
         serde_json::to_string(&answer).unwrap(),
     ))
 }
+
+#[cfg(test)]
+#[path = "library_custom_pad_tests.rs"]
+mod custom_pad_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7054,7 +7307,7 @@ mod tests {
         assert_eq!(properties["match_all"]["default"], false);
         assert_eq!(
             properties["shape"]["enum"],
-            json!(["circle", "rect", "oval", "roundrect"])
+            json!(["circle", "rect", "oval", "roundrect", "custom"])
         );
         assert_eq!(
             properties["zone_connect"]["enum"],
@@ -7111,7 +7364,7 @@ mod tests {
             &json!({
                 "footprint_path": "/does/not/exist.kicad_mod",
                 "pad_number": "1",
-                "shape": "custom"
+                "shape": "trapezoid"
             }),
             &test_ctx(),
         )

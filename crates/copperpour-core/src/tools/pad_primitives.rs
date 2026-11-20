@@ -8,10 +8,6 @@
 //! anchor and unrotated, as KiCad stores them. The pad's `size` is the
 //! anchor's size and is not part of this model.
 
-// The custom pad tools of #675 and #679 build on this model in the commits
-// that follow; drop this once they use it.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use super::footprint_graphics::{Fill, FootprintGraphic, Point};
 use copperpour_schematic_editor::types::fmt_f64;
 use copperpour_sexp::SexpNode;
@@ -166,6 +162,39 @@ impl CustomPadShape {
         out.push(')');
         out
     }
+}
+
+/// The JSON schema of a custom pad's shape, as [`CustomPadShape::from_json`]
+/// reads it: `set_footprint_graphics`' items plus the anchor and clearance.
+pub(super) fn custom_shape_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "A custom pad's shape, replacing its whole primitive list. Primitives are in the pad's own coordinates, relative to its anchor and unrotated, as KiCad stores them; the pad's width and height are the anchor's size. Coordinates, radii and widths are rounded to KiCad's 1 nm grid. KiCad's DRC reports a shape whose anchor and primitives do not merge into one polygon (DRCE_PADSTACK_INVALID, 'custom pad shape must resolve to a single polygon'); this tool does not check that.",
+        "properties": {
+            "anchor": { "type": "string", "enum": ["circle", "rect"] },
+            "clearance": {
+                "type": "string",
+                "enum": ["outline", "convexhull"],
+                "default": "outline",
+                "description": "The outline KiCad uses for the pad's clearance in zones."
+            },
+            "primitives": super::footprint_graphics::graphics_schema_with_fill(&["none", "solid"])
+        },
+        "required": ["anchor", "primitives"],
+        "additionalProperties": false
+    })
+}
+
+/// A block written by [`CustomPadShape::options_sexp`] or
+/// [`CustomPadShape::primitives_sexp`] on one line, for a pad written on one
+/// line (older files, `create_footprint`).
+pub(super) fn inline(block: &str) -> String {
+    block
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" )", ")")
 }
 
 /// A length in millimetres on KiCad's 1 nm grid, without a negative zero.
@@ -335,9 +364,12 @@ fn read_primitive(item: &SexpNode) -> Result<FootprintGraphic, String> {
         "gr_circle" => {
             let center = point("center")?;
             let end = point("end")?;
+            // KiCad stores lengths in whole nanometres, so the radius it
+            // means is the distance rounded to 1 nm, not its float error.
+            let radius_mm = ((end.x - center.x).hypot(end.y - center.y) * 1e6).round() / 1e6;
             FootprintGraphic::Circle {
                 center,
-                radius_mm: (end.x - center.x).hypot(end.y - center.y),
+                radius_mm,
                 stroke_width_mm: width,
                 fill: fill()?,
             }
