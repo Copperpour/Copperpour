@@ -205,6 +205,7 @@ column comes from `extract_error_kind()`, so JSONL logs share the vocabulary.
 | `mutation_outcome_uncertain` | Edit committed but readback could not prove it — carries `operation`, `path`, `reason`; reload and inspect the file (or live board) before retrying |
 | `ambiguous_open_board` | KiCad's open-document list is not a complete set of comparable board identities — carries `path`; neither live nor file path may run |
 | `invalid_configuration` | `config.json` or `.copperpour/project.json` exists but is unusable — carries `path`, `reason` (`malformed_json:` / `unreadable:`); defaults are never substituted, since the next save would overwrite the user's settings |
+| `malformed_file` | Referenced KiCad file exists and was read, but its structure is malformed so the operation refused to mutate it — carries `path`, `reason` |
 | `handler_error` | Catch-all for unmigrated `anyhow::Error` |
 
 In a handler:

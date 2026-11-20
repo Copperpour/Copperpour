@@ -3172,9 +3172,35 @@ impl FieldPlacementFailure {
             abort_batch: false,
         }
     }
+
+    fn malformed_file(path: &std::path::Path, reason: String, message: String) -> Self {
+        Self {
+            abort_batch: true,
+            error: CallToolResult::error_kind(
+                ToolErrorKind::MalformedFile {
+                    path: copperpour_sexp::paths::display_path(path),
+                    reason,
+                },
+                message,
+            ),
+        }
+    }
+}
+
+/// A field angle in `[0, 360)`, the form `rotate_schematic_component` writes.
+/// KiCad 10.0.8 keeps `450` as written on resave, so this is our canonical
+/// form, not KiCad's.
+fn normalize_placement_rotation(degrees: f64) -> f64 {
+    let wrapped = degrees.rem_euclid(360.0);
+    if wrapped == 0.0 || wrapped == 360.0 {
+        0.0
+    } else {
+        wrapped
+    }
 }
 
 fn apply_field_placements(
+    path: &std::path::Path,
     content: &mut String,
     reference: &str,
     args: &serde_json::Value,
@@ -3200,7 +3226,13 @@ fn apply_field_placements(
                 match spec.get(key) {
                     None | Some(serde_json::Value::Null) => {}
                     Some(value) => match value.as_f64() {
-                        Some(number) => *slot = Some(number),
+                        Some(number) => {
+                            *slot = Some(if key == "rotation" {
+                                normalize_placement_rotation(number)
+                            } else {
+                                number
+                            });
+                        }
                         None => {
                             plan.errors.push(format!("{name}.{key}: expected a number"));
                             bad = true;
@@ -3254,13 +3286,9 @@ fn apply_field_placements(
                 // found to be broken: the refusal would be reported while the
                 // write went ahead anyway.
                 Err(refusal @ PlacementRefusal::MalformedFile(_)) => {
-                    return Err(FieldPlacementFailure {
-                        abort_batch: true,
-                        error: CallToolResult::error(format!(
-                            "No fields were updated on '{reference}': {name}: {}",
-                            refusal.reason()
-                        )),
-                    })
+                    let reason = format!("{name}: {}", refusal.reason());
+                    let message = format!("No fields were updated on '{reference}': {reason}");
+                    return Err(FieldPlacementFailure::malformed_file(path, reason, message));
                 }
                 Err(refusal) => plan.errors.push(format!("{name}: {}", refusal.reason())),
             }
@@ -3285,13 +3313,14 @@ pub(crate) fn plan_batch_field_placements(
     reference: &str,
     args: &serde_json::Value,
 ) -> Result<BatchFieldPlacements, FieldPlacementFailure> {
-    parse_sexp(content).map_err(|error| FieldPlacementFailure {
-        error: CallToolResult::error(format!("Schematic is malformed: {error}")),
-        abort_batch: true,
+    parse_sexp(content).map_err(|error| {
+        let reason = error.to_string();
+        let message = format!("Schematic is malformed: {reason}");
+        FieldPlacementFailure::malformed_file(path, reason, message)
     })?;
     let target = component_target_from_source(path, content, reference)
         .map_err(|error| FieldPlacementFailure::local(error.into_result()))?;
-    let plan = apply_field_placements(content, reference, args, target.units.len())?;
+    let plan = apply_field_placements(path, content, reference, args, target.units.len())?;
     Ok(BatchFieldPlacements {
         changes: plan.changes,
         errors: plan.errors,
@@ -3368,7 +3397,10 @@ fn placement_landed(seen: &serde_json::Value, placement: &FieldPlacement) -> boo
     };
     agrees("x", placement.x)
         && agrees("y", placement.y)
-        && agrees("rotation", placement.rotation)
+        && agrees(
+            "rotation",
+            placement.rotation.map(normalize_placement_rotation),
+        )
         && placement
             .hide
             .is_none_or(|want| seen["hide"].as_bool() == Some(want))
@@ -3408,6 +3440,42 @@ impl PlacementRefusal {
     }
 }
 
+/// Read a placed symbol block's own direct `(unit N)` child strictly.
+///
+/// Scanning the raw block text for `(unit ` matches quoted property values
+/// placed earlier in the block, and defaulting parse failures to unit 1
+/// silently reclassifies a corrupt unit as unit 1.
+fn symbol_unit_from_block(block: &str, reference: &str) -> Result<u32, PlacementRefusal> {
+    let unit_children: Vec<_> = find_direct_child_blocks(block, "symbol")
+        .into_iter()
+        .filter(|&(child_start, child_end)| block_tag(&block[child_start..child_end]) == "unit")
+        .collect();
+    match unit_children.as_slice() {
+        [(child_start, child_end)] => {
+            let child = &block[*child_start..*child_end];
+            let unit = parse_sexp(child)
+                .ok()
+                .and_then(|node| match node.children() {
+                    Some([_, copperpour_sexp::SexpNode::Atom(token)]) => {
+                        token.parse::<u32>().ok().filter(|&n| n > 0)
+                    }
+                    _ => None,
+                });
+            unit.ok_or_else(|| {
+                PlacementRefusal::MalformedFile(format!(
+                    "placed unit of '{reference}' has a malformed `{child}`"
+                ))
+            })
+        }
+        [] => Err(PlacementRefusal::MalformedFile(format!(
+            "placed unit of '{reference}' carries no (unit …)"
+        ))),
+        _ => Err(PlacementRefusal::MalformedFile(format!(
+            "placed unit of '{reference}' carries more than one (unit …)"
+        ))),
+    }
+}
+
 fn set_property_placement(
     content: &str,
     reference: &str,
@@ -3429,15 +3497,7 @@ fn set_property_placement(
     for (start, end) in blocks {
         let block = &content[start..end];
         if let Some(wanted) = only_unit {
-            let unit = block
-                .find("(unit ")
-                .and_then(|rel| {
-                    let from = start + rel + "(unit ".len();
-                    content[from..end]
-                        .find(')')
-                        .and_then(|to| content[from..from + to].trim().parse::<u32>().ok())
-                })
-                .unwrap_or(1);
+            let unit = symbol_unit_from_block(block, reference)?;
             if unit != wanted {
                 continue;
             }
@@ -3905,8 +3965,13 @@ async fn handle_edit_schematic_component(
     // overloading one argument's value type would make the schema lie about
     // what it accepts.
     let placements = args["field_placements"].as_object();
-    let plan = match apply_field_placements(&mut content, edit_reference, args, target.units.len())
-    {
+    let plan = match apply_field_placements(
+        &sch_path,
+        &mut content,
+        edit_reference,
+        args,
+        target.units.len(),
+    ) {
         Ok(plan) => plan,
         Err(failure) => return Ok(failure.error),
     };
@@ -9927,6 +9992,189 @@ mod multi_unit_component_tests {
         ));
     }
 
+    #[test]
+    fn placement_landed_compares_normalised_rotation() {
+        let seen_90 = json!({ "x": 10.0, "y": 20.0, "rotation": 90.0, "hide": false });
+        let seen_450 = json!({ "x": 10.0, "y": 20.0, "rotation": 450.0, "hide": false });
+        let want = |rotation| FieldPlacement {
+            x: None,
+            y: None,
+            rotation: Some(rotation),
+            hide: None,
+        };
+        assert!(placement_landed(&seen_90, &want(450.0)));
+        assert!(placement_landed(&seen_90, &want(-270.0)));
+        assert!(!placement_landed(&seen_450, &want(450.0)));
+    }
+
+    /// `450` and `-90` are written and reported as `90` and `270`, the form
+    /// `rotate_schematic_component` writes. KiCad 10.0.8 keeps a field angle
+    /// as written on resave, so this is a canonical form, not a resave match.
+    #[tokio::test]
+    async fn field_placement_normalises_rotation_before_writing_and_readback() {
+        let (_directory, path) = eeschema_fixture();
+        let handler = served_handler().await;
+
+        for (requested, expected) in [(450.0, 90.0), (-90.0, 270.0), (360.0, 0.0), (-0.0, 0.0)] {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "edit_schematic_component",
+                        "arguments": {
+                            "schematic": path,
+                            "reference": "R1",
+                            "field_placements": { "Value": { "rotation": requested } }
+                        }
+                    }
+                }))
+                .await
+                .expect("tools/call response");
+            let result = response.result.expect("JSON-RPC result");
+            assert_ne!(result["isError"], json!(true), "{result}");
+            let parsed: serde_json::Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                parsed["units"][0]["field_placements"]["Value"]["rotation"],
+                expected
+            );
+            // Read R1's Value `(at …)` itself: other R1 properties sit at the
+            // same point with angle 0, so a substring search can't see a `-0`.
+            let after = std::fs::read_to_string(&path).unwrap();
+            let (start, end) = find_all_symbol_instance_blocks(&after, "R1")[0];
+            let block = &after[start..end];
+            let value = &block[block.find("(property \"Value\"").unwrap()..];
+            let at = &value[value.find("(at ").unwrap()..];
+            let at = &at[..=at.find(')').unwrap()];
+            let expected_at = format!("(at 157.48 85.09 {})", cse::types::fmt_f64(expected));
+            assert_eq!(at, expected_at, "requested {requested}");
+        }
+    }
+
+    /// The batch path parses the candidate itself; an unparseable one is
+    /// `malformed_file`, and the batch aborts.
+    #[test]
+    fn batch_field_placement_planning_types_an_unparseable_schematic() {
+        let mut content = "(kicad_sch (version 20250114)".to_string();
+        let Err(failure) = plan_batch_field_placements(
+            std::path::Path::new("broken.kicad_sch"),
+            &mut content,
+            "R1",
+            &json!({ "field_placements": { "Value": { "x": 1.0 } } }),
+        ) else {
+            panic!("an unparseable schematic must not plan");
+        };
+        assert!(failure.abort_batch);
+        assert_eq!(
+            extract_error_kind(&failure.error).as_deref(),
+            Some("malformed_file"),
+            "{:?}",
+            failure.error
+        );
+    }
+
+    /// A property value placed before `(unit N)` may contain literal `(unit …)`
+    /// text. Unit selection must read the symbol's own `(unit N)` child rather
+    /// than scanning the raw block text.
+    #[tokio::test]
+    async fn field_placement_unit_selection_ignores_unit_text_inside_property_values() {
+        let (_directory, path) = eeschema_fixture();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let hostile = original.replacen(
+            "\t\t(unit 2)",
+            "\t\t(property \"Note\" \"see (unit bad) and (unit 1)\"\n\t\t\t(at 0 0 0)\n\t\t\t(effects (font (size 1.27 1.27)) (hide yes))\n\t\t)\n\t\t(unit 2)",
+            1,
+        );
+        assert_ne!(hostile, original, "fixture must contain U1 unit 2");
+        std::fs::write(&path, &hostile).unwrap();
+
+        let result = body(
+            handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "U1",
+                    "unit": 2,
+                    "field_placements": { "Value": { "x": 10.0, "y": 10.0 } }
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["changes"].as_array().unwrap().len(), 1);
+        let units = result["units"].as_array().unwrap();
+        let u1 = units.iter().find(|u| u["unit"] == 1).unwrap();
+        let u2 = units.iter().find(|u| u["unit"] == 2).unwrap();
+        assert_eq!(u2["field_placements"]["Value"]["x"], 10.0);
+        assert_eq!(u2["field_placements"]["Value"]["y"], 10.0);
+        assert_ne!(u1["field_placements"]["Value"]["x"], 10.0);
+    }
+
+    /// A symbol block whose `(unit …)` cannot be parsed (or is absent) must be
+    /// refused as `malformed_file` instead of defaulting to unit 1 and
+    /// mutating the wrong unit.
+    #[tokio::test]
+    async fn field_placement_refuses_malformed_unit_without_writing() {
+        for (replacement, expected_fragment) in [
+            ("\t\t(unit bad)", "bad"),
+            ("\t\t(unit 1)\n\t\t(unit 2)", "more than one"),
+            ("", "no (unit"),
+        ] {
+            let (_directory, path) = eeschema_fixture();
+            let original = std::fs::read_to_string(&path).unwrap();
+            let (start, end) = find_all_symbol_instance_blocks(&original, "R1")[0];
+            let block = &original[start..end];
+            let broken_block = block.replacen("\t\t(unit 1)", replacement, 1);
+            assert_ne!(broken_block, block, "R1 must carry (unit 1)");
+            let corrupted =
+                apply_edits(original, vec![SexpEdit::replace(start, end, broken_block)]);
+            std::fs::write(&path, &corrupted).unwrap();
+
+            let result = handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "R1",
+                    "unit": 1,
+                    "fields": { "Description": "must not land" },
+                    "field_placements": { "Value": { "x": 10.0, "y": 10.0 } }
+                }),
+                &context(),
+            )
+            .await
+            .unwrap();
+
+            assert!(result.is_error, "{result:?}");
+            assert_eq!(
+                extract_error_kind(&result).as_deref(),
+                Some("malformed_file"),
+                "{result:?}"
+            );
+            let message = format!("{result:?}");
+            assert!(
+                message.contains(expected_fragment),
+                "refusal must name `{expected_fragment}`: {message}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                corrupted,
+                "refusal must leave the file byte-identical"
+            );
+        }
+
+        // Non-positive and extra-token `(unit …)` forms are also refused by
+        // `symbol_unit_from_block` itself.
+        for bad_unit in ["(unit 0)", "(unit 1 2)"] {
+            let block = format!("(symbol (lib_id \"Device:R\") {bad_unit})");
+            let err = symbol_unit_from_block(&block, "R1").unwrap_err();
+            assert!(
+                matches!(err, PlacementRefusal::MalformedFile(ref msg) if msg.contains(bad_unit)),
+                "expected MalformedFile naming `{bad_unit}`, got {err:?}"
+            );
+        }
+    }
+
     /// A field's value is arbitrary text and may itself contain "(at " or
     /// "(hide ". Searching the whole property block finds the token inside the
     /// quoted value and rewrites *that* — the result is still valid
@@ -10087,13 +10335,20 @@ mod multi_unit_component_tests {
         .unwrap();
 
         assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("malformed_file"),
+            "{result:?}"
+        );
         // Assert the reason, not merely that something failed: this handler
         // has several ways to error, and a test that accepts any of them
         // passes with the strict parse gone.
         let message = format!("{result:?}");
         assert!(
-            message.contains("non-numeric x") && message.contains("bad"),
-            "the refusal must name the malformed coordinate: {message}"
+            message.contains("No fields were updated on 'R1': Value:")
+                && message.contains("non-numeric x")
+                && message.contains("bad"),
+            "the refusal must preserve the message and name the malformed coordinate: {message}"
         );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -10137,6 +10392,11 @@ mod multi_unit_component_tests {
         .unwrap();
 
         assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("malformed_file"),
+            "{result:?}"
+        );
         let message = format!("{result:?}");
         assert!(
             message.contains("non-numeric x") && message.contains("bad"),

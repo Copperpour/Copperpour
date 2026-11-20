@@ -6043,7 +6043,41 @@ mod batch_field_placement_tests {
         .await
         .unwrap();
         assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("malformed_file"),
+            "{result:?}"
+        );
         assert_eq!(std::fs::read_to_string(path).unwrap(), broken);
+    }
+
+    #[tokio::test]
+    async fn batch_field_placements_normalises_rotation_through_served_dispatch() {
+        let (_dir, path) = fixture();
+        let handler = handler().await;
+        let body = batch(
+            &handler,
+            &path,
+            json!([
+                {"reference": "R1", "field_placements": {"Value": {"rotation": 450}}},
+                {"reference": "U1", "unit": 2, "field_placements": {"Value": {"rotation": -90}}}
+            ]),
+        )
+        .await;
+        assert_eq!(
+            body["updated"][0]["units"][0]["field_placements"]["Value"]["rotation"],
+            90.0
+        );
+        let u2 = body["updated"][1]["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["unit"] == 2)
+            .unwrap();
+        assert_eq!(u2["field_placements"]["Value"]["rotation"], 270.0);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(placement(&after, "R1", 1, "Value")["rotation"], 90.0);
+        assert_eq!(placement(&after, "U1", 2, "Value")["rotation"], 270.0);
     }
 
     #[tokio::test]
