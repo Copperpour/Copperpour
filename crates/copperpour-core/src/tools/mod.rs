@@ -3303,6 +3303,20 @@ pub(crate) fn top_level_instance_paths(
     Some(paths)
 }
 
+/// Why [`resolve_schematic_ownership`] could not establish a single owning
+/// project when candidate projects exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectConflictReason {
+    /// Every candidate project hierarchy parsed cleanly, and none of them owns
+    /// the target schematic (neither as a top-level sheet nor as a linked child).
+    Unlinked,
+    /// More than one candidate project owns the target schematic.
+    MultipleOwners,
+    /// At least one candidate root or child sheet could not be read or parsed,
+    /// so ownership could not be established.
+    IncompleteHierarchy,
+}
+
 /// Candidate projects exist, but unique schematic ownership is not proven.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SchematicTargetError {
@@ -3313,6 +3327,7 @@ pub(crate) enum SchematicTargetError {
     ProjectConflict {
         target: std::path::PathBuf,
         roots: Vec<std::path::PathBuf>,
+        reason: ProjectConflictReason,
     },
     StaleTarget {
         target: std::path::PathBuf,
@@ -3329,7 +3344,25 @@ impl std::fmt::Display for SchematicTargetError {
                  Ownership was not established; restore directory access before retrying.",
                 directory.display()
             ),
-            Self::ProjectConflict { target, roots } => write!(
+            Self::ProjectConflict {
+                target,
+                roots,
+                reason: ProjectConflictReason::Unlinked,
+            } => write!(
+                formatter,
+                "Cannot establish unique project ownership for schematic '{}' in '{}': \
+                 it is not linked from any candidate root schematic ({}). \
+                 Link it from the owning root schematic with add_hierarchical_sheet before \
+                 retrying, or move it outside unrelated projects if it is standalone.",
+                target.display(),
+                copperpour_sexp::writer::parent_directory(target).display(),
+                roots
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::ProjectConflict { target, roots, .. } => write!(
                 formatter,
                 "Cannot establish unique project ownership for schematic '{}' in '{}'. \
                  Candidate root schematics: {}. Restore the saved sheet hierarchy or \
@@ -3355,6 +3388,121 @@ impl std::fmt::Display for SchematicTargetError {
 
 impl std::error::Error for SchematicTargetError {}
 
+/// Compute the `sheet_file` argument for `add_hierarchical_sheet` on `root`
+/// pointing to `target`, using forward slashes relative to `root`'s directory.
+///
+/// Returns `None` when `target` does not lie under `root`'s directory (since
+/// `add_hierarchical_sheet` rejects `..` parent traversal), so callers never
+/// suggest a `sheet_file` that would create a different file.
+pub(crate) fn suggested_sheet_file(
+    root: &std::path::Path,
+    target: &std::path::Path,
+) -> Option<String> {
+    let root_dir = copperpour_sexp::writer::parent_directory(root);
+    let clean_relative = |rel: &std::path::Path| -> Option<String> {
+        let mut parts = Vec::new();
+        for component in rel.components() {
+            match component {
+                std::path::Component::Normal(os) => parts.push(os.to_string_lossy().into_owned()),
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_) => return None,
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("/"))
+    };
+
+    target
+        .strip_prefix(root_dir)
+        .ok()
+        .and_then(clean_relative)
+        .or_else(|| {
+            if !target.is_relative() {
+                return None;
+            }
+            let joined = std::env::current_dir().ok()?.join(target);
+            joined.strip_prefix(root_dir).ok().and_then(clean_relative)
+        })
+        .or_else(|| {
+            let canon_root = std::fs::canonicalize(root_dir).ok()?;
+            let canon_target = std::fs::canonicalize(target).ok()?;
+            canon_target
+                .strip_prefix(&canon_root)
+                .ok()
+                .and_then(clean_relative)
+        })
+}
+
+/// Build the concrete `add_hierarchical_sheet` next-call entries for linking
+/// an unlinked schematic from each candidate root that can reference it.
+pub(crate) fn unlinked_schematic_next_calls(
+    target: &std::path::Path,
+    roots: &[std::path::PathBuf],
+) -> Vec<serde_json::Value> {
+    roots
+        .iter()
+        .filter_map(|root| {
+            let sheet_file = suggested_sheet_file(root, target)?;
+            Some(serde_json::json!({
+                "tool": "add_hierarchical_sheet",
+                "arguments": {
+                    "schematic": root.display().to_string(),
+                    "sheet_file": sheet_file,
+                }
+            }))
+        })
+        .collect()
+}
+
+fn unlinked_schematic_recovery(
+    target: &std::path::Path,
+    roots: &[std::path::PathBuf],
+) -> crate::mcp::error::RecoveryGuidance {
+    let candidate_roots: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
+    let next_calls = unlinked_schematic_next_calls(target, roots);
+    let mut next_steps: Vec<crate::mcp::error::RecoveryStep> = roots
+        .iter()
+        .filter_map(|root| {
+            let sheet_file = suggested_sheet_file(root, target)?;
+            Some(crate::mcp::error::RecoveryStep {
+                actor: "agent".to_string(),
+                action: format!(
+                    "Call add_hierarchical_sheet on '{}' with sheet_file '{}' to link this sheet into the project hierarchy, then retry the operation.",
+                    root.display(),
+                    sheet_file
+                ),
+                tool: Some("add_hierarchical_sheet".to_string()),
+            })
+        })
+        .collect();
+    next_steps.push(crate::mcp::error::RecoveryStep {
+        actor: "agent".to_string(),
+        action: "Or, if this file is meant to be a standalone schematic, move it outside any directory tree containing a .kicad_pro file.".to_string(),
+        tool: None,
+    });
+    crate::mcp::error::RecoveryGuidance {
+        cause: "unlinked_schematic".to_string(),
+        observed: format!(
+            "Schematic '{}' is not linked from any candidate project root ({}).",
+            target.display(),
+            candidate_roots.join(", ")
+        ),
+        evidence: serde_json::json!({
+            "target": target.display().to_string(),
+            "candidate_roots": candidate_roots,
+            "next_calls": next_calls,
+        }),
+        mutation_outcome: "none".to_string(),
+        retry_safe: false,
+        retry_prerequisites: vec![
+            "Link the schematic from its owning root schematic with add_hierarchical_sheet, or move it outside unrelated projects if it is standalone.".to_string(),
+        ],
+        next_steps,
+        troubleshooting_url: None,
+    }
+}
+
 impl SchematicTargetError {
     pub(crate) fn into_tool_result(self) -> CallToolResult {
         let message = self.to_string();
@@ -3363,14 +3511,24 @@ impl SchematicTargetError {
                 crate::mcp::error::ToolErrorKind::file_not_found(&directory),
                 message,
             ),
-            Self::ProjectConflict { target, roots } => {
+            Self::ProjectConflict {
+                target,
+                roots,
+                reason,
+            } => {
                 let directory = copperpour_sexp::writer::parent_directory(&target);
                 let mut paths = vec![directory.display().to_string()];
                 paths.extend(roots.iter().map(|root| root.display().to_string()));
-                CallToolResult::error_kind(
-                    crate::mcp::error::ToolErrorKind::Conflict { paths },
-                    message,
-                )
+                let kind = crate::mcp::error::ToolErrorKind::Conflict { paths };
+                if reason == ProjectConflictReason::Unlinked {
+                    CallToolResult::error_kind_with_recovery(
+                        kind,
+                        message,
+                        unlinked_schematic_recovery(&target, &roots),
+                    )
+                } else {
+                    CallToolResult::error_kind(kind, message)
+                }
             }
             Self::StaleTarget { target, reason } => CallToolResult::error_kind(
                 crate::mcp::error::ToolErrorKind::StaleTarget {
@@ -3451,9 +3609,17 @@ pub(crate) fn resolve_schematic_ownership_from(
 
     owners.sort_by(|left, right| left.root_schematic.cmp(&right.root_schematic));
     if !roots.is_empty() && (owners.len() != 1 || !complete) {
+        let reason = if owners.len() > 1 {
+            ProjectConflictReason::MultipleOwners
+        } else if !complete {
+            ProjectConflictReason::IncompleteHierarchy
+        } else {
+            ProjectConflictReason::Unlinked
+        };
         return Err(SchematicTargetError::ProjectConflict {
             target: target.to_path_buf(),
             roots,
+            reason,
         });
     }
     Ok(owners.pop())
@@ -4285,15 +4451,41 @@ pub(crate) mod schematic_target_tests {
         let child = blank(&nested.join("child.kicad_sch"));
 
         let error = resolve_schematic_ownership(&child).unwrap_err();
-        let SchematicTargetError::ProjectConflict { target, roots } = error else {
+        let SchematicTargetError::ProjectConflict {
+            target,
+            roots,
+            reason,
+        } = error
+        else {
             panic!("expected ownership conflict")
         };
         assert_eq!(target, child);
         assert_eq!(roots.len(), 2);
-        let result = SchematicTargetError::ProjectConflict { target, roots }.into_tool_result();
+        assert_eq!(reason, ProjectConflictReason::MultipleOwners);
+        let result = SchematicTargetError::ProjectConflict {
+            target,
+            roots,
+            reason,
+        }
+        .into_tool_result();
         assert_eq!(
             crate::mcp::error::extract_error_kind(&result).as_deref(),
             Some("conflict")
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(
+            body.get("recovery").is_none(),
+            "multiple owners must not suggest add_hierarchical_sheet: {body}"
+        );
+        assert!(
+            !body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("add_hierarchical_sheet"),
+            "multiple owners message must not suggest linking: {body}"
         );
     }
 
@@ -4308,12 +4500,101 @@ pub(crate) mod schematic_target_tests {
         );
         let target = blank(&directory.path().join("nested/loose.kicad_sch"));
 
-        let result = resolve_schematic_ownership(&target)
-            .unwrap_err()
-            .into_tool_result();
+        let error = resolve_schematic_ownership(&target).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SchematicTargetError::ProjectConflict {
+                    reason: ProjectConflictReason::IncompleteHierarchy,
+                    ..
+                }
+            ),
+            "expected IncompleteHierarchy, got {error:?}"
+        );
+        let result = error.into_tool_result();
         assert_eq!(
             crate::mcp::error::extract_error_kind(&result).as_deref(),
             Some("conflict")
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(
+            body.get("recovery").is_none(),
+            "incomplete hierarchy must not suggest add_hierarchical_sheet: {body}"
+        );
+    }
+
+    #[test]
+    fn unlinked_conflict_carries_add_hierarchical_sheet_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        write(&directory.path().join("proj.kicad_pro"), "{}");
+        let root = blank(&directory.path().join("proj.kicad_sch"));
+        let loose = blank(&directory.path().join("work/loose.kicad_sch"));
+
+        let error = resolve_schematic_ownership(&loose).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SchematicTargetError::ProjectConflict {
+                    reason: ProjectConflictReason::Unlinked,
+                    ..
+                }
+            ),
+            "expected Unlinked, got {error:?}"
+        );
+        let result = error.into_tool_result();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["kind"], "conflict", "{body}");
+        assert_eq!(
+            body["error"]["paths"],
+            serde_json::json!([
+                loose.parent().unwrap().display().to_string(),
+                root.display().to_string(),
+            ]),
+            "{body}"
+        );
+        assert_eq!(body["recovery"]["cause"], "unlinked_schematic", "{body}");
+        assert_eq!(
+            body["recovery"]["evidence"]["next_calls"],
+            serde_json::json!([{
+                "tool": "add_hierarchical_sheet",
+                "arguments": {
+                    "schematic": root.display().to_string(),
+                    "sheet_file": "work/loose.kicad_sch",
+                }
+            }]),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn suggested_sheet_file_normalizes_parent_dir_and_rejects_outside_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = blank(&directory.path().join("proj.kicad_sch"));
+        let node = blank(&directory.path().join("node.kicad_sch"));
+        std::fs::create_dir_all(directory.path().join("sub")).unwrap();
+
+        // A path containing `..` resolves to the real relative file rather than
+        // dropping `..` lexically into `"sub/node.kicad_sch"`.
+        let with_dotdot = directory.path().join("sub/../node.kicad_sch");
+        assert_eq!(
+            super::suggested_sheet_file(&root, &with_dotdot).as_deref(),
+            Some("node.kicad_sch")
+        );
+
+        // When the root sits in a subdirectory and target is outside it,
+        // `add_hierarchical_sheet` cannot link target directly, so no bogus
+        // `sheet_file` is suggested.
+        let nested_root = blank(&directory.path().join("roots/top.kicad_sch"));
+        assert_eq!(super::suggested_sheet_file(&nested_root, &node), None);
+        assert!(
+            super::unlinked_schematic_next_calls(&node, &[nested_root]).is_empty(),
+            "outside-root target must not emit a bogus add_hierarchical_sheet call"
         );
     }
 }

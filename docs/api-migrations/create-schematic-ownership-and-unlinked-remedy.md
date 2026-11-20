@@ -1,0 +1,5 @@
+### `create_schematic` reports ownership and unlinked schematic conflicts carry a structured remedy (minor release)
+
+`create_schematic` now resolves project ownership after writing the new `.kicad_sch` file and adds an `ownership` object to its JSON response (`status`: `"standalone"`, `"owned"`, `"unlinked"`, `"conflict"`, or `"unknown"`). Creating an unlinked sheet inside a project directory remains a success (not an error); when `status` is `"unlinked"`, the response includes `candidate_roots` and `next_calls` with the exact `add_hierarchical_sheet` invocation(s) required before writes to that sheet will succeed.
+
+When a schematic write or read fails with `error.kind == "conflict"` because the sheet is unlinked inside a project whose candidate hierarchies parsed cleanly, the conflict error now preserves `error.kind` and `error.paths` while adding a structured `recovery` object (`cause: "unlinked_schematic"`, `next_steps` naming `add_hierarchical_sheet`, and `evidence.next_calls`) and naming `add_hierarchical_sheet` in `message`. Callers that only match `error.kind == "conflict"` require no changes.
