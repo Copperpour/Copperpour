@@ -2453,7 +2453,12 @@ mod tests {
         let fixture_text = include_str!("../../tests/fixtures/rigid_block_move_kicad10.kicad_sch");
         let start = copperpour_sexp::writer::find_block_starts(fixture_text, "netclass_flag")[0];
         let (_, end) = find_balanced_block(fixture_text, start).unwrap();
-        for in_source in [true, false] {
+        for (tag, in_source) in [
+            ("netclass_flag", true),
+            ("netclass_flag", false),
+            ("directive_label", true),
+            ("directive_label", false),
+        ] {
             let (dir, request) = fixture();
             let path = if in_source {
                 request.schematic.clone()
@@ -2468,14 +2473,21 @@ mod tests {
                     original,
                     vec![SexpEdit::insert(
                         end_of_root,
-                        format!("\n{}\n", &fixture_text[start..end]),
+                        format!(
+                            "\n{}\n",
+                            fixture_text[start..end].replacen(
+                                "(netclass_flag",
+                                &format!("({tag}"),
+                                1
+                            )
+                        ),
                     )],
                 ),
             )
             .unwrap();
             let before = snapshot(dir.path());
             let error = Plan::prepare(&request).err().unwrap();
-            assert!(error.to_string().contains("netclass_flag"), "{error:#}");
+            assert!(error.to_string().contains(tag), "{error:#}");
             assert_eq!(before, snapshot(dir.path()));
         }
     }
@@ -3095,6 +3107,41 @@ mod tests {
         }}})
         .to_string();
         assert!(check_project_net_dependencies(&collision, &mapping).is_err());
+    }
+
+    #[test]
+    fn transfer_netclass_guard_refuses_different_patterns_for_the_same_class() {
+        let source = json!({"net_settings":{"netclass_patterns":[
+            {"pattern":"/source/*","netclass":"Fast"},
+            {"pattern":"/destination/*","netclass":"Fast"}
+        ]}})
+        .to_string();
+        let mapping = BTreeMap::from([("/source/LIMIT".into(), "/destination/LIMIT".into())]);
+        assert!(check_project_net_dependencies(&source, &mapping)
+            .unwrap_err()
+            .to_string()
+            .contains("preserves saved project netclass pattern matches"));
+    }
+
+    #[test]
+    fn transfer_refuses_to_change_inherited_simulation_exclusion() {
+        let (dir, request) = fixture();
+        let original = std::fs::read_to_string(&request.schematic).unwrap();
+        let start = copperpour_sexp::writer::find_block_starts(&original, "sheet")[0];
+        let (_, end) = find_balanced_block(&original, start).unwrap();
+        let sheet = &original[start..end];
+        assert!(sheet.contains("(exclude_from_sim no)"));
+        let modified = format!(
+            "{}{}{}",
+            &original[..start],
+            sheet.replacen("(exclude_from_sim no)", "(exclude_from_sim yes)", 1),
+            &original[end..]
+        );
+        std::fs::write(&request.schematic, modified).unwrap();
+        let before = snapshot(dir.path());
+        let error = Plan::prepare(&request).err().unwrap();
+        assert!(error.to_string().contains("inherited simulation exclusion"));
+        assert_eq!(snapshot(dir.path()), before);
     }
 
     #[test]
