@@ -1433,6 +1433,18 @@ async fn handle_upgrade_library(
     } else {
         match copperpour_sexp::recover_file_transactions(&journal_dir) {
             Ok(settled) => settled.len(),
+            Err(SexpError::TransactionConflict {
+                path: conflict_path,
+                journal,
+                kind: copperpour_sexp::TransactionConflictKind::Recovery,
+                ..
+            }) => {
+                return Ok(crate::tools::stuck_transaction_journal_result(
+                    &journal,
+                    &conflict_path,
+                    OPERATION,
+                ));
+            }
             Err(error) => {
                 return Ok(unsettled(format!(
                     "An unfinished transaction in {shown_dir} could not be settled ({error}), so \
@@ -1690,15 +1702,25 @@ async fn handle_upgrade_library(
     // interrupted after it was written.
     let replaced = to_write.len();
     if let Err(failure) = try_commit_file_transaction(&journal_dir, to_write) {
-        if failure.journal.is_none() {
-            // A file that changed after the read fails this transaction's own
-            // check, which names its journal before it is on disk; a journal
-            // that exists belongs to another, unfinished transaction.
-            let changed = match &failure.error {
-                SexpError::Conflict { path } => Some(path),
-                SexpError::TransactionConflict { path, journal, .. } if !journal.exists() => {
-                    Some(path)
+        if failure.journal.is_none()
+            && !matches!(
+                failure.error,
+                SexpError::TransactionConflict {
+                    kind: copperpour_sexp::TransactionConflictKind::AfterImage,
+                    ..
                 }
+            )
+        {
+            // A file that changed after the read fails this transaction's own
+            // before-image check; a recovery conflict belongs to an older,
+            // unfinished transaction.
+            let changed = match &failure.error {
+                SexpError::Conflict { path }
+                | SexpError::TransactionConflict {
+                    path,
+                    kind: copperpour_sexp::TransactionConflictKind::BeforeImage,
+                    ..
+                } => Some(path),
                 _ => None,
             };
             if let Some(changed) = changed {
@@ -1713,13 +1735,18 @@ async fn handle_upgrade_library(
                     ),
                 ));
             }
-            if matches!(failure.error, SexpError::TransactionConflict { .. }) {
-                return Ok(unsettled(format!(
-                    "An unfinished transaction appeared in {shown_dir} while upgrade_library ran \
-                     and could not be settled ({}), so upgrade_library wrote nothing of its own. \
-                     Inspect it with `copperpour transaction status {shown_dir}`.",
-                    failure.error
-                )));
+            if let SexpError::TransactionConflict {
+                path: conflict_path,
+                journal,
+                kind: copperpour_sexp::TransactionConflictKind::Recovery,
+                ..
+            } = &failure.error
+            {
+                return Ok(crate::tools::stuck_transaction_journal_result(
+                    journal,
+                    conflict_path,
+                    OPERATION,
+                ));
             }
             return Ok(handler_error(format!(
                 "upgrade_library wrote nothing: {}",

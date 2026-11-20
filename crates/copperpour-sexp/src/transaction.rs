@@ -11,7 +11,7 @@ use crate::writer::{
     read_string_unlocked, sync_parent_directory, write_atomic_unlocked_with,
     write_new_atomic_unlocked_private, write_new_atomic_unlocked_with, ExclusiveDocumentLock,
 };
-use crate::SexpError;
+use crate::{SexpError, TransactionConflictKind};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -381,6 +381,7 @@ pub fn try_commit_file_transaction(
                 return Err(transaction_conflict(
                     &pending,
                     &root,
+                    TransactionConflictKind::Recovery,
                     "resolve the pending transaction before committing a guarded transaction",
                 ));
             }
@@ -556,15 +557,21 @@ fn recover_journal(root: &Path, journal_path: &Path) -> Result<RecoveryOutcome, 
                 return Err(transaction_conflict(
                     journal_path,
                     &path,
+                    TransactionConflictKind::Recovery,
                     "content matches neither the before image nor replacement",
                 ))
             }
         }
     }
-    for entry in &pending {
-        apply_entry(root, journal_path, entry, &journal.entries)?;
-    }
-    verify_after_images(root, journal_path, &journal.entries)?;
+    // Completing an older journal shares the commit's publish and readback, but
+    // a conflict here is still that journal's: the caller wrote nothing.
+    (|| {
+        for entry in &pending {
+            apply_entry(root, journal_path, entry, &journal.entries)?;
+        }
+        verify_after_images(root, journal_path, &journal.entries)
+    })()
+    .map_err(as_recovery_conflict)?;
     remove_journal(journal_path)?;
     Ok(RecoveryOutcome {
         id: journal.id,
@@ -780,6 +787,7 @@ fn verify_before_images(
             return Err(transaction_conflict(
                 journal,
                 &path,
+                TransactionConflictKind::BeforeImage,
                 "content changed before the transaction committed",
             ));
         }
@@ -810,6 +818,7 @@ fn verify_after_images(
             return Err(transaction_conflict(
                 journal,
                 &path,
+                TransactionConflictKind::AfterImage,
                 "replacement did not remain durable",
             ));
         }
@@ -841,6 +850,7 @@ fn apply_entry(
                 return Err(transaction_conflict(
                     journal_path,
                     &path,
+                    TransactionConflictKind::AfterImage,
                     "guard content changed before publishing a transaction target",
                 ));
             }
@@ -965,11 +975,34 @@ fn is_journal_path(path: &Path) -> bool {
         .is_some_and(|id| !id.ends_with(".abandoned") && validate_transaction_id(id).is_ok())
 }
 
-fn transaction_conflict(journal: &Path, path: &Path, reason: &str) -> SexpError {
+fn transaction_conflict(
+    journal: &Path,
+    path: &Path,
+    kind: TransactionConflictKind,
+    reason: &str,
+) -> SexpError {
     SexpError::TransactionConflict {
         path: path.to_path_buf(),
         journal: journal.to_path_buf(),
+        kind,
         reason: reason.to_owned(),
+    }
+}
+
+fn as_recovery_conflict(error: SexpError) -> SexpError {
+    match error {
+        SexpError::TransactionConflict {
+            path,
+            journal,
+            reason,
+            ..
+        } => SexpError::TransactionConflict {
+            path,
+            journal,
+            kind: TransactionConflictKind::Recovery,
+            reason,
+        },
+        other => other,
     }
 }
 
@@ -1034,7 +1067,13 @@ mod tests {
         )
         .expect_err("a changed target is refused");
         assert!(
-            matches!(failure.error, SexpError::TransactionConflict { .. }),
+            matches!(
+                failure.error,
+                SexpError::TransactionConflict {
+                    kind: TransactionConflictKind::BeforeImage,
+                    ..
+                }
+            ),
             "{:?}",
             failure.error
         );
@@ -1191,7 +1230,13 @@ mod tests {
         )
         .expect_err("stale transaction conflicts");
 
-        assert!(matches!(error, SexpError::TransactionConflict { .. }));
+        assert!(matches!(
+            error,
+            SexpError::TransactionConflict {
+                kind: TransactionConflictKind::BeforeImage,
+                ..
+            }
+        ));
         assert_eq!(std::fs::read_to_string(parent).unwrap(), "external edit");
         assert!(!child.exists());
         assert!(recover_file_transactions(directory.path())
@@ -1388,7 +1433,10 @@ mod tests {
         assert!(failure.journal.is_none());
         assert!(matches!(
             failure.error,
-            SexpError::TransactionConflict { .. }
+            SexpError::TransactionConflict {
+                kind: TransactionConflictKind::Recovery,
+                ..
+            }
         ));
         assert_eq!(std::fs::read_to_string(&guard).unwrap(), "before");
         assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "untouched");
@@ -1522,6 +1570,57 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "after");
         assert_eq!(std::fs::read_to_string(&guard).unwrap(), "root");
         assert!(!journal.exists());
+    }
+
+    /// A guard that changes while recovery publishes an older journal's target
+    /// is that journal's conflict, not an after-image one of the caller's.
+    #[test]
+    fn a_guard_changed_during_recovery_is_a_recovery_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let guard = root.join("root.kicad_sch");
+        let guard_lock = root.join("~root.kicad_sch.lck");
+        let sheet = root.join("sheet.kicad_sch");
+        std::fs::write(&guard, "root").unwrap();
+        std::fs::write(&sheet, "before").unwrap();
+        let late_lock = guard_lock.clone();
+        BEFORE_PUBLISH.with(|hook| {
+            hook.set(Some(Box::new(move || {
+                std::fs::write(late_lock, "late editor lock").unwrap();
+            })));
+        });
+        let journal = try_commit_file_transaction(
+            &root,
+            vec![
+                FileTransition::guard(&guard, "root"),
+                FileTransition::replace(&sheet, "before", "after"),
+            ],
+        )
+        .unwrap_err()
+        .journal
+        .unwrap();
+        std::fs::remove_file(&guard_lock).unwrap();
+        let external = guard.clone();
+        BEFORE_PUBLISH.with(|hook| {
+            hook.set(Some(Box::new(move || {
+                std::fs::write(external, "external edit").unwrap();
+            })));
+        });
+
+        let error = recover_file_transactions(&root).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                SexpError::TransactionConflict {
+                    path,
+                    kind: TransactionConflictKind::Recovery,
+                    ..
+                } if *path == guard
+            ),
+            "{error:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "before");
+        assert!(journal.exists());
     }
 
     #[test]
@@ -1736,7 +1835,14 @@ mod tests {
         std::fs::remove_file(&board).unwrap();
         arm_board_restore();
         let error = recover_file_transactions(&root).unwrap_err();
-        assert!(matches!(error, SexpError::TransactionConflict { path, .. } if path == board));
+        assert!(matches!(
+            error,
+            SexpError::TransactionConflict {
+                path,
+                kind: TransactionConflictKind::Recovery,
+                ..
+            } if path == board
+        ));
         assert_eq!(std::fs::read(&journal).unwrap(), saved);
         assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "after");
         assert_eq!(std::fs::read_to_string(&board).unwrap(), "restored");
@@ -1764,14 +1870,26 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert!(
-            matches!(failure.error, SexpError::TransactionConflict { path, .. } if path == guard)
-        );
+        assert!(matches!(
+            failure.error,
+            SexpError::TransactionConflict {
+                path,
+                kind: TransactionConflictKind::AfterImage,
+                ..
+            } if path == guard
+        ));
         let journal = failure.journal.unwrap();
         let original_journal = std::fs::read(&journal).unwrap();
         assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "before");
         let error = recover_file_transactions(&root).unwrap_err();
-        assert!(matches!(error, SexpError::TransactionConflict { path, .. } if path == guard));
+        assert!(matches!(
+            error,
+            SexpError::TransactionConflict {
+                path,
+                kind: TransactionConflictKind::Recovery,
+                ..
+            } if path == guard
+        ));
         assert_eq!(std::fs::read_to_string(&guard).unwrap(), "external edit");
         assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "before");
         assert_eq!(std::fs::read(journal).unwrap(), original_journal);
@@ -1826,9 +1944,42 @@ mod tests {
 
         let error = recover_file_transactions(&root).expect_err("divergence conflicts");
 
-        assert!(matches!(error, SexpError::TransactionConflict { .. }));
+        assert!(matches!(
+            error,
+            SexpError::TransactionConflict {
+                kind: TransactionConflictKind::Recovery,
+                ..
+            }
+        ));
         assert_eq!(std::fs::read_to_string(parent).unwrap(), "external edit");
         assert!(journal_path.exists());
+    }
+
+    #[test]
+    fn verify_after_images_reports_after_image_conflict_kind() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().canonicalize().unwrap();
+        let target = root.join("root.kicad_sch");
+        std::fs::write(&target, "overwritten externally").unwrap();
+        let journal = journal_path(&root, "after-image-fixture");
+        let entries = vec![JournalEntry {
+            path: PathBuf::from("root.kicad_sch"),
+            expected: Some("before".to_owned()),
+            replacement: Some("intended replacement".to_owned()),
+        }];
+
+        let error = verify_after_images(&root, &journal, &entries)
+            .expect_err("non-durable replacement conflicts");
+        assert!(
+            matches!(
+                error,
+                SexpError::TransactionConflict {
+                    kind: TransactionConflictKind::AfterImage,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]

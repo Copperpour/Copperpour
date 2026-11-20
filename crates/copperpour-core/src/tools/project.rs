@@ -14,7 +14,7 @@ use crate::tool;
 use crate::tools::{get_path, invalid_arg, opt_str, require_str, ToolContext, ToolDef};
 use copperpour_sexp::{
     commit_file_transaction, try_commit_file_transaction, FileTransition, SexpError,
-    TransactionFailure,
+    TransactionConflictKind, TransactionFailure,
 };
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -178,7 +178,7 @@ fn existing_project_paths(paths: &[PathBuf]) -> std::io::Result<Vec<PathBuf>> {
 fn project_conflict(paths: Vec<PathBuf>) -> CallToolResult {
     let paths: Vec<String> = paths
         .into_iter()
-        .map(|path| path.display().to_string())
+        .map(|path| copperpour_sexp::paths::display_path(&path))
         .collect();
     CallToolResult::error_kind(
         ToolErrorKind::Conflict {
@@ -189,6 +189,37 @@ fn project_conflict(paths: Vec<PathBuf>) -> CallToolResult {
             paths.join(", ")
         ),
     )
+}
+
+fn map_create_project_transaction_error(error: SexpError) -> anyhow::Result<CallToolResult> {
+    match error {
+        SexpError::TransactionConflict {
+            path,
+            kind: TransactionConflictKind::BeforeImage,
+            ..
+        } => Ok(project_conflict(vec![path])),
+        SexpError::TransactionConflict {
+            path,
+            journal,
+            kind: TransactionConflictKind::Recovery,
+            ..
+        } => Ok(crate::tools::stuck_transaction_journal_result(
+            &journal,
+            &path,
+            "create_project",
+        )),
+        SexpError::TransactionConflict {
+            path,
+            journal,
+            kind: TransactionConflictKind::AfterImage,
+            ..
+        } => Ok(crate::tools::transaction_after_image_result(
+            &journal,
+            &path,
+            "create_project",
+        )),
+        other => Err(other.into()),
+    }
 }
 
 fn create_project_files(
@@ -256,10 +287,7 @@ async fn handle_create_project(
     .await?;
     match transaction {
         Ok(()) => {}
-        Err(SexpError::TransactionConflict { path, .. }) => {
-            return Ok(project_conflict(vec![path]));
-        }
-        Err(error) => return Err(error.into()),
+        Err(error) => return map_create_project_transaction_error(error),
     }
 
     Ok(CallToolResult::json(&json!({
@@ -929,6 +957,311 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn create_project_stuck_older_journal_names_journal_and_recovery_command() {
+        for prefix in [".copperpour-transaction-", ".konnect-transaction-"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let notes = dir.path().join("notes.txt");
+            std::fs::write(&notes, "C").unwrap();
+            let journal = dir.path().join(format!("{prefix}stuck.json"));
+            std::fs::write(
+                &journal,
+                r#"{"version":1,"id":"stuck","entries":[{"path":"notes.txt","expected":"A","replacement":"B"}]}"#,
+            )
+            .unwrap();
+
+            let ctx = test_ctx();
+            let args = json!({
+                "path": dir.path().to_str().unwrap(),
+                "name": "demo"
+            });
+
+            let result = handle_create_project(&args, &ctx)
+                .await
+                .expect("handler should return a structured conflict");
+            assert!(result.is_error);
+            assert_eq!(extract_error_kind(&result).as_deref(), Some("conflict"));
+            let body = response_json(&result);
+            let message = body["message"].as_str().unwrap();
+            assert!(
+                !message.contains("would replace existing path"),
+                "must not claim project creation would replace unrelated path: {body}"
+            );
+            assert!(
+                message.contains(&format!("{prefix}stuck.json")),
+                "must name the stuck journal: {body}"
+            );
+            assert!(
+                message.contains("copperpour transaction status")
+                    && message.contains("copperpour transaction recover"),
+                "must include recovery command: {body}"
+            );
+            let paths = body["error"]["paths"].as_array().unwrap();
+            assert_eq!(paths.len(), 1, "{body}");
+            assert!(
+                paths[0]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!("{prefix}stuck.json")),
+                "conflict path should name the stuck journal, not notes.txt: {body}"
+            );
+            assert!(!dir.path().join("demo.kicad_pro").exists());
+            assert!(!dir.path().join("demo.kicad_sch").exists());
+            assert!(!dir.path().join("demo.kicad_pcb").exists());
+            assert_eq!(std::fs::read_to_string(&notes).unwrap(), "C");
+            assert!(journal.exists());
+        }
+    }
+
+    #[test]
+    fn create_project_transaction_conflict_classification() {
+        let dir = PathBuf::from("/projects/demo");
+        let pro = dir.join("demo.kicad_pro");
+        let journal = dir.join(".copperpour-transaction-abc.json");
+
+        let before = map_create_project_transaction_error(SexpError::TransactionConflict {
+            path: pro.clone(),
+            journal: journal.clone(),
+            kind: TransactionConflictKind::BeforeImage,
+            reason: "content changed before the transaction committed".into(),
+        })
+        .expect("before-image returns structured conflict");
+        assert_eq!(extract_error_kind(&before).as_deref(), Some("conflict"));
+        let before_body = response_json(&before);
+        assert!(
+            before_body["message"]
+                .as_str()
+                .unwrap()
+                .contains("would replace existing path(s)"),
+            "{before_body}"
+        );
+        assert_eq!(
+            before_body["error"]["paths"],
+            json!([pro.display().to_string()])
+        );
+
+        let notes = dir.join("notes.txt");
+        let recovery = map_create_project_transaction_error(SexpError::TransactionConflict {
+            path: notes.clone(),
+            journal: journal.clone(),
+            kind: TransactionConflictKind::Recovery,
+            reason: "content matches neither the before image nor replacement".into(),
+        })
+        .expect("recovery returns structured conflict");
+        assert_eq!(extract_error_kind(&recovery).as_deref(), Some("conflict"));
+        let recovery_body = response_json(&recovery);
+        assert_eq!(
+            recovery_body["error"]["paths"],
+            json!([journal.display().to_string()])
+        );
+        assert!(
+            recovery_body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("copperpour transaction status")
+                    && m.contains("copperpour transaction recover")),
+            "{recovery_body}"
+        );
+
+        let after = map_create_project_transaction_error(SexpError::TransactionConflict {
+            path: pro.clone(),
+            journal: journal.clone(),
+            kind: TransactionConflictKind::AfterImage,
+            reason: "replacement did not remain durable".into(),
+        })
+        .expect("after-image returns mutation_outcome_uncertain");
+        assert_eq!(
+            extract_error_kind(&after).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
+        let after_body = response_json(&after);
+        assert_eq!(after_body["error"]["operation"], "create_project");
+        assert_eq!(after_body["error"]["path"], pro.display().to_string());
+        assert!(
+            after_body["message"]
+                .as_str()
+                .unwrap()
+                .contains(".copperpour-transaction-abc.json"),
+            "{after_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_project_stuck_journal_through_served_dispatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let notes = dir.path().join("notes.txt");
+        std::fs::write(&notes, "C").unwrap();
+        let journal = dir.path().join(".copperpour-transaction-stuck.json");
+        std::fs::write(
+            &journal,
+            r#"{"version":1,"id":"stuck","entries":[{"path":"notes.txt","expected":"A","replacement":"B"}]}"#,
+        )
+        .unwrap();
+
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 142,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_project",
+                    "arguments": {
+                        "path": dir.path().to_str().unwrap(),
+                        "name": "demo"
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call response");
+        assert!(response.error.is_none());
+        let result: CallToolResult =
+            serde_json::from_value(response.result.expect("result")).unwrap();
+        assert!(result.is_error);
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("conflict"));
+        let body = response_json(&result);
+        assert!(
+            body["error"]["paths"][0]
+                .as_str()
+                .unwrap()
+                .ends_with(".copperpour-transaction-stuck.json"),
+            "{body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("copperpour transaction status")
+                    && m.contains("copperpour transaction recover")),
+            "{body}"
+        );
+        assert!(!dir.path().join("demo.kicad_pro").exists());
+    }
+
+    #[tokio::test]
+    async fn rename_project_stuck_journal_and_after_image_classification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old_pro = dir.path().join("alpha.kicad_pro");
+        let new_pro = dir.path().join("beta.kicad_pro");
+        std::fs::write(&new_pro, "{}").unwrap();
+        let journal = dir.path().join(".copperpour-transaction-stuck.json");
+        let planned = vec![(old_pro.clone(), new_pro.clone())];
+        let targets = planned.clone();
+
+        // Recovery conflict rolls back renames and names the stuck journal.
+        let recovery = rename_rewrite_failed(
+            TransactionFailure {
+                error: SexpError::TransactionConflict {
+                    path: dir.path().join("notes.txt"),
+                    journal: journal.clone(),
+                    kind: TransactionConflictKind::Recovery,
+                    reason: "content matches neither the before image nor replacement".into(),
+                },
+                journal: None,
+            },
+            dir.path(),
+            &planned,
+            &targets,
+        )
+        .expect("structured conflict");
+        assert_eq!(extract_error_kind(&recovery).as_deref(), Some("conflict"));
+        let rec_body = response_json(&recovery);
+        assert!(
+            rec_body["error"]["paths"][0]
+                .as_str()
+                .unwrap()
+                .ends_with(".copperpour-transaction-stuck.json"),
+            "{rec_body}"
+        );
+        assert!(
+            rec_body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("copperpour transaction status")
+                    && !m.contains("changed while rename_project was running")),
+            "{rec_body}"
+        );
+        assert!(old_pro.exists() && !new_pro.exists());
+
+        // After-image failure reports mutation_outcome_uncertain.
+        std::fs::rename(&old_pro, &new_pro).unwrap();
+        let after = rename_rewrite_failed(
+            TransactionFailure {
+                error: SexpError::TransactionConflict {
+                    path: dir.path().join("notes.txt"),
+                    journal: journal.clone(),
+                    kind: TransactionConflictKind::AfterImage,
+                    reason: "replacement did not remain durable".into(),
+                },
+                journal: None,
+            },
+            dir.path(),
+            &planned,
+            &targets,
+        )
+        .expect("structured uncertain outcome");
+        assert_eq!(
+            extract_error_kind(&after).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
+
+        // Served dispatch: rename_project with a stuck journal returns conflict
+        // naming the journal and recovery command, leaving files untouched.
+        let notes = dir.path().join("notes.txt");
+        std::fs::write(&notes, "C").unwrap();
+        std::fs::write(
+            &journal,
+            r#"{"version":1,"id":"stuck","entries":[{"path":"notes.txt","expected":"A","replacement":"B"}]}"#,
+        )
+        .unwrap();
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 143,
+                "method": "tools/call",
+                "params": {
+                    "name": "rename_project",
+                    "arguments": {
+                        "project": old_pro.to_str().unwrap(),
+                        "new_name": "gamma"
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call response");
+        let result: CallToolResult =
+            serde_json::from_value(response.result.expect("result")).unwrap();
+        assert!(result.is_error);
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("conflict"));
+        let body = response_json(&result);
+        assert!(
+            body["error"]["paths"][0]
+                .as_str()
+                .unwrap()
+                .ends_with(".copperpour-transaction-stuck.json"),
+            "{body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("copperpour transaction status")
+                    && m.contains("copperpour transaction recover")),
+            "{body}"
+        );
+        assert!(old_pro.exists());
+        assert!(!dir.path().join("gamma.kicad_pro").exists());
+    }
+
     // ─── handle_get_project_info ───────────────────────────────────────────
 
     #[tokio::test]
@@ -1495,7 +1828,12 @@ fn rename_rewrite_failed(
             .map_or_else(|| path.to_path_buf(), |(source, _)| source.clone())
     };
     match failure.error {
-        SexpError::Conflict { path } | SexpError::TransactionConflict { path, .. } => {
+        SexpError::Conflict { path }
+        | SexpError::TransactionConflict {
+            path,
+            kind: TransactionConflictKind::BeforeImage,
+            ..
+        } => {
             let path = on_disk(&path);
             Ok(CallToolResult::error_kind(
                 ToolErrorKind::Conflict {
@@ -1508,6 +1846,26 @@ fn rename_rewrite_failed(
                 ),
             ))
         }
+        SexpError::TransactionConflict {
+            path,
+            journal,
+            kind: TransactionConflictKind::Recovery,
+            ..
+        } => Ok(crate::tools::stuck_transaction_journal_result(
+            &journal,
+            &path,
+            "rename_project",
+        )),
+        SexpError::TransactionConflict {
+            path,
+            journal,
+            kind: TransactionConflictKind::AfterImage,
+            ..
+        } => Ok(crate::tools::transaction_after_image_result(
+            &journal,
+            &path,
+            "rename_project",
+        )),
         // Dispatch classifies a KiCad lock, as it does the one checked
         // before the renames.
         SexpError::KiCadEditorLocked {

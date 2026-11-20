@@ -2039,6 +2039,18 @@ fn annotate_hierarchy_with_persistence(
                 ),
             )
         }
+        Err(copperpour_sexp::SexpError::TransactionConflict {
+            path: conflict_path,
+            journal,
+            kind: copperpour_sexp::TransactionConflictKind::Recovery,
+            ..
+        }) => {
+            return crate::tools::stuck_transaction_journal_result(
+                &journal,
+                &conflict_path,
+                OPERATION,
+            )
+        }
         Err(error) => {
             return conflict(
                 vec![shown.to_string()],
@@ -2198,9 +2210,23 @@ fn annotate_hierarchy_with_persistence(
         .map(|transition| transition.path().display().to_string())
         .collect();
     if let Err(failure) = persist(&directory, transitions) {
-        // Before its journal, the transaction touched nothing, so a lock or a
-        // changed file is a refusal. After it, the journal says what applied.
+        // Before its journal, the transaction touched nothing, so a lock, a
+        // changed file, or a stuck older journal is a refusal. After writes
+        // (including an after-image failure), the journal says what applied.
         if failure.journal.is_none() {
+            if let copperpour_sexp::SexpError::TransactionConflict {
+                path,
+                journal,
+                kind: copperpour_sexp::TransactionConflictKind::Recovery,
+                ..
+            } = &failure.error
+            {
+                return outcome::refused_before_write(
+                    crate::tools::stuck_transaction_journal_result(journal, path, OPERATION),
+                    target,
+                    requested,
+                );
+            }
             if let Some(refusal) =
                 crate::tools::unwritten_schematic_refusal(OPERATION, &failure.error)
             {
@@ -4359,6 +4385,61 @@ mod tests {
             );
         }
         assert_eq!(saved(dir.path(), &nested_names()), before);
+    }
+
+    #[test]
+    fn annotate_hierarchy_persist_classifies_recovery_and_after_image_conflicts() {
+        let (dir, root) = nested_project(unannotated_crystal);
+        let journal = dir.path().join(".copperpour-transaction-stuck.json");
+        let notes = dir.path().join("notes.txt");
+
+        let recovery = annotate_hierarchy_with_persistence(
+            &root,
+            AnnotateOptions::default(),
+            |_dir, _transitions| {
+                Err(copperpour_sexp::TransactionFailure {
+                    error: copperpour_sexp::SexpError::TransactionConflict {
+                        path: notes.clone(),
+                        journal: journal.clone(),
+                        kind: copperpour_sexp::TransactionConflictKind::Recovery,
+                        reason: "content matches neither the before image nor replacement".into(),
+                    },
+                    journal: None,
+                })
+            },
+        );
+        assert_eq!(extract_error_kind(&recovery).as_deref(), Some("conflict"));
+        assert!(
+            text_of(&recovery).contains(".copperpour-transaction-stuck.json")
+                && text_of(&recovery).contains("copperpour transaction recover"),
+            "{}",
+            text_of(&recovery)
+        );
+        assert_eq!(response_json(&recovery)["outcome"]["status"], "failed");
+
+        let after_image = annotate_hierarchy_with_persistence(
+            &root,
+            AnnotateOptions::default(),
+            |_dir, _transitions| {
+                Err(copperpour_sexp::TransactionFailure {
+                    error: copperpour_sexp::SexpError::TransactionConflict {
+                        path: notes.clone(),
+                        journal: journal.clone(),
+                        kind: copperpour_sexp::TransactionConflictKind::AfterImage,
+                        reason: "replacement did not remain durable".into(),
+                    },
+                    journal: None,
+                })
+            },
+        );
+        assert_eq!(
+            extract_error_kind(&after_image).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
+        assert_eq!(
+            response_json(&after_image)["outcome"]["status"],
+            "uncertain"
+        );
     }
 
     #[test]

@@ -1428,6 +1428,88 @@ pub(crate) fn readback_mismatch_result(path: &std::path::Path, operation: &str) 
     )
 }
 
+/// A durable multi-file transaction conflict carried in `error`, with its
+/// target path, journal path, and phase.
+pub(crate) fn transaction_conflict(
+    error: &anyhow::Error,
+) -> Option<(
+    &std::path::Path,
+    &std::path::Path,
+    copperpour_sexp::TransactionConflictKind,
+)> {
+    for cause in error.chain() {
+        if let Some(copperpour_sexp::SexpError::TransactionConflict {
+            path,
+            journal,
+            kind,
+            ..
+        }) = cause.downcast_ref()
+        {
+            return Some((path.as_path(), journal.as_path(), *kind));
+        }
+    }
+    None
+}
+
+/// The `conflict` refusal when an older unfinished transaction journal in the
+/// directory blocks `operation` (either because one of its targets diverged or
+/// because a guarded transaction requires the pending journal to be resolved
+/// first). Nothing of `operation` was written; the caller is directed to
+/// inspect and recover or abandon the journal.
+pub(crate) fn stuck_transaction_journal_result(
+    journal: &std::path::Path,
+    path: &std::path::Path,
+    operation: &str,
+) -> CallToolResult {
+    let shown_journal = copperpour_sexp::paths::display_path(journal);
+    let shown_path = copperpour_sexp::paths::display_path(path);
+    let dir = journal
+        .parent()
+        .map(copperpour_sexp::paths::display_path)
+        .unwrap_or_else(|| ".".to_string());
+    let detail = if journal.parent().is_some_and(|parent| parent == path) {
+        format!("is still pending in '{shown_path}'")
+    } else {
+        format!("could not be recovered because '{shown_path}' diverged")
+    };
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::Conflict {
+            paths: vec![shown_journal.clone()],
+        },
+        format!(
+            "An earlier unfinished transaction journal '{shown_journal}' {detail}, \
+             so {operation} wrote nothing. Inspect it with \
+             `copperpour transaction status {dir}`, then run \
+             `copperpour transaction recover {dir}` or `copperpour transaction abandon`."
+        ),
+    )
+}
+
+/// The `mutation_outcome_uncertain` result when a durable transaction wrote
+/// files but after-image verification found that a replacement did not stay
+/// durable and the journal was kept on disk.
+pub(crate) fn transaction_after_image_result(
+    journal: &std::path::Path,
+    path: &std::path::Path,
+    operation: &str,
+) -> CallToolResult {
+    let shown_journal = copperpour_sexp::paths::display_path(journal);
+    let shown_path = copperpour_sexp::paths::display_path(path);
+    let dir = journal
+        .parent()
+        .map(copperpour_sexp::paths::display_path)
+        .unwrap_or_else(|| ".".to_string());
+    mutation_outcome_uncertain(
+        std::path::Path::new(&shown_path),
+        operation,
+        format!(
+            "the transaction replacement for '{shown_path}' did not remain durable; files may \
+             already have been written and journal '{shown_journal}' was kept. Inspect it with \
+             `copperpour transaction status {dir}` before retrying."
+        ),
+    )
+}
+
 /// A KiCad editor lock that refused a write: the document, its lock file, and
 /// why the lock file could not be inspected, when that is what happened.
 pub(crate) struct LockedDocument<'e> {
@@ -1526,7 +1608,17 @@ pub(crate) fn unwritten_schematic_refusal(
         ));
     }
     let changed = match (error.downcast_ref(), error.downcast_ref()) {
-        (Some(SexpError::Conflict { path } | SexpError::TransactionConflict { path, .. }), _)
+        (
+            Some(
+                SexpError::Conflict { path }
+                | SexpError::TransactionConflict {
+                    path,
+                    kind: copperpour_sexp::TransactionConflictKind::BeforeImage,
+                    ..
+                },
+            ),
+            _,
+        )
         | (_, Some(EditorError::Conflict(path))) => path,
         _ => return None,
     };
@@ -4748,9 +4840,28 @@ mod unwritten_schematic_refusal_tests {
             kind(&SexpError::TransactionConflict {
                 path: "a.kicad_sch".into(),
                 journal: "j.json".into(),
+                kind: copperpour_sexp::TransactionConflictKind::BeforeImage,
                 reason: "changed".into(),
             }),
             conflict
+        );
+        assert_eq!(
+            kind(&SexpError::TransactionConflict {
+                path: "a.kicad_sch".into(),
+                journal: "j.json".into(),
+                kind: copperpour_sexp::TransactionConflictKind::Recovery,
+                reason: "diverged".into(),
+            }),
+            None
+        );
+        assert_eq!(
+            kind(&SexpError::TransactionConflict {
+                path: "a.kicad_sch".into(),
+                journal: "j.json".into(),
+                kind: copperpour_sexp::TransactionConflictKind::AfterImage,
+                reason: "not durable".into(),
+            }),
+            None
         );
         assert_eq!(
             kind(&SexpError::Conflict {
@@ -4785,6 +4896,7 @@ mod unwritten_schematic_refusal_tests {
         let changed = SexpError::TransactionConflict {
             path: r"\\?\C:\p\a.kicad_sch".into(),
             journal: r"\\?\C:\p\j.json".into(),
+            kind: copperpour_sexp::TransactionConflictKind::BeforeImage,
             reason: "changed".into(),
         };
         for error in [locked, changed] {
@@ -4817,6 +4929,49 @@ mod unwritten_schematic_refusal_tests {
         let unreadable = message(Some("permission denied"));
         assert!(!unreadable.contains("is present"), "{unreadable}");
         assert!(unreadable.contains("permission denied"), "{unreadable}");
+    }
+
+    #[test]
+    fn transaction_conflict_helpers_classify_and_strip_verbatim_prefix() {
+        let journal = std::path::Path::new(r"\\?\C:\proj\.copperpour-transaction-stuck.json");
+        let path = std::path::Path::new(r"\\?\C:\proj\notes.txt");
+
+        let stuck = super::stuck_transaction_journal_result(journal, path, "create_project");
+        assert_eq!(extract_error_kind(&stuck).as_deref(), Some("conflict"));
+        let crate::mcp::protocol::ToolContent::Text { text } = &stuck.content[0] else {
+            panic!("{stuck:?}");
+        };
+        assert!(!text.contains(r"\\?\"), "{text}");
+        assert!(text.contains("diverged"), "{text}");
+        assert!(text.contains("copperpour transaction status"), "{text}");
+        assert!(text.contains("copperpour transaction recover"), "{text}");
+
+        let pending = super::stuck_transaction_journal_result(
+            journal,
+            journal.parent().unwrap(),
+            "create_project",
+        );
+        assert_eq!(extract_error_kind(&pending).as_deref(), Some("conflict"));
+        let crate::mcp::protocol::ToolContent::Text { text } = &pending.content[0] else {
+            panic!("{pending:?}");
+        };
+        assert!(!text.contains(r"\\?\"), "{text}");
+        assert!(text.contains("is still pending"), "{text}");
+        assert!(!text.contains("diverged"), "{text}");
+
+        let after = super::transaction_after_image_result(journal, path, "create_project");
+        assert_eq!(
+            extract_error_kind(&after).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &after.content[0] else {
+            panic!("{after:?}");
+        };
+        assert!(!text.contains(r"\\?\"), "{text}");
+        assert!(
+            text.contains(".copperpour-transaction-stuck.json"),
+            "{text}"
+        );
     }
 }
 

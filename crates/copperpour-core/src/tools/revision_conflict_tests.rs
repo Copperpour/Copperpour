@@ -271,6 +271,7 @@ fn only_a_revision_conflict_is_classified_as_one() {
     let transaction = anyhow::Error::new(SexpError::TransactionConflict {
         path: path.to_path_buf(),
         journal: path.with_extension("journal"),
+        kind: copperpour_sexp::TransactionConflictKind::Recovery,
         reason: "neither image".into(),
     });
     assert_eq!(revision_conflict_path(&transaction), None);
