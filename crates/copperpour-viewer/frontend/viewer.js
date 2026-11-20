@@ -63,6 +63,7 @@
   let panX = 0, panY = 0;
   let isDragging = false;
   let dragStartX, dragStartY;
+  let userAdjusted = false;
   let darkTheme = true;
 
   const viewer = document.getElementById('viewer');
@@ -196,12 +197,14 @@
   }
 
   function fitToPage() {
+    userAdjusted = false;
     const svgEl = currentSvg();
     const size = svgEl && sheetSize(svgEl);
     if (!size) return;
     const { w: svgW, h: svgH } = size;
     const viewW = viewer.clientWidth;
     const viewH = viewer.clientHeight;
+    if (viewW <= 0 || viewH <= 0) return;
     scale = clampScale(Math.min(viewW / svgW, viewH / svgH) * 0.95);
     panX = (viewW - svgW * scale) / 2;
     panY = (viewH - svgH * scale) / 2;
@@ -215,6 +218,7 @@
     panX = x - (x - panX) * (newScale / scale);
     panY = y - (y - panY) * (newScale / scale);
     scale = newScale;
+    userAdjusted = true;
     updateTransform();
   }
 
@@ -256,8 +260,12 @@
 
   window.addEventListener('mousemove', (e) => {
     if (!isDragging) return;
-    panX = e.clientX - dragStartX;
-    panY = e.clientY - dragStartY;
+    const nextPanX = e.clientX - dragStartX;
+    const nextPanY = e.clientY - dragStartY;
+    if (nextPanX === panX && nextPanY === panY) return;
+    panX = nextPanX;
+    panY = nextPanY;
+    userAdjusted = true;
     updateTransform();
   });
 
@@ -421,3 +429,15 @@
   sheetSelector.addEventListener('change', onSheetSelected);
   window.addEventListener('dragover', event => event.preventDefault());
   window.addEventListener('drop', event => event.preventDefault());
+
+  // Refit on viewport resize until the user zooms or pans manually, so an
+  // embedded pane or window that finishes sizing after initial load doesn't
+  // stay stuck at a tiny initial zoom.
+  function refitIfUnadjusted() {
+    if (!userAdjusted) fitToPage();
+  }
+  if (typeof ResizeObserver !== 'undefined') {
+    new ResizeObserver(refitIfUnadjusted).observe(viewer);
+  } else {
+    window.addEventListener('resize', refitIfUnadjusted);
+  }
