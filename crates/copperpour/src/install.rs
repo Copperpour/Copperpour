@@ -1258,8 +1258,13 @@ fn apply_hooks(settings: &mut serde_json::Value, exe_str: &str) -> Result<Vec<Ho
     let mut steps = Vec::with_capacity(HOOK_SKILLS.len());
     for hook in HOOK_SKILLS {
         let command = hook_command(exe_str, "hook", hook.name);
-        let mut stale = own_hook_commands(exe_str, hook.name);
-        stale.retain(|own| *own != command);
+        let stale_own = own_hook_commands(exe_str, hook.name);
+        let is_stale = |candidate: &str| {
+            candidate != command
+                && (stale_own.iter().any(|own| own == candidate)
+                    || is_konnect_hook(candidate, hook.name)
+                    || is_legacy_konnect_hook(candidate, hook.name))
+        };
         let matcher = hook_matcher(hook)?;
         let event_arr = hooks_obj
             .entry(hook.event)
@@ -1267,12 +1272,12 @@ fn apply_hooks(settings: &mut serde_json::Value, exe_str: &str) -> Result<Vec<Ho
             .as_array_mut()
             .context("hook event field is not an array")?;
         let before = event_arr.clone();
-        // Migrate the exact handlers installed by the old plain-stdout form
-        // or through the alias. Do not use substring matching: user-authored
-        // neighboring handlers and unrelated commands containing "konnect"
-        // are not ours.
+        // Migrate handlers installed by the old plain-stdout form, through
+        // the alias, or from another copperpour/konnect executable path. Do
+        // not use substring matching: user-authored neighboring handlers and
+        // unrelated commands containing "konnect" or "copperpour" are not ours.
         let mut reason =
-            (remove_exact_commands(event_arr, &stale) > 0).then_some("duplicate_handler");
+            (remove_matching_commands(event_arr, is_stale) > 0).then_some("duplicate_handler");
         let holds_ours = |entry: &serde_json::Value| {
             entry["hooks"].as_array().is_some_and(|handlers| {
                 handlers
@@ -1317,7 +1322,9 @@ fn apply_hooks(settings: &mut serde_json::Value, exe_str: &str) -> Result<Vec<Ho
                 event_arr.len() - 1
             }
         };
-        if remove_exact_commands_except(event_arr, &[command.as_str()], Some(keep)) > 0 {
+        if remove_matching_commands_except(event_arr, |candidate| candidate == command, Some(keep))
+            > 0
+        {
             reason.get_or_insert("duplicate_handler");
         }
         steps.push(HookStep {
@@ -1328,19 +1335,19 @@ fn apply_hooks(settings: &mut serde_json::Value, exe_str: &str) -> Result<Vec<Ho
     Ok(steps)
 }
 
-/// Remove every handler running one of `commands`, and entries left empty;
-/// returns how many handlers went.
-fn remove_exact_commands(
+/// Remove every handler whose command satisfies `predicate`, and entries left
+/// empty; returns how many handlers went.
+fn remove_matching_commands(
     event_arr: &mut Vec<serde_json::Value>,
-    commands: &[impl AsRef<str>],
+    predicate: impl Fn(&str) -> bool,
 ) -> usize {
-    remove_exact_commands_except(event_arr, commands, None)
+    remove_matching_commands_except(event_arr, predicate, None)
 }
 
-/// [`remove_exact_commands`], leaving the entry at index `keep` untouched.
-fn remove_exact_commands_except(
+/// [`remove_matching_commands`], leaving the entry at index `keep` untouched.
+fn remove_matching_commands_except(
     event_arr: &mut Vec<serde_json::Value>,
-    commands: &[impl AsRef<str>],
+    predicate: impl Fn(&str) -> bool,
     keep: Option<usize>,
 ) -> usize {
     let mut removed = 0;
@@ -1357,7 +1364,7 @@ fn remove_exact_commands_except(
                 !handler
                     .get("command")
                     .and_then(|command| command.as_str())
-                    .is_some_and(|command| commands.iter().any(|own| own.as_ref() == command))
+                    .is_some_and(&predicate)
             });
             removed += before - handlers.len();
         }
@@ -1386,7 +1393,8 @@ fn remove_hooks_from_settings(path: &Path, exe_str: &str) -> Result<()> {
                 .get_mut(hook.event)
                 .and_then(|event| event.as_array_mut())
             {
-                remove_exact_commands(event_arr, &own_hook_commands(exe_str, hook.name));
+                let own = own_hook_commands(exe_str, hook.name);
+                remove_matching_commands(event_arr, |cmd| own.iter().any(|o| o == cmd));
             }
         }
     }
@@ -2127,11 +2135,25 @@ mod tests {
         let alias = in_bin("/opt/cp/bin", "konnect");
         let exe = in_bin("/opt/cp/bin", "copperpour");
         let hook = &HOOK_SKILLS[0];
+        let other_cp = in_bin("/opt/old", "copperpour");
+        let other_konnect = in_bin("/opt/old", "konnect");
         for (case, extra) in [
             ("alias", hook_command(&alias, "hook", hook.name)),
             ("legacy", legacy_hook_command(&exe, hook.name)),
             ("alias legacy", legacy_hook_command(&alias, hook.name)),
             ("current twice", hook_command(&exe, "hook", hook.name)),
+            (
+                "other copperpour",
+                hook_command(&other_cp, "hook", hook.name),
+            ),
+            (
+                "other konnect",
+                hook_command(&other_konnect, "hook", hook.name),
+            ),
+            (
+                "other legacy",
+                legacy_hook_command(&other_konnect, hook.name),
+            ),
         ] {
             let (temp, guidance) = guidance_beside_current(&exe, handler_entry(&extra));
             let read = hook_read(&guidance, hook.name);
@@ -2212,25 +2234,22 @@ mod tests {
         assert_all_current(&guidance, "");
     }
 
-    /// What `init` keeps beside our entry is not drift: a user's handler, a
-    /// Copperpour in another directory, or a copy inside our own entry. Nor
-    /// is a user's empty entry, which `init` drops without touching ours.
+    /// What `init` keeps beside our entry is not drift: a user's handler, an
+    /// unrelated binary whose command ends in the same hook tail, or a copy
+    /// inside our own entry. Nor is a user's empty entry, which `init` drops
+    /// without touching ours.
     #[test]
     fn handlers_init_keeps_beside_the_current_one_read_current() {
         let exe = in_bin("/opt/cp/bin", "copperpour");
         let hook = &HOOK_SKILLS[0];
         let ours = hook_command(&exe, "hook", hook.name);
         let user = handler_entry("user-board-check");
-        let other = handler_entry(&hook_command(
-            &in_bin("/opt/old", "konnect"),
-            "hook",
-            hook.name,
-        ));
+        let unrelated = handler_entry(&hook_command("/usr/bin/echo", "hook", hook.name));
         // `init` drops this entry, but it is not ours.
         let empty = serde_json::json!({"matcher": "Bash", "hooks": []});
         for (case, extra) in [
             ("user", user),
-            ("other directory", other),
+            ("unrelated binary", unrelated),
             ("empty user entry", empty),
         ] {
             let (_temp, guidance) = guidance_beside_current(&exe, extra);
@@ -2256,22 +2275,63 @@ mod tests {
         assert_eq!(patch_claude_settings(&settings_path, &exe).unwrap(), 0);
     }
 
-    /// A `konnect` elsewhere may be a separate install the user keeps.
+    /// #699: running `init` from a different executable path replaces hooks
+    /// registered by another `copperpour` or `konnect` binary (current or
+    /// legacy form), while preserving user-authored neighboring handlers and
+    /// unrelated binaries whose commands resemble ours.
     #[test]
-    fn install_keeps_the_hooks_of_a_konnect_in_another_directory() {
+    fn install_replaces_hooks_of_other_copperpour_and_konnect_executables() {
         let temp = TempDir::new().unwrap();
         let settings_path = temp.path().join("settings.json");
-        let other = in_bin("/opt/old", "konnect");
-        patch_claude_settings(&settings_path, &other).unwrap();
-        patch_claude_settings(&settings_path, &in_bin("/opt/cp/bin", "copperpour")).unwrap();
-        let commands = handler_commands(&settings_path, HOOK_SKILLS[0].event);
-        for hook in HOOK_SKILLS {
-            assert!(
-                commands.contains(&hook_command(&other, "hook", hook.name)),
-                "{}",
-                hook.name
-            );
-        }
+        let old_konnect = in_bin("/opt/old", "konnect");
+        let old_copperpour = in_bin("/opt/pcm/bin", "copperpour");
+        let current = in_bin("/opt/dev/target/debug", "copperpour");
+        let event = HOOK_SKILLS[0].event;
+
+        patch_claude_settings(&settings_path, &old_konnect).unwrap();
+        let mut entries = read_entries(&settings_path, event);
+        // Add a user-authored handler alongside an old Copperpour hook in a
+        // shared entry, a second old Copperpour executable, a legacy hook from
+        // another path, and unrelated commands that must stay untouched.
+        entries[0]["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type": "command", "command": "user-board-check"}));
+        entries.push(serde_json::json!({
+            "matcher": "mcp__konnect__.*",
+            "hooks": [
+                {"type": "command", "command": hook_command(&old_copperpour, "hook", HOOK_SKILLS[0].name)},
+                {"type": "command", "command": legacy_hook_command(&old_konnect, HOOK_SKILLS[1].name)},
+                {"type": "command", "command": hook_command("/usr/bin/echo", "hook", HOOK_SKILLS[0].name)},
+                {"type": "command", "command": "my-copperpour-helper hook pre-pcb-ipc"}
+            ]
+        }));
+        seed_settings(&settings_path, event, entries.into());
+
+        assert_eq!(
+            patch_claude_settings(&settings_path, &current).unwrap(),
+            HOOK_SKILLS.len()
+        );
+
+        let mut expected: Vec<String> = HOOK_SKILLS
+            .iter()
+            .filter(|hook| hook.event == event)
+            .map(|hook| hook_command(&current, "hook", hook.name))
+            .collect();
+        expected.extend([
+            "user-board-check".to_string(),
+            hook_command("/usr/bin/echo", "hook", HOOK_SKILLS[0].name),
+            "my-copperpour-helper hook pre-pcb-ipc".to_string(),
+        ]);
+        expected.sort();
+
+        let mut commands = handler_commands(&settings_path, event);
+        commands.sort();
+        assert_eq!(commands, expected);
+
+        let before = fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(patch_claude_settings(&settings_path, &current).unwrap(), 0);
+        assert_eq!(fs::read_to_string(&settings_path).unwrap(), before);
     }
 
     #[test]
