@@ -242,6 +242,16 @@ fn revision(content: &str) -> String {
 
 /// The sheet at `path` as saved, or the refusal saying why it cannot be read.
 fn read_sheet(path: &Path) -> anyhow::Result<Result<Sheet, CallToolResult>> {
+    read_parsed(path, Sheet::parse)
+}
+
+/// The saved sheet at `path` as `parse` reads it, or the refusal saying why it
+/// cannot be read: no such file, or a file `parse` refuses. `list_schematic_shapes`
+/// reads through this too.
+pub(super) fn read_parsed<T>(
+    path: &Path,
+    parse: impl FnOnce(String) -> Result<T, String>,
+) -> anyhow::Result<Result<T, CallToolResult>> {
     if !path.is_file() {
         return Ok(Err(CallToolResult::error_kind(
             ToolErrorKind::file_not_found(path),
@@ -249,7 +259,7 @@ fn read_sheet(path: &Path) -> anyhow::Result<Result<Sheet, CallToolResult>> {
         )));
     }
     let content = read_consistent(path)?;
-    Ok(Sheet::parse(content).map_err(|reason| {
+    Ok(parse(content).map_err(|reason| {
         invalid_arg(
             "schematic",
             &format!("'{}' is not a readable sheet: {reason}", path.display()),
@@ -315,24 +325,45 @@ fn target(args: &Value, operation: &str) -> anyhow::Result<Result<Target, CallTo
 
 /// Commit `command` on the sheet as read, which `target` found at the listed
 /// revision. The text it would write must pass `check` against the sheet read,
-/// or nothing is written. The write is refused while KiCad holds the sheet or its
-/// project's root open, or when the sheet changed after the read; the file is
-/// then read back. `Err` is the refusal or the uncertain outcome.
+/// or nothing is written. `Err` is the refusal or the uncertain outcome.
 fn write(
     target: &Target,
     operation: &str,
     command: SchematicCommand,
     check: impl Fn(&Sheet, &Sheet) -> Result<(), String>,
 ) -> anyhow::Result<Result<Sheet, CallToolResult>> {
-    let schematic = &target.schematic;
     let before = &target.sheet;
-    let (prepared, _) = prepare_command(schematic, &before.content, &command)?;
+    commit_checked(
+        &target.schematic,
+        &before.content,
+        operation,
+        &command,
+        |prepared| {
+            let after = Sheet::parse(prepared.to_owned())?;
+            check(before, &after).map(|()| after)
+        },
+    )
+}
+
+/// Commit `command` on `schematic`, whose saved text `before` the caller read.
+/// The text the command would write must pass `check`, which returns what the
+/// caller reports from it, or nothing is written. The write is refused while
+/// KiCad holds the sheet or its project's root open, or when the sheet changed
+/// after the read; the file is then read back, and a file that is not the text
+/// written is `mutation_outcome_uncertain`. `Err` is the refusal or the
+/// uncertain outcome. `add_schematic_shapes` writes through this too.
+pub(super) fn commit_checked<T>(
+    schematic: &Path,
+    before: &str,
+    operation: &str,
+    command: &SchematicCommand,
+    check: impl FnOnce(&str) -> Result<T, String>,
+) -> anyhow::Result<Result<T, CallToolResult>> {
+    let (prepared, _) = prepare_command(schematic, before, command)?;
     #[cfg(test)]
     let prepared = fault::prospective(prepared);
-    let after = match Sheet::parse(prepared.clone())
-        .and_then(|after| check(before, &after).map(|()| after))
-    {
-        Ok(after) => after,
+    let checked = match check(&prepared) {
+        Ok(checked) => checked,
         Err(reason) => {
             return Ok(Err(CallToolResult::error_kind(
                 ToolErrorKind::StaleTarget {
@@ -350,12 +381,12 @@ fn write(
         Ok(ownership) => ownership.map(|ownership| ownership.editor_schematic()),
         Err(error) => return Ok(Err(error.into_tool_result())),
     };
-    let transition = FileTransition::replace(schematic, before.content.clone(), prepared.clone());
+    let transition = FileTransition::replace(schematic, before.to_owned(), prepared.clone());
     #[cfg(test)]
     crate::tools::write_hook::run(schematic);
     if let Err(refusal) = commit_sheets(
         root.as_deref().unwrap_or(schematic),
-        &[schematic.as_path()],
+        &[schematic],
         vec![transition],
     )? {
         return Ok(Err(refusal));
@@ -368,9 +399,9 @@ fn write(
         )))
     };
     match read_consistent(schematic) {
-        // The file holds the checked text byte for byte, so `after` is its
-        // read-back.
-        Ok(on_disk) if on_disk == prepared => Ok(Ok(after)),
+        // The file holds the checked text byte for byte, so what `check`
+        // returned holds for it.
+        Ok(on_disk) if on_disk == prepared => Ok(Ok(checked)),
         Ok(_) => uncertain("the file on disk is not the text the transaction wrote".to_owned()),
         Err(error) => uncertain(format!("the sheet could not be read back: {error}")),
     }
@@ -379,7 +410,7 @@ fn write(
 /// Faults a test puts in a write's way: a prospective text in place of the one
 /// the command prepared, or a save over the file once the commit is done.
 #[cfg(test)]
-mod fault {
+pub(super) mod fault {
     use std::cell::RefCell;
     use std::path::Path;
 
@@ -388,11 +419,11 @@ mod fault {
         static COMMITTED: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
-    pub(super) fn set_prospective(text: String) {
+    pub(in crate::tools) fn set_prospective(text: String) {
         PROSPECTIVE.with(|slot| *slot.borrow_mut() = Some(text));
     }
 
-    pub(super) fn set_committed(text: String) {
+    pub(in crate::tools) fn set_committed(text: String) {
         COMMITTED.with(|slot| *slot.borrow_mut() = Some(text));
     }
 

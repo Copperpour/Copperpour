@@ -181,7 +181,7 @@ and Windows servers do not.
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings, pins, and label and field text (excluding free text), and wires drawn through a symbol body, with a reported origin fallback when geometry is unavailable. |
 
 ### `sch_batch` · 16 tools
-**Purpose:** Bulk add, edit, delete, and move schematic elements in one call; add, list, edit and delete free text items.
+**Purpose:** Bulk add, edit, delete, and move schematic elements in one call; add, list, edit and delete free text items; add and list graphic shapes.
 **Source:** [`crates/copperpour-core/src/tools/sch_batch.rs`](crates/copperpour-core/src/tools/sch_batch.rs)
 
 | Tool | Description |
@@ -198,6 +198,8 @@ and Windows servers do not.
 | `list_schematic_texts` | List a sheet's free text items, as `add_schematic_text` writes them: uuid, text, position and rotation, with the sheet's revision for `edit_schematic_text` and `delete_schematic_text`. |
 | `edit_schematic_text` | Replace one free text item's text by uuid and revision; only the quoted string changes. Refused on a stale revision, or while KiCad holds the sheet or its project's root open. |
 | `delete_schematic_text` | Delete one free text item by uuid and revision. Refused on a stale revision, for a member of a group, or while KiCad holds the sheet or its project's root open. |
+| `add_schematic_shapes` | Add graphic lines, polylines, rectangles and circles in one write, with `set_footprint_graphics`'s shape types and geometry keys, plus stroke style, colour and a sheet's fills. One bad shape writes none; refused on a stale `revision`, if given, or while KiCad holds the sheet or its project's root open. |
+| `list_schematic_shapes` | List a sheet's graphic lines, polylines, rectangles, circles, arcs and Bezier curves with uuid, geometry, stroke and fill, and the sheet's revision. Wires, text and library-symbol shapes are not listed. |
 | `get_schematic_layout` | Return component positions and transformed drawing/pin bounds (excluding free text), reporting unresolved geometry; optionally include wires and labels. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |

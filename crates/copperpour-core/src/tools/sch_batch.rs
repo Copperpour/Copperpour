@@ -422,6 +422,8 @@ pub fn tools() -> Vec<ToolDef> {
         super::sch_texts::list_tool(),
         super::sch_texts::edit_tool(),
         super::sch_texts::delete_tool(),
+        super::sch_shapes::add_tool(),
+        super::sch_shapes::list_tool(),
         tool!(
             "get_schematic_layout",
             "Return a compact spatial summary of the schematic: component positions, \
@@ -1999,7 +2001,7 @@ fn schematic_text_font(args: &serde_json::Value, size: f64) -> Result<String, St
 /// Accepts `[r, g, b]` or `[r, g, b, a]`. The three channels are 0–255
 /// integers as KiCad writes them; alpha is 0–1 and defaults to 1, because a
 /// colour given without one is meant to be seen.
-fn schematic_text_color(value: &serde_json::Value) -> Result<String, String> {
+pub(super) fn schematic_text_color(value: &serde_json::Value) -> Result<String, String> {
     let parts = value
         .as_array()
         .ok_or_else(|| "color must be an array [r, g, b] or [r, g, b, a]".to_string())?;

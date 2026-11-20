@@ -86,6 +86,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "trace_from_point",
     // sch_batch
     "get_schematic_layout",
+    "list_schematic_shapes",
     "list_schematic_texts",
     "validate_component_connections",
     "validate_wire_connections",
@@ -181,6 +182,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "add_schematic_component",
     "add_schematic_connection",
     "add_schematic_net_label",
+    "add_schematic_shapes",
     "add_schematic_text",
     "add_sheet_pin",
     "add_via",
