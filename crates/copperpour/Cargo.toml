@@ -33,6 +33,7 @@ tracing-subscriber.workspace = true
 toml.workspace = true
 dirs.workspace = true
 fs4.workspace = true
+sha2.workspace = true
 
 [features]
 # Forwards copperpour-core's integrations; see its Cargo.toml (#210).

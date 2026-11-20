@@ -58,7 +58,7 @@ uncertain outcome, or behaves unexpectedly in the client or KiCad.
 
 | Tool | What it establishes | Limits |
 |---|---|---|
-| `get_installation_info` | Running server version, `installation.binary_on_disk.newer_than_running`, `runtime.working_directory`, `kicad` CLI block, redacted IPC endpoint, and `guidance` drift (`checked`: `"now"` or `"earlier"`). | `newer_than_running: null` means unproven, not current. `guidance` is cached after the first scan per installed marker. |
+| `get_installation_info` | Running server version, `installation.binary_on_disk.newer_than_running`, `runtime.working_directory`, `kicad` CLI block, redacted IPC endpoint, and `guidance` drift (`checked`: `"now"` or `"earlier"`). | `newer_than_running: null` means unproven, not current. `guidance` is cached per installed marker and embedded guidance bundle. |
 | `get_recent_calls` | Recent tool calls that reached the MCP server process. | Absence from `get_recent_calls` does not prove a specific client failure (the client may filter or block calls before sending). |
 | `check_kicad_ui` | Live KiCad IPC reachability, `ipc_failure` reason, and `AS_NOT_READY` status. | A 5-second default timeout can expire while KiCad is still starting. |
 
