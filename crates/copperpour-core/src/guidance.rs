@@ -5,6 +5,16 @@ pub use bundle::{SkillManifest, LEGACY_OPERATING_RULES_SKILL, OPERATING_RULES_SK
 
 use serde_json::Value;
 
+/// Build commit captured by `build.rs` (from `COPPERPOUR_BUILD_COMMIT` or
+/// `.git/HEAD`), shared with the installer so dev-build install markers and
+/// drift notices can be distinguished from releases and from one another (#698).
+pub const BUILD_COMMIT: Option<&str> = option_env!("COPPERPOUR_BUILD_COMMIT");
+
+/// Where `build.rs` found [`BUILD_COMMIT`]: `git_head` for a build from a Git
+/// checkout, `build_environment` when the builder passed
+/// `COPPERPOUR_BUILD_COMMIT`, as the release jobs do (#698).
+pub const BUILD_COMMIT_SOURCE: Option<&str> = option_env!("COPPERPOUR_BUILD_COMMIT_SOURCE");
+
 pub trait GuidanceProbe: Send + Sync {
     /// The `guidance` block of `get_installation_info`.
     fn detail(&self) -> Value;

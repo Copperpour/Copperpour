@@ -1411,6 +1411,75 @@ fn a_stale_guidance_check_record_rechecks_once_over_stdio() {
     assert_eq!(body["guidance"]["claude"]["state"], "out_of_sync");
 }
 
+/// Regression for #698 over real stdio: when built with a commit SHA,
+/// `copperpour init` writes `<version>+<short_commit>` into the install marker,
+/// and both `copperpour status` and the MCP `initialize` drift notice include
+/// the commit suffix so dev builds on the same crate version are distinguishable.
+#[cfg(unix)]
+#[test]
+fn dev_build_install_marker_and_drift_notice_include_build_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let init = std::process::Command::new(env!("CARGO_BIN_EXE_copperpour"))
+        .args(["init", "--client", "claude"])
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "copperpour init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    // Edit one installed skill so drift detection triggers.
+    let skill = tmp.path().join(".claude/skills/copperpour/SKILL.md");
+    std::fs::write(&skill, "local edit").unwrap();
+
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let body = McpProcess::tool_body(&p.call_tool("get_installation_info", json!({})));
+    // A commit read from `.git/HEAD` marks a dev build; a release job passes
+    // its commit in and keeps the bare version.
+    let expected = match (
+        body["build"]["commit_source"].as_str(),
+        body["build"]["commit"].as_str(),
+    ) {
+        (Some("git_head"), Some(commit)) => format!(
+            "{}+{}",
+            env!("CARGO_PKG_VERSION"),
+            commit[..commit.len().min(8)].to_ascii_lowercase()
+        ),
+        _ => env!("CARGO_PKG_VERSION").to_string(),
+    };
+
+    let marker = std::fs::read_to_string(tmp.path().join(".copperpour/.installed-claude")).unwrap();
+    assert_eq!(marker.trim(), expected);
+
+    let instructions = p.initialized["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains(&format!(
+            "Copperpour Claude guidance (installed by v{expected}) does not match this server v{expected}:"
+        )),
+        "drift notice should include build commit suffix: {instructions}"
+    );
+    assert_eq!(body["guidance"]["claude"]["marker"]["version"], expected);
+    drop(p);
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_copperpour"))
+        .args(["status", "--client", "claude"])
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains(&format!("Copperpour v{expected} — Claude Install Status")),
+        "status header should include build commit suffix: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("Install marker: v{expected}")),
+        "status marker should include build commit suffix: {stdout}"
+    );
+}
+
 /// #787 over real stdio: with nothing to find, `check_freerouting` reports
 /// every location it searched, in the documented order, from the server's own
 /// environment. The environment is redirected so a Freerouting installed on

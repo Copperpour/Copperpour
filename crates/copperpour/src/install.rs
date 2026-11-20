@@ -424,7 +424,7 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
     }
 
     fs::create_dir_all(paths.data_dir())?;
-    fs::write(paths.marker(client), env!("CARGO_PKG_VERSION"))?;
+    fs::write(paths.marker(client), build_version_label())?;
     // The recorded check described the guidance this install just replaced;
     // a same-version re-init leaves the marker unchanged, so drop it.
     remove_if_present(&paths.guidance_checked(client))?;
@@ -592,7 +592,7 @@ impl fmt::Display for StatusText<'_> {
         writeln!(
             f,
             "Copperpour v{} — {client} Install Status\n",
-            env!("CARGO_PKG_VERSION")
+            build_version_label()
         )?;
         writeln!(
             f,
@@ -789,7 +789,7 @@ impl ClientGuidance {
              Ask the user to run `copperpour init{client_flag}`; it overwrites differing files, \
              which may hold their own edits. Do not rewrite these files yourself.",
             self.client,
-            env!("CARGO_PKG_VERSION"),
+            build_version_label(),
         ))
     }
 
@@ -811,6 +811,43 @@ impl ClientGuidance {
             })).collect::<Vec<_>>(),
         })
     }
+}
+
+/// Short build identifier for install markers, `status`, and drift notices.
+/// A dev build appends `+<8-char-commit>` so builds on the same crate version
+/// (e.g. `0.16.1`) are told apart from releases and from one another, while
+/// staying a SemVer build-metadata token [`is_plain_version`] accepts (#698).
+fn format_build_version(pkg_version: &str, dev_commit: Option<&str>) -> String {
+    let short = dev_commit
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|c| &c[..c.len().min(8)]);
+    match short {
+        Some(short) => format!("{pkg_version}+{}", short.to_ascii_lowercase()),
+        None => pkg_version.to_string(),
+    }
+}
+
+/// A dev build is one whose commit `build.rs` read from `.git/HEAD`. Release
+/// builders pass `COPPERPOUR_BUILD_COMMIT` (local CI's release jobs,
+/// `macos.yml`), and a build without Git metadata (Nix) has no commit, so
+/// both keep the bare `<version>`.
+fn dev_build_commit<'a>(source: Option<&str>, commit: Option<&'a str>) -> Option<&'a str> {
+    if source == Some("git_head") {
+        commit
+    } else {
+        None
+    }
+}
+
+fn build_version_label() -> String {
+    format_build_version(
+        env!("CARGO_PKG_VERSION"),
+        dev_build_commit(
+            copperpour_core::guidance::BUILD_COMMIT_SOURCE,
+            copperpour_core::guidance::BUILD_COMMIT,
+        ),
+    )
 }
 
 /// The marker's text reaches the model's instructions, so only a short
@@ -2525,7 +2562,10 @@ mod tests {
         assert_eq!(claude.state().as_str(), "current");
         assert_eq!(claude.notice(), None);
         let marker = claude.marker.as_ref().unwrap();
-        assert_eq!(marker.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            marker.version.as_deref(),
+            Some(build_version_label().as_str())
+        );
         assert!(!marker.legacy);
 
         let codex = inspect_guidance(InstallClient::Codex, &paths, &this_exe());
@@ -2639,7 +2679,7 @@ mod tests {
             1
         );
         let notice = guidance.notice().unwrap();
-        assert!(notice.contains(&format!("(installed by v{})", env!("CARGO_PKG_VERSION"))));
+        assert!(notice.contains(&format!("(installed by v{})", build_version_label())));
         assert!(notice.contains(": 1 different."), "{notice}");
         assert!(notice.contains("may hold their own edits"), "{notice}");
 
@@ -2951,12 +2991,13 @@ mod tests {
         assert_eq!(first.take_notice(), None, "one advisory per install");
         assert_eq!(first.detail(), detail, "one scan per process");
 
+        let expected_version = build_version_label();
         for (client, state, version, legacy) in [
             (InstallClient::Claude, "out_of_sync", "0.2.2", true),
             (
                 InstallClient::Codex,
                 "current",
-                env!("CARGO_PKG_VERSION"),
+                expected_version.as_str(),
                 false,
             ),
         ] {
@@ -3202,12 +3243,33 @@ mod tests {
         let detail = reinstalled.detail();
         assert_eq!(detail["claude"]["checked"], "now");
         assert_eq!(detail["claude"]["state"], "current");
-        assert_eq!(
-            detail["claude"]["marker"]["version"],
-            env!("CARGO_PKG_VERSION")
-        );
+        assert_eq!(detail["claude"]["marker"]["version"], build_version_label());
         assert_eq!(reinstalled.take_notice(), None);
         assert_eq!(start(&temp).detail()["claude"]["checked"], "earlier");
+    }
+
+    #[test]
+    fn format_build_version_appends_short_hex_commit_and_falls_back_cleanly() {
+        let with_full = format_build_version("0.16.1", Some("F5B12F821234567890abcdef"));
+        assert_eq!(with_full, "0.16.1+f5b12f82");
+        assert!(is_plain_version(&with_full));
+        assert_eq!(
+            format_build_version("0.16.1", Some("abc1234")),
+            "0.16.1+abc1234"
+        );
+        assert_eq!(format_build_version("0.16.1", None), "0.16.1");
+        assert_eq!(format_build_version("0.16.1", Some("   ")), "0.16.1");
+        assert_eq!(format_build_version("0.16.1", Some("not-a-sha!")), "0.16.1");
+    }
+
+    /// Only a commit read from `.git/HEAD` labels a build as dev; a commit the
+    /// builder passed in marks a release job, which stays bare (#698).
+    #[test]
+    fn only_a_commit_read_from_git_head_marks_a_dev_build() {
+        let commit = Some("f5b12f821234");
+        assert_eq!(dev_build_commit(Some("git_head"), commit), commit);
+        assert_eq!(dev_build_commit(Some("build_environment"), commit), None);
+        assert_eq!(dev_build_commit(None, None), None);
     }
 
     #[test]
