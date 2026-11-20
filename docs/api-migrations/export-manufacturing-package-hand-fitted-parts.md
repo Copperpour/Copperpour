@@ -17,7 +17,11 @@ these parts.
 
 A footprint that also has `exclude_from_bom`, or is not in the schematic (a
 mounting hole), is not a hand-fitted part. The BOM is unchanged when the board
-has no hand-fitted part, and for every other fab house.
+has no hand-fitted part, and for every other fab house. A
+`BOM-hand-fitted-<board>.csv` left in the output directory by an earlier JLCPCB
+export is removed when the board no longer has a hand-fitted part. If the list
+cannot be written, the BOM is left as KiCad wrote it, a warning says so and the
+package is reported incomplete.
 
 Callers that marked hand-fitted parts DNP to keep them out of the assembly
 files can set `exclude_from_pos_files` instead (`edit_component`), and clear

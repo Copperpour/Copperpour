@@ -1592,8 +1592,6 @@ mod jlcpcb_assembly_tests {
         assert!(mismatch.contains("missing from CPL [R1]"));
     }
 
-    /// A reference containing `-` is one part (#121); only KiCad's range
-    /// shape is refused, and not when the CPL names it as a part.
     /// #681: hand-fitted parts leave the assembler's BOM for a list of their
     /// own, a mixed group is cut in two with a quantity each, and the
     /// assembler's BOM then matches a CPL that left them out.
@@ -1649,6 +1647,8 @@ mod jlcpcb_assembly_tests {
         );
     }
 
+    /// A reference containing `-` is one part (#121); only KiCad's range
+    /// shape is refused, and not when the CPL names it as a part.
     #[test]
     fn hyphenated_references_are_parts_and_only_unknown_ranges_are_refused() {
         let bom = "\"Refs\",\"Value\"\n\"SMB-19-A1,SMB-19-K1\",\"clip\"\n\"R1\",\"10k\"\n\"C1-1\",\"1u\"\n";

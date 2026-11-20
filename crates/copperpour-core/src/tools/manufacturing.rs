@@ -639,24 +639,49 @@ pub(crate) async fn build_package(
 /// Moves the `hand_fitted` parts out of the JLCPCB BOM at `bom` into
 /// `hand_bom` (#681): the hand-fitted list is written first, then the BOM is
 /// replaced by the assembler's rows. The parts moved, or `None` when the BOM
-/// lists none of them and both files are left as they are.
+/// lists none of them: the BOM is left as it is, and a `hand_bom` file left by
+/// an earlier export is removed, so the folder holds no stale list.
 async fn split_hand_fitted_bom(
     bom: &std::path::Path,
     hand_bom: &std::path::Path,
     hand_fitted: &std::collections::BTreeSet<String>,
     fields: Option<&str>,
 ) -> anyhow::Result<Option<std::collections::BTreeSet<String>>> {
-    if hand_fitted.is_empty() {
-        return Ok(None);
-    }
-    let source = tokio::fs::read_to_string(bom).await?;
-    let Some(split) = crate::fab::jlcpcb::split_hand_fitted_bom(&source, hand_fitted, fields)?
-    else {
+    let split = if hand_fitted.is_empty() {
+        None
+    } else {
+        let source = tokio::fs::read_to_string(bom).await?;
+        crate::fab::jlcpcb::split_hand_fitted_bom(&source, hand_fitted, fields)?
+    };
+    let Some(split) = split else {
+        remove_stale_hand_fitted_bom(hand_bom).await?;
         return Ok(None);
     };
     cli::publish_verified_bytes(hand_bom, split.hand_fitted.as_bytes(), "hand-fitted BOM").await?;
     cli::publish_verified_bytes(bom, split.assembly.as_bytes(), "JLCPCB BOM").await?;
     Ok(Some(split.designators))
+}
+
+/// Removes the hand-fitted list an earlier export wrote at `hand_bom`, if
+/// there is one. Only a file is removed; anything else at that path is left.
+/// A name too long for the file system cannot have been written, so it has
+/// nothing to remove either.
+async fn remove_stale_hand_fitted_bom(hand_bom: &std::path::Path) -> anyhow::Result<()> {
+    match tokio::fs::symlink_metadata(hand_bom).await {
+        Ok(meta) if meta.is_file() => tokio::fs::remove_file(hand_bom)
+            .await
+            .with_context(|| format!("removing stale {}", hand_bom.display())),
+        Ok(_) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidFilename
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// A refusal of the order link: nothing was uploaded, and why.

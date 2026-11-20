@@ -344,10 +344,14 @@ mod tests {
                         item.value = fp.encode_to_vec();
                     }
                 }
-                if matches!(mode, "hand-fitted" | "hand-fitted-hole") {
+                if matches!(
+                    mode,
+                    "hand-fitted" | "hand-fitted-hole" | "hand-fitted-board-only"
+                ) {
                     // JF3 and JF4 are fitted by hand: out of position files
                     // only. In "hand-fitted-hole" JF4 is out of the BOM too,
-                    // as a mounting hole is.
+                    // as a mounting hole is; in "hand-fitted-board-only" it is
+                    // on the board only, not in the schematic.
                     for item in &mut items.items {
                         let mut fp =
                             kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
@@ -364,6 +368,8 @@ mod tests {
                             attrs.exclude_from_position_files = true;
                             attrs.exclude_from_bill_of_materials =
                                 mode == "hand-fitted-hole" && reference == "JF4";
+                            attrs.not_in_schematic =
+                                mode == "hand-fitted-board-only" && reference == "JF4";
                             item.value = fp.encode_to_vec();
                         }
                     }
@@ -445,7 +451,8 @@ mod tests {
     }
 
     /// #681: a footprint out of position files but fitted, bought and in
-    /// the schematic is fitted by hand; one also out of the BOM is not.
+    /// the schematic is fitted by hand; one also out of the BOM, or on the
+    /// board only, is not.
     #[test]
     fn hand_fitted_parts_are_left_out_of_positions_only() {
         let board = std::path::Path::new("midpoints.kicad_pcb");
@@ -454,6 +461,7 @@ mod tests {
         for (mode, expected) in [
             ("hand-fitted", vec!["JF3", "JF4"]),
             ("hand-fitted-hole", vec!["JF3"]),
+            ("hand-fitted-board-only", vec!["JF3"]),
             ("good", vec![]),
         ] {
             let mock = fixture_server(board, mode);
@@ -792,14 +800,51 @@ mod tests {
         );
 
         // Without a hand-fitted part, the BOM is KiCad's, byte for byte.
-        let dir = tempfile::tempdir().unwrap();
-        let (text, output) = served_package(dir.path(), "midpoints").await;
+        let fresh = tempfile::tempdir().unwrap();
+        let (text, output) = served_package(fresh.path(), "midpoints").await;
         assert!(!text.contains("bom_hand_fitted"), "{text}");
         assert!(!output.join("BOM-hand-fitted-midpoints.csv").exists());
         assert_eq!(
             std::fs::read_to_string(output.join("BOM-midpoints.csv")).unwrap(),
             "Reference\n\"JB0,JB1,JB2,JB3,JB4,JF0,JF1,JF2,JF3,JF4\"\nR1\n"
         );
+
+        // The same folder exported again without a hand-fitted part loses
+        // the earlier list, so nobody buys from a stale one.
+        let (text, output) = served_package(dir.path(), "midpoints").await;
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["complete"], true, "{body:#}");
+        assert!(!text.contains("bom_hand_fitted"), "{text}");
+        assert!(!path.exists());
+        assert!(output.join("BOM-midpoints.csv").exists());
+    }
+
+    /// #681: a hand-fitted list that cannot be written leaves a warning and
+    /// the package incomplete, so a BOM still listing the hand-fitted parts
+    /// is never reported ready to upload.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn served_jlcpcb_package_warns_when_its_hand_fitted_list_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("package/BOM-hand-fitted-midpoints.csv");
+        std::fs::create_dir_all(&blocked).unwrap();
+        let (text, output) = served_package_in(dir.path(), "midpoints", "hand-fitted").await;
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["complete"], false, "{body:#}");
+        let warnings = body["warnings"].as_array().unwrap();
+        assert!(
+            warnings.iter().any(|warning| warning
+                .as_str()
+                .unwrap()
+                .starts_with("Hand-fitted BOM split failed")),
+            "{warnings:#?}"
+        );
+        assert!(!text.contains("bom_hand_fitted"), "{text}");
+        assert!(blocked.is_dir());
+        // The BOM is KiCad's, hand-fitted parts included: nothing was moved.
+        assert!(std::fs::read_to_string(output.join("BOM-midpoints.csv"))
+            .unwrap()
+            .contains("JF3,JF4"));
     }
 
     /// #69: evidence that cannot be written leaves a warning, no path and
