@@ -569,14 +569,14 @@ pub(super) fn inspect_graphics(
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
-struct Point {
-    x: f64,
-    y: f64,
+pub(super) struct Point {
+    pub(super) x: f64,
+    pub(super) y: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
-enum Fill {
+pub(super) enum Fill {
     None,
     Solid,
 }
@@ -590,9 +590,11 @@ impl Fill {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+/// One graphic item in the shared vocabulary of `set_footprint_graphics`,
+/// also used for a custom pad's primitives (`pad_primitives`).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
-enum FootprintGraphic {
+pub(super) enum FootprintGraphic {
     Line {
         start: Point,
         end: Point,
@@ -737,7 +739,7 @@ fn points_differ(a: Point, b: Point) -> bool {
 }
 
 impl FootprintGraphic {
-    fn validate_and_normalize(&mut self) -> Result<(), String> {
+    pub(super) fn validate_and_normalize(&mut self) -> Result<(), String> {
         match self {
             Self::Line {
                 start,

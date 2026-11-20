@@ -412,6 +412,22 @@ set_footprint_metadata(
   for the whole footprint. `0` is an override like any other value;
   `inherited` removes it. A file older than KiCad's format 20240202 reads 0 as
   inherited, so 0 is refused there.
+- Use `edit_footprint_pad` with `roundrect_rratio` (`0` through `0.5`) to change
+  a roundrect pad's corner radius, as a fraction of its smaller side: a
+  datasheet's R0.05 corner on a 0.3 mm wide pad is `0.05 / 0.3`. It is refused
+  on a pad of another shape unless the same call sets `shape="roundrect"`.
+- Use `edit_footprint_pad` with `shape="custom"` and `custom_shape` to draw a
+  vendor land pattern that no standard shape gives, such as a cross-shaped or
+  L-shaped exposed pad: `anchor` (`rect` or `circle`, sized by the pad's
+  `width` and `height`), optional `clearance` (`outline`, KiCad's default, or
+  `convexhull`), and `primitives` in `set_footprint_graphics`' items, in the
+  pad's own coordinates (relative to its position, unrotated). `custom_shape`
+  alone redraws a pad that is already custom; it always replaces the whole
+  primitive list. Read the current shape with
+  `get_footprint_info(include_pads=true)`. KiCad's DRC reports a shape whose
+  anchor and primitives do not merge into one polygon; this tool does not
+  check that. `create_footprint` pads take `shape="custom"` with
+  `custom_shape` too.
 - Use `edit_footprint_pad` with `fabrication_property` to set KiCad's pad
   fabrication property, such as `castellated`, `heatsink` or `testpoint` (the
   schema lists all of KiCad's values), or `none` to remove it.

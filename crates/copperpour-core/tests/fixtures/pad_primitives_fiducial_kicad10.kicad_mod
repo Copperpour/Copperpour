@@ -1,0 +1,134 @@
+(footprint "Fiducial_Cross_1.5mm_Mask2mm"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(descr "Fiducial, cross variant, 1.5mm bare copper, 2mm soldermask opening")
+	(tags "fiducial")
+	(property "Reference" "REF**"
+		(at 0 -1.95 0)
+		(layer "F.SilkS")
+		(uuid "71d95ec7-d095-49cc-b2c2-613aa994ed14")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Value" "Fiducial_Cross_1.5mm_Mask2mm"
+		(at 0 1.95 0)
+		(layer "F.Fab")
+		(uuid "36486213-6eb4-4e05-bbe9-bdeeae11b5e8")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "d968bf04-bcd9-4208-ae08-bfa2346d6316")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "f275030e-47fe-47bf-a4ff-bf562ab05b9b")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property "KiLib_Generator" "fiducial"
+		(at 0 0 0)
+		(layer "F.SilkS")
+		(hide yes)
+		(uuid "044262fd-833e-4c32-b4b1-077cce2b22a1")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(attr smd exclude_from_bom)
+	(duplicate_pad_numbers_are_jumpers no)
+	(fp_circle
+		(center 0 0)
+		(end 1.25 0)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(fill no)
+		(layer "F.CrtYd")
+		(uuid "6093407d-b8f2-40e4-a4e4-734b155e9f5e")
+	)
+	(fp_circle
+		(center 0 0)
+		(end 1 0)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(fill no)
+		(layer "F.Fab")
+		(uuid "4ed58afb-dca9-4bfb-86cc-041c2b3e09dc")
+	)
+	(fp_text user "${REFERENCE}"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(uuid "6b03b8a7-155c-41bf-9f04-225ec031cac5")
+		(effects
+			(font
+				(size 0.5 0.5)
+				(thickness 0.08)
+			)
+		)
+	)
+	(pad "" smd circle
+		(at 0 0)
+		(size 0.25 0.25)
+		(property pad_prop_fiducial_glob)
+		(layers "F.Cu" "F.Mask")
+		(solder_mask_margin 0.875)
+		(clearance 0.975)
+		(uuid "47b9aedc-0e4e-4d73-936d-f96b2b0590e5")
+	)
+	(pad "" smd custom
+		(at 0 0)
+		(size 0.25 0.25)
+		(property pad_prop_fiducial_glob)
+		(layers "F.Cu" "F.Mask")
+		(options
+			(clearance outline)
+			(anchor circle)
+		)
+		(primitives
+			(gr_rect
+				(start -0.75 -0.125)
+				(end 0.75 0.125)
+				(width 0)
+				(fill yes)
+			)
+			(gr_rect
+				(start -0.125 -0.75)
+				(end 0.125 0.75)
+				(width 0)
+				(fill yes)
+			)
+		)
+		(uuid "24851bd3-6c46-417f-b45e-4c463cea5c4b")
+	)
+	(embedded_fonts no)
+)
