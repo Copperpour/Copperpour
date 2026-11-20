@@ -55,6 +55,7 @@ pub(crate) mod navigation_target;
 #[cfg(test)]
 mod own_at_children_tests;
 mod pad_nets;
+mod pad_primitives;
 pub mod pcb_board;
 mod pcb_board_outline;
 pub mod pcb_board_rule_area;
