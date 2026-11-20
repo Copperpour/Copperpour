@@ -1327,6 +1327,90 @@ fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
     );
 }
 
+/// Regression for #697 over real stdio: a cached `.guidance-checked-claude`
+/// record from an older binary (either legacy marker-only or an older
+/// `bundle_digest`) must not silence a newer binary whose embedded bundle
+/// changed; the upgraded binary rescans once, emits the `initialize` notice,
+/// and stays quiet on the next start.
+#[cfg(unix)]
+#[test]
+fn a_stale_guidance_check_record_rechecks_once_over_stdio() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join(".copperpour");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let installed_version = env!("CARGO_PKG_VERSION");
+    std::fs::write(data_dir.join(".installed-claude"), installed_version).unwrap();
+    // Simulate a pre-#697 marker-only cache record from an older binary with
+    // the same crate version (the exact state observed on upgraded dev builds).
+    std::fs::write(
+        data_dir.join(".guidance-checked-claude"),
+        serde_json::to_vec(&json!({
+            "key": {
+                "marker": {
+                    "version": installed_version,
+                    "legacy": false
+                }
+            },
+            "state": "out_of_sync"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let instructions = p.initialized["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains(&format!(
+            "Copperpour Claude guidance (installed by v{installed_version})"
+        )),
+        "upgraded binary must not stay silent on a pre-#697 cache record: {instructions}"
+    );
+    let body = McpProcess::tool_body(&p.call_tool("get_installation_info", json!({})));
+    assert_eq!(body["guidance"]["claude"]["checked"], "now");
+    assert_eq!(body["guidance"]["claude"]["state"], "out_of_sync");
+    drop(p);
+
+    // Second start of the same binary reuses the updated record and stays quiet.
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    assert_eq!(
+        p.initialized["result"]["instructions"],
+        copperpour_core::guidance::SESSION_RULES
+    );
+    let body = McpProcess::tool_body(&p.call_tool("get_installation_info", json!({})));
+    assert_eq!(body["guidance"]["claude"]["checked"], "earlier");
+    assert_eq!(body["guidance"]["claude"]["state"], "out_of_sync");
+    drop(p);
+
+    // Simulate a record written by an earlier binary whose embedded bundle had
+    // a different digest: the newer binary must re-check once and notify again.
+    std::fs::write(
+        data_dir.join(".guidance-checked-claude"),
+        serde_json::to_vec(&json!({
+            "key": {
+                "marker": {
+                    "version": installed_version,
+                    "legacy": false
+                },
+                "bundle_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "state": "out_of_sync"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let instructions = p.initialized["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains(&format!(
+            "Copperpour Claude guidance (installed by v{installed_version})"
+        )),
+        "upgraded binary must re-check when bundle_digest differs: {instructions}"
+    );
+    let body = McpProcess::tool_body(&p.call_tool("get_installation_info", json!({})));
+    assert_eq!(body["guidance"]["claude"]["checked"], "now");
+    assert_eq!(body["guidance"]["claude"]["state"], "out_of_sync");
+}
+
 /// #787 over real stdio: with nothing to find, `check_freerouting` reports
 /// every location it searched, in the documented order, from the server's own
 /// environment. The environment is redirected so a Freerouting installed on

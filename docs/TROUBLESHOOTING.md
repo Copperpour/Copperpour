@@ -163,16 +163,19 @@ Copperpour binary, written exactly as `copperpour init` writes it. A hook is
 unchanged.
 
 The serving process makes the same comparison for both clients once per
-installed guidance version, meaning each install marker. The first start
-for that marker scans, records the resulting state in
+`(install marker, embedded guidance bundle)` pair. The first start for a
+marker—or after a binary upgrade that changes that client's embedded skills,
+agents, or hook matchers—scans, records the resulting state in
 `~/.copperpour/.guidance-checked-<client>`, and sets the MCP `initialize`
 `instructions` to a one-line notice when either client is `out_of_sync`. Later
-starts read the record instead of rescanning and give no notice. Running
-`copperpour init` starts a new check. Upgrading the binary alone does not. `get_installation_info` reports the
-result under `guidance`; its `checked` field is `now` for a scan in this
-process, with per-file detail, or `earlier` for a recorded state without it.
-`copperpour status` always scans. Nothing rewrites guidance. Run `copperpour init` to
-update. It overwrites `different` files, so save any edits you made first.
+starts with the same marker and embedded bundle read the record instead of
+rescanning and give no notice. Running `copperpour init` starts a new check;
+upgrading to a binary with an unchanged guidance bundle stays quiet.
+`get_installation_info` reports the result under `guidance`; its `checked`
+field is `now` for a scan in this process, with per-file detail, or `earlier`
+for a recorded state without it. `copperpour status` always scans. Nothing
+rewrites guidance. Run `copperpour init` to update. It overwrites `different`
+files, so save any edits you made first.
 
 ## "KiCAD IPC socket path not configured"
 

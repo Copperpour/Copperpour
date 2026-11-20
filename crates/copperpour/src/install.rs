@@ -7,6 +7,7 @@ use crate::manifest::{
     AGENTS, HOOK_SKILLS, LEGACY_OPERATING_RULES_SKILL, OPERATING_RULES_SKILL, SKILLS,
 };
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
@@ -1016,17 +1017,99 @@ fn is_konnect_executable(path: &str) -> bool {
 /// Serves drift for both clients to `get_installation_info` and `initialize`.
 /// The executable is captured at startup, before an update can replace it.
 ///
-/// Each installed guidance version is scanned once: the first process to see
-/// a new install marker scans, records the result under `~/.konnect`, and
-/// offers one notice. Later processes read the record, even after a binary
-/// update, so guidance the user chose to keep is not reported on every start.
-/// `konnect status` still scans on demand.
+/// Each `(installed guidance marker, embedded bundle)` pair is scanned once:
+/// the first process to see a new marker or a changed embedded guidance bundle
+/// scans, records the result under `~/.copperpour`, and offers one notice.
+/// Later processes with the same marker and bundle digest read the record, so
+/// guidance the user chose to keep is not reported on every start, while an
+/// upgraded binary whose skills, agents, or hook matchers changed re-checks
+/// once (#697). `copperpour status` still scans on demand.
 pub struct InstalledGuidanceProbe {
     paths: InstallPaths,
     exe: String,
     /// Reported, never keyed; a test stands in an older binary's version.
     bundle_version: &'static str,
+    /// Per-client digest of the embedded guidance this binary would install.
+    bundle_digests: BundleDigests,
     reading: std::sync::Mutex<Option<GuidanceReading>>,
+}
+
+#[derive(Clone, Debug)]
+struct BundleDigests {
+    claude: String,
+    codex: String,
+}
+
+impl BundleDigests {
+    fn current() -> Self {
+        Self {
+            claude: bundle_digest(InstallClient::Claude),
+            codex: bundle_digest(InstallClient::Codex),
+        }
+    }
+
+    fn for_client(&self, client: InstallClient) -> &str {
+        match client {
+            InstallClient::Claude => &self.claude,
+            InstallClient::Codex => &self.codex,
+        }
+    }
+}
+
+fn hash_str(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+/// Deterministic SHA-256 digest of the embedded guidance `init` would write
+/// for `client` (skills + references, plus Claude agents and hook matchers).
+fn bundle_digest(client: InstallClient) -> String {
+    bundle_digest_of(client, SKILLS, AGENTS, HOOK_SKILLS)
+}
+
+fn bundle_digest_of(
+    client: InstallClient,
+    skills: &[copperpour_core::guidance::SkillManifest],
+    agents: &[crate::manifest::AgentManifest],
+    hooks: &[crate::manifest::HookSkillManifest],
+) -> String {
+    let mut hasher = Sha256::new();
+    for skill in skills {
+        hash_str(&mut hasher, "skill");
+        hash_str(&mut hasher, skill.name);
+        hash_str(&mut hasher, skill.content);
+        for (filename, content) in skill.references {
+            hash_str(&mut hasher, "reference");
+            hash_str(&mut hasher, filename);
+            hash_str(&mut hasher, content);
+        }
+    }
+    if client == InstallClient::Claude {
+        for agent in agents {
+            hash_str(&mut hasher, "agent");
+            hash_str(&mut hasher, agent.filename);
+            hash_str(&mut hasher, agent.content);
+        }
+        for hook in hooks {
+            hash_str(&mut hasher, "hook");
+            hash_str(&mut hasher, hook.name);
+            hash_str(&mut hasher, hook.event);
+            if let Ok(matcher) = hook_matcher(hook) {
+                hash_str(&mut hasher, &matcher);
+            }
+        }
+    }
+    encode_hex(&hasher.finalize())
 }
 
 struct GuidanceReading {
@@ -1047,6 +1130,7 @@ impl InstalledGuidanceProbe {
             paths,
             exe,
             bundle_version: env!("CARGO_PKG_VERSION"),
+            bundle_digests: BundleDigests::current(),
             reading: std::sync::Mutex::new(None),
         }
     }
@@ -1068,8 +1152,9 @@ impl InstalledGuidanceProbe {
         for client in [InstallClient::Claude, InstallClient::Codex] {
             let record = self.paths.guidance_checked(client);
             let marker = read_marker(client, &self.paths);
+            let digest = self.bundle_digests.for_client(client);
             detail[client.to_string().to_ascii_lowercase()] =
-                match recorded_state(&record, &Self::checked_key(marker.as_ref())) {
+                match recorded_state(&record, &Self::checked_key(marker.as_ref(), digest)) {
                     Some(state) => serde_json::json!({
                         "state": state,
                         "checked": "earlier",
@@ -1078,7 +1163,7 @@ impl InstalledGuidanceProbe {
                     None => {
                         let guidance = inspect_guidance(client, &self.paths, &self.exe);
                         notices.extend(guidance.notice());
-                        let key = Self::checked_key(guidance.marker.as_ref());
+                        let key = Self::checked_key(guidance.marker.as_ref(), digest);
                         if let Err(error) = record_state(&record, &key, guidance.state()) {
                             tracing::warn!(
                                 "could not record the {client} guidance check at {}: {error:#}",
@@ -1097,16 +1182,18 @@ impl InstalledGuidanceProbe {
         }
     }
 
-    /// What identifies one installed guidance version. The bundle version is
-    /// left out, so a new binary over the same install stays quiet (#728). So
-    /// is the marker path: it follows from `legacy`, and moving `HOME` is not
-    /// a new install.
-    fn checked_key(marker: Option<&MarkerInfo>) -> serde_json::Value {
+    /// What identifies one checked `(installed guidance, embedded bundle)` pair.
+    /// `bundle_version` is left out so two builds with identical embedded
+    /// guidance stay quiet, while any binary upgrade that changes skills,
+    /// agents, or hook matchers re-checks once (#697). The marker path is left
+    /// out: it follows from `legacy`, and moving `HOME` is not a new install.
+    fn checked_key(marker: Option<&MarkerInfo>, bundle_digest: &str) -> serde_json::Value {
         serde_json::json!({
             "marker": marker.map(|marker| serde_json::json!({
                 "version": marker.version,
                 "legacy": marker.legacy,
             })),
+            "bundle_digest": bundle_digest,
         })
     }
 }
@@ -2877,10 +2964,12 @@ mod tests {
                 serde_json::from_str(&fs::read_to_string(paths.guidance_checked(client)).unwrap())
                     .unwrap();
             assert_eq!(record["state"], state, "{client}");
-            // Only the installed marker identifies the check (#728).
             assert_eq!(
                 record["key"],
-                serde_json::json!({"marker": {"version": version, "legacy": legacy}}),
+                serde_json::json!({
+                    "marker": {"version": version, "legacy": legacy},
+                    "bundle_digest": bundle_digest(client),
+                }),
                 "{client}"
             );
         }
@@ -2921,8 +3010,9 @@ mod tests {
         );
     }
 
-    /// A new install marker is a new installed version: checked and reported
-    /// once more, then quiet again. A new binary over the same marker is not.
+    /// A new install marker is checked and reported once more, then quiet
+    /// again. A binary update with the same embedded bundle stays quiet, while
+    /// one whose embedded bundle changed re-checks and notifies once (#697).
     #[test]
     fn a_changed_installed_version_is_checked_and_reported_once() {
         use copperpour_core::guidance::GuidanceProbe;
@@ -2940,15 +3030,155 @@ mod tests {
         assert!(notice.starts_with("Copperpour Claude guidance (installed by v0.2.3)"));
         assert_eq!(start(&temp).take_notice(), None);
 
-        // A binary update over the same install marker stays quiet.
-        let other_bundle = InstalledGuidanceProbe {
+        // A binary update with the same embedded bundle stays quiet.
+        let same_bundle = InstalledGuidanceProbe {
             bundle_version: "0.0.1",
             ..start(&temp)
         };
-        assert_eq!(other_bundle.detail()["bundle_version"], "0.0.1");
-        assert_eq!(other_bundle.detail()["claude"]["checked"], "earlier");
-        assert_eq!(other_bundle.take_notice(), None);
-        assert_eq!(start(&temp).detail()["claude"]["checked"], "earlier");
+        assert_eq!(same_bundle.detail()["bundle_version"], "0.0.1");
+        assert_eq!(same_bundle.detail()["claude"]["checked"], "earlier");
+        assert_eq!(same_bundle.take_notice(), None);
+
+        // A binary update whose Claude bundle changed re-checks Claude once,
+        // notifies once, and leaves Codex untouched.
+        let mut upgraded_digests = BundleDigests::current();
+        upgraded_digests.claude = "upgraded-claude-bundle-digest".to_string();
+        let upgraded_claude = InstalledGuidanceProbe {
+            bundle_digests: upgraded_digests.clone(),
+            ..start(&temp)
+        };
+        assert_eq!(upgraded_claude.detail()["claude"]["checked"], "now");
+        assert_eq!(upgraded_claude.detail()["codex"]["checked"], "earlier");
+        let notice = upgraded_claude.take_notice().unwrap();
+        assert!(notice.starts_with("Copperpour Claude guidance (installed by v0.2.3)"));
+
+        // A second start with that same upgraded bundle stays quiet.
+        let upgraded_again = InstalledGuidanceProbe {
+            bundle_digests: upgraded_digests,
+            ..start(&temp)
+        };
+        assert_eq!(upgraded_again.detail()["claude"]["checked"], "earlier");
+        assert_eq!(upgraded_again.take_notice(), None);
+    }
+
+    #[test]
+    fn a_changed_codex_bundle_rechecks_codex_without_rechecking_claude() {
+        use copperpour_core::guidance::GuidanceProbe;
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        write_marker(paths.marker(InstallClient::Claude), "0.16.1");
+        write_marker(paths.marker(InstallClient::Codex), "0.16.1");
+        assert!(start(&temp).take_notice().is_some());
+        assert_eq!(start(&temp).take_notice(), None);
+
+        let mut upgraded_digests = BundleDigests::current();
+        upgraded_digests.codex = "upgraded-codex-bundle-digest".to_string();
+        let upgraded = InstalledGuidanceProbe {
+            bundle_digests: upgraded_digests.clone(),
+            ..start(&temp)
+        };
+        assert_eq!(upgraded.detail()["claude"]["checked"], "earlier");
+        assert_eq!(upgraded.detail()["codex"]["checked"], "now");
+        let notice = upgraded.take_notice().unwrap();
+        assert!(notice.starts_with("Copperpour Codex guidance (installed by v0.16.1)"));
+        assert!(!notice.contains("Copperpour Claude guidance"));
+
+        let second = InstalledGuidanceProbe {
+            bundle_digests: upgraded_digests,
+            ..start(&temp)
+        };
+        assert_eq!(second.detail()["codex"]["checked"], "earlier");
+        assert_eq!(second.take_notice(), None);
+    }
+
+    /// Each part `init` installs moves the digest: a skill's text, a
+    /// reference's text, an agent's text and a hook's event (#697).
+    #[test]
+    fn a_changed_skill_reference_agent_or_hook_changes_the_digest() {
+        use crate::manifest::{AgentManifest, HookSkillManifest};
+        use copperpour_core::guidance::SkillManifest;
+        let digest =
+            |skills: &[SkillManifest], agents: &[AgentManifest], hooks: &[HookSkillManifest]| {
+                bundle_digest_of(InstallClient::Claude, skills, agents, hooks)
+            };
+        let original = digest(SKILLS, AGENTS, HOOK_SKILLS);
+        assert_eq!(original, bundle_digest(InstallClient::Claude));
+
+        let skill = &SKILLS[0];
+        assert_ne!(
+            digest(
+                &[SkillManifest {
+                    content: "changed",
+                    ..*skill
+                }],
+                AGENTS,
+                HOOK_SKILLS
+            ),
+            digest(&[SkillManifest { ..*skill }], AGENTS, HOOK_SKILLS),
+        );
+        assert_ne!(
+            digest(
+                &[SkillManifest {
+                    references: &[("a.md", "one")],
+                    ..*skill
+                }],
+                AGENTS,
+                HOOK_SKILLS
+            ),
+            digest(
+                &[SkillManifest {
+                    references: &[("a.md", "two")],
+                    ..*skill
+                }],
+                AGENTS,
+                HOOK_SKILLS
+            ),
+        );
+
+        let agent = &AGENTS[0];
+        assert_ne!(
+            digest(
+                SKILLS,
+                &[AgentManifest {
+                    content: "changed",
+                    ..*agent
+                }],
+                HOOK_SKILLS
+            ),
+            digest(SKILLS, &[AgentManifest { ..*agent }], HOOK_SKILLS),
+        );
+
+        let hook = &HOOK_SKILLS[0];
+        let event = if hook.event == "PreToolUse" {
+            "PostToolUse"
+        } else {
+            "PreToolUse"
+        };
+        assert_ne!(
+            digest(SKILLS, AGENTS, &[HookSkillManifest { event, ..*hook }]),
+            digest(SKILLS, AGENTS, &[HookSkillManifest { ..*hook }]),
+        );
+    }
+
+    #[test]
+    fn bundle_digest_is_deterministic_hex_and_distinguishes_clients() {
+        let claude = bundle_digest(InstallClient::Claude);
+        let codex = bundle_digest(InstallClient::Codex);
+        for digest in [&claude, &codex] {
+            assert_eq!(digest.len(), 64, "{digest}");
+            assert!(
+                digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "expected lowercase hex: {digest}"
+            );
+        }
+        assert_eq!(claude, bundle_digest(InstallClient::Claude));
+        assert_eq!(codex, bundle_digest(InstallClient::Codex));
+        assert_ne!(
+            claude, codex,
+            "Claude bundle includes agents and hook matchers beyond Codex skills"
+        );
     }
 
     /// Re-running `konnect init` with the same version restores the guidance
