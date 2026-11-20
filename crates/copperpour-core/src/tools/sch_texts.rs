@@ -1,14 +1,15 @@
 //! `list_schematic_texts`, `edit_schematic_text` and `delete_schematic_text`:
 //! a sheet's free text items, listed with the sheet's revision, and one of them
-//! rewritten or removed by UUID under that revision.
+//! rewritten, moved, resized or removed by UUID under that revision.
 //!
 //! A text item is a plain `(text …)` at the top level of the sheet, what
 //! `add_schematic_text` writes. Labels, fields, text boxes and the text a
 //! library symbol draws are not listed and cannot be selected. An edit replaces
-//! only the quoted string, so the item keeps its UUID, position, effects and
-//! every other byte of the file. Both writes prepare their text with
-//! `SchematicCommand`, only on a sheet that still has the `DocumentRevision`
-//! the list returned.
+//! only the tokens it changes, the quoted string, the `x y` of `(at …)` and the
+//! `height width` of the font's `(size …)`, so the item keeps its UUID,
+//! rotation, the rest of its effects and every other byte of the file. Both
+//! writes prepare their text with `SchematicCommand`, only on a sheet that
+//! still has the `DocumentRevision` the list returned.
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -16,9 +17,10 @@ use crate::tool;
 use crate::tools::library::skip_sexp_token;
 use crate::tools::sch_batch::escaped_text;
 use crate::tools::sch_hierarchy::commit_sheets;
+use crate::tools::sch_shapes::{millimetres, num};
 use crate::tools::{get_path, invalid_arg, require_str, ToolContext, ToolDef};
 use copperpour_sexp::schematic::parse_at;
-use copperpour_sexp::writer::{apply_edits, find_direct_child_blocks};
+use copperpour_sexp::writer::{apply_edits, direct_children_with_tag, find_direct_child_blocks};
 use copperpour_sexp::{
     parse_sexp, prepare_command, read_consistent, DocumentRevision, FileTransition, ItemId,
     SchematicCommand, SexpEdit, SexpNode,
@@ -30,11 +32,16 @@ use std::path::Path;
 const EDIT: &str = "edit_schematic_text";
 const DELETE: &str = "delete_schematic_text";
 
+/// The font sizes KiCad 10 holds: it loads a smaller or larger `(size …)` as
+/// these, so a size outside them would not read back as written.
+const MIN_SIZE_MM: f64 = 0.001;
+const MAX_SIZE_MM: f64 = 250.0;
+
 pub(super) fn list_tool() -> ToolDef {
     tool!(
         "list_schematic_texts",
         "List a sheet's free text items, as add_schematic_text writes them: each one's uuid, \
-         text, position and rotation. Labels, fields, text boxes and text inside library \
+         text, position, rotation and font size. Labels, fields, text boxes and text inside library \
          symbols are not listed. Returns the sheet's revision, which edit_schematic_text and \
          delete_schematic_text require.",
         json!({
@@ -52,21 +59,25 @@ pub(super) fn list_tool() -> ToolDef {
 pub(super) fn edit_tool() -> ToolDef {
     tool!(
         "edit_schematic_text",
-        "Replace one free text item's text, by the uuid and revision list_schematic_texts \
-         returned. Only the quoted string changes; the item keeps its uuid, position, rotation \
-         and effects. On a sheet placed more than once, the change reaches every instance of \
-         the sheet. Refused when the sheet changed since that listing, or while KiCad holds \
-         the sheet or its project's root schematic open. Reports the text read back from the \
-         file and the sheet's new revision.",
+        "Change one free text item's text, position or font size, by the uuid and revision \
+         list_schematic_texts returned. Give any of text, x and y together, and size; what is \
+         not given stays as it is, and the item keeps its uuid, rotation and the rest of its \
+         effects. On a sheet placed more than once, the change reaches every instance of the \
+         sheet. Refused when the sheet changed since that listing, when nothing would change, \
+         or while KiCad holds the sheet or its project's root schematic open. Reports the item \
+         read back from the file and the sheet's new revision.",
         json!({
             "type": "object",
             "properties": {
                 "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                 "uuid": { "type": "string", "description": "The text item's uuid, as list_schematic_texts reports it" },
                 "revision": { "type": "string", "description": "The revision list_schematic_texts returned for this sheet" },
-                "text": { "type": "string", "minLength": 1, "description": "The new text, written as add_schematic_text writes it: line breaks as \\n, carriage returns dropped" }
+                "text": { "type": "string", "minLength": 1, "description": "The new text, written as add_schematic_text writes it: line breaks as \\n, carriage returns dropped" },
+                "x": { "type": "number", "description": "New X position in mm, with y; KiCad holds four decimals" },
+                "y": { "type": "number", "description": "New Y position in mm, with x; KiCad holds four decimals" },
+                "size": { "type": "number", "minimum": MIN_SIZE_MM, "maximum": MAX_SIZE_MM, "description": "New font height and width in mm, both set to this" }
             },
-            "required": ["schematic", "uuid", "revision", "text"],
+            "required": ["schematic", "uuid", "revision"],
             "additionalProperties": false
         }),
         |args, ctx| async move { handle_edit_schematic_text(args, ctx).await }
@@ -101,10 +112,16 @@ struct SavedText {
     uuid: Option<String>,
     text: String,
     at: (f64, f64, f64),
+    /// The font's `(size height width)`, if it has one.
+    size: Option<(f64, f64)>,
     /// The `(text …)` block.
     block: (usize, usize),
     /// Its quoted string, quotes included.
     string: (usize, usize),
+    /// The `x y` tokens of its `(at …)`.
+    xy: (usize, usize),
+    /// The `height width` tokens of its font's `(size …)`.
+    size_tokens: Option<(usize, usize)>,
 }
 
 impl SavedText {
@@ -114,8 +131,37 @@ impl SavedText {
             "text": self.text,
             "x": self.at.0,
             "y": self.at.1,
-            "rotation": self.at.2
+            "rotation": self.at.2,
+            "size": self.size.map(|(height, width)| json!({ "height": height, "width": width }))
         })
+    }
+}
+
+/// The span of the `count` number tokens after the head of the block at
+/// `open`, or `None` when there are fewer or one is not a number.
+fn number_tokens(content: &str, open: usize, count: usize) -> Option<(usize, usize)> {
+    let (_, mut end) = skip_sexp_token(content, open + 1)?;
+    let mut first = None;
+    for _ in 0..count {
+        let (start, token_end) = skip_sexp_token(content, end)?;
+        content[start..token_end].parse::<f64>().ok()?;
+        first.get_or_insert(start);
+        end = token_end;
+    }
+    Some((first?, end))
+}
+
+/// The absolute span of the one direct `(tag …)` child of the block at
+/// `block`, whose head is `parent`.
+fn only_child(
+    content: &str,
+    block: (usize, usize),
+    parent: &str,
+    tag: &str,
+) -> Option<(usize, usize)> {
+    match direct_children_with_tag(&content[block.0..block.1], parent, tag)[..] {
+        [(start, end)] => Some((block.0 + start, block.0 + end)),
+        _ => None,
     }
 }
 
@@ -185,12 +231,28 @@ impl Sheet {
                 .and_then(|(_, head_end)| skip_sexp_token(&content, head_end))
                 .filter(|&(open, _)| content.as_bytes()[open] == b'"')
                 .ok_or_else(|| at("quoted string"))?;
+            let xy = only_child(&content, (start, end), "text", "at")
+                .and_then(|(open, _)| number_tokens(&content, open, 2))
+                .ok_or_else(|| at("position"))?;
+            let size_tokens = only_child(&content, (start, end), "text", "effects")
+                .and_then(|effects| only_child(&content, effects, "effects", "font"))
+                .and_then(|font| only_child(&content, font, "font", "size"))
+                .and_then(|(open, _)| number_tokens(&content, open, 2));
+            let size = size_tokens.map(|(from, to)| {
+                let mut values = content[from..to]
+                    .split_whitespace()
+                    .map(|v| v.parse().unwrap_or(0.0));
+                (values.next().unwrap_or(0.0), values.next().unwrap_or(0.0))
+            });
             texts.push(SavedText {
                 uuid: uuid.map(str::to_owned),
                 text: text.clone(),
                 at: parse_at(&node).ok_or_else(|| at("position"))?,
+                size,
                 block: (start, end),
                 string,
+                xy,
+                size_tokens,
             });
         }
         Ok(Sheet {
@@ -242,6 +304,16 @@ fn revision(content: &str) -> String {
 
 /// The sheet at `path` as saved, or the refusal saying why it cannot be read.
 fn read_sheet(path: &Path) -> anyhow::Result<Result<Sheet, CallToolResult>> {
+    read_parsed(path, Sheet::parse)
+}
+
+/// The saved sheet at `path` as `parse` reads it, or the refusal saying why it
+/// cannot be read: no such file, or a file `parse` refuses. `list_schematic_shapes`
+/// reads through this too.
+pub(super) fn read_parsed<T>(
+    path: &Path,
+    parse: impl FnOnce(String) -> Result<T, String>,
+) -> anyhow::Result<Result<T, CallToolResult>> {
     if !path.is_file() {
         return Ok(Err(CallToolResult::error_kind(
             ToolErrorKind::file_not_found(path),
@@ -249,7 +321,7 @@ fn read_sheet(path: &Path) -> anyhow::Result<Result<Sheet, CallToolResult>> {
         )));
     }
     let content = read_consistent(path)?;
-    Ok(Sheet::parse(content).map_err(|reason| {
+    Ok(parse(content).map_err(|reason| {
         invalid_arg(
             "schematic",
             &format!("'{}' is not a readable sheet: {reason}", path.display()),
@@ -315,24 +387,45 @@ fn target(args: &Value, operation: &str) -> anyhow::Result<Result<Target, CallTo
 
 /// Commit `command` on the sheet as read, which `target` found at the listed
 /// revision. The text it would write must pass `check` against the sheet read,
-/// or nothing is written. The write is refused while KiCad holds the sheet or its
-/// project's root open, or when the sheet changed after the read; the file is
-/// then read back. `Err` is the refusal or the uncertain outcome.
+/// or nothing is written. `Err` is the refusal or the uncertain outcome.
 fn write(
     target: &Target,
     operation: &str,
     command: SchematicCommand,
     check: impl Fn(&Sheet, &Sheet) -> Result<(), String>,
 ) -> anyhow::Result<Result<Sheet, CallToolResult>> {
-    let schematic = &target.schematic;
     let before = &target.sheet;
-    let (prepared, _) = prepare_command(schematic, &before.content, &command)?;
+    commit_checked(
+        &target.schematic,
+        &before.content,
+        operation,
+        &command,
+        |prepared| {
+            let after = Sheet::parse(prepared.to_owned())?;
+            check(before, &after).map(|()| after)
+        },
+    )
+}
+
+/// Commit `command` on `schematic`, whose saved text `before` the caller read.
+/// The text the command would write must pass `check`, which returns what the
+/// caller reports from it, or nothing is written. The write is refused while
+/// KiCad holds the sheet or its project's root open, or when the sheet changed
+/// after the read; the file is then read back, and a file that is not the text
+/// written is `mutation_outcome_uncertain`. `Err` is the refusal or the
+/// uncertain outcome. `add_schematic_shapes` writes through this too.
+pub(super) fn commit_checked<T>(
+    schematic: &Path,
+    before: &str,
+    operation: &str,
+    command: &SchematicCommand,
+    check: impl FnOnce(&str) -> Result<T, String>,
+) -> anyhow::Result<Result<T, CallToolResult>> {
+    let (prepared, _) = prepare_command(schematic, before, command)?;
     #[cfg(test)]
     let prepared = fault::prospective(prepared);
-    let after = match Sheet::parse(prepared.clone())
-        .and_then(|after| check(before, &after).map(|()| after))
-    {
-        Ok(after) => after,
+    let checked = match check(&prepared) {
+        Ok(checked) => checked,
         Err(reason) => {
             return Ok(Err(CallToolResult::error_kind(
                 ToolErrorKind::StaleTarget {
@@ -350,12 +443,12 @@ fn write(
         Ok(ownership) => ownership.map(|ownership| ownership.editor_schematic()),
         Err(error) => return Ok(Err(error.into_tool_result())),
     };
-    let transition = FileTransition::replace(schematic, before.content.clone(), prepared.clone());
+    let transition = FileTransition::replace(schematic, before.to_owned(), prepared.clone());
     #[cfg(test)]
     crate::tools::write_hook::run(schematic);
     if let Err(refusal) = commit_sheets(
         root.as_deref().unwrap_or(schematic),
-        &[schematic.as_path()],
+        &[schematic],
         vec![transition],
     )? {
         return Ok(Err(refusal));
@@ -368,9 +461,9 @@ fn write(
         )))
     };
     match read_consistent(schematic) {
-        // The file holds the checked text byte for byte, so `after` is its
-        // read-back.
-        Ok(on_disk) if on_disk == prepared => Ok(Ok(after)),
+        // The file holds the checked text byte for byte, so what `check`
+        // returned holds for it.
+        Ok(on_disk) if on_disk == prepared => Ok(Ok(checked)),
         Ok(_) => uncertain("the file on disk is not the text the transaction wrote".to_owned()),
         Err(error) => uncertain(format!("the sheet could not be read back: {error}")),
     }
@@ -379,7 +472,7 @@ fn write(
 /// Faults a test puts in a write's way: a prospective text in place of the one
 /// the command prepared, or a save over the file once the commit is done.
 #[cfg(test)]
-mod fault {
+pub(super) mod fault {
     use std::cell::RefCell;
     use std::path::Path;
 
@@ -388,11 +481,11 @@ mod fault {
         static COMMITTED: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
-    pub(super) fn set_prospective(text: String) {
+    pub(in crate::tools) fn set_prospective(text: String) {
         PROSPECTIVE.with(|slot| *slot.borrow_mut() = Some(text));
     }
 
-    pub(super) fn set_committed(text: String) {
+    pub(in crate::tools) fn set_committed(text: String) {
         COMMITTED.with(|slot| *slot.borrow_mut() = Some(text));
     }
 
@@ -421,17 +514,35 @@ fn others<'s>(sheet: &'s Sheet, uuid: &str) -> Vec<Option<&'s str>> {
         .collect()
 }
 
-/// Text `index`'s bytes before and after its quoted string.
-fn around_string(sheet: &Sheet, index: usize) -> (&str, &str) {
-    let SavedText { block, string, .. } = &sheet.texts[index];
-    let content = sheet.content.as_str();
-    (&content[block.0..string.0], &content[string.1..block.1])
+/// Text `index`'s bytes but the tokens an edit may change: its quoted string,
+/// the `x y` of its position and the `height width` of its font size.
+fn fixed_parts(sheet: &Sheet, index: usize) -> Vec<&str> {
+    let item = &sheet.texts[index];
+    let mut cuts = vec![item.string, item.xy];
+    cuts.extend(item.size_tokens);
+    cuts.sort_unstable();
+    let mut parts = Vec::new();
+    let mut from = item.block.0;
+    for (start, end) in cuts {
+        parts.push(&sheet.content[from..start]);
+        from = end;
+    }
+    parts.push(&sheet.content[from..item.block.1]);
+    parts
 }
 
-/// Whether `after` is `before` with only text `uuid`'s string changed, to
-/// `text`: every other top-level item byte for byte in its place, and the
-/// text's own bytes but its string.
-fn edited(before: &Sheet, after: &Sheet, uuid: &str, text: &str) -> Result<(), String> {
+/// What a text item reads once edited.
+#[derive(Debug, Clone, PartialEq)]
+struct Wanted {
+    text: String,
+    at: (f64, f64, f64),
+    size: Option<(f64, f64)>,
+}
+
+/// Whether `after` is `before` with only text `uuid` changed, to read as
+/// `wanted`: every other top-level item byte for byte in its place, and the
+/// text's own bytes but its string, position and size tokens.
+fn edited(before: &Sheet, after: &Sheet, uuid: &str, wanted: &Wanted) -> Result<(), String> {
     if others(before, uuid) != others(after, uuid) {
         return Err(format!("a top-level item other than text {uuid} changed"));
     }
@@ -444,13 +555,21 @@ fn edited(before: &Sheet, after: &Sheet, uuid: &str, text: &str) -> Result<(), S
     let (Some(old), Some(new)) = (named(before), named(after)) else {
         return Err(format!("the sheet holds no text {uuid}"));
     };
-    if around_string(before, old) != around_string(after, new) {
-        return Err(format!("text {uuid} changed beyond its string"));
+    if fixed_parts(before, old) != fixed_parts(after, new) {
+        return Err(format!(
+            "text {uuid} changed beyond its string, position and size"
+        ));
     }
-    match after.texts[new].text.as_str() {
-        found if found == text => Ok(()),
-        found => Err(format!("text {uuid} reads {found:?}, not {text:?}")),
+    let item = &after.texts[new];
+    let found = Wanted {
+        text: item.text.clone(),
+        at: item.at,
+        size: item.size,
+    };
+    if &found != wanted {
+        return Err(format!("text {uuid} reads {found:?}, not {wanted:?}"));
     }
+    Ok(())
 }
 
 /// Whether `after` is `before` without item `uuid`: every other top-level item
@@ -488,17 +607,54 @@ async fn handle_edit_schematic_text(
     args: &Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let given = |key: &str| args.get(key).is_some_and(|value| !value.is_null());
     // Carriage returns are dropped as `escaped_text` drops them, so this is
     // the text KiCad will read back.
-    let text = match require_str(args, "text") {
-        Ok(text) => text.replace('\r', ""),
-        Err(refusal) => return Ok(refusal),
+    let text = if given("text") {
+        let text = match require_str(args, "text") {
+            Ok(text) => text.replace('\r', ""),
+            Err(refusal) => return Ok(refusal),
+        };
+        if text.is_empty() {
+            return Ok(invalid_arg(
+                "text",
+                "is empty once carriage returns are dropped; delete_schematic_text removes a \
+                 text item",
+            ));
+        }
+        Some(text)
+    } else {
+        None
     };
-    if text.is_empty() {
+    let at = match (given("x"), given("y")) {
+        (false, false) => None,
+        (true, true) => match (millimetres(&args["x"], "x"), millimetres(&args["y"], "y")) {
+            (Ok(x), Ok(y)) => Some((x, y)),
+            (Err(refusal), _) | (_, Err(refusal)) => return Ok(refusal),
+        },
+        (true, false) => return Ok(invalid_arg("y", "is required with x")),
+        (false, true) => return Ok(invalid_arg("x", "is required with y")),
+    };
+    let size = if given("size") {
+        match millimetres(&args["size"], "size") {
+            Ok(size) if (MIN_SIZE_MM..=MAX_SIZE_MM).contains(&size) => Some(size),
+            Ok(_) => {
+                return Ok(invalid_arg(
+                    "size",
+                    &format!(
+                        "must be from {MIN_SIZE_MM} to {MAX_SIZE_MM} mm, the sizes KiCad holds"
+                    ),
+                ))
+            }
+            Err(refusal) => return Ok(refusal),
+        }
+    } else {
+        None
+    };
+    if text.is_none() && at.is_none() && size.is_none() {
         return Ok(invalid_arg(
             "text",
-            "is empty once carriage returns are dropped; delete_schematic_text removes a \
-             text item",
+            "nothing to change: give text, x and y, or size",
         ));
     }
     let target = match target(args, EDIT)? {
@@ -506,21 +662,62 @@ async fn handle_edit_schematic_text(
         Err(refusal) => return Ok(refusal),
     };
     let (uuid, item) = (target.uuid.as_str(), target.item());
-    if text == item.text {
+    if size.is_some() && item.size_tokens.is_none() {
         return Ok(invalid_arg(
-            "text",
-            &format!("is the text of '{uuid}' already"),
+            "size",
+            &format!("text '{uuid}' has no (size …) in its font to change"),
         ));
     }
-    let (start, end) = item.string;
-    let candidate = apply_edits(
-        target.sheet.content.clone(),
-        vec![SexpEdit::replace(
+    let wanted = Wanted {
+        text: text.clone().unwrap_or_else(|| item.text.clone()),
+        at: at.map_or(item.at, |(x, y)| (x, y, item.at.2)),
+        size: size.map(|size| (size, size)).or(item.size),
+    };
+    let was = Wanted {
+        text: item.text.clone(),
+        at: item.at,
+        size: item.size,
+    };
+    if wanted == was {
+        let field = if text.is_some() {
+            "text"
+        } else if at.is_some() {
+            "x"
+        } else {
+            "size"
+        };
+        return Ok(invalid_arg(
+            field,
+            &format!("'{uuid}' already reads so; nothing would change"),
+        ));
+    }
+    let mut edits = Vec::new();
+    if wanted.text != was.text {
+        let (start, end) = item.string;
+        edits.push(SexpEdit::replace(
             start,
             end,
-            format!("\"{}\"", escaped_text(&text)),
-        )],
-    );
+            format!("\"{}\"", escaped_text(&wanted.text)),
+        ));
+    }
+    if wanted.at != was.at {
+        let (start, end) = item.xy;
+        edits.push(SexpEdit::replace(
+            start,
+            end,
+            format!("{} {}", num(wanted.at.0), num(wanted.at.1)),
+        ));
+    }
+    if let (Some((height, width)), Some((start, end))) = (wanted.size, item.size_tokens) {
+        if wanted.size != was.size {
+            edits.push(SexpEdit::replace(
+                start,
+                end,
+                format!("{} {}", num(height), num(width)),
+            ));
+        }
+    }
+    let candidate = apply_edits(target.sheet.content.clone(), edits);
     let command = SchematicCommand::replace_item_from_document(
         &target.sheet.content,
         &candidate,
@@ -528,26 +725,32 @@ async fn handle_edit_schematic_text(
         EDIT,
     )?;
     // The command must give back the candidate byte for byte, and the
-    // candidate must be the sheet with only the text's string changed.
+    // candidate must be the sheet with only the text's string, position and
+    // size changed, to what was asked.
     let check = |before: &Sheet, after: &Sheet| {
         if after.content != candidate {
             return Err("the command would write other bytes than its candidate".to_owned());
         }
-        edited(before, after, uuid, &text)
+        edited(before, after, uuid, &wanted)
     };
     let after = match write(&target, EDIT, command, check)? {
         Ok(after) => after,
         Err(refusal) => return Ok(refusal),
     };
     // `edited` proved the items come back in their order.
-    let landed = &after.texts[target.index];
+    let landed = after.texts[target.index].json();
+    let old = item.json();
     Ok(CallToolResult::json(&json!({
-        "uuid": landed.uuid,
+        "uuid": landed["uuid"],
         "old_text": item.text,
-        "text": landed.text,
-        "x": landed.at.0,
-        "y": landed.at.1,
-        "rotation": landed.at.2,
+        "text": landed["text"],
+        "x": landed["x"],
+        "y": landed["y"],
+        "rotation": landed["rotation"],
+        "size": landed["size"],
+        "old_x": old["x"],
+        "old_y": old["y"],
+        "old_size": old["size"],
         "revision": after.revision,
         "source": "file"
     })))
@@ -736,6 +939,27 @@ mod tests {
         )
     }
 
+    /// A text item at rotation 0 that reads `text` at `at`, `size` mm high and
+    /// wide.
+    fn wanted(text: &str, at: (f64, f64), size: f64) -> Wanted {
+        Wanted {
+            text: text.to_owned(),
+            at: (at.0, at.1, 0.0),
+            size: Some((size, size)),
+        }
+    }
+
+    async fn edit_with(
+        sheet: &Path,
+        uuid: &str,
+        revision: &str,
+        mut args: Value,
+    ) -> CallToolResult {
+        args["uuid"] = json!(uuid);
+        args["revision"] = json!(revision);
+        call("edit_schematic_text", sheet, args).await
+    }
+
     fn plain_note() -> String {
         kicad_text("Plain note", "25.4 25.4 0", PLAIN)
     }
@@ -774,17 +998,20 @@ mod tests {
             .iter()
             .map(|text| (text["uuid"].as_str().unwrap(), text))
             .collect();
-        for (uuid, string, x, y, rotation) in [
-            (PLAIN, "Plain note", 25.4, 25.4, 0.0),
-            (TWO_LINES, "First line\nSecond line", 25.4, 38.1, 0.0),
-            (QUOTED, "Say \"hi\" from C:\\new", 25.4, 50.8, 0.0),
-            (GROUPED, "Grouped note", 25.4, 63.5, 0.0),
-            (TURNED, "Turned note", 76.2, 38.1, 90.0),
-            (UNICODE, "R = 4k7 Ω ±1%", 25.4, 76.2, 0.0),
+        for (uuid, string, x, y, rotation, size) in [
+            (PLAIN, "Plain note", 25.4, 25.4, 0.0, 1.27),
+            (TWO_LINES, "First line\nSecond line", 25.4, 38.1, 0.0, 1.27),
+            (QUOTED, "Say \"hi\" from C:\\new", 25.4, 50.8, 0.0, 1.27),
+            (GROUPED, "Grouped note", 25.4, 63.5, 0.0, 1.27),
+            (TURNED, "Turned note", 76.2, 38.1, 90.0, 2.0),
+            (UNICODE, "R = 4k7 Ω ±1%", 25.4, 76.2, 0.0, 1.27),
         ] {
             assert_eq!(
                 texts[uuid],
-                &json!({ "uuid": uuid, "text": string, "x": x, "y": y, "rotation": rotation })
+                &json!({
+                    "uuid": uuid, "text": string, "x": x, "y": y, "rotation": rotation,
+                    "size": { "height": size, "width": size }
+                })
             );
         }
         // Neither the label nor the `(text "A")` that `Device:Ammeter_AC`
@@ -977,6 +1204,145 @@ mod tests {
         assert!(read(&path).contains(&format!("(members \"{GROUPED}\")")));
     }
 
+    /// A move rewrites the `x y` of `(at …)` and a resize the `height width` of
+    /// the font's `(size …)`; the rotation, the bold, the justification and
+    /// the string stay byte for byte. Coordinates round to the four decimals
+    /// KiCad holds.
+    #[tokio::test]
+    async fn a_text_moves_and_resizes_and_keeps_the_rest() {
+        let (_dir, path) = sheet_with(&fixture(SHEET));
+        let revision = revision_of(&path).await;
+        let args = json!({ "x": 10.123456, "y": 20, "size": 3.5 });
+        let reply = body(&edit_with(&path, TURNED, &revision, args).await);
+        let expected = swapped(
+            &swapped(&fixture(SHEET), "(at 76.2 38.1 90)", "(at 10.1235 20 90)"),
+            "(size 2 2)",
+            "(size 3.5 3.5)",
+        );
+        assert_eq!(read(&path), expected);
+        assert_eq!(reply["text"], "Turned note");
+        assert_eq!(reply["old_text"], "Turned note");
+        assert_eq!(
+            (reply["x"].clone(), reply["y"].clone()),
+            (json!(10.1235), json!(20.0))
+        );
+        assert_eq!(reply["rotation"], 90.0);
+        assert_eq!(reply["size"], json!({ "height": 3.5, "width": 3.5 }));
+        assert_eq!(
+            (reply["old_x"].clone(), reply["old_y"].clone()),
+            (json!(76.2), json!(38.1))
+        );
+        assert_eq!(reply["old_size"], json!({ "height": 2.0, "width": 2.0 }));
+        assert_eq!(reply["revision"], revision_of(&path).await);
+
+        // A move alone, and a text and a move in one call.
+        let (_dir, path) = sheet_with(&fixture(SHEET));
+        let revision = revision_of(&path).await;
+        body(&edit_with(&path, PLAIN, &revision, json!({ "x": 30, "y": 25.4 })).await);
+        let moved = swapped(&fixture(SHEET), "(at 25.4 25.4 0)", "(at 30 25.4 0)");
+        assert_eq!(read(&path), moved);
+        let revision = revision_of(&path).await;
+        let args = json!({ "text": "Moved", "x": -12.7, "y": 0 });
+        body(&edit_with(&path, PLAIN, &revision, args).await);
+        let expected = swapped(
+            &swapped(&moved, "(at 30 25.4 0)", "(at -12.7 0 0)"),
+            "(text \"Plain note\"",
+            "(text \"Moved\"",
+        );
+        assert_eq!(read(&path), expected);
+    }
+
+    /// KiCad writes a font's `(size height width)` height first. A move keeps
+    /// a size that is not square as it is, and a resize sets both. A font with
+    /// no `(size …)` is listed with `size: null`; it can be moved, not resized.
+    #[tokio::test]
+    async fn a_size_is_height_then_width_and_a_font_without_one_is_not_resized() {
+        let tall = swapped(&fixture(SHEET), "(size 2 2)", "(size 2 1.5)");
+        let (_dir, path) = sheet_with(&tall);
+        let texts = listed(&path).await["texts"].clone();
+        let turned = texts
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["uuid"] == TURNED);
+        assert_eq!(
+            turned.unwrap()["size"],
+            json!({ "height": 2.0, "width": 1.5 })
+        );
+        let revision = revision_of(&path).await;
+        let reply = body(&edit_with(&path, TURNED, &revision, json!({ "x": 0, "y": 0 })).await);
+        assert_eq!(reply["size"], json!({ "height": 2.0, "width": 1.5 }));
+        let moved = swapped(&tall, "(at 76.2 38.1 90)", "(at 0 0 90)");
+        assert_eq!(read(&path), moved);
+        let revision = revision_of(&path).await;
+        body(&edit_with(&path, TURNED, &revision, json!({ "size": 1.5 })).await);
+        assert_eq!(
+            read(&path),
+            swapped(&moved, "(size 2 1.5)", "(size 1.5 1.5)")
+        );
+
+        let no_size = plain_note().replacen("\t\t\t\t(size 1.27 1.27)\n", "", 1);
+        let source = swapped(&fixture(SHEET), &plain_note(), &no_size);
+        let (_dir, path) = sheet_with(&source);
+        let texts = listed(&path).await["texts"].clone();
+        let plain = texts
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["uuid"] == PLAIN);
+        assert_eq!(plain.unwrap()["size"], Value::Null);
+        let revision = revision_of(&path).await;
+        let result = edit_with(&path, PLAIN, &revision, json!({ "size": 2 })).await;
+        assert!(refused(&result, "invalid_argument").contains("Argument 'size' is invalid"));
+        assert_eq!(read(&path), source);
+        body(&edit_with(&path, PLAIN, &revision, json!({ "x": 30, "y": 25.4 })).await);
+        let moved = no_size.replacen("(at 25.4 25.4 0)", "(at 30 25.4 0)", 1);
+        assert_eq!(read(&path), swapped(&source, &no_size, &moved));
+    }
+
+    /// A position given in half, a size KiCad would load as another, a
+    /// coordinate it cannot hold, no change at all, or one to what the item
+    /// already reads, writes nothing, through the schema or without it.
+    #[tokio::test]
+    async fn a_move_or_resize_it_cannot_make_writes_nothing() {
+        let (_dir, path) = sheet_with(&fixture(SHEET));
+        let revision = revision_of(&path).await;
+        let context = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        for (args, field) in [
+            (json!({ "x": 1 }), "y"),
+            (json!({ "y": 1 }), "x"),
+            (json!({ "size": 0 }), "size"),
+            (json!({ "size": 0.0004 }), "size"),
+            (json!({ "size": 250.5 }), "size"),
+            (json!({ "size": -2 }), "size"),
+            (json!({ "size": "big" }), "size"),
+            (json!({ "x": 1e300, "y": 0 }), "x"),
+            (json!({ "x": 0, "y": -1e9 }), "y"),
+            (json!({}), "text"),
+            (json!({ "x": 25.4, "y": 25.4 }), "x"),
+            (json!({ "x": 25.400001, "y": 25.4 }), "x"),
+            (json!({ "size": 1.27 }), "size"),
+            (json!({ "text": "Plain note", "size": 1.27 }), "text"),
+        ] {
+            let mut direct = args.clone();
+            direct["schematic"] = json!(path.to_str().unwrap());
+            direct["uuid"] = json!(PLAIN);
+            direct["revision"] = json!(revision);
+            let result = handle_edit_schematic_text(&direct, &context).await.unwrap();
+            let message = refused(&result, "invalid_argument");
+            assert!(
+                message.contains(&format!("Argument '{field}' is invalid")),
+                "{args}: {message}"
+            );
+            let result = edit_with(&path, PLAIN, &revision, args.clone()).await;
+            refused(&result, "invalid_argument");
+        }
+        assert_eq!(read(&path), fixture(SHEET));
+    }
+
     #[tokio::test]
     async fn the_schema_refuses_what_it_does_not_declare() {
         let (_dir, path) = sheet_with(&fixture(SHEET));
@@ -985,7 +1351,15 @@ mod tests {
             ("list_schematic_texts", json!({ "uuid": PLAIN })),
             (
                 "edit_schematic_text",
-                json!({ "uuid": PLAIN, "revision": revision, "text": "X", "x": 1 }),
+                json!({ "uuid": PLAIN, "revision": revision, "text": "X", "bold": true }),
+            ),
+            (
+                "edit_schematic_text",
+                json!({ "uuid": PLAIN, "revision": revision, "size": 0 }),
+            ),
+            (
+                "edit_schematic_text",
+                json!({ "uuid": PLAIN, "revision": revision, "x": "1", "y": 2 }),
             ),
             ("edit_schematic_text", json!({ "uuid": PLAIN, "text": "X" })),
             (
@@ -1146,12 +1520,46 @@ mod tests {
         let new_note = kicad_text("New", "25.4 25.4 0", PLAIN);
         let resized = new_note.replacen("(size 1.27 1.27)", "(size 2 2)", 1);
         let and_its_font = parsed(swapped(&source, &new_note, &resized));
-        assert_eq!(edited(&before, &one, PLAIN, "New"), Ok(()));
-        assert!(edited(&before, &unchanged, PLAIN, "New").is_err());
-        assert!(edited(&before, &one, PLAIN, "Other").is_err());
-        assert!(edited(&before, &two, PLAIN, "New").is_err());
-        assert!(edited(&before, &and_a_label, PLAIN, "New").is_err());
-        assert!(edited(&before, &and_its_font, PLAIN, "New").is_err());
+        let bolded = new_note.replacen(
+            "(size 1.27 1.27)",
+            "(size 1.27 1.27)\n\t\t\t\t(bold yes)",
+            1,
+        );
+        let and_bold = parsed(swapped(&source, &new_note, &bolded));
+        let turned = new_note.replacen("(at 25.4 25.4 0)", "(at 25.4 25.4 90)", 1);
+        let and_turned = parsed(swapped(&source, &new_note, &turned));
+        let moved = new_note.replacen("(at 25.4 25.4 0)", "(at 30 25.4 0)", 1);
+        let and_moved = parsed(swapped(&source, &new_note, &moved));
+        let new = wanted("New", (25.4, 25.4), 1.27);
+        assert_eq!(edited(&before, &one, PLAIN, &new), Ok(()));
+        assert!(edited(&before, &unchanged, PLAIN, &new).is_err());
+        assert!(edited(&before, &one, PLAIN, &wanted("Other", (25.4, 25.4), 1.27)).is_err());
+        assert!(edited(&before, &two, PLAIN, &new).is_err());
+        assert!(edited(&before, &and_a_label, PLAIN, &new).is_err());
+        // The size and position tokens may change, but only to what was asked;
+        // the rest of the item may not.
+        assert!(edited(&before, &and_its_font, PLAIN, &new).is_err());
+        assert_eq!(
+            edited(
+                &before,
+                &and_its_font,
+                PLAIN,
+                &wanted("New", (25.4, 25.4), 2.0)
+            ),
+            Ok(())
+        );
+        assert!(edited(&before, &and_moved, PLAIN, &new).is_err());
+        assert_eq!(
+            edited(
+                &before,
+                &and_moved,
+                PLAIN,
+                &wanted("New", (30.0, 25.4), 1.27)
+            ),
+            Ok(())
+        );
+        assert!(edited(&before, &and_bold, PLAIN, &new).is_err());
+        assert!(edited(&before, &and_turned, PLAIN, &new).is_err());
 
         let without_plain = without(&fixture(SHEET), &plain_note());
         let gone = parsed(without_plain.clone());

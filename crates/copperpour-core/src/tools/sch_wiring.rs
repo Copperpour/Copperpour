@@ -462,7 +462,7 @@ pub(crate) fn insert_before_close(content: &str, new_sexp: &str) -> String {
 /// Find the byte offset of the first top-level symbol instance in the schematic.
 /// Top-level instances have `(lib_id` as a child, while lib_symbols definitions don't.
 /// Returns the position where wires/labels should be inserted BEFORE.
-fn find_first_symbol_instance(content: &str) -> Option<usize> {
+pub(super) fn find_first_symbol_instance(content: &str) -> Option<usize> {
     for (start, end) in find_direct_child_blocks(content, "kicad_sch") {
         let block = &content[start..end];
         if block.starts_with("(symbol") && block.contains("(lib_id ") {
