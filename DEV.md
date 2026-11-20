@@ -125,6 +125,10 @@ no item CRUD.
   `0600` regardless of umask; elsewhere keep the project directory private. Journals
   named `.konnect-transaction-*.json` by earlier releases are still recovered.
   `FileTransition::guard` locks and checks a file the change depends on without rewriting it. The journal records equal before and after images, so edits to the guard show as divergent and stop recovery. Guarded commits refuse if an older journal is pending; resolve it explicitly, then plan again.
+
+  `FileTransition::guard_absent` protects a path the plan requires not to exist. It writes neither the path nor a placeholder. A journal containing an absence guard uses version 2 so older Copperpour releases cannot recover it without enforcing that check; transactions without absence guards retain version 1. Recover pending version 2 journals with a supporting release before downgrading.
+
+  Commit and recovery check the write targets before the final guard check. The file locks coordinate Copperpour writers, but the final check and journal removal are not atomic against outside writers.
 - New design files and exports get `0666 & ~umask` on Unix. A replacement keeps the
   destination's mode, so a project an earlier Konnect created stays `0600` until
   `chmod`ed.

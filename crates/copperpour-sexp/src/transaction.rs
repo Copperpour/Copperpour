@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 const JOURNAL_VERSION: u32 = 1;
+const ABSENCE_GUARD_VERSION: u32 = 2;
 const JOURNAL_PREFIX: &str = ".copperpour-transaction-";
 /// Written before the rename to Copperpour; such journals are still recovered.
 const LEGACY_JOURNAL_PREFIX: &str = ".konnect-transaction-";
@@ -28,7 +29,7 @@ const JOURNAL_SUFFIX: &str = ".json";
 pub struct FileTransition {
     path: PathBuf,
     expected: Option<String>,
-    replacement: String,
+    replacement: Option<String>,
     guard: bool,
 }
 
@@ -43,7 +44,7 @@ impl FileTransition {
         Self {
             path: path.into(),
             expected: Some(expected.into()),
-            replacement: replacement.into(),
+            replacement: Some(replacement.into()),
             guard: false,
         }
     }
@@ -54,7 +55,7 @@ impl FileTransition {
         Self {
             path: path.into(),
             expected: None,
-            replacement: replacement.into(),
+            replacement: Some(replacement.into()),
             guard: false,
         }
     }
@@ -74,8 +75,20 @@ impl FileTransition {
         let expected = expected.into();
         Self {
             path: path.into(),
-            replacement: expected.clone(),
+            replacement: Some(expected.clone()),
             expected: Some(expected),
+            guard: true,
+        }
+    }
+
+    /// Require this path to remain absent through commit and crash recovery.
+    /// Nothing is ever created at the guarded path.
+    #[must_use]
+    pub fn guard_absent(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            expected: None,
+            replacement: None,
             guard: true,
         }
     }
@@ -161,14 +174,48 @@ struct JournalEntry {
     /// Path relative to the canonical journal directory.
     #[serde(with = "journal_path_serde")]
     path: PathBuf,
+    #[serde(deserialize_with = "deserialize_image")]
     expected: Option<String>,
-    replacement: String,
+    #[serde(deserialize_with = "deserialize_image")]
+    replacement: Option<String>,
+}
+
+// Both keys must be present. Only explicit null images can encode an absent path.
+fn deserialize_image<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Option::deserialize(deserializer)
 }
 
 impl JournalEntry {
     /// A read-set guard: locked and checked, never written.
     fn is_guard(&self) -> bool {
-        self.expected.as_deref() == Some(self.replacement.as_str())
+        self.expected == self.replacement
+    }
+
+    fn matches_image(&self, path: &Path, image: Option<&str>) -> Result<bool, SexpError> {
+        if self.replacement.is_none() {
+            return path_is_absent(path);
+        }
+        Ok(current_content(path)?.as_deref() == image)
+    }
+
+    fn state(&self, path: &Path) -> Result<TransactionTargetState, SexpError> {
+        if self.replacement.is_none() {
+            return Ok(if path_is_absent(path)? {
+                TransactionTargetState::Applied
+            } else {
+                TransactionTargetState::Divergent
+            });
+        }
+        let current = current_content(path)?;
+        Ok(if current == self.replacement {
+            TransactionTargetState::Applied
+        } else if current == self.expected {
+            TransactionTargetState::Pending
+        } else {
+            TransactionTargetState::Divergent
+        })
     }
 }
 
@@ -319,7 +366,11 @@ pub fn try_commit_file_transaction(
         let entries = normalize_transitions(&root, transitions)?;
         let id = uuid::Uuid::new_v4().to_string();
         let journal = Journal {
-            version: JOURNAL_VERSION,
+            version: if entries.iter().any(|entry| entry.replacement.is_none()) {
+                ABSENCE_GUARD_VERSION
+            } else {
+                JOURNAL_VERSION
+            },
             id,
             entries,
         };
@@ -498,10 +549,10 @@ fn recover_journal(root: &Path, journal_path: &Path) -> Result<RecoveryOutcome, 
     let mut pending = Vec::new();
     for entry in &journal.entries {
         let path = root.join(&entry.path);
-        match current_content(&path)? {
-            Some(current) if current == entry.replacement => {}
-            current if current == entry.expected => pending.push(entry),
-            _ => {
+        match entry.state(&path)? {
+            TransactionTargetState::Applied => {}
+            TransactionTargetState::Pending => pending.push(entry),
+            TransactionTargetState::Divergent => {
                 return Err(transaction_conflict(
                     journal_path,
                     &path,
@@ -555,10 +606,19 @@ fn read_validated_journal(root: &Path, path: &Path) -> Result<Journal, SexpError
             path.display()
         )));
     }
-    if journal.version != JOURNAL_VERSION {
+    if !matches!(journal.version, JOURNAL_VERSION | ABSENCE_GUARD_VERSION) {
         return Err(SexpError::InvalidValue(format!(
             "unsupported transaction journal version {} in {}",
             journal.version,
+            path.display()
+        )));
+    }
+    if journal.entries.iter().any(|entry| {
+        entry.replacement.is_none()
+            && (journal.version != ABSENCE_GUARD_VERSION || entry.expected.is_some())
+    }) {
+        return Err(SexpError::InvalidValue(format!(
+            "invalid absence guard in transaction journal {}",
             path.display()
         )));
     }
@@ -573,14 +633,7 @@ fn inspect_journal(
 ) -> Result<TransactionStatus, SexpError> {
     let mut targets = Vec::with_capacity(journal.entries.len());
     for entry in &journal.entries {
-        let current = current_content(&root.join(&entry.path))?;
-        let state = if current.as_deref() == Some(entry.replacement.as_str()) {
-            TransactionTargetState::Applied
-        } else if current == entry.expected {
-            TransactionTargetState::Pending
-        } else {
-            TransactionTargetState::Divergent
-        };
+        let state = entry.state(&root.join(&entry.path))?;
         targets.push(TransactionTargetStatus {
             path: entry.path.clone(),
             state,
@@ -612,7 +665,7 @@ fn normalize_transitions(
                 transition.path.display()
             )));
         }
-        if !transition.guard && transition.expected.as_ref() == Some(&transition.replacement) {
+        if !transition.guard && transition.expected == transition.replacement {
             return Err(SexpError::InvalidValue(format!(
                 "transaction target {} is unchanged",
                 transition.path.display()
@@ -723,7 +776,7 @@ fn verify_before_images(
 ) -> Result<(), SexpError> {
     for entry in entries {
         let path = root.join(&entry.path);
-        if current_content(&path)? != entry.expected {
+        if !entry.matches_image(&path, entry.expected.as_deref())? {
             return Err(transaction_conflict(
                 journal,
                 &path,
@@ -739,9 +792,21 @@ fn verify_after_images(
     journal: &Path,
     entries: &[JournalEntry],
 ) -> Result<(), SexpError> {
-    for entry in entries {
+    // Check guards after reading the written targets so a slow readback
+    // cannot unnecessarily widen the gap between guard check and cleanup.
+    let writes = entries.iter().filter(|entry| !entry.is_guard());
+    let guards = entries.iter().filter(|entry| entry.is_guard());
+    for entry in writes.chain(guards) {
+        #[cfg(test)]
+        if !entry.is_guard() {
+            BEFORE_TARGET_READBACK.with(|hook| {
+                if let Some(hook) = hook.take() {
+                    hook();
+                }
+            });
+        }
         let path = root.join(&entry.path);
-        if current_content(&path)?.as_deref() != Some(entry.replacement.as_str()) {
+        if !entry.matches_image(&path, entry.replacement.as_deref())? {
             return Err(transaction_conflict(
                 journal,
                 &path,
@@ -758,6 +823,9 @@ fn apply_entry(
     entry: &JournalEntry,
     entries: &[JournalEntry],
 ) -> Result<(), SexpError> {
+    let replacement = entry.replacement.as_deref().ok_or_else(|| {
+        SexpError::InvalidValue("an absence guard cannot be published as a write".into())
+    })?;
     let path = root.join(&entry.path);
     let check_guards = || {
         #[cfg(test)]
@@ -769,7 +837,7 @@ fn apply_entry(
         for guard in entries.iter().filter(|entry| entry.is_guard()) {
             let path = root.join(&guard.path);
             ensure_kicad_design_document_is_closed(&path)?;
-            if current_content(&path)? != guard.expected {
+            if !guard.matches_image(&path, guard.expected.as_deref())? {
                 return Err(transaction_conflict(
                     journal_path,
                     &path,
@@ -780,9 +848,9 @@ fn apply_entry(
         Ok(())
     };
     if entry.expected.is_some() {
-        write_atomic_unlocked_with(&path, &entry.replacement, check_guards)
+        write_atomic_unlocked_with(&path, replacement, check_guards)
     } else {
-        write_new_atomic_unlocked_with(&path, &entry.replacement, check_guards)
+        write_new_atomic_unlocked_with(&path, replacement, check_guards)
     }
 }
 
@@ -790,6 +858,16 @@ fn apply_entry(
 thread_local! {
     static BEFORE_PUBLISH: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::Cell::new(None) };
+    static BEFORE_TARGET_READBACK: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn path_is_absent(path: &Path) -> Result<bool, SexpError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn current_content(path: &Path) -> Result<Option<String>, SexpError> {
@@ -938,7 +1016,7 @@ mod tests {
             entries: vec![JournalEntry {
                 path: relative.clone(),
                 expected: None,
-                replacement: "created".to_owned(),
+                replacement: Some("created".to_owned()),
             }],
         };
         (journal, root.join(relative))
@@ -1039,7 +1117,7 @@ mod tests {
             entries: vec![JournalEntry {
                 path: PathBuf::from(PROBE_SHEET),
                 expected: None,
-                replacement: "created".to_owned(),
+                replacement: Some("created".to_owned()),
             }],
         };
 
@@ -1160,12 +1238,12 @@ mod tests {
                 JournalEntry {
                     path: PathBuf::from("root.kicad_sch"),
                     expected: Some("parent before".to_owned()),
-                    replacement: "parent after".to_owned(),
+                    replacement: Some("parent after".to_owned()),
                 },
                 JournalEntry {
                     path: PathBuf::from("child.kicad_sch"),
                     expected: None,
-                    replacement: "child after".to_owned(),
+                    replacement: Some("child after".to_owned()),
                 },
             ],
         };
@@ -1190,17 +1268,17 @@ mod tests {
                 JournalEntry {
                     path: PathBuf::from("dest.kicad_sch"),
                     expected: Some("dest before".to_owned()),
-                    replacement: "dest after".to_owned(),
+                    replacement: Some("dest after".to_owned()),
                 },
                 JournalEntry {
                     path: PathBuf::from("root.kicad_sch"),
                     expected: Some("root guard".to_owned()),
-                    replacement: "root guard".to_owned(),
+                    replacement: Some("root guard".to_owned()),
                 },
                 JournalEntry {
                     path: PathBuf::from("source.kicad_sch"),
                     expected: Some("source before".to_owned()),
-                    replacement: "source after".to_owned(),
+                    replacement: Some("source after".to_owned()),
                 },
             ],
         };
@@ -1226,7 +1304,7 @@ mod tests {
         let guard = &entries[0];
         assert_eq!(guard.path, PathBuf::from("root.kicad_sch"));
         assert_eq!(guard.expected.as_deref(), Some("root"));
-        assert_eq!(guard.replacement, "root");
+        assert_eq!(guard.replacement.as_deref(), Some("root"));
         assert!(guard.is_guard() && !entries[1].is_guard());
     }
 
@@ -1426,6 +1504,7 @@ mod tests {
         );
         let journal = failure.journal.unwrap();
         let original_journal = std::fs::read(&journal).unwrap();
+        assert_eq!(read_validated_journal(&root, &journal).unwrap().version, 1);
         assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "before");
 
         std::fs::remove_file(&guard_lock).unwrap();
@@ -1443,6 +1522,224 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "after");
         assert_eq!(std::fs::read_to_string(&guard).unwrap(), "root");
         assert!(!journal.exists());
+    }
+
+    #[test]
+    fn absence_guard_blocks_recovery_if_the_board_appears() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let board = root.join("project.kicad_pcb");
+        let sheet = root.join("sheet.kicad_sch");
+        let lock = root.join("~sheet.kicad_sch.lck");
+        std::fs::write(&sheet, "before").unwrap();
+        let late_lock = lock.clone();
+        BEFORE_PUBLISH.with(|hook| {
+            hook.set(Some(Box::new(move || {
+                std::fs::write(late_lock, "editor").unwrap();
+            })));
+        });
+        let failure = try_commit_file_transaction(
+            &root,
+            vec![
+                FileTransition::guard_absent(&board),
+                FileTransition::replace(&sheet, "before", "after"),
+            ],
+        )
+        .unwrap_err();
+        let journal = failure.journal.unwrap();
+        let saved = std::fs::read(&journal).unwrap();
+        let parsed = read_validated_journal(&root, &journal).unwrap();
+        assert_eq!(parsed.version, ABSENCE_GUARD_VERSION);
+        let board_status = || {
+            inspect_file_transactions(&root).unwrap()[0]
+                .targets
+                .iter()
+                .find(|target| target.path == Path::new("project.kicad_pcb"))
+                .unwrap()
+                .state
+        };
+        assert!(!board.exists());
+        assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "before");
+        std::fs::remove_file(lock).unwrap();
+        let board_source = b"\xff";
+        std::fs::write(&board, board_source).unwrap();
+        assert_eq!(board_status(), TransactionTargetState::Divergent);
+        let error = recover_file_transactions(&root).unwrap_err();
+        assert!(matches!(error, SexpError::TransactionConflict { path, .. } if path == board));
+        assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "before");
+        assert_eq!(std::fs::read(&board).unwrap(), board_source);
+        assert_eq!(std::fs::read(&journal).unwrap(), saved);
+
+        std::fs::remove_file(&board).unwrap();
+        assert_eq!(board_status(), TransactionTargetState::Applied);
+        assert_eq!(
+            recover_file_transactions(&root).unwrap()[0].completed_files,
+            1
+        );
+        assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "after");
+        assert!(!board.exists());
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn v2_journal_with_omitted_image_refuses_without_replaying() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let sheet = root.join("sheet.kicad_sch");
+        std::fs::write(&sheet, "before").unwrap();
+        let journal = journal_path(&root, "missing-image");
+        for field in ["expected", "replacement"] {
+            let mut entry = serde_json::json!({
+                "path": "create.kicad_sch",
+                "expected": null,
+                "replacement": null
+            });
+            entry.as_object_mut().unwrap().remove(field);
+            let content = serde_json::json!({
+                "id": "missing-image",
+                "version": ABSENCE_GUARD_VERSION,
+                "entries": [
+                    {"path": "sheet.kicad_sch", "expected": "before", "replacement": "after"},
+                    entry
+                ]
+            })
+            .to_string();
+            std::fs::write(&journal, &content).unwrap();
+            let error = recover_file_transactions(&root).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains(&format!("missing field `{field}`")));
+            assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "before");
+            assert!(!root.join("create.kicad_sch").exists());
+            assert_eq!(std::fs::read_to_string(&journal).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn invalid_absence_guard_images_refuse_without_replaying() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let sheet = root.join("sheet.kicad_sch");
+        std::fs::write(&sheet, "before").unwrap();
+        let journal = journal_path(&root, "invalid-absence");
+        for (version, expected) in [
+            (JOURNAL_VERSION, None),
+            (ABSENCE_GUARD_VERSION, Some("present")),
+        ] {
+            let content = serde_json::json!({
+                "id": "invalid-absence",
+                "version": version,
+                "entries": [
+                    {"path": "sheet.kicad_sch", "expected": "before", "replacement": "after"},
+                    {"path": "project.kicad_pcb", "expected": expected, "replacement": null}
+                ]
+            })
+            .to_string();
+            std::fs::write(&journal, &content).unwrap();
+            let error = recover_file_transactions(&root).unwrap_err();
+            assert!(
+                error.to_string().contains("invalid absence guard"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "before");
+            assert!(!root.join("project.kicad_pcb").exists());
+            assert_eq!(std::fs::read_to_string(&journal).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn absence_guard_refuses_an_occupied_path_before_journaling() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let sheet = root.join("sheet.kicad_sch");
+        let board = root.join("project.kicad_pcb");
+        std::fs::write(&sheet, "before").unwrap();
+        std::fs::create_dir(&board).unwrap();
+        let failure = try_commit_file_transaction(
+            &root,
+            vec![
+                FileTransition::replace(&sheet, "before", "after"),
+                FileTransition::guard_absent(&board),
+            ],
+        )
+        .unwrap_err();
+        assert!(failure.journal.is_none());
+        assert!(
+            matches!(failure.error, SexpError::TransactionConflict { path, .. } if path == board)
+        );
+        assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "before");
+        assert!(board.is_dir());
+        assert!(active_journal_paths(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn absence_guard_refuses_an_occupied_path_at_publish() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let sheet = root.join("sheet.kicad_sch");
+        let board = root.join("project.kicad_pcb");
+        std::fs::write(&sheet, "before").unwrap();
+        let late_board = board.clone();
+        BEFORE_PUBLISH.with(|hook| {
+            hook.set(Some(Box::new(move || {
+                std::fs::write(late_board, "appeared").unwrap();
+            })));
+        });
+        let failure = try_commit_file_transaction(
+            &root,
+            vec![
+                FileTransition::replace(&sheet, "before", "after"),
+                FileTransition::guard_absent(&board),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(failure.error, SexpError::TransactionConflict { path, .. } if path == board)
+        );
+        assert!(failure.journal.unwrap().is_file());
+        assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "before");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), "appeared");
+    }
+
+    #[test]
+    fn absence_guard_is_rechecked_after_target_readback() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let sheet = root.join("sheet.kicad_sch");
+        let board = root.join("project.kicad_pcb");
+        std::fs::write(&sheet, "before").unwrap();
+        let arm_board_restore = || {
+            let board = board.clone();
+            BEFORE_TARGET_READBACK.with(|hook| {
+                hook.set(Some(Box::new(move || {
+                    std::fs::write(board, "restored").unwrap();
+                })));
+            });
+        };
+        arm_board_restore();
+        let failure = try_commit_file_transaction(
+            &root,
+            vec![
+                FileTransition::guard_absent(&board),
+                FileTransition::replace(&sheet, "before", "after"),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(failure.error, SexpError::TransactionConflict { path, .. } if path == board)
+        );
+        let journal = failure.journal.unwrap();
+        let saved = std::fs::read(&journal).unwrap();
+        assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "after");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), "restored");
+
+        std::fs::remove_file(&board).unwrap();
+        arm_board_restore();
+        let error = recover_file_transactions(&root).unwrap_err();
+        assert!(matches!(error, SexpError::TransactionConflict { path, .. } if path == board));
+        assert_eq!(std::fs::read(&journal).unwrap(), saved);
+        assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "after");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), "restored");
     }
 
     #[test]
@@ -1494,7 +1791,7 @@ mod tests {
             entries: vec![JournalEntry {
                 path: PathBuf::from("root.kicad_sch"),
                 expected: Some("parent before".to_owned()),
-                replacement: "parent after".to_owned(),
+                replacement: Some("parent after".to_owned()),
             }],
         };
         let journal_path = journal_path(&root, &journal.id);
@@ -1521,7 +1818,7 @@ mod tests {
             entries: vec![JournalEntry {
                 path: PathBuf::from("root.kicad_sch"),
                 expected: Some("parent before".to_owned()),
-                replacement: "parent after".to_owned(),
+                replacement: Some("parent after".to_owned()),
             }],
         };
         let journal_path = journal_path(&root, &journal.id);
@@ -1548,17 +1845,17 @@ mod tests {
                 JournalEntry {
                     path: PathBuf::from("pending.kicad_sch"),
                     expected: Some("before".to_owned()),
-                    replacement: "after".to_owned(),
+                    replacement: Some("after".to_owned()),
                 },
                 JournalEntry {
                     path: PathBuf::from("applied.kicad_sch"),
                     expected: Some("before".to_owned()),
-                    replacement: "after".to_owned(),
+                    replacement: Some("after".to_owned()),
                 },
                 JournalEntry {
                     path: PathBuf::from("divergent.kicad_sch"),
                     expected: Some("before".to_owned()),
-                    replacement: "after".to_owned(),
+                    replacement: Some("after".to_owned()),
                 },
             ],
         };
@@ -1595,7 +1892,7 @@ mod tests {
                 entries: vec![JournalEntry {
                     path: PathBuf::from(&target),
                     expected: Some("before".to_owned()),
-                    replacement: "after".to_owned(),
+                    replacement: Some("after".to_owned()),
                 }],
             };
             persist_journal(&journal_path(&root, id), &journal).unwrap();
@@ -1627,7 +1924,7 @@ mod tests {
             entries: vec![JournalEntry {
                 path: PathBuf::from("root.kicad_sch"),
                 expected: Some("before".to_owned()),
-                replacement: "after".to_owned(),
+                replacement: Some("after".to_owned()),
             }],
         };
         persist_journal(&journal_path(&root, &journal.id), &journal).unwrap();
@@ -1652,7 +1949,7 @@ mod tests {
             entries: vec![JournalEntry {
                 path: PathBuf::from("root.kicad_sch"),
                 expected: Some("before".to_owned()),
-                replacement: "after".to_owned(),
+                replacement: Some("after".to_owned()),
             }],
         };
         let path = journal_path(&root, &journal.id);
@@ -1689,7 +1986,7 @@ mod tests {
             entries: vec![JournalEntry {
                 path: PathBuf::from(target),
                 expected: Some("before".to_owned()),
-                replacement: "after".to_owned(),
+                replacement: Some("after".to_owned()),
             }],
         };
         persist_journal(&path, &journal).unwrap();
@@ -1804,7 +2101,7 @@ mod tests {
             entries: vec![JournalEntry {
                 path: PathBuf::from("linked.kicad_sch"),
                 expected: Some("outside before".to_owned()),
-                replacement: "outside after".to_owned(),
+                replacement: Some("outside after".to_owned()),
             }],
         };
         let path = journal_path(&root, &journal.id);
