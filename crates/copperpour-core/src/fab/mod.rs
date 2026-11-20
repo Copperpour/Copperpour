@@ -232,20 +232,26 @@ impl AssemblyFormat {
 
     /// The live board snapshot this format exports from, captured before any
     /// output is written: JLCPCB assembly needs native pad midpoints over IPC.
-    /// The inner `Err` is why the board couldn't be read.
+    /// The inner `Err` is why the board couldn't be read. An unserved
+    /// binding carries the endpoint's specific answer.
     pub(crate) async fn capture(
         self,
         ctx: &ToolContext,
         board: &Path,
         include_assembly: bool,
-    ) -> anyhow::Result<Result<Option<jlcpcb::midpoints::Snapshot>, copperpour_ipc::IpcFailure>>
-    {
+    ) -> anyhow::Result<
+        Result<
+            crate::tools::BoardBinding<Option<jlcpcb::midpoints::Snapshot>>,
+            copperpour_ipc::IpcFailure,
+        >,
+    > {
         if self != Self::Jlcpcb || !include_assembly {
-            return Ok(Ok(None));
+            return Ok(Ok(crate::tools::BoardBinding::Bound(None)));
         }
-        let captured =
-            crate::tools::with_board_ipc_classified(ctx, board, jlcpcb::midpoints::capture).await?;
-        Ok(captured.map(Some))
+        crate::tools::with_bound_board_ipc_classified(ctx, board, |client, document| {
+            jlcpcb::midpoints::capture(client, document).map(Some)
+        })
+        .await
     }
 
     /// The position file's name.
