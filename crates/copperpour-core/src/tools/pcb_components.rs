@@ -2928,9 +2928,14 @@ async fn handle_move_component(
         "move",
         move |refusal| pcb_copper_check::refusal_kind("move_component", &named, refusal),
         move |c, document| {
-            pcb_copper_check::check_then_apply(c, document.clone(), &requests, options, |c| {
-                c.move_footprint_verified_in(document, &ref_ipc, x, y)
-            })
+            pcb_copper_check::check_then_apply(
+                c,
+                document.clone(),
+                "move_component",
+                &requests,
+                options,
+                |c| c.move_footprint_verified_in(document, &ref_ipc, x, y),
+            )
         },
     )
     .await?
@@ -2940,6 +2945,7 @@ async fn handle_move_component(
         )),
         BoardWrite::Ipc(Checked::Blocked(check)) => Ok(check.blocked_result("move_component")),
         BoardWrite::Ipc(Checked::DryRun(check)) => Ok(check.dry_run_result()),
+        BoardWrite::Ipc(Checked::Refused(refused)) => Ok(refused),
         BoardWrite::Refused(result) => Ok(result),
         BoardWrite::File(reason) if options.dry_run => closed_board_dry_run(
             &board,
@@ -3015,8 +3021,24 @@ async fn handle_edit_board_footprint_graphic(
     };
 
     let (ref_ipc, uuid_ipc, pts) = (reference.clone(), uuid.clone(), points.clone());
-    let kind: String = ipc!(ctx, args, |c| c
-        .set_footprint_graphic_points(&ref_ipc, &uuid_ipc, &pts));
+    let kind: Result<String, CallToolResult> = ipc!(ctx, args, |c, document| {
+        match super::pcb_footprint_update::refuse_owned_groups(
+            c,
+            &document,
+            "edit_board_footprint_graphic",
+            "edit the graphic of",
+            Some(&[ref_ipc.as_str()]),
+        )? {
+            Some(refused) => Ok(Err(refused)),
+            None => c
+                .set_footprint_graphic_points(&ref_ipc, &uuid_ipc, &pts)
+                .map(Ok),
+        }
+    });
+    let kind = match kind {
+        Ok(kind) => kind,
+        Err(refused) => return Ok(refused),
+    };
 
     Ok(CallToolResult::json(&json!({
         "edited": reference,
@@ -3057,9 +3079,14 @@ async fn handle_rotate_component(
         "rotation",
         move |refusal| pcb_copper_check::refusal_kind("rotate_component", &named, refusal),
         move |c, document| {
-            pcb_copper_check::check_then_apply(c, document, &requests, options, |c| {
-                c.rotate_footprint(&ref_ipc, rotation)
-            })
+            pcb_copper_check::check_then_apply(
+                c,
+                document,
+                "rotate_component",
+                &requests,
+                options,
+                |c| c.rotate_footprint(&ref_ipc, rotation),
+            )
         },
     )
     .await?
@@ -3071,6 +3098,7 @@ async fn handle_rotate_component(
         }))),
         BoardWrite::Ipc(Checked::Blocked(check)) => Ok(check.blocked_result("rotate_component")),
         BoardWrite::Ipc(Checked::DryRun(check)) => Ok(check.dry_run_result()),
+        BoardWrite::Ipc(Checked::Refused(refused)) => Ok(refused),
         BoardWrite::Refused(result) => Ok(result),
         BoardWrite::File(reason) if options.dry_run => closed_board_dry_run(
             &board,
@@ -3181,9 +3209,14 @@ async fn handle_set_component_placements(
         "component placement batch",
         move |refusal| pcb_copper_check::refusal_kind("set_component_placements", &named, refusal),
         move |client, document| {
-            pcb_copper_check::check_then_apply(client, document, &requests, options, |client| {
-                client.set_footprint_placements(&placements_ipc)
-            })
+            pcb_copper_check::check_then_apply(
+                client,
+                document,
+                "set_component_placements",
+                &requests,
+                options,
+                |client| client.set_footprint_placements(&placements_ipc),
+            )
         },
     )
     .await?
@@ -3198,6 +3231,7 @@ async fn handle_set_component_placements(
             Ok(check.blocked_result("set_component_placements"))
         }
         BoardWrite::Ipc(Checked::DryRun(check)) => Ok(check.dry_run_result()),
+        BoardWrite::Ipc(Checked::Refused(refused)) => Ok(refused),
         BoardWrite::Refused(result) => Ok(result),
         BoardWrite::File(reason) if options.dry_run => {
             let updates: Vec<_> = placements
@@ -3388,11 +3422,24 @@ async fn handle_edit_component(
             None,
         )));
     }
-    let outcome = ipc!(ctx, args, |c, document| c.edit_footprint_in(
-        document,
-        &live_reference,
-        &edit
-    ));
+    let outcome = ipc!(ctx, args, |c, document| {
+        match super::pcb_footprint_update::refuse_owned_groups(
+            c,
+            &document,
+            "edit_component",
+            "edit",
+            Some(&[live_reference.as_str()]),
+        )? {
+            Some(refused) => Ok(Err(refused)),
+            None => c
+                .edit_footprint_in(document, &live_reference, &edit)
+                .map(Ok),
+        }
+    });
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(refused) => return Ok(refused),
+    };
     Ok(edit_component_result(outcome, &get_path(args, "board")?))
 }
 
@@ -4002,6 +4049,24 @@ async fn handle_repair_corrupted_footprints(
                         "reference": reference,
                         "code": "reference_not_found",
                         "message": "the requested footprint reference is not present on the open board"
+                    }));
+                }
+            }
+            // A repair sends the whole footprint back, which drops its groups
+            // (#701). Read at the dry run and again at apply.
+            if !repairs.is_empty() {
+                let targets: Vec<&str> =
+                    repairs.iter().map(|repair| repair.reference.as_str()).collect();
+                for found in super::pcb_footprint_update::owned_group_reasons(
+                    client,
+                    &document,
+                    "update",
+                    Some(&targets),
+                )? {
+                    diagnostics.push(json!({
+                        "reference": found.reference,
+                        "code": "footprint_children_not_carried",
+                        "message": found.reason,
                     }));
                 }
             }
@@ -4717,7 +4782,17 @@ async fn handle_align_components(
     };
 
     let named = references.clone();
-    let aligned = match with_board_ipc_classified(ctx, &board, move |c, _| {
+    let aligned = match with_board_ipc_classified(ctx, &board, move |c, document| {
+        let targets: Vec<&str> = references.iter().map(String::as_str).collect();
+        if let Some(refused) = super::pcb_footprint_update::refuse_owned_groups(
+            c,
+            &document,
+            "align_components",
+            "move",
+            Some(&targets),
+        )? {
+            return Ok(Err(refused));
+        }
         c.run_commit("Align footprints", |c| {
             references
                 .iter()
@@ -4740,10 +4815,12 @@ async fn handle_align_components(
                 })
                 .collect::<anyhow::Result<Vec<_>>>()
         })
+        .map(Ok)
     })
     .await?
     {
-        Ok(aligned) => aligned,
+        Ok(Ok(aligned)) => aligned,
+        Ok(Err(refused)) => return Ok(refused),
         // Copperpour's own refusal, inside the commit it then dropped (#240).
         Err(copperpour_ipc::IpcFailure::Preflight(refusal)) => {
             let kind = crate::tools::pcb_board::preflight_refusal_kind(
@@ -10667,13 +10744,22 @@ mod nanometre_rounding_tests {
 
     /// Sibling route (#318): `repair_corrupted_footprints` preserves/restores
     /// pad fabrication properties and pad zone settings from the library.
-    #[tokio::test]
-    async fn repair_corrupted_footprints_carries_pad_properties_and_zone_settings() {
+    /// A KiCad holding a WSON-6 footprint with issue #244's corruption, and
+    /// the handler talking to it. `saved` builds, from the footprint's
+    /// reference, the board KiCad answers `SaveDocumentToString` with.
+    async fn corrupted_footprint_kicad(
+        saved: Option<fn(&str) -> String>,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::sync::Arc<std::sync::Mutex<crate::tools::pcb_board::board_mock::ItemStore>>,
+        crate::test_support::MockIpcServer,
+        crate::mcp::handler::McpHandler,
+    ) {
         use crate::tools::pcb_board::board_mock::{spawn_kicad_holding_items, ItemStore};
         use copperpour_ipc::builders::{any_is, pack_any};
-        use copperpour_ipc::gen::kiapi::board::types::{
-            FootprintInstance, Pad, PadFabricationProperty, ZoneConnectionStyle,
-        };
+        use copperpour_ipc::gen::kiapi;
+        use copperpour_ipc::gen::kiapi::board::types::{FootprintInstance, Pad};
         use std::sync::{Arc, Mutex};
 
         let dir = tempfile::tempdir().unwrap();
@@ -10716,13 +10802,28 @@ mod nanometre_rounding_tests {
             items: vec![pack_any(&corrupted, "kiapi.board.types.FootprintInstance")],
             ..Default::default()
         }));
-        let server = spawn_kicad_holding_items(
-            &board,
-            vec![],
-            store.clone(),
-            |_| {},
-            kicad_version_responder(10, 0, 8),
-        );
+        let server = spawn_kicad_holding_items(&board, vec![], store.clone(), |_| {}, {
+            let version = kicad_version_responder(10, 0, 8);
+            let saved = saved.map(|saved| saved(&super::footprint_instance_reference(&corrupted)));
+            move |command: &prost_types::Any, store: &mut ItemStore| {
+                version(command, store).or_else(|| {
+                    let saved = saved
+                        .as_ref()
+                        .filter(|_| command.type_url.ends_with("SaveDocumentToString"))?;
+                    let request = kiapi::common::commands::SaveDocumentToString::decode(
+                        command.value.as_slice(),
+                    )
+                    .unwrap();
+                    Some(pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            document: request.document,
+                            contents: saved.clone(),
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    ))
+                })
+            }
+        });
         let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
             ipc_address: server.address().to_string(),
             eager_toolsets: true,
@@ -10730,6 +10831,18 @@ mod nanometre_rounding_tests {
         })
         .await
         .unwrap();
+        let _ = lib_id;
+        (dir, board, store, server, handler)
+    }
+
+    #[tokio::test]
+    async fn repair_corrupted_footprints_carries_pad_properties_and_zone_settings() {
+        use copperpour_ipc::builders::any_is;
+        use copperpour_ipc::gen::kiapi::board::types::{
+            Pad, PadFabricationProperty, ZoneConnectionStyle,
+        };
+
+        let (_dir, board, store, _server, handler) = corrupted_footprint_kicad(None).await;
         let dry = handler
             .handle_message(json!({
                 "jsonrpc": "2.0",
@@ -10774,7 +10887,6 @@ mod nanometre_rounding_tests {
         )
         .unwrap();
         assert_eq!(applied_out["status"], "applied", "{applied_out}");
-        let _ = lib_id;
 
         let repaired = held_footprint(&store);
         let pads: Vec<Pad> = repaired
@@ -10949,6 +11061,53 @@ mod nanometre_rounding_tests {
             "{text}"
         );
         assert_eq!(store.lock().unwrap().updates, 0);
+    }
+
+    /// #701: a footprint to repair that owns a group is a conflict, at the dry
+    /// run, and nothing is sent: the repair sends the whole footprint back,
+    /// which KiCad 10.0.8 rebuilds without its groups.
+    #[tokio::test]
+    async fn repair_corrupted_footprints_refuses_a_footprint_that_owns_a_group() {
+        fn grouped(reference: &str) -> String {
+            format!(
+                "(kicad_pcb\n\t(version 20260206)\n\t(generator \"pcbnew\")\n\t(footprint \
+                 \"Package_SON:WSON-6\"\n\t\t(layer \"F.Cu\")\n\t\t(uuid \"fp-u4\")\n\t\t\
+                 (property \"Reference\" \"{reference}\")\n\t\t(group \"\" (uuid \"g-701\") \
+                 (members))\n\t)\n)\n"
+            )
+        }
+        let (_dir, board, store, _server, handler) = corrupted_footprint_kicad(Some(grouped)).await;
+        let dry = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "repair_corrupted_footprints",
+                    "arguments": { "board": board.to_string_lossy(), "dry_run": true }
+                }
+            }))
+            .await
+            .unwrap();
+        let dry_out: serde_json::Value = serde_json::from_str(
+            dry.result.as_ref().unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(dry_out["status"], "conflict", "{dry_out}");
+        let diagnostic = &dry_out["diagnostics"][0];
+        assert_eq!(diagnostic["code"], "footprint_children_not_carried");
+        let reference = diagnostic["reference"].as_str().unwrap();
+        assert_eq!(
+            diagnostic["message"],
+            format!(
+                "{reference} owns 1 group, which KiCad drops when its API updates a footprint; \
+                 update {reference} in KiCad's PCB editor instead"
+            )
+        );
+        let store = store.lock().unwrap();
+        assert_eq!((store.updates, store.creates, store.deletes), (0, 0, 0));
     }
 }
 
@@ -11228,7 +11387,9 @@ mod edit_component_tests {
                     "kiapi.common.commands.EndCommitResponse",
                 )))
             } else {
-                ok(None)
+                ok(crate::tools::pcb_board::board_mock::empty_saved_board(
+                    &command,
+                ))
             }
         });
         (server, sent)
@@ -11260,11 +11421,19 @@ mod edit_component_tests {
             .collect()
     }
 
-    fn assert_preflight(body: &serde_json::Value, reason: &str, sent: &Mutex<Sent>) {
-        assert_eq!(
-            sent.lock().unwrap().commands,
-            ["GetOpenDocuments", "GetItems"]
-        );
+    /// The commands a refused edit sends: the groups check (#701) reads the
+    /// board before the footprint is looked up.
+    const EDIT_READS: [&str; 3] = ["GetOpenDocuments", "SaveDocumentToString", "GetItems"];
+    /// The commands a refused call without an edit sends.
+    const NO_EDIT_READS: [&str; 2] = ["GetOpenDocuments", "GetItems"];
+
+    fn assert_preflight(
+        body: &serde_json::Value,
+        reason: &str,
+        sent: &Mutex<Sent>,
+        commands: &[&str],
+    ) {
+        assert_eq!(sent.lock().unwrap().commands, commands);
         assert_eq!(body["message"], reason);
         assert_eq!(body["error"]["kind"], "handler_error");
         let recovery = &body["recovery"];
@@ -11275,9 +11444,19 @@ mod edit_component_tests {
         assert!(recovery.get("troubleshooting_url").is_none());
     }
 
-    fn assert_edit_preflight(result: &CallToolResult, reason: &str, sent: &Mutex<Sent>) {
+    fn assert_edit_preflight(
+        result: &CallToolResult,
+        reason: &str,
+        sent: &Mutex<Sent>,
+        commands: &[&str],
+    ) {
         assert!(result.is_error, "{}", text(result));
-        assert_preflight(&serde_json::from_str(&text(result)).unwrap(), reason, sent);
+        assert_preflight(
+            &serde_json::from_str(&text(result)).unwrap(),
+            reason,
+            sent,
+            commands,
+        );
     }
 
     /// Run `edit_component` with `arguments` (beside `board` and the
@@ -11572,10 +11751,7 @@ mod edit_component_tests {
             body["recovery"]["evidence"]["status"],
             "IRS_DOCUMENT_NOT_FOUND"
         );
-        assert_eq!(
-            sent.lock().unwrap().commands,
-            ["GetOpenDocuments", "GetItems"]
-        );
+        assert_eq!(sent.lock().unwrap().commands, EDIT_READS);
     }
 
     #[tokio::test]
@@ -11641,7 +11817,7 @@ mod edit_component_tests {
             .unwrap();
         assert_eq!(result["isError"], true);
         let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_preflight(&body, "Footprint 'R99' not found", &sent);
+        assert_preflight(&body, "Footprint 'R99' not found", &sent, &EDIT_READS);
         assert_eq!(std::fs::read(board).unwrap(), saved);
     }
 
@@ -11649,7 +11825,7 @@ mod edit_component_tests {
     async fn a_missing_reference_is_reported_when_no_edit_is_requested() {
         let (result, sent, _) =
             edit(c_0603(false), Kicad::Keeps, json!({ "reference": "R99" })).await;
-        assert_edit_preflight(&result, "Footprint 'R99' not found", &sent);
+        assert_edit_preflight(&result, "Footprint 'R99' not found", &sent, &NO_EDIT_READS);
     }
 
     async fn assert_incomplete_footprint_inventory(kicad: Kicad) {
@@ -11660,7 +11836,7 @@ mod edit_component_tests {
             reason.starts_with("Cannot read footprint inventory:"),
             "{body}"
         );
-        assert_edit_preflight(&result, reason, &sent);
+        assert_edit_preflight(&result, reason, &sent, &EDIT_READS);
     }
 
     #[tokio::test]
@@ -11728,6 +11904,7 @@ mod edit_component_tests {
             &result,
             &format!("Footprint '{reference}' has no editable value field"),
             &sent,
+            &EDIT_READS,
         );
     }
 
@@ -11740,15 +11917,22 @@ mod edit_component_tests {
             &result,
             &format!("footprint '{reference}' has no KIID"),
             &sent,
+            &EDIT_READS,
         );
     }
 
     async fn assert_repeated_reference(arguments: serde_json::Value) {
+        let commands: &[&str] = if arguments == json!({}) {
+            &NO_EDIT_READS
+        } else {
+            &EDIT_READS
+        };
         let (result, sent, reference) = edit(c_0603(false), Kicad::ListsTwice, arguments).await;
         assert_edit_preflight(
             &result,
             &format!("Footprint reference '{reference}' is ambiguous: KiCad returned 2 matches"),
             &sent,
+            commands,
         );
     }
 

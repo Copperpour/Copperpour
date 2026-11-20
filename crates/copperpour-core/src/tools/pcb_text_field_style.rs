@@ -749,11 +749,25 @@ fn edit_file(board: &Path, request: &Request) -> anyhow::Result<Result<Value, Ca
 
 /// The live edit. A named layer is flipped for back-side footprints through
 /// the board's own copper stack, which KiCad reports beside its layers.
+/// Refused with nothing written when a footprint to edit owns groups (#701).
 fn edit_live(
     client: &KiCadIpcClient,
     document: DocumentSpecifier,
     request: &Request,
-) -> anyhow::Result<IpcFootprintFieldBatchOutcome> {
+) -> anyhow::Result<Result<IpcFootprintFieldBatchOutcome, CallToolResult>> {
+    let references: Option<Vec<&str>> = request
+        .references
+        .as_ref()
+        .map(|references| references.iter().map(String::as_str).collect());
+    if let Some(refused) = crate::tools::pcb_footprint_update::refuse_owned_groups(
+        client,
+        &document,
+        OPERATION,
+        "edit the fields of",
+        references.as_deref(),
+    )? {
+        return Ok(Err(refused));
+    }
     let back_edit = match &request.layer {
         None => None,
         Some(_) => {
@@ -763,13 +777,15 @@ fn edit_live(
             request.back_edit(CopperStack::new(copper)?)?
         }
     };
-    client.edit_footprint_fields_in(
-        document,
-        request.references.as_deref(),
-        &request.slots,
-        &request.edit(),
-        back_edit.as_ref(),
-    )
+    client
+        .edit_footprint_fields_in(
+            document,
+            request.references.as_deref(),
+            &request.slots,
+            &request.edit(),
+            back_edit.as_ref(),
+        )
+        .map(Ok)
 }
 
 /// A live refusal: a layer with no place on a back-side footprint of this
@@ -809,7 +825,8 @@ pub(super) async fn handle_set_footprint_field_style(
             })
             .await?
             {
-                Ok(Ok(outcome)) => live_result(outcome, &board),
+                Ok(Ok(Ok(outcome))) => live_result(outcome, &board),
+                Ok(Ok(Err(refused))) => refused,
                 Ok(Err(error)) => live_refusal(error),
                 Err(result) => result,
             },
@@ -826,7 +843,8 @@ pub(super) async fn handle_set_footprint_field_style(
     )
     .await?
     {
-        BoardWrite::Ipc(Ok(outcome)) => return Ok(live_result(outcome, &board)),
+        BoardWrite::Ipc(Ok(Ok(outcome))) => return Ok(live_result(outcome, &board)),
+        BoardWrite::Ipc(Ok(Err(refused))) => return Ok(refused),
         BoardWrite::Ipc(Err(error)) => return Ok(live_refusal(error)),
         BoardWrite::Refused(result) => return Ok(result),
         BoardWrite::File(reason) => reason,
