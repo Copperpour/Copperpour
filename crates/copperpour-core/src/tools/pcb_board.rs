@@ -981,11 +981,36 @@ fn format_outline(primitives: &[OutlinePrimitive], layer: &str, width: f64) -> S
         .join("")
 }
 
-fn format_gr_text(text: &str, [x, y, rot]: [f64; 3], layer: &str, size: f64, uuid: &str) -> String {
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GrTextEffects {
+    size: f64,
+    thickness: f64,
+    mirror: bool,
+    bold: bool,
+    italic: bool,
+}
+
+fn format_gr_text(
+    text: &str,
+    [x, y, rot]: [f64; 3],
+    layer: &str,
+    effects: GrTextEffects,
+    uuid: &str,
+) -> String {
     let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    let size = effects.size;
+    let thickness = effects.thickness;
+    let bold = if effects.bold { " (bold yes)" } else { "" };
+    let italic = if effects.italic { " (italic yes)" } else { "" };
+    let justify = if effects.mirror {
+        " (justify mirror)"
+    } else {
+        ""
+    };
     format!(
         "\n  (gr_text \"{escaped}\"\n    (at {x} {y} {rot})\n    (layer \"{layer}\")\n    \
-         (effects (font (size {size} {size}) (thickness 0.15)))\n    (uuid \"{uuid}\")\n  )"
+         (effects (font (size {size} {size}) (thickness {thickness}){bold}{italic}){justify})\n    \
+         (uuid \"{uuid}\")\n  )"
     )
 }
 
@@ -1580,8 +1605,12 @@ pub fn tools() -> Vec<ToolDef> {
                     "x":         { "type": "number" },
                     "y":         { "type": "number" },
                     "layer":     { "type": "string", "description": "Layer name", "default": "F.SilkS" },
-                    "size":      { "type": "number", "description": "Font size in mm", "default": 1.0 },
-                    "rotation":  { "type": "number", "description": "Rotation in degrees", "default": 0 }
+                    "size":      { "type": "number", "exclusiveMinimum": 0, "description": "Font size in mm", "default": 1.0 },
+                    "rotation":  { "type": "number", "description": "Rotation in degrees", "default": 0 },
+                    "thickness": { "type": "number", "exclusiveMinimum": 0, "description": "Stroke thickness in mm (default: size * 0.15)" },
+                    "mirror":    { "type": "boolean", "description": "Mirror the glyphs; set true on back layers (e.g. B.SilkS) so text reads correctly from the back", "default": false },
+                    "bold":      { "type": "boolean", "description": "Render text bold", "default": false },
+                    "italic":    { "type": "boolean", "description": "Render text italic", "default": false }
                 },
                 "required": ["board", "text", "x", "y"]
             }),
@@ -3291,6 +3320,43 @@ mod board_layer_arg_tests {
     }
 }
 
+fn optional_positive_mm(
+    args: &serde_json::Value,
+    field: &str,
+) -> Result<Option<f64>, CallToolResult> {
+    match &args[field] {
+        serde_json::Value::Null => Ok(None),
+        value => {
+            let Some(v) = value.as_f64().filter(|v| v.is_finite()) else {
+                return Err(invalid_arg(field, "must be a finite number of millimetres"));
+            };
+            if v <= 0.0 {
+                return Err(invalid_arg(field, "must be greater than zero"));
+            }
+            let nm = (v * 1_000_000.0).round();
+            if !nm.is_finite() || nm > f64::from(i32::MAX) {
+                return Err(invalid_arg(
+                    field,
+                    "is outside KiCad's board coordinate range (about ±2147 mm)",
+                ));
+            }
+            let rounded = round6(v);
+            if rounded <= 0.0 {
+                return Err(invalid_arg(field, "rounds to zero millimetres"));
+            }
+            Ok(Some(v))
+        }
+    }
+}
+
+fn optional_bool_arg(args: &serde_json::Value, field: &str) -> Result<bool, CallToolResult> {
+    match &args[field] {
+        serde_json::Value::Null => Ok(false),
+        serde_json::Value::Bool(v) => Ok(*v),
+        _ => Err(invalid_arg(field, "must be true or false")),
+    }
+}
+
 async fn handle_add_board_text(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -3312,26 +3378,44 @@ async fn handle_add_board_text(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let size = args["size"].as_f64().unwrap_or(1.0);
-    let rotation = args["rotation"].as_f64().unwrap_or(0.0);
-
-    let text_ipc = text.clone();
-    let layer_ipc = layer.clone();
-    let fallback_reason = match attempt_ipc_write(ctx, &board_path, "board text", move |c| {
-        let bt = builders::board_text(&layer_ipc, &text_ipc, x, y, size, rotation, false);
-        let any = builders::pack_any(&bt, "kiapi.board.types.BoardText");
-        c.create_items(vec![any]).map(|_| ())
-    })
-    .await?
-    {
-        BoardWrite::Ipc(()) => {
-            return Ok(CallToolResult::json(&json!({
-                "text": text, "x": x, "y": y, "layer": layer, "size": size,
-                "source": "ipc"
-            })))
+    let size = match optional_positive_mm(args, "size") {
+        Ok(v) => v.unwrap_or(1.0),
+        Err(e) => return Ok(e),
+    };
+    let rotation = match &args["rotation"] {
+        serde_json::Value::Null => 0.0,
+        value => match value.as_f64().filter(|v| v.is_finite()) {
+            Some(v) => v,
+            None => return Ok(invalid_arg("rotation", "must be a finite number")),
+        },
+    };
+    let size_written = round6(size);
+    let thickness = match optional_positive_mm(args, "thickness") {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            let derived = round6(size_written * 0.15);
+            if !derived.is_finite() || derived <= 0.0 {
+                return Ok(invalid_arg(
+                    "size",
+                    "is too small to derive a positive stroke thickness",
+                ));
+            }
+            derived
         }
-        BoardWrite::Refused(err) => return Ok(err),
-        BoardWrite::File(reason) => reason,
+        Err(e) => return Ok(e),
+    };
+    let thickness_written = round6(thickness);
+    let mirror = match optional_bool_arg(args, "mirror") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let bold = match optional_bool_arg(args, "bold") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let italic = match optional_bool_arg(args, "italic") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
     };
 
     // Rounded to the six decimals KiCad writes: a caller passing back a
@@ -3345,8 +3429,50 @@ async fn handle_add_board_text(
             return Ok(invalid_arg(field, "must be a finite number of millimetres"));
         }
     }
+
+    let text_ipc = text.clone();
+    let layer_ipc = layer.clone();
+    let style = builders::BoardTextStyle {
+        stroke_width_mm: thickness_written,
+        mirror,
+        bold,
+        italic,
+    };
+    let fallback_reason = match attempt_ipc_write(ctx, &board_path, "board text", move |c| {
+        let bt = builders::board_text_with_style(
+            &layer_ipc,
+            &text_ipc,
+            x,
+            y,
+            size_written,
+            rotation,
+            style,
+        );
+        let any = builders::pack_any(&bt, "kiapi.board.types.BoardText");
+        c.create_items(vec![any]).map(|_| ())
+    })
+    .await?
+    {
+        BoardWrite::Ipc(()) => {
+            return Ok(CallToolResult::json(&json!({
+                "text": text, "x": x, "y": y, "layer": layer, "size": size,
+                "thickness": thickness, "mirror": mirror, "bold": bold, "italic": italic,
+                "source": "ipc"
+            })))
+        }
+        BoardWrite::Refused(err) => return Ok(err),
+        BoardWrite::File(reason) => reason,
+    };
+
+    let effects = GrTextEffects {
+        size: size_written,
+        thickness: thickness_written,
+        mirror,
+        bold,
+        italic,
+    };
     let uuid = new_uuid();
-    let gr_text = format_gr_text(&text, at, &layer, size, &uuid);
+    let gr_text = format_gr_text(&text, at, &layer, effects, &uuid);
     let content = read_consistent(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
     if let Some(conflict) = write_board_edits(
@@ -3360,7 +3486,7 @@ async fn handle_add_board_text(
 
     let landed = std::fs::read_to_string(&board_path)
         .map_err(|e| format!("the saved board could not be re-read: {e}"))
-        .and_then(|content| gr_text_landed(&content, &uuid, at));
+        .and_then(|content| gr_text_landed(&content, &uuid, at, effects));
     if let Err(reason) = landed {
         return Ok(crate::tools::mutation_outcome_uncertain(
             &board_path,
@@ -3371,15 +3497,21 @@ async fn handle_add_board_text(
 
     Ok(CallToolResult::json(&json!({
         "text": text, "x": x, "y": y, "layer": layer, "size": size,
+        "thickness": thickness, "mirror": mirror, "bold": bold, "italic": italic,
         "source": "file",
         "fallback_reason": fallback_reason.evidence(),
         "warning": fallback_reason.warning()
     })))
 }
 
-/// Confirm `content` holds the board text `uuid` at its own `(at x y rotation)`,
-/// or say why not.
-fn gr_text_landed(content: &str, uuid: &str, at: [f64; 3]) -> Result<(), String> {
+/// Confirm `content` holds the board text `uuid` at its own `(at x y rotation)`
+/// with the requested font size, stroke thickness and style flags, or say why not.
+fn gr_text_landed(
+    content: &str,
+    uuid: &str,
+    at: [f64; 3],
+    expected: GrTextEffects,
+) -> Result<(), String> {
     let tree = parse_sexp(content).map_err(|e| format!("the saved board cannot be parsed: {e}"))?;
     let written = tree
         .find_all("gr_text")
@@ -3387,11 +3519,68 @@ fn gr_text_landed(content: &str, uuid: &str, at: [f64; 3]) -> Result<(), String>
         .find(|text| text.find_str("uuid") == Some(uuid))
         .ok_or_else(|| format!("the saved board has no text {uuid}"))?;
     match parse_at(written) {
-        Some((x, y, rotation)) if [x, y, rotation] == at => Ok(()),
-        found => Err(format!(
-            "text {uuid} is at {found:?} in the saved board, not at {at:?}"
-        )),
+        Some((x, y, rotation)) if [x, y, rotation] == at => {}
+        found => {
+            return Err(format!(
+                "text {uuid} is at {found:?} in the saved board, not at {at:?}"
+            ));
+        }
     }
+    let effects = written
+        .find("effects")
+        .ok_or_else(|| format!("text {uuid} has no (effects ...) block in the saved board"))?;
+    let font = effects
+        .find("font")
+        .ok_or_else(|| format!("text {uuid} has no (font ...) block in the saved board"))?;
+    let size = font
+        .find("size")
+        .and_then(|s| Some((s.get_f64(1)?, s.get_f64(2)?)));
+    if size != Some((expected.size, expected.size)) {
+        return Err(format!(
+            "text {uuid} has font size {size:?} in the saved board, not ({}, {})",
+            expected.size, expected.size
+        ));
+    }
+    let thickness = font.find_f64("thickness");
+    if thickness != Some(expected.thickness) {
+        return Err(format!(
+            "text {uuid} has thickness {thickness:?} in the saved board, not {}",
+            expected.thickness
+        ));
+    }
+    let font_flag = |name: &str| {
+        font.find(name)
+            .and_then(|n| n.get(1).and_then(|v| v.as_str()))
+            == Some("yes")
+    };
+    let bold = font_flag("bold");
+    if bold != expected.bold {
+        return Err(format!(
+            "text {uuid} has bold={bold} in the saved board, not {}",
+            expected.bold
+        ));
+    }
+    let italic = font_flag("italic");
+    if italic != expected.italic {
+        return Err(format!(
+            "text {uuid} has italic={italic} in the saved board, not {}",
+            expected.italic
+        ));
+    }
+    let mirrored = effects.find("justify").is_some_and(|j| {
+        j.children()
+            .unwrap_or(&[])
+            .iter()
+            .skip(1)
+            .any(|c| c.as_str() == Some("mirror"))
+    });
+    if mirrored != expected.mirror {
+        return Err(format!(
+            "text {uuid} has mirror={mirrored} in the saved board, not {}",
+            expected.mirror
+        ));
+    }
+    Ok(())
 }
 
 /// Shared implementation of `add_zone` and its `add_copper_pour` alias.
@@ -6361,13 +6550,378 @@ mod board_text_coordinate_tests {
     #[test]
     fn gr_text_landed_reads_the_written_position() {
         let block = |at: &str| {
-            format!("(kicad_pcb (gr_text \"hi\" (at {at}) (layer \"F.SilkS\") (uuid \"t1\")))")
+            format!(
+                "(kicad_pcb (gr_text \"hi\" (at {at}) (layer \"F.SilkS\") \
+                 (effects (font (size 1 1) (thickness 0.15))) (uuid \"t1\")))"
+            )
         };
         let at = [54.61, 27.94, 90.0];
+        let effects = GrTextEffects {
+            size: 1.0,
+            thickness: 0.15,
+            mirror: false,
+            bold: false,
+            italic: false,
+        };
         let noisy = block("54.60999999999999 27.939999999999998 90.00000000000001");
-        assert!(gr_text_landed(&noisy, "t1", at).is_err());
-        assert_eq!(gr_text_landed(&block("54.61 27.94 90"), "t1", at), Ok(()));
-        assert!(gr_text_landed(&block("54.61 27.94 90"), "t2", at).is_err());
+        assert!(gr_text_landed(&noisy, "t1", at, effects).is_err());
+        assert_eq!(
+            gr_text_landed(&block("54.61 27.94 90"), "t1", at, effects),
+            Ok(())
+        );
+        assert!(gr_text_landed(&block("54.61 27.94 90"), "t2", at, effects).is_err());
+    }
+}
+
+/// `add_board_text` file/IPC thickness parity and `thickness`/`mirror`/`bold`/`italic` (#41).
+#[cfg(test)]
+mod board_text_effects_tests {
+    use super::board_mock::spawn_kicad_holding_board;
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+    use copperpour_ipc::gen::kiapi;
+    use prost::Message;
+    use std::sync::{Arc, Mutex};
+
+    const KICAD_BOARD: &str = include_str!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
+
+    async fn call_served(
+        handler: &McpHandler,
+        arguments: serde_json::Value,
+    ) -> (bool, serde_json::Value) {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_board_text",
+                    "arguments": arguments
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("JSON-RPC result");
+        let is_error = result["isError"] == json!(true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let body = serde_json::from_str(text).unwrap_or_else(|_| json!({ "raw": text }));
+        (is_error, body)
+    }
+
+    async fn make_handler(ipc_address: String) -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address,
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    fn spawn_recording_board_text_kicad(
+        board: &std::path::Path,
+        captured: Arc<Mutex<Vec<kiapi::board::types::BoardText>>>,
+    ) -> crate::test_support::MockIpcServer {
+        spawn_kicad_holding_board(board, move |command| {
+            let name = command.type_url.rsplit('.').next().unwrap();
+            if name != "CreateItems" {
+                return None;
+            }
+            let req =
+                kiapi::common::commands::CreateItems::decode(command.value.as_slice()).unwrap();
+            for item in &req.items {
+                if item.type_url.ends_with("BoardText") {
+                    let bt = kiapi::board::types::BoardText::decode(item.value.as_slice()).unwrap();
+                    captured.lock().unwrap().push(bt);
+                }
+            }
+            Some(copperpour_ipc::builders::pack_any(
+                &kiapi::common::commands::CreateItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    created_items: req
+                        .items
+                        .into_iter()
+                        .map(|item| kiapi::common::commands::ItemCreationResult {
+                            status: Some(kiapi::common::commands::ItemStatus {
+                                code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                error_message: String::new(),
+                            }),
+                            item: Some(item),
+                        })
+                        .collect(),
+                },
+                "kiapi.common.commands.CreateItemsResponse",
+            ))
+        })
+    }
+
+    /// Issue #41: at size 2.0 with no explicit thickness, file and IPC paths
+    /// must agree on 0.30 mm (size * 0.15), not 0.15 mm on file vs 0.30 mm on IPC.
+    #[tokio::test]
+    async fn file_and_ipc_paths_agree_on_default_thickness_for_non_unit_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_board = dir.path().join("file.kicad_pcb");
+        let ipc_board = dir.path().join("ipc.kicad_pcb");
+        std::fs::write(&file_board, KICAD_BOARD).unwrap();
+        std::fs::write(&ipc_board, KICAD_BOARD).unwrap();
+
+        let file_handler = make_handler(String::new()).await;
+        let (is_error, file_body) = call_served(
+            &file_handler,
+            json!({
+                "board": file_board.display().to_string(),
+                "text": "BACK2",
+                "x": 10.0,
+                "y": 20.0,
+                "size": 2.0
+            }),
+        )
+        .await;
+        assert!(!is_error, "{file_body}");
+        assert_eq!(file_body["source"], "file");
+        assert_eq!(file_body["thickness"], json!(0.3));
+
+        let saved = std::fs::read_to_string(&file_board).unwrap();
+        let tree = parse_sexp(&saved).unwrap();
+        let written = tree
+            .find_all("gr_text")
+            .into_iter()
+            .find(|n| n.get(1).and_then(|v| v.as_str()) == Some("BACK2"))
+            .expect("BACK2 written");
+        let file_thickness = written
+            .find("effects")
+            .and_then(|e| e.find("font"))
+            .and_then(|f| f.find_f64("thickness"))
+            .expect("thickness written");
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let kicad = spawn_recording_board_text_kicad(&ipc_board, Arc::clone(&captured));
+        let ipc_handler = make_handler(kicad.address().to_string()).await;
+        let (is_error, ipc_body) = call_served(
+            &ipc_handler,
+            json!({
+                "board": ipc_board.display().to_string(),
+                "text": "IPCBACK2",
+                "x": 10.0,
+                "y": 20.0,
+                "size": 2.0
+            }),
+        )
+        .await;
+        assert!(!is_error, "{ipc_body}");
+        assert_eq!(ipc_body["source"], "ipc");
+        assert_eq!(ipc_body["thickness"], json!(0.3));
+
+        let sent = captured.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let attrs = sent[0].text.as_ref().unwrap().attributes.as_ref().unwrap();
+        let ipc_thickness_mm = attrs.stroke_width.as_ref().unwrap().value_nm as f64 / 1_000_000.0;
+
+        assert_eq!(file_thickness, 0.3);
+        assert_eq!(ipc_thickness_mm, 0.3);
+        assert_eq!(file_thickness, ipc_thickness_mm);
+    }
+
+    /// Issue #41: explicit thickness, mirror, bold and italic land identically
+    /// on both the file path and the IPC path.
+    #[tokio::test]
+    async fn explicit_thickness_mirror_bold_and_italic_work_on_both_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_board = dir.path().join("file.kicad_pcb");
+        let ipc_board = dir.path().join("ipc.kicad_pcb");
+        std::fs::write(&file_board, KICAD_BOARD).unwrap();
+        std::fs::write(&ipc_board, KICAD_BOARD).unwrap();
+
+        let file_handler = make_handler(String::new()).await;
+        let (is_error, file_body) = call_served(
+            &file_handler,
+            json!({
+                "board": file_board.display().to_string(),
+                "text": "REV B",
+                "x": 15.0,
+                "y": 25.0,
+                "layer": "B.SilkS",
+                "size": 1.5,
+                "thickness": 0.25,
+                "mirror": true,
+                "bold": true,
+                "italic": true
+            }),
+        )
+        .await;
+        assert!(!is_error, "{file_body}");
+        assert_eq!(file_body["thickness"], json!(0.25));
+        assert_eq!(file_body["mirror"], json!(true));
+        assert_eq!(file_body["bold"], json!(true));
+        assert_eq!(file_body["italic"], json!(true));
+
+        let saved = std::fs::read_to_string(&file_board).unwrap();
+        let start = saved.find("(gr_text \"REV B\"").expect("REV B written");
+        let (_, end) = copperpour_sexp::writer::find_balanced_block(&saved, start).unwrap();
+        let block = &saved[start..end];
+        assert!(block.contains("(size 1.5 1.5)"), "{block}");
+        assert!(block.contains("(thickness 0.25)"), "{block}");
+        assert!(block.contains("(bold yes)"), "{block}");
+        assert!(block.contains("(italic yes)"), "{block}");
+        assert!(block.contains("(justify mirror)"), "{block}");
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let kicad = spawn_recording_board_text_kicad(&ipc_board, Arc::clone(&captured));
+        let ipc_handler = make_handler(kicad.address().to_string()).await;
+        let (is_error, ipc_body) = call_served(
+            &ipc_handler,
+            json!({
+                "board": ipc_board.display().to_string(),
+                "text": "REV B",
+                "x": 15.0,
+                "y": 25.0,
+                "layer": "B.SilkS",
+                "size": 1.5,
+                "thickness": 0.25,
+                "mirror": true,
+                "bold": true,
+                "italic": true
+            }),
+        )
+        .await;
+        assert!(!is_error, "{ipc_body}");
+        assert_eq!(ipc_body["thickness"], json!(0.25));
+        assert_eq!(ipc_body["mirror"], json!(true));
+        assert_eq!(ipc_body["bold"], json!(true));
+        assert_eq!(ipc_body["italic"], json!(true));
+
+        let sent = captured.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let attrs = sent[0].text.as_ref().unwrap().attributes.as_ref().unwrap();
+        assert_eq!(attrs.size.as_ref().unwrap().x_nm, 1_500_000);
+        assert_eq!(attrs.size.as_ref().unwrap().y_nm, 1_500_000);
+        assert_eq!(attrs.stroke_width.as_ref().unwrap().value_nm, 250_000);
+        assert!(attrs.mirrored);
+        assert!(attrs.bold);
+        assert!(attrs.italic);
+    }
+
+    /// Invalid size, thickness, rotation, or style flags are refused before
+    /// touching either IPC or the saved board file.
+    #[tokio::test]
+    async fn invalid_style_and_dimension_arguments_are_refused_unwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, KICAD_BOARD).unwrap();
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let kicad = spawn_recording_board_text_kicad(&board, Arc::clone(&captured));
+        let ipc_handler = make_handler(kicad.address().to_string()).await;
+        let file_handler = make_handler(String::new()).await;
+
+        let bad_cases = [
+            ("size", json!(0.0)),
+            ("size", json!(-1.0)),
+            ("size", json!(1e-7)),
+            ("size", json!(1e-6)),
+            ("size", json!(3000.0)),
+            ("size", json!("big")),
+            ("thickness", json!(0.0)),
+            ("thickness", json!(-0.15)),
+            ("thickness", json!(1e-7)),
+            ("thickness", json!(3000.0)),
+            ("thickness", json!("thick")),
+            ("rotation", json!("90")),
+            ("mirror", json!("yes")),
+            ("bold", json!(1)),
+            ("italic", json!("true")),
+        ];
+        for (field, value) in &bad_cases {
+            let mut args = json!({
+                "board": board.display().to_string(),
+                "text": "BAD",
+                "x": 10.0,
+                "y": 10.0
+            });
+            args[*field] = value.clone();
+
+            for (label, handler) in [("file", &file_handler), ("ipc", &ipc_handler)] {
+                let (is_error, body) = call_served(handler, args.clone()).await;
+                assert!(is_error, "{label} {field}={value}: {body}");
+                assert_eq!(
+                    body["error"]["kind"],
+                    json!("invalid_argument"),
+                    "{label} {field}={value}: {body}"
+                );
+            }
+            // Direct handler check too, bypassing JSON Schema validation.
+            let direct =
+                handle_add_board_text(&args, &mounting_hole_tests::ctx_with_ipc(String::new()))
+                    .await
+                    .unwrap();
+            assert!(direct.is_error, "direct {field}={value}");
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&direct).as_deref(),
+                Some("invalid_argument"),
+                "direct {field}={value}"
+            );
+        }
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "refused calls must never send CreateItems"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            KICAD_BOARD,
+            "refused calls must leave the board file untouched"
+        );
+    }
+
+    /// Post-write readback rejects the old hardcoded `(thickness 0.15)` at
+    /// `size: 2.0`, as well as any dropped `mirror`, `bold` or `italic` flag.
+    #[test]
+    fn gr_text_landed_rejects_mismatched_effects() {
+        let at = [10.0, 20.0, 0.0];
+        let expected = GrTextEffects {
+            size: 2.0,
+            thickness: 0.3,
+            mirror: true,
+            bold: true,
+            italic: true,
+        };
+        let valid = "(kicad_pcb (gr_text \"X\" (at 10 20 0) (layer \"B.SilkS\") \
+                     (effects (font (size 2 2) (thickness 0.3) (bold yes) (italic yes)) (justify mirror)) \
+                     (uuid \"u1\")))";
+        assert_eq!(gr_text_landed(valid, "u1", at, expected), Ok(()));
+
+        // The file-path bug from #41: hardcoded thickness 0.15 at size 2.0.
+        let old_bug = "(kicad_pcb (gr_text \"X\" (at 10 20 0) (layer \"B.SilkS\") \
+                       (effects (font (size 2 2) (thickness 0.15) (bold yes) (italic yes)) (justify mirror)) \
+                       (uuid \"u1\")))";
+        assert!(gr_text_landed(old_bug, "u1", at, expected).is_err());
+
+        let missing_mirror = "(kicad_pcb (gr_text \"X\" (at 10 20 0) (layer \"B.SilkS\") \
+                              (effects (font (size 2 2) (thickness 0.3) (bold yes) (italic yes))) \
+                              (uuid \"u1\")))";
+        assert!(gr_text_landed(missing_mirror, "u1", at, expected).is_err());
+
+        let missing_bold = "(kicad_pcb (gr_text \"X\" (at 10 20 0) (layer \"B.SilkS\") \
+                            (effects (font (size 2 2) (thickness 0.3) (italic yes)) (justify mirror)) \
+                            (uuid \"u1\")))";
+        assert!(gr_text_landed(missing_bold, "u1", at, expected).is_err());
+
+        let missing_italic = "(kicad_pcb (gr_text \"X\" (at 10 20 0) (layer \"B.SilkS\") \
+                              (effects (font (size 2 2) (thickness 0.3) (bold yes)) (justify mirror)) \
+                              (uuid \"u1\")))";
+        assert!(gr_text_landed(missing_italic, "u1", at, expected).is_err());
+
+        // Unexpected mirror when mirror=false.
+        let unmirrored = GrTextEffects {
+            mirror: false,
+            ..expected
+        };
+        assert!(gr_text_landed(valid, "u1", at, unmirrored).is_err());
     }
 }
 

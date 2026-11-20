@@ -818,6 +818,15 @@ pub fn board_polygon(
     )
 }
 
+/// Styling flags and stroke width for a [`kiapi::board::types::BoardText`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoardTextStyle {
+    pub stroke_width_mm: f64,
+    pub mirror: bool,
+    pub bold: bool,
+    pub italic: bool,
+}
+
 /// Build a BoardText. `size_mm` sets both width and height of the glyphs.
 #[allow(clippy::too_many_arguments)]
 pub fn board_text(
@@ -853,13 +862,40 @@ pub fn board_text_with_stroke_width(
     rotation_deg: f64,
     mirror: bool,
 ) -> kiapi::board::types::BoardText {
+    board_text_with_style(
+        layer,
+        text,
+        x,
+        y,
+        size_mm,
+        rotation_deg,
+        BoardTextStyle {
+            stroke_width_mm,
+            mirror,
+            bold: false,
+            italic: false,
+        },
+    )
+}
+
+/// Build a BoardText with explicit stroke width and style flags.
+#[allow(clippy::too_many_arguments)]
+pub fn board_text_with_style(
+    layer: &str,
+    text: &str,
+    x: f64,
+    y: f64,
+    size_mm: f64,
+    rotation_deg: f64,
+    style: BoardTextStyle,
+) -> kiapi::board::types::BoardText {
     kiapi::board::types::BoardText {
         id: None,
         text: Some(kiapi::common::types::Text {
             position: Some(vec2(x, y)),
             attributes: Some(kiapi::common::types::TextAttributes {
-                // ponytail: font/alignment/bold/italic left at proto default.
-                // Add args (or a builder struct) when a caller needs them.
+                // font face and alignment stay at proto default; edit_board_text
+                // can change them in place on a live board.
                 font_name: String::new(),
                 horizontal_alignment: kiapi::common::types::HorizontalAlignment::HaCenter as i32,
                 vertical_alignment: kiapi::common::types::VerticalAlignment::VaCenter as i32,
@@ -867,12 +903,12 @@ pub fn board_text_with_stroke_width(
                     value_degrees: rotation_deg,
                 }),
                 line_spacing: 1.0,
-                stroke_width: Some(distance(stroke_width_mm)),
-                italic: false,
-                bold: false,
+                stroke_width: Some(distance(style.stroke_width_mm)),
+                italic: style.italic,
+                bold: style.bold,
                 underlined: false,
                 visible: true,
-                mirrored: mirror,
+                mirrored: style.mirror,
                 multiline: false,
                 keep_upright: false,
                 size: Some(vec2(size_mm, size_mm)),
@@ -1408,6 +1444,27 @@ pub(crate) mod tests {
                 .value_nm,
             110_000
         );
+
+        let styled = board_text_with_style(
+            "B.SilkS",
+            "REV B",
+            10.0,
+            20.0,
+            1.5,
+            90.0,
+            BoardTextStyle {
+                stroke_width_mm: 0.25,
+                mirror: true,
+                bold: true,
+                italic: true,
+            },
+        );
+        let styled_attrs = styled.text.unwrap().attributes.unwrap();
+        assert_eq!(styled_attrs.size.unwrap().x_nm, 1_500_000);
+        assert_eq!(styled_attrs.stroke_width.unwrap().value_nm, 250_000);
+        assert!(styled_attrs.mirrored);
+        assert!(styled_attrs.bold);
+        assert!(styled_attrs.italic);
     }
 
     #[test]
