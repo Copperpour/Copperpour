@@ -31,6 +31,43 @@ pub enum Xform {
     },
 }
 
+/// KiCad's `RotatePoint` on a point in nanometres, about the origin
+/// (`libs/kimath/src/trigo.cpp`): the angle normalised to [0, 360), the four
+/// right angles exact, and otherwise each coordinate rounded half away from
+/// zero, with `EDA_ANGLE`'s `M_SQRT1_2` sine and cosine at the odd multiples
+/// of 45°.
+pub fn rotate_point(x: i64, y: i64, degrees: f64) -> (i64, i64) {
+    let angle = within_a_turn(degrees);
+    if angle == 0.0 {
+        return (x, y);
+    }
+    if angle == 90.0 {
+        return (y, -x);
+    }
+    if angle == 180.0 {
+        return (-x, -y);
+    }
+    if angle == 270.0 {
+        return (-y, x);
+    }
+    let half = std::f64::consts::FRAC_1_SQRT_2;
+    let (sin, cos) = match angle {
+        45.0 => (half, half),
+        135.0 => (half, -half),
+        225.0 => (-half, -half),
+        315.0 => (-half, half),
+        _ => {
+            let radians = angle * (std::f64::consts::PI / 180.0);
+            (radians.sin(), radians.cos())
+        }
+    };
+    let (x, y) = (x as f64, y as f64);
+    (
+        (y * sin + x * cos).round() as i64,
+        (y * cos - x * sin).round() as i64,
+    )
+}
+
 impl Xform {
     pub(crate) fn point(&self, x: i64, y: i64) -> (i64, i64) {
         match *self {
@@ -40,14 +77,9 @@ impl Xform {
                 cy_nm,
                 delta_deg,
             } => {
-                // KiCAD's RotatePoint (libs/kimath/src/trigo.cpp):
-                //   x' = x·cosθ + y·sinθ ;  y' = y·cosθ − x·sinθ
-                let (rx, ry) = ((x - cx_nm) as f64, (y - cy_nm) as f64);
-                let (s, c) = delta_deg.to_radians().sin_cos();
-                (
-                    cx_nm + (rx * c + ry * s).round() as i64,
-                    cy_nm + (ry * c - rx * s).round() as i64,
-                )
+                // KiCad's RotatePoint about a centre: subtract it, turn, add it.
+                let (x, y) = rotate_point(x - cx_nm, y - cy_nm, delta_deg);
+                (cx_nm + x, cy_nm + y)
             }
         }
     }
@@ -66,8 +98,19 @@ impl Xform {
     }
 }
 
+/// `degrees` in [0, 360), as `EDA_ANGLE::Normalize` puts an angle
+/// (`libs/kimath/include/geometry/eda_angle.h:229-238` at 10.0.6).
+pub fn within_a_turn(degrees: f64) -> f64 {
+    let turn = degrees.rem_euclid(360.0);
+    if turn >= 360.0 {
+        turn - 360.0
+    } else {
+        turn
+    }
+}
+
 /// Normalize to (-180, 180], the range KiCAD's `EDA_ANGLE::Normalize180` uses.
-fn normalize_deg(deg: f64) -> f64 {
+pub fn normalize_deg(deg: f64) -> f64 {
     let mut d = deg % 360.0;
     if d <= -180.0 {
         d += 360.0;
@@ -145,6 +188,21 @@ fn xform_polyset(ps: &mut common::PolySet, xf: &Xform) {
     }
 }
 
+/// The layer of `gs` when it is a rounded rectangle `xf` turns off axis.
+/// KiCAD always sends `corner_radius`, 0 for a square corner, so only a
+/// positive radius is rounded. KiCAD approximates a rotated rounded rectangle
+/// with a segmented polygon; refuse rather than guess its arc tolerance.
+fn rounded_off_axis(gs: &board::BoardGraphicShape, xf: &Xform) -> Option<&'static str> {
+    use common::graphic_shape::Geometry;
+    let Some(Geometry::Rectangle(rect)) = gs.shape.as_ref().and_then(|s| s.geometry.as_ref())
+    else {
+        return None;
+    };
+    let layer = gs.layer();
+    (!xf.is_cardinal() && rect.corner_radius.is_some_and(|r| r.value_nm > 0))
+        .then(|| crate::builders::layer_name(layer).unwrap_or(layer.as_str_name()))
+}
+
 fn xform_graphic_shape(
     gs: &mut board::BoardGraphicShape,
     xf: &Xform,
@@ -152,7 +210,16 @@ fn xform_graphic_shape(
 ) -> Result<()> {
     use common::graphic_shape::Geometry;
 
-    let layer = gs.layer();
+    if let Some(layer) = rounded_off_axis(gs, xf) {
+        return Err(rotation_refusal(
+            reference,
+            format!(
+                "cannot rotate footprint '{reference}' by a non-90° angle: its \
+                 rounded-rectangle graphic on {layer} has no off-axis form; use a \
+                 multiple of 90°"
+            ),
+        ));
+    }
     let Some(shape) = gs.shape.as_mut() else {
         return Ok(());
     };
@@ -165,20 +232,6 @@ fn xform_graphic_shape(
             if xf.is_cardinal() {
                 xform_vec2(&mut rect.top_left, xf);
                 xform_vec2(&mut rect.bottom_right, xf);
-            } else if rect.corner_radius.is_some_and(|r| r.value_nm > 0) {
-                // KiCAD always sends `corner_radius`, 0 for a square corner,
-                // so only a positive radius is rounded. KiCAD approximates a
-                // rotated rounded rectangle with a segmented polygon; refuse
-                // rather than guess its arc tolerance.
-                return Err(rotation_refusal(
-                    reference,
-                    format!(
-                        "cannot rotate footprint '{reference}' by a non-90° angle: its \
-                         rounded-rectangle graphic on {} has no off-axis form; use a \
-                         multiple of 90°",
-                        crate::builders::layer_name(layer).unwrap_or(layer.as_str_name())
-                    ),
-                ));
             } else {
                 // Mirror KiCAD's EDA_SHAPE::Rotate: an off-axis rectangle
                 // becomes a closed polygon of its four rotated corners.
@@ -250,7 +303,20 @@ fn rotation_refusal(reference: &str, reason: String) -> anyhow::Error {
     .into()
 }
 
-fn xform_zone(zone: &mut board::Zone, xf: &Xform) {
+/// A text box's corners and angle carried by `xf`, a right angle or a move.
+fn xform_text_box(tb: &mut board::BoardTextBox, xf: &Xform) {
+    if let Some(textbox) = tb.textbox.as_mut() {
+        xform_vec2(&mut textbox.top_left, xf);
+        xform_vec2(&mut textbox.bottom_right, xf);
+        if let Some(attrs) = textbox.attributes.as_mut() {
+            xform_angle(&mut attrs.angle, xf);
+        }
+    }
+}
+
+/// A zone's outline and holes carried by `xf`, its cached fill with them as
+/// it is: the fill is moved, not rebuilt.
+pub fn transform_zone(zone: &mut board::Zone, xf: &Xform) {
     if let Some(outline) = zone.outline.as_mut() {
         xform_polyset(outline, xf);
     }
@@ -331,13 +397,7 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
                 ));
             }
             let mut tb = board::BoardTextBox::decode(item.value.as_slice())?;
-            if let Some(textbox) = tb.textbox.as_mut() {
-                xform_vec2(&mut textbox.top_left, xf);
-                xform_vec2(&mut textbox.bottom_right, xf);
-                if let Some(attrs) = textbox.attributes.as_mut() {
-                    xform_angle(&mut attrs.angle, xf);
-                }
-            }
+            xform_text_box(&mut tb, xf);
             item.value = tb.encode_to_vec();
         } else if url == "kiapi.board.types.Field" {
             let mut field = board::Field::decode(item.value.as_slice())?;
@@ -351,7 +411,7 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
             item.value = shape.encode_to_vec();
         } else if url == "kiapi.board.types.Zone" {
             let mut zone = board::Zone::decode(item.value.as_slice())?;
-            xform_zone(&mut zone, xf);
+            transform_zone(&mut zone, xf);
             item.value = zone.encode_to_vec();
         } else if url == "kiapi.board.types.Dimension" {
             let mut dim = board::Dimension::decode(item.value.as_slice())?;
@@ -383,6 +443,67 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
         }
     }
     Ok(())
+}
+
+/// The last step of KiCad's `FOOTPRINT::Rotate` (`pcbnew/footprint.cpp:2849-2856`
+/// at 10.0.6), after its children are turned: `PCB_TEXT::KeepUpright`
+/// (`pcbnew/pcb_text.cpp:379-397`) on each field and text child of `fp`. A
+/// text with keep-upright set whose angle, taken into [0, 360), is 180° or
+/// more turns half round and swaps left and right, and top and bottom; a
+/// centred one stays centred. Text boxes are not texts there and are left.
+pub fn keep_footprint_text_upright(fp: &mut board::FootprintInstance) -> Result<()> {
+    for field in [
+        &mut fp.reference_field,
+        &mut fp.value_field,
+        &mut fp.datasheet_field,
+        &mut fp.description_field,
+    ] {
+        if let Some(text) = field.as_mut().and_then(|field| field.text.as_mut()) {
+            keep_upright(&mut text.text);
+        }
+    }
+    let Some(def) = fp.definition.as_mut() else {
+        return Ok(());
+    };
+    for item in def.items.iter_mut() {
+        let url = crate::builders::any_type_name(item);
+        if url == "kiapi.board.types.Field" {
+            let mut field = board::Field::decode(item.value.as_slice())?;
+            if let Some(text) = field.text.as_mut() {
+                keep_upright(&mut text.text);
+            }
+            item.value = field.encode_to_vec();
+        } else if url == "kiapi.board.types.BoardText" {
+            let mut text = board::BoardText::decode(item.value.as_slice())?;
+            keep_upright(&mut text.text);
+            item.value = text.encode_to_vec();
+        }
+    }
+    Ok(())
+}
+
+fn keep_upright(text: &mut Option<common::Text>) {
+    use common::{HorizontalAlignment as H, VerticalAlignment as V};
+    let Some(attrs) = text.as_mut().and_then(|text| text.attributes.as_mut()) else {
+        return;
+    };
+    let angle = within_a_turn(attrs.angle.map_or(0.0, |angle| angle.value_degrees));
+    if !attrs.keep_upright || angle < 180.0 {
+        return;
+    }
+    attrs.horizontal_alignment = match H::try_from(attrs.horizontal_alignment) {
+        Ok(H::HaLeft) => H::HaRight as i32,
+        Ok(H::HaRight) => H::HaLeft as i32,
+        _ => attrs.horizontal_alignment,
+    };
+    attrs.vertical_alignment = match V::try_from(attrs.vertical_alignment) {
+        Ok(V::VaTop) => V::VaBottom as i32,
+        Ok(V::VaBottom) => V::VaTop as i32,
+        _ => attrs.vertical_alignment,
+    };
+    attrs.angle = Some(common::Angle {
+        value_degrees: within_a_turn(angle + 180.0),
+    });
 }
 
 /// The transforms that carry a footprint's children from the pose KiCad
@@ -433,6 +554,31 @@ pub fn transform_polygon(polygon: &mut common::PolygonWithHoles, xf: &Xform) {
     for hole in polygon.holes.iter_mut() {
         xform_polyline(hole, xf);
     }
+}
+
+/// A board graphic carried by `xf` as a footprint's graphic is. A rounded
+/// rectangle turned by an angle that is not a multiple of 90° is refused: it
+/// has no exact form there.
+pub fn transform_board_graphic(gs: &mut board::BoardGraphicShape, xf: &Xform) -> Result<()> {
+    if let Some(layer) = rounded_off_axis(gs, xf) {
+        anyhow::bail!(
+            "its rounded rectangle on {layer} has no exact form at a turn that is not a \
+             multiple of 90°"
+        );
+    }
+    xform_graphic_shape(gs, xf, "")
+}
+
+/// A board text box carried by `xf` as a footprint's is. A turn that is not
+/// a multiple of 90° is refused: KiCad 10.0.8 crashes on a text box set at
+/// such an angle.
+pub fn transform_board_text_box(tb: &mut board::BoardTextBox, xf: &Xform) -> Result<()> {
+    anyhow::ensure!(
+        xf.is_cardinal(),
+        "KiCad cannot hold a text box turned by an angle that is not a multiple of 90°"
+    );
+    xform_text_box(tb, xf);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -797,6 +943,172 @@ mod tests {
             delta_deg: 90.0,
         });
         assert_eq!(turned, at(builders::vec2(103.81, 96.19)));
+    }
+
+    /// A text at `angle_deg` with its keep-upright flag and justification.
+    fn text(angle_deg: f64, keep_upright: bool, h: i32, v: i32) -> common::Text {
+        common::Text {
+            attributes: Some(common::TextAttributes {
+                angle: Some(common::Angle {
+                    value_degrees: angle_deg,
+                }),
+                keep_upright,
+                horizontal_alignment: h,
+                vertical_alignment: v,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn field_with(text: common::Text) -> board::Field {
+        board::Field {
+            text: Some(board::BoardText {
+                text: Some(text),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn keep_upright_text_past_180_turns_half_round_and_swaps_its_justification() {
+        use common::{HorizontalAlignment as H, VerticalAlignment as V};
+        let (left, right, h_centre) = (H::HaLeft as i32, H::HaRight as i32, H::HaCenter as i32);
+        let (top, bottom, v_centre) = (V::VaTop as i32, V::VaBottom as i32, V::VaCenter as i32);
+        let textbox = builders::pack_any(
+            &board::BoardTextBox::default(),
+            "kiapi.board.types.BoardTextBox",
+        );
+        let mut fp = instance_with(vec![
+            builders::pack_any(
+                &board::BoardText {
+                    text: Some(text(-90.0, true, h_centre, v_centre)),
+                    ..Default::default()
+                },
+                "kiapi.board.types.BoardText",
+            ),
+            builders::pack_any(
+                &field_with(text(90.0, true, left, bottom)),
+                "kiapi.board.types.Field",
+            ),
+            textbox.clone(),
+        ]);
+        fp.reference_field = Some(field_with(text(225.0, true, left, top)));
+        fp.value_field = Some(field_with(text(225.0, false, left, top)));
+
+        keep_footprint_text_upright(&mut fp).unwrap();
+
+        let attrs = |field: &Option<board::Field>| {
+            let field = field.as_ref().unwrap().text.as_ref().unwrap();
+            field.text.as_ref().unwrap().attributes.clone().unwrap()
+        };
+        let summary = |attrs: common::TextAttributes| {
+            let angle = attrs.angle.unwrap().value_degrees;
+            (angle, attrs.horizontal_alignment, attrs.vertical_alignment)
+        };
+        // 225 is past 180: half round to 45, left to right, top to bottom.
+        assert_eq!(summary(attrs(&fp.reference_field)), (45.0, right, bottom));
+        // Without keep-upright nothing changes.
+        assert_eq!(summary(attrs(&fp.value_field)), (225.0, left, top));
+        let items = &fp.definition.as_ref().unwrap().items;
+        let board_text = board::BoardText::decode(items[0].value.as_slice()).unwrap();
+        // -90 is 270 in [0, 360): half round to 90, centred stays centred.
+        assert_eq!(
+            summary(board_text.text.unwrap().attributes.unwrap()),
+            (90.0, h_centre, v_centre)
+        );
+        // 90 is upright already.
+        let field = board::Field::decode(items[1].value.as_slice()).unwrap();
+        assert_eq!(
+            summary(field.text.unwrap().text.unwrap().attributes.unwrap()),
+            (90.0, left, bottom)
+        );
+        assert_eq!(items[2], textbox);
+    }
+
+    #[test]
+    fn a_board_rounded_rectangle_turns_by_right_angles_only() {
+        let turn = |delta_deg| Xform::Rotate {
+            cx_nm: builders::mm_to_nm(100.0),
+            cy_nm: builders::mm_to_nm(100.0),
+            delta_deg,
+        };
+        let rounded = || {
+            board::BoardGraphicShape::decode(kicad_rectangle("F.Fab", 250_000).value.as_slice())
+                .unwrap()
+        };
+        let mut shape = rounded();
+        let error = transform_board_graphic(&mut shape, &turn(45.0)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "its rounded rectangle on F.Fab has no exact form at a turn that is not a \
+             multiple of 90°"
+        );
+        assert_eq!(shape, rounded(), "nothing moved before the refusal");
+
+        let mut shape = rounded();
+        transform_board_graphic(&mut shape, &turn(90.0)).unwrap();
+        let Some(common::graphic_shape::Geometry::Rectangle(rect)) = shape.shape.unwrap().geometry
+        else {
+            panic!("still a rectangle")
+        };
+        // (99, 99) and (101, 101) about (100, 100): (99, 101) and (101, 99).
+        assert_eq!(rect.top_left.unwrap(), builders::vec2(99.0, 101.0));
+        assert_eq!(rect.bottom_right.unwrap(), builders::vec2(101.0, 99.0));
+    }
+
+    /// pcbnew's own turn of these points by 45°, with `EDA_ANGLE`'s
+    /// `M_SQRT1_2`, as `repeat_layout`'s `a_45_degree_turn_rounds_as_kicad_rounds_it`
+    /// holds them: the sine of 45° in radians puts `y` a nanometre away.
+    #[test]
+    fn a_turn_by_45_rounds_as_kicad_rounds_it() {
+        let turn = Xform::Rotate {
+            cx_nm: 0,
+            cy_nm: 0,
+            delta_deg: 45.0,
+        };
+        assert_eq!(
+            turn.point(150_000_000, 111_386_035),
+            (184_827_838, -27_304_197)
+        );
+        assert_eq!(
+            turn.point(150_000_001, 134_005_573),
+            (200_822_267, -11_309_769)
+        );
+    }
+
+    #[test]
+    fn a_board_text_box_turns_by_right_angles_only() {
+        let turn = |delta_deg| Xform::Rotate {
+            cx_nm: builders::mm_to_nm(100.0),
+            cy_nm: builders::mm_to_nm(100.0),
+            delta_deg,
+        };
+        let held = board::BoardTextBox {
+            textbox: Some(common::TextBox {
+                top_left: Some(builders::vec2(99.0, 99.0)),
+                bottom_right: Some(builders::vec2(103.0, 101.0)),
+                attributes: Some(common::TextAttributes {
+                    angle: Some(common::Angle { value_degrees: 0.0 }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut tb = held.clone();
+        assert!(transform_board_text_box(&mut tb, &turn(45.0)).is_err());
+        assert_eq!(tb, held, "nothing moved before the refusal");
+
+        transform_board_text_box(&mut tb, &turn(90.0)).unwrap();
+        let textbox = tb.textbox.unwrap();
+        assert_eq!(textbox.top_left.unwrap(), builders::vec2(99.0, 101.0));
+        assert_eq!(textbox.bottom_right.unwrap(), builders::vec2(101.0, 97.0));
+        assert_eq!(
+            textbox.attributes.unwrap().angle.unwrap().value_degrees,
+            90.0
+        );
     }
 
     #[test]

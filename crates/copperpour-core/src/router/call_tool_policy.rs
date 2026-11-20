@@ -358,6 +358,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "set_visual_baseline",
     "snapshot_project",
     "split_wire_at_point",
+    "transform_pcb_items",
     "update_footprints_from_library",
     "update_pcb_from_schematic",
     "update_symbols_from_library",

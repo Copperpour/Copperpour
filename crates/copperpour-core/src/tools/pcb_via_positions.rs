@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+const OPERATION: &str = "set_via_positions";
 const VIA: &str = "kiapi.board.types.Via";
 const UNDO: &str = "Set via positions";
 const LIMIT: i64 = super::pcb_board_outline::COORDINATE_LIMIT_NM;
@@ -91,7 +92,7 @@ fn coordinate(args: &Value, field: &str) -> Refusal<i64> {
     Ok(mm_to_nm(mm))
 }
 
-fn point(args: &Value) -> Refusal<Vector2> {
+pub(super) fn point(args: &Value) -> Refusal<Vector2> {
     Ok(Vector2 {
         x_nm: coordinate(args, "x")?,
         y_nm: coordinate(args, "y")?,
@@ -137,56 +138,70 @@ fn parse(args: &Value) -> Refusal<Request> {
     Ok(Request { targets, relative })
 }
 
-fn blocked(reasons: Vec<String>) -> CallToolResult {
+/// `operation`'s refusal for `reasons`, before anything stays applied.
+pub(super) fn blocked(operation: &str, reasons: Vec<String>) -> CallToolResult {
     CallToolResult::error_kind(
         ToolErrorKind::PlanBlocked {
-            operation: "set_via_positions".into(),
+            operation: operation.into(),
             reasons: reasons.clone(),
         },
         format!(
-            "set_via_positions refused: {}. No requested move remains applied.",
+            "{operation} refused: {}. No requested move remains applied.",
             reasons.join("; ")
         ),
     )
 }
 
-fn stale(path: &Path) -> CallToolResult {
+/// A stale plan: the board or the `noun` move plan changed since the dry run.
+pub(super) fn stale(path: &Path, noun: &str) -> CallToolResult {
     CallToolResult::error_kind(
         ToolErrorKind::StaleTarget {
             target: path.display().to_string(),
-            reason: "board or via move plan changed since the dry run".into(),
+            reason: format!("board or {noun} move plan changed since the dry run"),
         },
         "The plan is stale. Nothing was written; dry-run again against the live board.",
     )
 }
 
-fn uncertain(path: &Path, ids: &[String], reason: String) -> CallToolResult {
+/// `operation`'s unconfirmed outcome, naming the `noun` UUIDs to inspect.
+pub(super) fn uncertain(
+    operation: &str,
+    noun: &str,
+    path: &Path,
+    ids: &[String],
+    reason: String,
+) -> CallToolResult {
     let result = CallToolResult::error_kind(
         ToolErrorKind::MutationOutcomeUncertain {
-            operation: "set_via_positions".into(),
+            operation: operation.into(),
             path: path.display().to_string(),
             reason: reason.clone(),
         },
         format!(
-            "{reason}. Inspect these via UUIDs before retrying: {}",
+            "{reason}. Inspect these {noun} UUIDs before retrying: {}",
             ids.join(", ")
         ),
     );
-    let mut body: Value = serde_json::from_str(match &result.content[0] {
-        crate::mcp::protocol::ToolContent::Text { text } => text,
-        _ => unreachable!(),
-    })
-    .expect("structured error JSON");
-    body["uuids"] = json!(ids);
-    {
-        let mut result = CallToolResult::json(&body);
-        result.is_error = true;
-        result
-    }
+    with_key(result, "uuids", json!(ids))
+}
+
+/// `result` with `key` added to its JSON body.
+pub(super) fn with_key(result: CallToolResult, key: &str, value: Value) -> CallToolResult {
+    let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+        unreachable!("structured results are text")
+    };
+    let mut body: Value = serde_json::from_str(text).expect("structured error JSON");
+    body[key] = value;
+    let mut keyed = CallToolResult::json(&body);
+    keyed.is_error = result.is_error;
+    keyed
 }
 
 /// Use the shared live-board serializer; this is never a saved-file fallback.
-fn snapshot(client: &KiCadIpcClient, document: &DocumentSpecifier) -> anyhow::Result<String> {
+pub(super) fn snapshot(
+    client: &KiCadIpcClient,
+    document: &DocumentSpecifier,
+) -> anyhow::Result<String> {
     client.save_document_to_string_in(document.clone())
 }
 
@@ -227,13 +242,14 @@ fn plan(request: &Request, before: &BTreeMap<String, Via>) -> Refusal<BTreeMap<S
     let mut after = before.clone();
     for (id, via) in &mut after {
         if via.locked != LockedState::LsUnlocked as i32 {
-            return Err(blocked(vec![format!(
-                "via '{id}' is locked or its lock state is unknown"
-            )]));
+            return Err(blocked(
+                OPERATION,
+                vec![format!("via '{id}' is locked or its lock state is unknown")],
+            ));
         }
         let old = via
             .position
-            .ok_or_else(|| blocked(vec![format!("via '{id}' has no position")]))?;
+            .ok_or_else(|| blocked(OPERATION, vec![format!("via '{id}' has no position")]))?;
         let target = request.targets[id];
         let new = if request.relative {
             Vector2 {
@@ -365,7 +381,7 @@ async fn handle_set_via_positions(
     Ok(envelope(result, &path, count))
 }
 
-fn envelope(result: CallToolResult, path: &Path, count: usize) -> CallToolResult {
+pub(super) fn envelope(result: CallToolResult, path: &Path, count: usize) -> CallToolResult {
     let kind = crate::mcp::error::extract_error_kind(&result);
     let uncertain = matches!(
         kind.as_deref(),
@@ -420,9 +436,10 @@ fn apply(
     let before = match read_vias(client, document, &ids) {
         Ok(vias) => vias,
         Err(error) => {
-            return Ok(blocked(vec![format!(
-                "cannot resolve all requested vias: {error:#}"
-            )]))
+            return Ok(blocked(
+                OPERATION,
+                vec![format!("cannot resolve all requested vias: {error:#}")],
+            ))
         }
     };
     let after = match plan(request, &before) {
@@ -437,7 +454,7 @@ fn apply(
         ));
     }
     if expected != Some(rev.as_str()) {
-        return Ok(stale(path));
+        return Ok(stale(path, "via"));
     }
     if before == after {
         return Ok(CallToolResult::json(
@@ -463,6 +480,8 @@ fn apply(
         }
         if error.downcast_ref::<IpcOutcomeUnknown>().is_some() {
             return Ok(uncertain(
+                OPERATION,
+                "via",
                 path,
                 &ids,
                 format!("batch outcome cannot be confirmed: {error:#}"),
@@ -471,18 +490,24 @@ fn apply(
         if stale_inside {
             // The closure sent no UpdateItems and the empty commit was dropped.
             // External target edits are not writes made by this call.
-            return Ok(stale(path));
+            return Ok(stale(path, "via"));
         }
         if !update_attempted {
-            return Ok(blocked(vec![format!(
-                "pre-update check failed; no update was sent: {error:#}"
-            )]));
+            return Ok(blocked(
+                OPERATION,
+                vec![format!(
+                    "pre-update check failed; no update was sent: {error:#}"
+                )],
+            ));
         }
         return Ok(match read_vias(client, document, &ids) {
-            Ok(observed) if observed == before => blocked(vec![format!(
-                "commit failed; original vias verified: {error:#}"
-            )]),
+            Ok(observed) if observed == before => blocked(
+                OPERATION,
+                vec![format!("commit failed; original vias verified: {error:#}")],
+            ),
             _ => uncertain(
+                OPERATION,
+                "via",
                 path,
                 &ids,
                 format!("commit failed and original vias could not be verified: {error:#}"),
@@ -493,6 +518,8 @@ fn apply(
         Ok(value) => value,
         Err(error) => {
             return Ok(uncertain(
+                OPERATION,
+                "via",
                 path,
                 &ids,
                 format!("committed vias cannot be read back: {error:#}"),
@@ -513,6 +540,8 @@ fn apply(
     }
     if !net_changed || without_net_changes != after {
         return Ok(uncertain(
+            OPERATION,
+            "via",
             path,
             &ids,
             "readback differs in position or a preserved native property".into(),
@@ -543,8 +572,10 @@ fn apply(
     );
     match restoration {
         Ok(()) => match read_vias(client, document, &ids) {
-            Ok(value) if value == before => Ok(blocked(reasons)),
+            Ok(value) if value == before => Ok(blocked(OPERATION, reasons)),
             _ => Ok(uncertain(
+                OPERATION,
+                "via",
                 path,
                 &ids,
                 format!(
@@ -554,6 +585,8 @@ fn apply(
             )),
         },
         Err(error) => Ok(uncertain(
+            OPERATION,
+            "via",
             path,
             &ids,
             format!(
