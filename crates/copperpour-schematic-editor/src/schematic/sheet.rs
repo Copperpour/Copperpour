@@ -63,11 +63,11 @@ impl SheetPin {
             qstr(self.name.clone()),
             atom(self.pin_type.clone()),
             self.at.to_sexp(),
+            tagged("uuid", vec![qstr(self.uuid.clone())]),
         ];
         if let Some(e) = &self.effects {
             c.push(e.to_sexp());
         }
-        c.push(tagged("uuid", vec![qstr(self.uuid.clone())]));
         SexpNode::List(c)
     }
 

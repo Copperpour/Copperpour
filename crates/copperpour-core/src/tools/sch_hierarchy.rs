@@ -8638,6 +8638,34 @@ mod sheet_pin_resize_tests {
         .await
     }
 
+    #[tokio::test]
+    async fn editing_a_sheet_pin_keeps_kicads_pin_field_order() {
+        let (_d, path) = sheet();
+        move_pin(&path, "L", 132.08, 81.28).await;
+
+        let original = copperpour_sexp::parse_sexp(ROOT).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        let saved = copperpour_sexp::parse_sexp(&written).unwrap();
+        let original_pins = original.find("sheet").unwrap().find_all("pin");
+        let saved_pins = saved.find("sheet").unwrap().find_all("pin");
+        assert_eq!(saved_pins.len(), original_pins.len());
+
+        for (before, after) in original_pins.into_iter().zip(saved_pins) {
+            let name = before.get(1).unwrap().as_str().unwrap();
+            assert_eq!(before.get(4).and_then(|node| node.head()), Some("uuid"));
+            assert_eq!(before.get(5).and_then(|node| node.head()), Some("effects"));
+            if name == "L" {
+                let before = before.children().unwrap();
+                let after = after.children().unwrap();
+                assert_eq!(&after[..3], &before[..3], "{name}: pin header");
+                assert_eq!(&after[4..], &before[4..], "{name}: UUID and effects");
+            } else {
+                assert_eq!(after, before, "{name}: untouched pin");
+            }
+        }
+        assert_eq!(at_in_file(&path, "L"), (132.08, 81.28, 0.0));
+    }
+
     /// The right and bottom edges move out, and their pins and the file
     /// caption with them; the left and top pins stay.
     #[tokio::test]
