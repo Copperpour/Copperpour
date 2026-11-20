@@ -225,3 +225,84 @@ fn install_through_the_pcm_launcher_registers_the_launcher() {
     );
     assert!(after.windows(2).all(|w| w[0] != w[1]), "each hook once");
 }
+
+/// #699: `copperpour init` replaces `PreToolUse` hooks registered by another
+/// `copperpour` or `konnect` executable path instead of accumulating a second
+/// set, while keeping user-authored neighboring handlers intact.
+#[test]
+fn init_replaces_hooks_from_another_executable_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let settings_path = home.join(".claude/settings.json");
+    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+
+    #[cfg(windows)]
+    let (old_cp, old_konnect) = (
+        "\"C:\\old\\copperpour.exe\" hook \"pre-pcb-ipc\"",
+        "\"C:\\legacy\\konnect.exe\" hook \"pre-pcb-fallback\"",
+    );
+    #[cfg(not(windows))]
+    let (old_cp, old_konnect) = (
+        "'/opt/old/copperpour' hook 'pre-pcb-ipc'",
+        "'/opt/legacy/konnect' hook 'pre-pcb-fallback'",
+    );
+
+    fs::write(
+        &settings_path,
+        json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "mcp__konnect__.*",
+                        "hooks": [
+                            {"type": "command", "command": old_cp},
+                            {"type": "command", "command": "user-board-check"}
+                        ]
+                    },
+                    {
+                        "matcher": "mcp__konnect__.*",
+                        "hooks": [
+                            {"type": "command", "command": old_konnect}
+                        ]
+                    }
+                ]
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    assert!(copperpour(home)
+        .args(["init", "--client", "claude"])
+        .stdout(Stdio::null())
+        .status()
+        .unwrap()
+        .success());
+
+    let settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    let commands: Vec<&str> = settings["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|entry| entry["hooks"].as_array().unwrap())
+        .map(|handler| handler["command"].as_str().unwrap())
+        .collect();
+
+    assert!(!commands.contains(&old_cp), "{commands:#?}");
+    assert!(!commands.contains(&old_konnect), "{commands:#?}");
+    assert!(commands.contains(&"user-board-check"), "{commands:#?}");
+    assert_eq!(
+        commands.len(),
+        5,
+        "4 current hooks + 1 user handler: {commands:#?}"
+    );
+
+    let status_out = copperpour(home)
+        .args(["status", "--client", "claude"])
+        .output()
+        .unwrap();
+    assert!(status_out.status.success());
+    let stdout = String::from_utf8_lossy(&status_out.stdout);
+    assert!(stdout.contains("Guidance: current\n"), "{stdout}");
+}
