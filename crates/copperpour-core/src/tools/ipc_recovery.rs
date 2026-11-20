@@ -507,6 +507,50 @@ pub(crate) fn for_ipc_failure(failure: &IpcFailure) -> RecoveryGuidance {
         IpcFailure::Target { error, .. } => for_board_target_error(error),
         IpcFailure::Uncertain(message) => for_ipc_outcome_unknown(message),
         IpcFailure::Recovered(message) => for_ipc_batch_recovered(message),
+        IpcFailure::ItemRejected { message, rejection, rollback } => {
+            use copperpour_ipc::client::{ItemRejection, ItemRejectionRollback};
+            let mut guidance = for_ipc_outcome_unknown(message);
+            let (rollback_status, observed) = match rollback {
+                ItemRejectionRollback::NotEstablished => (
+                    "not_established",
+                    "KiCad rejected one or more items. Other changes may have applied.",
+                ),
+                ItemRejectionRollback::Confirmed { commit_id } => {
+                    guidance.evidence["commit_id"] = json!(commit_id);
+                    ("confirmed", "KiCad rejected one or more items and acknowledged dropping the commit. That does not verify the overall board outcome.")
+                }
+                ItemRejectionRollback::Unconfirmed => (
+                    "unconfirmed",
+                    "KiCad rejected one or more items, but rollback was not confirmed.",
+                ),
+            };
+            if !matches!(rollback, ItemRejectionRollback::Unconfirmed) {
+                guidance.cause = "kicad_api_rejection".into();
+                guidance.troubleshooting_url = Some(troubleshooting_url("kicad-rejected-items-during-an-ipc-write"));
+            }
+            guidance.observed = observed.into();
+            guidance.evidence["rollback"] = json!(rollback_status);
+            match rejection.as_ref() {
+                ItemRejection::Create { requested_count, reported_created_count, rejected_items, .. } => {
+                    guidance.evidence["command"] = json!("CreateItems");
+                    guidance.evidence["requested_count"] = json!(requested_count);
+                    guidance.evidence["reported_created_count"] = json!(reported_created_count);
+                    guidance.evidence["rejected_items"] = json!(rejected_items.iter().map(|row| json!({
+                        "reply_index": row.reply_index, "status": row.status.as_str_name(), "error_message": row.error_message,
+                    })).collect::<Vec<_>>());
+                }
+                ItemRejection::Delete { reported_deleted_kiids, rejected_items, unclassified_kiids, unreported_kiids, .. } => {
+                    guidance.evidence["command"] = json!("DeleteItems");
+                    guidance.evidence["reported_deleted_kiids"] = json!(reported_deleted_kiids);
+                    guidance.evidence["unclassified_kiids"] = json!(unclassified_kiids);
+                    guidance.evidence["unreported_kiids"] = json!(unreported_kiids);
+                    guidance.evidence["rejected_items"] = json!(rejected_items.iter().map(|row| json!({
+                        "kiid": row.kiid, "status": row.status.as_str_name(),
+                    })).collect::<Vec<_>>());
+                }
+            }
+            guidance
+        }
         IpcFailure::Preflight(refusal) => for_preflight_refusal(refusal),
         IpcFailure::Rejected { message, status } => RecoveryGuidance {
             cause: if status.is_some() { "kicad_api_rejection" } else { "unknown" }.to_string(),
@@ -817,6 +861,48 @@ mod tests {
             "The operation failed, but the source of the failure and what was applied are not known."
         );
         assert!(recovery.get("troubleshooting_url").is_none());
+    }
+
+    #[test]
+    fn delete_item_rejection_does_not_imply_that_nothing_applied() {
+        use copperpour_ipc::client::{DeleteItemRejection, ItemRejection};
+        use copperpour_ipc::gen::kiapi::common::commands::ItemDeletionStatus;
+
+        let error = ItemRejection::Delete {
+            reported_deleted_kiids: vec!["accepted-track".into()],
+            rejected_items: vec![DeleteItemRejection {
+                kiid: "protected-track".into(),
+                status: ItemDeletionStatus::IdsImmutable,
+            }],
+            unclassified_kiids: vec![],
+            unreported_kiids: vec!["unreported-track".into()],
+            diagnostic: "protected track refused".into(),
+        };
+        let body = parse_result(&ipc_failure_result(IpcFailure::from_error(error.into())));
+        let recovery = &body["recovery"];
+        assert_eq!(recovery["cause"], "kicad_api_rejection");
+        assert_eq!(recovery["mutation_outcome"], "unknown");
+        assert_eq!(recovery["retry_safe"], false);
+        assert!(recovery["troubleshooting_url"]
+            .as_str()
+            .unwrap()
+            .ends_with("#kicad-rejected-items-during-an-ipc-write"));
+        assert_eq!(recovery["evidence"]["command"], "DeleteItems");
+        assert_eq!(
+            recovery["evidence"]["rejected_items"],
+            json!([
+                {"kiid": "protected-track", "status": "IDS_IMMUTABLE"}
+            ])
+        );
+        assert_eq!(
+            recovery["evidence"]["reported_deleted_kiids"],
+            json!(["accepted-track"])
+        );
+        assert_eq!(recovery["evidence"]["rollback"], "not_established");
+        assert_eq!(
+            recovery["evidence"]["unreported_kiids"],
+            json!(["unreported-track"])
+        );
     }
 
     #[test]

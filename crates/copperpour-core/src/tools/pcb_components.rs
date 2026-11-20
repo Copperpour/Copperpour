@@ -4362,6 +4362,9 @@ async fn handle_get_component_pads(
         Err(copperpour_ipc::IpcFailure::Uncertain(message)) => {
             return Ok(crate::tools::ipc_uncertain_result(&message));
         }
+        Err(failure @ copperpour_ipc::IpcFailure::ItemRejected { .. }) => {
+            return Ok(crate::tools::ipc_failure_result(failure));
+        }
     }
 
     let content = std::fs::read_to_string(&board_path)?;

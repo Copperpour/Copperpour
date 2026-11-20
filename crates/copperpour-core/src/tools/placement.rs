@@ -277,6 +277,9 @@ pub(crate) async fn live_or_saved_board(
         Err(copperpour_ipc::IpcFailure::Uncertain(message)) => {
             return Ok(Err(crate::tools::ipc_uncertain_result(&message)));
         }
+        Err(failure @ copperpour_ipc::IpcFailure::ItemRejected { .. }) => {
+            return Ok(Err(crate::tools::ipc_failure_result(failure)));
+        }
     };
     Ok(Ok((content, source)))
 }

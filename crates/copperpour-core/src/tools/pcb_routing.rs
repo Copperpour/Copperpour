@@ -1356,15 +1356,24 @@ async fn handle_apply_specctra_ses(
             })
         })();
         match operation {
-            Ok(evidence) => Ok(evidence),
+            Ok(evidence) => Ok(Ok(evidence)),
             Err(error) => {
                 let rollback = client.run_commit("Rollback failed Freerouting SES import", |client| {
                     client.delete_items_in(document.clone(), created_ids.clone())
                 });
                 if let Err(rollback_error) = rollback {
-                    anyhow::bail!(
-                        "SES import failed ({error}); compensating deletion also failed ({rollback_error})"
+                    let reason = format!(
+                        "SES import failed ({error:#}); compensating deletion also failed ({rollback_error:#})"
                     );
+                    let typed = copperpour_ipc::IpcFailure::from_error(rollback_error);
+                    if matches!(typed, copperpour_ipc::IpcFailure::ItemRejected { .. }) {
+                        let mut recovery = crate::tools::ipc_recovery::for_ipc_outcome_unknown(&reason);
+                        // This describes the cleanup commit, not the already-published import.
+                        recovery.evidence["compensating_deletion"] =
+                            crate::tools::ipc_recovery::for_ipc_failure(&typed).evidence;
+                        return Ok(Err(crate::tools::ipc_uncertain_result_with_recovery(&reason, recovery)));
+                    }
+                    anyhow::bail!(reason);
                 }
                 let restored = client.save_document_to_string_in(document.clone())?;
                 if restored != before {
@@ -1387,7 +1396,7 @@ async fn handle_apply_specctra_ses(
     .await?;
 
     match result {
-        Ok(evidence) => Ok(CallToolResult::json(&json!({
+        Ok(Ok(evidence)) => Ok(CallToolResult::json(&json!({
             "success": true,
             "method": "strict_atomic_kicad_ipc_import",
             "board": board,
@@ -1417,6 +1426,10 @@ async fn handle_apply_specctra_ses(
             },
             "zone_refill": zone_refill(&evidence.zones)
         }))),
+        Ok(Err(result)) => Ok(result),
+        Err(failure @ copperpour_ipc::IpcFailure::ItemRejected { .. }) => {
+            Ok(crate::tools::ipc_failure_result(failure))
+        }
         Err(failure) => {
             let reason = failure.message().to_string();
             Ok(CallToolResult::error_kind(
@@ -5617,6 +5630,7 @@ mod route_pad_to_pad_tests {
 #[cfg(all(test, unix))]
 mod apply_specctra_ses_candidate_drc_tests {
     use super::*;
+    use crate::mcp::handler::McpHandler;
     use crate::router::ToolRouter;
     use crate::tools::pcb_board::board_mock::{spawn_kicad_holding_items, ItemStore};
     use crate::tools::ServerConfig;
@@ -5689,12 +5703,28 @@ mod apply_specctra_ses_candidate_drc_tests {
         /// The board path kicad-cli checked, and the rules beside it.
         checked: Option<std::path::PathBuf>,
         rules: Option<String>,
+        writes: Vec<String>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ItemFailure {
+        None,
+        Create,
+        Cleanup { acknowledge_drop: bool },
     }
 
     /// Serves `apply_specctra_ses` on a source project whose `.kicad_dru`
     /// holds `rules`, the candidate written in another directory, with
     /// `extra` merged into the arguments.
     async fn apply_in_project(rules: &str, extra: serde_json::Value) -> Applied {
+        apply_with_item_failure(rules, extra, ItemFailure::None).await
+    }
+
+    async fn apply_with_item_failure(
+        rules: &str,
+        extra: serde_json::Value,
+        failure: ItemFailure,
+    ) -> Applied {
         let project = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         let seen = tempfile::tempdir().unwrap();
@@ -5726,12 +5756,110 @@ mod apply_specctra_ses_candidate_drc_tests {
         );
 
         let store = Arc::new(Mutex::new(ItemStore::default()));
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let observed_writes = writes.clone();
         let server = spawn_kicad_holding_items(
             &board,
             vec!["", "GND", "VCC"],
             store.clone(),
             |_| {},
-            |command, held| {
+            move |command, held| {
+                use copperpour_ipc::builders::pack_any;
+                use kiapi::common::{commands as cmd, types::ItemRequestStatus};
+                let name = command.type_url.rsplit('.').next().unwrap();
+                match name {
+                    "BeginCommit" | "CreateItems" | "DeleteItems" => {
+                        observed_writes.lock().unwrap().push(name.to_string());
+                    }
+                    "EndCommit" => {
+                        let request = cmd::EndCommit::decode(command.value.as_slice()).unwrap();
+                        observed_writes
+                            .lock()
+                            .unwrap()
+                            .push(request.action().as_str_name().into());
+                        if request.action() == cmd::CommitAction::CmaDrop
+                            && matches!(
+                                failure,
+                                ItemFailure::Create
+                                    | ItemFailure::Cleanup {
+                                        acknowledge_drop: false
+                                    }
+                            )
+                        {
+                            return Some(pack_any(
+                                &cmd::EndCommitResponse {},
+                                "test.UnrelatedResponse",
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                if name == "CreateItems" && matches!(failure, ItemFailure::Create) {
+                    let request = cmd::CreateItems::decode(command.value.as_slice()).unwrap();
+                    assert!(request.items.len() > 1);
+                    return Some(pack_any(
+                        &cmd::CreateItemsResponse {
+                            status: ItemRequestStatus::IrsOk as i32,
+                            created_items: request
+                                .items
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, item)| {
+                                    let code = if i == 1 {
+                                        cmd::ItemStatusCode::IscInvalidData
+                                    } else {
+                                        cmd::ItemStatusCode::IscOk
+                                    };
+                                    cmd::ItemCreationResult {
+                                        status: Some(cmd::ItemStatus {
+                                            code: code as i32,
+                                            error_message: String::new(),
+                                        }),
+                                        item: (i != 1).then_some(item),
+                                    }
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.CreateItemsResponse",
+                    ));
+                }
+                if matches!(failure, ItemFailure::Cleanup { .. }) && held.creates != 0 {
+                    if name == "GetItems" {
+                        return Some(prost_types::Any {
+                            type_url: "type.googleapis.com/kiapi.common.commands.GetItemsResponse"
+                                .into(),
+                            value: vec![0xff],
+                        });
+                    }
+                    if name == "DeleteItems" {
+                        let request = cmd::DeleteItems::decode(command.value.as_slice()).unwrap();
+                        assert_eq!(request.item_ids.len(), 3);
+                        return Some(pack_any(
+                            &cmd::DeleteItemsResponse {
+                                status: ItemRequestStatus::IrsOk as i32,
+                                deleted_items: request
+                                    .item_ids
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, id)| {
+                                        let status = if i == 1 {
+                                            cmd::ItemDeletionStatus::IdsImmutable
+                                        } else {
+                                            cmd::ItemDeletionStatus::IdsOk
+                                        };
+                                        cmd::ItemDeletionResult {
+                                            id: Some(id),
+                                            status: status as i32,
+                                        }
+                                    })
+                                    .collect(),
+                                ..Default::default()
+                            },
+                            "kiapi.common.commands.DeleteItemsResponse",
+                        ));
+                    }
+                }
                 if !command.type_url.ends_with("SaveDocumentToString") {
                     return None;
                 }
@@ -5750,18 +5878,17 @@ mod apply_specctra_ses_candidate_drc_tests {
                 ))
             },
         );
-        let ctx = ToolContext::new(
-            ServerConfig {
-                kicad_cli: cli.to_string_lossy().into_owned(),
-                kicad_binary: String::new(),
-                ipc_address: server.address().to_string(),
-                project_dir: None,
-                jlcpcb_db_path: None,
-                auto_load_toolsets: false,
-                eager_toolsets: false,
-            },
-            Arc::new(ToolRouter::new()),
-        );
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: cli.to_string_lossy().into_owned(),
+            kicad_binary: String::new(),
+            ipc_address: server.address().to_string(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .unwrap();
         let mut args = json!({
             "board": board,
             "ses_path": ses,
@@ -5771,7 +5898,16 @@ mod apply_specctra_ses_candidate_drc_tests {
         if let serde_json::Value::Object(extra) = extra {
             args.as_object_mut().unwrap().extend(extra);
         }
-        let result = handle_apply_specctra_ses(&args, &ctx).await.unwrap();
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 589,
+                "method": "tools/call",
+                "params": {"name": "apply_specctra_ses", "arguments": args},
+            }))
+            .await
+            .unwrap();
+        let result: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
         let body = response_json(&result);
         let checked = std::fs::read_to_string(seen.path().join("board"))
             .ok()
@@ -5779,6 +5915,8 @@ mod apply_specctra_ses_candidate_drc_tests {
         let rules_seen = std::fs::read_to_string(seen.path().join("rules")).ok();
         if !result.is_error {
             assert!(candidate.is_file(), "the candidate stays");
+        } else if !matches!(failure, ItemFailure::None) {
+            assert!(!candidate.exists());
         }
         assert_eq!(std::fs::read_to_string(&board).unwrap(), SAVED);
         assert_eq!(
@@ -5786,11 +5924,76 @@ mod apply_specctra_ses_candidate_drc_tests {
             rules,
             "the project's rules are never written"
         );
+        let writes = writes.lock().unwrap().clone();
         Applied {
             result,
             body,
             checked,
             rules: rules_seen,
+            writes,
+        }
+    }
+
+    #[tokio::test]
+    async fn ses_create_rejection_with_unconfirmed_drop_keeps_item_evidence() {
+        let applied = apply_with_item_failure(RULES, json!({}), ItemFailure::Create).await;
+        assert!(applied.result.is_error);
+        assert!(applied.checked.is_none());
+        assert_eq!(applied.writes, ["BeginCommit", "CreateItems", "CMA_DROP"]);
+        assert_eq!(applied.body["error"]["kind"], "ipc_outcome_unknown");
+        let evidence = &applied.body["recovery"]["evidence"];
+        assert_eq!(evidence["rollback"], "unconfirmed");
+        assert_eq!(evidence["rejected_items"][0]["reply_index"], 1);
+        assert_eq!(evidence["rejected_items"][0]["status"], "ISC_INVALID_DATA");
+    }
+
+    #[tokio::test]
+    async fn ses_cleanup_drop_does_not_prove_that_the_import_was_rolled_back() {
+        for acknowledge_drop in [true, false] {
+            let applied = apply_with_item_failure(
+                RULES,
+                json!({}),
+                ItemFailure::Cleanup { acknowledge_drop },
+            )
+            .await;
+            assert!(applied.result.is_error);
+            assert!(applied.checked.is_none());
+            assert_eq!(
+                applied.writes,
+                [
+                    "BeginCommit",
+                    "CreateItems",
+                    "CMA_COMMIT",
+                    "BeginCommit",
+                    "DeleteItems",
+                    "CMA_DROP",
+                ]
+            );
+            assert_eq!(applied.body["error"]["kind"], "ipc_outcome_unknown");
+            let recovery = &applied.body["recovery"];
+            assert_eq!(recovery["mutation_outcome"], "unknown");
+            let reason = recovery["evidence"]["reason"].as_str().unwrap();
+            assert!(
+                reason.contains("Failed to decode protobuf Any body: failed to decode Protobuf message: invalid varint"),
+                "{reason}"
+            );
+            let cleanup = &recovery["evidence"]["compensating_deletion"];
+            assert_eq!(
+                cleanup["rollback"],
+                if acknowledge_drop {
+                    "confirmed"
+                } else {
+                    "unconfirmed"
+                }
+            );
+            assert_eq!(
+                cleanup["rejected_items"],
+                json!([{"kiid": "created-2", "status": "IDS_IMMUTABLE"}])
+            );
+            assert_eq!(
+                cleanup["reported_deleted_kiids"],
+                json!(["created-1", "created-3"])
+            );
         }
     }
 

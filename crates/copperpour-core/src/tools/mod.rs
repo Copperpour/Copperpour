@@ -822,7 +822,15 @@ pub(crate) fn ipc_failure_result(failure: copperpour_ipc::IpcFailure) -> CallToo
             )
         }
         copperpour_ipc::IpcFailure::Target { error, .. } => ipc_target_error_result(&error),
-        failure @ (copperpour_ipc::IpcFailure::Rejected { .. }
+        failure @ copperpour_ipc::IpcFailure::ItemRejected {
+            rollback: copperpour_ipc::client::ItemRejectionRollback::Unconfirmed,
+            ..
+        } => ipc_uncertain_result_with_recovery(
+            failure.message(),
+            ipc_recovery::for_ipc_failure(&failure),
+        ),
+        failure @ (copperpour_ipc::IpcFailure::ItemRejected { .. }
+        | copperpour_ipc::IpcFailure::Rejected { .. }
         | copperpour_ipc::IpcFailure::Preflight(_)) => {
             let message = failure.message().to_owned();
             let recovery = ipc_recovery::for_ipc_failure(&failure);
@@ -885,6 +893,13 @@ pub(crate) fn ipc_unserved_handler_error(
 }
 
 pub(crate) fn ipc_uncertain_result(message: &str) -> CallToolResult {
+    ipc_uncertain_result_with_recovery(message, ipc_recovery::for_ipc_outcome_unknown(message))
+}
+
+fn ipc_uncertain_result_with_recovery(
+    message: &str,
+    recovery: crate::mcp::error::RecoveryGuidance,
+) -> CallToolResult {
     CallToolResult::error_kind_with_recovery(
         crate::mcp::error::ToolErrorKind::IpcOutcomeUnknown {
             board_state: "unknown".to_string(),
@@ -892,7 +907,7 @@ pub(crate) fn ipc_uncertain_result(message: &str) -> CallToolResult {
             reason: message.to_string(),
         },
         format!("{message}. Do not repeat the mutation or edit the saved file. Inspect the requested live board and reconcile any applied work before retrying. Automatic recovery has not been established."),
-        ipc_recovery::for_ipc_outcome_unknown(message),
+        recovery,
     )
 }
 

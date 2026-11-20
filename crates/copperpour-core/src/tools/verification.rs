@@ -1692,6 +1692,9 @@ async fn handle_check_clearance(
         Err(copperpour_ipc::IpcFailure::Uncertain(message)) => {
             return Ok(crate::tools::ipc_uncertain_result(&message));
         }
+        Err(failure @ copperpour_ipc::IpcFailure::ItemRejected { .. }) => {
+            return Ok(crate::tools::ipc_failure_result(failure));
+        }
     };
     let tree = copperpour_sexp::parser::parse_sexp(&content)?;
 

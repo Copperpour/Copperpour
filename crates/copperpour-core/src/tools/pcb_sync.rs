@@ -694,11 +694,19 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             )?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
-            client.run_commit_recovering_in(snapshot.document.clone(), "Update PCB from saved schematic", |client| {
+            let commit = client.run_commit_recovering_in(snapshot.document.clone(), "Update PCB from saved schematic", |client| {
                 create_sync_items_in(client, &snapshot.document, &creates)?;
                 client.update_items_in(snapshot.document.clone(), updates)?;
                 Ok(())
-            })?;
+            });
+            if let Err(error) = commit {
+                if error.downcast_ref::<copperpour_ipc::client::ItemRejection>().is_some() {
+                    return Ok(crate::tools::ipc_failure_result(
+                        copperpour_ipc::IpcFailure::from_error(error),
+                    ));
+                }
+                return Err(error);
+            }
             for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?
             {
                 plan.diagnostics.push(conflict(
@@ -7808,6 +7816,8 @@ mod tests {
     /// What the mock's board holds after `CreateItems`.
     #[derive(Clone, Copy)]
     enum Readback {
+        /// Refuse creation before there is any new footprint to read back.
+        RefuseCreation,
         /// Exactly what was sent, as a KiCad that kept everything does.
         AsSent,
         /// What was sent without the instance attributes and 3D models: the
@@ -8066,13 +8076,16 @@ mod tests {
                         ));
                     }
                     if command.type_url.ends_with("CreateItems") {
-                        let request =
-                            kiapi::common::commands::CreateItems::decode(command.value.as_slice())
-                                .expect("CreateItems request");
-                        board_items
-                            .lock()
-                            .unwrap()
-                            .extend(request.items.iter().cloned());
+                        use kiapi::common::commands as cmd;
+                        let request = cmd::CreateItems::decode(command.value.as_slice())
+                            .expect("CreateItems request");
+                        let refused = matches!(readback, Readback::RefuseCreation);
+                        if !refused {
+                            board_items
+                                .lock()
+                                .unwrap()
+                                .extend(request.items.iter().cloned());
+                        }
                         return Some(copperpour_ipc::builders::pack_any(
                             &kiapi::common::commands::CreateItemsResponse {
                                 header: None,
@@ -8082,11 +8095,19 @@ mod tests {
                                     .into_iter()
                                     .map(|item| kiapi::common::commands::ItemCreationResult {
                                         status: Some(kiapi::common::commands::ItemStatus {
-                                            code: kiapi::common::commands::ItemStatusCode::IscOk
+                                            code: if refused {
+                                                cmd::ItemStatusCode::IscInvalidData
+                                            } else {
+                                                cmd::ItemStatusCode::IscOk
+                                            }
                                                 as i32,
-                                            error_message: String::new(),
+                                            error_message: if refused {
+                                                "footprint refused".into()
+                                            } else {
+                                                String::new()
+                                            },
                                         }),
-                                        item: Some(item),
+                                        item: (!refused).then_some(item),
                                     })
                                     .collect(),
                             },
@@ -8127,6 +8148,16 @@ mod tests {
                         ));
                     }
                     if command.type_url.ends_with("EndCommit") {
+                        if matches!(readback, Readback::RefuseCreation) {
+                            let request = kiapi::common::commands::EndCommit::decode(
+                                command.value.as_slice(),
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                request.action(),
+                                kiapi::common::commands::CommitAction::CmaDrop
+                            );
+                        }
                         committed.store(true, std::sync::atomic::Ordering::SeqCst);
                         return Some(copperpour_ipc::builders::pack_any(
                             &kiapi::common::commands::EndCommitResponse {},
@@ -8305,7 +8336,7 @@ mod tests {
     /// A created item as the mock's board lists it back.
     fn read_back(item: &prost_types::Any, readback: Readback) -> prost_types::Any {
         match readback {
-            Readback::AsSent => item.clone(),
+            Readback::AsSent | Readback::RefuseCreation => item.clone(),
             Readback::WithoutLibraryData => {
                 let mut footprint =
                     copperpour_ipc::gen::kiapi::board::types::FootprintInstance::decode(
@@ -9192,6 +9223,37 @@ mod tests {
             keys(&refused["diagnostics"][0]),
             keys(&planned["diagnostics"][0])
         );
+    }
+
+    #[tokio::test]
+    async fn sync_reports_create_rejection_after_acknowledged_drop() {
+        let served = ServedSync::reading_back(Readback::RefuseCreation).await;
+        let netlist = exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]);
+        let before = std::fs::read(&served.board).unwrap();
+        let plan = served.dry_run(&netlist).await;
+        assert_eq!(plan["status"], "ready", "{plan}");
+        let (is_error, result) = served
+            .sync(
+                &netlist,
+                serde_json::json!({
+                    "dry_run": false, "expected_plan_revision": plan["plan_revision"],
+                }),
+            )
+            .await;
+        assert!(is_error);
+        let recovery = &result["recovery"];
+        assert_eq!(recovery["cause"], "kicad_api_rejection", "{result}");
+        assert_eq!(recovery["mutation_outcome"], "unknown");
+        assert_eq!(recovery["evidence"]["rollback"], "confirmed");
+        assert_eq!(
+            recovery["evidence"]["rejected_items"][0]["status"],
+            "ISC_INVALID_DATA"
+        );
+        assert_eq!(served.sent("CreateItems"), 1);
+        assert_eq!(served.sent("EndCommit"), 1);
+        assert_eq!(served.sent("UpdateItems"), 0);
+        assert!(served.held.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read(&served.board).unwrap(), before);
     }
 
     /// #789 through the served boundary. A stock 0603 capacitor the board

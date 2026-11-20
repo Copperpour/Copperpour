@@ -176,6 +176,8 @@ where
         LiveBoard::Uncertain(message) => BoardRead::Refused(super::ipc_uncertain_result(&message)),
         LiveBoard::Recovered(message) => BoardRead::Refused(super::ipc_recovered_result(&message)),
 
+        LiveBoard::ItemRejected(failure) => BoardRead::Refused(super::ipc_failure_result(failure)),
+
         result @ (LiveBoard::Rejected { .. } | LiveBoard::Preflight(_)) => {
             let failure = match result {
                 LiveBoard::Rejected { message, status } => {

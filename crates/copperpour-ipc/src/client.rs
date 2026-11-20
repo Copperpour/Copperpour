@@ -1133,6 +1133,13 @@ pub enum IpcFailure {
         message: String,
         status: Option<String>,
     },
+    /// A create/delete reply reported a per-item refusal. The rollback
+    /// evidence determines whether other changes may still have applied.
+    ItemRejected {
+        message: String,
+        rejection: Box<ItemRejection>,
+        rollback: ItemRejectionRollback,
+    },
     /// Copperpour refused the request itself, on what it read from KiCad,
     /// before KiCad kept any of it. Its message is the refusal's `reason`.
     Preflight(PreflightRefusal),
@@ -1153,7 +1160,23 @@ impl IpcFailure {
     /// message text.
     pub fn from_error(error: anyhow::Error) -> Self {
         let message = format!("{error:#}");
-        if error.downcast_ref::<IpcOutcomeUnknown>().is_some() {
+        let uncertain = error.downcast_ref::<IpcOutcomeUnknown>().is_some();
+        if let Some(rejection) = error.downcast_ref::<ItemRejection>() {
+            let rollback = if uncertain {
+                ItemRejectionRollback::Unconfirmed
+            } else if let Some(dropped) = error.downcast_ref::<ItemRejectionDropped>() {
+                ItemRejectionRollback::Confirmed {
+                    commit_id: dropped.commit_id.clone(),
+                }
+            } else {
+                ItemRejectionRollback::NotEstablished
+            };
+            IpcFailure::ItemRejected {
+                message,
+                rejection: Box::new(rejection.clone()),
+                rollback,
+            }
+        } else if uncertain {
             IpcFailure::Uncertain(message)
         } else if error.downcast_ref::<IpcBatchRecovered>().is_some() {
             IpcFailure::Recovered(message)
@@ -1198,11 +1221,81 @@ impl IpcFailure {
         match self {
             IpcFailure::Unreachable { message, .. }
             | IpcFailure::Rejected { message, .. }
+            | IpcFailure::ItemRejected { message, .. }
             | IpcFailure::Uncertain(message)
             | IpcFailure::Recovered(message)
             | IpcFailure::Target { message, .. } => message,
             IpcFailure::Preflight(refusal) => &refusal.reason,
         }
+    }
+}
+
+/// Explicit per-item statuses from a failed create or delete request. These
+/// describe KiCad's reply, not what persisted on the board.
+#[derive(Debug, Clone)]
+pub enum ItemRejection {
+    Create {
+        requested_count: usize,
+        reported_created_count: usize,
+        rejected_items: Vec<CreateItemRejection>,
+        diagnostic: String,
+    },
+    Delete {
+        reported_deleted_kiids: Vec<String>,
+        rejected_items: Vec<DeleteItemRejection>,
+        unclassified_kiids: Vec<String>,
+        unreported_kiids: Vec<String>,
+        diagnostic: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateItemRejection {
+    pub reply_index: usize,
+    pub status: kiapi::common::commands::ItemStatusCode,
+    pub error_message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteItemRejection {
+    pub kiid: String,
+    pub status: kiapi::common::commands::ItemDeletionStatus,
+}
+
+#[derive(Debug, Clone)]
+pub enum ItemRejectionRollback {
+    /// No transaction result establishes that these changes were dropped.
+    NotEstablished,
+    /// KiCad acknowledged dropping the commit; no snapshot comparison.
+    Confirmed { commit_id: String },
+    /// Outcome-unknown evidence takes precedence over the rejection.
+    Unconfirmed,
+}
+
+impl std::fmt::Display for ItemRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Create { diagnostic, .. } | Self::Delete { diagnostic, .. } => {
+                f.write_str(diagnostic)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ItemRejection {}
+
+#[derive(Debug)]
+struct ItemRejectionDropped {
+    commit_id: String,
+}
+
+impl std::fmt::Display for ItemRejectionDropped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "KiCad batch failed; changes dropped (commit {})",
+            self.commit_id
+        )
     }
 }
 
@@ -2828,10 +2921,14 @@ impl KiCadIpcClient {
             items,
             container: None,
         };
-        let response = unpack_required::<kiapi::common::commands::CreateItemsResponse>(
-            self.send_command(&cmd, "kiapi.common.commands.CreateItems")?,
-            "CreateItems",
-        )?;
+        let reply = self.send_command(&cmd, "kiapi.common.commands.CreateItems")?;
+        // Decodable bytes alone are not evidence of a create refusal. Keep the
+        // existing accept/refuse decision, but only attribute typed rows to this reply.
+        let exact_type = reply.as_ref().is_some_and(|reply| {
+            crate::builders::any_is(reply, "kiapi.common.commands.CreateItemsResponse")
+        });
+        let response =
+            unpack_required::<kiapi::common::commands::CreateItemsResponse>(reply, "CreateItems")?;
         ensure_item_request_ok(response.status, "item creation")?;
         if response.created_items.is_empty() {
             // KiCad 10.0's observed behaviour for a request it ignores: an
@@ -2844,6 +2941,7 @@ impl KiCadIpcClient {
         let mut created = 0usize;
         let mut created_items = Vec::new();
         let mut rejections = Vec::new();
+        let mut rejected_items = Vec::new();
         for (index, result) in response.created_items.iter().enumerate() {
             let (code, is_created) = creation_outcome(result);
             if is_created {
@@ -2855,6 +2953,17 @@ impl KiCadIpcClient {
                     created_items.push(item);
                 }
             } else {
+                if let Some(status) = result
+                    .status
+                    .as_ref()
+                    .filter(|_| code != kiapi::common::commands::ItemStatusCode::IscUnknown)
+                {
+                    rejected_items.push(CreateItemRejection {
+                        reply_index: index,
+                        status: code,
+                        error_message: status.error_message.clone(),
+                    });
+                }
                 let message = result
                     .status
                     .as_ref()
@@ -2865,11 +2974,21 @@ impl KiCadIpcClient {
             }
         }
         if created != expected_count {
-            anyhow::bail!(
+            let diagnostic = format!(
                 "KiCad created {created} of {expected_count} requested items{}{}",
                 if rejections.is_empty() { "" } else { ": " },
                 rejections.join("; ")
             );
+            if !exact_type || rejected_items.is_empty() {
+                anyhow::bail!(diagnostic);
+            }
+            return Err(ItemRejection::Create {
+                requested_count: expected_count,
+                reported_created_count: created,
+                rejected_items,
+                diagnostic,
+            }
+            .into());
         }
         Ok(created_items)
     }
@@ -3025,10 +3144,13 @@ impl KiCadIpcClient {
                 .map(|id| kiapi::common::types::Kiid { value: id.clone() })
                 .collect(),
         };
-        let response = unpack_required::<kiapi::common::commands::DeleteItemsResponse>(
-            self.send_command(&cmd, "kiapi.common.commands.DeleteItems")?,
-            "DeleteItems",
-        )?;
+        let reply = self.send_command(&cmd, "kiapi.common.commands.DeleteItems")?;
+        // As for CreateItems, the type only gates how we report an existing failure.
+        let exact_type = reply.as_ref().is_some_and(|reply| {
+            crate::builders::any_is(reply, "kiapi.common.commands.DeleteItemsResponse")
+        });
+        let response =
+            unpack_required::<kiapi::common::commands::DeleteItemsResponse>(reply, "DeleteItems")?;
         ensure_item_request_ok(response.status, "item deletion")?;
         // KiCad 10 builds per-item results in
         // API_HANDLER_EDITOR::handleDeleteItems and then never attaches them
@@ -3042,29 +3164,59 @@ impl KiCadIpcClient {
         if response.deleted_items.is_empty() {
             return Ok(());
         }
-        if response.deleted_items.len() != expected_count {
-            anyhow::bail!(
+        let mut first_failure = (response.deleted_items.len() != expected_count).then(|| {
+            format!(
                 "KiCad returned {} deletion results for {} requested items",
                 response.deleted_items.len(),
                 expected_count
-            );
-        }
+            )
+        });
+        use kiapi::common::commands::ItemDeletionStatus;
+        let mut rejected_items = Vec::new();
+        let mut reported_deleted_kiids = Vec::new();
+        let mut unclassified_kiids = Vec::new();
         for result in response.deleted_items {
             let status = result.status();
-            let id = result
-                .id
-                .context("KiCad returned a deletion result without an item identifier")?
-                .value;
+            let Some(id) = result.id.map(|id| id.value) else {
+                first_failure.get_or_insert_with(|| {
+                    "KiCad returned a deletion result without an item identifier".into()
+                });
+                continue;
+            };
             if !expected_ids.remove(&id) {
-                anyhow::bail!("KiCad returned a deletion result for unexpected item '{id}'");
+                first_failure.get_or_insert_with(|| {
+                    format!("KiCad returned a deletion result for unexpected item '{id}'")
+                });
+                continue;
             }
-            if status != kiapi::common::commands::ItemDeletionStatus::IdsOk {
-                anyhow::bail!(
-                    "KiCad failed to delete item '{}': {}",
-                    id,
-                    status.as_str_name()
-                );
+            if status != ItemDeletionStatus::IdsOk {
+                first_failure.get_or_insert_with(|| {
+                    format!(
+                        "KiCad failed to delete item '{id}': {}",
+                        status.as_str_name()
+                    )
+                });
             }
+            match status {
+                ItemDeletionStatus::IdsOk => reported_deleted_kiids.push(id),
+                ItemDeletionStatus::IdsUnknown => unclassified_kiids.push(id),
+                _ => rejected_items.push(DeleteItemRejection { kiid: id, status }),
+            }
+        }
+        if let Some(diagnostic) = first_failure {
+            if !exact_type || rejected_items.is_empty() {
+                anyhow::bail!(diagnostic);
+            }
+            let mut unreported_kiids: Vec<_> = expected_ids.into_iter().collect();
+            unreported_kiids.sort_unstable();
+            return Err(ItemRejection::Delete {
+                reported_deleted_kiids,
+                rejected_items,
+                unclassified_kiids,
+                unreported_kiids,
+                diagnostic,
+            }
+            .into());
         }
         Ok(())
     }
@@ -3169,6 +3321,16 @@ impl KiCadIpcClient {
         action: kiapi::common::commands::CommitAction,
         message: &str,
     ) -> Result<()> {
+        self.end_commit_with_reply_evidence(commit_id, action, message)
+            .map(|_| ())
+    }
+
+    fn end_commit_with_reply_evidence(
+        &self,
+        commit_id: &str,
+        action: kiapi::common::commands::CommitAction,
+        message: &str,
+    ) -> Result<bool> {
         let cmd = kiapi::common::commands::EndCommit {
             id: Some(kiapi::common::types::Kiid {
                 value: commit_id.to_string(),
@@ -3177,11 +3339,12 @@ impl KiCadIpcClient {
             message: message.to_string(),
             header: self.commit_header(),
         };
-        let _: kiapi::common::commands::EndCommitResponse = unpack_required(
-            self.send_command(&cmd, "kiapi.common.commands.EndCommit")?,
-            "EndCommit",
-        )?;
-        Ok(())
+        let reply = self.send_command(&cmd, "kiapi.common.commands.EndCommit")?;
+        let exact_type = reply.as_ref().is_some_and(|reply| {
+            crate::builders::any_is(reply, "kiapi.common.commands.EndCommitResponse")
+        });
+        let _: kiapi::common::commands::EndCommitResponse = unpack_required(reply, "EndCommit")?;
+        Ok(exact_type)
     }
 
     /// Push (commit) changes.
@@ -3262,11 +3425,28 @@ impl KiCadIpcClient {
                         "batch outcome unknown for commit {commit_id}; no blind rollback attempted"
                     ));
                 }
-                if let Err(rollback_error) = self.drop_commit(&commit_id) {
-                    return Err(operation_error.context(IpcOutcomeUnknown {
+                let drop_reply = self.end_commit_with_reply_evidence(
+                    &commit_id,
+                    kiapi::common::commands::CommitAction::CmaDrop,
+                    "",
+                );
+                let exact_type = match drop_reply {
+                    Ok(exact_type) => exact_type,
+                    Err(rollback_error) => return Err(operation_error.context(IpcOutcomeUnknown {
                         command: "EndCommit".to_string(),
                         reason: format!("commit {commit_id}: operation failed; rollback also failed ({rollback_error:#})"),
-                    }));
+                    })),
+                };
+                if operation_error.downcast_ref::<ItemRejection>().is_some() {
+                    if !exact_type {
+                        return Err(operation_error.context(IpcOutcomeUnknown {
+                            command: "EndCommit".into(),
+                            reason: format!(
+                                "commit {commit_id}: drop reply did not carry an EndCommitResponse"
+                            ),
+                        }));
+                    }
+                    return Err(operation_error).context(ItemRejectionDropped { commit_id });
                 }
                 Err(operation_error).context("KiCad batch failed; changes dropped")
             }

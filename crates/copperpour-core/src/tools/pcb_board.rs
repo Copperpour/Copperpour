@@ -384,6 +384,9 @@ where
         LiveBoard::Uncertain(message) => {
             BoardWrite::Refused(crate::tools::ipc_uncertain_result(&message))
         }
+        LiveBoard::ItemRejected(failure) => {
+            BoardWrite::Refused(crate::tools::ipc_failure_result(failure))
+        }
         // An endpoint that served no board still refuses, as a rejection
         // does. Whether a write should instead treat a proven-absent editor
         // as permission is mixelpixx/Konnect#577's question, not this one's. Only the
@@ -689,6 +692,13 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
             | LiveBoard::Unserved { .. }
             | LiveBoard::NotOpen { .. } => None,
             LiveBoard::Uncertain(message) => Some(crate::tools::ipc_uncertain_result(&message)),
+            LiveBoard::ItemRejected(
+                failure @ copperpour_ipc::IpcFailure::ItemRejected {
+                    rollback: copperpour_ipc::client::ItemRejectionRollback::Unconfirmed,
+                    ..
+                },
+            ) => Some(crate::tools::ipc_failure_result(failure)),
+            LiveBoard::ItemRejected(_) => None,
             LiveBoard::Recovered(message) => Some(crate::tools::ipc_recovered_result(&message)),
             LiveBoard::Unresolved(error) => Some(crate::tools::ipc_target_error_result(&error)),
             LiveBoard::NeverReached { .. } => board_lock_refusal(board_path),
@@ -5483,6 +5493,7 @@ mod delete_graphics_tests {
         board: &std::path::Path,
         shapes: Vec<(&'static str, &'static str)>,
         deleted: Arc<Mutex<Vec<String>>>,
+        delete_rejection: Option<kiapi::common::commands::ItemDeletionStatus>,
     ) -> crate::test_support::MockIpcServer {
         spawn_kicad_holding_board(board, move |command| {
             if command.type_url.ends_with("GetItems") {
@@ -5520,7 +5531,17 @@ mod delete_graphics_tests {
                     &kiapi::common::commands::DeleteItemsResponse {
                         header: None,
                         status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                        deleted_items: vec![],
+                        deleted_items: delete_rejection
+                            .into_iter()
+                            .flat_map(|status| {
+                                delete.item_ids.iter().cloned().map(move |id| {
+                                    kiapi::common::commands::ItemDeletionResult {
+                                        id: Some(id),
+                                        status: status as i32,
+                                    }
+                                })
+                            })
+                            .collect(),
                     },
                     "kiapi.common.commands.DeleteItemsResponse",
                 ))
@@ -5540,6 +5561,7 @@ mod delete_graphics_tests {
             &board,
             vec![("live-edge", "Edge.Cuts"), ("live-silk", "F.SilkS")],
             deleted.clone(),
+            None,
         );
         let ctx = ctx_talking_to(server.address().to_string());
 
@@ -5554,6 +5576,53 @@ mod delete_graphics_tests {
         assert_eq!(body["deleted"], json!(1));
         assert_eq!(*deleted.lock().unwrap(), vec!["live-edge".to_string()]);
         // The file is the last save; KiCad owns the board, so it stays as-is.
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
+    }
+
+    #[tokio::test]
+    async fn live_graphic_delete_rejection_does_not_fall_back_to_the_saved_board() {
+        let (_dir, board) = board_file();
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let server = spawn_kicad_with_shapes(
+            &board,
+            vec![("edge-top", "Edge.Cuts")],
+            deleted.clone(),
+            Some(kiapi::common::commands::ItemDeletionStatus::IdsImmutable),
+        );
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            ipc_address: server.address().to_string(),
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 589, "method": "tools/call",
+                "params": {"name": "delete_graphics", "arguments": {
+                    "board": board, "layer": "Edge.Cuts"
+                }}
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(response["isError"], true);
+        let body: serde_json::Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        let recovery = &body["recovery"];
+        assert_eq!(recovery["cause"], "kicad_api_rejection");
+        assert_eq!(recovery["mutation_outcome"], "unknown");
+        assert_eq!(recovery["retry_safe"], false);
+        assert_eq!(recovery["evidence"]["rollback"], "not_established");
+        assert_eq!(
+            recovery["evidence"]["rejected_items"],
+            json!([
+                {"kiid": "edge-top", "status": "IDS_IMMUTABLE"}
+            ])
+        );
+        assert_eq!(*deleted.lock().unwrap(), ["edge-top"]);
+        // The matching edge also exists in the file: a fallthrough would remove it.
         assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
     }
 

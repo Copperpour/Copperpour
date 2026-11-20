@@ -685,7 +685,8 @@ fn live_error_result(error: anyhow::Error, operation: &str) -> CallToolResult {
         copperpour_ipc::IpcFailure::Target { error, .. } => ipc_target_error_result(&error),
         copperpour_ipc::IpcFailure::Recovered(message) => ipc_recovered_result(&message),
         copperpour_ipc::IpcFailure::Uncertain(message) => ipc_uncertain_result(&message),
-        failure @ copperpour_ipc::IpcFailure::Unreachable { .. } => {
+        failure @ (copperpour_ipc::IpcFailure::Unreachable { .. }
+        | copperpour_ipc::IpcFailure::ItemRejected { .. }) => {
             crate::tools::ipc_failure_result(failure)
         }
         failure @ (copperpour_ipc::IpcFailure::Rejected { .. }
