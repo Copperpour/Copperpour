@@ -1083,6 +1083,9 @@ struct ApplyEvidence {
     preserved_locked_track_count: usize,
     preserved_locked_via_count: usize,
     drc_violations: usize,
+    drc_errors: usize,
+    drc_warnings: usize,
+    drc_findings: Vec<cli::DrcViolation>,
     unconnected_items: usize,
     schematic_parity_violations: usize,
     project_rules_applied: bool,
@@ -1338,6 +1341,13 @@ async fn handle_apply_specctra_ses(
                 skip_creepage,
             ))?;
             let parity_count = drc.schematic_parity.as_ref().map_or(0, Vec::len);
+            let drc_errors = drc.all().filter(|v| v.severity == "error").count();
+            let drc_warnings = drc.all().filter(|v| v.severity == "warning").count();
+            let mut drc_findings: Vec<cli::DrcViolation> = drc.all().cloned().collect();
+            drc_findings.sort_by(|a, b| {
+                super::drc::drc_severity_rank(&b.severity)
+                    .cmp(&super::drc::drc_severity_rank(&a.severity))
+            });
             Ok(ApplyEvidence {
                 source_sha256: plan.source_sha256.clone(),
                 session_id: plan.session_id.clone(),
@@ -1348,6 +1358,9 @@ async fn handle_apply_specctra_ses(
                 preserved_locked_track_count: plan.locked_track_count,
                 preserved_locked_via_count: plan.locked_via_count,
                 drc_violations: drc.violations.len(),
+                drc_errors,
+                drc_warnings,
+                drc_findings,
                 unconnected_items: drc.unconnected_items.as_ref().map_or(0, Vec::len),
                 schematic_parity_violations: parity_count,
                 project_rules_applied,
@@ -1396,36 +1409,49 @@ async fn handle_apply_specctra_ses(
     .await?;
 
     match result {
-        Ok(Ok(evidence)) => Ok(CallToolResult::json(&json!({
-            "success": true,
-            "method": "strict_atomic_kicad_ipc_import",
-            "board": board,
-            "candidate_output_path": candidate,
-            "source_overwritten": false,
-            "undo_description": "Import Freerouting SES",
-            "source_sha256": evidence.source_sha256,
-            "session_id": evidence.session_id,
-            "track_count": evidence.track_count,
-            "arc_count": evidence.arc_count,
-            "via_count": evidence.via_count,
-            "created_count": evidence.created_count,
-            "preserved_locked_routing": {
-                "tracks": evidence.preserved_locked_track_count,
-                "vias": evidence.preserved_locked_via_count
-            },
-            "ipc_readback": "exact_count_match",
-            "drc": {
-                "clean": evidence.drc_violations == 0
-                    && evidence.unconnected_items == 0
-                    && evidence.schematic_parity_violations == 0,
-                "violations": evidence.drc_violations,
-                "unconnected_items": evidence.unconnected_items,
-                "schematic_parity_violations": evidence.schematic_parity_violations,
-                "project_rules_applied": evidence.project_rules_applied,
-                "creepage_skipped": evidence.creepage_skipped
-            },
-            "zone_refill": zone_refill(&evidence.zones)
-        }))),
+        Ok(Ok(evidence)) => {
+            const DRC_FINDINGS_LIMIT: usize = 50;
+            let bounded = super::BoundedList::new(&evidence.drc_findings, DRC_FINDINGS_LIMIT);
+            Ok(CallToolResult::json(&json!({
+                "success": true,
+                "method": "strict_atomic_kicad_ipc_import",
+                "board": board,
+                "candidate_output_path": candidate,
+                "source_overwritten": false,
+                "undo_description": "Import Freerouting SES",
+                "source_sha256": evidence.source_sha256,
+                "session_id": evidence.session_id,
+                "track_count": evidence.track_count,
+                "arc_count": evidence.arc_count,
+                "via_count": evidence.via_count,
+                "created_count": evidence.created_count,
+                "preserved_locked_routing": {
+                    "tracks": evidence.preserved_locked_track_count,
+                    "vias": evidence.preserved_locked_via_count
+                },
+                "ipc_readback": "exact_count_match",
+                "drc": {
+                    "clean": evidence.drc_errors == 0
+                        && evidence.unconnected_items == 0
+                        && evidence.schematic_parity_violations == 0,
+                    "errors": evidence.drc_errors,
+                    "warnings": evidence.drc_warnings,
+                    "violations": evidence.drc_violations,
+                    "unconnected_items": evidence.unconnected_items,
+                    "schematic_parity_violations": evidence.schematic_parity_violations,
+                    "shown": bounded.shown,
+                    "truncated": bounded.truncated,
+                    "findings": bounded
+                        .items
+                        .iter()
+                        .map(super::drc::drc_finding_json)
+                        .collect::<Vec<_>>(),
+                    "project_rules_applied": evidence.project_rules_applied,
+                    "creepage_skipped": evidence.creepage_skipped
+                },
+                "zone_refill": zone_refill(&evidence.zones)
+            })))
+        }
         Ok(Err(result)) => Ok(result),
         Err(failure @ copperpour_ipc::IpcFailure::ItemRejected { .. }) => {
             Ok(crate::tools::ipc_failure_result(failure))
@@ -5725,6 +5751,30 @@ mod apply_specctra_ses_candidate_drc_tests {
         extra: serde_json::Value,
         failure: ItemFailure,
     ) -> Applied {
+        apply_in_project_with_report_and_failure(
+            rules,
+            extra,
+            r#"{"violations":[],"unconnected_items":[],"schematic_parity":[]}"#,
+            failure,
+        )
+        .await
+    }
+
+    async fn apply_in_project_with_report(
+        rules: &str,
+        extra: serde_json::Value,
+        drc_report_json: &str,
+    ) -> Applied {
+        apply_in_project_with_report_and_failure(rules, extra, drc_report_json, ItemFailure::None)
+            .await
+    }
+
+    async fn apply_in_project_with_report_and_failure(
+        rules: &str,
+        extra: serde_json::Value,
+        drc_report_json: &str,
+        failure: ItemFailure,
+    ) -> Applied {
         let project = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         let seen = tempfile::tempdir().unwrap();
@@ -5739,9 +5789,11 @@ mod apply_specctra_ses_candidate_drc_tests {
         std::fs::write(&manifest, export.manifest).unwrap();
         std::fs::write(&ses, SES).unwrap();
         let candidate = elsewhere.path().join("board.freerouted.kicad_pcb");
+        let report_file = seen.path().join("drc-report.json");
+        std::fs::write(&report_file, drc_report_json).unwrap();
 
         // Records the board path it was given and the rules beside it, then
-        // writes an empty report.
+        // copies the canned DRC report.
         let cli = cli::test_support::write_script(
             seen.path(),
             "drc-candidate-probe",
@@ -5749,8 +5801,9 @@ mod apply_specctra_ses_candidate_drc_tests {
                 "#!/bin/sh\nprev=\nfor a; do [ \"$prev\" = --output ] && out=\"$a\"; prev=\"$a\"; last=\"$a\"; done\n\
                  printf '%s' \"$last\" > '{seen}/board'\n\
                  cp \"${{last%.kicad_pcb}}.kicad_dru\" '{seen}/rules' 2>/dev/null\n\
-                 printf '%s' '{{\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]}}' > \"$out\"\nexit 0\n",
-                seen = seen.path().display()
+                 cp '{report}' \"$out\"\nexit 0\n",
+                seen = seen.path().display(),
+                report = report_file.display(),
             ),
             "@exit /b 1\r\n",
         );
@@ -6050,6 +6103,119 @@ mod apply_specctra_ses_candidate_drc_tests {
             applied.body
         );
         assert_eq!(applied.rules.as_deref(), Some(WITH_CREEPAGE));
+    }
+
+    #[tokio::test]
+    async fn warning_only_drc_is_clean_and_lists_the_warning() {
+        let report = json!({
+            "violations": [{
+                "type": "via_dangling",
+                "severity": "warning",
+                "description": "Via connected on one layer only",
+                "items": [{
+                    "description": "Via [GND] on F.Cu - B.Cu",
+                    "pos": { "x": 12.5, "y": 8.0 },
+                    "uuid": "11111111-1111-1111-1111-111111111111"
+                }]
+            }],
+            "unconnected_items": [],
+            "schematic_parity": []
+        })
+        .to_string();
+        let applied = apply_in_project_with_report(RULES, json!({}), &report).await;
+        let body = &applied.body;
+        assert!(!applied.result.is_error, "{body}");
+        assert_eq!(body["drc"]["clean"], true, "{body}");
+        assert_eq!(body["drc"]["errors"], 0, "{body}");
+        assert_eq!(body["drc"]["warnings"], 1, "{body}");
+        assert_eq!(body["drc"]["violations"], 1, "{body}");
+        assert_eq!(body["drc"]["shown"], 1, "{body}");
+        assert_eq!(body["drc"]["truncated"], false, "{body}");
+        assert_eq!(body["drc"]["findings"][0]["rule"], "via_dangling", "{body}");
+        assert_eq!(body["drc"]["findings"][0]["severity"], "warning", "{body}");
+        assert_eq!(
+            body["drc"]["findings"][0]["pos"],
+            json!({ "x": 12.5, "y": 8.0 }),
+            "{body}"
+        );
+        assert_eq!(
+            body["drc"]["findings"][0]["items"].as_array().map(Vec::len),
+            Some(1),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_drc_is_not_clean_and_lists_errors_before_warnings() {
+        let report = json!({
+            "violations": [
+                {
+                    "type": "via_dangling",
+                    "severity": "warning",
+                    "description": "Via connected on one layer only",
+                    "items": [{
+                        "description": "Via [GND] on F.Cu - B.Cu",
+                        "pos": { "x": 12.5, "y": 8.0 },
+                        "uuid": "11111111-1111-1111-1111-111111111111"
+                    }]
+                },
+                {
+                    "type": "clearance",
+                    "severity": "error",
+                    "description": "Clearance violation (netclass 'Default' clearance 0.2000 mm; actual 0.1200 mm)",
+                    "items": [{
+                        "description": "Track [VCC] on F.Cu",
+                        "pos": { "x": 20.0, "y": 10.0 },
+                        "uuid": "22222222-2222-2222-2222-222222222222"
+                    }]
+                }
+            ],
+            "unconnected_items": [],
+            "schematic_parity": []
+        })
+        .to_string();
+        let applied = apply_in_project_with_report(RULES, json!({}), &report).await;
+        let body = &applied.body;
+        assert!(!applied.result.is_error, "{body}");
+        assert_eq!(body["drc"]["clean"], false, "{body}");
+        assert_eq!(body["drc"]["errors"], 1, "{body}");
+        assert_eq!(body["drc"]["warnings"], 1, "{body}");
+        assert_eq!(body["drc"]["violations"], 2, "{body}");
+        assert_eq!(body["drc"]["findings"][0]["rule"], "clearance", "{body}");
+        assert_eq!(body["drc"]["findings"][0]["severity"], "error", "{body}");
+        assert_eq!(body["drc"]["findings"][1]["rule"], "via_dangling", "{body}");
+        assert_eq!(body["drc"]["findings"][1]["severity"], "warning", "{body}");
+    }
+
+    #[tokio::test]
+    async fn unconnected_item_is_not_clean_and_listed_in_findings() {
+        let report = json!({
+            "violations": [],
+            "unconnected_items": [{
+                "type": "unconnected_items",
+                "severity": "error",
+                "description": "Items have unrouted net",
+                "items": [{
+                    "description": "Pad 1 [VCC] of R1",
+                    "pos": { "x": 5.0, "y": 6.0 },
+                    "uuid": "33333333-3333-3333-3333-333333333333"
+                }]
+            }],
+            "schematic_parity": []
+        })
+        .to_string();
+        let applied = apply_in_project_with_report(RULES, json!({}), &report).await;
+        let body = &applied.body;
+        assert!(!applied.result.is_error, "{body}");
+        assert_eq!(body["drc"]["clean"], false, "{body}");
+        assert_eq!(body["drc"]["errors"], 1, "{body}");
+        assert_eq!(body["drc"]["warnings"], 0, "{body}");
+        assert_eq!(body["drc"]["violations"], 0, "{body}");
+        assert_eq!(body["drc"]["unconnected_items"], 1, "{body}");
+        assert_eq!(
+            body["drc"]["findings"][0]["rule"], "unconnected_items",
+            "{body}"
+        );
     }
 
     /// The four-layer board with copper zones: the served dry run says the
