@@ -36,8 +36,10 @@ The `Sheetfile` caption is at (50.8, 102.235), 0.635 below the bottom edge.
 
 Each case below was run through the server on a copy of the three files, then
 that copy was force-resaved by KiCad 10.0.7. In every case KiCad kept
-every pin and caption position the tool wrote; the resave only reorders each
-pin's `uuid` and writes `(fields_autoplaced yes)`.
+every pin and caption position the tool wrote. The historical resave also
+restored each pin's `uuid` immediately after `at` and wrote
+`(fields_autoplaced yes)`. The fixture records KiCad's order for the regression
+test for [#662](https://github.com/Copperpour/Copperpour/issues/662).
 
 | Call | Written by the tool, kept by KiCad |
 |---|---|
