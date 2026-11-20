@@ -494,6 +494,7 @@ mod tests {
             super::super::SchematicTargetError::ProjectConflict {
                 target: target.clone(),
                 roots: vec![PathBuf::from("a.kicad_sch"), PathBuf::from("b.kicad_sch")],
+                reason: super::super::ProjectConflictReason::MultipleOwners,
             },
         );
         assert_eq!(conflict.kind, NavigationTargetErrorKind::AmbiguousTarget);

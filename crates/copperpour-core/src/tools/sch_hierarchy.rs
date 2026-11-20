@@ -32,7 +32,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "create_schematic",
             "Create a new blank .kicad_sch schematic file, on A4 unless another paper \
-             size is given. Use set_schematic_page to change it later.",
+             size is given. Use set_schematic_page to change it later. A child sheet \
+             inside a project must be linked from its owning root schematic with \
+             add_hierarchical_sheet before it accepts writes (or create and link it \
+             directly with add_hierarchical_sheet).",
             json!({
                 "type": "object",
                 "properties": {
@@ -366,13 +369,66 @@ pub(crate) async fn handle_create_schematic(
             format!("the created schematic could not be rewritten: {error}"),
         ));
     }
+    let ownership = ownership_report(crate::tools::resolve_schematic_ownership(&path));
     Ok(CallToolResult::json(&json!({
         "created": path.display().to_string(),
         "size": size,
         "portrait": portrait,
         "width_mm": width_mm,
-        "height_mm": height_mm
+        "height_mm": height_mm,
+        "ownership": ownership
     })))
+}
+
+fn ownership_report(
+    resolved: Result<Option<crate::tools::SchematicOwnership>, crate::tools::SchematicTargetError>,
+) -> Value {
+    match resolved {
+        Ok(None) => json!({ "status": "standalone" }),
+        Ok(Some(owner)) => json!({
+            "status": "owned",
+            "project_file": owner.project_file.display().to_string(),
+            "root_schematic": owner.root_schematic.display().to_string(),
+        }),
+        Err(crate::tools::SchematicTargetError::ProjectConflict {
+            target,
+            roots,
+            reason: crate::tools::ProjectConflictReason::Unlinked,
+        }) => {
+            let candidate_roots: Vec<String> =
+                roots.iter().map(|r| r.display().to_string()).collect();
+            let next_calls = crate::tools::unlinked_schematic_next_calls(&target, &roots);
+            json!({
+                "status": "unlinked",
+                "candidate_roots": candidate_roots,
+                "next_calls": next_calls,
+                "note": "This schematic is not linked from any candidate project root. Writes to it will be refused with an ownership conflict until it is linked with add_hierarchical_sheet (or moved outside unrelated projects if it is a standalone schematic)."
+            })
+        }
+        Err(
+            ref error @ crate::tools::SchematicTargetError::ProjectConflict {
+                ref roots, reason, ..
+            },
+        ) => {
+            let candidate_roots: Vec<String> =
+                roots.iter().map(|r| r.display().to_string()).collect();
+            let reason_str = match reason {
+                crate::tools::ProjectConflictReason::MultipleOwners => "multiple_owners",
+                crate::tools::ProjectConflictReason::IncompleteHierarchy => "incomplete_hierarchy",
+                crate::tools::ProjectConflictReason::Unlinked => "unlinked",
+            };
+            json!({
+                "status": "conflict",
+                "reason": reason_str,
+                "candidate_roots": candidate_roots,
+                "note": error.to_string(),
+            })
+        }
+        Err(error) => json!({
+            "status": "unknown",
+            "reason": error.to_string(),
+        }),
+    }
 }
 
 /// Paper sizes KiCad accepts in a `(paper …)` node, with their landscape
@@ -7062,7 +7118,7 @@ mod instance_path_lifecycle_tests {
     const DELETED_CHILD: &str = "8cfbc41c-1769-4f0e-a76a-3a88df1bb62b";
     const DELETED_LEAF: &str = "824b7475-7b88-4c1b-8c63-e9c488733098";
 
-    fn project() -> (TempDir, PathBuf) {
+    pub(super) fn project() -> (TempDir, PathBuf) {
         let source =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sheet_instance_paths");
         let tmp = TempDir::new().unwrap();
@@ -8770,5 +8826,251 @@ mod sheet_pin_resize_tests {
         assert_eq!(out["changed_fields"], json!(["position", "side"]), "{out}");
         assert_eq!(out["pin"]["side"], "right", "{out}");
         assert_eq!(at_in_file(&path, "L"), (132.08, 50.8, 0.0));
+    }
+}
+
+#[cfg(test)]
+mod create_schematic_ownership_tests {
+    use super::instance_path_lifecycle_tests::{project, served};
+    use super::tools;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn create_schematic_in_empty_dir_reports_standalone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("standalone.kicad_sch");
+
+        let (is_error, body) = served(
+            "create_schematic",
+            json!({ "path": path.display().to_string() }),
+        )
+        .await;
+        assert!(!is_error, "{body}");
+        assert_eq!(
+            body["ownership"],
+            json!({ "status": "standalone" }),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_schematic_for_listed_project_root_reports_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let pro = dir.path().join("solo.kicad_pro");
+        std::fs::write(&pro, "{}").unwrap();
+        let root = dir.path().join("solo.kicad_sch");
+
+        let (is_error, body) = served(
+            "create_schematic",
+            json!({ "path": root.display().to_string() }),
+        )
+        .await;
+        assert!(!is_error, "{body}");
+        assert_eq!(
+            body["ownership"],
+            json!({
+                "status": "owned",
+                "project_file": pro.display().to_string(),
+                "root_schematic": root.display().to_string(),
+            }),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_schematic_inside_project_reports_unlinked_and_next_write_carries_remedy() {
+        let (tmp, root) = project();
+        let child = tmp.path().join("node1.kicad_sch");
+
+        let (is_error, created) = served(
+            "create_schematic",
+            json!({ "path": child.display().to_string() }),
+        )
+        .await;
+        assert!(!is_error, "{created}");
+        assert_eq!(created["ownership"]["status"], "unlinked", "{created}");
+        assert_eq!(
+            created["ownership"]["candidate_roots"],
+            json!([root.display().to_string()]),
+            "{created}"
+        );
+        let expected_call = json!({
+            "tool": "add_hierarchical_sheet",
+            "arguments": {
+                "schematic": root.display().to_string(),
+                "sheet_file": "node1.kicad_sch",
+            }
+        });
+        assert_eq!(
+            created["ownership"]["next_calls"],
+            json!([expected_call]),
+            "{created}"
+        );
+
+        // Nested subdirectory sheet reports the relative sheet_file from root.
+        let nested_dir = tmp.path().join("sub");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let nested = nested_dir.join("node2.kicad_sch");
+        let (is_error, nested_created) = served(
+            "create_schematic",
+            json!({ "path": nested.display().to_string() }),
+        )
+        .await;
+        assert!(!is_error, "{nested_created}");
+        assert_eq!(
+            nested_created["ownership"]["status"], "unlinked",
+            "{nested_created}"
+        );
+        assert_eq!(
+            nested_created["ownership"]["next_calls"],
+            json!([{
+                "tool": "add_hierarchical_sheet",
+                "arguments": {
+                    "schematic": root.display().to_string(),
+                    "sheet_file": "sub/node2.kicad_sch",
+                }
+            }]),
+            "{nested_created}"
+        );
+
+        // The very next write through batch_place_components fails with conflict + structured remedy.
+        let (is_error, batch_err) = served(
+            "batch_place_components",
+            json!({
+                "schematic": child.display().to_string(),
+                "components": [{
+                    "lib_id": "Device:R",
+                    "reference": "R1",
+                    "value": "10k",
+                    "x": 50.0,
+                    "y": 50.0
+                }]
+            }),
+        )
+        .await;
+        assert!(is_error, "{batch_err}");
+        assert_eq!(batch_err["error"]["kind"], "conflict", "{batch_err}");
+        assert_eq!(
+            batch_err["error"]["paths"],
+            json!([tmp.path().display().to_string(), root.display().to_string(),]),
+            "{batch_err}"
+        );
+        assert!(
+            batch_err["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("add_hierarchical_sheet"),
+            "{batch_err}"
+        );
+        assert_eq!(
+            batch_err["recovery"]["cause"], "unlinked_schematic",
+            "{batch_err}"
+        );
+        assert_eq!(
+            batch_err["recovery"]["mutation_outcome"], "none",
+            "{batch_err}"
+        );
+        assert_eq!(batch_err["recovery"]["retry_safe"], false, "{batch_err}");
+        assert_eq!(
+            batch_err["recovery"]["evidence"]["next_calls"],
+            json!([expected_call]),
+            "{batch_err}"
+        );
+        assert_eq!(
+            batch_err["recovery"]["next_steps"][0]["tool"], "add_hierarchical_sheet",
+            "{batch_err}"
+        );
+
+        // Sibling writers (unlisted in the issue) carry the same conflict kind and remedy.
+        let (is_error, comp_err) = served(
+            "add_schematic_component",
+            json!({
+                "schematic": child.display().to_string(),
+                "lib_id": "Device:R",
+                "reference": "R1",
+                "value": "10k",
+                "x": 50.0,
+                "y": 50.0
+            }),
+        )
+        .await;
+        assert!(is_error, "{comp_err}");
+        assert_eq!(comp_err["error"]["kind"], "conflict", "{comp_err}");
+        assert_eq!(
+            comp_err["recovery"]["cause"], "unlinked_schematic",
+            "{comp_err}"
+        );
+        assert_eq!(comp_err["outcome"]["status"], "failed", "{comp_err}");
+
+        let (is_error, title_err) = served(
+            "set_schematic_title_block",
+            json!({
+                "schematic": child.display().to_string(),
+                "title": "Node 1"
+            }),
+        )
+        .await;
+        assert!(is_error, "{title_err}");
+        assert_eq!(title_err["error"]["kind"], "conflict", "{title_err}");
+        assert_eq!(
+            title_err["recovery"]["cause"], "unlinked_schematic",
+            "{title_err}"
+        );
+
+        // Executing the exact suggested next_call links the sheet so writes succeed.
+        let next_call = &created["ownership"]["next_calls"][0];
+        let (is_error, linked) = served(
+            next_call["tool"].as_str().unwrap(),
+            next_call["arguments"].clone(),
+        )
+        .await;
+        assert!(!is_error, "{linked}");
+
+        let (is_error, title_ok) = served(
+            "set_schematic_title_block",
+            json!({
+                "schematic": child.display().to_string(),
+                "title": "Node 1"
+            }),
+        )
+        .await;
+        assert!(!is_error, "{title_ok}");
+    }
+
+    #[tokio::test]
+    async fn create_schematic_beside_broken_project_root_reports_conflict_not_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("broken.kicad_pro"), "{}").unwrap();
+        std::fs::write(dir.path().join("broken.kicad_sch"), "not a schematic").unwrap();
+        let child = dir.path().join("fresh.kicad_sch");
+
+        let (is_error, body) = served(
+            "create_schematic",
+            json!({ "path": child.display().to_string() }),
+        )
+        .await;
+        assert!(!is_error, "{body}");
+        assert_eq!(body["ownership"]["status"], "conflict", "{body}");
+        assert_eq!(
+            body["ownership"]["reason"], "incomplete_hierarchy",
+            "{body}"
+        );
+        assert!(
+            body["ownership"].get("next_calls").is_none(),
+            "incomplete hierarchy must not suggest add_hierarchical_sheet: {body}"
+        );
+    }
+
+    #[test]
+    fn create_schematic_description_mentions_linking_child_sheets() {
+        let def = tools()
+            .into_iter()
+            .find(|tool| tool.name == "create_schematic")
+            .expect("create_schematic tool definition");
+        assert!(
+            def.description.contains("add_hierarchical_sheet"),
+            "description must name add_hierarchical_sheet: {}",
+            def.description
+        );
     }
 }
