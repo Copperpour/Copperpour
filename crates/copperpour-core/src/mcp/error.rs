@@ -136,6 +136,9 @@ pub enum ToolErrorKind {
     /// over the user's own settings (#580). `reason` starts with
     /// `malformed_json:` or `unreadable:`.
     InvalidConfiguration { path: String, reason: String },
+    /// A referenced KiCad file exists and was read, but its structure is
+    /// malformed so the operation refused to mutate it.
+    MalformedFile { path: String, reason: String },
     /// Catch-all for handler `anyhow::Error` that hasn't been migrated yet.
     /// Eventually each variant above subsumes a subset of these.
     HandlerError { reason: String },
@@ -179,6 +182,7 @@ impl ToolErrorKind {
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::AmbiguousOpenBoard { .. } => "ambiguous_open_board",
             Self::InvalidConfiguration { .. } => "invalid_configuration",
+            Self::MalformedFile { .. } => "malformed_file",
             Self::HandlerError { .. } => "handler_error",
             Self::IpcOutcomeUnknown { .. } => "ipc_outcome_unknown",
             Self::IpcBatchRecovered { .. } => "ipc_batch_recovered",
@@ -440,6 +444,10 @@ mod tests {
                 reason: "r".into(),
             },
             ToolErrorKind::AmbiguousOpenBoard { path: "p".into() },
+            ToolErrorKind::MalformedFile {
+                path: "p".into(),
+                reason: "r".into(),
+            },
             ToolErrorKind::HandlerError { reason: "r".into() },
         ];
         for kind in kinds {
