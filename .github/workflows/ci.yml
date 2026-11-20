@@ -184,8 +184,10 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install jsonschema
       - name: Validate repository metadata
-        run: python packaging/validate-pcm.py --metadata packaging/metadata.json
-      - name: Test the PCM validator
+        run: |
+          python packaging/validate-pcm.py --metadata packaging/metadata.json
+          python packaging/validate-mcpb.py --manifest packaging/mcpb-manifest.json
+      - name: Test the packaging validators
         run: python -m unittest discover -s packaging/tests -v
 
       # Stub binaries carry each platform's executable magic: the validator
@@ -259,3 +261,27 @@ jobs:
              (.versions[0].platforms | sort == ["linux", "macos", "windows"]) and
              .versions[0].download_sha256 == $sha and .versions[0].download_size == $size and
              .versions[0].download_url == $url' submission.json
+
+      - name: Assemble and validate stub Claude Desktop (.mcpb) bundles
+        run: |
+          set -euo pipefail
+          python packaging/build-mcpb.py --version 0.0.0 --binary stub-copperpour.exe \
+            --platform windows --out dist-mcpb
+          python packaging/build-mcpb.py --version 0.0.0 --binary stub-copperpour-mac \
+            --platform macos --out dist-mcpb
+          python packaging/build-mcpb.py --version 0.0.0 --binary stub-copperpour \
+            --platform linux --out dist-mcpb
+          python packaging/validate-mcpb.py --expected-version 0.0.0 \
+            --bundle dist-mcpb/copperpour-v0.0.0-windows-x86_64.mcpb
+          python packaging/validate-mcpb.py --expected-version 0.0.0 \
+            --bundle dist-mcpb/copperpour-v0.0.0-macos-universal.mcpb
+          python packaging/validate-mcpb.py --expected-version 0.0.0 \
+            --bundle dist-mcpb/copperpour-v0.0.0-linux-x86_64.mcpb
+          python packaging/build-mcpb.py --version 0.0.0 --binary stub-copperpour-win \
+            --platform linux --out dist-mcpb-bad
+          if python packaging/validate-mcpb.py --expected-version 0.0.0 \
+              --bundle dist-mcpb-bad/copperpour-v0.0.0-linux-x86_64.mcpb; then
+            echo "::error::MCPB validator accepted a Windows binary in a linux bundle"
+            exit 1
+          fi
+          echo "OK: mismatched MCPB binary/platform correctly rejected"
