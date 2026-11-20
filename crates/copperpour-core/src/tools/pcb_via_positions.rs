@@ -128,7 +128,10 @@ fn parse(args: &Value) -> Refusal<Request> {
             (require_str(item, "uuid")?, point(item)?)
         };
         if id.trim().is_empty() || targets.insert(id.to_string(), position).is_some() {
-            return Err(invalid_arg("uuid", "UUIDs must be nonempty and unique"));
+            return Err(invalid_arg(
+                if relative { "uuids" } else { "uuid" },
+                "UUIDs must be nonempty and unique",
+            ));
         }
     }
     Ok(Request { targets, relative })
@@ -446,6 +449,7 @@ fn apply(
     let mut update_attempted = false;
     let committed = client.run_commit_recovering_in(document.clone(), UNDO, |scoped| {
         // Recheck after BeginCommit, before any update; both board copper and target properties matter.
+        // The per-via readback is a defense-in-depth second layer alongside the board-text snapshot.
         if snapshot(scoped, document)? != contents || read_vias(scoped, document, &ids)? != before {
             stale_inside = true;
             anyhow::bail!("live board changed before the batch update");

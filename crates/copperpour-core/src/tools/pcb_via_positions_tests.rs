@@ -19,14 +19,17 @@ struct State {
     sent: Vec<String>,
     updates: usize,
     renet: bool,
+    renet_restore: bool,
     corrupt_property: bool,
     partial_update: bool,
     failed_restore: bool,
     bad_readback: bool,
     duplicate_readback: bool,
+    foreign_readback: bool,
     wrong_type: bool,
     race: bool,
     target_race: bool,
+    restore_race: bool,
     failed_drop: bool,
     late_update: bool,
     snapshot_generation: u32,
@@ -93,6 +96,11 @@ fn answer(
             if state.duplicate_readback {
                 items.push(items[0].clone());
             }
+            if state.foreign_readback {
+                let mut foreign = Via::decode(items[0].value.as_slice()).unwrap();
+                foreign.id.as_mut().unwrap().value = "65100000-0000-4000-8000-999999999999".into();
+                items.push(pack_any(&foreign, VIA));
+            }
             if state.wrong_type {
                 items[0].type_url = "kiapi.board.types.Track".into();
             }
@@ -111,7 +119,7 @@ fn answer(
             if state.race {
                 state.snapshot_generation += 1;
             }
-            if state.target_race {
+            if state.target_race || (state.restore_race && state.updates > 0) {
                 state
                     .vias
                     .values_mut()
@@ -142,7 +150,7 @@ fn answer(
                 let refused = (state.partial_update && state.updates == 1 && index == 1)
                     || (state.failed_restore && state.updates > 1);
                 if !refused {
-                    if state.renet && state.updates == 1 && index == 0 {
+                    if state.renet && (state.updates == 1 || state.renet_restore) && index == 0 {
                         via.net.as_mut().unwrap().name = "FOREIGN".into();
                         via.net.as_mut().unwrap().code =
                             Some(copperpour_ipc::gen::kiapi::board::types::NetCode { value: 999 });
@@ -685,4 +693,60 @@ fn coordinates_refuse_out_of_range_before_integer_conversion() {
     assert!(coordinate(&json!({"x":1e99}), "x").is_err());
     assert!(coordinate(&json!({"x":-1e99}), "x").is_err());
     assert_eq!(coordinate(&json!({"x":-0.0000006}), "x").unwrap(), -1);
+}
+
+#[tokio::test]
+async fn restore_commit_whose_readback_still_differs_is_uncertain() {
+    let mut state = fixture();
+    state.renet = true;
+    state.renet_restore = true;
+    let scene = Scene::new(state).await;
+    let (error, result) = scene.apply(scene.offset()).await;
+    assert!(error, "{result}");
+    assert_eq!(result["error"]["kind"], "mutation_outcome_uncertain");
+    assert_eq!(result["uuids"].as_array().unwrap().len(), 20);
+    assert_eq!(result["outcome"]["retry"]["safe"], false);
+    assert_eq!(scene.state.lock().unwrap().updates, 2);
+}
+
+#[tokio::test]
+async fn renetting_with_another_property_change_never_restores() {
+    let mut state = fixture();
+    state.renet = true;
+    state.corrupt_property = true;
+    let scene = Scene::new(state).await;
+    let (error, result) = scene.apply(scene.offset()).await;
+    assert!(error, "{result}");
+    assert_eq!(result["error"]["kind"], "mutation_outcome_uncertain");
+    assert_eq!(result["uuids"].as_array().unwrap().len(), 20);
+    assert_eq!(result["outcome"]["retry"]["safe"], false);
+    assert_eq!(scene.state.lock().unwrap().updates, 1);
+}
+
+#[tokio::test]
+async fn external_edit_before_restoration_is_uncertain_without_second_update() {
+    let mut state = fixture();
+    state.renet = true;
+    state.restore_race = true;
+    let scene = Scene::new(state).await;
+    let (error, result) = scene.apply(scene.offset()).await;
+    assert!(error, "{result}");
+    assert_eq!(result["error"]["kind"], "mutation_outcome_uncertain");
+    assert_eq!(result["uuids"].as_array().unwrap().len(), 20);
+    assert_eq!(result["outcome"]["retry"]["safe"], false);
+    assert_eq!(scene.state.lock().unwrap().updates, 1);
+}
+
+#[tokio::test]
+async fn unrequested_via_in_readback_is_refused() {
+    let mut state = fixture();
+    state.foreign_readback = true;
+    let id = state.vias.keys().next().unwrap().clone();
+    let scene = Scene::new(state).await;
+    let (error, result) = scene
+        .call(json!({"uuids":[id],"offset":{"x":1,"y":0}}))
+        .await;
+    assert!(error, "{result}");
+    assert_eq!(result["error"]["kind"], "plan_blocked");
+    scene.assert_no_writes();
 }
