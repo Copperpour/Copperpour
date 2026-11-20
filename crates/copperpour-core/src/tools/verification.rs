@@ -247,6 +247,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         super::custom_rules::tool(),
         super::custom_rules::delete_tool(),
+        super::custom_rules::list_tool(),
         tool!(
             "check_clearance",
             "Measure spacing between two footprints on the requested board. `mode: anchor` \

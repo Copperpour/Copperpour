@@ -143,6 +143,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "check_kicad_ui",
     "get_design_rules",
     "get_predefined_sizes",
+    "list_custom_rules",
     // design_review
     "audit_connections",
     "audit_decoupling",
