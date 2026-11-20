@@ -14,6 +14,9 @@
 //! run time, so a probe then has kicad-cli load the file on a copy of the
 //! board; that verdict is KiCad's own, but names nothing. A board with no item
 //! gives the probe nothing to test, so there the check alone decides.
+//!
+//! `list_custom_rules` lists the file's rules with the same check, without
+//! the probe.
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -275,6 +278,28 @@ pub(super) fn delete_tool() -> ToolDef {
             "additionalProperties": false
         }),
         |args, ctx| async move { handle_delete_custom_rule(args, ctx).await }
+    )
+}
+
+pub(super) fn list_tool() -> ToolDef {
+    tool!(
+        "list_custom_rules",
+        "List the rules in the board's sibling .kicad_dru custom rules file in file order, \
+         each with its name, line and text as written, and the faults set_custom_rule's check \
+         of the file finds. A fault the check cannot read past, such as a rule never closed, \
+         hides the rules after it; a string left open, or a text variable, which KiCad expands \
+         from the board and the check does not, hides them all. A rule with no name is not \
+         listed. kicad-cli is not run, so property names come back unchecked. A board with no \
+         rules file has none.",
+        json!({
+            "type": "object",
+            "properties": {
+                "board": { "type": "string", "description": "Path to .kicad_pcb file" }
+            },
+            "required": ["board"],
+            "additionalProperties": false
+        }),
+        |args, ctx| async move { handle_list_custom_rules(args, ctx).await }
     )
 }
 
@@ -598,6 +623,49 @@ async fn handle_delete_custom_rule(
         "previous": previous,
         "kicad_checked": has_items,
         "unchecked_properties": if has_items { BTreeSet::new() } else { checked.properties },
+    })))
+}
+
+async fn handle_list_custom_rules(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let BoardFacts { user_layers, .. } = read_board(&board)?;
+    let rules_path = sibling_custom_rules_path(&board);
+    let text = match read_consistent(&rules_path) {
+        Ok(text) => text,
+        Err(SexpError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CallToolResult::json(&json!({
+                "rules_file": rules_path,
+                "exists": false,
+                "count": 0,
+                "rules": [],
+                "faults": [],
+                "unchecked_properties": [],
+            })))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let checked = check_rules(&text, &user_layers);
+    let rules: Vec<serde_json::Value> = checked
+        .rules
+        .iter()
+        .map(|rule| {
+            json!({
+                "name": rule.name,
+                "line": line_of(&text, rule.start),
+                "text": &text[rule.start..rule.end],
+            })
+        })
+        .collect();
+    Ok(CallToolResult::json(&json!({
+        "rules_file": rules_path,
+        "exists": true,
+        "count": rules.len(),
+        "rules": rules,
+        "faults": checked.faults,
+        "unchecked_properties": checked.properties,
     })))
 }
 
@@ -1877,6 +1945,33 @@ mod tests {
         call_tool("delete_custom_rule", &cli.display().to_string(), arguments).await
     }
 
+    /// `list_custom_rules`, called with a kicad-cli that fails, which the
+    /// list does not run.
+    async fn list(board: &Path) -> serde_json::Value {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_kicad_cli(dir.path(), None, 9);
+        call_tool(
+            "list_custom_rules",
+            &cli.display().to_string(),
+            json!({ "board": board }),
+        )
+        .await
+    }
+
+    fn names_and_lines(body: &serde_json::Value) -> Vec<(String, u64)> {
+        body["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|rule| {
+                (
+                    rule["name"].as_str().unwrap().to_string(),
+                    rule["line"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
     async fn call_tool(
         tool: &str,
         kicad_cli: &str,
@@ -2474,6 +2569,191 @@ mod tests {
         assert!(!write_hook::armed());
         assert_eq!(body["error"]["kind"], "conflict", "{body}");
         assert_eq!(rules_of(&board).unwrap(), saved);
+    }
+
+    #[tokio::test]
+    async fn a_list_gives_each_rule_as_written_in_file_order() {
+        let (_dir, board) = board_with(Some(RULES));
+        let body = list(&board).await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!((&body["exists"], &body["count"]), (&json!(true), &json!(3)));
+        assert_eq!(
+            names_and_lines(&body),
+            [
+                ("fanout".to_string(), 4),
+                ("keepout".to_string(), 9),
+                ("slot \"edge\"".to_string(), 15)
+            ]
+        );
+        assert_eq!(body["rules"][1]["text"], json!(KEEPOUT));
+        assert_eq!(
+            (&body["faults"], &body["unchecked_properties"]),
+            (&json!([]), &json!(["Width"]))
+        );
+        assert_eq!(rules_of(&board).unwrap(), RULES);
+    }
+
+    #[tokio::test]
+    async fn a_rule_set_is_listed_as_set_custom_rule_wrote_it() {
+        let (_dir, board) = board_with(Some(RULES));
+        let set = call(dp_pairs(&board)).await;
+        assert_ne!(set["is_error"], true, "{set}");
+        let written = rules_of(&board).unwrap();
+        let body = list(&board).await;
+        assert_eq!(body["count"], 4, "{body}");
+        assert_eq!(
+            body["rules"][3],
+            json!({ "name": "dp", "line": 25, "text": set["current"] })
+        );
+        assert_eq!(rules_of(&board).unwrap(), written);
+    }
+
+    #[tokio::test]
+    async fn a_list_on_a_board_with_no_rules_file_gives_none() {
+        let (_dir, board) = board_with(None);
+        let body = list(&board).await;
+        assert_eq!(
+            body,
+            json!({
+                "rules_file": board.with_extension("kicad_dru"),
+                "exists": false,
+                "count": 0,
+                "rules": [],
+                "faults": [],
+                "unchecked_properties": [],
+                "is_error": false
+            })
+        );
+        assert_eq!(rules_of(&board), None);
+    }
+
+    /// An empty file and one of comment lines alone hold no rule and no
+    /// fault, as KiCad 10's parser reads them: it reports nothing on a file
+    /// with no token.
+    #[tokio::test]
+    async fn a_file_with_no_rule_lists_none() {
+        for text in ["", "# rules to come\n"] {
+            let (_dir, board) = board_with(Some(text));
+            let body = list(&board).await;
+            assert_eq!(
+                (&body["exists"], &body["count"], &body["faults"]),
+                (&json!(true), &json!(0), &json!([])),
+                "{text:?}: {body}"
+            );
+        }
+    }
+
+    /// Lines are counted with CRLF endings as with LF, and a rule's text
+    /// keeps the endings inside it.
+    #[tokio::test]
+    async fn a_list_reads_a_file_with_crlf_endings() {
+        let crlf = RULES.replace('\n', "\r\n");
+        let (_dir, board) = board_with(Some(&crlf));
+        let body = list(&board).await;
+        assert_eq!(
+            names_and_lines(&body),
+            [
+                ("fanout".to_string(), 4),
+                ("keepout".to_string(), 9),
+                ("slot \"edge\"".to_string(), 15)
+            ]
+        );
+        assert_eq!(
+            body["rules"][1]["text"],
+            json!(KEEPOUT.replace('\n', "\r\n"))
+        );
+        assert_eq!(body["faults"], json!([]));
+    }
+
+    /// A rule with a fault inside it is listed with the rest, and the fault
+    /// is named: kicad-cli would drop the whole file.
+    #[tokio::test]
+    async fn a_list_names_a_fault_and_lists_its_rule() {
+        let faulty = format!("{RULES}\n(rule \"u\" (constraint clearance (min 0.2)))\n");
+        let (_dir, board) = board_with(Some(&faulty));
+        let body = list(&board).await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(body["count"], 4, "{body}");
+        assert_eq!(names_and_lines(&body)[3], ("u".to_string(), 25));
+        let faults = body["faults"].to_string();
+        assert!(
+            faults.contains("rule 'u', line 25") && faults.contains("needs units"),
+            "{body}"
+        );
+        assert_eq!(rules_of(&board).unwrap(), faulty);
+    }
+
+    /// A rule never closed stops the check, so the rules after it are not
+    /// listed, and the fault says where.
+    #[tokio::test]
+    async fn a_list_names_a_fault_that_hides_the_rules_after_it() {
+        let before =
+            format!("{RULES}\n(rule \"open\"\n  (constraint clearance (min 1mm))\n\n{DP_PAIRS}\n");
+        let (_dir, board) = board_with(Some(&before));
+        let body = list(&board).await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(
+            names_and_lines(&body),
+            [
+                ("fanout".to_string(), 4),
+                ("keepout".to_string(), 9),
+                ("slot \"edge\"".to_string(), 15)
+            ]
+        );
+        assert_eq!(
+            body["faults"],
+            json!(["line 25: the rule opened here is never closed"])
+        );
+        assert_eq!(rules_of(&board).unwrap(), before);
+    }
+
+    /// A string left open stops the lexer, and a text variable, which KiCad
+    /// expands from the board, stops the check before it reads any rule, so
+    /// none is listed, the rules before the fault included.
+    #[tokio::test]
+    async fn a_list_names_a_fault_that_hides_every_rule() {
+        for (tail, fault) in [
+            (
+                "(rule \"open\" (condition \"A.NetName == 'x))\n",
+                "line 25: a quoted string is not closed on its line",
+            ),
+            (
+                "(rule \"var\" (constraint clearance (min ${GAP})))\n",
+                "holds a text variable",
+            ),
+        ] {
+            let text = format!("{RULES}\n{tail}");
+            let (_dir, board) = board_with(Some(&text));
+            let body = list(&board).await;
+            assert_ne!(body["is_error"], true, "{body}");
+            assert_eq!(
+                (&body["count"], &body["rules"]),
+                (&json!(0), &json!([])),
+                "{body}"
+            );
+            assert!(body["faults"].to_string().contains(fault), "{body}");
+            assert_eq!(rules_of(&board).unwrap(), text);
+        }
+    }
+
+    /// A rule whose name cannot be read is not listed; its fault gives its
+    /// line, and the rules around it are listed.
+    #[tokio::test]
+    async fn a_rule_with_no_name_is_not_listed() {
+        let text = format!("{RULES}\n(rule (constraint clearance (min 1mm)))\n\n{DP_PAIRS}\n");
+        let (_dir, board) = board_with(Some(&text));
+        let body = list(&board).await;
+        assert_ne!(body["is_error"], true, "{body}");
+        assert_eq!(
+            names_and_lines(&body),
+            [
+                ("fanout".to_string(), 4),
+                ("keepout".to_string(), 9),
+                ("slot \"edge\"".to_string(), 15),
+                ("dp".to_string(), 27)
+            ]
+        );
+        assert_eq!(body["faults"], json!(["line 25: the rule has no name"]));
     }
 
     /// Live, against a real kicad-cli on the fixture board: a known property
