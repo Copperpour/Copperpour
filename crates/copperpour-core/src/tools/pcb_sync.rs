@@ -5364,6 +5364,7 @@ mod tests {
                 drill_oval: false,
                 layers: vec!["F.Cu".to_string()],
                 roundrect_ratio: 0.0,
+                custom: None,
             }],
             &[
                 copperpour_ipc::IpcGraphicDefinition::Line {
@@ -5790,6 +5791,7 @@ mod tests {
                 drill_oval: false,
                 layers: vec!["F.Cu".to_string()],
                 roundrect_ratio: 0.0,
+                custom: None,
             }],
             &[],
             &copperpour_ipc::IpcFieldPlacement::default(),
@@ -7460,12 +7462,19 @@ mod tests {
     const THERMAL_DFN: &str =
         "Package_DFN_QFN:DFN-14-1EP_3x4.5mm_P0.65mm_EP1.65x4.25mm_ThermalVias";
 
-    /// A project whose own `fp-lib-table` resolves four stock KiCad 10
-    /// footprints: the two with custom-shape pads that #657 met on a real
-    /// board (provenance in `tests/fixtures/custom_pads_kicad10.README.md`),
-    /// a plain 0603 and the DFN-14 with heatsink pads. A project table
-    /// shadows the global one, so these files are the ones read whether or
-    /// not KiCad is installed.
+    /// The stock generic VQFN-20 unchanged, in a library of its own: its
+    /// custom pads (circle anchors, outline clearance) are placed (#679).
+    const PLACEABLE_VQFN: &str = "Custom_Stock:VQFN-20-1EP_3x3mm_P0.45mm_EP1.55x1.55mm";
+
+    /// A project whose own `fp-lib-table` resolves stock KiCad 10 footprints:
+    /// the two with custom-shape pads that #657 met on a real board
+    /// (provenance in `tests/fixtures/custom_pads_kicad10.README.md`), a plain
+    /// 0603, the DFN-14 with heatsink pads, and the generic VQFN once more as
+    /// [`PLACEABLE_VQFN`]. Since custom pads are placed (#679), the two #657
+    /// footprints are written with `(clearance convexhull)`, which KiCad's pad
+    /// message cannot carry, so they stay unusable for a reason that holds. A
+    /// project table shadows the global one, so these files are the ones read
+    /// whether or not KiCad is installed.
     fn project_with_stock_footprints() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let board = temp.path().join("carrier.kicad_pcb");
@@ -7494,6 +7503,26 @@ mod tests {
                 ),
             ),
         ];
+        let convexhull = |source: &[u8]| {
+            let text = std::str::from_utf8(source).unwrap();
+            assert!(text.contains("(clearance outline)"));
+            text.replace("(clearance outline)", "(clearance convexhull)")
+                .into_bytes()
+        };
+        let mut stock: Vec<(&str, Vec<u8>)> = stock
+            .into_iter()
+            .map(|(footprint_id, source)| {
+                if footprint_id == TEXAS_VQFN || footprint_id == GENERIC_VQFN {
+                    (footprint_id, convexhull(source))
+                } else {
+                    (footprint_id, source.to_vec())
+                }
+            })
+            .collect();
+        stock.push((
+            PLACEABLE_VQFN,
+            include_bytes!("../../tests/fixtures/custom_pads_vqfn20_kicad10.kicad_mod").to_vec(),
+        ));
         for (footprint_id, source) in stock {
             let (library, name) = footprint_id.split_once(':').unwrap();
             let directory = temp.path().join(format!("{library}.pretty"));
@@ -7502,7 +7531,7 @@ mod tests {
         }
         std::fs::write(
             temp.path().join("fp-lib-table"),
-            "(fp_lib_table\n  (lib (name \"Package_DFN_QFN\") (type \"KiCad\") (uri \"${KIPRJMOD}/Package_DFN_QFN.pretty\") (options \"\") (descr \"\"))\n  (lib (name \"Capacitor_SMD\") (type \"KiCad\") (uri \"${KIPRJMOD}/Capacitor_SMD.pretty\") (options \"\") (descr \"\"))\n)\n",
+            "(fp_lib_table\n  (lib (name \"Package_DFN_QFN\") (type \"KiCad\") (uri \"${KIPRJMOD}/Package_DFN_QFN.pretty\") (options \"\") (descr \"\"))\n  (lib (name \"Capacitor_SMD\") (type \"KiCad\") (uri \"${KIPRJMOD}/Capacitor_SMD.pretty\") (options \"\") (descr \"\"))\n  (lib (name \"Custom_Stock\") (type \"KiCad\") (uri \"${KIPRJMOD}/Custom_Stock.pretty\") (options \"\") (descr \"\"))\n)\n",
         )
         .unwrap();
         (temp, board)
@@ -7582,7 +7611,8 @@ mod tests {
         assert!(
             texas.message.contains(TEXAS_VQFN)
                 && texas.message.contains("U1, U2")
-                && texas.message.contains("custom-shape pads"),
+                && texas.message.contains("custom pad '1'")
+                && texas.message.contains("(clearance convexhull)"),
             "{}",
             texas.message
         );
@@ -7592,6 +7622,48 @@ mod tests {
         assert_eq!(generic.footprint_id.as_deref(), Some(GENERIC_VQFN));
         assert_eq!(generic.references, ["U3"]);
         assert_eq!(generic.reference.as_deref(), Some("U3"));
+    }
+
+    /// A stock footprint with custom pads is prepared for Update PCB's
+    /// additions (#679): each custom pad carries its anchor and primitives.
+    #[test]
+    fn a_stock_footprint_with_custom_pads_is_prepared() {
+        let (_temp, board) = project_with_stock_footprints();
+        let plan = plan_adding(vec![planned_add("U9", PLACEABLE_VQFN, &["1"])]);
+
+        let (prepared, unprepared) = prepare_additions(&board, &plan);
+
+        assert!(unprepared.is_empty(), "{unprepared:?}");
+        let part = prepared.get(PLACEABLE_VQFN).expect("the VQFN is prepared");
+        let custom = part
+            .pads
+            .iter()
+            .filter_map(|pad| {
+                pad.custom
+                    .as_ref()
+                    .map(|custom| (pad.number.as_str(), custom))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            custom.iter().map(|(number, _)| *number).collect::<Vec<_>>(),
+            ["1", "5", "6", "10", "11", "15", "16", "20"]
+        );
+        let (_, first) = custom[0];
+        assert_eq!(first.anchor, copperpour_ipc::IpcCustomPadAnchor::Circle);
+        assert_eq!(
+            first.primitives,
+            [copperpour_ipc::IpcPadPrimitive::Polygon {
+                points: vec![
+                    (-0.375, -0.075),
+                    (0.254289, -0.075),
+                    (0.375, 0.045711),
+                    (0.375, 0.075),
+                    (-0.375, 0.075)
+                ],
+                width: 0.1,
+                filled: true
+            }]
+        );
     }
 
     /// The caller's next step differs with the stage that failed: fix the
@@ -9061,8 +9133,9 @@ mod tests {
             {
                 "code": "unsupported_library_footprint",
                 "message": format!(
-                    "{TEXAS_VQFN} cannot be placed (needed by U1, U2): custom-shape pads \
-                     are not supported by KiCad 10's typed placement path"
+                    "{TEXAS_VQFN} cannot be placed (needed by U1, U2): custom pad '1': its \
+                     (clearance convexhull) has no field in KiCad 10's pad message, which \
+                     gives the pad the outline clearance"
                 ),
                 "reference": null,
                 "references": ["U1", "U2"],
@@ -9071,8 +9144,9 @@ mod tests {
             {
                 "code": "unsupported_library_footprint",
                 "message": format!(
-                    "{GENERIC_VQFN} cannot be placed (needed by U3): custom-shape pads \
-                     are not supported by KiCad 10's typed placement path"
+                    "{GENERIC_VQFN} cannot be placed (needed by U3): custom pad '1': its \
+                     (clearance convexhull) has no field in KiCad 10's pad message, which \
+                     gives the pad the outline clearance"
                 ),
                 "reference": "U3",
                 "references": ["U3"],

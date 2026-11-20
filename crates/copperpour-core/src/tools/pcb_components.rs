@@ -224,11 +224,18 @@ pub(crate) fn extract_pad_definitions(
                     .ok_or_else(|| anyhow::anyhow!("footprint pad is missing {label}"))
             };
             let shape = required(3, "shape")?.to_string();
-            if shape == "custom" {
-                anyhow::bail!(
-                    "custom-shape pads are not supported by KiCad 10's typed placement path"
-                );
-            }
+            // A custom pad's anchor and primitives through the shared model
+            // (#679); what KiCad's pad message cannot carry is refused with
+            // the pad named.
+            let custom = if shape == "custom" {
+                let number = required(1, "number")?;
+                let custom = super::pad_primitives::CustomPadShape::from_pad(pad)
+                    .and_then(|custom| custom.to_ipc())
+                    .map_err(|reason| anyhow::anyhow!("custom pad '{number}': {reason}"))?;
+                Some(custom)
+            } else {
+                None
+            };
             let at = pad
                 .find("at")
                 .context("footprint pad is missing its position")?;
@@ -282,6 +289,7 @@ pub(crate) fn extract_pad_definitions(
                 drill_x,
                 drill_y,
                 drill_oval,
+                custom,
                 layers,
                 roundrect_ratio: pad.find_f64("roundrect_rratio").unwrap_or(0.0),
             })
@@ -8443,6 +8451,183 @@ mod tests {
             built.datasheet_field
         );
         assert_eq!(shown(&built.reference_field).as_deref(), Some("U1"));
+    }
+
+    /// Custom pads reach the IPC item as KiCad 10.0.8 holds them after
+    /// placing the same stock footprints itself (`custom_pads_ipc.README.md`):
+    /// shape, anchor, size, position, angle and every primitive, pad-local and
+    /// unrotated, at 0° and 90° and for both anchor shapes (#679). Only what
+    /// KiCad assigns itself (each primitive's id, parent and empty net) is
+    /// left out of the comparison.
+    #[test]
+    fn the_ipc_item_carries_custom_pads_as_kicad_places_them() {
+        use copperpour_ipc::gen::kiapi::board::types as board;
+        const VQFN: &str = "VQFN-20-1EP_3x3mm_P0.45mm_EP1.55x1.55mm";
+        const VQFN_SOURCE: &str =
+            include_str!("../../tests/fixtures/pad_primitives_vqfn20_kicad10.kicad_mod");
+        let pads = |footprint: &board::FootprintInstance| {
+            footprint
+                .definition
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .filter(|item| copperpour_ipc::builders::any_is(item, "kiapi.board.types.Pad"))
+                .map(|item| board::Pad::decode(item.value.as_slice()).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let comparable = |shapes: &[board::BoardGraphicShape]| {
+            shapes
+                .iter()
+                .cloned()
+                .map(|mut shape| {
+                    shape.id = None;
+                    shape.parent = None;
+                    shape.net = None;
+                    shape
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut custom = 0;
+        for (capture, library, name, source) in [
+            (
+                &include_bytes!("../../tests/fixtures/custom_pads_vqfn20_0_ipc.bin")[..],
+                "Package_DFN_QFN",
+                VQFN,
+                VQFN_SOURCE,
+            ),
+            (
+                &include_bytes!("../../tests/fixtures/custom_pads_vqfn20_90_ipc.bin")[..],
+                "Package_DFN_QFN",
+                VQFN,
+                VQFN_SOURCE,
+            ),
+            (
+                &include_bytes!("../../tests/fixtures/custom_pads_microsd_ipc.bin")[..],
+                "Connector_Card",
+                "SD-SIM_microSD-microSIM_Molex_104168-1620",
+                include_str!("../../tests/fixtures/pad_primitives_microsd_kicad10.kicad_mod"),
+            ),
+            (
+                &include_bytes!("../../tests/fixtures/custom_pads_wuerth_ipc.bin")[..],
+                "Mounting_Wuerth",
+                "Mounting_Wuerth_WA-SMSE-ExternalM3_H10mm_9771100360",
+                include_str!("../../tests/fixtures/pad_primitives_wuerth_kicad10.kicad_mod"),
+            ),
+            (
+                &include_bytes!("../../tests/fixtures/custom_pads_fiducial_ipc.bin")[..],
+                "Fiducial",
+                "Fiducial_Cross_1.5mm_Mask2mm",
+                include_str!("../../tests/fixtures/pad_primitives_fiducial_kicad10.kicad_mod"),
+            ),
+            (
+                &include_bytes!("../../tests/fixtures/custom_pads_sfh2201_0_ipc.bin")[..],
+                "OptoDevice",
+                "Osram_SFH2201",
+                include_str!("../../tests/fixtures/custom_pads_sfh2201_kicad10.kicad_mod"),
+            ),
+            (
+                &include_bytes!("../../tests/fixtures/custom_pads_sfh2201_270_ipc.bin")[..],
+                "OptoDevice",
+                "Osram_SFH2201",
+                include_str!("../../tests/fixtures/custom_pads_sfh2201_kicad10.kicad_mod"),
+            ),
+        ] {
+            let kicad = board::FootprintInstance::decode(capture).unwrap();
+            let reference = kicad
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.clone())
+                .unwrap();
+            let position = kicad.position.unwrap();
+            let x = copperpour_ipc::builders::nm_to_mm(position.x_nm);
+            let y = copperpour_ipc::builders::nm_to_mm(position.y_nm);
+            let rotation = kicad.orientation.unwrap().value_degrees;
+            let tmp = tempfile::tempdir().unwrap();
+            let pretty = tmp.path().join(format!("{library}.pretty"));
+            std::fs::create_dir(&pretty).unwrap();
+            std::fs::write(pretty.join(format!("{name}.kicad_mod")), source).unwrap();
+            library_fixture(tmp.path(), library, &pretty);
+            let lib_id = format!("{library}:{name}");
+            let prepared = PreparedFootprintPlacement::from_library(
+                source,
+                &lib_id,
+                &reference,
+                None,
+                x,
+                y,
+                rotation,
+                "F.Cu",
+                Some(tmp.path()),
+            )
+            .unwrap();
+            let item = prepared.ipc_item(&lib_id, &reference, x, y, true).unwrap();
+            let built = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            let (kicad_pads, built_pads) = (pads(&kicad), pads(&built));
+            assert_eq!(kicad_pads.len(), built_pads.len(), "{reference}");
+            for (kicad_pad, built_pad) in kicad_pads.iter().zip(&built_pads) {
+                let kicad_stack = kicad_pad.pad_stack.as_ref().unwrap();
+                let kicad_layer = &kicad_stack.copper_layers[0];
+                if kicad_layer.shape != board::PadStackShape::PssCustom as i32 {
+                    continue;
+                }
+                custom += 1;
+                let pad = format!("{reference} pad '{}'", kicad_pad.number);
+                let built_stack = built_pad.pad_stack.as_ref().unwrap();
+                let built_layer = &built_stack.copper_layers[0];
+                assert_eq!(built_pad.number, kicad_pad.number, "{pad}");
+                assert_eq!(built_pad.position, kicad_pad.position, "{pad}");
+                // The same angle, within one turn: the builder sends -90° where
+                // KiCad reports 270°.
+                let turn = |stack: &board::PadStack| {
+                    stack
+                        .angle
+                        .as_ref()
+                        .map(|angle| angle.value_degrees.rem_euclid(360.0))
+                };
+                assert_eq!(turn(built_stack), turn(kicad_stack), "{pad}");
+                assert_eq!(built_layer.shape, kicad_layer.shape, "{pad}");
+                assert_eq!(
+                    built_layer.custom_anchor_shape, kicad_layer.custom_anchor_shape,
+                    "{pad}"
+                );
+                assert_eq!(built_layer.size, kicad_layer.size, "{pad}");
+                // The zone connection and spoke angle KiCad holds after its
+                // parser loaded the pad: 90° for a rect anchor, 45° for a
+                // circle one.
+                assert_eq!(
+                    built_stack.zone_settings, kicad_stack.zone_settings,
+                    "{pad}"
+                );
+                assert_eq!(
+                    comparable(&built_layer.custom_shapes),
+                    comparable(&kicad_layer.custom_shapes),
+                    "{pad}"
+                );
+            }
+        }
+        assert_eq!(
+            custom,
+            8 + 8 + 2 + 3 + 1 + 2 + 2,
+            "every captured custom pad"
+        );
+    }
+
+    /// A custom pad with `(clearance convexhull)` is refused by name: KiCad's
+    /// pad message has no field for it, and placing it with the outline
+    /// clearance would give the board a different zone clearance from the
+    /// library (#679).
+    #[test]
+    fn a_convexhull_custom_pad_is_refused_with_the_pad_named() {
+        let source = include_str!("../../tests/fixtures/pad_primitives_vqfn20_kicad10.kicad_mod")
+            .replace("(clearance outline)", "(clearance convexhull)");
+        let error = extract_pad_definitions(&source).unwrap_err().to_string();
+        assert!(
+            error.contains("custom pad '1'") && error.contains("convexhull"),
+            "{error}"
+        );
     }
 
     /// The issue's reproduction, served: a stock C_0603 placed live at 180°

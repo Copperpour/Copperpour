@@ -745,6 +745,7 @@ impl PadZoneSettings {
     pub(crate) fn zone_connection_settings(
         &self,
         shape: i32,
+        anchor: i32,
     ) -> kiapi::board::types::ZoneConnectionSettings {
         kiapi::board::types::ZoneConnectionSettings {
             zone_connection: self
@@ -756,7 +757,7 @@ impl PadZoneSettings {
                 angle: Some(kiapi::common::types::Angle {
                     value_degrees: self
                         .spoke_angle
-                        .unwrap_or_else(|| default_thermal_spoke_angle(shape)),
+                        .unwrap_or_else(|| default_thermal_spoke_angle(shape, anchor)),
                 }),
                 gap: self.gap.map(copperpour_ipc::builders::distance),
             }),
@@ -788,12 +789,23 @@ fn zone_connection(text: &str) -> Result<kiapi::board::types::ZoneConnectionStyl
     })
 }
 
-/// The spoke angle KiCad gives a pad that doesn't set one, as
-/// `PADSTACK::DefaultThermalSpokeAngleForShape` does: 90° for ovals and
-/// rectangles, rounded or chamfered, and 45° for the rest. For the shapes
-/// typed refresh builds, KiCad's parser (`parsePAD`) gives the same.
-pub(crate) fn default_thermal_spoke_angle(shape: i32) -> f64 {
+/// The spoke angle KiCad's parser gives a pad that doesn't set one
+/// (`parsePAD`, `pcb_io_kicad_sexpr_parser.cpp`, 10.0.8): 90° for ovals and
+/// rectangles, rounded or chamfered, and for a custom pad with a rect anchor;
+/// 45° for circles and a custom pad with a circle anchor (in files from KiCad
+/// 6 on). `PADSTACK::DefaultThermalSpokeAngleForShape` gives every custom pad
+/// 45°, but a pad loaded from a file holds the parser's angle, and KiCad
+/// reports that over IPC (`custom_pads_ipc.README.md`: 90° on the rect-anchored
+/// pads, 45° on the others).
+pub(crate) fn default_thermal_spoke_angle(shape: i32, anchor: i32) -> f64 {
     use kiapi::board::types::PadStackShape;
+    if shape == PadStackShape::PssCustom as i32 {
+        return if anchor == PadStackShape::PssCircle as i32 {
+            45.0
+        } else {
+            90.0
+        };
+    }
     if [
         PadStackShape::PssOval,
         PadStackShape::PssRectangle,
@@ -832,12 +844,12 @@ pub(crate) fn apply_pad_settings(
                 .pad_stack
                 .as_mut()
                 .context("typed footprint builder returned a pad without a pad stack")?;
-            let shape = stack
+            let layer = stack
                 .copper_layers
                 .first()
-                .context("typed footprint builder returned a pad without a copper layer")?
-                .shape;
-            stack.zone_settings = Some(zone.zone_connection_settings(shape));
+                .context("typed footprint builder returned a pad without a copper layer")?;
+            let (shape, anchor) = (layer.shape, layer.custom_anchor_shape);
+            stack.zone_settings = Some(zone.zone_connection_settings(shape, anchor));
             *item = copperpour_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
         }
     }
@@ -974,13 +986,17 @@ pub(crate) fn unsupported_features(root: &SexpNode) -> Result<Vec<String>> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     check_supported_children(root, &mut |placed, _refresh| {
-        if seen.insert(placed.to_string()) {
+        if placed != CARRIED_BY_PLACEMENT && seen.insert(placed.to_string()) {
             out.push(placed.to_string());
         }
         Ok(())
     })?;
     Ok(out)
 }
+
+/// The placement note for something live placement carries but the typed
+/// library refresh does not compare yet, so only the refresh refuses it.
+const CARRIED_BY_PLACEMENT: &str = "";
 
 fn check_supported_children(
     root: &SexpNode,
@@ -1358,7 +1374,15 @@ fn check_pad(
         .get(3)
         .and_then(SexpNode::as_str)
         .context("footprint pad is missing its shape")?;
-    if !matches!(shape, "circle" | "rect" | "oval" | "roundrect") {
+    let custom = shape == "custom";
+    if custom {
+        // Placement and Update PCB's additions build custom pads (#679); the
+        // refresh does not compare them yet, so it still refuses them.
+        on_unsupported(
+            CARRIED_BY_PLACEMENT,
+            "pad shape 'custom' is not supported by typed library refresh",
+        )?;
+    } else if !matches!(shape, "circle" | "rect" | "oval" | "roundrect") {
         on_unsupported(
             &format!("pad shape '{shape}' is not carried by typed placement"),
             &format!("pad shape '{shape}' is not supported by typed library refresh"),
@@ -1368,6 +1392,10 @@ fn check_pad(
         let Some(tag) = child.head() else {
             continue;
         };
+        // A custom pad's shape, built from the shared model.
+        if custom && matches!(tag, "options" | "primitives") {
+            continue;
+        }
         if !matches!(
             tag,
             "at" | "size"
@@ -1423,6 +1451,22 @@ mod tests {
 
     fn root(source: &str) -> SexpNode {
         copperpour_sexp::parse_sexp(source).unwrap()
+    }
+
+    /// Custom pads are carried by live placement (#679), so a footprint with
+    /// them lists none of its shape, options or primitives as not carried;
+    /// the typed refresh does not compare them yet and still refuses them.
+    #[test]
+    fn custom_pads_are_carried_by_placement_and_refused_by_the_refresh() {
+        let vqfn = root(include_str!(
+            "../../tests/fixtures/pad_primitives_vqfn20_kicad10.kicad_mod"
+        ));
+        assert_eq!(unsupported_features(&vqfn).unwrap(), Vec::<String>::new());
+        let refusal = validate_supported_children(&vqfn).unwrap_err().to_string();
+        assert_eq!(
+            refusal,
+            "pad shape 'custom' is not supported by typed library refresh"
+        );
     }
 
     /// The KiCad-written 0603 capacitor: `(attr smd)`, its description and

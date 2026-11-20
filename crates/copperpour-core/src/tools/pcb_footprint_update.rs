@@ -1365,12 +1365,12 @@ fn build_updated_instance(
                 .pad_stack
                 .as_mut()
                 .context("typed footprint builder returned a pad without a pad stack")?;
-            let shape = stack
+            let layer = stack
                 .copper_layers
                 .first()
-                .context("typed footprint builder returned a pad without a copper layer")?
-                .shape;
-            stack.zone_settings = Some(zone.zone_connection_settings(shape));
+                .context("typed footprint builder returned a pad without a copper layer")?;
+            let (shape, anchor) = (layer.shape, layer.custom_anchor_shape);
+            stack.zone_settings = Some(zone.zone_connection_settings(shape, anchor));
             pad.net = old_nets
                 .get(&pad.number)
                 .map(|old| kiapi::board::types::Net {
@@ -2005,9 +2005,12 @@ fn normalized_items(
                     // every pad, and reads missing settings as an inherited
                     // connection and the shape's default angle
                     // (`PADSTACK::Deserialize`). Compare them that way.
-                    let shape = stack.copper_layers.first().map_or(
-                        kiapi::board::types::PadStackShape::PssUnknown as i32,
-                        |layer| layer.shape,
+                    let (shape, anchor) = stack.copper_layers.first().map_or(
+                        (
+                            kiapi::board::types::PadStackShape::PssUnknown as i32,
+                            kiapi::board::types::PadStackShape::PssUnknown as i32,
+                        ),
+                        |layer| (layer.shape, layer.custom_anchor_shape),
                     );
                     let settings = stack.zone_settings.get_or_insert_with(Default::default);
                     if settings.zone_connection
@@ -2018,7 +2021,7 @@ fn normalized_items(
                     }
                     let spokes = settings.thermal_spokes.get_or_insert_with(Default::default);
                     spokes.angle.get_or_insert(kiapi::common::types::Angle {
-                        value_degrees: default_thermal_spoke_angle(shape),
+                        value_degrees: default_thermal_spoke_angle(shape, anchor),
                     });
                 }
                 Ok(pad.encode_to_vec())
@@ -6568,7 +6571,8 @@ mod tests {
     fn a_built_pad_always_carries_its_spoke_angle() {
         use kiapi::board::types::{PadStackShape, ZoneConnectionStyle as Style};
         let settings = |zone: PadZoneSettings, shape: PadStackShape| {
-            let settings = zone.zone_connection_settings(shape as i32);
+            let settings =
+                zone.zone_connection_settings(shape as i32, PadStackShape::PssUnknown as i32);
             let spokes = settings.thermal_spokes.unwrap();
             (
                 settings.zone_connection,
@@ -6589,6 +6593,24 @@ mod tests {
                 settings(PadZoneSettings::default(), shape),
                 (inherited, Some(angle), None, None),
                 "{shape:?}"
+            );
+        }
+        // A custom pad's default follows its anchor, as KiCad's parser reads
+        // a file without the angle (#679).
+        for (anchor, angle) in [
+            (PadStackShape::PssCircle, 45.0),
+            (PadStackShape::PssRectangle, 90.0),
+        ] {
+            let settings = PadZoneSettings::default()
+                .zone_connection_settings(PadStackShape::PssCustom as i32, anchor as i32);
+            assert_eq!(
+                settings
+                    .thermal_spokes
+                    .unwrap()
+                    .angle
+                    .map(|a| a.value_degrees),
+                Some(angle),
+                "custom pad with a {anchor:?} anchor"
             );
         }
         // A connection alone still sends the default angle: KiCad would
@@ -6844,7 +6866,7 @@ mod tests {
                     continue;
                 }
                 assert_eq!(
-                    Some(zone.zone_connection_settings(shape)),
+                    Some(zone.zone_connection_settings(shape, PadStackShape::PssUnknown as i32)),
                     settings,
                     "{reference} pad {number}"
                 );

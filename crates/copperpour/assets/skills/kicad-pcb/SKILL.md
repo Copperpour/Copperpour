@@ -110,8 +110,9 @@ Follow this sequence for a clean PCB workflow:
    under `skipped_footprints` (counted in `coverage.skipped_footprint`), and so does
    the apply. Tell the user which parts were skipped and why, before applying and
    after. A skipped part stays as it is on the board until its cause is fixed and the
-   sync runs again: when its footprint cannot be placed (custom-shape pads are not
-   supported), assign the part a footprint without them; when the schematic connects
+   sync runs again: when its footprint cannot be placed (for example a custom pad
+   with `(clearance convexhull)`, which KiCad's pad message cannot carry), assign
+   the part another footprint or fix the pad; when the schematic connects
    a pad the footprint does not have, fix the symbol or the footprint choice. A
    successful apply is one KiCad undo entry, so Ctrl-Z reverses the whole update.
 3. **Refresh changed libraries** — when a linked footprint library changed, use

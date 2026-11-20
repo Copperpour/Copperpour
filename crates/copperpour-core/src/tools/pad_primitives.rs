@@ -126,6 +126,87 @@ impl CustomPadShape {
         Ok(shape)
     }
 
+    /// The shape as KiCad 10's pad message carries it, for building a pad
+    /// over IPC (#679). The message has no field for the clearance option and
+    /// KiCad gives such a pad the outline, so `convexhull` is refused rather
+    /// than placed with a different zone clearance from the library.
+    pub(super) fn to_ipc(&self) -> Result<copperpour_ipc::IpcCustomPadShape, String> {
+        use copperpour_ipc::IpcPadPrimitive;
+        if self.clearance == Clearance::Convexhull {
+            return Err(
+                "its (clearance convexhull) has no field in KiCad 10's pad message, \
+                        which gives the pad the outline clearance"
+                    .to_string(),
+            );
+        }
+        let xy = |point: &Point| (point.x, point.y);
+        let filled = |fill: &Fill| matches!(fill, Fill::Solid);
+        let primitives = self
+            .primitives
+            .iter()
+            .map(|primitive| match primitive {
+                FootprintGraphic::Line {
+                    start,
+                    end,
+                    stroke_width_mm,
+                } => IpcPadPrimitive::Segment {
+                    start: xy(start),
+                    end: xy(end),
+                    width: *stroke_width_mm,
+                },
+                FootprintGraphic::Arc {
+                    start,
+                    mid,
+                    end,
+                    stroke_width_mm,
+                } => IpcPadPrimitive::Arc {
+                    start: xy(start),
+                    mid: xy(mid),
+                    end: xy(end),
+                    width: *stroke_width_mm,
+                },
+                FootprintGraphic::Rect {
+                    start,
+                    end,
+                    stroke_width_mm,
+                    fill,
+                } => IpcPadPrimitive::Rectangle {
+                    start: xy(start),
+                    end: xy(end),
+                    width: *stroke_width_mm,
+                    filled: filled(fill),
+                },
+                FootprintGraphic::Circle {
+                    center,
+                    radius_mm,
+                    stroke_width_mm,
+                    fill,
+                } => IpcPadPrimitive::Circle {
+                    center: xy(center),
+                    radius: *radius_mm,
+                    width: *stroke_width_mm,
+                    filled: filled(fill),
+                },
+                FootprintGraphic::Poly {
+                    points,
+                    stroke_width_mm,
+                    fill,
+                } => IpcPadPrimitive::Polygon {
+                    points: points.iter().map(xy).collect(),
+                    width: *stroke_width_mm,
+                    filled: filled(fill),
+                },
+            })
+            .collect();
+        Ok(copperpour_ipc::IpcCustomPadShape {
+            anchor: match self.anchor {
+                Anchor::Circle => copperpour_ipc::IpcCustomPadAnchor::Circle,
+                Anchor::Rect => copperpour_ipc::IpcCustomPadAnchor::Rect,
+            },
+            primitives,
+        })
+    }
+
     /// The shape as JSON, the form [`Self::from_json`] reads.
     pub(super) fn to_json(&self) -> serde_json::Value {
         serde_json::to_value(self).expect("a custom pad shape serializes")

@@ -5249,6 +5249,7 @@ impl KiCadIpcClient {
                 layers.dedup();
 
                 let shape = match pad.shape.as_str() {
+                    _ if pad.custom.is_some() => kiapi::board::types::PadStackShape::PssCustom,
                     "circle" => kiapi::board::types::PadStackShape::PssCircle,
                     "rect" => kiapi::board::types::PadStackShape::PssRectangle,
                     "oval" => kiapi::board::types::PadStackShape::PssOval,
@@ -5256,6 +5257,27 @@ impl KiCadIpcClient {
                     "roundrect" => kiapi::board::types::PadStackShape::PssRoundrect,
                     "chamfered_rect" => kiapi::board::types::PadStackShape::PssChamferedrect,
                     _ => kiapi::board::types::PadStackShape::PssRectangle,
+                };
+                // A custom pad's anchor and primitives, pad-local and
+                // unrotated, as KiCad's own GetItems reports them
+                // (`custom_pads_ipc.README.md`).
+                let (anchor, custom_shapes) = match &pad.custom {
+                    Some(custom) => (
+                        match custom.anchor {
+                            crate::IpcCustomPadAnchor::Circle => {
+                                kiapi::board::types::PadStackShape::PssCircle
+                            }
+                            crate::IpcCustomPadAnchor::Rect => {
+                                kiapi::board::types::PadStackShape::PssRectangle
+                            }
+                        },
+                        custom
+                            .primitives
+                            .iter()
+                            .map(crate::builders::pad_primitive)
+                            .collect(),
+                    ),
+                    None => (shape, Vec::new()),
                 };
                 // Always F_Cu: it is KiCad's ALL_LAYERS sentinel for a
                 // PST_NORMAL stack, not a statement about which side the pad
@@ -5267,7 +5289,8 @@ impl KiCadIpcClient {
                     shape: shape as i32,
                     size: Some(crate::builders::vec2(pad.size_x, pad.size_y)),
                     corner_rounding_ratio: pad.roundrect_ratio,
-                    custom_anchor_shape: shape as i32,
+                    custom_anchor_shape: anchor as i32,
+                    custom_shapes,
                     offset: Some(crate::builders::vec2(0.0, 0.0)),
                     ..Default::default()
                 };
@@ -8443,6 +8466,7 @@ mod footprint_graphics_tests {
             drill_y: None,
             drill_oval: false,
             roundrect_ratio: 0.0,
+            custom: None,
             rotation: 0.0,
         };
 
@@ -8592,6 +8616,7 @@ mod footprint_graphics_tests {
             drill_y: None,
             drill_oval: false,
             roundrect_ratio: 0.0,
+            custom: None,
             rotation: 0.0,
         }];
         let error = format!("{:#}", build(&pad, &[], "F.Cu").expect_err("pad layer"));

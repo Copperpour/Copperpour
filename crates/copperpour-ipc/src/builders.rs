@@ -626,6 +626,54 @@ fn board_shape(
     }
 }
 
+/// One custom pad primitive as KiCad 10 serializes it in a pad stack's
+/// `custom_shapes`: on F.Cu (the stack's `ALL_LAYERS`), with a solid stroke,
+/// pad-local coordinates, and the id left to KiCad.
+pub fn pad_primitive(primitive: &crate::IpcPadPrimitive) -> kiapi::board::types::BoardGraphicShape {
+    use crate::IpcPadPrimitive;
+    let shape = match primitive {
+        IpcPadPrimitive::Segment { start, end, width } => {
+            board_segment("F.Cu", *width, start.0, start.1, end.0, end.1)
+        }
+        IpcPadPrimitive::Arc {
+            start,
+            mid,
+            end,
+            width,
+        } => board_arc("F.Cu", *width, start.0, start.1, mid.0, mid.1, end.0, end.1),
+        IpcPadPrimitive::Rectangle {
+            start,
+            end,
+            width,
+            filled,
+        } => {
+            let mut shape =
+                board_rectangle("F.Cu", *width, start.0, start.1, end.0, end.1, *filled);
+            // KiCad reports a pad primitive's corner radius as 0, not absent.
+            if let Some(kiapi::common::types::graphic_shape::Geometry::Rectangle(rectangle)) = shape
+                .shape
+                .as_mut()
+                .and_then(|shape| shape.geometry.as_mut())
+            {
+                rectangle.corner_radius = Some(distance(0.0));
+            }
+            shape
+        }
+        IpcPadPrimitive::Circle {
+            center,
+            radius,
+            width,
+            filled,
+        } => board_circle("F.Cu", *width, center.0, center.1, *radius, *filled),
+        IpcPadPrimitive::Polygon {
+            points,
+            width,
+            filled,
+        } => board_polygon("F.Cu", *width, *filled, std::slice::from_ref(points)),
+    };
+    with_line_style(shape, crate::IpcLineStyle::Solid)
+}
+
 /// Build a BoardGraphicShape for a straight segment.
 #[allow(clippy::too_many_arguments)]
 pub fn board_segment(
