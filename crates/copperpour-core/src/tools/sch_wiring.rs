@@ -3019,6 +3019,7 @@ fn add_power_symbol_to(
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(format!("power:{}", power_net), x, y);
     sym.at.rotation = Some(rotation);
+    sym.normalize_orientation();
     sym.unit = 1;
     // The library's exclusions, copied as `place_one_component` copies them.
     sym.exclude_from_sim = metadata.exclude_from_sim;

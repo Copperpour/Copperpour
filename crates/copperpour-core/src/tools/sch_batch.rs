@@ -208,7 +208,7 @@ pub fn tools() -> Vec<ToolDef> {
                                 "lib_id": { "type": "string" },
                                 "x": { "type": "number" }, "y": { "type": "number" },
                                 "rotation": { "type": "number", "default": 0 },
-                                "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric." },
+                                "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric. The stored orientation is normalized to the rotation and mirror pair eeschema writes (for example, 180° with 'x' is stored and reported as 0° with 'y')." },
                                 "reference": { "type": "string" },
                                 "value": { "type": "string" },
                                 "footprint": { "type": "string" },

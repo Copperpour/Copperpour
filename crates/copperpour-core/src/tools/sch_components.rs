@@ -82,7 +82,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "x": { "type": "number", "description": "X position in mm" },
                     "y": { "type": "number", "description": "Y position in mm" },
                     "rotation": { "type": "number", "description": "Rotation in degrees (0/90/180/270)", "default": 0 },
-                    "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric." },
+                    "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric. The stored orientation is normalized to the rotation and mirror pair eeschema writes (for example, 180° with 'x' is stored and reported as 0° with 'y')." },
                     "reference": { "type": "string", "description": "Optional reference designator. Default: the library prefix plus '?' (e.g. 'R?', '#FLG?'), which annotate_schematic numbers. A numbered one already placed on any sheet of the hierarchy is refused as invalid_argument, unless this is another unit of that part with its value" },
                     "value": { "type": "string", "description": "Optional override for the library symbol's Value" },
                     "footprint": { "type": "string", "description": "Optional override for the library symbol's Footprint" },
@@ -209,7 +209,9 @@ pub fn tools() -> Vec<ToolDef> {
              unit by the same delta. Does NOT adjust connected wires. Each unit's \
              Reference and Value text turns with its body, keeping any offset the caller \
              gave it; use reset_schematic_field_positions to put fields back on their \
-             library anchors instead. Junction dots are \
+             library anchors instead. Each unit's orientation is stored in the rotation \
+             and mirror pair eeschema writes for it (for example, 90° with 'y' is stored \
+             as 270° with 'x') and reported from the saved file. Junction dots are \
              re-judged where the pins turned, reported as junctions_pruned_count and \
              junctions_added_count. A no-connect flag travels with the pin it protects, \
              reported as no_connects_moved; the turn is refused before writing when that \
@@ -870,6 +872,7 @@ pub(crate) fn place_one_component(
     let mut sym = cse::Symbol::new(lib_id, x, y);
     sym.at.rotation = Some(rotation);
     sym.set_mirror(mirror);
+    sym.normalize_orientation();
     sym.unit = unit;
     // eeschema copies the library symbol's exclusions onto a symbol it
     // places, so a mounting hole stays out of the BOM (#124).
@@ -1177,6 +1180,7 @@ impl ComponentTargetUnit {
             .map(|path| (context.project_name.clone(), path.clone()))
             .collect::<Vec<_>>();
         instances.sort();
+        let (rotation, mirror) = cse::kicad_orientation(rotation, mirror);
         Self {
             uuid: uuid.to_owned(),
             unit,
@@ -4313,7 +4317,11 @@ async fn handle_rotate_schematic_component(
         .expect("structural target UUID is present in the loaded schematic");
     let rotation_delta = rotation - anchor.at.rotation.unwrap_or(0.0);
     for unit in &mut target.units {
-        unit.rotation = (unit.rotation + rotation_delta).rem_euclid(360.0);
+        let next = (unit.rotation + rotation_delta).rem_euclid(360.0);
+        let (canonical_rotation, canonical_mirror) =
+            cse::kicad_orientation(next, unit.mirror.as_deref());
+        unit.rotation = canonical_rotation;
+        unit.mirror = canonical_mirror.map(str::to_owned);
     }
     for symbol in sch
         .symbols
@@ -4322,12 +4330,12 @@ async fn handle_rotate_schematic_component(
     {
         // The delta lands each unit at its own angle, so a unit already at
         // 270° asked to follow a +90° turn computes 360° — normalize into
-        // [0, 360) before writing; eeschema only ever stores 0/90/180/270
-        // and re-saves anything else, so an unnormalized angle survives only
-        // until KiCad touches the file and then silently diverges from what
-        // this response reported.
+        // eeschema's canonical `(rotation, mirror)` pair before writing, so
+        // KiCad's next save leaves the pair alone and a later rotation computes
+        // its delta from the stored angle (#568).
         let new_rotation = (symbol.at.rotation.unwrap_or(0.0) + rotation_delta).rem_euclid(360.0);
         symbol.set_rotation(new_rotation);
+        symbol.normalize_orientation();
     }
     // A turn relocates pin endpoints exactly as a move does, so the markers on
     // those pins travel with them here too (#626).
@@ -15564,5 +15572,467 @@ mod root_editor_lock_tests {
         for (tool, arguments) in cases {
             root_lock_case(tool, arguments).await;
         }
+    }
+}
+
+/// Issue #568: placement (`add_schematic_component`, `batch_place_components`,
+/// `add_power_symbol`) and `rotate_schematic_component` must store and report
+/// KiCad's canonical `(rotation, mirror)` pair so a KiCad save changes nothing
+/// and later rotations compute their delta from the stored angle.
+#[cfg(test)]
+mod orientation_normalization_tests {
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+
+    const ECC83_SHEET: &str = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+    const POWER_SHEET: &str = include_str!("../../tests/fixtures/power_rows_kicad10.kicad_sch");
+
+    /// Oracle measured via `kicad-cli sch upgrade --force` (KiCad 10.0.8) —
+    /// restated as literals here rather than imported from `kicad_orientation`
+    /// so production and test cannot silently drift together.
+    const KICAD_PAIR_ORACLE: [(f64, &str, f64, Option<&str>); 6] = [
+        (0.0, "x", 0.0, Some("x")),
+        (90.0, "x", 90.0, Some("x")),
+        (180.0, "x", 0.0, Some("y")),
+        (90.0, "y", 270.0, Some("x")),
+        (180.0, "y", 0.0, Some("x")),
+        (270.0, "y", 90.0, Some("x")),
+    ];
+
+    fn sheet(source: &str, name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(name);
+        std::fs::write(&path, source).unwrap();
+        (directory, path)
+    }
+
+    async fn call(
+        handler: &McpHandler,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 568,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_ne!(
+            response["isError"],
+            json!(true),
+            "{name} unexpectedly failed: {response}"
+        );
+        serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    fn stored_orientation(path: &std::path::Path, reference: &str) -> (f64, Option<String>) {
+        let sch = cse::Schematic::load(path).unwrap();
+        let sym = sch
+            .symbols
+            .iter()
+            .find(|symbol| symbol.reference() == Some(reference))
+            .unwrap_or_else(|| panic!("symbol {reference} not found"));
+        (sym.at.rotation.unwrap_or(0.0), sym.mirror.clone())
+    }
+
+    fn pins_nm(path: &std::path::Path, reference: &str) -> Vec<(String, i64, i64)> {
+        let (_, tree) = read_schematic(path).unwrap();
+        let located = pin_locations_for_reference(&tree, reference).unwrap();
+        let mut pins = located["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pin| {
+                (
+                    pin["number"].as_str().unwrap().to_owned(),
+                    (pin["x"].as_f64().unwrap() * 1_000_000.0).round() as i64,
+                    (pin["y"].as_f64().unwrap() * 1_000_000.0).round() as i64,
+                )
+            })
+            .collect::<Vec<_>>();
+        pins.sort();
+        pins
+    }
+
+    #[tokio::test]
+    async fn add_schematic_component_normalizes_orientation_and_reports_stored_pair() {
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        let (_dir, path) = sheet(ECC83_SHEET, "ecc83-pp.kicad_sch");
+
+        for (index, &(req_rot, req_mirror, want_rot, want_mirror)) in
+            KICAD_PAIR_ORACLE.iter().enumerate()
+        {
+            let reference = format!("C{}", 20 + index);
+            let x = 25.4 + (index as f64) * 25.4;
+            let body = call(
+                &handler,
+                "add_schematic_component",
+                json!({
+                    "schematic": path.display().to_string(),
+                    "lib_id": "ecc83-pp:CP",
+                    "x": x,
+                    "y": 127.0,
+                    "rotation": req_rot,
+                    "mirror": req_mirror,
+                    "reference": reference,
+                }),
+            )
+            .await;
+
+            assert_eq!(
+                body["rotation"], want_rot,
+                "{req_rot}° {req_mirror} response: {body}"
+            );
+            assert_eq!(
+                body["mirror_x"].as_bool().unwrap_or(false),
+                want_mirror == Some("x"),
+                "{req_rot}° {req_mirror} response: {body}"
+            );
+            assert_eq!(
+                body["mirror_y"].as_bool().unwrap_or(false),
+                want_mirror == Some("y"),
+                "{req_rot}° {req_mirror} response: {body}"
+            );
+            let (stored_rot, stored_mirror) = stored_orientation(&path, &reference);
+            assert_eq!(
+                (stored_rot, stored_mirror.as_deref()),
+                (want_rot, want_mirror),
+                "{req_rot}° {req_mirror} on disk"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_place_components_normalizes_orientation_and_reports_stored_pair() {
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        let (_dir, path) = sheet(ECC83_SHEET, "ecc83-pp.kicad_sch");
+
+        let components = KICAD_PAIR_ORACLE
+            .iter()
+            .enumerate()
+            .map(|(index, &(req_rot, req_mirror, _, _))| {
+                json!({
+                    "lib_id": "ecc83-pp:CP",
+                    "x": 25.4 + (index as f64) * 25.4,
+                    "y": 127.0,
+                    "rotation": req_rot,
+                    "mirror": req_mirror,
+                    "reference": format!("C{}", 40 + index),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let body = call(
+            &handler,
+            "batch_place_components",
+            json!({
+                "schematic": path.display().to_string(),
+                "components": components,
+            }),
+        )
+        .await;
+        assert_eq!(body["placed_count"], KICAD_PAIR_ORACLE.len(), "{body}");
+        let placed = body["placed"].as_array().unwrap();
+
+        for (index, &(req_rot, req_mirror, want_rot, want_mirror)) in
+            KICAD_PAIR_ORACLE.iter().enumerate()
+        {
+            let reference = format!("C{}", 40 + index);
+            let entry = placed
+                .iter()
+                .find(|item| item["reference"] == reference)
+                .unwrap_or_else(|| panic!("missing {reference} in {body}"));
+            assert_eq!(
+                entry["rotation"], want_rot,
+                "batch {req_rot}° {req_mirror}: {entry}"
+            );
+            assert_eq!(
+                entry["mirror_x"].as_bool().unwrap_or(false),
+                want_mirror == Some("x"),
+                "batch {req_rot}° {req_mirror}: {entry}"
+            );
+            assert_eq!(
+                entry["mirror_y"].as_bool().unwrap_or(false),
+                want_mirror == Some("y"),
+                "batch {req_rot}° {req_mirror}: {entry}"
+            );
+            let (stored_rot, stored_mirror) = stored_orientation(&path, &reference);
+            assert_eq!(
+                (stored_rot, stored_mirror.as_deref()),
+                (want_rot, want_mirror),
+                "batch {req_rot}° {req_mirror} on disk"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rotate_schematic_component_normalizes_mirrored_symbol_and_preserves_pins() {
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+
+        // Start from a 0° y-mirrored asymmetric polarized cap (C20) and rotate to 90°, 180°, 270°.
+        for &(target_rot, want_rot, want_mirror) in &[
+            (90.0, 270.0, Some("x")),
+            (180.0, 0.0, Some("x")),
+            (270.0, 90.0, Some("x")),
+        ] {
+            let (_dir, path) = sheet(ECC83_SHEET, "ecc83-pp.kicad_sch");
+            call(
+                &handler,
+                "add_schematic_component",
+                json!({
+                    "schematic": path.display().to_string(),
+                    "lib_id": "ecc83-pp:CP",
+                    "x": 50.8,
+                    "y": 127.0,
+                    "rotation": 0.0,
+                    "mirror": "y",
+                    "reference": "C20",
+                }),
+            )
+            .await;
+
+            // Reference expectation: the unnormalized rotation applied directly.
+            let mut unnormalized = cse::Schematic::load(&path).unwrap();
+            unnormalized
+                .symbols
+                .iter_mut()
+                .find(|s| s.reference() == Some("C20"))
+                .unwrap()
+                .set_rotation(target_rot);
+            let (_exp_dir, exp_path) = sheet(&unnormalized.to_source(), "expected.kicad_sch");
+
+            let body = call(
+                &handler,
+                "rotate_schematic_component",
+                json!({
+                    "schematic": path.display().to_string(),
+                    "reference": "C20",
+                    "rotation": target_rot,
+                }),
+            )
+            .await;
+
+            assert_eq!(
+                body["rotation"], want_rot,
+                "rotate 0° y -> {target_rot}°: {body}"
+            );
+            assert_eq!(
+                body["mirror_x"],
+                want_mirror == Some("x"),
+                "rotate 0° y -> {target_rot}°: {body}"
+            );
+            assert_eq!(
+                body["mirror_y"],
+                want_mirror == Some("y"),
+                "rotate 0° y -> {target_rot}°: {body}"
+            );
+            assert_eq!(
+                body["placements"][0]["rotation"], want_rot,
+                "placements[0]: {body}"
+            );
+            assert_eq!(
+                body["placements"][0]["mirror_x"],
+                want_mirror == Some("x"),
+                "placements[0]: {body}"
+            );
+            assert_eq!(
+                body["placements"][0]["mirror_y"],
+                want_mirror == Some("y"),
+                "placements[0]: {body}"
+            );
+            let (stored_rot, stored_mirror) = stored_orientation(&path, "C20");
+            assert_eq!(
+                (stored_rot, stored_mirror.as_deref()),
+                (want_rot, want_mirror),
+                "rotate 0° y -> {target_rot}° on disk"
+            );
+            assert_eq!(
+                pins_nm(&path, "C20"),
+                pins_nm(&exp_path, "C20"),
+                "normalization must not move pins for 0° y -> {target_rot}°"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rotate_schematic_component_normalizes_each_unit_of_multi_unit_symbol() {
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        let (_dir, path) = sheet(ECC83_SHEET, "ecc83-pp.kicad_sch");
+
+        // Mirror only unit 2 to `y` (0° y), leaving unit 1 unmirrored (0°).
+        call(
+            &handler,
+            "mirror_schematic_component",
+            json!({
+                "schematic": path.display().to_string(),
+                "reference": "U1",
+                "mirror": "y",
+                "unit": 2,
+            }),
+        )
+        .await;
+
+        // Rotate U1 to 90°: unit 1 becomes (90°, none), unit 2 becomes (270°, x).
+        let body = call(
+            &handler,
+            "rotate_schematic_component",
+            json!({
+                "schematic": path.display().to_string(),
+                "reference": "U1",
+                "rotation": 90.0,
+            }),
+        )
+        .await;
+
+        assert_eq!(body["rotation"], 90.0, "{body}");
+        assert_eq!(body["mirror_x"], false, "{body}");
+        assert_eq!(body["mirror_y"], false, "{body}");
+        let placements = body["placements"].as_array().unwrap();
+        let u2 = placements
+            .iter()
+            .find(|u| u["unit"] == 2)
+            .expect("unit 2 in placements");
+        assert_eq!(
+            u2["rotation"], 270.0,
+            "unit 2 must normalize 90° y -> 270° x: {u2}"
+        );
+        assert_eq!(u2["mirror_x"], true, "{u2}");
+        assert_eq!(u2["mirror_y"], false, "{u2}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym2 = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("U1") && s.unit == 2)
+            .unwrap();
+        assert_eq!(sym2.at.rotation, Some(270.0));
+        assert_eq!(sym2.mirror.as_deref(), Some("x"));
+    }
+
+    #[tokio::test]
+    async fn add_power_symbol_normalizes_out_of_range_quarter_turn_rotation() {
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        let (_dir, path) = sheet(POWER_SHEET, "power_rows_kicad10.kicad_sch");
+
+        for &(req_rot, want_rot, x) in &[(360.0, 0.0, 25.4), (-90.0, 270.0, 50.8)] {
+            let body = call(
+                &handler,
+                "add_power_symbol",
+                json!({
+                    "schematic": path.display().to_string(),
+                    "power_net": "GND",
+                    "x": x,
+                    "y": 25.4,
+                    "rotation": req_rot,
+                }),
+            )
+            .await;
+            assert_eq!(body["rotation"], want_rot, "power {req_rot}°: {body}");
+            let reference = body["reference"].as_str().unwrap();
+            let (stored_rot, stored_mirror) = stored_orientation(&path, reference);
+            assert_eq!((stored_rot, stored_mirror), (want_rot, None));
+        }
+    }
+
+    #[test]
+    fn placement_readback_rejects_unnormalized_orientation_left_on_disk() {
+        let (_dir, path) = sheet(ECC83_SHEET, "ecc83-pp.kicad_sch");
+        let mut sch = cse::Schematic::load(&path).unwrap();
+        let context = crate::tools::sheet_instance_context(&path, &mut sch).unwrap();
+        // Simulate a broken writer that wrote (180°, x) directly to disk.
+        let mut sym = cse::Symbol::new("ecc83-pp:CP", 50.8, 127.0);
+        sym.at.rotation = Some(180.0);
+        sym.mirror = Some("x".to_string());
+        sym.unit = 1;
+        let metadata = cse::library::symbol_metadata(&sch, "ecc83-pp:CP");
+        let fields = PlacementFields::resolve("ecc83-pp:CP", &metadata, None, None);
+        sym.in_bom = fields.in_bom;
+        sym.on_board = fields.on_board;
+        sym.properties.push(crate::tools::positioned_property(
+            "Reference",
+            "C99",
+            50.8,
+            127.0,
+            0.0,
+            false,
+            cse::library::FieldJustify::default(),
+        ));
+        sym.properties.push(crate::tools::positioned_property(
+            "Value",
+            &fields.value,
+            50.8,
+            127.0,
+            0.0,
+            false,
+            cse::library::FieldJustify::default(),
+        ));
+        sym.properties.push(crate::tools::positioned_property(
+            "Footprint",
+            &fields.footprint,
+            50.8,
+            127.0,
+            0.0,
+            true,
+            cse::library::FieldJustify::default(),
+        ));
+        for instance_path in &context.instance_paths {
+            sym.set_instance_path(&context.project_name, instance_path, "C99", 1);
+        }
+        let uuid = sym.uuid.clone();
+        sch.add_symbol(sym);
+
+        let expected = ComponentTargetUnit::placement(
+            &uuid,
+            &context,
+            "ecc83-pp:CP",
+            50.8,
+            127.0,
+            180.0,
+            Some("x"),
+            "C99",
+            &fields,
+            1,
+        );
+        let err = placed_component_readback(&path, &sch, &expected, &context)
+            .expect_err("unnormalized (180°, x) on disk must fail canonical (0°, y) readback");
+        let text = match &err.content[0] {
+            ToolContent::Text { text } => text,
+            other => panic!("expected text error, got {other:?}"),
+        };
+        assert!(
+            text.contains("observed rotation differs"),
+            "expected rotation mismatch against canonical (0°, y), got: {text}"
+        );
     }
 }
