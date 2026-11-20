@@ -1436,6 +1436,18 @@ async fn handle_upgrade_library(
             Err(SexpError::TransactionConflict {
                 path: conflict_path,
                 journal,
+                kind: copperpour_sexp::TransactionConflictKind::AfterImage,
+                ..
+            }) => {
+                return Ok(crate::tools::transaction_after_image_result(
+                    &journal,
+                    &conflict_path,
+                    OPERATION,
+                ));
+            }
+            Err(SexpError::TransactionConflict {
+                path: conflict_path,
+                journal,
                 kind: copperpour_sexp::TransactionConflictKind::Recovery,
                 ..
             }) => {
@@ -1753,13 +1765,13 @@ async fn handle_upgrade_library(
                 failure.error
             )));
         }
-        return Ok(crate::tools::mutation_outcome_uncertain(
+        return Ok(crate::tools::file_outcome_uncertain(
             &path,
             OPERATION,
             format!(
-                "the transaction over {replaced} file(s) failed after its journal was written: {}; \
-                 the next upgrade_library call completes it, and `copperpour transaction status \
-                 {shown_dir}` shows what was applied",
+                "the upgrade planned for {replaced} file(s) stopped on a journaled failure: {}; \
+                 check for a remaining journal with `copperpour transaction status {shown_dir}` \
+                 before retrying",
                 failure.error
             ),
         ));
@@ -2615,6 +2627,32 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&other).unwrap(), "after");
         assert!(!journal.exists());
         assert_eq!(std::fs::read_to_string(&library).unwrap(), SYMBOLS_KICAD10);
+    }
+
+    #[tokio::test]
+    async fn upgrade_distinguishes_refused_and_interrupted_replay() {
+        for late_save in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let journal = if late_save {
+                crate::test_support::arm_late_save_during_recovery(dir.path())
+            } else {
+                crate::test_support::write_recovery_journal(dir.path(), "external")
+            };
+            let journal_before = std::fs::read(&journal).unwrap();
+            let library = dir.path().join("D.kicad_sym");
+            std::fs::write(&library, SYMBOLS_KICAD9).unwrap();
+            let body = call("", json!({"library_path": library, "dry_run": false})).await;
+            let kind = if late_save {
+                "mutation_outcome_uncertain"
+            } else {
+                "conflict"
+            };
+            assert_eq!(body["error"]["kind"], kind, "{body}");
+            assert!(body.to_string().contains("transaction status"), "{body}");
+            crate::test_support::assert_recovery_targets(dir.path(), late_save);
+            assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+            assert_eq!(std::fs::read_to_string(&library).unwrap(), SYMBOLS_KICAD9);
+        }
     }
 
     /// A read-only file would stop the transaction after its journal, so it

@@ -565,10 +565,13 @@ the lock. Remove a confirmed stale lock manually only as a last resort.
 Multi-file schematic changes persist a `.copperpour-transaction-<id>.json`
 write-ahead journal in the project before changing any target. Releases before
 the rename to Copperpour named it `.konnect-transaction-<id>.json`; those
-journals are still found, recovered and abandoned the same way. On restart,
-Copperpour safely completes files that still match either the recorded before
-image or intended replacement. It never overwrites a file changed by KiCad or
-another process after the journal was written.
+journals are still found, recovered and abandoned the same way. Recovery leaves
+files that already match the intended replacement alone. Apply and recovery both
+recheck each replacement target against its recorded before image just before the
+rename. If a save is detected, Copperpour leaves that file untouched, stops and
+keeps the journal. Earlier writes may already have applied and are not rolled back.
+Writers that ignore Copperpour's locks can still save in the gap between the final
+check and rename.
 
 Inspect active journals without printing their contents:
 

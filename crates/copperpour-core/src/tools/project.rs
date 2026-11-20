@@ -1186,7 +1186,7 @@ mod tests {
         );
         assert!(old_pro.exists() && !new_pro.exists());
 
-        // After-image failure reports mutation_outcome_uncertain.
+        // A cleanup failure can name a journal that has already been removed.
         std::fs::rename(&old_pro, &new_pro).unwrap();
         let after = rename_rewrite_failed(
             TransactionFailure {
@@ -1194,9 +1194,9 @@ mod tests {
                     path: dir.path().join("notes.txt"),
                     journal: journal.clone(),
                     kind: TransactionConflictKind::AfterImage,
-                    reason: "replacement did not remain durable".into(),
+                    reason: "journal directory sync failed after unlink".into(),
                 },
-                journal: None,
+                journal: Some(journal.clone().into_boxed_path()),
             },
             dir.path(),
             &planned,
@@ -1207,9 +1207,16 @@ mod tests {
             extract_error_kind(&after).as_deref(),
             Some("mutation_outcome_uncertain")
         );
+        let after_body = response_json(&after);
+        let message = after_body["message"].as_str().unwrap();
+        assert!(message.contains("check whether journal"), "{after_body}");
+        assert_eq!(after_body["error"]["path"], json!(dir.path()));
+        assert!(!journal.exists());
+        assert!(!old_pro.exists() && new_pro.exists());
 
         // Served dispatch: rename_project with a stuck journal returns conflict
         // naming the journal and recovery command, leaving files untouched.
+        std::fs::rename(&new_pro, &old_pro).unwrap();
         let notes = dir.path().join("notes.txt");
         std::fs::write(&notes, "C").unwrap();
         std::fs::write(
@@ -1796,15 +1803,16 @@ fn rename_rewrite_failed(
     planned_files: &[(PathBuf, PathBuf)],
     targets: &[(PathBuf, PathBuf)],
 ) -> anyhow::Result<CallToolResult> {
-    // Renaming back would strand the journal, which names the new paths.
+    // A retained journal can name the new paths, and some writes may have applied.
     if let Some(journal) = failure.journal {
         return Ok(rename_uncertain(
-            &journal,
+            dir,
             format!(
-                "The files were renamed, but rewriting their project references failed after \
-                 this journal was written ({}), so some may already hold the new name. Run \
-                 `copperpour transaction status` in the project directory.",
-                failure.error
+                "The files were renamed, but the file transaction stopped ({}). Some journaled \
+                 writes may have applied. The renames were not undone. Inspect the affected files \
+                 and run `copperpour transaction status` to check whether journal '{}' remains.",
+                failure.error,
+                copperpour_sexp::paths::display_path(&journal)
             ),
         ));
     }

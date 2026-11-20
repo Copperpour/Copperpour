@@ -12,17 +12,16 @@ pub enum TransactionConflictKind {
     BeforeImage,
     /// An older journal in the transaction directory is still pending, has a
     /// target whose content matches neither its before image nor its
-    /// replacement, or met a conflict while recovery completed it.
+    /// replacement, or recovery stopped before publishing any target.
     ///
     /// Nothing of the current call was written, and the older journal remains
     /// on disk for inspection, recovery, or abandonment.
     Recovery,
-    /// After this transaction's journal was persisted (during target publication or
-    /// after-image verification), a guard changed or a target did not read
-    /// back as its intended replacement.
+    /// A conflict during publication or readback of a new journal, or a
+    /// recovery conflict after replay already published an entry.
     ///
-    /// Target files may already have been modified and the journal remains on
-    /// disk, so callers must treat the outcome as uncertain.
+    /// Target files may already have been modified. The journal path is
+    /// diagnostic: a failed cleanup sync may follow a successful unlink.
     AfterImage,
 }
 
