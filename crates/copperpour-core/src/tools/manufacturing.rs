@@ -22,7 +22,8 @@ pub fn tools() -> Vec<ToolDef> {
             "Generate ALL files needed for PCB fabrication and assembly in one call: \
              Gerbers, drill files, BOM (fab-house format), and pick-and-place positions. \
              Targets a specific fab house (JLCPCB, PCBWay, etc.). JLCPCB assembly requires the exact board open in KiCad with IPC enabled; native pad midpoints and board exports use one stable live snapshot. \
-             The JLCPCB placement evidence is written whole beside the CPL, at `placement_orientation.evidence_path`; the response counts its lists and shows the first `limit` applied corrections.",
+             The JLCPCB placement evidence is written whole beside the CPL, at `placement_orientation.evidence_path`; the response counts its lists and shows the first `limit` applied corrections. \
+             For JLCPCB, a part fitted by hand (footprint attribute exclude_from_pos_files, not DNP) leaves the BOM as it leaves the CPL, and is listed in BOM-hand-fitted-<board>.csv for purchase.",
             json!({
                 "type": "object",
                 "properties": {
@@ -465,6 +466,37 @@ pub(crate) async fn build_package(
                 .await;
             match bom_result {
                 Ok(()) => {
+                    // Parts fitted by hand leave the assembler's BOM as they
+                    // already leave its CPL, for a list of their own (#681).
+                    let hand_fitted = match &snapshot {
+                        Some(snapshot) => {
+                            let path =
+                                output_dir.join(format!("BOM-hand-fitted-{project_name}.csv"));
+                            split_hand_fitted_bom(
+                                &bom_path,
+                                &path,
+                                &snapshot.hand_fitted,
+                                bom_options.fields,
+                            )
+                            .await
+                            .map(|designators| designators.map(|designators| (path, designators)))
+                        }
+                        None => Ok(None),
+                    };
+                    match hand_fitted {
+                        Ok(Some((path, designators))) => files_generated.push(json!({
+                            "type": "bom_hand_fitted",
+                            "path": path.to_str().unwrap_or(""),
+                            "format": "csv",
+                            "designators": designators,
+                            "note": "Parts fitted by hand: kept out of the assembler's BOM and CPL by their footprint's exclude_from_pos_files attribute, listed here for purchase. Not for upload."
+                        })),
+                        Ok(None) => {}
+                        Err(e) => {
+                            error!(error = %e, "[BETA] Hand-fitted BOM split failed");
+                            warnings.push(format!("Hand-fitted BOM split failed: {e:#}"));
+                        }
+                    }
                     let parsed = assembly
                         .bom_designators(&bom_path, cpl_designators.as_ref())
                         .await?;
@@ -605,6 +637,54 @@ pub(crate) async fn build_package(
         snapshot,
         _staging: snapshot_directory,
     }))
+}
+
+/// Moves the `hand_fitted` parts out of the JLCPCB BOM at `bom` into
+/// `hand_bom` (#681): the hand-fitted list is written first, then the BOM is
+/// replaced by the assembler's rows. The parts moved, or `None` when the BOM
+/// lists none of them: the BOM is left as it is, and a `hand_bom` file left by
+/// an earlier export is removed, so the folder holds no stale list.
+async fn split_hand_fitted_bom(
+    bom: &std::path::Path,
+    hand_bom: &std::path::Path,
+    hand_fitted: &std::collections::BTreeSet<String>,
+    fields: Option<&str>,
+) -> anyhow::Result<Option<std::collections::BTreeSet<String>>> {
+    let split = if hand_fitted.is_empty() {
+        None
+    } else {
+        let source = tokio::fs::read_to_string(bom).await?;
+        crate::fab::jlcpcb::split_hand_fitted_bom(&source, hand_fitted, fields)?
+    };
+    let Some(split) = split else {
+        remove_stale_hand_fitted_bom(hand_bom).await?;
+        return Ok(None);
+    };
+    cli::publish_verified_bytes(hand_bom, split.hand_fitted.as_bytes(), "hand-fitted BOM").await?;
+    cli::publish_verified_bytes(bom, split.assembly.as_bytes(), "JLCPCB BOM").await?;
+    Ok(Some(split.designators))
+}
+
+/// Removes the hand-fitted list an earlier export wrote at `hand_bom`, if
+/// there is one. Only a file is removed; anything else at that path is left.
+/// A name too long for the file system cannot have been written, so it has
+/// nothing to remove either.
+async fn remove_stale_hand_fitted_bom(hand_bom: &std::path::Path) -> anyhow::Result<()> {
+    match tokio::fs::symlink_metadata(hand_bom).await {
+        Ok(meta) if meta.is_file() => tokio::fs::remove_file(hand_bom)
+            .await
+            .with_context(|| format!("removing stale {}", hand_bom.display())),
+        Ok(_) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidFilename
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// A refusal of the order link: nothing was uploaded, and why.
