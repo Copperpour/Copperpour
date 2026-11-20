@@ -285,7 +285,7 @@ enum Fill {
 }
 
 /// `value` as KiCad will hold it, rounded to its 100 nm unit, or why not.
-fn millimetres(value: &Value, field: &str) -> Result<f64, CallToolResult> {
+pub(super) fn millimetres(value: &Value, field: &str) -> Result<f64, CallToolResult> {
     let raw = value
         .as_f64()
         .ok_or_else(|| invalid_arg(field, "missing or not a number"))?;
@@ -497,7 +497,7 @@ fn parse_shape(shape: &Value, index: usize) -> Result<Shape, CallToolResult> {
 
 /// A coordinate as KiCad writes it: the shortest decimal that reads back as
 /// the rounded value, `0` for `-0`.
-fn num(value: f64) -> String {
+pub(super) fn num(value: f64) -> String {
     format!("{}", value + 0.0)
 }
 
