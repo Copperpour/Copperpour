@@ -759,6 +759,7 @@ fn place_footprint_sends_graphics_children() {
         drill_oval: false,
         layers: vec!["F.Cu".to_string()],
         roundrect_ratio: 0.25,
+        custom: None,
     }];
     let graphics = vec![
         IpcGraphicDefinition::Rect {
@@ -2059,6 +2060,7 @@ fn footprint_with_a_pad_and_a_line(pad_uuid: &str, line_uuid: &str) -> prost_typ
             drill_oval: false,
             layers: vec!["F.Cu".to_string()],
             roundrect_ratio: 0.0,
+            custom: None,
         }],
         &[copperpour_ipc::IpcGraphicDefinition::Poly {
             points: vec![(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0)],

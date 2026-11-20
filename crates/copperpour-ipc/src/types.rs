@@ -346,6 +346,59 @@ pub struct IpcPadDefinition {
     pub drill_oval: bool,
     pub layers: Vec<String>,
     pub roundrect_ratio: f64,
+    /// A custom pad's anchor and primitives; `None` for every other shape.
+    pub custom: Option<IpcCustomPadShape>,
+}
+
+/// A custom pad's anchor and primitives, in the pad's own millimetres:
+/// relative to its anchor and unrotated, as KiCad stores and serializes them
+/// (`PADSTACK::Serialize`, `pcbnew/padstack.cpp`). The pad's size is the
+/// anchor's size. The clearance option has no field in KiCad 10's pad
+/// message, so a pad built from this gets KiCad's default, the outline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IpcCustomPadShape {
+    pub anchor: IpcCustomPadAnchor,
+    pub primitives: Vec<IpcPadPrimitive>,
+}
+
+/// The anchor shape KiCad merges with a custom pad's primitives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcCustomPadAnchor {
+    Circle,
+    Rect,
+}
+
+/// One primitive of a custom pad: points in mm, widths in mm.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IpcPadPrimitive {
+    Segment {
+        start: (f64, f64),
+        end: (f64, f64),
+        width: f64,
+    },
+    Arc {
+        start: (f64, f64),
+        mid: (f64, f64),
+        end: (f64, f64),
+        width: f64,
+    },
+    Rectangle {
+        start: (f64, f64),
+        end: (f64, f64),
+        width: f64,
+        filled: bool,
+    },
+    Circle {
+        center: (f64, f64),
+        radius: f64,
+        width: f64,
+        filled: bool,
+    },
+    Polygon {
+        points: Vec<(f64, f64)>,
+        width: f64,
+        filled: bool,
+    },
 }
 
 /// A graphic's line style, as KiCad's `(stroke (type …))` names it.
