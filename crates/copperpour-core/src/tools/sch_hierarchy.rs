@@ -1102,16 +1102,235 @@ fn create_blank_schematic(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn next_free_page(parent: &cse::Schematic, project_name: &str) -> u32 {
-    let mut max_page: u32 = 1; // page 1 is always the root sheet
-    for sheet in parent.sheets.iter() {
-        if let Some(p) = sheet.page(project_name) {
-            if let Ok(n) = p.parse::<u32>() {
-                max_page = max_page.max(n);
+fn record_root_sheet_instance_page(sch: &cse::Schematic, used: &mut HashSet<u32>) {
+    for node in &sch.raw_other {
+        if node.tag() != Some("sheet_instances") {
+            continue;
+        }
+        for path in node.find_all("path") {
+            if path.value() != Some("/") {
+                continue;
+            }
+            if let Some(n) = path
+                .get_value("page")
+                .and_then(|p| p.trim().parse::<u32>().ok())
+            {
+                if n > 0 {
+                    used.insert(n);
+                }
             }
         }
     }
-    max_page + 1
+}
+
+fn record_sheet_pages(
+    sheet: &cse::Sheet,
+    project_name: &str,
+    hier_prefix: &str,
+    is_root: bool,
+    used: &mut HashSet<u32>,
+) {
+    let page = sheet
+        .page_at(project_name, hier_prefix)
+        .or_else(|| {
+            // eeschema matches a sheet's page by parent instance path alone
+            // (and older files may store an empty project name or "/").
+            sheet
+                .instances
+                .iter()
+                .find(|inst| inst.path == hier_prefix)
+                .map(|inst| inst.page.as_str())
+        })
+        .or_else(|| sheet.page(project_name))
+        .or_else(|| {
+            is_root
+                .then(|| {
+                    sheet
+                        .instances
+                        .iter()
+                        .find(|inst| inst.project_name.is_empty() && inst.path == "/")
+                        .map(|inst| inst.page.as_str())
+                })
+                .flatten()
+        });
+    if let Some(n) = page.and_then(|p| p.trim().parse::<u32>().ok()) {
+        if n > 0 {
+            used.insert(n);
+        }
+    }
+}
+
+/// A hierarchy the page walk cannot finish (a cycle, or a sheet it cannot
+/// read) is a `conflict` on that file: nothing was written.
+fn page_allocation_conflict(path: &Path, message: String) -> CallToolResult {
+    CallToolResult::error_kind(
+        ToolErrorKind::Conflict {
+            paths: vec![path.display().to_string()],
+        },
+        message,
+    )
+}
+
+fn collect_used_pages(
+    path: &Path,
+    hier_prefix: &str,
+    project_name: &str,
+    parent_override: (&Path, &cse::Schematic),
+    depth: usize,
+    visited: &mut HashSet<PathBuf>,
+    used: &mut HashSet<u32>,
+) -> Result<(), CallToolResult> {
+    if depth > MAX_HIERARCHY_DEPTH {
+        return Err(page_allocation_conflict(
+            path,
+            format!(
+                "Schematic hierarchy exceeds maximum depth ({MAX_HIERARCHY_DEPTH}) at '{}' — \
+                 possible reference cycle; nothing was written",
+                path.display()
+            ),
+        ));
+    }
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canon.clone()) {
+        return Err(page_allocation_conflict(
+            path,
+            format!(
+                "Schematic hierarchy contains a cycle through '{}'; nothing was written",
+                path.display()
+            ),
+        ));
+    }
+
+    let loaded;
+    let sch = if super::same_schematic_document(path, parent_override.0) {
+        parent_override.1
+    } else {
+        loaded = match cse::Schematic::load(path) {
+            Ok(sch) => sch,
+            Err(_) if depth > 0 => {
+                // An unreadable descendant cannot be walked, but its own sheet
+                // block in its parent was already recorded. Nested targets have
+                // already been refused by `resolve_schematic_ownership`.
+                visited.remove(&canon);
+                return Ok(());
+            }
+            Err(error) => {
+                visited.remove(&canon);
+                return Err(page_allocation_conflict(
+                    path,
+                    format!(
+                        "Cannot read '{}' while allocating a sheet page number: {error}; \
+                         nothing was written",
+                        path.display()
+                    ),
+                ));
+            }
+        };
+        &loaded
+    };
+
+    if depth == 0 {
+        record_root_sheet_instance_page(sch, used);
+    }
+    let dir = parent_dir(path);
+    for sheet in sch.sheets.iter() {
+        record_sheet_pages(sheet, project_name, hier_prefix, depth == 0, used);
+        if sheet.file().is_empty() {
+            continue;
+        }
+        let child_path = dir.join(sheet.file());
+        if child_path.is_file() {
+            let child_prefix = format!("{hier_prefix}/{}", sheet.uuid);
+            if let Err(error) = collect_used_pages(
+                &child_path,
+                &child_prefix,
+                project_name,
+                parent_override,
+                depth + 1,
+                visited,
+                used,
+            ) {
+                visited.remove(&canon);
+                return Err(error);
+            }
+        }
+    }
+    visited.remove(&canon);
+    Ok(())
+}
+
+/// Allocate the lowest positive page number >= 2 not already used by any sheet
+/// placement in the owning project's hierarchy (page 1 is reserved for the root).
+fn next_free_page(
+    located: &SheetParent,
+    parent_path: &Path,
+    parent: &cse::Schematic,
+    project_name: &str,
+) -> Result<u32, CallToolResult> {
+    let Some(top_level_sheets) = located.top_level_sheets.as_deref() else {
+        return Err(page_allocation_conflict(
+            parent_path,
+            "Cannot determine free page numbers because another top-level sheet in this project \
+             could not be read; nothing was written"
+                .to_string(),
+        ));
+    };
+    let mut used = HashSet::new();
+    let mut visited = HashSet::new();
+    for top_level in top_level_sheets {
+        let root_prefix = format!("/{}", top_level.uuid);
+        collect_used_pages(
+            &top_level.schematic,
+            &root_prefix,
+            project_name,
+            (parent_path, parent),
+            0,
+            &mut visited,
+            &mut used,
+        )?;
+    }
+    (2u32..).find(|page| !used.contains(page)).ok_or_else(|| {
+        CallToolResult::error("No free page numbers remain in this schematic hierarchy")
+    })
+}
+
+/// Read the committed parent back and verify the newly inserted sheet records
+/// `expected_page` at `parent_instance_path`. Returns `mutation_outcome_uncertain`
+/// if the committed file does not hold it.
+fn verify_committed_sheet(
+    parent_path: &Path,
+    sheet_uuid: &str,
+    project_name: &str,
+    parent_instance_path: &str,
+    expected_page: &str,
+    operation: &str,
+) -> Result<Value, CallToolResult> {
+    let committed = cse::Schematic::load(parent_path).map_err(|error| {
+        super::mutation_outcome_uncertain(
+            parent_path,
+            operation,
+            format!("the parent schematic could not be read back: {error}"),
+        )
+    })?;
+    let Some(sheet_ref) = committed.sheets.by_uuid(sheet_uuid) else {
+        return Err(super::mutation_outcome_uncertain(
+            parent_path,
+            operation,
+            format!("the committed sheet '{sheet_uuid}' was not found on readback"),
+        ));
+    };
+    let observed_page = sheet_ref.page_at(project_name, parent_instance_path);
+    if observed_page != Some(expected_page) {
+        return Err(super::mutation_outcome_uncertain(
+            parent_path,
+            operation,
+            format!(
+                "the committed sheet recorded page {observed_page:?} at '{parent_instance_path}' \
+                 for project '{project_name}', expected '{expected_page}'"
+            ),
+        ));
+    }
+    Ok(sheet_json(sheet_ref, project_name))
 }
 
 fn sheet_json(sheet: &cse::Sheet, project_name: &str) -> Value {
@@ -2394,7 +2613,10 @@ async fn handle_add_hierarchical_sheet(
         Err(error) => return Ok(error),
     };
     let project_name = located.project_name.clone();
-    let page = next_free_page(&parent, &project_name).to_string();
+    let page = match next_free_page(&located, &parent_path, &parent, &project_name) {
+        Ok(page) => page.to_string(),
+        Err(error) => return Ok(error),
+    };
     let parent_base = if located.is_root {
         ensure_hierarchy_root_footer(&parent_base)?
     } else {
@@ -2504,14 +2726,20 @@ async fn handle_add_hierarchical_sheet(
             return Ok(error);
         }
     }
-    let committed = cse::Schematic::load(&parent_path)?;
-    let sheet_ref = committed
-        .sheets
-        .by_name(&sheet_name)
-        .ok_or_else(|| anyhow::anyhow!("committed sheet was not readable"))?;
+    let sheet = match verify_committed_sheet(
+        &parent_path,
+        &sheet_uuid,
+        &project_name,
+        &parent_instance_path,
+        &page,
+        "add_hierarchical_sheet",
+    ) {
+        Ok(sheet) => sheet,
+        Err(error) => return Ok(error),
+    };
     Ok(CallToolResult::json(&json!({
         "added": sheet_name,
-        "sheet": sheet_json(sheet_ref, &project_name),
+        "sheet": sheet,
         "child_file": child_path.display().to_string(),
         "reused_existing_file": child_existed,
         "patched_symbol_instances": patched
@@ -3035,8 +3263,11 @@ async fn handle_duplicate_sheet(
         Ok(path) => path,
         Err(error) => return Ok(error),
     };
-    let project_name = located.project_name;
-    let page = next_free_page(&parent, &project_name).to_string();
+    let project_name = located.project_name.clone();
+    let page = match next_free_page(&located, &sch_path, &parent, &project_name) {
+        Ok(page) => page.to_string(),
+        Err(error) => return Ok(error),
+    };
     let parent_base = if located.is_root {
         ensure_hierarchy_root_footer(&parent_base)?
     } else {
@@ -3095,14 +3326,20 @@ async fn handle_duplicate_sheet(
         return Ok(error);
     }
 
-    let committed = cse::Schematic::load(&sch_path)?;
-    let sheet_ref = committed
-        .sheets
-        .by_name(&new_name)
-        .ok_or_else(|| anyhow::anyhow!("duplicated sheet was not readable"))?;
+    let sheet = match verify_committed_sheet(
+        &sch_path,
+        &sheet_uuid,
+        &project_name,
+        &parent_instance_path,
+        &page,
+        "duplicate_sheet",
+    ) {
+        Ok(sheet) => sheet,
+        Err(error) => return Ok(error),
+    };
     Ok(CallToolResult::json(&json!({
         "duplicated_from": source_name,
-        "sheet": sheet_json(sheet_ref, &project_name),
+        "sheet": sheet,
         "child_file": new_child.display().to_string(),
         "patched_symbol_instances": patched
     })))
@@ -8344,7 +8581,7 @@ mod instance_path_lifecycle_tests {
         assert_eq!(tree["children"][0]["page"], json!("5"), "{tree}");
         assert_eq!(
             tree["children"][0]["children"][0]["page"],
-            json!("2"),
+            json!("6"),
             "{tree}"
         );
 
@@ -8360,6 +8597,385 @@ mod instance_path_lifecycle_tests {
         assert_eq!(body["error"]["kind"], json!("invalid_argument"), "{body}");
         assert!(body.to_string().contains("placed 2 times"), "{body}");
         assert_eq!(std::fs::read(&bank).unwrap(), bank_before);
+    }
+
+    #[tokio::test]
+    async fn add_and_duplicate_nested_sheets_allocate_project_wide_free_pages() {
+        let (tmp, root) = project();
+        let mid = tmp.path().join("mid.kicad_sch");
+
+        // `demo.kicad_sch` already uses pages 2 (Child), 3 (Shared A),
+        // 4 (Shared B) and 5 (Mid). Adding Leaf inside `mid.kicad_sch` must
+        // get page 6, not collide with page 2.
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({
+                "schematic": mid.display().to_string(),
+                "sheet_file": "leaf.kicad_sch",
+                "sheet_name": "Leaf"
+            }),
+        )
+        .await;
+        assert!(!failed, "{body}");
+        assert_eq!(body["sheet"]["page"], json!("6"), "{body}");
+        let mid_sch = cse::Schematic::load(&mid).unwrap();
+        assert_eq!(
+            mid_sch
+                .sheets
+                .by_name("Leaf")
+                .unwrap()
+                .page_at("demo", &format!("/{ROOT}/{MID}")),
+            Some("6")
+        );
+
+        // Adding a sibling sheet to the root must skip page 6 used inside `mid`.
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({
+                "schematic": root.display().to_string(),
+                "sheet_file": "extra.kicad_sch",
+                "sheet_name": "Extra"
+            }),
+        )
+        .await;
+        assert!(!failed, "{body}");
+        assert_eq!(body["sheet"]["page"], json!("7"), "{body}");
+
+        // Duplicating `Leaf` inside `mid.kicad_sch` must skip page 7 used on the root.
+        let (failed, body) = served(
+            "duplicate_sheet",
+            json!({
+                "schematic": mid.display().to_string(),
+                "source_sheet_name": "Leaf",
+                "new_sheet_name": "Leaf Copy",
+                "new_file": "leaf_copy.kicad_sch"
+            }),
+        )
+        .await;
+        assert!(!failed, "{body}");
+        assert_eq!(body["sheet"]["page"], json!("8"), "{body}");
+        let mid_sch = cse::Schematic::load(&mid).unwrap();
+        assert_eq!(
+            mid_sch
+                .sheets
+                .by_name("Leaf Copy")
+                .unwrap()
+                .page_at("demo", &format!("/{ROOT}/{MID}")),
+            Some("8")
+        );
+    }
+
+    #[tokio::test]
+    async fn add_hierarchical_sheet_fills_gaps_and_skips_reused_child_and_duplicate_pages() {
+        // `annotate_nested_hierarchy` has pages:
+        //   root: south=2, north=10
+        //   bank (reused): east={3, 12}, west={4, 11}
+        // First free positive page >= 2 is 5 (not 11, which collides with west under north).
+        let (_tmp, root, _bank, _cell) = nested_project();
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({
+                "schematic": root.display().to_string(),
+                "sheet_file": "aux_a.kicad_sch",
+                "sheet_name": "Aux A"
+            }),
+        )
+        .await;
+        assert!(!failed, "{body}");
+        assert_eq!(body["sheet"]["page"], json!("5"), "{body}");
+
+        // Fill the rest of the gap (6, 7, 8, 9), then verify the next page skips
+        // north=10 AND bank's reused-child pages west=11, east=12 -> gets 13.
+        for (idx, expected) in ["6", "7", "8", "9", "13"].into_iter().enumerate() {
+            let (failed, body) = served(
+                "add_hierarchical_sheet",
+                json!({
+                    "schematic": root.display().to_string(),
+                    "sheet_file": format!("aux_{idx}.kicad_sch"),
+                    "sheet_name": format!("Aux {idx}")
+                }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["sheet"]["page"], json!(expected), "{body}");
+        }
+
+        // Duplicate existing pages: if a hierarchy already has two sheets claiming page 2,
+        // a newly added nested sheet still skips 2..=4 and picks the first free page (5).
+        let (tmp2, root2) = project();
+        let mid2 = tmp2.path().join("mid.kicad_sch");
+        let root_text = std::fs::read_to_string(&root2).unwrap();
+        // Change Mid's page from "5" to "2" to create a pre-existing duplicate page "2".
+        let dup_text = root_text.replacen("(page \"5\")", "(page \"2\")", 1);
+        assert_ne!(root_text, dup_text);
+        std::fs::write(&root2, dup_text).unwrap();
+
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({
+                "schematic": mid2.display().to_string(),
+                "sheet_file": "leaf.kicad_sch",
+                "sheet_name": "Leaf"
+            }),
+        )
+        .await;
+        assert!(!failed, "{body}");
+        assert_eq!(body["sheet"]["page"], json!("5"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn add_hierarchical_sheet_refuses_cyclic_missing_and_ambiguous_hierarchies() {
+        // 1. Cyclic hierarchy (`demo -> mid -> demo`) must be refused before writing.
+        {
+            let (tmp, root) = project();
+            let mid = tmp.path().join("mid.kicad_sch");
+            let mid_text = std::fs::read_to_string(&mid).unwrap();
+            let cycle_block = format_hierarchical_sheet(HierarchicalSheetSpec {
+                name: "BackToRoot",
+                file: "demo.kicad_sch",
+                x: 25.4,
+                y: 25.4,
+                width: 25.4,
+                height: 12.7,
+                project_name: "demo",
+                parent_instance_path: &format!("/{ROOT}/{MID}"),
+                page: "6",
+            });
+            let cmd = SchematicCommand::insert_item(
+                &mid_text,
+                cycle_block,
+                ItemAnchor::BeforeFooter,
+                "Insert cycle for test",
+            )
+            .unwrap();
+            let (cyclic_mid, _) = super::prepare_command(&mid, &mid_text, &cmd).unwrap();
+            std::fs::write(&mid, &cyclic_mid).unwrap();
+            let root_before = std::fs::read(&root).unwrap();
+
+            let (failed, body) = served(
+                "add_hierarchical_sheet",
+                json!({
+                    "schematic": root.display().to_string(),
+                    "sheet_file": "new_sheet.kicad_sch",
+                    "sheet_name": "NewSheet"
+                }),
+            )
+            .await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["kind"], json!("conflict"), "{body}");
+            assert!(
+                body.to_string().to_lowercase().contains("cycle"),
+                "expected cycle error, got: {body}"
+            );
+            assert_eq!(std::fs::read(&root).unwrap(), root_before);
+            assert!(!tmp.path().join("new_sheet.kicad_sch").exists());
+        }
+
+        // 2. Missing sibling sheet when adding to a nested parent is refused with conflict.
+        {
+            let (tmp, _root) = project();
+            let mid = tmp.path().join("mid.kicad_sch");
+            std::fs::remove_file(tmp.path().join("child.kicad_sch")).unwrap();
+            let mid_before = std::fs::read(&mid).unwrap();
+
+            let (failed, body) = served(
+                "add_hierarchical_sheet",
+                json!({
+                    "schematic": mid.display().to_string(),
+                    "sheet_file": "leaf.kicad_sch",
+                    "sheet_name": "Leaf"
+                }),
+            )
+            .await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["kind"], json!("conflict"), "{body}");
+            assert_eq!(std::fs::read(&mid).unwrap(), mid_before);
+        }
+
+        // 3. Ambiguous ownership (two projects placing `mid.kicad_sch`) is refused with conflict.
+        {
+            let (tmp, root) = project();
+            let mid = tmp.path().join("mid.kicad_sch");
+            std::fs::copy(
+                tmp.path().join("demo.kicad_pro"),
+                tmp.path().join("other.kicad_pro"),
+            )
+            .unwrap();
+            std::fs::copy(&root, tmp.path().join("other.kicad_sch")).unwrap();
+            let mid_before = std::fs::read(&mid).unwrap();
+
+            let (failed, body) = served(
+                "add_hierarchical_sheet",
+                json!({
+                    "schematic": mid.display().to_string(),
+                    "sheet_file": "leaf.kicad_sch",
+                    "sheet_name": "Leaf"
+                }),
+            )
+            .await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["kind"], json!("conflict"), "{body}");
+            assert_eq!(std::fs::read(&mid).unwrap(), mid_before);
+        }
+
+        // 4. Reused child parent (`bank.kicad_sch` placed twice) is refused with invalid_argument.
+        {
+            let (_tmp, _root, bank, _cell) = nested_project();
+            let bank_before = std::fs::read(&bank).unwrap();
+
+            let (failed, body) = served(
+                "add_hierarchical_sheet",
+                json!({
+                    "schematic": bank.display().to_string(),
+                    "sheet_file": "extra.kicad_sch",
+                    "sheet_name": "Extra"
+                }),
+            )
+            .await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["kind"], json!("invalid_argument"), "{body}");
+            assert_eq!(std::fs::read(&bank).unwrap(), bank_before);
+        }
+    }
+
+    #[test]
+    fn verify_committed_sheet_reports_uncertain_on_wrong_page_or_missing_sheet() {
+        let (_tmp, root) = project();
+        let child_uuid = sheet_uuid(&root, "Child");
+        let root_path = format!("/{ROOT}");
+
+        // Child records page "2"; expecting "2" succeeds and returns its committed JSON.
+        let ok = super::verify_committed_sheet(
+            &root,
+            &child_uuid,
+            "demo",
+            &root_path,
+            "2",
+            "add_hierarchical_sheet",
+        )
+        .unwrap();
+        assert_eq!(ok["page"], json!("2"));
+
+        // If the committed file recorded page "2" (what `main` wrote) when "6" was expected,
+        // readback reports `mutation_outcome_uncertain`.
+        let err = super::verify_committed_sheet(
+            &root,
+            &child_uuid,
+            "demo",
+            &root_path,
+            "6",
+            "add_hierarchical_sheet",
+        )
+        .unwrap_err();
+        let raw = serde_json::to_value(&err).unwrap();
+        let body: Value =
+            serde_json::from_str(raw["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            body["error"]["kind"],
+            json!("mutation_outcome_uncertain"),
+            "{body}"
+        );
+
+        // Missing sheet UUID on readback also reports `mutation_outcome_uncertain`.
+        let missing = super::verify_committed_sheet(
+            &root,
+            "00000000-0000-0000-0000-000000000000",
+            "demo",
+            &root_path,
+            "6",
+            "add_hierarchical_sheet",
+        )
+        .unwrap_err();
+        let raw = serde_json::to_value(&missing).unwrap();
+        let body: Value =
+            serde_json::from_str(raw["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            body["error"]["kind"],
+            json!("mutation_outcome_uncertain"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_allocation_handles_multi_top_level_sheets_legacy_records_and_non_numeric_pages() {
+        // 1. Multi-top-level-sheet project: pages used by a second top-level sheet
+        //    (including its own `sheet_instances` page) are skipped, and an unreadable
+        //    second top-level sheet refuses the write.
+        let (tmp, root) = project();
+        let second = tmp.path().join("second.kicad_sch");
+        let second_text = super::ensure_hierarchy_root_footer(
+            &copperpour_sexp::schematic::format_blank_schematic(),
+        )
+        .unwrap()
+        .replacen("(page \"1\")", "(page \"6\")", 1);
+        assert!(second_text.contains("(page \"6\")"), "{second_text}");
+        std::fs::write(&second, &second_text).unwrap();
+        let second_uuid = cse::Schematic::load(&second).unwrap().uuid.unwrap();
+        let pro_path = tmp.path().join("demo.kicad_pro");
+        let mut settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&pro_path).unwrap()).unwrap();
+        settings["schematic"]["top_level_sheets"] = json!([
+            { "uuid": ROOT, "name": "demo", "filename": "demo.kicad_sch" },
+            { "uuid": second_uuid, "name": "second", "filename": "second.kicad_sch" }
+        ]);
+        std::fs::write(&pro_path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        // demo uses 2..=5, second's own sheet_instances claims 6 -> new sheet gets 7.
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({
+                "schematic": root.display().to_string(),
+                "sheet_file": "extra.kicad_sch",
+                "sheet_name": "Extra"
+            }),
+        )
+        .await;
+        assert!(!failed, "{body}");
+        assert_eq!(body["sheet"]["page"], json!("7"), "{body}");
+
+        // Making the second top-level sheet unreadable refuses adding to root without writing.
+        std::fs::write(&second, "(kicad_sch broken").unwrap();
+        let root_before = std::fs::read(&root).unwrap();
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({
+                "schematic": root.display().to_string(),
+                "sheet_file": "extra2.kicad_sch",
+                "sheet_name": "Extra2"
+            }),
+        )
+        .await;
+        assert!(failed, "{body}");
+        assert_eq!(body["error"]["kind"], json!("conflict"), "{body}");
+        assert_eq!(std::fs::read(&root).unwrap(), root_before);
+
+        // 2. Legacy `(project "" (path "/" (page "2")))` and non-numeric/zero pages:
+        //    legacy page "2" is respected, while "2a" and "0" are safely ignored.
+        let (tmp2, root2) = project();
+        let root2_text = std::fs::read_to_string(&root2)
+            .unwrap()
+            .replacen(
+                &format!("(project \"demo\"\n\t\t\t\t(path \"/{ROOT}\"\n\t\t\t\t\t(page \"2\")"),
+                "(project \"\"\n\t\t\t\t(path \"/\"\n\t\t\t\t\t(page \"2\")",
+                1,
+            )
+            .replacen("(page \"3\")", "(page \"2a\")", 1)
+            .replacen("(page \"4\")", "(page \"0\")", 1);
+        std::fs::write(&root2, &root2_text).unwrap();
+        let mid2 = tmp2.path().join("mid.kicad_sch");
+
+        // Used positive pages are now {2 (legacy), 5 (Mid)}, so first free is 3.
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({
+                "schematic": mid2.display().to_string(),
+                "sheet_file": "leaf.kicad_sch",
+                "sheet_name": "Leaf"
+            }),
+        )
+        .await;
+        assert!(!failed, "{body}");
+        assert_eq!(body["sheet"]["page"], json!("3"), "{body}");
     }
 }
 
