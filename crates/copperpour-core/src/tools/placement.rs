@@ -50,6 +50,7 @@
 //! the request (the recurring defect class this repo pins tests against).
 
 mod overview;
+pub(super) use overview::check_netclass_rename_pattern;
 mod plan_status;
 mod repeat_layout;
 #[cfg(test)]

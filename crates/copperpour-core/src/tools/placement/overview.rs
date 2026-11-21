@@ -387,6 +387,25 @@ impl NetclassPattern {
     }
 }
 
+/// For mutation preflight, a wildcard-only approximation is not evidence.
+pub(in crate::tools) fn check_netclass_rename_pattern(
+    pattern: &str,
+    mapping: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let matcher = NetclassPattern::new(pattern);
+    anyhow::ensure!(
+        matcher.expression.is_some(),
+        "Cannot prove a net rename preserves unsupported netclass pattern {pattern:?}"
+    );
+    for (old, new) in mapping {
+        anyhow::ensure!(
+            matcher.names(old) == matcher.names(new),
+            "Renaming {old:?} to {new:?} changes the match of netclass pattern {pattern:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The project's netclasses other than `Default`, each with its patterns.
 /// Empty when there is no readable `.kicad_pro` or it assigns no nets.
 fn project_netclass_patterns(board: &std::path::Path) -> Vec<(String, Vec<String>)> {

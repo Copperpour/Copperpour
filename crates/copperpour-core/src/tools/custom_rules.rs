@@ -1186,6 +1186,64 @@ fn closing(tokens: &[Token], open: usize) -> Option<usize> {
     None
 }
 
+/// Prove that rule conditions do not inspect net names. This does not
+/// simulate DRC or validate unrelated constraints.
+pub(super) fn check_net_name_independent_conditions(text: &str) -> Result<(), String> {
+    let tokens = lex(text).map_err(|(offset, fault)| {
+        format!("custom rule at line {}: {fault}", line_of(text, offset))
+    })?;
+    // KiCad expands text variables before parsing the rules, so a token
+    // containing one is not proof of the structure KiCad will evaluate.
+    if tokens.iter().any(|t| t.tok.text().contains("${")) {
+        return Err("a text variable may expand into a net-name dependency".into());
+    }
+    let mut start = 0;
+    while start < tokens.len() {
+        if tokens[start].tok != Tok::Open {
+            return Err("invalid custom rule block".into());
+        }
+        let end = closing(&tokens, start).ok_or("unbalanced custom rules")?;
+        if end <= start + 1 {
+            return Err("invalid custom rule block".into());
+        }
+        let head = &tokens[start + 1].tok;
+        if head.is_keyword("rule") {
+            if !tokens.get(start + 2).is_some_and(|t| t.tok.is_symbol()) || end < start + 3 {
+                return Err("custom rule has no name".into());
+            }
+            let mut clause = start + 3;
+            while clause < end {
+                if tokens[clause].tok != Tok::Open {
+                    return Err("invalid custom rule clause".into());
+                }
+                let close = closing(&tokens, clause)
+                    .filter(|&i| i < end)
+                    .ok_or("unbalanced custom rule clause")?;
+                if close <= clause + 1 {
+                    return Err("invalid custom rule clause".into());
+                }
+                let kind = &tokens[clause + 1].tok;
+                if kind.is_keyword("condition") {
+                    if close != clause + 3 || !tokens[clause + 2].tok.is_symbol() {
+                        return Err("invalid custom rule condition".into());
+                    }
+                    check_net_name_independent_expression(tokens[clause + 2].tok.text())?;
+                } else if !["constraint", "layer", "severity"]
+                    .iter()
+                    .any(|name| kind.is_keyword(name))
+                {
+                    return Err(format!("unknown custom rule clause '{}'", kind.text()));
+                }
+                clause = close + 1;
+            }
+        } else if !head.is_keyword("version") {
+            return Err(format!("unknown custom rule block '{}'", head.text()));
+        }
+        start = end + 1;
+    }
+    Ok(())
+}
+
 struct RuleParser<'a> {
     tokens: &'a [Token],
     at: usize,
@@ -1808,6 +1866,27 @@ impl Codegen<'_> {
 
 /// Check one condition, assertion or value as KiCad's compiler reads it, and
 /// say what it measures.
+fn check_net_name_independent_expression(text: &str) -> Result<(), String> {
+    check_expression(text, Resolver::Pcb, &mut BTreeSet::new())?;
+    let lexemes = lex_expression(text, Resolver::Pcb)?;
+    for pair in lexemes.windows(2) {
+        if let [Lexeme::Dot, Lexeme::Ident(field)] = pair {
+            if field.eq_ignore_ascii_case("NetName") {
+                return Err(format!("condition reads {field}"));
+            }
+        }
+        if let [Lexeme::Ident(function), Lexeme::Open] = pair {
+            if ["inDiffPair", "isCoupledDiffPair"]
+                .iter()
+                .any(|name| function.eq_ignore_ascii_case(name))
+            {
+                return Err(format!("condition calls {function}()"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn check_expression(
     text: &str,
     resolver: Resolver,
@@ -1844,6 +1923,28 @@ fn check_expression(
 mod tests {
     use super::*;
     use crate::mcp::handler::McpHandler;
+
+    #[test]
+    fn rename_guard_reads_rule_conditions_not_comments_or_literals() {
+        let rule = |condition: &str| {
+            format!("(version 1)\n# (condition \"A.NetName\")\n(rule \"r\" (condition \"{condition}\"))")
+        };
+        assert!(check_net_name_independent_conditions("(version 1)").is_ok());
+        assert!(
+            check_net_name_independent_conditions(&rule("A.Type == 'NetName inDiffPair'")).is_ok()
+        );
+        for condition in [
+            "A.nEtNaMe == '/Source/SIG'",
+            "A.inDiffPair('Data')",
+            "A.isCoupledDiffPair()",
+            "A.futureNetFunction('Data')",
+            "A.Type == '${TEXT}'",
+        ] {
+            let result = check_net_name_independent_conditions(&rule(condition));
+            assert!(result.is_err(), "{condition}: {result:?}");
+        }
+        assert!(check_net_name_independent_conditions(&rule("A.fromTo('J1-1', 'J2-1')")).is_ok());
+    }
     use crate::tools::{write_hook, ServerConfig};
 
     /// Rules of our own in the forms KiCad 10's parser reads: comment lines,
