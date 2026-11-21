@@ -1051,16 +1051,20 @@ fn is_konnect_executable(path: &str) -> bool {
         .any(|program| name == *program || name.eq_ignore_ascii_case(&format!("{program}.exe")))
 }
 
-/// Serves drift for both clients to `get_installation_info` and `initialize`.
-/// The executable is captured at startup, before an update can replace it.
+/// Serves drift for both clients to `get_installation_info`, `initialize`, and
+/// the session's first tool call. The executable is captured at startup, before
+/// an update can replace it.
 ///
 /// Each `(installed guidance marker, embedded bundle)` pair is scanned once:
 /// the first process to see a new marker or a changed embedded guidance bundle
-/// scans, records the result under `~/.copperpour`, and offers one notice.
-/// Later processes with the same marker and bundle digest read the record, so
-/// guidance the user chose to keep is not reported on every start, while an
-/// upgraded binary whose skills, agents, or hook matchers changed re-checks
-/// once (#697). `copperpour status` still scans on demand.
+/// scans and offers one notice in `initialize` (via `peek_notice`) and on the
+/// first non-`get_guidance` tool call (via `take_notice`), recording an
+/// `out_of_sync` check under `~/.copperpour` when that tool call consumes the
+/// notice (#722). `current` and `not_installed` checks have no notice and are
+/// recorded on scan. Later processes with the same marker and bundle digest
+/// read the record, so guidance the user chose to keep is not reported on every
+/// start, while an upgraded binary whose skills, agents, or hook matchers
+/// changed re-checks once (#697). `copperpour status` still scans on demand.
 pub struct InstalledGuidanceProbe {
     paths: InstallPaths,
     exe: String,
@@ -1149,9 +1153,17 @@ fn bundle_digest_of(
     encode_hex(&hasher.finalize())
 }
 
+struct PendingGuidanceRecord {
+    client: InstallClient,
+    path: PathBuf,
+    key: serde_json::Value,
+    state: GuidanceState,
+}
+
 struct GuidanceReading {
     detail: serde_json::Value,
     notice: Option<String>,
+    pending_records: Vec<PendingGuidanceRecord>,
 }
 
 impl InstalledGuidanceProbe {
@@ -1186,6 +1198,7 @@ impl InstalledGuidanceProbe {
             "bundle_version": self.bundle_version,
         });
         let mut notices = Vec::new();
+        let mut pending_records = Vec::new();
         for client in [InstallClient::Claude, InstallClient::Codex] {
             let record = self.paths.guidance_checked(client);
             let marker = read_marker(client, &self.paths);
@@ -1199,9 +1212,21 @@ impl InstalledGuidanceProbe {
                     }),
                     None => {
                         let guidance = inspect_guidance(client, &self.paths, &self.exe);
-                        notices.extend(guidance.notice());
                         let key = Self::checked_key(guidance.marker.as_ref(), digest);
-                        if let Err(error) = record_state(&record, &key, guidance.state()) {
+                        let state = guidance.state();
+                        if let Some(notice) = guidance.notice() {
+                            notices.push(notice);
+                            // Defer recording an `out_of_sync` check until a
+                            // tool call consumes the notice (#722), so a
+                            // non-KiCad session that only runs `initialize`
+                            // does not silence the next session.
+                            pending_records.push(PendingGuidanceRecord {
+                                client,
+                                path: record,
+                                key,
+                                state,
+                            });
+                        } else if let Err(error) = record_state(&record, &key, state) {
                             tracing::warn!(
                                 "could not record the {client} guidance check at {}: {error:#}",
                                 record.display()
@@ -1216,6 +1241,7 @@ impl InstalledGuidanceProbe {
         GuidanceReading {
             detail,
             notice: (!notices.is_empty()).then(|| notices.join("\n")),
+            pending_records,
         }
     }
 
@@ -1240,8 +1266,23 @@ impl copperpour_core::guidance::GuidanceProbe for InstalledGuidanceProbe {
         self.with_reading(|reading| reading.detail.clone())
     }
 
+    fn peek_notice(&self) -> Option<String> {
+        self.with_reading(|reading| reading.notice.clone())
+    }
+
     fn take_notice(&self) -> Option<String> {
-        self.with_reading(|reading| reading.notice.take())
+        self.with_reading(|reading| {
+            for pending in reading.pending_records.drain(..) {
+                if let Err(error) = record_state(&pending.path, &pending.key, pending.state) {
+                    tracing::warn!(
+                        "could not record the {} guidance check at {}: {error:#}",
+                        pending.client,
+                        pending.path.display()
+                    );
+                }
+            }
+            reading.notice.take()
+        })
     }
 }
 
@@ -3190,6 +3231,43 @@ mod tests {
         };
         assert_eq!(second.detail()["codex"]["checked"], "earlier");
         assert_eq!(second.take_notice(), None);
+    }
+
+    /// #722: peeking at an `out_of_sync` notice (during `initialize`) must not
+    /// write `.guidance-checked-<client>` on disk until `take_notice()` runs on
+    /// a tool call, while `current` and `not_installed` checks still record
+    /// immediately.
+    #[test]
+    fn an_out_of_sync_check_is_recorded_only_when_the_notice_is_taken() {
+        use copperpour_core::guidance::GuidanceProbe;
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        write_marker(paths.marker(InstallClient::Claude), "0.2.2");
+        run_install_at(InstallClient::Codex, &paths, false).unwrap();
+
+        let idle = start(&temp);
+        let peeked = idle.peek_notice().unwrap();
+        assert!(peeked.starts_with("Copperpour Claude guidance (installed by v0.2.2)"));
+        assert!(!paths.guidance_checked(InstallClient::Claude).exists());
+        assert!(
+            paths.guidance_checked(InstallClient::Codex).exists(),
+            "current client has no notice to defer and records immediately"
+        );
+
+        // Next process after an idle session still rescans Claude and offers the notice.
+        let active = start(&temp);
+        assert_eq!(active.detail()["claude"]["checked"], "now");
+        assert_eq!(active.detail()["codex"]["checked"], "earlier");
+        assert!(!paths.guidance_checked(InstallClient::Claude).exists());
+        assert_eq!(active.take_notice().as_deref(), Some(peeked.as_str()));
+        assert!(paths.guidance_checked(InstallClient::Claude).exists());
+        assert_eq!(active.take_notice(), None);
+
+        // Once taken, a later process reuses the record and stays quiet.
+        let later = start(&temp);
+        assert_eq!(later.detail()["claude"]["checked"], "earlier");
+        assert_eq!(later.peek_notice(), None);
+        assert_eq!(later.take_notice(), None);
     }
 
     /// Each part `init` installs moves the digest: a skill's text, a

@@ -165,9 +165,13 @@ unchanged.
 The serving process makes the same comparison for both clients once per
 `(install marker, embedded guidance bundle)` pair. The first start for a
 marker—or after a binary upgrade that changes that client's embedded skills,
-agents, or hook matchers—scans, records the resulting state in
-`~/.copperpour/.guidance-checked-<client>`, and sets the MCP `initialize`
-`instructions` to a one-line notice when either client is `out_of_sync`. Later
+agents, or hook matchers—scans; when either client is `out_of_sync`, it sets the
+MCP `initialize` `instructions` to a one-line notice and attaches the same
+notice as `guidance_notice` to non-`get_guidance` tool calls in that session,
+recording `~/.copperpour/.guidance-checked-<client>` once the first eligible
+tool call delivers it (while `current` and `not_installed` states are recorded
+on scan). A session that exits after `initialize` without calling a tool does
+not consume the notice. Later
 starts with the same marker and embedded bundle read the record instead of
 rescanning and give no notice. Running `copperpour init` starts a new check;
 upgrading to a binary with an unchanged guidance bundle stays quiet.

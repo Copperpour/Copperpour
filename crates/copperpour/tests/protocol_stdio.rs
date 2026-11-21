@@ -1411,6 +1411,91 @@ fn a_stale_guidance_check_record_rechecks_once_over_stdio() {
     assert_eq!(body["guidance"]["claude"]["state"], "out_of_sync");
 }
 
+/// Regression for #722 over real stdio: a session that only runs `initialize`
+/// (or `tools/list` and `get_guidance`) without calling another tool must not
+/// burn `.guidance-checked-claude`, and the first non-`get_guidance` tool call
+/// in a session must carry `guidance_notice` once and record the check.
+#[cfg(unix)]
+#[test]
+fn guidance_drift_notice_survives_idle_session_and_attaches_to_first_tool_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join(".copperpour");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(data_dir.join(".installed-claude"), "0.2.2").unwrap();
+
+    // First session: non-KiCad session that only initializes and lists tools.
+    let mut idle = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let instructions = idle.initialized["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("Copperpour Claude guidance (installed by v0.2.2)"),
+        "{instructions}"
+    );
+    let _ = idle.request("tools/list", json!({}));
+    drop(idle);
+    assert!(
+        !data_dir.join(".guidance-checked-claude").exists(),
+        "an idle session that called no tools must not record .guidance-checked-claude"
+    );
+
+    // Second session: real KiCad session reads get_guidance first, then loads a toolset.
+    let mut active = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let instructions = active.initialized["result"]["instructions"]
+        .as_str()
+        .unwrap();
+    assert!(
+        instructions.contains("Copperpour Claude guidance (installed by v0.2.2)"),
+        "second session must still see the notice after an idle session: {instructions}"
+    );
+
+    let guidance_doc = McpProcess::tool_body(
+        &active.call_tool("get_guidance", json!({"path": "copperpour/SKILL.md"})),
+    );
+    assert!(
+        guidance_doc.get("guidance_notice").is_none(),
+        "get_guidance must preserve its resources/read payload without consuming the notice"
+    );
+    assert!(
+        !data_dir.join(".guidance-checked-claude").exists(),
+        "get_guidance alone must not consume the one-time drift notice"
+    );
+
+    let loaded =
+        McpProcess::tool_body(&active.call_tool("load_toolset", json!({"name": "sch_components"})));
+    let notice = loaded["guidance_notice"]
+        .as_str()
+        .expect("first non-get_guidance tool call must carry guidance_notice");
+    assert!(
+        notice.contains("Copperpour Claude guidance (installed by v0.2.2)")
+            && notice.contains("`copperpour init`"),
+        "{notice}"
+    );
+    assert!(
+        data_dir.join(".guidance-checked-claude").exists(),
+        "first non-get_guidance tool call must record .guidance-checked-claude"
+    );
+
+    // Later tool calls in the same drifted session keep `guidance_notice` so a
+    // multi-tool turn still sees the warning on its final tool call.
+    let info = McpProcess::tool_body(&active.call_tool("get_installation_info", json!({})));
+    assert_eq!(info["guidance_notice"], notice);
+    assert_eq!(info["guidance"]["claude"]["checked"], "now");
+    assert_eq!(info["guidance"]["claude"]["state"], "out_of_sync");
+    drop(active);
+
+    // Third session with the same install and bundle stays quiet.
+    let mut later = McpProcess::spawn_configured(Some(tmp.path()), true);
+    assert_eq!(
+        later.initialized["result"]["instructions"],
+        copperpour_core::guidance::SESSION_RULES
+    );
+    let loaded_again =
+        McpProcess::tool_body(&later.call_tool("load_toolset", json!({"name": "sch_components"})));
+    assert!(
+        loaded_again.get("guidance_notice").is_none(),
+        "later session must stay quiet once the notice was delivered: {loaded_again}"
+    );
+}
+
 /// Regression for #698 over real stdio: when built with a commit SHA,
 /// `copperpour init` writes `<version>+<short_commit>` into the install marker,
 /// and both `copperpour status` and the MCP `initialize` drift notice include
