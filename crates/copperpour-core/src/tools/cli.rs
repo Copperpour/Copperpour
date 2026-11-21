@@ -423,6 +423,14 @@ struct CliOutput {
     stderr: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to spawn kicad-cli: {configured}")]
+pub(crate) struct CliSpawnError {
+    configured: String,
+    #[source]
+    pub(crate) source: std::io::Error,
+}
+
 /// Run a kicad-cli command with arguments and capture stdout.
 async fn run_cli(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<String> {
     Ok(run_cli_captured(cli, args, timeout_dur).await?.stdout)
@@ -440,12 +448,13 @@ async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Re
     cmd.kill_on_drop(true);
 
     #[cfg(test)]
-    let child = test_support::spawn_cli(&mut cmd)
-        .with_context(|| format!("Failed to spawn kicad-cli: {}", cli))?;
+    let spawned = test_support::spawn_cli(&mut cmd);
     #[cfg(not(test))]
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("Failed to spawn kicad-cli: {}", cli))?;
+    let spawned = cmd.spawn();
+    let child = spawned.map_err(|source| CliSpawnError {
+        configured: cli.to_owned(),
+        source,
+    })?;
 
     let output = timeout(timeout_dur, child.wait_with_output())
         .await
@@ -897,10 +906,54 @@ pub async fn run_erc(cli: &str, schematic: &Path) -> Result<ErcReport> {
     run_erc_with_temp_root(cli, schematic, None).await
 }
 
+pub(crate) async fn run_erc_strict(
+    cli: &str,
+    schematic: &Path,
+    expected_paths: &std::collections::BTreeSet<String>,
+) -> Result<ErcReport> {
+    run_erc_with_decoder(cli, schematic, None, |raw| {
+        // parse_erc_json refuses a report without sheets, or a sheet
+        // without violations, before either is read here.
+        let report = parse_erc_json(raw)?;
+        let sheets = raw["sheets"].as_array().map(Vec::as_slice).unwrap_or_default();
+        {
+            let observed = sheets.iter().filter_map(|sheet| {
+                sheet["uuid_path"].as_str().map(|path| path.trim_end_matches('/'))
+            }).collect::<std::collections::BTreeSet<_>>();
+            anyhow::ensure!(
+                sheets.len() == expected_paths.len() && observed.into_iter().eq(expected_paths.iter().map(String::as_str)),
+                "KiCad ERC did not cover every project sheet instance (multi-root projects need KiCad 10.0.7 or newer)"
+            );
+        }
+        for sheet in sheets {
+            let violations = sheet["violations"].as_array().map(Vec::as_slice);
+            for violation in violations.unwrap_or_default() {
+                anyhow::ensure!(
+                    ["type", "severity"].iter().all(|key| violation[key].as_str().is_some_and(|s| !s.is_empty()))
+                        && violation["items"].as_array().is_some_and(|items|
+                            !items.is_empty() && items.iter().all(serde_json::Value::is_object)
+                        ),
+                    "Malformed ERC violation identity"
+                );
+            }
+        }
+        Ok(report)
+    }).await
+}
+
 async fn run_erc_with_temp_root(
     cli: &str,
     schematic: &Path,
     temp_root: Option<&Path>,
+) -> Result<ErcReport> {
+    run_erc_with_decoder(cli, schematic, temp_root, parse_erc_json).await
+}
+
+async fn run_erc_with_decoder(
+    cli: &str,
+    schematic: &Path,
+    temp_root: Option<&Path>,
+    decode: impl FnOnce(&serde_json::Value) -> Result<ErcReport>,
 ) -> Result<ErcReport> {
     let report_dir = match temp_root {
         Some(root) => tempfile::Builder::new()
@@ -934,7 +987,7 @@ async fn run_erc_with_temp_root(
             .context("ERC output file not found")?;
         let raw: serde_json::Value =
             serde_json::from_str(&json_str).context("kicad-cli's ERC report is not valid JSON")?;
-        parse_erc_json(&raw)
+        decode(&raw)
     }
     .await;
 

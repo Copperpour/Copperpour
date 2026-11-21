@@ -98,6 +98,7 @@ mod sch_instance_repair;
 mod sch_label_rename;
 mod sch_shapes;
 mod sch_texts;
+mod sch_transfer;
 pub mod sch_wiring;
 pub mod schematic_builder;
 #[cfg(test)]
