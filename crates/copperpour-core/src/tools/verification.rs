@@ -1221,6 +1221,9 @@ async fn handle_launch_kicad_ui(
         "Pass display (for example \":0\") to open KiCad on the desktop's X display.",
     );
     let exited = CallToolResult::error;
+    // A new KiCad may bind a socket path a dead one used, leaving the candidate
+    // set unchanged, so clear any ping backoff for follow-up calls (#32).
+    ctx.reset_ipc_probe_backoff();
 
     if !wait_ready {
         if let Err(message) = kicad.watch(copperpour_viewer::launch::STARTUP_WINDOW).await {
@@ -1234,13 +1237,17 @@ async fn handle_launch_kicad_ui(
 
     // Poll IPC until responsive or timeout. A KiCad that exited will never
     // answer, so its exit ends the wait, even while a ping is in flight.
-    let endpoint = ctx.ipc_endpoint();
+    // Re-resolve the endpoint on each poll so a server started before KiCad
+    // observes the socket created by the process just launched (#32).
+    // `kicad.watch(KICAD_IPC_POLL)` already paces this loop at 500 ms, so reset
+    // the ping backoff per iteration rather than let it delay a late startup.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         if let Err(message) = kicad.watch(KICAD_IPC_POLL).await {
             return Ok(exited(message));
         }
-        let endpoint = endpoint.clone();
+        ctx.reset_ipc_probe_backoff();
+        let endpoint = ctx.ipc_endpoint();
         let ping = task::spawn_blocking(move || endpoint.client().ping_outcome());
         let outcome = tokio::select! {
             outcome = ping => outcome.ok(),
@@ -3287,6 +3294,152 @@ mod kicad_launch_tests {
             serde_json::from_str::<Value>(&text).unwrap(),
             json!({"launched": true, "ipc_ready": null})
         );
+    }
+
+    /// Issue #32: starting Copperpour before KiCad leaves the startup endpoint
+    /// unresolved. `launch_kicad_ui(wait_ready: true)` must reset any prior
+    /// unresolved-probe backoff and re-probe during its poll loop so it
+    /// observes the socket created by the launched KiCad.
+    #[tokio::test]
+    async fn launch_kicad_ui_wait_ready_observes_endpoint_created_after_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let kicad_dir = dir.path().join("kicad");
+        std::fs::create_dir_all(&kicad_dir).unwrap();
+        let fake_kicad = dir.path().join("kicad.sh");
+        std::fs::write(&fake_kicad, "sleep 10\n").unwrap();
+
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: "/bin/sh".into(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+        handler.enable_ipc_rediscovery();
+        handler.set_ipc_kicad_dir_for_test(kicad_dir.clone());
+
+        // KiCad is not running yet: the endpoint is unresolved before launch.
+        let pre = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 31,
+                "method": "tools/call",
+                "params": {"name": "check_kicad_ui", "arguments": {}}
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let pre_body: Value =
+            serde_json::from_str(pre["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(pre_body["ipc_responsive"], false, "{pre_body}");
+
+        let socket_addr = format!("ipc://{}", kicad_dir.join("api.sock").display());
+        // Bind after the first 500 ms poll misses so the test proves the loop
+        // re-probes across iterations rather than succeeding on the first tick.
+        let server_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            MockIpcServer::spawn_at(socket_addr, |_| kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: kiapi::common::ApiStatusCode::AsOk as i32,
+                    error_message: String::new(),
+                }),
+                header: None,
+                message: None,
+            })
+        });
+
+        let result = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 32,
+                "method": "tools/call",
+                "params": {
+                    "name": "launch_kicad_ui",
+                    "arguments": {
+                        "project": fake_kicad.display().to_string(),
+                        "wait_ready": true,
+                        "timeout_seconds": 3
+                    }
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let server = server_task.await.unwrap();
+        drop(server);
+
+        assert!(!is_error, "{text}");
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["launched"], true, "{body}");
+        assert_eq!(body["ipc_ready"], true, "{body}");
+    }
+
+    /// Explicit `ipc_address` stays authoritative in `launch_kicad_ui`: with
+    /// rediscovery off, a live socket in the discovery directory is never
+    /// substituted for the configured endpoint (#32).
+    #[tokio::test]
+    async fn launch_kicad_ui_wait_ready_preserves_explicit_ipc_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let kicad_dir = dir.path().join("kicad");
+        std::fs::create_dir_all(&kicad_dir).unwrap();
+        let fake_kicad = dir.path().join("kicad.sh");
+        std::fs::write(&fake_kicad, "sleep 5\n").unwrap();
+
+        let socket_addr = format!("ipc://{}", kicad_dir.join("api.sock").display());
+        let _discovered = MockIpcServer::spawn_at(socket_addr, |_| kiapi::common::ApiResponse {
+            status: Some(kiapi::common::ApiResponseStatus {
+                status: kiapi::common::ApiStatusCode::AsOk as i32,
+                error_message: String::new(),
+            }),
+            header: None,
+            message: None,
+        });
+
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: "/bin/sh".into(),
+            ipc_address: NOBODY.into(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+        handler.set_ipc_kicad_dir_for_test(kicad_dir);
+
+        let result = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 33,
+                "method": "tools/call",
+                "params": {
+                    "name": "launch_kicad_ui",
+                    "arguments": {
+                        "project": fake_kicad.display().to_string(),
+                        "wait_ready": true,
+                        "timeout_seconds": 1
+                    }
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(!is_error, "{text}");
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["launched"], true, "{body}");
+        assert_eq!(body["ipc_ready"], false, "{body}");
     }
 
     /// KiCad up for the whole wait and still `AS_NOT_READY` is most likely

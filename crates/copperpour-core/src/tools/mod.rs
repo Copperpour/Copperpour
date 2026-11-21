@@ -344,6 +344,10 @@ pub struct ToolContext {
     /// `KICAD_API_SOCKET` address stays authoritative, and test contexts keep
     /// the address they set.
     ipc_rediscovery: std::sync::atomic::AtomicBool,
+    /// Serializes rediscovery probes and backs off re-pinging a candidate set
+    /// none of whose sockets answered, so rapid or concurrent calls do not
+    /// spin on dead sockets (#32).
+    ipc_probe_backoff: std::sync::Mutex<IpcProbeBackoff>,
     /// The endpoint `open_board` last found holding its board (#23). With
     /// rediscovery on, it decides between several sockets that qualify.
     selected_ipc_endpoint: std::sync::Mutex<Option<String>>,
@@ -371,6 +375,7 @@ impl ToolContext {
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
             ipc_rediscovery: std::sync::atomic::AtomicBool::new(false),
+            ipc_probe_backoff: std::sync::Mutex::new(IpcProbeBackoff::default()),
             selected_ipc_endpoint: std::sync::Mutex::new(None),
             opening_board: tokio::sync::Mutex::new(()),
             #[cfg(all(test, unix))]
@@ -396,6 +401,7 @@ impl ToolContext {
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
             ipc_rediscovery: std::sync::atomic::AtomicBool::new(false),
+            ipc_probe_backoff: std::sync::Mutex::new(IpcProbeBackoff::default()),
             selected_ipc_endpoint: std::sync::Mutex::new(None),
             opening_board: tokio::sync::Mutex::new(()),
             #[cfg(all(test, unix))]
@@ -447,8 +453,19 @@ impl ToolContext {
 
     /// [`Self::ipc_endpoint`] and where it came from, for reporting the
     /// endpoint the calls use (`get_installation_info`). It costs what an IPC
-    /// call's own lookup costs.
+    /// call's own lookup costs, and shares the same ping backoff (250 ms to
+    /// 2 s) for a candidate set none of whose sockets answered (#32).
     pub fn ipc_endpoint_with_origin(&self) -> (IpcEndpoint, IpcEndpointOrigin) {
+        let resolve = |candidates: &dyn Fn() -> Vec<String>,
+                       detect: &dyn Fn() -> copperpour_ipc::IpcDetection| {
+            endpoint_and_origin_for(self.rediscovers_ipc(), &self.config.ipc_address, || {
+                let mut backoff = self
+                    .ipc_probe_backoff
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                backoff.resolve(std::time::Instant::now(), &candidates(), detect)
+            })
+        };
         #[cfg(all(test, unix))]
         if let Some(dir) = self
             .ipc_kicad_dir_override
@@ -458,21 +475,30 @@ impl ToolContext {
         {
             return with_selection(
                 &self.selected_ipc_endpoint,
-                endpoint_and_origin_for(self.rediscovers_ipc(), &self.config.ipc_address, || {
-                    copperpour_ipc::socket::detect_ipc_endpoint_in(&dir)
-                }),
+                resolve(
+                    &|| copperpour_ipc::socket::candidate_endpoints_in(&dir),
+                    &|| copperpour_ipc::socket::detect_ipc_endpoint_in(&dir),
+                ),
                 || copperpour_ipc::socket::candidate_endpoints_in(&dir),
             );
         }
         with_selection(
             &self.selected_ipc_endpoint,
-            endpoint_and_origin_for(
-                self.rediscovers_ipc(),
-                &self.config.ipc_address,
-                copperpour_ipc::detect_ipc_endpoint,
+            resolve(
+                &copperpour_ipc::candidate_endpoints,
+                &copperpour_ipc::detect_ipc_endpoint,
             ),
             copperpour_ipc::candidate_endpoints,
         )
+    }
+
+    /// Clear any active ping backoff, e.g. after launching KiCad
+    /// so the `wait_ready` loop probes without inheriting a stale delay (#32).
+    pub(crate) fn reset_ipc_probe_backoff(&self) {
+        self.ipc_probe_backoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reset();
     }
 
     /// Whether the endpoint is looked for on each call, rather than configured.
@@ -486,10 +512,13 @@ impl ToolContext {
     /// configured address stays the one the calls use.
     pub(crate) fn select_ipc_endpoint(&self, address: String) {
         if self.rediscovers_ipc() {
-            *self
-                .selected_ipc_endpoint
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(address);
+            {
+                *self
+                    .selected_ipc_endpoint
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(address);
+            }
+            self.reset_ipc_probe_backoff();
         }
     }
 
@@ -743,6 +772,75 @@ pub(crate) fn compile_input_validator(
 }
 
 // ─── IPC helpers ──────────────────────────────────────────────────────────────
+
+/// Initial and maximum delay before re-pinging a candidate set none of whose
+/// sockets answered (#32).
+const INITIAL_IPC_REPROBE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+const MAX_IPC_REPROBE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Bounded exponential backoff for the pings of IPC rediscovery on
+/// [`ToolContext`].
+///
+/// Only an `Ambiguous` outcome pings: no candidate, or a single one, is
+/// decided from the socket directory alone, so those always run and a socket
+/// that appears is seen on the next call. An `Ambiguous` outcome is reused for
+/// the same candidate set until its window ends; a changed set probes at once.
+/// Serialized by a mutex on [`ToolContext`], so concurrent callers share one
+/// probe.
+#[derive(Debug, Default)]
+struct IpcProbeBackoff {
+    consecutive_misses: u32,
+    /// The candidate set last found ambiguous, its outcome, and when it may be
+    /// pinged again.
+    last_ambiguous: Option<(
+        Vec<String>,
+        copperpour_ipc::IpcDetection,
+        std::time::Instant,
+    )>,
+}
+
+impl IpcProbeBackoff {
+    fn resolve(
+        &mut self,
+        now: std::time::Instant,
+        candidates: &[String],
+        detect: impl FnOnce() -> copperpour_ipc::IpcDetection,
+    ) -> copperpour_ipc::IpcDetection {
+        let same_set = match &self.last_ambiguous {
+            Some((set, outcome, until)) if set.as_slice() == candidates => {
+                if now < *until {
+                    return outcome.clone();
+                }
+                true
+            }
+            _ => false,
+        };
+        if candidates.len() < 2 {
+            self.reset();
+            return detect();
+        }
+        if !same_set {
+            self.consecutive_misses = 0;
+        }
+        let outcome = detect();
+        if matches!(outcome, copperpour_ipc::IpcDetection::Ambiguous(_)) {
+            let shift = self.consecutive_misses.min(4);
+            let delay = INITIAL_IPC_REPROBE_BACKOFF
+                .saturating_mul(1u32 << shift)
+                .min(MAX_IPC_REPROBE_BACKOFF);
+            self.consecutive_misses = self.consecutive_misses.saturating_add(1);
+            self.last_ambiguous = Some((candidates.to_vec(), outcome.clone(), now + delay));
+        } else {
+            self.reset();
+        }
+        outcome
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_misses = 0;
+        self.last_ambiguous = None;
+    }
+}
 
 /// The KiCad IPC endpoint one tool call uses, from [`ToolContext::ipc_endpoint`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5316,6 +5414,167 @@ mod ipc_rediscovery_tests {
             Some("ipc:///tmp/kicad/api-42.sock")
         );
     }
+
+    fn two_dead() -> Vec<String> {
+        vec!["ipc:///k/a.sock".into(), "ipc:///k/b.sock".into()]
+    }
+
+    /// An empty or single candidate set is decided without a ping, so it is
+    /// never backed off: a socket that appears is seen on the next call (#32,
+    /// #565).
+    #[test]
+    fn unpinged_outcomes_are_never_backed_off() {
+        let mut backoff = IpcProbeBackoff::default();
+        let probes = std::cell::Cell::new(0usize);
+        let t0 = std::time::Instant::now();
+        for _ in 0..3 {
+            let out = backoff.resolve(t0, &[], || {
+                probes.set(probes.get() + 1);
+                IpcDetection::NotFound
+            });
+            assert_eq!(out, IpcDetection::NotFound);
+        }
+        assert_eq!(probes.get(), 3);
+        let sock = vec!["ipc:///k/api.sock".to_string()];
+        let found = backoff.resolve(t0, &sock, || {
+            probes.set(probes.get() + 1);
+            IpcDetection::Found(sock[0].clone())
+        });
+        assert_eq!(found, IpcDetection::Found(sock[0].clone()));
+        assert_eq!(probes.get(), 4);
+    }
+
+    /// A candidate set none of whose sockets answered is re-pinged with
+    /// exponential backoff (250 ms → 500 ms → 1 s → 2 s cap); a changed set,
+    /// a `Found` outcome or `reset()` probes at once (#32).
+    #[test]
+    fn ambiguous_reprobe_backs_off_per_candidate_set() {
+        use std::time::Duration;
+        let mut backoff = IpcProbeBackoff::default();
+        let probes = std::cell::Cell::new(0usize);
+        let t0 = std::time::Instant::now();
+        let set = two_dead();
+        let mut probe = |at: std::time::Instant, set: &[String]| {
+            backoff.resolve(at, set, || {
+                probes.set(probes.get() + 1);
+                IpcDetection::Ambiguous(set.to_vec())
+            })
+        };
+
+        let mut at = t0;
+        for window in [250u64, 500, 1000, 2000, 2000] {
+            let before = probes.get();
+            assert_eq!(probe(at, &set), IpcDetection::Ambiguous(set.clone()));
+            assert_eq!(probes.get(), before + 1, "probes when the window ends");
+            let inside = at + Duration::from_millis(window - 1);
+            assert_eq!(probe(inside, &set), IpcDetection::Ambiguous(set.clone()));
+            assert_eq!(probes.get(), before + 1, "suppressed inside {window} ms");
+            at += Duration::from_millis(window);
+        }
+        // Still capped at 2 s: the next window has ended.
+        let before = probes.get();
+        probe(at, &set);
+        assert_eq!(probes.get(), before + 1, "the window is capped at 2 s");
+
+        // A new socket changes the set: probed at once, backoff restarts.
+        let mut grown = set.clone();
+        grown.push("ipc:///k/c.sock".into());
+        let before = probes.get();
+        probe(at, &grown);
+        assert_eq!(probes.get(), before + 1);
+        probe(at + Duration::from_millis(249), &grown);
+        assert_eq!(probes.get(), before + 1);
+        probe(at + Duration::from_millis(250), &grown);
+        assert_eq!(probes.get(), before + 2);
+
+        // `reset()` clears an active window.
+        backoff.reset();
+        let before = probes.get();
+        backoff.resolve(at + Duration::from_millis(251), &grown, || {
+            probes.set(probes.get() + 1);
+            IpcDetection::Ambiguous(grown.clone())
+        });
+        assert_eq!(probes.get(), before + 1);
+
+        // A `Found` outcome clears it too: the next miss after it starts
+        // again at 250 ms instead of escalating from the earlier miss.
+        let a = grown[0].clone();
+        let found_at = at + Duration::from_secs(10);
+        backoff.resolve(found_at, &grown, || IpcDetection::Found(a.clone()));
+        let miss = || {
+            probes.set(probes.get() + 1);
+            IpcDetection::Ambiguous(grown.clone())
+        };
+        let before = probes.get();
+        backoff.resolve(found_at, &grown, miss);
+        assert_eq!(probes.get(), before + 1);
+        backoff.resolve(found_at + Duration::from_millis(250), &grown, miss);
+        assert_eq!(probes.get(), before + 2, "the window after Found is 250 ms");
+    }
+
+    /// `open_board` choosing an endpoint clears an active ping backoff, so
+    /// the next call probes at once (#32).
+    #[test]
+    fn selecting_an_endpoint_clears_the_ping_backoff() {
+        let ctx = ToolContext::new(ServerConfig::default(), Arc::new(ToolRouter::new()));
+        ctx.enable_ipc_rediscovery();
+        let set = two_dead();
+        let t0 = std::time::Instant::now();
+        ctx.ipc_probe_backoff
+            .lock()
+            .unwrap()
+            .resolve(t0, &set, || IpcDetection::Ambiguous(set.clone()));
+        assert!(ctx
+            .ipc_probe_backoff
+            .lock()
+            .unwrap()
+            .last_ambiguous
+            .is_some());
+
+        ctx.select_ipc_endpoint(set[0].clone());
+        let backoff = ctx.ipc_probe_backoff.lock().unwrap();
+        assert!(backoff.last_ambiguous.is_none());
+        assert_eq!(backoff.consecutive_misses, 0);
+    }
+
+    /// Concurrent callers facing the same dead candidate set share the backoff
+    /// window, so only one of them pings (#32).
+    #[test]
+    fn concurrent_ambiguous_probes_share_backoff_without_spinning() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        const WORKERS: usize = 8;
+        let backoff = Arc::new(std::sync::Mutex::new(IpcProbeBackoff::default()));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let now = std::time::Instant::now();
+
+        let handles: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let backoff = Arc::clone(&backoff);
+                let probes = Arc::clone(&probes);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut guard = backoff.lock().unwrap();
+                    guard.resolve(now, &two_dead(), || {
+                        probes.fetch_add(1, Ordering::SeqCst);
+                        IpcDetection::Ambiguous(two_dead())
+                    })
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), IpcDetection::Ambiguous(two_dead()));
+        }
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "concurrent calls must coalesce into one probe"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5687,5 +5946,93 @@ mod multi_endpoint_discovery_tests {
         .await;
         assert!(is_error, "duplicate holders must refuse: {dup}");
         assert_eq!(dup["error"]["kind"], "ambiguous_target", "{dup}");
+    }
+
+    /// Issue #32 end to end through served `check_kicad_ui`:
+    /// 1. Client-first (no KiCad) reports `ipc_responsive: false` (`not_configured`).
+    /// 2. Starting KiCad afterward is discovered without restarting the server.
+    /// 3. Concurrent `check_kicad_ui` calls while live and while absent succeed cleanly.
+    /// 4. Disappearance (socket removed) and a stale socket left behind never
+    ///    present a dead address as responsive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn served_check_kicad_ui_discovers_kicad_after_startup_then_observes_disappearance_and_stale_socket(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let kicad_dir = dir.path().join("kicad");
+        std::fs::create_dir_all(&kicad_dir).unwrap();
+        let sock_path = kicad_dir.join("api.sock");
+        let sock_addr = format!("ipc://{}", sock_path.display());
+
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        handler.enable_ipc_rediscovery();
+        handler.set_ipc_kicad_dir_for_test(kicad_dir);
+
+        // 1. Client-first: no KiCad socket yet.
+        let (is_error, before) = call_served(&handler, 1, "check_kicad_ui", json!({})).await;
+        assert!(!is_error, "{before}");
+        assert_eq!(before["ipc_responsive"], false, "{before}");
+        assert_eq!(before["ipc_failure"]["kind"], "not_configured", "{before}");
+
+        // 2. KiCad-second: bind the socket; the next call sees it.
+        let server = MockIpcServer::spawn_at(sock_addr, |_| {
+            reply(kiapi::common::ApiStatusCode::AsOk, "", None)
+        });
+
+        let (is_error, after) = call_served(&handler, 2, "check_kicad_ui", json!({})).await;
+        assert!(!is_error, "{after}");
+        assert_eq!(after["ipc_responsive"], true, "{after}");
+        assert!(after["ipc_failure"].is_null(), "{after}");
+
+        // 3. Concurrent calls against the live discovered endpoint.
+        let (r1, r2, r3, r4) = tokio::join!(
+            call_served(&handler, 3, "check_kicad_ui", json!({})),
+            call_served(&handler, 4, "check_kicad_ui", json!({})),
+            call_served(&handler, 5, "check_kicad_ui", json!({})),
+            call_served(&handler, 6, "check_kicad_ui", json!({})),
+        );
+        for (err, body) in [r1, r2, r3, r4] {
+            assert!(!err, "{body}");
+            assert_eq!(body["ipc_responsive"], true, "{body}");
+        }
+
+        // 4. Disappearance: KiCad stops and removes the socket.
+        drop(server);
+        let _ = std::fs::remove_file(&sock_path);
+        let (is_error, gone) = call_served(&handler, 7, "check_kicad_ui", json!({})).await;
+        assert!(!is_error, "{gone}");
+        assert_eq!(gone["ipc_responsive"], false, "{gone}");
+        assert_eq!(gone["ipc_failure"]["kind"], "not_configured", "{gone}");
+
+        // 5. Stale socket left behind by an exited KiCad: adopted by metadata
+        //    on the next call, then Ping proves it is not responsive.
+        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        drop(listener);
+        assert!(sock_path.exists(), "sanity: stale socket file remains");
+
+        let (is_error, stale) = call_served(&handler, 8, "check_kicad_ui", json!({})).await;
+        assert!(!is_error, "{stale}");
+        assert_eq!(stale["ipc_responsive"], false, "{stale}");
+        assert_eq!(stale["ipc_failure"]["kind"], "no_listener", "{stale}");
+
+        // 6. Remove stale socket and issue concurrent calls while absent: all
+        //    serialize on the probe lock cleanly without deadlock or panic.
+        let _ = std::fs::remove_file(&sock_path);
+        let (a1, a2, a3, a4) = tokio::join!(
+            call_served(&handler, 9, "check_kicad_ui", json!({})),
+            call_served(&handler, 10, "check_kicad_ui", json!({})),
+            call_served(&handler, 11, "check_kicad_ui", json!({})),
+            call_served(&handler, 12, "check_kicad_ui", json!({})),
+        );
+        for (err, body) in [a1, a2, a3, a4] {
+            assert!(!err, "{body}");
+            assert_eq!(body["ipc_responsive"], false, "{body}");
+            assert_eq!(body["ipc_failure"]["kind"], "not_configured", "{body}");
+        }
     }
 }
