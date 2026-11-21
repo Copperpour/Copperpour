@@ -166,6 +166,83 @@ pub(super) fn build_model_sexp(args: &serde_json::Value) -> String {
     )
 }
 
+/// The layer names a pad's `layers` argument may hold, in `create_footprint`
+/// and `edit_footprint_pad` alike (#710).
+pub(super) const PAD_LAYER_NAMES: &[&str] = &[
+    "F.Cu", "B.Cu", "F.Paste", "B.Paste", "F.Mask", "B.Mask", "*.Cu", "*.Mask",
+];
+
+/// The names of a pad's `layers` argument, checked against `PAD_LAYER_NAMES`:
+/// strings only, at least one. Shared by `create_footprint` and
+/// `edit_footprint_pad` (#710).
+fn pad_layer_names(layers: &[serde_json::Value]) -> Result<Vec<&str>, String> {
+    let mut names = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let layer = layer
+            .as_str()
+            .ok_or_else(|| "pad layers must contain strings".to_string())?;
+        if !PAD_LAYER_NAMES.contains(&layer) {
+            return Err(format!("invalid pad layer: {layer}"));
+        }
+        names.push(layer);
+    }
+    if names.is_empty() {
+        return Err("pad layers must not be empty".to_string());
+    }
+    Ok(names)
+}
+
+/// A pad's `(layers …)` as KiCad writes it in a footprint library
+/// (`PCB_IO_KICAD_SEXPR::formatLayers`, `pcbnew/pcb_io/kicad_sexpr/
+/// pcb_io_kicad_sexpr.cpp`, 10.0.8): `*.Cu` for front and back copper (a pad,
+/// not a zone), `*.Paste` and `*.Mask` for both sides, then every remaining
+/// layer in layer-ID order (`include/layer_ids.h`: F.Cu 0, F.Mask 1, B.Cu 2,
+/// B.Mask 3, F.Paste 13, B.Paste 15). A name given twice is written once.
+pub(super) fn kicad_pad_layers(names: &[&str]) -> String {
+    let has = |name: &str| names.contains(&name);
+    let all_copper = has("*.Cu") || (has("F.Cu") && has("B.Cu"));
+    let all_paste = has("F.Paste") && has("B.Paste");
+    let all_mask = has("*.Mask") || (has("F.Mask") && has("B.Mask"));
+    let mut written = Vec::new();
+    for (wildcard, set) in [
+        ("*.Cu", all_copper),
+        ("*.Paste", all_paste),
+        ("*.Mask", all_mask),
+    ] {
+        if set {
+            written.push(wildcard);
+        }
+    }
+    for (layer, covered) in [
+        ("F.Cu", all_copper),
+        ("F.Mask", all_mask),
+        ("B.Cu", all_copper),
+        ("B.Mask", all_mask),
+        ("F.Paste", all_paste),
+        ("B.Paste", all_paste),
+    ] {
+        if has(layer) && !covered {
+            written.push(layer);
+        }
+    }
+    let quoted: Vec<String> = written.iter().map(|layer| format!("\"{layer}\"")).collect();
+    format!("(layers {})", quoted.join(" "))
+}
+
+/// A pad's layers as written in its `(layers …)`.
+fn written_pad_layers(pad: &SexpNode) -> Vec<String> {
+    pad.find("layers")
+        .and_then(SexpNode::children)
+        .map(|children| {
+            children[1..]
+                .iter()
+                .filter_map(SexpNode::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Build the courtyard, silkscreen, fab outline, reference/value text, and the
 /// pin-1 marker (silk dot + fab chamfer) for a footprint from its pad geometry.
 fn build_footprint_graphics(args: &serde_json::Value, name: &str, pads: &[PadGeom]) -> String {
@@ -351,30 +428,7 @@ pub(crate) async fn handle_create_footprint(
         let h = pad["height"].as_f64().expect("validated");
 
         let layer_names = if let Some(layers) = pad["layers"].as_array() {
-            let mut names = Vec::with_capacity(layers.len());
-            for layer in layers {
-                let layer = layer
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("pad layers must contain strings"))?;
-                if !matches!(
-                    layer,
-                    "F.Cu"
-                        | "B.Cu"
-                        | "F.Paste"
-                        | "B.Paste"
-                        | "F.Mask"
-                        | "B.Mask"
-                        | "*.Cu"
-                        | "*.Mask"
-                ) {
-                    anyhow::bail!("invalid pad layer: {layer}");
-                }
-                names.push(layer);
-            }
-            if names.is_empty() {
-                anyhow::bail!("pad layers must not be empty");
-            }
-            names
+            pad_layer_names(layers).map_err(anyhow::Error::msg)?
         } else if pad_type == "smd" {
             vec!["F.Cu", "F.Paste", "F.Mask"]
         } else {
@@ -692,6 +746,19 @@ pub(super) async fn handle_edit_footprint_pad(
         Ok(ratio) => ratio,
         Err(reason) => return Ok(invalid_library_argument("roundrect_rratio", reason)),
     };
+    let layers = match args.get("layers") {
+        None => None,
+        Some(value) => match value.as_array().map(|layers| pad_layer_names(layers)) {
+            Some(Ok(names)) => Some(kicad_pad_layers(&names)),
+            Some(Err(reason)) => return Ok(invalid_library_argument("layers", reason)),
+            None => {
+                return Ok(invalid_library_argument(
+                    "layers",
+                    "must be an array of layer names when supplied",
+                ))
+            }
+        },
+    };
     let custom_shape = match args
         .get("custom_shape")
         .map(crate::tools::pad_primitives::CustomPadShape::from_json)
@@ -758,6 +825,7 @@ pub(super) async fn handle_edit_footprint_pad(
     let mut observed_fabrication_properties = Vec::new();
     let mut observed_ratios = Vec::new();
     let mut observed_custom_shapes = Vec::new();
+    let mut observed_layers = Vec::new();
     let mut warnings = Vec::new();
     for (start, end) in find_direct_child_blocks(&content, "footprint") {
         let block = &content[start..end];
@@ -824,6 +892,18 @@ pub(super) async fn handle_edit_footprint_pad(
             push_distinct(
                 &mut observed_ratios,
                 json!({ "previous": ratio_of(&node), "current": ratio_of(&written) }),
+            );
+        }
+        if let Some(layers) = &layers {
+            // Replaced in place, so the pad keeps its UUID and every other child.
+            edited = set_pad_child(edited, "layers", Some(layers.clone()));
+            let written = parse_sexp(&edited)?;
+            push_distinct(
+                &mut observed_layers,
+                json!({
+                    "previous": written_pad_layers(&node),
+                    "current": written_pad_layers(&written)
+                }),
             );
         }
         if let Some(zone_connect) = zone_connect {
@@ -894,6 +974,7 @@ pub(super) async fn handle_edit_footprint_pad(
     for (key, observed) in [
         ("roundrect_rratio", observed_ratios),
         ("custom_shape", observed_custom_shapes),
+        ("layers", observed_layers),
     ] {
         match observed.as_slice() {
             [] => {}

@@ -408,6 +408,11 @@ set_footprint_metadata(
   implicitly adding `exclude_from_bom`.
 - Use `edit_footprint_pad` with `new_number` and optional `match_all=true` to
   renumber one or every matching direct-child pad atomically.
+- Use `edit_footprint_pad` with `layers` to change a pad's layers in place, for
+  example `["F.Cu", "F.Mask", "F.Paste"]` to give an SMD pad back its stencil
+  opening. It takes the names `create_footprint` takes and writes them as KiCad
+  does (`*.Cu` / `*.Mask` for both sides); the pad keeps its UUID, and
+  `match_all=true` changes every pad with that number.
 - Use `edit_footprint_pad` with `zone_connect` (`solid`, `thermal`, `none`) to
   override how zones connect to one pad, or `inherited` to remove the override.
 - Use `edit_footprint_pad` with `solder_mask_margin` and `solder_paste_margin`
