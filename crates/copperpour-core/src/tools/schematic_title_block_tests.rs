@@ -246,11 +246,21 @@ fn a_sheet_changed_after_it_was_read_is_a_conflict() {
     let journal = dir.path().join(".copperpour-transaction-left.json");
     std::fs::write(&journal, "{}").unwrap();
     let kept = copperpour_sexp::SexpError::TransactionConflict {
-        path: sheet,
-        journal,
+        path: sheet.clone(),
+        journal: journal.clone(),
+        kind: copperpour_sexp::TransactionConflictKind::AfterImage,
         reason: "replacement did not remain durable".into(),
     };
     assert!(super::sch_hierarchy::stale_sheet_refusal(&kept).is_none());
+
+    // A stuck older journal is also not a stale-sheet refusal.
+    let stuck = copperpour_sexp::SexpError::TransactionConflict {
+        path: sheet,
+        journal,
+        kind: copperpour_sexp::TransactionConflictKind::Recovery,
+        reason: "content matches neither the before image nor replacement".into(),
+    };
+    assert!(super::sch_hierarchy::stale_sheet_refusal(&stuck).is_none());
 }
 
 /// A journal an earlier, Konnect-named release left in the project is
@@ -271,10 +281,18 @@ async fn a_legacy_konnect_journal_is_settled_before_a_hierarchy_edit() {
     std::fs::write(&journal, left.to_string()).unwrap();
     let result = call(&root, arguments.clone()).await;
     assert!(result.is_error);
+    let stuck_body = body(&result);
+    assert_eq!(stuck_body["error"]["kind"], "conflict", "{stuck_body}");
     assert!(
-        body(&result).to_string().contains("legacy-left"),
-        "{}",
-        body(&result)
+        stuck_body.to_string().contains("legacy-left"),
+        "{stuck_body}"
+    );
+    assert!(
+        stuck_body["message"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("copperpour transaction status")
+                && msg.contains("copperpour transaction recover")),
+        "{stuck_body}"
     );
     assert_untouched(dir.path());
     assert!(journal.exists());
@@ -352,4 +370,68 @@ async fn a_hierarchy_deeper_than_the_limit_is_refused() {
         "{body}"
     );
     assert!(!read(dir.path(), "s0.kicad_sch").contains("title_block"));
+}
+
+/// Sibling transaction-backed schematic tools propagating `commit_file_transaction`
+/// errors through dispatch also report a stuck older journal as `conflict` naming
+/// the journal and recovery command, without modifying any sheet.
+#[tokio::test]
+async fn renumber_sheet_pages_stuck_journal_returns_conflict_with_recovery_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = project(dir.path());
+    // Perturb one page so renumber_sheet_pages has a real transition to commit.
+    let perturbed = fixture(ROOT).replacen("(page \"2\")", "(page \"99\")", 1);
+    assert_ne!(perturbed, fixture(ROOT));
+    std::fs::write(&root, &perturbed).unwrap();
+    let notes = dir.path().join("notes.txt");
+    std::fs::write(&notes, "C").unwrap();
+    let journal = dir.path().join(".copperpour-transaction-stuck.json");
+    std::fs::write(
+        &journal,
+        r#"{"version":1,"id":"stuck","entries":[{"path":"notes.txt","expected":"A","replacement":"B"}]}"#,
+    )
+    .unwrap();
+
+    let handler = McpHandler::new(ServerConfig {
+        auto_load_toolsets: true,
+        eager_toolsets: true,
+        ..Default::default()
+    })
+    .await
+    .expect("handler builds");
+    let response = handler
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 144,
+            "method": "tools/call",
+            "params": {
+                "name": "renumber_sheet_pages",
+                "arguments": { "schematic": root.to_string_lossy() }
+            }
+        }))
+        .await
+        .expect("tools/call receives a response");
+    assert!(response.error.is_none());
+    let result: CallToolResult =
+        serde_json::from_value(response.result.expect("a result")).expect("an MCP result");
+    assert!(result.is_error);
+    let stuck_body = body(&result);
+    assert_eq!(stuck_body["error"]["kind"], "conflict", "{stuck_body}");
+    assert!(
+        stuck_body["error"]["paths"][0]
+            .as_str()
+            .unwrap()
+            .ends_with(".copperpour-transaction-stuck.json"),
+        "{stuck_body}"
+    );
+    assert!(
+        stuck_body["message"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("copperpour transaction status")
+                && msg.contains("copperpour transaction recover")),
+        "{stuck_body}"
+    );
+    assert_eq!(read(dir.path(), ROOT), perturbed);
+    assert_eq!(read(dir.path(), CHILD), fixture(CHILD));
+    assert!(journal.exists());
 }

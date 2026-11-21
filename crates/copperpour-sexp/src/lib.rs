@@ -18,7 +18,7 @@ pub use command::{
     commit_command, prepare_command, DocumentRevision, ItemAnchor, ItemChange, ItemId,
     SchematicCommand, TransactionOutcome,
 };
-pub use error::SexpError;
+pub use error::{SexpError, TransactionConflictKind};
 pub use geometry::{transform_direction, transform_pin, PinTransform};
 pub use parser::{parse_sexp, SexpNode};
 pub use transaction::{

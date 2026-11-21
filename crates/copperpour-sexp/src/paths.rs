@@ -155,6 +155,7 @@ mod tests {
         let error = crate::error::SexpError::TransactionConflict {
             path: std::path::PathBuf::from("board.kicad_pcb"),
             journal: std::path::PathBuf::from(r"\\?\C:\proj\.journal"),
+            kind: crate::error::TransactionConflictKind::BeforeImage,
             reason: "content changed before the transaction committed".to_owned(),
         };
         let message = error.to_string();

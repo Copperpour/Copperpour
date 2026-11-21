@@ -700,6 +700,11 @@ impl McpHandler {
                         Some("conflict".to_string()),
                     )
                 }
+                Err(e) if crate::tools::transaction_conflict(&e).is_some() => {
+                    let (path, journal, kind) =
+                        crate::tools::transaction_conflict(&e).expect("guard matched");
+                    classify_transaction_conflict(path, journal, kind, name)
+                }
                 Err(e) => {
                     warn!(tool = %name, error = %e, "tool handler returned anyhow::Error");
                     let kind = ToolErrorKind::HandlerError {
@@ -806,6 +811,33 @@ fn board_lock_reason(lock: &crate::tools::LockedDocument<'_>) -> &'static str {
 /// The KiCad editor lock anywhere in `error`'s chain.
 fn kicad_editor_lock(error: &anyhow::Error) -> Option<crate::tools::LockedDocument<'_>> {
     error.chain().find_map(crate::tools::kicad_editor_lock)
+}
+
+/// Classify a durable multi-file transaction conflict that propagated out of a
+/// tool handler to dispatch.
+fn classify_transaction_conflict(
+    path: &std::path::Path,
+    journal: &std::path::Path,
+    kind: copperpour_sexp::TransactionConflictKind,
+    name: &str,
+) -> (CallToolResult, CallStatus, Option<String>) {
+    match kind {
+        copperpour_sexp::TransactionConflictKind::BeforeImage => (
+            crate::tools::revision_conflict_result(path, name),
+            CallStatus::Error,
+            Some("conflict".to_string()),
+        ),
+        copperpour_sexp::TransactionConflictKind::Recovery => (
+            crate::tools::stuck_transaction_journal_result(journal, path, name),
+            CallStatus::Error,
+            Some("conflict".to_string()),
+        ),
+        copperpour_sexp::TransactionConflictKind::AfterImage => (
+            crate::tools::transaction_after_image_result(journal, path, name),
+            CallStatus::Error,
+            Some("mutation_outcome_uncertain".to_string()),
+        ),
+    }
 }
 
 /// Sum of content bytes in a `CallToolResult` — used for observability size
@@ -959,6 +991,51 @@ mod required_argument_dispatch_tests {
         };
         assert_eq!(reason(None), "kicad_lock_present");
         assert_eq!(reason(Some("permission denied")), "kicad_lock_unreadable");
+    }
+
+    #[test]
+    fn transaction_conflict_dispatch_classifies_all_three_kinds() {
+        use copperpour_sexp::TransactionConflictKind;
+        let path = std::path::Path::new("/proj/sheet.kicad_sch");
+        let journal = std::path::Path::new("/proj/.copperpour-transaction-abc.json");
+
+        let (before, status, code) = classify_transaction_conflict(
+            path,
+            journal,
+            TransactionConflictKind::BeforeImage,
+            "renumber_sheet_pages",
+        );
+        assert!(matches!(status, CallStatus::Error));
+        assert_eq!(code.as_deref(), Some("conflict"));
+        assert_eq!(extract_error_kind(&before).as_deref(), Some("conflict"));
+
+        let (recovery, status, code) = classify_transaction_conflict(
+            path,
+            journal,
+            TransactionConflictKind::Recovery,
+            "renumber_sheet_pages",
+        );
+        assert!(matches!(status, CallStatus::Error));
+        assert_eq!(code.as_deref(), Some("conflict"));
+        assert_eq!(extract_error_kind(&recovery).as_deref(), Some("conflict"));
+        let crate::mcp::protocol::ToolContent::Text { text } = &recovery.content[0] else {
+            panic!("{recovery:?}");
+        };
+        assert!(text.contains("copperpour transaction status"), "{text}");
+        assert!(text.contains("copperpour transaction recover"), "{text}");
+
+        let (after, status, code) = classify_transaction_conflict(
+            path,
+            journal,
+            TransactionConflictKind::AfterImage,
+            "renumber_sheet_pages",
+        );
+        assert!(matches!(status, CallStatus::Error));
+        assert_eq!(code.as_deref(), Some("mutation_outcome_uncertain"));
+        assert_eq!(
+            extract_error_kind(&after).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
     }
 
     async fn handler() -> McpHandler {

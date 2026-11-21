@@ -1,6 +1,31 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// Which phase of a durable multi-file transaction raised
+/// [`SexpError::TransactionConflict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionConflictKind {
+    /// A target of this transaction did not match its expected before image.
+    ///
+    /// This check runs before the transaction's journal is persisted, so no
+    /// target file was modified.
+    BeforeImage,
+    /// An older journal in the transaction directory is still pending, has a
+    /// target whose content matches neither its before image nor its
+    /// replacement, or met a conflict while recovery completed it.
+    ///
+    /// Nothing of the current call was written, and the older journal remains
+    /// on disk for inspection, recovery, or abandonment.
+    Recovery,
+    /// After this transaction's journal was persisted (during target publication or
+    /// after-image verification), a guard changed or a target did not read
+    /// back as its intended replacement.
+    ///
+    /// Target files may already have been modified and the journal remains on
+    /// disk, so callers must treat the outcome as uncertain.
+    AfterImage,
+}
+
 #[derive(Debug, Error)]
 pub enum SexpError {
     #[error("Parse error at offset {offset}: {message}")]
@@ -59,8 +84,9 @@ pub enum SexpError {
         reason: String,
     },
 
-    /// A durable multi-file transaction found content that matches neither
-    /// the recorded before image nor the intended replacement.
+    /// A durable multi-file transaction encountered a conflict during
+    /// before-image verification, older-journal recovery, or after-image
+    /// verification.
     #[error(
         "transaction conflict in {}: {}: {reason}",
         crate::paths::display_path(.journal),
@@ -69,6 +95,7 @@ pub enum SexpError {
     TransactionConflict {
         path: PathBuf,
         journal: PathBuf,
+        kind: TransactionConflictKind,
         reason: String,
     },
 }

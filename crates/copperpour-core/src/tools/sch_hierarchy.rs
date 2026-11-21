@@ -646,16 +646,18 @@ pub(super) fn commit_sheets(
 }
 
 /// A commit refused because a sheet changed after it was read. That check
-/// runs before the journal is written, so a conflict whose journal does not
-/// exist changed nothing. Any other failure (a journal left for recovery, or
-/// a write that did not stay durable) is returned as it is.
+/// runs before the journal is written, so a before-image conflict changed
+/// nothing. Any other failure (a stuck older journal, or a write that did not
+/// stay durable) is returned as it is for dispatch to classify.
 pub(super) fn stale_sheet_refusal(error: &copperpour_sexp::SexpError) -> Option<CallToolResult> {
-    let copperpour_sexp::SexpError::TransactionConflict { path, journal, .. } = error else {
+    let copperpour_sexp::SexpError::TransactionConflict {
+        path,
+        kind: copperpour_sexp::TransactionConflictKind::BeforeImage,
+        ..
+    } = error
+    else {
         return None;
     };
-    if journal.exists() {
-        return None;
-    }
     Some(CallToolResult::error_kind(
         ToolErrorKind::Conflict {
             paths: vec![path.display().to_string()],
