@@ -97,9 +97,34 @@ Likewise, `installation.source: "unknown"` means no trusted package manifest
 identified the channel; Copperpour does not guess from directory names. Endpoint
 credentials and query or fragment data are redacted.
 
-Follow the returned platform-specific guidance, restart the MCP client (and
-KiCad when it owns the server process), then call `get_installation_info` again
-to verify the process that actually restarted. This diagnostic writes nothing.
+Follow the returned platform-specific guidance, restart the **host process that
+owns the MCP connection** (not merely the conversation), then call
+`get_installation_info` and `server_stats` again to verify that the answering
+process actually restarted (`runtime.executable_path`,
+`configuration.selected_path`, `started_at_ms`, `total_calls`). This diagnostic
+writes nothing.
+
+Which host process owns the connection depends on the client surface:
+
+- **Claude Code (CLI)**: exit and restart the CLI process.
+- **Claude Desktop (Chat)**: fully quit and relaunch Claude Desktop. Starting a
+  new chat reuses the app's running Copperpour process.
+- **Claude Code inside Claude Desktop (Code tab)**: current builds follow
+  Anthropic's surface separation and spawn a per-session Copperpour process from
+  Claude Code's config (`~/.claude.json` or `.mcp.json`), so a new Code session
+  reloads it. Some builds have been observed to share an app-managed Copperpour
+  process across Code sessions; if `server_stats` still reports the same
+  `started_at_ms` in a new session, fully quit and relaunch Claude Desktop
+  instead.
+- **KiCad-owned server**: stop the plugin server or quit and reopen KiCad.
+
+Configure Copperpour only for the surface you use unless you are intentionally
+testing multiple registrations; registering in both Claude Code and Claude
+Desktop spawns separate server processes side by side and makes diagnosis
+harder. Note also that `calls.jsonl` is written by every Copperpour process on
+the machine, so interleaved entries in that log do not prove two sessions share
+a process — `server_stats` (`started_at_ms`, `total_calls`, `per_tool`) is
+in-process and settles it.
 
 ## Relative paths return `file_not_found`
 
@@ -252,13 +277,18 @@ Step by step (based on the diagnostic guide contributed in
 3. In KiCAD, open **Tools → External Plugins → Copperpour** to open the settings
    dialog.
 4. Paste the address into the **IPC Socket** field and click **Save**.
-5. Confirm your AI client (Claude Code, Claude Desktop, …) has the
-   `copperpour` MCP server registered in its own config (`.mcp.json` or
-   `claude_desktop_config.json`) pointing at the `copperpour` binary — see
+5. Confirm your AI client has the `copperpour` MCP server registered in the
+   config for the surface you are using — `~/.claude.json` or `.mcp.json` for
+   Claude Code, or `claude_desktop_config.json` (or the `.mcpb` extension) for
+   Claude Desktop Chat — pointing at the `copperpour` binary; see
    [examples/](../examples/). This registration is separate from the KiCAD
-   plugin settings.
-6. Restart the AI client session so it spawns a fresh Copperpour process that
-   reads the saved settings.
+   plugin settings. Configure only the surface you use so duplicate Copperpour
+   processes are not spawned side by side.
+6. Restart the host process that owns the MCP connection so it spawns a fresh
+   Copperpour process that reads the saved settings (starting a new chat in
+   Claude Desktop reuses the existing process — see
+   ["Which Copperpour binary is this client using?"](#which-copperpour-binary-is-this-client-using)).
+   Verify the restart with `get_installation_info` and `server_stats`.
 7. Verify: have the AI call `open_project`. Expected:
 
    ```json
@@ -638,8 +668,13 @@ re-fetch `tools/list` in response. If newly loaded tools never show up:
    model and the server. A Chrome-extension "tool search" that shadowed the real
    tool list caused exactly this in
    [#67](https://github.com/mixelpixx/Konnect/issues/67).
-3. Re-issue `tools/list` (e.g. restart the client session) — the loaded toolset
-   state lives in the server process and survives a list refresh.
+3. Re-issue `tools/list` (reconnect the MCP server or restart the host process
+   that owns the MCP connection — starting a new chat in Claude Desktop reuses
+   the same server process; see
+   ["Which Copperpour binary is this client using?"](#which-copperpour-binary-is-this-client-using)).
+   If the client reconnects without respawning the server, the loaded toolset
+   state survives a list refresh; if the server process itself restarts, re-run
+   `load_toolset` (or set `eager_toolsets` below).
 
 If your client caches the initial tool list and never re-fetches it, none of the
 above helps: the tools are loaded server-side, but the client has no schema to
