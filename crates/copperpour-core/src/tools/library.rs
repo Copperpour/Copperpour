@@ -317,7 +317,9 @@ pub fn tools() -> Vec<ToolDef> {
              op-amps or gate banks (via `units` + optional `power_pins`). By default each unit \
              gets a rectangular body sized to its pins. Omitted edge-axis coordinates are \
              distributed at 2.54 mm pitch on the angle-selected edge (default left); supplied \
-             coordinates retain the existing body-edge alignment. Set `glyph` (symbol-level and/or per \
+             coordinates retain the existing body-edge alignment. Pins whose resolved coordinates \
+             fall off the 1.27 mm schematic grid are still written, with a warning in `warnings`. \
+             Set `glyph` (symbol-level and/or per \
              unit) to draw a conventional op-amp triangle or logic-gate body instead. With a \
              glyph, pins auto-place by their `type` (inputs left in the order listed top-to- \
              bottom, output right, power top/bottom) and their x/y are ignored.",
@@ -3738,7 +3740,31 @@ const PIN_NAME_GAP: f64 = 2.54;
 /// emitted as `(pin_names (offset …))`.
 const PIN_NAME_OFFSET: f64 = 1.016;
 /// Schematic grid. Body edges land on it so pins pushed out to meet them do too.
-const SYMBOL_GRID: f64 = 1.27;
+pub(super) const SYMBOL_GRID: f64 = 1.27;
+
+/// Whether `coord_mm` lies on KiCad's 1.27 mm (50 mil) schematic grid, within
+/// [`POSITION_EPSILON`] (1e-6 mm, absorbing float noise while catching even a
+/// single 0.0001 mm KiCad schematic internal unit of drift).
+pub(super) fn is_on_symbol_grid(coord_mm: f64) -> bool {
+    if !coord_mm.is_finite() {
+        return false;
+    }
+    let snapped = (coord_mm / SYMBOL_GRID).round() * SYMBOL_GRID;
+    (coord_mm - snapped).abs() <= POSITION_EPSILON
+}
+
+/// Warning when a single pin's written connection point `(x, y)` is off KiCad's
+/// 1.27 mm schematic grid, or `None` when both axes align to the grid.
+pub(super) fn off_grid_pin_coordinate_warning(pin_number: &str, x: f64, y: f64) -> Option<String> {
+    if is_on_symbol_grid(x) && is_on_symbol_grid(y) {
+        return None;
+    }
+    Some(format!(
+        "pin {pin_number} ({}, {}) is off the 1.27 mm schematic grid; grid-snapped wires and power symbols may not connect — use multiples of 1.27 mm",
+        fmt_f64(x),
+        fmt_f64(y),
+    ))
+}
 
 /// Width of a pin name as KiCad draws it. `~{FOO}` is an overbar rather than
 /// four extra glyphs, and a bare `~` means "unnamed" and draws nothing.
@@ -4888,6 +4914,43 @@ impl BuiltUnit {
         })
     }
 
+    /// A per-unit summary when any resolved pin sits off KiCad's 1.27 mm
+    /// schematic grid, or `None` when every pin is grid-aligned.
+    fn off_grid_pin_warning(&self, unit_label: &str) -> Option<String> {
+        let off_grid: Vec<&ResolvedPin> = self
+            .pins
+            .iter()
+            .filter(|pin| !is_on_symbol_grid(pin.x) || !is_on_symbol_grid(pin.y))
+            .collect();
+        if off_grid.is_empty() {
+            return None;
+        }
+        const MAX_LISTED: usize = 5;
+        let listed: Vec<String> = off_grid
+            .iter()
+            .take(MAX_LISTED)
+            .map(|pin| {
+                format!(
+                    "pin {} ({}, {})",
+                    pin.number,
+                    fmt_f64(pin.x),
+                    fmt_f64(pin.y)
+                )
+            })
+            .collect();
+        let more = if off_grid.len() > MAX_LISTED {
+            format!(" and {} more", off_grid.len() - MAX_LISTED)
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "{unit_label}: {} of {} pins are off the 1.27 mm schematic grid ({}{more}); grid-snapped wires and power symbols may not connect — use multiples of 1.27 mm or omit x/y for automatic layout",
+            off_grid.len(),
+            self.pins.len(),
+            listed.join(", "),
+        ))
+    }
+
     fn to_json(&self, unit: usize) -> serde_json::Value {
         json!({
             "unit": unit,
@@ -5025,6 +5088,7 @@ pub(crate) async fn handle_create_symbol(
                 };
             warnings.extend(unit1.warning.clone());
             warnings.extend(unit1.displacement_warning("unit 1"));
+            warnings.extend(unit1.off_grid_pin_warning("unit 1"));
             units_report.push(unit1.to_json(1));
             let (inner1, body1) = (unit1.sexp, unit1.rect);
             units_sexp.push_str(&unit_symbol(1, &inner1));
@@ -5036,6 +5100,7 @@ pub(crate) async fn handle_create_symbol(
             };
             warnings.extend(unit2.warning.clone());
             warnings.extend(unit2.displacement_warning("unit 2"));
+            warnings.extend(unit2.off_grid_pin_warning("unit 2"));
             units_report.push(unit2.to_json(2));
             let inner2 = unit2.sexp;
             units_sexp.push_str(&unit_symbol(2, &inner2));
@@ -5055,6 +5120,7 @@ pub(crate) async fn handle_create_symbol(
             };
             warnings.extend(unit.warning.clone());
             warnings.extend(unit.displacement_warning("unit 1"));
+            warnings.extend(unit.off_grid_pin_warning("unit 1"));
             units_report.push(unit.to_json(1));
             let (inner, body) = (unit.sexp, unit.rect);
             units_sexp.push_str(&unit_symbol(0, &inner));
@@ -5107,10 +5173,12 @@ pub(crate) async fn handle_create_symbol(
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
+            let unit_label = format!("unit {}", i + 1);
             if let Some(w) = unit.warning.clone() {
-                warnings.push(format!("unit {}: {}", i + 1, w));
+                warnings.push(format!("{unit_label}: {w}"));
             }
-            warnings.extend(unit.displacement_warning(&format!("unit {}", i + 1)));
+            warnings.extend(unit.displacement_warning(&unit_label));
+            warnings.extend(unit.off_grid_pin_warning(&unit_label));
             units_report.push(unit.to_json(i + 1));
             let (inner, body) = (unit.sexp, unit.rect);
             if i == 0 {
@@ -5149,7 +5217,9 @@ pub(crate) async fn handle_create_symbol(
                 ));
             }
             total += 1;
-            warnings.extend(unit.displacement_warning(&format!("unit {total}")));
+            let unit_label = format!("unit {total}");
+            warnings.extend(unit.displacement_warning(&unit_label));
+            warnings.extend(unit.off_grid_pin_warning(&unit_label));
             units_report.push(unit.to_json(total));
             let inner = unit.sexp;
             units_sexp.push_str(&unit_symbol(total, &inner));
@@ -12875,6 +12945,361 @@ mod create_footprint_replace_tests {
             std::fs::read_to_string(&path).unwrap(),
             external,
             "the concurrently created file must be preserved"
+        );
+    }
+}
+
+#[cfg(test)]
+mod off_grid_pin_warning_tests {
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+
+    async fn serve(
+        handler: &McpHandler,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 43,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_ne!(response["isError"], true, "{name}: {response}");
+        serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    #[test]
+    fn is_on_symbol_grid_checks_1_27_mm_multiples_within_epsilon() {
+        for on in [0.0, -0.0, 1.27, -1.27, 2.54, -5.08, 10.16, -27.94, 101.6] {
+            assert!(is_on_symbol_grid(on), "{on} must be on the 1.27 mm grid");
+        }
+        for off in [
+            0.635,
+            -0.635,
+            1.0,
+            -5.26,
+            -10.34,
+            1.2701,
+            f64::NAN,
+            f64::INFINITY,
+        ] {
+            assert!(
+                !is_on_symbol_grid(off),
+                "{off} must be off the 1.27 mm grid"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_symbol_warns_for_off_grid_pin_and_stays_quiet_on_grid() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("grid.kicad_sym");
+
+        // Explicit off-grid pin: -10.34 is 0.18 mm off the 1.27 mm grid (-10.16),
+        // and wide enough that auto-sizing does not slide the pins outward.
+        let off = serve(
+            &handler,
+            "create_symbol",
+            json!({
+                "library_path": lib,
+                "name": "OffGrid",
+                "reference_prefix": "U",
+                "pins": [
+                    {"number": "1", "name": "GND", "type": "power_in", "x": -10.34, "y": 0.0, "angle": 0, "length": 2.54},
+                    {"number": "2", "name": "OUT", "type": "output", "x": 10.16, "y": 0.0, "angle": 180, "length": 2.54}
+                ]
+            }),
+        )
+        .await;
+        let warnings = off["warnings"]
+            .as_array()
+            .expect("off-grid pin must produce a warning");
+        assert!(
+            warnings.iter().any(|w| {
+                let text = w.as_str().unwrap_or("");
+                text.contains("unit 1")
+                    && text.contains("1.27")
+                    && text.contains("pin 1")
+                    && text.contains("-10.34")
+            }),
+            "expected off-grid warning naming unit 1, 1.27 mm, and pin 1 (-10.34, 0); got {warnings:?}"
+        );
+
+        // Valid grid-aligned pins: no warning.
+        let on = serve(
+            &handler,
+            "create_symbol",
+            json!({
+                "library_path": lib,
+                "name": "OnGrid",
+                "reference_prefix": "U",
+                "pins": [
+                    {"number": "1", "name": "GND", "type": "power_in", "x": -10.16, "y": 0.0, "angle": 0, "length": 2.54},
+                    {"number": "2", "name": "OUT", "type": "output", "x": 10.16, "y": 0.0, "angle": 180, "length": 2.54}
+                ]
+            }),
+        )
+        .await;
+        assert!(
+            on.get("warnings").is_none(),
+            "grid-aligned pins must not warn: {on}"
+        );
+
+        // Glyph ignores caller-supplied off-grid x/y and places pins on-grid: no warning.
+        let glyph = serve(
+            &handler,
+            "create_symbol",
+            json!({
+                "library_path": lib,
+                "name": "GlyphIgnored",
+                "reference_prefix": "U",
+                "glyph": "opamp",
+                "pins": [
+                    {"number": "1", "name": "+", "type": "input", "x": 1.11, "y": 2.22},
+                    {"number": "2", "name": "-", "type": "input", "x": 3.33, "y": 4.44},
+                    {"number": "3", "name": "OUT", "type": "output", "x": 5.55, "y": 6.66}
+                ]
+            }),
+        )
+        .await;
+        assert!(
+            glyph.get("warnings").is_none(),
+            "glyph auto-placement onto the grid must not warn: {glyph}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_symbol_warns_for_off_grid_pins_in_drawn_and_multi_unit_symbols() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("drawn_and_multi.kicad_sym");
+
+        // Drawn graphics path writes caller coordinates verbatim.
+        let drawn = serve(
+            &handler,
+            "create_symbol",
+            json!({
+                "library_path": lib,
+                "name": "DrawnOff",
+                "reference_prefix": "U",
+                "graphics": [
+                    {"type": "rect", "start": {"x": -2.54, "y": 2.54}, "end": {"x": 2.54, "y": -2.54}, "stroke_width_mm": 0.254, "fill": "background"}
+                ],
+                "pins": [
+                    {"number": "1", "name": "IN", "type": "input", "x": -5.0, "y": 0.0, "angle": 0, "length": 2.54},
+                    {"number": "2", "name": "OUT", "type": "output", "x": 5.08, "y": 0.0, "angle": 180, "length": 2.54}
+                ]
+            }),
+        )
+        .await;
+        let drawn_warnings = drawn["warnings"]
+            .as_array()
+            .expect("drawn off-grid pin must warn");
+        assert!(
+            drawn_warnings.iter().any(|w| {
+                let text = w.as_str().unwrap_or("");
+                text.contains("unit 1") && text.contains("1.27") && text.contains("pin 1")
+            }),
+            "expected drawn off-grid warning, got {drawn_warnings:?}"
+        );
+
+        // Multi-unit path: unit 1 on-grid, unit 2 off-grid on Y, power unit (unit 3) off-grid on X.
+        let multi = serve(
+            &handler,
+            "create_symbol",
+            json!({
+                "library_path": lib,
+                "name": "MultiOff",
+                "reference_prefix": "U",
+                "units": [
+                    {
+                        "pins": [
+                            {"number": "1", "name": "A1", "type": "input", "x": -10.16, "y": 0.0, "angle": 0},
+                            {"number": "2", "name": "Y1", "type": "output", "x": 10.16, "y": 0.0, "angle": 180}
+                        ]
+                    },
+                    {
+                        "pins": [
+                            {"number": "3", "name": "A2", "type": "input", "x": -10.16, "y": 1.0, "angle": 0},
+                            {"number": "4", "name": "Y2", "type": "output", "x": 10.16, "y": 0.0, "angle": 180}
+                        ]
+                    }
+                ],
+                "power_pins": [
+                    {"number": "5", "name": "VCC", "type": "power_in", "x": 0.5, "y": 10.16, "angle": 270},
+                    {"number": "6", "name": "GND", "type": "power_in", "x": 0.0, "y": -10.16, "angle": 90}
+                ]
+            }),
+        )
+        .await;
+        let multi_warnings = multi["warnings"]
+            .as_array()
+            .expect("multi-unit off-grid pins must warn");
+        assert!(
+            !multi_warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("unit 1")),
+            "on-grid unit 1 must not warn: {multi_warnings:?}"
+        );
+        assert!(
+            multi_warnings.iter().any(|w| {
+                let t = w.as_str().unwrap_or("");
+                t.contains("unit 2") && t.contains("pin 3") && t.contains("1.27")
+            }),
+            "off-grid unit 2 must warn: {multi_warnings:?}"
+        );
+        assert!(
+            multi_warnings.iter().any(|w| {
+                let t = w.as_str().unwrap_or("");
+                t.contains("unit 3") && t.contains("pin 5") && t.contains("1.27")
+            }),
+            "off-grid power unit 3 must warn: {multi_warnings:?}"
+        );
+    }
+
+    /// Demonstrates the electrical-connectivity consequence of an off-grid pin
+    /// created by `create_symbol`: when placed on the 1.27 mm schematic grid,
+    /// a grid-snapped `GND` power symbol connects to the grid-aligned pin but
+    /// misses the off-grid pin by 0.18 mm and leaves it unconnected.
+    #[tokio::test]
+    async fn off_grid_symbol_pin_misses_grid_snapped_power_symbol_while_on_grid_connects() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("power_on_pin_kicad10.kicad_pro");
+        std::fs::write(&proj, "{}\n").unwrap();
+        // Seed from a committed KiCad 10 fixture that already embeds `power:GND`
+        // in `lib_symbols`, so the test runs without an installed KiCad on CI.
+        let sch = dir.path().join("power_on_pin_kicad10.kicad_sch");
+        std::fs::write(
+            &sch,
+            include_str!("../../tests/fixtures/power_on_pin_kicad10.kicad_sch"),
+        )
+        .unwrap();
+        let lib = dir.path().join("local.kicad_sym");
+
+        // 1. Create both symbols: identical except pin 1 X is -10.16 (on-grid) vs -10.34 (0.18 mm off-grid).
+        let on = serve(
+            &handler,
+            "create_symbol",
+            json!({
+                "library_path": lib,
+                "name": "OnGrid",
+                "reference_prefix": "U",
+                "pins": [
+                    {"number": "1", "name": "GND", "type": "power_in", "x": -10.16, "y": 0.0, "angle": 0, "length": 2.54},
+                    {"number": "2", "name": "OUT", "type": "output", "x": 10.16, "y": 0.0, "angle": 180, "length": 2.54}
+                ]
+            }),
+        )
+        .await;
+        assert!(on.get("warnings").is_none(), "on-grid must not warn: {on}");
+
+        let off = serve(
+            &handler,
+            "create_symbol",
+            json!({
+                "library_path": lib,
+                "name": "OffGrid",
+                "reference_prefix": "U",
+                "pins": [
+                    {"number": "1", "name": "GND", "type": "power_in", "x": -10.34, "y": 0.0, "angle": 0, "length": 2.54},
+                    {"number": "2", "name": "OUT", "type": "output", "x": 10.16, "y": 0.0, "angle": 180, "length": 2.54}
+                ]
+            }),
+        )
+        .await;
+        assert!(
+            off["warnings"]
+                .as_array()
+                .is_some_and(|w| w.iter().any(|s| s.as_str().unwrap_or("").contains("1.27"))),
+            "off-grid must warn: {off}"
+        );
+
+        // 2. Register the project library.
+        serve(
+            &handler,
+            "register_symbol_library",
+            json!({
+                "nickname": "Local",
+                "library_path": lib,
+                "scope": "project",
+                "project": proj
+            }),
+        )
+        .await;
+
+        // 3. Place both symbols on the 1.27 mm schematic grid via batch_place_components.
+        // U10 at (203.2, 101.6) -> pin 1 at (193.04, 101.6) (on-grid).
+        // U11 at (254.0, 101.6) -> pin 1 at (243.66, 101.6) (0.18 mm off-grid; nearest grid is 243.84).
+        serve(
+            &handler,
+            "batch_place_components",
+            json!({
+                "schematic": sch,
+                "components": [
+                    {"lib_id": "Local:OnGrid", "reference": "U10", "value": "OnGrid", "x": 203.2, "y": 101.6},
+                    {"lib_id": "Local:OffGrid", "reference": "U11", "value": "OffGrid", "x": 254.0, "y": 101.6}
+                ]
+            }),
+        )
+        .await;
+
+        // 4. Place GND power symbols by coordinate (which snaps to the 1.27 mm grid).
+        serve(
+            &handler,
+            "add_power_symbol",
+            json!({ "schematic": sch, "power_net": "GND", "x": 193.04, "y": 101.6 }),
+        )
+        .await;
+        serve(
+            &handler,
+            "add_power_symbol",
+            json!({ "schematic": sch, "power_net": "GND", "x": 243.66, "y": 101.6 }),
+        )
+        .await;
+
+        // 5. Verify electrical connectivity: U10.1 connects to GND; U11.1 is silently disconnected.
+        let u10_net = serve(
+            &handler,
+            "get_pin_net_name",
+            json!({ "schematic": sch, "reference": "U10", "pin_number": "1" }),
+        )
+        .await;
+        assert_eq!(
+            u10_net["net"],
+            json!("GND"),
+            "on-grid U10.1 must connect: {u10_net}"
+        );
+
+        let u11_net = serve(
+            &handler,
+            "get_pin_net_name",
+            json!({ "schematic": sch, "reference": "U11", "pin_number": "1" }),
+        )
+        .await;
+        assert!(
+            u11_net["net"].is_null(),
+            "off-grid U11.1 must miss the grid-snapped GND symbol: {u11_net}"
         );
     }
 }

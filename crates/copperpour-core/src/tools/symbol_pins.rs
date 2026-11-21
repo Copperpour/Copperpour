@@ -6,7 +6,9 @@ use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::footprint_metadata::quote_string;
-use crate::tools::library::{skip_sexp_token, ALLOWED_PIN_ELECTRICAL_TYPES};
+use crate::tools::library::{
+    off_grid_pin_coordinate_warning, skip_sexp_token, ALLOWED_PIN_ELECTRICAL_TYPES,
+};
 use crate::tools::sch_annotate::opt_string;
 use crate::tools::symbol_fields::{header, symbol_block, unusable, write_checked};
 use crate::tools::{invalid_arg, ToolContext, ToolDef};
@@ -55,7 +57,8 @@ pub(super) fn tool() -> ToolDef {
          body style needs unit or body_style to choose the pin; pins sharing a number in one \
          unit and body style are chosen by their current name (pin_name) or connection point \
          (pin_x, pin_y). Everything else, and the rest of the library, is left as written. \
-         Reports each changed part's previous and current value.",
+         Reports each changed part's previous and current value, and warns in `warnings` if a \
+         supplied `x`/`y` leaves the pin off the 1.27 mm schematic grid.",
         json!({
             "type": "object",
             "properties": {
@@ -439,7 +442,7 @@ async fn handle_edit_symbol_pin(
         }
     }
 
-    Ok(CallToolResult::json(&json!({
+    let mut response = json!({
         "success": true,
         "library_path": path.display().to_string(),
         "symbol": request.symbol,
@@ -448,7 +451,25 @@ async fn handle_edit_symbol_pin(
         "unit": target.unit,
         "body_style": target.body_style,
         "changes": changes
-    })))
+    });
+    if request.x.is_some() || request.y.is_some() {
+        let final_x = request
+            .x
+            .map(|u| u as f64 / UNITS_PER_MM)
+            .or_else(|| target.x.parse::<f64>().ok());
+        let final_y = request
+            .y
+            .map(|u| u as f64 / UNITS_PER_MM)
+            .or_else(|| target.y.parse::<f64>().ok());
+        let final_number = request.new_number.as_deref().unwrap_or(&request.number);
+        if let (Some(x), Some(y)) = (final_x, final_y) {
+            if let Some(warning) = off_grid_pin_coordinate_warning(final_number, x, y) {
+                response["warnings"] = json!([warning]);
+            }
+        }
+    }
+
+    Ok(CallToolResult::json(&response))
 }
 
 /// The library's `(version N)`.
@@ -2141,5 +2162,58 @@ mod tests {
                 "{refusal:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn moving_a_pin_off_the_1_27_mm_grid_warns_and_on_grid_stays_quiet() {
+        let (_dir, path) = library_with(OURS);
+        // Move pin 1 to an off-grid X (-5.26 is 0.18 mm off 1.27 mm grid).
+        let off = call(json!({
+            "library_path": path,
+            "symbol_name": "FIELDS_BARE",
+            "pin_number": "1",
+            "x": -5.26
+        }))
+        .await;
+        assert_eq!(off["success"], true, "{off}");
+        let warnings = off["warnings"]
+            .as_array()
+            .expect("off-grid edit_symbol_pin must warn");
+        assert!(
+            warnings.iter().any(|w| {
+                let text = w.as_str().unwrap_or("");
+                text.contains("1.27") && text.contains("pin 1") && text.contains("-5.26")
+            }),
+            "expected off-grid warning, got {warnings:?}"
+        );
+
+        // Non-position edit on the now-off-grid pin does not emit a spurious warning.
+        let rename = call(json!({
+            "library_path": path,
+            "symbol_name": "FIELDS_BARE",
+            "pin_number": "1",
+            "name": "IN_A"
+        }))
+        .await;
+        assert_eq!(rename["success"], true, "{rename}");
+        assert!(
+            rename.get("warnings").is_none(),
+            "non-position edit should not warn: {rename}"
+        );
+
+        // Moving pin 1 back onto the 1.27 mm grid clears the warning.
+        let on = call(json!({
+            "library_path": path,
+            "symbol_name": "FIELDS_BARE",
+            "pin_number": "1",
+            "x": -5.08,
+            "y": 0.0
+        }))
+        .await;
+        assert_eq!(on["success"], true, "{on}");
+        assert!(
+            on.get("warnings").is_none(),
+            "on-grid move must not warn: {on}"
+        );
     }
 }
