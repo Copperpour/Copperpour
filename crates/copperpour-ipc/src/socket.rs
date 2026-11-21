@@ -67,12 +67,43 @@ pub fn detect_ipc_address() -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcDetection {
     Found(String),
-    /// More than one socket qualifies and not exactly one of them answers a
-    /// Ping. None is adopted: picking one would be a guess, and the wrong
+    /// More than one socket qualifies and neither the Ping nor the
+    /// `GetOpenDocuments(DOCTYPE_PCB)` probe uniquely identifies one PCB
+    /// editor. None is adopted: picking one would be a guess, and the wrong
     /// guess hands the board to another KiCad. Every candidate is reported so
-    /// the user can set `ipc_address` to the right one (#374).
+    /// the user can set `ipc_address` to the right one (#374, #87).
     Ambiguous(Vec<String>),
     NotFound,
+}
+
+/// Whether a responsive endpoint serves PCB documents.
+///
+/// KiCad's Project Manager listens on `api.sock` and implements only
+/// `API_HANDLER_COMMON` (`Ping`, `GetVersion`, ...), answering `AS_UNHANDLED`
+/// to `GetOpenDocuments`, while the PCB editor serves `api-<pid>.sock` with
+/// `API_HANDLER_PCB` (#87). Schematic editors likewise answer `AS_UNHANDLED`
+/// to `DOCTYPE_PCB`. Only `AS_UNHANDLED` proves an endpoint does not serve PCB
+/// documents; any other error (`AS_NOT_READY`, `AS_UNIMPLEMENTED`, timeout)
+/// leaves the endpoint undecided so detection never guesses past a busy editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PcbEndpointProbe {
+    ServesPcb,
+    NoPcbHandler,
+    Undecided,
+}
+
+fn probe_pcb_endpoint(address: &str) -> PcbEndpointProbe {
+    match crate::KiCadIpcClient::new(address).get_open_documents() {
+        Ok(_) => PcbEndpointProbe::ServesPcb,
+        Err(error)
+            if crate::ApiStatusError::from_error(&error).is_some_and(|status| {
+                status.code == crate::gen::kiapi::common::ApiStatusCode::AsUnhandled as i32
+            }) =>
+        {
+            PcbEndpointProbe::NoPcbHandler
+        }
+        Err(_) => PcbEndpointProbe::Undecided,
+    }
 }
 
 /// Detect KiCad's endpoint, reporting ambiguity instead of resolving it by
@@ -81,36 +112,64 @@ pub enum IpcDetection {
 /// On Unix the candidates are this platform's default `api.sock` paths and,
 /// beside each, every `api-<pid>.sock` whose process is running: KiCad 10
 /// binds `api.sock` only while it holds `api.lock`, and a lock left by a
-/// session that did not exit cleanly sends the next KiCad to
+/// session that did not exit cleanly — or a Project Manager holding `api.sock`
+/// while the PCB editor runs in a separate process (#87) — sends the editor to
 /// `api-<pid>.sock` (#374). Every candidate must pass the same ownership and
 /// socket-type check, because `/tmp` is shared.
 ///
-/// One candidate is returned as before, unproven. Several are told apart only
+/// One candidate is returned as before, unproven. Several are told apart first
 /// by the bounded NNG Ping of [`crate::client`], the one handshake this crate
-/// performs: exactly one answering is evidence, not a guess. Otherwise the
-/// result is [`IpcDetection::Ambiguous`].
+/// performs: exactly one answering is evidence, not a guess. When several
+/// answer the Ping, each is asked `GetOpenDocuments(DOCTYPE_PCB)`: if exactly
+/// one serves PCB documents and every other answering endpoint explicitly
+/// answers `AS_UNHANDLED` (as a Project Manager or Schematic Editor does),
+/// that PCB editor endpoint is returned. Otherwise the result is
+/// [`IpcDetection::Ambiguous`].
 pub fn detect_ipc_endpoint() -> IpcDetection {
-    choose_endpoint(&adoptable_candidates(), |address| {
-        crate::KiCadIpcClient::new(address)
-            .ping_outcome()
-            .is_responsive()
-    })
+    detect_ipc_endpoint_from_defaults(candidate_socket_paths())
+}
+
+/// Like [`detect_ipc_endpoint`], scoped to a single `kicad` socket directory
+/// (`<kicad_dir>/api.sock` and live `<kicad_dir>/api-<pid>.sock` siblings).
+#[doc(hidden)]
+pub fn detect_ipc_endpoint_in(kicad_dir: &Path) -> IpcDetection {
+    detect_ipc_endpoint_from_defaults(vec![kicad_dir.join("api.sock")])
+}
+
+fn detect_ipc_endpoint_from_defaults(defaults: Vec<PathBuf>) -> IpcDetection {
+    choose_endpoint(
+        &adoptable_candidates_from_defaults(defaults),
+        |address| {
+            crate::KiCadIpcClient::new(address)
+                .ping_outcome()
+                .is_responsive()
+        },
+        probe_pcb_endpoint,
+    )
 }
 
 /// Every endpoint [`detect_ipc_endpoint`] chooses among, as addresses, before
 /// any is dialled: a caller that can tell them apart by what they hold, rather
 /// than by whether they answer, looks at each.
 pub fn candidate_endpoints() -> Vec<String> {
-    adoptable_candidates()
+    adoptable_candidates_from_defaults(candidate_socket_paths())
         .iter()
         .map(|path| format_address(path))
         .collect()
 }
 
-fn adoptable_candidates() -> Vec<PathBuf> {
+/// Like [`candidate_endpoints`], scoped to a single `kicad` socket directory.
+#[doc(hidden)]
+pub fn candidate_endpoints_in(kicad_dir: &Path) -> Vec<String> {
+    adoptable_candidates_from_defaults(vec![kicad_dir.join("api.sock")])
+        .iter()
+        .map(|path| format_address(path))
+        .collect()
+}
+
+fn adoptable_candidates_from_defaults(defaults: Vec<PathBuf>) -> Vec<PathBuf> {
     #[cfg(unix)]
     {
-        let defaults = candidate_socket_paths();
         let fallbacks = pid_socket_fallbacks(&defaults, pid_is_alive);
         defaults
             .into_iter()
@@ -120,7 +179,7 @@ fn adoptable_candidates() -> Vec<PathBuf> {
     }
     #[cfg(not(unix))]
     {
-        candidate_socket_paths()
+        defaults
             .into_iter()
             .filter(|path| is_adoptable(path))
             .take(1)
@@ -128,9 +187,15 @@ fn adoptable_candidates() -> Vec<PathBuf> {
     }
 }
 
-/// [`detect_ipc_endpoint`]'s decision with the Ping supplied, so a test can
-/// state which candidates answer. The Ping runs only when there is a choice.
-fn choose_endpoint(candidates: &[PathBuf], responds: impl Fn(&str) -> bool) -> IpcDetection {
+/// [`detect_ipc_endpoint`]'s decision with the Ping and PCB-handler probe
+/// supplied, so a test can state which candidates answer. The Ping runs only
+/// when there is a choice, and `probe_pcb` runs only when several candidates
+/// answer the Ping.
+fn choose_endpoint(
+    candidates: &[PathBuf],
+    responds: impl Fn(&str) -> bool,
+    probe_pcb: impl Fn(&str) -> PcbEndpointProbe,
+) -> IpcDetection {
     let addresses: Vec<String> = candidates.iter().map(|path| format_address(path)).collect();
     match addresses.as_slice() {
         [] => IpcDetection::NotFound,
@@ -138,8 +203,27 @@ fn choose_endpoint(candidates: &[PathBuf], responds: impl Fn(&str) -> bool) -> I
         _ => {
             let answering: Vec<&String> = addresses.iter().filter(|a| responds(a)).collect();
             match answering.as_slice() {
+                [] => IpcDetection::Ambiguous(addresses),
                 [one] => IpcDetection::Found((*one).clone()),
-                _ => IpcDetection::Ambiguous(addresses),
+                several => {
+                    let mut pcb_servers = Vec::new();
+                    let mut undecided = false;
+                    for address in several {
+                        match probe_pcb(address) {
+                            PcbEndpointProbe::ServesPcb => pcb_servers.push(*address),
+                            PcbEndpointProbe::NoPcbHandler => {}
+                            PcbEndpointProbe::Undecided => undecided = true,
+                        }
+                        if undecided || pcb_servers.len() > 1 {
+                            break;
+                        }
+                    }
+                    if !undecided && pcb_servers.len() == 1 {
+                        IpcDetection::Found(pcb_servers[0].clone())
+                    } else {
+                        IpcDetection::Ambiguous(addresses)
+                    }
+                }
             }
         }
     }
@@ -644,19 +728,25 @@ mod tests {
 
         #[test]
         fn one_candidate_is_used_without_a_ping() {
-            let chosen = choose_endpoint(&paths(&["api-42.sock"]), |_| panic!("no ping needed"));
+            let chosen = choose_endpoint(
+                &paths(&["api-42.sock"]),
+                |_| panic!("no ping needed"),
+                |_| panic!("no pcb probe needed"),
+            );
             assert_eq!(chosen, IpcDetection::Found("ipc:///k/api-42.sock".into()));
         }
 
         #[test]
         fn the_only_candidate_that_answers_is_used() {
-            let chosen = choose_endpoint(&paths(&["api.sock", "api-42.sock"]), |a| {
-                a.ends_with("api-42.sock")
-            });
+            let chosen = choose_endpoint(
+                &paths(&["api.sock", "api-42.sock"]),
+                |a| a.ends_with("api-42.sock"),
+                |_| panic!("single answering candidate needs no pcb probe"),
+            );
             assert_eq!(chosen, IpcDetection::Found("ipc:///k/api-42.sock".into()));
         }
 
-        /// Two live KiCads, or none answering: no guess, every candidate is
+        /// Two live PCB KiCads, or none answering: no guess, every candidate is
         /// reported (#374).
         #[test]
         fn several_candidates_without_one_answer_are_all_reported() {
@@ -667,18 +757,284 @@ mod tests {
             ];
             let candidates = paths(&["api.sock", "api-42.sock", "api-43.sock"]);
             assert_eq!(
-                choose_endpoint(&candidates, |a| a.contains("api-4")),
+                choose_endpoint(
+                    &candidates,
+                    |a| a.contains("api-4"),
+                    |_| PcbEndpointProbe::ServesPcb,
+                ),
                 IpcDetection::Ambiguous(all.clone())
             );
             assert_eq!(
-                choose_endpoint(&candidates, |_| false),
+                choose_endpoint(
+                    &candidates,
+                    |_| false,
+                    |_| panic!("no pcb probe when nothing answered ping"),
+                ),
                 IpcDetection::Ambiguous(all)
             );
         }
 
         #[test]
         fn no_candidate_is_not_found() {
-            assert_eq!(choose_endpoint(&[], |_| true), IpcDetection::NotFound);
+            assert_eq!(
+                choose_endpoint(&[], |_| true, |_| PcbEndpointProbe::ServesPcb),
+                IpcDetection::NotFound
+            );
+        }
+
+        struct MockEndpoint {
+            control: nng::Socket,
+            worker: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl MockEndpoint {
+            fn spawn(
+                address: String,
+                respond: impl Fn(
+                        crate::gen::kiapi::common::ApiRequest,
+                    ) -> crate::gen::kiapi::common::ApiResponse
+                    + Send
+                    + 'static,
+            ) -> Self {
+                use prost::Message;
+                let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+                socket.listen(&address).unwrap();
+                let control = socket.clone();
+                let worker = std::thread::spawn(move || {
+                    while let Ok(msg) = socket.recv() {
+                        let Ok(req) = crate::gen::kiapi::common::ApiRequest::decode(msg.as_slice())
+                        else {
+                            break;
+                        };
+                        let resp = respond(req);
+                        let out = nng::Message::from(resp.encode_to_vec().as_slice());
+                        if socket.send(out).is_err() {
+                            break;
+                        }
+                    }
+                });
+                Self {
+                    control,
+                    worker: Some(worker),
+                }
+            }
+        }
+
+        impl Drop for MockEndpoint {
+            fn drop(&mut self) {
+                self.control.close();
+                if let Some(worker) = self.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+        }
+
+        fn mock_reply(
+            status: crate::gen::kiapi::common::ApiStatusCode,
+            error: &str,
+            message: Option<prost_types::Any>,
+        ) -> crate::gen::kiapi::common::ApiResponse {
+            crate::gen::kiapi::common::ApiResponse {
+                status: Some(crate::gen::kiapi::common::ApiResponseStatus {
+                    status: status as i32,
+                    error_message: error.to_string(),
+                }),
+                header: None,
+                message,
+            }
+        }
+
+        fn spawn_unhandled_endpoint(path: &Path) -> MockEndpoint {
+            use crate::gen::kiapi::common::ApiStatusCode;
+            MockEndpoint::spawn(format_address(path), |req| {
+                let cmd = req.message.expect("command");
+                if cmd.type_url.ends_with("GetOpenDocuments") {
+                    mock_reply(
+                        ApiStatusCode::AsUnhandled,
+                        "no handler available for request of type kiapi.common.commands.GetOpenDocuments",
+                        None,
+                    )
+                } else {
+                    mock_reply(ApiStatusCode::AsOk, "", None)
+                }
+            })
+        }
+
+        fn spawn_pcb_endpoint(path: &Path) -> MockEndpoint {
+            use crate::gen::kiapi::common::{commands, ApiStatusCode};
+            use prost::Message;
+            MockEndpoint::spawn(format_address(path), |req| {
+                let cmd = req.message.expect("command");
+                if cmd.type_url.ends_with("GetOpenDocuments") {
+                    let docs = commands::GetOpenDocumentsResponse {
+                        documents: Vec::new(),
+                    };
+                    mock_reply(
+                        ApiStatusCode::AsOk,
+                        "",
+                        Some(prost_types::Any {
+                            type_url:
+                                "type.googleapis.com/kiapi.common.commands.GetOpenDocumentsResponse"
+                                    .to_string(),
+                            value: docs.encode_to_vec(),
+                        }),
+                    )
+                } else {
+                    mock_reply(ApiStatusCode::AsOk, "", None)
+                }
+            })
+        }
+
+        fn spawn_status_docs_endpoint(
+            path: &Path,
+            status: crate::gen::kiapi::common::ApiStatusCode,
+        ) -> MockEndpoint {
+            use crate::gen::kiapi::common::ApiStatusCode;
+            MockEndpoint::spawn(format_address(path), move |req| {
+                let cmd = req.message.expect("command");
+                if cmd.type_url.ends_with("GetOpenDocuments") {
+                    mock_reply(status, "docs status", None)
+                } else {
+                    mock_reply(ApiStatusCode::AsOk, "", None)
+                }
+            })
+        }
+
+        #[test]
+        fn project_manager_and_pcb_editor_selects_pcb_editor() {
+            let dir = tempfile::tempdir().unwrap();
+            let kicad_dir = dir.path().join("kicad");
+            std::fs::create_dir_all(&kicad_dir).unwrap();
+            let manager_path = kicad_dir.join("api.sock");
+            let pcb_path = kicad_dir.join(format!("api-{}.sock", std::process::id()));
+
+            let _manager = spawn_unhandled_endpoint(&manager_path);
+            let _pcb = spawn_pcb_endpoint(&pcb_path);
+
+            let detected = detect_ipc_endpoint_in(&kicad_dir);
+            assert_eq!(detected, IpcDetection::Found(format_address(&pcb_path)));
+        }
+
+        #[test]
+        fn project_manager_schematic_and_pcb_editor_selects_pcb_editor() {
+            let dir = tempfile::tempdir().unwrap();
+            let kicad_dir = dir.path().join("kicad");
+            std::fs::create_dir_all(&kicad_dir).unwrap();
+            let manager_path = kicad_dir.join("api.sock");
+            let sch_path = kicad_dir.join("api-1.sock");
+            let pcb_path = kicad_dir.join("api-2.sock");
+
+            let _manager = spawn_unhandled_endpoint(&manager_path);
+            let _sch = spawn_unhandled_endpoint(&sch_path);
+            let _pcb = spawn_pcb_endpoint(&pcb_path);
+
+            let detected = choose_endpoint(
+                &[manager_path, sch_path, pcb_path.clone()],
+                |address| {
+                    crate::KiCadIpcClient::new(address)
+                        .ping_outcome()
+                        .is_responsive()
+                },
+                probe_pcb_endpoint,
+            );
+            assert_eq!(detected, IpcDetection::Found(format_address(&pcb_path)));
+        }
+
+        #[test]
+        fn two_pcb_editors_beside_project_manager_stay_ambiguous() {
+            let dir = tempfile::tempdir().unwrap();
+            let kicad_dir = dir.path().join("kicad");
+            std::fs::create_dir_all(&kicad_dir).unwrap();
+            let manager_path = kicad_dir.join("api.sock");
+            let pcb1_path = kicad_dir.join("api-1.sock");
+            let pcb2_path = kicad_dir.join("api-2.sock");
+
+            let _manager = spawn_unhandled_endpoint(&manager_path);
+            let _pcb1 = spawn_pcb_endpoint(&pcb1_path);
+            let _pcb2 = spawn_pcb_endpoint(&pcb2_path);
+
+            let detected = choose_endpoint(
+                &[manager_path.clone(), pcb1_path.clone(), pcb2_path.clone()],
+                |address| {
+                    crate::KiCadIpcClient::new(address)
+                        .ping_outcome()
+                        .is_responsive()
+                },
+                probe_pcb_endpoint,
+            );
+            assert_eq!(
+                detected,
+                IpcDetection::Ambiguous(vec![
+                    format_address(&manager_path),
+                    format_address(&pcb1_path),
+                    format_address(&pcb2_path),
+                ])
+            );
+        }
+
+        #[test]
+        fn undecided_endpoint_prevents_guessing_pcb_editor() {
+            use crate::gen::kiapi::common::ApiStatusCode;
+            for status in [ApiStatusCode::AsNotReady, ApiStatusCode::AsUnimplemented] {
+                let dir = tempfile::tempdir().unwrap();
+                let kicad_dir = dir.path().join("kicad");
+                std::fs::create_dir_all(&kicad_dir).unwrap();
+                let manager_path = kicad_dir.join("api.sock");
+                let pcb_path = kicad_dir.join("api-1.sock");
+                let busy_path = kicad_dir.join("api-2.sock");
+
+                let _manager = spawn_unhandled_endpoint(&manager_path);
+                let _pcb = spawn_pcb_endpoint(&pcb_path);
+                let _busy = spawn_status_docs_endpoint(&busy_path, status);
+
+                let detected = choose_endpoint(
+                    &[manager_path.clone(), pcb_path.clone(), busy_path.clone()],
+                    |address| {
+                        crate::KiCadIpcClient::new(address)
+                            .ping_outcome()
+                            .is_responsive()
+                    },
+                    probe_pcb_endpoint,
+                );
+                assert_eq!(
+                    detected,
+                    IpcDetection::Ambiguous(vec![
+                        format_address(&manager_path),
+                        format_address(&pcb_path),
+                        format_address(&busy_path),
+                    ]),
+                    "status {status:?} must stay Ambiguous"
+                );
+            }
+        }
+
+        #[test]
+        fn project_manager_and_schematic_without_pcb_editor_stay_ambiguous() {
+            let dir = tempfile::tempdir().unwrap();
+            let kicad_dir = dir.path().join("kicad");
+            std::fs::create_dir_all(&kicad_dir).unwrap();
+            let manager_path = kicad_dir.join("api.sock");
+            let sch_path = kicad_dir.join("api-1.sock");
+
+            let _manager = spawn_unhandled_endpoint(&manager_path);
+            let _sch = spawn_unhandled_endpoint(&sch_path);
+
+            let detected = choose_endpoint(
+                &[manager_path.clone(), sch_path.clone()],
+                |address| {
+                    crate::KiCadIpcClient::new(address)
+                        .ping_outcome()
+                        .is_responsive()
+                },
+                probe_pcb_endpoint,
+            );
+            assert_eq!(
+                detected,
+                IpcDetection::Ambiguous(vec![
+                    format_address(&manager_path),
+                    format_address(&sch_path),
+                ])
+            );
         }
     }
 }

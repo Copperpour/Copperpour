@@ -350,6 +350,10 @@ pub struct ToolContext {
     /// Held for the whole of an `open_board` call: two at once would each see
     /// no editor holding the board and each start one.
     pub(crate) opening_board: tokio::sync::Mutex<()>,
+    /// Test-only override for the `kicad` socket directory consulted during
+    /// rediscovery, so served tests never touch the host's `/tmp/kicad`.
+    #[cfg(all(test, unix))]
+    ipc_kicad_dir_override: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
 impl ToolContext {
@@ -369,6 +373,8 @@ impl ToolContext {
             ipc_rediscovery: std::sync::atomic::AtomicBool::new(false),
             selected_ipc_endpoint: std::sync::Mutex::new(None),
             opening_board: tokio::sync::Mutex::new(()),
+            #[cfg(all(test, unix))]
+            ipc_kicad_dir_override: std::sync::Mutex::new(None),
         }
     }
 
@@ -392,7 +398,17 @@ impl ToolContext {
             ipc_rediscovery: std::sync::atomic::AtomicBool::new(false),
             selected_ipc_endpoint: std::sync::Mutex::new(None),
             opening_board: tokio::sync::Mutex::new(()),
+            #[cfg(all(test, unix))]
+            ipc_kicad_dir_override: std::sync::Mutex::new(None),
         }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_ipc_kicad_dir_for_test(&self, dir: std::path::PathBuf) {
+        *self
+            .ipc_kicad_dir_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dir);
     }
 
     /// Re-detect KiCad's socket on each IPC call (see `ipc_rediscovery`).
@@ -408,12 +424,15 @@ impl ToolContext {
     /// Copperpour, restarted, or moved to `api-<pid>.sock` (#374). With one
     /// candidate, detection reads file metadata only and never connects. With
     /// several, it sends each one, in turn, the NNG `Ping` of
-    /// [`copperpour_ipc::KiCadIpcClient`] before the call's own request, so
-    /// the call first waits on those Pings: each is bounded by the client's
-    /// reply timeout (30 s). A candidate whose Ping times out, such as a busy
-    /// KiCad, counts as not answering, so the result is
+    /// [`copperpour_ipc::KiCadIpcClient`] before the call's own request, and
+    /// when several answer the Ping it probes each answering endpoint with
+    /// `GetOpenDocuments(DOCTYPE_PCB)` so a unique PCB editor is selected
+    /// beside a Project Manager (`AS_UNHANDLED`, #87). Each RPC is bounded by
+    /// the client's reply timeout (30 s). A candidate whose Ping times out,
+    /// such as a busy KiCad, counts as not answering, so the result is
     /// [`IpcEndpoint::Ambiguous`] unless exactly one other candidate
-    /// answered, and the call is refused as not configured.
+    /// answered, and the call is refused as not configured (or resolved by
+    /// requested board in [`with_bound_board_ipc_classified`]).
     ///
     /// The startup address is kept only when detection finds nothing, so the
     /// caller's own `Ping` reports the failure as before. It is never used
@@ -430,6 +449,21 @@ impl ToolContext {
     /// endpoint the calls use (`get_installation_info`). It costs what an IPC
     /// call's own lookup costs.
     pub fn ipc_endpoint_with_origin(&self) -> (IpcEndpoint, IpcEndpointOrigin) {
+        #[cfg(all(test, unix))]
+        if let Some(dir) = self
+            .ipc_kicad_dir_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return with_selection(
+                &self.selected_ipc_endpoint,
+                endpoint_and_origin_for(self.rediscovers_ipc(), &self.config.ipc_address, || {
+                    copperpour_ipc::socket::detect_ipc_endpoint_in(&dir)
+                }),
+                || copperpour_ipc::socket::candidate_endpoints_in(&dir),
+            );
+        }
         with_selection(
             &self.selected_ipc_endpoint,
             endpoint_and_origin_for(
@@ -1095,6 +1129,90 @@ impl BoardEditorAbsence {
     }
 }
 
+struct BoundCandidate {
+    address: String,
+    client: copperpour_ipc::client::KiCadIpcClient,
+    document: copperpour_ipc::gen::kiapi::common::types::DocumentSpecifier,
+}
+
+enum AmbiguousBoardResolution {
+    Unique(Box<BoundCandidate>),
+    MultipleHolders(Vec<String>),
+    Unresolved,
+}
+
+enum CandidateBoardProbe {
+    Holds(Box<BoundCandidate>),
+    DoesNotHold,
+    Undecided,
+}
+
+/// When endpoint discovery left several candidates (`Ambiguous`), probe each in
+/// parallel for `requested`: if exactly one holds it and every other candidate
+/// explicitly proves it does not (wrong board, no open boards, `AS_UNHANDLED`,
+/// or unreachable), bind that holder. Two holders refuse as `AmbiguousDocument`;
+/// any undecided candidate (`AS_NOT_READY`, `AS_UNIMPLEMENTED`, timeout, parse
+/// error) keeps the ambiguous refusal rather than guessing.
+async fn resolve_ambiguous_board_endpoint(
+    candidates: &[String],
+    requested: &std::path::Path,
+) -> anyhow::Result<AmbiguousBoardResolution> {
+    let mut probes = tokio::task::JoinSet::new();
+    for (index, address) in candidates.iter().cloned().enumerate() {
+        let board = requested.to_path_buf();
+        probes.spawn_blocking(move || {
+            let client = copperpour_ipc::client::KiCadIpcClient::new(address.clone());
+            let outcome = match client.find_open_board(&board) {
+                Ok(document) => CandidateBoardProbe::Holds(Box::new(BoundCandidate {
+                    address,
+                    client,
+                    document,
+                })),
+                Err(error)
+                    if BoardEditorAbsence::from_error(&error)
+                        == Some(BoardEditorAbsence::NoPcbEditor)
+                        || error
+                            .downcast_ref::<copperpour_ipc::BoardTargetError>()
+                            .is_some_and(copperpour_ipc::BoardTargetError::proves_not_open)
+                        || copperpour_ipc::is_transport_unreachable(&error) =>
+                {
+                    CandidateBoardProbe::DoesNotHold
+                }
+                Err(_) => CandidateBoardProbe::Undecided,
+            };
+            (index, outcome)
+        });
+    }
+
+    let mut ordered: Vec<Option<CandidateBoardProbe>> =
+        (0..candidates.len()).map(|_| None).collect();
+    while let Some(joined) = probes.join_next().await {
+        match joined {
+            Ok((index, outcome)) => ordered[index] = Some(outcome),
+            Err(_) => return Ok(AmbiguousBoardResolution::Unresolved),
+        }
+    }
+
+    let mut holders = Vec::new();
+    let mut undecided = false;
+    for slot in ordered {
+        match slot {
+            Some(CandidateBoardProbe::Holds(bound)) => holders.push(bound),
+            Some(CandidateBoardProbe::DoesNotHold) => {}
+            Some(CandidateBoardProbe::Undecided) | None => undecided = true,
+        }
+    }
+
+    if holders.len() > 1 {
+        let addresses = holders.into_iter().map(|bound| bound.address).collect();
+        Ok(AmbiguousBoardResolution::MultipleHolders(addresses))
+    } else if !undecided && holders.len() == 1 {
+        Ok(AmbiguousBoardResolution::Unique(holders.pop().unwrap()))
+    } else {
+        Ok(AmbiguousBoardResolution::Unresolved)
+    }
+}
+
 /// As [`with_board_ipc_classified`], handing `f` the document KiCad resolved
 /// rather than leaving it to ask again.
 ///
@@ -1120,28 +1238,65 @@ where
     let requested = board_path.to_path_buf();
     let observation = requested.clone();
     let memory = ctx.board_session.clone();
-    with_ipc_classified(ctx.ipc_endpoint(), move |client| {
-        let document = match client.find_open_board(&requested) {
-            Ok(document) => document,
-            // Classified by the typed status in the chain, never by message
-            // text. It has to happen here: `IpcFailure` keeps only the
-            // rendered message, so by the time the caller sees one the status
-            // is gone — and the two unsupported statuses part company here,
-            // because only one of them is evidence about KiCad's editors.
-            Err(error) => match BoardEditorAbsence::from_error(&error) {
-                Some(absence) => {
-                    return Ok(BoardBinding::Unserved {
-                        absence,
-                        message: format!("{error:#}"),
-                    })
+    match ctx.ipc_endpoint() {
+        endpoint @ IpcEndpoint::Address(_) => {
+            with_ipc_classified(endpoint, move |client| {
+                let document = match client.find_open_board(&requested) {
+                    Ok(document) => document,
+                    // Classified by the typed status in the chain, never by message
+                    // text. It has to happen here: `IpcFailure` keeps only the
+                    // rendered message, so by the time the caller sees one the status
+                    // is gone — and the two unsupported statuses part company here,
+                    // because only one of them is evidence about KiCad's editors.
+                    Err(error) => match BoardEditorAbsence::from_error(&error) {
+                        Some(absence) => {
+                            return Ok(BoardBinding::Unserved {
+                                absence,
+                                message: format!("{error:#}"),
+                            })
+                        }
+                        None => return Err(error),
+                    },
+                };
+                memory.observe_live(&observation);
+                f(client, document).map(BoardBinding::Bound)
+            })
+            .await
+        }
+        IpcEndpoint::Ambiguous(candidates) => {
+            match resolve_ambiguous_board_endpoint(&candidates, &requested).await? {
+                AmbiguousBoardResolution::Unique(bound) => tokio::task::spawn_blocking(move || {
+                    memory.observe_live(&observation);
+                    f(&bound.client, bound.document)
+                        .map(BoardBinding::Bound)
+                        .map_err(|error| {
+                            warn_if_ipc_unreachable(&bound.address, &error);
+                            copperpour_ipc::IpcFailure::from_error(error)
+                        })
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("Thread error: {e}")),
+                AmbiguousBoardResolution::MultipleHolders(holders) => {
+                    let error = copperpour_ipc::BoardTargetError::AmbiguousDocument {
+                        requested: copperpour_sexp::paths::display_path(&requested),
+                        candidates: holders
+                            .iter()
+                            .map(|addr| copperpour_ipc::redact_endpoint(addr))
+                            .collect(),
+                    };
+                    let message = error.to_string();
+                    Ok(Err(copperpour_ipc::IpcFailure::Target { error, message }))
                 }
-                None => return Err(error),
-            },
-        };
-        memory.observe_live(&observation);
-        f(client, document).map(BoardBinding::Bound)
-    })
-    .await
+                AmbiguousBoardResolution::Unresolved => {
+                    with_ipc_classified(IpcEndpoint::Ambiguous(candidates), move |client| {
+                        let _ = client.find_open_board(&requested)?;
+                        unreachable!("ambiguous endpoint client fails before sending")
+                    })
+                    .await
+                }
+            }
+        }
+    }
 }
 
 /// Run `f` against KiCad's IPC API, reporting a failure as its message.
@@ -5160,5 +5315,377 @@ mod ipc_rediscovery_tests {
             ctx.selected_ipc_endpoint.lock().unwrap().as_deref(),
             Some("ipc:///tmp/kicad/api-42.sock")
         );
+    }
+}
+
+#[cfg(test)]
+mod multi_endpoint_discovery_tests {
+    use super::*;
+    #[cfg(unix)]
+    use crate::mcp::handler::McpHandler;
+    use crate::test_support::MockIpcServer;
+    use copperpour_ipc::gen::kiapi;
+    #[cfg(unix)]
+    use serde_json::{json, Value};
+
+    fn reply(
+        status: kiapi::common::ApiStatusCode,
+        error: &str,
+        message: Option<prost_types::Any>,
+    ) -> kiapi::common::ApiResponse {
+        kiapi::common::ApiResponse {
+            status: Some(kiapi::common::ApiResponseStatus {
+                status: status as i32,
+                error_message: error.to_string(),
+            }),
+            header: None,
+            message,
+        }
+    }
+
+    fn board_document(board: &std::path::Path) -> kiapi::common::types::DocumentSpecifier {
+        let filename = board
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        let dir = board.parent().unwrap().to_string_lossy().to_string();
+        let stem = board
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            identifier: Some(
+                kiapi::common::types::document_specifier::Identifier::BoardFilename(filename),
+            ),
+            project: Some(kiapi::common::types::ProjectSpecifier {
+                name: stem,
+                path: dir,
+            }),
+        }
+    }
+
+    fn manager_response(request: kiapi::common::ApiRequest) -> kiapi::common::ApiResponse {
+        let cmd = request.message.expect("command");
+        if cmd.type_url.ends_with("GetOpenDocuments") {
+            reply(
+                kiapi::common::ApiStatusCode::AsUnhandled,
+                "no handler available for request of type kiapi.common.commands.GetOpenDocuments",
+                None,
+            )
+        } else {
+            reply(kiapi::common::ApiStatusCode::AsOk, "", None)
+        }
+    }
+
+    fn pcb_editor_response(
+        doc: kiapi::common::types::DocumentSpecifier,
+    ) -> impl Fn(kiapi::common::ApiRequest) -> kiapi::common::ApiResponse + Send + 'static {
+        move |request| {
+            let cmd = request.message.expect("command");
+            if cmd.type_url.ends_with("GetOpenDocuments") {
+                reply(
+                    kiapi::common::ApiStatusCode::AsOk,
+                    "",
+                    Some(copperpour_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![doc.clone()],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    )),
+                )
+            } else if cmd.type_url.ends_with("GetBoardStackup") {
+                reply(
+                    kiapi::common::ApiStatusCode::AsOk,
+                    "",
+                    Some(copperpour_ipc::builders::pack_any(
+                        &kiapi::board::commands::BoardStackupResponse {
+                            stackup: Some(kiapi::board::BoardStackup::default()),
+                        },
+                        "kiapi.board.commands.BoardStackupResponse",
+                    )),
+                )
+            } else {
+                reply(kiapi::common::ApiStatusCode::AsOk, "", None)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn call_served(
+        handler: &McpHandler,
+        id: u64,
+        name: &str,
+        arguments: Value,
+    ) -> (bool, Value) {
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": arguments,
+            }
+        });
+        let raw = handler.handle_message(req).await.expect("response");
+        let parsed = serde_json::to_value(raw).unwrap();
+        let result = &parsed["result"];
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let body: Value = serde_json::from_str(text).unwrap();
+        (is_error, body)
+    }
+
+    /// Issue #87 end to end through served dispatch: with Project Manager on
+    /// `api.sock` (`AS_UNHANDLED`) and PCB Editor on `api-<pid>.sock`,
+    /// auto-discovery selects the PCB Editor for board-targeted, project, and
+    /// installation-info tools without requiring `open_board` first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn served_project_manager_and_pcb_editor_selects_pcb_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let kicad_dir = dir.path().join("kicad");
+        std::fs::create_dir_all(&kicad_dir).unwrap();
+        let board = dir.path().join("demo.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260101))\n").unwrap();
+
+        let manager_addr = format!("ipc://{}", kicad_dir.join("api.sock").display());
+        let pcb_addr = format!(
+            "ipc://{}",
+            kicad_dir
+                .join(format!("api-{}.sock", std::process::id()))
+                .display()
+        );
+        let _manager = MockIpcServer::spawn_at(manager_addr, manager_response);
+        let _pcb = MockIpcServer::spawn_at(
+            pcb_addr.clone(),
+            pcb_editor_response(board_document(&board)),
+        );
+
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        handler.enable_ipc_rediscovery();
+        handler.set_ipc_kicad_dir_for_test(kicad_dir);
+
+        let (is_error, stackup) =
+            call_served(&handler, 1, "get_board_stackup", json!({ "board": board })).await;
+        assert!(!is_error, "get_board_stackup should succeed: {stackup}");
+
+        let (is_error, project) =
+            call_served(&handler, 2, "open_project", json!({ "path": board })).await;
+        assert!(!is_error, "open_project should succeed: {project}");
+        assert_eq!(project["ipc_available"], true, "{project}");
+        assert_eq!(project["requested_open"], true, "{project}");
+        assert_eq!(project["ipc_address"], pcb_addr, "{project}");
+
+        let (is_error, info) = call_served(&handler, 3, "get_installation_info", json!({})).await;
+        assert!(!is_error, "get_installation_info should succeed: {info}");
+        assert_eq!(info["ipc"]["source"], "detected_at_call_time", "{info}");
+        assert_eq!(info["ipc"]["endpoint"], pcb_addr, "{info}");
+    }
+
+    /// An explicitly configured `ipc_address` stays authoritative even when a
+    /// sibling PCB editor socket sits beside it: rediscovery is off, so
+    /// `get_board_stackup` preserves `no_pcb_editor_at_endpoint`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn served_configured_manager_address_is_not_overridden_by_sibling_pcb_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let kicad_dir = dir.path().join("kicad");
+        std::fs::create_dir_all(&kicad_dir).unwrap();
+        let board = dir.path().join("demo.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260101))\n").unwrap();
+
+        let manager_addr = format!("ipc://{}", kicad_dir.join("api.sock").display());
+        let pcb_addr = format!(
+            "ipc://{}",
+            kicad_dir
+                .join(format!("api-{}.sock", std::process::id()))
+                .display()
+        );
+        let _manager = MockIpcServer::spawn_at(manager_addr.clone(), manager_response);
+        let _pcb = MockIpcServer::spawn_at(pcb_addr, pcb_editor_response(board_document(&board)));
+
+        let handler = McpHandler::new(ServerConfig {
+            ipc_address: manager_addr,
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        handler.set_ipc_kicad_dir_for_test(kicad_dir);
+
+        let (is_error, stackup) =
+            call_served(&handler, 1, "get_board_stackup", json!({ "board": board })).await;
+        assert!(is_error, "explicit manager endpoint must refuse: {stackup}");
+        assert_eq!(stackup["error"]["kind"], "editor_unavailable", "{stackup}");
+        assert_eq!(
+            stackup["recovery"]["cause"], "no_pcb_editor_at_endpoint",
+            "{stackup}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_board_resolution_binds_unique_holder_across_multiple_pcb_editors() {
+        let dir = tempfile::tempdir().unwrap();
+        let board_a = dir.path().join("a.kicad_pcb");
+        let board_b = dir.path().join("b.kicad_pcb");
+        let board_c = dir.path().join("c.kicad_pcb");
+
+        let manager = MockIpcServer::spawn("multi-mgr", manager_response);
+        let pcb_a =
+            MockIpcServer::spawn("multi-pcb-a", pcb_editor_response(board_document(&board_a)));
+        let pcb_b =
+            MockIpcServer::spawn("multi-pcb-b", pcb_editor_response(board_document(&board_b)));
+        let candidates = vec![
+            manager.address().to_string(),
+            pcb_a.address().to_string(),
+            pcb_b.address().to_string(),
+            "inproc://copperpour-unreachable-sibling-test".to_string(),
+        ];
+
+        match resolve_ambiguous_board_endpoint(&candidates, &board_a)
+            .await
+            .unwrap()
+        {
+            AmbiguousBoardResolution::Unique(bound) => {
+                assert_eq!(bound.address, pcb_a.address());
+            }
+            _ => panic!("expected unique holder for board_a"),
+        }
+
+        match resolve_ambiguous_board_endpoint(&candidates, &board_b)
+            .await
+            .unwrap()
+        {
+            AmbiguousBoardResolution::Unique(bound) => {
+                assert_eq!(bound.address, pcb_b.address());
+            }
+            _ => panic!("expected unique holder for board_b"),
+        }
+
+        assert!(matches!(
+            resolve_ambiguous_board_endpoint(&candidates, &board_c)
+                .await
+                .unwrap(),
+            AmbiguousBoardResolution::Unresolved
+        ));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_board_resolution_refuses_duplicate_holders_and_undecided_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("dup.kicad_pcb");
+
+        let pcb_1 = MockIpcServer::spawn("dup-pcb-1", pcb_editor_response(board_document(&board)));
+        let pcb_2 = MockIpcServer::spawn("dup-pcb-2", pcb_editor_response(board_document(&board)));
+        let dup_candidates = vec![pcb_1.address().to_string(), pcb_2.address().to_string()];
+
+        match resolve_ambiguous_board_endpoint(&dup_candidates, &board)
+            .await
+            .unwrap()
+        {
+            AmbiguousBoardResolution::MultipleHolders(holders) => {
+                assert_eq!(holders, dup_candidates);
+            }
+            _ => panic!("expected MultipleHolders when two editors hold the same board"),
+        }
+
+        let not_ready = MockIpcServer::not_ready("dup-not-ready");
+        let undecided_candidates =
+            vec![pcb_1.address().to_string(), not_ready.address().to_string()];
+        assert!(matches!(
+            resolve_ambiguous_board_endpoint(&undecided_candidates, &board)
+                .await
+                .unwrap(),
+            AmbiguousBoardResolution::Unresolved
+        ));
+    }
+
+    /// With two live PCB editors beside the Project Manager, `detect_ipc_endpoint`
+    /// returns `Ambiguous`, and `with_bound_board_ipc_classified` resolves each
+    /// board-targeted call to the unique editor holding that board — or refuses
+    /// with `ambiguous_target` when both hold the same board.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn served_multiple_pcb_editors_route_by_board_and_refuse_duplicate_holders() {
+        let dir = tempfile::tempdir().unwrap();
+        let kicad_dir = dir.path().join("kicad");
+        std::fs::create_dir_all(&kicad_dir).unwrap();
+        let board_a = dir.path().join("a.kicad_pcb");
+        let board_b = dir.path().join("b.kicad_pcb");
+        std::fs::write(&board_a, "(kicad_pcb (version 20260101))\n").unwrap();
+        std::fs::write(&board_b, "(kicad_pcb (version 20260101))\n").unwrap();
+
+        let manager_addr = format!("ipc://{}", kicad_dir.join("api.sock").display());
+        let pcb_a_addr = format!(
+            "ipc://{}",
+            kicad_dir
+                .join(format!("api-{}.sock", std::process::id()))
+                .display()
+        );
+        // PID 1 is always alive on Unix (`kill(1, 0)` returns 0 or EPERM).
+        let other_pid = if std::process::id() == 1 { 2 } else { 1 };
+        let pcb_b_addr = format!(
+            "ipc://{}",
+            kicad_dir.join(format!("api-{other_pid}.sock")).display()
+        );
+
+        let _manager = MockIpcServer::spawn_at(manager_addr, manager_response);
+        let _pcb_a = MockIpcServer::spawn_at(
+            pcb_a_addr.clone(),
+            pcb_editor_response(board_document(&board_a)),
+        );
+        let pcb_b = MockIpcServer::spawn_at(
+            pcb_b_addr.clone(),
+            pcb_editor_response(board_document(&board_b)),
+        );
+
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        handler.enable_ipc_rediscovery();
+        handler.set_ipc_kicad_dir_for_test(kicad_dir);
+
+        let (is_error, stackup_a) = call_served(
+            &handler,
+            1,
+            "get_board_stackup",
+            json!({ "board": board_a }),
+        )
+        .await;
+        assert!(!is_error, "board_a should route to pcb_a: {stackup_a}");
+
+        let (is_error, stackup_b) = call_served(
+            &handler,
+            2,
+            "get_board_stackup",
+            json!({ "board": board_b }),
+        )
+        .await;
+        assert!(!is_error, "board_b should route to pcb_b: {stackup_b}");
+
+        // Replace pcb_b with a second editor holding board_a: must refuse as ambiguous_target.
+        drop(pcb_b);
+        let _pcb_a_dup =
+            MockIpcServer::spawn_at(pcb_b_addr, pcb_editor_response(board_document(&board_a)));
+        let (is_error, dup) = call_served(
+            &handler,
+            3,
+            "get_board_stackup",
+            json!({ "board": board_a }),
+        )
+        .await;
+        assert!(is_error, "duplicate holders must refuse: {dup}");
+        assert_eq!(dup["error"]["kind"], "ambiguous_target", "{dup}");
     }
 }
