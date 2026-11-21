@@ -143,7 +143,7 @@ binary's bundle:
 | Status | Meaning |
 |--------|---------|
 | `current` | Byte-identical to the bundle, or the exact hook command `init` writes |
-| `different` | Present, but not identical. It may be an older release's copy or your own edit; the install marker records only a version, so the two cannot be told apart |
+| `different` | Present, but not identical. When `.installed-manifest-<client>.json` is present, unmodified files from a previous Copperpour install are distinguished from local user edits |
 | `missing` | Not present |
 | `unreadable` | Present but could not be read, or `settings.json` is not valid JSON or not the shape Claude expects |
 
@@ -165,21 +165,30 @@ unchanged.
 The serving process makes the same comparison for both clients once per
 `(install marker, embedded guidance bundle)` pair. The first start for a
 marker—or after a binary upgrade that changes that client's embedded skills,
-agents, or hook matchers—scans; when either client is `out_of_sync`, it sets the
-MCP `initialize` `instructions` to a one-line notice and attaches the same
-notice as `guidance_notice` to non-`get_guidance` tool calls in that session,
-recording `~/.copperpour/.guidance-checked-<client>` once the first eligible
-tool call delivers it (while `current` and `not_installed` states are recorded
-on scan). A session that exits after `initialize` without calling a tool does
-not consume the notice. Later
-starts with the same marker and embedded bundle read the record instead of
-rescanning and give no notice. Running `copperpour init` starts a new check;
-upgrading to a binary with an unchanged guidance bundle stays quiet.
-`get_installation_info` reports the result under `guidance`; its `checked`
-field is `now` for a scan in this process, with per-file detail, or `earlier`
-for a recorded state without it. `copperpour status` always scans. Nothing
-rewrites guidance. Run `copperpour init` to update. It overwrites `different`
-files, so save any edits you made first.
+agents, or hook matchers—scans. When an install manifest
+(`~/.copperpour/.installed-manifest-<client>.json`) matches the current install
+marker, unmodified files and managed hook entries (matching the previously
+recorded digests/entries) and newly added bundled files are updated in place
+automatically; if every item is then `current`, the install marker and check
+record advance silently without emitting a notice. Locally modified files,
+user-deleted files, user-edited/shared hook entries, symlinks, and legacy
+installs without a manifest are left untouched; when either client remains
+`out_of_sync`, the server sets the MCP `initialize` `instructions` to a
+one-line notice naming any locally modified files and the runnable `init`
+command (using the serving executable's path when `copperpour` is not on
+`PATH`), attaches the same notice as `guidance_notice` to non-`get_guidance`
+tool calls in that session, and records
+`~/.copperpour/.guidance-checked-<client>` once the first eligible tool call
+delivers it (while `current` and `not_installed` states are recorded on scan).
+A session that exits after `initialize` without calling a tool does not consume
+the notice. Later starts with the same marker and embedded bundle read the
+record instead of rescanning and give no notice. Running `copperpour init`
+starts a new check; upgrading to a binary with an unchanged guidance bundle
+stays quiet. `get_installation_info` reports the result under `guidance`; its
+`checked` field is `now` for a scan in this process, with per-file detail, or
+`earlier` for a recorded state without it. `copperpour status` always scans and
+never modifies files. Run the reported `init` command to overwrite remaining
+`different` files (back up any edits you made first).
 
 ## "KiCAD IPC socket path not configured"
 
