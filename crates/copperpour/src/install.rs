@@ -7,12 +7,15 @@ use crate::manifest::{
     AGENTS, HOOK_SKILLS, LEGACY_OPERATING_RULES_SKILL, OPERATING_RULES_SKILL, SKILLS,
 };
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum InstallClient {
@@ -33,6 +36,13 @@ impl InstallClient {
         match self {
             Self::Claude => ".guidance-checked-claude",
             Self::Codex => ".guidance-checked-codex",
+        }
+    }
+
+    fn manifest_name(self) -> &'static str {
+        match self {
+            Self::Claude => ".installed-manifest-claude.json",
+            Self::Codex => ".installed-manifest-codex.json",
         }
     }
 }
@@ -372,6 +382,195 @@ impl InstallPaths {
     fn guidance_checked(&self, client: InstallClient) -> PathBuf {
         self.data_dir().join(client.checked_name())
     }
+
+    fn installed_manifest(&self, client: InstallClient) -> PathBuf {
+        self.data_dir().join(client.manifest_name())
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+struct InstalledManifest {
+    version: String,
+    /// Map of `<kind>:<name>` (e.g. `skill:copperpour/SKILL.md`,
+    /// `agent:kicad-reviewer.md`) to lowercase hex SHA-256 of the bytes written.
+    files: BTreeMap<String, String>,
+    /// Managed Claude hook entries written by `init` or auto-update, keyed by
+    /// hook name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    hooks: BTreeMap<String, InstalledHookRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct InstalledHookRecord {
+    event: String,
+    matcher: String,
+    command: String,
+}
+
+impl InstalledManifest {
+    fn current(
+        client: InstallClient,
+        paths: &InstallPaths,
+        exe_str: &str,
+        include_hooks: bool,
+    ) -> Result<Self> {
+        let mut files = BTreeMap::new();
+        for file in managed_files(client, paths) {
+            files.insert(
+                manifest_file_key(file.kind, &file.name),
+                sha256_hex(file.content.as_bytes()),
+            );
+        }
+        let mut hooks = BTreeMap::new();
+        if client == InstallClient::Claude && include_hooks {
+            for hook in HOOK_SKILLS {
+                hooks.insert(
+                    hook.name.to_string(),
+                    InstalledHookRecord {
+                        event: hook.event.to_string(),
+                        matcher: hook_matcher(hook)?,
+                        command: hook_command(exe_str, "hook", hook.name),
+                    },
+                );
+            }
+        }
+        Ok(Self {
+            version: build_version_label(),
+            files,
+            hooks,
+        })
+    }
+}
+
+fn manifest_file_key(kind: &str, name: &str) -> String {
+    format!("{kind}:{name}")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    encode_hex(&Sha256::digest(bytes))
+}
+
+fn read_installed_manifest(
+    client: InstallClient,
+    paths: &InstallPaths,
+    marker: Option<&MarkerInfo>,
+) -> Option<InstalledManifest> {
+    let marker = marker?;
+    if marker.legacy {
+        return None;
+    }
+    let marker_version = marker.version.as_deref()?;
+    let raw = fs::read_to_string(paths.installed_manifest(client)).ok()?;
+    let manifest: InstalledManifest = serde_json::from_str(&raw).ok()?;
+    (manifest.version == marker_version).then_some(manifest)
+}
+
+fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let seq = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("copperpour");
+    let scratch = path.with_file_name(format!(".{file_name}.tmp-{}-{seq}", std::process::id()));
+    if let Err(error) = fs::write(&scratch, bytes) {
+        let _ = fs::remove_file(&scratch);
+        return Err(error.into());
+    }
+    if let Err(error) = fs::rename(&scratch, path) {
+        let _ = fs::remove_file(&scratch);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn write_installed_manifest(
+    client: InstallClient,
+    paths: &InstallPaths,
+    manifest: &InstalledManifest,
+) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(manifest)?;
+    write_atomic_bytes(&paths.installed_manifest(client), &bytes)
+}
+
+fn format_category_count(
+    updated: usize,
+    unchanged: usize,
+    singular: &str,
+    plural: &str,
+    verb: &str,
+) -> String {
+    let label = |count| if count == 1 { singular } else { plural };
+    match (updated, unchanged) {
+        (0, u) => format!("{u} {} unchanged", label(u)),
+        (n, 0) => format!("{n} {} {verb}", label(n)),
+        (n, u) => format!("{n} {} {verb} ({u} unchanged)", label(n)),
+    }
+}
+
+fn format_install_summary(
+    client: InstallClient,
+    updated_skills: usize,
+    unchanged_skills: usize,
+    updated_agents: usize,
+    unchanged_agents: usize,
+    updated_hooks: usize,
+    total_hooks: usize,
+) -> String {
+    let unchanged_hooks = total_hooks.saturating_sub(updated_hooks);
+    match client {
+        InstallClient::Claude => {
+            if updated_skills == 0 && updated_agents == 0 && updated_hooks == 0 {
+                format!(
+                    "Done: Claude guidance already up to date ({unchanged_skills} skills, {unchanged_agents} agents, {total_hooks} hooks)."
+                )
+            } else {
+                format!(
+                    "Done: {}, {}, {} for Claude.",
+                    format_category_count(
+                        updated_skills,
+                        unchanged_skills,
+                        "skill",
+                        "skills",
+                        "updated"
+                    ),
+                    format_category_count(
+                        updated_agents,
+                        unchanged_agents,
+                        "agent",
+                        "agents",
+                        "updated"
+                    ),
+                    format_category_count(
+                        updated_hooks,
+                        unchanged_hooks,
+                        "hook",
+                        "hooks",
+                        "patched"
+                    ),
+                )
+            }
+        }
+        InstallClient::Codex => {
+            if updated_skills == 0 {
+                format!("Done: Codex guidance already up to date ({unchanged_skills} skills).")
+            } else {
+                format!(
+                    "Done: {} for Codex.",
+                    format_category_count(
+                        updated_skills,
+                        unchanged_skills,
+                        "skill",
+                        "skills",
+                        "updated"
+                    )
+                )
+            }
+        }
+    }
 }
 
 fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) -> Result<()> {
@@ -384,27 +583,41 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
         }
     }
 
-    let skill_count = install_skills(client, paths, verbose)?;
-    let mut agent_count = 0;
+    let (updated_skills, unchanged_skills) = install_skills(client, paths, verbose)?;
+    let mut updated_agents = 0;
+    let mut unchanged_agents = 0;
     let mut hook_count = 0;
+    let mut hooks_ok = true;
+    let exe_str = registered_exe()?;
     if client == InstallClient::Claude {
         for file in managed_files(client, paths) {
             if file.kind == "agent" {
-                write_managed_file(&file)?;
-                agent_count += 1;
-                if verbose {
-                    println!("  [+] Agent: {}", file.name);
+                let changed = write_managed_file_if_changed(&file)?;
+                if changed {
+                    updated_agents += 1;
+                    if verbose {
+                        println!("  [+] Agent: {}", file.name);
+                    }
+                } else {
+                    unchanged_agents += 1;
+                    if verbose {
+                        println!("  [=] Agent: {} (up to date)", file.name);
+                    }
                 }
             }
         }
 
-        let exe_str = registered_exe()?;
         let settings_path = paths.claude_settings_path();
-        hook_count = if verbose {
-            patch_claude_settings(&settings_path, &exe_str)?
+        let (count, hooks_patched_ok) = if verbose {
+            (patch_claude_settings(&settings_path, &exe_str)?, true)
         } else {
-            patch_claude_settings(&settings_path, &exe_str).unwrap_or_default()
+            match patch_claude_settings(&settings_path, &exe_str) {
+                Ok(count) => (count, true),
+                Err(_) => (0, false),
+            }
         };
+        hook_count = count;
+        hooks_ok = hooks_patched_ok;
         if verbose {
             if hook_count > 0 {
                 println!("  [+] Hooks: {hook_count} entries patched into settings.json");
@@ -424,23 +637,31 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
     }
 
     fs::create_dir_all(paths.data_dir())?;
-    fs::write(paths.marker(client), build_version_label())?;
+    write_atomic_bytes(&paths.marker(client), build_version_label().as_bytes())?;
+    let manifest = InstalledManifest::current(client, paths, &exe_str, hooks_ok)?;
+    write_installed_manifest(client, paths, &manifest)?;
     // The recorded check described the guidance this install just replaced;
     // a same-version re-init leaves the marker unchanged, so drop it.
     remove_if_present(&paths.guidance_checked(client))?;
 
     if verbose {
-        match client {
-            InstallClient::Claude => println!(
-                "\nDone: {skill_count} skills, {agent_count} agents, {hook_count} hooks installed for Claude."
-            ),
-            InstallClient::Codex => {
-                println!("\nDone: {skill_count} skills installed for Codex.")
-            }
-        }
+        println!(
+            "\n{}",
+            format_install_summary(
+                client,
+                updated_skills,
+                unchanged_skills,
+                updated_agents,
+                unchanged_agents,
+                hook_count,
+                HOOK_SKILLS.len(),
+            )
+        );
     } else {
         eprintln!(
-            "[copperpour] Silent {client} install complete: {skill_count} skills, {agent_count} agents"
+            "[copperpour] Silent {client} install complete: {} skills, {} agents",
+            updated_skills + unchanged_skills,
+            updated_agents + unchanged_agents
         );
     }
     Ok(())
@@ -491,18 +712,25 @@ fn managed_files(client: InstallClient, paths: &InstallPaths) -> Vec<ManagedFile
     files
 }
 
-fn write_managed_file(file: &ManagedFile) -> Result<()> {
-    if let Some(parent) = file.path.parent() {
-        fs::create_dir_all(parent)?;
+fn write_managed_file_if_changed(file: &ManagedFile) -> Result<bool> {
+    if fs::read(&file.path).is_ok_and(|bytes| bytes == file.content.as_bytes()) {
+        return Ok(false);
     }
-    fs::write(&file.path, file.content)?;
-    Ok(())
+    write_atomic_bytes(&file.path, file.content.as_bytes())?;
+    Ok(true)
 }
 
-fn install_skills(client: InstallClient, paths: &InstallPaths, verbose: bool) -> Result<usize> {
+fn install_skills(
+    client: InstallClient,
+    paths: &InstallPaths,
+    verbose: bool,
+) -> Result<(usize, usize)> {
+    let mut changed_by_skill = BTreeSet::new();
     for file in managed_files(client, paths) {
-        if file.kind == "skill" {
-            write_managed_file(&file)?;
+        if file.kind == "skill" && write_managed_file_if_changed(&file)? {
+            if let Some(skill_name) = file.name.split('/').next() {
+                changed_by_skill.insert(skill_name.to_string());
+            }
         }
     }
     if remove_renamed_skill(&paths.skills_dir(client))? && verbose {
@@ -510,12 +738,22 @@ fn install_skills(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
             "  [-] Removed skill: {LEGACY_OPERATING_RULES_SKILL} (now {OPERATING_RULES_SKILL})"
         );
     }
-    if verbose {
-        for skill in SKILLS {
-            println!("  [+] Skill: {}", skill.name);
+    let mut updated = 0;
+    let mut unchanged = 0;
+    for skill in SKILLS {
+        if changed_by_skill.contains(skill.name) {
+            updated += 1;
+            if verbose {
+                println!("  [+] Skill: {}", skill.name);
+            }
+        } else {
+            unchanged += 1;
+            if verbose {
+                println!("  [=] Skill: {} (up to date)", skill.name);
+            }
         }
     }
-    Ok(SKILLS.len())
+    Ok((updated, unchanged))
 }
 
 fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) -> Result<()> {
@@ -556,6 +794,7 @@ fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) 
     }
 
     remove_if_present(&paths.marker(client))?;
+    remove_if_present(&paths.installed_manifest(client))?;
     remove_if_present(&paths.guidance_checked(client))?;
     if verbose {
         println!("\nDone.");
@@ -634,12 +873,14 @@ impl fmt::Display for StatusText<'_> {
     }
 }
 
-// ─── Drift detection (#728) ──────────────────────────────────────────────────
+// ─── Drift detection (#728, #731) ────────────────────────────────────────────
 //
-// Read-only. A file is compared byte for byte with the bundle this binary
-// embeds. The marker records only a version, so a differing file cannot be
-// told apart as an older release's copy or a user's edit; it is reported as
-// `different`, never `stale` or `modified`.
+// `inspect_guidance` is read-only. A file is compared byte for byte with the
+// bundle this binary embeds; when a matching `.installed-manifest-<client>.json`
+// exists, a differing file whose SHA-256 differs from the recorded digest is
+// flagged as `user_modified` so `InstalledGuidanceProbe` auto-updates only
+// untouched files and names locally edited ones in `guidance_notice`. Legacy
+// installs without a manifest stay read-only and report `different`.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ItemStatus {
@@ -686,6 +927,10 @@ struct FileCheck {
     name: String,
     path: PathBuf,
     status: ItemStatus,
+    /// `true` when the file is `Different` and an installed manifest exists
+    /// whose recorded SHA-256 differs from the bytes currently on disk (or the
+    /// path is a symlink), meaning the user edited it locally.
+    user_modified: bool,
 }
 
 #[derive(Debug)]
@@ -717,6 +962,7 @@ impl MarkerInfo {
 #[derive(Debug)]
 struct ClientGuidance {
     client: InstallClient,
+    exe: String,
     files: Vec<FileCheck>,
     hooks: Vec<HookCheck>,
     marker: Option<MarkerInfo>,
@@ -757,6 +1003,10 @@ impl ClientGuidance {
 
     /// One line the model can act on. Only out-of-sync guidance gets one.
     fn notice(&self) -> Option<String> {
+        self.notice_with_path(std::env::var_os("PATH").as_deref())
+    }
+
+    fn notice_with_path(&self, path_env: Option<&OsStr>) -> Option<String> {
         if self.state() != GuidanceState::OutOfSync {
             return None;
         }
@@ -780,13 +1030,21 @@ impl ClientGuidance {
         })
         .collect::<Vec<_>>()
         .join(", ");
-        let client_flag = match self.client {
-            InstallClient::Claude => "",
-            InstallClient::Codex => " --client codex",
+        let modified_names: Vec<&str> = self
+            .files
+            .iter()
+            .filter(|file| file.user_modified)
+            .map(|file| file.name.as_str())
+            .collect();
+        let modified_detail = if modified_names.is_empty() {
+            String::new()
+        } else {
+            format!(" (locally modified: {})", modified_names.join(", "))
         };
+        let init_cmd = format_init_command(&self.exe, self.client, path_env);
         Some(format!(
-            "Copperpour {} guidance ({installed_by}) does not match this server v{}: {counts}. \
-             Ask the user to run `copperpour init{client_flag}`; it overwrites differing files, \
+            "Copperpour {} guidance ({installed_by}) does not match this server v{}: {counts}{modified_detail}. \
+             Ask the user to run `{init_cmd}`; it overwrites differing files, \
              which may hold their own edits. Do not rewrite these files yourself.",
             self.client,
             build_version_label(),
@@ -860,23 +1118,145 @@ fn is_plain_version(text: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
 }
 
-fn check_file(path: &Path, expected: &str) -> ItemStatus {
+/// Build a runnable `init` command for [`ClientGuidance::notice`].
+/// Uses bare `copperpour` only when the first `copperpour` executable on `PATH`
+/// resolves to `exe`; otherwise uses `exe` (quoted when needed) so PCM plugin
+/// and custom-path installs work directly (#731).
+fn format_init_command(exe: &str, client: InstallClient, path_env: Option<&OsStr>) -> String {
+    let client_flag = match client {
+        InstallClient::Claude => "",
+        InstallClient::Codex => " --client codex",
+    };
+    let program = if exe.is_empty() || is_exe_on_path(exe, path_env) {
+        "copperpour".to_string()
+    } else {
+        format_shell_program(exe)
+    };
+    format!("{program} init{client_flag}")
+}
+
+fn format_shell_program(exe: &str) -> String {
+    let safe_unquoted = !exe.is_empty()
+        && exe.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'/' | b'.' | b'_' | b'-' | b':' | b'+' | b'@')
+                || (cfg!(windows) && b == b'\\')
+        });
+    if safe_unquoted {
+        exe.to_string()
+    } else {
+        quote_command_arg(exe)
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn is_exe_on_path(exe: &str, path_env: Option<&OsStr>) -> bool {
+    let Some(path_env) = path_env else {
+        return false;
+    };
+    let bin_name = format!("copperpour{}", std::env::consts::EXE_SUFFIX);
+    let Some(found) = std::env::split_paths(path_env)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(&bin_name))
+        .find(|candidate| is_executable_file(candidate))
+    else {
+        return false;
+    };
+    let target = Path::new(exe);
+    if found == target {
+        return true;
+    }
+    match (fs::canonicalize(&found), fs::canonicalize(target)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// Whether any path component from `base` down to `path` (inclusive) is a
+/// symlink. Auto-update refuses to follow symlinks inside managed directories.
+fn path_has_symlink_under(base: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(base) else {
+        return true;
+    };
+    let mut current = base.to_path_buf();
+    for component in std::iter::once(None).chain(relative.components().map(Some)) {
+        if let Some(component) = component {
+            current.push(component);
+        }
+        if fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn managed_file_base_dir(client: InstallClient, paths: &InstallPaths, kind: &str) -> PathBuf {
+    if kind == "agent" {
+        paths.claude_agents_dir()
+    } else {
+        paths.skills_dir(client)
+    }
+}
+
+fn check_file(
+    base_dir: &Path,
+    path: &Path,
+    expected: &str,
+    recorded_digest: Option<&str>,
+) -> (ItemStatus, bool) {
     match fs::read(path) {
-        Ok(bytes) if bytes == expected.as_bytes() => ItemStatus::Current,
-        Ok(_) => ItemStatus::Different,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ItemStatus::Missing,
-        Err(_) => ItemStatus::Unreadable,
+        Ok(bytes) if bytes == expected.as_bytes() => (ItemStatus::Current, false),
+        Ok(bytes) => {
+            let user_modified = if path_has_symlink_under(base_dir, path) {
+                recorded_digest.is_some()
+            } else {
+                recorded_digest.is_some_and(|recorded| sha256_hex(&bytes) != recorded)
+            };
+            (ItemStatus::Different, user_modified)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (ItemStatus::Missing, false),
+        Err(_) => (ItemStatus::Unreadable, false),
     }
 }
 
 fn inspect_guidance(client: InstallClient, paths: &InstallPaths, exe_str: &str) -> ClientGuidance {
+    let marker = read_marker(client, paths);
+    let manifest = read_installed_manifest(client, paths, marker.as_ref());
     let files = managed_files(client, paths)
         .into_iter()
-        .map(|file| FileCheck {
-            status: check_file(&file.path, file.content),
-            kind: file.kind,
-            name: file.name,
-            path: file.path,
+        .map(|file| {
+            let base_dir = managed_file_base_dir(client, paths, file.kind);
+            let recorded_digest = manifest.as_ref().and_then(|m| {
+                m.files
+                    .get(&manifest_file_key(file.kind, &file.name))
+                    .map(String::as_str)
+            });
+            let (status, user_modified) =
+                check_file(&base_dir, &file.path, file.content, recorded_digest);
+            FileCheck {
+                status,
+                user_modified,
+                kind: file.kind,
+                name: file.name,
+                path: file.path,
+            }
         })
         .collect();
     let hooks = match client {
@@ -885,9 +1265,10 @@ fn inspect_guidance(client: InstallClient, paths: &InstallPaths, exe_str: &str) 
     };
     ClientGuidance {
         client,
+        exe: exe_str.to_string(),
         files,
         hooks,
-        marker: read_marker(client, paths),
+        marker,
     }
 }
 
@@ -1203,40 +1584,91 @@ impl InstalledGuidanceProbe {
             let record = self.paths.guidance_checked(client);
             let marker = read_marker(client, &self.paths);
             let digest = self.bundle_digests.for_client(client);
-            detail[client.to_string().to_ascii_lowercase()] =
-                match recorded_state(&record, &Self::checked_key(marker.as_ref(), digest)) {
-                    Some(state) => serde_json::json!({
-                        "state": state,
-                        "checked": "earlier",
-                        "marker": marker.as_ref().map(MarkerInfo::to_json),
-                    }),
-                    None => {
-                        let guidance = inspect_guidance(client, &self.paths, &self.exe);
-                        let key = Self::checked_key(guidance.marker.as_ref(), digest);
-                        let state = guidance.state();
-                        if let Some(notice) = guidance.notice() {
-                            notices.push(notice);
-                            // Defer recording an `out_of_sync` check until a
-                            // tool call consumes the notice (#722), so a
-                            // non-KiCad session that only runs `initialize`
-                            // does not silence the next session.
-                            pending_records.push(PendingGuidanceRecord {
+            detail[client.to_string().to_ascii_lowercase()] = match recorded_state(
+                &record,
+                &Self::checked_key(marker.as_ref(), digest),
+            ) {
+                Some(state) => serde_json::json!({
+                    "state": state,
+                    "checked": "earlier",
+                    "marker": marker.as_ref().map(MarkerInfo::to_json),
+                }),
+                None => {
+                    let mut guidance = inspect_guidance(client, &self.paths, &self.exe);
+                    if guidance.state() == GuidanceState::OutOfSync {
+                        if let Some(manifest) =
+                            read_installed_manifest(client, &self.paths, guidance.marker.as_ref())
+                        {
+                            let updated = auto_update_unmodified(
                                 client,
-                                path: record,
-                                key,
-                                state,
-                            });
-                        } else if let Err(error) = record_state(&record, &key, state) {
-                            tracing::warn!(
-                                "could not record the {client} guidance check at {}: {error:#}",
-                                record.display()
+                                &self.paths,
+                                &self.exe,
+                                &guidance,
+                                &manifest,
                             );
+                            if updated > 0 {
+                                // Re-inspect on disk (post-write readback)
+                                // to verify the resulting state.
+                                guidance = inspect_guidance(client, &self.paths, &self.exe);
+                                if guidance.state() == GuidanceState::Current {
+                                    match write_atomic_bytes(
+                                        &self.paths.marker(client),
+                                        build_version_label().as_bytes(),
+                                    ) {
+                                        Ok(()) => {
+                                            if let Ok(current_manifest) = InstalledManifest::current(
+                                                client,
+                                                &self.paths,
+                                                &self.exe,
+                                                true,
+                                            ) {
+                                                if let Err(error) = write_installed_manifest(
+                                                    client,
+                                                    &self.paths,
+                                                    &current_manifest,
+                                                ) {
+                                                    tracing::warn!(
+                                                        "could not update {client} install manifest: {error:#}"
+                                                    );
+                                                }
+                                            }
+                                            guidance.marker = read_marker(client, &self.paths);
+                                        }
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                "could not update {client} install marker: {error:#}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        let mut entry = guidance.to_json();
-                        entry["checked"] = "now".into();
-                        entry
                     }
-                };
+                    let key = Self::checked_key(guidance.marker.as_ref(), digest);
+                    let state = guidance.state();
+                    if let Some(notice) = guidance.notice() {
+                        notices.push(notice);
+                        // Defer recording an `out_of_sync` check until a
+                        // tool call consumes the notice (#722), so a
+                        // non-KiCad session that only runs `initialize`
+                        // does not silence the next session.
+                        pending_records.push(PendingGuidanceRecord {
+                            client,
+                            path: record,
+                            key,
+                            state,
+                        });
+                    } else if let Err(error) = record_state(&record, &key, state) {
+                        tracing::warn!(
+                            "could not record the {client} guidance check at {}: {error:#}",
+                            record.display()
+                        );
+                    }
+                    let mut entry = guidance.to_json();
+                    entry["checked"] = "now".into();
+                    entry
+                }
+            };
         }
         GuidanceReading {
             detail,
@@ -1385,19 +1817,272 @@ fn display_home_path(path: &Path, home: &Path) -> String {
         .unwrap_or_else(|_| path.display().to_string())
 }
 
+/// Automatically update unmodified (or newly bundled) files and hooks for an
+/// upgraded server when a recorded [`InstalledManifest`] proves the on-disk
+/// item has not been edited or deleted by the user (#731).
+///
+/// Returns how many items were updated. Never follows symlinks and never
+/// overwrites user-modified files or user-edited/shared hook entries.
+fn auto_update_unmodified(
+    client: InstallClient,
+    paths: &InstallPaths,
+    exe_str: &str,
+    guidance: &ClientGuidance,
+    manifest: &InstalledManifest,
+) -> usize {
+    let mut next_manifest = manifest.clone();
+    let mut updated = 0;
+
+    for file in managed_files(client, paths) {
+        let base_dir = managed_file_base_dir(client, paths, file.kind);
+        if path_has_symlink_under(&base_dir, &file.path) {
+            continue;
+        }
+        let key = manifest_file_key(file.kind, &file.name);
+        let expected_digest = sha256_hex(file.content.as_bytes());
+        match fs::read(&file.path) {
+            Ok(bytes) if bytes == file.content.as_bytes() => {
+                next_manifest.files.insert(key, expected_digest);
+            }
+            Ok(bytes) => {
+                if manifest.files.get(&key).map(String::as_str) == Some(sha256_hex(&bytes).as_str())
+                {
+                    match write_atomic_bytes(&file.path, file.content.as_bytes()) {
+                        Ok(()) => {
+                            next_manifest.files.insert(key, expected_digest);
+                            updated += 1;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "could not auto-update {client} guidance file {}: {error:#}",
+                                file.path.display()
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Only create files that were newly added in this bundle; if
+                // the previous manifest recorded it, the user deleted it.
+                if !manifest.files.contains_key(&key) {
+                    match write_atomic_bytes(&file.path, file.content.as_bytes()) {
+                        Ok(()) => {
+                            next_manifest.files.insert(key, expected_digest);
+                            updated += 1;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "could not auto-install new {client} guidance file {}: {error:#}",
+                                file.path.display()
+                            );
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    if client == InstallClient::Claude {
+        updated += auto_update_unmodified_hooks(
+            &paths.claude_settings_path(),
+            exe_str,
+            &guidance.hooks,
+            manifest,
+            &mut next_manifest,
+        );
+    }
+
+    if updated > 0 {
+        if let Err(error) = write_installed_manifest(client, paths, &next_manifest) {
+            tracing::warn!("could not persist updated {client} install manifest: {error:#}");
+        }
+    }
+
+    updated
+}
+
+/// Returns `true` when `settings` holds a sole-handler entry matching the exact
+/// `(event, matcher, command)` that Copperpour previously installed, AND no
+/// other entry under that event also references `hook.name` (so auto-update
+/// never touches duplicate or user-shared entries or orphaned events).
+fn settings_has_unmodified_hook(
+    settings: &serde_json::Value,
+    hook: &crate::manifest::HookSkillManifest,
+    exe_str: &str,
+    recorded: &InstalledHookRecord,
+) -> bool {
+    if recorded.event != hook.event {
+        return false;
+    }
+    let Some(entries) = settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get(hook.event))
+        .and_then(|event| event.as_array())
+    else {
+        return false;
+    };
+    let own_commands = own_hook_commands(exe_str, hook.name);
+    let is_our_hook = |cmd: &str| {
+        cmd == recorded.command
+            || own_commands.iter().any(|own| own == cmd)
+            || is_konnect_hook(cmd, hook.name)
+            || is_legacy_konnect_hook(cmd, hook.name)
+    };
+    let mut matching_sole = 0usize;
+    let mut total_ours = 0usize;
+    for entry in entries {
+        let Some(handlers) = entry.get("hooks").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        let entry_ours = handlers
+            .iter()
+            .filter(|h| {
+                h.get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(&is_our_hook)
+            })
+            .count();
+        total_ours += entry_ours;
+        if entry_ours == 1
+            && handlers.len() == 1
+            && entry.get("matcher").and_then(serde_json::Value::as_str)
+                == Some(recorded.matcher.as_str())
+            && handlers[0]
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                == Some(recorded.command.as_str())
+        {
+            matching_sole += 1;
+        }
+    }
+    matching_sole == 1 && total_ours == 1
+}
+
+fn auto_update_unmodified_hooks(
+    settings_path: &Path,
+    exe_str: &str,
+    hook_checks: &[HookCheck],
+    manifest: &InstalledManifest,
+    next_manifest: &mut InstalledManifest,
+) -> usize {
+    if fs::symlink_metadata(settings_path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return 0;
+    }
+    let Ok(raw) = fs::read_to_string(settings_path) else {
+        return 0;
+    };
+    let Ok(mut settings) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return 0;
+    };
+
+    let mut hooks_to_update = Vec::new();
+    for (hook, check) in HOOK_SKILLS.iter().zip(hook_checks.iter()) {
+        match check.status {
+            ItemStatus::Current => {
+                if let Ok(matcher) = hook_matcher(hook) {
+                    next_manifest.hooks.insert(
+                        hook.name.to_string(),
+                        InstalledHookRecord {
+                            event: hook.event.to_string(),
+                            matcher,
+                            command: hook_command(exe_str, "hook", hook.name),
+                        },
+                    );
+                }
+            }
+            ItemStatus::Different => {
+                if let Some(recorded) = manifest.hooks.get(hook.name) {
+                    if settings_has_unmodified_hook(&settings, hook, exe_str, recorded) {
+                        hooks_to_update.push(hook);
+                    }
+                }
+            }
+            ItemStatus::Missing => {
+                if !manifest.hooks.contains_key(hook.name) {
+                    hooks_to_update.push(hook);
+                }
+            }
+            ItemStatus::Unreadable => {}
+        }
+    }
+
+    if hooks_to_update.is_empty() {
+        return 0;
+    }
+
+    let Some(hooks_obj) = settings.as_object_mut().and_then(|root| {
+        root.entry("hooks")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+    }) else {
+        return 0;
+    };
+
+    let mut updated_hooks = Vec::new();
+    for hook in hooks_to_update {
+        match apply_single_hook(hooks_obj, hook, exe_str) {
+            Ok(step) if step.changed => updated_hooks.push(hook),
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    "could not auto-update Claude hook '{}': {error:#}",
+                    hook.name
+                );
+            }
+        }
+    }
+
+    if updated_hooks.is_empty() {
+        return 0;
+    }
+
+    match serde_json::to_string_pretty(&settings)
+        .map_err(anyhow::Error::from)
+        .and_then(|json| write_atomic_bytes(settings_path, json.as_bytes()))
+    {
+        Ok(()) => {
+            for hook in &updated_hooks {
+                if let Ok(matcher) = hook_matcher(hook) {
+                    next_manifest.hooks.insert(
+                        hook.name.to_string(),
+                        InstalledHookRecord {
+                            event: hook.event.to_string(),
+                            matcher,
+                            command: hook_command(exe_str, "hook", hook.name),
+                        },
+                    );
+                }
+            }
+            updated_hooks.len()
+        }
+        Err(error) => {
+            tracing::warn!(
+                "could not write auto-updated Claude settings at {}: {error:#}",
+                settings_path.display()
+            );
+            0
+        }
+    }
+}
+
 fn patch_claude_settings(path: &Path, exe_str: &str) -> Result<usize> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let raw = if path.exists() {
+    let existed = path.exists();
+    let raw = if existed {
         fs::read_to_string(path)?
     } else {
         "{}".to_string()
     };
     let mut settings: serde_json::Value = serde_json::from_str(&raw)?;
     let steps = apply_hooks(&mut settings, exe_str)?;
-    fs::write(path, serde_json::to_string_pretty(&settings)?)?;
-    Ok(steps.iter().filter(|step| step.changed).count())
+    let changed = steps.iter().filter(|step| step.changed).count();
+    if changed > 0 || !existed {
+        write_atomic_bytes(path, serde_json::to_string_pretty(&settings)?.as_bytes())?;
+    }
+    Ok(changed)
 }
 
 /// What one hook's step in [`apply_hooks`] did.
@@ -1422,82 +2107,89 @@ fn apply_hooks(settings: &mut serde_json::Value, exe_str: &str) -> Result<Vec<Ho
 
     let mut steps = Vec::with_capacity(HOOK_SKILLS.len());
     for hook in HOOK_SKILLS {
-        let command = hook_command(exe_str, "hook", hook.name);
-        let stale_own = own_hook_commands(exe_str, hook.name);
-        let is_stale = |candidate: &str| {
-            candidate != command
-                && (stale_own.iter().any(|own| own == candidate)
-                    || is_konnect_hook(candidate, hook.name)
-                    || is_legacy_konnect_hook(candidate, hook.name))
-        };
-        let matcher = hook_matcher(hook)?;
-        let event_arr = hooks_obj
-            .entry(hook.event)
-            .or_insert_with(|| serde_json::json!([]))
-            .as_array_mut()
-            .context("hook event field is not an array")?;
-        let before = event_arr.clone();
-        // Migrate handlers installed by the old plain-stdout form, through
-        // the alias, or from another copperpour/konnect executable path. Do
-        // not use substring matching: user-authored neighboring handlers and
-        // unrelated commands containing "konnect" or "copperpour" are not ours.
-        let mut reason =
-            (remove_matching_commands(event_arr, is_stale) > 0).then_some("duplicate_handler");
-        let holds_ours = |entry: &serde_json::Value| {
-            entry["hooks"].as_array().is_some_and(|handlers| {
-                handlers
-                    .iter()
-                    .any(|handler| handler["command"].as_str() == Some(command.as_str()))
-            })
-        };
-        // Keep one entry for our handler and strip it from the rest. The
-        // matcher follows the registry, so an older install's is stale
-        // (#739): an entry with the current matcher is kept as it is; else
-        // one where our handler stands alone gets the current matcher; else
-        // a fresh entry is added. A user's handler beside ours keeps the
-        // matcher the user gave it.
-        let current = event_arr
-            .iter()
-            .position(|entry| entry["matcher"] == matcher.as_str() && holds_ours(entry));
-        let sole = || {
-            event_arr.iter().position(|entry| {
-                holds_ours(entry) && entry["hooks"].as_array().is_some_and(|h| h.len() == 1)
-            })
-        };
-        let keep = match current.or_else(sole) {
-            Some(index) => {
-                if event_arr[index]["matcher"] != matcher.as_str() {
-                    reason.get_or_insert("stale_matcher");
-                }
-                event_arr[index]["matcher"] = matcher.into();
-                index
-            }
-            None => {
-                // Ours is only inside an entry the user shares with it.
-                if event_arr.iter().any(holds_ours) {
-                    reason.get_or_insert("shared_entry");
-                }
-                event_arr.push(serde_json::json!({
-                    "matcher": matcher,
-                    "hooks": [{
-                        "type": "command",
-                        "command": command
-                    }]
-                }));
-                event_arr.len() - 1
-            }
-        };
-        if remove_matching_commands_except(event_arr, |candidate| candidate == command, Some(keep))
-            > 0
-        {
-            reason.get_or_insert("duplicate_handler");
-        }
-        steps.push(HookStep {
-            changed: *event_arr != before,
-            reason,
-        });
+        steps.push(apply_single_hook(hooks_obj, hook, exe_str)?);
     }
     Ok(steps)
+}
+
+fn apply_single_hook(
+    hooks_obj: &mut serde_json::Map<String, serde_json::Value>,
+    hook: &crate::manifest::HookSkillManifest,
+    exe_str: &str,
+) -> Result<HookStep> {
+    let command = hook_command(exe_str, "hook", hook.name);
+    let stale_own = own_hook_commands(exe_str, hook.name);
+    let is_stale = |candidate: &str| {
+        candidate != command
+            && (stale_own.iter().any(|own| own == candidate)
+                || is_konnect_hook(candidate, hook.name)
+                || is_legacy_konnect_hook(candidate, hook.name))
+    };
+    let matcher = hook_matcher(hook)?;
+    let event_arr = hooks_obj
+        .entry(hook.event)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .context("hook event field is not an array")?;
+    let before = event_arr.clone();
+    // Migrate handlers installed by the old plain-stdout form, through
+    // the alias, or from another copperpour/konnect executable path. Do
+    // not use substring matching: user-authored neighboring handlers and
+    // unrelated commands containing "konnect" or "copperpour" are not ours.
+    let mut reason =
+        (remove_matching_commands(event_arr, is_stale) > 0).then_some("duplicate_handler");
+    let holds_ours = |entry: &serde_json::Value| {
+        entry["hooks"].as_array().is_some_and(|handlers| {
+            handlers
+                .iter()
+                .any(|handler| handler["command"].as_str() == Some(command.as_str()))
+        })
+    };
+    // Keep one entry for our handler and strip it from the rest. The
+    // matcher follows the registry, so an older install's is stale
+    // (#739): an entry with the current matcher is kept as it is; else
+    // one where our handler stands alone gets the current matcher; else
+    // a fresh entry is added. A user's handler beside ours keeps the
+    // matcher the user gave it.
+    let current = event_arr
+        .iter()
+        .position(|entry| entry["matcher"] == matcher.as_str() && holds_ours(entry));
+    let sole = || {
+        event_arr.iter().position(|entry| {
+            holds_ours(entry) && entry["hooks"].as_array().is_some_and(|h| h.len() == 1)
+        })
+    };
+    let keep = match current.or_else(sole) {
+        Some(index) => {
+            if event_arr[index]["matcher"] != matcher.as_str() {
+                reason.get_or_insert("stale_matcher");
+            }
+            event_arr[index]["matcher"] = matcher.into();
+            index
+        }
+        None => {
+            // Ours is only inside an entry the user shares with it.
+            if event_arr.iter().any(holds_ours) {
+                reason.get_or_insert("shared_entry");
+            }
+            event_arr.push(serde_json::json!({
+                "matcher": matcher,
+                "hooks": [{
+                    "type": "command",
+                    "command": command
+                }]
+            }));
+            event_arr.len() - 1
+        }
+    };
+    if remove_matching_commands_except(event_arr, |candidate| candidate == command, Some(keep)) > 0
+    {
+        reason.get_or_insert("duplicate_handler");
+    }
+    Ok(HookStep {
+        changed: *event_arr != before,
+        reason,
+    })
 }
 
 /// Remove every handler whose command satisfies `predicate`, and entries left
@@ -2745,7 +3437,15 @@ mod tests {
             "Copperpour Claude guidance (installed by v0.2.2) does not match this server v"
         ));
         assert!(notice.contains(": 2 different, 4 missing."), "{notice}");
-        assert!(notice.contains("`copperpour init`"), "{notice}");
+        let expected_cmd = format!(
+            "`{}`",
+            format_init_command(
+                &this_exe(),
+                InstallClient::Claude,
+                std::env::var_os("PATH").as_deref()
+            )
+        );
+        assert!(notice.contains(&expected_cmd), "{notice}");
 
         // Detection is read-only.
         assert_eq!(fs::read(paths.claude_settings_path()).unwrap(), before);
@@ -2781,7 +3481,12 @@ mod tests {
         );
         let notice = guidance.notice().unwrap();
         assert!(notice.contains(&format!("(installed by v{})", build_version_label())));
-        assert!(notice.contains(": 1 different."), "{notice}");
+        assert!(
+            notice.contains(
+                ": 1 different (locally modified: kicad-pcb/references/design-rules.md)."
+            ),
+            "{notice}"
+        );
         assert!(notice.contains("may hold their own edits"), "{notice}");
 
         let text = StatusText(&guidance, &paths).to_string();
@@ -3009,10 +3714,15 @@ mod tests {
         assert_eq!(file_status(&codex, "kicad-library/SKILL.md"), "missing");
         let notice = codex.notice().unwrap();
         assert!(notice.starts_with("Copperpour Codex guidance"), "{notice}");
-        assert!(
-            notice.contains("`copperpour init --client codex`"),
-            "{notice}"
+        let expected_cmd = format!(
+            "`{}`",
+            format_init_command(
+                &this_exe(),
+                InstallClient::Codex,
+                std::env::var_os("PATH").as_deref()
+            )
         );
+        assert!(notice.contains(&expected_cmd), "{notice}");
         assert_eq!(
             inspect_guidance(InstallClient::Claude, &paths, &this_exe())
                 .state()
@@ -3511,5 +4221,591 @@ mod tests {
         for hook in HOOK_SKILLS {
             assert!(!remaining.contains(&hook_command(exe, "hook", hook.name)));
         }
+    }
+
+    // ─── #731: auto-update unmodified guidance, runnable init path, incremental init summary ──
+
+    fn make_executable(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn init_command_uses_bare_name_only_when_same_exe_is_first_on_path() {
+        let temp = TempDir::new().unwrap();
+        let bin_name = format!("copperpour{}", std::env::consts::EXE_SUFFIX);
+        let on_path_dir = temp.path().join("bin");
+        let on_path_exe = on_path_dir.join(&bin_name);
+        make_executable(&on_path_exe);
+
+        let pcm_dir = temp.path().join("plugins/bin");
+        let pcm_exe = pcm_dir.join(&bin_name);
+        make_executable(&pcm_exe);
+
+        let path_env = std::env::join_paths([&on_path_dir]).unwrap();
+
+        // Serving binary IS the first `copperpour` on PATH -> bare command.
+        assert_eq!(
+            format_init_command(
+                &on_path_exe.to_string_lossy(),
+                InstallClient::Claude,
+                Some(path_env.as_os_str()),
+            ),
+            "copperpour init"
+        );
+        assert_eq!(
+            format_init_command(
+                &on_path_exe.to_string_lossy(),
+                InstallClient::Codex,
+                Some(path_env.as_os_str()),
+            ),
+            "copperpour init --client codex"
+        );
+
+        // Serving binary is NOT on PATH -> full executable path.
+        let empty_path = std::env::join_paths::<[&Path; 0], _>([]).unwrap();
+        assert_eq!(
+            format_init_command(
+                &pcm_exe.to_string_lossy(),
+                InstallClient::Claude,
+                Some(empty_path.as_os_str()),
+            ),
+            format!("{} init", pcm_exe.display())
+        );
+
+        // A DIFFERENT `copperpour` is on PATH -> full executable path of the serving binary.
+        assert_eq!(
+            format_init_command(
+                &pcm_exe.to_string_lossy(),
+                InstallClient::Claude,
+                Some(path_env.as_os_str()),
+            ),
+            format!("{} init", pcm_exe.display())
+        );
+
+        // Spaces in executable path are shell-quoted.
+        let spaced = temp.path().join("My Plugins/bin").join(&bin_name);
+        make_executable(&spaced);
+        assert_eq!(
+            format_init_command(
+                &spaced.to_string_lossy(),
+                InstallClient::Codex,
+                Some(empty_path.as_os_str()),
+            ),
+            format!(
+                "{} init --client codex",
+                quote_command_arg(&spaced.to_string_lossy())
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_command_recognizes_symlink_on_path_pointing_to_serving_exe() {
+        let temp = TempDir::new().unwrap();
+        let pcm_exe = temp.path().join("plugins/bin/copperpour");
+        make_executable(&pcm_exe);
+        let local_bin = temp.path().join("local/bin");
+        fs::create_dir_all(&local_bin).unwrap();
+        std::os::unix::fs::symlink(&pcm_exe, local_bin.join("copperpour")).unwrap();
+
+        let path_env = std::env::join_paths([&local_bin]).unwrap();
+        assert_eq!(
+            format_init_command(
+                &pcm_exe.to_string_lossy(),
+                InstallClient::Claude,
+                Some(path_env.as_os_str()),
+            ),
+            "copperpour init"
+        );
+    }
+
+    /// Helper: simulate an earlier release's install by recording custom file
+    /// contents and/or hook matchers in both disk and `.installed-manifest-<client>.json`
+    /// under version `"0.15.0"`.
+    fn simulate_previous_install(
+        client: InstallClient,
+        paths: &InstallPaths,
+        old_version: &str,
+        stale_files: &[(&str, &str, &str)], // (kind, name, old_content)
+        stale_hook_matcher: Option<(&str, &str)>, // (hook_name, old_matcher)
+    ) {
+        run_install_at(client, paths, false).unwrap();
+        let mut manifest =
+            read_installed_manifest(client, paths, read_marker(client, paths).as_ref()).unwrap();
+        manifest.version = old_version.to_string();
+        write_atomic_bytes(&paths.marker(client), old_version.as_bytes()).unwrap();
+
+        for (kind, name, old_content) in stale_files {
+            let file = managed_files(client, paths)
+                .into_iter()
+                .find(|f| f.kind == *kind && f.name == *name)
+                .expect("managed file");
+            fs::write(&file.path, old_content).unwrap();
+            manifest.files.insert(
+                manifest_file_key(kind, name),
+                sha256_hex(old_content.as_bytes()),
+            );
+        }
+
+        if let Some((hook_name, old_matcher)) = stale_hook_matcher {
+            let settings_path = paths.claude_settings_path();
+            let mut settings: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+            let hook = HOOK_SKILLS.iter().find(|h| h.name == hook_name).unwrap();
+            let cmd = hook_command(&this_exe(), "hook", hook_name);
+            for entry in settings["hooks"][hook.event].as_array_mut().unwrap() {
+                if entry["hooks"][0]["command"].as_str() == Some(cmd.as_str()) {
+                    entry["matcher"] = serde_json::json!(old_matcher);
+                }
+            }
+            fs::write(
+                &settings_path,
+                serde_json::to_string_pretty(&settings).unwrap(),
+            )
+            .unwrap();
+            manifest.hooks.get_mut(hook_name).unwrap().matcher = old_matcher.to_string();
+        }
+
+        write_installed_manifest(client, paths, &manifest).unwrap();
+    }
+
+    #[test]
+    fn unmodified_claude_and_codex_guidance_auto_updates_on_upgrade() {
+        use copperpour_core::guidance::GuidanceProbe;
+        for client in [InstallClient::Claude, InstallClient::Codex] {
+            let temp = TempDir::new().unwrap();
+            let paths = test_paths(&temp);
+            let mut stale = vec![
+                ("skill", "copperpour/SKILL.md", "old skill v0.15"),
+                (
+                    "skill",
+                    "kicad-pcb/references/design-rules.md",
+                    "old reference v0.15",
+                ),
+            ];
+            let stale_hook = if client == InstallClient::Claude {
+                stale.push(("agent", "kicad-design-review-agent.md", "old agent v0.15"));
+                Some((HOOK_SKILLS[0].name, "mcp__(copperpour|konnect)__(old_tool)"))
+            } else {
+                None
+            };
+            simulate_previous_install(client, &paths, "0.15.0", &stale, stale_hook);
+
+            let probe = start(&temp);
+            assert_eq!(
+                probe.peek_notice(),
+                None,
+                "{client}: unmodified upgrade should stay quiet"
+            );
+            assert_eq!(probe.take_notice(), None, "{client}");
+            let detail = probe.detail();
+            let key = client.to_string().to_ascii_lowercase();
+            assert_eq!(detail[&key]["state"], "current", "{client}: {detail}");
+            assert_eq!(detail[&key]["checked"], "now", "{client}");
+            assert_eq!(
+                detail[&key]["marker"]["version"],
+                build_version_label(),
+                "{client}: marker updated to new version"
+            );
+
+            // Verify on-disk files and hooks match the current bundle.
+            let after = inspect_guidance(client, &paths, &this_exe());
+            assert_eq!(after.state(), GuidanceState::Current, "{client}");
+
+            // Next start uses the cached record and stays quiet.
+            let later = start(&temp);
+            assert_eq!(later.detail()[&key]["checked"], "earlier", "{client}");
+            assert_eq!(later.take_notice(), None, "{client}");
+        }
+    }
+
+    #[test]
+    fn mixed_upgrade_updates_unmodified_files_and_preserves_user_edits() {
+        use copperpour_core::guidance::GuidanceProbe;
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        simulate_previous_install(
+            InstallClient::Claude,
+            &paths,
+            "0.15.0",
+            &[
+                ("skill", "copperpour/SKILL.md", "old skill v0.15"),
+                ("agent", "kicad-design-review-agent.md", "old agent v0.15"),
+            ],
+            Some((HOOK_SKILLS[0].name, "mcp__(copperpour|konnect)__(old_tool)")),
+        );
+
+        // Hand-edit a third file so its digest matches neither v0.15 nor current.
+        let edited_path = paths
+            .skills_dir(InstallClient::Claude)
+            .join("kicad-pcb/SKILL.md");
+        fs::write(&edited_path, "my custom pcb workflow").unwrap();
+
+        let probe = start(&temp);
+        let notice = probe
+            .take_notice()
+            .expect("user-modified file must still trigger a notice");
+        assert!(
+            notice.contains("1 different (locally modified: kicad-pcb/SKILL.md)"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("(installed by v0.15.0)"),
+            "marker must stay at previous version while out_of_sync: {notice}"
+        );
+
+        // Unmodified stale files and hook were auto-updated.
+        let after = inspect_guidance(InstallClient::Claude, &paths, &this_exe());
+        assert_eq!(file_status(&after, "copperpour/SKILL.md"), "current");
+        assert_eq!(
+            file_status(&after, "kicad-design-review-agent.md"),
+            "current"
+        );
+        assert_eq!(
+            hook_read(&after, HOOK_SKILLS[0].name).status,
+            ItemStatus::Current
+        );
+        // User-modified file was preserved untouched.
+        assert_eq!(
+            fs::read_to_string(&edited_path).unwrap(),
+            "my custom pcb workflow"
+        );
+        assert_eq!(file_status(&after, "kicad-pcb/SKILL.md"), "different");
+    }
+
+    #[test]
+    fn newly_added_bundled_file_is_installed_while_user_deleted_file_is_not_recreated() {
+        use copperpour_core::guidance::GuidanceProbe;
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        simulate_previous_install(InstallClient::Codex, &paths, "0.15.0", &[], None);
+
+        // Simulate a newly added bundled file: remove from disk AND from previous manifest.
+        let new_file = paths
+            .skills_dir(InstallClient::Codex)
+            .join("kicad-library/SKILL.md");
+        fs::remove_file(&new_file).unwrap();
+        let mut manifest = read_installed_manifest(
+            InstallClient::Codex,
+            &paths,
+            read_marker(InstallClient::Codex, &paths).as_ref(),
+        )
+        .unwrap();
+        manifest
+            .files
+            .remove(&manifest_file_key("skill", "kicad-library/SKILL.md"));
+        write_installed_manifest(InstallClient::Codex, &paths, &manifest).unwrap();
+
+        // Simulate a user-deleted file: remove from disk, keep in previous manifest.
+        let deleted_file = paths
+            .skills_dir(InstallClient::Codex)
+            .join("kicad-review/SKILL.md");
+        fs::remove_file(&deleted_file).unwrap();
+
+        let probe = start(&temp);
+        let notice = probe
+            .take_notice()
+            .expect("user-deleted file must keep guidance out_of_sync");
+        assert!(notice.contains(": 1 missing."), "{notice}");
+        assert!(
+            new_file.is_file(),
+            "newly bundled file should be auto-installed"
+        );
+        assert!(
+            !deleted_file.exists(),
+            "user-deleted file must not be recreated"
+        );
+    }
+
+    #[test]
+    fn user_modified_hook_matcher_is_not_overwritten_during_auto_update() {
+        use copperpour_core::guidance::GuidanceProbe;
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        simulate_previous_install(
+            InstallClient::Claude,
+            &paths,
+            "0.15.0",
+            &[],
+            Some((HOOK_SKILLS[0].name, "mcp__(copperpour|konnect)__(old_tool)")),
+        );
+
+        // User manually edits the hook's matcher in settings.json so it no longer
+        // matches the recorded manifest matcher.
+        let settings_path = paths.claude_settings_path();
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let hook = &HOOK_SKILLS[0];
+        let cmd = hook_command(&this_exe(), "hook", hook.name);
+        for entry in settings["hooks"][hook.event].as_array_mut().unwrap() {
+            if entry["hooks"][0]["command"].as_str() == Some(cmd.as_str()) {
+                entry["matcher"] = serde_json::json!("mcp__custom_user_matcher__.*");
+            }
+        }
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        let probe = start(&temp);
+        assert!(probe.take_notice().is_some());
+        let after_settings = fs::read_to_string(&settings_path).unwrap();
+        assert!(
+            after_settings.contains("mcp__custom_user_matcher__.*"),
+            "user-edited hook matcher must be preserved"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_update_refuses_symlinks_inside_skills_dir() {
+        use copperpour_core::guidance::GuidanceProbe;
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        simulate_previous_install(
+            InstallClient::Codex,
+            &paths,
+            "0.15.0",
+            &[("skill", "copperpour/SKILL.md", "old skill v0.15")],
+            None,
+        );
+
+        // Replace copperpour/SKILL.md with a symlink to an external file holding
+        // the exact old bytes (same SHA-256 as manifest). Auto-update must still
+        // refuse to follow the symlink.
+        let outside = temp.path().join("outside.md");
+        fs::write(&outside, "old skill v0.15").unwrap();
+        let skill_path = paths
+            .skills_dir(InstallClient::Codex)
+            .join("copperpour/SKILL.md");
+        fs::remove_file(&skill_path).unwrap();
+        std::os::unix::fs::symlink(&outside, &skill_path).unwrap();
+
+        let probe = start(&temp);
+        let notice = probe
+            .take_notice()
+            .expect("symlink must not be auto-updated");
+        assert!(
+            notice.contains("(locally modified: copperpour/SKILL.md)"),
+            "{notice}"
+        );
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "old skill v0.15");
+        assert!(fs::symlink_metadata(&skill_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn mismatched_manifest_version_is_ignored_and_never_auto_updates() {
+        use copperpour_core::guidance::GuidanceProbe;
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        simulate_previous_install(
+            InstallClient::Codex,
+            &paths,
+            "0.15.0",
+            &[("skill", "copperpour/SKILL.md", "old skill v0.15")],
+            None,
+        );
+        // Simulate an older pre-#731 binary overwriting `.installed-codex` without
+        // updating `.installed-manifest-codex.json`.
+        write_atomic_bytes(&paths.marker(InstallClient::Codex), b"0.14.0").unwrap();
+
+        let probe = start(&temp);
+        assert!(probe.take_notice().is_some());
+        let skill_path = paths
+            .skills_dir(InstallClient::Codex)
+            .join("copperpour/SKILL.md");
+        assert_eq!(
+            fs::read_to_string(&skill_path).unwrap(),
+            "old skill v0.15",
+            "stale manifest for a different marker version must not trigger auto-update"
+        );
+    }
+
+    #[test]
+    fn install_summary_distinguishes_updated_and_unchanged_items() {
+        assert_eq!(
+            format_install_summary(InstallClient::Claude, 0, 6, 0, 2, 0, 4),
+            "Done: Claude guidance already up to date (6 skills, 2 agents, 4 hooks)."
+        );
+        assert_eq!(
+            format_install_summary(InstallClient::Claude, 1, 5, 0, 2, 0, 4),
+            "Done: 1 skill updated (5 unchanged), 2 agents unchanged, 4 hooks unchanged for Claude."
+        );
+        assert_eq!(
+            format_install_summary(InstallClient::Claude, 6, 0, 2, 0, 4, 4),
+            "Done: 6 skills updated, 2 agents updated, 4 hooks patched for Claude."
+        );
+        assert_eq!(
+            format_install_summary(InstallClient::Codex, 0, 6, 0, 0, 0, 0),
+            "Done: Codex guidance already up to date (6 skills)."
+        );
+        assert_eq!(
+            format_install_summary(InstallClient::Codex, 2, 4, 0, 0, 0, 0),
+            "Done: 2 skills updated (4 unchanged) for Codex."
+        );
+
+        // Incremental install_skills returns (updated, unchanged).
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        assert_eq!(
+            install_skills(InstallClient::Codex, &paths, false).unwrap(),
+            (SKILLS.len(), 0)
+        );
+        assert_eq!(
+            install_skills(InstallClient::Codex, &paths, false).unwrap(),
+            (0, SKILLS.len())
+        );
+        fs::write(
+            paths
+                .skills_dir(InstallClient::Codex)
+                .join("copperpour/SKILL.md"),
+            "changed",
+        )
+        .unwrap();
+        assert_eq!(
+            install_skills(InstallClient::Codex, &paths, false).unwrap(),
+            (1, SKILLS.len() - 1)
+        );
+    }
+
+    #[test]
+    fn shared_claude_hook_entry_is_not_modified_during_auto_update() {
+        use copperpour_core::guidance::GuidanceProbe;
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        simulate_previous_install(
+            InstallClient::Claude,
+            &paths,
+            "0.15.0",
+            &[],
+            Some((HOOK_SKILLS[0].name, "mcp__(copperpour|konnect)__(old_tool)")),
+        );
+
+        // User adds their own handler into our hook's entry (making it shared).
+        let settings_path = paths.claude_settings_path();
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let hook = &HOOK_SKILLS[0];
+        let cmd = hook_command(&this_exe(), "hook", hook.name);
+        for entry in settings["hooks"][hook.event].as_array_mut().unwrap() {
+            if entry["hooks"][0]["command"].as_str() == Some(cmd.as_str()) {
+                entry["hooks"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"type": "command", "command": "user-extra-hook"}));
+            }
+        }
+        let before = serde_json::to_string_pretty(&settings).unwrap();
+        fs::write(&settings_path, &before).unwrap();
+
+        let probe = start(&temp);
+        assert!(probe.take_notice().is_some());
+        assert_eq!(
+            fs::read_to_string(&settings_path).unwrap(),
+            before,
+            "shared hook entry must remain untouched during auto-update"
+        );
+    }
+
+    #[test]
+    fn status_inspection_with_matching_manifest_is_strictly_read_only() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        simulate_previous_install(
+            InstallClient::Codex,
+            &paths,
+            "0.15.0",
+            &[("skill", "copperpour/SKILL.md", "old skill v0.15")],
+            None,
+        );
+
+        let guidance = inspect_guidance(InstallClient::Codex, &paths, &this_exe());
+        assert_eq!(guidance.state(), GuidanceState::OutOfSync);
+        assert_eq!(
+            fs::read_to_string(
+                paths
+                    .skills_dir(InstallClient::Codex)
+                    .join("copperpour/SKILL.md")
+            )
+            .unwrap(),
+            "old skill v0.15",
+            "inspect_guidance (status) must never auto-update files on disk"
+        );
+    }
+
+    #[test]
+    fn consecutive_upgrades_after_partial_auto_update_keep_updating_unmodified_files() {
+        use copperpour_core::guidance::GuidanceProbe;
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        simulate_previous_install(
+            InstallClient::Codex,
+            &paths,
+            "0.15.0",
+            &[("skill", "copperpour/SKILL.md", "old skill v0.15")],
+            None,
+        );
+        // User hand-edits kicad-pcb/SKILL.md.
+        let edited = paths
+            .skills_dir(InstallClient::Codex)
+            .join("kicad-pcb/SKILL.md");
+        fs::write(&edited, "user edit").unwrap();
+
+        // First upgrade: copperpour/SKILL.md auto-updates; kicad-pcb/SKILL.md stays edited.
+        let first = start(&temp);
+        assert!(first.take_notice().unwrap().contains("kicad-pcb/SKILL.md"));
+        assert_eq!(
+            file_status(
+                &inspect_guidance(InstallClient::Codex, &paths, &this_exe()),
+                "copperpour/SKILL.md"
+            ),
+            "current"
+        );
+        assert_eq!(fs::read_to_string(&edited).unwrap(), "user edit");
+
+        // Second upgrade (simulated by another skill becoming stale with matching manifest
+        // digest and a new bundle digest): unmodified file updates again, user edit still preserved.
+        let second_stale = paths
+            .skills_dir(InstallClient::Codex)
+            .join("kicad-review/SKILL.md");
+        fs::write(&second_stale, "old review v0.16").unwrap();
+        let mut manifest = read_installed_manifest(
+            InstallClient::Codex,
+            &paths,
+            read_marker(InstallClient::Codex, &paths).as_ref(),
+        )
+        .unwrap();
+        manifest.files.insert(
+            manifest_file_key("skill", "kicad-review/SKILL.md"),
+            sha256_hex(b"old review v0.16"),
+        );
+        write_installed_manifest(InstallClient::Codex, &paths, &manifest).unwrap();
+
+        let mut next_digests = BundleDigests::current();
+        next_digests.codex = "next-codex-bundle-digest".to_string();
+        let second = InstalledGuidanceProbe {
+            bundle_digests: next_digests,
+            ..start(&temp)
+        };
+        let notice = second.take_notice().unwrap();
+        assert!(notice.contains("kicad-pcb/SKILL.md"), "{notice}");
+        assert_eq!(
+            file_status(
+                &inspect_guidance(InstallClient::Codex, &paths, &this_exe()),
+                "kicad-review/SKILL.md"
+            ),
+            "current"
+        );
+        assert_eq!(fs::read_to_string(&edited).unwrap(), "user edit");
     }
 }

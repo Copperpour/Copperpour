@@ -1268,7 +1268,11 @@ fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
             && instructions.contains("Copperpour Claude guidance (installed by v0.2.2)"),
         "{instructions}"
     );
-    assert!(instructions.contains("`copperpour init`"), "{instructions}");
+    let expected_init = format!("`{} init`", env!("CARGO_BIN_EXE_copperpour"));
+    assert!(
+        instructions.contains(&expected_init) || instructions.contains("`copperpour init`"),
+        "{instructions}"
+    );
     assert_eq!(instructions.matches("installed by v0.2.2").count(), 1);
     assert!(
         !instructions.contains("Copperpour Codex guidance"),
@@ -1464,9 +1468,10 @@ fn guidance_drift_notice_survives_idle_session_and_attaches_to_first_tool_call()
     let notice = loaded["guidance_notice"]
         .as_str()
         .expect("first non-get_guidance tool call must carry guidance_notice");
+    let expected_init = format!("`{} init`", env!("CARGO_BIN_EXE_copperpour"));
     assert!(
         notice.contains("Copperpour Claude guidance (installed by v0.2.2)")
-            && notice.contains("`copperpour init`"),
+            && (notice.contains(&expected_init) || notice.contains("`copperpour init`")),
         "{notice}"
     );
     assert!(
@@ -1562,6 +1567,153 @@ fn dev_build_install_marker_and_drift_notice_include_build_commit() {
     assert!(
         stdout.contains(&format!("Install marker: v{expected}")),
         "status marker should include build commit suffix: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Regression for #731 over real stdio: when an upgraded server sees an
+/// existing install whose files and hooks match the digests recorded in
+/// `.installed-manifest-claude.json` (unmodified since the previous install),
+/// it updates them in place, updates `.installed-claude`, and emits no
+/// `guidance_notice`.
+#[cfg(unix)]
+#[test]
+fn auto_updates_unmodified_guidance_on_upgrade_over_stdio() {
+    let tmp = tempfile::tempdir().unwrap();
+    let init = std::process::Command::new(env!("CARGO_BIN_EXE_copperpour"))
+        .args(["init", "--client", "claude"])
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "copperpour init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    // Simulate an older release's install by replacing a skill and updating
+    // the recorded manifest + marker to match that older version.
+    let skill_path = tmp.path().join(".claude/skills/copperpour/SKILL.md");
+    let current_skill = std::fs::read_to_string(&skill_path).unwrap();
+    let old_skill = "old bundled copperpour skill v0.15.0";
+    std::fs::write(&skill_path, old_skill).unwrap();
+
+    let data_dir = tmp.path().join(".copperpour");
+    std::fs::write(data_dir.join(".installed-claude"), "0.15.0").unwrap();
+    let manifest_path = data_dir.join(".installed-manifest-claude.json");
+    let mut manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["version"] = json!("0.15.0");
+    manifest["files"]["skill:copperpour/SKILL.md"] = json!(sha256_hex(old_skill.as_bytes()));
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    // Start the upgraded server over stdio.
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    assert_eq!(
+        p.initialized["result"]["instructions"],
+        copperpour_core::guidance::SESSION_RULES,
+        "unmodified guidance should auto-update without an initialize notice"
+    );
+
+    let loaded =
+        McpProcess::tool_body(&p.call_tool("load_toolset", json!({"name": "sch_components"})));
+    assert!(
+        loaded.get("guidance_notice").is_none(),
+        "tool call must carry no guidance_notice after clean auto-update: {loaded}"
+    );
+
+    let info = McpProcess::tool_body(&p.call_tool("get_installation_info", json!({})));
+    assert_eq!(info["guidance"]["claude"]["state"], "current");
+    assert_eq!(
+        std::fs::read_to_string(&skill_path).unwrap(),
+        current_skill,
+        "unmodified stale skill should be updated in place"
+    );
+    assert_ne!(
+        std::fs::read_to_string(data_dir.join(".installed-claude"))
+            .unwrap()
+            .trim(),
+        "0.15.0",
+        "install marker should advance after clean auto-update"
+    );
+}
+
+/// Regression for #731 over real stdio: during an upgrade with both an
+/// unmodified stale file and a user-modified file, the server updates the
+/// unmodified file, leaves the user's edit untouched, and emits
+/// `guidance_notice` naming the edited file and the runnable binary path when
+/// `copperpour` is not on `PATH`.
+#[cfg(unix)]
+#[test]
+fn mixed_upgrade_preserves_user_edits_and_reports_runnable_exe_path_over_stdio() {
+    let tmp = tempfile::tempdir().unwrap();
+    let init = std::process::Command::new(env!("CARGO_BIN_EXE_copperpour"))
+        .args(["init", "--client", "claude"])
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+
+    // Stale unmodified file (matches manifest).
+    let stale_path = tmp.path().join(".claude/skills/copperpour/SKILL.md");
+    let current_stale = std::fs::read_to_string(&stale_path).unwrap();
+    let old_stale = "old bundled copperpour skill v0.15.0";
+    std::fs::write(&stale_path, old_stale).unwrap();
+
+    // User-modified file (differs from both manifest and current bundle).
+    let edited_path = tmp.path().join(".claude/skills/kicad-pcb/SKILL.md");
+    std::fs::write(&edited_path, "user custom pcb rules").unwrap();
+
+    let data_dir = tmp.path().join(".copperpour");
+    std::fs::write(data_dir.join(".installed-claude"), "0.15.0").unwrap();
+    let manifest_path = data_dir.join(".installed-manifest-claude.json");
+    let mut manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["version"] = json!("0.15.0");
+    manifest["files"]["skill:copperpour/SKILL.md"] = json!(sha256_hex(old_stale.as_bytes()));
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    // Run with an empty PATH so `copperpour` is guaranteed not to be on PATH.
+    let mut p = McpProcess::spawn_with_env(Some(tmp.path()), true, &[("PATH", "")]);
+    let loaded =
+        McpProcess::tool_body(&p.call_tool("load_toolset", json!({"name": "sch_components"})));
+    let notice = loaded["guidance_notice"]
+        .as_str()
+        .expect("user-modified file must surface guidance_notice");
+    let expected_cmd = format!("`{} init`", env!("CARGO_BIN_EXE_copperpour"));
+    assert!(
+        notice.contains("(locally modified: kicad-pcb/SKILL.md)"),
+        "notice must name the locally modified file: {notice}"
+    );
+    assert!(
+        notice.contains(&expected_cmd),
+        "notice must include the runnable executable path when not on PATH: {notice}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&stale_path).unwrap(),
+        current_stale,
+        "unmodified stale file should still be auto-updated"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&edited_path).unwrap(),
+        "user custom pcb rules",
+        "user-modified file must remain untouched"
     );
 }
 
