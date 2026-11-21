@@ -1107,7 +1107,7 @@ async fn create_footprint_writes_a_pad_fabrication_property() {
         .collect();
     assert_eq!(pads.len(), 3);
     assert!(
-        pads[0].contains(r#"(property pad_prop_castellated) (layers "*.Cu" "*.Mask")"#),
+        pads[0].contains("(property pad_prop_castellated)\n\t\t(layers \"*.Cu\" \"*.Mask\")"),
         "{}",
         pads[0]
     );
@@ -1176,6 +1176,7 @@ fn pad(number: &str, t: &str, x: f64, y: f64, w: f64, h: f64) -> PadGeom {
         y,
         w,
         h,
+        rotation: 0.0,
     }
 }
 
@@ -1472,8 +1473,8 @@ async fn create_footprint_emits_courtyard_pin1_and_model() {
     assert!(c.contains("F.SilkS"));
     assert!(c.contains("(fp_poly"), "missing fab chamfer outline");
     assert!(c.contains("(fp_circle"), "missing pin-1 silk dot");
-    assert!(c.contains("(fp_text reference \"REF**\""));
-    assert!(c.contains("(fp_text value \"TEST_QFN\""));
+    assert!(c.contains("(property \"Reference\" \"REF**\""));
+    assert!(c.contains("(property \"Value\" \"TEST_QFN\""));
     assert!(c.contains("(model \"${KICAD9_3DMODEL_DIR}/Package.3dshapes/TEST_QFN.wrl\""));
     // Round-trips through the S-expression parser.
     assert!(
@@ -1527,8 +1528,8 @@ async fn create_footprint_emits_bottom_layer_rotated_roundrect_pad() {
         "missing pad rotation:\n{content}"
     );
     assert!(
-        content.contains("(layers \"B.Cu\" \"B.Paste\" \"B.Mask\")"),
-        "missing bottom pad layers:\n{content}"
+        content.contains("(layers \"B.Cu\" \"B.Mask\" \"B.Paste\")"),
+        "missing bottom pad layers, in KiCad's order:\n{content}"
     );
     assert!(
         content.contains("(roundrect_rratio 0.2)"),
@@ -1557,12 +1558,12 @@ async fn create_footprint_legacy_pad_payload_remains_front_side() {
     let result = handle_create_footprint(&args, &test_ctx()).await.unwrap();
     assert!(!result.is_error);
     let content = std::fs::read_to_string(&out).unwrap();
-    assert!(content.contains("(at 0 0)"), "{content}");
+    let pad = &content[content.find("(pad \"1\"").unwrap()..];
+    assert!(pad.contains("(at 0 0)\n"), "{content}");
     assert!(
-        content.contains("(layers \"F.Cu\" \"F.Paste\" \"F.Mask\")"),
+        pad.contains("(layers \"F.Cu\" \"F.Mask\" \"F.Paste\")"),
         "{content}"
     );
-    assert!(!content.contains("(at 0 0 0)"), "{content}");
 }
 
 #[tokio::test]

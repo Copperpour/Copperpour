@@ -332,6 +332,11 @@ create_footprint(
 - Extend courtyard **0.25mm** beyond the outermost pad edges on all sides
 - This ensures minimum spacing between components during assembly
 - Use `F.CrtYd` layer, 0.05mm line width
+- Give `create_footprint` the body as `body_width` (X) and `body_height` (Y,
+  the size seen from above, not the 3D height). It then draws the courtyard
+  around the pads and the body, and the silk 0.11 mm outside the body, broken
+  where it would come within 0.2 mm of a pad; without a body, both follow the
+  pads. It writes the KiCad 10 format KiCad's own footprint editor writes.
 
 ### Footprint Layers
 

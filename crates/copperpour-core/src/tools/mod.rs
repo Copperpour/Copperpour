@@ -33,6 +33,7 @@ pub mod editor_navigation;
 mod erc_severity;
 mod footprint_fields;
 mod footprint_graphics;
+mod footprint_kicad10;
 mod footprint_metadata;
 mod footprint_models;
 pub(crate) mod footprint_rename;
