@@ -8210,4 +8210,101 @@ mod board_revision_tests {
             Some(ZoneConnectionStyle::ZcsFull as i32)
         );
     }
+
+    /// `add_mounting_hole` builds its library footprint as `place_component`
+    /// does, solder margins included. The file under the hole's name is each
+    /// of #667's four margin footprints in turn (`solder_margins_kicad10.README.md`):
+    /// what is checked is the margins, not a hole's pads.
+    #[tokio::test]
+    async fn add_mounting_hole_carries_library_solder_margins() {
+        use crate::tools::library_footprint::test_margins::{
+            expected_margins, placed_margins, SOLDER_MARGIN_FOOTPRINTS,
+        };
+        use board_mock::{spawn_kicad_holding_items, ItemStore};
+        use copperpour_ipc::builders::{any_is, pack_any};
+        use copperpour_ipc::gen::kiapi;
+        use kiapi::board::types::FootprintInstance;
+        use prost::Message;
+        use std::sync::{Arc, Mutex};
+
+        for (name, source, own, pad_9) in SOLDER_MARGIN_FOOTPRINTS {
+            let dir = tempfile::tempdir().unwrap();
+            let pretty = dir.path().join("MountingHole.pretty");
+            std::fs::create_dir_all(&pretty).unwrap();
+            std::fs::write(pretty.join("MountingHole_2.2mm_M2.kicad_mod"), source).unwrap();
+            std::fs::write(
+                dir.path().join("fp-lib-table"),
+                "(fp_lib_table\n  (version 7)\n  (lib (name \"MountingHole\")(type \"KiCad\")(uri \"${KIPRJMOD}/MountingHole.pretty\")(options \"\")(descr \"\")))\n",
+            )
+            .unwrap();
+            let board = dir.path().join("board.kicad_pcb");
+            std::fs::write(
+                &board,
+                "(kicad_pcb (version 20241229) (generator \"pcbnew\"))\n",
+            )
+            .unwrap();
+
+            let store = Arc::new(Mutex::new(ItemStore::default()));
+            // Pad 9's heatsink property makes placement ask KiCad's version.
+            let server = spawn_kicad_holding_items(
+                &board,
+                vec![],
+                store.clone(),
+                |_| {},
+                |command, _| {
+                    any_is(command, "kiapi.common.commands.GetVersion").then(|| {
+                        pack_any(
+                            &kiapi::common::commands::GetVersionResponse {
+                                version: Some(kiapi::common::types::KiCadVersion {
+                                    major: 10,
+                                    minor: 0,
+                                    patch: 8,
+                                    full_version: "10.0.8".to_string(),
+                                }),
+                            },
+                            "kiapi.common.commands.GetVersionResponse",
+                        )
+                    })
+                },
+            );
+            let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+                ipc_address: server.address().to_string(),
+                eager_toolsets: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "add_mounting_hole",
+                        "arguments": {
+                            "board": board.display().to_string(),
+                            "x": 10.0,
+                            "y": 10.0,
+                            "drill_diameter": 2.2,
+                            "reference": "H1"
+                        }
+                    }
+                }))
+                .await
+                .unwrap();
+            let result = response.result.unwrap();
+            assert!(
+                !result["isError"].as_bool().unwrap_or(false),
+                "{name}: {result}"
+            );
+
+            let footprint =
+                FootprintInstance::decode(store.lock().unwrap().items[0].value.as_slice()).unwrap();
+            assert_eq!(
+                placed_margins(&footprint),
+                expected_margins(own, pad_9),
+                "{name}"
+            );
+        }
+    }
 }
