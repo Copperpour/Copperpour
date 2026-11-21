@@ -242,7 +242,7 @@ pub(super) enum Stacked {
 
 /// A trailing run of digits and what comes before it, as KiCad's
 /// `ParseAlphaNumericPin` splits a pin number.
-fn alphanumeric(number: &str) -> (&str, Option<i64>) {
+pub(super) fn alphanumeric(number: &str) -> (&str, Option<i64>) {
     let digits = number.len() - number.trim_end_matches(|c: char| c.is_ascii_digit()).len();
     let (prefix, value) = number.split_at(number.len() - digits);
     (prefix, value.parse().ok())

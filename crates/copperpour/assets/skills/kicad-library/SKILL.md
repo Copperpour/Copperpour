@@ -191,6 +191,13 @@ Acceptance procedure:
    assigned to a different function, or ambiguous in view/direction. Record an
    unavailable datasheet figure, query, or render as `BLOCKED`, never as pass.
 
+`get_symbol_info` lists every pin with its `unit` and `body_style`, the values
+`edit_symbol_pin` takes to choose a pin. `pin_count` is KiCad's count: every
+unit in body style 1, a stacked number such as `[2,3,6,7]` once per pin. A pin
+drawn in two units under one number counts twice, as in KiCad's chooser.
+`warnings` name the duplicate pins KiCad's symbol checker reports; fix a real
+duplicate with `edit_symbol_pin`.
+
 The rows below are *starting hypotheses for generic parts only*. Verify each
 against the actual symbol with `get_symbol_info` before relying on it.
 

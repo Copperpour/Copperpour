@@ -884,6 +884,7 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "match_all",
         "replace_existing",
         "roundrect_rratio",
+        "pin_count",
         // Structured MCP error discriminant, not a callable tool.
         "unsafe_file_fallback",
         "unsupported_capability",
