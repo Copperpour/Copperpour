@@ -190,8 +190,14 @@ fn hook_matcher(hook: &crate::manifest::HookSkillManifest) -> Result<String> {
     if names.is_empty() {
         anyhow::bail!("hook '{}' has no registered tool targets", hook.name);
     }
-    // A client may still register the server under its old name, `konnect`.
-    Ok(format!("mcp__(copperpour|konnect)__({})", names.join("|")))
+    // Claude Code's `PreToolUse` matcher is case-sensitive. A client may
+    // register the server as `copperpour` (`.mcp.json` / `~/.claude.json`),
+    // `Copperpour` (Claude Desktop's `.mcpb` extension `display_name`), or
+    // its old name `konnect` / `Konnect` (#737).
+    Ok(format!(
+        "mcp__(copperpour|Copperpour|konnect|Konnect)__({})",
+        names.join("|")
+    ))
 }
 
 fn quote_command_arg(argument: &str) -> String {
@@ -2579,7 +2585,7 @@ mod tests {
         for hook in HOOK_SKILLS {
             let matcher = hook_matcher(hook).unwrap();
             let targets = matcher
-                .strip_prefix("mcp__(copperpour|konnect)__(")
+                .strip_prefix("mcp__(copperpour|Copperpour|konnect|Konnect)__(")
                 .and_then(|value| value.strip_suffix(')'))
                 .unwrap()
                 .split('|')
@@ -2913,7 +2919,10 @@ mod tests {
         for entry in &mut entries {
             let matcher = entry["matcher"].as_str().unwrap().to_string();
             entry["matcher"] = matcher
-                .replace("mcp__(copperpour|konnect)__", "mcp__konnect__")
+                .replace(
+                    "mcp__(copperpour|Copperpour|konnect|Konnect)__",
+                    "mcp__konnect__",
+                )
                 .into();
         }
         entries.push(serde_json::json!({
@@ -4902,5 +4911,150 @@ mod tests {
             "current"
         );
         assert_eq!(fs::read_to_string(&edited).unwrap(), "user edit");
+    }
+
+    /// #737: Claude Desktop's `.mcpb` extension exposes MCP tools under the
+    /// capitalized display-name prefix `mcp__Copperpour__<tool>`. Every
+    /// generated `PreToolUse` matcher must cover `copperpour`, `Copperpour`,
+    /// `konnect`, and `Konnect`, and installs carrying the older
+    /// `mcp__(copperpour|konnect)__(...)` matcher must flag `stale_matcher` and
+    /// upgrade cleanly via both `init` and #731 auto-update.
+    #[test]
+    fn hook_matchers_cover_claude_desktop_mcpb_prefix_and_upgrade_lowercase_matchers() {
+        use copperpour_core::guidance::GuidanceProbe;
+
+        for hook in HOOK_SKILLS {
+            let matcher = hook_matcher(hook).unwrap();
+            let rest = matcher.strip_prefix("mcp__(").unwrap_or_else(|| {
+                panic!("unexpected matcher format for {}: {matcher}", hook.name)
+            });
+            let (prefix_group, tools_group) = rest.split_once(")__(").unwrap_or_else(|| {
+                panic!("missing prefix/tool split for {}: {matcher}", hook.name)
+            });
+            let prefixes: Vec<&str> = prefix_group.split('|').collect();
+            assert_eq!(
+                prefixes,
+                vec!["copperpour", "Copperpour", "konnect", "Konnect"],
+                "hook {} must match lowercase and capitalized Copperpour/Konnect prefixes",
+                hook.name
+            );
+            assert!(
+                tools_group.ends_with(')') && tools_group.len() > 1,
+                "hook {} must list at least one tool target: {matcher}",
+                hook.name
+            );
+        }
+
+        // Simulate a previous release whose settings.json and install manifest
+        // recorded the older lowercase-only `mcp__(copperpour|konnect)__(...)`
+        // matchers for all four hooks.
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+
+        let settings_path = paths.claude_settings_path();
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let mut manifest = read_installed_manifest(
+            InstallClient::Claude,
+            &paths,
+            read_marker(InstallClient::Claude, &paths).as_ref(),
+        )
+        .unwrap();
+        manifest.version = "0.15.0".to_string();
+        write_atomic_bytes(&paths.marker(InstallClient::Claude), b"0.15.0").unwrap();
+
+        for hook in HOOK_SKILLS {
+            let old_matcher = format!(
+                "mcp__(copperpour|konnect)__({})",
+                hook_tool_names(hook.board_access).join("|")
+            );
+            let cmd = hook_command(&this_exe(), "hook", hook.name);
+            let entries = settings["hooks"][hook.event].as_array_mut().unwrap();
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry["hooks"][0]["command"].as_str() == Some(cmd.as_str()))
+                .expect("installed hook entry");
+            entry["matcher"] = serde_json::json!(old_matcher);
+            manifest.hooks.get_mut(hook.name).unwrap().matcher = old_matcher;
+        }
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+        write_installed_manifest(InstallClient::Claude, &paths, &manifest).unwrap();
+
+        let before = inspect_guidance(InstallClient::Claude, &paths, &this_exe());
+        for hook in HOOK_SKILLS {
+            let read = hook_read(&before, hook.name);
+            assert_eq!(
+                (read.status.as_str(), read.reason),
+                ("different", Some("stale_matcher")),
+                "legacy lowercase matcher for {} must report stale_matcher",
+                hook.name
+            );
+        }
+
+        // #731 auto-update upgrades every unmodified legacy matcher silently.
+        let probe = start(&temp);
+        assert_eq!(probe.take_notice(), None);
+        let after = inspect_guidance(InstallClient::Claude, &paths, &this_exe());
+        assert_eq!(after.state(), GuidanceState::Current);
+        let upgraded: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        for hook in HOOK_SKILLS {
+            let expected = hook_matcher(hook).unwrap();
+            assert!(
+                upgraded["hooks"][hook.event]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["matcher"].as_str() == Some(expected.as_str())),
+                "auto-updated settings.json must carry {expected}"
+            );
+        }
+
+        // `copperpour init` (patch_claude_settings) also refreshes a legacy
+        // lowercase-only matcher when no manifest is involved, and is idempotent.
+        let init_temp = TempDir::new().unwrap();
+        let init_settings = init_temp.path().join("settings.json");
+        let old_entries: Vec<serde_json::Value> = HOOK_SKILLS
+            .iter()
+            .map(|hook| {
+                serde_json::json!({
+                    "matcher": format!(
+                        "mcp__(copperpour|konnect)__({})",
+                        hook_tool_names(hook.board_access).join("|")
+                    ),
+                    "hooks": [{
+                        "type": "command",
+                        "command": hook_command(&this_exe(), "hook", hook.name)
+                    }]
+                })
+            })
+            .collect();
+        seed_settings(&init_settings, HOOK_SKILLS[0].event, old_entries.into());
+        assert_eq!(
+            patch_claude_settings(&init_settings, &this_exe()).unwrap(),
+            HOOK_SKILLS.len()
+        );
+        let init_upgraded: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&init_settings).unwrap()).unwrap();
+        for hook in HOOK_SKILLS {
+            let expected = hook_matcher(hook).unwrap();
+            assert!(
+                init_upgraded["hooks"][hook.event]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["matcher"].as_str() == Some(expected.as_str())),
+                "init-refreshed settings.json must carry {expected}"
+            );
+        }
+        assert_eq!(
+            patch_claude_settings(&init_settings, &this_exe()).unwrap(),
+            0
+        );
     }
 }

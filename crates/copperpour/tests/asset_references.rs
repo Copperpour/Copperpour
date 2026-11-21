@@ -122,6 +122,55 @@ fn agents_preload_existing_skills() {
     );
 }
 
+/// Every bundled Claude agent must allow the lowercase and capitalized MCP
+/// server prefixes (`copperpour`, `Copperpour` for Claude Desktop's `.mcpb`
+/// extension display_name, plus legacy `konnect` / `Konnect`) (#737).
+#[test]
+fn agents_allow_every_mcp_server_prefix() {
+    let required = [
+        "mcp__copperpour__*",
+        "mcp__Copperpour__*",
+        "mcp__konnect__*",
+        "mcp__Konnect__*",
+    ];
+    let mut missing = Vec::new();
+    let mut checked = 0usize;
+
+    for entry in std::fs::read_dir(assets_root().join("agents"))
+        .unwrap()
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        checked += 1;
+        let text = std::fs::read_to_string(&path).unwrap();
+        let normalized = text.replace("\r\n", "\n");
+        let frontmatter = normalized
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n"))
+            .map(|(head, _)| head)
+            .unwrap_or("");
+        let tools = yaml_list(frontmatter, "tools");
+        for prefix in required {
+            if !tools.iter().any(|tool| tool == prefix) {
+                missing.push(format!(
+                    "{} missing tool allowlist `{prefix}`",
+                    display(&path)
+                ));
+            }
+        }
+    }
+
+    assert!(checked > 0, "expected at least one bundled agent");
+    assert!(
+        missing.is_empty(),
+        "bundled agents are missing MCP server tool prefixes:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
 /// The top-level router names every installed agent so a caller can delegate
 /// deliberately instead of leaving agents undiscoverable (#357).
 #[test]

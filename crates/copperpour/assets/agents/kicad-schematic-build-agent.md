@@ -7,7 +7,9 @@ skills:
   - kicad-schematic
 tools:
   - mcp__copperpour__*
+  - mcp__Copperpour__*
   - mcp__konnect__*
+  - mcp__Konnect__*
 maxTurns: 40
 ---
 
