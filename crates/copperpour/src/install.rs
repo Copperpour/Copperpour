@@ -467,6 +467,15 @@ fn read_installed_manifest(
 
 fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+    // Write through a symlinked file (dotfile managers link settings.json)
+    // instead of replacing the link with a regular file.
+    let resolved;
+    let path = if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        resolved = fs::canonicalize(path)?;
+        resolved.as_path()
+    } else {
+        path
+    };
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1976,6 +1985,16 @@ fn auto_update_unmodified_hooks(
         return 0;
     };
 
+    // Hooks run a binary by path. Only the binary that installed them may
+    // rewrite them; another copy (a dev build, a second client's install)
+    // would silently repoint them at itself.
+    let installed_by_us = manifest
+        .hooks
+        .iter()
+        .all(|(name, recorded)| recorded.command == hook_command(exe_str, "hook", name));
+    if !installed_by_us {
+        return 0;
+    }
     let mut hooks_to_update = Vec::new();
     for (hook, check) in HOOK_SKILLS.iter().zip(hook_checks.iter()) {
         match check.status {
@@ -4560,6 +4579,71 @@ mod tests {
         assert!(
             after_settings.contains("mcp__custom_user_matcher__.*"),
             "user-edited hook matcher must be preserved"
+        );
+    }
+
+    #[test]
+    fn hooks_installed_by_another_binary_are_not_repointed() {
+        use copperpour_core::guidance::GuidanceProbe;
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        simulate_previous_install(InstallClient::Claude, &paths, "0.15.0", &[], None);
+        // Re-home the install onto a binary named like a real one, so the
+        // server below recognises its hooks as Copperpour's.
+        let installer = temp
+            .path()
+            .join("a/copperpour")
+            .to_string_lossy()
+            .into_owned();
+        let settings_path = paths.claude_settings_path();
+        let rehome = |text: String| {
+            text.replace(
+                &quote_command_arg(&this_exe()),
+                &quote_command_arg(&installer),
+            )
+        };
+        let before = rehome(fs::read_to_string(&settings_path).unwrap());
+        fs::write(&settings_path, &before).unwrap();
+        let manifest_path = paths.installed_manifest(InstallClient::Claude);
+        let manifest = rehome(fs::read_to_string(&manifest_path).unwrap());
+        assert!(manifest.contains("a/copperpour"), "{manifest}");
+        fs::write(&manifest_path, manifest).unwrap();
+
+        let other_exe = temp.path().join("b/copperpour");
+        let probe =
+            InstalledGuidanceProbe::at(test_paths(&temp), other_exe.to_string_lossy().into_owned());
+        assert!(probe.take_notice().is_some());
+        assert_eq!(
+            fs::read_to_string(&settings_path).unwrap(),
+            before,
+            "a server started from another path must not repoint the hooks"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_writes_through_symlinked_settings_json() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        let target = temp.path().join("dotfiles/settings.json");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, r#"{"theme":"dark"}"#).unwrap();
+        let link = paths.claude_settings_path();
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert!(
+            settings["hooks"].is_object(),
+            "hooks written to the link target"
         );
     }
 
