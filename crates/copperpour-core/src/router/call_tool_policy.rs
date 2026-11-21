@@ -295,6 +295,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "move_sheet",
     "move_via",
     "mutate_editor_selection",
+    "open_board",
     "open_schematic_viewer",
     "place_component",
     "place_component_array",

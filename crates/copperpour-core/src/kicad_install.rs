@@ -46,6 +46,39 @@ pub fn gui_or_default(configured_binary: &str, configured_cli: &str) -> String {
         })
 }
 
+/// KiCad's standalone PCB editor of the installation [`find_gui`] resolves,
+/// else one on `PATH`, else the bare name for the OS to look up.
+pub fn pcb_editor_or_default(configured_binary: &str, configured_cli: &str) -> String {
+    find_gui(configured_binary, configured_cli)
+        .and_then(|gui| pcb_editor_beside(&gui))
+        .or_else(|| find_on_path(Path::new(pcb_editor_filename())))
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| pcb_editor_filename().to_string())
+}
+
+/// `pcbnew` in the GUI's own directory, as on Linux and Windows, or in the
+/// macOS bundle's `Contents/Applications/pcbnew.app` beside `Contents/MacOS`
+/// (#87's process listing).
+fn pcb_editor_beside(gui: &Path) -> Option<PathBuf> {
+    let dir = gui.parent()?;
+    let sibling = dir.join(pcb_editor_filename());
+    if sibling.is_file() {
+        return Some(sibling);
+    }
+    let bundled = dir
+        .parent()?
+        .join("Applications/pcbnew.app/Contents/MacOS/pcbnew");
+    bundled.is_file().then_some(bundled)
+}
+
+fn pcb_editor_filename() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "pcbnew.exe"
+    } else {
+        "pcbnew"
+    }
+}
+
 fn cli_candidates() -> Vec<PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -479,6 +512,31 @@ mod tests {
 
         assert_eq!(find_cli(cli.to_str().unwrap()), Some(cli.clone()));
         assert_eq!(find_gui(gui_filename(), cli.to_str().unwrap()), Some(gui));
+    }
+
+    /// Beside the GUI, or in the macOS bundle's own `pcbnew.app`.
+    #[test]
+    fn the_pcb_editor_is_the_resolved_installations() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let gui = bin.join(gui_filename());
+        let editor = bin.join(pcb_editor_filename());
+        std::fs::write(&gui, b"").unwrap();
+        std::fs::write(&editor, b"").unwrap();
+        assert_eq!(
+            pcb_editor_or_default(gui.to_str().unwrap(), ""),
+            editor.to_string_lossy()
+        );
+
+        let contents = temp.path().join("KiCad.app/Contents");
+        let gui = contents.join("MacOS/kicad");
+        let editor = contents.join("Applications/pcbnew.app/Contents/MacOS/pcbnew");
+        std::fs::create_dir_all(gui.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(editor.parent().unwrap()).unwrap();
+        std::fs::write(&gui, b"").unwrap();
+        std::fs::write(&editor, b"").unwrap();
+        assert_eq!(pcb_editor_beside(&gui), Some(editor));
     }
 
     /// Tests run in the package root, where `Cargo.toml` is a same-named file

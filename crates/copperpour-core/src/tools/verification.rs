@@ -204,6 +204,33 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_launch_kicad_ui(args, ctx).await }
         ),
         tool!(
+            "open_board",
+            "Open a .kicad_pcb in KiCad's PCB editor (pcbnew) and wait until a KiCad IPC \
+             endpoint reports that exact board; when several endpoints answer, the calls \
+             that follow use that one. An endpoint already holding the board is used \
+             without starting an editor. requested_open is false, with a note, when none \
+             reports it within timeout_seconds.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to the .kicad_pcb file to open" },
+                    "display": {
+                        "type": "string",
+                        "description": "X display to open the editor on, as launch_kicad_ui takes it. Linux and other X11 systems only: refused on Windows and macOS."
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Maximum wait for the board, in seconds",
+                        "minimum": 1,
+                        "maximum": 300,
+                        "default": 30
+                    }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_open_board(args, ctx).await }
+        ),
+        tool!(
             "copy_routing_pattern",
             "Copy the segments, arcs and vias inside a source region of a board KiCad is not \
              holding, shifted by (dest_x - src_x1, dest_y - src_y1). An item is copied when all \
@@ -1033,8 +1060,13 @@ fn ui_running(process_detected: bool, ipc_responsive: bool) -> bool {
 }
 
 fn health_timeout_seconds(args: &serde_json::Value) -> Result<u64, CallToolResult> {
+    timeout_seconds(args, 5)
+}
+
+/// `timeout_seconds`, 1 to 300, `default` when absent.
+fn timeout_seconds(args: &serde_json::Value, default: u64) -> Result<u64, CallToolResult> {
     let timeout = match args.get("timeout_seconds") {
-        None | Some(serde_json::Value::Null) => 5,
+        None | Some(serde_json::Value::Null) => default,
         Some(value) => value.as_u64().ok_or_else(|| {
             CallToolResult::error_kind(
                 crate::mcp::error::ToolErrorKind::InvalidArgument {
@@ -1240,6 +1272,497 @@ async fn handle_launch_kicad_ui(
                 "ipc_ready": false,
                 "note": note
             })));
+        }
+    }
+}
+
+/// What one KiCad endpoint said about the board `open_board` asked for.
+struct EndpointSeen {
+    address: String,
+    /// The board is among its open documents, and a read of it succeeded.
+    holds_board: bool,
+    /// The board is among its open documents.
+    listed: bool,
+    /// KiCad answered the Ping with `AS_OK`.
+    responsive: bool,
+    /// KiCad answered the Ping with `AS_NOT_READY`.
+    not_ready: bool,
+    /// The look ended without KiCad's own answer: a request that timed out,
+    /// a reply that did not parse, or a status such as `AS_NOT_READY` to the
+    /// Ping.
+    unsure: bool,
+    /// The look ended before the deadline.
+    answered: bool,
+    error: Option<String>,
+}
+
+impl EndpointSeen {
+    fn pending(address: String) -> Self {
+        EndpointSeen {
+            address,
+            holds_board: false,
+            listed: false,
+            responsive: false,
+            not_ready: false,
+            unsure: false,
+            answered: false,
+            error: Some("no answer yet".to_string()),
+        }
+    }
+
+    /// It may hold the board without having said so: a dialog or a load, a
+    /// request unanswered or still running, or the board listed but no read
+    /// served, as while KiCad refills zones.
+    fn undecided(&self) -> bool {
+        self.unsure || !self.answered || (self.listed && !self.holds_board)
+    }
+
+    fn report(&self) -> Value {
+        json!({
+            "ipc_address": copperpour_ipc::redact_endpoint(&self.address),
+            "requested_open": self.holds_board,
+            "error": self.error,
+        })
+    }
+}
+
+/// Ask the KiCad at `address` for `board` as a board-scoped call does: bind it
+/// among the open documents, then read it. A Project Manager answers the Ping
+/// and refuses `GetOpenDocuments` as `AS_UNHANDLED`.
+fn look_for_board(board: &Path, address: &str) -> EndpointSeen {
+    let client = copperpour_ipc::KiCadIpcClient::new(address.to_string());
+    let ping = client.ping_outcome();
+    // KiCad's own answer settles it: a status, or the documents it names. A
+    // reply that timed out or did not parse does not.
+    let explicit = |error: &anyhow::Error| {
+        error
+            .downcast_ref::<copperpour_ipc::BoardTargetError>()
+            .is_some()
+            || copperpour_ipc::ApiStatusError::from_error(error).is_some()
+    };
+    let (listed, unsure, found) = match &ping {
+        copperpour_ipc::PingOutcome::Responsive => match client.find_open_board(board) {
+            Ok(_) => (
+                true,
+                false,
+                client.wait_for_board_ready(std::time::Duration::ZERO),
+            ),
+            Err(error) => (false, !explicit(&error), Err(error)),
+        },
+        failed => (
+            false,
+            matches!(failed, copperpour_ipc::PingOutcome::RequestFailed { .. }),
+            Err(anyhow::anyhow!(
+                "{}",
+                failed.failure_message().unwrap_or_default()
+            )),
+        ),
+    };
+    let found = found.map_err(|error| format!("{error:#}"));
+    EndpointSeen {
+        address: address.to_string(),
+        holds_board: found.is_ok(),
+        listed,
+        responsive: ping.is_responsive(),
+        not_ready: ping.kicad_not_ready(),
+        unsure,
+        answered: true,
+        error: found.err(),
+    }
+}
+
+/// Look at every endpoint at once, so one that takes its whole reply timeout
+/// holds up none of the others. Once one holds the board, the rest get a
+/// poll's time more, to find a second holder; one with no answer by then, or
+/// by `until`, is pending, and its look ends on its own.
+async fn look_for_board_at(
+    board: &Path,
+    addresses: Vec<String>,
+    until: std::time::Instant,
+) -> Vec<EndpointSeen> {
+    let mut looks = tokio::task::JoinSet::new();
+    for (index, address) in addresses.iter().cloned().enumerate() {
+        let board = board.to_path_buf();
+        looks.spawn_blocking(move || (index, look_for_board(&board, &address)));
+    }
+    let mut seen: Vec<Option<EndpointSeen>> = addresses.iter().map(|_| None).collect();
+    let mut until = tokio::time::Instant::from_std(until);
+    loop {
+        match tokio::time::timeout_at(until, looks.join_next()).await {
+            Ok(Some(Ok((index, one)))) => {
+                if one.holds_board {
+                    until = until.min(tokio::time::Instant::now() + KICAD_IPC_POLL);
+                }
+                seen[index] = Some(one);
+            }
+            // A look that panicked leaves its endpoint pending.
+            Ok(Some(Err(_))) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    looks.detach_all();
+    addresses
+        .into_iter()
+        .zip(seen)
+        .map(|(address, one)| one.unwrap_or_else(|| EndpointSeen::pending(address)))
+        .collect()
+}
+
+/// Where `open_board` looks for the board.
+struct Looking {
+    endpoints: Box<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// Why a PCB editor started now could not be found there, if it could not.
+    unreachable_editor: Option<String>,
+}
+
+impl Looking {
+    /// Every candidate detection chooses among, or the configured endpoint
+    /// alone. KiCad binds its socket in its own temporary directory, so an
+    /// editor started now can serve a configured endpoint only if it is that.
+    fn for_context(ctx: &ToolContext) -> Self {
+        if ctx.rediscovers_ipc() {
+            return Looking {
+                endpoints: Box::new(copperpour_ipc::candidate_endpoints),
+                unreachable_editor: None,
+            };
+        }
+        let configured = ctx.config.ipc_address.trim().to_string();
+        let defaults = copperpour_ipc::candidate_socket_paths();
+        let kicad_binds = configured
+            .strip_prefix("ipc://")
+            .is_some_and(|path| defaults.iter().any(|default| Path::new(path) == default));
+        let unreachable_editor = if configured.is_empty() {
+            Some("no KiCad endpoint is configured".to_string())
+        } else {
+            (!kicad_binds).then(|| {
+                format!(
+                    "the configured KiCad endpoint {} is not the socket KiCad binds ({}), so \
+                     a PCB editor started now could not be found there",
+                    copperpour_ipc::redact_endpoint(&configured),
+                    defaults
+                        .iter()
+                        .map(|path| format!("ipc://{}", path.display()))
+                        .collect::<Vec<_>>()
+                        .join(" or ")
+                )
+            })
+        };
+        Looking {
+            endpoints: Box::new(move || {
+                Some(configured.clone())
+                    .filter(|address| !address.is_empty())
+                    .into_iter()
+                    .collect()
+            }),
+            unreachable_editor,
+        }
+    }
+
+    /// Each endpoint gets until `deadline`, and a look begun near or after it
+    /// one poll's time, so its answer is still seen.
+    async fn look(&self, board: &Path, deadline: std::time::Instant) -> Vec<EndpointSeen> {
+        let until = deadline.max(std::time::Instant::now() + KICAD_IPC_POLL);
+        look_for_board_at(board, (self.endpoints)(), until).await
+    }
+}
+
+/// What `open_board` reports about itself, whatever the outcome.
+struct OpenBoardCall<'a> {
+    board: &'a Path,
+    shown: &'a str,
+    timeout_seconds: u64,
+    started: std::time::Instant,
+}
+
+impl OpenBoardCall<'_> {
+    /// The answer once exactly one endpoint holds the board: recorded as a
+    /// live observation and used by the calls that follow.
+    fn found(
+        &self,
+        ctx: &ToolContext,
+        seen: &[EndpointSeen],
+        launched: bool,
+    ) -> Option<CallToolResult> {
+        let holders: Vec<&EndpointSeen> = seen.iter().filter(|e| e.holds_board).collect();
+        match holders.as_slice() {
+            [] => None,
+            [holder] => {
+                ctx.board_session.observe_live(self.board);
+                ctx.select_ipc_endpoint(holder.address.clone());
+                Some(CallToolResult::json(&json!({
+                    "requested_board": self.shown,
+                    "requested_open": true,
+                    "launched": launched,
+                    "ipc_address": copperpour_ipc::redact_endpoint(&holder.address),
+                    "timed_out": false,
+                    "timeout_seconds": self.timeout_seconds,
+                    "elapsed_ms": self.started.elapsed().as_millis() as u64,
+                    "endpoints": seen.iter().map(EndpointSeen::report).collect::<Vec<_>>(),
+                })))
+            }
+            several => {
+                let candidates: Vec<String> = several
+                    .iter()
+                    .map(|e| copperpour_ipc::redact_endpoint(&e.address))
+                    .collect();
+                Some(CallToolResult::error_kind(
+                    ToolErrorKind::AmbiguousTarget {
+                        target: self.shown.to_string(),
+                        candidates: candidates.clone(),
+                    },
+                    format!(
+                        "{} KiCad endpoints hold {}: {}. None was chosen; close the board in \
+                         all but one and call open_board again.",
+                        several.len(),
+                        self.shown,
+                        candidates.join(", ")
+                    ),
+                ))
+            }
+        }
+    }
+
+    /// The refusal while KiCad's lock beside the board is present, or could
+    /// not be checked, and no endpoint in `seen` reports the board.
+    fn locked(
+        &self,
+        seen: &[EndpointSeen],
+        observed: super::live_board::EditorLock,
+    ) -> Option<CallToolResult> {
+        let endpoints = seen
+            .iter()
+            .map(|e| copperpour_ipc::redact_endpoint(&e.address))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let shown = self.shown;
+        let (lock, message) = match observed {
+            super::live_board::EditorLock::Absent => return None,
+            super::live_board::EditorLock::Present(lock) => {
+                let lock = copperpour_sexp::paths::display_path(&lock);
+                let message = format!(
+                    "KiCad's lock {lock} says {shown} is open, and no endpoint looked at reports \
+                     it ({endpoints}). No PCB editor was started: a second one would stop at \
+                     KiCad's \"already open\" dialog. If no KiCad has the board open, the lock \
+                     is left from one that did not close it; remove it and call open_board again."
+                );
+                (lock, message)
+            }
+            super::live_board::EditorLock::Unreadable(lock, error) => {
+                let lock = copperpour_sexp::paths::display_path(&lock);
+                let message = format!(
+                    "KiCad's lock {lock} could not be checked ({error}), and no endpoint looked \
+                     at reports {shown} ({endpoints}). No PCB editor was started: a KiCad \
+                     holding the board cannot be ruled out, and a second one would stop at \
+                     KiCad's \"already open\" dialog. Make the lock's path checkable, then call \
+                     open_board again."
+                );
+                (lock, message)
+            }
+        };
+        Some(CallToolResult::error_kind(
+            ToolErrorKind::Conflict { paths: vec![lock] },
+            message,
+        ))
+    }
+
+    /// The answer when no endpoint reported the board by the deadline.
+    fn timed_out(&self, seen: &[EndpointSeen], launched: bool, note: &str) -> CallToolResult {
+        CallToolResult::json(&json!({
+            "requested_board": self.shown,
+            "requested_open": false,
+            "launched": launched,
+            "ipc_address": null,
+            "timed_out": true,
+            "timeout_seconds": self.timeout_seconds,
+            "elapsed_ms": self.started.elapsed().as_millis() as u64,
+            "endpoints": seen.iter().map(EndpointSeen::report).collect::<Vec<_>>(),
+            "note": note
+        }))
+    }
+}
+
+async fn handle_open_board(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    open_board(args, ctx, Looking::for_context(ctx)).await
+}
+
+async fn open_board(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    looking: Looking,
+) -> anyhow::Result<CallToolResult> {
+    let requested = match require_str(args, "board") {
+        Ok(board) => PathBuf::from(board),
+        Err(refusal) => return Ok(refusal),
+    };
+    if !requested
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("kicad_pcb"))
+    {
+        return Ok(invalid_arg("board", "must be a .kicad_pcb file"));
+    }
+    let board = match std::fs::canonicalize(&requested) {
+        Ok(board) if board.is_file() => board,
+        Ok(_) => return Ok(invalid_arg("board", "is not a file")),
+        Err(_) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::file_not_found(&requested),
+                format!("No board at {}.", requested.display()),
+            ))
+        }
+    };
+    let timeout_seconds = match timeout_seconds(args, 30) {
+        Ok(timeout) => timeout,
+        Err(refusal) => return Ok(refusal),
+    };
+    let display = match launch_display(args) {
+        Ok(display) => display,
+        Err(refusal) => return Ok(refusal),
+    };
+    let shown = copperpour_sexp::paths::display_path(&board);
+    let call = OpenBoardCall {
+        board: &board,
+        shown: &shown,
+        timeout_seconds,
+        started: std::time::Instant::now(),
+    };
+    let deadline = call.started + std::time::Duration::from_secs(timeout_seconds);
+    // The wait for another call counts against this one's timeout too.
+    let Ok(_one_at_a_time) = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        ctx.opening_board.lock(),
+    )
+    .await
+    else {
+        return Ok(call.timed_out(
+            &[],
+            false,
+            "Another open_board call was still running at timeout_seconds.",
+        ));
+    };
+
+    // An endpoint that has not said may hold the board, and an editor started
+    // on it now would stop at KiCad's "already open" dialog: wait for it.
+    let mut seen = looking.look(&board, deadline).await;
+    loop {
+        if let Some(answer) = call.found(ctx, &seen, false) {
+            return Ok(answer);
+        }
+        if !seen.iter().any(EndpointSeen::undecided) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let note = if seen.iter().any(|e| e.not_ready) {
+                crate::tools::NOT_READY_NOTE
+            } else if seen.iter().any(|e| e.listed) {
+                "An endpoint lists the board but served no read of it within \
+                 timeout_seconds, as while KiCad refills zones, so no PCB editor was started."
+            } else {
+                "An endpoint gave no clear answer within timeout_seconds, so no PCB editor \
+                 was started: a busy KiCad may hold the board."
+            };
+            return Ok(call.timed_out(&seen, false, note));
+        }
+        tokio::time::sleep(KICAD_IPC_POLL).await;
+        seen = looking.look(&board, deadline).await;
+    }
+    if let Some(refusal) = call.locked(&seen, super::live_board::editor_lock(&board)) {
+        return Ok(refusal);
+    }
+    // A KiCad answering at a configured endpoint keeps it, so an editor
+    // started now would serve another, which the calls never use.
+    if !ctx.rediscovers_ipc() {
+        if let Some(serving) = seen.iter().find(|e| e.responsive) {
+            let endpoint = copperpour_ipc::redact_endpoint(&serving.address);
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::EditorUnavailable {
+                    editor: "pcb".to_string(),
+                    reason: format!(
+                        "the configured KiCad endpoint {endpoint} answers without {shown} open"
+                    ),
+                },
+                format!(
+                    "The configured KiCad endpoint {endpoint} answers without {shown} open, and \
+                     a PCB editor started now would serve a socket of its own, which a \
+                     configured ipc_address or KICAD_API_SOCKET is never replaced by. Open the \
+                     board in the KiCad at that endpoint, then call open_board again."
+                ),
+            ));
+        }
+    }
+    if let Some(reason) = &looking.unreachable_editor {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::EditorUnavailable {
+                editor: "pcb".to_string(),
+                reason: reason.clone(),
+            },
+            format!(
+                "No PCB editor was started: {reason}. Open the board in the KiCad that serves \
+                 it, or leave ipc_address and KICAD_API_SOCKET unset so the endpoint is \
+                 detected, then call open_board again."
+            ),
+        ));
+    }
+
+    // `kicad -f pcb` would be the launcher's own road, but KiCad 10.0.8 exits
+    // on a segmentation fault there: its PCB frame registers an API handler
+    // before the launcher creates the API server (kicad/kicad.cpp:274, :298).
+    let binary = crate::kicad_install::pcb_editor_or_default(
+        &ctx.config.kicad_binary,
+        &ctx.config.kicad_cli,
+    );
+    let mut cmd = std::process::Command::new(&binary);
+    // The resolved path, as the lock checks resolve it; on Windows its display
+    // form, without the `\\?\` prefix `canonicalize` adds.
+    if cfg!(windows) {
+        cmd.arg(&shown);
+    } else {
+        cmd.arg(&board);
+    }
+    if let Some(display) = &display {
+        cmd.env("DISPLAY", display)
+            .env("GDK_BACKEND", "x11")
+            .env_remove("WAYLAND_DISPLAY");
+    }
+    let mut editor = match copperpour_viewer::launch::spawn(
+        cmd,
+        "KiCad's PCB editor",
+        |line| tracing::warn!(target: "kicad", "{line}"),
+    ) {
+        Ok(editor) => editor,
+        Err(e) => {
+            return Ok(CallToolResult::error(format!(
+                "Failed to launch KiCad's PCB editor ({binary}): {e}"
+            )))
+        }
+    };
+    editor.on_no_display(
+        "Pass display (for example \":0\") to open the editor on the desktop's X display.",
+    );
+
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if let Err(message) = editor.watch(KICAD_IPC_POLL.min(remaining)).await {
+            return Ok(CallToolResult::error(message));
+        }
+        let seen = tokio::select! {
+            seen = looking.look(&board, deadline) => seen,
+            message = editor.exited() => return Ok(CallToolResult::error(message)),
+        };
+        if let Some(answer) = call.found(ctx, &seen, true) {
+            return Ok(answer);
+        }
+        if std::time::Instant::now() >= deadline {
+            let note = if seen.iter().any(|e| e.not_ready) {
+                crate::tools::NOT_READY_NOTE
+            } else {
+                "No KiCad endpoint reported the board within timeout_seconds, and the PCB \
+                 editor started for it is still running. Beside another KiCad it serves its \
+                 own socket, api-<pid>.sock, which is looked for only on Unix."
+            };
+            return Ok(call.timed_out(&seen, true, note));
         }
     }
 }
@@ -2844,6 +3367,832 @@ mod kicad_launch_tests {
             serde_json::from_str::<Value>(&text).unwrap(),
             json!({"launched": true, "ipc_ready": true})
         );
+    }
+}
+
+/// `open_board` (#23). A `sh` script stands in for KiCad's PCB editor: it
+/// marks the board `.started` and runs until the test marks it `.done`.
+#[cfg(all(test, unix))]
+mod open_board_tests {
+    use super::{
+        handle_open_board, look_for_board, open_board, EndpointSeen, Looking, OpenBoardCall,
+    };
+    use crate::router::ToolRouter;
+    use crate::test_support::{resolved_dir, MockIpcServer};
+    use crate::tools::pcb_board::board_mock::{
+        board_document, spawn_kicad_holding_board, spawn_kicad_holding_board_refusing,
+    };
+    use crate::tools::{ServerConfig, ToolContext};
+    use crate::write_executable_script::write_executable_script;
+    use copperpour_ipc::gen::kiapi;
+    use serde_json::{json, Value};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// It writes the path it was given to `<board>.started`, a line per start,
+    /// and ends when the test marks the board done or removes it.
+    const EDITOR: &str = "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$1.started\"\n\
+                          while [ -e \"$1\" ] && [ ! -e \"$1.done\" ]; do sleep 0.05; done\n";
+
+    /// A board in a directory of its own, the KiCad install beside it: a
+    /// `kicad` to resolve and the PCB editor `script`.
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        board: PathBuf,
+        kicad: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(script: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = resolved_dir(dir.path());
+            let board = root.join("my board.kicad_pcb");
+            std::fs::write(&board, "(kicad_pcb)\n").unwrap();
+            let bin = root.join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let kicad = bin.join("kicad");
+            std::fs::write(&kicad, "").unwrap();
+            write_executable_script(&bin.join("pcbnew"), script);
+            Fixture {
+                _dir: dir,
+                board,
+                kicad,
+            }
+        }
+
+        fn ctx(&self, ipc_address: &str) -> ToolContext {
+            ToolContext::new(
+                ServerConfig {
+                    kicad_binary: self.kicad.display().to_string(),
+                    ipc_address: ipc_address.to_string(),
+                    ..ServerConfig::default()
+                },
+                Arc::new(ToolRouter::new()),
+            )
+        }
+
+        fn marker(&self, suffix: &str) -> PathBuf {
+            PathBuf::from(format!("{}.{suffix}", self.board.display()))
+        }
+
+        fn editor_started(&self) -> bool {
+            self.marker("started").exists()
+        }
+
+        /// How many editors were started on the board.
+        fn editors_started(&self) -> usize {
+            std::fs::read_to_string(self.marker("started"))
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        }
+
+        async fn open(&self, ctx: &ToolContext, arguments: Value) -> (bool, String) {
+            let mut args = json!({ "board": self.board });
+            args.as_object_mut()
+                .unwrap()
+                .extend(arguments.as_object().unwrap().clone());
+            let result = handle_open_board(&args, ctx).await.unwrap();
+            (result.is_error, text_of(&result))
+        }
+
+        fn rediscovering_ctx(&self) -> ToolContext {
+            let ctx = self.ctx("");
+            ctx.enable_ipc_rediscovery();
+            ctx
+        }
+
+        /// As the served tool does with rediscovery on, looking at
+        /// `addresses` instead of the sockets on this machine.
+        async fn open_at(&self, addresses: Vec<String>, arguments: Value) -> (bool, String) {
+            self.open_with(&self.rediscovering_ctx(), addresses, arguments)
+                .await
+        }
+
+        async fn open_with(
+            &self,
+            ctx: &ToolContext,
+            addresses: Vec<String>,
+            arguments: Value,
+        ) -> (bool, String) {
+            self.open_looking(ctx, move || addresses.clone(), arguments)
+                .await
+        }
+
+        /// As [`Self::open_with`], with the endpoints of each look from
+        /// `endpoints`.
+        async fn open_looking(
+            &self,
+            ctx: &ToolContext,
+            endpoints: impl Fn() -> Vec<String> + Send + Sync + 'static,
+            arguments: Value,
+        ) -> (bool, String) {
+            let mut args = json!({ "board": self.board });
+            args.as_object_mut()
+                .unwrap()
+                .extend(arguments.as_object().unwrap().clone());
+            let looking = Looking {
+                endpoints: Box::new(endpoints),
+                unreachable_editor: None,
+            };
+            let result = open_board(&args, ctx, looking).await.unwrap();
+            (result.is_error, text_of(&result))
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.marker("done"), "");
+        }
+    }
+
+    fn reply(
+        status: kiapi::common::ApiStatusCode,
+        error: &str,
+        message: Option<prost_types::Any>,
+    ) -> kiapi::common::ApiResponse {
+        kiapi::common::ApiResponse {
+            status: Some(kiapi::common::ApiResponseStatus {
+                status: status as i32,
+                error_message: error.to_string(),
+            }),
+            header: None,
+            message,
+        }
+    }
+
+    /// A KiCad Project Manager: it answers the Ping and has no handler for
+    /// `GetOpenDocuments`, as KiCad 10.0.6 answers on its `api.sock` (#87).
+    fn project_manager() -> MockIpcServer {
+        MockIpcServer::spawn("open-board-manager", |request| {
+            let command = request.message.expect("a command");
+            if command.type_url.ends_with("GetOpenDocuments") {
+                reply(
+                    kiapi::common::ApiStatusCode::AsUnhandled,
+                    "no handler available for request of type \
+                     kiapi.common.commands.GetOpenDocuments",
+                    None,
+                )
+            } else {
+                reply(kiapi::common::ApiStatusCode::AsOk, "", None)
+            }
+        })
+    }
+
+    /// A PCB editor holding `board`, at `address`.
+    fn editor_at(address: String, board: &Path) -> MockIpcServer {
+        let documents = vec![board_document(&board.to_string_lossy())];
+        MockIpcServer::spawn_at(address, move |request| {
+            let command = request.message.expect("a command");
+            let message = command.type_url.ends_with("GetOpenDocuments").then(|| {
+                copperpour_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetOpenDocumentsResponse {
+                        documents: documents.clone(),
+                    },
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                )
+            });
+            reply(kiapi::common::ApiStatusCode::AsOk, "", message)
+        })
+    }
+
+    fn unused_address(purpose: &str) -> String {
+        format!(
+            "inproc://copperpour-core-open-board-{}-{purpose}",
+            std::process::id()
+        )
+    }
+
+    fn body(text: &str) -> Value {
+        serde_json::from_str(text).unwrap_or_else(|_| panic!("not JSON: {text}"))
+    }
+
+    fn text_of(result: &crate::mcp::protocol::CallToolResult) -> String {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            other => panic!("not text: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_path_that_is_not_a_board_is_refused_before_anything_starts() {
+        let fixture = Fixture::new(EDITOR);
+        let ctx = fixture.ctx("");
+        let schematic = fixture.board.with_extension("kicad_sch");
+        std::fs::write(&schematic, "").unwrap();
+        let directory = fixture.board.with_file_name("folder.kicad_pcb");
+        std::fs::create_dir(&directory).unwrap();
+        let missing = fixture.board.with_file_name("missing.kicad_pcb");
+        for (path, kind) in [
+            (&schematic, "invalid_argument"),
+            (&directory, "invalid_argument"),
+            (&missing, "file_not_found"),
+        ] {
+            let result = handle_open_board(&json!({ "board": path }), &ctx)
+                .await
+                .unwrap();
+            assert!(result.is_error);
+            let text = text_of(&result);
+            assert_eq!(body(&text)["error"]["kind"], kind, "{text}");
+        }
+        assert!(!fixture.editor_started());
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_already_holding_the_board_is_used_and_no_editor_starts() {
+        let fixture = Fixture::new(EDITOR);
+        let kicad = spawn_kicad_holding_board(&fixture.board, |_| None);
+        let ctx = fixture.ctx(kicad.address());
+        let (is_error, text) = fixture.open(&ctx, json!({})).await;
+        assert!(!is_error, "{text}");
+        let answer = body(&text);
+        assert_eq!(answer["requested_open"], true, "{answer}");
+        assert_eq!(answer["launched"], false, "{answer}");
+        assert_eq!(answer["ipc_address"], kicad.address(), "{answer}");
+        assert!(!fixture.editor_started());
+        assert!(ctx.board_session.was_observed_live(&fixture.board));
+    }
+
+    /// An editor started now would serve a socket of its own, which a
+    /// configured address never follows.
+    #[tokio::test]
+    async fn a_configured_endpoint_answering_without_the_board_starts_no_editor() {
+        let fixture = Fixture::new(EDITOR);
+        let other = fixture.board.with_file_name("other.kicad_pcb");
+        std::fs::write(&other, "").unwrap();
+        let other_editor = spawn_kicad_holding_board(&other, |_| None);
+        let manager = project_manager();
+        for kicad in [&manager, &other_editor] {
+            let ctx = fixture.ctx(kicad.address());
+            let (is_error, text) = fixture.open(&ctx, json!({})).await;
+            assert!(is_error, "{text}");
+            let refusal = body(&text);
+            assert_eq!(refusal["error"]["kind"], "editor_unavailable", "{refusal}");
+            assert!(
+                refusal["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("answers without"),
+                "{refusal}"
+            );
+            assert!(!fixture.editor_started(), "{text}");
+        }
+    }
+
+    /// A configured endpoint other than KiCad's own socket is one no editor
+    /// started now would serve.
+    #[tokio::test]
+    async fn a_configured_endpoint_kicad_never_binds_starts_no_editor() {
+        let fixture = Fixture::new(EDITOR);
+        let ctx = fixture.ctx(&unused_address("configured-elsewhere"));
+        let (is_error, text) = fixture.open(&ctx, json!({})).await;
+        assert!(is_error, "{text}");
+        let refusal = body(&text);
+        assert_eq!(refusal["error"]["kind"], "editor_unavailable", "{refusal}");
+        assert!(
+            refusal["message"]
+                .as_str()
+                .unwrap()
+                .contains("is not the socket KiCad binds"),
+            "{refusal}"
+        );
+        assert!(!fixture.editor_started(), "{text}");
+    }
+
+    /// AS_NOT_READY is a KiCad behind a dialog or still loading, which may
+    /// hold the board.
+    #[tokio::test]
+    async fn a_kicad_that_is_not_ready_starts_no_editor() {
+        let fixture = Fixture::new(EDITOR);
+        let kicad = MockIpcServer::not_ready("open-board-not-ready");
+        let (is_error, text) = fixture
+            .open_at(
+                vec![kicad.address().to_string()],
+                json!({ "timeout_seconds": 1 }),
+            )
+            .await;
+        assert!(!is_error, "{text}");
+        let answer = body(&text);
+        assert_eq!(answer["timed_out"], true, "{answer}");
+        assert_eq!(answer["launched"], false, "{answer}");
+        assert_eq!(answer["note"], crate::tools::NOT_READY_NOTE, "{answer}");
+        assert!(!fixture.editor_started());
+    }
+
+    /// KiCad's lock with no endpoint reporting the board is a KiCad out of
+    /// reach holding it, or a lock left behind.
+    #[tokio::test]
+    async fn a_locked_board_no_endpoint_reports_starts_no_editor() {
+        let fixture = Fixture::new(EDITOR);
+        let lock = copperpour_sexp::writer::kicad_editor_lock_path(&fixture.board).unwrap();
+        std::fs::write(&lock, "").unwrap();
+        let (is_error, text) = fixture
+            .open_at(vec![unused_address("locked")], json!({}))
+            .await;
+        assert!(is_error, "{text}");
+        let refusal = body(&text);
+        assert_eq!(refusal["error"]["kind"], "conflict", "{refusal}");
+        assert_eq!(
+            refusal["error"]["paths"],
+            json!([lock.display().to_string()]),
+            "{refusal}"
+        );
+        assert!(!fixture.editor_started(), "{text}");
+    }
+
+    /// A lock that cannot be checked may be a KiCad's, so it refuses as one
+    /// that is present does.
+    #[test]
+    fn a_lock_that_cannot_be_checked_refuses_as_a_present_one() {
+        let board = Path::new("/boards/a.kicad_pcb");
+        let lock = copperpour_sexp::writer::kicad_editor_lock_path(board).unwrap();
+        let observed = crate::tools::live_board::editor_lock_with(board, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))
+        });
+        let refusal = call(board, "/boards/a.kicad_pcb")
+            .locked(&[], observed)
+            .expect("a lock that cannot be checked refuses");
+        assert!(refusal.is_error);
+        let refusal = body(&text_of(&refusal));
+        assert_eq!(refusal["error"]["kind"], "conflict", "{refusal}");
+        assert_eq!(
+            refusal["error"]["paths"],
+            json!([lock.display().to_string()]),
+            "{refusal}"
+        );
+        assert!(
+            refusal["message"]
+                .as_str()
+                .unwrap()
+                .contains("could not be checked (denied)"),
+            "{refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_started_editor_is_used_once_it_reports_the_board() {
+        let fixture = Fixture::new(EDITOR);
+        let address = unused_address("started-editor");
+        let started = fixture.marker("started");
+        let board = fixture.board.clone();
+        let editor = std::thread::spawn({
+            let address = address.clone();
+            move || {
+                let given_up = std::time::Instant::now() + Duration::from_secs(30);
+                while !started.exists() && std::time::Instant::now() < given_up {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                editor_at(address, &board)
+            }
+        });
+        let (is_error, text) = fixture
+            .open_at(vec![address.clone()], json!({ "timeout_seconds": 20 }))
+            .await;
+        drop(editor.join().unwrap());
+        assert!(!is_error, "{text}");
+        let answer = body(&text);
+        assert_eq!(answer["requested_open"], true, "{answer}");
+        assert_eq!(answer["launched"], true, "{answer}");
+        assert_eq!(answer["ipc_address"], address, "{answer}");
+        assert_eq!(answer["timed_out"], false, "{answer}");
+    }
+
+    #[tokio::test]
+    async fn an_editor_that_exits_during_startup_is_reported() {
+        let fixture = Fixture::new("#!/bin/sh\necho 'pcbnew: cannot open the board' >&2\nexit 3\n");
+        let (is_error, text) = fixture
+            .open_at(vec![unused_address("exits")], json!({}))
+            .await;
+        assert!(is_error, "{text}");
+        assert!(
+            text.starts_with("KiCad's PCB editor exited during startup")
+                && text.contains("pcbnew: cannot open the board"),
+            "{text}"
+        );
+    }
+
+    /// An editor that exits while a look waits on an endpoint is reported
+    /// then, with its stderr, not as a timeout at the deadline.
+    #[tokio::test]
+    async fn an_editor_that_exits_during_a_look_is_reported() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        // It outlives the first watch, so it exits during the look after it.
+        let fixture = Fixture::new(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$1.started\"\nsleep 1\n\
+             echo 'pcbnew: lost the display' >&2\nexit 3\n",
+        );
+        let answered = Arc::new(AtomicBool::new(false));
+        let slow = MockIpcServer::spawn("open-board-slow-look", {
+            let answered = Arc::clone(&answered);
+            move |_| {
+                std::thread::sleep(Duration::from_secs(4));
+                answered.store(true, Ordering::SeqCst);
+                reply(kiapi::common::ApiStatusCode::AsNotReady, "busy", None)
+            }
+        });
+        // Nothing answers before the editor starts; after, an endpoint
+        // answers only past the deadline.
+        let looks = AtomicUsize::new(0);
+        let before = unused_address("exits-during-a-look");
+        let after = slow.address().to_string();
+        let (is_error, text) = fixture
+            .open_looking(
+                &fixture.rediscovering_ctx(),
+                move || match looks.fetch_add(1, Ordering::SeqCst) {
+                    0 => vec![before.clone()],
+                    _ => vec![after.clone()],
+                },
+                json!({ "timeout_seconds": 3 }),
+            )
+            .await;
+        assert!(is_error, "{text}");
+        assert!(
+            text.starts_with("KiCad's PCB editor exited during startup")
+                && text.contains("pcbnew: lost the display"),
+            "{text}"
+        );
+        while !answered.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(slow);
+    }
+
+    #[tokio::test]
+    async fn no_endpoint_reporting_the_board_in_time_is_a_timeout_with_a_note() {
+        let fixture = Fixture::new(EDITOR);
+        let (is_error, text) = fixture
+            .open_at(
+                vec![unused_address("nobody")],
+                json!({ "timeout_seconds": 1 }),
+            )
+            .await;
+        assert!(!is_error, "{text}");
+        let answer = body(&text);
+        assert_eq!(answer["requested_open"], false, "{answer}");
+        assert_eq!(answer["launched"], true, "{answer}");
+        assert_eq!(answer["timed_out"], true, "{answer}");
+        assert!(answer["note"].as_str().unwrap().contains("api-<pid>.sock"));
+        assert!(fixture.editor_started());
+    }
+
+    /// A KiCad slower than the deadline may hold the board, so no editor is
+    /// started on it.
+    #[tokio::test]
+    async fn an_endpoint_slower_than_the_deadline_starts_no_editor() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fixture = Fixture::new(EDITOR);
+        let answered = Arc::new(AtomicBool::new(false));
+        let busy = MockIpcServer::spawn("open-board-busy", {
+            let answered = Arc::clone(&answered);
+            move |_| {
+                std::thread::sleep(Duration::from_secs(2));
+                answered.store(true, Ordering::SeqCst);
+                reply(kiapi::common::ApiStatusCode::AsNotReady, "busy", None)
+            }
+        });
+        let ctx = fixture.ctx(busy.address());
+        let (is_error, text) = fixture.open(&ctx, json!({ "timeout_seconds": 1 })).await;
+        assert!(!is_error, "{text}");
+        let answer = body(&text);
+        assert_eq!(answer["timed_out"], true, "{answer}");
+        assert_eq!(answer["launched"], false, "{answer}");
+        assert!(answer["note"].as_str().unwrap().contains("no clear answer"));
+        assert!(!fixture.editor_started());
+        // The look still waits on its Ping; a mock gone before it answers
+        // would hold the runtime's shutdown for the client's reply timeout.
+        while !answered.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(busy);
+    }
+
+    /// The endpoints are looked at together: one still answering at the
+    /// deadline does not keep the one holding the board from being found.
+    #[tokio::test]
+    async fn an_endpoint_still_answering_does_not_hide_the_holder() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fixture = Fixture::new(EDITOR);
+        let answered = Arc::new(AtomicBool::new(false));
+        let busy = MockIpcServer::spawn("open-board-slow", {
+            let answered = Arc::clone(&answered);
+            move |_| {
+                std::thread::sleep(Duration::from_secs(4));
+                answered.store(true, Ordering::SeqCst);
+                reply(kiapi::common::ApiStatusCode::AsNotReady, "busy", None)
+            }
+        });
+        let holder = spawn_kicad_holding_board(&fixture.board, |_| None);
+        let (is_error, text) = fixture
+            .open_at(
+                vec![busy.address().to_string(), holder.address().to_string()],
+                json!({ "timeout_seconds": 10 }),
+            )
+            .await;
+        assert!(!is_error, "{text}");
+        let answer = body(&text);
+        assert_eq!(answer["requested_open"], true, "{answer}");
+        assert_eq!(answer["ipc_address"], holder.address(), "{answer}");
+        assert_eq!(answer["endpoints"][0]["error"], "no answer yet", "{answer}");
+        // A poll after the holder answered, not the slow one's 4 s.
+        assert!(answer["elapsed_ms"].as_u64().unwrap() < 3000, "{answer}");
+        assert!(!fixture.editor_started());
+        while !answered.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(busy);
+    }
+
+    /// A Ping answered with an error status, as a timed-out or malformed
+    /// reply, is no answer about the board: no editor is started.
+    #[tokio::test]
+    async fn a_ping_answered_with_an_error_starts_no_editor() {
+        let fixture = Fixture::new(EDITOR);
+        let kicad = MockIpcServer::spawn("open-board-busy-ping", |_| {
+            reply(kiapi::common::ApiStatusCode::AsBusy, "busy", None)
+        });
+        let (is_error, text) = fixture
+            .open_at(
+                vec![kicad.address().to_string()],
+                json!({ "timeout_seconds": 1 }),
+            )
+            .await;
+        assert!(!is_error, "{text}");
+        let answer = body(&text);
+        assert_eq!(answer["timed_out"], true, "{answer}");
+        assert_eq!(answer["launched"], false, "{answer}");
+        assert!(answer["note"].as_str().unwrap().contains("no clear answer"));
+        assert!(!fixture.editor_started());
+    }
+
+    /// An open-document list that does not parse is no answer either.
+    #[tokio::test]
+    async fn a_document_list_that_does_not_parse_starts_no_editor() {
+        let fixture = Fixture::new(EDITOR);
+        let kicad = MockIpcServer::spawn("open-board-garbled", |request| {
+            let command = request.message.expect("a command");
+            let message =
+                command
+                    .type_url
+                    .ends_with("GetOpenDocuments")
+                    .then(|| prost_types::Any {
+                        type_url: "type.googleapis.com/kiapi.common.commands.Unknown".to_string(),
+                        value: vec![1, 2, 3],
+                    });
+            reply(kiapi::common::ApiStatusCode::AsOk, "", message)
+        });
+        let (is_error, text) = fixture
+            .open_at(
+                vec![kicad.address().to_string()],
+                json!({ "timeout_seconds": 1 }),
+            )
+            .await;
+        assert!(!is_error, "{text}");
+        let answer = body(&text);
+        assert_eq!(answer["timed_out"], true, "{answer}");
+        assert_eq!(answer["launched"], false, "{answer}");
+        assert!(!fixture.editor_started());
+    }
+
+    /// The editor gets the resolved path, as the lock checks resolve it.
+    #[tokio::test]
+    async fn the_editor_is_given_the_resolved_path() {
+        let fixture = Fixture::new(EDITOR);
+        let spelled = fixture
+            .board
+            .parent()
+            .unwrap()
+            .join("bin")
+            .join("..")
+            .join(fixture.board.file_name().unwrap());
+        let (_, text) = fixture
+            .open_at(
+                vec![unused_address("resolved")],
+                json!({ "board": spelled, "timeout_seconds": 1 }),
+            )
+            .await;
+        let given = std::fs::read_to_string(fixture.marker("started")).unwrap();
+        assert_eq!(
+            given.trim_end(),
+            fixture.board.display().to_string(),
+            "{text}"
+        );
+    }
+
+    /// The board in the list is not enough to use an endpoint: a read of it
+    /// must succeed too. Nor is it nothing: KiCad has the board, so no second
+    /// editor is started while the read is refused, as during a zone refill.
+    #[tokio::test]
+    async fn an_endpoint_listing_the_board_but_serving_no_read_starts_no_editor() {
+        let fixture = Fixture::new(EDITOR);
+        let kicad = spawn_kicad_holding_board_refusing(
+            &fixture.board,
+            vec![kiapi::common::types::KiCadObjectType::KotPcbDimension],
+            |_| None,
+        );
+        let board = fixture.board.clone();
+        let address = kicad.address().to_string();
+        let seen = tokio::task::spawn_blocking(move || look_for_board(&board, &address))
+            .await
+            .unwrap();
+        assert!(seen.responsive && seen.listed && !seen.holds_board);
+        assert!(seen.undecided());
+
+        let (is_error, text) = fixture
+            .open_at(
+                vec![kicad.address().to_string()],
+                json!({ "timeout_seconds": 1 }),
+            )
+            .await;
+        assert!(!is_error, "{text}");
+        let answer = body(&text);
+        assert_eq!(answer["timed_out"], true, "{answer}");
+        assert_eq!(answer["launched"], false, "{answer}");
+        assert!(answer["note"].as_str().unwrap().contains("lists the board"));
+        assert!(!fixture.editor_started());
+    }
+
+    /// Two calls at once: the second waits for the first, then finds the
+    /// editor it started, so only one is started.
+    #[tokio::test]
+    async fn two_calls_at_once_start_one_editor() {
+        let fixture = Fixture::new(EDITOR);
+        let address = unused_address("two-calls");
+        let started = fixture.marker("started");
+        let board = fixture.board.clone();
+        let editor = std::thread::spawn({
+            let address = address.clone();
+            move || {
+                let given_up = std::time::Instant::now() + Duration::from_secs(30);
+                while !started.exists() && std::time::Instant::now() < given_up {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                editor_at(address, &board)
+            }
+        });
+        let ctx = fixture.rediscovering_ctx();
+        let arguments = json!({ "timeout_seconds": 20 });
+        let (first, second) = tokio::join!(
+            fixture.open_with(&ctx, vec![address.clone()], arguments.clone()),
+            fixture.open_with(&ctx, vec![address.clone()], arguments.clone()),
+        );
+        drop(editor.join().unwrap());
+        let launched: Vec<bool> = [first, second]
+            .iter()
+            .map(|(is_error, text)| {
+                assert!(!is_error, "{text}");
+                let answer = body(text);
+                assert_eq!(answer["requested_open"], true, "{answer}");
+                answer["launched"].as_bool().unwrap()
+            })
+            .collect();
+        assert_eq!(launched.iter().filter(|launched| **launched).count(), 1);
+        assert_eq!(fixture.editors_started(), 1);
+    }
+
+    /// KiCad's own socket, however the configuration spells it, is one an
+    /// editor started now would serve.
+    #[test]
+    fn a_configured_kicad_socket_is_known_however_it_is_spelled() {
+        let default = copperpour_ipc::candidate_socket_paths()[0].clone();
+        let spelled = format!("ipc://{}", default.display()).replacen("/kicad/", "//kicad/", 1);
+        let configured = |address: &str| {
+            ToolContext::new(
+                ServerConfig {
+                    ipc_address: address.to_string(),
+                    ..ServerConfig::default()
+                },
+                Arc::new(ToolRouter::new()),
+            )
+        };
+        assert!(Looking::for_context(&configured(&spelled))
+            .unreachable_editor
+            .is_none());
+        assert!(
+            Looking::for_context(&configured("ipc:///elsewhere/api.sock"))
+                .unreachable_editor
+                .is_some()
+        );
+    }
+
+    /// Through the served dispatch, as a client calls it.
+    #[tokio::test]
+    async fn the_served_tool_uses_an_endpoint_holding_the_board() {
+        let fixture = Fixture::new(EDITOR);
+        let kicad = spawn_kicad_holding_board(&fixture.board, |_| None);
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_binary: fixture.kicad.display().to_string(),
+            ipc_address: kicad.address().to_string(),
+            auto_load_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        let result = handler
+            .handle_message(json!({"jsonrpc":"2.0", "id":23, "method":"tools/call",
+                "params":{"name":"open_board","arguments":{"board": fixture.board}}}))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_ne!(result["isError"], true, "{result}");
+        let answer = body(result["content"][0]["text"].as_str().unwrap());
+        assert_eq!(answer["requested_open"], true, "{answer}");
+        assert_eq!(answer["launched"], false, "{answer}");
+        assert!(!fixture.editor_started());
+    }
+
+    fn call<'a>(board: &'a Path, shown: &'a str) -> OpenBoardCall<'a> {
+        OpenBoardCall {
+            board,
+            shown,
+            timeout_seconds: 30,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn selected(ctx: &ToolContext) -> Option<String> {
+        ctx.selected_ipc_endpoint.lock().unwrap().clone()
+    }
+
+    /// The Project Manager and an editor holding another board both answer
+    /// the Ping, which is all detection can tell them apart by; the board
+    /// each reports is what chooses.
+    #[tokio::test]
+    async fn the_endpoint_holding_the_board_is_chosen_among_those_that_answer() {
+        let fixture = Fixture::new(EDITOR);
+        let other = fixture.board.with_file_name("other.kicad_pcb");
+        std::fs::write(&other, "").unwrap();
+        let manager = project_manager();
+        let other_editor = spawn_kicad_holding_board(&other, |_| None);
+        let holder = spawn_kicad_holding_board(&fixture.board, |_| None);
+        let board = fixture.board.clone();
+        let addresses: Vec<String> = [&manager, &other_editor, &holder]
+            .iter()
+            .map(|kicad| kicad.address().to_string())
+            .collect();
+        let seen: Vec<EndpointSeen> = tokio::task::spawn_blocking(move || {
+            addresses
+                .iter()
+                .map(|address| look_for_board(&board, address))
+                .collect()
+        })
+        .await
+        .unwrap();
+        assert!(seen[0].responsive && !seen[0].holds_board);
+        assert!(seen[0].error.as_deref().unwrap().contains("AS_UNHANDLED"));
+        assert!(seen[1].responsive && !seen[1].holds_board);
+        assert!(seen[2].holds_board);
+
+        let ctx = fixture.ctx("");
+        ctx.enable_ipc_rediscovery();
+        let shown = fixture.board.display().to_string();
+        let answer = call(&fixture.board, &shown)
+            .found(&ctx, &seen, false)
+            .unwrap();
+        let answer = body(&text_of(&answer));
+        assert_eq!(answer["ipc_address"], holder.address(), "{answer}");
+        assert_eq!(answer["endpoints"].as_array().unwrap().len(), 3);
+        assert_eq!(selected(&ctx).as_deref(), Some(holder.address()));
+    }
+
+    #[test]
+    fn two_endpoints_holding_the_board_choose_neither() {
+        let board = Path::new("/boards/a.kicad_pcb");
+        let holder = |address: &str| EndpointSeen {
+            address: address.to_string(),
+            holds_board: true,
+            listed: true,
+            responsive: true,
+            not_ready: false,
+            unsure: false,
+            answered: true,
+            error: None,
+        };
+        let seen = [holder("ipc:///k/api.sock"), holder("ipc:///k/api-42.sock")];
+        let ctx = ToolContext::new(ServerConfig::default(), Arc::new(ToolRouter::new()));
+        ctx.enable_ipc_rediscovery();
+        let answer = call(board, "/boards/a.kicad_pcb")
+            .found(&ctx, &seen, true)
+            .unwrap();
+        assert!(answer.is_error);
+        let refusal = body(&text_of(&answer));
+        assert_eq!(refusal["error"]["kind"], "ambiguous_target", "{refusal}");
+        assert_eq!(
+            refusal["error"]["target"], "/boards/a.kicad_pcb",
+            "{refusal}"
+        );
+        assert_eq!(
+            refusal["error"]["candidates"],
+            json!(["ipc:///k/api.sock", "ipc:///k/api-42.sock"]),
+            "{refusal}"
+        );
+        assert_eq!(selected(&ctx), None);
     }
 }
 
