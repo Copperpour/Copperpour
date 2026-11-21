@@ -142,7 +142,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// How long closing the socket and joining the worker may take.
     const PROMPT_RELEASE: Duration = Duration::from_secs(1);
@@ -162,9 +162,26 @@ mod tests {
         );
     }
 
-    /// Under `PROMPT_RELEASE` and the failure test's 1 s client timeout, so a
-    /// joining guard and a panicked worker both set the flag in time.
+    /// Under `PROMPT_RELEASE`, so a joining guard sets the flag in time.
     const WORKER_EXIT_PAUSE: Duration = Duration::from_millis(200);
+
+    /// How long `responder_failure_still_releases_the_endpoint` waits for a
+    /// panicked worker to finish unwinding after the client's receive times out.
+    const WORKER_EXIT_WAIT: Duration = Duration::from_secs(5);
+
+    /// Polls `exited` until it turns `true` or `timeout` elapses.
+    fn wait_for_exit(exited: &AtomicBool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if exited.load(Ordering::SeqCst) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     /// Moved into a responder, so the worker drops it only as it exits. The
     /// pause keeps the flag clear for a guard that detaches the worker instead
@@ -311,7 +328,7 @@ mod tests {
         let address = server.address().to_string();
         let socket = nng::Socket::new(nng::Protocol::Req0).expect("mock client socket");
         socket
-            .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(1)))
+            .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_millis(100)))
             .expect("client timeout");
         socket.dial(server.address()).expect("server is ready");
         let request = kiapi::common::ApiRequest {
@@ -323,10 +340,13 @@ mod tests {
             .expect("request");
         assert!(socket.recv().is_err(), "failed responder must not reply");
         // The panic ends the worker on its own, before the guard is dropped;
-        // only the endpoint check below depends on `Drop` here.
+        // only the endpoint check below depends on `Drop` here. Wait with a
+        // deadline because `socket.recv()` returns on the client's
+        // `RecvTimeout`, which can fire before the worker finishes unwinding
+        // and dropping `WorkerExit` (#727).
         assert!(
-            exited.load(Ordering::SeqCst),
-            "the failed worker must have exited"
+            wait_for_exit(&exited, WORKER_EXIT_WAIT),
+            "the failed worker must have exited within {WORKER_EXIT_WAIT:?}"
         );
         drop(socket);
         drop_promptly(server);
@@ -350,5 +370,29 @@ mod tests {
                 .listen(&address)
                 .expect("each fixture lifecycle releases its endpoint");
         }
+    }
+
+    #[test]
+    fn wait_for_exit_observes_delayed_flag() {
+        let exited = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&exited);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            setter.store(true, Ordering::SeqCst);
+        });
+        assert!(
+            wait_for_exit(&exited, Duration::from_secs(2)),
+            "wait_for_exit must wait for a flag set before the deadline"
+        );
+        handle.join().expect("setter thread");
+    }
+
+    #[test]
+    fn wait_for_exit_times_out_when_flag_never_sets() {
+        let exited = AtomicBool::new(false);
+        assert!(
+            !wait_for_exit(&exited, Duration::from_millis(30)),
+            "wait_for_exit must return false once the deadline expires"
+        );
     }
 }
