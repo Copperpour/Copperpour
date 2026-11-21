@@ -24,10 +24,10 @@ const SUPPORTED_ATTRIBUTES: &[&str] = &[
 pub(super) fn tool() -> ToolDef {
     tool!(
         "set_footprint_metadata",
-        "Atomically replace a footprint's description, tags, supported attributes, or its own \
-         solder mask and paste margins while preserving pads, graphics, properties, groups, \
-         and models. Reports each changed field's previous and current value, and warns when \
-         attributes drop the footprint type (smd/through_hole) or an attribute it does not \
+        "Atomically replace a footprint's description, tags, supported attributes, Value text, \
+         or its own solder mask and paste margins while preserving pads, graphics, properties, \
+         groups, and models. Reports each changed field's previous and current value, and warns \
+         when attributes drop the footprint type (smd/through_hole) or an attribute it does not \
          accept.",
         json!({
             "type": "object",
@@ -53,6 +53,10 @@ pub(super) fn tool() -> ToolDef {
                         "enum": SUPPORTED_ATTRIBUTES
                     }
                 },
+                "value": {
+                    "type": "string",
+                    "description": "Replacement text of the footprint's Value field. Only the text changes; its position, layer, effects and UUID are kept. A footprint without a Value is refused"
+                },
                 "solder_mask_margin": Margin::Mask.schema("footprint"),
                 "solder_paste_margin": Margin::Paste.schema("footprint"),
                 "solder_paste_margin_ratio": Margin::PasteRatio.schema("footprint")
@@ -69,6 +73,8 @@ struct MetadataUpdate {
     description: Option<String>,
     tags: Option<Vec<String>>,
     attributes: Option<Vec<String>>,
+    /// The Value field's new text.
+    value: Option<String>,
     /// The footprint's own margins to set, in KiCad's order.
     margins: Vec<(Margin, Setting)>,
 }
@@ -175,12 +181,18 @@ fn parse_update(args: &serde_json::Value) -> Result<MetadataUpdate, MetadataErro
             ));
         }
     }
+    let value = optional_string(args, "value")?;
     let margins = solder_margins::requested(args)
         .map_err(|refusal| invalid(refusal.field, refusal.reason))?;
-    if description.is_none() && tags.is_none() && attributes.is_none() && margins.is_empty() {
+    if description.is_none()
+        && tags.is_none()
+        && attributes.is_none()
+        && value.is_none()
+        && margins.is_empty()
+    {
         return Err(invalid(
             "metadata",
-            "at least one of description, tags, attributes, solder_mask_margin, \
+            "at least one of description, tags, attributes, value, solder_mask_margin, \
              solder_paste_margin or solder_paste_margin_ratio must be supplied",
         ));
     }
@@ -188,6 +200,7 @@ fn parse_update(args: &serde_json::Value) -> Result<MetadataUpdate, MetadataErro
         description,
         tags,
         attributes,
+        value,
         margins,
     })
 }
@@ -316,6 +329,21 @@ fn prepare_mutation(
         &mut insertions,
         &mut changed_fields,
     )?;
+    // Only the Value's text is replaced, as KiCad's `FOOTPRINT::SetValue`
+    // changes only the field's text (#713); the field is never created.
+    if let Some(value) = &update.value {
+        let Some((span, text)) = super::footprint_rename::value_span(source) else {
+            return Err(invalid(
+                "value",
+                "the footprint has no Value field ((property \"Value\" …) or (fp_text value …)) \
+                 to change",
+            ));
+        };
+        if &text != value {
+            edits.push(SexpEdit::replace(span.0, span.1, quote_string(value)));
+            changed_fields.push("value");
+        }
+    }
 
     if !insertions.is_empty() {
         let root_end = find_balanced_block(source, 0)
@@ -345,7 +373,10 @@ fn prepare_mutation(
     }
 
     // Both sides read the same way, `current` off the replacement itself.
-    let (before, after) = (metadata_values(&root), metadata_values(&parsed));
+    let (before, after) = (
+        metadata_values(&root, source),
+        metadata_values(&parsed, &replacement),
+    );
     let mut changes = serde_json::Map::new();
     for (field, previous, current) in [
         (
@@ -359,6 +390,7 @@ fn prepare_mutation(
             json!(before.attributes),
             json!(after.attributes),
         ),
+        ("value", json!(before.value), json!(after.value)),
     ] {
         if changed_fields.contains(&field) {
             changes.insert(
@@ -405,9 +437,10 @@ struct MetadataValues {
     description: Option<String>,
     tags: Vec<String>,
     attributes: Vec<String>,
+    value: Option<String>,
 }
 
-fn metadata_values(root: &copperpour_sexp::SexpNode) -> MetadataValues {
+fn metadata_values(root: &copperpour_sexp::SexpNode, source: &str) -> MetadataValues {
     let words = |tag: &str| -> Vec<String> {
         root.find(tag)
             .and_then(|node| node.children())
@@ -429,6 +462,7 @@ fn metadata_values(root: &copperpour_sexp::SexpNode) -> MetadataValues {
             .map(str::to_string)
             .collect(),
         attributes: words("attr"),
+        value: super::footprint_rename::value_span(source).map(|(_, text)| text),
     }
 }
 
@@ -1182,6 +1216,98 @@ mod tests {
             assert_eq!(body["error"]["field"], field, "{body}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), BARE_FOOTPRINT);
         }
+    }
+
+    // KiCad 10.0.8 wrote both from the stock Hirose FH12-24S; the second is the
+    // first after `SetValue( "FH12-24S" )`. Provenance in
+    // tests/fixtures/rename_footprint_kicad10.README.md.
+    const VALUE_SOURCE: &str = "rename_footprint_source_kicad10.kicad_mod";
+    const VALUE_SET: &str =
+        include_str!("../../tests/fixtures/rename_footprint_kept_source_kicad10.kicad_mod");
+
+    #[tokio::test]
+    async fn a_value_is_written_as_kicad_sets_it() {
+        let (body, written) = served(VALUE_SOURCE, json!({ "value": "FH12-24S" })).await;
+        assert_eq!(
+            without_uuids(&written),
+            without_uuids(VALUE_SET),
+            "only the Value's text changes, as KiCad's SetValue changes it"
+        );
+        assert_eq!(body["changed_fields"], json!(["value"]));
+        assert_eq!(
+            body["changes"],
+            json!({
+                "value": {
+                    "previous": "Hirose_FH12-24S-0.5SH_1x24-1MP_P0.50mm_Horizontal",
+                    "current": "FH12-24S"
+                }
+            })
+        );
+        assert_eq!(body["warnings"], json!([]));
+    }
+
+    #[test]
+    fn an_older_fp_text_value_is_replaced_in_place() {
+        let source = METADATA_FOOTPRINT.replace(
+            "  (fp_line",
+            "  (fp_text value \"Socket\" (at 0 2) (layer \"F.Fab\"))\n  (fp_line",
+        );
+        let update =
+            parse_update(&json!({ "value": "Socket \"2\"", "description": "new" })).unwrap();
+        let prepared = prepare_mutation(&source, &update).unwrap();
+        assert_eq!(
+            prepared.replacement,
+            source
+                .replace("(descr \"old description\")", "(descr \"new\")")
+                .replace(
+                    "(fp_text value \"Socket\"",
+                    "(fp_text value \"Socket \\\"2\\\"\""
+                ),
+            "the text is escaped, and nothing else of the field changes"
+        );
+        assert_eq!(prepared.changed_fields, vec!["description", "value"]);
+        assert_eq!(
+            prepared.changes["value"],
+            json!({ "previous": "Socket", "current": "Socket \"2\"" })
+        );
+    }
+
+    #[test]
+    fn an_unchanged_value_is_not_reported() {
+        let source =
+            include_str!("../../tests/fixtures/rename_footprint_kept_source_kicad10.kicad_mod");
+        let update = parse_update(&json!({ "value": "FH12-24S" })).unwrap();
+        let prepared = prepare_mutation(source, &update).unwrap();
+        assert_eq!(prepared.replacement, source);
+        assert!(prepared.changed_fields.is_empty());
+        assert!(prepared.changes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_footprint_without_a_value_is_refused_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Socket.kicad_mod");
+        std::fs::write(&path, BARE_FOOTPRINT).unwrap();
+        let result = handle_set_footprint_metadata(
+            &json!({ "footprint_path": path, "value": "Socket", "description": "kept out" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let body: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "value", "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), BARE_FOOTPRINT);
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_string_is_refused_on_its_argument() {
+        for value in [json!(5), json!(null), json!(["FH12"])] {
+            let error = parse_update(&json!({ "value": value })).unwrap_err();
+            assert_eq!(error.field, "value");
+        }
+        assert_eq!(tool().input_schema["properties"]["value"]["type"], "string");
     }
 
     use solder_margins::without_uuids;

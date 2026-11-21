@@ -26,6 +26,10 @@ old name. Nothing was edited by hand.
 | `rename_footprint_kept_source_kicad10.kicad_mod` | `…_source_kicad10` | Value set to `FH12-24S` | `172a598dcf1e3fce` |
 | `rename_footprint_kept_kicad10.kicad_mod` | `…_kept_source_kicad10` | renamed to `FFC_Hirose_FH12-24S_Renamed` | `adab432ed7d7d22a` |
 
+`set_footprint_metadata`'s `value` test (#713) uses the first and third: the
+third is the first after KiCad's `SetValue( "FH12-24S" )`, so setting that Value
+must give it back, UUIDs masked.
+
 ## What they show
 
 - A rename changes the name in the footprint's header, and the Value when it

@@ -351,8 +351,8 @@ fn renamed_source(source: &str, old_name: &str, new_name: &str) -> Result<Rename
 }
 
 /// The span and text of the footprint's Value: `(property "Value" "…")`, or
-/// `(fp_text value "…")` in an older file.
-fn value_span(source: &str) -> Option<((usize, usize), String)> {
+/// `(fp_text value "…")` in an older file. Shared with `set_footprint_metadata`.
+pub(super) fn value_span(source: &str) -> Option<((usize, usize), String)> {
     for (start, end) in find_direct_child_blocks(source, "footprint") {
         let Ok(node) = parse_sexp(&source[start..end]) else {
             continue;
