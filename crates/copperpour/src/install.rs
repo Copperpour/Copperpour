@@ -4590,24 +4590,35 @@ mod tests {
         simulate_previous_install(InstallClient::Claude, &paths, "0.15.0", &[], None);
         // Re-home the install onto a binary named like a real one, so the
         // server below recognises its hooks as Copperpour's.
-        let installer = temp
-            .path()
-            .join("a/copperpour")
-            .to_string_lossy()
-            .into_owned();
+        let installer = temp.path().join("a").join("copperpour");
+        let installer = installer.to_string_lossy().into_owned();
         let settings_path = paths.claude_settings_path();
-        let rehome = |text: String| {
-            text.replace(
-                &quote_command_arg(&this_exe()),
-                &quote_command_arg(&installer),
-            )
-        };
-        let before = rehome(fs::read_to_string(&settings_path).unwrap());
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        for hook in HOOK_SKILLS {
+            let ours = hook_command(&this_exe(), "hook", hook.name);
+            for entry in settings["hooks"][hook.event].as_array_mut().unwrap() {
+                for handler in entry["hooks"].as_array_mut().unwrap() {
+                    if handler["command"].as_str() == Some(ours.as_str()) {
+                        handler["command"] = hook_command(&installer, "hook", hook.name).into();
+                    }
+                }
+            }
+        }
+        let before = serde_json::to_string_pretty(&settings).unwrap();
         fs::write(&settings_path, &before).unwrap();
-        let manifest_path = paths.installed_manifest(InstallClient::Claude);
-        let manifest = rehome(fs::read_to_string(&manifest_path).unwrap());
-        assert!(manifest.contains("a/copperpour"), "{manifest}");
-        fs::write(&manifest_path, manifest).unwrap();
+        let client = InstallClient::Claude;
+        let mut manifest =
+            read_installed_manifest(client, &paths, read_marker(client, &paths).as_ref()).unwrap();
+        for (name, recorded) in &mut manifest.hooks {
+            recorded.command = hook_command(&installer, "hook", name);
+        }
+        write_installed_manifest(client, &paths, &manifest).unwrap();
+        assert_eq!(
+            inspect_guidance(client, &paths, &installer).state(),
+            GuidanceState::Current,
+            "re-homed install is current for its own binary"
+        );
 
         let other_exe = temp.path().join("b/copperpour");
         let probe =
