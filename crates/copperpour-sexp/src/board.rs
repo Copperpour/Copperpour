@@ -1925,6 +1925,161 @@ fn index_into(node: &SexpNode, owner: &ItemOwner, out: &mut HashMap<String, Uuid
     }
 }
 
+// ─── Edge-mounted footprints (#144) ──────────────────────────────────────────
+
+/// One footprint with at least one pad or drill hole on, or crossing, an edge
+/// of an axis-aligned rectangular board outline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeMountedFootprint {
+    /// The reference designator (`property "Reference"`, or legacy
+    /// `fp_text reference`); `None` when the footprint carries neither.
+    pub reference: Option<String>,
+    /// Footprint anchor `(x, y)` in board coordinates, matching
+    /// [`FootprintCourtyard::at`].
+    pub at: (f64, f64),
+    /// Footprint root rotation in degrees, matching
+    /// [`FootprintCourtyard::rotation_deg`].
+    pub rotation_deg: f64,
+    /// Board side, matching [`FootprintCourtyard::layer_side`].
+    pub layer_side: Side,
+    /// Number of pads or drill holes touching or crossing the outline boundary.
+    pub edge_pads: usize,
+}
+
+/// Footprints that have at least one pad or drill hole on, or crossing, an
+/// edge of the axis-aligned rectangular `outline` `(min_x, min_y, max_x, max_y)`,
+/// within [`OUTLINE_CHAINING_EPSILON_MM`].
+///
+/// Covers electrical pads (`smd`, `thru_hole`, `connect`) and non-plated holes
+/// (`np_thru_hole`), including circular and oval drills. Unreadable pads or
+/// drills are skipped (fail-closed) rather than guessed.
+pub fn footprints_with_pad_on_outline(
+    tree: &SexpNode,
+    outline: (f64, f64, f64, f64),
+) -> Vec<EdgeMountedFootprint> {
+    let (ox0, oy0, ox1, oy1) = outline;
+    if !(ox0.is_finite()
+        && oy0.is_finite()
+        && ox1.is_finite()
+        && oy1.is_finite()
+        && ox0 < ox1
+        && oy0 < oy1)
+    {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for fp in footprints(tree) {
+        let Some((fx, fy, rot)) = footprint_root_at(fp) else {
+            continue;
+        };
+        let Some(layer_side) = footprint_side(fp) else {
+            continue;
+        };
+        let mut edge_pads = 0usize;
+        for pad in fp.find_all("pad") {
+            let Some(pad_box) = crate::bounds::pad_bbox(pad, fx, fy, rot) else {
+                continue;
+            };
+            let Some(drill_box) = pad_drill_bbox(pad, fx, fy, rot) else {
+                continue;
+            };
+            let combined = match drill_box {
+                Some(db) => merge_bbox(Some(pad_box), db),
+                None => pad_box,
+            };
+            if box_meets_rect_perimeter(combined, outline, OUTLINE_CHAINING_EPSILON_MM) {
+                edge_pads += 1;
+            }
+        }
+        if edge_pads > 0 {
+            out.push(EdgeMountedFootprint {
+                reference: footprint_reference(fp),
+                at: (fx, fy),
+                rotation_deg: rot,
+                layer_side,
+                edge_pads,
+            });
+        }
+    }
+    out
+}
+
+/// Board-space bbox of a pad's `(drill …)` hole, if it carries one.
+///
+/// Returns `Some(None)` when the pad has no hole (either no `(drill …)` child
+/// or an offset-only `(drill (offset dx dy))` on an SMD pad, which KiCad uses
+/// for pad-shape offsets on castellated modules), `Some(Some(bb))` when the
+/// drill parses cleanly, and `None` when a present `(drill …)` or `(at …)` is
+/// malformed. A drill is always centred on the pad's `(at …)`; `(offset …)`
+/// shifts the copper pad (handled by [`crate::bounds::pad_bbox`]), not the
+/// hole.
+fn pad_drill_bbox(
+    pad: &SexpNode,
+    fx: f64,
+    fy: f64,
+    footprint_rot: f64,
+) -> Option<Option<(f64, f64, f64, f64)>> {
+    let Some(drill) = pad.find("drill") else {
+        return Some(None);
+    };
+    if drill.get(1).and_then(SexpNode::head) == Some("offset") {
+        // Offset-only `(drill (offset dx dy))` on an SMD pad (no hole;
+        // `bounds::pad_bbox` already validated `(offset dx dy)`). Reject
+        // unexpected trailing tokens.
+        return (drill.children().map(<[_]>::len) == Some(2)).then_some(None);
+    }
+    let at = pad.find("at")?;
+    let (px, py) = (at.get_f64(1)?, at.get_f64(2)?);
+    let angle = match at.get(3) {
+        None => 0.0,
+        Some(value) => value.as_str()?.parse::<f64>().ok()?,
+    };
+    if !(px.is_finite() && py.is_finite() && angle.is_finite()) {
+        return None;
+    }
+    let (cx, cy) = crate::geometry::transform_pad(px, py, fx, fy, footprint_rot);
+    if drill.get(1).and_then(SexpNode::as_str) == Some("oval") {
+        let (w, h) = (drill.get_f64(2)?, drill.get_f64(3)?);
+        if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
+            return None;
+        }
+        let r = w.min(h) / 2.0;
+        let (a, b) = if w >= h {
+            ((-(w / 2.0 - r), 0.0), (w / 2.0 - r, 0.0))
+        } else {
+            ((0.0, -(h / 2.0 - r)), (0.0, h / 2.0 - r))
+        };
+        let p1 = crate::geometry::transform_pad(a.0, a.1, cx, cy, angle);
+        let p2 = crate::geometry::transform_pad(b.0, b.1, cx, cy, angle);
+        let b1 = (p1.0 - r, p1.1 - r, p1.0 + r, p1.1 + r);
+        let b2 = (p2.0 - r, p2.1 - r, p2.0 + r, p2.1 + r);
+        Some(Some(merge_bbox(Some(b1), b2)))
+    } else {
+        let d = drill.get_f64(1)?;
+        if !(d.is_finite() && d > 0.0) {
+            return None;
+        }
+        let r = d / 2.0;
+        Some(Some((cx - r, cy - r, cx + r, cy + r)))
+    }
+}
+
+/// Whether axis-aligned box `(px0, py0, px1, py1)` touches or crosses any of
+/// the four edge segments of rectangle `(ox0, oy0, ox1, oy1)` within `eps`.
+fn box_meets_rect_perimeter(
+    (px0, py0, px1, py1): (f64, f64, f64, f64),
+    (ox0, oy0, ox1, oy1): (f64, f64, f64, f64),
+    eps: f64,
+) -> bool {
+    let spans_y = py0 <= oy1 + eps && py1 >= oy0 - eps;
+    let spans_x = px0 <= ox1 + eps && px1 >= ox0 - eps;
+    let hits_left = px0 <= ox0 + eps && px1 >= ox0 - eps && spans_y;
+    let hits_right = px0 <= ox1 + eps && px1 >= ox1 - eps && spans_y;
+    let hits_top = py0 <= oy0 + eps && py1 >= oy0 - eps && spans_x;
+    let hits_bottom = py0 <= oy1 + eps && py1 >= oy1 - eps && spans_x;
+    hits_left || hits_right || hits_top || hits_bottom
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2903,6 +3058,90 @@ mod tests {
             })
             .unwrap(),
             serde_json::json!({ "kind": "footprint" })
+        );
+    }
+
+    #[test]
+    fn footprints_with_pad_on_outline_distinguishes_edge_interior_exterior_and_collinear() {
+        let board = "(kicad_pcb\n\
+            \t(version 20260206)\n\
+            \t(footprint \"edge_oval_drill\"\n\
+            \t\t(layer \"F.Cu\")\n\
+            \t\t(at 0.9 20 35)\n\
+            \t\t(property \"Reference\" \"E1\")\n\
+            \t\t(pad \"1\" thru_hole oval\n\
+            \t\t\t(at 0 0 35)\n\
+            \t\t\t(size 1.0 0.8)\n\
+            \t\t\t(drill oval 2.2 0.6)\n\
+            \t\t)\n\
+            \t)\n\
+            \t(footprint \"smd_offset_only_drill\"\n\
+            \t\t(layer \"F.Cu\")\n\
+            \t\t(at 1.0 30 0)\n\
+            \t\t(property \"Reference\" \"M1\")\n\
+            \t\t(pad \"1\" smd rect\n\
+            \t\t\t(at 0 0)\n\
+            \t\t\t(size 1.0 0.8)\n\
+            \t\t\t(drill (offset -0.7 0))\n\
+            \t\t)\n\
+            \t)\n\
+            \t(footprint \"collinear_past_corner\"\n\
+            \t\t(layer \"F.Cu\")\n\
+            \t\t(at 0 -10 0)\n\
+            \t\t(property \"Reference\" \"C_OUT\")\n\
+            \t\t(pad \"1\" thru_hole circle\n\
+            \t\t\t(at 0 0)\n\
+            \t\t\t(size 1.6 1.6)\n\
+            \t\t\t(drill 1.0)\n\
+            \t\t)\n\
+            \t)\n\
+            \t(footprint \"interior_only\"\n\
+            \t\t(layer \"F.Cu\")\n\
+            \t\t(at 10 20 0)\n\
+            \t\t(property \"Reference\" \"R_IN\")\n\
+            \t\t(pad \"1\" smd rect\n\
+            \t\t\t(at 0 0)\n\
+            \t\t\t(size 1.0 1.0)\n\
+            \t\t)\n\
+            \t)\n\
+            \t(footprint \"malformed_drill\"\n\
+            \t\t(layer \"F.Cu\")\n\
+            \t\t(at 0 15 0)\n\
+            \t\t(property \"Reference\" \"BAD1\")\n\
+            \t\t(pad \"1\" thru_hole circle\n\
+            \t\t\t(at 0 0)\n\
+            \t\t\t(size 1.6 1.6)\n\
+            \t\t\t(drill bogus)\n\
+            \t\t)\n\
+            \t)\n\
+            )";
+        let tree = parse_sexp(board).unwrap();
+        let found = footprints_with_pad_on_outline(&tree, (0.0, 0.0, 60.0, 45.0));
+        // E1's rotated (35°) copper pad spans x≈0.41..1.39 (inside), while its
+        // rotated oval drill reaches x≈0.9 - (0.8*cos(35°)+0.3) ≈ -0.055 (crosses x=0).
+        // M1 is an SMD pad with KiCad's offset-only `(drill (offset -0.7 0))`
+        // (no hole, used on castellated module footprints): its offset copper
+        // spans x=-0.2..0.8 (crosses x=0) and must not be skipped.
+        // C_OUT lies on x=0 above y=0, R_IN is strictly inside, and BAD1 has a
+        // malformed drill (fail-closed).
+        assert_eq!(
+            found,
+            vec![
+                EdgeMountedFootprint {
+                    reference: Some("E1".to_string()),
+                    at: (0.9, 20.0),
+                    rotation_deg: 35.0,
+                    layer_side: Side::Front,
+                    edge_pads: 1,
+                },
+                EdgeMountedFootprint {
+                    reference: Some("M1".to_string()),
+                    at: (1.0, 30.0),
+                    rotation_deg: 0.0,
+                    layer_side: Side::Front,
+                    edge_pads: 1,
+                },
+            ]
         );
     }
 }

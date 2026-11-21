@@ -62,9 +62,10 @@ use crate::tools::{get_path, opt_positive_f64, with_board_ipc_classified, ToolCo
 #[cfg(test)]
 use copperpour_sexp::board::board_outline_bbox;
 use copperpour_sexp::board::{
-    board_outline_shape, footprint_courtyards, footprint_outline, footprints, ContourRole,
-    CourtyardSource, FootprintCourtyard, FootprintOutline, OutlineOwner, OutlineShape,
-    PcbConnectivityIndex, Side,
+    board_outline_shape, footprint_courtyards, footprint_outline, footprints,
+    footprints_with_pad_on_outline, ContourRole, CourtyardSource, FootprintCourtyard,
+    FootprintOutline, OutlineOwner, OutlineShape, PcbConnectivityIndex, Side,
+    OUTLINE_CHAINING_EPSILON_MM,
 };
 use copperpour_sexp::geometry::round6;
 use copperpour_sexp::parser::SexpNode;
@@ -86,14 +87,24 @@ pub fn tools() -> Vec<ToolDef> {
          a provably axis-aligned rectangular outline; a concave, notched, rounded, rotated, \
          or multi-boundary outline cannot prove containment from its bbox, so those checks \
          are skipped and the verdict is 'outline_unproven' (see 'outline_shape' in the \
-         response) rather than a silent pass. A board with no Edge.Cuts of its own takes \
-         its outline from footprints' Edge.Cuts as KiCad does ('outline_source': \
-         'footprint'), and a footprint with no electrical pads that is that outline is not \
-         scored as a part.",
+         response) rather than a silent pass. Parts with a pad or drill hole on or crossing \
+         the outline (such as castellated half-holes) are recognized automatically as \
+         edge-mounted and reported in 'edge_mounted' instead of failing 'outside_outline'; \
+         pass 'edge_mounted' to declare overhanging parts whose pads all lie inside (such as \
+         a flush USB-C receptacle). Connector edge distance ('connector_edges[].edge_distance_mm') \
+         is measured from the nearest courtyard edge to the outline boundary, alongside \
+         'center_edge_distance_mm'. A board with no Edge.Cuts of its own takes its outline \
+         from footprints' Edge.Cuts as KiCad does ('outline_source': 'footprint'), and a \
+         footprint with no electrical pads that is that outline is not scored as a part.",
             json!({
                 "type": "object",
                 "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file" }
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "edge_mounted": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1 },
+                        "description": "Footprint references intentionally mounted at the board edge whose courtyard overhangs the outline (for example a flush USB-C receptacle whose courtyard extends past Edge.Cuts). Parts with a pad or hole on or crossing the outline (such as castellated half-holes) are recognized automatically without needing to be listed here."
+                    }
                 },
                 "required": ["board"]
             }),
@@ -305,6 +316,10 @@ async fn handle_score_placement(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
+    let explicit_edge_mounted = match parse_edge_mounted_arg(args) {
+        Ok(refs) => refs,
+        Err(refusal) => return Ok(refusal),
+    };
 
     // The exact board open live in KiCad, when it is this one, is the truthful
     // source: a saved-file read here would silently score a stale snapshot
@@ -317,6 +332,24 @@ async fn handle_score_placement(
         Err(result) => return Ok(result),
     };
     let tree = copperpour_sexp::parse_sexp(&content)?;
+    if !explicit_edge_mounted.is_empty() {
+        let board_references = footprint_references(&tree);
+        let missing: Vec<&str> = explicit_edge_mounted
+            .iter()
+            .filter(|r| !board_references.contains(r.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            let listed = missing.join(", ");
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "edge_mounted".into(),
+                    reason: format!("not on this board: {listed}"),
+                },
+                format!("Argument 'edge_mounted' names footprints not on this board: {listed}"),
+            ));
+        }
+    }
 
     let scan = footprint_courtyards(&tree);
     // A board that draws no Edge.Cuts of its own may carry its outline in a
@@ -398,12 +431,80 @@ async fn handle_score_placement(
     // ── Hard failure (b): parts outside the board outline ───────────────────
     // No outline means this check is blocked, not passed: the response carries
     // `outline_missing: true` and the verdict can never be "pass".
+    //
+    // Edge-mounted parts (#144): footprints with a pad or drill hole on or
+    // crossing the rectangular outline (castellated half-holes, edge fingers,
+    // edge holes) are recognized automatically; callers may also declare
+    // overhanging parts whose pads all lie inside (e.g. a flush USB-C
+    // receptacle) via `edge_mounted`. An explicitly listed part is recognized
+    // as edge-mounted only when its courtyard actually touches or crosses the
+    // outline boundary (within `OUTLINE_CHAINING_EPSILON_MM`): a part wholly
+    // outside the outline still fails `outside_outline`, and a part wholly
+    // inside the outline is not echoed as `edge_mounted: true`.
     let mut outside_refs: Vec<String> = Vec::new();
-    if let Some((ox0, oy0, ox1, oy1)) = outline {
-        for c in &parts {
+    let mut edge_mounted_reports: Vec<serde_json::Value> = Vec::new();
+    let mut edge_mounted_indices: BTreeSet<usize> = BTreeSet::new();
+    let mut edge_mounted_warnings: Vec<String> = Vec::new();
+    if let Some(outline_bbox) = outline {
+        let (ox0, oy0, ox1, oy1) = outline_bbox;
+        let pad_on_outline = footprints_with_pad_on_outline(&tree, outline_bbox);
+        let mut seen_explicit: BTreeSet<&str> = BTreeSet::new();
+        for (idx, c) in parts.iter().enumerate() {
             let (x0, y0, x1, y1) = c.bbox;
-            if x0 < ox0 || y0 < oy0 || x1 > ox1 || y1 > oy1 {
+            let overhangs = x0 < ox0 || y0 < oy0 || x1 > ox1 || y1 > oy1;
+            let edge_distance = distance_bbox_to_outline_edge(c.bbox, outline_bbox);
+            let meets_perimeter = edge_distance <= OUTLINE_CHAINING_EPSILON_MM;
+            let edge_pads = pad_on_outline
+                .iter()
+                .find(|e| {
+                    e.reference == c.reference
+                        && e.at == c.at
+                        && e.layer_side == c.layer_side
+                        && e.rotation_deg == c.rotation_deg
+                })
+                .map_or(0, |e| e.edge_pads);
+            let has_pad_on_outline = edge_pads > 0;
+            let is_explicit = c.reference.as_deref().is_some_and(|r| {
+                if explicit_edge_mounted.contains(r) {
+                    seen_explicit.insert(r);
+                    true
+                } else {
+                    false
+                }
+            });
+
+            if has_pad_on_outline || (is_explicit && meets_perimeter) {
+                edge_mounted_indices.insert(idx);
                 let reference = courtyard_reference(c);
+                let reason = match (has_pad_on_outline, is_explicit) {
+                    (true, true) => "pad_on_outline_and_explicit",
+                    (true, false) => "pad_on_outline",
+                    (false, true) => "explicit",
+                    (false, false) => unreachable!(),
+                };
+                let overhang_mm = round3(
+                    (ox0 - x0)
+                        .max(x1 - ox1)
+                        .max(oy0 - y0)
+                        .max(y1 - oy1)
+                        .max(0.0),
+                );
+                edge_mounted_reports.push(json!({
+                    "reference": reference,
+                    "reason": reason,
+                    "edge_pads": edge_pads,
+                    "overhang_mm": overhang_mm,
+                    "exempted_outside_outline": overhangs,
+                }));
+            } else if overhangs {
+                let reference = courtyard_reference(c);
+                if is_explicit {
+                    edge_mounted_warnings.push(format!(
+                        "{reference} was listed in edge_mounted, but its courtyard bbox does \
+                         not touch the board outline ({ox0}, {oy0})..({ox1}, {oy1}); it still \
+                         fails outside_outline."
+                    ));
+                }
                 outside_refs.push(reference.to_string());
                 hard_failures.push(json!({
                     "kind": "outside_outline",
@@ -414,29 +515,49 @@ async fn handle_score_placement(
                         round3(x0), round3(y0), round3(x1), round3(y1),
                     ),
                 }));
+            } else if is_explicit {
+                let reference = courtyard_reference(c);
+                edge_mounted_warnings.push(format!(
+                    "{reference} was listed in edge_mounted, but its courtyard bbox lies wholly \
+                     inside the board outline (nearest edge {} mm); no outside_outline exemption \
+                     was needed.",
+                    round3(edge_distance),
+                ));
+            }
+        }
+        for reference in &explicit_edge_mounted {
+            if !seen_explicit.contains(reference.as_str()) {
+                edge_mounted_warnings.push(format!(
+                    "{reference} was listed in edge_mounted, but it was not scored as a part \
+                     (outline carrier or unreadable courtyard)."
+                ));
             }
         }
     }
 
     // ── Connector-edge check (J*) ───────────────────────────────────────────
-    // A connector whose bbox center is further than the limit from *every*
-    // outline edge cannot be reached by a cable without a tunnel. Blocked
-    // without an outline, like the outside check.
+    // Measured from the nearest courtyard edge to the outline boundary (#144),
+    // not the courtyard bbox centre: a flush or deep edge connector whose
+    // mouth sits on the edge reads 0 mm even when its centre is several mm in.
+    // Blocked without a proven-rectangular outline, like the outside check.
     let mut connector_edges: Vec<serde_json::Value> = Vec::new();
     let mut connector_violations: Vec<(String, f64)> = Vec::new();
-    if let Some((ox0, oy0, ox1, oy1)) = outline {
-        for c in &parts {
+    if let Some(outline_bbox) = outline {
+        for (idx, c) in parts.iter().enumerate() {
             let Some(reference) = c.reference.as_deref() else {
                 continue;
             };
             if ref_prefix(reference) != "J" {
                 continue;
             }
-            let (cx, cy) = bbox_center(c.bbox);
-            let edge_distance = (cx - ox0).min(ox1 - cx).min(cy - oy0).min(oy1 - cy);
+            let edge_distance = distance_bbox_to_outline_edge(c.bbox, outline_bbox);
+            let center_edge_distance =
+                distance_point_to_outline_edge(bbox_center(c.bbox), outline_bbox);
             connector_edges.push(json!({
                 "reference": reference,
                 "edge_distance_mm": round3(edge_distance),
+                "center_edge_distance_mm": round3(center_edge_distance),
+                "edge_mounted": edge_mounted_indices.contains(&idx),
             }));
             if edge_distance > CONNECTOR_EDGE_LIMIT_MM {
                 connector_violations.push((reference.to_string(), edge_distance));
@@ -494,7 +615,7 @@ async fn handle_score_placement(
             "detail": connector_violations
                 .iter()
                 .map(|(r, d)| format!(
-                    "{r} center is {} mm from the nearest board edge (limit {CONNECTOR_EDGE_LIMIT_MM} mm)",
+                    "{r} courtyard edge is {} mm from the nearest board edge (limit {CONNECTOR_EDGE_LIMIT_MM} mm)",
                     round3(*d),
                 ))
                 .collect::<Vec<_>>()
@@ -566,6 +687,7 @@ async fn handle_score_placement(
         )),
         FootprintOutline::NotApplicable => {}
     }
+    warnings.extend(edge_mounted_warnings);
 
     Ok(CallToolResult::json(&json!({
         "verdict": verdict,
@@ -620,6 +742,7 @@ async fn handle_score_placement(
         "warnings": warnings,
         "hard_failures": hard_failures,
         "deductions": deductions,
+        "edge_mounted": edge_mounted_reports,
         "connector_edges": connector_edges,
         "uncoupled_caps": uncoupled_caps,
         "unproven_decoupling_caps": unproven_decoupling_caps
@@ -2434,6 +2557,66 @@ fn bbox_center((x0, y0, x1, y1): (f64, f64, f64, f64)) -> (f64, f64) {
     ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
 }
 
+/// Parse optional `edge_mounted` argument (array of non-empty footprint
+/// references). Omitted defaults to an empty set; malformed present values
+/// (including `null`, non-arrays, non-strings, and blank strings) are refused
+/// with `InvalidArgument` naming `"edge_mounted"`.
+fn parse_edge_mounted_arg(args: &serde_json::Value) -> Result<BTreeSet<String>, CallToolResult> {
+    let Some(raw) = args.get("edge_mounted") else {
+        return Ok(BTreeSet::new());
+    };
+    let Some(items) = raw.as_array() else {
+        return Err(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "edge_mounted".into(),
+                reason: "must be an array of footprint reference strings".into(),
+            },
+            "Argument 'edge_mounted' must be an array of footprint reference strings",
+        ));
+    };
+    let mut out = BTreeSet::new();
+    for item in items {
+        let Some(reference) = item.as_str().filter(|s| !s.trim().is_empty()) else {
+            return Err(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "edge_mounted".into(),
+                    reason: "every entry must be a non-empty footprint reference string".into(),
+                },
+                "Argument 'edge_mounted' must contain only non-empty strings",
+            ));
+        };
+        out.insert(reference.to_string());
+    }
+    Ok(out)
+}
+
+/// Shortest Euclidean distance from axis-aligned box `bbox` to the boundary of
+/// rectangular `outline`:
+/// - strictly inside `outline`: distance from the nearest box face to its
+///   matching outline edge (`min(x0 - ox0, ox1 - x1, y0 - oy0, oy1 - y1)`);
+/// - touching or crossing `outline`'s boundary: `0.0`;
+/// - strictly outside `outline`: Euclidean distance from the box to the
+///   nearest outline edge or corner.
+fn distance_bbox_to_outline_edge(bbox: Bbox, outline: Bbox) -> f64 {
+    let (x0, y0, x1, y1) = bbox;
+    let (ox0, oy0, ox1, oy1) = outline;
+    if x0 >= ox0 && x1 <= ox1 && y0 >= oy0 && y1 <= oy1 {
+        (x0 - ox0).min(ox1 - x1).min(y0 - oy0).min(oy1 - y1)
+    } else if x1 < ox0 || x0 > ox1 || y1 < oy0 || y0 > oy1 {
+        let dx = (ox0 - x1).max(x0 - ox1).max(0.0);
+        let dy = (oy0 - y1).max(y0 - oy1).max(0.0);
+        dx.hypot(dy)
+    } else {
+        0.0
+    }
+}
+
+/// Shortest Euclidean distance from a point to the boundary of rectangular
+/// `outline`.
+fn distance_point_to_outline_edge((px, py): (f64, f64), outline: Bbox) -> f64 {
+    distance_bbox_to_outline_edge((px, py, px, py), outline)
+}
+
 fn side_name(side: Side) -> &'static str {
     match side {
         Side::Front => "front",
@@ -2554,11 +2737,15 @@ mod tests {
             "{response}"
         );
 
-        // J1's hand-computed edge distance, reported even though it passes.
+        // J1's hand-computed courtyard-edge (3.23 mm) and centre (8.81 mm)
+        // distances to the left edge x=0, reported even though it passes.
         let edges = response["connector_edges"].as_array().unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0]["reference"], "J1");
-        assert_eq!(edges[0]["edge_distance_mm"], 8.81);
+        assert_eq!(edges[0]["edge_distance_mm"], 3.23);
+        assert_eq!(edges[0]["center_edge_distance_mm"], 8.81);
+        assert_eq!(edges[0]["edge_mounted"], false);
+        assert_eq!(response["edge_mounted"], json!([]));
 
         // No live KiCad in this test — the saved file is the disclosed source.
         assert_eq!(response["source"], "saved_file");
@@ -5021,5 +5208,574 @@ mod tests {
         .await
         .unwrap();
         assert!(result.is_error);
+    }
+
+    const EDGE_MOUNTED_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../copperpour-sexp/tests/fixtures/placement/edge_mounted_kicad10.kicad_pcb"
+    );
+
+    /// Issue #144 reproduction: castellated headers (J3 front, J4 back) and an
+    /// edge-centred mounting hole (H1) have pads/holes crossing Edge.Cuts and
+    /// must be auto-recognized as edge-mounted; a flush USB-C receptacle (J1)
+    /// whose courtyard overhangs by 0.505 mm must pass when named in
+    /// `edge_mounted`; and `connector_edges[].edge_distance_mm` must measure
+    /// from the nearest courtyard edge (0.0 for J1, 2.03 for J2) rather than
+    /// the courtyard bbox centre (3.965 for J1, 12.69 for J2).
+    #[tokio::test]
+    async fn edge_mounted_board_passes_with_explicit_usb_and_auto_castellated_parts() {
+        // Without explicit `edge_mounted`: J3 (front castellated), J4 (back
+        // castellated), and H1 (edge mounting hole) are auto-detected, leaving
+        // only J1 (courtyard-only USB-C overhang) as an `outside_outline`
+        // hard failure. J2 passes connector-edge under courtyard-edge (2.03 mm
+        // <= 10 mm) despite its centre sitting 12.69 mm in.
+        let without_arg = score(std::path::Path::new(EDGE_MOUNTED_FIXTURE)).await;
+        assert_eq!(without_arg["verdict"], "hard_fail", "{without_arg}");
+        assert_eq!(without_arg["score"], 80, "{without_arg}");
+        let failures = without_arg["hard_failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1, "{without_arg}");
+        assert_eq!(failures[0]["kind"], "outside_outline");
+        assert_eq!(failures[0]["references"], json!(["J1"]));
+        assert_eq!(
+            without_arg["deductions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["outside_outline"],
+            "J2 must not incur a connector_edge deduction under courtyard-edge distance: {without_arg}"
+        );
+
+        let mut auto_mounted = without_arg["edge_mounted"].as_array().unwrap().clone();
+        auto_mounted.sort_by_key(|e| e["reference"].as_str().unwrap().to_owned());
+        assert_eq!(
+            auto_mounted,
+            vec![
+                json!({"reference": "H1", "reason": "pad_on_outline", "edge_pads": 1, "overhang_mm": 3.45, "exempted_outside_outline": true}),
+                json!({"reference": "J3", "reason": "pad_on_outline", "edge_pads": 8, "overhang_mm": 1.77, "exempted_outside_outline": true}),
+                json!({"reference": "J4", "reason": "pad_on_outline", "edge_pads": 8, "overhang_mm": 1.77, "exempted_outside_outline": true}),
+            ],
+            "{without_arg}"
+        );
+
+        // With `edge_mounted: ["J1"]`: the whole board reaches `pass` at 100.
+        let result = handle_score_placement(
+            &json!({
+                "board": EDGE_MOUNTED_FIXTURE,
+                "edge_mounted": ["J1"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = text_of(&result).await;
+        assert_eq!(response["verdict"], "pass", "{response}");
+        assert_eq!(response["score"], 100, "{response}");
+        assert_eq!(response["hard_failures"], json!([]), "{response}");
+        assert_eq!(response["deductions"], json!([]), "{response}");
+
+        let mut mounted = response["edge_mounted"].as_array().unwrap().clone();
+        mounted.sort_by_key(|e| e["reference"].as_str().unwrap().to_owned());
+        assert_eq!(
+            mounted,
+            vec![
+                json!({"reference": "H1", "reason": "pad_on_outline", "edge_pads": 1, "overhang_mm": 3.45, "exempted_outside_outline": true}),
+                json!({"reference": "J1", "reason": "explicit", "edge_pads": 0, "overhang_mm": 0.505, "exempted_outside_outline": true}),
+                json!({"reference": "J3", "reason": "pad_on_outline", "edge_pads": 8, "overhang_mm": 1.77, "exempted_outside_outline": true}),
+                json!({"reference": "J4", "reason": "pad_on_outline", "edge_pads": 8, "overhang_mm": 1.77, "exempted_outside_outline": true}),
+            ],
+            "{response}"
+        );
+
+        let mut conn_edges = response["connector_edges"].as_array().unwrap().clone();
+        conn_edges.sort_by_key(|e| e["reference"].as_str().unwrap().to_owned());
+        assert_eq!(
+            conn_edges,
+            vec![
+                json!({"reference": "J1", "edge_distance_mm": 0.0, "center_edge_distance_mm": 3.965, "edge_mounted": true}),
+                json!({"reference": "J2", "edge_distance_mm": 2.03, "center_edge_distance_mm": 12.69, "edge_mounted": false}),
+                json!({"reference": "J3", "edge_distance_mm": 0.0, "center_edge_distance_mm": 0.0, "edge_mounted": true}),
+                json!({"reference": "J4", "edge_distance_mm": 0.0, "center_edge_distance_mm": 0.0, "edge_mounted": true}),
+            ],
+            "{response}"
+        );
+
+        // Listing a part that also has pads on the outline reports the combined
+        // reason cleanly rather than losing either signal.
+        let both = handle_score_placement(
+            &json!({
+                "board": EDGE_MOUNTED_FIXTURE,
+                "edge_mounted": ["J1", "J3"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let both_body = text_of(&both).await;
+        let j3 = both_body["edge_mounted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["reference"] == "J3")
+            .unwrap();
+        assert_eq!(j3["reason"], "pad_on_outline_and_explicit", "{both_body}");
+    }
+
+    /// Explicitly naming a part in `edge_mounted` must NOT rubber-stamp a
+    /// footprint parked wholly off the board: its courtyard does not touch the
+    /// outline, so it still fails `outside_outline`, emits a warning, and
+    /// reports a positive Euclidean `edge_distance_mm` instead of a negative
+    /// number.
+    #[tokio::test]
+    async fn explicit_edge_mounted_does_not_exempt_a_part_wholly_outside_the_outline() {
+        let content = std::fs::read_to_string(EDGE_MOUNTED_FIXTURE).unwrap();
+        assert_eq!(content.matches("(at 3.675 22.5 -90)").count(), 1);
+        let parked = content.replace("(at 3.675 22.5 -90)", "(at 200 22.5 -90)");
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_variant(&dir, "parked_usb.kicad_pcb", parked);
+
+        let result = handle_score_placement(
+            &json!({
+                "board": path.to_string_lossy(),
+                "edge_mounted": ["J1"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let body = text_of(&result).await;
+        assert_eq!(body["verdict"], "hard_fail", "{body}");
+        assert!(
+            body["hard_failures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["kind"] == "outside_outline" && f["references"] == json!(["J1"])),
+            "{body}"
+        );
+        assert!(
+            !body["edge_mounted"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["reference"] == "J1"),
+            "wholly off-board part must not be listed in edge_mounted: {body}"
+        );
+        assert!(
+            body["warnings"].as_array().unwrap().iter().any(|w| w
+                .as_str()
+                .unwrap()
+                .contains("J1 was listed in edge_mounted")),
+            "{body}"
+        );
+        let j1_edge = body["connector_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["reference"] == "J1")
+            .unwrap();
+        // J1 moved from x=3.675 to x=200 (shift +196.325): courtyard min_x =
+        // -0.505 + 196.325 = 195.82, so distance to right edge x=60 is 135.82 mm.
+        assert_eq!(j1_edge["edge_distance_mm"], 135.82, "{j1_edge}");
+        assert_eq!(j1_edge["edge_mounted"], false, "{j1_edge}");
+        assert!(
+            body["deductions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["kind"] == "connector_edge" && d["references"] == json!(["J1"])),
+            "{body}"
+        );
+    }
+
+    /// Edge-mounted exemption waives `outside_outline` only: a same-side
+    /// courtyard overlap involving an edge-mounted part is still a hard failure.
+    #[tokio::test]
+    async fn edge_mounted_part_still_hard_fails_same_side_courtyard_overlap() {
+        let content = std::fs::read_to_string(EDGE_MOUNTED_FIXTURE).unwrap();
+        assert_eq!(content.matches("(at 25 22.5)").count(), 1);
+        // Move R1 onto J3's top-edge courtyard (16.23..37.55, -1.77..1.77).
+        let overlapped = content.replace("(at 25 22.5)", "(at 25 1)");
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_variant(&dir, "edge_overlap.kicad_pcb", overlapped);
+
+        let result = handle_score_placement(
+            &json!({
+                "board": path.to_string_lossy(),
+                "edge_mounted": ["J1"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let body = text_of(&result).await;
+        assert_eq!(body["verdict"], "hard_fail", "{body}");
+        assert!(
+            body["hard_failures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["kind"] == "courtyard_overlap"
+                    && f["references"].as_array().unwrap().contains(&json!("J3"))
+                    && f["references"].as_array().unwrap().contains(&json!("R1"))),
+            "{body}"
+        );
+    }
+
+    /// A connector whose nearest courtyard edge still sits > 10 mm from every
+    /// board edge still triggers a `connector_edge` deduction under the new
+    /// metric.
+    #[tokio::test]
+    async fn deep_interior_connector_still_triggers_connector_edge_deduction() {
+        let content = std::fs::read_to_string(EDGE_MOUNTED_FIXTURE).unwrap();
+        assert_eq!(content.matches("(at 38.42 22.5 90)").count(), 1);
+        // Move J2 to (20, 30), clear of R1 at (25, 22.5) and J4 at y=45:
+        // courtyard spans x=18.23..39.55, y=28.23..31.77. Nearest outline edge
+        // is bottom edge y=45 at 13.23 mm (> 10 mm limit); centre is 15.0 mm in.
+        let deep = content.replace("(at 38.42 22.5 90)", "(at 20 30 90)");
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_variant(&dir, "deep_connector.kicad_pcb", deep);
+
+        let result = handle_score_placement(
+            &json!({
+                "board": path.to_string_lossy(),
+                "edge_mounted": ["J1"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let body = text_of(&result).await;
+        assert_eq!(body["verdict"], "pass", "{body}");
+        assert_eq!(body["score"], 85, "{body}");
+        let j2 = body["connector_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["reference"] == "J2")
+            .unwrap();
+        assert_eq!(j2["edge_distance_mm"], 13.23, "{j2}");
+        assert_eq!(j2["center_edge_distance_mm"], 15.0, "{j2}");
+        let deduction = body["deductions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["kind"] == "connector_edge")
+            .unwrap();
+        assert_eq!(deduction["points"], 15, "{deduction}");
+        assert_eq!(deduction["references"], json!(["J2"]), "{deduction}");
+        assert!(
+            deduction["detail"]
+                .as_str()
+                .unwrap()
+                .contains("J2 courtyard edge is 13.23 mm"),
+            "{deduction}"
+        );
+    }
+
+    /// Contract input validation for `edge_mounted`: malformed types, blank
+    /// strings, and references absent from the board all return structured
+    /// `invalid_argument` naming `"edge_mounted"`.
+    #[tokio::test]
+    async fn score_placement_refuses_invalid_or_unknown_edge_mounted_argument() {
+        for bad_value in [
+            json!("J1"),
+            json!(null),
+            json!([123]),
+            json!([""]),
+            json!(["   "]),
+            json!(["J99"]),
+        ] {
+            let result = handle_score_placement(
+                &json!({
+                    "board": EDGE_MOUNTED_FIXTURE,
+                    "edge_mounted": bad_value,
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                result.is_error,
+                "expected error for {bad_value}: {result:?}"
+            );
+            let body = text_of(&result).await;
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], "edge_mounted", "{body}");
+        }
+    }
+
+    /// Served `tools/call` dispatch coverage for issue #144: verifies the
+    /// advertised schema accepts `edge_mounted`, passes the board with J1
+    /// declared, reports courtyard-edge distances, and refuses unknown
+    /// references with structured `invalid_argument`.
+    #[tokio::test]
+    async fn served_score_placement_accepts_edge_mounted_and_reports_courtyard_edge_distances() {
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let ok_resp = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 144,
+                "method": "tools/call",
+                "params": {
+                    "name": "score_placement",
+                    "arguments": {
+                        "board": EDGE_MOUNTED_FIXTURE,
+                        "edge_mounted": ["J1"]
+                    }
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(ok_resp["isError"], json!(false), "{ok_resp}");
+        let body: serde_json::Value =
+            serde_json::from_str(ok_resp["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["verdict"], "pass", "{body}");
+        assert_eq!(body["score"], 100, "{body}");
+        let j1 = body["connector_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["reference"] == "J1")
+            .unwrap();
+        assert_eq!(j1["edge_distance_mm"], 0.0, "{j1}");
+        assert_eq!(j1["center_edge_distance_mm"], 3.965, "{j1}");
+        assert_eq!(j1["edge_mounted"], true, "{j1}");
+
+        // Unknown reference is refused cleanly through served dispatch.
+        let bad_resp = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 145,
+                "method": "tools/call",
+                "params": {
+                    "name": "score_placement",
+                    "arguments": {
+                        "board": EDGE_MOUNTED_FIXTURE,
+                        "edge_mounted": ["DOES_NOT_EXIST"]
+                    }
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(bad_resp["isError"], json!(true), "{bad_resp}");
+        let bad_body: serde_json::Value =
+            serde_json::from_str(bad_resp["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(bad_body["error"]["kind"], "invalid_argument", "{bad_body}");
+        assert_eq!(bad_body["error"]["field"], "edge_mounted", "{bad_body}");
+    }
+
+    /// Sibling caller verification: `score_of_content` (shared by
+    /// `place_decoupling_caps`, `auto_place_from_schematic`, and
+    /// `refine_placement_force_directed`) routes through `handle_score_placement`,
+    /// so boards with auto-detected castellated/edge-hole parts no longer
+    /// report `hard_fail` when planners evaluate them.
+    #[tokio::test]
+    async fn planner_score_of_content_recognizes_auto_edge_mounted_parts() {
+        let content = std::fs::read_to_string(EDGE_MOUNTED_FIXTURE).unwrap();
+        // Move J1 inward by 1 mm so only the auto-detected parts (J3, J4, H1)
+        // overhang the outline.
+        let inward_j1 = content.replace("(at 3.675 22.5 -90)", "(at 4.675 22.5 -90)");
+        let scored = score_of_content(&test_ctx(), &inward_j1).await.unwrap();
+        assert_eq!(scored["verdict"], "pass", "{scored}");
+        assert_eq!(scored["score"], 100, "{scored}");
+        assert_eq!(
+            scored["edge_mounted"].as_array().unwrap().len(),
+            3,
+            "{scored}"
+        );
+    }
+
+    /// An interior part listed in `edge_mounted` is not echoed as
+    /// `edge_mounted: true` (response fields derive from board geometry), emits
+    /// a warning, and still incurs `connector_edge` if > 10 mm from every edge.
+    #[tokio::test]
+    async fn explicit_edge_mounted_on_an_interior_part_warns_and_does_not_echo_edge_mounted() {
+        let content = std::fs::read_to_string(EDGE_MOUNTED_FIXTURE).unwrap();
+        let deep = content.replace("(at 38.42 22.5 90)", "(at 20 30 90)");
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_variant(&dir, "interior_explicit.kicad_pcb", deep);
+
+        let result = handle_score_placement(
+            &json!({
+                "board": path.to_string_lossy(),
+                "edge_mounted": ["J1", "J2", "R1"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let body = text_of(&result).await;
+        assert_eq!(body["verdict"], "pass", "{body}");
+        assert_eq!(body["score"], 85, "{body}");
+
+        let mounted_refs: Vec<&str> = body["edge_mounted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["reference"].as_str().unwrap())
+            .collect();
+        assert!(mounted_refs.contains(&"J1"), "{body}");
+        assert!(!mounted_refs.contains(&"J2"), "{body}");
+        assert!(!mounted_refs.contains(&"R1"), "{body}");
+
+        let j2 = body["connector_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["reference"] == "J2")
+            .unwrap();
+        assert_eq!(j2["edge_mounted"], false, "{j2}");
+        assert_eq!(j2["edge_distance_mm"], 13.23, "{j2}");
+
+        let warnings = body["warnings"].to_string();
+        assert!(
+            warnings.contains(
+                "J2 was listed in edge_mounted, but its courtyard bbox lies wholly inside"
+            ) && warnings.contains(
+                "R1 was listed in edge_mounted, but its courtyard bbox lies wholly inside"
+            ),
+            "{body}"
+        );
+    }
+
+    /// `edge_mounted` on an unproven outline still validates unknown references
+    /// and preserves `outline_unproven` without silently passing.
+    #[tokio::test]
+    async fn edge_mounted_on_unproven_outline_validates_refs_and_preserves_unproven_verdict() {
+        let path = footprint_outline_fixture("mech1");
+        let ok = handle_score_placement(
+            &json!({
+                "board": path.to_string_lossy(),
+                "edge_mounted": ["R1"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!ok.is_error, "{ok:?}");
+        let body = text_of(&ok).await;
+        assert_eq!(body["verdict"], "outline_unproven", "{body}");
+        assert_eq!(body["edge_mounted"], json!([]), "{body}");
+
+        let bad = handle_score_placement(
+            &json!({
+                "board": path.to_string_lossy(),
+                "edge_mounted": ["NO_SUCH_PART"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(bad.is_error, "{bad:?}");
+        let bad_body = text_of(&bad).await;
+        assert_eq!(bad_body["error"]["kind"], "invalid_argument", "{bad_body}");
+        assert_eq!(bad_body["error"]["field"], "edge_mounted", "{bad_body}");
+    }
+
+    /// Footprint-owned rectangular outline (`card_edge`) works with
+    /// pad-on-outline detection too: moving R1 (no Edge.Cuts of its own) onto
+    /// the right edge of J1's 80..120 × 85..115 outline puts pad 2 on x=120,
+    /// recognizing R1 as edge-mounted instead of `outside_outline`, while
+    /// SLOT1 off the card still fails `outside_outline`.
+    #[tokio::test]
+    async fn footprint_owned_rectangular_outline_recognizes_edge_mounted_parts() {
+        let content = std::fs::read_to_string(footprint_outline_fixture("card_edge")).unwrap();
+        // R1 is the only footprint with exact `(at 100 100)` (J1 has `(at 100 100 90)`).
+        assert_eq!(content.matches("(at 100 100)").count(), 1);
+        // R1 pad 2 sits at local (+0.8, 0), size 0.8×0.95, courtyard ±1.5×±0.75:
+        // placing R1 at (119.2, 100) centres pad 2 on x=120 with 0.7 mm courtyard overhang.
+        let on_edge = content.replace("(at 100 100)", "(at 119.2 100)");
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_variant(&dir, "card_edge_r1_on_edge.kicad_pcb", on_edge);
+
+        let body = score(&path).await;
+        assert_eq!(body["outline_source"], "footprint", "{body}");
+        assert_eq!(body["outline_shape"], "rectangular", "{body}");
+        assert_eq!(body["verdict"], "hard_fail", "{body}");
+        assert_eq!(
+            body["hard_failures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| (f["kind"].clone(), f["references"].clone()))
+                .collect::<Vec<_>>(),
+            vec![(json!("outside_outline"), json!(["SLOT1"]))],
+            "only SLOT1 (wholly off the card) may fail outside_outline: {body}"
+        );
+        assert_eq!(
+            body["edge_mounted"],
+            json!([{
+                "reference": "R1",
+                "reason": "pad_on_outline",
+                "edge_pads": 1,
+                "overhang_mm": 0.7,
+                "exempted_outside_outline": true,
+            }]),
+            "{body}"
+        );
+    }
+
+    /// Back-to-back footprints sharing `(reference, at)` on opposite sides must
+    /// not alias: the `F.Cu` footprint with a pad on the edge is edge-mounted,
+    /// while the `B.Cu` footprint at the same anchor with no pad on the edge
+    /// still fails `outside_outline`.
+    #[tokio::test]
+    async fn back_to_back_footprints_at_same_anchor_do_not_alias_pad_on_outline() {
+        let board = "(kicad_pcb\n\
+            \t(version 20260206)\n\
+            \t(gr_rect (start 0 0) (end 40 30) (layer \"Edge.Cuts\"))\n\
+            \t(footprint \"front_edge\"\n\
+            \t\t(layer \"F.Cu\")\n\
+            \t\t(at 0 15 0)\n\
+            \t\t(fp_rect (start -1 -1) (end 2 1) (layer \"F.CrtYd\"))\n\
+            \t\t(pad \"1\" thru_hole circle (at 0 0) (size 1.6 1.6) (drill 1.0) (layers \"*.Cu\"))\n\
+            \t)\n\
+            \t(footprint \"back_overhang_no_edge_pad\"\n\
+            \t\t(layer \"B.Cu\")\n\
+            \t\t(at 0 15 0)\n\
+            \t\t(fp_rect (start -1 -1) (end 4 1) (layer \"B.CrtYd\"))\n\
+            \t\t(pad \"1\" smd rect (at 3 0) (size 1 1) (layers \"B.Cu\"))\n\
+            \t)\n\
+            )";
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_variant(&dir, "back_to_back.kicad_pcb", board.to_string());
+
+        let body = score(&path).await;
+        assert_eq!(body["verdict"], "hard_fail", "{body}");
+        assert_eq!(
+            body["edge_mounted"].as_array().unwrap().len(),
+            1,
+            "only the F.Cu footprint has a pad on the edge: {body}"
+        );
+        assert_eq!(
+            body["hard_failures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|f| f["kind"] == "outside_outline")
+                .count(),
+            1,
+            "the B.Cu footprint at the same anchor must still fail outside_outline: {body}"
+        );
     }
 }
