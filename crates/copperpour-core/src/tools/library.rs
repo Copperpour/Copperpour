@@ -13185,9 +13185,16 @@ mod off_grid_pin_warning_tests {
     async fn off_grid_symbol_pin_misses_grid_snapped_power_symbol_while_on_grid_connects() {
         let handler = handler().await;
         let dir = tempfile::tempdir().unwrap();
-        let proj = dir.path().join("demo.kicad_pro");
+        let proj = dir.path().join("power_on_pin_kicad10.kicad_pro");
         std::fs::write(&proj, "{}\n").unwrap();
-        let sch = dir.path().join("demo.kicad_sch");
+        // Seed from a committed KiCad 10 fixture that already embeds `power:GND`
+        // in `lib_symbols`, so the test runs without an installed KiCad on CI.
+        let sch = dir.path().join("power_on_pin_kicad10.kicad_sch");
+        std::fs::write(
+            &sch,
+            include_str!("../../tests/fixtures/power_on_pin_kicad10.kicad_sch"),
+        )
+        .unwrap();
         let lib = dir.path().join("local.kicad_sym");
 
         // 1. Create both symbols: identical except pin 1 X is -10.16 (on-grid) vs -10.34 (0.18 mm off-grid).
@@ -13228,7 +13235,7 @@ mod off_grid_pin_warning_tests {
             "off-grid must warn: {off}"
         );
 
-        // 2. Register the project library and create a schematic.
+        // 2. Register the project library.
         serve(
             &handler,
             "register_symbol_library",
@@ -13240,19 +13247,18 @@ mod off_grid_pin_warning_tests {
             }),
         )
         .await;
-        serve(&handler, "create_schematic", json!({ "path": sch })).await;
 
         // 3. Place both symbols on the 1.27 mm schematic grid via batch_place_components.
-        // U1 at (101.6, 101.6) -> pin 1 at (91.44, 101.6) (on-grid).
-        // U2 at (152.4, 101.6) -> pin 1 at (142.06, 101.6) (0.18 mm off-grid; nearest grid is 142.24).
+        // U10 at (203.2, 101.6) -> pin 1 at (193.04, 101.6) (on-grid).
+        // U11 at (254.0, 101.6) -> pin 1 at (243.66, 101.6) (0.18 mm off-grid; nearest grid is 243.84).
         serve(
             &handler,
             "batch_place_components",
             json!({
                 "schematic": sch,
                 "components": [
-                    {"lib_id": "Local:OnGrid", "reference": "U1", "value": "OnGrid", "x": 101.6, "y": 101.6},
-                    {"lib_id": "Local:OffGrid", "reference": "U2", "value": "OffGrid", "x": 152.4, "y": 101.6}
+                    {"lib_id": "Local:OnGrid", "reference": "U10", "value": "OnGrid", "x": 203.2, "y": 101.6},
+                    {"lib_id": "Local:OffGrid", "reference": "U11", "value": "OffGrid", "x": 254.0, "y": 101.6}
                 ]
             }),
         )
@@ -13262,38 +13268,38 @@ mod off_grid_pin_warning_tests {
         serve(
             &handler,
             "add_power_symbol",
-            json!({ "schematic": sch, "power_net": "GND", "x": 91.44, "y": 101.6 }),
+            json!({ "schematic": sch, "power_net": "GND", "x": 193.04, "y": 101.6 }),
         )
         .await;
         serve(
             &handler,
             "add_power_symbol",
-            json!({ "schematic": sch, "power_net": "GND", "x": 142.06, "y": 101.6 }),
+            json!({ "schematic": sch, "power_net": "GND", "x": 243.66, "y": 101.6 }),
         )
         .await;
 
-        // 5. Verify electrical connectivity: U1.1 connects to GND; U2.1 is silently disconnected.
-        let u1_net = serve(
+        // 5. Verify electrical connectivity: U10.1 connects to GND; U11.1 is silently disconnected.
+        let u10_net = serve(
             &handler,
             "get_pin_net_name",
-            json!({ "schematic": sch, "reference": "U1", "pin_number": "1" }),
+            json!({ "schematic": sch, "reference": "U10", "pin_number": "1" }),
         )
         .await;
         assert_eq!(
-            u1_net["net"],
+            u10_net["net"],
             json!("GND"),
-            "on-grid U1.1 must connect: {u1_net}"
+            "on-grid U10.1 must connect: {u10_net}"
         );
 
-        let u2_net = serve(
+        let u11_net = serve(
             &handler,
             "get_pin_net_name",
-            json!({ "schematic": sch, "reference": "U2", "pin_number": "1" }),
+            json!({ "schematic": sch, "reference": "U11", "pin_number": "1" }),
         )
         .await;
         assert!(
-            u2_net["net"].is_null(),
-            "off-grid U2.1 must miss the grid-snapped GND symbol: {u2_net}"
+            u11_net["net"].is_null(),
+            "off-grid U11.1 must miss the grid-snapped GND symbol: {u11_net}"
         );
     }
 }
