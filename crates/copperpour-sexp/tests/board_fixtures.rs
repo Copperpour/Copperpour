@@ -1334,3 +1334,36 @@ fn installed_demo_boards_report_genuinely_locked_footprints() {
          is matching pad- or graphic-level locks, not footprint-level ones"
     );
 }
+
+/// Issue #144: KiCad 10.0.8 board with castellated headers (J3 front, J4 back),
+/// an edge-centred mounting hole (H1), a flush USB-C receptacle (J1, pads
+/// inside), a long header near the right edge (J2), and an interior resistor
+/// (R1). Oracle counts come from `pcbnew.LoadBoard` in
+/// `tests/fixtures/placement/edge_mounted_kicad10.README.md`.
+#[test]
+fn edge_mounted_kicad10_hole_on_outline_matches_pcbnew_oracle() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/placement/edge_mounted_kicad10.kicad_pcb");
+    let content = std::fs::read_to_string(&path).unwrap();
+    let tree = parse_sexp(&content).unwrap();
+    let outline = copperpour_sexp::board::board_outline_bbox(&tree).unwrap();
+    assert_eq!(outline, (0.0, 0.0, 60.0, 45.0));
+
+    let mut found: Vec<(Option<String>, usize)> =
+        copperpour_sexp::board::footprints_with_hole_on_outline(&tree, outline)
+            .into_iter()
+            .map(|e| (e.reference, e.edge_holes))
+            .collect();
+    found.sort();
+
+    // Oracle table from edge_mounted_kicad10.README.md (pcbnew.LoadBoard):
+    // H1=1, J3=8, J4=8; J1, J2, R1 have 0 edge pads.
+    assert_eq!(
+        found,
+        vec![
+            (Some("H1".to_string()), 1),
+            (Some("J3".to_string()), 8),
+            (Some("J4".to_string()), 8),
+        ]
+    );
+}
