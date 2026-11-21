@@ -4880,7 +4880,7 @@ PCB
     cat > "$5" <<NETLIST
 <export><design><sheet tstamps="/"><title_block><source>component_fields_kicad10.kicad_sch</source></title_block></sheet>
     <sheet tstamps="/{SHEET_UUID}/"><title_block><source>logic.kicad_sch</source></title_block></sheet></design>
-    <components><comp ref="R1"><tstamps>{RESISTOR}</tstamps></comp></components>
+    <components><comp ref="R1"><tstamps>{RESISTOR}</tstamps><sheetpath names="/Logic regulator/" tstamps="/{SHEET_UUID}/"/><property name="Sheetfile" value="logic.kicad_sch"/></comp></components>
     <nets><net name="$name" class="Default"><node ref="R1" pin="1"/></net></nets></export>
 NETLIST
 fi
@@ -5278,8 +5278,12 @@ fp = next(fp for fp in b.GetFootprints() if fp.GetReference() == 'R1')
 assert fp.GetPath().AsString() == sys.argv[2]
 if sys.argv[3]:
     assert b.FindNet(sys.argv[3])
-    assert any(t.GetNetname() == sys.argv[3] for t in b.GetTracks())
-    assert any(pad.GetNetname() == sys.argv[3] for pad in fp.Pads())
+    code = b.FindNet(sys.argv[3]).GetNetCode()
+    tracks = list(b.GetTracks())
+    assert any(t.GetNetCode() == code for t in tracks), \
+        (sys.argv[3], code, sorted({(t.GetNetCode(), t.GetNetname()) for t in tracks}))
+    assert any(pad.GetNetCode() == code for pad in fp.Pads()), \
+        [(pad.GetNumber(), pad.GetNetCode(), pad.GetNetname()) for pad in fp.Pads()]
 "#,
             ])
             .arg(path)
