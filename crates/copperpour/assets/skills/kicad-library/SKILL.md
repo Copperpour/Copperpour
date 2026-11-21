@@ -24,7 +24,8 @@ load_toolset('library')    # search_symbols, search_footprints, create_symbol, c
                            # set_footprint_models, get_footprint_info, register_symbol_library,
                            # register_footprint_library, get_symbol_info,
                            # set_symbol_properties
-load_toolset('library_maintenance') # upgrade_library, rename_footprint, rename_symbol
+load_toolset('library_maintenance') # upgrade_library, rename_footprint, rename_symbol,
+                                    # delete_symbol_pin
 load_toolset('pcb_components') # update_footprints_from_library for placed instances
 ```
 
@@ -256,6 +257,16 @@ removes that property.
 keeping its value and layout, `remove_fields=["LCSC"]` deletes one, `value`
 sets the Value field, `datasheet` the Datasheet field, and `reference_prefix` the
 Reference field.
+
+### Remove a Symbol Pin
+
+`delete_symbol_pin` (toolset `library_maintenance`) removes one pin of a library symbol, such as the second of
+two pins with one number that KiCad's symbol checker reports. It chooses the pin
+as `edit_symbol_pin` does: `pin_number`, then `unit` or `body_style` where the
+number is in several, then `pin_name` or `pin_x` and `pin_y` where pins share a
+number in one unit and body style; an ambiguous choice is refused before
+writing. A derived symbol is refused: remove the pin from its root. The answer
+reports the removed pin.
 
 ### Symbol Layout Guidelines
 

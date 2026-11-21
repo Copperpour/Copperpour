@@ -446,7 +446,7 @@ Live `move_component`, `rotate_component`, `set_component_placements`, `align_co
 ---
 
 ### `library_maintenance` · 3 tools
-**Purpose:** Maintain library files as a whole: upgrade their file format with content checked, and rename library symbols and footprints.
+**Purpose:** Maintain library files as a whole: upgrade their file format with content checked, rename library symbols and footprints, and remove one pin of a library symbol.
 **Source:** [`crates/copperpour-core/src/tools/library_upgrade.rs`](crates/copperpour-core/src/tools/library_upgrade.rs), [`crates/copperpour-core/src/tools/footprint_rename.rs`](crates/copperpour-core/src/tools/footprint_rename.rs), [`crates/copperpour-core/src/tools/symbol_rename.rs`](crates/copperpour-core/src/tools/symbol_rename.rs)
 
 | Tool | Description |
@@ -454,6 +454,7 @@ Live `move_component`, `rotate_component`, `set_component_placements`, `align_co
 | `upgrade_library` | Upgrade a `.kicad_sym` symbol library or a `.pretty` footprint library to the running KiCad's file format with `kicad-cli`, comparing each older file with its upgraded copy as KiCad reads both, and replacing the older files in one journalled transaction only when none differs; a dry run, the default, reports counts and the files that differ or carry notes. |
 | `rename_footprint` | Rename a footprint in its `.pretty` library as KiCad's footprint editor does: `NEW_NAME.kicad_mod` with the new name inside, and the Value too when it equals the old name. Refuses a name in use, including one that differs only in case, and names KiCad cannot use; a case-only rename of the same footprint is allowed. Symbols' Footprint fields and placed footprints keep the old library id. |
 | `rename_symbol` | Rename a symbol in its `.kicad_sym` library as KiCad's symbol editor does: the symbol and its unit blocks take the new name, derived symbols extend it, and the Value changes when it equals the old name; the name is stored escaped as KiCad stores it, and the library keeps KiCad's save order. Refuses a name in use. Placed symbols keep the old library id. |
+| `delete_symbol_pin` | Remove one pin of an existing library symbol, chosen as `edit_symbol_pin` chooses one (number, then unit or body style, then current name or connection point), refusing an ambiguous choice and a derived symbol before writing; reports the removed pin. |
 
 ---
 

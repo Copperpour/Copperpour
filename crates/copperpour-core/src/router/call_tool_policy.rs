@@ -238,6 +238,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "delete_sheet",
     "delete_sheet_pin",
     "delete_symbol",
+    "delete_symbol_pin",
     "delete_trace",
     "delete_via",
     "delete_zone",

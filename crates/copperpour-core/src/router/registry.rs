@@ -112,7 +112,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "library_maintenance",
-        description: "Maintain symbol and footprint libraries as a whole: upgrade a library's file format with kicad-cli, replacing files only when their content is kept, and rename library symbols and footprints",
+        description: "Maintain symbol and footprint libraries as a whole: upgrade a library's file format with kicad-cli, replacing files only when their content is kept, rename library symbols and footprints, and remove one pin of a library symbol",
         category: "library",
     },
     ToolsetMeta {
@@ -221,7 +221,11 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "library_maintenance" => Some(
             library_upgrade::tools()
                 .into_iter()
-                .chain([footprint_rename::tool(), symbol_rename::tool()])
+                .chain([
+                    footprint_rename::tool(),
+                    symbol_rename::tool(),
+                    symbol_pins::delete_tool(),
+                ])
                 .collect(),
         ),
         "model_3d" => Some(model_3d::tools()),
