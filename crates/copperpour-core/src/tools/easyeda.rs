@@ -2044,8 +2044,14 @@ f 1/1/1 2/1/1 3/1/1 4/1/1
 
         let updated = std::fs::read_to_string(&fp_path).unwrap();
         assert!(updated.contains("(model \"${KIPRJMOD}/3dmodels/TEST_PKG.wrl\""));
-        assert!(updated.contains("(offset (xyz 0.5 -0.5 0))"));
-        assert!(updated.contains("(rotate (xyz 0 0 180))"));
+        // The model block is in KiCad's nested layout (#715); read it flat.
+        let flat = updated
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace(" )", ")");
+        assert!(flat.contains("(offset (xyz 0.5 -0.5 0))"), "{updated}");
+        assert!(flat.contains("(rotate (xyz 0 0 180))"), "{updated}");
     }
 }
 

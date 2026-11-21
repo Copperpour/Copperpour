@@ -346,6 +346,10 @@ pub(super) async fn handle_get_footprint_info(
         "pad_count": pad_count,
         "has_courtyard": has_courtyard,
         "has_3d_model": has_3d,
+        "models": crate::tools::footprint_models::written_models(&footprint)
+            .iter()
+            .map(crate::tools::footprint_models::WrittenModel::to_json)
+            .collect::<Vec<_>>(),
         "path": path.to_str().unwrap_or("")
     });
     if args["include_pads"].as_bool().unwrap_or(false) {

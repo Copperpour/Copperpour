@@ -478,6 +478,11 @@ set_footprint_models(
 - `delete` requires models to be omitted or empty and removes every top-level model.
 - Omitted transforms default to offset `0/0/0`, scale `1/1/1`, and rotation `0/0/0`.
 - Multiple model blocks are written in payload order in one atomic operation.
+- `visible` (default true) and `opacity` (0 to 1, default 1) hide a model or make it
+  transparent in the 3D viewer. `replace` keeps a replaced model's `visible` and
+  `opacity` when the new model has the same path and omits them, and warns when a
+  hidden or transparent model is dropped. Read the current models, with their
+  transforms, visibility and opacity, from `get_footprint_info`'s `models` first.
 
 ---
 
