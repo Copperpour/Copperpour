@@ -806,6 +806,11 @@ impl McpHandler {
         self.ctx.set_ipc_kicad_dir_for_test(dir);
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn ipc_context_for_test(&self) -> &crate::tools::ToolContext {
+        &self.ctx
+    }
+
     async fn notify_tools_list_changed(&self) {
         let notification = JsonRpcNotification::new(TOOLS_LIST_CHANGED, None);
         let Ok(json) = serde_json::to_string(&notification) else {
