@@ -1341,7 +1341,7 @@ fn installed_demo_boards_report_genuinely_locked_footprints() {
 /// (R1). Oracle counts come from `pcbnew.LoadBoard` in
 /// `tests/fixtures/placement/edge_mounted_kicad10.README.md`.
 #[test]
-fn edge_mounted_kicad10_pad_on_outline_matches_pcbnew_oracle() {
+fn edge_mounted_kicad10_hole_on_outline_matches_pcbnew_oracle() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/placement/edge_mounted_kicad10.kicad_pcb");
     let content = std::fs::read_to_string(&path).unwrap();
@@ -1350,9 +1350,9 @@ fn edge_mounted_kicad10_pad_on_outline_matches_pcbnew_oracle() {
     assert_eq!(outline, (0.0, 0.0, 60.0, 45.0));
 
     let mut found: Vec<(Option<String>, usize)> =
-        copperpour_sexp::board::footprints_with_pad_on_outline(&tree, outline)
+        copperpour_sexp::board::footprints_with_hole_on_outline(&tree, outline)
             .into_iter()
-            .map(|e| (e.reference, e.edge_pads))
+            .map(|e| (e.reference, e.edge_holes))
             .collect();
     found.sort();
 

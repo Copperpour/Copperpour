@@ -63,7 +63,7 @@ use crate::tools::{get_path, opt_positive_f64, with_board_ipc_classified, ToolCo
 use copperpour_sexp::board::board_outline_bbox;
 use copperpour_sexp::board::{
     board_outline_shape, footprint_courtyards, footprint_outline, footprints,
-    footprints_with_pad_on_outline, ContourRole, CourtyardSource, FootprintCourtyard,
+    footprints_with_hole_on_outline, ContourRole, CourtyardSource, FootprintCourtyard,
     FootprintOutline, OutlineOwner, OutlineShape, PcbConnectivityIndex, Side,
     OUTLINE_CHAINING_EPSILON_MM,
 };
@@ -87,11 +87,11 @@ pub fn tools() -> Vec<ToolDef> {
          a provably axis-aligned rectangular outline; a concave, notched, rounded, rotated, \
          or multi-boundary outline cannot prove containment from its bbox, so those checks \
          are skipped and the verdict is 'outline_unproven' (see 'outline_shape' in the \
-         response) rather than a silent pass. Parts with a pad or drill hole on or crossing \
-         the outline (such as castellated half-holes) are recognized automatically as \
+         response) rather than a silent pass. Parts with a drill hole on or crossing the \
+         outline (such as castellated half-holes) are recognized automatically as \
          edge-mounted and reported in 'edge_mounted' instead of failing 'outside_outline'; \
-         pass 'edge_mounted' to declare overhanging parts whose pads all lie inside (such as \
-         a flush USB-C receptacle). Connector edge distance ('connector_edges[].edge_distance_mm') \
+         pass 'edge_mounted' to declare other parts whose courtyard overhangs the outline \
+         (such as a flush USB-C receptacle, or an SMD module with edge pads). Connector edge distance ('connector_edges[].edge_distance_mm') \
          is measured from the nearest courtyard edge to the outline boundary, alongside \
          'center_edge_distance_mm'. A board with no Edge.Cuts of its own takes its outline \
          from footprints' Edge.Cuts as KiCad does ('outline_source': 'footprint'), and a \
@@ -103,7 +103,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "edge_mounted": {
                         "type": "array",
                         "items": { "type": "string", "minLength": 1 },
-                        "description": "Footprint references intentionally mounted at the board edge whose courtyard overhangs the outline (for example a flush USB-C receptacle whose courtyard extends past Edge.Cuts). Parts with a pad or hole on or crossing the outline (such as castellated half-holes) are recognized automatically without needing to be listed here."
+                        "description": "Footprint references intentionally mounted at the board edge whose courtyard overhangs the outline (for example a flush USB-C receptacle whose courtyard extends past Edge.Cuts). Parts with a drill hole on or crossing the outline (such as castellated half-holes) are recognized automatically without needing to be listed here; copper pads alone on the edge are not."
                     }
                 },
                 "required": ["board"]
@@ -432,11 +432,11 @@ async fn handle_score_placement(
     // No outline means this check is blocked, not passed: the response carries
     // `outline_missing: true` and the verdict can never be "pass".
     //
-    // Edge-mounted parts (#144): footprints with a pad or drill hole on or
-    // crossing the rectangular outline (castellated half-holes, edge fingers,
-    // edge holes) are recognized automatically; callers may also declare
-    // overhanging parts whose pads all lie inside (e.g. a flush USB-C
-    // receptacle) via `edge_mounted`. An explicitly listed part is recognized
+    // Edge-mounted parts (#144): footprints with a drill hole on or crossing
+    // the rectangular outline (castellated half-holes, edge holes) are
+    // recognized automatically. Copper alone on the edge is not, since a
+    // misplaced SMD part straddling it looks the same; callers declare such
+    // parts (e.g. a flush USB-C receptacle) via `edge_mounted`. An explicitly listed part is recognized
     // as edge-mounted only when its courtyard actually touches or crosses the
     // outline boundary (within `OUTLINE_CHAINING_EPSILON_MM`): a part wholly
     // outside the outline still fails `outside_outline`, and a part wholly
@@ -447,14 +447,14 @@ async fn handle_score_placement(
     let mut edge_mounted_warnings: Vec<String> = Vec::new();
     if let Some(outline_bbox) = outline {
         let (ox0, oy0, ox1, oy1) = outline_bbox;
-        let pad_on_outline = footprints_with_pad_on_outline(&tree, outline_bbox);
+        let hole_on_outline = footprints_with_hole_on_outline(&tree, outline_bbox);
         let mut seen_explicit: BTreeSet<&str> = BTreeSet::new();
         for (idx, c) in parts.iter().enumerate() {
             let (x0, y0, x1, y1) = c.bbox;
             let overhangs = x0 < ox0 || y0 < oy0 || x1 > ox1 || y1 > oy1;
             let edge_distance = distance_bbox_to_outline_edge(c.bbox, outline_bbox);
             let meets_perimeter = edge_distance <= OUTLINE_CHAINING_EPSILON_MM;
-            let edge_pads = pad_on_outline
+            let edge_holes = hole_on_outline
                 .iter()
                 .find(|e| {
                     e.reference == c.reference
@@ -462,8 +462,8 @@ async fn handle_score_placement(
                         && e.layer_side == c.layer_side
                         && e.rotation_deg == c.rotation_deg
                 })
-                .map_or(0, |e| e.edge_pads);
-            let has_pad_on_outline = edge_pads > 0;
+                .map_or(0, |e| e.edge_holes);
+            let has_hole_on_outline = edge_holes > 0;
             let is_explicit = c.reference.as_deref().is_some_and(|r| {
                 if explicit_edge_mounted.contains(r) {
                     seen_explicit.insert(r);
@@ -473,12 +473,12 @@ async fn handle_score_placement(
                 }
             });
 
-            if has_pad_on_outline || (is_explicit && meets_perimeter) {
+            if has_hole_on_outline || (is_explicit && meets_perimeter) {
                 edge_mounted_indices.insert(idx);
                 let reference = courtyard_reference(c);
-                let reason = match (has_pad_on_outline, is_explicit) {
-                    (true, true) => "pad_on_outline_and_explicit",
-                    (true, false) => "pad_on_outline",
+                let reason = match (has_hole_on_outline, is_explicit) {
+                    (true, true) => "hole_on_outline_and_explicit",
+                    (true, false) => "hole_on_outline",
                     (false, true) => "explicit",
                     (false, false) => unreachable!(),
                 };
@@ -492,7 +492,7 @@ async fn handle_score_placement(
                 edge_mounted_reports.push(json!({
                     "reference": reference,
                     "reason": reason,
-                    "edge_pads": edge_pads,
+                    "edge_holes": edge_holes,
                     "overhang_mm": overhang_mm,
                     "exempted_outside_outline": overhangs,
                 }));
@@ -5216,7 +5216,7 @@ mod tests {
     );
 
     /// Issue #144 reproduction: castellated headers (J3 front, J4 back) and an
-    /// edge-centred mounting hole (H1) have pads/holes crossing Edge.Cuts and
+    /// edge-centred mounting hole (H1) have holes crossing Edge.Cuts and
     /// must be auto-recognized as edge-mounted; a flush USB-C receptacle (J1)
     /// whose courtyard overhangs by 0.505 mm must pass when named in
     /// `edge_mounted`; and `connector_edges[].edge_distance_mm` must measure
@@ -5252,9 +5252,9 @@ mod tests {
         assert_eq!(
             auto_mounted,
             vec![
-                json!({"reference": "H1", "reason": "pad_on_outline", "edge_pads": 1, "overhang_mm": 3.45, "exempted_outside_outline": true}),
-                json!({"reference": "J3", "reason": "pad_on_outline", "edge_pads": 8, "overhang_mm": 1.77, "exempted_outside_outline": true}),
-                json!({"reference": "J4", "reason": "pad_on_outline", "edge_pads": 8, "overhang_mm": 1.77, "exempted_outside_outline": true}),
+                json!({"reference": "H1", "reason": "hole_on_outline", "edge_holes": 1, "overhang_mm": 3.45, "exempted_outside_outline": true}),
+                json!({"reference": "J3", "reason": "hole_on_outline", "edge_holes": 8, "overhang_mm": 1.77, "exempted_outside_outline": true}),
+                json!({"reference": "J4", "reason": "hole_on_outline", "edge_holes": 8, "overhang_mm": 1.77, "exempted_outside_outline": true}),
             ],
             "{without_arg}"
         );
@@ -5281,10 +5281,10 @@ mod tests {
         assert_eq!(
             mounted,
             vec![
-                json!({"reference": "H1", "reason": "pad_on_outline", "edge_pads": 1, "overhang_mm": 3.45, "exempted_outside_outline": true}),
-                json!({"reference": "J1", "reason": "explicit", "edge_pads": 0, "overhang_mm": 0.505, "exempted_outside_outline": true}),
-                json!({"reference": "J3", "reason": "pad_on_outline", "edge_pads": 8, "overhang_mm": 1.77, "exempted_outside_outline": true}),
-                json!({"reference": "J4", "reason": "pad_on_outline", "edge_pads": 8, "overhang_mm": 1.77, "exempted_outside_outline": true}),
+                json!({"reference": "H1", "reason": "hole_on_outline", "edge_holes": 1, "overhang_mm": 3.45, "exempted_outside_outline": true}),
+                json!({"reference": "J1", "reason": "explicit", "edge_holes": 0, "overhang_mm": 0.505, "exempted_outside_outline": true}),
+                json!({"reference": "J3", "reason": "hole_on_outline", "edge_holes": 8, "overhang_mm": 1.77, "exempted_outside_outline": true}),
+                json!({"reference": "J4", "reason": "hole_on_outline", "edge_holes": 8, "overhang_mm": 1.77, "exempted_outside_outline": true}),
             ],
             "{response}"
         );
@@ -5320,7 +5320,7 @@ mod tests {
             .iter()
             .find(|e| e["reference"] == "J3")
             .unwrap();
-        assert_eq!(j3["reason"], "pad_on_outline_and_explicit", "{both_body}");
+        assert_eq!(j3["reason"], "hole_on_outline_and_explicit", "{both_body}");
     }
 
     /// Explicitly naming a part in `edge_mounted` must NOT rubber-stamp a
@@ -5692,13 +5692,12 @@ mod tests {
         assert_eq!(bad_body["error"]["field"], "edge_mounted", "{bad_body}");
     }
 
-    /// Footprint-owned rectangular outline (`card_edge`) works with
-    /// pad-on-outline detection too: moving R1 (no Edge.Cuts of its own) onto
-    /// the right edge of J1's 80..120 × 85..115 outline puts pad 2 on x=120,
-    /// recognizing R1 as edge-mounted instead of `outside_outline`, while
-    /// SLOT1 off the card still fails `outside_outline`.
+    /// A misplaced SMD part straddling the edge is not edge-mounted: moving R1
+    /// (no Edge.Cuts of its own) onto the right edge of J1's footprint-owned
+    /// 80..120 × 85..115 outline (`card_edge`) puts its copper pad 2 on x=120,
+    /// but it has no hole, so R1 still fails `outside_outline` beside SLOT1.
     #[tokio::test]
-    async fn footprint_owned_rectangular_outline_recognizes_edge_mounted_parts() {
+    async fn smd_part_straddling_the_outline_still_fails_outside_outline() {
         let content = std::fs::read_to_string(footprint_outline_fixture("card_edge")).unwrap();
         // R1 is the only footprint with exact `(at 100 100)` (J1 has `(at 100 100 90)`).
         assert_eq!(content.matches("(at 100 100)").count(), 1);
@@ -5712,27 +5711,16 @@ mod tests {
         assert_eq!(body["outline_source"], "footprint", "{body}");
         assert_eq!(body["outline_shape"], "rectangular", "{body}");
         assert_eq!(body["verdict"], "hard_fail", "{body}");
-        assert_eq!(
-            body["hard_failures"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|f| (f["kind"].clone(), f["references"].clone()))
-                .collect::<Vec<_>>(),
-            vec![(json!("outside_outline"), json!(["SLOT1"]))],
-            "only SLOT1 (wholly off the card) may fail outside_outline: {body}"
-        );
-        assert_eq!(
-            body["edge_mounted"],
-            json!([{
-                "reference": "R1",
-                "reason": "pad_on_outline",
-                "edge_pads": 1,
-                "overhang_mm": 0.7,
-                "exempted_outside_outline": true,
-            }]),
-            "{body}"
-        );
+        let mut outside = body["hard_failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["kind"] == "outside_outline")
+            .flat_map(|f| f["references"].as_array().unwrap().clone())
+            .collect::<Vec<_>>();
+        outside.sort_by_key(|r| r.as_str().unwrap().to_owned());
+        assert_eq!(outside, vec![json!("R1"), json!("SLOT1")], "{body}");
+        assert_eq!(body["edge_mounted"], json!([]), "{body}");
     }
 
     /// Back-to-back footprints sharing `(reference, at)` on opposite sides must
@@ -5740,7 +5728,7 @@ mod tests {
     /// while the `B.Cu` footprint at the same anchor with no pad on the edge
     /// still fails `outside_outline`.
     #[tokio::test]
-    async fn back_to_back_footprints_at_same_anchor_do_not_alias_pad_on_outline() {
+    async fn back_to_back_footprints_at_same_anchor_do_not_alias_hole_on_outline() {
         let board = "(kicad_pcb\n\
             \t(version 20260206)\n\
             \t(gr_rect (start 0 0) (end 40 30) (layer \"Edge.Cuts\"))\n\
