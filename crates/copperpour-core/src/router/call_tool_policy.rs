@@ -292,6 +292,7 @@ pub const OTHER_TOOLS: &[&str] = &[
     "move_labels_by_offset",
     "move_region",
     "move_schematic_component",
+    "move_schematic_objects_between_sheets",
     "move_sheet",
     "move_via",
     "mutate_editor_selection",
