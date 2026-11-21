@@ -128,7 +128,11 @@ no item CRUD.
 
   `FileTransition::guard_absent` protects a path the plan requires not to exist. It writes neither the path nor a placeholder. A journal containing an absence guard uses version 2 so older Copperpour releases cannot recover it without enforcing that check; transactions without absence guards retain version 1. Recover pending version 2 journals with a supporting release before downgrading.
 
-  Commit and recovery check the write targets before the final guard check. The file locks coordinate Copperpour writers, but the final check and journal removal are not atomic against outside writers.
+  Apply and recovery recheck each replacement target against its before image after
+  staging the write, just before renaming it into place. A mismatch leaves the target
+  untouched and retains the journal. Earlier replacements are not rolled back. The
+  locks coordinate Copperpour writers only. An outside writer can still save between
+  the final check and rename, or after the final readback and before journal removal.
 - New design files and exports get `0666 & ~umask` on Unix. A replacement keeps the
   destination's mode, so a project an earlier Konnect created stays `0600` until
   `chmod`ed.

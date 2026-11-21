@@ -13,6 +13,34 @@ pub(crate) fn resolved_dir(dir: &Path) -> PathBuf {
     PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text))
 }
 
+/// An older journal whose second target receives an external save during replay.
+pub(crate) fn arm_late_save_during_recovery(dir: &Path) -> PathBuf {
+    let journal = write_recovery_journal(dir, "before");
+    copperpour_sexp::writer::test_hooks::save_before_final_check(&dir.join("b.txt"), "external");
+    journal
+}
+
+pub(crate) fn write_recovery_journal(dir: &Path, second_on_disk: &str) -> PathBuf {
+    let journal = dir.join(".copperpour-transaction-interrupted.json");
+    let contents = serde_json::json!({
+        "version": 1, "id": "interrupted",
+        "entries": [
+            {"path": "a.txt", "expected": "before", "replacement": "after"},
+            {"path": "b.txt", "expected": "before", "replacement": "after"}
+        ]
+    });
+    std::fs::write(dir.join("a.txt"), "before").unwrap();
+    std::fs::write(dir.join("b.txt"), second_on_disk).unwrap();
+    std::fs::write(&journal, contents.to_string()).unwrap();
+    journal
+}
+
+pub(crate) fn assert_recovery_targets(dir: &Path, first_applied: bool) {
+    let first = if first_applied { "after" } else { "before" };
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), first);
+    assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"external");
+}
+
 /// An already-listening in-process KiCad IPC double.
 ///
 /// The guard owns the endpoint for its entire lifetime. Dropping it closes the

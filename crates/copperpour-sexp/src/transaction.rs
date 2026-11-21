@@ -3,8 +3,8 @@
 //! A write-ahead journal is persisted before the first target is changed. On
 //! restart, recovery rolls the transaction forward only while every target
 //! still equals either its recorded before image or intended replacement.
-//! Divergent content is never overwritten and leaves the journal available for
-//! explicit resolution.
+//! Both apply and recovery recheck the before image just before replacing a
+//! file. The check and rename are not atomic against noncooperating writers.
 
 use crate::writer::{
     ensure_kicad_design_document_is_closed, lock_document_exclusive, parent_directory,
@@ -125,7 +125,7 @@ pub enum TransactionTargetState {
     Pending,
     /// The target already matches its intended replacement.
     Applied,
-    /// The target matches neither image and will never be overwritten automatically.
+    /// The target matches neither image and blocks automatic recovery.
     Divergent,
 }
 
@@ -337,11 +337,9 @@ pub fn commit_file_transaction(
 #[derive(Debug)]
 pub struct TransactionFailure {
     pub error: SexpError,
-    /// The journal that reached disk, so this transaction's targets may
-    /// already hold their replacements and recovery may still complete them.
-    /// `None` means none of its targets was touched. Boxed, so the error
-    /// stays under clippy's `result_large_err` limit where `PathBuf` is
-    /// larger, as on Windows.
+    /// Path of the new journal, or of the older journal that stopped replay
+    /// after targets were published. This is not proof the journal still
+    /// exists: a cleanup failure may follow unlinking. Boxed to limit size.
     pub journal: Option<Box<Path>>,
 }
 
@@ -350,19 +348,33 @@ pub struct TransactionFailure {
 ///
 /// # Errors
 ///
-/// The same errors as [`commit_file_transaction`], with the journal left
-/// behind, if any.
+/// The same errors as [`commit_file_transaction`], plus the journal's
+/// diagnostic path when available.
 pub fn try_commit_file_transaction(
     journal_directory: impl AsRef<Path>,
     transitions: Vec<FileTransition>,
 ) -> Result<TransactionCommit, TransactionFailure> {
     // Everything up to the journal leaves the targets untouched.
+    let refused = |error| TransactionFailure {
+        error,
+        journal: None,
+    };
+    let root = canonical_directory(journal_directory.as_ref()).map_err(refused)?;
+    let guarded = transitions.iter().any(|transition| transition.guard);
+    if !guarded {
+        recover_file_transactions(&root).map_err(|error| TransactionFailure {
+            journal: match &error {
+                SexpError::TransactionConflict {
+                    journal,
+                    kind: TransactionConflictKind::AfterImage,
+                    ..
+                } => Some(journal.clone().into_boxed_path()),
+                _ => None,
+            },
+            error,
+        })?;
+    }
     let prepare = || -> Result<_, SexpError> {
-        let root = canonical_directory(journal_directory.as_ref())?;
-        let guarded = transitions.iter().any(|transition| transition.guard);
-        if !guarded {
-            recover_file_transactions(&root)?;
-        }
         let entries = normalize_transitions(&root, transitions)?;
         let id = uuid::Uuid::new_v4().to_string();
         let journal = Journal {
@@ -388,12 +400,9 @@ pub fn try_commit_file_transaction(
         }
         ensure_entries_are_closed(&root, &journal.entries)?;
         verify_before_images(&root, &journal_path, &journal.entries)?;
-        Ok((root, journal, journal_path, locks))
+        Ok((journal, journal_path, locks))
     };
-    let (root, journal, journal_path, _locks) = prepare().map_err(|error| TransactionFailure {
-        error,
-        journal: None,
-    })?;
+    let (journal, journal_path, _locks) = prepare().map_err(refused)?;
     // The journal is renamed into place, so a failed persist may still have
     // left it behind.
     persist_journal(&journal_path, &journal).map_err(|error| TransactionFailure {
@@ -405,14 +414,34 @@ pub fn try_commit_file_transaction(
 
     (|| -> Result<(), SexpError> {
         for entry in journal.entries.iter().filter(|entry| !entry.is_guard()) {
-            apply_entry(&root, &journal_path, entry, &journal.entries)?;
+            apply_entry(&root, &journal_path, entry, &journal.entries, || {}).map_err(|error| {
+                match error {
+                    SexpError::KiCadEditorLocked { ref path, .. } => transaction_conflict(
+                        &journal_path,
+                        path,
+                        TransactionConflictKind::AfterImage,
+                        &error.to_string(),
+                    ),
+                    other => other,
+                }
+            })?;
         }
         verify_after_images(&root, &journal_path, &journal.entries)?;
         remove_journal(&journal_path)
     })()
-    .map_err(|error| TransactionFailure {
-        error,
-        journal: Some(journal_path.into_boxed_path()),
+    .map_err(|mut error| {
+        if let SexpError::TransactionConflict {
+            kind: TransactionConflictKind::AfterImage,
+            reason,
+            ..
+        } = &mut error
+        {
+            reason.push_str(PARTIAL_APPLICATION);
+        }
+        TransactionFailure {
+            error,
+            journal: Some(journal_path.into_boxed_path()),
+        }
     })?;
 
     Ok(TransactionCommit {
@@ -442,8 +471,11 @@ pub fn recover_file_transactions(
     let journals = active_journal_paths(&root)?;
 
     let mut outcomes = Vec::with_capacity(journals.len());
+    let mut wrote_targets = false;
     for path in journals {
-        outcomes.push(recover_journal(&root, &path)?);
+        let outcome = recover_journal(&root, &path, &mut wrote_targets)
+            .map_err(|error| classify_replay_failure(&path, error, wrote_targets))?;
+        outcomes.push(outcome);
     }
     Ok(outcomes)
 }
@@ -483,7 +515,9 @@ pub fn recover_file_transaction(
 ) -> Result<RecoveryOutcome, SexpError> {
     let root = canonical_directory(journal_directory.as_ref())?;
     let path = existing_journal_path(&root, id)?;
-    recover_journal(&root, &path)
+    let mut wrote_targets = false;
+    recover_journal(&root, &path, &mut wrote_targets)
+        .map_err(|error| classify_replay_failure(&path, error, wrote_targets))
 }
 
 /// Make one unrecoverable journal inactive without modifying any target file.
@@ -543,7 +577,11 @@ pub fn abandon_file_transaction(
     })
 }
 
-fn recover_journal(root: &Path, journal_path: &Path) -> Result<RecoveryOutcome, SexpError> {
+fn recover_journal(
+    root: &Path,
+    journal_path: &Path,
+    wrote_targets: &mut bool,
+) -> Result<RecoveryOutcome, SexpError> {
     let journal = read_validated_journal(root, journal_path)?;
     let _locks = lock_entries(root, &journal.entries)?;
     ensure_entries_are_closed(root, &journal.entries)?;
@@ -563,15 +601,12 @@ fn recover_journal(root: &Path, journal_path: &Path) -> Result<RecoveryOutcome, 
             }
         }
     }
-    // Completing an older journal shares the commit's publish and readback, but
-    // a conflict here is still that journal's: the caller wrote nothing.
-    (|| {
-        for entry in &pending {
-            apply_entry(root, journal_path, entry, &journal.entries)?;
-        }
-        verify_after_images(root, journal_path, &journal.entries)
-    })()
-    .map_err(as_recovery_conflict)?;
+    for entry in &pending {
+        apply_entry(root, journal_path, entry, &journal.entries, || {
+            *wrote_targets = true;
+        })?;
+    }
+    verify_after_images(root, journal_path, &journal.entries)?;
     remove_journal(journal_path)?;
     Ok(RecoveryOutcome {
         id: journal.id,
@@ -831,6 +866,7 @@ fn apply_entry(
     journal_path: &Path,
     entry: &JournalEntry,
     entries: &[JournalEntry],
+    after_publish: impl FnOnce(),
 ) -> Result<(), SexpError> {
     let replacement = entry.replacement.as_deref().ok_or_else(|| {
         SexpError::InvalidValue("an absence guard cannot be published as a write".into())
@@ -857,10 +893,30 @@ fn apply_entry(
         }
         Ok(())
     };
-    if entry.expected.is_some() {
-        write_atomic_unlocked_with(&path, replacement, check_guards)
+    if let Some(expected) = entry.expected.as_deref() {
+        write_atomic_unlocked_with(
+            &path,
+            replacement,
+            check_guards,
+            || {
+                let reason = match entry.matches_image(&path, Some(expected)) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => "target content changed before replacement".to_owned(),
+                    Err(error) => {
+                        format!("could not verify target content before replacement: {error}")
+                    }
+                };
+                Err(transaction_conflict(
+                    journal_path,
+                    &path,
+                    TransactionConflictKind::AfterImage,
+                    &reason,
+                ))
+            },
+            after_publish,
+        )
     } else {
-        write_new_atomic_unlocked_with(&path, replacement, check_guards)
+        write_new_atomic_unlocked_with(&path, replacement, check_guards, after_publish)
     }
 }
 
@@ -989,28 +1045,276 @@ fn transaction_conflict(
     }
 }
 
-fn as_recovery_conflict(error: SexpError) -> SexpError {
-    match error {
-        SexpError::TransactionConflict {
-            path,
+const PARTIAL_APPLICATION: &str =
+    "; the transaction may have partially applied. Inspect the journal if present";
+
+fn classify_replay_failure(journal: &Path, mut error: SexpError, wrote_targets: bool) -> SexpError {
+    if let SexpError::TransactionConflict { kind, reason, .. } = &mut error {
+        // A previous journal may have written targets before this one stopped.
+        if wrote_targets {
+            reason.push_str(PARTIAL_APPLICATION);
+            *kind = TransactionConflictKind::AfterImage;
+        } else {
+            *kind = TransactionConflictKind::Recovery;
+            reason.push_str("; this recovery attempt published no targets");
+        }
+    } else if wrote_targets {
+        let path = match &error {
+            SexpError::KiCadEditorLocked { path, .. } => path,
+            _ => journal,
+        };
+        return transaction_conflict(
             journal,
-            reason,
-            ..
-        } => SexpError::TransactionConflict {
             path,
-            journal,
-            kind: TransactionConflictKind::Recovery,
-            reason,
-        },
-        other => other,
+            TransactionConflictKind::AfterImage,
+            &format!("{error}{PARTIAL_APPLICATION}"),
+        );
     }
+    error
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schematic::{format_hierarchical_sheet, HierarchicalSheetSpec};
+    use crate::writer::test_hooks::save_before_final_check;
     use crate::{prepare_command, ItemAnchor, SchematicCommand};
+
+    #[test]
+    fn apply_preserves_a_save_before_replacing_a_pending_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let first = root.join("a.txt");
+        let second = root.join("b.txt");
+        std::fs::write(&first, "before").unwrap();
+        std::fs::write(&second, "before").unwrap();
+        save_before_final_check(&second, "external save");
+
+        let result = try_commit_file_transaction(
+            &root,
+            vec![
+                FileTransition::replace(&first, "before", "after"),
+                FileTransition::replace(&second, "before", "after"),
+            ],
+        );
+        assert_eq!(std::fs::read(&second).unwrap(), b"external save");
+        let failure = result.expect_err("the late save blocks the second replacement");
+        let journal = failure.journal.expect("the transaction may have applied");
+        assert_journaled_conflict(failure.error, &second, &journal);
+        assert_eq!(std::fs::read(&first).unwrap(), b"after");
+
+        let status = inspect_file_transactions(&root).unwrap();
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].journal.as_path(), &*journal);
+        assert_eq!(status[0].targets[0].state, TransactionTargetState::Applied);
+        assert_eq!(
+            status[0].targets[1].state,
+            TransactionTargetState::Divergent
+        );
+    }
+
+    fn persist_pending_journal(root: &Path, id: &str, targets: &[&str]) -> PathBuf {
+        let path = journal_path(root, id);
+        let entries = targets
+            .iter()
+            .map(|name| {
+                std::fs::write(root.join(name), "before").unwrap();
+                JournalEntry {
+                    path: (*name).into(),
+                    expected: Some("before".to_owned()),
+                    replacement: Some("after".to_owned()),
+                }
+            })
+            .collect();
+        persist_journal(
+            &path,
+            &Journal {
+                version: JOURNAL_VERSION,
+                id: id.to_owned(),
+                entries,
+            },
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn recovery_preserves_a_save_before_replacing_a_pending_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let first = root.join("a.txt");
+        let second = root.join("b.txt");
+        let journal = persist_pending_journal(&root, "crash", &["a.txt", "b.txt"]);
+        let original_journal = std::fs::read(&journal).unwrap();
+        let status = inspect_file_transactions(&root).unwrap();
+        assert_eq!(status[0].targets.len(), 2);
+        assert!(status[0]
+            .targets
+            .iter()
+            .all(|target| target.state == TransactionTargetState::Pending));
+        save_before_final_check(&second, "external save");
+
+        let result = recover_file_transaction(&root, "crash");
+        assert_eq!(std::fs::read(&second).unwrap(), b"external save");
+        let error = result.expect_err("the late save blocks the second replacement");
+        assert_journaled_conflict(error, &second, &journal);
+        assert_eq!(std::fs::read(&first).unwrap(), b"after");
+        assert_eq!(std::fs::read(&journal).unwrap(), original_journal);
+
+        std::fs::write(&second, "before").unwrap();
+        let outcome = recover_file_transaction(&root, "crash").unwrap();
+        assert_eq!(outcome.completed_files, 1);
+        assert_eq!(std::fs::read(&first).unwrap(), b"after");
+        assert_eq!(std::fs::read(&second).unwrap(), b"after");
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn a_later_journal_conflict_keeps_the_progress_of_earlier_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let first = root.join("a.txt");
+        let second = root.join("b.txt");
+        let completed = persist_pending_journal(&root, "a", &["a.txt"]);
+        let retained = persist_pending_journal(&root, "b", &["b.txt"]);
+        let journal_before = std::fs::read(&retained).unwrap();
+        save_before_final_check(&second, "external");
+
+        let error = recover_file_transactions(&root).unwrap_err();
+        assert_journaled_conflict(error, &second, &retained);
+        assert_eq!(std::fs::read(&first).unwrap(), b"after");
+        assert_eq!(std::fs::read(&second).unwrap(), b"external");
+        assert!(!completed.exists());
+        assert_eq!(std::fs::read(&retained).unwrap(), journal_before);
+    }
+
+    #[test]
+    fn a_later_locked_journal_does_not_hide_earlier_replay_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let completed = persist_pending_journal(&root, "a", &["a.txt"]);
+        let retained = persist_pending_journal(&root, "b", &["b.kicad_sch"]);
+        let journal_before = std::fs::read(&retained).unwrap();
+        std::fs::write(root.join("~b.kicad_sch.lck"), "editor lock").unwrap();
+
+        let error = recover_file_transactions(&root).unwrap_err();
+        assert!(error.to_string().contains("KiCad editor lock"));
+        assert_journaled_conflict(error, &root.join("b.kicad_sch"), &retained);
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"after");
+        assert_eq!(std::fs::read(root.join("b.kicad_sch")).unwrap(), b"before");
+        assert!(!completed.exists());
+        assert_eq!(std::fs::read(&retained).unwrap(), journal_before);
+    }
+
+    #[test]
+    fn implicit_recovery_reports_an_older_journal_only_if_it_wrote_targets() {
+        for late_save in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let journal = persist_pending_journal(&root, "older", &["a.txt", "b.txt"]);
+            let journal_before = std::fs::read(&journal).unwrap();
+            let target = root.join("b.txt");
+            if late_save {
+                save_before_final_check(&target, "external");
+            } else {
+                std::fs::write(&target, "external").unwrap();
+            }
+            let new_target = root.join("new.txt");
+            let failure = try_commit_file_transaction(
+                &root,
+                vec![FileTransition::create(&new_target, "new")],
+            )
+            .unwrap_err();
+
+            if late_save {
+                assert_eq!(failure.journal.as_deref(), Some(journal.as_path()));
+                assert_journaled_conflict(failure.error, &target, &journal);
+                assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"after");
+            } else {
+                assert!(failure.journal.is_none());
+                assert!(matches!(
+                    failure.error,
+                    SexpError::TransactionConflict {
+                        kind: TransactionConflictKind::Recovery,
+                        ..
+                    }
+                ));
+                assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"before");
+            }
+            assert_eq!(std::fs::read(&target).unwrap(), b"external");
+            assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+            assert!(!new_target.exists());
+        }
+    }
+
+    #[test]
+    fn a_first_target_late_save_refuses_replay_without_a_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let journal = persist_pending_journal(&root, "older", &["a.txt"]);
+        let journal_before = std::fs::read(&journal).unwrap();
+        let target = root.join("a.txt");
+        save_before_final_check(&target, "external");
+
+        let error = recover_file_transactions(&root).unwrap_err();
+        assert!(matches!(
+            error,
+            SexpError::TransactionConflict {
+                kind: TransactionConflictKind::Recovery,
+                ref reason,
+                ..
+            } if reason.contains("published no targets")
+                && !reason.contains("may have partially applied")
+        ));
+        assert_eq!(std::fs::read(target).unwrap(), b"external");
+        assert_eq!(std::fs::read(journal).unwrap(), journal_before);
+    }
+
+    #[test]
+    fn failed_directory_sync_reports_replay_publication_before_sync() {
+        for remaining_syncs in [0, 1] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let journal = persist_pending_journal(&root, "older", &["a.txt"]);
+            let journal_before = std::fs::read(&journal).unwrap();
+            let new_target = root.join("new.txt");
+            crate::writer::FAIL_DIRECTORY_SYNC_AFTER.with(|remaining| {
+                remaining.set(Some(remaining_syncs));
+            });
+            let failure = try_commit_file_transaction(
+                &root,
+                vec![FileTransition::create(&new_target, "new")],
+            )
+            .unwrap_err();
+            crate::writer::FAIL_DIRECTORY_SYNC_AFTER.with(|remaining| {
+                assert_eq!(remaining.replace(None), None);
+            });
+
+            assert_eq!(failure.journal.as_deref(), Some(journal.as_path()));
+            assert!(failure
+                .error
+                .to_string()
+                .contains("injected directory sync failure"));
+            assert_journaled_conflict(failure.error, &journal, &journal);
+            assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"after");
+            assert!(!new_target.exists());
+            if remaining_syncs == 0 {
+                assert_eq!(std::fs::read(journal).unwrap(), journal_before);
+            } else {
+                assert!(!journal.exists());
+            }
+        }
+    }
+
+    fn assert_journaled_conflict(error: SexpError, target: &Path, retained_journal: &Path) {
+        assert!(matches!(
+            error,
+            SexpError::TransactionConflict {
+                path, journal, ref reason, kind: TransactionConflictKind::AfterImage
+            } if path == target && journal == retained_journal
+                && reason.contains("may have partially applied")
+        ));
+    }
 
     #[test]
     fn transaction_replaces_and_creates_files_together() {
@@ -1166,7 +1470,8 @@ mod tests {
         // the same transaction machinery in the same run — the two creation
         // policies have to differ. The journal is deliberately left in place
         // for the parent to inspect.
-        apply_entry(&root, &path, &journal.entries[0], &journal.entries).expect("entry applies");
+        apply_entry(&root, &path, &journal.entries[0], &journal.entries, || {})
+            .expect("entry applies");
     }
 
     #[cfg(unix)]
@@ -1547,10 +1852,9 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert!(
-            matches!(failure.error, SexpError::KiCadEditorLocked { path, .. } if path == guard)
-        );
         let journal = failure.journal.unwrap();
+        assert!(failure.error.to_string().contains("KiCad editor lock"));
+        assert_journaled_conflict(failure.error, &guard, &journal);
         let original_journal = std::fs::read(&journal).unwrap();
         assert_eq!(read_validated_journal(&root, &journal).unwrap().version, 1);
         assert_eq!(std::fs::read_to_string(&sheet).unwrap(), "before");

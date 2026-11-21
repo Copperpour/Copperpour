@@ -1949,18 +1949,25 @@ fn annotate_hierarchy_with_persistence(
     let conflict = |paths: Vec<String>, message: String| {
         CallToolResult::error_kind(ToolErrorKind::Conflict { paths }, message)
     };
-    let uncertain = |reason: String, requested: usize| {
+    let uncertain_outcome = |result, source, requested: usize| {
         outcome::attach(
-            crate::tools::mutation_outcome_uncertain(path, OPERATION, reason),
+            result,
             outcome::summary(
                 OutcomeStatus::Uncertain,
                 path.display().to_string(),
-                "saved_file_readback",
+                source,
                 requested,
                 0,
                 requested,
                 Some(outcome::inspect_before_retry()),
             ),
+        )
+    };
+    let uncertain = |reason: String, requested: usize| {
+        uncertain_outcome(
+            crate::tools::mutation_outcome_uncertain(path, OPERATION, reason),
+            "saved_file_readback",
+            requested,
         )
     };
 
@@ -2037,6 +2044,18 @@ fn annotate_hierarchy_with_persistence(
                      it does not settle them. Run without dry_run, which settles them first, or \
                      inspect them with `copperpour transaction status {shown}`."
                 ),
+            )
+        }
+        Err(SexpError::TransactionConflict {
+            path: conflict_path,
+            journal,
+            kind: copperpour_sexp::TransactionConflictKind::AfterImage,
+            ..
+        }) => {
+            return uncertain_outcome(
+                crate::tools::transaction_after_image_result(&journal, &conflict_path, OPERATION),
+                "saved_file",
+                0,
             )
         }
         Err(copperpour_sexp::SexpError::TransactionConflict {
@@ -2233,13 +2252,18 @@ fn annotate_hierarchy_with_persistence(
                 return outcome::refused_before_write(refusal, target, requested);
             }
         }
-        return uncertain(
-            format!(
-                "the transaction over {} failed: {}; `copperpour transaction status {shown}` \
-                 shows what was applied",
-                written.join(", "),
-                failure.error
+        return uncertain_outcome(
+            crate::tools::file_outcome_uncertain(
+                path,
+                OPERATION,
+                format!(
+                    "the transaction over {} failed: {}; check for a remaining journal with \
+                     `copperpour transaction status {shown}` before retrying",
+                    written.join(", "),
+                    failure.error
+                ),
             ),
+            "saved_file",
             requested,
         );
     }
@@ -4385,6 +4409,33 @@ mod tests {
             );
         }
         assert_eq!(saved(dir.path(), &nested_names()), before);
+    }
+
+    #[test]
+    fn annotate_distinguishes_refused_and_interrupted_replay() {
+        for late_save in [false, true] {
+            let (dir, root) = nested_project(unannotated_crystal);
+            let journal = if late_save {
+                crate::test_support::arm_late_save_during_recovery(dir.path())
+            } else {
+                crate::test_support::write_recovery_journal(dir.path(), "external")
+            };
+            let journal_before = std::fs::read(&journal).unwrap();
+            let before = saved(dir.path(), &nested_names());
+            let result = annotate_hierarchy(&root, AnnotateOptions::default());
+            let body = response_json(&result);
+            let kind = if late_save {
+                assert_eq!(body["outcome"]["retry"], outcome::inspect_before_retry());
+                "mutation_outcome_uncertain"
+            } else {
+                "conflict"
+            };
+            assert_eq!(body["error"]["kind"], kind, "{body}");
+            assert!(text_of(&result).contains("transaction status"));
+            crate::test_support::assert_recovery_targets(dir.path(), late_save);
+            assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+            assert_eq!(saved(dir.path(), &nested_names()), before);
+        }
     }
 
     #[test]

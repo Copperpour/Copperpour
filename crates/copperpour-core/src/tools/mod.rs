@@ -1485,9 +1485,7 @@ pub(crate) fn stuck_transaction_journal_result(
     )
 }
 
-/// The `mutation_outcome_uncertain` result when a durable transaction wrote
-/// files but after-image verification found that a replacement did not stay
-/// durable and the journal was kept on disk.
+/// Report a journaled transaction that may have written targets before it stopped.
 pub(crate) fn transaction_after_image_result(
     journal: &std::path::Path,
     path: &std::path::Path,
@@ -1499,14 +1497,18 @@ pub(crate) fn transaction_after_image_result(
         .parent()
         .map(copperpour_sexp::paths::display_path)
         .unwrap_or_else(|| ".".to_string());
-    mutation_outcome_uncertain(
-        std::path::Path::new(&shown_path),
-        operation,
-        format!(
-            "the transaction replacement for '{shown_path}' did not remain durable; files may \
-             already have been written and journal '{shown_journal}' was kept. Inspect it with \
-             `copperpour transaction status {dir}` before retrying."
-        ),
+    let reason = format!(
+        "The transaction stopped at '{shown_path}'; files may already have been written. \
+         Inspect the affected files and check whether journal '{shown_journal}' remains with \
+         `copperpour transaction status {dir}` before retrying."
+    );
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain {
+            operation: operation.to_owned(),
+            path: shown_path,
+            reason: reason.clone(),
+        },
+        reason,
     )
 }
 
