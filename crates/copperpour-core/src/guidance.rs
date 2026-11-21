@@ -18,9 +18,14 @@ pub const BUILD_COMMIT_SOURCE: Option<&str> = option_env!("COPPERPOUR_BUILD_COMM
 pub trait GuidanceProbe: Send + Sync {
     /// The `guidance` block of `get_installation_info`.
     fn detail(&self) -> Value;
+    /// A pending drift notice for `initialize` instructions without consuming
+    /// it or recording `.guidance-checked-<client>` before a tool call runs (#722).
+    fn peek_notice(&self) -> Option<String> {
+        self.take_notice()
+    }
     /// A notice for the model when installed guidance differs from the bundle
-    /// this server carries. The probe hands it out at most once for each
-    /// installed version, so a later call or a later start gets `None`.
+    /// this server carries. Consumed and recorded on the first eligible tool
+    /// call of a session, so a later call or a later start gets `None`.
     fn take_notice(&self) -> Option<String>;
 }
 
@@ -44,7 +49,10 @@ with zero findings.\n\
 Use get_guidance with no arguments to list this build's skills and references, \
 then read an exact listed path (start with copperpour/SKILL.md). The same content \
 is available as copperpour://guidance/ resources. Server guidance needs no init \
-or local skill installation; init remains opt-in for native skills and hooks.";
+or local skill installation; init remains opt-in for native skills and hooks. \
+When initialize instructions or a tool result includes a guidance_notice, you \
+must surface that notice in your reply to the user and ask them to run the \
+reported init command.";
 
 pub fn session_instructions(notice: Option<&str>) -> String {
     match notice {

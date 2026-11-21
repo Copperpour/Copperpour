@@ -44,6 +44,12 @@ pub struct McpHandler {
     /// tools outside the reviewed read-only list. Set once at startup from
     /// the server configuration; no request can change it.
     call_tool_allow_writes: Arc<AtomicBool>,
+    /// One-shot guidance drift notice latched on the first non-`get_guidance`
+    /// tool call of this session (#722). Kept on non-`get_guidance` tool
+    /// results throughout that one drifted session so multi-step turns still
+    /// see it right before replying to the user, while `.guidance-checked-*`
+    /// silences later sessions.
+    session_guidance_notice: Arc<std::sync::OnceLock<Option<String>>>,
 }
 
 /// MCP clients known to cache the first `tools/list` and ignore
@@ -68,6 +74,24 @@ const CLIENTS_THAT_CACHE_TOOL_LIST: &[&str] = &["claude-ai", "local-agent-mode-"
 
 /// The meta-tool that runs another tool by name (see `dispatch_call_tool`).
 const CALL_TOOL: &str = "call_tool";
+
+/// Attach a one-time installed-guidance drift notice to a tool call response
+/// (#722). JSON-object responses receive a top-level `guidance_notice` field so
+/// callers parsing `content[0].text` as JSON remain valid; non-object responses
+/// receive an additional text content block.
+fn attach_guidance_notice(result: &mut CallToolResult, notice: String) {
+    for content in &mut result.content {
+        if let ToolContent::Text { text } = content {
+            if let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(text) {
+                map.entry("guidance_notice")
+                    .or_insert_with(|| Value::String(notice));
+                *text = Value::Object(map).to_string();
+                return;
+            }
+        }
+    }
+    result.content.push(ToolContent::Text { text: notice });
+}
 
 /// An `invalid_argument` refusal for `field`.
 fn invalid_argument(field: &str, reason: &str) -> (CallToolResult, CallStatus, Option<String>) {
@@ -180,6 +204,7 @@ impl McpHandler {
             observer,
             meta_input_validators: Arc::new(meta_input_validators),
             call_tool_allow_writes: Arc::new(AtomicBool::new(false)),
+            session_guidance_notice: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -374,7 +399,7 @@ impl McpHandler {
                     .ctx
                     .guidance
                     .get()
-                    .and_then(|probe| probe.take_notice());
+                    .and_then(|probe| probe.peek_notice());
                 let result = McpServerState::build_initialize_result(notice);
                 Ok(Some(serde_json::to_value(result)?))
             }
@@ -452,7 +477,21 @@ impl McpHandler {
             "tool_call_start"
         );
 
-        let (result, status, error_kind) = self.dispatch_tool(&params.name, &args).await;
+        let (mut result, status, error_kind) = self.dispatch_tool(&params.name, &args).await;
+        if recorded_name != "get_guidance" {
+            let notice = self
+                .session_guidance_notice
+                .get_or_init(|| {
+                    self.ctx
+                        .guidance
+                        .get()
+                        .and_then(|probe| probe.take_notice())
+                })
+                .clone();
+            if let Some(notice) = notice {
+                attach_guidance_notice(&mut result, notice);
+            }
+        }
 
         let dur_ms = started.elapsed().as_millis() as u64;
         let result_bytes = result_content_bytes(&result);
@@ -3558,6 +3597,142 @@ mod client_adaptation_tests {
             format!("{}\n\nrun copperpour init", crate::guidance::SESSION_RULES)
         );
         assert_eq!(result["serverInfo"]["name"], "copperpour");
+    }
+
+    struct OneShotProbe(std::sync::Mutex<Option<String>>);
+
+    impl crate::guidance::GuidanceProbe for OneShotProbe {
+        fn detail(&self) -> Value {
+            json!({"probe_status": "ok"})
+        }
+
+        fn peek_notice(&self) -> Option<String> {
+            self.0.lock().unwrap().clone()
+        }
+
+        fn take_notice(&self) -> Option<String> {
+            self.0.lock().unwrap().take()
+        }
+    }
+
+    /// #722: `initialize` peeks at the guidance drift notice without consuming
+    /// it, `get_guidance` (direct or through `call_tool`) leaves it pending so
+    /// its `resources/read` payload is untouched, and the first other tool call
+    /// carries `guidance_notice` once.
+    #[tokio::test]
+    async fn first_non_guidance_tool_call_carries_guidance_notice_once() {
+        use crate::guidance::GuidanceProbe;
+        let handler = lazy_handler().await;
+        let probe = Arc::new(OneShotProbe(std::sync::Mutex::new(Some(
+            "run copperpour init".to_string(),
+        ))));
+        handler.set_guidance_probe(probe.clone());
+
+        // `initialize` includes the notice in `instructions` without consuming it.
+        let init = initialize_result(&handler).await;
+        assert_eq!(
+            init["instructions"],
+            format!("{}\n\nrun copperpour init", crate::guidance::SESSION_RULES)
+        );
+
+        // Neither direct `get_guidance` nor `call_tool` -> `get_guidance` consumes it.
+        for call in [
+            json!({"name": "get_guidance", "arguments": {"path": "copperpour/SKILL.md"}}),
+            json!({
+                "name": "call_tool",
+                "arguments": {"name": "get_guidance", "arguments": {"path": "copperpour/SKILL.md"}}
+            }),
+        ] {
+            let reply = handler
+                .handle_message(
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": call}),
+                )
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            let body: Value =
+                serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert!(
+                body.get("guidance_notice").is_none(),
+                "get_guidance must not consume or attach guidance_notice: {body}"
+            );
+        }
+
+        // First non-`get_guidance` tool call receives `guidance_notice`.
+        let first = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "load_toolset", "arguments": {"name": "templates"}}
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let first_body: Value =
+            serde_json::from_str(first["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(first_body["guidance_notice"], "run copperpour init");
+
+        // Subsequent tool calls in the same drifted session keep `guidance_notice`
+        // visible through the end of a multi-tool turn, while `take_notice()` on
+        // the underlying probe was consumed on the first eligible call.
+        assert_eq!(probe.take_notice(), None);
+        let second = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "get_active_toolsets", "arguments": {}}
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let second_body: Value =
+            serde_json::from_str(second["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(second_body["guidance_notice"], "run copperpour init");
+
+        // Sibling routes through `execute_tool`: a domain tool (`list_templates`
+        // in the preloaded starter kit) and `call_tool` targeting a domain tool
+        // also receive `guidance_notice` when they are the first eligible call.
+        for call in [
+            json!({"name": "list_templates", "arguments": {}}),
+            json!({"name": "call_tool", "arguments": {"name": "list_templates", "arguments": {}}}),
+        ] {
+            let sibling_handler = lazy_handler().await;
+            sibling_handler.set_guidance_probe(Arc::new(OneShotProbe(std::sync::Mutex::new(
+                Some("run copperpour init".to_string()),
+            ))));
+            let reply = sibling_handler
+                .handle_message(
+                    json!({"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": call}),
+                )
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            let body: Value =
+                serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(body["guidance_notice"], "run copperpour init", "{call}");
+        }
+    }
+
+    #[test]
+    fn attach_guidance_notice_handles_json_objects_and_non_object_results() {
+        let mut json_result = CallToolResult::json(&json!({"ok": true}));
+        attach_guidance_notice(&mut json_result, "run copperpour init".to_string());
+        let ToolContent::Text { text } = &json_result.content[0] else {
+            panic!("expected text content");
+        };
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["guidance_notice"], "run copperpour init");
+
+        let mut plain_result = CallToolResult::error("plain error");
+        attach_guidance_notice(&mut plain_result, "run copperpour init".to_string());
+        assert_eq!(plain_result.content.len(), 2);
+        let ToolContent::Text { text: appended } = &plain_result.content[1] else {
+            panic!("expected appended text content");
+        };
+        assert_eq!(appended, "run copperpour init");
     }
 
     /// #50: Claude Code stays on the starter kit, so a `load_toolset` it
