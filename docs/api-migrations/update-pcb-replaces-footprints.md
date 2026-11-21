@@ -10,7 +10,8 @@ as KiCad's Update PCB does (`BOARD_NETLIST_UPDATER::replaceFootprint`):
 - The replaced footprint keeps its KIID, position, rotation, side, lock and
   symbol link, and each pad's net and schematic pin by pad number. It takes
   the new library footprint's pads, artwork, texts, custom properties,
-  attributes and 3D models, and Reference and Value take the library's
+  attributes, its own clearance, zone connection and solder mask and paste
+  margins, and 3D models, and Reference and Value take the library's
   position and style when the library footprint states them as properties
   (KiCad 8 and later); a footprint in the older `fp_text reference` form
   leaves the placed text as it is. The schematic's value, fields, DNP and BOM exclusion are

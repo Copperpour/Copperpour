@@ -1,8 +1,8 @@
 use super::library::PadFabricationProperty;
 use super::library_footprint::{
-    apply_reference_points, carries_kicad_10_0_7_fields, default_thermal_spoke_angle, fab_property,
-    needs_kicad_10_0_7_summary, pad_zones, points, validate_supported_children, LibraryPoint,
-    PadZoneSettings,
+    apply_pad_margins, apply_reference_points, carries_kicad_10_0_7_fields,
+    default_thermal_spoke_angle, fab_property, needs_kicad_10_0_7_summary, pad_margins, pad_zones,
+    points, validate_supported_children, LibraryPoint, PadZoneSettings, SolderMargins,
 };
 use crate::hex::encode_hex;
 use crate::mcp::protocol::{CallToolResult, ToolContent};
@@ -37,6 +37,10 @@ struct LibraryFootprint {
     /// Each pad's zone connection and thermal relief clauses, in the order
     /// of `pads`.
     pad_zones: Vec<PadZoneSettings>,
+    /// Each pad's own solder mask and paste margins, in the order of `pads`.
+    pad_margins: Vec<SolderMargins>,
+    /// The footprint's own solder mask and paste margins.
+    margins: SolderMargins,
     graphics: Vec<copperpour_ipc::IpcGraphicDefinition>,
     points: Vec<LibraryPoint>,
     models: Vec<kiapi::board::types::Footprint3DModel>,
@@ -60,6 +64,7 @@ enum ChangedDomain {
     Metadata,
     Models,
     TextEffects,
+    ClearanceOverrides,
 }
 
 #[derive(Debug)]
@@ -88,8 +93,9 @@ struct TextEffects {
 }
 
 /// Which of KiCad's Update Footprints reset options apply. Each is off by
-/// default, as in KiCad's update dialog (`dialog_exchange_footprints.cpp`,
-/// update mode), so a refresh keeps what they cover:
+/// default, so a refresh keeps what they cover; KiCad's update dialog
+/// (`dialog_exchange_footprints.cpp`, update mode) leaves each unchecked but
+/// the last:
 /// - "Update/reset text sizes and styles" (every text attribute, angle
 ///   included) and "Update/reset text positions" apply to Reference and
 ///   Value.
@@ -99,6 +105,11 @@ struct TextEffects {
 ///   library's mounting type and BOM and position-file exclusions. DNP and
 ///   "not in schematic" stay with the placed footprint either way: the
 ///   schematic sets them.
+/// - "Update/reset clearance overrides", which the dialog checks by default,
+///   gives the footprint the library's own clearance, zone connection,
+///   solder mask and paste margins and solder mask bridge setting
+///   (`PCB_EDIT_FRAME::ExchangeFootprint`). Pads take the library's margins
+///   either way, as KiCad replaces every pad.
 ///
 /// Flattened into the plan inputs, an unset flag is left out, so a call
 /// without one keeps the revision it had before the flags existed.
@@ -124,6 +135,11 @@ struct Resets {
         skip_serializing_if = "std::ops::Not::not"
     )]
     fabrication_attributes: bool,
+    #[serde(
+        rename = "reset_clearance_overrides",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    clearance_overrides: bool,
 }
 
 impl Resets {
@@ -298,8 +314,9 @@ pub(crate) fn tool() -> ToolDef {
         "Plan or atomically apply KiCad's Update Footprints from Library operation to placed \
          footprints on the live board. Defaults to a non-mutating dry run; apply requires its \
          exact plan revision. Preserves placed-instance state and pad nets while refreshing \
-         supported library-owned content; field text and fabrication attributes are kept \
-         unless reset_text_content or reset_fabrication_attributes is set. Refuses to replace \
+         supported library-owned content; field text, fabrication attributes and clearance \
+         overrides are kept unless reset_text_content, reset_fabrication_attributes or \
+         reset_clearance_overrides is set. Refuses to replace \
          a footprint that owns a group, or whose groups can't be read from the live board.",
         json!({
             "type": "object",
@@ -337,6 +354,11 @@ pub(crate) fn tool() -> ToolDef {
                     "type": "boolean",
                     "default": false,
                     "description": "Also give each footprint the library's mounting type and BOM and position-file exclusions, as KiCad's 'Update/reset fabrication attributes' option does. Off by default: the placed footprint keeps them. DNP and 'not in schematic' are kept either way."
+                },
+                "reset_clearance_overrides": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also give each footprint the library's own clearance, zone connection, solder mask and paste margins and solder mask bridge setting, as KiCad's 'Update/reset clearance overrides' option does, which its dialog checks by default. Off by default: the placed footprint keeps them."
                 },
                 "dry_run": {
                     "type": "boolean",
@@ -768,6 +790,7 @@ fn parse_filters(args: &serde_json::Value) -> std::result::Result<UpdateFilters,
             positions: flag(args, "reset_text_positions")?,
             content: flag(args, "reset_text_content")?,
             fabrication_attributes: flag(args, "reset_fabrication_attributes")?,
+            clearance_overrides: flag(args, "reset_clearance_overrides")?,
         },
     })
 }
@@ -1071,6 +1094,8 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     let pad_properties = super::library_footprint::pad_properties(&pad_nodes, pads.len())?;
     // Read from the same nodes, so there is one per pad.
     let pad_zones = pad_zones(&pad_nodes)?;
+    let pad_margins = pad_margins(&root, &pad_nodes)?;
+    let margins = SolderMargins::of_footprint(&root)?;
     let points = points(&root)?;
     // Custom properties travel as typed Field items below. Treating visible
     // properties as generic graphics as well would duplicate their text.
@@ -1098,6 +1123,8 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         pads,
         pad_properties,
         pad_zones,
+        pad_margins,
+        margins,
         graphics,
         points,
         models,
@@ -1133,9 +1160,10 @@ impl ReplacementFootprint {
 /// defaults): it keeps its KIID, position, rotation, side, lock, symbol link,
 /// DNP, and each pad's net and schematic pin by pad number; everything else
 /// comes from the new footprint. That includes the Reference and Value text
-/// positions and styles, the attributes and the 3D models, and the custom
-/// properties: the old ones go, whether the old library or the board gave
-/// them, and the caller sets the symbol's fields again, as Update PCB does.
+/// positions and styles, the attributes, the clearance and margin overrides,
+/// the 3D models, and the custom properties: the old ones go, whether the old
+/// library or the board gave them, and the caller sets the symbol's fields
+/// again, as Update PCB does.
 /// The text of Reference and Value is kept; the caller sets it from the
 /// schematic.
 ///
@@ -1181,6 +1209,7 @@ pub(crate) fn replace_footprint(
         positions: reference_and_value,
         content: true,
         fabrication_attributes: true,
+        clearance_overrides: true,
     };
     let prepared = build_updated_instance(
         &relabelled,
@@ -1353,11 +1382,15 @@ fn build_updated_instance(
         is_back.then_some(stack),
     )?;
     // The builder emits the pads in the library's order.
-    let mut pad_properties = library.pad_properties.iter().zip(&library.pad_zones);
+    let mut pad_properties = library
+        .pad_properties
+        .iter()
+        .zip(&library.pad_zones)
+        .zip(&library.pad_margins);
     for item in &mut definition.items {
         if item.type_url.ends_with("kiapi.board.types.Pad") {
             let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
-            let (property, zone) = pad_properties
+            let ((property, zone), margins) = pad_properties
                 .next()
                 .context("typed footprint builder returned more pads than the library has")?;
             pad.fab_property = fab_property(*property) as i32;
@@ -1371,6 +1404,7 @@ fn build_updated_instance(
                 .context("typed footprint builder returned a pad without a copper layer")?;
             let (shape, anchor) = (layer.shape, layer.custom_anchor_shape);
             stack.zone_settings = Some(zone.zone_connection_settings(shape, anchor));
+            apply_pad_margins(stack, margins);
             pad.net = old_nets
                 .get(&pad.number)
                 .map(|old| kiapi::board::types::Net {
@@ -1425,8 +1459,21 @@ fn build_updated_instance(
             attributes.exclude_from_bill_of_materials =
                 current_attributes.exclude_from_bill_of_materials;
         }
+        if !resets.clearance_overrides {
+            attributes.allow_soldermask_bridges = current_attributes.allow_soldermask_bridges;
+        }
     }
     updated.attributes = Some(attributes);
+    if resets.clearance_overrides {
+        // The refresh refuses a library footprint with its own clearance or
+        // zone connection, so the library's are none and inherited.
+        updated.overrides = Some(kiapi::board::types::FootprintDesignRuleOverrides {
+            solder_mask: library.margins.mask_overrides(),
+            solder_paste: library.margins.paste_overrides(),
+            copper_clearance: None,
+            zone_connection: kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32,
+        });
+    }
 
     let mut text_effects = Vec::new();
     if resets.reference_and_value() {
@@ -1930,6 +1977,11 @@ fn changed_domains(
     {
         changed.insert(ChangedDomain::TextEffects);
     }
+    if normalized_overrides(current.overrides.as_ref())
+        != normalized_overrides(updated.overrides.as_ref())
+    {
+        changed.insert(ChangedDomain::ClearanceOverrides);
+    }
     Ok(changed)
 }
 
@@ -2261,6 +2313,31 @@ fn library_owned_attributes(
     })
 }
 
+/// A footprint's clearance and margin overrides as KiCad reads them
+/// (`FOOTPRINT::Deserialize`, 10.0.8): none, an unknown zone connection and
+/// settings without a margin all mean inherited. `expose_copper` has no
+/// meaning for a footprint.
+fn normalized_overrides(
+    overrides: Option<&kiapi::board::types::FootprintDesignRuleOverrides>,
+) -> kiapi::board::types::FootprintDesignRuleOverrides {
+    use kiapi::board::types::ZoneConnectionStyle;
+    let mut overrides = overrides.copied().unwrap_or_default();
+    if overrides.zone_connection == ZoneConnectionStyle::ZcsUnknown as i32 {
+        overrides.zone_connection = ZoneConnectionStyle::ZcsInherited as i32;
+    }
+    overrides.solder_mask = overrides
+        .solder_mask
+        .and_then(|mask| mask.solder_mask_margin)
+        .map(|margin| kiapi::board::types::SolderMaskOverrides {
+            solder_mask_margin: Some(margin),
+            ..Default::default()
+        });
+    overrides.solder_paste = overrides.solder_paste.filter(|paste| {
+        paste.solder_paste_margin.is_some() || paste.solder_paste_margin_ratio.is_some()
+    });
+    overrides
+}
+
 fn field_text(field: &Option<kiapi::board::types::Field>) -> String {
     field
         .as_ref()
@@ -2274,6 +2351,9 @@ fn field_text(field: &Option<kiapi::board::types::Field>) -> String {
 mod tests {
     use super::*;
 
+    use crate::tools::library_footprint::test_margins::{
+        expected_margins, placed_margins, NO_MARGINS, SOLDER_MARGIN_FOOTPRINTS,
+    };
     use copperpour_ipc::builders;
     use copperpour_ipc::gen::kiapi;
     use kiapi::common::types::ElectricalPinType;
@@ -3224,16 +3304,6 @@ mod tests {
         );
         let error = parse_library_footprint("Test:Socket", &dashed).unwrap_err();
         assert!(error.to_string().contains("stroke type"), "{error:#}");
-
-        let solder_margin = LIBRARY_FOOTPRINT.replace(
-            "(roundrect_rratio 0.2))",
-            "(roundrect_rratio 0.2) (solder_mask_margin 0.05))",
-        );
-        let error = parse_library_footprint("Test:Socket", &solder_margin).unwrap_err();
-        assert!(
-            error.to_string().contains("solder_mask_margin"),
-            "{error:#}"
-        );
     }
 
     /// `(unlocked yes)` is KiCad's "don't keep upright"; the Pico footprints
@@ -5485,30 +5555,42 @@ mod tests {
         positions: true,
         content: false,
         fabrication_attributes: false,
+        clearance_overrides: false,
     };
     const STYLES: Resets = Resets {
         sizes_and_styles: true,
         positions: false,
         content: false,
         fabrication_attributes: false,
+        clearance_overrides: false,
     };
     const POSITIONS: Resets = Resets {
         sizes_and_styles: false,
         positions: true,
         content: false,
         fabrication_attributes: false,
+        clearance_overrides: false,
     };
     const CONTENT: Resets = Resets {
         sizes_and_styles: false,
         positions: false,
         content: true,
         fabrication_attributes: false,
+        clearance_overrides: false,
     };
     const FABRICATION: Resets = Resets {
         sizes_and_styles: false,
         positions: false,
         content: false,
         fabrication_attributes: true,
+        clearance_overrides: false,
+    };
+    const CLEARANCE: Resets = Resets {
+        sizes_and_styles: false,
+        positions: false,
+        content: false,
+        fabrication_attributes: false,
+        clearance_overrides: true,
     };
 
     fn reset_with(
@@ -5752,6 +5834,7 @@ mod tests {
                         positions: flags & 2 != 0,
                         content: flags & 4 != 0,
                         fabrication_attributes: flags & 8 != 0,
+                        clearance_overrides: flags & 16 != 0,
                     },
                     ..Default::default()
                 },
@@ -5759,8 +5842,8 @@ mod tests {
             )
             .plan_revision
         };
-        let revisions = (0..16).map(plan).collect::<BTreeSet<_>>();
-        assert_eq!(revisions.len(), 16);
+        let revisions = (0..32).map(plan).collect::<BTreeSet<_>>();
+        assert_eq!(revisions.len(), 32);
         // Unset flags serialize as they did before the flags existed.
         assert_eq!(
             serde_json::to_value(UpdateFilters::default()).unwrap(),
@@ -5861,6 +5944,7 @@ mod tests {
             "reset_text_positions",
             "reset_text_content",
             "reset_fabrication_attributes",
+            "reset_clearance_overrides",
         ] {
             let result = served_call(
                 &handler,
@@ -7043,6 +7127,489 @@ mod tests {
         let body = issue_300_served_dry_run((10, 0, 6), &["U1", "U3", "U4", "U5"]).await;
         assert_eq!(body["status"], "noop", "{body}");
         assert_eq!(body["coverage"]["unchanged"]["planned"], 4, "{body}");
+    }
+
+    // ─── #723: pad and footprint solder margins ─────────────────────────────
+
+    /// KiCad 10.0.8's reports of #667's footprints placed from their library
+    /// (`solder_margins_ipc.README.md`): U1 to U4 on the front in
+    /// `SOLDER_MARGIN_FOOTPRINTS`' order, U5 to U8 the same on the back at
+    /// 90°, and U9 and U10 with overrides set on the board.
+    const SOLDER_MARGIN_CAPTURES: [(&str, &[u8]); 10] = [
+        (
+            "U1",
+            include_bytes!("../../tests/fixtures/solder_margins_u1.ipc.bin"),
+        ),
+        (
+            "U2",
+            include_bytes!("../../tests/fixtures/solder_margins_u2.ipc.bin"),
+        ),
+        (
+            "U3",
+            include_bytes!("../../tests/fixtures/solder_margins_u3.ipc.bin"),
+        ),
+        (
+            "U4",
+            include_bytes!("../../tests/fixtures/solder_margins_u4.ipc.bin"),
+        ),
+        (
+            "U5",
+            include_bytes!("../../tests/fixtures/solder_margins_u5.ipc.bin"),
+        ),
+        (
+            "U6",
+            include_bytes!("../../tests/fixtures/solder_margins_u6.ipc.bin"),
+        ),
+        (
+            "U7",
+            include_bytes!("../../tests/fixtures/solder_margins_u7.ipc.bin"),
+        ),
+        (
+            "U8",
+            include_bytes!("../../tests/fixtures/solder_margins_u8.ipc.bin"),
+        ),
+        (
+            "U9",
+            include_bytes!("../../tests/fixtures/solder_margins_u9.ipc.bin"),
+        ),
+        (
+            "U10",
+            include_bytes!("../../tests/fixtures/solder_margins_u10.ipc.bin"),
+        ),
+    ];
+
+    /// #667's footprint with no margins of its own or on any pad, and the
+    /// library changes KiCad wrote from #667's (`solder_margins_kicad10.README.md`):
+    /// pad 9's mask margin, the footprint's own mask margin, and a clearance
+    /// or zone connection of the footprint's own.
+    const SOLDER_MARGINS_NONE: &str =
+        include_str!("../../tests/fixtures/solder_margins_none_kicad10.kicad_mod");
+    const SOLDER_MARGINS_EP_CHANGED: &str =
+        include_str!("../../tests/fixtures/solder_margins_ep_changed_kicad10.kicad_mod");
+    const SOLDER_MARGINS_FOOTPRINT_CHANGED: &str =
+        include_str!("../../tests/fixtures/solder_margins_footprint_changed_kicad10.kicad_mod");
+    const SOLDER_MARGINS_CLEARANCE: &str =
+        include_str!("../../tests/fixtures/solder_margins_clearance_kicad10.kicad_mod");
+    const SOLDER_MARGINS_ZONE_CONNECT: &str =
+        include_str!("../../tests/fixtures/solder_margins_zone_connect_kicad10.kicad_mod");
+
+    fn solder_margin_capture(reference: &str) -> kiapi::board::types::FootprintInstance {
+        let (_, bytes) = SOLDER_MARGIN_CAPTURES
+            .iter()
+            .find(|(capture, _)| *capture == reference)
+            .unwrap();
+        kiapi::board::types::FootprintInstance::decode(*bytes).unwrap()
+    }
+
+    /// `reference`'s capture refreshed with `resets` from `source` as its
+    /// library entry, and what that changes.
+    fn solder_margin_refresh(
+        reference: &str,
+        source: &str,
+        resets: Resets,
+    ) -> (
+        kiapi::board::types::FootprintInstance,
+        kiapi::board::types::FootprintInstance,
+        BTreeSet<ChangedDomain>,
+    ) {
+        let current = solder_margin_capture(reference);
+        let id = current.definition.as_ref().unwrap().id.clone().unwrap();
+        let (current, updated) = refresh_with(
+            current,
+            &[(&id.library_nickname, &id.entry_name, source)],
+            resets,
+        );
+        let changed = changed_domains(&current, &updated).unwrap();
+        (current, updated, changed)
+    }
+
+    /// KiCad reports a placed footprint's own margins on its overrides and
+    /// each pad's on both outer layers, the values `SOLDER_MARGIN_FOOTPRINTS`
+    /// lists and placement's tests build; a pad without margins reports no
+    /// outer layer, and a footprint no clearance and an inherited zone
+    /// connection.
+    #[test]
+    fn kicad_reports_each_placed_footprints_margins_as_its_library_sets_them() {
+        for (index, (name, _, own, pad_9)) in SOLDER_MARGIN_FOOTPRINTS.into_iter().enumerate() {
+            for reference in [format!("U{}", index + 1), format!("U{}", index + 5)] {
+                let capture = solder_margin_capture(&reference);
+                let definition = capture.definition.as_ref().unwrap();
+                assert_eq!(definition.id.as_ref().unwrap().entry_name, name);
+                assert_eq!(
+                    placed_margins(&capture),
+                    expected_margins(own, pad_9),
+                    "{reference} {name}"
+                );
+                for item in &definition.items {
+                    if !item.type_url.ends_with("kiapi.board.types.Pad") {
+                        continue;
+                    }
+                    let pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                    let stack = pad.pad_stack.unwrap();
+                    if pad.number != "9" || pad_9 == NO_MARGINS {
+                        assert_eq!(stack.front_outer_layers, None, "{reference}");
+                        assert_eq!(stack.back_outer_layers, None, "{reference}");
+                    }
+                }
+                let overrides = capture.overrides.unwrap();
+                assert_eq!(overrides.copper_clearance, None, "{reference}");
+                assert_eq!(
+                    overrides.zone_connection,
+                    kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32,
+                    "{reference}"
+                );
+            }
+        }
+    }
+
+    /// A dry run of the `references` captures against #667's library, with
+    /// `arguments` beside the board.
+    async fn solder_margin_served_dry_run(
+        references: &[&str],
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        // The mock answers a 2-layer stack, as KiCad did for this board. Its
+        // answer listed the #283 board's layers.
+        let enabled_layers = kiapi::board::commands::BoardEnabledLayersResponse::decode(
+            include_bytes!("../../tests/fixtures/issue_283_enabled_layers.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        assert_eq!(enabled_layers.copper_layer_count, 2);
+        let (_temp, board) = libraries_project(
+            &SOLDER_MARGIN_FOOTPRINTS.map(|(name, source, ..)| ("Margins", name, source)),
+        );
+        let footprints = SOLDER_MARGIN_CAPTURES
+            .iter()
+            .filter(|(reference, _)| references.contains(reference))
+            .map(|(_, bytes)| prost_types::Any {
+                type_url: "type.googleapis.com/kiapi.board.types.FootprintInstance".to_string(),
+                value: bytes.to_vec(),
+            })
+            .collect();
+        let mock = spawn_planner_mock_on(&board, footprints, false, true, (10, 0, 8));
+        let handler = served(mock.kicad.address()).await;
+        let mut arguments = arguments;
+        arguments["board"] = serde_json::json!(board);
+        let body = result_json(&served_call(&handler, arguments).await);
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 0);
+        assert!(capture.update_batches.is_empty());
+        body
+    }
+
+    /// Through the served dispatch, the eight footprints KiCad placed from
+    /// their library plan nothing, with or without `reset_clearance_overrides`.
+    #[tokio::test]
+    async fn served_dry_run_of_footprints_placed_with_solder_margins_is_noop() {
+        let placed = ["U1", "U2", "U3", "U4", "U5", "U6", "U7", "U8"];
+        for arguments in [
+            serde_json::json!({}),
+            serde_json::json!({ "reset_clearance_overrides": true }),
+        ] {
+            let body = solder_margin_served_dry_run(&placed, arguments.clone()).await;
+            assert_eq!(body["status"], "noop", "{arguments}: {body}");
+            assert_eq!(
+                body["coverage"]["unchanged"]["planned"], 8,
+                "{arguments}: {body}"
+            );
+        }
+    }
+
+    /// Inline because KiCad writes no such clause: a pad's or the
+    /// footprint's margin that is not one number refuses the library
+    /// footprint, which the plan reports as `unsupported_library_footprint`
+    /// and Update PCB as a replacement it cannot build.
+    #[test]
+    fn a_malformed_solder_margin_refuses_the_library_footprint() {
+        for (owner, reference, (entry, source, ..), clause) in [
+            (
+                "pad",
+                "U1",
+                SOLDER_MARGIN_FOOTPRINTS[0],
+                "(solder_mask_margin -0.05)",
+            ),
+            (
+                "footprint",
+                "U3",
+                SOLDER_MARGIN_FOOTPRINTS[2],
+                "(solder_mask_margin 0.05)",
+            ),
+        ] {
+            assert_eq!(source.matches(clause).count(), 1, "{owner}");
+            let malformed = source.replace(clause, "(solder_mask_margin x)");
+            let message = format!("{owner} clause 'solder_mask_margin' has an invalid value 'x'");
+            let (_temp, board) = libraries_project(&[("Margins", entry, &malformed)]);
+            let (_, bytes) = SOLDER_MARGIN_CAPTURES
+                .iter()
+                .find(|(capture, _)| *capture == reference)
+                .unwrap();
+            let plan = plan_updates(
+                &board,
+                &[prost_types::Any {
+                    type_url: "type.googleapis.com/kiapi.board.types.FootprintInstance".to_string(),
+                    value: bytes.to_vec(),
+                }],
+                two_layers(),
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &UpdateFilters::default(),
+                &kicad_10_0_8(),
+            );
+            assert_eq!(plan.status, PlanStatus::Conflict, "{owner}");
+            assert_eq!(plan.diagnostics.len(), 1, "{owner}");
+            assert_eq!(
+                plan.diagnostics[0].code, "unsupported_library_footprint",
+                "{owner}"
+            );
+            assert!(
+                plan.diagnostics[0].message.contains(&message),
+                "{owner}: {}",
+                plan.diagnostics[0].message
+            );
+            let replacement =
+                ReplacementFootprint::parse(&format!("Margins:{entry}"), &malformed).unwrap_err();
+            assert!(
+                format!("{replacement:#}").contains(&message),
+                "{replacement:#}"
+            );
+        }
+    }
+
+    /// The refresh refuses a library footprint with its own clearance or zone
+    /// connection, so the library's, which `reset_clearance_overrides` gives
+    /// the footprint, are always none and inherited.
+    #[test]
+    fn a_library_footprints_own_clearance_or_zone_connection_is_refused() {
+        for (source, clause) in [
+            (SOLDER_MARGINS_CLEARANCE, "clearance"),
+            (SOLDER_MARGINS_ZONE_CONNECT, "zone_connect"),
+        ] {
+            let error = parse_library_footprint("Margins:none", source).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("footprint child '{clause}' is not supported by typed library refresh")
+            );
+        }
+    }
+
+    /// A pad takes its library pad's margins whatever the reset: a changed
+    /// or removed one plans `pads`, on either side.
+    #[test]
+    fn a_changed_pad_margin_plans_pads_carrying_the_librarys() {
+        for reference in ["U1", "U5"] {
+            for resets in [Resets::default(), CLEARANCE] {
+                let (current, updated, domains) =
+                    solder_margin_refresh(reference, SOLDER_MARGINS_EP_CHANGED, resets);
+                assert_eq!(
+                    domains,
+                    BTreeSet::from([ChangedDomain::Pads]),
+                    "{reference}"
+                );
+                assert_eq!(
+                    placed_margins(&updated),
+                    expected_margins(NO_MARGINS, (Some(30_000), Some(-100_000), Some(-0.2))),
+                    "{reference}"
+                );
+                assert_eq!(updated.overrides, current.overrides, "{reference}");
+
+                let (_, updated, domains) =
+                    solder_margin_refresh(reference, SOLDER_MARGINS_NONE, resets);
+                assert_eq!(
+                    domains,
+                    BTreeSet::from([ChangedDomain::Pads]),
+                    "{reference}"
+                );
+                assert_eq!(
+                    placed_margins(&updated),
+                    expected_margins(NO_MARGINS, NO_MARGINS),
+                    "{reference}"
+                );
+            }
+        }
+    }
+
+    /// A footprint keeps its own margins unless `reset_clearance_overrides`
+    /// is set; then a changed or removed library margin plans
+    /// `clearance_overrides` and the footprint takes the library's.
+    #[test]
+    fn a_changed_footprint_margin_plans_clearance_overrides_only_when_reset() {
+        for reference in ["U3", "U7"] {
+            for (source, margins) in [
+                (
+                    SOLDER_MARGINS_FOOTPRINT_CHANGED,
+                    (Some(-20_000), Some(-30_000), Some(-0.1)),
+                ),
+                (SOLDER_MARGINS_NONE, NO_MARGINS),
+            ] {
+                let (current, kept, domains) =
+                    solder_margin_refresh(reference, source, Resets::default());
+                assert_eq!(domains, BTreeSet::new(), "{reference}");
+                assert_eq!(kept.overrides, current.overrides, "{reference}");
+
+                let (_, reset, domains) = solder_margin_refresh(reference, source, CLEARANCE);
+                assert_eq!(
+                    domains,
+                    BTreeSet::from([ChangedDomain::ClearanceOverrides]),
+                    "{reference}"
+                );
+                assert_eq!(placed_margins(&reset).0, margins, "{reference}");
+            }
+        }
+    }
+
+    /// U9 and U10 carry a clearance, a zone connection, margins and the
+    /// bridge setting set on the board, and U10 a pad margin. Without a reset
+    /// the footprint keeps them and only the pad takes its library's; with
+    /// `reset_clearance_overrides` they become the library's: its margins, no
+    /// clearance, an inherited zone connection, no bridges.
+    #[test]
+    fn overrides_set_on_the_board_stay_unless_reset() {
+        use kiapi::board::types::ZoneConnectionStyle;
+        let ep = SOLDER_MARGIN_FOOTPRINTS[0];
+        let footprint = SOLDER_MARGIN_FOOTPRINTS[2];
+
+        let (current, kept, domains) = solder_margin_refresh("U9", footprint.1, Resets::default());
+        let overrides = current.overrides.unwrap();
+        assert_eq!(overrides.copper_clearance.unwrap().value_nm, 200_000);
+        assert_eq!(
+            overrides.zone_connection,
+            ZoneConnectionStyle::ZcsFull as i32
+        );
+        assert_eq!(
+            placed_margins(&current),
+            expected_margins((Some(70_000), Some(-30_000), Some(-0.3)), NO_MARGINS)
+        );
+        assert!(current.attributes.unwrap().allow_soldermask_bridges);
+        assert_eq!(domains, BTreeSet::new());
+        assert_eq!(kept.overrides, current.overrides);
+        assert!(kept.attributes.unwrap().allow_soldermask_bridges);
+
+        let (current, kept, domains) = solder_margin_refresh("U10", ep.1, Resets::default());
+        assert_eq!(
+            placed_margins(&current).1,
+            [("9".to_string(), (Some(-20_000), Some(-100_000), Some(-0.2)))]
+        );
+        let overrides = current.overrides.unwrap();
+        assert_eq!(overrides.copper_clearance.unwrap().value_nm, 150_000);
+        assert_eq!(
+            overrides.zone_connection,
+            ZoneConnectionStyle::ZcsNone as i32
+        );
+        assert_eq!(domains, BTreeSet::from([ChangedDomain::Pads]));
+        assert_eq!(placed_margins(&kept), expected_margins(ep.2, ep.3));
+        assert_eq!(kept.overrides, current.overrides);
+
+        for (reference, library, domains) in [
+            (
+                "U9",
+                footprint,
+                BTreeSet::from([ChangedDomain::Attributes, ChangedDomain::ClearanceOverrides]),
+            ),
+            (
+                "U10",
+                ep,
+                BTreeSet::from([ChangedDomain::Pads, ChangedDomain::ClearanceOverrides]),
+            ),
+        ] {
+            let (current, reset, changed) = solder_margin_refresh(reference, library.1, CLEARANCE);
+            assert_eq!(changed, domains, "{reference}");
+            assert_eq!(
+                placed_margins(&reset),
+                expected_margins(library.2, library.3),
+                "{reference}"
+            );
+            let overrides = reset.overrides.as_ref().unwrap();
+            assert_eq!(overrides.copper_clearance, None, "{reference}");
+            assert_eq!(
+                overrides.zone_connection,
+                ZoneConnectionStyle::ZcsInherited as i32,
+                "{reference}"
+            );
+            assert!(
+                !reset.attributes.as_ref().unwrap().allow_soldermask_bridges,
+                "{reference}"
+            );
+            assert!(
+                !PreservedState::derive(&current, &reset, &BTreeMap::new()).instance_overrides,
+                "{reference}"
+            );
+        }
+    }
+
+    /// Through the served dispatch: without the argument U9 is unchanged and
+    /// U10 plans `pads`; with it both plan `clearance_overrides` too.
+    #[tokio::test]
+    async fn served_dry_run_resets_board_overrides_only_when_asked() {
+        for (arguments, u9, u10) in [
+            (serde_json::json!({}), None, serde_json::json!(["pads"])),
+            (
+                serde_json::json!({ "reset_clearance_overrides": false }),
+                None,
+                serde_json::json!(["pads"]),
+            ),
+            (
+                serde_json::json!({ "reset_clearance_overrides": true }),
+                Some(serde_json::json!(["attributes", "clearance_overrides"])),
+                serde_json::json!(["pads", "clearance_overrides"]),
+            ),
+        ] {
+            let body = solder_margin_served_dry_run(&["U9", "U10"], arguments.clone()).await;
+            assert_eq!(body["status"], "ready", "{arguments}: {body}");
+            let domains = |reference: &str| {
+                body["changes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|change| change["reference"] == reference)
+                    .map(|change| change["changed_domains"].clone())
+            };
+            assert_eq!(domains("U9"), u9, "{arguments}: {body}");
+            assert_eq!(domains("U10"), Some(u10), "{arguments}: {body}");
+        }
+    }
+
+    /// KiCad reads no overrides, an unknown zone connection and mask or
+    /// paste settings without a margin as inherited (`FOOTPRINT::Deserialize`),
+    /// so they compare equal; a margin of 0 is an override.
+    #[test]
+    fn overrides_compare_as_kicad_reads_them() {
+        use kiapi::board::types::{
+            FootprintDesignRuleOverrides, SolderMaskOverrides, SolderPasteOverrides,
+            ZoneConnectionStyle,
+        };
+        let inherited = FootprintDesignRuleOverrides {
+            zone_connection: ZoneConnectionStyle::ZcsInherited as i32,
+            ..Default::default()
+        };
+        for same in [
+            None,
+            Some(FootprintDesignRuleOverrides::default()),
+            Some(FootprintDesignRuleOverrides {
+                solder_mask: Some(SolderMaskOverrides {
+                    solder_mask_margin: None,
+                    expose_copper: true,
+                }),
+                solder_paste: Some(SolderPasteOverrides::default()),
+                ..inherited
+            }),
+        ] {
+            assert_eq!(
+                normalized_overrides(same.as_ref()),
+                normalized_overrides(Some(&inherited)),
+                "{same:?}"
+            );
+        }
+        let zero = FootprintDesignRuleOverrides {
+            solder_mask: Some(SolderMaskOverrides {
+                solder_mask_margin: Some(builders::distance(0.0)),
+                ..Default::default()
+            }),
+            ..inherited
+        };
+        assert_ne!(
+            normalized_overrides(Some(&zero)),
+            normalized_overrides(Some(&inherited))
+        );
     }
 
     // ─── #319: keep-upright text angles on back-side footprints ─────────────

@@ -857,7 +857,7 @@ impl SolderMargins {
         Ok(margins)
     }
 
-    fn mask_overrides(&self) -> Option<kiapi::board::types::SolderMaskOverrides> {
+    pub(crate) fn mask_overrides(&self) -> Option<kiapi::board::types::SolderMaskOverrides> {
         self.mask
             .map(|mask| kiapi::board::types::SolderMaskOverrides {
                 solder_mask_margin: Some(copperpour_ipc::builders::distance(mask)),
@@ -865,7 +865,7 @@ impl SolderMargins {
             })
     }
 
-    fn paste_overrides(&self) -> Option<kiapi::board::types::SolderPasteOverrides> {
+    pub(crate) fn paste_overrides(&self) -> Option<kiapi::board::types::SolderPasteOverrides> {
         (self.paste.is_some() || self.paste_ratio.is_some()).then(|| {
             kiapi::board::types::SolderPasteOverrides {
                 solder_paste_margin: self.paste.map(copperpour_ipc::builders::distance),
@@ -898,6 +898,23 @@ pub(crate) fn apply_footprint_margins(
     let overrides = footprint.overrides.get_or_insert_with(Default::default);
     overrides.solder_mask = margins.mask_overrides();
     overrides.solder_paste = margins.paste_overrides();
+}
+
+/// Give a built pad's `stack` a library pad's own margins. KiCad's parser
+/// sets a pad's one margin on both sides (the `PAD::SetLocalSolder*`
+/// setters, `pcbnew/pad.h`).
+pub(crate) fn apply_pad_margins(
+    stack: &mut kiapi::board::types::PadStack,
+    margins: &SolderMargins,
+) {
+    if *margins == SolderMargins::default() {
+        return;
+    }
+    for outer in [&mut stack.front_outer_layers, &mut stack.back_outer_layers] {
+        let outer = outer.get_or_insert_with(Default::default);
+        outer.solder_mask_settings = margins.mask_overrides();
+        outer.solder_paste_settings = margins.paste_overrides();
+    }
 }
 
 /// The spoke angle KiCad's parser gives a pad that doesn't set one
@@ -962,15 +979,7 @@ pub(crate) fn apply_pad_settings(
                 .context("typed footprint builder returned a pad without a copper layer")?;
             let (shape, anchor) = (layer.shape, layer.custom_anchor_shape);
             stack.zone_settings = Some(zone.zone_connection_settings(shape, anchor));
-            // KiCad's parser sets a pad's one margin on both sides
-            // (the `PAD::SetLocalSolder*` setters, `pcbnew/pad.h`).
-            if *margins != SolderMargins::default() {
-                for outer in [&mut stack.front_outer_layers, &mut stack.back_outer_layers] {
-                    let outer = outer.get_or_insert_with(Default::default);
-                    outer.solder_mask_settings = margins.mask_overrides();
-                    outer.solder_paste_settings = margins.paste_overrides();
-                }
-            }
+            apply_pad_margins(stack, margins);
             *item = copperpour_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
         }
     }
@@ -1147,18 +1156,11 @@ fn check_supported_children(
                     )?;
                 }
             }
-            // Placement and Update PCB's additions carry the footprint's own
-            // margins; the refresh does not compare them yet, so it still
-            // refuses them.
+            // The footprint's own margins, which placement and the refresh
+            // carry.
             tag if Margin::ALL
                 .iter()
-                .any(|margin| margin.footprint_tokens().contains(&tag)) =>
-            {
-                on_unsupported(
-                    CARRIED_BY_PLACEMENT,
-                    &format!("footprint child '{tag}' is not supported by typed library refresh"),
-                )?;
-            }
+                .any(|margin| margin.footprint_tokens().contains(&tag)) => {}
             unsupported => {
                 on_unsupported(
                     &format!("footprint child '{unsupported}' is not carried by typed placement"),
@@ -1529,13 +1531,8 @@ fn check_pad(
         if custom && matches!(tag, "options" | "primitives") {
             continue;
         }
-        // Placement and Update PCB's additions carry a pad's own margins; the
-        // refresh does not compare them yet, so it still refuses them.
+        // A pad's own margins, which placement and the refresh carry.
         if Margin::ALL.iter().any(|margin| margin.name() == tag) {
-            on_unsupported(
-                CARRIED_BY_PLACEMENT,
-                &format!("pad clause '{tag}' is not supported by typed library refresh"),
-            )?;
             continue;
         }
         if !matches!(
@@ -1726,20 +1723,14 @@ mod tests {
         );
     }
 
-    /// Solder margins are carried by live placement, so a footprint with its
-    /// own or its pad's lists none as not carried; the typed refresh does not
-    /// compare them yet and still refuses them.
+    /// Solder margins are carried by live placement and the typed refresh, so
+    /// a footprint with its own or its pad's lists none as not carried, and
+    /// the refresh refuses neither.
     #[test]
-    fn solder_margins_are_carried_by_placement_and_refused_by_the_refresh() {
-        for (source, owner) in [
-            (
-                include_str!("../../tests/fixtures/solder_margins_ep_kicad10.kicad_mod"),
-                "pad clause",
-            ),
-            (
-                include_str!("../../tests/fixtures/solder_margins_footprint_kicad10.kicad_mod"),
-                "footprint child",
-            ),
+    fn solder_margins_are_carried_by_placement_and_the_refresh() {
+        for source in [
+            include_str!("../../tests/fixtures/solder_margins_ep_kicad10.kicad_mod"),
+            include_str!("../../tests/fixtures/solder_margins_footprint_kicad10.kicad_mod"),
         ] {
             let margins = root(source);
             assert_eq!(
@@ -1747,25 +1738,13 @@ mod tests {
                 Vec::<String>::new()
             );
             let mut refusals = Vec::new();
-            check_supported_children(&margins, &mut |placed, refresh| {
-                assert_eq!(placed, CARRIED_BY_PLACEMENT, "{refresh}");
+            check_supported_children(&margins, &mut |_placed, refresh| {
                 refusals.push(refresh.to_string());
                 Ok(())
             })
             .unwrap();
-            assert_eq!(
-                refusals,
-                Margin::ALL.map(|margin| format!(
-                    "{owner} '{}' is not supported by typed library refresh",
-                    margin.name()
-                ))
-            );
-            assert_eq!(
-                validate_supported_children(&margins)
-                    .unwrap_err()
-                    .to_string(),
-                refusals[0]
-            );
+            assert_eq!(refusals, Vec::<String>::new());
+            validate_supported_children(&margins).unwrap();
         }
     }
 

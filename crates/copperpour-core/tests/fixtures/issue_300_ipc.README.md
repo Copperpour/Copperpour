@@ -64,8 +64,8 @@ Refresh reads U1 to U5 whole:
   KiCad keeps its keep-upright text at the angle refresh builds (#319).
 
 The tests read U6 to U8 only pad by pad, for the values U1 to U5 don't have.
-Refresh still refuses all three for other clauses: U6 for a pad's
-`solder_paste_margin`, U7 for its custom pad, U8 for `net_tie_pad_groups`.
+Refresh still refuses all three for other clauses: U6 and U7 for a custom
+pad, U8 for `net_tie_pad_groups`.
 
 - **U6: `(zone_connect 0)` on 16 rectangles.** Reported `ZCS_NONE`, 90°.
 - **U7: `(zone_connect 1)` on 11 round thermal vias.** Reported `ZCS_THERMAL`,
