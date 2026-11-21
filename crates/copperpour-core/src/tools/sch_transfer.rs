@@ -5136,15 +5136,17 @@ b = p.LoadBoard(sys.argv[1])
 fp = next(fp for fp in b.GetFootprints() if fp.GetReference() == 'R1')
 fp.SetPath(p.KIID_PATH(sys.argv[3]))
 if sys.argv[4] == 'yes':
-    name = '/Channel 1/MID'
     target = p.NETINFO_ITEM(b, '/A{slash}B')
     b.Add(target)
-    connected = list(b.GetTracks())
-    assert any(item.GetNetname() == name for item in connected)
-    for item in connected:
-        if item.GetNetname() == name:
-            item.SetNet(target)
-    fp.FindPadByNumber('1').SetNet(target)
+    pad = fp.FindPadByNumber('1')
+    pad.SetNet(target)
+    track = p.PCB_TRACK(b)
+    track.SetStart(pad.GetPosition())
+    track.SetEnd(pad.GetPosition() + p.VECTOR2I(p.FromMM(1), 0))
+    track.SetWidth(p.FromMM(0.25))
+    track.SetLayer(p.F_Cu)
+    b.Add(track)
+    track.SetNet(target)
     graphic = p.PCB_SHAPE(b)
     graphic.SetShape(p.SHAPE_T_SEGMENT)
     graphic.SetStart(p.VECTOR2I(p.FromMM(75), p.FromMM(75)))
@@ -5180,6 +5182,14 @@ assert p.SaveBoard(sys.argv[2], b)
         let board = native_routed_board(&request, RESISTOR, "", true);
         let before = std::fs::read_to_string(&board).unwrap();
         assert!(before.contains("(net \"/A{slash}B\")"));
+        assert!(
+            parse_sexp(&before)
+                .unwrap()
+                .find_all("segment")
+                .iter()
+                .any(|segment| { segment.find_str("net") == Some("/A{slash}B") }),
+            "pcbnew fixture did not save the test track on the escaped net"
+        );
         assert_native_served_transfer(dir.path(), &request, "nested/logic.kicad_sch", RESISTOR)
             .await;
         let after = std::fs::read_to_string(&board).unwrap();
