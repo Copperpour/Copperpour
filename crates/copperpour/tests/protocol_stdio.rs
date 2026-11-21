@@ -1717,6 +1717,152 @@ fn mixed_upgrade_preserves_user_edits_and_reports_runnable_exe_path_over_stdio()
     );
 }
 
+/// Regression for #737 over real stdio: `copperpour init --client claude`
+/// writes `PreToolUse` hook matchers covering `mcp__Copperpour__*` (Claude
+/// Desktop `.mcpb` display_name) and agents allowing `mcp__Copperpour__*`, and
+/// upgrading from an earlier release's lowercase-only
+/// `mcp__(copperpour|konnect)__(...)` matchers auto-updates `settings.json`
+/// cleanly on server start.
+#[cfg(unix)]
+#[test]
+fn auto_updates_legacy_lowercase_hook_matcher_and_agent_tools_over_stdio() {
+    let tmp = tempfile::tempdir().unwrap();
+    let init = std::process::Command::new(env!("CARGO_BIN_EXE_copperpour"))
+        .args(["init", "--client", "claude"])
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "copperpour init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let settings_path = tmp.path().join(".claude/settings.json");
+    let settings: Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(
+        entries.len(),
+        4,
+        "expected 4 PreToolUse hooks: {entries:#?}"
+    );
+    for entry in entries {
+        let matcher = entry["matcher"].as_str().unwrap();
+        assert!(
+            matcher.starts_with("mcp__(copperpour|Copperpour|konnect|Konnect)__("),
+            "installed hook matcher must include Copperpour/Konnect: {matcher}"
+        );
+    }
+    for agent_name in [
+        "kicad-schematic-build-agent.md",
+        "kicad-design-review-agent.md",
+    ] {
+        let agent =
+            std::fs::read_to_string(tmp.path().join(".claude/agents").join(agent_name)).unwrap();
+        assert!(
+            agent.contains("mcp__Copperpour__*"),
+            "{agent_name} must allow mcp__Copperpour__*"
+        );
+        assert!(
+            agent.contains("mcp__Konnect__*"),
+            "{agent_name} must allow mcp__Konnect__*"
+        );
+    }
+
+    // Downgrade settings.json + an installed agent + manifest + marker to the
+    // pre-#737 lowercase-only form and verify real stdio startup auto-updates
+    // both the hook matchers and the bundled agent.
+    let mut legacy_settings = settings.clone();
+    let data_dir = tmp.path().join(".copperpour");
+    std::fs::write(data_dir.join(".installed-claude"), "0.15.0").unwrap();
+    let manifest_path = data_dir.join(".installed-manifest-claude.json");
+    let mut manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["version"] = json!("0.15.0");
+
+    let review_agent_path = tmp
+        .path()
+        .join(".claude/agents/kicad-design-review-agent.md");
+    let current_agent = std::fs::read_to_string(&review_agent_path).unwrap();
+    let legacy_agent = current_agent
+        .replace("  - mcp__Copperpour__*\n", "")
+        .replace("  - mcp__Konnect__*\n", "");
+    assert_ne!(legacy_agent, current_agent);
+    std::fs::write(&review_agent_path, &legacy_agent).unwrap();
+    manifest["files"]["agent:kicad-design-review-agent.md"] =
+        json!(sha256_hex(legacy_agent.as_bytes()));
+
+    for entry in legacy_settings["hooks"]["PreToolUse"]
+        .as_array_mut()
+        .unwrap()
+    {
+        let current = entry["matcher"].as_str().unwrap();
+        let legacy = current.replacen(
+            "mcp__(copperpour|Copperpour|konnect|Konnect)__(",
+            "mcp__(copperpour|konnect)__(",
+            1,
+        );
+        assert_ne!(legacy, current);
+        entry["matcher"] = json!(legacy);
+    }
+    for (_, record) in manifest["hooks"].as_object_mut().unwrap() {
+        let current = record["matcher"].as_str().unwrap();
+        let legacy = current.replacen(
+            "mcp__(copperpour|Copperpour|konnect|Konnect)__(",
+            "mcp__(copperpour|konnect)__(",
+            1,
+        );
+        assert_ne!(legacy, current);
+        record["matcher"] = json!(legacy);
+    }
+    std::fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&legacy_settings).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    assert_eq!(
+        p.initialized["result"]["instructions"],
+        copperpour_core::guidance::SESSION_RULES,
+        "clean matcher/agent upgrade should not append an initialize notice"
+    );
+    let info = McpProcess::tool_body(&p.call_tool("get_installation_info", json!({})));
+    assert_eq!(info["guidance"]["claude"]["state"], "current", "{info}");
+    assert!(
+        info.get("guidance_notice").is_none(),
+        "clean matcher upgrade must not emit guidance_notice: {info}"
+    );
+    assert_ne!(
+        std::fs::read_to_string(data_dir.join(".installed-claude"))
+            .unwrap()
+            .trim(),
+        "0.15.0",
+        "install marker should advance after clean matcher/agent auto-update"
+    );
+
+    let upgraded: Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    for entry in upgraded["hooks"]["PreToolUse"].as_array().unwrap() {
+        let matcher = entry["matcher"].as_str().unwrap();
+        assert!(
+            matcher.starts_with("mcp__(copperpour|Copperpour|konnect|Konnect)__("),
+            "upgraded hook matcher must include Copperpour/Konnect: {matcher}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&review_agent_path).unwrap(),
+        current_agent,
+        "unmodified legacy agent should auto-update to include mcp__Copperpour__*"
+    );
+}
+
 /// #787 over real stdio: with nothing to find, `check_freerouting` reports
 /// every location it searched, in the documented order, from the server's own
 /// environment. The environment is redirected so a Freerouting installed on
