@@ -1636,7 +1636,26 @@ fn move_pcb_net_names(
                         (node.head(), parent),
                         (
                             Some("net"),
-                            Some("kicad_pcb" | "pad" | "segment" | "arc" | "via" | "zone")
+                            Some(
+                                "kicad_pcb"
+                                    | "pad"
+                                    | "segment"
+                                    | "arc"
+                                    | "via"
+                                    | "zone"
+                                    | "gr_line"
+                                    | "gr_rect"
+                                    | "gr_circle"
+                                    | "gr_arc"
+                                    | "gr_poly"
+                                    | "gr_curve"
+                                    | "fp_line"
+                                    | "fp_rect"
+                                    | "fp_circle"
+                                    | "fp_arc"
+                                    | "fp_poly"
+                                    | "fp_curve"
+                            )
                         ) | (Some("net_name"), Some("zone"))
                             | (Some("add_net"), Some("net_class"))
                     ),
@@ -1959,36 +1978,51 @@ fn pcb_destination_sheet(
     let suffix = destination[1..]
         .split_once('/')
         .map_or("", |(_, tail)| tail);
-    let file = plan.instances[destination]
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("Missing destination sheet filename")?;
-    let mut matches = xml_child(netlist, "design")
-        .context("Netlist lacks design")?
+    let mut metadata: Option<PcbSheetMetadata> = None;
+    for component in xml_child(netlist, "components")
+        .context("Netlist lacks components")?
         .children()
-        .filter(|node| node.has_tag_name("sheet"))
-        .filter(|sheet| {
+    {
+        if !component
+            .attribute("ref")
+            .is_some_and(|reference| plan.netlist_identities.contains_key(reference))
+        {
+            continue;
+        }
+        let sheet = xml_child(component, "sheetpath")
+            .context("KiCad netlist lacks a moved component's sheet path")?;
+        ensure!(
             sheet
                 .attribute("tstamps")
-                .is_some_and(|path| path.trim_matches('/') == suffix)
-                && xml_child(*sheet, "title_block")
-                    .and_then(|block| xml_child(block, "source"))
-                    .and_then(|source| source.text())
-                    == Some(file)
-        });
-    let name = matches
-        .next()
-        .and_then(|sheet| sheet.attribute("name"))
-        .filter(|name| !name.is_empty())
-        .context("KiCad netlist lacks the destination sheet name for PCB metadata")?;
-    ensure!(
-        matches.next().is_none(),
-        "KiCad netlist destination sheet metadata is ambiguous"
-    );
-    Ok(PcbSheetMetadata {
-        name: name.to_owned(),
-        file: file.to_owned(),
-    })
+                .is_some_and(|path| path.trim_matches('/') == suffix),
+            "KiCad netlist puts a moved component on another sheet"
+        );
+        let name = sheet
+            .attribute("names")
+            .filter(|name| !name.is_empty())
+            .context("KiCad netlist lacks the destination sheet name")?;
+        let file = component
+            .children()
+            .filter(|node| {
+                node.has_tag_name("property") && node.attribute("name") == Some("Sheetfile")
+            })
+            .filter_map(|node| node.attribute("value"))
+            .last()
+            .filter(|file| !file.is_empty())
+            .context("KiCad netlist lacks the destination Sheetfile property")?;
+        if let Some(prior) = &metadata {
+            ensure!(
+                prior.name == name && prior.file == file,
+                "KiCad netlist disagrees on destination sheet metadata"
+            );
+        } else {
+            metadata = Some(PcbSheetMetadata {
+                name: name.to_owned(),
+                file: file.to_owned(),
+            });
+        }
+    }
+    metadata.context("KiCad netlist lacks moved component sheet metadata")
 }
 
 async fn verify_with_kicad(plan: &Plan, cli_path: &str) -> Result<Option<VerifiedTransfer>> {
@@ -3537,11 +3571,16 @@ mod tests {
             .to_string()
             .contains("changes the match of netclass pattern"));
         let equivalent = source
-            .replace("/source/*", "/(source|destination)/LIMIT")
+            .replace("/source/*", "/.*/LIMIT")
             .replace("/destination/*", ".*LIMIT");
         assert!(check_project_net_dependencies(&equivalent, &mapping, true).is_ok());
         let lookahead = equivalent.replace(".*LIMIT", "(?=LIMIT)");
         assert!(check_project_net_dependencies(&lookahead, &mapping, true)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported netclass pattern"));
+        let alternation = equivalent.replace(".*LIMIT", "/source/LIM|/other/LIMIT");
+        assert!(check_project_net_dependencies(&alternation, &mapping, true)
             .unwrap_err()
             .to_string()
             .contains("unsupported netclass pattern"));
@@ -3636,6 +3675,13 @@ mod tests {
     #[tokio::test]
     async fn transfer_pcb_recovery_preserves_a_divergent_rules_guard_then_resumes() {
         assert_served_transfer(Served::PcbInterrupt).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transfer_skips_rule_conditions_without_a_pcb_net_rename() {
+        assert_served_transfer(Served::RulesWithoutPcb).await;
+        assert_served_transfer(Served::PcbPathsOnly).await;
     }
 
     #[cfg(unix)]
@@ -3796,6 +3842,8 @@ mod tests {
         LateSave,
         Pcb,
         PcbInterrupt,
+        RulesWithoutPcb,
+        PcbPathsOnly,
     }
 
     #[cfg(unix)]
@@ -3803,7 +3851,10 @@ mod tests {
         let (dir, request) = fixture();
         let control = tempfile::tempdir().unwrap();
         let board = request.schematic.with_extension("kicad_pcb");
-        if matches!(mode, Served::Pcb | Served::PcbInterrupt) {
+        if matches!(
+            mode,
+            Served::Pcb | Served::PcbInterrupt | Served::PcbPathsOnly
+        ) {
             let saved =
                 include_str!("../../tests/fixtures/repeat_layout_routing_kicad10.kicad_pcb");
             let first = copperpour_sexp::board::footprints(&parse_sexp(saved).unwrap())[0]
@@ -3828,6 +3879,14 @@ mod tests {
                 .unwrap();
             }
         }
+        let rules = board.with_extension("kicad_dru");
+        if matches!(mode, Served::RulesWithoutPcb | Served::PcbPathsOnly) {
+            std::fs::write(
+                &rules,
+                "(version 1)\n(rule \"example\" (condition \"A.NetName == '/Channel 1/MID'\"))\n",
+            )
+            .unwrap();
+        }
         // This mock checks dispatch/transaction/readback, NOT KiCad semantics.
         let report = json!({"kicad_version":"10.0.7","sheets":[
             {"uuid_path":request.source_sheet_instance,"violations":[]},
@@ -3836,10 +3895,15 @@ mod tests {
         let netlist = format!(
             r#"<export><design><sheet tstamps="/"><title_block><source>component_fields_kicad10.kicad_sch</source></title_block></sheet>
                 <sheet name="/Logic regulator/" tstamps="/{SHEET_UUID}/"><title_block><source>logic.kicad_sch</source></title_block></sheet></design>
-                <components><comp ref="R1"><tstamps>{RESISTOR}</tstamps></comp></components><nets><net name="$net" class="Default"><node ref="R1" pin="1"/></net></nets></export>"#
+                <components><comp ref="R1"><tstamps>{RESISTOR}</tstamps><sheetpath names="/Logic regulator/" tstamps="/{SHEET_UUID}/"/><property name="Sheetfile" value="logic.kicad_sch"/></comp></components><nets><net name="$net" class="Default"><node ref="R1" pin="1"/></net></nets></export>"#
         );
+        let old_net = if mode == Served::PcbPathsOnly {
+            "/not-on-the-board"
+        } else {
+            "/Channel 1/MID"
+        };
         let command = format!(
-            "#!/bin/sh\ntrigger=\"$(dirname \"$0\")/late-input\"\nif [ -f \"$trigger\" ]; then printf 'late input' > \"$(cat \"$trigger\")\" || exit 1; fi\nif [ \"$2\" = erc ]; then\ncat > \"$4\" <<'ERC'\n{report}\nERC\nelse\nnet='/Channel 1/MID'\nif grep -q '{RESISTOR}' \"$(dirname \"$8\")/logic.kicad_sch\"; then net='/Logic regulator/MID'; fi\ncat > \"$5\" <<NETLIST\n{netlist}\nNETLIST\nfi\n"
+            "#!/bin/sh\ntrigger=\"$(dirname \"$0\")/late-input\"\nif [ -f \"$trigger\" ]; then printf 'late input' > \"$(cat \"$trigger\")\" || exit 1; fi\nif [ \"$2\" = erc ]; then\ncat > \"$4\" <<'ERC'\n{report}\nERC\nelse\nnet='{old_net}'\nif grep -q '{RESISTOR}' \"$(dirname \"$8\")/logic.kicad_sch\"; then net='/Logic regulator/MID'; fi\ncat > \"$5\" <<NETLIST\n{netlist}\nNETLIST\nfi\n"
         );
         let script =
             cli::test_support::write_script(control.path(), "fake-transfer-cli", &command, "");
@@ -3879,6 +3943,29 @@ mod tests {
         let planned: Value =
             serde_json::from_str(planned["content"][0]["text"].as_str().unwrap()).unwrap();
         let revision = planned["plan_revision"].as_str().unwrap().to_owned();
+        if matches!(mode, Served::RulesWithoutPcb | Served::PcbPathsOnly) {
+            assert_eq!(planned["pcb_net_name_mapping"], json!({}));
+            assert_eq!(planned["connectivity_impacts"][0]["old_name"], old_net);
+            assert_eq!(snapshot(dir.path()), before);
+            let response = handler
+                .handle_message(call(false, Some(&revision)))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            let result: Value =
+                serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(result["status"], "moved", "{result}");
+            assert_eq!(std::fs::read(&rules).unwrap(), before[&rules]);
+            if mode == Served::PcbPathsOnly {
+                let saved = std::fs::read_to_string(&board).unwrap();
+                assert!(saved.contains(&format!("(path \"/{SHEET_UUID}/{RESISTOR}\")")));
+                assert!(saved.contains("(net \"/Channel 1/MID\")"));
+            } else {
+                assert!(!board.exists());
+            }
+            return;
+        }
         if matches!(mode, Served::Pcb | Served::PcbInterrupt) {
             assert_eq!(before, snapshot(dir.path()));
             assert_eq!(
@@ -4558,7 +4645,7 @@ fi
                 .unwrap();
                 std::fs::write(
                     request.schematic.with_extension("kicad_dru"),
-                    "(version 1)\n(rule \"example\" (condition \"A.NetName == '/SIG'\"))\n",
+                    "(version 1)\n(rule \"example\" (condition \"A.(NetName) == '/SIG'\"))\n",
                 )
                 .unwrap();
             }
@@ -4783,6 +4870,14 @@ if sys.argv[4] == 'yes':
     for item in connected:
         if item.GetNetname() == name:
             item.SetNet(target)
+    graphic = p.PCB_SHAPE(b)
+    graphic.SetShape(p.SHAPE_T_SEGMENT)
+    graphic.SetStart(p.VECTOR2I(p.FromMM(75), p.FromMM(75)))
+    graphic.SetEnd(p.VECTOR2I(p.FromMM(76), p.FromMM(75)))
+    graphic.SetWidth(p.FromMM(0.25))
+    graphic.SetLayer(p.F_Cu)
+    graphic.SetNet(target)
+    b.Add(graphic)
 assert p.SaveBoard(sys.argv[2], b)
 "#;
         let output = std::process::Command::new(python)
@@ -4805,15 +4900,23 @@ assert p.SaveBoard(sys.argv[2], b)
     #[tokio::test]
     #[ignore = "requires KiCad 10.0.8 CLI and pcbnew Python"]
     async fn transfer_native_routed_board_net_and_path_acceptance() {
-        let (dir, mut request) = fixture();
+        let (dir, mut request) = fixture_with_destination("nested/logic.kicad_sch");
         add_transfer_signal(&mut request);
         let board = native_routed_board(&request, RESISTOR, "", true);
         let before = std::fs::read_to_string(&board).unwrap();
         assert!(before.contains("(net \"/TransferSignal\")"));
-        assert_native_served_transfer(dir.path(), &request, "logic.kicad_sch", RESISTOR).await;
+        assert_native_served_transfer(dir.path(), &request, "nested/logic.kicad_sch", RESISTOR)
+            .await;
         let after = std::fs::read_to_string(&board).unwrap();
         let old = format!("/{RESISTOR}");
         let new = format!("/{SHEET_UUID}/{RESISTOR}");
+        let tree = parse_sexp(&after).unwrap();
+        let moved = copperpour_sexp::board::footprints(&tree)
+            .into_iter()
+            .find(|fp| fp.find_str("path") == Some(&new))
+            .unwrap();
+        assert_eq!(moved.find_str("sheetfile"), Some("nested/logic.kicad_sch"));
+        assert_eq!(moved.find_str("sheetname"), Some("/Logic regulator/"));
         assert_board_changes(
             &before,
             &after,
@@ -4862,6 +4965,21 @@ assert p.SaveBoard(sys.argv[2], b)
             .unwrap();
         assert_eq!(footprint.find("uuid"), old_fp.find("uuid"));
         assert_eq!(footprint.find("at"), old_fp.find("at"));
+        if let Some(net) = net {
+            let old_graphic = prior
+                .find_all("gr_line")
+                .into_iter()
+                .find(|shape| shape.find_str("net") == Some("/TransferSignal"))
+                .unwrap();
+            let new_graphic = parsed
+                .find_all("gr_line")
+                .into_iter()
+                .find(|shape| shape.find_str("net") == Some(net))
+                .unwrap();
+            for field in ["uuid", "start", "end", "width", "layer"] {
+                assert_eq!(old_graphic.find(field), new_graphic.find(field));
+            }
+        }
         assert_ne!(
             footprint.find_str("sheetname"),
             old_fp.find_str("sheetname")

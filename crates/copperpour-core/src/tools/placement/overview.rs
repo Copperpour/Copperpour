@@ -394,7 +394,7 @@ pub(in crate::tools) fn check_netclass_rename_pattern(
 ) -> anyhow::Result<()> {
     let matcher = NetclassPattern::new(pattern);
     anyhow::ensure!(
-        matcher.expression.is_some(),
+        matcher.expression.is_some() && !pattern.contains('|'),
         "Cannot prove a net rename preserves unsupported netclass pattern {pattern:?}"
     );
     for (old, new) in mapping {

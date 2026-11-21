@@ -1194,7 +1194,23 @@ pub(super) fn check_net_name_independent_conditions(text: &str) -> Result<(), St
     })?;
     // KiCad expands text variables before parsing the rules, so a token
     // containing one is not proof of the structure KiCad will evaluate.
-    if tokens.iter().any(|t| t.tok.text().contains("${")) {
+    if tokens.iter().any(|t| {
+        let text = t.tok.text();
+        let mut rest = text;
+        while let Some((_, suffix)) = rest.split_once("${") {
+            let Some((selector, tail)) = suffix.split_once('}') else {
+                return true;
+            };
+            if !selector
+                .strip_prefix("Class:")
+                .is_some_and(|name| !name.is_empty() && !name.contains(['$', '{', '\'', '"']))
+            {
+                return true;
+            }
+            rest = tail;
+        }
+        false
+    }) {
         return Err("a text variable may expand into a net-name dependency".into());
     }
     let mut start = 0;
@@ -1777,6 +1793,7 @@ struct Codegen<'a> {
     bare_number: bool,
     first_unit: Option<usize>,
     properties: &'a mut BTreeSet<String>,
+    require_net_name_independence: bool,
 }
 
 impl Codegen<'_> {
@@ -1813,6 +1830,13 @@ impl Codegen<'_> {
                 };
                 match &**field {
                     Node::Ident(property) => {
+                        if self.require_net_name_independence
+                            && !["NetClass", "ComponentClass", "Type"]
+                                .iter()
+                                .any(|name| property.eq_ignore_ascii_case(name))
+                        {
+                            return Err(format!("cannot prove condition property {property} is independent of net names"));
+                        }
                         let item_field = ITEM_FIELDS
                             .iter()
                             .any(|field| field.eq_ignore_ascii_case(property));
@@ -1834,6 +1858,13 @@ impl Codegen<'_> {
                         }
                     }
                     Node::Call(function, arguments) => {
+                        if self.require_net_name_independence
+                            && ["inDiffPair", "isCoupledDiffPair"]
+                                .iter()
+                                .any(|name| function.eq_ignore_ascii_case(name))
+                        {
+                            return Err(format!("condition calls {function}()"));
+                        }
                         if !is_item(item) {
                             return Err(format!(
                                 "'{item}' is not an item; KiCad's are A, B, AB, L and null"
@@ -1864,33 +1895,25 @@ impl Codegen<'_> {
     }
 }
 
-/// Check one condition, assertion or value as KiCad's compiler reads it, and
-/// say what it measures.
 fn check_net_name_independent_expression(text: &str) -> Result<(), String> {
-    check_expression(text, Resolver::Pcb, &mut BTreeSet::new())?;
-    let lexemes = lex_expression(text, Resolver::Pcb)?;
-    for pair in lexemes.windows(2) {
-        if let [Lexeme::Dot, Lexeme::Ident(field)] = pair {
-            if field.eq_ignore_ascii_case("NetName") {
-                return Err(format!("condition reads {field}"));
-            }
-        }
-        if let [Lexeme::Ident(function), Lexeme::Open] = pair {
-            if ["inDiffPair", "isCoupledDiffPair"]
-                .iter()
-                .any(|name| function.eq_ignore_ascii_case(name))
-            {
-                return Err(format!("condition calls {function}()"));
-            }
-        }
-    }
-    Ok(())
+    check_expression_with_policy(text, Resolver::Pcb, &mut BTreeSet::new(), true).map(|_| ())
 }
 
+/// Check one condition, assertion or value as KiCad's compiler reads it, and
+/// say what it measures.
 fn check_expression(
     text: &str,
     resolver: Resolver,
     properties: &mut BTreeSet<String>,
+) -> Result<Quantity, String> {
+    check_expression_with_policy(text, resolver, properties, false)
+}
+
+fn check_expression_with_policy(
+    text: &str,
+    resolver: Resolver,
+    properties: &mut BTreeSet<String>,
+    require_net_name_independence: bool,
 ) -> Result<Quantity, String> {
     let lexemes = lex_expression(text, resolver)?;
     if lexemes.first() == Some(&Lexeme::End) {
@@ -1906,6 +1929,7 @@ fn check_expression(
         bare_number: false,
         first_unit: None,
         properties,
+        require_net_name_independence,
     };
     codegen.visit(&tree)?;
     // KiCad flags a lone number without units, which it would read in nm.
@@ -1935,6 +1959,7 @@ mod tests {
         );
         for condition in [
             "A.nEtNaMe == '/Source/SIG'",
+            "A.(NetName) == '/Source/SIG'",
             "A.inDiffPair('Data')",
             "A.isCoupledDiffPair()",
             "A.futureNetFunction('Data')",
@@ -1944,6 +1969,10 @@ mod tests {
             assert!(result.is_err(), "{condition}: {result:?}");
         }
         assert!(check_net_name_independent_conditions(&rule("A.fromTo('J1-1', 'J2-1')")).is_ok());
+        assert!(check_net_name_independent_conditions(&rule(
+            "A.intersectsCourtyard('${Class:Power}')"
+        ))
+        .is_ok());
     }
     use crate::tools::{write_hook, ServerConfig};
 
