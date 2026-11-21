@@ -1140,7 +1140,7 @@ fn format_shell_program(exe: &str) -> String {
         && exe.bytes().all(|b| {
             b.is_ascii_alphanumeric()
                 || matches!(b, b'/' | b'.' | b'_' | b'-' | b':' | b'+' | b'@')
-                || (cfg!(windows) && b == b'\\')
+                || (cfg!(windows) && matches!(b, b'\\' | b'~'))
         });
     if safe_unquoted {
         exe.to_string()
@@ -4243,7 +4243,7 @@ mod tests {
         let on_path_exe = on_path_dir.join(&bin_name);
         make_executable(&on_path_exe);
 
-        let pcm_dir = temp.path().join("plugins/bin");
+        let pcm_dir = temp.path().join("plugins").join("bin");
         let pcm_exe = pcm_dir.join(&bin_name);
         make_executable(&pcm_exe);
 
