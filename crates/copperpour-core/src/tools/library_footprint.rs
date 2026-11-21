@@ -8,6 +8,7 @@
 //! style, no exclusion flags, no description or keywords and no 3D model.
 
 use super::library::PadFabricationProperty;
+use super::solder_margins::Margin;
 use anyhow::{bail, Context, Result};
 use copperpour_ipc::gen::kiapi;
 use copperpour_sexp::layers::{flip_layer, CopperStack};
@@ -789,6 +790,116 @@ fn zone_connection(text: &str) -> Result<kiapi::board::types::ZoneConnectionStyl
     })
 }
 
+/// A library pad's or footprint's own solder mask and paste margins, as
+/// KiCad's parser reads them. Each is `None` when the clause is absent, or
+/// when it is 0 in a file KiCad reads 0 in as inherited.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct SolderMargins {
+    /// `(solder_mask_margin m)`, in mm.
+    pub(crate) mask: Option<f64>,
+    /// `(solder_paste_margin m)`, in mm.
+    pub(crate) paste: Option<f64>,
+    /// `(solder_paste_margin_ratio r)`, or a footprint's legacy
+    /// `(solder_paste_ratio r)`.
+    pub(crate) paste_ratio: Option<f64>,
+}
+
+impl SolderMargins {
+    /// Read a library pad's margins from a footprint file of `file_version`.
+    fn of_pad(pad: &SexpNode, file_version: u32) -> Result<Self> {
+        Self::read(pad, false, file_version)
+    }
+
+    /// Read a library footprint's own margins.
+    pub(crate) fn of_footprint(root: &SexpNode) -> Result<Self> {
+        Self::read(root, true, super::solder_margins::file_version(root))
+    }
+
+    /// A clause given twice keeps its last value, as in KiCad's parser.
+    /// `solder_margins::read` reports a margin to the library tools and takes
+    /// a clause it cannot read as inherited; placement refuses that clause,
+    /// as KiCad's parser does, so it reads the clauses here.
+    fn read(node: &SexpNode, footprint: bool, file_version: u32) -> Result<Self> {
+        use super::solder_margins::ZERO_IS_INHERITED;
+        let owner = if footprint { "footprint" } else { "pad" };
+        let mut margins = Self::default();
+        for child in node.children().unwrap_or_default() {
+            let Some(tag) = child.head() else {
+                continue;
+            };
+            let Some(margin) = Margin::ALL.into_iter().find(|margin| {
+                if footprint {
+                    margin.footprint_tokens().contains(&tag)
+                } else {
+                    margin.name() == tag
+                }
+            }) else {
+                continue;
+            };
+            let text = match child.children() {
+                Some([_, value]) => value.as_str(),
+                _ => None,
+            }
+            .with_context(|| format!("{owner} clause '{tag}' must hold exactly one number"))?;
+            let value = text
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .with_context(|| format!("{owner} clause '{tag}' has an invalid value '{text}'"))?;
+            // In a file up to ZERO_IS_INHERITED, KiCad reads 0 as inherited.
+            let value = (value != 0.0 || file_version > ZERO_IS_INHERITED).then_some(value);
+            match margin {
+                Margin::Mask => margins.mask = value,
+                Margin::Paste => margins.paste = value,
+                Margin::PasteRatio => margins.paste_ratio = value,
+            }
+        }
+        Ok(margins)
+    }
+
+    fn mask_overrides(&self) -> Option<kiapi::board::types::SolderMaskOverrides> {
+        self.mask
+            .map(|mask| kiapi::board::types::SolderMaskOverrides {
+                solder_mask_margin: Some(copperpour_ipc::builders::distance(mask)),
+                ..Default::default()
+            })
+    }
+
+    fn paste_overrides(&self) -> Option<kiapi::board::types::SolderPasteOverrides> {
+        (self.paste.is_some() || self.paste_ratio.is_some()).then(|| {
+            kiapi::board::types::SolderPasteOverrides {
+                solder_paste_margin: self.paste.map(copperpour_ipc::builders::distance),
+                solder_paste_margin_ratio: self
+                    .paste_ratio
+                    .map(|value| kiapi::common::types::Ratio { value }),
+            }
+        })
+    }
+}
+
+/// Each pad's own margins, from `pad_nodes` in the footprint `root`.
+pub(crate) fn pad_margins(root: &SexpNode, pad_nodes: &[&SexpNode]) -> Result<Vec<SolderMargins>> {
+    let file_version = super::solder_margins::file_version(root);
+    pad_nodes
+        .iter()
+        .map(|pad| SolderMargins::of_pad(pad, file_version))
+        .collect()
+}
+
+/// Give a placed footprint the library footprint's own margins, which KiCad
+/// reads from the instance's overrides (`FOOTPRINT::Deserialize`, 10.0.8).
+pub(crate) fn apply_footprint_margins(
+    footprint: &mut kiapi::board::types::FootprintInstance,
+    margins: &SolderMargins,
+) {
+    if *margins == SolderMargins::default() {
+        return;
+    }
+    let overrides = footprint.overrides.get_or_insert_with(Default::default);
+    overrides.solder_mask = margins.mask_overrides();
+    overrides.solder_paste = margins.paste_overrides();
+}
+
 /// The spoke angle KiCad's parser gives a pad that doesn't set one
 /// (`parsePAD`, `pcb_io_kicad_sexpr_parser.cpp`, 10.0.8): 90° for ovals and
 /// rectangles, rounded or chamfered, and for a custom pad with a rect anchor;
@@ -821,20 +932,21 @@ pub(crate) fn default_thermal_spoke_angle(shape: i32, anchor: i32) -> f64 {
     }
 }
 
-/// Apply library `pad_properties` (when `carry_10_0_7_fields` is true) and
-/// `pad_zones` to every `Pad` in `definition.items`. The builder emits pads
-/// in the library's order.
+/// Apply library `pad_properties` (when `carry_10_0_7_fields` is true),
+/// `pad_zones` and `pad_margins` to every `Pad` in `definition.items`. The
+/// builder emits pads in the library's order.
 pub(crate) fn apply_pad_settings(
     definition: &mut kiapi::board::types::Footprint,
     pad_properties: &[PadFabricationProperty],
     pad_zones: &[PadZoneSettings],
+    pad_margins: &[SolderMargins],
     carry_10_0_7_fields: bool,
 ) -> Result<()> {
-    let mut pairs = pad_properties.iter().zip(pad_zones);
+    let mut pairs = pad_properties.iter().zip(pad_zones).zip(pad_margins);
     for item in &mut definition.items {
         if copperpour_ipc::builders::any_is(item, "kiapi.board.types.Pad") {
             let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
-            let (property, zone) = pairs
+            let ((property, zone), margins) = pairs
                 .next()
                 .context("typed footprint builder returned more pads than the library has")?;
             if carry_10_0_7_fields {
@@ -850,6 +962,15 @@ pub(crate) fn apply_pad_settings(
                 .context("typed footprint builder returned a pad without a copper layer")?;
             let (shape, anchor) = (layer.shape, layer.custom_anchor_shape);
             stack.zone_settings = Some(zone.zone_connection_settings(shape, anchor));
+            // KiCad's parser sets a pad's one margin on both sides
+            // (the `PAD::SetLocalSolder*` setters, `pcbnew/pad.h`).
+            if *margins != SolderMargins::default() {
+                for outer in [&mut stack.front_outer_layers, &mut stack.back_outer_layers] {
+                    let outer = outer.get_or_insert_with(Default::default);
+                    outer.solder_mask_settings = margins.mask_overrides();
+                    outer.solder_paste_settings = margins.paste_overrides();
+                }
+            }
             *item = copperpour_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
         }
     }
@@ -1025,6 +1146,18 @@ fn check_supported_children(
                         ),
                     )?;
                 }
+            }
+            // Placement and Update PCB's additions carry the footprint's own
+            // margins; the refresh does not compare them yet, so it still
+            // refuses them.
+            tag if Margin::ALL
+                .iter()
+                .any(|margin| margin.footprint_tokens().contains(&tag)) =>
+            {
+                on_unsupported(
+                    CARRIED_BY_PLACEMENT,
+                    &format!("footprint child '{tag}' is not supported by typed library refresh"),
+                )?;
             }
             unsupported => {
                 on_unsupported(
@@ -1396,6 +1529,15 @@ fn check_pad(
         if custom && matches!(tag, "options" | "primitives") {
             continue;
         }
+        // Placement and Update PCB's additions carry a pad's own margins; the
+        // refresh does not compare them yet, so it still refuses them.
+        if Margin::ALL.iter().any(|margin| margin.name() == tag) {
+            on_unsupported(
+                CARRIED_BY_PLACEMENT,
+                &format!("pad clause '{tag}' is not supported by typed library refresh"),
+            )?;
+            continue;
+        }
         if !matches!(
             tag,
             "at" | "size"
@@ -1442,6 +1584,121 @@ fn check_pad(
     Ok(())
 }
 
+/// What the placement tests read back from a built footprint's margins, and
+/// #667's four footprints with what each carries.
+#[cfg(test)]
+pub(crate) mod test_margins {
+    use super::kiapi;
+    use super::kiapi::board::types::{FootprintInstance, Pad};
+    use prost::Message;
+
+    /// A footprint's own, or a pad side's, mask margin and paste margin in
+    /// nm, and its paste ratio.
+    pub(crate) type Margins = (Option<i64>, Option<i64>, Option<f64>);
+    pub(crate) const NO_MARGINS: Margins = (None, None, None);
+
+    /// #667's four KiCad-written footprints (`solder_margins_kicad10.README.md`):
+    /// each one's name, text, own margins and pad 9's.
+    pub(crate) const SOLDER_MARGIN_FOOTPRINTS: [(&str, &str, Margins, Margins); 4] = [
+        (
+            "ep",
+            include_str!("../../tests/fixtures/solder_margins_ep_kicad10.kicad_mod"),
+            NO_MARGINS,
+            (Some(-50_000), Some(-100_000), Some(-0.2)),
+        ),
+        (
+            "ep_zero",
+            include_str!("../../tests/fixtures/solder_margins_ep_zero_kicad10.kicad_mod"),
+            NO_MARGINS,
+            (Some(0), Some(0), Some(0.0)),
+        ),
+        (
+            "footprint",
+            include_str!("../../tests/fixtures/solder_margins_footprint_kicad10.kicad_mod"),
+            (Some(50_000), Some(-30_000), Some(-0.1)),
+            NO_MARGINS,
+        ),
+        (
+            "footprint_zero",
+            include_str!("../../tests/fixtures/solder_margins_footprint_zero_kicad10.kicad_mod"),
+            (Some(0), Some(0), Some(0.0)),
+            NO_MARGINS,
+        ),
+    ];
+
+    fn margins(
+        mask: Option<&kiapi::board::types::SolderMaskOverrides>,
+        paste: Option<&kiapi::board::types::SolderPasteOverrides>,
+    ) -> Margins {
+        (
+            mask.and_then(|overrides| overrides.solder_mask_margin.as_ref())
+                .map(|margin| margin.value_nm),
+            paste
+                .and_then(|overrides| overrides.solder_paste_margin.as_ref())
+                .map(|margin| margin.value_nm),
+            paste
+                .and_then(|overrides| overrides.solder_paste_margin_ratio.as_ref())
+                .map(|ratio| ratio.value),
+        )
+    }
+
+    /// A built footprint's own margins, and each pad's that has any, its two
+    /// outer layers required to agree.
+    pub(crate) fn placed_margins(
+        footprint: &FootprintInstance,
+    ) -> (Margins, Vec<(String, Margins)>) {
+        let side = |outer: Option<&kiapi::board::types::PadStackOuterLayer>| {
+            margins(
+                outer.and_then(|outer| outer.solder_mask_settings.as_ref()),
+                outer.and_then(|outer| outer.solder_paste_settings.as_ref()),
+            )
+        };
+        let overrides = footprint.overrides.unwrap_or_default();
+        let pads = footprint
+            .definition
+            .as_ref()
+            .expect("a built footprint has a definition")
+            .items
+            .iter()
+            .filter(|item| copperpour_ipc::builders::any_is(item, "kiapi.board.types.Pad"))
+            .map(|item| {
+                let pad = Pad::decode(item.value.as_slice()).unwrap();
+                let stack = pad.pad_stack.unwrap();
+                let front = side(stack.front_outer_layers.as_ref());
+                assert_eq!(
+                    front,
+                    side(stack.back_outer_layers.as_ref()),
+                    "pad '{}'",
+                    pad.number
+                );
+                (pad.number, front)
+            })
+            .filter(|(_, margins)| *margins != NO_MARGINS)
+            .collect();
+        (
+            margins(
+                overrides.solder_mask.as_ref(),
+                overrides.solder_paste.as_ref(),
+            ),
+            pads,
+        )
+    }
+
+    /// What `placed_margins` gives for a footprint with `own` margins and
+    /// `pad_9`'s.
+    pub(crate) fn expected_margins(
+        own: Margins,
+        pad_9: Margins,
+    ) -> (Margins, Vec<(String, Margins)>) {
+        let pads = if pad_9 == NO_MARGINS {
+            vec![]
+        } else {
+            vec![("9".to_string(), pad_9)]
+        };
+        (own, pads)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1466,6 +1723,214 @@ mod tests {
         assert_eq!(
             refusal,
             "pad shape 'custom' is not supported by typed library refresh"
+        );
+    }
+
+    /// Solder margins are carried by live placement, so a footprint with its
+    /// own or its pad's lists none as not carried; the typed refresh does not
+    /// compare them yet and still refuses them.
+    #[test]
+    fn solder_margins_are_carried_by_placement_and_refused_by_the_refresh() {
+        for (source, owner) in [
+            (
+                include_str!("../../tests/fixtures/solder_margins_ep_kicad10.kicad_mod"),
+                "pad clause",
+            ),
+            (
+                include_str!("../../tests/fixtures/solder_margins_footprint_kicad10.kicad_mod"),
+                "footprint child",
+            ),
+        ] {
+            let margins = root(source);
+            assert_eq!(
+                unsupported_features(&margins).unwrap(),
+                Vec::<String>::new()
+            );
+            let mut refusals = Vec::new();
+            check_supported_children(&margins, &mut |placed, refresh| {
+                assert_eq!(placed, CARRIED_BY_PLACEMENT, "{refresh}");
+                refusals.push(refresh.to_string());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                refusals,
+                Margin::ALL.map(|margin| format!(
+                    "{owner} '{}' is not supported by typed library refresh",
+                    margin.name()
+                ))
+            );
+            assert_eq!(
+                validate_supported_children(&margins)
+                    .unwrap_err()
+                    .to_string(),
+                refusals[0]
+            );
+        }
+    }
+
+    /// Inline because KiCad writes no such clause: a margin clause that is not
+    /// one finite number refuses the footprint, as a malformed `zone_connect`
+    /// does.
+    #[test]
+    fn a_malformed_solder_margin_is_refused() {
+        for clause in [
+            "(solder_mask_margin)",
+            "(solder_mask_margin 0.1 0.2)",
+            "(solder_paste_margin x)",
+            "(solder_paste_margin_ratio inf)",
+        ] {
+            let pad = root(&format!("(pad \"1\" smd rect {clause})"));
+            assert!(SolderMargins::of_pad(&pad, 20260206).is_err(), "{clause}");
+            let footprint = root(&format!("(footprint \"F\" (version 20260206) {clause})"));
+            assert!(SolderMargins::of_footprint(&footprint).is_err(), "{clause}");
+        }
+        let legacy = root("(footprint \"F\" (version 20260206) (solder_paste_ratio x))");
+        assert!(SolderMargins::of_footprint(&legacy).is_err());
+    }
+
+    /// Each margin travels alone: one with only a mask margin, a paste margin
+    /// or a paste ratio sends that one and leaves the others unset.
+    #[test]
+    fn each_solder_margin_travels_alone() {
+        for (margins, mask, paste, ratio) in [
+            (
+                SolderMargins {
+                    mask: Some(0.1),
+                    ..Default::default()
+                },
+                Some(100_000),
+                None,
+                None,
+            ),
+            (
+                SolderMargins {
+                    paste: Some(-0.05),
+                    ..Default::default()
+                },
+                None,
+                Some(-50_000),
+                None,
+            ),
+            (
+                SolderMargins {
+                    paste_ratio: Some(-0.2),
+                    ..Default::default()
+                },
+                None,
+                None,
+                Some(-0.2),
+            ),
+        ] {
+            let mut footprint = kiapi::board::types::FootprintInstance::default();
+            apply_footprint_margins(&mut footprint, &margins);
+            let overrides = footprint.overrides.unwrap();
+            assert_eq!(
+                overrides.solder_mask.is_some(),
+                mask.is_some(),
+                "{margins:?}"
+            );
+            assert_eq!(
+                overrides.solder_paste.is_some(),
+                paste.is_some() || ratio.is_some(),
+                "{margins:?}"
+            );
+            assert_eq!(
+                overrides
+                    .solder_mask
+                    .and_then(|settings| settings.solder_mask_margin)
+                    .map(|margin| margin.value_nm),
+                mask,
+                "{margins:?}"
+            );
+            assert_eq!(
+                overrides
+                    .solder_paste
+                    .and_then(|settings| settings.solder_paste_margin)
+                    .map(|margin| margin.value_nm),
+                paste,
+                "{margins:?}"
+            );
+            assert_eq!(
+                overrides
+                    .solder_paste
+                    .and_then(|settings| settings.solder_paste_margin_ratio)
+                    .map(|fraction| fraction.value),
+                ratio,
+                "{margins:?}"
+            );
+        }
+    }
+
+    /// Inline because KiCad writes each clause once: a clause given twice
+    /// keeps its last value, as KiCad's parser does, and a footprint's older
+    /// `solder_paste_ratio` and `solder_paste_margin_ratio` set one ratio, the
+    /// later winning. Placement carries the older token like the other; a
+    /// pad knows only the current one, so on a pad the older is no margin.
+    #[test]
+    fn the_last_of_a_repeated_solder_margin_wins() {
+        let pad = root("(pad \"1\" smd rect (solder_mask_margin 0.1) (solder_mask_margin 0.2))");
+        assert_eq!(
+            SolderMargins::of_pad(&pad, 20260206).unwrap().mask,
+            Some(0.2)
+        );
+        let pad = root("(pad \"1\" smd rect (solder_paste_ratio x))");
+        assert_eq!(
+            SolderMargins::of_pad(&pad, 20260206).unwrap(),
+            SolderMargins::default()
+        );
+        for (clauses, ratio) in [
+            (
+                "(solder_paste_ratio -0.1) (solder_paste_margin_ratio -0.3)",
+                -0.3,
+            ),
+            (
+                "(solder_paste_margin_ratio -0.3) (solder_paste_ratio -0.1)",
+                -0.1,
+            ),
+        ] {
+            let footprint = root(&format!("(footprint \"F\" (version 20260206) {clauses})"));
+            assert_eq!(
+                SolderMargins::of_footprint(&footprint).unwrap().paste_ratio,
+                Some(ratio),
+                "{clauses}"
+            );
+            assert_eq!(
+                unsupported_features(&footprint).unwrap(),
+                Vec::<String>::new(),
+                "{clauses}"
+            );
+        }
+    }
+
+    /// Inline because KiCad 10 writes neither: a margin of 0 in a file up to
+    /// format 20240201 is inherited, as KiCad's parser reads it, and a
+    /// footprint's legacy `solder_paste_ratio` is its paste ratio.
+    #[test]
+    fn solder_margins_read_as_kicad_reads_older_files() {
+        let footprint = |version: u32| {
+            root(&format!(
+                "(footprint \"F\" (version {version}) (solder_mask_margin 0) \
+                 (solder_paste_ratio -0.1) (pad \"1\" smd rect (solder_paste_margin 0)))"
+            ))
+        };
+        let older = footprint(20240201);
+        assert_eq!(
+            SolderMargins::of_footprint(&older).unwrap(),
+            SolderMargins {
+                paste_ratio: Some(-0.1),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            pad_margins(&older, &older.find_all("pad")).unwrap(),
+            [SolderMargins::default()]
+        );
+        let newer = footprint(20240202);
+        assert_eq!(SolderMargins::of_footprint(&newer).unwrap().mask, Some(0.0));
+        assert_eq!(
+            pad_margins(&newer, &newer.find_all("pad")).unwrap()[0].paste,
+            Some(0.0)
         );
     }
 

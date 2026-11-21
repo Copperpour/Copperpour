@@ -437,6 +437,10 @@ struct PreparedFootprint {
     pad_properties: Vec<PadFabricationProperty>,
     /// Each pad's zone connection and thermal relief settings, in the order of `pads`.
     pad_zones: Vec<super::library_footprint::PadZoneSettings>,
+    /// Each pad's own solder mask and paste margins, in the order of `pads`.
+    pad_margins: Vec<super::library_footprint::SolderMargins>,
+    /// The footprint's own solder mask and paste margins.
+    margins: super::library_footprint::SolderMargins,
     /// Reference points declared in the library footprint.
     points: Vec<super::library_footprint::LibraryPoint>,
     /// Library footprint clauses or children that typed placement leaves out.
@@ -2936,6 +2940,10 @@ fn prepare_footprint_source(
     let pad_properties =
         super::library_footprint::pad_properties(&pad_nodes, pads.len()).map_err(unsupported)?;
     let pad_zones = super::library_footprint::pad_zones(&pad_nodes).map_err(unsupported)?;
+    let pad_margins =
+        super::library_footprint::pad_margins(&root, &pad_nodes).map_err(unsupported)?;
+    let margins =
+        super::library_footprint::SolderMargins::of_footprint(&root).map_err(unsupported)?;
     let points = super::library_footprint::points(&root).map_err(unsupported)?;
     let unsupported_features =
         super::library_footprint::unsupported_features(&root).map_err(unsupported)?;
@@ -2963,6 +2971,8 @@ fn prepare_footprint_source(
         library_fields,
         pad_properties,
         pad_zones,
+        pad_margins,
+        margins,
         points,
         unsupported: unsupported_features,
         width,
@@ -2971,10 +2981,10 @@ fn prepare_footprint_source(
 }
 
 /// Give a footprint built from pads, drawings and fields the rest of what its
-/// library carries: the instance attributes, the definition's description and
-/// keywords, and its 3D models. Without them a synced SMD part had no `smd`
-/// attribute, so KiCad treated it as unspecified, and `export_3d`'s default
-/// left every one of them out of the STEP (#789).
+/// library carries: the instance attributes and solder margins, the
+/// definition's description and keywords, and its 3D models. Without them a
+/// synced SMD part had no `smd` attribute, so KiCad treated it as unspecified,
+/// and `export_3d`'s default left every one of them out of the STEP (#789).
 ///
 /// Runs before [`apply_footprint_fields`], which sets DNP from the schematic,
 /// so the schematic overrides a library `dnp` as KiCad's own update does.
@@ -2983,6 +2993,7 @@ fn apply_library_data(
     part: &PreparedFootprint,
 ) -> Result<()> {
     footprint.attributes = Some(part.attributes.clone());
+    super::library_footprint::apply_footprint_margins(footprint, &part.margins);
     let definition = footprint
         .definition
         .as_mut()
@@ -4034,6 +4045,7 @@ fn build_added_footprint(
         definition,
         &part.pad_properties,
         &part.pad_zones,
+        &part.pad_margins,
         carry_pad_properties,
     )?;
     if carry_pad_properties {
@@ -11634,6 +11646,135 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("reference point"));
+    }
+
+    /// Write each `(name, text)` footprint to a `Margins.pretty` library in
+    /// `served`'s project, with its `fp-lib-table` row.
+    fn margins_library(served: &ServedSync, footprints: &[(&str, &str)]) {
+        let project_dir = served.board.parent().unwrap();
+        let pretty = project_dir.join("Margins.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        for (name, source) in footprints {
+            std::fs::write(pretty.join(format!("{name}.kicad_mod")), source).unwrap();
+        }
+        let fp_table = project_dir.join("fp-lib-table");
+        let existing_table = std::fs::read_to_string(&fp_table)
+            .unwrap_or_else(|_| "(fp_lib_table\n  (version 7)\n)\n".to_string());
+        let updated_table = existing_table.replacen(
+            "\n)",
+            "\n  (lib (name \"Margins\")(type \"KiCad\")(uri \"${KIPRJMOD}/Margins.pretty\")(options \"\")(descr \"\"))\n)",
+            1,
+        );
+        std::fs::write(&fp_table, updated_table).unwrap();
+    }
+
+    /// An added footprint gets the library's own solder mask and paste
+    /// margins, and each pad its own on both outer layers, a margin of 0 as an
+    /// override, with none of them in `not_carried`; on KiCad 10.0.6 too,
+    /// which reads them as 10.0.8 does.
+    #[tokio::test]
+    async fn added_footprint_carries_pad_and_footprint_solder_margins() {
+        use crate::tools::library_footprint::test_margins::{
+            expected_margins, placed_margins, SOLDER_MARGIN_FOOTPRINTS,
+        };
+
+        let references = ["U1", "U2", "U3", "U4"];
+        let ids = SOLDER_MARGIN_FOOTPRINTS.map(|(name, ..)| format!("Margins:{name}"));
+        let parts: Vec<(&str, &str, &[&str])> = references
+            .iter()
+            .zip(&ids)
+            .map(|(reference, id)| (*reference, id.as_str(), &["1", "9"][..]))
+            .collect();
+        for version in [(10, 0, 6), (10, 0, 8)] {
+            let served = ServedSync::reading_back(Readback::AsSent).await;
+            served.report_kicad_version(version.0, version.1, version.2);
+            margins_library(
+                &served,
+                &SOLDER_MARGIN_FOOTPRINTS.map(|(name, source, ..)| (name, source)),
+            );
+
+            let applied = served.apply(&exported_netlist(&parts)).await;
+            assert_eq!(applied["status"], "applied", "{applied:#}");
+            assert!(
+                !applied["diagnostics"].to_string().contains("solder"),
+                "{applied:#}"
+            );
+            // On 10.0.6, pad 9's heatsink property, which needs 10.0.7, is
+            // listed.
+            if version == (10, 0, 8) {
+                assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+            }
+
+            let sent = served.sent_footprints();
+            assert_eq!(sent.len(), references.len());
+            for (reference, (name, _, own, pad_9)) in
+                references.iter().zip(SOLDER_MARGIN_FOOTPRINTS)
+            {
+                let placed = sent
+                    .iter()
+                    .find(|fp| {
+                        fp.reference_field
+                            .as_ref()
+                            .and_then(|field| field.text.as_ref())
+                            .and_then(|text| text.text.as_ref())
+                            .is_some_and(|text| text.text == *reference)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    placed_margins(placed),
+                    expected_margins(own, pad_9),
+                    "{name} on {version:?}"
+                );
+            }
+        }
+    }
+
+    /// Inline because KiCad writes no such clause: a library footprint whose
+    /// pad or own margin is not one number cannot be added; the part is
+    /// skipped and named, as KiCad's Update PCB skips a part it cannot add,
+    /// and the rest is still planned.
+    #[tokio::test]
+    async fn a_footprint_with_a_malformed_solder_margin_is_skipped_and_named() {
+        use crate::tools::library_footprint::test_margins::SOLDER_MARGIN_FOOTPRINTS;
+
+        for (owner, good, clause) in [
+            (
+                "pad",
+                SOLDER_MARGIN_FOOTPRINTS[0].1,
+                "(solder_mask_margin -0.05)",
+            ),
+            (
+                "footprint",
+                SOLDER_MARGIN_FOOTPRINTS[2].1,
+                "(solder_mask_margin 0.05)",
+            ),
+        ] {
+            assert_eq!(good.matches(clause).count(), 1, "{owner}");
+            let bad = good.replace(clause, "(solder_mask_margin x)");
+            let served = ServedSync::new().await;
+            margins_library(&served, &[("good", good), ("bad", &bad)]);
+
+            let plan = served
+                .dry_run(&exported_netlist(&[
+                    ("U1", "Margins:bad", &["1", "9"]),
+                    ("U2", "Margins:good", &["1", "9"]),
+                ]))
+                .await;
+            assert_eq!(plan["status"], "ready", "{owner}: {plan:#}");
+            assert_eq!(plan["changes_count"], 1, "{owner}: {plan:#}");
+            assert_eq!(plan["changes"][0]["reference"], "U2", "{owner}: {plan:#}");
+            let skipped = &plan["skipped_footprints"];
+            assert_eq!(skipped.as_array().unwrap().len(), 1, "{owner}: {plan:#}");
+            assert_eq!(skipped[0]["code"], "unsupported_library_footprint");
+            assert_eq!(skipped[0]["footprint_id"], "Margins:bad");
+            assert_eq!(skipped[0]["references"], serde_json::json!(["U1"]));
+            assert!(
+                skipped[0]["message"].as_str().unwrap().contains(&format!(
+                    "{owner} clause 'solder_mask_margin' has an invalid value 'x'"
+                )),
+                "{owner}: {plan:#}"
+            );
+        }
     }
 
     /// Issue #82: a KiCad-resaved hierarchy with root-page symbols, two

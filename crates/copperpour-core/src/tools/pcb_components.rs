@@ -957,6 +957,8 @@ struct LibraryFootprintData {
     properties: Result<super::library_footprint::LibraryProperties, String>,
     pad_properties: Vec<super::library::PadFabricationProperty>,
     pad_zones: Vec<super::library_footprint::PadZoneSettings>,
+    pad_margins: Vec<super::library_footprint::SolderMargins>,
+    margins: super::library_footprint::SolderMargins,
     points: Vec<super::library_footprint::LibraryPoint>,
     unsupported: Vec<String>,
 }
@@ -1015,6 +1017,8 @@ impl PreparedFootprintPlacement {
                 .map_err(|error| format!("{error:#}")),
             pad_properties: super::library_footprint::pad_properties(&pad_nodes, pads.len())?,
             pad_zones: super::library_footprint::pad_zones(&pad_nodes)?,
+            pad_margins: super::library_footprint::pad_margins(&root, &pad_nodes)?,
+            margins: super::library_footprint::SolderMargins::of_footprint(&root)?,
             points: super::library_footprint::points(&root)?,
             unsupported: super::library_footprint::unsupported_features(&root)?,
         };
@@ -1145,9 +1149,10 @@ impl PreparedFootprintPlacement {
 
     /// The F.Cu `FootprintInstance` the IPC path creates, with the library's
     /// 3D models, attributes, description and keywords, pad zone settings,
-    /// fields (Reference, Value, Datasheet, Description and custom
-    /// properties), and (when `carry_10_0_7_fields` is true) pad fabrication
-    /// properties and reference points on it.
+    /// pad and footprint solder mask and paste margins, fields (Reference,
+    /// Value, Datasheet, Description and custom properties), and (when
+    /// `carry_10_0_7_fields` is true) pad fabrication properties and
+    /// reference points on it.
     pub(crate) fn ipc_item(
         &self,
         lib_id: &str,
@@ -1175,6 +1180,7 @@ impl PreparedFootprintPlacement {
             item.value.as_slice(),
         )?;
         footprint.attributes = Some(library.attributes.clone());
+        super::library_footprint::apply_footprint_margins(&mut footprint, &library.margins);
         let position = footprint
             .position
             .context("built footprint has no position")?;
@@ -1190,6 +1196,7 @@ impl PreparedFootprintPlacement {
             definition,
             &library.pad_properties,
             &library.pad_zones,
+            &library.pad_margins,
             carry_10_0_7_fields,
         )?;
         if carry_10_0_7_fields {
@@ -3894,6 +3901,7 @@ async fn handle_repair_corrupted_footprints(
                 let pad_properties =
                     super::library_footprint::pad_properties(&pad_nodes, pads.len())?;
                 let pad_zones = super::library_footprint::pad_zones(&pad_nodes)?;
+                let pad_margins = super::library_footprint::pad_margins(&root, &pad_nodes)?;
                 let has_fab_props = pad_properties
                     .iter()
                     .any(|p| *p != super::library::PadFabricationProperty::None);
@@ -3950,6 +3958,7 @@ async fn handle_repair_corrupted_footprints(
                         definition,
                         &pad_properties,
                         &pad_zones,
+                        &pad_margins,
                         carry_10_0_7,
                     )?;
                 }
@@ -8615,6 +8624,108 @@ mod tests {
         );
     }
 
+    /// Pad solder margins reach the IPC item as KiCad 10.0.8 holds them after
+    /// placing the same stock footprints itself: the PQFN-8's paste margin on
+    /// four of its pads (`issue_300_ipc.README.md`) and the fiducial's mask
+    /// margin (`custom_pads_ipc.README.md`), on both outer layers, and nothing
+    /// on the pads without one. Neither footprint has margins of its own.
+    #[test]
+    fn the_ipc_item_carries_pad_solder_margins_as_kicad_places_them() {
+        use copperpour_ipc::gen::kiapi::board::types as board;
+        let margins = |outer: Option<&board::PadStackOuterLayer>| {
+            let mask = outer.and_then(|outer| outer.solder_mask_settings.as_ref());
+            let paste = outer.and_then(|outer| outer.solder_paste_settings.as_ref());
+            (
+                mask.and_then(|mask| mask.solder_mask_margin),
+                paste.and_then(|paste| paste.solder_paste_margin),
+                paste.and_then(|paste| paste.solder_paste_margin_ratio),
+            )
+        };
+        let summary = |footprint: &board::FootprintInstance| {
+            let overrides = footprint.overrides.unwrap_or_default();
+            let pads = footprint
+                .definition
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .filter(|item| copperpour_ipc::builders::any_is(item, "kiapi.board.types.Pad"))
+                .map(|item| {
+                    let pad = board::Pad::decode(item.value.as_slice()).unwrap();
+                    let stack = pad.pad_stack.unwrap();
+                    (
+                        pad.number,
+                        margins(stack.front_outer_layers.as_ref()),
+                        margins(stack.back_outer_layers.as_ref()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (
+                overrides
+                    .solder_mask
+                    .and_then(|mask| mask.solder_mask_margin),
+                overrides.solder_paste,
+                pads,
+            )
+        };
+        let mut with_margins = 0;
+        for (capture, library, name, source) in [
+            (
+                &include_bytes!("../../tests/fixtures/issue_300_u6.ipc.bin")[..],
+                "Package_DFN_QFN",
+                "PQFN-8-EP_6x5mm_P1.27mm_Generic",
+                include_str!("../../tests/fixtures/issue_300_pqfn8_kicad10.kicad_mod"),
+            ),
+            (
+                &include_bytes!("../../tests/fixtures/custom_pads_fiducial_ipc.bin")[..],
+                "Fiducial",
+                "Fiducial_Cross_1.5mm_Mask2mm",
+                include_str!("../../tests/fixtures/pad_primitives_fiducial_kicad10.kicad_mod"),
+            ),
+        ] {
+            let kicad = board::FootprintInstance::decode(capture).unwrap();
+            let reference = kicad
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.clone())
+                .unwrap();
+            let position = kicad.position.unwrap();
+            let x = copperpour_ipc::builders::nm_to_mm(position.x_nm);
+            let y = copperpour_ipc::builders::nm_to_mm(position.y_nm);
+            let rotation = kicad.orientation.unwrap().value_degrees;
+            let tmp = tempfile::tempdir().unwrap();
+            let pretty = tmp.path().join(format!("{library}.pretty"));
+            std::fs::create_dir(&pretty).unwrap();
+            std::fs::write(pretty.join(format!("{name}.kicad_mod")), source).unwrap();
+            library_fixture(tmp.path(), library, &pretty);
+            let lib_id = format!("{library}:{name}");
+            let prepared = PreparedFootprintPlacement::from_library(
+                source,
+                &lib_id,
+                &reference,
+                None,
+                x,
+                y,
+                rotation,
+                "F.Cu",
+                Some(tmp.path()),
+            )
+            .unwrap();
+            let item = prepared.ipc_item(&lib_id, &reference, x, y, true).unwrap();
+            let built = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            let kicad = summary(&kicad);
+            assert_eq!(summary(&built), kicad, "{reference}");
+            with_margins += kicad
+                .2
+                .iter()
+                .filter(|(_, front, _)| *front != (None, None, None))
+                .count();
+        }
+        assert_eq!(with_margins, 4 + 1, "every captured pad with a margin");
+    }
+
     /// A custom pad with `(clearance convexhull)` is refused by name: KiCad's
     /// pad message has no field for it, and placing it with the outline
     /// clearance would give the board a different zone clearance from the
@@ -9658,6 +9769,9 @@ mod off_axis_rotation_tests {
 /// literals, never `mm_to_nm`, so truncation inside the conversion fails them.
 #[cfg(test)]
 mod nanometre_rounding_tests {
+    use crate::tools::library_footprint::test_margins::{
+        expected_margins, placed_margins, NO_MARGINS, SOLDER_MARGIN_FOOTPRINTS,
+    };
     use crate::tools::pcb_board::board_mock::{spawn_kicad_holding_items, ItemStore};
     use copperpour_ipc::builders::{any_is, pack_any};
     use copperpour_ipc::gen::kiapi;
@@ -10104,8 +10218,8 @@ mod nanometre_rounding_tests {
     }
 
     /// A footprint with features typed placement cannot carry (footprint zone,
-    /// `solder_mask_margin`, `fp_text user` with `justify`) is still placed
-    /// (`isError: false`) and every uncarried feature is listed in `not_carried`.
+    /// `fp_text user` with `justify`) is still placed (`isError: false`) and
+    /// every uncarried feature is listed in `not_carried`.
     #[tokio::test]
     async fn place_component_with_unsupported_clauses_places_and_reports_not_carried() {
         use crate::tools::pcb_board::board_mock::ItemStore;
@@ -10115,11 +10229,10 @@ mod nanometre_rounding_tests {
   (version 20241229)
   (generator "pcbnew")
   (layer "F.Cu")
-  (solder_mask_margin 0.1)
   (property "Reference" "REF**" (at 0 -2 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))
   (property "Value" "Test_Part" (at 0 2 0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
   (fp_text user "NOTE" (at 0 0 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15)) (justify left)))
-  (pad "1" smd rect (at -1 0) (size 1 1) (layers "F.Cu" "F.Mask") (solder_mask_margin 0.05))
+  (pad "1" smd rect (at -1 0) (size 1 1) (layers "F.Cu" "F.Mask"))
   (zone (net 0) (net_name "") (layer "F.Cu"))
 )"#;
         let dir = tempfile::tempdir().unwrap();
@@ -10148,9 +10261,304 @@ mod nanometre_rounding_tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         let joined = not_carried.join(" | ");
-        assert!(joined.contains("solder_mask_margin"), "{joined}");
         assert!(joined.contains("justify"), "{joined}");
         assert!(joined.contains("zone"), "{joined}");
+    }
+
+    /// `place_component` gives the footprint the library's own solder mask
+    /// and paste margins, and each pad its own on both outer layers, as
+    /// KiCad's parser sets them; a margin of 0 is an override, and a pad
+    /// without one gets none. KiCad reads both since 10.0.0, unlike pad
+    /// fabrication properties, so the margins go to 10.0.6 too.
+    #[tokio::test]
+    async fn place_component_carries_pad_and_footprint_solder_margins() {
+        for version in [(10, 0, 6), (10, 0, 8)] {
+            for (name, source, own, pad_9) in SOLDER_MARGIN_FOOTPRINTS {
+                let name = format!("{name} on {version:?}");
+                let dir = tempfile::tempdir().unwrap();
+                let (board, lib_id) = issue_318_fixture(dir.path(), "Margins", "Margins", source);
+                let store = Arc::new(Mutex::new(ItemStore::default()));
+                let (is_error, text) = served_with_version(
+                    &board,
+                    store.clone(),
+                    version,
+                    "place_component",
+                    json!({
+                        "board": board.to_string_lossy(),
+                        "footprint": lib_id,
+                        "reference": "U1",
+                        "x": 10.0,
+                        "y": 10.0,
+                    }),
+                )
+                .await;
+                assert!(!is_error, "{name}: {text}");
+                let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert!(
+                    !out["not_carried"].to_string().contains("solder"),
+                    "{name}: {out}"
+                );
+                // On 10.0.6, pad 9's heatsink property, which needs 10.0.7,
+                // is listed.
+                if version == (10, 0, 8) {
+                    assert!(out.get("not_carried").is_none(), "{name}: {out}");
+                }
+                assert_eq!(
+                    placed_margins(&held_footprint(&store)),
+                    expected_margins(own, pad_9),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    /// `place_component_array` and `duplicate_component` build their
+    /// footprints as `place_component` does, margins included.
+    #[tokio::test]
+    async fn array_and_duplicate_carry_solder_margins() {
+        for (name, source, own, pad_9) in SOLDER_MARGIN_FOOTPRINTS {
+            let dir = tempfile::tempdir().unwrap();
+            let (board, lib_id) = issue_318_fixture(dir.path(), "Margins", "Margins", source);
+            let store = Arc::new(Mutex::new(ItemStore::default()));
+            for (tool, arguments) in [
+                (
+                    "place_component_array",
+                    json!({
+                        "board": board.to_string_lossy(),
+                        "footprint": lib_id,
+                        "start_x": 10.0,
+                        "start_y": 10.0,
+                        "count_x": 2,
+                        "count_y": 1,
+                        "spacing_x": 5.0,
+                        "ref_prefix": "U",
+                        "ref_start": 1,
+                    }),
+                ),
+                (
+                    "duplicate_component",
+                    json!({
+                        "board": board.to_string_lossy(),
+                        "reference": "U1",
+                        "new_reference": "U9",
+                        "x": 30.0,
+                        "y": 10.0,
+                    }),
+                ),
+            ] {
+                let (is_error, text) =
+                    served_with_version(&board, store.clone(), (10, 0, 8), tool, arguments).await;
+                assert!(!is_error, "{name} {tool}: {text}");
+                let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert!(out.get("not_carried").is_none(), "{name} {tool}: {out}");
+            }
+            let items = store.lock().unwrap().items.clone();
+            assert_eq!(items.len(), 3, "{name}");
+            for item in &items {
+                let footprint = FootprintInstance::decode(item.value.as_slice()).unwrap();
+                assert_eq!(
+                    placed_margins(&footprint),
+                    expected_margins(own, pad_9),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    /// A part for B.Cu is built on F.Cu with the library's margins and then
+    /// turned over by KiCad's own `FlipItems`. The stand-in flip changes only
+    /// the side, so what this shows is that the margins are built before the
+    /// flip and nothing after it replaces them.
+    #[tokio::test]
+    async fn place_component_on_b_cu_carries_solder_margins() {
+        for (name, source, own, pad_9) in SOLDER_MARGIN_FOOTPRINTS {
+            let dir = tempfile::tempdir().unwrap();
+            let (board, lib_id) = issue_318_fixture(dir.path(), "Margins", "Margins", source);
+            let store = Arc::new(Mutex::new(ItemStore::default()));
+            let flips = Arc::new(Mutex::new(0usize));
+            let flips_in_mock = flips.clone();
+            let version = kicad_version_responder(10, 0, 8);
+            // KiCad's flip reduced to the side, which is all this checks.
+            let server = spawn_kicad_holding_items(
+                &board,
+                vec![],
+                store.clone(),
+                |_| {},
+                move |command, held| {
+                    if let Some(reply) = version(command, held) {
+                        return Some(reply);
+                    }
+                    if !command.type_url.ends_with("kiapi.board.commands.FlipItems") {
+                        return None;
+                    }
+                    *flips_in_mock.lock().unwrap() += 1;
+                    let request =
+                        kiapi::board::commands::FlipItems::decode(command.value.as_slice())
+                            .unwrap();
+                    let mut flipped_items = Vec::new();
+                    for id in request.items {
+                        let slot = held
+                            .items
+                            .iter_mut()
+                            .find(|item| {
+                                crate::tools::pcb_board::board_mock::item_kiid(item).as_deref()
+                                    == Some(id.value.as_str())
+                            })
+                            .unwrap();
+                        let mut footprint =
+                            FootprintInstance::decode(slot.value.as_slice()).unwrap();
+                        footprint.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
+                        *slot = pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+                        flipped_items.push(kiapi::board::commands::ItemFlipResult {
+                            status: Some(kiapi::common::commands::ItemStatus {
+                                code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                error_message: String::new(),
+                            }),
+                            item: Some(slot.clone()),
+                        });
+                    }
+                    Some(pack_any(
+                        &kiapi::board::commands::FlipItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            flipped_items,
+                        },
+                        "kiapi.board.commands.FlipItemsResponse",
+                    ))
+                },
+            );
+            let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+                ipc_address: server.address().to_string(),
+                eager_toolsets: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "place_component",
+                        "arguments": {
+                            "board": board.to_string_lossy(),
+                            "footprint": lib_id,
+                            "reference": "U1",
+                            "x": 10.0,
+                            "y": 10.0,
+                            "rotation": 90.0,
+                            "layer": "B.Cu"
+                        }
+                    }
+                }))
+                .await
+                .unwrap();
+            let result = response.result.unwrap();
+            assert!(
+                !result["isError"].as_bool().unwrap_or(false),
+                "{name}: {result}"
+            );
+            assert_eq!(*flips.lock().unwrap(), 1, "{name}");
+            let placed = held_footprint(&store);
+            assert_eq!(
+                placed.layer,
+                kiapi::board::types::BoardLayer::BlBCu as i32,
+                "{name}"
+            );
+            assert_eq!(
+                placed_margins(&placed),
+                expected_margins(own, pad_9),
+                "{name}"
+            );
+        }
+    }
+
+    /// A footprint with no margins of its own or on its pads is sent as
+    /// before: no overrides, and no pad outer layers.
+    #[tokio::test]
+    async fn a_footprint_without_solder_margins_is_placed_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let (board, lib_id) = issue_318_fixture(
+            dir.path(),
+            "Margins",
+            "Margins",
+            include_str!("../../tests/fixtures/solder_margins_none_kicad10.kicad_mod"),
+        );
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let (is_error, text) = served_with_version(
+            &board,
+            store.clone(),
+            (10, 0, 8),
+            "place_component",
+            json!({
+                "board": board.to_string_lossy(),
+                "footprint": lib_id,
+                "reference": "U1",
+                "x": 10.0,
+                "y": 10.0,
+            }),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        let placed = held_footprint(&store);
+        assert_eq!(placed.overrides, None);
+        for item in &placed.definition.unwrap().items {
+            if any_is(item, "kiapi.board.types.Pad") {
+                let pad = Pad::decode(item.value.as_slice()).unwrap();
+                let stack = pad.pad_stack.unwrap();
+                assert_eq!(stack.front_outer_layers, None, "pad '{}'", pad.number);
+                assert_eq!(stack.back_outer_layers, None, "pad '{}'", pad.number);
+            }
+        }
+    }
+
+    /// Inline because KiCad writes no such clause: a pad's or a footprint's
+    /// margin that is not one number refuses the footprint, named, before
+    /// anything is sent to KiCad.
+    #[tokio::test]
+    async fn place_component_refuses_a_malformed_solder_margin() {
+        for (owner, source, clause) in [
+            (
+                "pad",
+                SOLDER_MARGIN_FOOTPRINTS[0].1,
+                "(solder_mask_margin -0.05)",
+            ),
+            (
+                "footprint",
+                SOLDER_MARGIN_FOOTPRINTS[2].1,
+                "(solder_mask_margin 0.05)",
+            ),
+        ] {
+            assert_eq!(source.matches(clause).count(), 1, "{owner}");
+            let source = source.replace(clause, "(solder_mask_margin x)");
+            let dir = tempfile::tempdir().unwrap();
+            let (board, lib_id) = issue_318_fixture(dir.path(), "Margins", "Margins", &source);
+            let store = Arc::new(Mutex::new(ItemStore::default()));
+            let (is_error, text) = served_with_version(
+                &board,
+                store.clone(),
+                (10, 0, 8),
+                "place_component",
+                json!({
+                    "board": board.to_string_lossy(),
+                    "footprint": lib_id,
+                    "reference": "U1",
+                    "x": 10.0,
+                    "y": 10.0,
+                }),
+            )
+            .await;
+            assert!(is_error, "{owner}: {text}");
+            assert!(
+                text.contains(&format!(
+                    "{owner} clause 'solder_mask_margin' has an invalid value 'x'"
+                )),
+                "{owner}: {text}"
+            );
+            let held = store.lock().unwrap();
+            assert_eq!((held.creates, held.items.len()), (0, 0), "{owner}");
+        }
     }
 
     /// Sibling routes (#318): `place_component_array` and `duplicate_component`
@@ -10382,6 +10790,154 @@ mod nanometre_rounding_tests {
                 .count(),
             2
         );
+    }
+
+    /// `repair_corrupted_footprints` gives the pads it rebuilds their
+    /// library's solder margins: the stock PQFN-8's paste margin on pads 1 to
+    /// 4, on both outer layers (`issue_300_ipc.README.md`), on KiCad 10.0.6
+    /// and 10.0.8. The board's pads are stripped of theirs first, so the
+    /// margins can only come from the library. Inline because KiCad writes no
+    /// such clause: a malformed margin in the library ends the call before
+    /// anything is sent, as a malformed `zone_connect` does.
+    #[tokio::test]
+    async fn repair_corrupted_footprints_carries_pad_solder_margins() {
+        use crate::tools::pcb_board::board_mock::{spawn_kicad_holding_items, ItemStore};
+        use copperpour_ipc::builders::{any_is, pack_any};
+        use copperpour_ipc::gen::kiapi::board::types::{FootprintInstance, Pad, PadStack};
+        use copperpour_ipc::gen::kiapi::common::types::Kiid;
+        use std::sync::{Arc, Mutex};
+
+        const PQFN8: &str = include_str!("../../tests/fixtures/issue_300_pqfn8_kicad10.kicad_mod");
+
+        /// The repair's dry run and, when it is ready, its apply, against
+        /// `library`, on KiCad `version` holding its own U6 with the #244
+        /// signature, as the test above builds U4, and its pads' margins
+        /// removed.
+        async fn repair(
+            library: &str,
+            version: (u32, u32, u32),
+        ) -> (Arc<Mutex<ItemStore>>, Vec<(bool, String)>) {
+            let dir = tempfile::tempdir().unwrap();
+            let (board, _) = issue_318_fixture(
+                dir.path(),
+                "Package_DFN_QFN",
+                "PQFN-8-EP_6x5mm_P1.27mm_Generic",
+                library,
+            );
+            let mut corrupted = FootprintInstance::decode(
+                include_bytes!("../../tests/fixtures/issue_300_u6.ipc.bin").as_slice(),
+            )
+            .unwrap();
+            let definition = corrupted.definition.as_mut().unwrap();
+            for item in &mut definition.items {
+                if any_is(item, "kiapi.board.types.Pad") {
+                    let mut pad = Pad::decode(item.value.as_slice()).unwrap();
+                    let stack = pad.pad_stack.as_mut().unwrap();
+                    stack.front_outer_layers = None;
+                    stack.back_outer_layers = None;
+                    *item = pack_any(&pad, "kiapi.board.types.Pad");
+                }
+            }
+            let shape = definition
+                .items
+                .iter()
+                .position(|item| any_is(item, "kiapi.board.types.BoardGraphicShape"))
+                .unwrap();
+            definition.items.remove(shape);
+            let phantom = Pad {
+                id: Some(Kiid {
+                    value: "phantom-1".to_string(),
+                }),
+                pad_stack: Some(PadStack::default()),
+                ..Default::default()
+            };
+            definition
+                .items
+                .push(pack_any(&phantom, "kiapi.board.types.Pad"));
+
+            let store = Arc::new(Mutex::new(ItemStore {
+                items: vec![pack_any(&corrupted, "kiapi.board.types.FootprintInstance")],
+                ..Default::default()
+            }));
+            let server = spawn_kicad_holding_items(
+                &board,
+                vec![],
+                store.clone(),
+                |_| {},
+                kicad_version_responder(version.0, version.1, version.2),
+            );
+            let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+                ipc_address: server.address().to_string(),
+                eager_toolsets: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let mut replies = Vec::new();
+            let mut revision = None;
+            for id in [1, 2] {
+                let mut arguments = json!({ "board": board.to_string_lossy(), "dry_run": id == 1 });
+                if let Some(revision) = &revision {
+                    arguments["expected_plan_revision"] = json!(revision);
+                }
+                let response = handler
+                    .handle_message(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": "tools/call",
+                        "params": { "name": "repair_corrupted_footprints", "arguments": arguments }
+                    }))
+                    .await
+                    .unwrap();
+                let result = response.result.unwrap();
+                let is_error = result["isError"].as_bool().unwrap_or(false);
+                let text = result["content"][0]["text"].as_str().unwrap().to_string();
+                replies.push((is_error, text.clone()));
+                if is_error {
+                    break;
+                }
+                let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+                revision = out["plan_revision"].as_str().map(str::to_string);
+            }
+            (store, replies)
+        }
+
+        for version in [(10, 0, 6), (10, 0, 8)] {
+            let (store, replies) = repair(PQFN8, version).await;
+            assert_eq!(replies.len(), 2, "{version:?}: {replies:?}");
+            for ((is_error, text), status) in replies.iter().zip(["ready", "applied"]) {
+                assert!(!is_error, "{version:?}: {text}");
+                let out: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(out["status"], status, "{version:?}: {out}");
+                assert!(
+                    !out["not_carried"].to_string().contains("solder"),
+                    "{version:?}: {out}"
+                );
+            }
+            assert_eq!(
+                placed_margins(&held_footprint(&store)),
+                (
+                    NO_MARGINS,
+                    ["1", "2", "3", "4"]
+                        .map(|number| (number.to_string(), (None, Some(-50_000), None)))
+                        .to_vec()
+                ),
+                "{version:?}"
+            );
+        }
+
+        let clause = "(solder_paste_margin -0.05)";
+        assert_eq!(PQFN8.matches(clause).count(), 4);
+        let malformed = PQFN8.replacen(clause, "(solder_paste_margin x)", 1);
+        let (store, replies) = repair(&malformed, (10, 0, 8)).await;
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        let (is_error, text) = &replies[0];
+        assert!(is_error, "{text}");
+        assert!(
+            text.contains("pad clause 'solder_paste_margin' has an invalid value 'x'"),
+            "{text}"
+        );
+        assert_eq!(store.lock().unwrap().updates, 0);
     }
 }
 
