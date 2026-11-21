@@ -6,9 +6,8 @@ name: E2E (real KiCAD)
 #   - the conformance suite round-trips every schematic in KiCAD's demo corpus
 #   - the PCM package is assembled and schema-validated
 #
-# Runs weekly, on demand, as the reusable release gate, and for a PR only when
-# a maintainer applies `run:e2e-kicad`. Installing KiCAD costs several minutes,
-# so this remains an opt-in PR lane rather than an ordinary required check.
+# Runs weekly, on demand, and as the reusable release gate. For a PR, a
+# maintainer runs it on local CI (docs/TESTING_AND_RELEASE.md).
 # `release.yml` calls this workflow at the tag commit and cannot publish until
 # the call succeeds.
 
@@ -17,8 +16,6 @@ on:
     - cron: "17 6 * * 1" # Mondays 06:17 UTC
   workflow_dispatch:
   workflow_call:
-  pull_request:
-    types: [labeled]
 
 permissions:
   contents: read
@@ -29,7 +26,6 @@ env:
 jobs:
   e2e:
     name: Full design loop on windows-latest
-    if: github.event_name != 'pull_request' || github.event.label.name == 'run:e2e-kicad'
     runs-on: windows-latest
     timeout-minutes: 60
     steps:

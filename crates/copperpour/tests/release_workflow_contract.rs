@@ -119,7 +119,7 @@ fn workflows_do_not_depend_on_node20_setup_protoc() {
 }
 
 #[test]
-fn real_kicad_workflow_remains_reusable_and_opt_in_for_pull_requests() {
+fn real_kicad_workflow_remains_reusable_and_not_a_pull_request_trigger() {
     let e2e = workflow("e2e-kicad.yml");
 
     let triggers = &e2e["on"];
@@ -127,15 +127,9 @@ fn real_kicad_workflow_remains_reusable_and_opt_in_for_pull_requests() {
         triggers.get("workflow_call").is_some(),
         "the release workflow needs a reusable real-KiCad workflow"
     );
-    assert_eq!(
-        triggers["pull_request"]["types"],
-        serde_json::json!(["labeled"]),
-        "the pull-request entry point must react only to label events"
-    );
-    assert_eq!(
-        e2e["jobs"]["e2e"]["if"],
-        "github.event_name != 'pull_request' || github.event.label.name == 'run:e2e-kicad'",
-        "pull requests must run real-KiCad acceptance only through the run:e2e-kicad label"
+    assert!(
+        triggers.get("pull_request").is_none() && triggers.get("pull_request_target").is_none(),
+        "a pull request gets real-KiCad acceptance from local CI, not from a GitHub trigger"
     );
     assert!(
         triggers.get("schedule").is_some() && triggers.get("workflow_dispatch").is_some(),

@@ -108,8 +108,7 @@ release build and the real-KiCad job run on a maintainer's machine (local CI).
 The real-KiCad job runs `e2e-kicad.yml`'s steps against KiCad 10.0.8 in a
 Windows VM. It is not a per-PR
 check, because it takes over half an hour. Ask a maintainer to run it on a pull
-request when KiCad-facing behavior needs that evidence. The `run:e2e-kicad`
-label no longer triggers anything.
+request when KiCad-facing behavior needs that evidence.
 
 Before creating a release tag, run `cargo xtask collect-api-migrations
 <version>` and `cargo xtask fix-doc-counts`, and commit the result. The first
