@@ -392,6 +392,12 @@ pub(in crate::tools) fn check_netclass_rename_pattern(
     pattern: &str,
     mapping: &BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
+    if mapping
+        .iter()
+        .all(|(old, new)| wildcard_matches(pattern, old) && wildcard_matches(pattern, new))
+    {
+        return Ok(());
+    }
     let matcher = NetclassPattern::new(pattern);
     anyhow::ensure!(
         matcher.expression.is_some() && !pattern.contains('|'),

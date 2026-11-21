@@ -521,10 +521,10 @@ impl Plan {
         crate::hex::encode_hex(&digest.finalize())
     }
 
-    fn update_net_name_dependencies(&mut self, impacts: &[Value]) -> Result<()> {
+    fn update_net_name_dependencies(&mut self, verified: &VerifiedTransfer) -> Result<()> {
         let mut mapping = BTreeMap::new();
         let mut destinations = BTreeSet::new();
-        for impact in impacts {
+        for impact in &verified.impacts {
             let old = impact["old_name"]
                 .as_str()
                 .context("Missing old net name")?;
@@ -541,14 +541,33 @@ impl Plan {
                 "Net-name mapping is not one-to-one"
             );
         }
-        if mapping.is_empty() {
-            return Ok(());
-        }
         let pro_path = self.root.with_extension("kicad_pro");
         let project = &self.documents[&pro_path].before;
-        check_project_net_dependencies(project, &mapping, self.board.is_some())?;
+        if !mapping.is_empty() {
+            check_project_net_dependencies(project, &mapping, self.board.is_some())?;
+        }
         if let Some(board) = &self.board {
-            let (candidate, renamed) = move_pcb_net_names(&self.documents[board].after, &mapping)?;
+            let evidence = verified
+                .board_nets
+                .as_ref()
+                .context("Missing native PCB netlist")?;
+            let native_mapping = evidence
+                .renames
+                .iter()
+                .map(|(old, (new, _))| (old.clone(), new.clone()))
+                .collect::<BTreeMap<_, _>>();
+            if native_mapping.is_empty() {
+                return Ok(());
+            }
+            check_project_net_dependencies(project, &native_mapping, true)?;
+            let (candidate, renamed) =
+                move_pcb_net_names(&self.documents[board].after, &native_mapping)?;
+            verify_pcb_pad_membership(
+                &self.documents[board].before,
+                evidence,
+                &renamed,
+                &self.instances,
+            )?;
             let rules = self.root.with_extension("kicad_dru");
             if !renamed.is_empty() {
                 if let Some(doc) = self.documents.get(&rules) {
@@ -583,7 +602,7 @@ impl Plan {
                 .context("Board was not staged")?;
             doc.after = update_pcb_sheet_metadata(&doc.after, &targets, sheet)?;
         }
-        self.update_net_name_dependencies(&verified.impacts)
+        self.update_net_name_dependencies(verified)
     }
 
     fn prepare(request: &Request) -> Result<Self> {
@@ -1966,6 +1985,165 @@ struct PcbSheetMetadata {
 struct VerifiedTransfer {
     impacts: Vec<Value>,
     destination_sheet: Option<PcbSheetMetadata>,
+    board_nets: Option<BoardNetEvidence>,
+}
+
+#[derive(Debug)]
+struct BoardNetEvidence {
+    renames: BTreeMap<String, (String, PinPartition)>,
+    // Reference -> root-relative sheet and its symbol UUIDs.
+    paths: BoardComponentPaths,
+}
+
+type BoardComponentPaths = BTreeMap<String, (Vec<uuid::Uuid>, BTreeSet<uuid::Uuid>)>;
+type BoardNetExport = (NetNames, BoardComponentPaths);
+
+fn pcb_netlist(source: &str) -> Result<BoardNetExport> {
+    let tree = parse_sexp(source)?;
+    ensure!(tree.head() == Some("export"), "Invalid native PCB netlist");
+    let mut paths = BTreeMap::new();
+    for comp in tree
+        .find("components")
+        .context("Native PCB netlist lacks components")?
+        .find_all("comp")
+    {
+        let reference = comp
+            .find_str("ref")
+            .context("Missing PCB netlist reference")?;
+        let timestamps = comp
+            .find("sheetpath")
+            .and_then(|s| s.find_str("tstamps"))
+            .context("Missing native PCB sheet path")?;
+        let path = if timestamps == "/" {
+            Vec::new()
+        } else {
+            pcb_uuid_path(timestamps.trim_end_matches('/'))?
+        };
+        let stamps = comp
+            .find_str("tstamps")
+            .context("Missing native PCB symbol UUIDs")?
+            .split_whitespace()
+            .map(uuid::Uuid::parse_str)
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+        ensure!(
+            !stamps.is_empty() && paths.insert(reference.to_owned(), (path, stamps)).is_none(),
+            "Ambiguous native PCB component {reference}"
+        );
+    }
+    let mut names = BTreeMap::new();
+    let mut used = BTreeSet::new();
+    for net in tree
+        .find("nets")
+        .context("Native PCB netlist lacks nets")?
+        .find_all("net")
+    {
+        let name = net
+            .find_str("name")
+            .context("Missing native PCB net name")?;
+        let mut pins = BTreeSet::new();
+        for node in net.find_all("node") {
+            let reference = node
+                .find_str("ref")
+                .context("Missing native PCB pin reference")?;
+            let pin = node
+                .find_str("pin")
+                .context("Missing native PCB pin number")?;
+            ensure!(
+                paths.contains_key(reference) && used.insert((reference, pin)),
+                "Ambiguous native PCB pin"
+            );
+            pins.insert((reference.to_owned(), pin.to_owned()));
+        }
+        ensure!(
+            !pins.is_empty() && names.insert(pins, name.to_owned()).is_none(),
+            "Ambiguous native PCB net {name:?}"
+        );
+    }
+    Ok((names, paths))
+}
+
+fn verify_pcb_pad_membership(
+    source: &str,
+    evidence: &BoardNetEvidence,
+    renamed: &BTreeMap<String, String>,
+    instances: &BTreeMap<String, PathBuf>,
+) -> Result<()> {
+    use copperpour_sexp::net::{net_id, net_name};
+    if renamed.is_empty() {
+        return Ok(());
+    }
+    let tree = parse_sexp(source)?;
+    let instance_paths = instances
+        .keys()
+        .map(|path| pcb_uuid_path(path))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let codes = tree
+        .find_all("net")
+        .into_iter()
+        .filter_map(|n| Some((net_id(n)?, net_name(n)?)))
+        .collect::<BTreeMap<_, _>>();
+    let mut witnessed = BTreeSet::new();
+    for fp in copperpour_sexp::board::footprints(&tree)
+        .into_iter()
+        .chain(tree.find_all("module"))
+    {
+        for pad in fp.find_all("pad") {
+            let Some(net) = pad.find("net") else {
+                continue;
+            };
+            let Some(name) = net_name(net).or_else(|| codes.get(net_id(net)?).copied()) else {
+                continue;
+            };
+            let Some((_, partition)) = evidence
+                .renames
+                .get(name)
+                .filter(|_| renamed.contains_key(name))
+            else {
+                continue;
+            };
+            let reference = property(fp, "Reference")
+                .or_else(|| {
+                    fp.find_all("fp_text")
+                        .into_iter()
+                        .find(|t| t.get(1).and_then(SexpNode::as_str) == Some("reference"))
+                        .and_then(|t| t.get(2))
+                        .and_then(SexpNode::as_str)
+                })
+                .context("Affected PCB pad has no footprint reference")?;
+            let pin = pad
+                .get(1)
+                .and_then(SexpNode::as_str)
+                .context("Affected PCB pad has no number")?;
+            let path = pcb_uuid_path(
+                fp.find_str("path")
+                    .context("Affected PCB pad has no schematic path")?,
+            )?;
+            let (symbol, sheet) = path
+                .split_last()
+                .context("Affected PCB pad has an empty path")?;
+            ensure!(
+                partition.contains(&(reference.to_owned(), pin.to_owned()))
+                    && evidence
+                        .paths
+                        .get(reference)
+                        .is_some_and(|(expected, stamps)| {
+                            stamps.contains(symbol)
+                                && (sheet == expected
+                                    || (instance_paths.contains(sheet)
+                                        && sheet.get(1..) == Some(expected.as_slice())))
+                        }),
+                "PCB net {name:?} does not match the verified schematic pin at {reference}.{pin}"
+            );
+            witnessed.insert(name);
+        }
+    }
+    for old in renamed.keys() {
+        ensure!(
+            witnessed.contains(old.as_str()),
+            "PCB net {old:?} has no verified schematic pad"
+        );
+    }
+    Ok(())
 }
 
 fn pcb_destination_sheet(
@@ -2007,7 +2185,7 @@ fn pcb_destination_sheet(
                 node.has_tag_name("property") && node.attribute("name") == Some("Sheetfile")
             })
             .filter_map(|node| node.attribute("value"))
-            .last()
+            .next_back()
             .filter(|file| !file.is_empty())
             .context("KiCad netlist lacks the destination Sheetfile property")?;
         if let Some(prior) = &metadata {
@@ -2033,6 +2211,7 @@ async fn verify_with_kicad(plan: &Plan, cli_path: &str) -> Result<Option<Verifie
     let mut violations = Vec::new();
     let mut net_names = Vec::new();
     let mut destination_sheet = None;
+    let mut pcb_exports = Vec::new();
     let expected_erc = plan.instances.keys().cloned().collect::<BTreeSet<_>>();
     for after in [false, true] {
         let identities = ErcIdentityIndex::build(plan, after)?;
@@ -2086,6 +2265,11 @@ async fn verify_with_kicad(plan: &Plan, cli_path: &str) -> Result<Option<Verifie
             );
         }
         netlists.push(partitions);
+        if plan.board.is_some() {
+            let output = snapshot.path().join("pcb.net");
+            cli::export_netlist(cli_path, &root, &output, "kicadsexpr").await?;
+            pcb_exports.push(pcb_netlist(&std::fs::read_to_string(output)?)?);
+        }
         let report = cli::run_erc_strict(cli_path, &root, &expected_erc).await?;
         let mut counts = BTreeMap::new();
         for violation in report.violations {
@@ -2118,9 +2302,38 @@ async fn verify_with_kicad(plan: &Plan, cli_path: &str) -> Result<Option<Verifie
         let new=net_names[1].get(nodes)?;
         (new != old).then(||json!({"kind":"net_name_changed","old_name":old,"new_name":new,"connectivity":"equivalent"}))
     }).collect();
+    let board_nets = if let [before, after] = pcb_exports.as_slice() {
+        ensure!(
+            before.0.keys().eq(after.0.keys()),
+            "Native PCB pin partitions changed"
+        );
+        let mut renames = BTreeMap::new();
+        let mut destinations = BTreeSet::new();
+        for (pins, old) in &before.0 {
+            let new = &after.0[pins];
+            if old != new {
+                ensure!(
+                    !old.is_empty()
+                        && !new.is_empty()
+                        && renames
+                            .insert(old.clone(), (new.clone(), pins.clone()))
+                            .is_none()
+                        && destinations.insert(new),
+                    "Native PCB net rename is not one-to-one"
+                );
+            }
+        }
+        Some(BoardNetEvidence {
+            renames,
+            paths: before.1.clone(),
+        })
+    } else {
+        None
+    };
     Ok(Some(VerifiedTransfer {
         impacts,
         destination_sheet,
+        board_nets,
     }))
 }
 
@@ -3487,6 +3700,45 @@ mod tests {
     }
 
     #[test]
+    fn transfer_pcb_refuses_a_same_named_net_on_the_wrong_pad_or_path() {
+        let old = "/SIG";
+        let new = "/Logic/SIG";
+        let native = format!(
+            "(export (components (comp (ref \"R1\") (sheetpath (tstamps \"/\")) \
+             (tstamps \"{RESISTOR}\"))) (nets (net (name \"{old}\") \
+             (node (ref \"R1\") (pin \"1\")))))"
+        );
+        let (nets, paths) = pcb_netlist(&native).unwrap();
+        let evidence = BoardNetEvidence {
+            renames: BTreeMap::from([(old.into(), (new.into(), nets.into_keys().next().unwrap()))]),
+            paths,
+        };
+        let renamed = BTreeMap::from([(old.into(), new.into())]);
+        let instances = BTreeMap::from([(format!("/{ROOT_UUID}"), PathBuf::new())]);
+        let board = |path: &str, pin: &str| {
+            format!(
+                "(kicad_pcb (footprint \"R\" (path \"{path}\") \
+                 (property \"Reference\" \"R1\") (pad \"{pin}\" (net \"{old}\"))))"
+            )
+        };
+        for path in [format!("/{RESISTOR}"), format!("/{ROOT_UUID}/{RESISTOR}")] {
+            assert!(
+                verify_pcb_pad_membership(&board(&path, "1"), &evidence, &renamed, &instances)
+                    .is_ok()
+            );
+            assert!(
+                verify_pcb_pad_membership(&board(&path, "2"), &evidence, &renamed, &instances)
+                    .is_err()
+            );
+        }
+        let foreign = format!("/{SHEET_UUID}/{RESISTOR}");
+        assert!(
+            verify_pcb_pad_membership(&board(&foreign, "1"), &evidence, &renamed, &instances)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn transfer_pcb_paths_refuse_duplicate_aliases_and_ambiguous_multi_root_paths() {
         let full = format!("/{ROOT_UUID}/{RESISTOR}");
         let short = format!("/{RESISTOR}");
@@ -3574,6 +3826,8 @@ mod tests {
             .replace("/source/*", "/.*/LIMIT")
             .replace("/destination/*", ".*LIMIT");
         assert!(check_project_net_dependencies(&equivalent, &mapping, true).is_ok());
+        let wildcard = equivalent.replace(".*LIMIT", "*/LIMIT");
+        assert!(check_project_net_dependencies(&wildcard, &mapping, true).is_ok());
         let lookahead = equivalent.replace(".*LIMIT", "(?=LIMIT)");
         assert!(check_project_net_dependencies(&lookahead, &mapping, true)
             .unwrap_err()
@@ -3857,19 +4111,31 @@ mod tests {
         ) {
             let saved =
                 include_str!("../../tests/fixtures/repeat_layout_routing_kicad10.kicad_pcb");
-            let first = copperpour_sexp::board::footprints(&parse_sexp(saved).unwrap())[0]
-                .find_str("path")
-                .unwrap()
-                .to_owned();
-            std::fs::write(
-                &board,
-                saved.replacen(
-                    &format!("(path {})", quote(&first)),
-                    &format!("(path \"/{RESISTOR}\")"),
-                    1,
-                ),
-            )
-            .unwrap();
+            let tree = parse_sexp(saved).unwrap();
+            let first = copperpour_sexp::board::footprints(&tree)[0].clone();
+            let first_path = first.find_str("path").unwrap();
+            let mut edits = Vec::new();
+            for (start, end) in find_direct_child_blocks(saved, "kicad_pcb") {
+                let block = &saved[start..end];
+                let node = parse_sexp(block).unwrap();
+                if node.head() == Some("footprint") {
+                    let changed = if node.find_str("path") == Some(first_path) {
+                        block
+                            .replace(
+                                &format!("(path {})", quote(first_path)),
+                                &format!("(path \"/{RESISTOR}\")"),
+                            )
+                            .replace(
+                                "(property \"Reference\" \"R2\"",
+                                "(property \"Reference\" \"R1\"",
+                            )
+                    } else {
+                        block.replace("(net \"/Channel 1/MID\")", "(net \"\")")
+                    };
+                    edits.push(SexpEdit::replace(start, end, changed));
+                }
+            }
+            std::fs::write(&board, apply_edits(saved.to_owned(), edits)).unwrap();
             if mode == Served::Pcb {
                 std::fs::write(
                     board.with_extension("kicad_dru"),
@@ -3903,7 +4169,7 @@ mod tests {
             "/Channel 1/MID"
         };
         let command = format!(
-            "#!/bin/sh\ntrigger=\"$(dirname \"$0\")/late-input\"\nif [ -f \"$trigger\" ]; then printf 'late input' > \"$(cat \"$trigger\")\" || exit 1; fi\nif [ \"$2\" = erc ]; then\ncat > \"$4\" <<'ERC'\n{report}\nERC\nelse\nnet='{old_net}'\nif grep -q '{RESISTOR}' \"$(dirname \"$8\")/logic.kicad_sch\"; then net='/Logic regulator/MID'; fi\ncat > \"$5\" <<NETLIST\n{netlist}\nNETLIST\nfi\n"
+            "#!/bin/sh\ntrigger=\"$(dirname \"$0\")/late-input\"\nif [ -f \"$trigger\" ]; then printf 'late input' > \"$(cat \"$trigger\")\" || exit 1; fi\nif [ \"$2\" = erc ]; then\ncat > \"$4\" <<'ERC'\n{report}\nERC\nelse\nnet='{old_net}'\nsheet=/\nif grep -q '{RESISTOR}' \"$(dirname \"$8\")/logic.kicad_sch\"; then net='/Logic regulator/MID'; sheet='/{SHEET_UUID}/'; fi\nif [ \"$7\" = kicadsexpr ]; then\ncat > \"$5\" <<PCB\n(export (components (comp (ref \"R1\") (sheetpath (tstamps \"$sheet\")) (tstamps \"{RESISTOR}\"))) (nets (net (name \"$net\") (node (ref \"R1\") (pin \"1\")))))\nPCB\nelse\ncat > \"$5\" <<NETLIST\n{netlist}\nNETLIST\nfi\nfi\n"
         );
         let script =
             cli::test_support::write_script(control.path(), "fake-transfer-cli", &command, "");
@@ -4600,8 +4866,16 @@ if [ "$2" = erc ]; then
 ERC
 else
     name=/SIG
+    sheet=/
     if grep -q '{RESISTOR}' "$(dirname "$8")/logic.kicad_sch"; then
         name="/Logic regulator/SIG"
+        sheet="/{SHEET_UUID}/"
+    fi
+    if [ "$7" = kicadsexpr ]; then
+        cat > "$5" <<PCB
+(export (components (comp (ref "R1") (sheetpath (tstamps "$sheet")) (tstamps "{RESISTOR}"))) (nets (net (name "$name") (node (ref "R1") (pin "1")))))
+PCB
+        exit
     fi
     cat > "$5" <<NETLIST
 <export><design><sheet tstamps="/"><title_block><source>component_fields_kicad10.kicad_sch</source></title_block></sheet>
@@ -4640,7 +4914,7 @@ fi
                 std::fs::write(request.schematic.with_extension("kicad_pro"), "{}").unwrap();
                 std::fs::write(
                     request.schematic.with_extension("kicad_pcb"),
-                    "(kicad_pcb (segment (net \"/SIG\")))",
+                    format!("(kicad_pcb (footprint \"R\" (property \"Reference\" \"R1\") (path \"/{RESISTOR}\") (pad \"1\" (net \"/SIG\"))) (segment (net \"/SIG\")))"),
                 )
                 .unwrap();
                 std::fs::write(
@@ -4817,11 +5091,11 @@ fi
         assert_eq!(snapshot(dir.path()), before);
     }
 
-    fn add_transfer_signal(request: &mut Request) {
+    fn add_transfer_signal(request: &mut Request, signal: &str) {
         use copperpour_sexp::schematic::{format_net_label, format_wire};
 
         let wire = format_wire(101.6, 72.39, 114.3, 72.39);
-        let label = format_net_label("TransferSignal", 114.3, 72.39, 0.0);
+        let label = format_net_label(signal, 114.3, 72.39, 0.0);
         for block in [&wire, &label] {
             let node = parse_sexp(block).unwrap();
             request
@@ -4863,13 +5137,14 @@ fp = next(fp for fp in b.GetFootprints() if fp.GetReference() == 'R1')
 fp.SetPath(p.KIID_PATH(sys.argv[3]))
 if sys.argv[4] == 'yes':
     name = '/Channel 1/MID'
-    target = p.NETINFO_ITEM(b, '/TransferSignal')
+    target = p.NETINFO_ITEM(b, '/A{slash}B')
     b.Add(target)
-    connected = list(b.GetTracks()) + [pad for fp in b.GetFootprints() for pad in fp.Pads()]
+    connected = list(b.GetTracks())
     assert any(item.GetNetname() == name for item in connected)
     for item in connected:
         if item.GetNetname() == name:
             item.SetNet(target)
+    fp.FindPadByNumber('1').SetNet(target)
     graphic = p.PCB_SHAPE(b)
     graphic.SetShape(p.SHAPE_T_SEGMENT)
     graphic.SetStart(p.VECTOR2I(p.FromMM(75), p.FromMM(75)))
@@ -4901,10 +5176,10 @@ assert p.SaveBoard(sys.argv[2], b)
     #[ignore = "requires KiCad 10.0.8 CLI and pcbnew Python"]
     async fn transfer_native_routed_board_net_and_path_acceptance() {
         let (dir, mut request) = fixture_with_destination("nested/logic.kicad_sch");
-        add_transfer_signal(&mut request);
+        add_transfer_signal(&mut request, "A/B");
         let board = native_routed_board(&request, RESISTOR, "", true);
         let before = std::fs::read_to_string(&board).unwrap();
-        assert!(before.contains("(net \"/TransferSignal\")"));
+        assert!(before.contains("(net \"/A{slash}B\")"));
         assert_native_served_transfer(dir.path(), &request, "nested/logic.kicad_sch", RESISTOR)
             .await;
         let after = std::fs::read_to_string(&board).unwrap();
@@ -4922,7 +5197,7 @@ assert p.SaveBoard(sys.argv[2], b)
             &after,
             &old,
             &new,
-            Some("/Logic regulator/TransferSignal"),
+            Some("/Logic regulator/A{slash}B"),
         );
     }
 
@@ -4969,7 +5244,7 @@ assert p.SaveBoard(sys.argv[2], b)
             let old_graphic = prior
                 .find_all("gr_line")
                 .into_iter()
-                .find(|shape| shape.find_str("net") == Some("/TransferSignal"))
+                .find(|shape| shape.find_str("net") == Some("/A{slash}B"))
                 .unwrap();
             let new_graphic = parsed
                 .find_all("gr_line")
@@ -5023,7 +5298,7 @@ if sys.argv[3]:
     #[ignore = "requires KiCad 10.0.8; run with COPPERPOUR_TEST_KICAD_CLI configured"]
     async fn transfer_native_refuses_changed_effective_netclass_without_writes() {
         let (dir, mut request) = fixture();
-        add_transfer_signal(&mut request);
+        add_transfer_signal(&mut request, "TransferSignal");
         let stock: Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/netclass_diff_pair_kicad10.kicad_pro"
         ))

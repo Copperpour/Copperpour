@@ -1189,6 +1189,14 @@ fn closing(tokens: &[Token], open: usize) -> Option<usize> {
 /// Prove that rule conditions do not inspect net names. This does not
 /// simulate DRC or validate unrelated constraints.
 pub(super) fn check_net_name_independent_conditions(text: &str) -> Result<(), String> {
+    // KiCad expands raw lines before recognizing comments. A substitution
+    // can add a newline followed by a live rule.
+    if text.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with('#') && line.contains("${")
+    }) {
+        return Err("a text variable in a comment may expand into a rule".into());
+    }
     let tokens = lex(text).map_err(|(offset, fault)| {
         format!("custom rule at line {}: {fault}", line_of(text, offset))
     })?;
@@ -1950,6 +1958,7 @@ mod tests {
 
     #[test]
     fn rename_guard_reads_rule_conditions_not_comments_or_literals() {
+        assert!(check_net_name_independent_conditions("(version 1)\n# ${EXTRA_RULE}\n").is_err());
         let rule = |condition: &str| {
             format!("(version 1)\n# (condition \"A.NetName\")\n(rule \"r\" (condition \"{condition}\"))")
         };
