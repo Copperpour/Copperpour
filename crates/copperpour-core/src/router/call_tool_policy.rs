@@ -369,6 +369,7 @@ pub const OTHER_TOOLS: &[&str] = &[
 
 /// Meta-tools `call_tool` always runs: they report and change nothing.
 pub const READ_ONLY_META_TOOLS: &[&str] = &[
+    "find_tools",
     "get_active_toolsets",
     "get_guidance",
     "get_installation_info",

@@ -178,6 +178,14 @@ fn tool_catalogue() -> &'static HashMap<&'static str, Vec<ToolDef>> {
     })
 }
 
+/// Borrow all registered definitions in toolset registration order.
+pub(super) fn toolsets_with_tools() -> impl Iterator<Item = (&'static str, &'static [ToolDef])> {
+    let catalogue = tool_catalogue();
+    ALL_TOOLSETS
+        .iter()
+        .map(move |toolset| (toolset.name, catalogue[toolset.name].as_slice()))
+}
+
 /// Return cached ToolDefs for a given toolset name, or None if unknown.
 /// Clones share each definition's compiled input validator through `Arc`.
 pub fn tools_for(name: &str) -> Option<Vec<ToolDef>> {
