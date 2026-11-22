@@ -459,7 +459,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Re-embed placed symbols' definitions from their libraries, like KiCad's \
              'Update Symbols from Library'. A schematic carries its own copy of every \
              symbol, so editing one in its library leaves the sheet drawing the old \
-             shape — this refreshes it. A symbol whose pins moved or disappeared in \
+             shape — this refreshes it. A placed symbol whose definition the sheet \
+             lacks, such as one repointed at another library, has it embedded \
+             (reported in added). A symbol whose pins moved or disappeared in \
              the library is refused (reported in pins_moved) unless allow_pin_moves \
              is set, because wires and labels attach at pin coordinates.",
             json!({
@@ -5232,9 +5234,28 @@ async fn handle_update_symbols_from_library(
 
     // One definition serves every instance of a lib_id, so refresh each once.
     let mut lib_ids: Vec<String> = Vec::new();
+    // An instance with a (lib_name …) draws from that sheet-local copy, so a
+    // missing lib_id copy is not missing for it. An embedded definition serves
+    // every instance that draws from it directly, selected or not, so the
+    // highest such unit is tracked across the whole sheet.
+    let mut selected_direct: Vec<String> = Vec::new();
+    let mut highest_direct_unit: Vec<(String, u32)> = Vec::new();
     for inst in instances {
+        let direct = inst.lib_symbol_name() == inst.lib_id;
+        if direct {
+            match highest_direct_unit
+                .iter_mut()
+                .find(|(id, _)| *id == inst.lib_id)
+            {
+                Some((_, unit)) => *unit = (*unit).max(inst.unit),
+                None => highest_direct_unit.push((inst.lib_id.clone(), inst.unit)),
+            }
+        }
         if only.as_ref().is_some_and(|r| !r.contains(&inst.reference)) {
             continue;
+        }
+        if direct && !selected_direct.contains(&inst.lib_id) {
+            selected_direct.push(inst.lib_id.clone());
         }
         if !lib_ids.contains(&inst.lib_id) {
             lib_ids.push(inst.lib_id);
@@ -5242,6 +5263,7 @@ async fn handle_update_symbols_from_library(
     }
 
     let mut updated = Vec::new();
+    let mut added = Vec::new();
     let mut unchanged = Vec::new();
     let mut pins_moved = Vec::new();
     let mut errors = Vec::new();
@@ -5263,30 +5285,83 @@ async fn handle_update_symbols_from_library(
                  embedded copy is left as it is",
                 lib_id
             )),
+            // The pin guard has no old copy to compare against here. KiCad
+            // draws such an instance without pins, so embedding orphans
+            // nothing, but the new pins may land on wires drawn for another
+            // symbol: the hint below says so.
             ReembedOutcome::NotEmbedded => {
-                errors.push(format!("'{}' has no embedded definition to update", lib_id))
+                if !selected_direct.contains(lib_id) {
+                    errors.push(format!(
+                        "'{}' is drawn only from sheet-local copies named by lib_name, \
+                         which this tool does not refresh",
+                        lib_id
+                    ));
+                    continue;
+                }
+                let placed_unit = highest_direct_unit
+                    .iter()
+                    .find(|(id, _)| id == lib_id)
+                    .map_or(1, |&(_, unit)| unit);
+                let unit_count = cse::library::symbol_unit_count(lib_id, &src);
+                let missing_unit = unit_count.filter(|&unit_count| placed_unit > unit_count);
+                if let Some(unit_count) = missing_unit {
+                    errors.push(format!(
+                        "'{}' was not embedded: placed unit {} does not exist in the \
+                         {}-unit library symbol",
+                        lib_id, placed_unit, unit_count
+                    ));
+                } else if super::ensure_lib_symbol_in_schematic(&mut content, lib_id, &src) {
+                    added.push(lib_id.clone());
+                } else if unit_count.is_some() {
+                    // symbol_unit_count resolves through the same lookup as
+                    // the embed, so a known unit count means it resolved.
+                    errors.push(format!(
+                        "'{}' resolves in its library but could not be placed in the \
+                         sheet's lib_symbols; nothing was embedded",
+                        lib_id
+                    ));
+                } else {
+                    errors.push(format!(
+                        "'{}' has no embedded definition, and nothing was embedded: {}",
+                        lib_id,
+                        super::lib_symbol_not_found_message(lib_id, &src)
+                    ));
+                }
             }
         }
     }
 
-    if !updated.is_empty() && !dry_run {
+    if (!updated.is_empty() || !added.is_empty()) && !dry_run {
         write_atomic_if_unchanged(&sch_path, &expected, &content)?;
     }
 
     let mut body = json!({
         "updated": updated,
         "updated_count": updated.len(),
+        "added": added,
+        "added_count": added.len(),
         "unchanged": unchanged,
         "pins_moved": pins_moved,
         "errors": errors,
         "dry_run": dry_run
     });
+    let mut hints = Vec::new();
     if !pins_moved.is_empty() {
-        body["hint"] = json!(
+        hints.push(
             "Symbols listed in pins_moved were left untouched: the library moved or \
              removed pins, and wires and labels attach at pin coordinates. Pass \
-             allow_pin_moves: true to update them anyway, then reconnect."
+             allow_pin_moves: true to update them anyway, then reconnect.",
         );
+    }
+    if !added.is_empty() {
+        hints.push(
+            "Symbols listed in added had no definition on the sheet, so their pins \
+             were not checked against the wires and labels already placed around \
+             them. Run ERC or check their connections.",
+        );
+    }
+    if !hints.is_empty() {
+        body["hint"] = json!(hints.join(" "));
     }
     Ok(CallToolResult::json(&body))
 }
@@ -7762,6 +7837,474 @@ mod tests {
             detail.contains("pin 2") && detail.contains("removed"),
             "{detail}"
         );
+    }
+
+    fn update_body(result: &CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// Names of the definitions embedded in the sheet's `lib_symbols`.
+    fn embedded_names(sheet: &str) -> Vec<String> {
+        let tree = copperpour_sexp::parse_sexp(sheet).unwrap();
+        tree.find("lib_symbols")
+            .map(|ls| {
+                ls.find_all("symbol")
+                    .iter()
+                    .filter_map(|s| s.get(1).and_then(|n| n.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// #46: repointing a placed symbol at another library symbol leaves the
+    /// sheet without a definition for it. The update embeds it, alongside a
+    /// refresh of a stale copy in the same write.
+    #[tokio::test]
+    async fn update_symbols_from_library_embeds_a_symbol_the_sheet_lacks() {
+        // In the stub project dir — see the stale-copy test above.
+        let (symdir, _env) = stub_symbol_dir();
+        let path = symdir.path().join("repointed.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        for (lib_id, reference, x) in [
+            ("Device:R", "R1", 100.0),
+            ("Device:WITH_DEFAULTS", "U1", 150.0),
+        ] {
+            let placed = handle_add_schematic_component(
+                &json!({ "schematic": path.display().to_string(), "lib_id": lib_id,
+                         "reference": reference, "x": x, "y": 100.0 }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!placed.is_error, "{placed:?}");
+        }
+        // Repoint U1, as a hand edit would; nothing embeds the new symbol.
+        let repoint = |from: &str, to: &str| {
+            let sheet = std::fs::read_to_string(&path).unwrap().replace(
+                &format!("(lib_id \"{from}\")"),
+                &format!("(lib_id \"{to}\")"),
+            );
+            assert!(!embedded_names(&sheet).contains(&to.to_string()));
+            std::fs::write(&path, sheet).unwrap();
+        };
+        let update = |mut args: serde_json::Value| {
+            args["schematic"] = json!(path.display().to_string());
+            let ctx = &ctx;
+            async move {
+                update_body(
+                    &handle_update_symbols_from_library(&args, ctx)
+                        .await
+                        .unwrap(),
+                )
+            }
+        };
+        repoint("Device:WITH_DEFAULTS", "Device:C_Polarized");
+
+        let before = std::fs::read_to_string(&path).unwrap();
+        let dry = update(json!({ "dry_run": true })).await;
+        assert_eq!(dry["added"], json!(["Device:C_Polarized"]), "{dry}");
+        assert_eq!(dry["errors"], json!([]), "{dry}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "dry_run must not write"
+        );
+
+        // Only an addition, so nothing else is there to cause the write.
+        let done = update(json!({})).await;
+        assert_eq!(done["added"], json!(["Device:C_Polarized"]), "{done}");
+        assert_eq!(done["added_count"], json!(1), "{done}");
+        assert_eq!(done["updated"], json!([]), "{done}");
+        assert!(done["hint"].as_str().unwrap().contains("added"), "{done}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        // U1 now resolves, the way KiCad looks it up, to a definition with pins.
+        let tree = copperpour_sexp::parse_sexp(&after).unwrap();
+        let u1 = extract_symbol_instances(&tree)
+            .into_iter()
+            .find(|i| i.reference == "U1")
+            .unwrap();
+        let lib_syms = tree.find("lib_symbols").unwrap().find_all("symbol");
+        let embedded = copperpour_sexp::schematic::find_lib_symbol(&lib_syms, &u1)
+            .expect("U1's embedded definition");
+        assert_eq!(embedded.find_all("symbol")[0].find_all("pin").len(), 2);
+
+        // Idempotent, through the references filter too.
+        let again = update(json!({ "references": ["U1"] })).await;
+        assert_eq!(again["added"], json!([]), "{again}");
+        assert_eq!(again["unchanged"], json!(["Device:C_Polarized"]), "{again}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+
+        // A refresh and an addition in one call land in the same write.
+        let lib = symdir
+            .path()
+            .join("Device.kicad_symdir")
+            .join("R.kicad_sym");
+        let edited = std::fs::read_to_string(&lib).unwrap().replace(
+            "(property \"Value\" \"R\"",
+            "(property \"Value\" \"WIDENED\"",
+        );
+        std::fs::write(&lib, edited).unwrap();
+        repoint("Device:C_Polarized", "Device:WITH_CUSTOM_FIELDS");
+        let both = update(json!({})).await;
+        assert_eq!(both["updated"], json!(["Device:R"]), "{both}");
+        assert_eq!(
+            both["added"],
+            json!(["Device:WITH_CUSTOM_FIELDS"]),
+            "{both}"
+        );
+        assert_eq!(both["errors"], json!([]), "{both}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        let tree = copperpour_sexp::parse_sexp(&after).unwrap();
+        let resistor = tree
+            .find("lib_symbols")
+            .unwrap()
+            .find_all("symbol")
+            .into_iter()
+            .find(|s| s.get(1).and_then(|n| n.as_str()) == Some("Device:R"))
+            .unwrap();
+        let value = resistor
+            .find_all("property")
+            .into_iter()
+            .find(|p| p.get(1).and_then(|n| n.as_str()) == Some("Value"))
+            .and_then(|p| p.get(2).and_then(|n| n.as_str()));
+        assert_eq!(value, Some("WIDENED"), "{after}");
+        let names = embedded_names(&after);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| *n == "Device:WITH_CUSTOM_FIELDS")
+                .count(),
+            1,
+            "{names:?}"
+        );
+    }
+
+    /// A missing definition that no library resolves stays an error, and the
+    /// sheet is left as it was.
+    #[tokio::test]
+    async fn update_symbols_from_library_reports_an_unresolvable_missing_symbol() {
+        let (symdir, _env) = stub_symbol_dir();
+        let path = symdir.path().join("dangling.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let placed = handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 100.0, "y": 100.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!placed.is_error, "{placed:?}");
+        let sheet = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("(lib_id \"Device:R\")", "(lib_id \"Device:NO_SUCH_PART\")");
+        std::fs::write(&path, &sheet).unwrap();
+
+        let body = update_body(
+            &handle_update_symbols_from_library(
+                &json!({ "schematic": path.display().to_string() }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(body["added"], json!([]), "{body}");
+        let error = body["errors"][0].as_str().unwrap();
+        assert!(
+            error.contains("Device:NO_SUCH_PART")
+                && error.contains("nothing was embedded")
+                && error.contains("not found in library"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), sheet);
+    }
+
+    /// An instance with `(lib_name …)` draws from that sheet-local copy, not
+    /// from its lib_id, so it is not missing a definition: embedding its
+    /// lib_id would add a copy nothing draws.
+    #[tokio::test]
+    async fn update_symbols_from_library_leaves_a_lib_name_instance_alone() {
+        let (symdir, _env) = stub_symbol_dir();
+        let path = symdir.path().join("local_copy.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let placed = handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 100.0, "y": 100.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!placed.is_error, "{placed:?}");
+        // Rename the embedded copy to a sheet-local `R_1` and point the
+        // instance at it, the way eeschema stores a locally edited symbol.
+        let original = std::fs::read_to_string(&path).unwrap();
+        let mut sheet = original.replacen("\"Device:R\"", "\"R_1\"", 1);
+        assert!(
+            embedded_names(&sheet).contains(&"R_1".to_string()),
+            "the first \"Device:R\" is the embedded copy's name:\n{original}"
+        );
+        sheet = sheet.replace(
+            "(lib_id \"Device:R\")",
+            "(lib_name \"R_1\")\n\t\t(lib_id \"Device:R\")",
+        );
+        std::fs::write(&path, &sheet).unwrap();
+
+        let body = update_body(
+            &handle_update_symbols_from_library(
+                &json!({ "schematic": path.display().to_string() }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(body["added"], json!([]), "{body}");
+        assert_eq!(
+            body["errors"],
+            json!([
+                "'Device:R' is drawn only from sheet-local copies named by lib_name, \
+                    which this tool does not refresh"
+            ]),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), sheet);
+    }
+
+    /// Like replace_component, embedding refuses a definition that lacks a
+    /// unit the sheet places: KiCad cannot draw or netlist that unit. The
+    /// copy serves unselected instances too, so their units count.
+    #[tokio::test]
+    async fn update_symbols_from_library_refuses_a_symbol_missing_a_placed_unit() {
+        let (symdir, _env) = stub_symbol_dir();
+        let path = symdir.path().join("units.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        for (reference, unit, x) in [("U1", 1, 100.0), ("U2", 3, 150.0)] {
+            let placed = handle_add_schematic_component(
+                &json!({ "schematic": path.display().to_string(), "lib_id": "Device:OPAMP_DUAL",
+                         "reference": reference, "unit": unit, "x": x, "y": 100.0 }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!placed.is_error, "{placed:?}");
+        }
+        let sheet = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("(lib_id \"Device:OPAMP_DUAL\")", "(lib_id \"Device:R\")");
+        std::fs::write(&path, &sheet).unwrap();
+
+        // Only U1, whose unit 1 the one-unit resistor has.
+        let body = update_body(
+            &handle_update_symbols_from_library(
+                &json!({ "schematic": path.display().to_string(), "references": ["U1"] }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(body["added"], json!([]), "{body}");
+        let error = body["errors"][0].as_str().unwrap();
+        assert!(
+            error.contains("Device:R") && error.contains("placed unit 3"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), sheet);
+    }
+
+    /// A sheet without a lib_symbols section gets one where KiCad writes it,
+    /// right after the header items, and nothing else moves.
+    #[tokio::test]
+    async fn update_symbols_from_library_creates_a_missing_lib_symbols_section() {
+        let (dir, _env) = stub_symbol_dir();
+        let path = dir.path().join("no_section.kicad_sch");
+        let sheet = "(kicad_sch\n\t(version 20250114)\n\t(generator \"eeschema\")\n\t(uuid \"11111111-2222-3333-[REDACTED]\")\n\t(paper \"A4\")\n\t(title_block\n\t\t(title \"Bare\")\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 100 100 0)\n\t\t(unit 1)\n\t\t(uuid \"aaaaaaaa-bbbb-cccc-dddd-000000000001\")\n\t\t(property \"Reference\" \"R1\" (at 100 100 0))\n\t)\n)\n";
+        std::fs::write(&path, sheet).unwrap();
+
+        let body = update_body(
+            &handle_update_symbols_from_library(
+                &json!({ "schematic": path.display().to_string() }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(body["added"], json!(["Device:R"]), "{body}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let items: Vec<String> =
+            copperpour_sexp::writer::find_direct_child_blocks(&after, "kicad_sch")
+                .into_iter()
+                .map(|(start, end)| after[start..end].to_string())
+                .collect();
+        let heads: Vec<&str> = items
+            .iter()
+            .map(|item| item[1..].split([' ', '\n', '\t']).next().unwrap())
+            .collect();
+        assert_eq!(
+            heads,
+            [
+                "version",
+                "generator",
+                "uuid",
+                "paper",
+                "title_block",
+                "lib_symbols",
+                "symbol"
+            ],
+            "{after}"
+        );
+        assert_eq!(embedded_names(&after), ["Device:R"]);
+        let before: Vec<String> =
+            copperpour_sexp::writer::find_direct_child_blocks(sheet, "kicad_sch")
+                .into_iter()
+                .map(|(start, end)| sheet[start..end].to_string())
+                .collect();
+        let without_section: Vec<String> = items
+            .into_iter()
+            .filter(|item| !item.starts_with("(lib_symbols"))
+            .collect();
+        assert_eq!(without_section, before);
+    }
+
+    /// A sheet with no lib_symbols section and no header items to put one
+    /// after: the symbol resolves but cannot be placed, which is reported as
+    /// that, not as a lookup failure, and nothing is written.
+    #[tokio::test]
+    async fn update_symbols_from_library_reports_a_definition_it_cannot_place() {
+        let (dir, _env) = stub_symbol_dir();
+        let path = dir.path().join("headerless.kicad_sch");
+        let sheet = "(kicad_sch\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 100 100 0)\n\t\t(unit 1)\n\t\t(property \"Reference\" \"R1\" (at 100 100 0))\n\t)\n)\n";
+        std::fs::write(&path, sheet).unwrap();
+
+        let body = update_body(
+            &handle_update_symbols_from_library(
+                &json!({ "schematic": path.display().to_string() }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(body["added"], json!([]), "{body}");
+        let error = body["errors"][0].as_str().unwrap();
+        assert!(error.contains("could not be placed"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), sheet);
+    }
+
+    /// #46's workflow on a KiCad-saved sheet, through the served tool: two
+    /// parts repointed at another registered library, one of them selected.
+    /// Only the selected one's definition is embedded, and nothing else on
+    /// the sheet moves — not even a title that quotes "(lib_symbols".
+    #[tokio::test]
+    async fn served_update_symbols_from_library_embeds_a_repointed_symbol_on_a_kicad_sheet() {
+        let (dir, _env) = stub_symbol_dir();
+        // Outside KICAD10_SYMBOL_DIR's own listing, so only the project's
+        // table entry can resolve it.
+        let passives = dir.path().join("libs").join("Passives.kicad_symdir");
+        std::fs::create_dir_all(&passives).unwrap();
+        for name in ["CAP_ALT", "RES_ALT"] {
+            std::fs::write(
+                passives.join(format!("{name}.kicad_sym")),
+                format!(
+                    "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"{name}\"\n\t\t(property \"Reference\" \"C\" (at 0 0 0))\n\t\t(property \"Value\" \"{name}\" (at 0 0 0))\n\t\t(symbol \"{name}_0_1\"\n\t\t\t(pin passive line (at 0 6.35 270) (length 2.54)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t\t(pin passive line (at 0 -6.35 90) (length 2.54)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"2\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n"
+                ),
+            )
+            .unwrap();
+        }
+        let table = dir.path().join("sym-lib-table");
+        let registered = std::fs::read_to_string(&table).unwrap().replace(
+            "\n)\n",
+            "\n  (lib (name \"Passives\") (type \"KiCad\") (uri \"${KIPRJMOD}/libs/Passives.kicad_symdir\") (options \"\") (descr \"\"))\n)\n",
+        );
+        std::fs::write(&table, registered).unwrap();
+
+        let sheet = include_str!("../../tests/fixtures/dnp_kicad10.kicad_sch")
+            .replacen(
+                "\t(paper \"A4\")\n",
+                "\t(paper \"A4\")\n\t(title_block\n\t\t(title \"Notes (lib_symbols)\")\n\t)\n",
+                1,
+            )
+            .replace("(lib_id \"Device:C\")", "(lib_id \"Passives:CAP_ALT\")")
+            .replace("(lib_id \"Device:R\")", "(lib_id \"Passives:RES_ALT\")");
+        assert!(sheet.contains("Notes (lib_symbols)") && sheet.contains("Passives:RES_ALT"));
+        let path = dir.path().join("repointed.kicad_sch");
+        std::fs::write(&path, &sheet).unwrap();
+
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+        let message = json!({"jsonrpc": "2.0", "id": 46, "method": "tools/call",
+            "params": {"name": "update_symbols_from_library", "arguments": {
+                "schematic": path.display().to_string(), "references": ["C1"] }}});
+        let result = handler
+            .handle_message(message)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_ne!(result["isError"], true, "{result}");
+        let body: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["added"], json!(["Passives:CAP_ALT"]), "{body}");
+        assert_eq!(body["errors"], json!([]), "{body}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let tree = copperpour_sexp::parse_sexp(&after).unwrap();
+        let c1 = extract_symbol_instances(&tree)
+            .into_iter()
+            .find(|i| i.reference == "C1")
+            .unwrap();
+        let lib_syms = tree.find("lib_symbols").unwrap().find_all("symbol");
+        let embedded = copperpour_sexp::schematic::find_lib_symbol(&lib_syms, &c1)
+            .expect("C1's embedded definition");
+        let pins = embedded.find_all("symbol")[0].find_all("pin");
+        let ys: Vec<f64> = pins
+            .iter()
+            .map(|pin| pin.find("at").unwrap().get_f64(2).unwrap())
+            .collect();
+        assert_eq!(ys, vec![6.35, -6.35]);
+        assert!(!embedded_names(&after).contains(&"Passives:RES_ALT".to_string()));
+
+        // Every other item on the sheet, and every copy already embedded, is
+        // byte for byte what it was.
+        let items = |text: &str, parent: &str| -> Vec<String> {
+            copperpour_sexp::writer::find_direct_child_blocks(text, parent)
+                .into_iter()
+                .map(|(start, end)| text[start..end].to_string())
+                .collect()
+        };
+        let outside = |text: &str| -> Vec<String> {
+            items(text, "kicad_sch")
+                .into_iter()
+                .filter(|item| !item.starts_with("(lib_symbols"))
+                .collect()
+        };
+        assert_eq!(outside(&after), outside(&sheet));
+        let kept = items(&sheet, "lib_symbols");
+        let now = items(&after, "lib_symbols");
+        assert_eq!(now.len(), kept.len() + 1);
+        assert_eq!(now[..kept.len()], kept[..]);
     }
 }
 
