@@ -75,9 +75,11 @@ position. A finding on a repeated sheet that reuses an item UUID can't be matche
 placement, so the move is refused.
 
 Without `kicad-cli`, a dry run still returns the plan, with
-`verification.status: "not_run"` and `connectivity_impacts: null`, and apply refuses. Once
-`kicad-cli` is available, run a new dry run and apply with its revision. A check that
-fails or returns output Copperpour can't read refuses the move.
+`verification.status: "not_run"` and `connectivity_impacts: null`, and apply refuses.
+If a PCB exists, `pcb_net_name_mapping` is also `null`, and `affected_files` may omit a
+board that only needs net-name or sheet metadata updates. Once `kicad-cli` is available,
+run a new dry run and apply with its revision. A failed check or unreadable result
+prevents the move.
 
 ## What the tool refuses
 
@@ -107,17 +109,37 @@ fails or returns output Copperpour can't read refuses the move.
 
 ## PCB and project settings
 
-The tool doesn't write the PCB or project settings. If the project has a same-named PCB,
-the tool refuses a move that would leave a footprint pointing at a stale schematic path,
-or whose destination path or new net name the PCB already uses.
+If the project has a same-named `.kicad_pcb`, the move also updates matching footprint
+paths, their saved sheet names and filenames, and any PCB nets that KiCad renames.
+Footprint and copper UUIDs, placement, and routing geometry stay the same.
 
-A net-name change must keep KiCad's effective netclasses, must not rename a saved PCB net
-and must not affect explicit netclass assignments in the project file. A net rename is
-also refused when the project file has a netclass pattern other than `*`, because
-Copperpour can't prove the patterns still match the same nets. It is refused when the
-project has a `.kicad_dru` custom rules file too, because the schematic checks don't
-evaluate custom PCB rules, including rules that depend on which sheet a footprint belongs
-to. Run PCB DRC after you next update the PCB from the schematic.
+Review `pcb_path_mapping` and `pcb_net_name_mapping` in the dry run. A root-relative
+footprint path can map to itself when only its saved sheet name and filename change.
+The tool does not place missing footprints, match by reference alone, or write project
+settings. It refuses ambiguous footprint paths, destination net collisions, changes in
+which netclass patterns match, changes to differential-pair membership or polarity,
+and renames that would change explicit net assignments. Without a PCB, a schematic
+net rename still requires the project to have no netclass pattern other than `*`.
+With a PCB, the tool refuses patterns it cannot compare reliably, such as a regular
+expression ending in an escaped `$`, unless the wildcard matches both names.
+Before renaming a PCB net, it checks that the saved pads on that net belong to the
+verified schematic pin group. If the check fails, reconcile the board with the
+schematic and plan again.
+
+The plan and transaction require the same-named `.kicad_dru` to stay unchanged, or to
+stay absent if it does not exist. If present, the rules file must be a regular file,
+not a symlink or directory. The tool never rewrites custom rules.
+
+- When a PCB net changes names, a rule condition or assertion must not depend on net
+  names, for example through `NetName` or `inDiffPair`.
+- When a footprint changes sheets, even without a PCB net rename, a rule condition or
+  assertion must not depend on sheet membership, for example through `memberOfSheet()`
+  or `memberOfSheetOrChildren()`. If the project assigns component classes per sheet
+  or through Board Setup rules, the tool also refuses expressions that use those
+  classes.
+
+If the tool cannot rule out the relevant dependency, it refuses the move and names
+the rules file. Run PCB DRC after the move. The transfer checks do not replace it.
 
 The tool doesn't look at other boards or projects. In a multi-board workflow, reconcile
 them yourself before moving objects.
@@ -150,7 +172,7 @@ check it on the destination sheet.
 
 ## If something goes wrong
 
-The tool writes both sheet files through one journal. Before writing, it checks every
+The tool writes both sheets and any changed PCB through one journal. It checks every
 project file it read, and that files it expects to be missing, such as a PCB, rules file,
 library table or project lock, are still missing. It never rewrites or creates those
 files.
@@ -178,9 +200,9 @@ To finish an interrupted move:
 
 1. Run `copperpour transaction status` on the project directory. If no journal remains,
    there is nothing to recover; inspect the saved project before retrying.
-2. If the journal remains, run `copperpour transaction recover`. Recovery checks both
-   sheets: each must match either its contents before the move or its contents after it,
-   and recovery writes only the sheets that still have their before contents. Every other
+2. If the journal remains, run `copperpour transaction recover`. Both sheets and any
+   changed PCB must match their contents before or after the move. Recovery writes
+   only the targets that still have their before contents. Every other
    file it read must be unchanged, the files it expects to be missing must still be
    missing, and no KiCad editor lock may be present on the files involved. Otherwise it
    stops and keeps the journal.
