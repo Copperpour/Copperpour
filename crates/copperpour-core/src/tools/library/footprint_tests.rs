@@ -10,9 +10,9 @@ const DUPLICATE_PAD_FOOTPRINT: &str = r#"(footprint "DualSocket"
   (pad "3" thru_hole oval (at 3 4 90) (size 3 2) (drill oval 1 2) (layers "*.Cu" "*.Mask"))
   (pad "1" thru_hole circle (at 5 6) (size 2 2) (drill 1) (layers "*.Cu" "*.Mask"))
   (model "../models/keep.step"
-(offset (xyz 0 0 0))
-(scale (xyz 1 1 1))
-(rotate (xyz 0 0 0)))
+    (offset (xyz 0 0 0))
+    (scale (xyz 1 1 1))
+    (rotate (xyz 0 0 0)))
 )
 "#;
 
@@ -1428,12 +1428,12 @@ async fn get_footprint_info_includes_graphics_only_when_requested() {
   (layer "F.Cu")
   (descr "Inspection fixture")
   (fp_line (start 0 0) (end 1 0)
-(stroke (width 0.1) (type solid)) (layer "F.SilkS"))
+    (stroke (width 0.1) (type solid)) (layer "F.SilkS"))
   (fp_poly
-(pts (xy 0 0) (xy 2 0) (xy 2 1))
-(stroke (width 0.05) (type solid)) (fill none) (layer "B.CrtYd"))
+    (pts (xy 0 0) (xy 2 0) (xy 2 1))
+    (stroke (width 0.05) (type solid)) (fill none) (layer "B.CrtYd"))
   (pad "1" thru_hole circle (at 0 0) (size 1.8 1.8) (drill 1)
-(layers "*.Cu" "*.Mask"))
+    (layers "*.Cu" "*.Mask"))
 )
 "#,
     )

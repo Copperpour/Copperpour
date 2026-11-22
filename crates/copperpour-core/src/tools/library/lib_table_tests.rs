@@ -1298,15 +1298,15 @@ const EXTENDS_DERIVED_LIB: &str = "\
 (kicad_symbol_lib
   (version 20251024)
   (symbol \"Base\"
-(symbol \"Base_1_1\"
-  (pin input line (at -5.08 2.54 0) (length 2.54) (name \"G\") (number \"1\"))
-  (pin output line (at 5.08 0 180) (length 2.54) (name \"S\") (number \"3\"))
-)
+    (symbol \"Base_1_1\"
+      (pin input line (at -5.08 2.54 0) (length 2.54) (name \"G\") (number \"1\"))
+      (pin output line (at 5.08 0 180) (length 2.54) (name \"S\") (number \"3\"))
+    )
   )
   (symbol \"Derived\"
-(extends \"Base\")
-(property \"Reference\" \"U\" (at 0 5.08 0))
-(property \"Value\" \"Derived\" (at 0 -5.08 0))
+    (extends \"Base\")
+    (property \"Reference\" \"U\" (at 0 5.08 0))
+    (property \"Value\" \"Derived\" (at 0 -5.08 0))
   )
 )
 ";
@@ -1477,9 +1477,9 @@ fn resolve_symbol_pins_follows_multilevel_chain() {
     let src = "\
 (kicad_symbol_lib
   (symbol \"C\"
-(symbol \"C_1_1\"
-  (pin passive line (at 0 5.08 0) (length 2.54) (name \"C1\") (number \"1\"))
-)
+    (symbol \"C_1_1\"
+      (pin passive line (at 0 5.08 0) (length 2.54) (name \"C1\") (number \"1\"))
+    )
   )
   (symbol \"B\" (extends \"C\"))
   (symbol \"A\" (extends \"B\"))
@@ -1503,16 +1503,16 @@ fn resolve_symbol_pins_handles_cycle() {
     let src = "\
 (kicad_symbol_lib
   (symbol \"A\"
-(extends \"B\")
-(symbol \"A_1_1\"
-  (pin passive line (at 0 5.08 0) (length 2.54) (name \"A1\") (number \"1\"))
-)
+    (extends \"B\")
+    (symbol \"A_1_1\"
+      (pin passive line (at 0 5.08 0) (length 2.54) (name \"A1\") (number \"1\"))
+    )
   )
   (symbol \"B\"
-(extends \"A\")
-(symbol \"B_1_1\"
-  (pin passive line (at 0 -5.08 0) (length 2.54) (name \"B2\") (number \"2\"))
-)
+    (extends \"A\")
+    (symbol \"B_1_1\"
+      (pin passive line (at 0 -5.08 0) (length 2.54) (name \"B2\") (number \"2\"))
+    )
   )
 )";
     let root = parse_sexp(src).unwrap();
@@ -1536,10 +1536,10 @@ fn resolve_symbol_pins_missing_base_falls_back() {
     let src = "\
 (kicad_symbol_lib
   (symbol \"Orphan\"
-(extends \"NoSuch\")
-(symbol \"Orphan_1_1\"
-  (pin passive line (at 0 5.08 0) (length 2.54) (name \"P\") (number \"7\"))
-)
+    (extends \"NoSuch\")
+    (symbol \"Orphan_1_1\"
+      (pin passive line (at 0 5.08 0) (length 2.54) (name \"P\") (number \"7\"))
+    )
   )
 )";
     let root = parse_sexp(src).unwrap();
@@ -1562,15 +1562,15 @@ fn resolve_symbol_pins_derived_shadows_base() {
     let src = "\
 (kicad_symbol_lib
   (symbol \"Base\"
-(symbol \"Base_1_1\"
-  (pin input line (at 0 5.08 0) (length 2.54) (name \"BASE_G\") (number \"1\"))
-)
+    (symbol \"Base_1_1\"
+      (pin input line (at 0 5.08 0) (length 2.54) (name \"BASE_G\") (number \"1\"))
+    )
   )
   (symbol \"Derived\"
-(extends \"Base\")
-(symbol \"Derived_1_1\"
-  (pin output line (at 0 -5.08 0) (length 2.54) (name \"DERIVED_G\") (number \"1\"))
-)
+    (extends \"Base\")
+    (symbol \"Derived_1_1\"
+      (pin output line (at 0 -5.08 0) (length 2.54) (name \"DERIVED_G\") (number \"1\"))
+    )
   )
 )";
     let root = parse_sexp(src).unwrap();
