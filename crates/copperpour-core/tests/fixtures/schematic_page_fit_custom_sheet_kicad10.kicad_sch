@@ -1,0 +1,41 @@
+(kicad_sch
+	(version 20260306)
+	(generator "eeschema")
+	(generator_version "10.0")
+	(uuid "3c88a2eb-7e4e-47f5-947c-28295aae1ca7")
+	(paper "A4")
+	(lib_symbols)
+	(text "Custom title block only"
+		(exclude_from_sim no)
+		(at 140 160 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "6c4ada6a-f488-4955-9317-fde3702de0a8")
+	)
+	(text "Between the frames"
+		(exclude_from_sim no)
+		(at 14 100 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "af49ab94-c590-447a-bc71-da303ed76d53")
+	)
+	(text "Inside both frames"
+		(exclude_from_sim no)
+		(at 30 35 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "cf4b807c-ce1f-4288-9454-26784d38a8ab")
+	)
+)

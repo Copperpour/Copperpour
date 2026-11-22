@@ -1,0 +1,52 @@
+(kicad_sch
+	(version 20260306)
+	(generator "eeschema")
+	(generator_version "10.0")
+	(uuid "0f056a47-ac65-4987-8232-9ed927c88028")
+	(paper "A4" portrait)
+	(lib_symbols)
+	(text "Into the title block"
+		(exclude_from_sim no)
+		(at 95 275 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "193e18ce-df0a-41c3-b92c-b3084cf504de")
+	)
+	(text "Past the left frame"
+		(exclude_from_sim no)
+		(at 11 65 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "6b4afa8a-f208-4bc5-be79-f0e327405a78")
+	)
+	(text "Inside the frame"
+		(exclude_from_sim no)
+		(at 30 35 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "bab478bc-4627-4192-90aa-5d4738f56a32")
+	)
+	(text "Left of the title block"
+		(exclude_from_sim no)
+		(at 25 275 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "eccc16b9-cac4-41c2-a6ef-19e8b9070a7c")
+	)
+)
