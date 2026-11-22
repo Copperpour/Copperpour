@@ -2514,11 +2514,11 @@ fn turn_label(
     };
 
     let effects = child(block, label.kind, "effects");
-    let justify = effects.and_then(|(e_start, e_end)| {
+    let old_justify = effects.and_then(|(e_start, e_end)| {
         child(&block[e_start..e_end], "effects", "justify")
             .map(|(j_start, j_end)| (e_start + j_start, e_start + j_end))
     });
-    if let Some((j_start, j_end)) = justify {
+    if let Some((j_start, j_end)) = old_justify {
         // Replace the existing justify in place.
         edits.push(SexpEdit::replace(
             block_start + j_start,
@@ -5501,6 +5501,10 @@ mod label_tests {
         );
         let result = rotate(&path, "EN", 10.0, 20.0, 180.0).await;
         assert!(!result.is_error);
+        let reply: serde_json::Value =
+            serde_json::from_str(crate::tools::project_file_writer_tests::text_of(&result))
+                .unwrap();
+        assert_eq!(reply["justify"], json!("right"), "{reply}");
 
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("(at 10 20 180)"), "anchor must rotate");
@@ -5525,6 +5529,34 @@ mod label_tests {
             "the file's own font must be preserved"
         );
         assert_eq!(body.matches("(justify").count(), 1, "no duplicate justify");
+    }
+
+    /// The reply's `justify` is the direction written, not where the label's
+    /// old justify sat in the file. Both labels of the KiCad-saved sheet
+    /// carry a justify for the edit to replace.
+    #[tokio::test]
+    async fn rotate_reports_the_justify_it_writes() {
+        for (net, kind, y, rotation, justify, written) in [
+            ("(at 1 2)", "label", 97.79, 180.0, "right", "right bottom"),
+            ("PWR", "global_label", 105.41, 90.0, "left", "left"),
+        ] {
+            let (_d, path) = label_move_sheet();
+            let result = rotate(&path, net, 114.3, y, rotation).await;
+            let text = crate::tools::project_file_writer_tests::text_of(&result);
+            assert!(!result.is_error, "{text}");
+            let sheet = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(justify_of(&sheet, net), written);
+            let body: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                body,
+                json!({
+                    "rotated_label": net,
+                    "type": kind,
+                    "rotation": rotation,
+                    "justify": justify
+                })
+            );
+        }
     }
 
     #[tokio::test]
