@@ -35,7 +35,8 @@ mm control reports nothing.
 KiCad 10.0.8 plots all seven wires (360.68 mm in total). `kicad-cli sch export netlist`
 puts `R1.2` and `R2.1` on `Net-(R1-Pad2)` and leaves `R1.1` and `R2.2` on
 `unconnected-(…)` nets. `kicad-cli sch erc --severity-all` reports 2 `pin_not_connected`,
-1 `wire_dangling` and 1 `label_dangling` error and 3 `unconnected_wire_endpoint` warnings,
-all from the open `LONG` run and the free control wire. ERC counts leave out
-`lib_symbol_issues` and `footprint_link_issues`, which depend on the machine's KiCad
-library tables.
+1 `wire_dangling` and 1 `label_dangling` error and 3 `unconnected_wire_endpoint` warnings.
+The `pin_not_connected` errors are R1.1 and R2.2, the `wire_dangling` is the free control
+wire, and the `label_dangling` is the `LONG` label at the end of that run. ERC counts
+leave out `lib_symbol_issues` and `footprint_link_issues`, which depend on the machine's
+KiCad library tables.

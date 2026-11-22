@@ -31,6 +31,7 @@ kicad-cli sch export svg --exclude-drawing-sheet -o . wire_over_label_kicad10.ki
 
 `kicad-cli sch export netlist` (10.0.8) loads the sheet and lists no nets, since it has no
 component. `kicad-cli sch erc --severity-all` reports 4 `wire_dangling` and 3
-`label_dangling` errors and 11 `unconnected_wire_endpoint` warnings. A wire through label
-text does not connect to the label, and nothing in ERC is about text, so ERC cannot see
-the crossings.
+`label_dangling` errors and 11 `unconnected_wire_endpoint` warnings. The 4 `wire_dangling`
+are the four vertical wires: the two crossing wires and the two controls at x = 102.87 and
+below `SIGNAL_CLEAR`. A wire through label text does not connect to the label, and nothing
+in ERC is about text, so ERC cannot tell a crossing from a clear wire.
