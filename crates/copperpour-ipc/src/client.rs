@@ -5516,9 +5516,10 @@ impl KiCadIpcClient {
     ///
     /// A class KiCad declines to list (`AS_BAD_REQUEST`) is named in
     /// `unavailable` with KiCad's answer instead of vanishing from the read.
-    /// KiCad 10.0.5 declines tables and generators. Both are asked for on every
-    /// read: the bundled protocol has no message for either, so a KiCad that
-    /// does list them is reported too, with how many it listed. Any other
+    /// KiCad 10.0.5 declines tables and generators; KiCad 10.0.7+ lists tables
+    /// as `kiapi.board.types.Table` (so they are measured) and still declines
+    /// generators. Generators have no message in the bundled protocol yet, so a
+    /// KiCad that lists them is reported too, with how many it listed. Any other
     /// failure still fails the read.
     ///
     /// `BBM_ITEM_ONLY` leaves a footprint's text out of its box: board extents
@@ -5548,7 +5549,7 @@ impl KiCadIpcClient {
         }
 
         // (GetItems class, the message KiCad answers with, the response key)
-        const CLASSES: [(Kind, &str, &str); 11] = [
+        const CLASSES: [(Kind, &str, &str); 12] = [
             (
                 Kind::KotPcbFootprint,
                 "kiapi.board.types.FootprintInstance",
@@ -5580,16 +5581,14 @@ impl KiCadIpcClient {
                 "kiapi.board.types.ReferenceImage",
                 "reference_images",
             ),
+            (Kind::KotPcbTable, "kiapi.board.types.Table", "tables"),
         ];
 
-        // Classes the bundled protocol has no item message for. A table's or a
-        // generator's own box can reach past anything listed above: on the
-        // Jetson demo, 164 of 167 tuning patterns extend up to 3.99 mm beyond
-        // their member tracks.
-        const UNREADABLE: [(Kind, &str); 2] = [
-            (Kind::KotPcbTable, "tables"),
-            (Kind::KotPcbGenerator, "generators"),
-        ];
+        // Classes the bundled protocol has no item message for. A generator's
+        // own box can reach past anything listed above: on the Jetson demo,
+        // 164 of 167 tuning patterns extend up to 3.99 mm beyond their member
+        // tracks.
+        const UNREADABLE: [(Kind, &str); 1] = [(Kind::KotPcbGenerator, "generators")];
 
         let mut ids = Vec::new();
         let mut seen = BTreeSet::new();
@@ -5626,7 +5625,11 @@ impl KiCadIpcClient {
                     Kind::KotPcbZone => kiid::<board::Zone>(item, |m| m.id.as_ref()),
                     Kind::KotPcbDimension => kiid::<board::Dimension>(item, |m| m.id.as_ref()),
                     Kind::KotPcbBarcode => kiid::<board::Barcode>(item, |m| m.id.as_ref()),
-                    _ => kiid::<board::ReferenceImage>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbReferenceImage => {
+                        kiid::<board::ReferenceImage>(item, |m| m.id.as_ref())
+                    }
+                    Kind::KotPcbTable => kiid::<board::Table>(item, |m| m.id.as_ref()),
+                    _ => unreachable!("unhandled board bounds class {kind:?}"),
                 }?;
                 if seen.insert(id.clone()) {
                     ids.push(id);
