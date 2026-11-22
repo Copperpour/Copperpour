@@ -204,7 +204,8 @@ pub fn tools() -> Vec<ToolDef> {
              reported. Also finds \
              conflicting labels at the same location, colliding label and field text \
              (`text_overlap`), wires drawn through a symbol's body (`wire_overlap`), and \
-             reports any symbol whose embedded \
+             wires crossing label text or visible power symbol Value text (`wire_label_overlap`). \
+             Reports any symbol whose embedded \
              geometry could not be resolved and used the origin fallback instead.",
             json!({ "type": "object",
                 "properties": {
@@ -1302,12 +1303,25 @@ async fn handle_check_overlaps(
         }
     }
 
+    let label_texts = texts
+        .iter()
+        .filter(|text| match &text.owner {
+            TextOwner::Label { .. } => true,
+            TextOwner::Field {
+                field,
+                is_power_symbol,
+                ..
+            } => *is_power_symbol && field == "Value",
+        })
+        .collect::<Vec<_>>();
+
     // A wire drawn through a symbol's body reads as part of the symbol, so
     // what it connects is hidden; it is reported with the body it crosses. A
     // wire along an edge or ending on a pin tip outside the body is contact,
     // and so is one that leaves the symbol's own pin tip outward, though a
     // drawing that reaches past the tip may clip it.
     let mut wire_overlaps: Vec<serde_json::Value> = Vec::new();
+    let mut wire_label_overlaps: Vec<serde_json::Value> = Vec::new();
     for wire in extract_wires(&tree) {
         let (from, to) = ((wire.x1, wire.y1), (wire.x2, wire.y2));
         for (instance, placed) in &placements {
@@ -1320,14 +1334,7 @@ async fn handle_check_overlaps(
             if body.segment_enters(from, to) && !geometry.wire_leaves_pin(from, to) {
                 wire_overlaps.push(json!({
                     "type": "wire_overlap",
-                    "a": {
-                        "kind": "wire",
-                        "uuid": wire.uuid,
-                        "x1": wire.x1,
-                        "y1": wire.y1,
-                        "x2": wire.x2,
-                        "y2": wire.y2
-                    },
+                    "a": wire_json(&wire),
                     "b": {
                         "kind": "symbol_body",
                         "reference": instance.reference,
@@ -1338,12 +1345,23 @@ async fn handle_check_overlaps(
                 }));
             }
         }
+        for text in &label_texts {
+            if from != to && text.wire_crossing_bounds().segment_enters(from, to) {
+                wire_label_overlaps.push(json!({
+                    "type": "wire_label_overlap",
+                    "a": wire_json(&wire),
+                    "b": text_json(text),
+                    "bounds_b": bounds_json(text.reported_run())
+                }));
+            }
+        }
     }
 
     let mut all = comp_overlaps;
     all.extend(label_overlaps);
     all.extend(text_overlaps);
     all.extend(wire_overlaps);
+    all.extend(wire_label_overlaps);
     let bounds_unresolved = placements
         .iter()
         .filter(|(_, placed)| placed.is_none())
@@ -1375,7 +1393,18 @@ fn is_own_field(text: &TextExtent, instance: &SymbolInstance) -> bool {
     }
 }
 
-/// One side of a `text_overlap`: the label or field whose text it is.
+fn wire_json(wire: &Wire) -> serde_json::Value {
+    json!({
+        "kind": "wire",
+        "uuid": wire.uuid,
+        "x1": wire.x1,
+        "y1": wire.y1,
+        "x2": wire.x2,
+        "y2": wire.y2
+    })
+}
+
+/// The label or field whose text an overlap involves.
 fn text_json(text: &TextExtent) -> serde_json::Value {
     match &text.owner {
         TextOwner::Label {
@@ -1396,6 +1425,7 @@ fn text_json(text: &TextExtent) -> serde_json::Value {
             unit,
             symbol_uuid,
             field,
+            ..
         } => json!({
             "kind": "field",
             "reference": reference,
@@ -1405,6 +1435,42 @@ fn text_json(text: &TextExtent) -> serde_json::Value {
             "text": text.text
         }),
     }
+}
+
+#[cfg(test)]
+async fn served_overlaps(source: &[u8]) -> serde_json::Value {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sheet.kicad_sch");
+    std::fs::write(&path, source).unwrap();
+    let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+        eager_toolsets: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let response = handler
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "check_schematic_overlaps",
+                "arguments": { "schematic": path.display().to_string() }
+            }
+        }))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), source);
+    let result = response.result.expect("successful JSON-RPC response");
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let body: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        body["overlap_count"],
+        body["overlaps"].as_array().unwrap().len(),
+        "{body}"
+    );
+    body
 }
 
 #[cfg(test)]
@@ -1520,36 +1586,10 @@ mod placement_overlap_tests {
     /// leaves unconnected.
     #[tokio::test]
     async fn the_served_dispatch_passes_pin_tip_contact_and_reports_collisions() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("symbol_pin_contact_kicad10.kicad_sch");
-        std::fs::write(
-            &path,
-            include_str!("../../tests/fixtures/symbol_pin_contact_kicad10.kicad_sch"),
-        )
-        .unwrap();
-        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
-            eager_toolsets: true,
-            ..ServerConfig::default()
-        })
-        .await
-        .expect("handler builds");
-
-        let response = handler
-            .handle_message(json!({
-                "jsonrpc": "2.0",
-                "id": 745,
-                "method": "tools/call",
-                "params": {
-                    "name": "check_schematic_overlaps",
-                    "arguments": { "schematic": path.display().to_string() }
-                }
-            }))
-            .await
-            .expect("tools/call receives a response");
-        let result = response.result.expect("successful JSON-RPC response");
-        assert_ne!(result["isError"], json!(true), "{result}");
-        let body: serde_json::Value =
-            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        let body = served_overlaps(include_bytes!(
+            "../../tests/fixtures/symbol_pin_contact_kicad10.kicad_sch"
+        ))
+        .await;
 
         assert_eq!(body["bounds_resolved"], 11, "{body}");
         let mut pairs = body["overlaps"]
@@ -2019,6 +2059,279 @@ mod text_overlap_tests {
         assert_eq!(sda["bounds_b"]["x_max"], 50.8762, "{sda}");
         let noisy = crate::tools::noisy_numbers(&body);
         assert!(noisy.is_empty(), "reported {noisy:?}");
+    }
+}
+
+#[cfg(test)]
+mod wire_label_overlap_tests {
+    use super::*;
+    use serde_json::Value;
+
+    const LABELS: &[u8] = include_bytes!("../../tests/fixtures/wire_over_label_kicad10.kicad_sch");
+    const POWER: &[u8] =
+        include_bytes!("../../tests/fixtures/wire_over_power_text_kicad10.kicad_sch");
+    const VARIANTS: &[u8] =
+        include_bytes!("../../tests/fixtures/wire_label_variants_kicad10.kicad_sch");
+
+    fn assert_crossing(
+        finding: &Value,
+        wire_uuid: &str,
+        [x1, y1, x2, y2]: [f64; 4],
+        text: Value,
+        [left, top, right, bottom]: [f64; 4],
+    ) {
+        assert_eq!(finding["type"], "wire_label_overlap", "{finding}");
+        assert_eq!(
+            finding["a"],
+            json!({"kind": "wire", "uuid": wire_uuid, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+        );
+        assert_eq!(finding["b"], text);
+        // The extents bound the ink measured in the KiCad SVG, not the outline.
+        let bounds = &finding["bounds_b"];
+        for (coordinate, ink, direction) in [
+            ("x_min", left, -1.0),
+            ("y_min", top, -1.0),
+            ("x_max", right, 1.0),
+            ("y_max", bottom, 1.0),
+        ] {
+            let margin = direction * (bounds[coordinate].as_f64().unwrap() - ink);
+            assert!((0.0..0.5).contains(&margin), "{coordinate}: {finding}");
+        }
+    }
+
+    fn label(label_type: &str, net: &str, uuid: &str) -> Value {
+        json!({"kind": "label", "label_type": label_type, "net": net, "uuid": uuid, "text": net})
+    }
+
+    #[tokio::test]
+    async fn local_and_global_text_crossings_exclude_attachments_and_outline_only_crossings() {
+        let body = served_overlaps(LABELS).await;
+        assert_eq!(body["overlap_count"], 2, "{body}");
+        let findings = body["overlaps"].as_array().unwrap();
+        let by_net = |net| {
+            findings
+                .iter()
+                .find(|o| o["b"]["net"] == net)
+                .unwrap_or_else(|| panic!("missing {net}: {body}"))
+        };
+        assert_crossing(
+            by_net("SIGNAL_INPUT"),
+            "ddfda1f2-03eb-4aa5-bbb6-cc27920289a9",
+            [55.88, 45.72, 55.88, 49.53],
+            label(
+                "net_label",
+                "SIGNAL_INPUT",
+                "c54b569e-d996-4a07-94d1-782cdcd5bfc0",
+            ),
+            [51.14, 49.02, 63.78, 50.41],
+        );
+        assert_crossing(
+            by_net("GLOBAL_SIGNAL"),
+            "97e6a672-ef03-40f3-aafd-fef9c1657218",
+            [104.14, 48.26, 104.14, 53.34],
+            label(
+                "global_label",
+                "GLOBAL_SIGNAL",
+                "b51d4554-2452-493d-9845-46cc0c95feba",
+            ),
+            [103.37, 50.20, 117.52, 51.59],
+        );
+    }
+
+    #[tokio::test]
+    async fn reported_text_bounds_use_kicads_six_decimal_precision() {
+        let body = served_overlaps(LABELS).await;
+        let noisy = crate::tools::noisy_numbers(&body);
+        assert!(noisy.is_empty(), "reported {noisy:?}");
+    }
+
+    #[tokio::test]
+    async fn a_zero_length_wire_inside_the_run_does_not_cross_it() {
+        let mut schematic =
+            cse::Schematic::from_source("source.kicad_sch", std::str::from_utf8(LABELS).unwrap())
+                .unwrap();
+        let degenerate = schematic.add_wire(55.88, 49.53, 55.88, 49.53).uuid.clone();
+        let body = served_overlaps(schematic.to_source().as_bytes()).await;
+        assert!(
+            body["overlaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|o| o["a"]["uuid"] != degenerate),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_horizontal_baseline_and_tee_do_not_cross_local_label_descenders() {
+        let body = served_overlaps(VARIANTS).await;
+        let descenders = body["overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["b"]["net"] == "VCC(3V3)")
+            .collect::<Vec<_>>();
+        assert_eq!(descenders.len(), 1, "{body}");
+        assert_crossing(
+            descenders[0],
+            "35ac8957-7fc8-485d-b354-8088d9439b24",
+            [55.88, 135.89, 55.88, 138.43],
+            label(
+                "net_label",
+                "VCC(3V3)",
+                "f2297762-bc6a-40f0-9ffe-ec0c2a19264e",
+            ),
+            [51.02, 137.74, 59.43, 139.67],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vertical_baseline_and_tee_do_not_cross_local_label_subscripts() {
+        let body = served_overlaps(VARIANTS).await;
+        assert!(
+            body["overlaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|o| o["b"]["net"] != "V_{gs}"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hierarchical_label_text_crossing_is_reported_but_its_attachment_is_not() {
+        let body = served_overlaps(POWER).await;
+        let labels = body["overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["b"]["kind"] == "label")
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), 1, "{body}");
+        assert_crossing(
+            labels[0],
+            "b8b54e8d-2371-44ae-89e5-460d81aeee1e",
+            [80.01, 48.26, 80.01, 53.34],
+            label(
+                "hierarchical_label",
+                "SIG_H",
+                "e98278f5-aba7-46f7-a1af-b49c2e5ab2a5",
+            ),
+            [78.00, 50.11, 82.84, 51.50],
+        );
+    }
+
+    #[tokio::test]
+    async fn power_value_crossing_is_reported_but_its_pin_attachment_and_near_miss_are_not() {
+        let body = served_overlaps(POWER).await;
+        let other = body["overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["b"]["kind"] != "label")
+            .collect::<Vec<_>>();
+        assert_eq!(other.len(), 1, "{body}");
+        assert_crossing(
+            other[0],
+            "a1dd2242-097c-42f2-81f7-2f296aeebff6",
+            [45.72, 46.99, 55.88, 46.99],
+            json!({
+                "kind": "field", "reference": "#PWR01", "unit": 1,
+                "symbol_uuid": "bb8234ac-3887-4cae-8062-7d496f3f5909", "field": "Value", "text": "+3V3"
+            }),
+            [48.56, 46.55, 53.10, 47.82],
+        );
+    }
+
+    #[tokio::test]
+    async fn rotated_labels_and_a_wire_through_its_own_global_label_are_reported() {
+        let body = served_overlaps(VARIANTS).await;
+        let labels = body["overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| {
+                o["b"]["kind"] == "label"
+                    && !matches!(o["b"]["net"].as_str(), Some("VCC(3V3)" | "V_{gs}"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), 5, "{body}");
+        for (net, kind, label_uuid, wire_uuid, endpoints, ink) in [
+            (
+                "TURN_UP",
+                "net_label",
+                "bae663da-893d-4904-9a4c-f2a25ec4d841",
+                "6f5e0796-b502-45f8-a08a-663172b19511",
+                [48.26, 45.72, 52.07, 45.72],
+                [49.02, 42.48, 50.41, 50.58],
+            ),
+            (
+                "FACE_LEFT",
+                "global_label",
+                "c340cad7-9684-4f01-a2d5-663445cd509f",
+                "b3ca56be-e631-4da5-a24d-14f1a9e462e0",
+                [97.79, 48.26, 97.79, 53.34],
+                [90.58, 50.20, 99.95, 51.59],
+            ),
+            (
+                "TURN_DOWN",
+                "hierarchical_label",
+                "070a95f8-ff53-4367-a192-5b3d85858119",
+                "f8437346-f86c-4eb7-985f-597716c18e2f",
+                [149.86, 54.61, 154.94, 54.61],
+                [151.71, 52.66, 153.10, 63.49],
+            ),
+            (
+                "THROUGH",
+                "global_label",
+                "b80124a0-1183-436b-9774-f7190bb60476",
+                "671d5905-e0bd-449c-a6dd-7a91d3ba48af",
+                [203.2, 50.8, 215.9, 50.8],
+                [204.85, 50.20, 213.26, 51.47],
+            ),
+            (
+                "VERT_GLOBAL",
+                "global_label",
+                "abf9fd68-9ac3-40b3-b6ea-a3a1f496a46a",
+                "6f6f1ffa-3b4a-4aaa-9f2b-bbb3baa8fe96",
+                [200.66, 96.52, 205.74, 96.52],
+                [202.60, 87.73, 203.99, 99.95],
+            ),
+        ] {
+            let finding = labels
+                .iter()
+                .find(|o| o["b"]["net"] == net)
+                .unwrap_or_else(|| panic!("missing {net}: {body}"));
+            assert_crossing(
+                finding,
+                wire_uuid,
+                endpoints,
+                label(kind, net, label_uuid),
+                ink,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn only_visible_power_value_text_counts_as_label_text() {
+        let body = served_overlaps(VARIANTS).await;
+        let fields = body["overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["b"]["kind"] != "label")
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 1, "{body}");
+        assert_crossing(
+            fields[0],
+            "26ff5974-14a7-474a-8459-76984cb68503",
+            [99.06, 96.52, 110.49, 96.52],
+            json!({
+                "kind": "field", "reference": "#PWR01", "unit": 1,
+                "symbol_uuid": "884fbc50-49a6-434d-8886-79c88cd4cbad", "field": "Value", "text": "+3V3"
+            }),
+            [103.17, 95.83, 107.71, 97.10],
+        );
     }
 }
 

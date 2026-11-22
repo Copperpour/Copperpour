@@ -1,8 +1,8 @@
 # Wire crossings over label text
 
 `wire_over_label_kicad10.kicad_sch` is an A4 sheet with three net labels and the wires
-that cross or miss their text. It has no symbols and no design data. It backs the proposed
-check that reports a wire drawn through a label's text.
+that cross or miss their text. It has no symbols and no design data. It tests
+`wire_label_overlap` findings in `check_schematic_overlaps`.
 
 ## Provenance
 
