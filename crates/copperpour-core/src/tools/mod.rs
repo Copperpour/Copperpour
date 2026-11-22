@@ -6408,6 +6408,42 @@ pub(super) mod multi_endpoint_discovery_tests {
         assert_eq!(dup["error"]["kind"], "ambiguous_target", "{dup}");
     }
 
+    /// Drop `socket` and wait until `path` has no remaining open descriptors in
+    /// the kernel and refuses a stream dial with `ECONNREFUSED`.
+    ///
+    /// If another test thread calls `fork()` between `bind()` and `close()`,
+    /// the child process inherits a duplicate descriptor until `exec()` closes
+    /// `FD_CLOEXEC`. While that duplicate remains open, a listening socket can
+    /// accept a dial and reset it on `exec()` (`handshake_failed`), and a
+    /// datagram socket rejects a stream dial with `EPROTOTYPE`
+    /// (`transport_error`). Once the parent descriptor is closed and
+    /// `UnixStream::connect` observes `ConnectionRefused`, the kernel socket is
+    /// gone and no later `fork()` can inherit it (#801).
+    #[cfg(unix)]
+    fn stale_socket_after_drop<S>(path: &std::path::Path, socket: S) {
+        drop(socket);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match std::os::unix::net::UnixStream::connect(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return,
+                other if std::time::Instant::now() < deadline => {
+                    let _ = other;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                other => panic!(
+                    "stale socket at {} did not refuse a stream connect before deadline: {other:?}",
+                    path.display()
+                ),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_stale_socket(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        stale_socket_after_drop(path, std::os::unix::net::UnixDatagram::bind(path).unwrap());
+    }
+
     #[cfg(unix)]
     async fn with_cached_selected_editor(
         dir: &std::path::Path,
@@ -6509,8 +6545,7 @@ pub(super) mod multi_endpoint_discovery_tests {
             *until = std::time::Instant::now() + std::time::Duration::from_secs(3600);
         }
         drop(selected);
-        let _ = std::fs::remove_file(&selected_path);
-        drop(std::os::unix::net::UnixListener::bind(&selected_path).unwrap());
+        create_stale_socket(&selected_path);
         assert_eq!(
             copperpour_ipc::socket::candidate_endpoints_in(&kicad_dir),
             candidates
@@ -6531,6 +6566,66 @@ pub(super) mod multi_endpoint_discovery_tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         (handler, other)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_socket_helper_waits_out_inherited_descriptors_before_reporting_no_listener() {
+        fn assert_waits_out_inherited<S: Send + 'static>(
+            path: &std::path::Path,
+            socket: S,
+            inherited: S,
+        ) {
+            let release = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                drop(inherited);
+            });
+            stale_socket_after_drop(path, socket);
+            assert_eq!(
+                copperpour_ipc::KiCadIpcClient::new(format!("ipc://{}", path.display()))
+                    .ping_outcome()
+                    .failure_kind(),
+                Some("no_listener")
+            );
+            release.join().unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // A child process forked between `UnixListener::bind` and `drop` holds a
+        // duplicate listening descriptor until `exec` closes `FD_CLOEXEC`. While
+        // that duplicate descriptor is open, dialing the dropped listener is
+        // accepted into the kernel backlog and reset when the duplicate closes,
+        // producing `handshake_failed` instead of `no_listener` (#801).
+        let listener_path = dir.path().join("inherited-listener.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&listener_path).unwrap();
+        let inherited_listener = listener.try_clone().unwrap();
+        assert_waits_out_inherited(&listener_path, listener, inherited_listener);
+
+        // Binding a datagram socket avoids `listen()`, but a duplicate datagram
+        // descriptor still held between `fork` and `exec` rejects a stream dial
+        // with `EPROTOTYPE` (`transport_error`) until the duplicate closes and
+        // the kernel socket is torn down (`ConnectionRefused` / `no_listener`).
+        let datagram_path = dir.path().join("inherited-datagram.sock");
+        let datagram = std::os::unix::net::UnixDatagram::bind(&datagram_path).unwrap();
+        let inherited_datagram = datagram.try_clone().unwrap();
+        assert_waits_out_inherited(&datagram_path, datagram, inherited_datagram);
+
+        // Replacing an existing path leaves an adoptable stale socket behind.
+        let replaced_path = dir.path().join("api.sock");
+        let replaced_addr = format!("ipc://{}", replaced_path.display());
+        std::fs::write(&replaced_path, "previous").unwrap();
+        create_stale_socket(&replaced_path);
+        assert_eq!(
+            copperpour_ipc::socket::candidate_endpoints_in(dir.path()),
+            vec![replaced_addr.clone()]
+        );
+        assert_eq!(
+            copperpour_ipc::KiCadIpcClient::new(replaced_addr)
+                .ping_outcome()
+                .failure_kind(),
+            Some("no_listener")
+        );
     }
 
     #[cfg(unix)]
@@ -6748,7 +6843,7 @@ pub(super) mod multi_endpoint_discovery_tests {
             manager_response,
         );
         let stale = dir.path().join(format!("api-{}.sock", std::process::id()));
-        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        create_stale_socket(&stale);
         let handler = McpHandler::new(ServerConfig {
             eager_toolsets: true,
             ..ServerConfig::default()
@@ -7084,7 +7179,7 @@ pub(super) mod multi_endpoint_discovery_tests {
         let board = dir.path().join("requested.kicad_pcb");
         std::fs::write(&board, "").unwrap();
         let configured = dir.path().join("configured.sock");
-        drop(std::os::unix::net::UnixListener::bind(&configured).unwrap());
+        create_stale_socket(&configured);
         let editor = format!("ipc://{}", dir.path().join("api.sock").display());
         let _editor = MockIpcServer::spawn_at(editor, pcb_editor_response(board_document(&board)));
         let handler = McpHandler::new(ServerConfig {
@@ -7193,8 +7288,7 @@ pub(super) mod multi_endpoint_discovery_tests {
 
         // 5. Stale socket left behind by an exited KiCad: adopted by metadata
         //    on the next call, then Ping proves it is not responsive.
-        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
-        drop(listener);
+        create_stale_socket(&sock_path);
         assert!(sock_path.exists(), "sanity: stale socket file remains");
 
         let (is_error, stale) = call_served(&handler, 8, "check_kicad_ui", json!({})).await;
