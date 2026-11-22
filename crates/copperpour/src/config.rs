@@ -1,8 +1,83 @@
-use anyhow::Result;
-use copperpour_core::config_resolution::ConfigResolution;
+use copperpour_core::config_resolution::{ConfigResolution, ConfigSource};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
+
+/// Where a configuration file load originated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigLoadOrigin {
+    ExplicitPath,
+    SearchPath,
+}
+
+impl ConfigLoadOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitPath => "explicit_path",
+            Self::SearchPath => "search_path",
+        }
+    }
+}
+
+/// Structured classification for startup configuration load failures.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConfigLoadError {
+    #[error("configuration path must not be empty ({})", .origin.as_str())]
+    EmptyPath { origin: ConfigLoadOrigin },
+    #[error("configuration file '{}' ({}) was not found: {detail}", .path.display(), .origin.as_str())]
+    NotFound {
+        origin: ConfigLoadOrigin,
+        path: PathBuf,
+        detail: String,
+    },
+    #[error("configuration file '{}' ({}) could not be read: {detail}", .path.display(), .origin.as_str())]
+    Unreadable {
+        origin: ConfigLoadOrigin,
+        path: PathBuf,
+        detail: String,
+    },
+    #[error("configuration file '{}' ({}) is not valid JSON: {detail}", .path.display(), .origin.as_str())]
+    MalformedJson {
+        origin: ConfigLoadOrigin,
+        path: PathBuf,
+        detail: String,
+    },
+    #[error("configuration file '{}' ({}) is not valid TOML: {detail}", .path.display(), .origin.as_str())]
+    MalformedToml {
+        origin: ConfigLoadOrigin,
+        path: PathBuf,
+        detail: String,
+    },
+}
+
+/// Log which configuration file configured the running process.
+///
+/// Shared by both the standalone binary and the embedded plugin entry point so
+/// startup provenance is reported identically before the first tool call.
+pub fn log_config_resolution(config_resolution: &ConfigResolution) {
+    match (
+        config_resolution.source(),
+        config_resolution.selected_path(),
+    ) {
+        // An explicit path bypasses discovery, so a count of "later
+        // candidates" would claim a search ran that never did.
+        (ConfigSource::ExplicitPath, Some(path)) => info!(
+            "configuration: explicit_path from {} (search list not consulted)",
+            path.display(),
+        ),
+        (_, Some(path)) => info!(
+            skipped_existing_paths = ?config_resolution.skipped_existing_paths(),
+            "configuration: {} from {} ({} later candidate(s) exist and were not merged)",
+            config_resolution.source().as_str(),
+            path.display(),
+            config_resolution.skipped_existing_paths().len(),
+        ),
+        (_, None) => info!(
+            "configuration: {} (no configuration file was loaded)",
+            config_resolution.source().as_str(),
+        ),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -232,8 +307,8 @@ impl Config {
     /// `main.rs`, and `ffi.rs` silently ignoring KICAD_API_SOCKET until the
     /// same fix reached it.
     pub fn load_resolved(
-        path: Option<&std::path::Path>,
-    ) -> Result<(Self, IpcAddressSource, ConfigResolution)> {
+        path: Option<&Path>,
+    ) -> std::result::Result<(Self, IpcAddressSource, ConfigResolution), ConfigLoadError> {
         match path {
             Some(path) => {
                 let mut config = Self::load_from(path)?;
@@ -253,12 +328,12 @@ impl Config {
     /// selected file is an error rather than permission to fall through to a
     /// later one, no candidates means defaults, and the environment fallback is
     /// applied after file or default resolution.
-    fn load() -> Result<(Self, IpcAddressSource, ConfigResolution)> {
+    fn load() -> std::result::Result<(Self, IpcAddressSource, ConfigResolution), ConfigLoadError> {
         let (selected, skipped) = select_config_candidate(&default_config_paths());
 
         let (mut config, resolution) = match selected {
             Some(path) => {
-                let config = Self::load_from(&path)?;
+                let config = Self::load_from_with_origin(&path, ConfigLoadOrigin::SearchPath)?;
                 (config, ConfigResolution::search_path(&path, &skipped))
             }
             None => (Self::default(), ConfigResolution::defaults()),
@@ -307,20 +382,48 @@ impl Config {
     }
 
     /// Load config from a specific file path. Auto-detects JSON vs TOML by extension.
-    pub fn load_from(path: &std::path::Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)?;
+    pub fn load_from(path: &Path) -> std::result::Result<Self, ConfigLoadError> {
+        Self::load_from_with_origin(path, ConfigLoadOrigin::ExplicitPath)
+    }
+
+    fn load_from_with_origin(
+        path: &Path,
+        origin: ConfigLoadOrigin,
+    ) -> std::result::Result<Self, ConfigLoadError> {
+        if path.as_os_str().is_empty() {
+            return Err(ConfigLoadError::EmptyPath { origin });
+        }
+
+        let content = std::fs::read_to_string(path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                ConfigLoadError::NotFound {
+                    origin,
+                    path: path.to_path_buf(),
+                    detail: err.to_string(),
+                }
+            } else {
+                ConfigLoadError::Unreadable {
+                    origin,
+                    path: path.to_path_buf(),
+                    detail: err.to_string(),
+                }
+            }
+        })?;
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         match ext {
             "json" => {
-                let config: Config = serde_json::from_str(&content)?;
-                Ok(config)
+                serde_json::from_str(&content).map_err(|err| ConfigLoadError::MalformedJson {
+                    origin,
+                    path: path.to_path_buf(),
+                    detail: err.to_string(),
+                })
             }
-            _ => {
-                // Default: TOML
-                let config: Config = toml::from_str(&content)?;
-                Ok(config)
-            }
+            _ => toml::from_str(&content).map_err(|err| ConfigLoadError::MalformedToml {
+                origin,
+                path: path.to_path_buf(),
+                detail: err.to_string(),
+            }),
         }
     }
 }
@@ -812,5 +915,52 @@ mod tests {
         assert!(IpcAddressSource::Unresolved.rediscovers());
         assert!(!IpcAddressSource::Config.rediscovers());
         assert!(!IpcAddressSource::Environment.rediscovers());
+    }
+
+    #[test]
+    fn load_from_classifies_empty_missing_unreadable_and_malformed_configs() {
+        assert_eq!(
+            Config::load_from(Path::new("")).unwrap_err(),
+            ConfigLoadError::EmptyPath {
+                origin: ConfigLoadOrigin::ExplicitPath
+            }
+        );
+
+        let missing = Path::new("does/not/exist-structured.toml");
+        assert!(matches!(
+            Config::load_from(missing).unwrap_err(),
+            ConfigLoadError::NotFound {
+                origin: ConfigLoadOrigin::ExplicitPath,
+                path,
+                ..
+            } if path == missing
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            Config::load_from(dir.path()).unwrap_err(),
+            ConfigLoadError::Unreadable {
+                origin: ConfigLoadOrigin::ExplicitPath,
+                ..
+            }
+        ));
+
+        let bad_json = write_temp("json", "{not json");
+        assert!(matches!(
+            Config::load_from(bad_json.path()).unwrap_err(),
+            ConfigLoadError::MalformedJson {
+                origin: ConfigLoadOrigin::ExplicitPath,
+                ..
+            }
+        ));
+
+        let bad_toml = write_temp("toml", "broken = [[[");
+        assert!(matches!(
+            Config::load_from(bad_toml.path()).unwrap_err(),
+            ConfigLoadError::MalformedToml {
+                origin: ConfigLoadOrigin::ExplicitPath,
+                ..
+            }
+        ));
     }
 }
