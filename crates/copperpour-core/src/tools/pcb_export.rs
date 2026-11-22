@@ -1075,12 +1075,14 @@ async fn handle_export_specctra_dsn(
         return Ok(CallToolResult::error_kind(
             ToolErrorKind::HandlerError {
                 reason: format!(
-                    "custom DRC rules are not supported by the revision-bound SES import: {}",
+                    "{}: {}",
+                    crate::specctra_ses::CUSTOM_RULES_NOT_CARRIED,
                     custom_rules_path.display()
                 ),
             },
             format!(
-                "Specctra export refused: custom DRC rules are not supported by the revision-bound SES import; native export cannot bypass this check ({})",
+                "Specctra export refused: {}; native export cannot bypass this check ({})",
+                crate::specctra_ses::CUSTOM_RULES_NOT_CARRIED,
                 custom_rules_path.display()
             ),
         ));
@@ -1581,7 +1583,13 @@ mod new_export_format_tests {
             crate::mcp::protocol::ToolContent::Text { text } => text,
             _ => panic!("expected text result"),
         };
-        assert!(text.contains("custom DRC rules"), "{text}");
+        assert!(
+            text.contains(
+                "custom DRC rules are not carried to the router, so Copperpour cannot vouch \
+                 for routes against them"
+            ),
+            "{text}"
+        );
     }
 
     #[tokio::test]
