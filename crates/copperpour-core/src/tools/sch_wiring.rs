@@ -637,14 +637,26 @@ pub(crate) fn insert_wire_with_junctions(
     x2: f64,
     y2: f64,
 ) -> String {
-    // Parse existing wires to detect new T-junctions
     let tree = copperpour_sexp::parse_sexp(&content).ok();
-    let mut existing_wires = tree.as_ref().map(extract_wires).unwrap_or_default();
+    let exits = tree
+        .as_ref()
+        .map(crate::tools::junction_exit_points)
+        .unwrap_or_default();
+    insert_wire_with_exits(content, tree.as_ref(), &exits, (x1, y1), (x2, y2))
+}
+
+fn insert_wire_with_exits(
+    content: String,
+    tree: Option<&copperpour_sexp::SexpNode>,
+    exits: &[(f64, f64)],
+    (x1, y1): (f64, f64),
+    (x2, y2): (f64, f64),
+) -> String {
+    let mut existing_wires = tree.map(extract_wires).unwrap_or_default();
 
     // Existing junction positions, so a hit already marked isn't re-inserted
     // (L-bends, and any loop calling this repeatedly, would otherwise double it).
     let existing_junctions = tree
-        .as_ref()
         .map(copperpour_sexp::schematic::extract_junctions)
         .unwrap_or_default();
 
@@ -658,11 +670,7 @@ pub(crate) fn insert_wire_with_junctions(
     };
     existing_wires.push(new_wire);
 
-    let exits = tree
-        .as_ref()
-        .map(crate::tools::junction_exit_points)
-        .unwrap_or_default();
-    let junctions = new_wire_junctions(&existing_wires, &exits, (x1, y1), (x2, y2));
+    let junctions = new_wire_junctions(&existing_wires, exits, (x1, y1), (x2, y2));
 
     let mut c = content;
     c = insert_before_close(&c, &format_wire(x1, y1, x2, y2));
@@ -888,36 +896,16 @@ fn route_between(
             crate::tools::UNRESOLVED_PIN_GEOMETRY
         )])));
     };
-    let from = (x1, y1);
-    let to = (x2, y2);
-    let straight = [from, to];
-    let horizontal = [from, (x2, y1), to];
-    let vertical = [from, (x1, y2), to];
-    let prefer_vertical = !aligned && vertical_elbow_is_clearer(&before, horizontal, vertical);
-    let bends: &[(&str, &[(f64, f64)])] = if aligned {
-        &[("straight", &straight)]
-    } else if prefer_vertical {
-        &[
-            ("vertical-first", &vertical),
-            ("horizontal-first", &horizontal),
-        ]
-    } else {
-        &[
-            ("horizontal-first", &horizontal),
-            ("vertical-first", &vertical),
-        ]
-    };
+    let (bends, prefer_vertical) = ordered_route_paths(&before, (x1, y1), (x2, y2));
     let mut refused = Vec::new();
-    for &(bend, points) in bends {
-        let routed = points.windows(2).fold(content.to_owned(), |c, leg| {
-            insert_wire_with_junctions(c, leg[0].0, leg[0].1, leg[1].0, leg[1].1)
-        });
+    for (bend, points) in bends {
+        let routed = draw_route(content, &points);
         match guard.refusal(&format!("{bend} route"), &routed)? {
             Some(reason) => refused.push(reason),
             None => {
                 return Ok(Ok(Routed {
                     content: routed,
-                    path: points.to_vec(),
+                    path: points,
                 }));
             }
         }
@@ -926,6 +914,69 @@ fn route_between(
         refused.reverse();
     }
     Ok(Err(ConnectionRefusal::Unsafe(refused)))
+}
+
+type RoutePaths = Vec<(&'static str, Vec<(f64, f64)>)>;
+
+pub(super) fn ordered_route_paths(
+    tree: &copperpour_sexp::SexpNode,
+    from: (f64, f64),
+    to: (f64, f64),
+) -> (RoutePaths, bool) {
+    let mut bends = route_paths(from, to);
+    let prefer_vertical = match bends.as_slice() {
+        [(_, horizontal), (_, vertical)] => vertical_elbow_is_clearer(
+            tree,
+            [horizontal[0], horizontal[1], horizontal[2]],
+            [vertical[0], vertical[1], vertical[2]],
+        ),
+        _ => false,
+    };
+    if prefer_vertical {
+        bends.reverse();
+    }
+    (bends, prefer_vertical)
+}
+
+pub(super) fn route_paths(from: (f64, f64), to: (f64, f64)) -> RoutePaths {
+    if (from.0 - to.0).abs() < 0.01 || (from.1 - to.1).abs() < 0.01 {
+        vec![("straight", vec![from, to])]
+    } else {
+        vec![
+            ("horizontal-first", vec![from, (to.0, from.1), to]),
+            ("vertical-first", vec![from, (from.0, to.1), to]),
+        ]
+    }
+}
+
+pub(super) fn draw_route(content: &str, points: &[(f64, f64)]) -> String {
+    points.windows(2).fold(content.to_owned(), |c, leg| {
+        insert_wire_with_junctions(c, leg[0].0, leg[0].1, leg[1].0, leg[1].1)
+    })
+}
+
+pub(super) fn draw_route_with_drawn_pins(
+    content: &str,
+    points: &[(f64, f64)],
+) -> anyhow::Result<String> {
+    let tree = parse_sexp(content)?;
+    let pins = super::drawn_symbol_pins(&tree)
+        .ok_or_else(|| anyhow::anyhow!(super::UNRESOLVED_PIN_GEOMETRY))?;
+    let exits = super::junction_exits(
+        &pins,
+        copperpour_sexp::schematic::extract_sheet_pins(&tree),
+        super::sch_connectivity::bus_entry_wire_ends(
+            &tree,
+            &copperpour_sexp::schematic::extract_buses(&tree),
+            super::sch_connectivity::COINCIDENT_TOLERANCE,
+        ),
+    );
+    let mut content = content.to_owned();
+    for leg in points.windows(2) {
+        let tree = parse_sexp(&content)?;
+        content = insert_wire_with_exits(content, Some(&tree), &exits, leg[0], leg[1]);
+    }
+    Ok(content)
 }
 
 fn vertical_elbow_is_clearer(
@@ -992,7 +1043,7 @@ pub(crate) fn route_blocked(operation: &str, reasons: Vec<String>) -> CallToolRe
 /// What a sheet held before a wire from `from`, built once for every bend or
 /// direction tried. Wire ends are not terminals: a net is joined through what it
 /// carries, and a net of bare wires has nothing to short.
-struct RouteGuard {
+pub(super) struct RouteGuard {
     /// The nets at `from` and `also`, and those of any wire one lies on: a route
     /// ending mid-span is dotted there, so tapping a wire is the caller's ask.
     allowed: Vec<crate::tools::sch_connectivity::NetRoot>,
@@ -1018,6 +1069,15 @@ impl RouteGuard {
         also: &[(f64, f64)],
     ) -> Option<Self> {
         let pins = crate::tools::resolved_placed_pins_by_reference(before)?;
+        Some(Self::with_pins(before, from, also, pins, None))
+    }
+
+    pub(super) fn for_drawn_pins(
+        before: &copperpour_sexp::SexpNode,
+        from: (f64, f64),
+        also: &[(f64, f64)],
+    ) -> Option<Self> {
+        let pins = super::drawn_symbol_pins(before)?;
         Some(Self::with_pins(before, from, also, pins, None))
     }
 
@@ -1114,7 +1174,7 @@ impl RouteGuard {
 
     /// Why the `candidate` sheet in `after` is refused, or `None` when it joins
     /// nothing [`Self::foreign_joins`] reports.
-    fn refusal(&self, candidate: &str, after: &str) -> anyhow::Result<Option<String>> {
+    pub(super) fn refusal(&self, candidate: &str, after: &str) -> anyhow::Result<Option<String>> {
         let joined = self.foreign_joins(&parse_sexp(after)?);
         Ok((!joined.is_empty())
             .then(|| format!("the {candidate} would join {}", joined.join(", "))))
@@ -1369,6 +1429,7 @@ struct IdentifiedPin {
 /// more coarsely — it cannot see one symbol of ten failing to resolve.
 fn identified_pins(
     tree: &copperpour_sexp::SexpNode,
+    resolve: PinResolver,
 ) -> Result<Vec<IdentifiedPin>, NoConnectCarryError> {
     let unresolved = || NoConnectCarryError::Unmappable {
         reason: format!(
@@ -1376,7 +1437,7 @@ fn identified_pins(
             crate::tools::UNRESOLVED_PIN_GEOMETRY
         ),
     };
-    let grouped = crate::tools::resolved_placed_pins_by_reference(tree).ok_or_else(unresolved)?;
+    let grouped = resolve(tree).ok_or_else(unresolved)?;
     let mut pins = Vec::new();
     for (instance, placed) in grouped {
         let symbol_uuid = instance.uuid.clone().ok_or_else(unresolved)?;
@@ -1505,7 +1566,21 @@ pub(crate) fn plan_no_connect_carry(
     before: &copperpour_sexp::SexpNode,
     after: &copperpour_sexp::SexpNode,
 ) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
-    plan_no_connect_carry_with(before, after, true)
+    plan_no_connect_carry_with(
+        before,
+        after,
+        true,
+        super::resolved_placed_pins_by_reference,
+    )
+}
+
+/// Cleanup plans against the drawn sheet, so only selected body-style pins can
+/// own a marker. The legacy placement and replacement tools keep their resolver.
+pub(super) fn plan_drawn_no_connect_carry(
+    before: &copperpour_sexp::SexpNode,
+    after: &copperpour_sexp::SexpNode,
+) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
+    plan_no_connect_carry_with(before, after, true, super::drawn_symbol_pins)
 }
 
 /// Follow a no-connect through a symbol replacement by the identity that the
@@ -1519,13 +1594,21 @@ pub(crate) fn plan_no_connect_carry_for_replacement(
     before: &copperpour_sexp::SexpNode,
     after: &copperpour_sexp::SexpNode,
 ) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
-    plan_no_connect_carry_with(before, after, false)
+    plan_no_connect_carry_with(
+        before,
+        after,
+        false,
+        super::resolved_placed_pins_by_reference,
+    )
 }
+
+type PinResolver = fn(&copperpour_sexp::SexpNode) -> Option<super::PlacedPinsByReference>;
 
 fn plan_no_connect_carry_with(
     before: &copperpour_sexp::SexpNode,
     after: &copperpour_sexp::SexpNode,
     require_same_local_geometry: bool,
+    resolve: PinResolver,
 ) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
     const TOL: f64 = crate::tools::sch_connectivity::COINCIDENT_TOLERANCE;
     let coincident = |a: (f64, f64), b: (f64, f64)| {
@@ -1552,7 +1635,10 @@ fn plan_no_connect_carry_with(
         return Ok(Vec::new());
     }
 
-    let (before_pins, after_pins) = (identified_pins(before)?, identified_pins(after)?);
+    let (before_pins, after_pins) = (
+        identified_pins(before, resolve)?,
+        identified_pins(after, resolve)?,
+    );
 
     let mut carries: Vec<NoConnectCarry> = Vec::new();
     for (uuid, from) in &markers {

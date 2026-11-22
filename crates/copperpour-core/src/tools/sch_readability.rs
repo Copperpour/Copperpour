@@ -16,6 +16,7 @@ pub fn tools() -> Vec<ToolDef> {
         sch_wire_runs::tool_def(),
         compare_tool_def(),
         sch_pin_contacts::definition(),
+        super::sch_cleanup::definition(),
     ]
 }
 
@@ -153,5 +154,13 @@ mod tests {
     #[tokio::test]
     async fn wire_runs_belong_to_readability() {
         assert_readability_route("check_schematic_wire_runs").await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_belongs_to_readability() {
+        assert!(crate::tools::sch_analysis::tools()
+            .iter()
+            .all(|tool| tool.name != "plan_schematic_cleanup"));
+        assert_readability_route("plan_schematic_cleanup").await;
     }
 }

@@ -1,7 +1,7 @@
 //! Compare two snapshots of one saved sheet, independent of the editor.
 
 use super::sch_analysis::{orphan_findings, overlap_findings, ORPHAN_TOLERANCE, OVERLAP_TOLERANCE};
-use super::sch_block_move::snapshot_net_changes;
+use super::sch_block_move::{snapshot_net_changes, NetComparison};
 use super::sch_connectivity::{drawn_net_graph_for, ConnectivityIndex, COINCIDENT_TOLERANCE};
 use super::sch_pin_contacts::default_contact_counts;
 use super::{get_path, invalid_arg, opt_str_list, resolved_placed_pins_by_reference, ToolContext};
@@ -62,7 +62,7 @@ fn term_json(key: &str, number: Option<i64>) -> Value {
     }
 }
 
-struct Score {
+pub(super) struct Score {
     terms: Terms,
     bounds_unresolved: Vec<String>,
     wire_segments: usize,
@@ -89,7 +89,7 @@ fn increment(score: &mut Terms, key: &str) {
     }
 }
 
-fn measure(tree: &SexpNode) -> Score {
+pub(super) fn measure(tree: &SexpNode) -> Score {
     let wires = extract_wires(tree);
     let buses = extract_buses(tree);
     let labels = extract_all_net_labels(tree);
@@ -292,7 +292,20 @@ fn identities(tree: &SexpNode) -> Option<BTreeMap<&str, &SexpNode>> {
     Some(result)
 }
 
-fn gate(before: &SexpNode, after: &SexpNode, requested: &[String]) -> Vec<String> {
+pub(super) fn cleanup_gate(
+    before: &SexpNode,
+    after: &SexpNode,
+    requested: &[String],
+) -> Vec<String> {
+    gate(before, after, requested, NetComparison::Cleanup)
+}
+
+fn gate(
+    before: &SexpNode,
+    after: &SexpNode,
+    requested: &[String],
+    comparison: NetComparison,
+) -> Vec<String> {
     let (Some(was), Some(now)) = (identities(before), identities(after)) else {
         return vec!["a placed symbol has missing or duplicate identity".to_owned()];
     };
@@ -338,7 +351,7 @@ fn gate(before: &SexpNode, after: &SexpNode, requested: &[String]) -> Vec<String
     for uuid in now.keys().filter(|uuid| !was.contains_key(*uuid)) {
         reasons.push(format!("symbol {uuid} was added"));
     }
-    reasons.extend(snapshot_net_changes(before, after, &approved));
+    reasons.extend(snapshot_net_changes(before, after, &approved, comparison));
     reasons
 }
 
@@ -371,7 +384,24 @@ fn verdict(delta: &Terms, reasons: &[String]) -> &'static str {
     }
 }
 
-fn read_sheet(path: &Path) -> Result<SexpNode, CallToolResult> {
+pub(super) fn cleanup_rank(baseline: &Score, tree: &SexpNode) -> Option<[i64; TIERS.len()]> {
+    let delta = measure(tree).delta_from(baseline);
+    (verdict(&delta, &[]) == "improved")
+        .then(|| TIERS.map(|tier| tier.iter().filter_map(|key| delta[key]).sum()))
+}
+
+impl Score {
+    fn delta_from(&self, baseline: &Self) -> Terms {
+        terms()
+            .map(|key| {
+                let change = self.terms[key].zip(baseline.terms[key]);
+                (key, change.map(|(now, was)| now - was))
+            })
+            .collect()
+    }
+}
+
+pub(super) fn read_saved_sheet(path: &Path) -> Result<(String, SexpNode), CallToolResult> {
     // The writers replace atomically; a single open reads one saved version
     // without creating the cooperative lockfile used by read_schematic.
     let malformed = |reason: String| {
@@ -390,12 +420,12 @@ fn read_sheet(path: &Path) -> Result<SexpNode, CallToolResult> {
             format!("Cannot read schematic {}: {err}", path.display()),
         )
     })?;
-    let source = std::str::from_utf8(&bytes).map_err(|err| malformed(err.to_string()))?;
-    let tree = parse_sexp(source).map_err(|err| malformed(err.to_string()))?;
+    let source = String::from_utf8(bytes).map_err(|err| malformed(err.utf8_error().to_string()))?;
+    let tree = parse_sexp(&source).map_err(|err| malformed(err.to_string()))?;
     if tree.head() != Some("kicad_sch") || tree.find_str("version").is_none() {
         return Err(malformed("expected a KiCad schematic sheet".to_owned()));
     }
-    Ok(tree)
+    Ok((source, tree))
 }
 
 pub(super) async fn handle_compare_schematic_layout(
@@ -418,27 +448,22 @@ pub(super) async fn handle_compare_schematic_layout(
             "requires a baseline",
         ));
     }
-    let sheet = match read_sheet(&path) {
-        Ok(sheet) => sheet,
+    let sheet = match read_saved_sheet(&path) {
+        Ok((_, sheet)) => sheet,
         Err(error) => return Ok(error),
     };
     let score = measure(&sheet);
     let (baseline_score, delta, verdict, reasons, not_compared) = if let Some(path) = baseline {
-        let baseline = match read_sheet(&path) {
-            Ok(sheet) => sheet,
+        let baseline = match read_saved_sheet(&path) {
+            Ok((_, sheet)) => sheet,
             Err(error) => return Ok(error),
         };
         let baseline_score = measure(&baseline);
-        let delta: Terms = terms()
-            .map(|key| {
-                let change = score.terms[key].zip(baseline_score.terms[key]);
-                (key, change.map(|(now, was)| now - was))
-            })
-            .collect();
+        let delta = score.delta_from(&baseline_score);
         let not_compared = terms()
             .filter(|key| delta[key].is_none())
             .collect::<Vec<_>>();
-        let reasons = gate(&baseline, &sheet, &removed);
+        let reasons = gate(&baseline, &sheet, &removed, NetComparison::Layout);
         let verdict = verdict(&delta, &reasons);
         let delta: Value = delta
             .iter()
