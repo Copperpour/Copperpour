@@ -72,25 +72,39 @@ fn handle_find_pin_contacts(args: &Value) -> anyhow::Result<CallToolResult> {
     if tree.head() != Some("kicad_sch") {
         return Ok(malformed("expected a kicad_sch document"));
     }
-    let Some(pins) = drawn_symbol_pins(&tree) else {
-        return Ok(malformed(UNRESOLVED_PIN_GEOMETRY));
-    };
     let wires = extract_wires(&tree);
+    let (contacts, short_wires) = match pin_contact_findings(&tree, &wires, min_wire_mm) {
+        Ok(findings) => findings,
+        Err(reason) => return Ok(malformed(reason)),
+    };
+    Ok(CallToolResult::json(&json!({
+        "schematic": path,
+        "contact_count": contacts.len(),
+        "contacts": contacts,
+        "short_wire_count": short_wires.len(),
+        "short_wires": short_wires,
+    })))
+}
+
+pub(super) fn pin_contact_findings(
+    tree: &SexpNode,
+    wires: &[Wire],
+    min_wire_mm: f64,
+) -> Result<(Vec<Value>, Vec<Value>), &'static str> {
+    let pins = drawn_symbol_pins(tree).ok_or(UNRESOLVED_PIN_GEOMETRY)?;
     if wires.len() != tree.find_all("wire").len()
         || wires
             .iter()
             .any(|w| ![w.x1, w.y1, w.x2, w.y2].into_iter().all(f64::is_finite))
     {
-        return Ok(malformed(
-            "one or more wire segments have unreadable endpoints",
-        ));
+        return Err("one or more wire segments have unreadable endpoints");
     }
     if ["label", "global_label", "hierarchical_label"]
         .into_iter()
         .flat_map(|kind| tree.find_all(kind))
         .any(|label| anchor(label).is_none())
     {
-        return Ok(malformed("one or more labels have unreadable anchors"));
+        return Err("one or more labels have unreadable anchors");
     }
     let directives: Option<Vec<_>> = DIRECTIVE_TAGS
         .into_iter()
@@ -103,29 +117,28 @@ fn handle_find_pin_contacts(args: &Value) -> anyhow::Result<CallToolResult> {
         })
         .collect();
     let Some(directives) = directives else {
-        return Ok(malformed(
-            "one or more directive labels have unreadable anchors",
-        ));
+        return Err("one or more directive labels have unreadable anchors");
     };
-    let labels = extract_labels(&tree);
-    let buses = extract_buses(&tree);
+    let labels = extract_labels(tree);
+    let buses = extract_buses(tree);
     let index = ConnectivityIndex::with_placed_pins(
-        &tree,
-        &wires,
+        tree,
+        wires,
         &buses,
         &labels,
         COINCIDENT_TOLERANCE,
         pins,
     );
-    let contacts = pin_contacts(&index, &wires, &directives);
-    let short_wires = short_pin_wires(&index, &wires, &directives, min_wire_mm);
-    Ok(CallToolResult::json(&json!({
-        "schematic": path,
-        "contact_count": contacts.len(),
-        "contacts": contacts,
-        "short_wire_count": short_wires.len(),
-        "short_wires": short_wires,
-    })))
+    Ok((
+        pin_contacts(&index, wires, &directives),
+        short_pin_wires(&index, wires, &directives, min_wire_mm),
+    ))
+}
+
+pub(super) fn default_contact_counts(tree: &SexpNode, wires: &[Wire]) -> Option<(usize, usize)> {
+    pin_contact_findings(tree, wires, DEFAULT_MIN_WIRE_MM)
+        .ok()
+        .map(|(contacts, short_wires)| (contacts.len(), short_wires.len()))
 }
 
 fn near(a: Point, b: Point) -> bool {

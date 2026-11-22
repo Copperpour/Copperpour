@@ -70,6 +70,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "list_schematic_components",
     // sch_analysis
     "check_schematic_overlaps",
+    "compare_schematic_layout",
     "find_orphan_items",
     "find_pin_contacts",
     "find_shorted_nets",

@@ -201,6 +201,7 @@ pub(crate) fn pt_key(x: f64, y: f64) -> (i64, i64) {
 struct NetName {
     name: String,
     kind: LabelKind,
+    power_local: bool,
 }
 
 /// KiCad's net-name precedence, highest first: a global label outranks a power
@@ -225,13 +226,14 @@ fn driver_priority(kind: LabelKind) -> u8 {
 /// net gave `AAA` over `LOCAL_VCC`, and `LOCAL_VCC` over `ZZZ`).
 fn names_ahead_of(a: &NetName, b: &NetName) -> bool {
     let (pa, pb) = (driver_priority(a.kind), driver_priority(b.kind));
-    pa > pb || (pa == pb && a.name < b.name)
+    pa > pb || (pa == pb && (&a.name, a.power_local) < (&b.name, b.power_local))
 }
 
 /// A net's identity: the union-find root every point on that net resolves to.
 ///
 /// Distinct from a net *name*, which a net may have several of or none at all.
 pub(crate) type NetRoot = (i64, i64);
+pub(super) type ScopedNetName = (String, u8);
 
 /// A graph of points joined into nets, and the name each net carries.
 ///
@@ -249,7 +251,7 @@ pub(crate) struct NetGraph {
     point_nets: HashMap<(i64, i64), Vec<NetName>>,
     parent: HashMap<(i64, i64), NetRoot>,
     /// The winning name per root, resolved once at the end of seeding.
-    root_names: HashMap<NetRoot, String>,
+    root_names: HashMap<NetRoot, NetName>,
     /// Every name on each root, sorted. A caller classifying a net — is this a
     /// rail? is it ground? — must read all of them: the winning name can be a
     /// global label that says nothing about the `+3V3` alias beside it.
@@ -298,16 +300,24 @@ impl NetGraph {
     }
 
     fn add_label(&mut self, x: f64, y: f64, net: &str, kind: LabelKind) {
+        self.add_driver(x, y, net, kind, false);
+    }
+
+    fn add_driver(&mut self, x: f64, y: f64, net: &str, kind: LabelKind, power_local: bool) {
         let k = pt_key(x, y);
         self.ensure(k);
         let held = self.point_nets.entry(k).or_default();
         // Kept whole, and ranked only when a name has to be *chosen*: every
         // name at this point still has to reach `merge_named_nets`, or a net
         // joined to this one by the losing name would stay a net of its own.
-        if !held.iter().any(|name| name.name == net) {
+        if !held
+            .iter()
+            .any(|name| name.name == net && name.kind == kind && name.power_local == power_local)
+        {
             held.push(NetName {
                 name: net.to_string(),
                 kind,
+                power_local,
             });
         }
     }
@@ -334,7 +344,29 @@ impl NetGraph {
     /// the same binary and the audits reported the losing name as a rail of its
     /// own.
     pub(crate) fn name_of_root(&self, root: NetRoot) -> Option<String> {
-        self.root_names.get(&root).cloned()
+        self.root_names.get(&root).map(|name| name.name.clone())
+    }
+
+    pub(super) fn scoped_name_of_root(&self, root: NetRoot) -> Option<ScopedNetName> {
+        self.root_names.get(&root).map(scoped_name)
+    }
+
+    /// The winner and each scoped alias on its net. Roots are local to one
+    /// snapshot; comparing these pairs also covers nets without placed pins.
+    pub(super) fn named_net_aliases(&mut self) -> BTreeSet<(ScopedNetName, ScopedNetName)> {
+        let points: Vec<_> = self.point_nets.keys().copied().collect();
+        let mut aliases = BTreeSet::new();
+        for point in points {
+            let root = self.find(point);
+            if let Some(winner) = self.scoped_name_of_root(root) {
+                aliases.extend(
+                    self.point_nets[&point]
+                        .iter()
+                        .map(|name| (winner.clone(), scoped_name(name))),
+                );
+            }
+        }
+        aliases
     }
 
     /// Every name on the net at `root`, sorted, empty when nothing names it.
@@ -401,10 +433,7 @@ impl NetGraph {
                 }
             }
         }
-        self.root_names = best
-            .into_iter()
-            .map(|(root, name)| (root, name.name))
-            .collect();
+        self.root_names = best;
         self.root_aliases = aliases;
     }
 
@@ -443,6 +472,16 @@ impl NetGraph {
     }
 }
 
+fn scoped_name(name: &NetName) -> (String, u8) {
+    let scope = match name.kind {
+        LabelKind::PowerSymbol if name.power_local => 1,
+        LabelKind::GlobalLabel | LabelKind::PowerSymbol => 0,
+        LabelKind::NetLabel => 1,
+        LabelKind::HierarchicalLabel => 2,
+    };
+    (name.name.clone(), scope)
+}
+
 /// Seed a graph from the terminals that name and join nets. Both
 /// [`net_graph_for`] and [`ConnectivityIndex::net_graph`] come through here, so
 /// the two cannot answer differently.
@@ -459,6 +498,19 @@ impl NetGraph {
 /// that pin carries, inventing a short KiCad does not see. Registering the
 /// point is still worth doing, so a query at a sheet pin resolves its net.
 fn seed_net_graph(
+    wires: &[Wire],
+    labels: &[Label],
+    junctions: &[(f64, f64)],
+    sheet_pins: &[(f64, f64)],
+    on_wire: &WireIndex,
+) -> NetGraph {
+    let mut graph = seed_drawn_graph(wires, labels, junctions, sheet_pins, on_wire);
+    graph.merge_named_nets();
+    graph.name_nets();
+    graph
+}
+
+fn seed_drawn_graph(
     wires: &[Wire],
     labels: &[Label],
     junctions: &[(f64, f64)],
@@ -485,8 +537,6 @@ fn seed_net_graph(
     for &(x, y) in sheet_pins {
         graph.ensure(pt_key(x, y));
     }
-    graph.merge_named_nets();
-    graph.name_nets();
     graph
 }
 
@@ -524,6 +574,57 @@ pub(crate) fn net_graph_for(tree: &SexpNode, wires: &[Wire], labels: &[Label]) -
         &extract_sheet_pins(tree),
         &WireIndex::build(wires, COINCIDENT_TOLERANCE),
     )
+}
+
+/// Drawn nodes, before separate wire islands are joined by name. Power
+/// symbols are queried as pins, not attached mid-span as labels.
+pub(super) fn drawn_net_graph_for(tree: &SexpNode, wires: &[Wire], labels: &[Label]) -> NetGraph {
+    seed_drawn_graph(
+        wires,
+        labels,
+        &extract_junctions(tree),
+        &extract_sheet_pins(tree),
+        &WireIndex::build(wires, COINCIDENT_TOLERANCE),
+    )
+}
+
+/// Power labels name their pin's node. They do not attach that pin to an
+/// unsplit wire crossed without a junction.
+pub(super) fn snapshot_net_graph(tree: &SexpNode, wires: &[Wire]) -> NetGraph {
+    use copperpour_sexp::schematic::{
+        extract_labels, extract_power_symbol_labels, find_lib_symbol,
+    };
+
+    let labels = extract_labels(tree);
+    let mut graph = drawn_net_graph_for(tree, wires, &labels);
+    let lib_symbols = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    let mut local_power = HashSet::new();
+    for (inst, pins) in crate::tools::placed_pins_by_reference(tree) {
+        if let Some(power) = find_lib_symbol(&lib_symbols, &inst).and_then(|lib| lib.find("power"))
+        {
+            if power.get(1).and_then(SexpNode::as_str) == Some("local") {
+                local_power.extend(inst.uuid);
+            }
+        } else {
+            for (pin, transform) in pins {
+                if pin.hidden && pin.electrical_type == "power_in" {
+                    let (x, y) = pin_endpoint(&pin, transform);
+                    let name = super::sch_label_rename::stored_name(&pin.name);
+                    graph.add_driver(x, y, &name, LabelKind::PowerSymbol, false);
+                }
+            }
+        }
+    }
+    for label in extract_power_symbol_labels(tree) {
+        let local = label.uuid.is_some_and(|uuid| local_power.contains(&uuid));
+        graph.add_driver(label.x, label.y, &label.net, label.kind, local);
+    }
+    graph.merge_named_nets();
+    graph.name_nets();
+    graph
 }
 
 // ─── Nets named after a pin ───────────────────────────────────────────────────

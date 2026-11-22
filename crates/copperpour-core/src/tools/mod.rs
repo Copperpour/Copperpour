@@ -99,6 +99,7 @@ pub mod sch_export;
 pub mod sch_hierarchy;
 mod sch_instance_repair;
 mod sch_label_rename;
+mod sch_layout_score;
 mod sch_pin_contacts;
 mod sch_shapes;
 mod sch_texts;
