@@ -14,7 +14,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **26 toolsets** organized into 10 categories
-- **257 registered tools** + **7 always-visible meta-tools** = **264 total**
+- **281 registered tools** + **9 always-visible meta-tools** = **290 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<copperpour dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -180,7 +180,7 @@ and Windows servers do not.
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings, pins, and label and field text (excluding free text), and wires drawn through a symbol body, with a reported origin fallback when geometry is unavailable. |
 
-### `sch_batch` · 16 tools
+### `sch_batch` · 19 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call; add, list, edit and delete free text items; add and list graphic shapes.
 **Source:** [`crates/copperpour-core/src/tools/sch_batch.rs`](crates/copperpour-core/src/tools/sch_batch.rs)
 
@@ -224,7 +224,7 @@ and Windows servers do not.
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A part whose footprint cannot be placed or rebuilt, lacks a connected pad, or would lose what KiCad's API drops is skipped and listed under `skipped_footprints` in the dry run and the apply, and every other part is still synced; with nothing else to apply, the dry run is a conflict. A footprint the schematic names differently is replaced in place, as KiCad's Update PCB replaces it; a locked one keeps its footprint with a note. A pad net change on a net routed copper uses is a `routed_pad_net_change` conflict until `acknowledged_net_changes` names it; the apply of that plan then reports each named net's routed copper and DRC. |
 
-### `sch_hierarchy` · 17 tools
+### `sch_hierarchy` · 18 tools
 **Purpose:** Sheet files and hierarchical sheets: create a schematic file and set its page
 size and title block, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering
 queries, stale symbol instance record repair, moving circuit objects between sheets,
@@ -283,7 +283,7 @@ import/add/edit/delete sheet pins, net label renames, pin/label sync validation.
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 | `set_footprint_field` | Add or update a custom field (LCSC, MPN, …) on a placed footprint via KiCAD IPC. Refuses the mandatory fields; a new field is hidden by default and sits on the footprint's Fab layer. One undo step; the response is a fresh read-back. |
 
-### `pcb_text` · 4 tools
+### `pcb_text` · 5 tools
 **Purpose:** List and edit placed board text and footprint reference/value fields in place.
 **Source:** [`crates/copperpour-core/src/tools/pcb_text.rs`](crates/copperpour-core/src/tools/pcb_text.rs)
 
@@ -359,7 +359,7 @@ Live `move_component`, `rotate_component`, `set_component_placements`, `align_co
 | `delete_netclass` | Delete a netclass, or one `netclass_patterns` entry by its exact text, in the `.kicad_pro`, as Board Setup does: a deleted class's patterns move to `Default`, and `Default` cannot be deleted. Schematic netclass labels are reported, not edited. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
 
-### `pcb_copper` · 1 tool
+### `pcb_copper` · 4 tools
 **Purpose:** Copper edits on the board open in KiCad: create tracks and vias, batch-move existing vias, and read or set native pad and via teardrops.
 **Source:** [`crates/copperpour-core/src/tools/pcb_copper.rs`](crates/copperpour-core/src/tools/pcb_copper.rs)
 
@@ -370,7 +370,7 @@ Live `move_component`, `rotate_component`, `set_component_placements`, `align_co
 | `get_teardrop_settings` | Read KiCad's native teardrop settings of the pads and vias on the board open in KiCad 10.0.7 or newer, with each item's UUID, reference, pad number, net and position, the board's teardrop zones by net, and whether it uses legacy teardrops. Filters: `references` (pads only), `nets`, `kinds`; `limit` bounds the list, with `total` and `truncated`. Older or unknown KiCad versions are `unsupported_capability`. |
 | `set_teardrop_settings` | Enable, adjust or disable native teardrops on selected pads and vias in one KiCad undo step, without saving. `targets` is the union of `pads` (`{reference, pad_number}` or `{uuid}`), `vias` (UUIDs), `references` (their pads), `nets` (pads and vias), `all_pads` and `all_vias`; a selector that matches nothing refuses the call. Omitted `settings` fields keep their value; both length limits take `null` for no limit. KiCad rebuilds the edited items' teardrops in that step. `refill_zones` (default `false`) requests a board-wide refill afterwards; the copper read after the request does not prove the queued fill finished. Pad edits send the whole footprint back, as `set_pad_net` does. Item readback lists the teardrop fields changed in `verified_changes`. An additional comparison of the full board text can detect changes missing from item readback, including [lost footprint unit metadata](docs/TROUBLESHOOTING.md#footprint-unit-metadata-disappears-after-a-live-pcb-edit) on KiCad 10.0.7. Unexpected changes return `mutation_outcome_uncertain` after the commit. Reports commit copper and copper observed after the refill request separately; `dry_run` writes nothing. Refuses KiCad before 10.0.7 or of unknown version (`unsupported_capability`), legacy-teardrop boards and pads of footprints that own groups (`plan_blocked`), with nothing written. |
 
-### `placement` · 5 tools
+### `placement` · 7 tools
 **Purpose:** Placement quality and automation — score, plan decoupling rows, plan BGA fanouts; every plan reports its own before/after score.
 **Source:** [`crates/copperpour-core/src/tools/placement.rs`](crates/copperpour-core/src/tools/placement.rs)
 
@@ -386,7 +386,7 @@ Live `move_component`, `rotate_component`, `set_component_placements`, `align_co
 
 ---
 
-### `pcb_export` · 14 tools
+### `pcb_export` · 15 tools
 **Purpose:** Gerber, PDF, SVG, 3D model, BOM, revision-bound Specctra DSN, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++.
 **Source:** [`crates/copperpour-core/src/tools/pcb_export.rs`](crates/copperpour-core/src/tools/pcb_export.rs)
 
@@ -412,7 +412,7 @@ Live `move_component`, `rotate_component`, `set_component_placements`, `align_co
 
 ## Library
 
-### `library` · 19 tools
+### `library` · 20 tools
 **Purpose:** Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models.
 **Source:** [`crates/copperpour-core/src/tools/library.rs`](crates/copperpour-core/src/tools/library.rs)
 
@@ -441,7 +441,7 @@ Live `move_component`, `rotate_component`, `set_component_placements`, `align_co
 
 ---
 
-### `library_maintenance`
+### `library_maintenance` · 3 tools
 **Purpose:** Maintain library files as a whole: upgrade their file format with content checked, and rename library symbols and footprints.
 **Source:** [`crates/copperpour-core/src/tools/library_upgrade.rs`](crates/copperpour-core/src/tools/library_upgrade.rs), [`crates/copperpour-core/src/tools/footprint_rename.rs`](crates/copperpour-core/src/tools/footprint_rename.rs), [`crates/copperpour-core/src/tools/symbol_rename.rs`](crates/copperpour-core/src/tools/symbol_rename.rs)
 
@@ -453,7 +453,7 @@ Live `move_component`, `rotate_component`, `set_component_placements`, `align_co
 
 ---
 
-### `model_3d`
+### `model_3d` · 1 tool
 **Purpose:** Generate approximate package STEP geometry without an external CAD runtime.
 **Source:** [`crates/copperpour-core/src/tools/model_3d.rs`](crates/copperpour-core/src/tools/model_3d.rs)
 
@@ -490,7 +490,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ## Verification
 
-### `verification` · 12 tools
+### `verification` · 15 tools
 **Purpose:** DRC and its checks' severities, design rules, layer constraints, clearance checks, KiCAD UI control. ERC lives in `sch_export` (`run_erc`), not here.
 **Source:** [`crates/copperpour-core/src/tools/verification.rs`](crates/copperpour-core/src/tools/verification.rs)
 
