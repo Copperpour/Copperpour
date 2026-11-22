@@ -71,6 +71,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     // sch_analysis
     "check_schematic_overlaps",
     "find_orphan_items",
+    "find_pin_contacts",
     "find_shorted_nets",
     "find_single_pin_nets",
     "get_component_nets",

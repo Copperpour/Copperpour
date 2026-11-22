@@ -97,6 +97,7 @@ pub mod sch_export;
 pub mod sch_hierarchy;
 mod sch_instance_repair;
 mod sch_label_rename;
+mod sch_pin_contacts;
 mod sch_shapes;
 mod sch_texts;
 mod sch_transfer;
@@ -2626,6 +2627,41 @@ fn placed_symbols_with_pins(
                     .collect()
             });
             (inst, pins)
+        })
+        .collect()
+}
+
+pub(crate) fn symbol_body_style(node: &copperpour_sexp::SexpNode) -> u32 {
+    node.find_str("body_style")
+        .or_else(|| node.find_str("convert"))
+        .and_then(|style| style.parse().ok())
+        .unwrap_or(1)
+}
+
+/// Resolve the pins actually drawn by the selected unit and body style.
+fn drawn_symbol_pins(tree: &copperpour_sexp::SexpNode) -> Option<PlacedPinsByReference> {
+    use copperpour_sexp::schematic::{
+        find_lib_symbol, resolve_lib_pins_for_unit_and_body_style, symbol_instance,
+    };
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|n| n.find_all("symbol"))
+        .unwrap_or_default();
+    tree.find_all("symbol")
+        .into_iter()
+        .map(|node| {
+            let inst = symbol_instance(node)?;
+            if ![inst.x, inst.y, inst.rotation]
+                .into_iter()
+                .all(f64::is_finite)
+            {
+                return None;
+            }
+            let lib = find_lib_symbol(&lib_syms, &inst)?;
+            let transform = inst.pin_transform();
+            let pins =
+                resolve_lib_pins_for_unit_and_body_style(lib, inst.unit, symbol_body_style(node))?;
+            Some((inst, pins.into_iter().map(|pin| (pin, transform)).collect()))
         })
         .collect()
 }
