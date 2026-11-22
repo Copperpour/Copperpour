@@ -1,0 +1,66 @@
+(kicad_sch
+	(version 20260306)
+	(generator "eeschema")
+	(generator_version "10.0")
+	(uuid "f9f25157-e6c5-420e-9fe2-78988a232029")
+	(paper "A4")
+	(lib_symbols)
+	(text "Automatic pen"
+		(exclude_from_sim no)
+		(at 40 110 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.0001)
+			)
+			(justify left bottom)
+		)
+		(uuid "28de3046-1bf1-4966-aeb6-d96978a9776c")
+	)
+	(text "Thin stroke"
+		(exclude_from_sim no)
+		(at 40 55 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.005)
+			)
+			(justify left top)
+		)
+		(uuid "300b83bb-96da-423f-87fe-49615424e197")
+	)
+	(text "Ends here\n"
+		(exclude_from_sim no)
+		(at 40 40 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "36a0fd8c-f260-4ea5-829b-5abd8a7e62a1")
+	)
+	(text "Expression @{1 + 2}"
+		(exclude_from_sim no)
+		(at 40 95 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "3cc63106-5143-40c8-9ead-13ffa877ca9a")
+	)
+	(text "Custom pen"
+		(exclude_from_sim no)
+		(at 40 75 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.3)
+			)
+			(justify right top)
+		)
+		(uuid "932cd07d-e05f-4811-b049-a90e9a2b2ba7")
+	)
+)
