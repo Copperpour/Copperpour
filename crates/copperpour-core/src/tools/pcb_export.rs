@@ -177,7 +177,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "output_dir"]
             }),
             |args, ctx| async move { handle_export_gerber(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "export_pdf",
             "Export the PCB layout to a PDF file using kicad-cli.",
@@ -196,7 +197,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "output"]
             }),
             |args, ctx| async move { handle_export_pdf(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "export_svg",
             "Export the PCB layout to an SVG file using kicad-cli.",
@@ -215,7 +217,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "output"]
             }),
             |args, ctx| async move { handle_export_svg(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "export_3d",
             "Export the PCB as a 3D model (STEP or VRML) using kicad-cli.",
@@ -238,7 +241,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "output"]
             }),
             |args, ctx| async move { handle_export_3d(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "check_3d_models",
             "Audit placed footprints in the saved .kicad_pcb file (unsaved editor changes are not included) for missing 3D models or broken/unresolvable model file paths before export_3d. Includes hidden models; embedded models are resolved from footprint or board embedded_files.",
@@ -252,7 +256,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_check_3d_models(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::SavedSnapshot),
         tool!(
             "export_bom",
             "Generate a Bill of Materials (BOM) CSV from the schematic's component data.",
@@ -310,7 +315,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "output"]
             }),
             |args, ctx| async move { handle_export_netlist(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "export_specctra_dsn",
             "Export a revision-bound Specctra DSN plus reverse manifest from the exact live \
@@ -354,7 +360,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "output"]
             }),
             |args, ctx| async move { handle_export_specctra_dsn(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "export_position_file",
             "Generate a component placement (pick-and-place) position file for SMT assembly. \
@@ -386,7 +393,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "output"]
             }),
             |args, ctx| async move { handle_export_position_file(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "export_dxf",
             "Export the PCB to DXF using kicad-cli, one file per requested layer. \
@@ -405,7 +413,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "output_dir", "layers"]
             }),
             |args, ctx| async move { handle_export_dxf(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "export_gencad",
             "Export the PCB in GenCAD format using kicad-cli. GenCAD is accepted by some \
@@ -419,7 +428,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "output"]
             }),
             |args, ctx| async move { handle_export_gencad(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "export_ipc2581",
             "Export the PCB in IPC-2581 format using kicad-cli. IPC-2581 is a unified \
@@ -436,7 +446,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "output"]
             }),
             |args, ctx| async move { handle_export_ipc2581(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "export_odb",
             "Export the PCB in ODB++ format using kicad-cli. ODB++ is a unified fabrication \
@@ -452,7 +463,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "output"]
             }),
             |args, ctx| async move { handle_export_odb(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "refill_zones",
             "Refill all copper pour zones on the board. KiCad IPC refills the complete board; per-zone selection is not available. Requires a running KiCad instance with IPC enabled.",
@@ -464,7 +476,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_refill_zones(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "get_drc_violations",
             "Run the Design Rule Check (DRC) on the PCB and return a list of violations. \
@@ -489,7 +502,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_drc_violations(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::CliSaved),
     ]
 }
 

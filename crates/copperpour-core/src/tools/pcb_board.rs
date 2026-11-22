@@ -1402,7 +1402,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_board_info(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::MixedSource),
         tool!(
             "set_board_title_block",
             "Set fields of the board's title block, which ${TITLE}, ${ISSUE_DATE}, \
@@ -1484,7 +1485,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_get_layer_list(args, ctx).await }
         )
-        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
+        .with_board_access(crate::tools::BoardAccess::MixedSource),
         tool!(
             "add_layer",
             "Add a new inner copper or technical layer to the board layer stack.",
@@ -1512,7 +1513,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "layer"]
             }),
             |args, ctx| async move { handle_set_active_layer(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::Unsupported),
         tool!(
             "add_board_outline",
             "Add a rectangular board outline on Edge.Cuts, optionally using circular rounded \
@@ -2840,7 +2842,7 @@ mod active_layer_refusal_tests {
             .find(|tool| tool.name == "set_active_layer")
             .expect("registered tool");
 
-        assert_eq!(tool.board_access, BoardAccess::None);
+        assert_eq!(tool.board_access, BoardAccess::Unsupported);
         assert!(tool.description.contains("unsupported_capability"));
         assert!(tool.description.contains("never writes"));
         assert!(!tool.description.contains("recorded in the board file"));

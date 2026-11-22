@@ -78,7 +78,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "output_dir"]
             }),
             |args, ctx| async move { handle_export_manufacturing_package(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::MixedSource),
         tool!(
             "validate_for_manufacturing",
             "Pre-flight check before ordering: verifies the design is ready for the target \
@@ -103,7 +104,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_validate_for_manufacturing(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::CliSaved),
         tool!(
             "estimate_cost",
             "Estimate the total manufacturing cost for PCB fabrication and assembly at a given fab house. \
@@ -134,7 +136,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_estimate_cost(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::SavedSnapshot),
         #[cfg(feature = "jlcpcb")]
         tool!(
             "generate_jlcpcb_order_link",
@@ -165,7 +168,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_generate_jlcpcb_order_link(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::MixedSource),
     ]
 }
 

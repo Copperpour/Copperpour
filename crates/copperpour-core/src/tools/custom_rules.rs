@@ -257,6 +257,7 @@ pub(super) fn tool() -> ToolDef {
         }),
         |args, ctx| async move { handle_set_custom_rule(args, ctx).await }
     )
+    .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly)
 }
 
 pub(super) fn delete_tool() -> ToolDef {
@@ -279,6 +280,7 @@ pub(super) fn delete_tool() -> ToolDef {
         }),
         |args, ctx| async move { handle_delete_custom_rule(args, ctx).await }
     )
+    .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly)
 }
 
 pub(super) fn list_tool() -> ToolDef {
@@ -301,6 +303,7 @@ pub(super) fn list_tool() -> ToolDef {
         }),
         |args, ctx| async move { handle_list_custom_rules(args, ctx).await }
     )
+    .with_board_access(crate::tools::BoardAccess::SavedSnapshot)
 }
 
 /// One constraint of the requested rule.

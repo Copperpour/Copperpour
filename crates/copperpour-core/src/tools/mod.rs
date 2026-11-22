@@ -155,23 +155,71 @@ pub struct ToolDef {
     pub board_access: BoardAccess,
 }
 
-/// The board-state contract of a tool.
+/// The board-state source and access contract of a registered tool.
+///
+/// Every registered tool whose input schema accepts a `board` parameter must
+/// declare a non-[`BoardAccess::None`] variant, and tools without a `board`
+/// parameter must keep [`BoardAccess::None`]. Client hooks
+/// (`crates/copperpour/src/manifest.rs`) and contract tests derive from this
+/// single executable inventory rather than maintaining separate lists.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BoardAccess {
-    /// The tool does not need board-state guidance.
+    /// The tool does not accept a `board` parameter.
     #[default]
     None,
-    /// The requested board must be open in a reachable KiCad instance.
+    /// The requested board must be open in a reachable KiCad instance (IPC only).
     LiveOnly,
-    /// Live IPC is preferred, with a guarded file fallback only when KiCad is
-    /// unreachable and the board is safe to edit offline.
+    /// Live IPC is preferred for the exact open board, with a guarded saved-file
+    /// fallback when KiCad is unreachable or does not hold this board.
     LivePreferredWithFallback,
-    /// The operation writes the file directly and therefore requires KiCad to
-    /// have the board closed.
+    /// Reads the saved `.kicad_pcb` (or sibling `.kicad_pro` / `.kicad_dru`)
+    /// file directly without querying KiCad IPC; unsaved editor changes are
+    /// excluded.
+    SavedSnapshot,
+    /// Invokes `kicad-cli` against the saved `.kicad_pcb` file (with optional
+    /// explicit live-board synchronization where supported, such as
+    /// `sync_live_board` on DRC).
+    CliSaved,
+    /// Combines multiple authoritative sources — for example live-or-saved
+    /// board state alongside `.kicad_pro` settings, file-only board fields,
+    /// schematic files, or live IPC snapshot capture staged for `kicad-cli`.
+    MixedSource,
+    /// Writes the `.kicad_pcb` or sibling `.kicad_pro` / `.kicad_dru` file
+    /// directly without IPC, so KiCad must not hold the board open.
     ClosedBoardOnly,
     /// Planning is non-mutating, while applying has a stricter board-state
     /// requirement described by the tool itself.
     ApplyModeDependent,
+    /// Opens or activates a board file in KiCad's PCB Editor rather than
+    /// reading or mutating board content.
+    EditorLifecycle,
+    /// Accepts a `board` parameter for compatibility, but always refuses with
+    /// `unsupported_capability` and never reads or modifies board state.
+    Unsupported,
+}
+
+impl BoardAccess {
+    /// Canonical `snake_case` identifier for this board-access class.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::LiveOnly => "live_only",
+            Self::LivePreferredWithFallback => "live_preferred_with_fallback",
+            Self::SavedSnapshot => "saved_snapshot",
+            Self::CliSaved => "cli_saved",
+            Self::MixedSource => "mixed_source",
+            Self::ClosedBoardOnly => "closed_board_only",
+            Self::ApplyModeDependent => "apply_mode_dependent",
+            Self::EditorLifecycle => "editor_lifecycle",
+            Self::Unsupported => "unsupported",
+        }
+    }
+
+    /// Whether a read-only tool in this class may advertise the additive
+    /// `board_source` (`auto` / `live` / `saved`) selector.
+    pub const fn supports_board_source_selector(self) -> bool {
+        matches!(self, Self::LivePreferredWithFallback | Self::MixedSource)
+    }
 }
 
 impl ToolDef {
@@ -196,6 +244,25 @@ impl ToolDef {
     pub fn with_board_access(mut self, board_access: BoardAccess) -> Self {
         self.board_access = board_access;
         self
+    }
+
+    /// Whether this tool's advertised input schema accepts a `board` argument.
+    pub fn accepts_board_arg(&self) -> bool {
+        self.input_schema.pointer("/properties/board").is_some()
+    }
+
+    /// Whether this tool's advertised input schema exposes `board_source`.
+    pub fn advertises_board_source(&self) -> bool {
+        self.input_schema
+            .pointer("/properties/board_source")
+            .is_some()
+    }
+
+    /// Whether this tool's advertised input schema exposes `sync_live_board`.
+    pub fn advertises_sync_live_board(&self) -> bool {
+        self.input_schema
+            .pointer("/properties/sync_live_board")
+            .is_some()
     }
 
     pub fn to_mcp_description(&self) -> McpToolDescription {

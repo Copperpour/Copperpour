@@ -113,7 +113,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_audit_manufacturing(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::SavedSnapshot),
         tool!(
             "run_design_review",
             "Run all available audit checks and produce a consolidated design review report. \
@@ -137,7 +138,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic"]
             }),
             |args, ctx| async move { handle_run_design_review(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::MixedSource),
         tool!(
             "check_bom_health",
             "Analyze the BOM for supply chain risks: parts with no MPN, lifecycle warnings, \

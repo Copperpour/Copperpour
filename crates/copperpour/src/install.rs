@@ -171,12 +171,16 @@ pub fn print_hook_output(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn hook_tool_names(board_access: copperpour_core::tools::BoardAccess) -> Vec<&'static str> {
+fn hook_tool_names(hook: &crate::manifest::HookSkillManifest) -> Vec<&'static str> {
     let mut names = BTreeSet::new();
     for toolset in copperpour_core::router::registry::ALL_TOOLSETS {
         if let Some(tools) = copperpour_core::router::registry::tools_for(toolset.name) {
             for tool in tools {
-                if tool.board_access == board_access {
+                if tool.board_access == hook.board_access
+                    && (!hook.mutators_only
+                        || !copperpour_core::router::call_tool_policy::READ_ONLY_TOOLS
+                            .contains(&tool.name))
+                {
                     names.insert(tool.name);
                 }
             }
@@ -186,7 +190,7 @@ fn hook_tool_names(board_access: copperpour_core::tools::BoardAccess) -> Vec<&'s
 }
 
 fn hook_matcher(hook: &crate::manifest::HookSkillManifest) -> Result<String> {
-    let names = hook_tool_names(hook.board_access);
+    let names = hook_tool_names(hook);
     if names.is_empty() {
         anyhow::bail!("hook '{}' has no registered tool targets", hook.name);
     }
@@ -2593,15 +2597,26 @@ mod tests {
             assert!(!targets.is_empty());
             for target in targets {
                 assert_eq!(registered.get(target), Some(&hook.board_access), "{target}");
+                if hook.mutators_only {
+                    assert!(
+                        !copperpour_core::router::call_tool_policy::READ_ONLY_TOOLS
+                            .contains(&target),
+                        "mutators-only hook '{}' must not match read-only tool '{target}'",
+                        hook.name
+                    );
+                }
             }
         }
-        assert!(!HOOK_SKILLS
-            .iter()
-            .any(|hook| hook_matcher(hook).unwrap().contains("refill_zones")));
-        assert_eq!(
-            registered.get("route_trace"),
-            Some(&copperpour_core::tools::BoardAccess::LiveOnly)
-        );
+        // `refill_zones` and `export_specctra_dsn` are live-IPC-only (since
+        // `drc::refill` removed the legacy file fallback) and belong in the
+        // live-only hook class (#58).
+        for tool_name in ["route_trace", "refill_zones", "export_specctra_dsn"] {
+            assert_eq!(
+                registered.get(tool_name),
+                Some(&copperpour_core::tools::BoardAccess::LiveOnly),
+                "{tool_name} must be in the live-only Claude hook class"
+            );
+        }
         for tool_name in ["plan_specctra_ses_import", "apply_specctra_ses"] {
             assert_eq!(
                 registered.get(tool_name),
@@ -2620,10 +2635,70 @@ mod tests {
             registered.get("flip_component"),
             Some(&copperpour_core::tools::BoardAccess::LivePreferredWithFallback)
         );
+        for tool_name in [
+            "copy_routing_pattern",
+            "set_design_rules",
+            "set_predefined_sizes",
+            "create_netclass",
+            "assign_net_to_class",
+            "delete_netclass",
+            "add_net",
+            "set_custom_rule",
+            "delete_custom_rule",
+            "set_layer_constraints",
+        ] {
+            assert_eq!(
+                registered.get(tool_name),
+                Some(&copperpour_core::tools::BoardAccess::ClosedBoardOnly),
+                "{tool_name} must be in the closed-board Claude hook class"
+            );
+        }
         assert_eq!(
             registered.get("plan_bga_fanout"),
             Some(&copperpour_core::tools::BoardAccess::ApplyModeDependent)
         );
+        // Read-only fallback tools are classified LivePreferredWithFallback
+        // without receiving the file-edit pre-pcb-fallback hook.
+        for tool_name in [
+            "score_placement",
+            "check_clearance",
+            "get_board_extents",
+            "list_zones",
+            "get_component_pads",
+            "get_pad_position",
+        ] {
+            assert_eq!(
+                registered.get(tool_name),
+                Some(&copperpour_core::tools::BoardAccess::LivePreferredWithFallback),
+                "{tool_name} must be classified LivePreferredWithFallback"
+            );
+            assert!(
+                !HOOK_SKILLS
+                    .iter()
+                    .any(|hook| hook_tool_names(hook).contains(&tool_name)),
+                "read-only fallback tool '{tool_name}' must not match any PreToolUse edit hook"
+            );
+        }
+        // Non-hook inventory classes (SavedSnapshot, CliSaved, MixedSource,
+        // EditorLifecycle, Unsupported) are classified without attaching
+        // misleading PreToolUse edit hooks.
+        for tool_name in [
+            "audit_manufacturing",
+            "export_gerber",
+            "run_drc",
+            "get_board_info",
+            "get_layer_list",
+            "get_netclasses",
+            "open_board",
+            "set_active_layer",
+        ] {
+            assert!(
+                !HOOK_SKILLS
+                    .iter()
+                    .any(|hook| hook_tool_names(hook).contains(&tool_name)),
+                "{tool_name} must not match any PreToolUse mutation hook"
+            );
+        }
     }
 
     #[test]
@@ -4967,7 +5042,7 @@ mod tests {
         for hook in HOOK_SKILLS {
             let old_matcher = format!(
                 "mcp__(copperpour|konnect)__({})",
-                hook_tool_names(hook.board_access).join("|")
+                hook_tool_names(hook).join("|")
             );
             let cmd = hook_command(&this_exe(), "hook", hook.name);
             let entries = settings["hooks"][hook.event].as_array_mut().unwrap();
@@ -5025,7 +5100,7 @@ mod tests {
                 serde_json::json!({
                     "matcher": format!(
                         "mcp__(copperpour|konnect)__({})",
-                        hook_tool_names(hook.board_access).join("|")
+                        hook_tool_names(hook).join("|")
                     ),
                     "hooks": [{
                         "type": "command",

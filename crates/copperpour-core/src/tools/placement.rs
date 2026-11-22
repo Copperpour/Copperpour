@@ -109,7 +109,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_score_placement(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "place_decoupling_caps",
             "Plan (and optionally apply) a row of decoupling capacitors beside an IC, from \
