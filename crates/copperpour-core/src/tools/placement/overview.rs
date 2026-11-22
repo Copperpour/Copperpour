@@ -398,9 +398,18 @@ pub(in crate::tools) fn check_netclass_rename_pattern(
     {
         return Ok(());
     }
+    // KiCad adds an end anchor only when the pattern does not end in '$'.
+    // An escaped final '$' can therefore match a prefix there. Use only
+    // simple regex atoms here rather than assuming wxRegEx and Rust agree.
+    let supported = pattern
+        .bytes()
+        .all(|c| c.is_ascii_alphanumeric() || b" /_-:~#=%@.,+*?^$".contains(&c))
+        && mapping
+            .iter()
+            .all(|(old, new)| !old.contains(['\r', '\n']) && !new.contains(['\r', '\n']));
     let matcher = NetclassPattern::new(pattern);
     anyhow::ensure!(
-        matcher.expression.is_some() && !pattern.contains('|'),
+        matcher.expression.is_some() && supported,
         "Cannot prove a net rename preserves unsupported netclass pattern {pattern:?}"
     );
     for (old, new) in mapping {

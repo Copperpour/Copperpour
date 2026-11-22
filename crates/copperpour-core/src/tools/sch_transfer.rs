@@ -28,8 +28,9 @@ pub(super) fn tool() -> ToolDef {
          label moves, boundary connections and local-label collisions are refused with \
          explicit rewiring diagnostics. Apply requires the plan_revision of a current dry \
          run. Updates matching footprint paths and renamed nets on the same-named PCB in \
-         the same transaction. Refuses collisions and unsafe net-name dependencies. Recovery completes the journaled move \
-         forward unless a file it read has changed. Never deletes a source sheet.",
+         the same transaction. Refuses collisions and unsafe net-name or sheet dependencies. \
+         Recovery completes the journaled move forward unless a file it read has changed. \
+         Never deletes a source sheet.",
         json!({
             "type": "object", "additionalProperties": false,
             "properties": {
@@ -571,7 +572,10 @@ impl Plan {
             let rules = self.root.with_extension("kicad_dru");
             if !renamed.is_empty() {
                 if let Some(doc) = self.documents.get(&rules) {
-                    super::custom_rules::check_net_name_independent_conditions(&doc.before)
+                    super::custom_rules::check_rule_independence(
+                        &doc.before,
+                        super::custom_rules::RuleDependency::NetNames,
+                    )
                         .map_err(|reason| anyhow::anyhow!(
                             "Cannot rename PCB nets {renamed:?}: custom rules in '{}' depend on net names or cannot be checked: {reason}",
                             rules.display()
@@ -596,6 +600,23 @@ impl Plan {
                 .values()
                 .map(|value| value.as_str().context("Invalid PCB destination path"))
                 .collect::<Result<BTreeSet<_>>>()?;
+            let rules = self.root.with_extension("kicad_dru");
+            if !targets.is_empty() {
+                if let Some(doc) = self.documents.get(&rules) {
+                    super::custom_rules::check_rule_independence(
+                        &doc.before,
+                        super::custom_rules::RuleDependency::FootprintSheets {
+                            dynamic_component_classes: may_have_dynamic_component_classes(
+                                &self.documents[&self.root.with_extension("kicad_pro")].before,
+                            ),
+                        },
+                    )
+                    .map_err(|reason| anyhow::anyhow!(
+                        "Cannot relink PCB footprints: custom rules in '{}' depend on sheet membership or cannot be checked: {reason}",
+                        rules.display()
+                    ))?;
+                }
+            }
             let doc = self
                 .documents
                 .get_mut(board)
@@ -1830,6 +1851,29 @@ fn optional_project_inputs(root: &Path) -> impl Iterator<Item = PathBuf> + '_ {
         .into_iter()
         .map(|name| root.with_file_name(name))
         .chain(std::iter::once(root.with_extension("kicad_dru")))
+}
+
+// KiCad can derive classes from the saved footprint sheet, including through
+// custom assignment expressions. Treat nonempty or unfamiliar settings as dynamic.
+fn may_have_dynamic_component_classes(project: &str) -> bool {
+    let Ok(settings) = serde_json::from_str::<Value>(project) else {
+        return true;
+    };
+    let Some(project) = settings.as_object() else {
+        return true;
+    };
+    let Some(settings) = project.get("component_class_settings") else {
+        return false;
+    };
+    let Some(settings) = settings.as_object() else {
+        return true;
+    };
+    settings.iter().any(|(key, value)| match key.as_str() {
+        "meta" => value.pointer("/version").and_then(Value::as_u64) != Some(0),
+        "assignments" => !value.as_array().is_some_and(Vec::is_empty),
+        "sheet_component_classes" => value.get("enabled").and_then(Value::as_bool) != Some(false),
+        _ => true,
+    })
 }
 
 fn check_project_net_dependencies(
@@ -3943,6 +3987,18 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unsupported netclass pattern"));
+        let escaped_dollar = json!({"net_settings":{"netclass_patterns":[
+            {"pattern":r"^/Source/SIG\$","netclass":"Fast"},
+            {"pattern":"*","netclass":"Fast"}
+        ]}})
+        .to_string();
+        let mapping = BTreeMap::from([("/Source/SIG$A".into(), "/Dest/SIG$A".into())]);
+        assert!(
+            check_project_net_dependencies(&escaped_dollar, &mapping, true)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported netclass pattern")
+        );
     }
 
     #[test]
@@ -4038,9 +4094,15 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn transfer_skips_rule_conditions_without_a_pcb_net_rename() {
+    async fn transfer_skips_net_rule_checks_without_a_pcb_net_rename() {
         assert_served_transfer(Served::RulesWithoutPcb).await;
         assert_served_transfer(Served::PcbPathsOnly).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transfer_refuses_sheet_rules_without_a_pcb_net_rename() {
+        assert_served_transfer(Served::SheetRules).await;
     }
 
     #[cfg(unix)]
@@ -4203,6 +4265,7 @@ mod tests {
         PcbInterrupt,
         RulesWithoutPcb,
         PcbPathsOnly,
+        SheetRules,
         StaleSelection,
         WrongPcbPad,
         SplitDiffPair,
@@ -4231,6 +4294,7 @@ mod tests {
             Served::Pcb
                 | Served::PcbInterrupt
                 | Served::PcbPathsOnly
+                | Served::SheetRules
                 | Served::StaleSelection
                 | Served::WrongPcbPad
                 | Served::SplitDiffPair
@@ -4281,7 +4345,8 @@ mod tests {
         if matches!(mode, Served::RulesWithoutPcb | Served::PcbPathsOnly) {
             std::fs::write(
                 &rules,
-                "(version 1)\n(rule \"example\" (condition \"A.NetName == '/Channel 1/MID'\"))\n",
+                "(version 1)\n(rule \"example\" (condition \"A.NetName == '/Channel 1/MID' && A.hasComponentClass('Static')\"))\n\
+                 (rule \"independent\" (constraint assertion \"A.Type == 'Track'\"))\n",
             )
             .unwrap();
         }
@@ -4296,7 +4361,7 @@ mod tests {
                 <components><comp ref="R1"><tstamps>{RESISTOR}</tstamps><sheetpath names="/Logic regulator/" tstamps="/{SHEET_UUID}/"/><property name="Sheetfile" value="logic.kicad_sch"/></comp></components><nets><net name="$net" class="Default"><node ref="R1" pin="$pin"/></net></nets></export>"#
         );
         let old_net = match mode {
-            Served::PcbPathsOnly => "/not-on-the-board",
+            Served::PcbPathsOnly | Served::SheetRules => "/not-on-the-board",
             Served::SplitDiffPair => "/Channel 1/USB_P",
             _ => "/Channel 1/MID",
         };
@@ -4360,6 +4425,61 @@ mod tests {
             return;
         }
         let revision = planned["plan_revision"].as_str().unwrap().to_owned();
+        if mode == Served::SheetRules {
+            assert_eq!(planned["pcb_net_name_mapping"], json!({}));
+            assert!(!planned["pcb_path_mapping"].as_object().unwrap().is_empty());
+            assert_eq!(snapshot(dir.path()), before);
+            let project = board.with_extension("kicad_pro");
+            let settings: Value = serde_json::from_slice(&before[&project]).unwrap();
+            for (clause, reason, component_classes) in [
+                (
+                    r#"(condition "A.memberOfSheet('/')")"#,
+                    "rule calls memberOfSheet()",
+                    Value::Null,
+                ),
+                (
+                    r#"(constraint assertion "A.memberOfSheetOrChildren('/')")"#,
+                    "rule calls memberOfSheetOrChildren()",
+                    Value::Null,
+                ),
+                (
+                    r#"(condition "A.hasComponentClass('/')")"#,
+                    "rule calls hasComponentClass()",
+                    json!({"sheet_component_classes": {"enabled": true}, "assignments": []}),
+                ),
+                (
+                    r#"(constraint assertion "A.ComponentClass == 'Source'")"#,
+                    "cannot classify rule property ComponentClass",
+                    json!({"sheet_component_classes": {"enabled": false}, "assignments": [{}]}),
+                ),
+            ] {
+                if !component_classes.is_null() {
+                    let mut settings = settings.clone();
+                    settings["component_class_settings"] = component_classes;
+                    std::fs::write(&project, serde_json::to_vec(&settings).unwrap()).unwrap();
+                }
+                std::fs::write(&rules, format!("(version 1)\n(rule \"sheet\" {clause})\n"))
+                    .unwrap();
+                // Bind the current inputs so the revision check cannot mask the rule refusal.
+                let revision = Plan::prepare(&request).unwrap().revision(&request);
+                let before = snapshot(dir.path());
+                for dry_run in [true, false] {
+                    let response = handler
+                        .handle_message(call(dry_run, (!dry_run).then_some(revision.as_str())))
+                        .await
+                        .unwrap()
+                        .result
+                        .unwrap();
+                    assert_eq!(snapshot(dir.path()), before, "{response}");
+                    assert!(copperpour_sexp::inspect_file_transactions(dir.path())
+                        .unwrap()
+                        .is_empty());
+                    assert_eq!(kind(&response), "plan_blocked", "{response}");
+                    assert!(response.to_string().contains(reason), "{response}");
+                }
+            }
+            return;
+        }
         if mode == Served::StaleSelection {
             assert!(!planned["pcb_path_mapping"].as_object().unwrap().is_empty());
             assert_eq!(snapshot(dir.path()), before);

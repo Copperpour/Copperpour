@@ -120,20 +120,26 @@ settings. It refuses ambiguous footprint paths, destination net collisions, chan
 which netclass patterns match, changes to differential-pair membership or polarity,
 and renames that would change explicit net assignments. Without a PCB, a schematic
 net rename still requires the project to have no netclass pattern other than `*`.
+With a PCB, the tool refuses patterns it cannot compare reliably, such as a regular
+expression ending in an escaped `$`, unless the wildcard matches both names.
 Before renaming a PCB net, it checks that the saved pads on that net belong to the
 verified schematic pin group. If the check fails, reconcile the board with the
 schematic and plan again.
 
 The plan and transaction require the same-named `.kicad_dru` to stay unchanged, or to
 stay absent if it does not exist. If present, the rules file must be a regular file,
-not a symlink or directory. The tool never rewrites custom rules. If a PCB net
-would change names, the tool refuses the move when a rule condition or assertion uses
-`NetName`, `inDiffPair`, or another expression it cannot prove is independent of net
-names. The refusal names the rules file and the old and new net names. The expression
-check runs only when a PCB net would change names.
+not a symlink or directory. The tool never rewrites custom rules.
 
-Run PCB DRC after the move. Schematic verification does not check how a footprint's
-new sheet membership affects custom rules.
+- When a PCB net changes names, a rule condition or assertion must not depend on net
+  names, for example through `NetName` or `inDiffPair`.
+- When a footprint changes sheets, even without a PCB net rename, a rule condition or
+  assertion must not depend on sheet membership, for example through `memberOfSheet()`
+  or `memberOfSheetOrChildren()`. If the project assigns component classes per sheet
+  or through Board Setup rules, the tool also refuses expressions that use those
+  classes.
+
+If the tool cannot rule out the relevant dependency, it refuses the move and names
+the rules file. Run PCB DRC after the move. The transfer checks do not replace it.
 
 The tool doesn't look at other boards or projects. In a multi-board workflow, reconcile
 them yourself before moving objects.

@@ -6513,12 +6513,21 @@ pub(super) mod multi_endpoint_discovery_tests {
             copperpour_ipc::socket::candidate_endpoints_in(&kicad_dir),
             candidates
         );
-        assert_eq!(
-            copperpour_ipc::KiCadIpcClient::new(selected_addr)
-                .ping_outcome()
-                .failure_kind(),
-            Some("no_listener")
-        );
+        // A parallel test can fork while the dummy listener is open. Allow
+        // that child's transient copy to close before probing the selection.
+        let client = copperpour_ipc::KiCadIpcClient::new(selected_addr);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let outcome = client.ping_outcome();
+            if outcome.failure_kind() == Some("no_listener") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Expected the selected listener to be gone: {outcome:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
         (handler, other)
     }
 

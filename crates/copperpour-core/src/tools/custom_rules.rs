@@ -1186,9 +1186,17 @@ fn closing(tokens: &[Token], open: usize) -> Option<usize> {
     None
 }
 
-/// Prove that rule conditions do not inspect net names. This does not
-/// simulate DRC or validate unrelated constraints.
-pub(super) fn check_net_name_independent_conditions(text: &str) -> Result<(), String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RuleDependency {
+    NetNames,
+    FootprintSheets { dynamic_component_classes: bool },
+}
+
+/// Check conditions and assertions for one dependency. This does not simulate DRC.
+pub(super) fn check_rule_independence(
+    text: &str,
+    dependency: RuleDependency,
+) -> Result<(), String> {
     // KiCad expands raw lines before recognizing comments. A substitution
     // can add a newline followed by a live rule.
     if text.lines().any(|line| {
@@ -1215,11 +1223,19 @@ pub(super) fn check_net_name_independent_conditions(text: &str) -> Result<(), St
             {
                 return true;
             }
+            if matches!(
+                dependency,
+                RuleDependency::FootprintSheets {
+                    dynamic_component_classes: true
+                }
+            ) {
+                return true;
+            }
             rest = tail;
         }
         false
     }) {
-        return Err("a text variable may expand into a net-name dependency".into());
+        return Err("a text variable may change how the rule is evaluated".into());
     }
     let mut start = 0;
     while start < tokens.len() {
@@ -1251,14 +1267,14 @@ pub(super) fn check_net_name_independent_conditions(text: &str) -> Result<(), St
                     if close != clause + 3 || !tokens[clause + 2].tok.is_symbol() {
                         return Err("invalid custom rule condition".into());
                     }
-                    check_net_name_independent_expression(tokens[clause + 2].tok.text())?;
+                    check_rule_expression(tokens[clause + 2].tok.text(), dependency)?;
                 } else if kind.is_keyword("constraint")
                     && tokens[clause + 2].tok.is_keyword("assertion")
                 {
                     if close != clause + 4 || !tokens[clause + 3].tok.is_symbol() {
                         return Err("invalid custom rule assertion".into());
                     }
-                    check_net_name_independent_expression(tokens[clause + 3].tok.text())?;
+                    check_rule_expression(tokens[clause + 3].tok.text(), dependency)?;
                 } else if !["constraint", "layer", "severity"]
                     .iter()
                     .any(|name| kind.is_keyword(name))
@@ -1808,7 +1824,7 @@ struct Codegen<'a> {
     bare_number: bool,
     first_unit: Option<usize>,
     properties: &'a mut BTreeSet<String>,
-    require_net_name_independence: bool,
+    dependency: Option<RuleDependency>,
 }
 
 impl Codegen<'_> {
@@ -1845,12 +1861,20 @@ impl Codegen<'_> {
                 };
                 match &**field {
                     Node::Ident(property) => {
-                        if self.require_net_name_independence
-                            && !["NetClass", "ComponentClass", "Type"]
+                        if let Some(dependency) = self.dependency {
+                            let independent: &[&str] = match dependency {
+                                RuleDependency::NetNames => &["NetClass", "ComponentClass", "Type"],
+                                RuleDependency::FootprintSheets {
+                                    dynamic_component_classes: true,
+                                } => &["NetClass", "NetName", "Type"],
+                                RuleDependency::FootprintSheets { .. } => ITEM_FIELDS,
+                            };
+                            if !independent
                                 .iter()
                                 .any(|name| property.eq_ignore_ascii_case(name))
-                        {
-                            return Err(format!("cannot prove condition property {property} is independent of net names"));
+                            {
+                                return Err(format!("cannot classify rule property {property}"));
+                            }
                         }
                         let item_field = ITEM_FIELDS
                             .iter()
@@ -1873,12 +1897,25 @@ impl Codegen<'_> {
                         }
                     }
                     Node::Call(function, arguments) => {
-                        if self.require_net_name_independence
-                            && ["inDiffPair", "isCoupledDiffPair"]
-                                .iter()
-                                .any(|name| function.eq_ignore_ascii_case(name))
+                        let dependent: &[&str] = match self.dependency {
+                            Some(RuleDependency::NetNames) => &["inDiffPair", "isCoupledDiffPair"],
+                            Some(RuleDependency::FootprintSheets {
+                                dynamic_component_classes: true,
+                            }) => &[
+                                "memberOfSheet",
+                                "memberOfSheetOrChildren",
+                                "hasComponentClass",
+                            ],
+                            Some(RuleDependency::FootprintSheets { .. }) => {
+                                &["memberOfSheet", "memberOfSheetOrChildren"]
+                            }
+                            None => &[],
+                        };
+                        if dependent
+                            .iter()
+                            .any(|name| function.eq_ignore_ascii_case(name))
                         {
-                            return Err(format!("condition calls {function}()"));
+                            return Err(format!("rule calls {function}()"));
                         }
                         if !is_item(item) {
                             return Err(format!(
@@ -1910,8 +1947,9 @@ impl Codegen<'_> {
     }
 }
 
-fn check_net_name_independent_expression(text: &str) -> Result<(), String> {
-    check_expression_with_policy(text, Resolver::Pcb, &mut BTreeSet::new(), true).map(|_| ())
+fn check_rule_expression(text: &str, dependency: RuleDependency) -> Result<(), String> {
+    check_expression_with_policy(text, Resolver::Pcb, &mut BTreeSet::new(), Some(dependency))
+        .map(|_| ())
 }
 
 /// Check one condition, assertion or value as KiCad's compiler reads it, and
@@ -1921,14 +1959,14 @@ fn check_expression(
     resolver: Resolver,
     properties: &mut BTreeSet<String>,
 ) -> Result<Quantity, String> {
-    check_expression_with_policy(text, resolver, properties, false)
+    check_expression_with_policy(text, resolver, properties, None)
 }
 
 fn check_expression_with_policy(
     text: &str,
     resolver: Resolver,
     properties: &mut BTreeSet<String>,
-    require_net_name_independence: bool,
+    dependency: Option<RuleDependency>,
 ) -> Result<Quantity, String> {
     let lexemes = lex_expression(text, resolver)?;
     if lexemes.first() == Some(&Lexeme::End) {
@@ -1944,7 +1982,7 @@ fn check_expression_with_policy(
         bare_number: false,
         first_unit: None,
         properties,
-        require_net_name_independence,
+        dependency,
     };
     codegen.visit(&tree)?;
     // KiCad flags a lone number without units, which it would read in nm.
@@ -1965,6 +2003,8 @@ mod tests {
 
     #[test]
     fn rename_guard_reads_rule_conditions_not_comments_or_literals() {
+        let check_net_name_independent_conditions =
+            |text: &str| check_rule_independence(text, RuleDependency::NetNames);
         let assertion =
             |expr| format!("(version 1)\n(rule \"r\" (constraint assertion \"{expr}\"))");
         assert!(check_net_name_independent_conditions(&assertion("A.NetName == '/SIG'")).is_err());
