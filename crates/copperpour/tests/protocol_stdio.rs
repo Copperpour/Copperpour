@@ -2228,14 +2228,18 @@ fn a_relative_home_never_reaches_the_working_directory() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
     }
-    // A spawned kicad-cli creates KiCad's own user directories under the
-    // `HOME` it inherits; that is KiCad's path, not one of Copperpour's, and
-    // the directories leading to it are skipped by comparing files only.
+    // A spawned kicad-cli creates KiCad's own user directories and config files
+    // under the `HOME` it inherits; those are KiCad's paths, not Copperpour's,
+    // and the directories leading to them are skipped by comparing files only.
     let kicad_data = home.join(".local/share/kicad");
+    let kicad_config = [
+        home.join(".config/kicad/10.0/kicad.json"),
+        home.join(".config/kicad/10.0/kicad_common.json"),
+    ];
     let tree = |dir: &std::path::Path| {
         let mut files: Vec<_> = walk(dir)
             .into_iter()
-            .filter(|path| !path.starts_with(&kicad_data))
+            .filter(|path| !path.starts_with(&kicad_data) && !kicad_config.contains(path))
             .collect();
         files.sort();
         files
@@ -2251,6 +2255,7 @@ fn a_relative_home_never_reaches_the_working_directory() {
         false,
         &[
             ("HOME", "home"),
+            ("XDG_CONFIG_HOME", ""),
             ("XDG_DATA_HOME", ""),
             ("COPPERPOUR_STATE_DIR", ""),
             ("KONNECT_STATE_DIR", ""),
