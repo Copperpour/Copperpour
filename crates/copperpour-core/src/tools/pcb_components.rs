@@ -2412,7 +2412,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "edit_component",
-            "Change a placed footprint's value and its assembly flags: dnp (do not \
+            "Change a placed footprint's value, lock (locked) and assembly flags: dnp (do not \
              populate), exclude_from_bom and exclude_from_pos_files. Every property not named \
              is kept. One KiCad undo step; the result is a fresh readback of what the board \
              holds, and a readback that does not match the request is reported as an error \
@@ -2431,7 +2431,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "value":     { "type": "string", "description": "New value string (optional)" },
                     "dnp":       { "type": "boolean", "description": "Do not populate (optional)" },
                     "exclude_from_bom":       { "type": "boolean", "description": "Exclude from the bill of materials (optional)" },
-                    "exclude_from_pos_files": { "type": "boolean", "description": "Exclude from position (pick-and-place) files (optional)" }
+                    "exclude_from_pos_files": { "type": "boolean", "description": "Exclude from position (pick-and-place) files (optional)" },
+                    "locked":    { "type": "boolean", "description": "Lock (true) or unlock (false) the footprint (optional)" }
                 },
                 "required": ["board", "reference"]
             }),
@@ -3373,6 +3374,7 @@ async fn handle_edit_component(
         dnp: args["dnp"].as_bool(),
         exclude_from_bom: args["exclude_from_bom"].as_bool(),
         exclude_from_pos_files: args["exclude_from_pos_files"].as_bool(),
+        locked: args["locked"].as_bool(),
     };
     let live_reference = reference.clone();
     if edit.is_empty() {
@@ -3422,6 +3424,7 @@ fn edit_component_state_json(state: &copperpour_ipc::IpcFootprintState) -> serde
         "dnp": state.dnp,
         "exclude_from_bom": state.exclude_from_bom,
         "exclude_from_pos_files": state.exclude_from_pos_files,
+        "locked": state.locked,
     })
 }
 
@@ -3437,10 +3440,16 @@ fn edit_component_body(
     let after = edit_component_state_json(state);
     let before_json = before.map(edit_component_state_json);
     let changed: Vec<&str> = match &before_json {
-        Some(before_json) => ["value", "dnp", "exclude_from_bom", "exclude_from_pos_files"]
-            .into_iter()
-            .filter(|key| before_json[*key] != after[*key])
-            .collect(),
+        Some(before_json) => [
+            "value",
+            "dnp",
+            "exclude_from_bom",
+            "exclude_from_pos_files",
+            "locked",
+        ]
+        .into_iter()
+        .filter(|key| before_json[*key] != after[*key])
+        .collect(),
         None => Vec::new(),
     };
     json!({
@@ -3453,6 +3462,7 @@ fn edit_component_body(
         "dnp": state.dnp,
         "exclude_from_bom": state.exclude_from_bom,
         "exclude_from_pos_files": state.exclude_from_pos_files,
+        "locked": state.locked,
         "linked_to_schematic": state.linked_to_schematic,
         "changed": changed,
         "before": before_json.unwrap_or_else(|| after.clone()),
@@ -10971,6 +10981,8 @@ mod edit_component_tests {
         /// Answers OK but keeps the flags it held, as a KiCad that ignored
         /// the attributes would.
         IgnoresFlags,
+        /// Answers OK but keeps the lock it held.
+        IgnoresLock,
         /// Refuses the update and stores nothing.
         Refuses,
         /// Lists the footprint twice, as a board with a repeated reference.
@@ -11190,6 +11202,9 @@ mod edit_component_tests {
                 let mut held = held.lock().unwrap();
                 if kicad == Kicad::IgnoresFlags {
                     footprint.attributes = held.attributes.clone();
+                }
+                if kicad == Kicad::IgnoresLock {
+                    footprint.locked = held.locked;
                 }
                 *held = footprint.clone();
                 ok(Some(pack_any(
@@ -11415,6 +11430,108 @@ mod edit_component_tests {
         );
         assert!(
             text(&result).contains("dnp: expected true, observed false"),
+            "{}",
+            text(&result)
+        );
+        assert_eq!(sent.lock().unwrap().begins, 1);
+    }
+
+    /// The capture as KiCad reports it once locked.
+    fn locked_c_0603(linked: bool) -> kiapi::board::types::FootprintInstance {
+        let mut footprint = c_0603(linked);
+        footprint.locked = kiapi::common::types::LockedState::LsLocked as i32;
+        footprint
+    }
+
+    #[tokio::test]
+    async fn the_lock_is_set_in_one_commit_and_read_back() {
+        let before = c_0603(false);
+        assert_eq!(
+            before.locked,
+            kiapi::common::types::LockedState::LsUnlocked as i32,
+            "premise: KiCad reported the capture unlocked"
+        );
+        let (result, sent, _) = edit(before.clone(), Kicad::Keeps, json!({ "locked": true })).await;
+        assert!(!result.is_error, "{}", text(&result));
+        let body: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
+        assert_eq!(body["status"], "applied");
+        assert_eq!(body["locked"], true);
+        assert_eq!(body["before"]["locked"], false);
+        assert_eq!(body["changed"], json!(["locked"]));
+        assert_eq!(body["undo"], "one KiCad undo step");
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.begins, 1, "one KiCad undo step");
+        assert_eq!(sent.updates.len(), 1);
+        assert_eq!(
+            sent.updates[0].locked,
+            kiapi::common::types::LockedState::LsLocked as i32
+        );
+        // Only the lock changed: the rest of KiCad's message went back as sent.
+        let mut unchanged = sent.updates[0].clone();
+        unchanged.locked = before.locked;
+        assert_eq!(unchanged, before);
+    }
+
+    #[tokio::test]
+    async fn the_lock_is_cleared_without_a_warning_about_the_sync() {
+        let (result, sent, _) = edit(
+            locked_c_0603(true),
+            Kicad::Keeps,
+            json!({ "locked": false }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text(&result));
+        let body: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
+        assert_eq!(body["locked"], false);
+        assert_eq!(body["changed"], json!(["locked"]));
+        assert_eq!(
+            sent.lock().unwrap().updates[0].locked,
+            kiapi::common::types::LockedState::LsUnlocked as i32
+        );
+        // update_pcb_from_schematic keeps the board's lock when it updates a
+        // footprint (`update_footprint_item`), so a linked footprint's lock
+        // needs no warning about the sync.
+        let warning = body["warning"].as_str().unwrap();
+        assert!(!warning.contains("update_pcb_from_schematic"), "{warning}");
+    }
+
+    #[tokio::test]
+    async fn a_lock_the_footprint_already_holds_sends_nothing() {
+        let (result, sent, _) = edit(
+            locked_c_0603(false),
+            Kicad::Keeps,
+            json!({ "locked": true }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text(&result));
+        let body: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
+        assert_eq!(body["status"], "unchanged");
+        assert_eq!(body["locked"], true);
+        let sent = sent.lock().unwrap();
+        assert_eq!((sent.begins, sent.updates.len()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn no_property_reports_the_lock_without_a_commit() {
+        let (result, sent, _) = edit(locked_c_0603(false), Kicad::Keeps, json!({})).await;
+        assert!(!result.is_error, "{}", text(&result));
+        let body: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
+        assert_eq!(body["locked"], true);
+        assert_eq!(sent.lock().unwrap().begins, 0);
+    }
+
+    #[tokio::test]
+    async fn a_lock_kicad_did_not_keep_is_an_uncertain_outcome() {
+        let (result, sent, _) =
+            edit(c_0603(false), Kicad::IgnoresLock, json!({ "locked": true })).await;
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
+        assert!(
+            text(&result).contains("locked: expected true, observed false"),
             "{}",
             text(&result)
         );

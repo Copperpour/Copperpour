@@ -1,5 +1,5 @@
-//! In-place edit of a placed footprint's value and assembly flags: do not
-//! populate, exclude from BOM and exclude from position files.
+//! In-place edit of a placed footprint's value, its assembly flags (do not
+//! populate, exclude from BOM and exclude from position files) and its lock.
 //!
 //! The contract is the one [`super::text_edit`] follows for fields: read the
 //! exact footprint, change only the requested properties on the message KiCad
@@ -13,8 +13,8 @@ use crate::gen::kiapi::common::types as common;
 
 const FOOTPRINT_INSTANCE: &str = "kiapi.board.types.FootprintInstance";
 
-/// The value and assembly flags of `footprint`, from its instance attributes,
-/// which are the ones KiCad reads.
+/// The value, assembly flags and lock of `footprint`, from its instance, which
+/// is where KiCad reads them.
 pub(super) fn footprint_state(footprint: &board::FootprintInstance) -> IpcFootprintState {
     let attributes = footprint.attributes.clone().unwrap_or_default();
     let field_text = |field: &Option<board::Field>| {
@@ -39,6 +39,7 @@ pub(super) fn footprint_state(footprint: &board::FootprintInstance) -> IpcFootpr
         dnp: attributes.do_not_populate,
         exclude_from_bom: attributes.exclude_from_bill_of_materials,
         exclude_from_pos_files: attributes.exclude_from_position_files,
+        locked: footprint.locked == common::LockedState::LsLocked as i32,
         linked_to_schematic: footprint
             .symbol_path
             .as_ref()
@@ -49,7 +50,8 @@ pub(super) fn footprint_state(footprint: &board::FootprintInstance) -> IpcFootpr
 /// Apply `edit` to `footprint`. The flags go on the instance attributes:
 /// `FOOTPRINT::Deserialize` reads them there, and the definition's attributes
 /// carry only the description and keywords. The value goes on the instance's
-/// value field, with the definition's copy kept in step.
+/// value field, with the definition's copy kept in step. The lock is the
+/// instance's own `locked`, which `FOOTPRINT::Deserialize` reads.
 fn apply_footprint_edit(
     footprint: &mut board::FootprintInstance,
     edit: &IpcFootprintEdit,
@@ -87,12 +89,19 @@ fn apply_footprint_edit(
     if let Some(exclude) = edit.exclude_from_pos_files {
         attributes.exclude_from_position_files = exclude;
     }
+    if let Some(locked) = edit.locked {
+        footprint.locked = if locked {
+            common::LockedState::LsLocked
+        } else {
+            common::LockedState::LsUnlocked
+        } as i32;
+    }
     Ok(())
 }
 
 /// Every difference between two states of the same footprint that this edit
-/// could plausibly touch: the value and the flags, the pose and every
-/// mandatory field.
+/// could plausibly touch: the value, the flags and the lock, the pose and
+/// every mandatory field.
 fn edit_mismatches(
     expected: &board::FootprintInstance,
     observed: &board::FootprintInstance,
@@ -119,6 +128,7 @@ fn edit_mismatches(
             want.exclude_from_pos_files,
             got.exclude_from_pos_files,
         ),
+        ("locked", want.locked, got.locked),
     ] {
         if want != got {
             out.push(format!("{name}: expected {want}, observed {got}"));
@@ -129,7 +139,7 @@ fn edit_mismatches(
 }
 
 impl KiCadIpcClient {
-    /// The value and assembly flags of the one placed footprint with
+    /// The value, assembly flags and lock of the one placed footprint with
     /// `reference` on `document`.
     pub fn footprint_state_in(
         &self,
@@ -141,8 +151,8 @@ impl KiCadIpcClient {
         ))
     }
 
-    /// Change the value and the assembly flags of the one placed footprint
-    /// with `reference` on `document`, in one KiCad undo step.
+    /// Change the value, the assembly flags and the lock of the one placed
+    /// footprint with `reference` on `document`, in one KiCad undo step.
     ///
     /// The whole footprint is sent back, as KiCad has no narrower update,
     /// with only the requested properties changed. Success requires a fresh
@@ -280,6 +290,38 @@ mod tests {
             vec!["dnp: expected true, observed false".to_string()]
         );
         assert!(edit_mismatches(&expected, &expected).is_empty());
+    }
+
+    #[test]
+    fn the_lock_is_set_and_cleared_on_the_instance() {
+        let mut edited = footprint("10k", false);
+        let lock = |locked| IpcFootprintEdit {
+            locked: Some(locked),
+            ..Default::default()
+        };
+        apply_footprint_edit(&mut edited, &lock(true)).unwrap();
+        assert_eq!(edited.locked, common::LockedState::LsLocked as i32);
+        assert!(footprint_state(&edited).locked);
+        assert_eq!(
+            edited.attributes,
+            footprint("10k", false).attributes,
+            "the lock is not an attribute"
+        );
+        apply_footprint_edit(&mut edited, &lock(false)).unwrap();
+        assert_eq!(edited.locked, common::LockedState::LsUnlocked as i32);
+        assert!(!footprint_state(&edited).locked);
+    }
+
+    #[test]
+    fn a_lock_kicad_did_not_keep_is_a_mismatch() {
+        let mut expected = footprint("10k", false);
+        expected.locked = common::LockedState::LsLocked as i32;
+        let mut observed = footprint("10k", false);
+        observed.locked = common::LockedState::LsUnlocked as i32;
+        assert_eq!(
+            edit_mismatches(&expected, &observed),
+            vec!["locked: expected true, observed false".to_string()]
+        );
     }
 
     #[test]
