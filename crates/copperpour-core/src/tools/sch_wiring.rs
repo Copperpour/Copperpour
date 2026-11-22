@@ -225,9 +225,13 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "add_power_symbol",
             "Add a power symbol (VCC, GND, etc.) to the schematic. Name the pin it ties to \
-             with reference + pin_number, or give x + y. A named pin places the symbol on the \
-             pin's endpoint and, unless rotation is given, turns it to face away from the body. \
-             Coordinates snap to the 1.27mm grid like the other placers. Reports the placed \
+             with reference + pin_number, or give x + y. A named pin gets a straight outward \
+             stub (2.54 mm by default); a blocked stub refuses with plan_blocked without writing. \
+             The symbol keeps its library direction where clear, or faces away from the pin's body. \
+             An explicit rotation wins. By-pin placements report the stub, orientation, overlaps \
+             and any bounds_unresolved that could not be checked. If any symbol's pins cannot \
+             be resolved, new stubs are refused; use stub_length: 0 to place on the tip without a wire. \
+             Placement by coordinates snaps to the 1.27 mm grid. Reports the placed \
              coordinates. Auto-numbers the \
              internal reference in the library symbol's prefix (#PWR, or #FLG for PWR_FLAG; each \
              prefix its own series) to the lowest number free in the whole hierarchy, one per \
@@ -248,7 +252,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "x": { "type": "number", "description": "X in mm; alternative to reference + pin_number" },
                     "y": { "type": "number", "description": "Y in mm" },
                     "rotation": { "type": "number",
-                        "description": "Degrees. Defaults to facing away from a named pin's body, else 0." }
+                        "description": "Degrees. For a named pin, overrides automatic orientation; for x + y, defaults to 0." },
+                    "stub_length": { "type": "number", "minimum": 0, "default": 2.54,
+                        "description": "Named pins only: stub length in mm, a multiple of 1.27. Zero keeps placement on the pin tip, with the original facing-away rotation unless rotation is given." }
                 },
                 "required": ["schematic", "power_net"]
             }),
@@ -1011,6 +1017,32 @@ impl RouteGuard {
         from: (f64, f64),
         also: &[(f64, f64)],
     ) -> Option<Self> {
+        let pins = crate::tools::resolved_placed_pins_by_reference(before)?;
+        Some(Self::with_pins(before, from, also, pins, None))
+    }
+
+    fn for_power(
+        before: &copperpour_sexp::SexpNode,
+        from: (f64, f64),
+        also: &[(f64, f64)],
+        power_net: &str,
+    ) -> Self {
+        Self::with_pins(
+            before,
+            from,
+            also,
+            super::sch_pin_contacts::clearance_pin_inventory(before).0,
+            Some(power_net),
+        )
+    }
+
+    fn with_pins(
+        before: &copperpour_sexp::SexpNode,
+        from: (f64, f64),
+        also: &[(f64, f64)],
+        pins: crate::tools::PlacedPinsByReference,
+        power_net: Option<&str>,
+    ) -> Self {
         use crate::tools::sch_connectivity::pt_key;
         use copperpour_sexp::geometry::point_on_segment;
         use copperpour_sexp::schematic::{extract_sheet_pins, LabelKind};
@@ -1037,7 +1069,7 @@ impl RouteGuard {
                 });
             }
         };
-        for (inst, pins) in crate::tools::resolved_placed_pins_by_reference(before)? {
+        for (inst, pins) in pins {
             for (pin, t) in pins {
                 push(
                     pin_endpoint(&pin, t),
@@ -1061,18 +1093,23 @@ impl RouteGuard {
         let ends: Vec<_> = std::iter::once(from).chain(also.iter().copied()).collect();
         let mut allowed: Vec<_> = ends.iter().map(|p| graph.root_at(p.0, p.1)).collect();
         for w in &wires {
-            if ends
-                .iter()
-                .any(|p| point_on_segment(p.0, p.1, w.x1, w.y1, w.x2, w.y2, 0.01))
-            {
+            if ends.iter().any(|p| {
+                power_net.is_none() && point_on_segment(p.0, p.1, w.x1, w.y1, w.x2, w.y2, 0.01)
+            }) {
                 allowed.push(graph.root_at(w.x1, w.y1));
             }
         }
-        Some(RouteGuard {
+        allowed.extend(
+            labels
+                .iter()
+                .filter(|l| Some(l.net.as_str()) == power_net)
+                .map(|l| graph.root_at(l.x, l.y)),
+        );
+        RouteGuard {
             allowed,
             a: from,
             terminals,
-        })
+        }
     }
 
     /// Why the `candidate` sheet in `after` is refused, or `None` when it joins
@@ -3053,6 +3090,7 @@ fn number_in_series(designator: &str, prefix: &str) -> Option<u32> {
 /// also avoids re-issuing a live designator after a deletion: drop `#PWR028`
 /// from a sheet of 29 and the count is 28, so the next symbol would be handed
 /// `#PWR029`, still in use.
+#[derive(Clone)]
 struct PwrNumbering {
     /// The series numbered, such as `#PWR` or `#FLG`.
     prefix: String,
@@ -3259,6 +3297,35 @@ enum PowerSite {
     },
 }
 
+const POWER_STUB_MM: f64 = 2.54;
+
+fn power_stub_length(args: &serde_json::Value, allow_zero: bool) -> Result<f64, CallToolResult> {
+    let length = if args["stub_length"].is_null() {
+        POWER_STUB_MM
+    } else {
+        require_f64(args, "stub_length")?
+    };
+    if !length.is_finite() || length < 0.0 || (!allow_zero && length == 0.0) {
+        let reason = if allow_zero {
+            "must be a finite, nonnegative length in mm"
+        } else {
+            "must be a finite length greater than zero"
+        };
+        return Err(crate::tools::invalid_arg("stub_length", reason));
+    }
+    let grid_length = (length / 1.27).round() * 1.27;
+    if (length - grid_length).abs() > 1e-6
+        || (length > 0.0 && grid_length == 0.0)
+        || !(grid_length * 1e6).is_finite()
+    {
+        return Err(crate::tools::invalid_arg(
+            "stub_length",
+            "must be a multiple of 1.27 mm",
+        ));
+    }
+    Ok(grid_length)
+}
+
 /// The one pin `reference` + `pin_number` names, refused as
 /// `add_power_symbol` words it.
 fn resolve_power_pin(
@@ -3289,16 +3356,12 @@ fn power_symbol_pin(
     }
 }
 
-/// Where a power symbol goes so its pin, not its origin, lands on `point`,
-/// facing `outward` unless `rotation` is given.
-fn power_symbol_on_point(
+/// Where a power symbol goes so its pin, not its origin, lands on `point`.
+fn power_symbol_origin(
     power_pin: &copperpour_sexp::schematic::LibPin,
     point: (f64, f64),
-    outward: f64,
-    rotation: Option<f64>,
-) -> (f64, f64, f64) {
-    let rotation =
-        rotation.unwrap_or_else(|| copperpour_sexp::schematic::rotation_facing(power_pin, outward));
+    rotation: f64,
+) -> (f64, f64) {
     let (dx, dy) = pin_endpoint(
         power_pin,
         copperpour_sexp::geometry::PinTransform {
@@ -3309,7 +3372,29 @@ fn power_symbol_on_point(
             mirror_y: false,
         },
     );
-    (point.0 - dx, point.1 - dy, rotation)
+    (point.0 - dx, point.1 - dy)
+}
+
+/// Choose a rail's default rotation. Only a quarter-turn away from the
+/// library direction needs a clearance trial; a half-turn keeps the graphic
+/// from pointing back across the part.
+pub(crate) fn select_power_symbol_rotation(
+    power_pin: &copperpour_sexp::schematic::LibPin,
+    outward: f64,
+    library_blocked: impl FnOnce() -> anyhow::Result<Option<String>>,
+) -> anyhow::Result<(f64, Option<String>)> {
+    let facing = copperpour_sexp::schematic::rotation_facing(power_pin, outward);
+    match facing {
+        0.0 => Ok((0.0, None)),
+        180.0 => Ok((
+            facing,
+            Some("the pin faces against the library direction".into()),
+        )),
+        _ => match library_blocked()? {
+            Some(reason) => Ok((facing, Some(reason))),
+            None => Ok((0.0, None)),
+        },
+    }
 }
 
 /// The `power_net` power symbols already on a sheet, by the net each one is on.
@@ -3374,7 +3459,7 @@ fn add_power_symbol_to(
     x: f64,
     y: f64,
     rotation: f64,
-) -> (String, super::sch_components::ComponentTargetUnit) {
+) -> (String, String, super::sch_components::ComponentTargetUnit) {
     // Spelled by the rule `annotate_schematic` uses, which is eeschema's:
     // `#PWR01`, `#PWR010`, `#PWR0100`. `{:03}` put a second spelling of the
     // same number beside every eeschema-numbered symbol (#583).
@@ -3487,7 +3572,308 @@ fn add_power_symbol_to(
     )
     .with_instance_references(records.iter().map(|(_, reference)| reference.as_str()));
     sch.add_symbol(sym);
-    (pwr_ref, placement)
+    (pwr_ref, uuid, placement)
+}
+
+struct PinPowerPlacement {
+    segment: Option<Segment>,
+    wire_uuid: Option<String>,
+    orientation_reason: Option<String>,
+    automatic: bool,
+}
+
+impl PinPowerPlacement {
+    fn disclose(
+        &self,
+        observed: &mut serde_json::Value,
+        before: &copperpour_sexp::SexpNode,
+        tree: &copperpour_sexp::SexpNode,
+    ) -> Result<(), String> {
+        let wires = extract_wires(tree);
+        let wire = match (&self.wire_uuid, self.segment) {
+            (Some(uuid), Some((a, b))) => {
+                Some(observed_power_wire(&wires, uuid, a, b).ok_or_else(|| {
+                    format!("stub wire {uuid} was not read back at its planned endpoints")
+                })?)
+            }
+            _ => None,
+        };
+        observed["wire"] = match wire {
+            Some(w) => json!({"x1": w.x1, "y1": w.y1, "x2": w.x2, "y2": w.y2, "uuid": w.uuid}),
+            None => serde_json::Value::Null,
+        };
+        let rotation = observed["rotation"]
+            .as_f64()
+            .ok_or_else(|| "the saved power symbol's rotation could not be read".to_string())?;
+        observed["orientation"] = json!(match rotation.rem_euclid(360.0) {
+            0.0 => "library",
+            180.0 => "inverted",
+            _ => "sideways",
+        });
+        if let Some(reason) = &self.orientation_reason {
+            observed["orientation_reason"] = json!(reason);
+        }
+        let uuid = observed["uuid"]
+            .as_str()
+            .ok_or_else(|| "the saved power symbol's UUID could not be read".to_string())?;
+        let mut changed = vec![uuid];
+        changed.extend(self.wire_uuid.as_deref());
+        let report = super::sch_analysis::added_clearance_findings(before, tree, &changed);
+        let mut findings = report.findings;
+        if let Some((anchor, _)) = self.segment {
+            for crossing in power_corridor_crossings(before, tree, uuid, anchor) {
+                if self.automatic {
+                    let reason = crossing["message"]
+                        .as_str()
+                        .expect("corridor has a message");
+                    let previous = observed["orientation_reason"].as_str();
+                    observed["orientation_reason"] = json!(match previous {
+                        Some(previous) => format!("{previous}; {reason}"),
+                        None => reason.to_owned(),
+                    });
+                }
+                findings.push(crossing);
+            }
+        }
+        observed["text_overlaps"] = json!(findings);
+        observed["bounds_unresolved"] = json!(report.bounds_unresolved);
+        Ok(())
+    }
+}
+
+fn observed_power_wire<'a>(
+    wires: &'a [Wire],
+    uuid: &str,
+    (x1, y1): (f64, f64),
+    (x2, y2): (f64, f64),
+) -> Option<&'a Wire> {
+    use copperpour_sexp::geometry::points_coincident;
+    wires.iter().find(|w| {
+        w.uuid.as_deref() == Some(uuid)
+            && points_coincident(w.x1, w.y1, x1, y1, TOLERANCE)
+            && points_coincident(w.x2, w.y2, x2, y2, TOLERANCE)
+    })
+}
+
+fn power_corridor_crossings(
+    before: &copperpour_sexp::SexpNode,
+    tree: &copperpour_sexp::SexpNode,
+    symbol_uuid: &str,
+    anchor: (f64, f64),
+) -> Vec<serde_json::Value> {
+    use copperpour_sexp::geometry::{point_on_segment, points_coincident};
+    use copperpour_sexp::schematic::{
+        pin_outward_direction, PinSegment, SymbolBounds, SymbolGeometry,
+    };
+    use copperpour_sexp::text_bounds::TextOwner;
+
+    let Some(instance) = extract_symbol_instances(tree)
+        .into_iter()
+        .find(|i| i.uuid.as_deref() == Some(symbol_uuid))
+    else {
+        return Vec::new();
+    };
+    let Some(lib) = tree.find("lib_symbols") else {
+        return Vec::new();
+    };
+    let Some(geometry) = find_lib_symbol(&lib.find_all("symbol"), &instance)
+        .and_then(|lib| symbol_geometry_for_instance(lib, &instance))
+    else {
+        return Vec::new();
+    };
+    let texts = text_extents(tree);
+    let value = texts.iter().find(|text| {
+        matches!(&text.owner, TextOwner::Field { field, symbol_uuid: uuid, .. }
+            if uuid.as_deref() == Some(symbol_uuid) && field == "Value")
+    });
+    // Planned batch wires do not consume a corridor before their symbols
+    // have had an orientation trial.
+    let wires = extract_wires(before);
+    let no_connects = copperpour_sexp::schematic::extract_no_connects(tree);
+    let mut crossings = Vec::new();
+    for (other, pins) in crate::tools::drawn_symbol_pin_inventory(tree)
+        .into_iter()
+        .flatten()
+    {
+        if other.uuid.as_deref() == Some(symbol_uuid)
+            || crate::tools::is_power_symbol_reference(&other.reference)
+        {
+            continue;
+        }
+        for (pin, transform) in pins {
+            let tip = pin_endpoint(&pin, transform);
+            let near = |(x, y)| points_coincident(tip.0, tip.1, x, y, TOLERANCE);
+            let dir =
+                crate::tools::stub_direction("auto", Some(pin_outward_direction(&pin, transform)));
+            let end = dir.end(tip, POWER_STUB_MM);
+            if pin.hidden
+                || near(anchor)
+                || wires.iter().any(|wire| {
+                    point_on_segment(tip.0, tip.1, wire.x1, wire.y1, wire.x2, wire.y2, TOLERANCE)
+                        && [(wire.x1, wire.y1), (wire.x2, wire.y2)]
+                            .into_iter()
+                            .any(|(x, y)| {
+                                !near((x, y))
+                                    && if tip.0 == end.0 {
+                                        (x - tip.0).abs() <= TOLERANCE
+                                            && (y - tip.1).signum() == (end.1 - tip.1).signum()
+                                    } else {
+                                        (y - tip.1).abs() <= TOLERANCE
+                                            && (x - tip.0).signum() == (end.0 - tip.0).signum()
+                                    }
+                            })
+                })
+                || no_connects.iter().copied().any(near)
+            {
+                continue;
+            }
+            let corridor = SymbolGeometry {
+                body: None,
+                pins: vec![PinSegment { tip, root: end }],
+            };
+            let bounds = SymbolBounds {
+                min_x: tip.0.min(end.0),
+                min_y: tip.1.min(end.1),
+                max_x: tip.0.max(end.0),
+                max_y: tip.1.max(end.1),
+            };
+            // The future symbol sits at the far endpoint, so touching it
+            // with an edge of this graphic is enough to rule out this rotation.
+            if geometry.body.is_some_and(|body| !body.separated(bounds))
+                || geometry.collides(&corridor)
+                || value.is_some_and(|text| text.compared.segment_enters(tip, end))
+            {
+                crossings.push(json!({
+                    "type": "pin_stub_corridor_overlap",
+                    "a": {"kind": "symbol", "reference": instance.reference, "symbol_uuid": symbol_uuid},
+                    "b": {"kind": "pin_stub_corridor", "reference": other.reference, "unit": other.unit,
+                          "symbol_uuid": other.uuid, "pin_number": pin.number,
+                          "x1": round6(tip.0), "y1": round6(tip.1), "x2": end.0, "y2": end.1},
+                    "message": format!("the power symbol crosses the stub corridor of {} pin {}", other.reference, pin.number)
+                }));
+            }
+        }
+    }
+    crossings
+}
+
+/// Why a candidate library-facing power symbol fails the clearance rule.
+/// The caller supplies the parsed candidate, including the new or moved
+/// symbol at its proposed origin, with the final wiring already present.
+pub(super) fn library_power_clearance_reason(
+    before: &copperpour_sexp::SexpNode,
+    candidate: &copperpour_sexp::SexpNode,
+    symbol_uuid: &str,
+    source_pin: (f64, f64),
+) -> Option<String> {
+    if let Some(crossing) =
+        power_corridor_crossings(before, candidate, symbol_uuid, source_pin).first()
+    {
+        return crossing["message"].as_str().map(str::to_owned);
+    }
+    let report = super::sch_analysis::added_clearance_findings(before, candidate, &[symbol_uuid]);
+    report.findings.first().map(|finding| {
+        format!(
+            "the library direction would leave a {}",
+            finding["type"].as_str().unwrap_or("collision")
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_power_on_pin(
+    sch: &mut cse::Schematic,
+    context: &crate::tools::SheetInstanceContext,
+    numbering: &mut PwrNumbering,
+    power_net: &str,
+    lib_id: &str,
+    power_pin: &copperpour_sexp::schematic::LibPin,
+    endpoint: (f64, f64),
+    outward: f64,
+    wire: Option<(Segment, String)>,
+    requested_rotation: Option<f64>,
+    before: &copperpour_sexp::SexpNode,
+) -> anyhow::Result<(
+    String,
+    super::sch_components::ComponentTargetUnit,
+    PinPowerPlacement,
+)> {
+    let (segment, wire_uuid) =
+        wire.map_or((None, None), |(segment, uuid)| (Some(segment), Some(uuid)));
+    let point = segment.map_or(endpoint, |(_, end)| end);
+    let (rotation, orientation_reason) = if let Some(rotation) = requested_rotation {
+        (rotation, None)
+    } else if segment.is_none() {
+        let rotation = copperpour_sexp::schematic::rotation_facing(power_pin, outward);
+        (
+            rotation,
+            (rotation != 0.0).then(|| "stub_length 0 keeps the on-tip orientation".into()),
+        )
+    } else {
+        select_power_symbol_rotation(power_pin, outward, || {
+            let (x, y) = power_symbol_origin(power_pin, point, 0.0);
+            let (_, trial_uuid, _) = add_power_symbol_to(
+                sch,
+                context,
+                &mut numbering.clone(),
+                lib_id,
+                power_net,
+                x,
+                y,
+                0.0,
+            );
+            let candidate = sch.to_source();
+            sch.symbols.remove_by_uuid(&trial_uuid);
+            let tree = parse_sexp(&candidate)?;
+            Ok(library_power_clearance_reason(
+                before,
+                &tree,
+                &trial_uuid,
+                endpoint,
+            ))
+        })?
+    };
+    let (x, y) = power_symbol_origin(power_pin, point, rotation);
+    let (reference, _, placement) =
+        add_power_symbol_to(sch, context, numbering, lib_id, power_net, x, y, rotation);
+    Ok((
+        reference,
+        placement,
+        PinPowerPlacement {
+            segment,
+            wire_uuid,
+            orientation_reason,
+            automatic: requested_rotation.is_none(),
+        },
+    ))
+}
+
+fn checked_power_stub(
+    obstacles: &PowerObstacles,
+    endpoint: (f64, f64),
+    outward: f64,
+    length: f64,
+) -> Result<Segment, Vec<String>> {
+    let dir = crate::tools::stub_direction("auto", Some(outward));
+    let stub = (endpoint, dir.end(endpoint, length));
+    if let Some(reason) = obstacles.blocking(&[stub], &[endpoint]) {
+        return Err(vec![reason]);
+    }
+    Ok(stub)
+}
+
+fn power_stub_blocked(operation: &str, reasons: Vec<String>) -> CallToolResult {
+    let message = format!(
+        "{operation} could not add an outward power stub: {}",
+        reasons.join("; ")
+    );
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::PlanBlocked {
+            operation: operation.into(),
+            reasons,
+        },
+        message,
+    )
 }
 
 async fn handle_add_power_symbol(
@@ -3503,11 +3889,37 @@ async fn handle_add_power_symbol(
         Ok(selector) => selector,
         Err(e) => return Ok(e),
     };
-    let requested_rotation = opt_f64(args, "rotation");
+    let requested_rotation = if matches!(selector, PowerSelector::Point { .. }) {
+        opt_f64(args, "rotation")
+    } else if args["rotation"].is_null() {
+        None
+    } else {
+        match require_f64(args, "rotation") {
+            Ok(rotation) => Some(rotation),
+            Err(error) => return Ok(error),
+        }
+    };
+    let length = match selector {
+        PowerSelector::Pin { .. } => match power_stub_length(args, true) {
+            Ok(length) => length,
+            Err(error) => return Ok(error),
+        },
+        PowerSelector::Point { .. }
+            if !args["stub_length"].is_null() && args["stub_length"].as_f64() != Some(0.0) =>
+        {
+            return Ok(crate::tools::invalid_arg(
+                "stub_length",
+                "a nonzero stub length requires a named pin",
+            ));
+        }
+        PowerSelector::Point { .. } => 0.0,
+    };
 
     // One read serves both the pin lookup and the edit, so the pin cannot
     // come from a revision other than the one the write is checked against.
     let content = read_consistent(&sch_path)?;
+    let mut pin_tree = None;
+    let mut pin_obstacles = None;
     let site = match selector {
         PowerSelector::Point { x, y } => PowerSite::Point { x, y },
         PowerSelector::Pin {
@@ -3515,7 +3927,20 @@ async fn handle_add_power_symbol(
             pin_number,
         } => {
             let tree = parse_sexp(&content)?;
-            let site = match resolve_power_pin(&PlacedPins::new(&tree), &reference, &pin_number) {
+            let placed = if length == 0.0 {
+                PlacedPins::new(&tree)
+            } else {
+                let (obstacles, placed) = PowerObstacles::with_drawn_pins(&tree);
+                if obstacles.pin_geometry_unresolved(&reference) {
+                    return Ok(power_stub_blocked(
+                        "add_power_symbol",
+                        obstacles.unresolved_pin_reason().into_iter().collect(),
+                    ));
+                }
+                pin_obstacles = Some(obstacles);
+                placed
+            };
+            let site = match resolve_power_pin(&placed, &reference, &pin_number) {
                 Ok(pin) => PowerSite::Pin {
                     endpoint: pin.endpoint(),
                     outward: pin.outward(),
@@ -3535,6 +3960,7 @@ async fn handle_add_power_symbol(
                     })));
                 }
             }
+            pin_tree = Some(tree);
             site
         }
     };
@@ -3556,7 +3982,8 @@ async fn handle_add_power_symbol(
     if !cse::library::ensure_lib_symbol(&mut sch, &lib_id, &src) {
         return Ok(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
     }
-    let (x, y, rotation) = match site {
+    let mut numbering = PwrNumbering::for_sheet(&sch_path, &sch, &lib_id, &context);
+    let (pwr_ref, placement, pin_placement) = match site {
         // Snap like `place_one_component` does for the other two placers. Wires
         // and labels are snapped to this grid, so a power symbol left off it
         // cannot be reached by them: ERC reports the endpoint off grid and the
@@ -3565,7 +3992,17 @@ async fn handle_add_power_symbol(
         // point.
         PowerSite::Point { x, y } => {
             let (x, y) = copperpour_sexp::geometry::snap_point(x, y, 1.27);
-            (x, y, requested_rotation.unwrap_or(0.0))
+            let (reference, _, placement) = add_power_symbol_to(
+                &mut sch,
+                &context,
+                &mut numbering,
+                &lib_id,
+                &power_net,
+                x,
+                y,
+                requested_rotation.unwrap_or(0.0),
+            );
+            (reference, placement, None)
         }
         // Not snapped: the pin is where its symbol put it, and a snapped
         // symbol would miss an off-grid pin.
@@ -3576,40 +4013,114 @@ async fn handle_add_power_symbol(
                     &format!("'{lib_id}' does not have exactly one pin; give x + y instead"),
                 ));
             };
-            power_symbol_on_point(&power_pin, endpoint, outward, requested_rotation)
+            let segment = if length == 0.0 {
+                None
+            } else {
+                let obstacles = pin_obstacles
+                    .as_ref()
+                    .expect("a positive-length stub uses the drawn pin inventory");
+                match checked_power_stub(obstacles, endpoint, outward, length) {
+                    Ok(segment) => Some(segment),
+                    Err(reasons) => return Ok(power_stub_blocked("add_power_symbol", reasons)),
+                }
+            };
+            let wire = segment.map(|stub @ ((x1, y1), (x2, y2))| {
+                (stub, sch.add_wire(x1, y1, x2, y2).uuid.clone())
+            });
+            let (reference, placement, pin) = add_power_on_pin(
+                &mut sch,
+                &context,
+                &mut numbering,
+                &power_net,
+                &lib_id,
+                &power_pin,
+                endpoint,
+                outward,
+                wire,
+                requested_rotation,
+                pin_tree.as_ref().expect("named pin has a source tree"),
+            )?;
+            (reference, placement, Some(pin))
         }
     };
-    let mut numbering = PwrNumbering::for_sheet(&sch_path, &sch, &lib_id, &context);
-    let (pwr_ref, placement) = add_power_symbol_to(
-        &mut sch,
-        &context,
-        &mut numbering,
-        &lib_id,
-        &power_net,
-        x,
-        y,
-        rotation,
-    );
+    let segment = pin_placement.as_ref().and_then(|pin| pin.segment);
+    let mut stub_junctions = Vec::new();
+    if let Some((start, end)) = segment {
+        let tree = pin_tree.as_ref().expect("only named pins get a stub");
+        let exits = power_junction_exits(tree);
+        for (x, y) in new_wire_junctions(&cse_wires_to_sexp(&sch), &exits, start, end) {
+            if add_missing_junctions(&mut sch, &[(x, y)]) != 0 {
+                stub_junctions.push((x, y));
+            }
+        }
+        let guard = RouteGuard::for_power(tree, start, &[], &power_net);
+        if let Some(reason) = guard.refusal("power stub", &sch.to_source())? {
+            return Ok(power_stub_blocked("add_power_symbol", vec![reason]));
+        }
+    } else if pin_placement.is_some() {
+        let tree = pin_tree.as_ref().expect("named pin has a source tree");
+        let at = match site {
+            PowerSite::Pin { endpoint, .. } => endpoint,
+            PowerSite::Point { .. } => unreachable!(),
+        };
+        if extract_wires(tree)
+            .iter()
+            .any(|w| !pins_mid_segment(&[at], w.x1, w.y1, w.x2, w.y2).is_empty())
+            && add_missing_junctions(&mut sch, &[at]) != 0
+        {
+            stub_junctions.push(at);
+        }
+    }
     sch.overwrite()?;
 
     // A power pin landing mid-segment on an existing wire needs a junction
     // dot, or KiCad ERC reports it as not connected.
-    let junctions_added = match crate::tools::add_pin_midwire_junctions(&sch_path, &pwr_ref) {
-        Ok(junctions) => junctions,
-        Err(error) if crate::tools::readback_mismatch_path(&error).is_some() => return Err(error),
-        Err(error) => {
-            return Ok(crate::tools::mutation_outcome_uncertain(
-                &sch_path,
-                "add_power_symbol",
-                format!("post-write junction processing failed: {error}"),
-            ))
+    let junctions_added = if pin_placement.is_some() {
+        stub_junctions
+    } else {
+        match crate::tools::add_pin_midwire_junctions(&sch_path, &pwr_ref) {
+            Ok(junctions) => junctions,
+            Err(error) if crate::tools::readback_mismatch_path(&error).is_some() => {
+                return Err(error)
+            }
+            Err(error) => {
+                return Ok(crate::tools::mutation_outcome_uncertain(
+                    &sch_path,
+                    "add_power_symbol",
+                    format!("post-write junction processing failed: {error}"),
+                ))
+            }
         }
     };
-    let committed = cse::Schematic::load(&sch_path)?;
+    let uncertain = |reason: String| {
+        crate::tools::mutation_outcome_uncertain(&sch_path, "add_power_symbol", reason)
+    };
+    let committed_source = match read_consistent(&sch_path) {
+        Ok(source) => source,
+        Err(error) => {
+            return Ok(uncertain(format!(
+                "saved schematic could not be read: {error}"
+            )))
+        }
+    };
+    let committed = match cse::Schematic::from_source(&sch_path, committed_source.as_str()) {
+        Ok(committed) => committed,
+        Err(error) => {
+            return Ok(uncertain(format!(
+                "saved schematic could not be loaded: {error}"
+            )))
+        }
+    };
     let mut observed = match super::sch_components::placed_component_readback(
         &sch_path, &committed, &placement, &context,
     ) {
         Ok(result) => result,
+        Err(error) if pin_placement.is_some() => {
+            return Ok(uncertain(format!(
+                "saved power symbol readback failed: {}",
+                super::sch_batch::error_text(&error)
+            )));
+        }
         Err(error) => return Ok(error),
     };
     if !super::sch_components::wants_verbose(args) {
@@ -3623,6 +4134,29 @@ async fn handle_add_power_symbol(
         .iter()
         .map(|(x, y)| json!({"x": x, "y": y}))
         .collect::<Vec<_>>());
+    if let Some(pin) = pin_placement {
+        let tree = match parse_sexp(&committed_source) {
+            Ok(tree) => tree,
+            Err(error) => {
+                return Ok(uncertain(format!(
+                    "saved pin placement could not be read: {error}"
+                )))
+            }
+        };
+        let saved_dots = copperpour_sexp::schematic::extract_junctions(&tree);
+        if junctions_added.iter().any(|at| !saved_dots.contains(at)) {
+            return Ok(uncertain(
+                "a new junction was not found in the saved file".to_string(),
+            ));
+        }
+        if let Err(reason) = pin.disclose(
+            &mut observed,
+            pin_tree.as_ref().expect("named pin has a source tree"),
+            &tree,
+        ) {
+            return Ok(uncertain(reason));
+        }
+    }
 
     Ok(CallToolResult::json(&observed))
 }
@@ -3634,6 +4168,7 @@ struct PowerPoint {
     pins: Vec<(String, String)>,
     endpoint: (f64, f64),
     outward: f64,
+    rotation: Option<f64>,
 }
 
 impl PowerPoint {
@@ -3657,7 +4192,7 @@ impl PowerPoint {
 }
 
 /// Split points into rows that can share one bar: same outward direction, same
-/// depth, and no gap wider than `max_gap` between neighbours. Order follows the
+/// approximate depth, and no gap wider than `max_gap` between neighbours. Order follows the
 /// first point of each row, and each row runs along its cross axis.
 fn group_power_points(points: Vec<PowerPoint>, max_gap: f64) -> Vec<Vec<PowerPoint>> {
     let tol = 0.01;
@@ -3714,27 +4249,34 @@ fn power_bar(group: &[PowerPoint], stub_length: f64) -> (Vec<Segment>, (f64, f64
 struct PowerObstacles {
     points: Vec<((f64, f64), &'static str)>,
     wires: Vec<Segment>,
+    junctions: Vec<(f64, f64)>,
+    unresolved_pins: Vec<String>,
 }
 
 impl PowerObstacles {
-    fn from_tree(tree: &copperpour_sexp::SexpNode) -> Self {
+    fn with_drawn_pins(tree: &copperpour_sexp::SexpNode) -> (Self, PlacedPins) {
         use copperpour_sexp::schematic as ks;
-        let mut points: Vec<((f64, f64), &'static str)> = Vec::new();
-        points.extend(
-            crate::tools::all_pin_endpoints(tree)
-                .into_iter()
-                .map(|p| (p, "pin")),
-        );
+        let (pins, unresolved_pins) = super::sch_pin_contacts::clearance_pin_inventory(tree);
+        let mut points: Vec<_> = pins
+            .iter()
+            .flat_map(|(_, pins)| pins.iter().map(|(pin, t)| (pin_endpoint(pin, *t), "pin")))
+            .collect();
         points.extend(
             ks::extract_labels(tree)
                 .into_iter()
                 .map(|l| ((l.x, l.y), "label")),
         );
         points.extend(
-            ks::extract_junctions(tree)
+            ["netclass_flag", "directive_label"]
                 .into_iter()
-                .map(|p| (p, "junction")),
+                .flat_map(|tag| {
+                    tree.find_all(tag).into_iter().filter_map(|node| {
+                        parse_at(node).map(|(x, y, _)| ((x, y), "directive label"))
+                    })
+                }),
         );
+        let junctions = ks::extract_junctions(tree);
+        points.extend(junctions.iter().copied().map(|p| (p, "junction")));
         points.extend(
             ks::extract_no_connects(tree)
                 .into_iter()
@@ -3750,17 +4292,41 @@ impl PowerObstacles {
             .chain(ks::extract_buses(tree))
             .map(|w| ((w.x1, w.y1), (w.x2, w.y2)))
             .collect();
-        Self { points, wires }
+        let obstacles = Self {
+            points,
+            wires,
+            junctions,
+            unresolved_pins,
+        };
+        (obstacles, PlacedPins::from_drawn(pins))
+    }
+
+    fn pin_geometry_unresolved(&self, reference: &str) -> bool {
+        self.unresolved_pins.iter().any(|name| name == reference)
+    }
+
+    fn unresolved_pin_reason(&self) -> Option<String> {
+        (!self.unresolved_pins.is_empty()).then(|| {
+            format!(
+                "cannot check what the stub would touch: unresolved pin geometry for {}. \
+             Repair the embedded symbol definitions, or use add_power_symbol with \
+             stub_length: 0 on a resolved pin to place on the tip without adding a wire",
+                self.unresolved_pins.join(", ")
+            )
+        })
     }
 
     /// Why `segments` cannot be drawn, or `None` when they touch nothing but
     /// the group's own pin endpoints.
     fn blocking(&self, segments: &[Segment], own: &[(f64, f64)]) -> Option<String> {
         use copperpour_sexp::geometry::{point_on_segment, points_coincident};
+        if let Some(reason) = self.unresolved_pin_reason() {
+            return Some(reason);
+        }
         let tol = 0.01;
         let is_own = |p: (f64, f64)| {
             own.iter()
-                .any(|o| points_coincident(p.0, p.1, o.0, o.1, tol))
+                .any(|o| (round6(o.0), round6(o.1)) == (round6(p.0), round6(p.1)))
         };
         let on =
             |p: (f64, f64), (a, b): Segment| point_on_segment(p.0, p.1, a.0, a.1, b.0, b.1, tol);
@@ -3774,14 +4340,42 @@ impl PowerObstacles {
                 return Some(format!("a wire would touch a {kind} at {}", at(*p)));
             }
             for &wire in &self.wires {
+                let at_endpoint = |p: (f64, f64)| {
+                    [wire.0, wire.1]
+                        .into_iter()
+                        .any(|end| points_coincident(p.0, p.1, end.0, end.1, tol))
+                };
+                let already_bound = |p: (f64, f64)| {
+                    is_own(p)
+                        && (at_endpoint(p)
+                            || self
+                                .junctions
+                                .iter()
+                                .any(|j| points_coincident(p.0, p.1, j.0, j.1, tol)))
+                };
+                let ((ax, ay), (bx, _)) = segment;
+                let ((cx, cy), (dx, dy)) = wire;
+                let (delta, offset) = if ax == bx {
+                    (dx - cx, ax - cx)
+                } else {
+                    (dy - cy, ay - cy)
+                };
+                let crossing = (delta.abs() > 1e-6)
+                    .then(|| {
+                        let t = offset / delta;
+                        (t, (cx + t * (dx - cx), cy + t * (dy - cy)))
+                    })
+                    .filter(|(t, p)| (0.0..=1.0).contains(t) && on(*p, segment))
+                    .map(|(_, p)| p);
                 let touch = [segment.0, segment.1]
                     .into_iter()
-                    .find(|p| on(*p, wire) && !is_own(*p))
+                    .find(|p| on(*p, wire) && !already_bound(*p))
                     .or_else(|| {
                         [wire.0, wire.1]
                             .into_iter()
                             .find(|p| on(*p, segment) && !is_own(*p))
-                    });
+                    })
+                    .or_else(|| crossing.filter(|p| !already_bound(*p)));
                 if let Some(p) = touch {
                     return Some(format!("a wire would touch an existing wire at {}", at(p)));
                 }
@@ -3798,6 +4392,32 @@ struct PlannedPower {
     outward: f64,
     wires: Vec<Segment>,
     not_joined_reason: Option<String>,
+}
+
+fn power_junction_exits(tree: &copperpour_sexp::SexpNode) -> Vec<(f64, f64)> {
+    use super::sch_connectivity::{bus_entry_wire_ends, COINCIDENT_TOLERANCE};
+    use copperpour_sexp::schematic::{extract_buses, extract_sheet_pins};
+    super::junction_exits(
+        &super::sch_pin_contacts::clearance_pin_inventory(tree).0,
+        extract_sheet_pins(tree),
+        bus_entry_wire_ends(tree, &extract_buses(tree), COINCIDENT_TOLERANCE),
+    )
+}
+
+fn power_wires_refusal(
+    tree: &copperpour_sexp::SexpNode,
+    sch: &cse::Schematic,
+    segments: &[Segment],
+    sources: &[(f64, f64)],
+    power_net: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut candidate = cse::Schematic::from_source(sch.filepath(), sch.to_source())?;
+    let exits = power_junction_exits(tree);
+    for &((x1, y1), (x2, y2)) in segments {
+        add_stub_wire(&mut candidate, &exits, (x1, y1), (x2, y2));
+    }
+    RouteGuard::for_power(tree, sources[0], &sources[1..], power_net)
+        .refusal("power wiring", &candidate.to_source())
 }
 
 pub(crate) async fn handle_batch_add_power_symbol(
@@ -3829,17 +4449,10 @@ pub(crate) async fn handle_batch_add_power_symbol(
             }
         },
     };
-    let stub_length = match crate::tools::opt_positive_f64(args, "stub_length") {
-        Ok(v) => v.unwrap_or(2.54),
+    let stub_length = match power_stub_length(args, false) {
+        Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    // Off-grid bars cannot be reached by later wires drawn on the grid.
-    if ((stub_length / 1.27).round() * 1.27 - stub_length).abs() > 1e-6 {
-        return Ok(crate::tools::invalid_arg(
-            "stub_length",
-            "must be a multiple of 1.27 mm",
-        ));
-    }
 
     let content = read_consistent(&sch_path)?;
     let tree = parse_sexp(&content)?;
@@ -3854,9 +4467,13 @@ pub(crate) async fn handle_batch_add_power_symbol(
         return Ok(error.into_tool_result());
     }
 
-    // Resolve every pin before anything is planned: one bad pin refuses the call.
+    // Validate every selector before planning. Missing pin geometry is a
+    // safety refusal, distinct from a stale or ambiguous selector.
     let mut points: Vec<PowerPoint> = Vec::new();
-    let placed_pins = PlacedPins::new(&tree);
+    let mut conflicting_rotations = Vec::new();
+    let (mut obstacles, placed_pins) = PowerObstacles::with_drawn_pins(&tree);
+    let mut errors = Vec::new();
+    let mut blocking_reasons = Vec::new();
     for (index, pin) in requested.iter().enumerate() {
         let field = |key: &str| {
             pin[key].as_str().map(str::to_owned).ok_or_else(|| {
@@ -3870,6 +4487,31 @@ pub(crate) async fn handle_batch_add_power_symbol(
             (Ok(r), Ok(n)) => (r, n),
             (Err(e), _) | (_, Err(e)) => return Ok(e),
         };
+        let rotation = match &pin["rotation"] {
+            serde_json::Value::Null => None,
+            value => match value.as_f64() {
+                Some(rotation) if rotation.is_finite() => Some(rotation),
+                _ => {
+                    return Ok(crate::tools::invalid_arg(
+                        &format!("pins[{index}].rotation"),
+                        "must be a finite number of degrees",
+                    ))
+                }
+            },
+        };
+        if obstacles.pin_geometry_unresolved(&reference) {
+            let reason = obstacles
+                .unresolved_pin_reason()
+                .expect("reference is unresolved");
+            errors.push(json!({
+                "reference": reference,
+                "pin_number": pin_number,
+                "kind": "plan_blocked",
+                "reasons": [&reason],
+            }));
+            blocking_reasons.push(reason);
+            continue;
+        }
         let (endpoint, outward) = match resolve_power_pin(&placed_pins, &reference, &pin_number) {
             Ok(pin) => (pin.endpoint(), pin.outward()),
             Err(e) => return Ok(e),
@@ -3880,6 +4522,12 @@ pub(crate) async fn handle_batch_add_power_symbol(
             .find(|p| points_coincident(p.endpoint.0, p.endpoint.1, endpoint.0, endpoint.1, 0.01))
         {
             Some(point) => {
+                if let (Some(a), Some(b)) = (point.rotation, rotation) {
+                    if a.rem_euclid(360.0) != b.rem_euclid(360.0) {
+                        conflicting_rotations.push((point.endpoint, index));
+                    }
+                }
+                point.rotation = point.rotation.or(rotation);
                 if !point.pins.contains(&pin) {
                     point.pins.push(pin);
                 }
@@ -3888,6 +4536,7 @@ pub(crate) async fn handle_batch_add_power_symbol(
                 pins: vec![pin],
                 endpoint,
                 outward,
+                rotation,
             }),
         }
     }
@@ -3907,47 +4556,128 @@ pub(crate) async fn handle_batch_add_power_symbol(
         None => true,
     });
 
-    let mut obstacles = PowerObstacles::from_tree(&tree);
-    let mut plans: Vec<PlannedPower> = Vec::new();
-    for group in group_power_points(points, max_gap) {
-        let single = |point: PowerPoint, reason: Option<String>| PlannedPower {
-            pin_at: point.endpoint,
-            outward: point.outward,
-            points: vec![point],
-            wires: Vec::new(),
-            not_joined_reason: reason,
-        };
-        if group.len() == 1 {
-            plans.extend(group.into_iter().map(|p| single(p, None)));
-            continue;
+    let mut plans = Vec::new();
+    let mut unjoined = Vec::new();
+    for (index, group) in group_power_points(points, max_gap).into_iter().enumerate() {
+        let mut not_joined_reason = None;
+        if group.len() > 1 {
+            let (wires, pin_at) = power_bar(&group, stub_length);
+            let own: Vec<_> = group.iter().map(|point| point.endpoint).collect();
+            let depth = group[0].depth_and_cross().0;
+            let blocker = if group.iter().any(|point| point.depth_and_cross().0 != depth) {
+                Some("pin tips are not exactly aligned for a shared bar".into())
+            } else {
+                match obstacles.blocking(&wires, &own) {
+                    some @ Some(_) => some,
+                    None => power_wires_refusal(&tree, &sch, &wires, &own, &power_net)?,
+                }
+            };
+            if let Some(reason) = blocker {
+                not_joined_reason = Some(reason);
+            } else {
+                obstacles.wires.extend(wires.iter().copied());
+                obstacles.points.push((pin_at, "pin"));
+                plans.push((
+                    index,
+                    PlannedPower {
+                        outward: group[0].outward,
+                        points: group,
+                        pin_at,
+                        wires,
+                        not_joined_reason: None,
+                    },
+                ));
+                continue;
+            }
         }
-        let (wires, pin_at) = power_bar(&group, stub_length);
-        let own: Vec<(f64, f64)> = group.iter().map(|p| p.endpoint).collect();
-        if let Some(reason) = obstacles.blocking(&wires, &own) {
-            plans.extend(group.into_iter().map(|p| single(p, Some(reason.clone()))));
-            continue;
-        }
-        // Later groups in this call must not run into this one.
-        obstacles.wires.extend(wires.iter().copied());
-        obstacles.points.push((pin_at, "pin"));
-        plans.push(PlannedPower {
-            outward: group[0].outward,
-            points: group,
-            pin_at,
-            wires,
-            not_joined_reason: None,
-        });
+        unjoined.push((index, group, not_joined_reason));
     }
+    if obstacles.unresolved_pins.is_empty() {
+        if let Some((_, index)) = conflicting_rotations.iter().find(|(at, _)| {
+            unjoined
+                .iter()
+                .any(|(_, group, _)| group.iter().any(|point| point.endpoint == *at))
+        }) {
+            return Ok(crate::tools::invalid_arg(
+                &format!("pins[{index}].rotation"),
+                "stacked pins sharing a power symbol must agree on rotation",
+            ));
+        }
+    }
+    for (index, group, not_joined_reason) in unjoined {
+        for point in group {
+            let checked =
+                match checked_power_stub(&obstacles, point.endpoint, point.outward, stub_length) {
+                    Ok(stub) => match power_wires_refusal(
+                        &tree,
+                        &sch,
+                        &[stub],
+                        &[point.endpoint],
+                        &power_net,
+                    )? {
+                        Some(reason) => Err(vec![reason]),
+                        None => Ok(stub),
+                    },
+                    Err(reasons) => Err(reasons),
+                };
+            let stub = match checked {
+                Ok(stub) => stub,
+                Err(reasons) => {
+                    errors.extend(point.pins.iter().map(|(reference, pin_number)| {
+                        json!({
+                            "reference": reference,
+                            "pin_number": pin_number,
+                            "kind": "plan_blocked",
+                            "reasons": reasons,
+                        })
+                    }));
+                    for reason in reasons {
+                        if !blocking_reasons.contains(&reason) {
+                            blocking_reasons.push(reason);
+                        }
+                    }
+                    continue;
+                }
+            };
+            obstacles.wires.push(stub);
+            obstacles.points.push((stub.1, "pin"));
+            plans.push((
+                index,
+                PlannedPower {
+                    pin_at: stub.1,
+                    outward: point.outward,
+                    points: vec![point],
+                    wires: vec![stub],
+                    not_joined_reason: not_joined_reason.clone(),
+                },
+            ));
+        }
+    }
+    plans.sort_by_key(|(index, _)| *index);
+    let plans: Vec<_> = plans.into_iter().map(|(_, plan)| plan).collect();
 
     if plans.is_empty() {
-        return Ok(CallToolResult::json(&json!({
+        let mut reply = json!({
             "power_net": power_net,
             "groups": [],
             "already_connected": already_connected,
             "placed_count": 0,
             "wires_added_count": 0,
             "junctions_added": [],
-        })));
+        });
+        if !errors.is_empty() {
+            reply["message"] = json!("No new power stubs could be drawn. Nothing was written.");
+            reply["error"] = json!({
+                "kind": "plan_blocked",
+                "operation": "batch_add_power_symbol",
+                "reasons": blocking_reasons,
+            });
+            reply["errors"] = json!(errors);
+            let mut result = CallToolResult::json(&reply);
+            result.is_error = true;
+            return Ok(result);
+        }
+        return Ok(CallToolResult::json(&reply));
     }
 
     let lib_id = format!("power:{power_net}");
@@ -3969,21 +4699,51 @@ pub(crate) async fn handle_batch_add_power_symbol(
     let mut numbering = PwrNumbering::for_sheet(&sch_path, &sch, &lib_id, &context);
     let mut placed = Vec::new();
     let mut new_wires: Vec<copperpour_sexp::schematic::Wire> = Vec::new();
-    for plan in &plans {
-        let mut wire_uuids = Vec::new();
-        for &((x1, y1), (x2, y2)) in &plan.wires {
-            let wire = sch.add_wire(x1, y1, x2, y2);
-            wire_uuids.push(wire.uuid.clone());
-            new_wires.push(Wire {
-                x1,
-                y1,
-                x2,
-                y2,
-                uuid: Some(wire.uuid.clone()),
-            });
+    let planned_wire_ids: Vec<Vec<String>> = plans
+        .iter()
+        .map(|plan| {
+            plan.wires
+                .iter()
+                .map(|&((x1, y1), (x2, y2))| {
+                    let uuid = sch.add_wire(x1, y1, x2, y2).uuid.clone();
+                    new_wires.push(Wire {
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        uuid: Some(uuid.clone()),
+                    });
+                    uuid
+                })
+                .collect()
+        })
+        .collect();
+    // Joined symbols have fixed rotation. Draw them before choosing a lone
+    // symbol's rotation so the trial sees their bodies and fields as well as
+    // their wires, even when the joined group was requested later.
+    let mut placement_order: Vec<_> = plans.iter().zip(planned_wire_ids).enumerate().collect();
+    placement_order.sort_by_key(|(_, (plan, _))| plan.points.len() == 1);
+    for (index, (plan, wire_uuids)) in placement_order {
+        if let [point] = plan.points.as_slice() {
+            let (_, placement, pin) = add_power_on_pin(
+                &mut sch,
+                &context,
+                &mut numbering,
+                &power_net,
+                &lib_id,
+                &power_pin,
+                point.endpoint,
+                point.outward,
+                Some((plan.wires[0], wire_uuids[0].clone())),
+                point.rotation,
+                &tree,
+            )?;
+            placed.push((index, (placement, wire_uuids, Some(pin))));
+            continue;
         }
-        let (x, y, rotation) = power_symbol_on_point(&power_pin, plan.pin_at, plan.outward, None);
-        let (_, placement) = add_power_symbol_to(
+        let rotation = copperpour_sexp::schematic::rotation_facing(&power_pin, plan.outward);
+        let (x, y) = power_symbol_origin(&power_pin, plan.pin_at, rotation);
+        let (_, _, placement) = add_power_symbol_to(
             &mut sch,
             &context,
             &mut numbering,
@@ -3993,8 +4753,9 @@ pub(crate) async fn handle_batch_add_power_symbol(
             y,
             rotation,
         );
-        placed.push((placement, wire_uuids));
+        placed.push((index, (placement, wire_uuids, None)));
     }
+    placed.sort_by_key(|(index, _)| *index);
 
     // Dots where a stub meets the bar mid-span, and where a new power pin
     // lands mid-wire; KiCad connects neither without one.
@@ -4015,7 +4776,7 @@ pub(crate) async fn handle_batch_add_power_symbol(
     // A bar's corners and its power pin, judged as a new wire's ends are: a
     // two-pin group's symbol sits on a corner, where the stub, the bar and
     // the power pin are three exits (#376).
-    let exits: Vec<(f64, f64)> = crate::tools::junction_exit_points(&tree)
+    let exits: Vec<(f64, f64)> = power_junction_exits(&tree)
         .into_iter()
         .chain(power_pins.iter().copied())
         .collect();
@@ -4052,20 +4813,25 @@ pub(crate) async fn handle_batch_add_power_symbol(
             reason,
         ))
     };
-    let committed = match super::sch_components::load_committed_component_schematic(&sch_path) {
-        Ok(committed) => committed,
-        Err(error) => return uncertain(format!("saved schematic could not be reloaded: {error}")),
+    let committed_source = match read_consistent(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return uncertain(format!("saved schematic could not be read: {error}")),
     };
-    let committed_tree = parse_sexp(&std::fs::read_to_string(&sch_path)?)?;
+    let committed = match cse::Schematic::from_source(&sch_path, committed_source.as_str()) {
+        Ok(committed) => committed,
+        Err(error) => return uncertain(format!("saved schematic could not be loaded: {error}")),
+    };
+    let committed_tree = match parse_sexp(&committed_source) {
+        Ok(tree) => tree,
+        Err(error) => return uncertain(format!("saved wire placement could not be read: {error}")),
+    };
     let committed_wires = extract_wires(&committed_tree);
     let committed_junctions = copperpour_sexp::schematic::extract_junctions(&committed_tree);
     for w in &new_wires {
-        let found = committed_wires.iter().any(|c| {
-            c.uuid == w.uuid
-                && points_coincident(c.x1, c.y1, w.x1, w.y1, 0.01)
-                && points_coincident(c.x2, c.y2, w.x2, w.y2, 0.01)
+        let found = w.uuid.as_deref().and_then(|uuid| {
+            observed_power_wire(&committed_wires, uuid, (w.x1, w.y1), (w.x2, w.y2))
         });
-        if !found {
+        if found.is_none() {
             return uncertain(format!(
                 "wire {} is not in the saved file",
                 w.uuid.as_deref().unwrap_or("")
@@ -4086,7 +4852,7 @@ pub(crate) async fn handle_batch_add_power_symbol(
     }
 
     let mut groups = Vec::new();
-    for (plan, (placement, wire_uuids)) in plans.iter().zip(&placed) {
+    for (plan, (_, (placement, wire_uuids, pin))) in plans.iter().zip(&placed) {
         let observed = match super::sch_components::placed_component_readback(
             &sch_path, &committed, placement, &context,
         ) {
@@ -4105,7 +4871,7 @@ pub(crate) async fn handle_batch_add_power_symbol(
             .collect();
         let mut group = json!({
             "pins": pins,
-            "joined": !plan.wires.is_empty(),
+            "joined": plan.points.len() > 1,
             "symbol": {
                 "reference": observed["reference"],
                 "uuid": observed["uuid"],
@@ -4115,6 +4881,25 @@ pub(crate) async fn handle_batch_add_power_symbol(
             },
             "wire_uuids": wire_uuids,
         });
+        if let Some(pin) = pin {
+            if let Err(reason) = pin.disclose(&mut group["symbol"], &tree, &committed_tree) {
+                return uncertain(reason);
+            }
+        } else {
+            let ignored: Vec<_> = pins
+                .iter()
+                .filter(|pin| {
+                    requested.iter().any(|entry| {
+                        !entry["rotation"].is_null()
+                            && entry["reference"] == pin["reference"]
+                            && entry["pin_number"] == pin["pin_number"]
+                    })
+                })
+                .collect();
+            if !ignored.is_empty() {
+                group["ignored_rotations"] = json!(ignored);
+            }
+        }
         if let Some(reason) = &plan.not_joined_reason {
             group["not_joined_reason"] = json!(reason);
         }
@@ -4132,6 +4917,9 @@ pub(crate) async fn handle_batch_add_power_symbol(
             .map(|(x, y)| json!({"x": round6(*x), "y": round6(*y)}))
             .collect::<Vec<_>>(),
     });
+    if !errors.is_empty() {
+        reply["errors"] = json!(errors);
+    }
     numbering.disclose(&mut reply);
     Ok(CallToolResult::json(&reply))
 }
@@ -7926,7 +8714,7 @@ mod power_on_pin_tests {
     }
 
     #[tokio::test]
-    async fn a_named_pin_takes_the_symbol_to_kicads_endpoint_facing_away() {
+    async fn zero_length_keeps_kicads_pin_endpoint_and_the_legacy_facing_away_rotation() {
         let handler = handler().await;
         // (net, reference, pin, KiCad's ERC position, rotation). GND's pin
         // points up into a body below it and +3V3's down into a body above,
@@ -7950,7 +8738,7 @@ mod power_on_pin_tests {
             let placed = serve(
                 &handler,
                 &path,
-                json!({"power_net": net, "reference": reference, "pin_number": pin}),
+                json!({"power_net": net, "reference": reference, "pin_number": pin, "stub_length": 0}),
             )
             .await;
             assert_eq!(
@@ -7973,24 +8761,28 @@ mod power_on_pin_tests {
                 (x, y, rotation),
                 "{reference}.{pin}"
             );
+            assert_eq!(placed["wire"], serde_json::Value::Null, "{placed}");
         }
     }
 
     #[tokio::test]
     async fn an_explicit_rotation_wins_over_the_pin() {
         let handler = handler().await;
-        let dir = tempfile::tempdir().unwrap();
-        let path = sheet(dir.path(), "power_on_pin_kicad10", SHEET);
-        let placed = serve(
-            &handler,
-            &path,
-            json!({"power_net": "GND", "reference": "R2", "pin_number": "2", "rotation": 180}),
-        )
-        .await;
-        assert_eq!(placed["is_error"], json!(false), "{placed}");
-        // GND's pin sits at its origin, so the point is the pin's whatever
-        // the rotation.
-        assert_eq!(committed_at(&path, &placed), (134.62, 80.01, 180.0));
+        for (length, x) in [(0.0, 134.62), (5.08, 139.7)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = sheet(dir.path(), "power_on_pin_kicad10", SHEET);
+            let placed = serve(
+                &handler,
+                &path,
+                json!({"power_net": "GND", "reference": "R2", "pin_number": "2",
+                       "rotation": 180, "stub_length": length}),
+            )
+            .await;
+            assert_eq!(placed["is_error"], json!(false), "{placed}");
+            assert_eq!(committed_at(&path, &placed), (x, 80.01, 180.0));
+            assert!(placed.get("orientation_reason").is_none(), "{placed}");
+            assert_eq!(placed["wire"].is_null(), length == 0.0, "{placed}");
+        }
     }
 
     #[tokio::test]
@@ -8019,7 +8811,7 @@ mod power_on_pin_tests {
         let placed = serve(
             &handler,
             &path,
-            json!({"power_net": "GND", "reference": "C4", "pin_number": "2"}),
+            json!({"power_net": "GND", "reference": "C4", "pin_number": "2", "stub_length": 0}),
         )
         .await;
         assert_eq!(placed["is_error"], json!(false), "{placed}");
@@ -8133,7 +8925,7 @@ mod power_on_pin_tests {
         let refused = serve(
             &handler,
             &path,
-            json!({"power_net": "GND", "reference": "R4", "pin_number": "1"}),
+            json!({"power_net": "GND", "reference": "R4", "pin_number": "1", "stub_length": 0}),
         )
         .await;
         assert_eq!(refused["error"]["kind"], "stale_target", "{refused}");
@@ -8781,6 +9573,10 @@ mod coincident_route_tests {
         assert_added_wire(&path, (63.5, 143.51), (81.28, 143.51));
     }
 }
+
+#[cfg(test)]
+#[path = "power_orientation_tests.rs"]
+mod power_orientation_tests;
 
 #[cfg(test)]
 mod no_connect_carry_tests {
@@ -9798,7 +10594,7 @@ mod batch_power_tests {
         path
     }
 
-    async fn handler() -> crate::mcp::handler::McpHandler {
+    pub(super) async fn handler() -> crate::mcp::handler::McpHandler {
         crate::mcp::handler::McpHandler::new(ServerConfig {
             eager_toolsets: true,
             ..Default::default()
@@ -9830,7 +10626,7 @@ mod batch_power_tests {
         body
     }
 
-    fn pins(list: &[&str]) -> serde_json::Value {
+    pub(super) fn pins(list: &[&str]) -> serde_json::Value {
         json!(list
             .iter()
             .map(|p| {
@@ -9946,15 +10742,15 @@ mod batch_power_tests {
             ("U1.23,U1.35,U1.47,U1.8", true, (101.6, 132.08, 0.0)),
             ("C1.2,C2.2,C3.2", true, (147.32, 146.05, 0.0)),
             // 20.32 mm from C3, past max_gap.
-            ("C4.2", false, (175.26, 143.51, 0.0)),
+            ("C4.2", false, (175.26, 146.05, 0.0)),
             // Same row as C8.2, facing the other way.
-            ("C7.2", false, (195.58, 143.51, 0.0)),
-            ("C8.2", false, (203.2, 143.51, 180.0)),
-            ("R1.1", false, (135.89, 63.5, 270.0)),
-            ("R1.2", false, (143.51, 63.5, 90.0)),
+            ("C7.2", false, (195.58, 146.05, 0.0)),
+            ("C8.2", false, (203.2, 140.97, 180.0)),
+            ("R1.1", false, (133.35, 63.5, 0.0)),
+            ("R1.2", false, (146.05, 63.5, 0.0)),
             // Their bar would run through the BLOCK label.
-            ("C5.2", false, (139.7, 173.99, 0.0)),
-            ("C6.2", false, (147.32, 173.99, 0.0)),
+            ("C5.2", false, (139.7, 176.53, 0.0)),
+            ("C6.2", false, (147.32, 176.53, 0.0)),
         ]);
         assert_eq!(groups(&path, &body), expected, "{body}");
         assert_eq!(
@@ -9967,6 +10763,13 @@ mod batch_power_tests {
                 ((147.32, 143.51), (147.32, 146.05)),
                 ((154.94, 143.51), (154.94, 146.05)),
                 ((139.7, 146.05), (154.94, 146.05)),
+                ((175.26, 143.51), (175.26, 146.05)),
+                ((195.58, 143.51), (195.58, 146.05)),
+                ((203.2, 143.51), (203.2, 140.97)),
+                ((135.89, 63.5), (133.35, 63.5)),
+                ((143.51, 63.5), (146.05, 63.5)),
+                ((139.7, 173.99), (139.7, 176.53)),
+                ((147.32, 173.99), (147.32, 176.53)),
             ])
         );
         // The middle cap's stub meets the bar mid-span; the U1 bar's symbol
@@ -10064,11 +10867,17 @@ mod batch_power_tests {
         assert_eq!(
             groups(&path, &body),
             sorted_groups(vec![
-                ("C5.2", false, (139.7, 173.99, 0.0)),
-                ("C6.2", false, (147.32, 173.99, 0.0)),
+                ("C5.2", false, (139.7, 176.53, 0.0)),
+                ("C6.2", false, (147.32, 176.53, 0.0)),
             ])
         );
-        assert!(wires_in(&path).is_empty());
+        assert_eq!(
+            wires_in(&path),
+            sorted_segs(vec![
+                ((139.7, 173.99), (139.7, 176.53)),
+                ((147.32, 173.99), (147.32, 176.53)),
+            ])
+        );
     }
 
     #[tokio::test]
@@ -10080,16 +10889,16 @@ mod batch_power_tests {
                 7.62,
                 vec![
                     ("C1.2,C2.2,C3.2", true, (147.32, 146.05, 0.0)),
-                    ("C4.2", false, (175.26, 143.51, 0.0)),
+                    ("C4.2", false, (175.26, 146.05, 0.0)),
                 ],
             ),
             (
                 7.6,
                 vec![
-                    ("C1.2", false, (139.7, 143.51, 0.0)),
-                    ("C2.2", false, (147.32, 143.51, 0.0)),
-                    ("C3.2", false, (154.94, 143.51, 0.0)),
-                    ("C4.2", false, (175.26, 143.51, 0.0)),
+                    ("C1.2", false, (139.7, 146.05, 0.0)),
+                    ("C2.2", false, (147.32, 146.05, 0.0)),
+                    ("C3.2", false, (154.94, 146.05, 0.0)),
+                    ("C4.2", false, (175.26, 146.05, 0.0)),
                 ],
             ),
             // Four stubs: the symbol takes the second, nearest the middle.
@@ -10170,7 +10979,7 @@ mod batch_power_tests {
         );
         assert_eq!(
             groups(&path, &body),
-            sorted_groups(vec![("U1.8", false, (104.14, 129.54, 0.0))])
+            sorted_groups(vec![("U1.8", false, (104.14, 132.08, 0.0))])
         );
     }
 
@@ -10208,7 +11017,7 @@ mod batch_power_tests {
             &handler,
             "add_power_symbol",
             &path,
-            json!({"power_net": "+3V3", "reference": "C1", "pin_number": "2"}),
+            json!({"power_net": "+3V3", "reference": "C1", "pin_number": "2", "stub_length": 0}),
         )
         .await;
         assert_eq!(other["is_error"], json!(false), "{other}");
@@ -10232,6 +11041,11 @@ mod batch_power_tests {
             ),
             (
                 json!({"pins": pins(&["C1.2", "C2.2"]), "stub_length": 1.0}),
+                "invalid_argument",
+                "stub_length",
+            ),
+            (
+                json!({"pins": pins(&["C1.2"]), "stub_length": 0}),
                 "invalid_argument",
                 "stub_length",
             ),

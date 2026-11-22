@@ -2878,6 +2878,15 @@ impl PlacedPins {
         }
     }
 
+    fn from_drawn(pins: PlacedPinsByReference) -> Self {
+        Self {
+            symbols: pins
+                .into_iter()
+                .map(|(inst, pins)| (inst, Some(pins)))
+                .collect(),
+        }
+    }
+
     /// The one pin `reference` + `pin_number` names. A duplicated reference,
     /// or a pin drawn on two placed units, is refused rather than resolved to
     /// whichever comes first in the file, so nothing lands on a pin the

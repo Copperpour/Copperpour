@@ -480,7 +480,7 @@ async fn library_direction_rails_trade_wire_for_readability() {
             &handler,
             &today,
             "add_power_symbol",
-            json!({"power_net": net, "reference": reference, "pin_number": pin}),
+            json!({"power_net": net, "reference": reference, "pin_number": pin, "stub_length": 0}),
         )
         .await;
         references.push(body["reference"].as_str().unwrap().to_owned());
