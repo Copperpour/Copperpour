@@ -53,9 +53,9 @@ Netlists are compared as pin sets.
 
 | J1 label calls | Result | `check_schematic_overlaps` | KiCad netlist and ERC |
 |---|---|---|---|
-| `connect_to_net` J1.1 `SIG_IN`, J1.2 `SIG_OUT`, defaults | `right`, 2.54 mm stubs; labels at (96.52, 93.98) and (96.52, 91.44) | `SIG_OUT` label × `+3V3` value: overlap 1.41 × 1.54 mm; plus the existing `+3V3` × `GND` | `/SIG_IN` J1.1 U1.3; `/SIG_OUT` J1.2 R1.2 U1.1; rest unchanged; ERC 2 errors (`power_pin_not_driven` ×2) |
-| the same with `stub_length: 5.08` | `right`; labels at (99.06, 93.98) and (99.06, 91.44) | only the existing `+3V3` × `GND` | the same netlist and ERC |
+| `connect_to_net` J1.1 `SIG_IN`, J1.2 `SIG_OUT`, both fixed to `right` and 2.54 mm (the defaults before #772) | Labels at (96.52, 93.98) and (96.52, 91.44) | `SIG_OUT` label × `+3V3` value: overlap 1.41 × 1.54 mm; plus the existing `+3V3` × `GND` | `/SIG_IN` J1.1 U1.3; `/SIG_OUT` J1.2 R1.2 U1.1; rest unchanged; ERC 2 errors (`power_pin_not_driven` ×2) |
+| `connect_to_net` J1.1 `SIG_IN`, J1.2 `SIG_OUT`, defaults after #772 | `right`; J1.1 stays at (96.52, 93.98), J1.2 moves to (99.06, 91.44) | only the existing `+3V3` × `GND` | the same netlist and ERC |
 | J1.2 with `direction: "up"` or `"down"` | `plan_blocked`, nothing written | — | — |
 
-The second row is the shape proposed as the default when the caller leaves the stub length
-to the tool.
+Only J1.2 needs the longer stub. The label and wire at J1.1 are unchanged apart from
+their generated UUIDs.

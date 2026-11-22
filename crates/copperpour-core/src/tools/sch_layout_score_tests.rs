@@ -472,9 +472,9 @@ async fn a_longer_label_stub_trades_wire_for_readability() {
     let short = input.fork();
     let long = input.fork();
     for (pin, net) in [("1", "SIG_IN"), ("2", "SIG_OUT")] {
-        let args = json!({"reference": "J1", "pin_number": pin, "net": net});
+        let mut args =
+            json!({"reference": "J1", "pin_number": pin, "net": net, "stub_length": 2.54});
         ok(&handler, &short, "connect_to_net", args.clone()).await;
-        let mut args = args;
         args["stub_length"] = json!(5.08);
         ok(&handler, &long, "connect_to_net", args).await;
     }

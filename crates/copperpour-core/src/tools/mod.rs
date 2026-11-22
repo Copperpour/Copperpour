@@ -1,6 +1,8 @@
 //! Tool trait definitions, ToolContext, and all toolset modules.
 
 #[cfg(test)]
+mod authoring_clearance_tests;
+#[cfg(test)]
 mod board_extents_tests;
 #[cfg(test)]
 mod board_layer_refusal_tests;

@@ -18,7 +18,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
-async fn call(path: &Path, name: &str, mut arguments: Value) -> (bool, Value) {
+pub(super) async fn call(path: &Path, name: &str, mut arguments: Value) -> (bool, Value) {
     let handler = McpHandler::new(ServerConfig {
         eager_toolsets: true,
         ..ServerConfig::default()
@@ -147,27 +147,40 @@ async fn connect_to_net_refuses_when_every_direction_joins_another_net() {
 async fn connect_to_net_may_end_on_a_pin_already_on_the_net() {
     let (_dir, path) = fixture();
     // R10.1 carries label N, so joining it is what the call asks for.
-    let args = json!({ "reference": "R9", "pin_number": "2", "net": "N" });
+    let args = json!({
+        "reference": "R9", "pin_number": "2", "net": "N",
+        "direction": "down", "stub_length": 2.54
+    });
     let (is_error, body) = call(&path, "connect_to_net", args).await;
     assert!(!is_error, "{body}");
     assert_eq!(body["direction"], "down", "{body}");
     assert_eq!(wires(&path), [[127.0, 54.61, 127.0, 57.15]]);
+    let overlaps = body["text_overlaps"].as_array().unwrap();
+    assert!(
+        overlaps
+            .iter()
+            .any(|finding| finding["type"] == "text_overlap"
+                && finding["a"]["text"] == "N"
+                && finding["b"]["text"] == "N"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_delegated_stub_turns_instead_of_overprinting_an_existing_label_of_its_net() {
+    let (_dir, path) = fixture();
+    let args = json!({ "reference": "R9", "pin_number": "2", "net": "N" });
+    let (is_error, body) = call(&path, "connect_to_net", args).await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["direction"], "right", "{body}");
+    assert_eq!(body["text_overlaps"], json!([]));
+    assert_eq!(wires(&path), [[127.0, 54.61, 129.54, 54.61]]);
 }
 
 #[tokio::test]
 async fn connect_to_net_refuses_when_pins_cannot_be_resolved() {
     let (_dir, path) = fixture();
-    // Without the embedded Device:R, no pin on the sheet can be located.
-    let text = std::fs::read_to_string(&path).unwrap();
-    let start = text.find("(lib_symbols").unwrap();
-    let end = copperpour_sexp::writer::find_balanced_block(&text, start)
-        .unwrap()
-        .1;
-    std::fs::write(
-        &path,
-        format!("{}(lib_symbols){}", &text[..start], &text[end..]),
-    )
-    .unwrap();
+    remove_library_symbols(&path);
     // The promised wording, restated rather than read from the code under test.
     let args = json!({ "pin_x": 127.0, "pin_y": 54.61, "net": "N9" });
     assert_refused(
@@ -176,6 +189,47 @@ async fn connect_to_net_refuses_when_pins_cannot_be_resolved() {
         &["cannot check what the stub would join: one or more placed symbols have unresolved library pin geometry"],
     )
     .await;
+}
+
+fn remove_library_symbols(path: &Path) {
+    // Without the embedded Device:R, no pin on the sheet can be located.
+    let text = std::fs::read_to_string(path).unwrap();
+    let start = text.find("(lib_symbols").unwrap();
+    let end = copperpour_sexp::writer::find_balanced_block(&text, start)
+        .unwrap()
+        .1;
+    std::fs::write(
+        path,
+        format!("{}(lib_symbols){}", &text[..start], &text[end..]),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_label_only_write_reports_unresolved_symbol_bounds() {
+    let (_dir, path) = fixture();
+    remove_library_symbols(&path);
+    let (is_error, coverage) = call(&path, "check_schematic_overlaps", json!({})).await;
+    assert!(!is_error, "{coverage}");
+    assert!(coverage["bounds_unresolved"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("R9")));
+
+    let (is_error, body) = call(
+        &path,
+        "connect_to_net",
+        json!({ "pin_x": 127.0, "pin_y": 54.61, "net": "N9", "stub_length": 0 }),
+    )
+    .await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["text_overlaps"], json!([]));
+    assert_eq!(body["bounds_unresolved"], coverage["bounds_unresolved"]);
+    let (_, tree) = read_schematic(&path).unwrap();
+    assert!(copperpour_sexp::schematic::extract_labels(&tree)
+        .iter()
+        .any(|label| label.net == "N9" && (label.x, label.y) == (127.0, 54.61)));
+    assert!(extract_wires(&tree).is_empty());
 }
 
 #[tokio::test]
@@ -320,16 +374,7 @@ async fn connect_passthrough_turns_away_and_keeps_label_reading_away_from_symbol
 #[tokio::test]
 async fn connect_passthrough_refuses_when_pins_cannot_be_resolved() {
     let (_dir, path) = fixture();
-    let text = std::fs::read_to_string(&path).unwrap();
-    let start = text.find("(lib_symbols").unwrap();
-    let end = copperpour_sexp::writer::find_balanced_block(&text, start)
-        .unwrap()
-        .1;
-    std::fs::write(
-        &path,
-        format!("{}(lib_symbols){}", &text[..start], &text[end..]),
-    )
-    .unwrap();
+    remove_library_symbols(&path);
     let args = json!({ "net_name": "P", "x": 127.0, "y": 54.61 });
     assert_refused_tool(
         &path,
@@ -338,4 +383,111 @@ async fn connect_passthrough_refuses_when_pins_cannot_be_resolved() {
         &["cannot check what the stub would join: one or more placed symbols have unresolved library pin geometry"],
     )
     .await;
+}
+
+/// The lines `after` inserts into `before`, with the UUIDs it introduces
+/// replaced by `<new>`; `None` when it changes or drops a line of `before`.
+fn inserted_lines(before: &str, after: &str) -> Option<Vec<String>> {
+    let uuid = regex::Regex::new(r#"\(uuid "([0-9a-f-]{36})"\)"#).unwrap();
+    let mut old = before.lines().peekable();
+    let mut inserted = Vec::new();
+    for line in after.lines() {
+        if old.peek() == Some(&line) {
+            old.next();
+        } else {
+            inserted.push(uuid.replace_all(line, r#"(uuid "<new>")"#).into_owned());
+        }
+    }
+    old.next().is_none().then_some(inserted)
+}
+
+/// `batch_connect_to_net` and `connect_passthrough` share the stub helpers that
+/// #772 changed. Their replies and written lines are the ones `main` gave
+/// before it, on the same calls.
+#[tokio::test]
+async fn shared_stub_tools_keep_their_legacy_answers() {
+    let (_dir, path) = fixture();
+    let before = std::fs::read_to_string(&path).unwrap();
+    let args = json!({
+        "net_name": "N2", "stub_length": 2.54, "direction": "down",
+        "pins": [pin("R1", "2"), pin("R3", "2"), pin("R5", "2")]
+    });
+    let (is_error, body) = call(&path, "batch_connect_to_net", args).await;
+    assert!(!is_error, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "net": "N2",
+            "added": [{
+                "reference": "R3", "pin": "2", "x": 76.2, "y": 54.61, "rotation": 0.0,
+                "direction": "down",
+                "label": { "x": 76.2, "y": 57.15, "rotation": 0.0 },
+                "wire": { "x1": 76.2, "y1": 54.61, "x2": 76.2, "y2": 57.15 }
+            }],
+            "added_count": 1,
+            "errors": [format!("R1.2: {R1_DOWN}"), format!("R5.2: {}", BOXED[0])],
+            "stub_length": 2.54,
+            "label_type": "net_label"
+        })
+    );
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        inserted_lines(&before, &after).expect("only insertions"),
+        [
+            "\t(wire",
+            "\t\t(pts",
+            "\t\t\t(xy 76.2 54.61) (xy 76.2 57.15)",
+            "\t\t)",
+            "\t\t(uuid \"<new>\")",
+            "\t)",
+            "\t(label \"N2\"",
+            "\t\t(at 76.2 57.15 0)",
+            "\t\t(effects",
+            "\t\t\t(font",
+            "\t\t\t\t(size 1.27 1.27)",
+            "\t\t\t)",
+            "\t\t\t(justify left bottom)",
+            "\t\t)",
+            "\t\t(uuid \"<new>\")",
+            "\t)",
+        ]
+    );
+
+    let (_dir, path) = fixture();
+    let before = std::fs::read_to_string(&path).unwrap();
+    let args = json!({ "net_name": "P", "x": 50.8, "y": 54.61 });
+    let (is_error, body) = call(&path, "connect_passthrough", args).await;
+    assert!(!is_error, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "net": "P",
+            "stub_root": { "x": 50.8, "y": 54.61 },
+            "label_position": { "x": 53.34, "y": 54.61 },
+            "direction": "right",
+            "label_rotation": 0.0
+        })
+    );
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        inserted_lines(&before, &after).expect("only insertions"),
+        [
+            "(wire",
+            "\t\t(pts",
+            "\t\t\t(xy 50.8 54.61) (xy 53.34 54.61)",
+            "\t\t)",
+            "\t\t(stroke",
+            "\t\t\t(width 0)",
+            "\t\t\t(type default)",
+            "\t\t)",
+            "\t\t(uuid \"<new>\")",
+            "\t)",
+            "  (label \"P\"",
+            "    (at 53.34 54.61 0)",
+            "    (fields_autoplaced yes)",
+            "    (effects (font (size 1.27 1.27)) (justify left bottom))",
+            "    (uuid \"<new>\")",
+            "  )",
+        ]
+    );
 }
