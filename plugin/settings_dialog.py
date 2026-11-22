@@ -1,8 +1,8 @@
 """
 Copperpour — Settings Dialog.
 
-wxPython dialog for configuring the MCP server: paths and
-server control. Launched from the KiCAD Tools menu via the action plugin.
+wxPython dialog for configuring the MCP server and native Specctra bridge.
+Launched from the KiCad Tools menu via the action plugin.
 
 Settings persist to settings.json in the plugin directory.
 """
@@ -154,12 +154,8 @@ class CopperpourSettingsDialog(wx.Dialog):
         self,
         parent,
         plugin_dir,
-        binary_path,
-        server_running=False,
         native_bridge_available=False,
         native_bridge_running=False,
-        on_start_server=None,
-        on_stop_server=None,
     ):
         # No fixed pixel size: on high-DPI/scaled Windows displays a fixed
         # (520, 480) clipped the Save/Close buttons off-screen (issue #18).
@@ -169,15 +165,10 @@ class CopperpourSettingsDialog(wx.Dialog):
             title="Copperpour Settings",
             style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
         )
-        self.plugin_dir = plugin_dir
-        self.binary_path = binary_path
         self.settings_path = os.path.join(plugin_dir, "settings.json")
         self.settings = load_settings(self.settings_path)
-        self._server_running = server_running
         self._native_bridge_available = native_bridge_available
         self._native_bridge_running = native_bridge_running
-        self._on_start_server = on_start_server
-        self._on_stop_server = on_stop_server
 
         self._build_ui()
         self._populate_fields()
@@ -249,15 +240,6 @@ class CopperpourSettingsDialog(wx.Dialog):
         adv_box.Add(self.native_bridge_status, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         main_sizer.Add(adv_box, 0, wx.EXPAND | wx.ALL, 8)
 
-        # ── Server status section ────────────────────────────────────
-        server_box = wx.StaticBoxSizer(wx.HORIZONTAL, panel, "Server")
-        self.server_status = wx.StaticText(panel, label="Stopped")
-        server_box.Add(self.server_status, 1, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 5)
-        self.start_stop_btn = wx.Button(panel, label="Start Server")
-        self.start_stop_btn.Bind(wx.EVT_BUTTON, self._on_start_stop)
-        server_box.Add(self.start_stop_btn, 0, wx.ALL, 5)
-        main_sizer.Add(server_box, 0, wx.EXPAND | wx.ALL, 8)
-
         # ── Bottom buttons ───────────────────────────────────────────
         btn_sizer = wx.StdDialogButtonSizer()
         self.save_btn = wx.Button(panel, wx.ID_SAVE, "Save")
@@ -277,8 +259,6 @@ class CopperpourSettingsDialog(wx.Dialog):
         dlg_sizer = wx.BoxSizer(wx.VERTICAL)
         dlg_sizer.Add(panel, 1, wx.EXPAND)
         self.SetSizer(dlg_sizer)
-
-        self._update_server_status()
 
     def _populate_fields(self):
         """Fill dialog fields from loaded settings."""
@@ -323,17 +303,6 @@ class CopperpourSettingsDialog(wx.Dialog):
         })
         return settings
 
-    def _update_server_status(self):
-        """Update the server status display."""
-        if self._server_running:
-            self.server_status.SetLabel("Running")
-            self.server_status.SetForegroundColour(wx.Colour(0, 128, 0))
-            self.start_stop_btn.SetLabel("Stop Server")
-        else:
-            self.server_status.SetLabel("Stopped")
-            self.server_status.SetForegroundColour(wx.Colour(180, 0, 0))
-            self.start_stop_btn.SetLabel("Start Server")
-
     # ── Event handlers ───────────────────────────────────────────────
 
     def _on_browse_cli(self, event):
@@ -353,27 +322,6 @@ class CopperpourSettingsDialog(wx.Dialog):
         self.settings = self._collect_settings()
         save_settings(self.settings_path, self.settings)
         wx.MessageBox("Settings saved.", "Copperpour", wx.OK | wx.ICON_INFORMATION, parent=self)
-
-    def _on_start_stop(self, event):
-        """Toggle server state — executes callbacks in-place or delegates via EndModal."""
-        self.settings = self._collect_settings()
-        save_settings(self.settings_path, self.settings)
-
-        if not self._server_running:
-            if self._on_start_server:
-                success = self._on_start_server()
-                if success is not False:
-                    self._server_running = True
-                    self._update_server_status()
-            else:
-                self.EndModal(wx.ID_YES)
-        else:
-            if self._on_stop_server:
-                self._on_stop_server()
-                self._server_running = False
-                self._update_server_status()
-            else:
-                self.EndModal(wx.ID_NO)
 
     def _on_close(self, event):
         self.EndModal(wx.ID_CLOSE)

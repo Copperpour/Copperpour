@@ -281,9 +281,10 @@ Step by step (based on the diagnostic guide contributed in
    config for the surface you are using — `~/.claude.json` or `.mcp.json` for
    Claude Code, or `claude_desktop_config.json` (or the `.mcpb` extension) for
    Claude Desktop Chat — pointing at the `copperpour` binary; see
-   [examples/](../examples/). This registration is separate from the KiCAD
-   plugin settings. Configure only the surface you use so duplicate Copperpour
-   processes are not spawned side by side.
+   [examples/](../examples/). The MCP client starts the stdio server from this
+   registration. The KiCad plugin saves settings and applies the native bridge
+   preference. Configure only the surface you use to avoid duplicate Copperpour
+   processes.
 6. Restart the host process that owns the MCP connection so it spawns a fresh
    Copperpour process that reads the saved settings (starting a new chat in
    Claude Desktop reuses the existing process — see

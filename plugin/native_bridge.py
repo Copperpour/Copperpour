@@ -47,19 +47,6 @@ def bridge_root():
     return _join(base, "copperpour", "native-bridge")
 
 
-def cache_root():
-    """Return the plugin's cache directory: server.pid and the staged binary.
-
-    `LOCALAPPDATA` on Windows, `~/.cache` elsewhere, or `None` when that
-    would be relative to KiCad's working directory (#190).
-    """
-    if os.name == "nt":
-        base = _absolute(os.environ.get("LOCALAPPDATA"))
-    else:
-        base = _join(_home(), ".cache")
-    return _join(base, "copperpour", "cache")
-
-
 def _absolute(path):
     if not path or not os.path.isabs(path):
         return None

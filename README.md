@@ -112,8 +112,8 @@ including the macOS app bundle. Normal installations need no manual path setting
 
 ### Step 2: Register the MCP server
 
-Your AI client starts the server itself, over stdio, whenever it needs it; you never
-run it by hand.
+For the stdio setup below, your AI client starts and manages Copperpour automatically.
+The KiCad plugin opens settings, including the optional native Specctra bridge.
 
 The PCM install puts the server binary at:
 
