@@ -393,10 +393,462 @@ fn lost_live_board(board_path: &Path, situation: &str) -> CallToolResult {
     )
 }
 
+/// Validate the executable board-access inventory for a slice of registered
+/// tools. Returns one diagnostic message per violation; an empty vector means
+/// every tool satisfies the Stage 1 board-source inventory contract (#58):
+///
+/// 1. Tool names are unique across the inventory.
+/// 2. Every tool accepting `board` declares a non-[`BoardAccess::None`] class.
+/// 3. No tool without a `board` parameter declares a non-[`BoardAccess::None`]
+///    class.
+/// 4. Any tool advertising `board_source` is read-only
+///    ([`call_tool_policy::READ_ONLY_TOOLS`]), has a selector-eligible
+///    [`BoardAccess`] (`LivePreferredWithFallback` or `MixedSource`), and
+///    exposes the canonical [`board_source_schema`].
+/// 5. Any tool advertising `sync_live_board` is classified as
+///    [`BoardAccess::CliSaved`].
+/// 6. `SavedSnapshot` contains only read-only tools, while `ClosedBoardOnly`
+///    and `ApplyModeDependent` contain only non-read-only tools, preventing a
+///    mutating tool from being misclassified into a read-only snapshot class.
+#[cfg(test)]
+pub(crate) fn validate_board_access_inventory(tools: &[crate::tools::ToolDef]) -> Vec<String> {
+    use crate::router::call_tool_policy;
+    use crate::tools::BoardAccess;
+    use std::collections::BTreeSet;
+
+    let canonical_selector = board_source_schema();
+    let mut seen_names = BTreeSet::new();
+    let mut violations = Vec::new();
+
+    for tool in tools {
+        if !seen_names.insert(tool.name) {
+            violations.push(format!(
+                "{}: duplicate tool name in board-access inventory",
+                tool.name
+            ));
+        }
+
+        let accepts_board = tool.accepts_board_arg();
+        let has_class = tool.board_access != BoardAccess::None;
+        let is_read_only = call_tool_policy::READ_ONLY_TOOLS.contains(&tool.name);
+
+        if accepts_board && !has_class {
+            violations.push(format!(
+                "{}: accepts 'board' but has BoardAccess::None (unclassified)",
+                tool.name
+            ));
+        }
+        if !accepts_board && has_class {
+            violations.push(format!(
+                "{}: declares BoardAccess::{:?} without a 'board' parameter",
+                tool.name, tool.board_access
+            ));
+        }
+        if tool.advertises_board_source() {
+            if !tool.board_access.supports_board_source_selector() {
+                violations.push(format!(
+                    "{}: advertises 'board_source' with ineligible BoardAccess::{:?}",
+                    tool.name, tool.board_access
+                ));
+            }
+            if !is_read_only {
+                violations.push(format!(
+                    "{}: advertises 'board_source' but is not in call_tool_policy::READ_ONLY_TOOLS",
+                    tool.name
+                ));
+            }
+            if tool.input_schema.pointer("/properties/board_source") != Some(&canonical_selector) {
+                violations.push(format!(
+                    "{}: advertises non-canonical 'board_source' schema",
+                    tool.name
+                ));
+            }
+        }
+        if tool.advertises_sync_live_board() && tool.board_access != BoardAccess::CliSaved {
+            violations.push(format!(
+                "{}: advertises 'sync_live_board' with BoardAccess::{:?} instead of CliSaved",
+                tool.name, tool.board_access
+            ));
+        }
+        if tool.board_access == BoardAccess::SavedSnapshot && !is_read_only {
+            violations.push(format!(
+                "{}: declares BoardAccess::SavedSnapshot but is not in call_tool_policy::READ_ONLY_TOOLS",
+                tool.name
+            ));
+        }
+        if matches!(
+            tool.board_access,
+            BoardAccess::ClosedBoardOnly | BoardAccess::ApplyModeDependent
+        ) && is_read_only
+        {
+            violations.push(format!(
+                "{}: declares mutating BoardAccess::{:?} but is listed in call_tool_policy::READ_ONLY_TOOLS",
+                tool.name, tool.board_access
+            ));
+        }
+    }
+
+    violations
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::router::registry;
+    use crate::tools::{BoardAccess, ServerConfig, ToolDef};
     use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn all_registered_tools() -> Vec<ToolDef> {
+        registry::ALL_TOOLSETS
+            .iter()
+            .flat_map(|toolset| registry::tools_for(toolset.name).unwrap_or_default())
+            .collect()
+    }
+
+    fn dummy_tool(name: &'static str, schema: Value, board_access: BoardAccess) -> ToolDef {
+        ToolDef::new(
+            name,
+            "synthetic inventory check tool",
+            schema,
+            std::sync::Arc::new(|_, _| Box::pin(async { Ok(CallToolResult::text("{}")) })),
+        )
+        .with_board_access(board_access)
+    }
+
+    #[test]
+    fn reliability_contract_board_access_inventory_is_complete() {
+        let tools = all_registered_tools();
+        let violations = validate_board_access_inventory(&tools);
+        assert!(
+            violations.is_empty(),
+            "board-access inventory violations ({}):\n  {}",
+            violations.len(),
+            violations.join("\n  ")
+        );
+
+        let board_tools: Vec<&ToolDef> = tools.iter().filter(|t| t.accepts_board_arg()).collect();
+        assert!(
+            board_tools.len() >= 100,
+            "expected at least 100 registered board tools, found {}",
+            board_tools.len()
+        );
+        // Every non-None variant in the inventory is represented by at least one registered tool.
+        for variant in [
+            BoardAccess::LiveOnly,
+            BoardAccess::LivePreferredWithFallback,
+            BoardAccess::SavedSnapshot,
+            BoardAccess::CliSaved,
+            BoardAccess::MixedSource,
+            BoardAccess::ClosedBoardOnly,
+            BoardAccess::ApplyModeDependent,
+            BoardAccess::EditorLifecycle,
+            BoardAccess::Unsupported,
+        ] {
+            assert!(
+                board_tools.iter().any(|t| t.board_access == variant),
+                "BoardAccess::{variant:?} has no registered tool"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_validator_catches_each_contract_violation() {
+        let unclassified = dummy_tool(
+            "synthetic_unclassified",
+            json!({
+                "type": "object",
+                "properties": { "board": { "type": "string" } }
+            }),
+            BoardAccess::None,
+        );
+        let violations = validate_board_access_inventory(&[unclassified]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("BoardAccess::None"),
+            "{violations:?}"
+        );
+
+        let non_board_classified = dummy_tool(
+            "audit_manufacturing",
+            json!({
+                "type": "object",
+                "properties": { "schematic": { "type": "string" } }
+            }),
+            BoardAccess::SavedSnapshot,
+        );
+        let violations = validate_board_access_inventory(&[non_board_classified]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("without a 'board' parameter"),
+            "{violations:?}"
+        );
+
+        // Read-only tool with canonical selector but ineligible class (LiveOnly).
+        let ineligible_selector = dummy_tool(
+            "get_component_list",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "board_source": board_source_schema()
+                }
+            }),
+            BoardAccess::LiveOnly,
+        );
+        let violations = validate_board_access_inventory(&[ineligible_selector]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("ineligible BoardAccess::LiveOnly"),
+            "{violations:?}"
+        );
+
+        // Mutating tool (not in READ_ONLY_TOOLS) advertising board_source.
+        let mutating_selector = dummy_tool(
+            "place_component",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "board_source": board_source_schema()
+                }
+            }),
+            BoardAccess::LivePreferredWithFallback,
+        );
+        let violations = validate_board_access_inventory(&[mutating_selector]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("READ_ONLY_TOOLS"), "{violations:?}");
+
+        // Read-only eligible tool with non-canonical board_source schema.
+        let drifted_selector = dummy_tool(
+            "get_board_extents",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "board_source": { "type": "string", "enum": ["auto", "live"] }
+                }
+            }),
+            BoardAccess::LivePreferredWithFallback,
+        );
+        let violations = validate_board_access_inventory(&[drifted_selector]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("non-canonical 'board_source'"),
+            "{violations:?}"
+        );
+
+        // sync_live_board tool not classified as CliSaved.
+        let bad_sync = dummy_tool(
+            "run_drc",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "sync_live_board": { "type": "boolean" }
+                }
+            }),
+            BoardAccess::LiveOnly,
+        );
+        let violations = validate_board_access_inventory(&[bad_sync]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("sync_live_board"), "{violations:?}");
+
+        // Duplicate tool name across the inventory.
+        let dup_a = dummy_tool(
+            "audit_manufacturing",
+            json!({
+                "type": "object",
+                "properties": { "board": { "type": "string" } }
+            }),
+            BoardAccess::SavedSnapshot,
+        );
+        let dup_b = dummy_tool(
+            "audit_manufacturing",
+            json!({
+                "type": "object",
+                "properties": { "board": { "type": "string" } }
+            }),
+            BoardAccess::SavedSnapshot,
+        );
+        let violations = validate_board_access_inventory(&[dup_a, dup_b]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("duplicate"), "{violations:?}");
+
+        // Mutating tool classified as SavedSnapshot.
+        let mutator_as_saved = dummy_tool(
+            "place_component",
+            json!({
+                "type": "object",
+                "properties": { "board": { "type": "string" } }
+            }),
+            BoardAccess::SavedSnapshot,
+        );
+        let violations = validate_board_access_inventory(&[mutator_as_saved]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("SavedSnapshot"), "{violations:?}");
+
+        // Read-only tool classified as ClosedBoardOnly or ApplyModeDependent.
+        for access in [
+            BoardAccess::ClosedBoardOnly,
+            BoardAccess::ApplyModeDependent,
+        ] {
+            let reader_as_mutator = dummy_tool(
+                "audit_manufacturing",
+                json!({
+                    "type": "object",
+                    "properties": { "board": { "type": "string" } }
+                }),
+                access,
+            );
+            let violations = validate_board_access_inventory(&[reader_as_mutator]);
+            assert_eq!(violations.len(), 1, "{violations:?}");
+            assert!(
+                violations[0].contains("mutating BoardAccess::"),
+                "{violations:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn served_catalogue_matches_executable_inventory_and_mutators_reject_board_source() {
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("initialize handler with all toolsets");
+
+        let list_reply = handler
+            .handle_message(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+            .await
+            .expect("tools/list response");
+        let list_json = serde_json::to_value(&list_reply).unwrap();
+        let served_tools = list_json["result"]["tools"]
+            .as_array()
+            .expect("served tool list");
+
+        let by_name: BTreeMap<&'static str, BoardAccess> = all_registered_tools()
+            .into_iter()
+            .map(|tool| (tool.name, tool.board_access))
+            .collect();
+
+        let mut served_board_count = 0usize;
+        for tool in served_tools {
+            let name = tool["name"].as_str().expect("tool name");
+            let has_board = tool["inputSchema"].pointer("/properties/board").is_some();
+            let Some(&access) = by_name.get(name) else {
+                // Meta-tools do not live in ALL_TOOLSETS and must not accept `board`.
+                assert!(
+                    !has_board,
+                    "meta-tool '{name}' unexpectedly accepts 'board'"
+                );
+                continue;
+            };
+            if has_board {
+                served_board_count += 1;
+                assert_ne!(
+                    access,
+                    BoardAccess::None,
+                    "served tool '{name}' accepts 'board' but has BoardAccess::None"
+                );
+            } else {
+                assert_eq!(
+                    access,
+                    BoardAccess::None,
+                    "served tool '{name}' has no 'board' arg but declares BoardAccess::{access:?}"
+                );
+            }
+        }
+        assert!(
+            served_board_count >= 100,
+            "served_board_count={served_board_count}"
+        );
+
+        // Mutating tools across every mutating class (LiveOnly, LivePreferredWithFallback,
+        // ClosedBoardOnly, ApplyModeDependent) keep their closed schemas and refuse a
+        // caller-supplied `board_source` by name before the handler runs.
+        for (id, name, extra) in [
+            (2, "refill_zones", json!({})),
+            (3, "export_specctra_dsn", json!({"output": "out.dsn"})),
+            (
+                4,
+                "copy_routing_pattern",
+                json!({
+                    "src_x1": 0.0, "src_y1": 0.0, "src_x2": 1.0, "src_y2": 1.0,
+                    "dest_x": 2.0, "dest_y": 2.0
+                }),
+            ),
+            (5, "set_design_rules", json!({"min_clearance": 0.2})),
+            (
+                6,
+                "place_component",
+                json!({"footprint": "R_0603", "reference": "R1", "x": 1.0, "y": 1.0}),
+            ),
+            (7, "add_layer", json!({"layer_name": "In1.Cu"})),
+            (
+                8,
+                "place_decoupling_caps",
+                json!({"ic_reference": "U1", "capacitor_references": ["C1"]}),
+            ),
+        ] {
+            let mut arguments = extra;
+            arguments["board"] = json!("/nonexistent/board.kicad_pcb");
+            arguments["board_source"] = json!("saved");
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            });
+            let reply = handler
+                .handle_message(request)
+                .await
+                .expect("tools/call response");
+            let parsed = serde_json::to_value(&reply).unwrap();
+            assert_eq!(
+                parsed["result"]["isError"],
+                json!(true),
+                "{name} must refuse board_source: {parsed}"
+            );
+            let body: Value =
+                serde_json::from_str(parsed["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(
+                body["error"]["kind"],
+                json!("invalid_argument"),
+                "{name} must refuse board_source as invalid_argument: {body}"
+            );
+            let message = body["message"].as_str().unwrap_or("");
+            assert!(
+                message.contains("board_source"),
+                "{name} must specifically reject 'board_source', got: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_board_access_variant_has_a_distinct_snake_case_name() {
+        let variants = [
+            (BoardAccess::None, "none"),
+            (BoardAccess::LiveOnly, "live_only"),
+            (
+                BoardAccess::LivePreferredWithFallback,
+                "live_preferred_with_fallback",
+            ),
+            (BoardAccess::SavedSnapshot, "saved_snapshot"),
+            (BoardAccess::CliSaved, "cli_saved"),
+            (BoardAccess::MixedSource, "mixed_source"),
+            (BoardAccess::ClosedBoardOnly, "closed_board_only"),
+            (BoardAccess::ApplyModeDependent, "apply_mode_dependent"),
+            (BoardAccess::EditorLifecycle, "editor_lifecycle"),
+            (BoardAccess::Unsupported, "unsupported"),
+        ];
+        for (variant, expected) in variants {
+            assert_eq!(variant.as_str(), expected);
+        }
+    }
 
     /// Windows resolves a network share's lock path to `\\?\UNC\…`. The
     /// detail names it as `\\server\share\…`, the form a user can paste

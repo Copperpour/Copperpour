@@ -66,7 +66,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_run_drc(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::CliSaved),
         super::drc_severity::tool(),
         tool!(
             "set_design_rules",
@@ -93,7 +94,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_set_design_rules(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "get_design_rules",
             "Return the current design rule constraints defined in the sibling KiCAD project file.",
@@ -105,7 +107,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_design_rules(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::SavedSnapshot),
         tool!(
             "set_predefined_sizes",
             "Write the PCB editor Pre-defined Sizes list (track widths and via pad/drill \
@@ -142,7 +145,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_set_predefined_sizes(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "get_predefined_sizes",
             "Return the PCB editor Pre-defined Sizes list from the sibling .kicad_pro: \
@@ -156,7 +160,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_predefined_sizes(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::SavedSnapshot),
         tool!(
             "check_kicad_ui",
             "Check whether the KiCad GUI application is running and whether IPC responds within a bounded timeout. When IPC does not answer, ipc_failure.kind says why: not_configured, no_listener, access_denied (the operating system refused this account; likely a different account or a restrictive ACL, as with a sandboxed client), handshake_failed (the listener did not complete NNG's handshake, so it is probably not KiCad; this takes NNG's 10 s limit, so pass timeout_seconds above 10 to see it), transport_error, or request_failed (the request did not complete and may have reached the endpoint; an explicit KiCad status such as AS_NOT_READY proves receipt, a timeout or malformed reply does not), and ipc_failure.recovery provides structured cause, mutation_outcome, retry_safe, next_steps, and troubleshooting_url. ipc_failure is null when no kind was established: the Ping succeeded with AS_OK, or this check's own timeout expired first (timed_out: true).",
@@ -229,7 +234,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_open_board(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::EditorLifecycle),
         tool!(
             "copy_routing_pattern",
             "Copy the segments, arcs and vias inside a source region of a board KiCad is not \
@@ -256,7 +262,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "src_x1", "src_y1", "src_x2", "src_y2", "dest_x", "dest_y"]
             }),
             |args, ctx| async move { handle_copy_routing_pattern(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "set_layer_constraints",
             "Set per-layer design constraints (e.g. min trace width, clearance) in the sibling .kicad_dru custom rules file.",
@@ -271,7 +278,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "layer"]
             }),
             |args, ctx| async move { handle_set_layer_constraints(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         super::custom_rules::tool(),
         super::custom_rules::delete_tool(),
         super::custom_rules::list_tool(),
@@ -301,7 +309,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "ref1", "ref2"]
             }),
             |args, ctx| async move { handle_check_clearance(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
     ]
 }
 

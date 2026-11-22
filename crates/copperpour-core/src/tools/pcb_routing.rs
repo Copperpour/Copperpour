@@ -59,7 +59,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "net_name"]
             }),
             |args, ctx| async move { handle_add_net(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "route_trace",
             "Route a trace segment between two points on a copper layer via KiCAD IPC.",
@@ -313,7 +314,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "name"]
             }),
             |args, ctx| async move { handle_create_netclass(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "get_netclasses",
             "Read every netclass in the project's design rules, with its settings, \
@@ -346,7 +348,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_get_netclasses(args, ctx).await }
         )
-        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
+        .with_board_access(crate::tools::BoardAccess::MixedSource),
         tool!(
             "assign_net_to_class",
             "Assign a net to an existing netclass, as a netclass_patterns entry in \
@@ -365,7 +367,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "net_name", "netclass"]
             }),
             |args, ctx| async move { handle_assign_net_to_class(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "delete_netclass",
             "Delete a netclass, or one netclass_patterns entry, from the sibling \
@@ -388,7 +391,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_delete_netclass(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "route_differential_pair",
             "Route a differential pair (two parallel traces with a specified gap).",

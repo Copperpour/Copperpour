@@ -20,6 +20,9 @@ pub struct HookSkillManifest {
     pub name: &'static str,
     pub content: &'static str,
     pub board_access: copperpour_core::tools::BoardAccess,
+    /// When true, read-only tools (`call_tool_policy::READ_ONLY_TOOLS`) are
+    /// excluded so file-edit warnings do not attach to pure read/analysis tools.
+    pub mutators_only: bool,
     pub event: &'static str, // "PreToolUse" or "PostToolUse"
 }
 
@@ -43,24 +46,28 @@ pub const HOOK_SKILLS: &[HookSkillManifest] = &[
         name: "pre-pcb-ipc",
         content: "This operation is live-IPC-only. KiCad must be running with the exact requested .kicad_pcb board open. If IPC or board identity fails, ask the user to open that board and retry once; do not bypass the server-side guard or edit the board file behind KiCad.",
         board_access: copperpour_core::tools::BoardAccess::LiveOnly,
+        mutators_only: false,
         event: "PreToolUse",
     },
     HookSkillManifest {
         name: "pre-pcb-fallback",
         content: "This operation prefers live KiCad IPC but has a guarded closed-board file fallback. Let the tool select the safe path. Never force a file edit while KiCad holds this board open, and treat the server-side board identity and revision checks as authoritative.",
         board_access: copperpour_core::tools::BoardAccess::LivePreferredWithFallback,
+        mutators_only: true,
         event: "PreToolUse",
     },
     HookSkillManifest {
         name: "pre-pcb-closed",
         content: "This operation requires the requested board to be closed in KiCad because it edits the saved file directly. Ask the user to close that board before applying the change; do not bypass the server-side open-board refusal.",
         board_access: copperpour_core::tools::BoardAccess::ClosedBoardOnly,
+        mutators_only: true,
         event: "PreToolUse",
     },
     HookSkillManifest {
         name: "pre-pcb-conditional",
         content: "This tool has different board-state requirements for planning and applying. Dry-run or planning is non-mutating; before apply, follow the tool description and returned plan exactly. Do not reuse a stale plan revision or bypass the server-side board-state guard.",
         board_access: copperpour_core::tools::BoardAccess::ApplyModeDependent,
+        mutators_only: true,
         event: "PreToolUse",
     },
 ];

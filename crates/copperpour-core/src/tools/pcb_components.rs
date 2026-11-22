@@ -2646,7 +2646,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_board_2d_view(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::CliSaved),
     ];
     tools.push(super::placed_footprint_models::tool());
     tools

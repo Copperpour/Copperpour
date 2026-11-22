@@ -76,6 +76,7 @@ pub(super) fn tool() -> ToolDef {
         }),
         |args, ctx| async move { handle_placement_overview(args, ctx).await }
     )
+    .with_board_access(crate::tools::BoardAccess::MixedSource)
 }
 
 /// One airwire: two pads of one net, by index into the net's deduplicated pads.
