@@ -1300,12 +1300,37 @@ pub fn extract_lib_pins_for_unit_and_body_style(
     unit: u32,
     body_style: u32,
 ) -> Vec<LibPin> {
-    let mut out = Vec::new();
-    for pin in sym_node.find_all("pin") {
-        if let Some(lib_pin) = parse_lib_pin(pin) {
-            out.push(lib_pin);
+    lib_pin_nodes_for_body_style(sym_node, unit, body_style)
+        .into_iter()
+        .filter_map(parse_lib_pin)
+        .collect()
+}
+
+/// Like [`extract_lib_pins_for_unit_and_body_style`], but refuses an incomplete
+/// inventory rather than silently dropping a pin with no usable position.
+pub fn resolve_lib_pins_for_unit_and_body_style(
+    sym_node: &SexpNode,
+    unit: u32,
+    body_style: u32,
+) -> Option<Vec<LibPin>> {
+    lib_pin_nodes_for_body_style(sym_node, unit, body_style)
+        .into_iter()
+        .map(|node| {
+            let pin = parse_lib_pin(node)?;
+            (pin.local_x.is_finite() && pin.local_y.is_finite()).then_some(pin)
+        })
+        .collect()
+}
+
+fn lib_pin_nodes_for_body_style(sym_node: &SexpNode, unit: u32, body_style: u32) -> Vec<&SexpNode> {
+    fn collect_nodes<'a>(node: &'a SexpNode, out: &mut Vec<&'a SexpNode>) {
+        out.extend(node.find_all("pin"));
+        for sub in node.find_all("symbol") {
+            collect_nodes(sub, out);
         }
     }
+
+    let mut out = sym_node.find_all("pin");
     for sub in sym_node.find_all("symbol") {
         let name = sub.get(1).and_then(|n| n.as_str()).unwrap_or_default();
         let sub_unit = parse_subsymbol_unit(name);
@@ -1313,7 +1338,7 @@ pub fn extract_lib_pins_for_unit_and_body_style(
         match (sub_unit, sub_style) {
             (Some(n), _) if n != 0 && n != unit => {}
             (_, Some(m)) if m != 0 && m != body_style => {}
-            _ => collect_pins_recursive(sub, &mut out),
+            _ => collect_nodes(sub, &mut out),
         }
     }
     out

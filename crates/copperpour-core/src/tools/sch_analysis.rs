@@ -29,6 +29,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
+        super::sch_pin_contacts::definition(),
         tool!(
             "list_schematic_wires",
             "List all wire segments in a schematic with start/end coordinates and UUIDs.",

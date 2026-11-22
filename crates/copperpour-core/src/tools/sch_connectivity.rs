@@ -753,11 +753,7 @@ impl PinNetNames {
             let unannotated = instance.reference.is_empty() || instance.reference.ends_with('?');
             // `(convert N)` is the parser's legacy token for it, and
             // `BODY_STYLE::BASE`, 1, its default.
-            let body_style = node
-                .find_str("body_style")
-                .or_else(|| node.find_str("convert"))
-                .and_then(|style| style.parse().ok())
-                .unwrap_or(1);
+            let body_style = super::symbol_body_style(node);
             let pins: Vec<LibPin> =
                 extract_lib_pins_for_unit_and_body_style(lib, instance.unit, body_style)
                     .into_iter()
@@ -883,6 +879,10 @@ impl PinNetNames {
 /// via `placed_pins_by_reference`, so a multi-unit symbol never contributes
 /// another unit's pins as phantom connection points (#35).
 pub(crate) struct PlacedPin {
+    pub(crate) symbol_index: usize,
+    pub(crate) symbol_uuid: Option<String>,
+    pub(crate) unit: u32,
+    pub(crate) is_power_symbol: bool,
     pub(crate) reference: String,
     /// The owning component's value, carried so a caller reporting a pin does
     /// not re-walk the instances this was built from.
@@ -960,7 +960,24 @@ impl<'a> ConnectivityIndex<'a> {
         labels: &'a [Label],
         tolerance: f64,
     ) -> Self {
-        let by_reference = crate::tools::placed_pins_by_reference(tree);
+        Self::with_placed_pins(
+            tree,
+            wires,
+            buses,
+            labels,
+            tolerance,
+            super::placed_pins_by_reference(tree),
+        )
+    }
+
+    pub(crate) fn with_placed_pins(
+        tree: &SexpNode,
+        wires: &'a [Wire],
+        buses: &'a [Wire],
+        labels: &'a [Label],
+        tolerance: f64,
+        by_reference: super::PlacedPinsByReference,
+    ) -> Self {
         let junctions = extract_junctions(tree);
         let sheet_pins = extract_sheet_pins(tree);
         let on_bus = WireIndex::build(buses, tolerance);
@@ -970,10 +987,23 @@ impl<'a> ConnectivityIndex<'a> {
             sheet_pins.iter().copied(),
             bus_entry_wire_points.iter().copied(),
         );
+        let power_symbols: HashSet<_> = tree
+            .find("lib_symbols")
+            .into_iter()
+            .flat_map(|lib| lib.find_all("symbol"))
+            .filter(|lib| lib.find("power").is_some())
+            .filter_map(|lib| lib.get(1)?.as_str())
+            .collect();
         let placed_pins: Vec<PlacedPin> = by_reference
             .into_iter()
-            .flat_map(|(inst, pins)| {
+            .enumerate()
+            .flat_map(|(symbol_index, (inst, pins))| {
+                let is_power_symbol = power_symbols.contains(inst.lib_symbol_name());
                 pins.into_iter().map(move |(pin, transform)| PlacedPin {
+                    symbol_index,
+                    symbol_uuid: inst.uuid.clone(),
+                    unit: inst.unit,
+                    is_power_symbol,
                     reference: inst.reference.clone(),
                     value: inst.value.clone(),
                     at: pin_endpoint(&pin, transform),
@@ -1025,6 +1055,14 @@ impl<'a> ConnectivityIndex<'a> {
 
     pub(crate) fn labels(&self) -> &[Label] {
         self.labels
+    }
+
+    pub(crate) fn junctions(&self) -> impl Iterator<Item = (f64, f64)> + '_ {
+        self.junction_points
+            .buckets
+            .values()
+            .flatten()
+            .map(|&(x, y, _)| (x, y))
     }
 
     /// How many wire endpoints lie at `(x, y)`. A point that is itself a wire
@@ -1090,6 +1128,30 @@ impl<'a> ConnectivityIndex<'a> {
         self.label_points.contains(x, y)
     }
 
+    pub(crate) fn pin_indices_at(&self, x: f64, y: f64) -> Vec<usize> {
+        let mut indices: Vec<_> = self.pin_points.hits_at(x, y).map(|(_, _, i)| i).collect();
+        indices.sort_unstable();
+        indices
+    }
+
+    pub(crate) fn wire_run_pins_at(&self, x: f64, y: f64) -> impl Iterator<Item = usize> + '_ {
+        let key = pt_key(x, y);
+        self.pin_points
+            .hits_at(x, y)
+            .filter(move |&(px, py, i)| !self.placed_pins[i].pin.hidden && pt_key(px, py) == key)
+            .map(|(_, _, i)| i)
+    }
+
+    pub(crate) fn wire_run_joint_has_attachment(&self, x: f64, y: f64) -> bool {
+        self.wire_run_pins_at(x, y).next().is_some()
+            || self.has_label(x, y)
+            || self.has_sheet_pin(x, y)
+            || self.has_junction(x, y)
+            || self.has_no_connect(x, y)
+            || self.has_bus_entry_wire_end(x, y)
+            || self.on_wire_interior(x, y)
+    }
+
     /// What is on `(x, y)`, item by item: the component pins there and the
     /// junction dots there, under this index's tolerance. The predicates below
     /// answer whether a point is attached; this answers what is attached, for
@@ -1099,10 +1161,10 @@ impl<'a> ConnectivityIndex<'a> {
     /// returned: `trace_from_point` does not report them, and handing them over
     /// unused would let the two drift apart silently.
     pub(crate) fn point_detail(&self, x: f64, y: f64) -> PointDetail<'_> {
-        let mut pins: Vec<(usize, &PlacedPin)> = self
-            .pin_points
-            .hits_at(x, y)
-            .map(|(_, _, ordinal)| (ordinal, &self.placed_pins[ordinal]))
+        let pins = self
+            .pin_indices_at(x, y)
+            .into_iter()
+            .map(|ordinal| &self.placed_pins[ordinal])
             .collect();
         let mut junctions: Vec<(usize, (f64, f64))> = self
             .junction_points
@@ -1111,10 +1173,9 @@ impl<'a> ConnectivityIndex<'a> {
             .collect();
         // Bucket order is not file order, and a reported list that reorders
         // itself with the query point is a list a caller cannot diff.
-        pins.sort_by_key(|(ordinal, _)| *ordinal);
         junctions.sort_by_key(|(ordinal, _)| *ordinal);
         PointDetail {
-            pins: pins.into_iter().map(|(_, pin)| pin).collect(),
+            pins,
             junctions: junctions.into_iter().map(|(_, at)| at).collect(),
         }
     }
