@@ -35,3 +35,12 @@ wrote the texts in its own order.
 
 The group no tool writes is added in the test, before the closing parenthesis.
 KiCad 10.0.6's `kicad-cli sch upgrade --force` keeps that sheet byte for byte.
+
+## Note bounds
+
+The `get_schematic_layout` regression uses this same sheet. Its expected bounds
+come from `kicad-cli sch export svg` on KiCad 10.0.8 with the default plot
+settings. The visible `<g class="stroked-text">` path coordinates give each
+line's bounds after adding half the plotted stroke width on each side. The
+multiline note uses the union of both lines. The text drawn inside the ammeter
+symbol and the net label are not free-standing notes and are excluded.

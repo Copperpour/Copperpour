@@ -1,0 +1,7 @@
+(kicad_wks (version 20210606) (generator pl_editor)
+(setup (textsize 1.5 1.5)(linewidth 0.15)(textlinewidth 0.15)
+(left_margin 15)(right_margin 15)(top_margin 15)(bottom_margin 15))
+(rect (name "") (start 150 40) (end 2 2) (comment "rect around the title block"))
+(rect (name "") (start 0 0 ltcorner) (end 0 0) (repeat 2) (incrx 2) (incry 2))
+(tbtext "Title: ${TITLE}" (name "") (pos 149 10.7) (font (size 2 2) bold))
+)

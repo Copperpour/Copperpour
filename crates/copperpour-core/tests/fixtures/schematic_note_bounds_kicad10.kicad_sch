@@ -1,0 +1,196 @@
+(kicad_sch
+	(version 20260306)
+	(generator "eeschema")
+	(generator_version "10.0")
+	(uuid "c66a9bdb-f3db-4507-8e95-09fa6a9e5776")
+	(paper "A4")
+	(lib_symbols)
+	(text "Big bold"
+		(exclude_from_sim no)
+		(at 30 135 0)
+		(effects
+			(font
+				(size 2.54 2.54)
+				(thickness 0.508)
+				(bold yes)
+			)
+			(justify left bottom)
+		)
+		(uuid "0c3d6182-64fd-41f8-9f43-b69fa2c85cc2")
+	)
+	(text "Turned left\nbottom"
+		(exclude_from_sim no)
+		(at 130 70 90)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "300152cf-c120-44e1-b065-ba317e3b58f3")
+	)
+	(text "Right bottom"
+		(exclude_from_sim no)
+		(at 90 90 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify right bottom)
+		)
+		(uuid "38bbb472-5326-4455-a90c-03aa610e58cf")
+	)
+	(text "Turned centre"
+		(exclude_from_sim no)
+		(at 145 60 90)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+		(uuid "4f36e723-790d-4a3e-8f5b-be08565e7b84")
+	)
+	(text "Upside note"
+		(exclude_from_sim no)
+		(at 220 40 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "53abdbd9-c1b2-4712-af44-c25d8904128d")
+	)
+	(text "Gap above\n\nGap below"
+		(exclude_from_sim no)
+		(at 30 110 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "6514fd70-a095-43c1-aa3a-6966ba40102d")
+	)
+	(text "Center bottom"
+		(exclude_from_sim no)
+		(at 60 75 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify bottom)
+		)
+		(uuid "6d0143cf-832c-4a54-be1e-9c8416087f6e")
+	)
+	(text "Down note\nsecond"
+		(exclude_from_sim no)
+		(at 240 50 90)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "73ad1334-085e-4303-a457-d4ccd9de0e50")
+	)
+	(text "Italic note"
+		(exclude_from_sim no)
+		(at 120 130 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+				(italic yes)
+			)
+			(justify left bottom)
+		)
+		(uuid "7917c164-7034-461d-9234-3229aa59eca5")
+	)
+	(text "Arrow → here"
+		(exclude_from_sim no)
+		(at 120 140 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "ab2d9c81-12c2-4d00-b919-c6ab3975748f")
+	)
+	(text "${TITLE}"
+		(exclude_from_sim no)
+		(at 120 120 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "c1d22f60-2227-4405-923d-7478e5339915")
+	)
+	(text "Right top A\nRight top B"
+		(exclude_from_sim no)
+		(at 90 45 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify right top)
+		)
+		(uuid "ca6c95c0-6d96-4ace-ae3e-4be71f266d22")
+	)
+	(text "Left top"
+		(exclude_from_sim no)
+		(at 30 60 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left top)
+		)
+		(uuid "d5b8802c-2764-4816-b0af-2654549d8164")
+	)
+	(text "Turned right\ntop"
+		(exclude_from_sim no)
+		(at 160 40 90)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify right top)
+		)
+		(uuid "dbe7e220-e5a8-4b5d-931b-b1343abf1494")
+	)
+	(text "V_{OUT} and ~{RST}"
+		(exclude_from_sim no)
+		(at 120 110 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "f460394c-bdcd-4b6d-a408-b70807b6dd37")
+	)
+	(text "Centered\nthree\nlines"
+		(exclude_from_sim no)
+		(at 40 30 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+		(uuid "f56b7401-f7c8-4b9f-9d30-c333b7a9b100")
+	)
+	(text "   "
+		(exclude_from_sim no)
+		(at 120 150 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "ff078463-7992-4419-9dfb-58e08d1c830d")
+	)
+)

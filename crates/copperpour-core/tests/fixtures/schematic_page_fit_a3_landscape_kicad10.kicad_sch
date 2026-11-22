@@ -1,0 +1,82 @@
+(kicad_sch
+	(version 20260306)
+	(generator "eeschema")
+	(generator_version "10.0")
+	(uuid "2551c6b4-067b-4399-be48-8b90709f71fa")
+	(paper "A3")
+	(lib_symbols)
+	(text "Left of the title block"
+		(exclude_from_sim no)
+		(at 278.38 275 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "04823c19-2f1a-4f17-9a71-b5e570b716c0")
+	)
+	(text "Past the right frame"
+		(exclude_from_sim no)
+		(at 395 60 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "0dfce099-79ac-4a75-b8d0-bdf9cc031d70")
+	)
+	(text "Inside the frame"
+		(exclude_from_sim no)
+		(at 30 35 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "7a69c731-422d-40c5-8606-227103652977")
+	)
+	(text "Into the title block"
+		(exclude_from_sim no)
+		(at 305 275 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "a53e7b30-d36e-4ca9-83b2-df9fa2a6de3a")
+	)
+	(wire
+		(pts
+			(xy 250.19 257.81) (xy 298.45 257.81)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "278d9522-7f4f-4c57-8ccb-3588653dd851")
+	)
+	(wire
+		(pts
+			(xy 49.53 279.4) (xy 49.53 289.56)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "70552b90-0d7a-463d-aab2-0b27965da363")
+	)
+	(wire
+		(pts
+			(xy 250.19 265.43) (xy 320.04 265.43)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "8cbfcdde-6cca-472f-bb33-c11c5f77c426")
+	)
+)

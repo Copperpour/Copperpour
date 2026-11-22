@@ -1,0 +1,18 @@
+(kicad_sch
+	(version 20250610)
+	(generator "copperpour")
+	(generator_version "10.0")
+	(uuid "9930d527-4109-4f2d-9227-c3c8cd0ddba4")
+	(paper "A4")
+	(lib_symbols)
+  (text "Upside note"
+    (at 220 40 180)
+    (effects (font (size 1.27 1.27)) (justify left bottom))
+    (uuid "68db779e-114a-4643-9c18-68ec6bdbdb83")
+  )
+  (text "Down note\nsecond"
+    (at 240 50 270)
+    (effects (font (size 1.27 1.27)) (justify left bottom))
+    (uuid "a4214d20-bddf-4c00-9611-4921d948d594")
+  )
+)
