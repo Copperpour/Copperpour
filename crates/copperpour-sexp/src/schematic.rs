@@ -1336,17 +1336,24 @@ pub fn lib_pin_nodes_for_body_style(
     }
 
     let mut out = sym_node.find_all("pin");
-    for sub in sym_node.find_all("symbol") {
+    for sub in unit_body_children(sym_node, unit, body_style) {
+        collect_nodes(sub, &mut out);
+    }
+    out
+}
+
+fn unit_body_children(
+    sym_node: &SexpNode,
+    unit: u32,
+    body_style: u32,
+) -> impl Iterator<Item = &SexpNode> {
+    sym_node.find_all("symbol").into_iter().filter(move |sub| {
         let name = sub.get(1).and_then(|n| n.as_str()).unwrap_or_default();
         let sub_unit = parse_subsymbol_unit(name);
         let sub_style = sub_unit.and_then(|_| name.rsplit('_').next()?.parse::<u32>().ok());
-        match (sub_unit, sub_style) {
-            (Some(n), _) if n != 0 && n != unit => {}
-            (_, Some(m)) if m != 0 && m != body_style => {}
-            _ => collect_nodes(sub, &mut out),
-        }
-    }
-    out
+        sub_unit.is_none_or(|n| n == 0 || n == unit)
+            && sub_style.is_none_or(|m| m == 0 || m == body_style)
+    })
 }
 
 /// Parse the unit number `N` out of a `Name_N_M` sub-symbol name. Returns
@@ -1358,6 +1365,16 @@ pub fn parse_subsymbol_unit(name: &str) -> Option<u32> {
     let unit: u32 = it.next()?.parse().ok()?;
     it.next()?; // a base name must exist before the suffix
     Some(unit)
+}
+
+/// The selected unit and body style contain library text for which
+/// `symbol_geometry_for_instance` does not measure drawing bounds.
+pub fn has_unmeasured_library_text(sym_node: &SexpNode, unit: u32, body_style: u32) -> bool {
+    fn has_text(node: &SexpNode) -> bool {
+        node.find("text").is_some() || node.find_all("symbol").into_iter().any(has_text)
+    }
+
+    sym_node.find("text").is_some() || unit_body_children(sym_node, unit, body_style).any(has_text)
 }
 
 fn collect_pins_recursive(node: &SexpNode, out: &mut Vec<LibPin>) {

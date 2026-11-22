@@ -21,6 +21,19 @@ fn anchor(node: &SexpNode) -> Option<Point> {
     (x.is_finite() && y.is_finite()).then_some((x, y))
 }
 
+fn directives(tree: &SexpNode) -> Option<Vec<Directive<'_>>> {
+    DIRECTIVE_TAGS
+        .into_iter()
+        .flat_map(|kind| tree.find_all(kind))
+        .map(|node| {
+            Some(Directive {
+                at: anchor(node)?,
+                uuid: node.find_str("uuid"),
+            })
+        })
+        .collect()
+}
+
 struct Directive<'a> {
     at: Point,
     uuid: Option<&'a str>,
@@ -106,17 +119,7 @@ pub(super) fn pin_contact_findings(
     {
         return Err("one or more labels have unreadable anchors");
     }
-    let directives: Option<Vec<_>> = DIRECTIVE_TAGS
-        .into_iter()
-        .flat_map(|kind| tree.find_all(kind))
-        .map(|node| {
-            Some(Directive {
-                at: anchor(node)?,
-                uuid: node.find_str("uuid"),
-            })
-        })
-        .collect();
-    let Some(directives) = directives else {
+    let Some(directives) = directives(tree) else {
         return Err("one or more directive labels have unreadable anchors");
     };
     let labels = extract_labels(tree);
@@ -130,7 +133,7 @@ pub(super) fn pin_contact_findings(
         pins,
     );
     Ok((
-        pin_contacts(&index, wires, &directives),
+        pin_contacts(&index, wires, &directives, false),
         short_pin_wires(&index, wires, &directives, min_wire_mm),
     ))
 }
@@ -139,6 +142,50 @@ pub(super) fn default_contact_counts(tree: &SexpNode, wires: &[Wire]) -> Option<
     pin_contact_findings(tree, wires, DEFAULT_MIN_WIRE_MM)
         .ok()
         .map(|(contacts, short_wires)| (contacts.len(), short_wires.len()))
+}
+
+pub(super) fn clearance_pin_contacts(tree: &SexpNode, wires: &[Wire]) -> (Vec<Value>, Vec<String>) {
+    let (pins, unresolved) = clearance_pin_inventory(tree);
+    let labels = extract_labels(tree);
+    let buses = extract_buses(tree);
+    let index = ConnectivityIndex::with_placed_pins(
+        tree,
+        wires,
+        &buses,
+        &labels,
+        COINCIDENT_TOLERANCE,
+        pins,
+    );
+    // Directives do not affect whether two pin tips coincide.
+    (pin_contacts(&index, wires, &[], true), unresolved)
+}
+
+pub(super) fn clearance_pin_inventory(
+    tree: &SexpNode,
+) -> (super::PlacedPinsByReference, Vec<String>) {
+    let mut pins = Vec::new();
+    let mut unresolved = Vec::new();
+    for (node, placed) in tree
+        .find_all("symbol")
+        .into_iter()
+        .zip(super::drawn_symbol_pin_inventory(tree))
+    {
+        match placed {
+            Some(placed) => pins.push(placed),
+            None => unresolved.push(
+                node.find_all("property")
+                    .into_iter()
+                    .find(|property| {
+                        property.get(1).and_then(SexpNode::as_str) == Some("Reference")
+                    })
+                    .and_then(|property| property.get(2).and_then(SexpNode::as_str))
+                    .filter(|reference| !reference.is_empty())
+                    .unwrap_or("<unknown symbol>")
+                    .to_owned(),
+            ),
+        }
+    }
+    (pins, unresolved)
 }
 
 fn near(a: Point, b: Point) -> bool {
@@ -180,6 +227,7 @@ fn pin_contacts(
     index: &ConnectivityIndex<'_>,
     wires: &[Wire],
     directives: &[Directive<'_>],
+    stable_point: bool,
 ) -> Vec<Value> {
     let pins = index.placed_pins();
     let neighborhoods: Vec<_> = pins
@@ -205,6 +253,17 @@ fn pin_contacts(
         if !spans_symbols(pins, matches, matches) || strict_subset || !seen.insert(matches) {
             continue;
         }
+        // Only a pin with this exact neighborhood can serve as its center.
+        let at = if stable_point {
+            matches
+                .iter()
+                .filter(|&&i| &neighborhoods[i] == matches)
+                .map(|&i| pins[i].at)
+                .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)))
+                .unwrap_or(at)
+        } else {
+            at
+        };
         let detail = index.point_detail(at.0, at.1);
         let labels = index.labels().iter().filter(|label| near(at, (label.x, label.y))).map(|label| json!({
             "uuid": label.uuid, "net": label.net, "kind": format!("{:?}", label.kind),
@@ -215,7 +274,16 @@ fn pin_contacts(
         let contact = json!({
             "kind": "pin_contact",
             "point": point(at),
-            "pins": matches.iter().map(|&i| pin_info(&pins[i])).collect::<Vec<_>>(),
+            "pins": matches.iter().map(|&i| {
+                let pin = &pins[i];
+                let mut info = pin_info(pin);
+                if stable_point {
+                    // Pin numbers can repeat at different locations in one
+                    // unit. The library-local tip survives a placement move.
+                    info["_local_tip"] = json!([pin.pin.local_x, pin.pin.local_y]);
+                }
+                info
+            }).collect::<Vec<_>>(),
             "wires": wires.iter().filter(|wire| touches(at, wire)).map(|wire| json!({
                 "uuid": wire.uuid, "start": point((wire.x1, wire.y1)), "end": point((wire.x2, wire.y2))
             })).collect::<Vec<_>>(),

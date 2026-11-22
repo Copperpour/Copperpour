@@ -1164,7 +1164,21 @@ pub(super) fn overlap_findings(
     wires: &[Wire],
     tol: f64,
 ) -> (Vec<serde_json::Value>, usize, Vec<String>) {
-    let instances = extract_symbol_instances(tree);
+    schematic_overlaps(tree, wires, tol, &[])
+}
+
+fn schematic_overlaps(
+    tree: &copperpour_sexp::SexpNode,
+    wires: &[Wire],
+    tol: f64,
+    changed_uuids: &[&str],
+) -> (Vec<serde_json::Value>, usize, Vec<String>) {
+    let instances = tree.find_all("symbol").into_iter().filter_map(|node| {
+        Some((
+            copperpour_sexp::schematic::symbol_instance(node)?,
+            super::symbol_body_style(node),
+        ))
+    });
     let lib_symbols = tree
         .find("lib_symbols")
         .map(|node| node.find_all("symbol"))
@@ -1174,13 +1188,22 @@ pub(super) fn overlap_findings(
     // can still place two large symbols on top of each other; the old origin
     // comparison missed that normal collision shape entirely.
     let placements = instances
-        .iter()
-        .map(|instance| {
-            let placed = find_lib_symbol(&lib_symbols, instance).and_then(|symbol| {
-                let geometry = symbol_geometry_for_instance(symbol, instance)?;
+        .map(|(instance, style)| {
+            let library = find_lib_symbol(&lib_symbols, &instance);
+            let placed = library.and_then(|symbol| {
+                let geometry = symbol_geometry_for_instance(symbol, &instance)?;
                 Some((geometry.envelope()?, geometry))
             });
-            (instance, placed)
+            let unresolved = placed.is_none()
+                || !changed_uuids.is_empty()
+                    && library.is_some_and(|symbol| {
+                        copperpour_sexp::schematic::has_unmeasured_library_text(
+                            symbol,
+                            instance.unit,
+                            style,
+                        )
+                    });
+            (instance, placed, unresolved)
         })
         .collect::<Vec<_>>();
     let mut comp_overlaps: Vec<serde_json::Value> = Vec::new();
@@ -1192,42 +1215,69 @@ pub(super) fn overlap_findings(
             "y_max": bounds.max_y
         })
     };
-    for (index, (a, a_placed)) in placements.iter().enumerate() {
-        for (b, b_placed) in &placements[index + 1..] {
+    let changed = |uuid: Option<&str>| uuid.is_some_and(|id| changed_uuids.contains(&id));
+    let symbol_matches = |instance: &SymbolInstance| changed(instance.uuid.as_deref());
+    let text_matches = |text: &TextExtent| match &text.owner {
+        TextOwner::Field { symbol_uuid, .. } => changed(symbol_uuid.as_deref()),
+        TextOwner::Label { uuid, .. } => changed(uuid.as_deref()),
+    };
+    let identify = |mut finding: serde_json::Value, a: Option<&str>, b: Option<&str>| {
+        if !changed_uuids.is_empty() {
+            finding["_participants"] = json!([a, b]);
+        }
+        finding
+    };
+    for (index, (a, a_placed, _)) in placements.iter().enumerate() {
+        for (b, b_placed, _) in &placements[index + 1..] {
+            if !changed_uuids.is_empty() && !symbol_matches(a) && !symbol_matches(b) {
+                continue;
+            }
             match (a_placed, b_placed) {
                 (Some((a_bounds, a_geometry)), Some((b_bounds, b_geometry))) => {
                     // Pin-tip contact is a normal connection, so the drawings
                     // and pins are compared, not their envelopes.
                     if !a_bounds.separated(*b_bounds) && a_geometry.collides(b_geometry) {
                         let (overlap_x, overlap_y) = a_bounds.overlap_depth(*b_bounds);
-                        comp_overlaps.push(json!({
-                            "type": "component_overlap",
-                            "a": a.reference,
-                            "unit_a": a.unit,
-                            "b": b.reference,
-                            "unit_b": b.unit,
-                            "overlap_x_mm": overlap_x,
-                            "overlap_y_mm": overlap_y,
-                            "bounds_a": bounds_json(*a_bounds),
-                            "bounds_b": bounds_json(*b_bounds),
-                            "detection": "symbol_geometry"
-                        }));
+                        comp_overlaps.push(identify(
+                            json!({
+                                "type": "component_overlap",
+                                "a": a.reference,
+                                "unit_a": a.unit,
+                                "b": b.reference,
+                                "unit_b": b.unit,
+                                "overlap_x_mm": overlap_x,
+                                "overlap_y_mm": overlap_y,
+                                "bounds_a": bounds_json(*a_bounds),
+                                "bounds_b": bounds_json(*b_bounds),
+                                "detection": "symbol_geometry"
+                            }),
+                            a.uuid.as_deref(),
+                            b.uuid.as_deref(),
+                        ));
                     }
                 }
                 // Preserve a useful conservative check when an old or damaged
                 // schematic lacks the embedded definition. The response names
                 // every such fallback below so it cannot look authoritative.
                 _ if points_coincident(a.x, a.y, b.x, b.y, tol) => {
-                    comp_overlaps.push(json!({
-                        "type": "component_overlap",
-                        "a": a.reference,
-                        "unit_a": a.unit,
-                        "b": b.reference,
-                        "unit_b": b.unit,
-                        "x": a.x,
-                        "y": a.y,
-                        "detection": "origin_fallback"
-                    }));
+                    let mut finding = identify(
+                        json!({
+                            "type": "component_overlap",
+                            "a": a.reference,
+                            "unit_a": a.unit,
+                            "b": b.reference,
+                            "unit_b": b.unit,
+                            "x": a.x,
+                            "y": a.y,
+                            "detection": "origin_fallback"
+                        }),
+                        a.uuid.as_deref(),
+                        b.uuid.as_deref(),
+                    );
+                    if !changed_uuids.is_empty() {
+                        finding["_anchors"] = json!([[a.x, a.y], [b.x, b.y]]);
+                    }
+                    comp_overlaps.push(finding);
                 }
                 _ => {}
             }
@@ -1240,8 +1290,24 @@ pub(super) fn overlap_findings(
     let mut label_overlaps: Vec<serde_json::Value> = Vec::new();
     for (i, a) in all_labels.iter().enumerate() {
         for b in &all_labels[i + 1..] {
+            if !changed_uuids.is_empty()
+                && !changed(a.uuid.as_deref())
+                && !changed(b.uuid.as_deref())
+            {
+                continue;
+            }
             if points_coincident(a.x, a.y, b.x, b.y, tol) && a.net != b.net {
-                label_overlaps.push(json!({ "type": "label_overlap", "net_a": a.net, "net_b": b.net, "x": a.x, "y": a.y }));
+                let mut finding = identify(
+                    json!({
+                        "type": "label_overlap", "net_a": a.net, "net_b": b.net, "x": a.x, "y": a.y
+                    }),
+                    a.uuid.as_deref(),
+                    b.uuid.as_deref(),
+                );
+                if !changed_uuids.is_empty() {
+                    finding["_anchors"] = json!([[a.x, a.y], [b.x, b.y]]);
+                }
+                label_overlaps.push(finding);
             }
         }
     }
@@ -1268,6 +1334,9 @@ pub(super) fn overlap_findings(
     };
     for (index, a) in texts.iter().enumerate() {
         for b in &texts[index + 1..] {
+            if !changed_uuids.is_empty() && !text_matches(a) && !text_matches(b) {
+                continue;
+            }
             let already_reported = match (&a.owner, &b.owner) {
                 (
                     TextOwner::Label {
@@ -1287,7 +1356,10 @@ pub(super) fn overlap_findings(
                 push_text(text_json(a), a.bounds, text_json(b), b.bounds);
             }
         }
-        for (instance, placed) in &placements {
+        for (instance, placed, _) in &placements {
+            if !changed_uuids.is_empty() && !text_matches(a) && !symbol_matches(instance) {
+                continue;
+            }
             let Some(body) = placed.as_ref().and_then(|(_, geometry)| geometry.body) else {
                 continue;
             };
@@ -1331,7 +1403,11 @@ pub(super) fn overlap_findings(
     let mut wire_text_overlaps: Vec<serde_json::Value> = Vec::new();
     for wire in wires {
         let (from, to) = ((wire.x1, wire.y1), (wire.x2, wire.y2));
-        for (instance, placed) in &placements {
+        let wire_matches = changed(wire.uuid.as_deref());
+        for (instance, placed, _) in &placements {
+            if !changed_uuids.is_empty() && !wire_matches && !symbol_matches(instance) {
+                continue;
+            }
             let Some((_, geometry)) = placed else {
                 continue;
             };
@@ -1353,6 +1429,9 @@ pub(super) fn overlap_findings(
             }
         }
         for (text, kind) in &wire_texts {
+            if !changed_uuids.is_empty() && !wire_matches && !text_matches(text) {
+                continue;
+            }
             if from != to && text.wire_crossing_bounds().segment_enters(from, to) {
                 wire_text_overlaps.push(json!({
                     "type": kind,
@@ -1371,11 +1450,526 @@ pub(super) fn overlap_findings(
     all.extend(wire_text_overlaps);
     let bounds_unresolved = placements
         .iter()
-        .filter(|(_, placed)| placed.is_none())
-        .map(|(instance, _)| instance.reference.clone())
+        .filter(|(_, _, unresolved)| *unresolved)
+        .map(|(instance, _, _)| instance.reference.clone())
         .collect::<Vec<_>>();
     let bounds_resolved = placements.len() - bounds_unresolved.len();
     (all, bounds_resolved, bounds_unresolved)
+}
+
+/// Clearance findings introduced by the given wires, symbols or labels, in
+/// the overlap check's shape. Both snapshots must come from the same revision.
+#[derive(Default)]
+pub struct ClearanceReport {
+    pub findings: Vec<serde_json::Value>,
+    pub bounds_unresolved: Vec<String>,
+}
+
+pub fn added_clearance_findings(
+    before: &copperpour_sexp::SexpNode,
+    after: &copperpour_sexp::SexpNode,
+    changed_uuids: &[&str],
+) -> ClearanceReport {
+    if changed_uuids.is_empty() {
+        return ClearanceReport::default();
+    }
+    let changed = |uuid: Option<&str>| uuid.is_some_and(|id| changed_uuids.contains(&id));
+    let symbols_changed = [before, after].into_iter().any(|tree| {
+        tree.find_all("symbol")
+            .iter()
+            .any(|symbol| changed(symbol.find_str("uuid")))
+    });
+    let findings = |tree| {
+        let wires = extract_wires(tree);
+        let (mut result, _, mut unresolved) = schematic_overlaps(tree, &wires, 0.5, changed_uuids);
+        if symbols_changed {
+            let (contacts, unresolved_pins) =
+                super::sch_pin_contacts::clearance_pin_contacts(tree, &wires);
+            for reference in unresolved_pins {
+                if !unresolved.contains(&reference) {
+                    unresolved.push(reference);
+                }
+            }
+            for contact in contacts {
+                let pins = contact["pins"]
+                    .as_array()
+                    .expect("pin contact lists its pins");
+                if pins.iter().any(|pin| changed(pin["symbol_uuid"].as_str())) {
+                    result.push(json!({
+                        "type": "pin_contact",
+                        "point": contact["point"],
+                        "pins": pins,
+                    }));
+                }
+            }
+        }
+        for (i, a) in wires.iter().enumerate() {
+            for b in &wires[i + 1..] {
+                if (changed(a.uuid.as_deref()) || changed(b.uuid.as_deref()))
+                    && super::sch_layout_score::collinear_overlap(a, b)
+                {
+                    result.push(json!({
+                        "type": "collinear_overlap",
+                        "a": wire_json(a),
+                        "b": wire_json(b),
+                    }));
+                }
+            }
+        }
+        (result, unresolved)
+    };
+    let key = |finding: &serde_json::Value| {
+        let mut finding = finding.clone();
+        let object = finding.as_object_mut().expect("finding is an object");
+        if object.contains_key("_anchors") {
+            object.remove("x");
+            object.remove("y");
+        }
+        for side in ["a", "b"] {
+            if let Some(wire) = object.get_mut(side).filter(|item| item["kind"] == "wire") {
+                let start = (wire["x1"].as_f64(), wire["y1"].as_f64());
+                let end = (wire["x2"].as_f64(), wire["y2"].as_f64());
+                if start > end {
+                    (wire["x1"], wire["y1"]) = (json!(end.0), json!(end.1));
+                    (wire["x2"], wire["y2"]) = (json!(start.0), json!(start.1));
+                }
+            }
+        }
+        if object["type"] == "pin_contact" {
+            // Compare physical pin occurrences, not their sheet positions.
+            // A move can preserve a contact even when its center changes.
+            object.remove("point");
+            if let Some(pins) = object
+                .get_mut("pins")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                pins.sort_by_cached_key(serde_json::Value::to_string);
+            }
+        }
+        let swap = match object["type"].as_str() {
+            Some("component_overlap" | "label_overlap") => object
+                .get("_participants")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|ids| ids[0].as_str() > ids[1].as_str()),
+            Some("text_overlap" | "collinear_overlap") => {
+                fn side_key(side: &serde_json::Value) -> ([Option<&str>; 8], Option<u64>) {
+                    (
+                        [
+                            "kind",
+                            "uuid",
+                            "symbol_uuid",
+                            "field",
+                            "reference",
+                            "label_type",
+                            "net",
+                            "text",
+                        ]
+                        .map(|key| side[key].as_str()),
+                        side["unit"].as_u64(),
+                    )
+                }
+                let a = &object["a"];
+                let b = &object["b"];
+                side_key(a)
+                    .cmp(&side_key(b))
+                    .then_with(|| {
+                        let (a, b, keys) = if object["type"] == "collinear_overlap" {
+                            (a, b, ["x1", "y1", "x2", "y2"])
+                        } else {
+                            (
+                                &object["bounds_a"],
+                                &object["bounds_b"],
+                                ["x_min", "y_min", "x_max", "y_max"],
+                            )
+                        };
+                        keys.into_iter()
+                            .map(|key| {
+                                a[key]
+                                    .as_f64()
+                                    .unwrap_or_default()
+                                    .total_cmp(&b[key].as_f64().unwrap_or_default())
+                            })
+                            .find(|order| !order.is_eq())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .is_gt()
+            }
+            _ => false,
+        };
+        if swap {
+            for (a, b) in [
+                ("a", "b"),
+                ("unit_a", "unit_b"),
+                ("net_a", "net_b"),
+                ("bounds_a", "bounds_b"),
+            ] {
+                if let (Some(a_value), Some(b_value)) =
+                    (object.get(a).cloned(), object.get(b).cloned())
+                {
+                    object.insert(a.into(), b_value);
+                    object.insert(b.into(), a_value);
+                }
+            }
+            for field in ["_participants", "_anchors"] {
+                if let Some(pair) = object
+                    .get_mut(field)
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    pair.swap(0, 1);
+                }
+            }
+        }
+        finding.to_string()
+    };
+    let (previous, _) = findings(before);
+    let previous: HashSet<_> = previous.iter().map(key).collect();
+    let (mut added, bounds_unresolved) = findings(after);
+    added.retain(|finding| !previous.contains(&key(finding)));
+    for finding in &mut added {
+        let object = finding.as_object_mut().expect("finding is an object");
+        object.remove("_participants");
+        object.remove("_anchors");
+        if let Some(pins) = object
+            .get_mut("pins")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for pin in pins {
+                pin.as_object_mut()
+                    .expect("contact pin is an object")
+                    .remove("_local_tip");
+            }
+        }
+    }
+    ClearanceReport {
+        findings: added,
+        bounds_unresolved,
+    }
+}
+
+#[cfg(test)]
+mod clearance_tests {
+    use super::*;
+    use copperpour_sexp::parse_sexp;
+
+    const SOURCE: &str =
+        include_str!("../../tests/fixtures/power_orientation_kicad10/power_orientation.kicad_sch");
+
+    #[test]
+    fn moving_a_symbol_onto_another_pin_reports_the_contact() {
+        let before = parse_sexp(SOURCE).unwrap();
+        let mut after = cse::Schematic::from_source("power_orientation.kicad_sch", SOURCE).unwrap();
+        let ground = after.symbols.by_reference_mut("#PWR02").unwrap();
+        ground.at.x = 68.58;
+        ground.at.y = 66.04;
+        let uuid = ground.uuid.clone();
+        let after = parse_sexp(&after.to_source()).unwrap();
+        let findings = added_clearance_findings(&before, &after, &[&uuid]).findings;
+        let contacts: Vec<_> = findings
+            .iter()
+            .filter(|f| f["type"] == "pin_contact")
+            .collect();
+        assert_eq!(contacts.len(), 1, "{findings:?}");
+        assert_eq!(contacts[0]["point"], json!({"x": 68.58, "y": 66.04}));
+    }
+
+    #[test]
+    fn a_label_edit_does_not_need_unrelated_pin_geometry() {
+        let mut sch = cse::Schematic::from_source("power_orientation.kicad_sch", SOURCE).unwrap();
+        sch.symbols.by_reference_mut("J3").unwrap().lib_id = "unresolved:Connector".into();
+        let before = parse_sexp(&sch.to_source()).unwrap();
+        let uuid = sch.add_label("OTHER", 114.3, 121.92).uuid.clone();
+        let after = parse_sexp(&sch.to_source()).unwrap();
+        let report = added_clearance_findings(&before, &after, &[&uuid]);
+        assert_eq!(report.bounds_unresolved, ["J3"]);
+        let findings = report.findings;
+        assert!(
+            findings.iter().any(|f| f["type"] == "label_overlap"),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn wire_field_crossings_report_only_changed_wires_or_symbols() {
+        const LANES: &str =
+            include_str!("../../tests/fixtures/direct_lanes_kicad10/direct_lanes.kicad_sch");
+        let wire = "c9ac38c6-043c-4795-93f9-b053e790821e";
+        let symbol = "2d93183c-1dda-4390-8f0b-b713d830dc03";
+        let mut sch = cse::Schematic::from_source("direct_lanes.kicad_sch", LANES).unwrap();
+        assert!(sch.wires.remove_by_uuid(wire).is_some());
+        let before = parse_sexp(&sch.to_source()).unwrap();
+        let after = parse_sexp(LANES).unwrap();
+        let crossings = |uuid| {
+            added_clearance_findings(&before, &after, &[uuid])
+                .findings
+                .into_iter()
+                .filter(|f| f["type"] == "wire_field_overlap")
+                .collect::<Vec<_>>()
+        };
+        for changed in [wire, symbol] {
+            let findings = crossings(changed);
+            assert_eq!(findings.len(), 2, "{findings:?}");
+            assert!(findings
+                .iter()
+                .all(|f| f["a"]["uuid"] == wire && f["b"]["symbol_uuid"] == symbol));
+        }
+        assert!(crossings("676cb32a-f015-4eb4-8a3f-5b9364d0e345").is_empty());
+    }
+
+    #[test]
+    fn library_text_in_the_active_style_is_reported_even_with_a_pin_envelope() {
+        let source = r#"(kicad_sch
+          (lib_symbols (symbol "test:Text"
+            (symbol "Text_0_0"
+              (pin passive line (at -5.08 0 0) (length 2.54) (name "~") (number "1")))
+            (symbol "Text_1_2" (text "MARK" (at 0 0 0) (effects (font (size 1 1)))))))
+          (symbol (lib_id "test:Text") (at 30 30 0) (unit 1) (body_style 1)
+            (uuid "u1") (property "Reference" "U1"))
+          (symbol (lib_id "test:Text") (at 50 50 0) (unit 1) (body_style 2)
+            (uuid "u2") (property "Reference" "U2")))"#;
+        let tree = parse_sexp(source).unwrap();
+        let report = added_clearance_findings(&tree, &tree, &["u2"]);
+        assert_eq!(report.bounds_unresolved, ["U2"]);
+        let (_, resolved, unresolved) = overlap_findings(&tree, &[], 0.5);
+        assert_eq!(resolved, 2);
+        assert!(unresolved.is_empty());
+    }
+
+    #[test]
+    fn reordering_symbols_with_unknown_bounds_does_not_reintroduce_origin_overlap() {
+        let mut sch = cse::Schematic::from_source("power_orientation.kicad_sch", SOURCE).unwrap();
+        let j3 = sch.symbols.by_reference_mut("J3").unwrap();
+        j3.lib_id = "missing:Symbol".into();
+        j3.at.x = 63.6;
+        j3.at.y = 124.46;
+        let before = parse_sexp(&sch.to_source()).unwrap();
+        let j3 = sch.symbols.remove_by_reference("J3").unwrap();
+        let uuid = j3.uuid.clone();
+        sch.symbols.push(j3);
+        let after = parse_sexp(&sch.to_source()).unwrap();
+        let report = added_clearance_findings(&before, &after, &[&uuid]);
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f["detection"] == "origin_fallback"),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_second_physical_contact_between_the_same_pin_numbers_is_new() {
+        let source = r#"(kicad_sch
+          (lib_symbols (symbol "test:Dup"
+            (symbol "Dup_0_1"
+              (pin passive line (at 0 0 0) (length 0) (name "~") (number "1"))
+              (pin passive line (at -2.54 0 0) (length 0) (name "~") (number "1")))))
+          (symbol (lib_id "test:Dup") (at 20 20 0) (unit 1)
+            (uuid "a") (property "Reference" "J1"))
+          (symbol (lib_id "test:Dup") (at 20 20 0) (unit 1) (mirror y)
+            (uuid "b") (property "Reference" "J2")))"#;
+        let before = parse_sexp(source).unwrap();
+        let after = parse_sexp(&source.replace(" (mirror y)", "")).unwrap();
+        let report = added_clearance_findings(&before, &after, &["b"]);
+        let contacts: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f["type"] == "pin_contact")
+            .collect();
+        assert_eq!(contacts.len(), 1, "{:?}", report.findings);
+        assert_eq!(contacts[0]["point"], json!({"x": 17.46, "y": 20.0}));
+        assert!(contacts[0]["pins"][0].get("_local_tip").is_none());
+    }
+
+    #[test]
+    fn moving_a_pin_within_a_continuing_contact_does_not_report_a_new_contact() {
+        let source = r#"(kicad_sch
+          (lib_symbols (symbol "test:Pin"
+            (pin passive line (at 0 0 0) (length 0) (name "~") (number "1"))))
+          (symbol (lib_id "test:Pin") (at 100 100 0)
+            (uuid "a") (property "Reference" "J1"))
+          (symbol (lib_id "test:Pin") (at 100.005 100 0)
+            (uuid "b") (property "Reference" "J2")))"#;
+        let before = parse_sexp(source).unwrap();
+        let after = parse_sexp(&source.replace("100.005", "99.995")).unwrap();
+        let report = added_clearance_findings(&before, &after, &["b"]);
+        assert!(
+            !report.findings.iter().any(|f| f["type"] == "pin_contact"),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_contact_point_is_within_reach_of_every_pin_in_its_group() {
+        let source = r#"(kicad_sch
+          (lib_symbols
+            (symbol "test:A"
+              (pin passive line (at 0 0 0) (length 0) (name "~") (number "1")))
+            (symbol "test:B"
+              (pin passive line (at 0 0 0) (length 0) (name "~") (number "1"))
+              (pin passive line (at 0 -0.016 0) (length 0) (name "~") (number "1")))
+            (symbol "test:C"
+              (pin passive line (at 0 0 0) (length 0) (name "~") (number "1"))
+              (pin passive line (at 0 0.016 0) (length 0) (name "~") (number "1"))))
+          (symbol (lib_id "test:A") (at 100 100 0)
+            (uuid "a") (property "Reference" "J1"))
+          (symbol (lib_id "test:B") (at 100.007 99.992 0)
+            (uuid "b") (property "Reference" "J2"))
+          (symbol (lib_id "test:C") (at 100.014 99.992 0)
+            (uuid "c") (property "Reference" "J3")))"#;
+        let before = parse_sexp(source).unwrap();
+        let after = parse_sexp(
+            &source.replace("(at 100.014 99.992 0)", "(at 100.014 99.992 0) (mirror x)"),
+        )
+        .unwrap();
+        let report = added_clearance_findings(&before, &after, &["c"]);
+        let contacts: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f["type"] == "pin_contact")
+            .collect();
+        assert_eq!(contacts.len(), 1, "{:?}", report.findings);
+        assert_eq!(contacts[0]["point"], json!({"x": 100.007, "y": 100.008}));
+    }
+
+    #[test]
+    fn only_new_findings_involving_changed_uuids_are_returned() {
+        let before = parse_sexp(SOURCE).unwrap();
+        let mut after = cse::Schematic::from_source("power_orientation.kicad_sch", SOURCE).unwrap();
+        let label = after.add_label("OTHER", 114.3, 121.92).uuid.clone();
+        let with_label = parse_sexp(&after.to_source()).unwrap();
+        let findings = added_clearance_findings(&before, &with_label, &[&label]).findings;
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding["type"] == "label_overlap"),
+            "{findings:?}"
+        );
+        let wire = after.add_wire(175.26, 152.4, 176.53, 152.4).uuid.clone();
+        let with_wire = parse_sexp(&after.to_source()).unwrap();
+        assert!(
+            added_clearance_findings(&with_label, &with_wire, &[&label, &wire])
+                .findings
+                .is_empty()
+        );
+        assert!(added_clearance_findings(&before, &with_wire, &[&wire])
+            .findings
+            .is_empty());
+    }
+
+    #[test]
+    fn distinct_labels_with_the_same_name_do_not_hide_a_new_overlap() {
+        let mut sch = cse::Schematic::from_source("power_orientation.kicad_sch", SOURCE).unwrap();
+        sch.add_label("A", 220.98, 180.34);
+        let first = sch.add_label("B", 220.98, 180.34).uuid.clone();
+        let second = sch.add_label("B", 228.6, 180.34).uuid.clone();
+        let before = parse_sexp(&sch.to_source()).unwrap();
+        let moved = sch
+            .labels
+            .iter_mut()
+            .find(|label| label.uuid == second)
+            .unwrap();
+        moved.at.x = 220.98;
+        let after = parse_sexp(&sch.to_source()).unwrap();
+        let report = added_clearance_findings(&before, &after, &[&first, &second]);
+        let label_overlaps: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f["type"] == "label_overlap")
+            .collect();
+        assert_eq!(label_overlaps.len(), 1, "{:?}", report.findings);
+        assert!(label_overlaps[0].get("_participants").is_none());
+    }
+
+    #[test]
+    fn reordering_a_label_does_not_reintroduce_an_anchor_overlap() {
+        let mut sch = cse::Schematic::from_source("power_orientation.kicad_sch", SOURCE).unwrap();
+        let uuid = sch.add_label("A", 220.98, 180.34).uuid.clone();
+        sch.add_label("B", 221.08, 180.34);
+        let before = parse_sexp(&sch.to_source()).unwrap();
+        let mut a = sch
+            .labels
+            .iter()
+            .find(|label| label.uuid == uuid)
+            .unwrap()
+            .clone();
+        sch.labels.retain(|label| label.uuid != uuid);
+        a.set_rotation(180.0);
+        sch.labels.push(a);
+        let after = parse_sexp(&sch.to_source()).unwrap();
+        let report = added_clearance_findings(&before, &after, &[&uuid]);
+        assert!(
+            !report.findings.iter().any(|f| f["type"] == "label_overlap"),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_new_collinear_overlap_names_both_wires() {
+        let mut sch = cse::Schematic::from_source("power_orientation.kicad_sch", SOURCE).unwrap();
+        let old = sch.add_wire(220.98, 180.34, 226.06, 180.34).uuid.clone();
+        let before = parse_sexp(&sch.to_source()).unwrap();
+        let new = sch.add_wire(228.6, 180.34, 223.52, 180.34).uuid.clone();
+        let after = parse_sexp(&sch.to_source()).unwrap();
+        let report = added_clearance_findings(&before, &after, &[&new]);
+        let [finding] = report.findings.as_slice() else {
+            panic!("expected one collinear overlap: {:?}", report.findings);
+        };
+        assert_eq!(finding["type"], "collinear_overlap");
+        assert_eq!(finding["a"]["uuid"], old);
+        assert_eq!(finding["b"]["uuid"], new);
+    }
+
+    #[test]
+    fn reversing_a_wire_does_not_reintroduce_a_collinear_overlap() {
+        let mut sch = cse::Schematic::from_source("power_orientation.kicad_sch", SOURCE).unwrap();
+        sch.add_wire(220.98, 180.34, 226.06, 180.34);
+        let wire = sch.add_wire(228.6, 180.34, 223.52, 180.34).clone();
+        let before = parse_sexp(&sch.to_source()).unwrap();
+        let reversed = sch.wires.iter_mut().find(|w| w.uuid == wire.uuid).unwrap();
+        std::mem::swap(&mut reversed.start, &mut reversed.end);
+        let after = parse_sexp(&sch.to_source()).unwrap();
+        assert!(added_clearance_findings(&before, &after, &[&wire.uuid])
+            .findings
+            .is_empty());
+    }
+
+    #[test]
+    fn reordering_symbols_does_not_reintroduce_a_pin_contact() {
+        const CONTACT: &str =
+            include_str!("../../tests/fixtures/pin_contact_kicad10/pin_contact.kicad_sch");
+        let before = parse_sexp(CONTACT).unwrap();
+        let mut sch = cse::Schematic::from_source("pin_contact.kicad_sch", CONTACT).unwrap();
+        // J1 follows R1 in the fixture; put it before R1 so the contact's
+        // raw participant order actually changes.
+        let r1 = sch.symbols.remove_by_reference("R1").unwrap();
+        let uuid = r1.uuid.clone();
+        sch.symbols.push(r1);
+        let after = parse_sexp(&sch.to_source()).unwrap();
+        let participants = |tree| {
+            super::super::sch_pin_contacts::clearance_pin_contacts(tree, &[])
+                .0
+                .into_iter()
+                .find(|contact| {
+                    contact["pins"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|pin| pin["symbol_uuid"] == uuid)
+                })
+                .unwrap()["pins"]
+                .clone()
+        };
+        assert_ne!(participants(&before), participants(&after));
+        let report = added_clearance_findings(&before, &after, &[&uuid]);
+        assert!(
+            !report.findings.iter().any(|f| f["type"] == "pin_contact"),
+            "{:?}",
+            report.findings
+        );
+    }
 }
 
 /// Whether `text` is one of `instance`'s own fields: the same placed symbol by
