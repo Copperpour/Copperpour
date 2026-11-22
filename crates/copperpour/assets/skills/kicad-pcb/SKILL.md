@@ -120,7 +120,8 @@ Follow this sequence for a clean PCB workflow:
    Footprints from Library**. This is distinct from `update_pcb_from_schematic`:
    it refreshes supported library-owned pads, graphics, attributes, metadata, and
    3D models without changing references, placement, side, rotation, KIID, symbol
-   metadata, instance overrides, or pad nets. Always call it first with
+   metadata, instance overrides (unless `reset_clearance_overrides` is set), or
+   pad nets. Always call it first with
    `dry_run: true`; apply only with `dry_run: false` and the exact returned
    `expected_plan_revision`. The requested board must be open in live KiCad, one
    apply is one undo entry, and unsupported or stale content returns a non-mutating

@@ -11,6 +11,3313 @@ a release is cut.
 Changes from Konnect, up to its last release, v0.13.0, are in
 [Konnect's copy of this file](https://github.com/mixelpixx/Konnect/blob/v0.13.0/docs/API_MIGRATIONS.md).
 
+## v0.17.0
+
+### New `search_3d_models` and `check_3d_models` tools (minor release)
+
+No existing tool names, arguments, or responses change. Two read-only tools
+complete discovery and pre-export checks around 3D models:
+
+- `search_3d_models` (`library` toolset) searches KiCad's bundled `3dmodels`
+  directories and/or `<project_dir>/3dmodels` for `.step`, `.stp`, `.stpz`, `.stp.gz`, `.step.gz`,
+  `.igs`, `.iges`, `.wrl`, `.wrz`, `.x3d`, `.idf`, and `.emn` files, returning `${KICAD*_3DMODEL_DIR}/...` or
+  `${KIPRJMOD}/3dmodels/...` paths usable with `set_footprint_models` and
+  `set_placed_footprint_models`.
+- `check_3d_models` (`pcb_export` toolset) audits a `.kicad_pcb` file on disk
+  for placed footprints with missing `(model ...)` entries or unresolvable model
+  files before running `export_3d`, skipping `dnp` and `board_only` footprints
+  unless `include_dnp` or `include_board_only` is set.
+
+The audit reads the saved board, including hidden models; unsaved editor changes
+are not included. Embedded `kicad-embed://` models resolve against footprint or
+board `embedded_files` entries. Search follows KiCad's OCE, VRML and IDF plugin
+formats; OBJ files are not loadable by KiCad and are excluded. Search returns an
+absolute path whenever a variable path cannot resolve back to the discovered file.
+
+### `add_board_text` adds `thickness`, `mirror`, `bold`, and `italic`, and aligns file/IPC default thickness (minor release)
+
+`add_board_text` now accepts optional `thickness` (mm, positive, default `round6(size * 0.15)`), `mirror` (boolean, default `false`), `bold` (boolean, default `false`), and `italic` (boolean, default `false`), and returns all four resolved fields in both `source: "ipc"` and `source: "file"` responses.
+
+When `thickness` is omitted, the file fallback now writes `round6(size * 0.15)` instead of hardcoded `0.15`, matching the IPC path at all font sizes. Non-positive or non-numeric `size` and `thickness` values and non-boolean style flags are refused with `invalid_argument` before touching IPC or disk. Pass an explicit `thickness: 0.15` if you relied on the old fixed 0.15 mm stroke at non-unit sizes on the file path.
+
+### `add_rule_area` adds live KiCad rule areas in the `pcb_rule_areas` toolset (minor release)
+
+The new `pcb_rule_areas` toolset provides `add_rule_area` for creating netless KiCad rule areas (keep-out zones) on one or more enabled copper layers of a live board open in KiCad (`ZT_RULE_AREA`, `RuleAreaSettings`).
+
+- Accepts `layers` (specific enabled copper layers or `"*.Cu"`), either `points` or `rect` geometry in millimetres, optional `name`, and KiCad's five keepout flags (`keepout_tracks`, `keepout_vias`, `keepout_pads` defaulting to `true`; `keepout_copper_pours`, `keepout_footprints` defaulting to `false`).
+- Requires a live KiCad PCB Editor holding the exact requested board (no closed-board file fallback in this increment); validates enabled layers before opening a commit, verifies post-commit readback by KIID, refills copper zones afterward (reporting an `applied_but_not_refilled` partial outcome if refill fails), and uses the shared `outcome` envelope.
+- Creating a rule area does not run autorouting. The [Specctra rule-area profile](specctra-rule-areas.md), added by [#81](https://github.com/Copperpour/Copperpour/issues/81), supports straight routing keep-outs with whole-micrometre vertices and lists the forms still refused by export.
+
+### `add_schematic_net_label` refuses a label shape KiCad cannot load or draw (patch release)
+
+`shape` is now one of `input`, `output`, `bidirectional`, `tri_state` and
+`passive`, the shapes the sheet-pin tools take. Any other value is refused as
+`invalid_argument` on `shape`, through the schema and in the handler, and
+nothing is written. On a global or hierarchical label it used to be written as
+given: KiCad 10 then could not load the sheet, and a parent sheet's netlist left
+its parts out, or, for `dot` or `round` on a hierarchical label, kicad-cli
+crashed plotting it. On a `net_label` it was ignored; it is refused
+there too.
+
+Omitted, `shape` is still `input`, and a `net_label` given one of the five
+still writes none, so a call that sends the schema's default with a plain label
+is unchanged. Issue: [#479](https://github.com/Copperpour/Copperpour/issues/479).
+
+### `add_via` validates drill and pad geometry before IPC (patch release)
+
+`drill` and `pad_size` must be numbers that round to positive nanometre sizes,
+with `drill` strictly smaller than `pad_size` after rounding. Invalid sizes and
+malformed present values (including null) now return `invalid_argument` naming
+the field before any IPC call. Previously these could reach KiCad or silently
+select defaults. Omit the fields to keep the 0.4 mm drill and 0.8 mm pad defaults;
+otherwise supply valid geometry. Board design rules may require larger sizes
+or annular rings; this check does not replace DRC.
+
+### `apply_copper` makes blind, buried and micro vias (minor release)
+
+Each item of `vias` takes three optional keys, named as `query_vias` reports
+them ([#423](https://github.com/Copperpour/Copperpour/issues/423)): `via_type`,
+one of `through` (the default), `blind`, `buried` or `micro`, and `start_layer`
+and `end_layer`, the copper layers the drill spans, in either order: both, or
+neither for a through via. KiCad tells a blind via from a buried one by its
+span, and keeps a through via on F.Cu to B.Cu, so the span must be the type's:
+`blind` has exactly one end on F.Cu or B.Cu, `buried` neither, and `through`
+spans F.Cu to B.Cu; `micro` may join any two layers. A span that is not its
+type's, a layer the board does not have, a missing end, or one layer at both
+ends is refused as `invalid_argument` on that item's field before anything is
+sent.
+
+Each via in the dry run's plan and in the applied read-back carries `via_type`,
+`start_layer` and `end_layer`, the end nearer F.Cu first; the read-back takes
+them from KiCad. These keys were refused before as additional properties. Calls
+that leave them out make the through vias they made before, though a
+`plan_revision` that a dry run returned before this change no longer matches.
+
+### `apply_specctra_ses` checks the candidate under the project's rules (minor release)
+
+The candidate DRC of `apply_specctra_ses` now applies the source board's
+project: the netclasses of its `.kicad_pro`, the custom rules of its
+`.kicad_dru`, and its schematic for the parity check. Before, kicad-cli read
+the project from files named like the candidate, which a new candidate never
+has, so the candidate was checked against KiCad's defaults and `drc.clean` could
+be `true` on a board whose project DRC fails (#312).
+
+kicad-cli runs on a temporary view of the project directory (symbolic links)
+in which the board under the source board's name is the candidate; nothing in
+the project is written. `drc` adds `project_rules_applied`: `true` when the
+project's rules applied, `false` only without symbolic links (some Windows
+setups), where the candidate is checked on its own as before.
+
+Callers may see violations, unconnected items or schematic parity differences
+that the previous candidate DRC did not report. They are the ones `run_drc` on
+the source project reports for the same board.
+
+### `apply_specctra_ses` reports DRC `errors`, `warnings`, and `findings` separately (minor release)
+
+`apply_specctra_ses` previously set `drc.clean` to `false` whenever `drc.violations` was non-zero, even if the only finding was a warning (such as `via_dangling`), and omitted the findings list.
+
+`drc` now separates errors from warnings and lists the findings (in the same `rule`, `severity`, `description`, `pos`, `items` shape as `run_drc`), ordered with errors before warnings and bounded to 50 entries:
+
+- `drc.errors`: count of `error`-severity findings across `violations`, `unconnected_items`, and `schematic_parity`.
+- `drc.warnings`: count of `warning`-severity findings across those categories.
+- `drc.clean`: `true` when `drc.errors == 0`, `unconnected_items == 0`, and `schematic_parity_violations == 0` (warnings alone no longer mark `clean` as `false`).
+- `drc.findings`, `drc.shown`, `drc.truncated`: bounded list of findings and truncation metadata.
+- `drc.violations` remains the total count of entries in KiCad's `violations` array for backwards compatibility.
+
+Callers gating on `drc.clean` will now see `true` when an import has only warnings; callers that want to inspect or fail on warnings should check `drc.warnings` and `drc.findings`.
+
+### `apply_specctra_ses` takes `skip_creepage` (minor release)
+
+`apply_specctra_ses` accepts the optional boolean `skip_creepage` that
+`run_drc` already takes (default `false`). The candidate DRC now reads the
+source project's custom rules (#312), creepage constraints included, and
+KiCad checks creepage single-threaded over every net pair: on a large board
+that one DRC can take minutes to hours. When `true`, the candidate is checked
+against the project's `.kicad_dru` without its `creepage` constraints; every
+other rule, the netclasses and the schematic parity check still apply, and the
+project directory is never written.
+
+`drc` adds `creepage_skipped`, `true` only when constraints were actually left
+out: `false` when `skip_creepage` is off, when the project has no creepage
+constraint, and without symbolic links (some Windows setups), where the
+candidate is checked on its own. A non-boolean `skip_creepage` is refused as
+`invalid_argument` before KiCad is asked. Calls that leave `skip_creepage` out
+are unchanged; run the full DRC before manufacturing.
+
+### `apply_template` executes its connection map (minor release)
+
+`apply_template` previously only placed components despite promising wiring. It now
+connects resolvable map entries using short wires and local net labels, with the
+same collision checks as `batch_connect_to_net`. Component spacing allows room
+below tall symbols; the response reports the resulting positions.
+
+Inspect `connections_made` (verified against saved connectivity),
+`connections_unresolved` (entries or pins that could not be wired), and
+`unconnected_pins` (placed pins not wired by this call). An unresolved entry does
+not prevent independent entries from being connected. `joined_existing_nets`
+names verified joins to nets present before placement, including generated
+internal names. Applied explicit mappings acknowledge their destination names.
+Shared-pin chains are normalized into one net; a connected explicit name takes
+precedence over generated names. Generated names use the actual reference and
+pin number, so distinct pins with the same library name stay separate. Malformed
+`net_mappings` and blank destination names now produce `invalid_argument` before
+placement instead of silently using the original net.
+
+`connections_to_wire` remains as a deprecated copy of the mapped connection guide
+for compatibility; it is **not** a list of outstanding work. Use the new result
+fields before deciding what still needs wiring. Pins absent from a connection
+map remain unconnected; this tool does not infer missing circuitry or add
+no-connect flags.
+
+Placement and each net are separate revision-checked writes. A failure after
+placement reports `mutation_outcome_uncertain` with placed references and any nets
+already written. Inspect the saved sheet and finish remaining connections; do
+not reapply the template, which would place another copy.
+
+### `audit_decoupling` picks supply pins by electrical type (patch release)
+
+`audit_decoupling`, and with it `run_design_review`, chose the pins to audit
+by name alone. It now audits every `power_in` pin, whatever its name
+(`IOVDD`, `VREG_IN`), and applies the name list only to pins typed
+`unspecified` or `passive`. A pin of any other type is not audited even when
+its name matches, so a bidirectional `3V3_EN` and a `power_out` `3V3` are no
+longer reported. Nor is a pin under a no-connect flag, a ground pin (its name
+or a name of its net is a ground name as KiCad's ERC reads one: containing
+`GND`, or `EARTH`, `EARTH_…`, `VSS` or `VSSA`), or a power symbol's pin. A
+hidden `power_in` pin is on the net its name names, as KiCad nets it, so a
+capacitor on that rail decouples it. `total_power_pins` and `pass_count` count
+the pins audited. Issue: [#120](https://github.com/Copperpour/Copperpour/issues/120).
+
+### Unmodified Claude/Codex guidance auto-updates on upgrade and drift notices use a runnable `init` path (patch release)
+
+`copperpour init` now writes a sibling manifest
+(`~/.copperpour/.installed-manifest-claude.json` or
+`~/.copperpour/.installed-manifest-codex.json`) recording the SHA-256 digests of
+installed skills, references, and agents plus managed Claude hook entries
+([#731](https://github.com/Copperpour/Copperpour/issues/731)).
+
+When an upgraded MCP server scans an `out_of_sync` Claude or Codex install whose
+manifest version matches `.installed-<client>`:
+
+- Unmodified files and managed sole-handler hook entries matching the recorded
+  manifest (and newly bundled files) are updated atomically in place. If all
+  items become `current`, `.installed-<client>`, `.installed-manifest-<client>.json`,
+  and `.guidance-checked-<client>` advance without emitting `guidance_notice`.
+- User-modified files, user-deleted files, user-edited or shared hook entries,
+  symlinks, and legacy installs without a matching manifest are left untouched.
+  Remaining drift emits `guidance_notice` naming any locally modified files
+  (`(locally modified: ...)`).
+- Drift notices now include the serving executable's runnable path (quoted when
+  needed) instead of bare `copperpour init` whenever bare `copperpour` on `PATH`
+  does not resolve to the serving binary (e.g. KiCad PCM plugin installs).
+- `copperpour init` skips rewriting unchanged files and reports updated vs.
+  unchanged skills, agents, and hooks in its progress output and final summary.
+
+### `batch_add_schematic_net_label` adds several labels in one write (minor release)
+
+The new `sch_batch` tool takes `labels`, each entry with the arguments
+`add_schematic_net_label` takes: `net`, `x`, `y`, `rotation`, `label_type`
+and `shape`. A sheet's interface of hierarchical labels is one call instead of
+one per signal:
+
+```json
+{
+  "schematic": "interface.kicad_sch",
+  "labels": [
+    {"net": "SDA", "x": 96.52, "y": 99.06, "rotation": 180,
+     "label_type": "hierarchical_label", "shape": "bidirectional"},
+    {"net": "SCL", "x": 96.52, "y": 101.6, "rotation": 180,
+     "label_type": "hierarchical_label", "shape": "input"}
+  ]
+}
+```
+
+`shape` is one of `input`, `output`, `bidirectional`, `tri_state` and
+`passive`, the shapes `add_sheet_pin` takes, and defaults to `input` on a
+global or hierarchical label; a `net_label` given one is refused. Every entry
+is checked before the file is read, so a malformed one refuses the whole call
+with `invalid_argument` naming it (`labels[1].x`) and nothing is written.
+
+The labels are written in one revision-checked write. A save made after the
+read, or KiCad's lock on the sheet or on its project's root, refuses the call as
+`conflict` with nothing written. `added` is read back from the written file: per
+label its `net`, `label_type`, `shape` (`null` on a `net_label`), `x`, `y`,
+`rotation` and `uuid`, in request order, with `added_count`. A write that fails
+after it may have replaced the file, a file that cannot be read back, or one that
+does not hold exactly the requested labels beside the ones it had returns
+`mutation_outcome_uncertain`; reload and inspect it before retrying.
+
+### `batch_add_power_symbol` dots the corner a two-pin group's symbol sits on (patch release)
+
+A group whose pins end on two points puts its power symbol on the first stub's
+end, a corner of the bar, where the stub, the bar and the power pin meet. That
+corner now gets a junction dot, as eeschema draws one at three or more exits,
+and it is listed in `junctions_added`. KiCad joined the pins there without the
+dot, so no net changes. Groups of one point, or of three or more, are
+unchanged. Issue: [#376](https://github.com/Copperpour/Copperpour/issues/376).
+
+### `batch_rotate_labels` counts only the labels it rotates (patch release)
+
+A `labels` item missing `rotation`, or naming a label that is not at its
+`x` and `y`, used to be counted in `rotated` and left as it was
+([#724](https://github.com/Copperpour/Copperpour/issues/724)). An item missing
+`net`, `x`, `y` or `rotation` is now refused as `invalid_argument` naming it,
+such as `labels[1].rotation`, as `batch_add_junction` refuses a position
+missing a coordinate. A label that is not there refuses the call naming the
+item, and two items naming the same label are refused as `invalid_argument`.
+In every case nothing is written: the batch is now one read and one write, as
+its description says. A call whose labels are all found, each named once,
+behaves as before.
+
+### Batch schematic edits support field text placement and unit selection (minor release)
+
+Each `batch_edit_schematic_components.edits[]` entry now accepts
+`field_placements` and `unit`, with the same schema, placement parser, and writer
+as `edit_schematic_component`. This moves field text without moving symbol bodies
+or changing field values. For example:
+
+```json
+{
+  "schematic": "amplifier.kicad_sch",
+  "edits": [
+    {"reference": "R1", "field_placements": {"Value": {"x": 12.5, "y": 34.5, "rotation": 90}}},
+    {"reference": "U1", "unit": 2, "field_placements": {"Value": {"hide": true}}}
+  ]
+}
+```
+
+Coordinates are absolute schematic millimetres, not offsets from the symbol.
+Omitted placement attributes retain their existing values. A position (`x` or
+`y`) on a part with several placed units requires a positive `unit` selector.
+Rotation and visibility changes without `unit` apply to every placed unit.
+A supplied unit selects field text only: values, footprints, custom fields, and
+DNP remain whole-component edits. A DNP edit with `unit` but no nonempty
+`field_placements` is refused for that entry, as in the single-component tool.
+
+Successful placement entries add `unit_count` and `units` from the saved-file
+readback. Each unit includes `field_placements`, keyed by field name with
+`x`, `y`, `rotation`, and `hide`, plus its UUID and other existing component
+readback data. `units` includes every placed unit, even when only one was edited.
+Existing batch response fields, including the per-field `fields` array and
+`updated_count` (successful edit entries), keep their meanings. Multiple entries
+can place text on different units of the same component; their readbacks show the
+final saved state, including values or DNP set by later entries.
+`updated_unit_copies` and `created_unit_copies` continue to count property-value
+writes and creations; text placements are reported through `changes` and `units`
+rather than added to those counters.
+
+The batch plans in memory and commits once through the existing revision-checked
+atomic writer. Atomic publication does **not** mean every requested edit succeeds:
+inspect `errors` as well as `updated`. Missing fields/units, empty per-field placement specs,
+and a missing selector for a multi-unit position are reported in `errors`; other
+valid field changes and entries can still apply. With `field_placements`,
+non-positive or out-of-range integer unit selectors refuse that entry before its
+value/DNP edits. Invalid schema types or unknown placement attributes refuse the whole call
+before the handler runs. No missing field is created by `field_placements`; use
+`fields` with `create_missing: true` to create a custom field in the same batch.
+
+A field on a particular placed unit may receive a placement assignment only once
+per batch. An overlapping assignment refuses **all placements in the later
+entry**; its otherwise valid value/field/DNP edits may still apply. Combine that
+field's position, rotation, and visibility in one placement spec.
+
+Malformed source placement data or a failed prospective readback refuses the
+whole write. A mismatch in the component/placement readback after publication returns
+`mutation_outcome_uncertain`, naming the schematic and entries carried in the
+write. Reload and inspect those entries before retrying; do not replay the whole
+batch merely because verification failed. Editor-lock and revision-conflict
+protections remain in force, including locks held on a parent/root sheet.
+
+### DRC and library responses expose consistent truncation metadata (minor release)
+
+`get_drc_violations` now accepts `limit` (default **50**), like `run_drc`.
+Both return `shown` (the number of entries in `violations`) and `truncated`
+(whether more severity-filtered violations exist). `limit: 0` returns counts
+without violation rows. Raise `limit` when a larger sample is needed, or supply
+`output` to publish the complete JSON report, including all reported categories
+and severities. The limit affects presentation only: the complete DRC still runs,
+`filtered_count` and existing total/category/error/warning counts remain complete,
+and missing categories remain unchecked (`null`), not checked zeroes.
+
+`list_symbols_in_library` adds `shown` alongside its existing `truncated` flag.
+Its `count` remains the full number of symbols; the default limit remains **100**.
+
+`search_symbols` and `search_footprints` add `shown` and `truncated`, with the
+existing default limit of **50**. Their existing `count` still counts returned
+matches and equals `shown`; it is **not** a full catalogue total. Search looks
+for one extra match to establish `truncated`, including across libraries, then
+stops. If no extra match exists, proving that may visit all remaining registered
+libraries. `limit: 0` returns no matches and reports whether any match was found.
+Search metadata covers the libraries successfully searched; unreadable or missing
+libraries retain the existing skip behavior. Result order and search scope are
+unchanged; this adds neither pagination nor exhaustive catalogue accounting.
+
+All five tools accept non-negative integer limits, including JSON spellings such
+as `1.0`. Negative, fractional, null, boolean and string limits produce `invalid_argument`
+at both the served schema and direct handler boundaries. In particular, negative
+limits no longer fall back to a default, and `1.0` applies a one-entry limit.
+Limits bound entry counts,
+not response bytes or nested violation items.
+
+### `open_schematic_viewer` uses the browser service; standalone Tauri viewer deprecated (minor release)
+
+> Later superseded by [standalone viewer retirement](retire-standalone-viewer.md):
+> the owner waived the planned release grace period and approved immediate removal.
+> Statements below about retention describe this earlier phase only.
+
+The tool name and required `schematic` argument remain. An optional `open_browser`
+boolean defaults to true; false starts/reuses the service without launching a
+browser. Malformed present values, including null, are refused. The service uses
+the server's configured `kicad-cli` or normal discovery and reads saved files.
+It applies the hierarchy/snapshot restrictions documented in the viewer README.
+
+Successful responses retain `launched`, `viewer`, `schematic` and `note`.
+`launched: true` now means the loopback browser service started or was reused;
+`viewer` is `"browser"` rather than a standalone executable path. `schematic`
+is the canonical root path. New fields are `url`, `reused`,
+`browser_launch_requested`, `browser_launch_succeeded` and `browser_launch_error`.
+The browser fields report the OS opener's observed exit, not proof that a browser
+window became visible. A failed/timed-out opener leaves the service usable and
+returns its URL with a diagnostic; use it manually rather than starting duplicates.
+With `open_browser: false`, both launch booleans are false and the error is null.
+Root resolution, render or bind failure returns a tool error without a success URL.
+
+The URL includes a fragment credential; treat it as a private local capability.
+One viewer is reused per canonical root in a `ToolContext`. It lives until that
+MCP server context ends; closing a browser tab does not stop it. Dropping the
+context signals shutdown of listener, watcher and render processes. With stdio, the
+context ends when its connection closes. The stateless HTTP transport shares one
+context across clients; disconnecting a client does not stop viewers, which remain
+until HTTP server shutdown. A later server context gets a new URL; old URLs cannot reconnect to it. For headless/SSH use, forward the
+printed port to the same local port, preserving the printed `127.0.0.1` origin;
+Host/Origin validation rejects other ports or hostnames. The service makes no
+outbound network requests and remains available in offline builds.
+
+The documented `schematic-viewer` binary and `--kicad-cli` flag remain available
+but are deprecated. Keep its packaging and CI through one shipped release
+containing this notice. A later removal PR must wait until that release has
+shipped; this change does not remove Tauri or provide an automatic fallback to it.
+
+### Shared browser viewer service (minor release; phase two of #242)
+
+> Later superseded by [standalone viewer retirement](retire-standalone-viewer.md):
+> the owner waived the planned release grace period and approved immediate removal.
+> Statements below about retention describe this earlier phase only.
+
+This phase adds a development browser service in `copperpour-viewer`, accessible
+through its Rust API and `browser_viewer` example. It does not switch
+`open_schematic_viewer`, deprecate Tauri, remove `schematic-viewer`, or change
+that binary's arguments. The MCP default switch and its response migration belong
+to phase three; Tauri retirement must wait for the release/deprecation window.
+
+The existing `crates/schematic-viewer/frontend/index.html` source path remains
+available; it and the adjacent new `viewer.js` are shared by both adapters.
+The installed Tauri binary still embeds its frontend and needs no external HTML
+files. There is no source-asset path retirement in this phase.
+
+Browser instances use a launch-bound root, authenticated loopback endpoints and
+SSE snapshots. They read saved files through temporary snapshots. Outside-root or
+parent-traversing child references and failed snapshot copies are refused in this
+path. The legacy Tauri engine retains its existing behavior. See the viewer crate
+README for the service, lifecycle, security boundaries and local testing command.
+
+### Browser viewer startup and listener recovery (minor release)
+
+The browser viewer retries transient listener accept errors instead of terminating
+its HTTP service. Connection errors retry immediately; other errors are logged
+and retry after one second. Shutdown interrupts the backoff. Authentication,
+loopback binding and bounded ownership of accepted connections are unchanged.
+
+An unchanged hierarchy renders once at startup. Source timestamps and lengths
+are observed before discovery reads and compared after watcher installation;
+changed sources receive a catch-up refresh. Changed project settings invalidate
+all sheets, and unavailable revision metadata conservatively triggers catch-up.
+Treat `revision` as an opaque change marker: it remains 1 at unchanged startup
+until an actual update or explicit refresh, rather than advancing to 2 for a
+redundant second full render. SSE still sends the current snapshot on connection.
+
+Existing refusal of child paths containing `..` remains, including paths such as
+`sub/../child.kicad_sch` that resolve inside the root. Tests now pin that refusal
+and its diagnostic independently of the later outside-root check.
+
+### Bus connections and pin analysis require a unique placed pin (minor release)
+
+`get_pin_connections` and its alias `get_pin_net_name` now return
+`ambiguous_target` with candidates (unit, UUID and position) when a reference and
+pin number name more than one placed pin. Missing components, pins or embedded
+symbol definitions return `stale_target`. Previously these tools reported the
+first matching pin, or a free-text missing-target error.
+
+`connect_pins_to_bus` uses the same strict resolver and honors sheet-local
+`lib_name` definitions. Ambiguous or stale items are skipped and described in
+`errors`; valid items still connect. A call with no valid items leaves the file
+unchanged. Its arguments and response shape are unchanged.
+
+Give placed symbols unique references before retrying ambiguous items. For a
+pin shared by multiple placed units, use explicit-coordinate wiring and bus
+entry tools for the intended candidate instead. Retry only skipped bus items;
+successful items have already been applied.
+
+### New always-visible meta-tool `call_tool` (minor release)
+
+`call_tool(name, arguments)` runs a tool by name, whether or not its toolset is
+loaded and whether or not the client lists it, and returns that tool's own
+result. Arguments are checked against the target's schema as in a direct call,
+and the call log records the target's name. `tools/list` does not change. A
+client that never re-fetches its tool list after `load_toolset` can reach the
+read-only tools of every toolset through it. No caller needs to change
+anything.
+
+By default `call_tool` runs only tools on a reviewed read-only list: queries,
+listings and checks that write no file, change nothing in KiCad or in the
+server's session, and send nothing over the network. Any other target is
+refused before it runs, with the new error kind `tool_not_permitted` (`tool`,
+and `reason` `writes_not_enabled`). That includes `load_toolset` and
+`unload_toolset`, a tool that plans by default and applies on request, and a
+check that can write its report to a path the caller names. Call such a tool
+directly under its own name. `call_tool` never runs itself or `reload_server`
+(`reason` `never_through_call_tool`).
+
+The new server configuration key `call_tool_allow_writes` (default `false`)
+lets `call_tool` run the other tools as well. Only the operator can set it, in
+`copperpour.toml` or `settings.json`; no argument of `call_tool` does. An MCP
+client asks for approval per tool name, so allowing the gateway may allow
+mutating targets without their usual individual approval prompts. Turn the key
+on only for a client that cannot call those tools directly and whose user
+accepts that.
+
+### `check_schematic_overlaps` reports a wire through a symbol's body as `wire_overlap` (minor release)
+
+`check_schematic_overlaps` compared symbol drawings and pins, labels and text,
+and nothing looked at wires, so a wire drawn straight through a symbol's body
+reported clean. A wire whose ends sit on a crystal's two pin tips, drawn through
+its body, joins both pins in KiCad and reported clean. It now reports each schematic
+wire that passes through the drawn body of a placed symbol as an entry of
+`"type": "wire_overlap"`. `a` names the wire, `{"kind": "wire", "uuid", "x1",
+"y1", "x2", "y2"}` as `list_schematic_wires` writes its ends, and `b` the symbol,
+`{"kind": "symbol_body", "reference", "unit", "symbol_uuid"}` as `text_overlap`
+does, with `bounds_b` the body's bounds. Wires in any direction are checked.
+
+The body is the symbol's drawings without its pins, the box `text_overlap`
+compares text against. A wire counts when the middle of its run inside that box
+lies strictly within it, so a wire along an edge, one that only touches an edge,
+and one ending on a pin tip outside the body are not reported. Nor is a
+wire with an end on one of the symbol's own pin tips that does not head back
+toward the pin's root, because a symbol's drawing can reach past a pin's tip,
+as KiCad's stock `Device:LED` does with its emission arrows. A wire from the
+tip toward the root is reported, and a zero-length pin, such as a power
+symbol's, exempts nothing, so a wire from its tip into its own drawing is
+reported. A wire leaving a tip square to the pin is exempt even where it crosses the drawing that reaches past the tip, as one from the LED's cathode tip down across an emission arrow would; that is the limit of the rule. Buses and graphic lines are not checked, and a symbol whose geometry is not resolved is
+skipped, as it is for `text_overlap`; it is still named in `bounds_unresolved`.
+
+Entries are counted in `overlap_count` and listed in `overlaps` with the others,
+so a sheet that reported clean may now report. `component_overlap`,
+`label_overlap` and `text_overlap` entries are unchanged. Issue:
+[#504](https://github.com/Copperpour/Copperpour/issues/504).
+
+### Schematic writes respect the root editor lock (patch release)
+
+Every tool that writes a schematic sheet now also checks the KiCad editor lock of
+the project that owns it, `~<project>.kicad_sch.lck` beside the root schematic,
+before it writes. Eeschema locks only that root and saves every sheet from memory,
+so a child sheet was written while the project was open, and the change was lost
+on Eeschema's next save. A present or unreadable root lock now refuses the write
+with `conflict` naming the root, and leaves every file unchanged.
+`delete_schematic_component` refuses earlier, in its document binding, with
+`stale_target`. A sheet that more than one project could own is refused while any
+of those projects is open. If the owning project cannot be determined, for
+example because its directory is unreadable, the write is refused as well.
+
+Save and close Eeschema before retrying a refused write. Remove a stale lock only
+after confirming no editor owns it. Annotation dry runs and calls that change
+nothing remain read-only and can run while the project is open.
+
+### Claude `PreToolUse` hooks and bundled agents match `mcp__Copperpour__*` (patch release)
+
+`copperpour init` now writes Claude `PreToolUse` hook matchers of the form
+`mcp__(copperpour|Copperpour|konnect|Konnect)__(...)` instead of
+`mcp__(copperpour|konnect)__(...)`, and both bundled Claude agents
+(`kicad-schematic-build-agent` and `kicad-design-review-agent`) now allow
+`mcp__Copperpour__*` and `mcp__Konnect__*` alongside the lowercase prefixes
+([#737](https://github.com/Copperpour/Copperpour/issues/737)).
+
+Claude Desktop's `.mcpb` extension registers tools under its capitalized
+`display_name` (`mcp__Copperpour__<tool>`) in Claude Desktop's Code tab, which
+missed the previous case-sensitive lowercase-only matchers and agent tool
+allowlists. Unmodified installs carrying a matching install manifest upgrade
+automatically on the next server start; older or customized installs report
+`stale_matcher` / `different` and refresh on `copperpour init`.
+
+### Closed-board footprint edits report late KiCad locks as `unsafe_file_fallback` (patch release)
+
+`move_component`, `rotate_component`, `set_component_placements`,
+`flip_component`, `place_decoupling_caps`, and
+`refine_placement_force_directed` now hand writer and I/O errors from
+`ClosedBoardError::into_result` back to dispatch instead of wrapping them in an
+untyped error. When a `~<board>.kicad_pcb.lck` file appears between the
+pre-write gate and the atomic rename, callers now receive
+`unsafe_file_fallback` (matching other board writers). Other failures to read,
+parse or write the board surface as `handler_error`. Retry only after confirming no KiCad
+process holds the board and the lock is gone.
+
+### Placement and component-list results are compact by default (minor release)
+
+`add_schematic_component`, `add_power_symbol` and `batch_place_components` now
+return a compact entry per placed part: `reference`, `uuid`, `lib_id`,
+`value`, `footprint`, `x`, `y`, `rotation` and `unit`, plus `mirror_x`,
+`mirror_y`, `dnp`, `unit_count`, `in_bom` or `on_board` only when they differ
+from the default. The single-part tools also keep `schematic`, and their
+`junctions_added`, `added_power` and `lcsc_catalog`. The full readback
+(`fields`, `units`, `field_placements`, `instance_paths`, `project`, `added`,
+`datasheet`) is still verified after every write; pass `verbose: true` to have
+it returned as before.
+
+`list_schematic_components` now leaves out of each row's `properties` the
+fields the row already carries (`Reference`, `Value`, `Footprint`), empty
+fields, and `Datasheet` and `Description`. Pass `verbose: true` for every field,
+or read one part with `get_schematic_component`.
+
+### A reference on another sheet is refused with that sheet's file (patch release)
+
+`get_component_nets`, `get_pin_connections`, `get_connected_items`,
+`get_schematic_component`, `get_schematic_pin_locations` and
+`replace_component` read one sheet file. When the reference is not on it but
+is on another `.kicad_sch` file in the same directory, the refusal still starts
+with `Component '<ref>' not found`, now followed by ` on this sheet (…)` and
+the file to pass as `schematic`. A reference recorded only for another
+instance of a sheet placed more than once also names the reference that file
+saves the symbol as. A reference on no sheet keeps the plain message.
+
+### `connect_passthrough` refuses a stub that joins another net (patch release)
+
+`connect_passthrough` now checks its 2.54 mm stub with `clear_stub_direction`
+before writing, matching `connect_to_net`:
+
+- With `direction: "auto"` (the default), a stub that would end on or run over a
+  terminal of another net turns across instead of joining it.
+- With a named `direction`, or with `direction: "auto"` when every direction
+  would join another net (or when placed symbol pin geometry cannot be
+  resolved), `connect_passthrough` refuses with `plan_blocked` and writes
+  nothing.
+- A stub that meets a pin or label already on the requested net still succeeds.
+
+### Generate approximate package STEP models with `create_3d_model` (minor release)
+
+The new `model_3d` toolset contains `create_3d_model`. It creates a new AP214
+STEP file from an explicit rectangular body and optional pin-row boxes, or
+from an unambiguous saved footprint F.Fab rectangle (F.CrtYd fallback only
+when F.Fab has no outline) and a supplied height. No CAD runtime dependency,
+network access or existing-tool rename is introduced.
+
+Output uses millimetres, Y-up coordinates and independent, unfused solids.
+The tool reports the source used and solid bounds/colours; it never attaches
+the model or modifies the source footprint. Existing output paths are
+refused with `conflict`; a failed post-write readback reports
+`mutation_outcome_uncertain`. `call_tool` requires write permission.
+
+Read [the usage and validation guide](../3d-model-generation.md) for exact
+limits, approximation semantics, defaults, recovery and the independent
+KiCad/OCCT test. Runtime success establishes exact file readback, not CAD
+validation or physical fit. Existing callers need no changes.
+
+### `create_footprint` refuses an existing `.kicad_mod` unless `replace_existing` is true (minor release)
+
+`create_footprint` now refuses with `conflict` when `output` already exists on
+disk instead of silently overwriting it. Pass `replace_existing: true` to
+replace an existing `.kicad_mod` file (checked with `write_if_unchanged` against
+the bytes read before writing). `import_jlcpcb_part` passes
+`replace_existing: true` automatically so part re-imports keep working.
+
+### `create_schematic` reports ownership and unlinked schematic conflicts carry a structured remedy (minor release)
+
+`create_schematic` now resolves project ownership after writing the new `.kicad_sch` file and adds an `ownership` object to its JSON response (`status`: `"standalone"`, `"owned"`, `"unlinked"`, `"conflict"`, or `"unknown"`). Creating an unlinked sheet inside a project directory remains a success (not an error); when `status` is `"unlinked"`, the response includes `candidate_roots` and `next_calls` with the exact `add_hierarchical_sheet` invocation(s) required before writes to that sheet will succeed.
+
+When a schematic write or read fails with `error.kind == "conflict"` because the sheet is unlinked inside a project whose candidate hierarchies parsed cleanly, the conflict error now preserves `error.kind` and `error.paths` while adding a structured `recovery` object (`cause: "unlinked_schematic"`, `next_steps` naming `add_hierarchical_sheet`, and `evidence.next_calls`) and naming `add_hierarchical_sheet` in `message`. Callers that only match `error.kind == "conflict"` require no changes.
+
+### Custom pad shapes and the corner ratio in the library footprint tools (minor release)
+
+As agreed on [#675](https://github.com/Copperpour/Copperpour/issues/675):
+
+- **`edit_footprint_pad`:**
+  - `roundrect_rratio` (0..0.5) sets a roundrect pad's corner ratio and is reported as `roundrect_rratio` with `previous` and `current`. It is refused on a pad of another shape unless the same call sets `shape: "roundrect"`.
+  - `shape` also takes `"custom"`, which needs `custom_shape`: `anchor` (`circle` or `rect`), `clearance` (`outline`, the default, or `convexhull`) and `primitives` in `set_footprint_graphics`' items, in the pad's own coordinates.
+  - `custom_shape` alone redraws a pad that is already custom. It always replaces the whole primitive list, written as KiCad writes it, with coordinates, radii and widths rounded to KiCad's 1 nm grid. The answer reports `custom_shape` as read back from the pad as written.
+  - `custom_shape` on a pad that is not custom, without `shape: "custom"`, is refused on `custom_shape`. So is `shape: "custom"` without it.
+- **`create_footprint`:** a pad with `shape: "custom"` needs `custom_shape`, and `custom_shape` is refused on any other shape. Before, `shape: "custom"` wrote a custom pad without primitives.
+- **`get_footprint_info` with `include_pads`:** a custom pad also has `custom_shape`, in the form the two tools take. A pad the model cannot read has `custom_shape_unreadable` with the reason instead, for example a polygon with arc segments in its outline.
+
+KiCad's single-polygon rule for custom pads is left to its DRC (`DRCE_PADSTACK_INVALID`). Callers that never use the new arguments need not change their calls.
+
+### Live placement and Update PCB place footprints with custom pads (minor release)
+
+As agreed on [#679](https://github.com/Copperpour/Copperpour/issues/679), part 1:
+
+- **Now placed:** footprints with custom-shape pads, by `place_component`, `place_component_array` and `duplicate_component` while the board is open in KiCad, and by `update_pcb_from_schematic` when it adds a part. Each pad's anchor and primitives are built as KiCad builds them from the library. Before, all of these refused such a footprint ("custom-shape pads are not supported by KiCad 10's typed placement path").
+- **Still refused:** a custom pad with `(clearance convexhull)` refuses the footprint as before, now naming the pad ("custom pad '1': its (clearance convexhull) has no field in KiCad 10's pad message ..."), with `unsupported_library_footprint` in Update PCB. So does a primitive the shared model does not read, such as a polygon with arc segments in its outline.
+- **No longer in `not_carried`:** live placement no longer lists a custom pad's shape, options or primitives there.
+- **Unchanged until part 2:** `update_footprints_from_library`, and Update PCB's footprint replacement, still refuse custom pads by name ("pad shape 'custom' is not supported by typed library refresh").
+
+Callers that refused or worked around such footprints can now place them directly.
+
+### Portable skills installation target (patch release)
+
+`copperpour init`, `status`, and `uninstall` now accept `--skills-dir <absolute path>`
+and the `COPPERPOUR_SKILLS_DIR` environment variable. The flag takes precedence,
+and the variable is ignored when `--client` is given.
+With either override, these commands operate on portable skills only, without
+writing Claude agents, hooks, or client-profile installation markers. Without an
+override their client-specific behavior is unchanged. The option is not a server
+startup or double-click installer setting.
+
+Keep the target's `.copperpour-skills.json` ownership marker. Custom uninstall
+preserves modified/unowned files and the target root. Custom init refuses to
+replace locally edited files and any file the marker does not list. Files that a
+later release no longer bundles are removed by init or uninstall unless edited. See README's Managing skills
+section for other clients and update instructions.
+
+Installer-only `--client gemini`, `--client cursor`, and `--client antigravity`
+(alias `agy`) select ownership-checked, skills-only roots at `~/.gemini/skills`,
+`~/.cursor/skills`, and `~/.gemini/config/skills` respectively. Precedence is
+explicit `--skills-dir`, then the preset directory; `COPPERPOUR_SKILLS_DIR` applies
+only without `--client`.
+Use the same target when checking or removing an installation. These presets do
+not register an MCP server or change server-startup client selection. Existing
+`claude` means Claude Code; existing `codex` also covers the desktop app. Claude
+Desktop skill uploads remain a separate workflow.
+
+### DRC no longer writes or deletes `<board>.drc.json` (patch release)
+
+`run_drc`, `get_drc_violations`, `design_review`,
+`validate_for_manufacturing`, `pcb_board_outline` and the candidate DRC of
+`apply_specctra_ses` now have `kicad-cli` write its report to a temporary
+directory of their own. An existing `<board>.drc.json` beside the board is left
+untouched; before, the DRC overwrote it and then deleted it, or, through a
+project view (`skip_creepage`, the SES candidate), overwrote the project's copy
+with the view's report.
+
+`apply_specctra_ses` no longer refuses with `conflict` when
+`<candidate>.drc.json` exists, and no longer deletes that file on rollback; it
+still refuses when the candidate board itself exists. Nothing for callers to
+change.
+
+### `run_drc` reports per-rule counts and accepts a rule include list (minor release)
+
+`run_drc` adds `by_rule`, keyed by exact reported rule names:
+
+```json
+{"by_rule": {"clearance": {"errors": 7, "warnings": 2}}}
+```
+
+Counts cover the complete result after severity and rule filtering, before the
+display `limit`. `limit: 0` still returns the breakdown. Each bucket counts errors
+and warnings, as the existing global counters do; informational rows remain in
+`filtered_count`/`violations` when requested with `severity: "info"`. A rule with
+only informational rows has a bucket with zero errors and zero warnings.
+
+Pass an optional `rules` array to inspect a subset without repeated findings
+from other rules consuming the returned sample:
+
+```json
+{"board": "/absolute/project/board.kicad_pcb", "rules": ["clearance"], "limit": 10}
+```
+
+Names match case-sensitively against the response's `rule` values. Omitted
+`rules` includes all names; `rules: []` includes none. Duplicate names are
+coalesced and unknown names yield no matching rows. A malformed present list,
+including `null` or any non-string item, returns `invalid_argument` before DRC
+or report work. The new `rules_filter` field is the sorted unique effective
+selection, or `null` when the argument was omitted.
+
+`filtered_count`, global `errors`/`warnings`, `by_rule`, the displayed list,
+`shown`, and `truncated` all use both filters. Existing calls without `rules`
+keep their previous counts/order and gain the new metadata. Full-report
+`total_violations` and category counts retain their existing unfiltered meanings;
+missing categories remain `null`/`categories_not_reported`, not checked zeroes.
+
+Rule selection does not reduce KiCad's checks, change synchronization/refill
+behavior, or filter the complete optional `output` report. It reduces response
+content; it does not make the DRC engine run faster.
+
+### `edit_component` sets DNP and the BOM and position-file exclusions (minor release)
+
+`edit_component` changed only a placed footprint's value. It now also takes
+`dnp`, `exclude_from_bom` and `exclude_from_pos_files`, each optional; every
+property not named is kept. Before, these flags could be set on a board only
+through the schematic and `update_pcb_from_schematic`.
+
+An edit is one KiCad undo step, and the answer is a fresh read of the
+footprint, as `edit_footprint_field` answers. This applies to a value edit as
+well, which before was neither a single undo step nor read back:
+
+- The answer keeps `reference`, `value` and `footprint`, and adds `dnp`,
+  `exclude_from_bom`, `exclude_from_pos_files`, `linked_to_schematic`,
+  `status` (`applied` or `unchanged`), `applied`, `source`, `changed`,
+  `before`, `undo` and `warning`.
+- A request the footprint already holds sends nothing and answers `unchanged`.
+- A fresh read that does not hold the request is a `mutation_outcome_uncertain`
+  error instead of success.
+- `warning` says that KiCad 10 replaced the footprint whole, and, for a
+  footprint linked to a schematic symbol, that `update_pcb_from_schematic` sets
+  `dnp` and `exclude_from_bom` from the symbol again.
+
+A call naming no property reports the footprint, as before, with the new keys.
+
+`reference`, `value` and `footprint` keep their names and formats (`footprint`
+is `Library:Entry`, as `list_footprints` writes it), and a missing reference
+or a footprint without a value field is refused with the same text as before.
+One refusal is new: a reference that more than one footprint carries is
+refused before anything is sent ("Footprint reference 'R1' is ambiguous:
+KiCad returned 2 matches"); before, the first of them was reported or edited.
+
+### `edit_component` sets and reports a footprint's lock (minor release)
+
+`edit_component` takes `locked`, optional: `true` locks a placed footprint and
+`false` unlocks it, as KiCad's own lock. Before, no tool set or cleared the
+lock, though `auto_place_from_schematic` and `refine_placement_force_directed`
+hold a footprint KiCad marks locked. As with the other properties, the edit is
+one KiCad undo step and the answer is a fresh read.
+
+The answer adds `locked`, at the top level and in `before`, and `changed` can
+name it. A call naming no property reports the lock too. Issue:
+[#39](https://github.com/Copperpour/Copperpour/issues/39).
+
+### New `pcb_text` toolset lists and edits placed board text and footprint fields in place (minor release)
+
+No tool could change a piece of text already on the board without deleting
+and re-adding it, and none could change a placed footprint's Reference or
+Value text beyond its position. Four tools make up a new `pcb_text` toolset
+(`load_toolset("pcb_text")`). All need the board open in KiCad; each edit is
+one undo step, is read back from KiCad afterwards, and keeps every property it
+was not asked to change.
+
+- `list_board_texts` lists board-level text items with their UUID, raw text
+  (`${VARIABLE}` kept), position, angle, size, thickness, font, layer,
+  alignment and KiCad's bounding box.
+- `edit_board_text` moves, rotates, resizes, re-layers, re-words or restyles
+  one of them by UUID: `mirrored` (or `mirror: "auto"` to match its layer
+  side), `horizontal_alignment`, `vertical_alignment`, `bold`, `italic`,
+  `keep_upright`, `knockout`, `locked` and `font`.
+- `list_footprint_fields` lists the Reference, Value and other fields of one or
+  every placed footprint, with the same attributes.
+- `edit_footprint_field` makes the same edits to one placed footprint's
+  Reference or Value field, and can show or hide it.
+
+No existing call changes. `pcb_board`, already at the 20-tool cap, keeps its
+tools.
+
+### Schematic component edits preserve private fields (patch release)
+
+`edit_schematic_component` now updates existing private fields in place instead of planning a public duplicate and returning `ambiguous_target`. `batch_edit_schematic_components` also updates existing private fields with the default `create_missing: false`.
+
+When an edit adds a missing copy to another unit, the new copy is private if all existing copies are private. If the existing copies disagree and a copy is missing, the tool reports an error for that field and writes none of its copies. A unit with duplicate field names is still refused. `remove_fields` still refuses to remove a private field.
+
+### `edit_sheet` relinks symbol instances and resolves owning `project_name` (patch release)
+
+`edit_sheet` with `new_file` previously changed only the parent sheet's
+`Sheetfile` property, leaving symbol instance paths in the old and new child
+files stale so subsequent writes failed with `stale_target`. It now validates
+that `new_file` is an existing relative `.kicad_sch` path whose subtree is
+readable and acyclic, updates symbol instance paths across both the old and new
+subtrees in one journaled transaction (leaving an unplaced old file
+untouched), and verifies readback on every relinked file. Its answer gains
+`relinked_symbol_instances`, the number of symbol instance records it changed
+in those files (0 when `Sheetfile` is unchanged).
+
+`edit_sheet`, `get_sheet_hierarchy`, and `renumber_sheet_pages` also now
+default `project_name` to the owning project instead of the schematic file's
+stem, so nested parents report and renumber page entries under the owning
+project and its hierarchy path. `edit_sheet` and `renumber_sheet_pages` refuse a
+`project_name` that disagrees with the owning project, and
+`renumber_sheet_pages` refuses a parent schematic placed more than once.
+
+### `edit_symbol_pin` shows or hides a pin (minor release)
+
+`edit_symbol_pin` takes `hidden`: `true` hides the pin and `false` shows it,
+as KiCad's pin dialog does. Without it, a pin's visibility is left as it is.
+
+- **Write:** every hide marker of the pin is removed, and a hidden pin gets
+  one where KiCad writes it, after `(length …)`: `(hide yes)`, or a bare
+  `hide` in a library older than format 20241004, which KiCad 8 can still
+  open. A pin already as asked is left as written.
+- **Read:** as KiCad reads a pin, a bare `hide` hides it and the last
+  `(hide yes|no)` decides.
+- **Answer:** `changes.hidden` gives the previous and current visibility when
+  it changed.
+- **Refused** as `invalid_argument` on `hidden`: anything but `true` or
+  `false`.
+
+A hidden pin stacked on another, such as an exposed pad's extra pin, is drawn
+over that pin once shown; move it with `x` and `y` in the same call.
+
+### `edit_symbol_pin` chooses between pins that share a number (minor release)
+
+`edit_symbol_pin` chose its pin by `pin_number`, narrowed by `unit` and
+`body_style`, and refused two pins with one number in the same unit and body
+style as pins it "cannot tell apart". Such pins are the duplicates KiCad's
+symbol checker reports, and renumbering one of them is the fix.
+
+- New selectors, which only choose the pin and change nothing: `pin_name`, the
+  pin's current name, and `pin_x` with `pin_y`, its current connection point
+  in mm. `name`, `x` and `y` still set new values.
+- Pins sharing a number in one unit and body style are now an
+  `ambiguous_target` whose candidates give each pin's name and connection
+  point, so a caller can pick one. Before, this was a `handler_error`.
+- Pins that share number, name and connection point stay refused as before.
+- A selector that matches no pin is `invalid_argument` on `pin_name` or
+  `pin_x`; `pin_x` without `pin_y`, or the reverse, is `invalid_argument` on
+  the one missing.
+- The answer also carries `pin_name`, the chosen pin's name before the edit.
+
+### `export_manufacturing_package` lists JLCPCB hand-fitted parts on their own (minor release)
+
+A footprint with KiCad's `exclude_from_pos_files` attribute that is not DNP is
+fitted, but not by the placement machine: a through-hole connector soldered
+after JLCPCB assembly, for example. The JLCPCB CPL already left it out, but the
+BOM, read from the schematic, still listed it, so the package ended with
+`JLCPCB BOM/CPL designators do not match: missing from CPL [...]` and was
+reported incomplete.
+
+For `fab_house` `jlcpcb` with assembly, such a part now leaves the BOM as it
+leaves the CPL, and is written to `BOM-hand-fitted-<board>.csv` beside it, with
+the BOM's columns, so it is still bought. A BOM row grouping both kinds is cut
+in two, each with its own quantity. `files_generated` describes the new file
+with the type `bom_hand_fitted` and its `designators`; it is not in `files`,
+as it is not uploaded, and `generate_jlcpcb_order_link` uploads the BOM without
+these parts.
+
+A footprint that also has `exclude_from_bom`, or is not in the schematic (a
+mounting hole), is not a hand-fitted part. The BOM is unchanged when the board
+has no hand-fitted part, and for every other fab house. A
+`BOM-hand-fitted-<board>.csv` left in the output directory by an earlier JLCPCB
+export is removed when the board no longer has a hand-fitted part. If the list
+cannot be written, the BOM is left as KiCad wrote it, a warning says so and the
+package is reported incomplete.
+
+Callers that marked hand-fitted parts DNP to keep them out of the assembly
+files can set `exclude_from_pos_files` instead (`edit_component`), and clear
+DNP.
+
+### `export_netlist` exports IPC-D-356 from the board and KiCad netlists from the schematic (patch release)
+
+`export_netlist` ran `kicad-cli sch export netlist` on the given file whatever
+the format. That command does not load a `.kicad_pcb` and has no IPC-D-356
+format, so both documented formats failed on a board
+([#155](https://github.com/Copperpour/Copperpour/issues/155)).
+
+- `format: "ipc"` (also `ipcd356`, `ipc-d-356`, `d356`) now runs
+  `pcb export ipcd356` on the board. Given a `.kicad_sch` it is refused as
+  `invalid_argument` on `board`.
+- A schematic netlist format (`kicad`, `kicadxml`, `cadstar`, `orcadpcb2`,
+  `spice`, `spicemodel`, `pads` or `allegro`, or the aliases `kicadsexpr`,
+  `sexp`, `xml` and `orcad`) given a `.kicad_pcb` is exported from the
+  `.kicad_sch` of the same name beside the board, and the response names that
+  file in a new `source_schematic` field. When no such
+  schematic exists the call is refused as `invalid_argument` on `board`
+  before kicad-cli runs. A `.kicad_sch` path works as before.
+- Any other format name is refused as `invalid_argument` on `format` before
+  kicad-cli runs. It used to reach kicad-cli, which failed with
+  `Invalid format`.
+
+### `export_schematic_svg` honours the `output` filename (minor release)
+
+`export_schematic_svg` used `output` only as a directory: kicad-cli names SVG
+files after the schematic (`<stem>.svg`, one per sheet), so the caller's
+filename was discarded and two exports of same-stem schematics into one
+directory overwrote each other. The tool now behaves like
+`export_schematic_pdf`: `output` names the root SVG file, and each child sheet
+of a hierarchy is written beside it as `<output stem>-<sheetname>.svg`,
+keeping kicad-cli's per-sheet convention under the caller's name
+([#25](https://github.com/Copperpour/Copperpour/issues/25)).
+
+The response keeps `exported`, now the requested root path, and adds `files`:
+every published path, root first, then child sheets sorted by name. Callers
+that reconstructed `<schematic stem>.svg` must read `exported` or `files`
+instead. `get_schematic_view` also writes into its per-schematic
+`<temp>/copperpour-schematic-views/<hash>/<stem>.svg` slot directory rather than
+the shared parent directory, so two schematics with the same file stem no longer
+overwrite each other's view.
+
+### `field_placements` entries now report `drawn_orientation` and document symbol-relative rotation (minor release)
+
+`units[].field_placements.<name>` in schematic component responses (such as
+`edit_schematic_component` and `batch_edit_schematic_components`) now includes
+`"drawn_orientation"`: `"horizontal"` or `"vertical"`. KiCad stores a field's
+`rotation` relative to its parent symbol, so on a 90° or 270° symbol
+`rotation: 90` draws horizontally and `rotation: 0` draws vertically; the
+`field_placements` schema now documents this explicitly.
+
+### `edit_schematic_component` and `batch_edit_schematic_components` normalise `field_placements` rotation and return `malformed_file` on corrupt placement/unit data (minor release)
+
+- `field_placements.<name>.rotation` is now normalised into `[0, 360)` with `rem_euclid(360.0)` before writing to the schematic and before readback verification (for example, `450` writes and reports `90`, and `-90` writes and reports `270`), the form `rotate_schematic_component` writes. KiCad itself keeps an angle such as `450` as written.
+- Unit-scoped `field_placements` now reads each placed symbol's direct `(unit N)` child instead of scanning raw block text, ignoring `(unit …)` text inside quoted property values. A missing, duplicated, or non-positive/unparseable `(unit …)` child is refused instead of silently defaulting to unit 1.
+- Malformed-file aborts during `field_placements` planning now return a structured error with `error.kind: "malformed_file"` (`path`, `reason`) instead of an untyped plain-text error (`handler_error`), while keeping the existing message text. Callers branching on `error.kind` can distinguish a corrupt schematic from a concurrent-edit `conflict` or a missing target.
+
+### `file_not_found` reports `absolute_path` and `get_installation_info` reports `working_directory` (patch release)
+
+When a tool refuses on a missing file or directory, the structured `file_not_found`
+error now reports `absolute_path` alongside the requested `path`. Relative paths
+resolve against the server process's working directory (`std::env::current_dir()`),
+which the MCP client sets upon launching Copperpour. When `path` is relative,
+`absolute_path` reports `cwd.join(path)`; when `path` is already absolute, both fields
+report that path.
+
+Additionally, `get_installation_info` now includes `working_directory` in its `runtime`
+response section, allowing clients and agents to discover the server's working
+directory without guessing.
+
+Callers should pass absolute filesystem paths to avoid resolving against an unexpected
+working directory. Existing callers matching on `error.kind == "file_not_found"` or
+reading `error.path` require no changes.
+
+### Tool calls surface installed-guidance drift notice (`guidance_notice`) and defer recording until a tool runs (patch release)
+
+When installed Claude or Codex guidance is `out_of_sync` for a new
+`(install marker, embedded guidance bundle)` pair, the MCP server now attaches
+the one-line drift notice as a top-level `guidance_notice` string on
+non-`get_guidance` tool call responses in that drifted session (in addition to
+including it in MCP `initialize` `instructions`), and writes
+`~/.copperpour/.guidance-checked-<client>` for that `out_of_sync` client only
+when the session's first non-`get_guidance` tool call delivers the notice
+([#722](https://github.com/Copperpour/Copperpour/issues/722)).
+
+Previously, `.guidance-checked-<client>` was written during `initialize` and
+the notice appeared only in `initialize` `instructions`, where clients with
+large multi-server system prompts could overlook it and where a non-KiCad
+session that initialized the server without calling any Copperpour tool consumed
+the one-time notice before any KiCad work ran.
+
+`get_guidance` responses are unchanged (preserving byte-for-byte parity with
+`resources/read`), and subsequent sessions whose installed guidance is
+`current`, `not_installed`, or already recorded for the current
+`(marker, bundle_digest)` pair see no `guidance_notice` field.
+
+### `set_footprint_metadata` accepts `allow_soldermask_bridges` (patch release)
+
+`attributes` now accepts `allow_soldermask_bridges`, which KiCad writes in a
+footprint's `(attr …)` block, as on its stock solder jumpers. It was refused, so
+an attributes edit on such a footprint removed the flag
+([#119](https://github.com/Copperpour/Copperpour/issues/119)). `attributes` still
+replaces the whole block: list the flag to keep it. Leaving it out drops it
+without the warning given for an attribute the argument does not accept;
+`changes` still shows it under `previous`.
+
+### Footprint refresh refuses pads and graphics on missing inner copper layers (patch release)
+
+`update_footprints_from_library` reports `footprint_update_conflict` if a selected footprint has a library pad, graphic, custom property, or reference point on an inner copper layer that the live board does not have. This now applies to front-side footprints as well as back-side footprints. No footprints in the batch are written. Correct the library layers or the board stack as appropriate, then run a new dry run before applying.
+
+`update_pcb_from_schematic` reports `unsupported_library_footprint` for the same conflict when replacing an existing footprint. New footprint placement is unchanged.
+
+### Library refresh compares keep-upright text angles modulo 180° (patch release)
+
+`update_footprints_from_library` now compares angles of `keep_upright` footprint user texts, custom properties, and reset `Reference`/`Value` fields modulo 180° instead of 360°. Back-side footprints flipped left-to-right (`FLIP_DIRECTION::LEFT_RIGHT`, KiCad 10's default) no longer plan spurious `graphics`, `metadata`, or `text_effects` updates when KiCad keeps a keep-upright text 180° from the angle refresh builds. Text with `keep_upright` disabled (`(unlocked yes)`) continues to compare modulo 360°.
+
+### Library refresh refuses footprints that own groups (patch release)
+
+`update_footprints_from_library` now reads the live board before it reports or applies a replacement, and returns `status: "conflict"` with `footprint_children_not_carried` if a footprint it would replace owns a group, which KiCad 10.0.8's API drops. Nothing in the plan is applied. Refresh such footprints with KiCad's Update Footprints from Library. A footprint that is only a member of a board-level group is unaffected.
+
+### Footprint unit-mapping warnings name the affected KiCad versions (patch release)
+
+The descriptions for `edit_component`, `edit_footprint_field`, and `set_footprint_field_style`, and the live warnings from `edit_component` and `set_footprint_field_style`, now explain that whole-footprint IPC writes can drop symbol-unit mapping on KiCad 10 before 10.0.8. The warning is still returned after the same live writes; its text is not a report that the mapping was lost. Tool inputs, response fields, and edit behavior are unchanged. Callers need not change their calls.
+
+The live warnings link to [Troubleshooting](https://github.com/Copperpour/Copperpour/blob/main/docs/TROUBLESHOOTING.md#footprint-unit-metadata-disappears-after-a-live-pcb-edit) for checking a board edited on an affected version and recovering missing mappings. Upgrading does not restore missing mappings.
+
+### `check_freerouting` and `route_specctra_dsn` start errors keep the exception header (patch release)
+
+When Freerouting's MCP server fails to start, no `.freerouting.log` keeps its
+stderr, and the error ended with the last 12 lines of it. A Java stack trace
+names the failure in its first lines, so a long trace lost them. The error now
+puts the header of the last stack trace in front of those 12 lines when they
+leave it out: the last line that names an error (`ERROR`, `Exception` or
+`Error`), with the line just before it when that one names an error too, each
+cut to 500 characters, then a `...` line. Errors of a run that wrote a
+`.freerouting.log` are unchanged.
+
+### `get_board_info` exposes live query failures and source evidence (minor release)
+
+`get_board_info` now uses the shared board-reader source policy. Once the exact
+board is identified in KiCad, failures reading its title block, enabled layers or
+nets return an error instead of a successful answer from a possibly older saved
+file. Retry the live read, or explicitly request `board_source: "saved"` to inspect
+the saved snapshot. The optional selector accepts `auto` (default), `live`, and
+`saved`, matching other board readers.
+
+Existing metadata fields and `source: "ipc" | "file"` remain. New `sources` keys
+identify `metadata` and `paper` independently, and `source_evidence` explains the
+board observation and any saved-file fallback. Paper settings still come only
+from the saved file; on a live answer with an unreadable file their provenance is
+`unavailable` and their values remain null. `board_source: "live"` requires live
+metadata, not live paper settings.
+
+This supersedes the `get_board_info` fallback-policy exception documented in
+`require-net-response.md` for #464/#469.
+
+### `get_installation_info` reports the IPC endpoint the tools dial now (minor release)
+
+`get_installation_info` reported only the address resolved at startup, as
+`source: "resolved_server_config"`. With socket rediscovery, a KiCad started or
+restarted after the server is found on every IPC call, so the report could say
+`endpoint: null` while every tool was talking to KiCad, or name a socket the
+calls no longer used.
+
+The `ipc` block now reports what the next IPC call dials, from the same
+decision the calls make:
+
+- `endpoint`: that address, redacted as before, or `null` when nothing is
+  dialled.
+- `source`: `resolved_server_config` (the startup address, as before),
+  `detected_at_call_time` (a socket found now), `ambiguous` (several sockets
+  qualify and not exactly one answered a Ping, so none is dialled), or
+  `unresolved` (nothing to dial).
+- `candidates`, new: the redacted sockets an `ambiguous` detection found;
+  empty otherwise.
+- `configured` is unchanged: whether an address was resolved at startup.
+
+With rediscovery on, the report looks for KiCad's socket the way an IPC call
+does: file metadata, and a Ping to each candidate only when several qualify.
+
+A caller that read `source` as always `resolved_server_config` should accept
+the three new values; one that read `endpoint: null` as "KiCad is not
+reachable" can now rely on it meaning that nothing is dialled.
+
+### New tool `get_placement_overview` in the `placement` toolset (minor release)
+
+Describes a footprint placement as numbers: airwire (ratsnest) length in total,
+per net and per footprint, the longest airwires with their pads, crossings
+between nets, parts outside the outline, and per net group (the project's
+netclasses, or `net_groups`) its nets, parts, region, the other parts inside
+that region and the closest pads of other nets. `image: true` adds
+a picture as an image block. It reads the board live from KiCad when open
+there, else the saved file, as `score_placement` does. No caller needs to
+change anything.
+
+
+How nets are matched:
+
+- **Netclass groups** (the default) use the patterns in the project file's
+  `net_settings.netclass_patterns`, matched as KiCad matches them: against
+  the whole net name, as a wildcard pattern or as a regular expression,
+  whichever names the net. `VCC` does not name `/power/VCC`, and `A.B` names
+  `AxB`. A net in several netclasses is in each of those groups.
+- **Where it can name fewer nets than KiCad** (measured against pcbnew
+  10.0.7): a pattern with a brace, and an expression the Rust `regex` crate
+  does not accept (look-around, `\Q...\E`), are matched as wildcards only.
+  Netclass directives placed in the schematic are not read, so a net assigned
+  only that way is in no group.
+- **`net_groups` and `skip_nets`** patterns also match a sheet-local net by
+  the name after its last `/`: `G_A` names `/Output stage/G_A`.
+
+`call_tool` can run it: it only reads.
+
+### `get_symbol_info` reads a `.kicad_sym` file by path (minor release)
+
+`get_symbol_info` took only `lib_id`, resolved through the project and global
+symbol library tables, so a library no table registers could not be read; a
+path in `lib_id` was taken as a library nickname. It now also takes
+`library_path`, a `.kicad_sym` file, with `symbol_name`, as the library editing
+tools do and as `get_footprint_info` takes a `.kicad_mod` path.
+
+- `lib_id` is no longer required: give it, or `library_path` with
+  `symbol_name`. Giving both, `library_path` without `symbol_name`, or
+  `symbol_name` with `lib_id` is refused as `invalid_argument`; a missing file
+  is `file_not_found`.
+- An answer read by path carries `library_path` instead of `lib_id` and
+  `library`, with the same `name`, `pin_count`, `pins` and `properties`.
+
+Calls with `lib_id` are unchanged.
+
+### `get_symbol_info` refuses `project_dir` with `library_path` (patch release)
+
+`project_dir` resolves a `lib_id`'s library through the project's symbol
+library table. With `library_path`, which names the file itself, it was
+accepted and ignored. It is now refused as `invalid_argument` on
+`project_dir`, as `lib_id` with `library_path` and `symbol_name` with `lib_id`
+are. Leave `project_dir` out when naming the symbol by `library_path`.
+
+### Installed-guidance drift probe re-checks once when the embedded bundle changes (patch release)
+
+`~/.copperpour/.guidance-checked-<client>` now keys its cached drift state on
+both the install marker and a SHA-256 digest of that client's embedded guidance
+bundle (skills, references, and for Claude, agents and hook matchers).
+
+Previously, the cache key included only the install marker, so upgrading the
+`copperpour` binary (either to a newer release or a newer dev build) never
+re-scanned installed guidance or emitted the MCP `initialize` drift notice.
+
+Callers of `initialize` and `get_installation_info` see no schema changes. On
+the first start of an upgraded binary whose embedded guidance changed (or when
+upgrading over a pre-change cache file without `bundle_digest`), `checked`
+reports `"now"` with per-file detail and `initialize` includes the one-line
+drift notice if `out_of_sync`. Subsequent starts with the same marker and
+embedded bundle stay quiet (`checked: "earlier"`).
+
+### `add_hierarchical_sheet` and `duplicate_sheet` allocate project-wide free page numbers (patch release)
+
+`add_hierarchical_sheet` and `duplicate_sheet` now walk the owning project's
+entire sheet hierarchy (across all top-level sheets and every placement of
+reused child sheets) and assign the lowest unused positive page number `>= 2`
+(page 1 remains reserved for the root), instead of scanning only the immediate
+parent schematic. Previously, adding or duplicating a sheet inside a child
+schematic could collide with page numbers already used elsewhere in the project.
+
+If the hierarchy contains a reference cycle or an unreadable top-level sheet,
+both tools now refuse the write with `conflict`, naming that file, before modifying any file. Callers that relied
+on parent-local numbering or expected gaps not to be reused should inspect the
+committed `sheet.page` in the tool response or run `renumber_sheet_pages` to
+impose depth-first sequential numbering.
+
+### `import_jlcpcb_part` attaches 3D models and reports partial failures (minor release)
+
+`include_3d` still defaults to `false`. Non-boolean values are refused with
+`invalid_argument` before downloading or writing anything.
+
+With `include_3d: true`, the importer resolves the model UUID and transform from
+EasyEDA's `outline3D` SVGNODE. It prefers STEP payloads with complete Part-21 envelopes, otherwise
+converts OBJ to KiCad-scaled VRML (`.wrl`). Both paths require finite OBJ bounds
+to establish the model's placement; a STEP-only download is refused rather than
+attached at a guessed origin. STEP bytes are preserved, including non-UTF-8 strings. Envelope checks detect incomplete responses;
+they are not a full CAD geometry validator. WRL fallback provides mesh
+visualization, not a STEP solid for mechanical exports.
+
+Models are saved under `${KIPRJMOD}/3dmodels/<footprint>-<content-hash>.<ext>`
+with verified, create-only atomic publication. Identical regular files can be
+reused. Conflicting files, directories and symlinks are never overwritten.
+The generated footprint receives its converted offset/rotation through the
+existing revision-checked `set_footprint_models` writer.
+
+Successful responses include `model_3d.status: "attached"`, `uuid`, `format`,
+`kicad_path`, `path`, `offset_mm`, and `rotation_degrees`. An absent model UUID
+reports `status: "not_available"` without downloading or publishing a model.
+
+A failed requested 3D stage now returns `isError: true` and `success: false`,
+rather than an overall success with a discarded download/write error. Existing
+structured `conflict` and `mutation_outcome_uncertain` errors are retained.
+`model_3d` reports `status: "error"` or `"uncertain"`, the failing `stage`
+(`download`, `prepare`, `publish`, or `attach`), model identity/path when known,
+`retry_safe: false`, and recovery guidance. Unclassified writer errors are
+conservatively uncertain; they do not prove that nothing changed.
+
+The import is a multi-file operation, not one atomic transaction. Its symbol
+and footprint may already have been created when the model stage fails.
+`imported` identifies those paths, states that rollback was not attempted, and
+reports schematic placement as `"not_attempted"`. A successfully published model
+is retained if footprint attachment fails. Inspect the reported library files,
+model and footprint before retrying; repair only the incomplete stage rather
+than blindly repeating the import or assuming rollback.
+
+### `copperpour init` replaces Claude hooks from other Copperpour executable paths (patch release)
+
+Running `copperpour init` for Claude now replaces existing Copperpour-managed `PreToolUse` hook handlers registered by another `copperpour` or `konnect` executable path (in either current `hook` or legacy `skill` form), rather than appending a second set of hooks alongside them. User-authored neighboring handlers and unrelated commands are preserved.
+
+`copperpour status` and `get_installation_info` correspondingly report `different` (`duplicate_handler`) when a hook from another `copperpour`/`konnect` executable sits beside the current executable's hook. Running `copperpour init` removes the duplicate and restores `current` status. `copperpour uninstall` remains scoped to the current executable's own hook commands.
+
+### Dev-build install markers, `copperpour status`, and guidance drift notices include build commit (patch release)
+
+When Copperpour is built from a Git checkout, so that its build script reads
+the commit from `.git/HEAD`, `copperpour init` now writes
+`<version>+<8-char-commit>` (for example `0.16.1+f5b12f82`) into
+`~/.copperpour/.installed-<client>` instead of the bare crate version.
+`copperpour status` and MCP `initialize` guidance drift notices display the
+same `<version>+<8-char-commit>` label.
+
+Release builds, whose builders pass the commit in `COPPERPOUR_BUILD_COMMIT`,
+and builds without Git metadata (such as Nix) keep the bare `<version>`
+label. This distinguishes development builds on the same crate version from
+releases and from one another while remaining a valid SemVer build-metadata
+string accepted by older `copperpour` binaries. `get_installation_info`'s
+`build.version` and `guidance.bundle_version` fields are unchanged.
+
+### `get_installation_info` probes the configured CLI executable (patch release)
+
+For a nonempty `kicad_cli`, `get_installation_info` now uses the same executable
+resolution as CLI tools and the schematic viewer. An explicit missing path is
+reported in `kicad.cli_path` with `probe_status = "launch_failed"` and a null
+version, rather than reporting another installed KiCad. Bare names still use
+PATH and installation discovery; an empty value retains installation discovery.
+
+Correct an unusable configured path and restart the server before checking again.
+No argument or response-key changes are required.
+
+### Automatic IPC discovery selects the PCB editor socket beside Project Manager (minor release)
+
+When KiCad's Project Manager listens on `api.sock` (answering `GetOpenDocuments` with
+`AS_UNHANDLED`) alongside a PCB editor on `api-<pid>.sock`, automatic IPC discovery
+(`detect_ipc_endpoint`, used when `ipc_address` and `KICAD_API_SOCKET` are unset) now
+probes answering candidates with `GetOpenDocuments(DOCTYPE_PCB)` and selects the unique
+PCB editor endpoint instead of refusing as `ambiguous_endpoint` (#87).
+
+When multiple PCB editors are running and discovery remains ambiguous, board-targeted
+IPC tools (`update_pcb_from_schematic`, `get_board_info`, `get_board_stackup`, etc.)
+probe those candidates in parallel for the exact requested board: a unique holder is
+used (when no other candidate is undecided), and multiple holders of the same board are
+refused as `ambiguous_target`. Explicitly configured `ipc_address` and
+`KICAD_API_SOCKET` values remain authoritative and are never overridden.
+
+### IPC recovery reports per-item create and delete rejections (minor release)
+
+On tools that return shared IPC recovery, look in `recovery.evidence` for the failed command and KiCad's per-item status. `CreateItems` reports `rejected_items` with zero-based `reply_index`, status names, and KiCad's messages, along with `requested_count` and `reported_created_count`. `DeleteItems` reports `rejected_items` with their KIIDs and status names, as well as `reported_deleted_kiids`, `unclassified_kiids` for rows with unknown statuses, and sorted `unreported_kiids` for requested items with no result row. Reported success describes the reply, not persistence. A missing row does not prove KiCad skipped the item.
+
+Use `recovery.mutation_outcome` and `recovery.evidence.rollback` together. The overall outcome stays `unknown`. `not_established` does not rule out partial application. `confirmed` means KiCad acknowledged dropping the named commit, not that Copperpour independently verified the whole operation left the board unchanged. Both use `recovery.cause: "kicad_api_rejection"` and link to [item rejection troubleshooting](../TROUBLESHOOTING.md#kicad-rejected-items-during-an-ipc-write). `unconfirmed` returns `ipc_outcome_unknown` and retains the original rejection evidence. Inspect the live board before retrying any unknown outcome. Write, rollback and fallback policy are unchanged.
+
+Tools using the shared live-write path may now return structured JSON instead of plain text for per-item rejections. These include `set_board_size`, `add_board_outline`, `delete_graphics`, `add_mounting_hole`, `add_board_text`, `add_zone`, `add_copper_pour`, and `import_svg_logo`. Continue accepting plain text for other IPC errors. Routing tools using shared IPC recovery may also change from `recovery.cause: "unknown"` to `"kicad_api_rejection"`; use the structured fields rather than matching the old message prefix. `update_pcb_from_schematic` returns structured IPC recovery for these rejections instead of labeling them preflight conflicts.
+
+Delete evidence requires KiCad to send deletion result rows. The empty-reply behavior on KiCad 10 is unchanged, and the deletion evidence tests use simulated replies.
+
+`apply_specctra_ses` also returns structured IPC recovery for item rejections. If compensating deletion fails after the import was published, its item evidence is under `recovery.evidence.compensating_deletion`. A confirmed drop there describes the cleanup commit only; the import outcome is still unknown.
+
+### Verify live PCB readback before reporting success (minor release)
+
+An empty, correctly typed `GetNets` reply still means there are no nets. A reply with a different protobuf type does not.
+
+Deleting a trace, via, or footprint requires a readable inventory of the bound board showing that the original item is gone. An unreadable inventory does not prove absence. A footprint delete sends no write if the requested reference is empty, missing, or ambiguous, or if the inventory has an unreadable footprint reference. A KiCad status that prevents the initial read is retained as evidence in the no-write refusal.
+
+After KiCad acknowledges a write, Copperpour checks the assigned KIID and pose for initial footprint creation, and the original KIID and pose for a single-footprint move. Via placement checks the assigned KIID, position, and net before reporting success. On a net mismatch it requires a readable position and keeps the existing cleanup behavior. Via moves check the original KIID, destination, and observed net. If required readback cannot verify the write, Copperpour returns `ipc_outcome_unknown` with the board and any known item identity. Inspect the live board before retrying.
+
+These checks do not verify via dimensions, footprint children or groups, the subsequent flip or model lookup during placement, batch alignment, or straight-trace creation. Write acknowledgement handling and rollback policy are unchanged.
+
+### Runtime IPC failures return structured `recovery` guidance (minor release)
+
+Non-error health diagnostics (`check_kicad_ui`, `open_project`) that report
+`ipc_failure` now include an additive `ipc_failure.recovery` object, and IPC
+error responses returned through the shared helpers (`ipc_failure_result`,
+`ipc_target_error_result`, `ipc_uncertain_result`, `ipc_recovered_result`,
+`ipc_unserved_result`, and `editor_unavailable` IPC boundaries) now include an
+additive top-level `recovery` object alongside `message` and `error`.
+
+Each `recovery` object contains:
+- `cause`: stable machine-readable cause (`not_configured`, `ambiguous_endpoint`,
+  `no_listener`, `access_denied`, `handshake_failed`, `kicad_not_ready`,
+  `no_open_documents`, `wrong_document`, `ambiguous_document`,
+  `unresolved_document_identities`, `stale_document`, `ipc_outcome_unknown`,
+  `ipc_batch_recovered`, `no_pcb_editor_at_endpoint`, `preflight_refusal`, `kicad_api_rejection`, or `unknown` when unclassified);
+- `observed` and `evidence`: what was actually observed without guessing from
+  message text;
+- `mutation_outcome`: `"none"`, `"unchanged"`, or `"unknown"`;
+- `retry_safe` and `retry_prerequisites`: `retry_safe` remains `false` whenever
+  prerequisites apply or outcome/safety is unknown;
+- `next_steps`: ordered steps tagged with `actor` (`"agent"` or `"user"`) and
+  optional `tool`;
+- `troubleshooting_url`: optional link to `docs/TROUBLESHOOTING.md` when an IPC troubleshooting step applies.
+
+`ipc_failure.kind`, `ipc_failure.message` and `ipc_failure.note` are unchanged,
+and so is `error.kind`, with these exceptions:
+
+- `get_board_stackup`, `get_nets_list`, `set_placed_footprint_models` and the
+  live-board synchronization behind DRC and zone refill reported an IPC request with an
+  unknown outcome, or a dropped and restored batch, as `editor_unavailable`.
+  They now report `ipc_outcome_unknown` and `ipc_batch_recovered`, as every
+  other IPC caller does, because the board may have changed.
+- Tools that returned an IPC failure as plain text with no `error` object
+  (`set_footprint_field`, `set_pad_net`, `apply_copper`, `delete_trace`, the
+  `pcb_components` and `pcb_routing` IPC tools) now return a structured error:
+  `editor_unavailable` when KiCad or its board editor did not answer,
+  other failures retain a specific error kind when one applies (for example, `ipc_outcome_unknown` after an accepted write whose verification request fails) or use `handler_error` at the generic boundary. Use `recovery` to distinguish an explicit KiCad rejection, a Copperpour refusal, and an unclassified failure.
+
+### IPC recovery distinguishes Copperpour refusals from KiCad errors (minor release)
+
+A typed Copperpour refusal reports `recovery.cause: "preflight_refusal"` and `mutation_outcome: "none"`. Address the reported problem before retrying. An explicit KiCad error status that is not part of a typed preflight refusal reports `cause: "kicad_api_rejection"` and includes the status in `recovery.evidence.status`. An unclassified failure still reports `cause: "unknown"` and does not say KiCad rejected the request. Neither an error status nor an unclassified error, by itself, proves that the board is unchanged.
+
+Treat `recovery.troubleshooting_url` as optional. It is omitted when IPC troubleshooting would not address the failure. Existing editor, transport and uncertain-outcome diagnostics still include their applicable links. If a KiCad status prevents the placement copper check from completing, the existing `plan_blocked` error includes that status in `recovery.evidence.status`; no placement was written. A write whose verification request fails now reports `ipc_outcome_unknown` on the affected trace, via and footprint paths. No tool arguments changed.
+
+### `launch_kicad_ui(wait_ready)` re-probes and IPC discovery backs off dead sockets (minor release)
+
+`launch_kicad_ui` with `wait_ready: true` previously resolved `ipc_endpoint()` once
+before its polling loop. When Copperpour was started before KiCad (unresolved startup
+endpoint), the wait loop kept polling the empty address until timeout even after the
+launched KiCad created its socket.
+
+Two runtime behaviors change:
+
+- `launch_kicad_ui` now resets any active ping backoff after spawning
+  KiCad, and with `wait_ready: true` re-resolves the IPC endpoint on each 500 ms
+  poll iteration, so it observes the socket created by the launched KiCad without
+  restarting Copperpour.
+- IPC rediscovery probes on `ToolContext` are now serialized. When several candidate
+  sockets exist and none can be chosen (`Ambiguous`), the same set is re-pinged with
+  bounded exponential backoff (250 ms doubling up to 2 s); a changed set, a found
+  endpoint, `open_board`'s selection or a KiCad launch probes at once. No socket or
+  a single one needs no ping and is never backed off, so a KiCad started after
+  Copperpour is seen on the next call.
+
+Explicitly configured `ipc_address` and `KICAD_API_SOCKET` values remain authoritative
+and never trigger discovery or backoff. No tool arguments or response schemas changed.
+
+### A detected KiCad socket is looked for again on every IPC call (minor release)
+
+When `ipc_address` is not configured and `KICAD_API_SOCKET` is unset, the
+server used to detect KiCad's socket once at startup and keep that address for
+its whole life. It now looks again on every IPC call, reading file metadata,
+so KiCad started or restarted after Copperpour is found without restarting the
+server. On Linux and macOS the search also takes every `api-<pid>.sock` beside
+`api.sock` whose process is running and that passes the same ownership check,
+which is where KiCad 10 listens when a stale `api.lock` blocks `api.sock`.
+When more than one socket qualifies, the one that answers an NNG Ping is used;
+if not exactly one answers, none is adopted and the "not configured" error and
+the startup log list every candidate. That holds on every call: the address
+found at startup is never used in its place, and `open_project` then reports
+an empty `ipc_address`. Telling several candidates apart costs one Ping each
+before the call's own request, each bounded by the 30 s reply timeout, and a
+candidate that times out counts as not answering. A configured or `KICAD_API_SOCKET`
+address is never replaced. `get_installation_info` reports the address the
+calls dial now (`get-installation-info-ipc-endpoint.md`).
+
+### JLCPCB export preserves unserved board binding reasons (minor release)
+
+When `GetOpenDocuments` returns `AS_UNHANDLED` or `AS_UNIMPLEMENTED`, `export_manufacturing_package` with JLCPCB assembly and `generate_jlcpcb_order_link` now report `editor_unavailable` with `recovery.mutation_outcome: "none"` instead of a generic `handler_error`. Neither refusal starts an export. Tool arguments and successful responses are unchanged.
+
+`AS_UNHANDLED` reports `no_pcb_editor_at_endpoint`. `AS_UNIMPLEMENTED` does not establish whether a PCB editor is open. The shared binding formatter includes both statuses in `recovery.evidence.status`, including for other callers that already returned these refusals. The export message now identifies the binding problem and says that no package was exported or uploaded. `error.reason` no longer has the `native_midpoint_unavailable:` prefix for these two cases.
+
+### CLI-backed tools report signal termination (patch release)
+
+On Unix, when a signal kills `kicad-cli`, the failure message reports the signal instead of `exited with -1`. The error kind, diagnostic output and messages for ordinary exit codes are unchanged. Use `isError` and `error.kind` where present, and keep checking tool-specific warnings for incomplete results.
+
+### The `konnect` executable is gone (minor release)
+
+This completes the removal that "Renamed to Copperpour" announced.
+Source builds, the standalone archives and the Nix flake no longer include
+`konnect`, the shim that ran the `copperpour` beside it, and the flake drops its
+`konnect` package and app. An MCP client configuration or hook that starts
+`konnect` must name `copperpour` (`copperpour.exe` on Windows) instead. An
+archive unpacked over an older one leaves the old `konnect` in place: delete it,
+or it keeps such configurations working until the next clean install. A Nix
+profile that installed `#konnect` needs `nix profile remove` and an install of
+`#copperpour`. The PCM package never shipped it. `copperpour init` still replaces the Claude hooks an
+install through the alias wrote, `uninstall` still removes them, and `status`
+still reports them as `alias_handler`
+([#296](https://github.com/Copperpour/Copperpour/issues/296)).
+
+### `launch_kicad_ui` takes `display`; KiCad health messages name dialogs and `enable_server` (minor release)
+
+`launch_kicad_ui` accepts an optional `display`, a local X display such as
+`":0"` or `":1.0"`. KiCad starts with that `DISPLAY`, `GDK_BACKEND=x11`, and
+without `WAYLAND_DISPLAY`. Any other value, a remote `host:N` display among
+them, is refused as `invalid_argument`, and so is any value on Windows and
+macOS. When KiCad exits during startup and the server has neither
+`DISPLAY` nor `WAYLAND_DISPLAY`, the error adds a line saying so, and
+`launch_kicad_ui` adds that `display` fixes it. The browser viewer's
+`POST /open-in-kicad` `503` body adds the same line, and so does
+`open_schematic_viewer`'s `browser_launch_error` when the opener failed (not
+when it timed out).
+
+When KiCad answers `AS_NOT_READY`, `ipc_failure` (from `check_kicad_ui` and
+`open_project`) carries a `note` saying it is still starting or held by a
+modal dialog. `launch_kicad_ui` returns that `note` in place of "IPC not yet
+responsive" when its wait ends that way. The `no_listener` message names
+`api.enable_server` in `kicad_common.json`.
+
+From an SSH session, pass `display`. Treat a lasting `AS_NOT_READY` as a dialog
+to close, not a start to wait for.
+
+### `list_custom_rules` (minor release)
+
+A new `verification` tool lists the rules in the board's sibling `.kicad_dru`
+custom rules file: `list_custom_rules(board)`. `set_custom_rule` and
+`delete_custom_rule` write the file, and `get_design_rules` reads only the
+`.kicad_pro`, so until now no tool read it
+([#685](https://github.com/Copperpour/Copperpour/issues/685)).
+
+Each rule comes in file order with its `name`, its `line` and its `text`, from
+its `(` to its `)` as written. The rules are those `set_custom_rule`'s check of
+the file reads, the reading both writers use to find a rule by name, and
+`faults` gives what the check finds; kicad-cli drops a rules file it cannot
+parse. A fault the check cannot read past, such as a rule never closed, hides
+the rules after it; a string left open, or a text variable, which KiCad expands
+from the board and the check does not, hides them all. A rule with no name is
+not listed; its fault gives its line. kicad-cli is not run, so the property
+names the rules use come back unchecked in `unchecked_properties`. The
+response also gives `rules_file` and `count`; a board with no rules file gives
+`exists: false` and no rules. The tool changes no design file.
+
+No existing tool's arguments or responses change.
+
+### Live placement carries pad properties, zone settings and reference points, and reports `not_carried` (minor release)
+
+Live IPC footprint placement (`place_component`, `place_component_array`, `duplicate_component`, `add_mounting_hole`, `repair_corrupted_footprints`, and added footprints in `update_pcb_from_schematic`) now carries pad zone connections, thermal relief settings, and (on KiCad 10.0.7+) pad fabrication properties and reference points.
+
+When a library footprint includes clauses or children that typed IPC placement cannot carry (or requires KiCad 10.0.7+ on an older KiCad), placement still succeeds (`isError: false`) and reports the omitted items:
+
+- Placement and repair tools include a non-empty `not_carried` array of strings in the JSON response.
+- `update_pcb_from_schematic` emits non-blocking `not_carried` entries in `diagnostics`, replacing `pad_properties_not_carried`.
+
+### Live placement and Update PCB carry pad and footprint solder margins (patch release)
+
+[#723](https://github.com/Copperpour/Copperpour/issues/723):
+
+- **Now carried:** a library footprint's own `solder_mask_margin`, `solder_paste_margin` and `solder_paste_margin_ratio` (or the older `solder_paste_ratio`), and each pad's own, by `place_component`, `place_component_array`, `duplicate_component` and `add_mounting_hole` while the board is open in KiCad, and by `update_pcb_from_schematic` when it adds a part. `repair_corrupted_footprints` gives the pads it rebuilds their library margins and keeps the board's footprint margins, as before. Before, the board's values applied and each clause was listed in `not_carried`.
+- **No longer in `not_carried`:** those clauses.
+- **Now refused:** a margin clause that is not one number, which KiCad's parser does not load either, refuses the footprint in each of these tools, as a malformed `zone_connect` does; Update PCB reports it as `unsupported_library_footprint`. Before, it was listed in `not_carried`.
+
+### `load_toolset` no longer repeats the tools of a toolset that is already loaded (minor release)
+
+Loading a toolset that is already loaded used to return every one of its tools
+with its description again. Now the single-name form adds
+`"already_loaded": true` and returns `tools` as an empty array, and the array
+form lists such toolsets in a new `already_loaded` array and leaves their tools
+out of `tools`. `loaded` and `tools_added` keep their meaning: `tools_added`
+still counts the tools of every toolset named in `loaded`.
+
+A caller that read tool descriptions from a repeated `load_toolset` result
+should take them from `tools/list`, where a loaded toolset's tools already are.
+
+### `load_toolset` returns a `hint` (patch release)
+
+A `load_toolset` reply that adds tools now carries a `hint` string: if the client
+still rejects the new tools as unknown, it caches its first `tools/list`, and
+`"eager_toolsets": true` plus a client restart makes them callable. A reply that
+loads nothing new has no `hint`. Callers that ignore unknown keys need no change.
+
+### `validate_for_manufacturing` and `export_manufacturing_package` put the verdict first and bound their lists (minor release)
+
+Both responses had their keys sorted, which put `validate_for_manufacturing`'s
+`verdict` after every issue and the package's `summary` and `warnings` after
+its placement evidence. Both grew with the board: one `issues` entry per DRC
+error, and the JLCPCB placement evidence with an entry per placed part, carried
+twice ([#69](https://github.com/Copperpour/Copperpour/issues/69)).
+
+`validate_for_manufacturing`'s keys now come in this order: `verdict`,
+`summary`, `fab_house`, `board_info`, `drc`, `issues_count`, `issues_shown`,
+`issues_truncated`, then `issues`. `issues` holds the first `limit`, 50 unless
+the call names another; `issues_count`, the verdict and `summary` cover them
+all. The issues that are not a single DRC error, such as a DRC category
+kicad-cli did not report, now come before the DRC errors, so the bound cannot
+hide them. `output` names a file to receive the whole response, every issue
+listed, as `run_drc` writes its report. A path that is the board, a directory,
+or under something that is not a directory is refused before the board is
+read; a write that fails after that check fails the call.
+
+`export_manufacturing_package`'s keys now come in this order: `complete`,
+`summary`, `warnings`, `next_steps`, `fab_house`, `output_dir`, `files`,
+`files_generated`, `gerber_layers`, `position_units`, `position_side`,
+`board_source`, `project_settings_source`, then `placement_orientation`. For a
+JLCPCB assembly, the whole placement evidence, the object `placement_orientation`
+held, is written to `CPL-<project>.orientation.json` beside the CPL. It is not
+in `files`, which lists what to upload; a failed write is a warning, and the
+package is incomplete. The file stays in `output_dir` with the other outputs,
+and nothing removes it: a later export into the same directory replaces it
+only when it writes evidence again, so with another fab house, without
+assembly, or after a failed write, an earlier file stays there unnamed. Export
+into a fresh directory, as for the CPL and BOM.
+
+`placement_orientation` now holds `status`, `physical_validation`, `note`,
+`evidence_path` (that file's path, null when it was not written),
+`geometry_count`, `unmatched_footprints_count`, `unverified_footprints_count`,
+`applied_corrections_count`, `applied_corrections_shown`,
+`applied_corrections_truncated`, `policies`, and the first `limit`
+`applied_corrections`, 50 unless the call names another. Read `geometry`,
+`unmatched_footprints` and `unverified_footprints` from the file; `warnings`
+still names every part they call to review. The pick-and-place entry of
+`files_generated` no longer carries its own copy of `placement_orientation`.
+
+`generate_jlcpcb_order_link` repeats the package's `placement_orientation`
+without `evidence_path`, since its package is written to a temporary directory
+removed when the call returns. Run `export_manufacturing_package` for the file.
+A failed evidence write leaves its package incomplete, which it refuses to
+upload, as it refuses any incomplete package. It takes no `limit`, and repeats
+the first 50 applied corrections.
+
+`validate_for_manufacturing` and `export_manufacturing_package` take `limit` as
+`run_drc` does: a non-negative integer, `0` for counts only.
+
+### `modify_trace` changes the track in place (patch release)
+
+`modify_trace` now updates the track it names, so the track keeps its UUID and
+`modified_uuid` names a track that is still on the board, and the change is one
+KiCad undo step ([#366](https://github.com/Copperpour/Copperpour/issues/366)).
+It used to delete the track and create a new one with a new UUID; when KiCad
+refused the new one, the old track was already gone.
+
+It now refuses, with the board unchanged, when the UUID is not a trace segment
+on the board (`stale_target`; it used to delete whatever item had that UUID),
+when the board has no net named `net_name` (`invalid_argument` on `net_name`),
+when the board has no such copper layer (`invalid_argument` on `layer`), and
+when `width` is not greater than zero (`invalid_argument` on `width`; it used to
+be sent to KiCad). If KiCad accepts the update but the track does not read back
+as sent, the answer is `ipc_outcome_unknown`: inspect the live board before
+retrying.
+
+### `move_schematic_component` accepts `unit` (minor release)
+
+`move_schematic_component` moved the lowest-numbered unit of a component to
+`x`, `y` and translated every other placed unit by the same delta, so one unit
+of a multi-unit symbol could not be repositioned alone
+([#44](https://github.com/Copperpour/Copperpour/issues/44)). The new optional
+`unit` moves only that placed unit to `x`, `y`; every other unit stays where the
+file has it, and the saved-file readback holds each of them to that. A `unit`
+the component has no placement for is refused as `invalid_argument` with the
+placed units named, before anything is written. A unit carried by more than one
+placement is refused as `ambiguous_target`, as every component edit already
+refuses it.
+
+Calls without `unit` behave as before. With `unit`, `moved_units` is 1; the
+moved unit's new position is its entry in `placements`, which still lists every
+unit. As in every component tool, the top-level `x` and `y` describe the
+lowest-numbered unit.
+
+### `move_schematic_objects_between_sheets` moves objects between sheets (minor release)
+
+`move_schematic_objects_between_sheets` is a new tool in `sch_hierarchy`. It moves
+UUID-selected symbols, wires, junctions, local and global labels, no-connect flags, text
+and text boxes from one sheet of a saved project to another, offset by `offset_x_mm` and
+`offset_y_mm`. Each sheet must be placed only once. Symbol and pin UUIDs, references, unit
+membership, properties and footprint assignments don't change. Instance paths change to
+the destination sheet.
+
+- It defaults to a dry run. To apply, pass the dry run's `plan_revision` as
+  `expected_plan_revision`. A missing revision is `invalid_argument`. Apply rebuilds and
+  checks the plan again, so failed validation can return `plan_blocked`. If the plan
+  revision no longer matches, including because the verification result changed, apply
+  returns `stale_target`. None of these writes anything.
+- Without `kicad-cli`, a dry run returns the plan with `verification.status: "not_run"`
+  and apply refuses with `plan_blocked`. A check that can't be read is a refusal, not a
+  pass.
+- The two sheets may sit under different top-level schematics of one project. A sheet path
+  is the top-level instance UUID followed by child sheet-symbol UUIDs; use the
+  project-declared top-level UUID. A lone top-level sheet whose declared UUID differs from
+  its file's UUID is refused. Projects with several top-level schematics need KiCad 10.0.7
+  or newer.
+- It doesn't write the PCB. It refuses a move that would leave a footprint path stale,
+  reuse a path or net name the PCB already has, change an effective netclass or inherited
+  simulation exclusion, or need dependent net names edited. A net rename is also refused
+  when the project has a netclass pattern other than `*`, because Copperpour can't prove
+  the patterns still match, or custom PCB rules, because the schematic checks don't
+  evaluate them.
+- It checks every project file it read, and that files it expects to be missing still are,
+  before it writes and again during recovery.
+- A failure before the journal is written is a refusal and changes nothing:
+  `invalid_argument`, `stale_target`, `unsafe_file_fallback`, `conflict` or
+  `plan_blocked`. An inspected older unfinished journal is a `conflict` that names it. A
+  failure after that is `mutation_outcome_uncertain`. It names the journal and, when
+  available, the file where the write stopped, or, if the move finished but reading it
+  back didn't match, the transaction ID. Run `copperpour transaction status` on the
+  project directory, and `copperpour transaction recover` only if a journal remains.
+  Recovery checks that each sheet matches its contents before or after the move, writes
+  only sheets still in their before state, and requires the other read files unchanged,
+  expected-missing files still missing and no KiCad editor lock present.
+- Its journals record files that must stay missing, so recovering one needs a Copperpour
+  version that reads version 2 journals. Recover any pending journal before downgrading.
+
+See [cross-sheet transfer][move-objects-guide] for the refusals and the recovery steps.
+
+[move-objects-guide]:
+  https://github.com/Copperpour/Copperpour/blob/main/docs/CROSS_SHEET_TRANSFER.md
+
+### Native Specctra export no longer runs Rust-only geometry checks first (minor release)
+
+`export_specctra_dsn` keeps `native_bridge_mode: "disable"` as the Rust-only
+default. All modes first validate the stable live IPC snapshot and shared
+reverse-manifest/import requirements. On KiCad 10, `require` then attempts the
+authenticated native bridge and refuses with a native-path reason if unavailable
+or semantically invalid, without running or falling back to the Rust writer.
+`prefer` also attempts native first; it uses Rust only if native is unavailable
+or invalid, and only if Rust-specific checks pass. A refused fallback reports
+the native diagnostic as well as the Rust reason.
+
+The native correlator now uses identities built directly from the validated
+snapshot model. The Rust writer alone requires a single closed outline of
+Edge.Cuts lines and circular arcs (flattened within `max_error`). KiCad-native
+circular Edge.Cuts cutouts can therefore export through `prefer`/`require`.
+Native output is still checked against components, pads, nets, layers/types,
+routing classes/vias and planes, and the live source revision is rechecked after
+receiving a native DSN. Source/hash binding, non-replacing paired publication
+and SES validation/apply are preserved.
+
+The native manifest’s `supported_profile.outline` now truthfully labels a
+KiCad-native boundary rather than Rust flattening. Manifest schema 4 and older
+supported schemas remain readable; this is a label change, not a schema change.
+Existing method strings, counts, paths and response keys remain unchanged.
+
+Shared restrictions still apply: representable SMD and all-copper through-hole
+pads (including the current per-layer geometry limitation), supported copper stack and zones, locked-routing
+inventory, complete effective rules, no rule areas and no custom rules. The
+`.kicad_dru` presence refusal now names its SES-import reason explicitly; #75 owns
+future custom-rule support. This does not add KiCad 11 native export, repeated-pad
+native adoption (#386), or relax existing native parser limitations (#98).
+Native export remains an explicit opt-in through the KiCad 10 legacy plugin.
+
+### `get_teardrop_settings` and `set_teardrop_settings` read and set native pad and via teardrops (minor release)
+
+Two new tools in the `pcb_copper` toolset work on KiCad's own pad and via teardrop settings on the board open in KiCad ([#555](https://github.com/Copperpour/Copperpour/issues/555)). Both need KiCad 10.0.7 or newer, read from the bound editor; older or unknown versions get `unsupported_capability` before anything is read or written.
+
+- `get_teardrop_settings(board, references?, nets?, kinds?, limit?)` lists each pad and via with its UUID, reference, pad number, net, position and settings, plus the board's teardrop zones by net and `legacy_teardrops`. `references` selects pads only. `total` and `truncated` say when `limit` cut the list.
+- `set_teardrop_settings(board, targets, settings, refill_zones?, dry_run?)` changes the settings of the selected pads and vias in one KiCad undo step, without saving. `targets` is the union of `pads` (`{reference, pad_number}` or `{uuid}`), `vias` (UUIDs), `references` (their pads), `nets` (pads and vias), `all_pads` and `all_vias`; a selector that matches nothing refuses the whole call. `settings` takes `enabled`, `curved_edges`, `allow_multiple_track_segments`, `prefer_zone_connection`, `max_length_mm` and `max_width_mm` (`null` for no limit), `best_length_ratio` (0.2 to 2), `best_width_ratio` (0.6 to 1) and `max_track_width_ratio` (0 to 1); omitted fields keep their value.
+
+KiCad rebuilds the edited items' teardrops in the same undo step. `refill_zones` defaults to `false`; set it to request a board-wide refill afterwards. The response reports `targets` and `verified_changes` from settings readback separately from `copper.commit` and `copper.refill`. The latter describes teardrop copper observed after the refill request once the board accepts reads; `completion_verified: false` means that observation does not prove the queued fill finished. If the refill request or subsequent read fails, the error retains the confirmed settings and commit evidence under `applied`.
+
+Boards in legacy teardrop mode, and pads of a footprint that owns groups, are refused with `plan_blocked` and nothing written: pads are written inside their whole footprint, which would drop such a group.
+
+### Net queries refuse a name nothing on the sheet spells (patch release)
+
+`get_net_connections`, `get_net_connectivity` and `get_net_components` now
+return a structured `invalid_argument` error on `net` when no label or power
+symbol on the sheet spells the name asked for. Previously they answered it as a
+net with nothing on it: no pins, labels, wires or components, and no error.
+Where a name on the sheet differs only in case, or by the sheet path KiCad's
+netlist puts before a local label's name (`/SDA` for `SDA`), the reason offers
+it. A net no label or power symbol names has no name these tools take; reach it
+with `get_connected_items` or `trace_from_point`. Arguments, and the responses
+for a name on the sheet, are unchanged. Issue:
+[#101](https://github.com/Copperpour/Copperpour/issues/101).
+
+### Net queries report each label's uuid (patch release)
+
+`get_net_connections`, `get_net_connectivity`, `get_connected_items` and
+`trace_from_point` now add `uuid` to each net, global or hierarchical label
+they return, the UUID `list_schematic_labels` lists and `batch_delete` takes.
+An entry of type `PowerSymbol` has no `uuid`: it stands for a power symbol's
+pin, and the symbol's own UUID would delete the symbol. `get_net_connectivity`'s
+wires also carry `uuid`, as `get_connected_items`' wires and
+`list_schematic_wires` do. Every existing field is unchanged. Issue:
+[#93](https://github.com/Copperpour/Copperpour/issues/93).
+
+### Schematic placement and rotation normalize orientation to KiCad's canonical pair (patch release)
+
+`add_schematic_component`, `batch_place_components`, `add_power_symbol`, and `rotate_schematic_component` now normalize each symbol's `(rotation, mirror)` pair to the canonical form eeschema writes (`180° x` -> `0° y`, `180° y` -> `0° x`, `90° y` -> `270° x`, `270° y` -> `90° x`, and quarter-turn angles folded into `[0, 360)`), matching `mirror_schematic_component`.
+
+The drawn body, pins, and field text are unchanged, and KiCad's next save no longer rewrites the stored pair. Callers that chain `rotate_schematic_component` should read the stored `rotation`, `mirror_x`, and `mirror_y` from the tool response rather than assuming the requested pair was stored verbatim.
+
+### New tool `open_board` in `verification` (minor release)
+
+`open_board(board, display?, timeout_seconds?)` opens a `.kicad_pcb` in
+KiCad's PCB editor and waits until a KiCad IPC endpoint reports that exact
+board, as asked on [#23](https://github.com/Copperpour/Copperpour/issues/23).
+
+- **Looks first:** every endpoint detection chooses among, or the configured
+  one alone, is asked for its open documents and then a read of the board.
+  One holding the board is used, and no editor is started.
+- **Starts:** otherwise `pcbnew <board>` of the KiCad installation Copperpour
+  resolves, and waits for it. `kicad -f pcb` is not used: it exits on a
+  segmentation fault in KiCad 10.0.8.
+- **Then:** when several sockets answer, as a Project Manager beside a PCB
+  editor does, the calls that follow use the one the last `open_board` found
+  holding its board, while it is among them; `get_installation_info` reports
+  it as `source: "selected_by_open_board"`.
+- **Answer:** `requested_board`, `requested_open`, `launched`, `ipc_address`,
+  `timed_out`, `timeout_seconds`, `elapsed_ms` and `endpoints`, each with
+  `ipc_address`, `requested_open` and `error`; a `note` when none reported
+  the board in time.
+- **No editor is started** while an endpoint answers `AS_NOT_READY` or gives
+  no clear answer (a request timed out, or a reply that does not parse), lists
+  the board without serving a read of it, or has a request still running;
+  while KiCad's lock beside the board is present or cannot be checked,
+  refused as `conflict` with the lock in `paths`; or when a configured
+  `ipc_address` or `KICAD_API_SOCKET` answers without the board or is not
+  KiCad's own socket, refused as `editor_unavailable`. Each says what to do
+  instead.
+- **Two endpoints holding the board:** refused as `ambiguous_target`, the
+  board as `target` and the endpoints as `candidates`; neither is used.
+- **Windows:** detection looks at the default pipe alone, so an editor started
+  beside a running KiCad is not found there, and the call times out.
+
+### A pin on a net no label names reports KiCad's name for that net (patch release)
+
+`get_component_nets`, `get_pin_connections` and `get_pin_net_name` answered
+`net: null` for a pin on a net that no label, power symbol or sheet pin names,
+the answer they give a pin on nothing. They now give the name KiCad's netlist
+gives that net after one of its pins, such as `Net-(R1-Pad2)`, `Net-(U1-VIN)`
+or `Net-(U2A-+)`, `unconnected-(…)` when a no-connect flag is on it, and a
+hidden `power_in` pin's own name, as KiCad 10.0.8 does, whose unannotated
+pins drive their nets. `null` is left for a pin KiCad nets alone, for a pin
+whose net a sheet pin carries to the sheet below, and for a pin on a net KiCad
+names after an unannotated symbol's pin, whose name carries a hash of that
+symbol's UUID. A name a label
+gives is unchanged, and the tools that take a net by name still take only
+those. Issue: [#618](https://github.com/Copperpour/Copperpour/issues/618).
+
+### `place_component` places Reference and Value as the library has them (patch release)
+
+Placed live, a footprint's Reference and Value fields were built without the
+library's text style: no stroke width, a line spacing of 0, not kept upright,
+both on the silkscreen, and the Value hidden
+([#157](https://github.com/Copperpour/Copperpour/issues/157)). They now carry
+the library's layer, visibility, font, stroke, line spacing, justification and
+keep-upright, placed as `update_pcb_from_schematic` places the footprints it
+adds.
+
+A library footprint whose properties cannot be read, such as one that writes
+a property twice, is still placed with the default fields, and the response
+then has a `warning` saying so. Placement into a closed board file is
+unchanged.
+
+### Placed symbols take the library symbol's exclusions (patch release)
+
+`add_schematic_component`, `batch_place_components`, `apply_template`,
+`add_power_symbol` and `batch_add_power_symbol` copy the library symbol's
+`exclude_from_sim`, `in_bom`, `on_board` and `in_pos_files` onto the symbol
+they place, as eeschema does. A `Mechanical:MountingHole`, `(in_bom no)` in
+KiCad's library, is now placed out of the BOM; it used to be placed with
+`(in_bom yes)`. A library symbol that sets all four, as KiCad 10 writes them,
+now also gives its placed symbol `(exclude_from_sim …)` and `(in_pos_files …)`.
+A flag the library omits keeps its default. Issue:
+[#124](https://github.com/Copperpour/Copperpour/issues/124).
+
+### Live placement gives a footprint its library's Datasheet, Description and custom properties (patch release)
+
+`place_component`, `place_component_array`, `duplicate_component` and `add_mounting_hole` (with a library footprint), placing while the board is open in KiCad, now give the footprint every field its library footprint has: Datasheet and Description where the library has them, and every custom property, such as `KiLib_Generator`. They are placed as `update_pcb_from_schematic` places them on the footprints it adds. Before, these fields were left out without saying so, and a library refresh dry run right after placing reported `metadata` changed.
+
+When the library's properties cannot be read, the part is still placed with default Reference and Value fields, and the existing warning and `not_carried` entry now also say that Datasheet, Description and custom properties were left out. Tool inputs and response fields are unchanged; closed-board placement already copied the whole library footprint. Callers need not change their calls.
+
+### Placement refuses a numbered designator already in use (minor release)
+
+`add_schematic_component`, `batch_place_components` and `apply_template` wrote a
+placement under a numbered designator that another placement of the project
+already held, on the same sheet or on another sheet of the hierarchy, and
+reported success. eeschema's annotation check reports the pair as duplicate
+items, and `kicad-cli sch export netlist` warns that the schematic has
+annotation errors.
+
+Such a placement is now refused as `invalid_argument` on `reference`, or on
+`ref_start` for `apply_template`, naming the placements that hold the
+designator (three, and a count of any more), and nothing is written for it.
+Only the other units of one multi-unit part, with one value, share a
+designator, as `annotate_schematic` keeps one; this also refuses units of two
+different parts with one value and unit count, which eeschema does not report.
+An unannotated designator (`R?`, the default) is never refused.
+`batch_place_components` refuses only that entry, an earlier entry of the same
+batch counting as a holder, and places the others; `apply_template` refuses the
+whole call. Omit the reference, or give one no placement holds.
+`apply_template` with `ref_start` left out still numbers from one above the
+highest number on its own sheet, so on a sheet of a hierarchy it can now be
+refused; give a `ref_start` no placement holds.
+
+The other sheets are read as `add_power_symbol` reads them for its numbers; a
+sheet no project owns is checked against itself alone. A sheet file that could
+not be read is named in `other_sheets_unreadable` in the reply of a call that
+places, present only then, and its designators were not checked. A placement
+on a sheet placed more than once holds its designator once, though each
+instance record carries it, as before. Issue:
+[#615](https://github.com/Copperpour/Copperpour/issues/615).
+
+### Power symbols take the library's reference prefix, so `PWR_FLAG` is `#FLG` (patch release)
+
+`add_power_symbol` and `batch_add_power_symbol` gave every symbol they placed a
+`#PWR` designator. KiCad's `power:PWR_FLAG` has the `Reference` `#FLG`, and
+eeschema numbers `#FLG01`, `#FLG02`, … apart from `#PWR`, so a flag disagreed
+with the library definition the tool had just embedded and used up a `#PWR`
+number.
+
+The prefix is now the embedded library symbol's `Reference`, as eeschema takes
+it when it places a symbol, and each prefix is numbered on its own: the lowest
+number free among that prefix's designators across the hierarchy. A
+`PWR_FLAG` gets `#FLG01` and a `GND` placed after it still gets `#PWR01`. A
+library symbol with no `Reference` prefix still gets `#PWR`. Flags already
+placed as `#PWR` are left as they are, and their numbers stay held in the
+`#PWR` series. Issue:
+[#110](https://github.com/Copperpour/Copperpour/issues/110).
+
+### Power symbols are numbered across the whole hierarchy (minor release)
+
+`add_power_symbol` and `batch_add_power_symbol` gave a new `#PWR` the lowest
+number free on the one sheet file, so a number already held on another sheet of
+the project was issued again, and a sheet placed more than once got the same
+designator on every instance. eeschema checks annotation over the whole
+hierarchy, power symbols included: the netlist export warns that the schematic
+has annotation errors.
+
+The number is now the lowest free among every `#PWR` this sheet holds and the
+project's instance records on every other sheet file of the hierarchy, read as
+`annotate_schematic` reads them. Each instance of a sheet placed more than once
+gets its own number, in hierarchy order as eeschema numbers its pages, and the
+`Reference` property carries the one eeschema saves for that file, the record
+of its first instance in page order, so the lowest. A compact reply gives that
+property; the per-instance numbers are in the file and in the `verbose` reply's
+`instance_references`. A batch numbers each symbol after the previous one.
+
+A sheet no project owns is numbered against itself alone, as before. The reply
+now has `other_sheets_consulted` and `other_sheets_unreadable`, the keys
+`annotate_schematic` uses. A sheet file that could not be read is named in
+`other_sheets_unreadable`, and its numbers were not seen. When the hierarchy's
+page order could not be loaded, the file it stopped at is named there too, the
+other sheets' numbers are still taken, and the instance paths are numbered in
+sorted path order instead of page order. Issue:
+[#505](https://github.com/Copperpour/Copperpour/issues/505).
+
+### A failed readback after a write is `mutation_outcome_uncertain` (patch release)
+
+A file tool whose write replaced the file, but whose readback then found
+something else there (another program saved it in between), now answers
+`mutation_outcome_uncertain` with the tool's name as `operation`. It used to
+answer as if nothing had been written: `conflict` from `set_footprint_metadata`,
+`set_footprint_graphics`, `set_footprint_models` and `copy_routing_pattern`,
+`stale_target` from `delete_schematic_component`, `batch_delete`,
+`batch_delete_schematic_components`, `enrich_datasheets` and `fix_connectivity`,
+and a plain or `handler_error` message, "write conflict: … changed since it was
+read", from the others.
+
+`conflict` and `stale_target` now mean nothing was written, so a retry is safe.
+On `mutation_outcome_uncertain`, reload the file and inspect it before retrying.
+
+### `update_footprints_from_library` keeps field text and fabrication attributes by default (minor release)
+
+A refresh used to write the library's Datasheet, Description and custom
+property text over the placed footprint's, and the library's mounting type and
+BOM and position-file exclusions over its attributes. It now keeps them, as
+KiCad's Update Footprints from Library dialog does by default
+(`dialog_exchange_footprints.cpp`, update mode), and offers two optional
+booleans beside `reset_text_sizes_and_styles` and `reset_text_positions`, each
+mapped onto one of the dialog's checkboxes:
+
+- `reset_text_content` ("Update text content") gives Datasheet, Description
+  and each custom property the library also has the library's text.
+- `reset_fabrication_attributes` ("Update fabrication attributes") gives the
+  footprint the library's mounting type and BOM and position-file exclusions.
+
+Both are `false` by default. DNP and "not in schematic" are kept either way,
+as before. Custom properties the library has still take the library's
+position, layer and style; only their text is kept.
+
+What a dry run plans changes: a footprint that differs from its library only
+in that text or those attributes is now `unchanged`, so its plan revision
+differs too. A caller that relied on a refresh setting them back passes
+`reset_text_content: true` and `reset_fabrication_attributes: true`. An unset
+flag is left out of the plan revision, so calls that set neither keep their
+revision inputs.
+
+### `update_footprints_from_library` carries solder margins and takes `reset_clearance_overrides` (minor release)
+
+[#723](https://github.com/Copperpour/Copperpour/issues/723):
+
+- **Now carried:** a library footprint's own `solder_mask_margin`, `solder_paste_margin` and `solder_paste_margin_ratio` (or the older `solder_paste_ratio`), and each pad's own, by `update_footprints_from_library`, which refused such a footprint by name ("pad clause 'solder_mask_margin' is not supported by typed library refresh"), and by `update_pcb_from_schematic` when it replaces a footprint.
+- **Pads:** a refreshed pad takes its library pad's margins, as KiCad replaces every pad, so a pad whose margins differ plans `pads`.
+- **New argument:** `reset_clearance_overrides`, a boolean, `false` by default like the other reset flags, is KiCad's "Update/reset clearance overrides", which KiCad's dialog checks by default. Set, it gives each footprint the library's own clearance, zone connection, solder mask and paste margins and solder mask bridge setting; the refresh refuses a library footprint with its own clearance or zone connection, so those two become none and inherited. A footprint whose clearance, zone connection or margins change plans the new `changed_domains` value `clearance_overrides`. Left unset, it is left out of the plan revision.
+- **Changed by default:** a refresh keeps the placed footprint's solder mask bridge setting unless `reset_clearance_overrides` is set, as KiCad does with the option unchecked. Before, it took the library's and planned `attributes`.
+- **What to do:** to refresh as KiCad's dialog does by default, pass `reset_clearance_overrides: true`. It takes the library's bridge setting, as a refresh did before, and also its clearance, zone connection and margins, which a refresh kept before; no argument takes the one without the other.
+
+### New tool `rename_footprint` in `library_maintenance` (minor release)
+
+`rename_footprint(library_path, footprint_name, new_name)` renames a footprint
+in its `.pretty` library, as KiCad's footprint editor does, and as agreed on
+[#633](https://github.com/Copperpour/Copperpour/issues/633).
+
+- **Write:** `new_name.kicad_mod` holds the footprint with the new name in its
+  header, and the Value changed when it equals the old name; then
+  `footprint_name.kicad_mod` is removed. Nothing else in the file changes. A
+  rename that changes only the case renames the one file, then rewrites it.
+- **Refused** as `invalid_argument` on `new_name`, with nothing written: a name
+  already in the library, or one that differs from a footprint in the library
+  only in case; an empty name, one with spaces at either end, or one with a
+  character KiCad does not accept in a footprint name (`% $ < > " \ / :`, tabs
+  or line breaks); on Windows also `* ? |` and device names such as `CON` or
+  `NUL`. `footprint_name` not in the library is refused on `footprint_name`. A
+  path that is not a `.pretty` directory is a handler error; a missing one is
+  `file_not_found`.
+- **Concurrent change:** if the old file changes before it is removed, the new
+  file is removed again and the call answers `conflict`; in a case-only
+  rename, the file gets its old name back. A rename interrupted after writing
+  the new file, or a case-only one interrupted after renaming the file, is
+  finished by the next call (`finished_earlier_rename`), with the same `value`
+  as an uninterrupted rename.
+- **Answer:** `previous_name`, `name`, `footprint_path`, `value` (`previous`
+  and `current`) when the Value changed, and `kept_references`: symbols'
+  Footprint fields and footprints placed on boards keep the old library id.
+
+### New tool `rename_symbol` in `library_maintenance` (minor release)
+
+`rename_symbol(library_path, symbol_name, new_name)` renames a symbol in its
+`.kicad_sym` library, as KiCad's symbol editor does, and as agreed on
+[#634](https://github.com/Copperpour/Copperpour/issues/634).
+
+- **Write:** the symbol and its unit blocks (`NAME_<unit>_<body style>`) take
+  the new name, symbols derived from it extend the new name, and its Value
+  changes when it equals the old name. The name is stored as KiCad stores it
+  from its rename dialog: `\ < > : "` escaped as `{backslash}`, `{lt}`,
+  `{gt}`, `{colon}`, `{dblquote}`, line breaks dropped. A library in KiCad's
+  save order (inheritance depth, then name) keeps it: the symbol moves to its
+  place. A library in another order keeps that order.
+- **Refused** as `invalid_argument` on `new_name`, with nothing written: a
+  name already in the library, the symbol's own name, an empty name, one with
+  spaces at either end, or one with a tab. `symbol_name` not in the library is
+  refused on `symbol_name`. A file that is not a `.kicad_sym` is a handler
+  error, as is a unit block not named after its symbol; a missing file is
+  `file_not_found`.
+- **Answer:** `previous_name`, `name` (as stored), `escaped` when the stored
+  name differs from `new_name`, `value` (`previous` and `current`) when the
+  Value changed, `derived_symbols` whose `extends` changed, `moved` when the
+  symbol moved, and `kept_references`: symbols placed in schematics keep the
+  old library id.
+
+### Inline renders arrive as image content, not a base64 string (minor release)
+
+`render_schematic_png` with `inline: true` no longer adds `png_base64` to its
+JSON report, and `compare_visual_baseline` with `inline_diff: true` no longer
+adds `current_png_base64`. The report stays the first content block, and the
+PNG follows as a second block of type `image` (`mimeType` `image/png`), the
+form `get_board_2d_view` already used. Read the image from that block; the PNG
+file named in `rendered` is unchanged.
+
+### `repeat_layout` copies the routing in the reference placement's area (minor release)
+
+`repeat_layout` copied the routing on the reference placement's own nets, those
+with a pad on it and none elsewhere, and replaced a target's routing on the nets
+the copies took.
+
+It now copies the tracks, arcs and vias that lie in the reference placement's
+area, as KiCad's Repeat Layout copies what lies in a rule area. The area is the
+outline KiCad's Generate Placement Rule Areas draws: the boxes of the
+placement's footprints, of every item in the groups they are in, and of the
+routing on its own nets, 0.1 mm out, around their convex hull in horizontal and
+vertical edges. Routing on a net the placement shares, such as GND or a net that
+reaches another sheet, is now copied when it lies in the area. A copy takes the
+net of the target's matched pads, or keeps its own when no pad of the placement
+is on it. The copies replace the routing that lies in the target's own area or
+in the reference's area carried onto the target, whatever its net; an item the
+reference copies is never removed. A net local to the reference must still
+become one net local to the target, and every copied net one net there, or the
+call is refused as `plan_blocked`. A closed board whose area needs the box of an
+item the saved file cannot measure, such as a text in a group, is refused as
+`plan_blocked` naming it. `routing.targets[].nets` lists every net a copy goes
+on.
+
+`copy_routing: false` keeps the footprint-only behaviour. Issue:
+[#608](https://github.com/Copperpour/Copperpour/issues/608).
+
+### `repeat_layout` copies the reference placement's routing (minor release)
+
+`repeat_layout` placed footprints only; a target placement's tracks and vias
+were the caller's to draw.
+
+It now copies the reference placement's tracks, arcs and vias onto each target
+placement, turned and moved as its footprints are. It copies the routing on the
+placement's own nets, those with a pad on it and none elsewhere; KiCad's Repeat
+Layout copies what lies in a rule area instead. Each copy takes the net of the
+target's pads matched to that net's pads, and the copies replace the target's
+own routing on those nets. A net whose routing is copied and that does not
+become one net of the target's own is refused as `plan_blocked`, with a reason
+for each, and nothing moves. The response adds `routing`: `copied_count`,
+`removed_count` and, for each target, `target_reference`, its counts and the
+`nets` it mapped. On a live board the routing joins the placements' one KiCad
+commit, the copper check leaves out the routing that commit removes, and a copy
+not confirmed on its net after the commit is listed in `routing.unconfirmed`
+with a `warning`. On a closed board whose tracks name their net by number, as
+boards before KiCad 10 do, the call is refused unless `copy_routing` is false.
+
+`copy_routing: false` keeps the footprint-only behaviour. Issue:
+[#608](https://github.com/Copperpour/Copperpour/issues/608).
+
+### New `repeat_layout` places every other placement of a sheet as one is placed (minor release)
+
+A sheet placed more than once took a `set_component_placements` batch whose
+poses the caller worked out: each footprint's counterpart's pose, turned and
+moved by the change between two anchor footprints.
+
+`repeat_layout`, in the `placement` toolset, takes an `anchor_reference`, a
+footprint on the placement already laid out. Every other footprint of the
+anchor's symbol anchors a placement to lay out, or only those named in
+`target_references`. Footprints are matched by symbol instance path over the
+anchor's sheet and the sheets below it, and each takes its counterpart's pose,
+turned by the two anchors' difference in rotation and moved onto its own
+anchor, with the arithmetic of KiCad's Repeat Layout. A placement whose footprints
+differ from the anchor's in number, library footprint, pad count or side is
+refused as `plan_blocked`, with a reason for each footprint, and nothing
+moves. Its arguments `dry_run` and `allow_copper_conflicts` and its response
+are `set_component_placements`'. Routing, zones and other board items are not
+copied. Issue: [#608](https://github.com/Copperpour/Copperpour/issues/608).
+
+No existing call changes.
+
+### Live net readers require a `GetNets` response payload (patch release)
+
+`get_nets_list` now returns a structured `editor_unavailable` error naming the
+requested board when KiCad supplies no net response payload, instead of reporting
+`count: 0` and `nets: []`. Malformed responses also return this query failure.
+Retry the live query after checking KiCad; no saved board is substituted.
+An explicitly present, empty `NetsResponse` still returns a successful empty list.
+Successful response fields and tool arguments are unchanged.
+
+The IPC `get_nets` and `get_nets_in` methods now require a response, just like
+`get_nets_required_in` (retained as an alias). Their consumers propagate a missing
+payload through their existing query/planning failure paths rather than deriving
+empty net tables, unknown-net decisions, or empty routing rules. In particular,
+`get_netclasses` refuses the failed live read without saved-file fallback.
+`get_board_info` retains its existing fallback policy for failed live queries;
+this change does not migrate that tool's source selection.
+
+### Standalone Tauri schematic viewer retired (minor release)
+
+The standalone `schematic-viewer` / `schematic-viewer.exe` command and its
+`--kicad-cli` flag are removed. There is no shim or Tauri fallback. Use the
+`open_schematic_viewer` MCP tool, which already runs the browser service embedded
+in the MCP server. Configure the server’s `kicad_cli` when automatic KiCad
+CLI discovery is unsuitable. `open_browser: false` returns the private URL
+without launching a browser; opener failure leaves a successfully started
+service available. See [the MCP contract](browser-viewer-mcp.md) for response
+fields, lifetime, saved-file behavior and headless forwarding.
+
+The earlier plan retained Tauri for one shipped deprecation release. The
+[owner explicitly waived that grace period](https://github.com/Copperpour/Copperpour/issues/242#issuecomment-6825001324)
+after the MCP default moved to the browser service in #439. This retirement
+supersedes the retention text in the earlier phase migration notes.
+
+`crates/schematic-viewer`, its lockfile, frontend source path, platform icons,
+Tauri configuration and separate `viewer` CI job are removed. Browser assets
+now live in `crates/copperpour-viewer/frontend` and are embedded at build time.
+HTTP paths and authentication/sandbox behavior are unchanged. README uses the
+shared PCM logo. No GUI runtime is needed by the server; rendering still needs
+`kicad-cli`, and viewing needs a browser. KiCad itself retains its own native
+runtime requirements.
+
+PCM and release builds package only the MCP server, which includes the viewer.
+Remove `--viewer PATH` from `packaging/build-pcm.sh` calls and `-ViewerPath PATH`
+from `packaging/build-pcm.ps1` calls; these retired arguments explicitly refuse
+rather than silently dropping an expected binary. PowerShell retains its old
+parameter slot solely for this refusal, preserving other positional meanings.
+Old PCM archives remain readable by the merge/validation tooling. Existing
+installs may still contain an old viewer executable; it is no longer launched
+by the MCP tool. Update scripts or shortcuts that call it directly.
+
+Tauri-only GTK/WebKit development dependencies and universal viewer builds are
+removed from release CI and the Nix development shell. Workspace tests cover the
+engine/service; browser execution checks remain separate. The live required
+`Schematic viewer` check and Local CI configuration need maintainer coordination
+when this PR lands; deleting its workflow does not itself edit branch rules.
+
+### A file that changed after a tool read it is a `conflict`, not `handler_error` (patch release)
+
+When a file changes between a tool's read and its write, the writer refuses
+before replacing it, so the file holds only the other program's save. Tools that
+passed the writer's error on unchanged, such as `add_schematic_net_label`,
+`add_no_connect`, `batch_add_wire`, `batch_connect_to_net`,
+`move_labels_by_offset`, `edit_footprint_pad` and `delete_symbol`, answered
+`handler_error` ("write conflict: … changed since it was read", or "loaded").
+The closed-board footprint edits (`move_component`, `rotate_component`,
+`flip_component`, `set_component_placements`, and `place_decoupling` and
+`force_directed` through them) answered it as an untyped error. They now answer
+`conflict` with `paths` naming the file, as the tools that refused it themselves
+already did: reload the file and reapply the change. A multi-file transaction's
+`TransactionConflict` is unchanged.
+
+`create_schematic` and `add_power_symbol` write the file once before their last
+write, so a failure of that last write, including a save or KiCad's editor lock
+found only then, is now `mutation_outcome_uncertain`, not `handler_error` or
+`conflict`: reload and inspect the file before retrying. Issue:
+[#480](https://github.com/Copperpour/Copperpour/issues/480).
+
+### `rotate_schematic_label` and `batch_rotate_labels` take a label's `uuid` (minor release)
+
+`rotate_schematic_label`, and each `batch_rotate_labels` item, names its label
+by `uuid` alone, as `list_schematic_labels` reports it, or by `net` with `x`
+and `y` as before, as `rename_schematic_net_label` names one label. Of two
+labels of one name on one anchor, a position finds only the first; each can now
+be rotated by its uuid. The schema now requires only `rotation` beside
+`schematic`; the handler checks the rest.
+
+A `uuid` given with `net`, `x` or `y` is `invalid_argument` on `uuid`; neither
+`uuid` nor `net` is `invalid_argument` on `net`, `give uuid, or net with x and
+y`; `net` with neither `x` nor `y` is `invalid_argument` on `net`, `goes with x
+and y`; a missing `x` or `y` is `missing or not a number` on it, where the
+schema gate refused a missing `net`, `x` or `y` as a required property. A batch
+item's refusal names its field, such as `labels[1].uuid`. A uuid that is no
+label's on the sheet is refused, `No label with uuid '…' in this schematic`,
+in a batch with `labels[i]:` before it, and nothing is written. Two items
+finding one label, by uuid, by position or one of each, are refused as two
+found by position are. A call that names its labels by net and position, each
+with its `x` and `y`, behaves as before.
+
+Issue: [#747](https://github.com/Copperpour/Copperpour/issues/747).
+
+### `rotate_schematic_label` reports the justify it writes (patch release)
+
+`rotate_schematic_label`'s reply carries `justify` as the direction it
+writes, `"left"` or `"right"`, as it did before
+[#516](https://github.com/Copperpour/Copperpour/pull/516). Since then it was
+the byte range of the label's old justify within the label's block, such as
+`[88, 109]`, or `null` for a label with no justify. What the tool writes to
+the file is unchanged.
+
+Issue: [#746](https://github.com/Copperpour/Copperpour/issues/746).
+
+### `route_differential_pair` creates the pair in one commit (patch release)
+
+`route_differential_pair` now sends both traces in one `CreateItems` inside one
+KiCad commit, so a routed pair is one undo step, and when KiCad refuses either
+trace the commit is dropped and neither is left on the board
+([#367](https://github.com/Copperpour/Copperpour/issues/367)). It used to create
+them one after the other, each its own undo step, and a failure creating the
+negative trace left the positive one behind.
+
+`net_neg` equal to `net_pos` is now refused with `invalid_argument` on
+`net_neg` before KiCad is asked anything; it used to route two traces of one
+net. A failure is now reported in its own words; only an unreachable KiCad, or
+one holding no board, still reads "KiCAD must be running". KiCad refusing to
+open the commit, while busy or with one of this client's already open, fails
+the call before anything is created. A create, commit or drop KiCad does not
+confirm is `ipc_outcome_unknown`: inspect the live board before retrying. The
+arguments and the successful response are unchanged.
+
+### `route_specctra_dsn` keeps the routed board when its diagnostics log cannot be written (minor release)
+
+`route_specctra_dsn` refuses to replace `<ses stem>.freerouting.log`, and it
+already refuses before routing when that file exists. A file of that name
+that appeared during the run made the call fail with only "Freerouting
+diagnostics output already exists" once routing was over: the routed board was
+left behind as a hidden temporary SES next to the requested output, and a
+failed run's own cause was not reported.
+
+The routing now decides the call:
+
+- A routed board is written to `ses_output_path` as usual, no temporary SES
+  stays behind, and the existing log is left untouched.
+  `artifacts.diagnostics_path` is `null` and the new
+  `artifacts.diagnostics_error` says why Freerouting's stderr was not saved.
+  It is `null` whenever the log was written or there was nothing to write.
+- A failed run reports its own cause first, then "(Freerouting stderr not
+  saved: …)", then the end of Freerouting's stderr as before.
+
+Callers that treated the log error as a routing failure should read `success`
+and, if they need the log, `artifacts.diagnostics_error`.
+
+### `route_specctra_dsn` takes `neck_to_min_track_width` (minor release)
+
+A Specctra DSN only carries the net class widths, so Freerouting never routes
+a trace narrower than its class, even where the board's minimum track width
+would let a connection through. The new optional boolean
+`neck_to_min_track_width` (default false) sends the KiCad project's
+`min_track_width` as Freerouting's `neck_width_um`: a connection that fails at
+its class width is retried at that width.
+
+- Freerouting narrows the whole connection, on any net, power and mains
+  classes included, and KiCad's DRC does not flag a track narrower than its
+  net class. Check the widths of power nets after routing.
+- The width is sent as if the caller had set `router_settings.neck_width_um`:
+  if Freerouting does not apply it, the run is refused before routing, like
+  any other requested setting, rather than listed in
+  `project_rules.not_applied`.
+- An explicit `router_settings.neck_width_um` wins, and nothing is then read
+  from the project.
+- With the argument set, a call is refused with `invalid_argument` on
+  `neck_to_min_track_width`, before routing, when no project is read (none or
+  several found, see `project_path`) or when its `min_track_width` is absent
+  or not above 0.
+
+The answer's `project_rules` object has a new `neck_width_um`: the width sent
+from the project, in um, or null.
+
+`min_track_width` is not sent by default: calls without the new argument route
+as before.
+
+### Routing refuses missing live nets and disabled copper layers (patch release)
+
+`route_trace`, `route_pad_to_pad`, and `route_differential_pair` now validate the
+requested copper layer and nets on the bound live board before creating tracks.
+`add_via` also validates its requested net before creating the via. A missing net
+returns `invalid_argument` naming `net_name`, `net_pos`, or `net_neg`; a disabled
+copper layer names `layer`. Previously these cases were reported as KiCad being
+unreachable, and a missing negative differential-pair net could leave the positive
+trace behind. Both pair nets are now checked before creating either trace.
+
+Choose an existing live-board net and enabled copper layer, then retry. IPC read
+failures, missing net response bodies, and empty enabled-layer evidence remain
+failures, not evidence that a requested net or layer is missing. The IPC client
+adds `get_nets_required_in`; existing `get_nets_in` fallback behavior is unchanged. No arguments or
+successful response formats change. This preflight does not make separate IPC
+creation calls atomic against later errors or intervening editor changes.
+
+### Routing widths and differential-pair gaps must be positive (patch release)
+
+`route_trace`, `route_pad_to_pad`, `modify_trace`, and
+`route_differential_pair` refuse non-positive widths as `invalid_argument` before
+IPC. `route_differential_pair` applies the same rule to `gap`. Values that round
+to zero nanometres and malformed supplied values are also refused. The schemas
+advertise `exclusiveMinimum: 0`; handlers additionally check nanometre precision.
+
+Supply positive numeric dimensions that round to at least one nanometre, or omit
+them to retain the existing defaults (0.25 mm width, or 0.1 mm width and gap for
+pairs). Existing valid calls and success responses are unchanged.
+
+### `run_drc` names the checks a run ignored (minor release)
+
+A DRC check whose severity is `ignore` is not run, so it never appears among
+`run_drc`'s violations or counts, and a clean summary could not be told from a
+board whose check was switched off
+([#519](https://github.com/Copperpour/Copperpour/issues/519)). KiCad lists
+those checks in its own DRC report; `run_drc`'s summary now gives their keys
+as `ignored_checks`, in KiCad's order, for example
+`["missing_courtyard", "footprint_filters_mismatch"]`. It is `null` when the
+report carries no such list, which is not the same as `[]`, nothing ignored.
+
+Read a count of zero beside `ignored_checks`. `set_drc_severity` turns an
+ignored check back on. Nothing `run_drc` returned before changes.
+
+### Placement, annotation and templates refuse a locked schematic as `conflict` (patch release)
+
+`add_schematic_component`, `batch_place_components`, `annotate_schematic` and
+`apply_template` reported a write that never happened as
+`mutation_outcome_uncertain`, with `retry.safe: false`
+([#427](https://github.com/Copperpour/Copperpour/issues/427)). That covered
+KiCad's `~<name>.kicad_sch.lck` editor lock, and a schematic saved by another
+program after the tool read it. Both are checked before the file is replaced
+(for `annotate_schematic` over a hierarchy, before the transaction's journal is
+written), so the files are unchanged.
+
+They now return `conflict`, with `paths` holding the schematic, and write
+nothing. For the lock, the message names the lock file: save and close the
+schematic in Eeschema, then retry; a lock file that could not be inspected is
+reported as that, with the reason. For a changed file, reload it and retry.
+Where the tool returns an `outcome`, it is `status: "failed"` with
+`retry.safe: true`. A readback that does not match after the replacement is
+still `mutation_outcome_uncertain`.
+
+### `add_schematic_shapes`, `list_schematic_shapes`; `edit_schematic_text` moves and resizes (minor release)
+
+Two new `sch_batch` tools draw and read a sheet's graphic shapes, which carry
+no electrical meaning
+([#228](https://github.com/Copperpour/Copperpour/issues/228)); `sch_batch`'s
+description now names them.
+
+`add_schematic_shapes(schematic, shapes, revision?)` takes the shape types and
+geometry keys `set_footprint_graphics` and `create_symbol` share: each shape is a
+`line` (`start`, `end`), a `poly` (`points`, three or more, open unless its
+last point repeats its first), a `rect` (`start`, `end`) or a `circle`
+(`center`, `radius_mm`), with points as `{x, y}` in millimetres. Every shape
+takes `stroke_width_mm` (default 0, the sheet's width), `stroke_type`
+(`default`, `solid`, `dash`, `dot`, `dash_dot`, `dash_dot_dot`) and
+`stroke_color`; a `poly`, `rect` or `circle` also takes `fill` (`none`,
+`background`, or `color` with `fill_color`). A sheet has no `outline` fill
+(KiCad 10 saves one as a colour fill in the stroke's colour), and KiCad's hatch
+fills are listed but not written. Colours are `[r, g, b]` or
+`[r, g, b, a]`, as `add_schematic_text` takes them. Coordinates are rounded to
+KiCad's 0.0001 mm. Each shape's block is written as KiCad 10 saves it, so a
+save in KiCad keeps its bytes, though KiCad may reorder the sheet's items.
+Shapes go in the order given, before the sheet's first placed symbol, where
+`add_schematic_text` writes a text, or before KiCad's trailing instance tables
+on a sheet without one. A line or poly is a `(polyline …)`, as KiCad writes a graphic
+line. Text is not a shape: `add_schematic_text` writes it.
+
+All shapes are prepared as one `SchematicCommand` and committed through the
+guard `edit_schematic_text` uses. One bad shape is `invalid_argument` naming
+its field, for example `shapes[2].fill_color`, and nothing is written. A
+`revision` the sheet no longer has, or a prepared sheet that changes anything
+but the new shapes, is `stale_target`; `conflict` while KiCad holds the sheet
+or its project's root schematic open, when the sheet changed after it was
+read, or when its project cannot be told; `unsupported_capability` for a
+sheet outside its project's directory. The sheet is read back: the response
+holds `added_count`, each shape as listed from the file with its `uuid`, the
+sheet's new `revision` and `source: "file"`; a file that is not the text
+written is `mutation_outcome_uncertain`.
+
+`list_schematic_shapes(schematic)` returns `count`, `shapes` and the sheet's
+`revision` (the one `list_schematic_texts` returns), with `source: "file"`.
+Each shape has `type`, `uuid`, its geometry, `stroke_width_mm`,
+`stroke_type`, `stroke_color` and, but for a line, `fill` and `fill_color`,
+a colour as `[r, g, b, a]` (whole-number channels) or `null`. A two-point
+polyline is a `line`; an `arc` (`start`, `mid`, `end`) and a `bezier` (four
+`points`) are listed though not written. Wires, buses, text and the shapes
+inside library symbols are not listed. A listed line, poly, rect or circle
+whose fill is `none`, `background` or `color`, its `uuid` and `null` values
+dropped, can be passed back to `add_schematic_shapes`. A sheet holding a shape
+that cannot be read, such as a polyline of one point, is `invalid_argument`
+for both tools, as a sheet with an unreadable text item is for
+`list_schematic_texts`. `batch_delete` removes a
+shape by `uuid`, as it always has, without a revision or group check.
+
+`edit_schematic_text` now also moves and resizes a text item, the rest of
+#228's edit: `text` is optional, and the tool takes `x` and `y` (together,
+rounded to KiCad's 0.0001 mm) and `size`, the font's height and width in
+millimetres, both set to it, from 0.001 to 250 (KiCad loads a size outside
+those as the nearest one). What is not given stays as written: the edit
+replaces only the string, the `x y` of `(at …)` and the `height width` of the
+font's `(size …)`, so the rotation, thickness, bold, italic, justification and
+every other byte stay. A call with none of them, `x` without `y` or `y`
+without `x`, a size outside that range, or one that would leave the item as it
+reads is `invalid_argument`, and the prepared text must change nothing but
+those tokens, to the values asked, or it is `stale_target`. A call that passes
+only `text` behaves as before. The response adds `size` (`{height, width}`)
+and the item's `old_x`, `old_y` and `old_size` to the fields it returned, and
+`list_schematic_texts` adds each item's `size`, `null` for a font without one.
+
+`sch_texts`'s write path is now shared with `add_schematic_shapes`.
+
+### `score_placement` recognizes edge-mounted parts and measures connector distance from courtyard edges (minor release)
+
+`score_placement` previously reported an `outside_outline` hard failure for any
+footprint whose courtyard bbox crossed a rectangular `Edge.Cuts` outline, so
+boards with castellated half-hole connectors or flush overhanging receptacles
+could never reach `verdict: "pass"`. Separately, `connector_edges[].edge_distance_mm`
+measured from the courtyard bbox centre instead of the nearest courtyard edge.
+
+- Footprints with at least one drill hole on or crossing a rectangular
+  outline edge (within `0.01 mm`) are now automatically recognized as
+  edge-mounted and exempted from `outside_outline`. Copper pads alone on the
+  edge are not, so a misplaced SMD part straddling it still fails.
+- New optional argument `edge_mounted` (array of footprint reference strings)
+  covers other footprints whose courtyard overhangs the outline (such as a
+  flush USB-C receptacle, or an SMD module with castellated edge pads). Unknown references are refused with
+  `invalid_argument`; listed footprints whose courtyard does not touch or cross
+  the outline boundary (within `0.01 mm`) are not echoed as edge-mounted and
+  emit a warning — wholly off-board parts still fail `outside_outline`, and
+  wholly interior parts remain unexempted. Same-side `courtyard_overlap` checks
+  still apply to every edge-mounted part.
+- New response field `edge_mounted` lists each recognized edge-mounted part
+  with `reference`, `reason` (`"hole_on_outline"`, `"explicit"`, or
+  `"hole_on_outline_and_explicit"`), `edge_holes`, `overhang_mm`, and
+  `exempted_outside_outline`.
+- `connector_edges[].edge_distance_mm` now measures the shortest distance from
+  the connector's courtyard bbox edge to the outline boundary (`0.0` when
+  touching or crossing the outline; Euclidean distance when wholly outside),
+  and each entry now also carries `center_edge_distance_mm` and
+  `edge_mounted`. `connector_edge` deductions are evaluated against this
+  courtyard-edge distance.
+
+Issue: [#144](https://github.com/Copperpour/Copperpour/issues/144).
+
+### `score_placement` reads an outline that a footprint draws (patch release)
+
+A board whose only Edge.Cuts graphics belong to a footprint, as an imported
+mechanical footprint's do, used to score as having no outline, and a courtyard
+on that footprint's outline overlapped every part. When a board draws no
+Edge.Cuts of its own, `score_placement` now reads the outline from footprints
+as KiCad builds it: a footprint whose graphics close with a pad outside them,
+or into more than one outline, cuts holes; the rest chain end to nearest end
+within 0.01 mm into contours, classified as `outline_shape` always was. A
+footprint with no electrical pads that is the outline is not scored as a part.
+
+New response fields: `outline_source` (`"board"`, `"footprint"`, or `null`
+when no outline is read), `outline_owners` (`reference`, `electrical_pads`,
+`primitives`, `role`, `scored`), `outline_contours` (`role`, `references`,
+`primitives`, `bbox`) and `warnings`.
+When the footprints' graphics make no outline (an open end, a curve, cut-outs
+only), the outline stays missing and a warning says why. The board is not
+changed; moving the graphics to board graphics stays a manual step. Issue:
+[#27](https://github.com/Copperpour/Copperpour/issues/27).
+
+### MCP resource reads now return bundled guidance (minor release)
+
+Every `initialize` response includes short operating rules, followed by any
+existing one-time installed-guidance drift notice. Clients should no longer
+expect `instructions` to be absent when there is no drift. This sends guidance;
+it cannot force a client or model to follow it.
+
+`initialize` advertises the static `resources: {}` capability. `resources/list`
+lists bundled skill and reference Markdown at `copperpour://guidance/<path>`.
+`resources/read` requires a string `uri` and returns MCP `contents` with `uri`,
+`mimeType` and `text`, replacing the invalid empty `resources` read response.
+Unknown resource identities return `-32002`; malformed parameters or a supplied
+continuation cursor return `-32602`. There are no templates, subscriptions,
+list-change notifications or pagination. `resources/templates/list` returns an
+empty `resourceTemplates` list. Both list methods accept omitted parameters.
+
+For clients that do not expose resources, the new always-visible `get_guidance`
+meta-tool lists exact bundle paths when called with `{}`. Pass, for example,
+`{"path":"copperpour/SKILL.md"}` or
+`{"path":"copperpour/references/reliability-contract.md"}` to return the same
+`contents`. Null/non-string paths, unknown paths and extra arguments are refused
+as `invalid_argument`; only omission lists the catalog. Resource paths are exact
+catalog identities, not local file paths. Resolve a relative reference from a
+skill into that skill’s listed `references/` path before calling the tool.
+
+Serving and native installation use the same embedded catalog. Server delivery
+needs neither `init` nor filesystem/network access to guidance. It does not
+create, overwrite or remove native skill files. `init` remains opt-in for native
+skill discovery, local customization and Claude hooks; its arguments, existing
+paths and drift reporting are unchanged. Custom skill roots and setup snippets
+are separate later PRs for #461. Reconnect after upgrading the server to obtain
+the new build’s catalog.
+
+Protocol shape follows the [MCP 2025-06-18 resources specification](https://modelcontextprotocol.io/specification/2025-06-18/server/resources).
+
+### `set_custom_rule` writes `bridged_mask` and `via_dangling` (minor release)
+
+A constraint's `type` may now be `bridged_mask` or `via_dangling`
+([#474](https://github.com/Copperpour/Copperpour/issues/474)). Neither takes a
+min, opt or max: KiCad's DRC reads only the rule's severity, so with
+`severity: "ignore"` a rule allows solder mask bridging or a dangling via on the
+items its condition selects. The tool writes them bare, as
+`(constraint bridged_mask)`, and refuses one given `min`, `opt` or `max` as
+`invalid_argument` on that value's field, such as `constraints[0].min`,
+writing nothing. Both types were refused before by the schema. `disallow`,
+`zone_connection`, `min_resolved_spokes`, `assertion` and
+`solder_paste_rel_margin` are still not written.
+
+### `set_drc_severity` (minor release)
+
+A new `verification` tool sets the severity of DRC checks in a project file
+([#519](https://github.com/Copperpour/Copperpour/issues/519)), the sibling of
+`set_erc_severity`: `set_drc_severity(project, severities)`. `project` is the
+`.kicad_pro`; `severities` maps a check, by its key under
+`board.design_settings.rule_severities` (for example `silk_edge_clearance`), to
+`error`, `warning` or `ignore`. A check is one KiCad 10.0.6 has or one the file
+already names, as a later KiCad writes the checks it adds. Only the named keys
+are written, through the project file's revision check, and a project with no
+`rule_severities` gets one holding only them. Any other check (KiCad's internal
+ones and KiCad 8's `hole_near_hole` included) or severity, an empty map, a path
+that is not a `.kicad_pro`, and a project KiCad holds (its
+`~<project>.kicad_pro.lck`) are refused, and nothing is written.
+
+The response gives `file`, `changed` (false when the file already held every
+severity named, and then nothing is written) and `severities`, each check's
+`previous` and `current`, `previous` null where the file did not name the
+check. `run_drc` reports by the new severities from its next run, and a check
+set to `ignore` is not run at all. No existing tool's arguments or responses
+change. `verification` rises from 12 to 13 tools.
+
+### `set_footprint_field_style` sets the layer, visibility and mirror flag (minor release)
+
+`set_footprint_field_style` takes three more optional arguments, as KiCad's
+Edit Text and Graphic Properties dialog sets them on a selection:
+
+- `layer`: named as on a front-side footprint. A footprint on the back gets
+  the flipped layer (`F.Fab` becomes `B.Fab`, `In1.Cu` becomes `In2.Cu` on four
+  copper layers), as KiCad's Flip moves a footprint's own texts, so one call
+  puts every Reference on its own side's Fab layer. A layer with no flipped
+  counterpart on the board is refused as `invalid_argument` before anything is
+  sent. Changing the layer keeps the mirror flag.
+- `visible`: show or hide the field.
+- `mirror`: `keep` (the default) or `auto`, which sets each field's mirrored
+  flag from the side of the layer it ends on, as `edit_footprint_field` does.
+
+All three need KiCad running with the board open. A call that names one of
+them with no live KiCad holding the board is refused as `editor_unavailable`
+and changes nothing; it does not fall back to the saved file.
+
+Each field's `before` and `after` now also hold `layer`, `visible` and
+`mirrored`, on both paths. On the file path `layer` is null for a field the
+file stores no layer for.
+
+Existing calls change only in those three added response keys.
+
+### New `set_footprint_field_style` sets field text size and thickness on many footprints (minor release)
+
+`update_footprints_from_library` with `reset_text_sizes_and_styles` gives
+Reference and Value the library's text style. A style of the caller's own
+choosing, such as a fabricator's minimum thickness above the library's or one
+text size across the board, took one `edit_footprint_field` call per
+footprint, with the board open in KiCad.
+
+`set_footprint_field_style`, in the `pcb_text` toolset, sets `size_x`,
+`size_y` and/or `thickness` on the Reference or Value field of the footprints
+named in `references`, or of every footprint when it is omitted. With KiCad
+holding the board it is one undo step, read back afterwards; with the board
+closed it edits the saved file, only while the file still holds what it read.
+Both paths answer with the same fields: `source` says which ran (`ipc` or
+`file`), `undo` is set on the live path only, and `fallback_reason` (why the
+file was edited) is null on the live path. `warning` says why the file was
+edited on the file path; on the live path it is set only when footprints were
+sent. The response lists each field's values before and after, and a whole-board
+run reports fields it could not edit in `skipped`.
+
+The live path sends each footprint back whole. See [footprint unit metadata loss before KiCad 10.0.8](../TROUBLESHOOTING.md#footprint-unit-metadata-disappears-after-a-live-pcb-edit).
+
+No existing call changes.
+
+### `set_footprint_graphics` accepts `selector.item_id` (minor release)
+
+`set_footprint_graphics` previously accepted only `selector.layer`, so
+`replace` and `delete` affected every supported graphic on that layer.
+
+`selector` now accepts either `layer` or `item_id` (from
+`get_footprint_info` with `include_graphics: true`). With `selector.item_id`:
+
+- `replace` replaces that single graphic on its existing layer, preserving its
+  `uuid` (or legacy `tstamp`) on a 1-for-1 replacement.
+- `delete` removes that single graphic.
+- `append` is refused with `invalid_argument`.
+- Missing `item_id` returns `stale_target`; duplicate `item_id` or a graphic
+  referenced by a `(group ...)` returns `conflict`.
+- Responses include `"item_id"` alongside `"layer"` when selected by `item_id`.
+
+Existing `selector.layer` calls are unchanged.
+
+### `set_pad_net` proves the whole footprint after the update (patch release)
+
+`set_pad_net` sends the pad's whole footprint back to KiCad, as KiCad 10 requires for a pad. Its read-back used to check only that the footprint kept its KIID and item count and that the edited pads held the net. It now shares the footprint update path with `set_teardrop_settings` and compares every field of the footprint, each pad and each other child with what was sent and with what was there before. A footprint that comes back changed anywhere else is reported as `ipc_outcome_unknown` naming the field, where it used to be reported as applied; KiCad reporting an error while the board holds the request is now reported as applied. Arguments and the success response are unchanged.
+
+A target that changes before the write now returns `stale_target`, rather than an uncertain outcome; nothing was written. The public `IpcPadNetOutcome` enum adds `Stale { reason }` for this refusal.
+
+### `set_symbol_properties` sets the Datasheet field (minor release)
+
+`set_symbol_properties` takes `datasheet`, a URL or path for the symbol's
+Datasheet field. Only the field's value changes; it keeps its position,
+visibility and effects, and the answer reports its previous and current value
+like the other fields. A `~` is written as an empty string, as `create_symbol`
+writes it.
+
+`fields` still refuses `Datasheet`, now pointing to the new argument, as it does
+for Value, Footprint and Description. Before, a symbol's Datasheet could only be
+set when `create_symbol` created it.
+
+### `set_symbol_properties` sets the Reference prefix (minor release)
+
+`set_symbol_properties` takes `reference_prefix`, the value of the symbol's
+Reference field (such as `U` or `J`), as `create_symbol` takes it. Only the
+field's value changes; the answer reports its previous and current value like
+the other fields.
+
+A value with nothing left once trailing digits and `?` are removed (`""`, `1`,
+`?`) is refused as `invalid_argument`, as KiCad's Symbol Properties dialog
+refuses it. A symbol without a Reference field is refused rather than given a
+second one, as for Value.
+
+`fields` still refuses `Reference`, now pointing to the new argument. Before, a
+symbol's Reference could only be set when `create_symbol` created it.
+
+### `set_via_positions` batches existing via moves (minor release)
+
+Load `pcb_copper` for the new live-only `set_via_positions` tool. Existing
+`move_via`, `query_vias` and `apply_copper` calls are unchanged.
+
+Give either `placements: [{uuid, x, y}]` for absolute millimetre destinations,
+or `uuids: ["..."]` and `offset: {x, y}` for one shared translation. The two
+forms are mutually exclusive and must select at least one unique via. The tool
+rounds to nanometres and refuses out-of-range coordinates and destinations,
+missing/non-via IDs, and locked or unknown-lock-state targets.
+
+`dry_run` defaults to `true`. Apply the identical plan with `dry_run: false` and
+`expected_plan_revision` from the dry run. The revision binds the exact live
+board snapshot, document, target preimages and normalized destinations. Changed
+copper or target properties require a new dry run. An unchanged plan does not
+open a commit.
+
+Apply uses one KiCad commit and reads every selected via back, including all
+native fields, not just position. If KiCad re-nets a via, a net-only mismatch
+restores the entire batch in a second commit and verifies the original messages.
+This is not a promise of atomicity: a failed or unverifiable write/restoration
+returns `mutation_outcome_uncertain` with `uuids` and requires inspection before
+retrying. A confirmed refusal is distinct from an uncertain mutation. Responses
+from the handler include the shared `outcome` metadata (dispatch/schema refusals
+retain their existing error contract); successful `vias` rows contain observed
+UUID, X and Y, with `source: "ipc_readback"`. Dry-run rows are planned destinations
+with `source: "ipc_plan"`, not observations of a completed move.
+
+No board is saved and no connected track is moved or stretched. Zone refill and
+DRC remain caller-controlled steps after a completed batch; refill before DRC.
+
+### Hierarchical sheet writers use KiCad's autoplacement spelling (patch release)
+
+Tools that rewrite hierarchical sheet items, including `edit_sheet`,
+`move_sheet`, `renumber_sheet_pages`, `move_region` and sheet pin edits, now
+write an enabled autoplacement flag as `(fields_autoplaced yes)` after the
+sheet attributes and before the stroke and fill. Copperpour still reads the
+legacy bare `(fields_autoplaced)` form. Callers that inspect raw schematic
+text should accept both forms.
+
+### Hierarchical sheet pins use KiCad's UUID field order (patch release)
+
+When Copperpour writes a hierarchical sheet pin, its `(uuid …)` follows `(at …)` and precedes `(effects …)`, matching KiCad. UUID values and tool arguments and responses are unchanged. Callers do not need to change their requests.
+
+### Whole-sheet writes pack `(pts …)` points as eeschema does (patch release)
+
+A tool that rewrites a whole `.kicad_sch` used to put each `(xy …)` point of a
+wire, bus or polyline on a line of its own. It now keeps a run of points on one
+line while the line is shorter than 99 characters, a tab counting one, as
+eeschema writes them, so the `(pts …)` blocks it did not edit come back as they
+were. A sheet saved with one point per line is repacked on its next write. No
+tool argument or response changes. Issue:
+[#20](https://github.com/Copperpour/Copperpour/issues/20).
+
+### `find_single_pin_nets` checks global and power nets across the project (minor release)
+
+A net named by a global label or a power symbol is now checked across the
+saved hierarchy of the project that owns the given sheet, as
+`resolve_schematic_ownership` establishes it, over every top-level sheet the
+project lists. Pins are counted once per sheet instance, as KiCad's netlist
+counts them: a pin on a sheet placed twice is two pins, and this includes the
+given sheet. When the design gives such a net a second pin, it is no longer
+listed in `nets`; its name is in the new `cross_sheet_resolved` array.
+
+`cross_sheet_unverified: false` on a listed net now means it was checked
+project-wide, unless a hierarchical label also names it. The new
+`sheets_checked` gives the number of sheet files read.
+
+With no owning project, ambiguous or unproven ownership (for example two
+`.kicad_pro` files that both could own the sheet), or a hierarchy that cannot
+be walked, the response is as before and carries neither new key.
+`single_pin_net_count` counts the nets still listed.
+
+### `edit_footprint_pad` and `set_footprint_metadata` set solder mask and paste margins (minor release)
+
+Both tools accept `solder_mask_margin` and `solder_paste_margin` (mm) and
+`solder_paste_margin_ratio` (a fraction, as KiCad stores it: `-0.1` for
+-10 %), as agreed on
+[#637](https://github.com/Copperpour/Copperpour/issues/637).
+`edit_footprint_pad` sets a pad's own margins, on every matching pad with
+`match_all`; `set_footprint_metadata` sets the footprint's own.
+
+- **Values:** a number writes the override where KiCad writes it. `0` is an
+  override like any other value, since KiCad's format 20240202.
+  `"inherited"` removes the override, so the footprint's or the board's
+  value applies. Omitting an argument leaves the margin as it is.
+- **Refused** as `invalid_argument` on the argument, with nothing written:
+  anything else, such as `null` or a numeric string; a length beyond the
+  largest KiCad keeps; and `0` in a file of format 20240201 or older, where
+  KiCad reads a margin of 0 as inherited.
+- **Answer:** `edit_footprint_pad` reports each margin set as
+  `{"previous": …, "current": …}`, read as KiCad reads the pad, with
+  `"inherited"` for no override; pads that disagree give a list of the
+  distinct pairs. `set_footprint_metadata` reports a changed margin in
+  `changed_fields` and `changes`, as it does its other fields.
+- `set_footprint_metadata` now also accepts a call with only margins.
+
+### The Specctra round trip takes bottom-side footprints (minor release)
+
+`export_specctra_dsn` no longer refuses a footprint on `B.Cu`
+([#430](https://github.com/Copperpour/Copperpour/issues/430), part of
+[#37](https://github.com/Copperpour/Copperpour/issues/37)). A bottom
+footprint is written as KiCad's own exporter writes it: its front image, the
+SMD pads on `F.Cu` and each pin's own turn mirrored, placed `back` at KiCad's
+rotation plus 180 (normalized to 0..360). The router mirrors that image back
+onto `B.Cu`. A bottom footprint's SMD pad must be on `B.Cu`, as a front
+footprint's must be on `F.Cu`; any other layer is still refused. With the
+KiCad 10 native bridge, KiCad's DSN must give every bottom footprint the same
+side, rotation, pins and padstacks, or it is refused.
+
+The reverse manifest keeps its schema. Each component's `side` is now the
+side its footprint is on (`front` or `back`, it was always `front`), and its
+`rotation_degrees` is the DSN `place` rotation. `supported_profile.component_side`
+is derived from the footprints: `front`, `back` or `both`.
+`apply_specctra_ses` and `plan_specctra_ses_import` refuse a manifest whose
+component side differs from its footprint on the live board, or whose profile
+side does not match its components, and still refuse a session that changes a
+footprint's side, in every mode.
+
+In the `export_specctra_dsn` response, `capabilities.supported_profile` is now
+`even_layer_both_sides_circle_rect_roundrect_oval_no_existing_routing_zones_as_planes`,
+and `capabilities.component_side` is new: `front`, `back` or `both`, from the
+exported footprints.
+
+### The Specctra round trip keeps copper zones as planes (minor release)
+
+`export_specctra_dsn` no longer refuses a board with copper zones
+([#430](https://github.com/Copperpour/Copperpour/issues/430), part of
+[#37](https://github.com/Copperpour/Copperpour/issues/37)). Each zone is
+written as its outline, one DSN `plane` of the zone's net on every copper
+layer it covers, as KiCad's own exporter writes it; its fill is not
+exported. Freerouting then reaches a plane through vias instead of routing
+its net. Still refused, each with its own message: a rule area (keep-outs stay
+with [#81](https://github.com/Copperpour/Copperpour/issues/81)), a zone
+without a net, an outline with a cutout, an outline point that is not a
+straight-edge corner, a zone on a layer that is not one of the board's copper
+layers, a zone inside a footprint, and a zone whose net has no pad.
+
+A copper layer the board's layer table marks `power` is now a DSN `power`
+layer, where Freerouting lays no track, as KiCad's exporter writes it; it was
+always `signal`. `signal`, `mixed` and `jumper` layers stay `signal`. With
+the KiCad 10 native bridge, KiCad's planes must be the same outlines on the
+same layers and nets, in any order, and its layer types the same, or the
+native DSN is refused.
+
+The reverse manifest moves to schema 3. `supported_profile.copper_zones` is
+`true` when the board has zones, and the new `zones` list counts them per
+copper layer and net (`{"layer", "net", "count"}`); a board without zones
+omits it. `apply_specctra_ses` and `plan_specctra_ses_import` refuse a
+manifest whose inventory differs from the live board's, and still read a
+schema 1 or 2 manifest of a board without zones.
+
+The import never creates, changes, deletes or refills a zone. Both tools'
+responses have a new `zone_refill` object: `required` (whether the board has
+zones), `zones` (the manifest's inventory) and `remedy` (what to run, or
+`null`). It is a declared consequence of the import, not an observation of
+the fills ([#71](https://github.com/Copperpour/Copperpour/issues/71)): the
+candidate DRC of `apply_specctra_ses` runs on the fills as exported, so
+refill them (`refill_zones`, or `run_drc` with `refill_zones` and
+`sync_live_board`) before judging it.
+
+In the `export_specctra_dsn` response, `capabilities.supported_profile` is now
+`even_layer_front_side_circle_rect_roundrect_oval_no_existing_routing_zones_as_planes`,
+and `capabilities.copper_zones` is new: the exported board's zone count.
+
+### `export_specctra_dsn` adopts KiCad courtyard polygons and sub-micrometre pins (minor release)
+
+Native Specctra adoption (`native_bridge_mode: "prefer"` or `"require"`)
+previously refused KiCad DSNs from ordinary stock footprints because of two
+parser/correlator limits ([#98](https://github.com/Copperpour/Copperpour/issues/98)):
+
+- **Courtyard polygons:** KiCad exports a footprint's `fp_rect` courtyard as
+  `(outline (polygon ...))`, which the underlying Specctra syntax validator
+  rejected. Syntax validation now accepts `(outline (polygon ...))` while
+  keeping the native DSN byte-for-byte unchanged.
+- **Sub-micrometre pin positions:** Stock footprints such as `R_0805_2012Metric`
+  place pads at ±0.9125 mm (±912.5 µm), and 45°-rotated footprints can store
+  nanometre-rounded offsets such as ±499.999 µm. Copperpour's DSN model now
+  preserves pad offsets at nanometre resolution—so both the default Rust
+  exporter (`native_bridge_mode: "disable"` or `prefer` fallback, e.g. `-912.5`
+  instead of `-913` and `±499.999` instead of `±500`) and native adoption write
+  or match sub-micrometre pin coordinates, with native pins compared within one
+  DSN resolution step (0.1 µm).
+
+No tool names, arguments, or manifest schema fields changed. Callers comparing
+Rust DSNs or routing results will see exact sub-micrometre pin coordinates
+instead of whole-micrometre rounded ones, and boards with stock footprints that
+previously fell back to Rust under `prefer` or failed under `require` can now
+adopt KiCad's native DSN directly.
+
+### The Specctra round trip takes 2 to 32 copper layers (minor release)
+
+`export_specctra_dsn` no longer refuses a board whose copper is not exactly
+`F.Cu` and `B.Cu` ([#430](https://github.com/Copperpour/Copperpour/issues/430),
+[#37](https://github.com/Copperpour/Copperpour/issues/37)). Any stack KiCad
+gives a board is exported: `F.Cu`, `In1.Cu`..`In<N-2>.Cu` and `B.Cu`, N even,
+written top to bottom as DSN signal layers 0 to N-1 whatever the order of the
+board's layer table. A copper set with a gap, a repeat or a missing outer
+layer is still refused. Through-hole pads must cover every copper layer
+(`*.Cu`, or every copper layer listed once, in any order); a through-hole pad
+on `F.Cu` and `B.Cu` only of a four-layer board is refused. A locked via must still be a through via, which
+KiCad writes as `F.Cu` to `B.Cu` on any stack; its DSN padstack, like each
+routing via's, has a shape on every copper layer. Component side, zones and
+custom rules are unchanged.
+
+The reverse manifest keeps schema 2: `supported_profile.copper_layers` is the
+board's copper layer count instead of always `2`, and `layers` maps each of
+them. `apply_specctra_ses` accepts such a manifest when its layer mappings are
+exactly the stack of that count, indexed top to bottom; a manifest written by
+an earlier release, with two layers, is read as before. A session wire on a
+layer the manifest does not map is still refused.
+
+In the `export_specctra_dsn` response, `capabilities.supported_profile` is now
+`even_layer_front_side_circle_rect_roundrect_oval_no_existing_routing_or_zones`;
+it was `two_layer_front_side_circle_rect_roundrect_oval_no_existing_routing_or_zones`.
+`capabilities.copper_layers` is new: the exported board's copper layer count.
+Callers that compared the profile string to the old value should read
+`copper_layers` instead.
+
+### `export_specctra_dsn` refuses KiCad's native DSN when it merges pads of different drills (patch release)
+
+KiCad's native Specctra exporter names a pad's padstack after its copper
+alone, so two pads with the same shape and size but different drills share one
+padstack name. The native bridge adopted that DSN, and its reverse manifest
+then held the same padstack name twice: `plan_specctra_ses_import` and
+`apply_specctra_ses` refused it with "manifest contains an empty or duplicate
+padstack name", only once the board had been routed. The export now refuses
+the native DSN itself, with "KiCad native DSN gives one padstack '…' to pads
+that the Rust export keeps apart: …", naming each pad with its drill. With
+`native_bridge_mode` `prefer` the export uses the Rust DSN, which names one
+padstack per shape and drill, and reports the refusal in
+`native_bridge_diagnostics`; with `require` it fails before any routing. Boards
+whose pads do not share a shape across drills are unaffected.
+
+### `export_specctra_dsn` exports oval pads (minor release)
+
+A pad with shape `oval`, as most through-hole connectors have, was refused with
+`pad <reference>-<number> has shape 'oval'`
+([#384](https://github.com/Copperpour/Copperpour/issues/384)). It is now
+exported as KiCad's own Specctra exporter writes it: a `path` whose width is the
+pad's shorter side, along its longer axis, on each copper layer of the pad. An
+equal-sided oval is a path of zero length. An oval drill (a slot) is still
+refused.
+
+What changes for a caller:
+
+- The response's `capabilities.supported_profile` is now
+  `two_layer_front_side_circle_rect_roundrect_oval_no_existing_routing_or_zones`;
+  it was `two_layer_front_side_circle_rect_roundrect_no_existing_routing_or_zones`.
+- In the reverse manifest, `supported_profile.pad_shapes` lists `oval`, and an
+  oval padstack has `"shape": "oval"`.
+- With `native_bridge_mode` `prefer` or `require`, KiCad's oval padstacks are
+  matched to Copperpour's. A stock footprint's native DSN still fails to parse
+  on its courtyard polygon, so it isn't adopted
+  ([#98](https://github.com/Copperpour/Copperpour/issues/98)).
+
+### The Specctra round trip accepts pads on no copper layer (minor release)
+
+`export_specctra_dsn` no longer refuses a footprint whose pads include one
+on no copper layer, such as the unnumbered paste apertures over the exposed
+pad or tab of KiCad's stock QFN, DFN, SO and TO footprints
+([#458](https://github.com/Copperpour/Copperpour/issues/458)). An SMD pad
+whose layers are all technical (`F.Paste`, `B.Mask`, ...) is left out of the
+DSN image, as KiCad's own exporter leaves it out, so the router never sees
+it. An unnumbered pad with copper, and an `np_thru_hole` pad, are still
+refused.
+
+The reverse manifest moves to schema 4. Each component lists such pads in
+the new `non_copper_pads` array (`{"pad_number", "pad_uuid", "layers"}`;
+`pad_number` may be empty); a component without them omits it.
+`apply_specctra_ses` and `plan_specctra_ses_import` compare that list with
+the live board's and refuse the session when a pad was added, removed,
+renumbered or moved to other layers since the export. They still read a
+schema 1 to 3 manifest, which never records one.
+
+### `export_specctra_dsn` exports pads that share a number (minor release)
+
+A footprint whose pads share a number, such as a connector's two `MP` pads, was
+refused with `footprint '<reference>' has duplicate pad number '<number>'`
+([#338](https://github.com/Copperpour/Copperpour/issues/338)). Each such pad is
+now its own DSN pin, on its own net. The first, by pad UUID, keeps the number as
+its name, and the others get `@1`, `@2`, as KiCad's own Specctra export names
+them: `J1-MP` and `J1-MP@1`. Pads with a number of their own are named as
+before.
+
+The reverse manifest's `schema_version` is now 2. Each pin adds `pad_uuid`, the
+pad's KiCad UUID, which says which physical pad a DSN pin is.
+`plan_specctra_ses_import` and `apply_specctra_ses` now check every manifest pin
+against the live board's pads, by UUID, number, net and name, and refuse a
+mismatch before anything is planned. They still read a schema 1 manifest,
+checked by number. A board with a pad without a UUID, or a UUID two pads share,
+is refused, and so is a pad number equal to a name the suffix would give.
+
+With `native_bridge_mode` `prefer` or `require`, a board with such pads is not
+adopted from KiCad's native DSN: KiCad names them by file order, which isn't
+proven to map one to one. `prefer` uses Copperpour's export; `require` refuses.
+
+### `export_specctra_dsn` supports rounded board outlines (minor release)
+
+The Rust exporter used to refuse `Edge.Cuts` arcs. It now flattens circular
+arcs into line segments within the board project's `max_error` tolerance,
+keeping one closed `Edge.Cuts` loop. Boards without a `.kicad_pro` file use
+KiCad's 5 µm default. Unsupported outline geometry and multiple or open loops
+remain refused.
+
+The reverse manifest's `supported_profile.outline` now describes a closed
+loop of lines and circular arcs flattened within `max_error`; callers should
+not rely on the former straight-lines-only description.
+
+### The Specctra round trip keeps rule areas as keep-outs (minor release)
+
+`export_specctra_dsn` no longer refuses a board with rule areas
+([#81](https://github.com/Copperpour/Copperpour/issues/81), part of
+[#37](https://github.com/Copperpour/Copperpour/issues/37)). Each supported board
+rule area is written as its outline per copper layer it covers:
+
+- `tracks` and `vias` not allowed -> `keepout`
+- `tracks` not allowed, `vias` allowed -> `wire_keepout`
+- `vias` not allowed, `tracks` allowed -> `via_keepout`
+
+What Specctra DSN keep-outs cannot express without approximation is still
+refused, each with its own message: a rule area that allows both tracks and vias
+(pour-, pad- or footprint-only keep-outs, which KiCad's own exporter turns into
+full `keepout`s), a rule area with room `placement` enabled, a rule area with a
+net, an outline with a cutout or non-straight edge, a rule area off the copper
+stack, a zone inside a footprint, and any vertex off the whole-micrometre grid.
+For example, `113.001` mm is supported but `113.0006` mm is refused. This check
+runs before either writer; vertices are never rounded into a smaller keep-out. With the KiCad 10 native bridge, KiCad's
+keep-outs must match the exported kinds, layers and closed outlines in any
+order, or the native DSN is refused.
+
+The DSN kinds encode the tracks/vias restrictions. Pad, copper-pour and footprint
+flags do not change the DSN kind when routing is blocked: those objects and their
+original rule-area settings remain in the revision-bound KiCad board, and SES
+import cannot move components or change zones. Original copper zones still need
+refill after routing. Areas that restrict only these non-routing objects remain
+refused because translating them to full routing keep-outs would change intent.
+
+The reverse manifest moves to schema 5. `supported_profile.rule_areas` is `true`
+when the board has rule areas, and the new `rule_areas` list records each one's
+`kind` (`keepout`, `wire_keepout`, `via_keepout`), `layers` and `outline_um`
+points in canonical order; a board without rule areas omits it.
+`apply_specctra_ses` and `plan_specctra_ses_import` refuse a manifest whose
+rule-area inventory differs from the live board's, still read a schema 1 to 4
+manifest of a board without rule areas, and reject any SES track, arc or via
+whose copper overlaps an active rule-area keep-out on a covered layer.
+
+In the `export_specctra_dsn` response, `capabilities.supported_profile` is now
+`even_layer_both_sides_circle_rect_roundrect_oval_no_existing_routing_zones_as_planes_rule_areas_as_keepouts`,
+and `capabilities.rule_areas` is new: the exported board's rule-area count.
+
+### `plan_specctra_ses_import` and `apply_specctra_ses` accept negative footprint angles (patch release)
+
+KiCad writes a footprint's angle in (-180, 180], and Freerouting returns it in
+[0, 360): a footprint at -90 degrees comes back as 270. The import compared the
+two numbers as written and refused every board with a footprint at a negative
+angle with "SES changes placement of component '…'". It now compares placement
+angles modulo 360, with the same 1e-9 degree tolerance. A session that really
+turns a footprint (90 to 180, for example) is still refused with the same
+error; position, side and image checks are unchanged.
+
+### `export_specctra_dsn` accepts two-edge (D-shaped) outlines (minor release)
+
+The Rust exporter used to refuse an `Edge.Cuts` loop of fewer than three lines
+or arcs, so a D-shaped board (one line and one arc) failed with "need at least
+three Edge.Cuts lines or arcs" although KiCad exports it. Two edges now form a
+valid loop when it encloses an area. Two straight lines between the same two
+points, or one arc drawn twice, are refused with "two Edge.Cuts edges enclose
+no area". A board without any `Edge.Cuts` line or arc is refused with "no
+Edge.Cuts lines or arcs". A lone full `gr_circle` outline is still refused.
+
+### `split_wire_at_point` writes a junction only at a T that has none (patch release)
+
+`split_wire_at_point` used to write a junction dot at every split point: a
+second dot where a T already had one, a dot where only the wire's two halves
+meet, and a dot where another wire crosses with nothing ending there, which
+joined that wire to the split one. KiCad keeps such dots through a resave and
+its ERC does not report them. Now the point gets a dot only where a wire end,
+pin, sheet pin or bus entry there makes three or more distinct wire exits and
+none stands, and the response adds `junctions_added_count`, 0 or 1. A caller
+that split a wire at a crossing to join the two adds the dot with
+`add_junction`. Issue: [#570](https://github.com/Copperpour/Copperpour/issues/570).
+
+### `create_symbol` and `edit_symbol_pin` warn when a pin is off the 1.27 mm grid (patch release)
+
+`create_symbol` now adds a per-unit entry to `warnings` when any resolved pin
+connection point `(x, y)` does not lie on KiCad's 1.27 mm schematic grid, and
+`edit_symbol_pin` now returns a `warnings` array when a position edit (`x` or
+`y`) leaves the pin off the 1.27 mm grid. Both tools still write the requested
+coordinates; callers that expect a clean `warnings`-free response should pass
+multiples of 1.27 mm (or omit `x`/`y` on `create_symbol` for automatic
+grid-aligned placement).
+
+### Transaction conflict classification across project and schematic tools (minor release)
+
+`SexpError::TransactionConflict` now carries a typed `TransactionConflictKind` (`BeforeImage`, `Recovery`, or `AfterImage`) so callers and MCP dispatch distinguish why a durable multi-file transaction failed:
+
+- `create_project` still returns `conflict` naming the colliding project file when a target already exists (`BeforeImage`), now returns `conflict` naming the stuck journal and `copperpour transaction status` / `recover` / `abandon` when an older journal in the directory cannot be recovered (`Recovery`), and returns `mutation_outcome_uncertain` when after-image durability verification fails (`AfterImage`).
+- `rename_project`, `set_schematic_title_block`, `annotate_schematic` (`hierarchy`), `upgrade_library`, and other transaction-backed schematic tools (`add_hierarchical_sheet`, `duplicate_sheet`, `renumber_sheet_pages`, sheet mutations) now classify `BeforeImage` as `conflict`, `Recovery` as `conflict` naming the stuck journal and recovery command, and `AfterImage` as `mutation_outcome_uncertain` instead of `handler_error` or a stale-target message.
+
+Callers branching on `error.kind` should handle `conflict` (safe refusal; inspect `message` / `paths` for a stuck journal) and `mutation_outcome_uncertain` (reload and inspect before retrying).
+
+### Finish pending version 2 transaction journals before downgrading (minor release)
+
+Copperpour still writes version 1 journals for transactions that do not need to guard an absent path. A transaction that needs to make sure a path stays absent writes a version 2 journal. Earlier Copperpour releases cannot inspect or recover version 2 journals.
+
+Before downgrading, use a release that supports version 2. Run `copperpour transaction status <project-dir>` to check for pending journals. If any remain, run `copperpour transaction recover <project-dir>`, then run `status` again and confirm it reports `No active transaction journals.`
+
+If an editor lock blocks recovery, close KiCad and retry. If `status` lists a file as `divergent`, inspect the file and restore it to the expected state only if you can do so without losing edits. Do not force-abandon a journal just to downgrade: abandoning does not undo writes that already happened. If you already downgraded and the older release rejects the journal, return to a release that supports version 2 to finish recovery.
+
+### File transactions recheck replacement targets before writing (patch release)
+
+Apply and recovery stop if a replacement target no longer matches its recorded
+before image at the final check. The changed file is left untouched. Earlier
+writes may already have applied, so inspect the retained journal with
+`copperpour transaction status <project-dir>` before retrying. No journal format
+or command changes are required.
+
+Rust callers of `try_commit_file_transaction` can also receive the older
+journal in `TransactionFailure::journal` if implicit recovery hits a conflict
+after writing a target. This path does not mean the new transaction started
+or that the journal still exists after a cleanup failure.
+A KiCad lock that blocks publication after journaling is reported as a
+transaction conflict with the journal path. A lock found during preflight
+keeps its existing error.
+
+If journal recovery publishes a target and then stops, it reports
+`TransactionConflictKind::AfterImage`, and tools report
+`mutation_outcome_uncertain`. This includes writes from an earlier journal
+in the same recovery call. A divergent journal rejected before a target write
+still uses `Recovery` and reports `conflict`. Dry runs do not replay journals.
+
+### `update_pcb_from_schematic` applies a routed pad net change the caller acknowledges (minor release)
+
+A pad net change on a net that routed copper uses, as a renamed or split net
+makes on a routed board, was a `routed_pad_net_change` conflict with no way
+past it. A caller can now acknowledge each one:
+
+- Each `routed_pad_net_change` diagnostic carries
+  `net_change: { "pad", "from", "to" }`. The key is absent from every other
+  diagnostic but the note below.
+- `acknowledged_net_changes: [{ "reference", "pad", "from", "to" }]` names
+  the changes to plan anyway, each copied from a diagnostic. A named change
+  is planned as any other pad net change: the pad takes its new net, and
+  Copperpour sends no copper. KiCad's commit then moves a track or via onto
+  the new net when every pad it joins is on it, as after its own Update PCB,
+  and leaves the rest. A `routed_pad_net_change_acknowledged` diagnostic with
+  the same `net_change` notes it and refuses nothing.
+- A named change the plan does not make is a
+  `net_change_acknowledgement_unmatched` conflict. A routed change left
+  unnamed, and every other conflict, still refuses the plan.
+- The acknowledgement is part of the plan: dry run with it, then apply with
+  the same acknowledgements and that dry run's `plan_revision`. The
+  conflict's own revision is stale for the apply.
+- The apply's response adds
+  `routed_copper: [{ "net", "before_count", "after_count" }]`, each named
+  net's tracks, arcs, vias and copper zones before the commit and after, as
+  KiCad reads them back, and `drc`, kicad-cli's DRC of the board KiCad then
+  holds under the project's rules, with the keys `apply_specctra_ses`
+  reports. The board file is not saved. Both keys are absent from every other
+  response.
+- If the readback or the DRC fails after the commit, or a copper zone reads
+  back with no net it can be counted on, the response is still `applied`, is
+  an error, and carries `acknowledged_apply_unchecked`: the plan must not be
+  applied again.
+
+Without `acknowledged_net_changes` the tool behaves as before, but for
+`net_change` on `routed_pad_net_change`.
+
+### `update_pcb_from_schematic` places pads with their fabrication properties (minor release)
+
+A footprint the sync added lost every pad's fabrication property,
+`(property pad_prop_heatsink)`, `pad_prop_bga`, `pad_prop_mechanical` and the
+rest, without saying so, and KiCad's DRC then reported
+`lib_footprint_mismatch` for it
+([#149](https://github.com/Copperpour/Copperpour/issues/149)). On KiCad
+10.0.7 and later each added pad now gets its library property, and the
+post-apply readback reports a pad property the board lost as
+`board_readback_differs`.
+
+KiCad before 10.0.7 can't take the property over its API. There the footprint
+is still placed without it, and the dry run and the apply carry a new
+non-blocking diagnostic, `pad_properties_not_carried`. It names the footprint in
+`footprint_id`, the parts in `references`, and the pads, their properties and
+the KiCad version in `message`. KiCad's Tools > Update Footprints from Library
+restores the properties. The plan's `status` stays `ready`. Its
+`plan_revision` includes whether the properties are carried, so a plan made on
+one side of KiCad 10.0.7 is stale on the other.
+
+### `update_pcb_from_schematic` gives footprints their sheet name, sheet file and footprint filters (minor release)
+
+A footprint the sync placed had no sheet name, sheet file or footprint
+filters until KiCad's own Update PCB ran, and KiCad's rule areas generated
+from sheets, and Repeat Layout with them, find a sheet's footprints by their
+sheet name ([#237](https://github.com/Copperpour/Copperpour/issues/237)). The
+sync now sets all three as Update PCB does: the symbol's sheet path, its
+sheet's file and its library symbol's footprint filters.
+
+Each planned `add` and `update` in `changes` carries them as `sheet_name`,
+`sheet_file` and `footprint_filters`. A footprint whose three differ from the
+schematic's is an `update`, so the first sync of a board an earlier sync built
+plans an update of every footprint that sync placed. A footprint that owns
+groups, points or variants and differs only in these three leaves the plan
+instead, with a `footprint_sheet_not_updated` diagnostic that refuses nothing:
+KiCad's Update PCB sets its sheet in place. One that differs in anything else
+as well gets a `footprint_children_not_carried` diagnostic, and its part is
+skipped (`update-pcb-skips-unbuildable-parts.md`). The
+post-apply readback reports a sheet the board did not keep as
+`board_readback_differs`.
+
+### `update_pcb_from_schematic` replaces a footprint the schematic names differently (minor release)
+
+A footprint whose symbol names another library footprint stopped the whole
+sync with a `footprint_id_changed` conflict. The sync now replaces it in place,
+as KiCad's Update PCB does (`BOARD_NETLIST_UPDATER::replaceFootprint`):
+
+- The planned change is an `update` with
+  `replace_footprint: { "from": "<old Library:Footprint>", "to": "<new>" }`.
+  The key is absent from every other update.
+- The replaced footprint keeps its KIID, position, rotation, side, lock and
+  symbol link, and each pad's net and schematic pin by pad number. It takes
+  the new library footprint's pads, artwork, texts, custom properties,
+  attributes, its own clearance, zone connection and solder mask and paste
+  margins, and 3D models, and Reference and Value take the library's
+  position and style when the library footprint states them as properties
+  (KiCad 8 and later); a footprint in the older `fp_text reference` form
+  leaves the placed text as it is. The schematic's value, fields, DNP and BOM exclusion are
+  then set as for any update; every symbol field is set again, because the
+  old custom properties are gone.
+- A locked footprint is not replaced. Its other differences are still
+  planned, and the plan carries a `footprint_locked_not_replaced` diagnostic
+  that refuses nothing, as KiCad's Update PCB warns.
+- The dry run builds each replacement once, so a planned replacement is one
+  the apply can build. One it cannot build is reported when the new footprint
+  does not resolve (`footprint_library_resolution_failed`), cannot be read
+  (`footprint_library_read_failed`) or cannot be rebuilt losslessly
+  (`unsupported_library_footprint`), when it lacks a pad the schematic
+  connects (`footprint_pad_missing`), or when it would drop a pad that carries
+  a net on the board (`footprint_replacement_drops_connected_pad`). Its part
+  is skipped and listed under `skipped_footprints`; see
+  `update-pcb-skips-unbuildable-parts.md`.
+
+`footprint_id_changed` is no longer reported. A caller that read it as "this
+part needs a manual footprint change" can review the planned replacement in
+the dry run and apply it.
+
+### `update_pcb_from_schematic` matches equivalent root-prefixed schematic identities (patch release)
+
+`update_pcb_from_schematic` now normalizes only the requested root schematic's
+UUID prefix (`/<root_uuid>/...`) when comparing exported root-relative netlist
+identities against stored PCB footprint `symbol_path` values.
+
+- Existing footprints carrying either `/<root_uuid>/<sheet...>/<symbol>` or
+  `/<sheet...>/<symbol>` match the exported component (including reference
+  renames, unassigned components, and `on_board=no` exclusions) and retain
+  their stored PCB `symbol_path` and pose on updates.
+- Newly added footprints continue to receive native root-relative paths from
+  the netlist export.
+- Foreign root UUIDs, other sheet instances, other symbol UUIDs, and boards
+  carrying simultaneous rooted and root-relative aliases for the same identity
+  remain refused (`reference_identity_conflict` / `duplicate_board_identity`)
+  before any PCB mutation.
+
+No caller changes are required.
+
+### `update_pcb_from_schematic` skips a part it cannot build instead of refusing the sync (minor release)
+
+One part the dry run found it could not build made the whole sync a conflict,
+with nothing planned for the parts that could be built. Such a part is now
+skipped and every other part is synced, as KiCad's Update PCB reports its
+errors and still commits the rest (`BOARD_NETLIST_UPDATER`). KiCad handles
+some of these parts differently: it adds a footprint that lacks a connected
+pad and reports the pad, and it keeps the old footprint of a replacement it
+cannot build. The sync leaves the whole part as it is instead.
+
+- A part is skipped when its library footprint does not resolve, cannot be
+  read or cannot be placed (`footprint_library_resolution_failed`,
+  `footprint_library_read_failed`, `unsupported_library_footprint`), when its
+  footprint lacks a pad the schematic connects (`footprint_pad_missing` for an
+  added part), when its update would drop groups, points or variants the
+  footprint owns (`footprint_children_not_carried`), or when its replacement
+  footprint cannot be built (the replacement codes of
+  `update-pcb-replaces-footprints.md`, including
+  `footprint_replacement_drops_connected_pad`).
+- New response key `skipped_footprints`: each skipped part's diagnostic, with
+  the same fields and codes the conflict carried (`code`, `message`,
+  `reference`, `references`, `footprint_id`). One diagnostic can name several
+  parts that share a footprint, and one part can have several diagnostics.
+  The apply answer carries it too.
+- New count `coverage.skipped_footprint` (`planned`, `applied`): how many parts
+  were skipped, by the dry run and by the apply (as `unassigned_footprint`
+  counts parts left out). The other counts no longer include them, nor the pad
+  net changes of a skipped update.
+- The status is `ready` when anything else is left to apply, and the apply
+  applies only that. The skipped parts are part of the plan revision.
+- A note about a skipped part, such as `footprint_locked_not_replaced`, is
+  dropped from `diagnostics`. So is `routed_pad_net_change_acknowledged`: an
+  acknowledged routed pad net change (`acknowledged_net_changes`) goes with its
+  part: the apply neither makes it nor runs the post-apply copper and DRC
+  check for it.
+
+Unchanged:
+
+- With nothing else to apply, the dry run is a `conflict` as before, with the
+  same diagnostics in `diagnostics`, counted in `coverage.conflicts`, and
+  `skipped_footprints` empty. So is a plan whose updates cannot be checked
+  because the board KiCad wrote cannot be read or lacks a planned footprint:
+  that is not the part's fault, so nothing is skipped for it.
+- The planner's own conflicts still refuse the whole sync: a duplicate
+  reference, a pad net change on routed copper that `acknowledged_net_changes`
+  does not name, an acknowledgement that matches no change, a pad a placed
+  footprint lacks (without a replacement).
+
+A caller that read a `conflict` as "nothing can be synced until every part is
+fixed" should check `skipped_footprints` on a `ready` plan: those parts stay as
+they are on the board until the cause is fixed and the sync is run again.
+
+### New toolset `library_maintenance` with `upgrade_library` (minor release)
+
+The new `library_maintenance` toolset holds `upgrade_library(library_path,
+dry_run?, limit?)`. It upgrades a `.kicad_sym` symbol library or a `.pretty`
+footprint library to the running KiCad's file format with `kicad-cli sym
+upgrade` or `fp upgrade`. The upgrade runs into a temporary copy. Each file
+older than the format kicad-cli writes is compared with its upgraded copy as
+KiCad reads both, including the conversions KiCad's loader makes on older
+files: overbars, `%R`/`%V`, footprint attributes before 20200826, margins and
+clearances of 0 up to 20240201, net ties from keywords up to 20220815, De
+Morgan body styles before 20250827, pad layer wildcards, and hidden footprint
+texts as fields.
+
+- **Not compared:** graphics, zones and groups are compared by count, not
+  geometry, and text positions not at all.
+- **Answer:** `kind` (`symbol` or `footprint`), `status` (`current`, `ready`,
+  `blocked`, or `applied` after an apply), `format_version`, `counts` per file
+  status (`current`, `upgraded`, `differs`), and `files`: up to `limit`
+  (default 50) entries, those that differ first, then those with `notes`, then
+  upgraded and current ones, each with `version`, `upgraded_version`, `status`,
+  `differences` and, where there are any, `notes`. `shown` and `truncated`
+  describe the list. `warning` says that older KiCad versions cannot open an
+  upgraded file.
+- **Dry run** (the default): writes nothing. An unfinished transaction in the
+  library's directory is a `conflict`, since it could still change the files.
+- **Apply** (`dry_run: false`): first completes an unfinished transaction in
+  the library's directory and answers how many in `settled_transactions`; one
+  it cannot complete is a `conflict` with nothing written. It then replaces the
+  older files in one journalled transaction and answers `replaced`, the number
+  of files. A file already in kicad-cli's format is left as it is. It is
+  refused, writing nothing:
+  - as `plan_blocked` when any file differs; `reasons` names the first
+    differences;
+  - as a `conflict` when a file changed after the read;
+  - as a handler error when a file to replace is read-only, or when the
+    library has more older files than the process may open at once.
+
+  A failure after the transaction's journal is written is
+  `mutation_outcome_uncertain`: the next apply completes the transaction, and
+  `copperpour transaction status <directory>` shows what was applied.
+- **Notes:** a footprint whose name inside the file is not its file name is a
+  note, not a difference: KiCad uses the file name.
+
+### Schematic viewer defaults to the local X display on Linux (patch release)
+
+**Open in KiCad** now starts KiCad with `DISPLAY=:0` on Linux when both
+`DISPLAY` and `WAYLAND_DISPLAY` are unset or empty. Existing display settings,
+`XAUTHORITY`, and runtime variables are preserved; the fallback affects only the
+KiCad child process. Other platforms and `launch_kicad_ui` are unchanged.
+
+If the fallback display is unavailable or inaccessible, the viewer still reports
+the startup failure, identifies the attempted fallback, and recommends configuring
+Copperpour with the desktop's display and `XAUTHORITY`. To use another display,
+set the server's display environment before starting Copperpour. The button label
+and tooltip now use the official KiCad spelling.
+
+### The schematic viewer renders with the server's `kicad-cli` (patch release)
+
+`open_schematic_viewer` now renders with the `kicad-cli` the other kicad-cli
+tools run. A bare `kicad_cli` (the default, `kicad-cli`) is looked up on `PATH`,
+then in the install paths, where it used to be handed to the OS unresolved. An
+empty one is looked up in the install paths, as `get_installation_info` does,
+then as `kicad-cli` on `PATH`; it used to search a separate list that lacked
+`~/Applications/KiCad` on macOS. An explicit path is still used as given.
+
+On Linux the install paths now include `/snap/kicad/current/usr/bin/kicad-cli`,
+which only the viewer used to try, so `get_installation_info` and the kicad-cli
+tools find a snap install too. Nothing to change in calls.
+
+### The viewer's Open in KiCAD honours `kicad_binary` (patch release)
+
+**Open in KiCAD** in a viewer started by `open_schematic_viewer` now runs the
+KiCad that `launch_kicad_ui` runs: the configured `kicad_binary`, else the GUI
+beside the configured `kicad_cli`, else the usual install paths, else `kicad`
+on `PATH`. It used to check only a fixed list of install paths and `kicad` on
+`PATH`, so a Flatpak wrapper or an `/opt` install set in `kicad_binary` was
+ignored.
+
+On Linux, both now also try `/usr/bin/kicad` and `/usr/local/bin/kicad` after
+`PATH`, so a server started with a reduced `PATH` still finds a stock install;
+`launch_kicad_ui` used to fall back to a bare `kicad` there. Nothing to change
+in calls.
+
+### Schematic viewer's Open in KiCAD reports a KiCad that exits at startup (patch release)
+
+`POST /open-in-kicad` on the browser viewer started by `open_schematic_viewer`
+now waits up to a second for KiCad to exit, as `launch_kicad_ui` does. A KiCad
+that exits in that time, such as one started with no `DISPLAY`, returns `503`
+with its exit status and the end of its stderr, where it used to return
+`200 {"spawned":true}`. A second request while one launch is being watched
+returns `409`. A KiCad that stays up still returns `200 {"spawned":true}`, now
+about a second later. KiCad no longer inherits the server's stdin and stdout.
+
+The page shows the error in its status bar. Fix the cause it names, for example
+the server's display, and click again.
+
+### `open_schematic_viewer` identifies missing schematics (minor release)
+
+> Later superseded by [standalone viewer retirement](retire-standalone-viewer.md):
+> the owner waived the planned release grace period and approved immediate removal.
+> Statements below about retention describe this earlier phase only.
+
+A schematic path that cannot resolve because it does not exist now returns
+structured `file_not_found` with the requested `path`, instead of a generic
+`handler_error`. Other resolution failures retain their existing legacy error text; clients
+should not interpret a permission error or symlink loop as a missing file.
+
+Correct the path before retrying. This refusal starts no viewer service or browser.
+Existing successful response fields, service ownership, browser-launch behavior,
+and the standalone Tauri deprecation window are unchanged.
+
+The shared browser handle adds `request_shutdown()`, a non-consuming shutdown
+signal. `is_running()` becomes false when stop is requested; `shutdown().await`
+waits for task teardown. The MCP registry replaces stopped services rather than
+reusing their credential URLs. No new MCP tool or HTTP stop endpoint is added.
+
+### The wiring tools refuse a pin that two placed symbols share (minor release)
+
+`connect_to_net`, `connect_pins`, `batch_connect_to_net` and
+`batch_connect_pins` resolved `reference` + `pin_number` to the first placed
+symbol carrying the pin, in file order, and reported success
+([#88](https://github.com/Copperpour/Copperpour/issues/88)). A duplicated
+reference, or a pin drawn on more than one placed unit of one symbol, now names
+more than one pin and is refused, as `add_power_symbol` already refused it.
+
+`connect_to_net` and `connect_pins` return `ambiguous_target`, with `target`
+(`R4 pin 1`) and `candidates` naming each pin by unit, UUID and position, and
+write nothing. Give `connect_to_net` the chosen pin's `pin_x` + `pin_y`; wire
+`connect_pins`' ends with `add_schematic_connection`. A missing component or pin
+is now `stale_target` with a `reason` (`component R99 is not present`,
+`U1 has no pin 9 on placed units 1, 3`) instead of a plain-text error. So is a
+reference with a placed unit whose library definition is not embedded: that
+unit may be the one carrying the pin, so it is no longer skipped.
+
+The batch tools skip such a pin and list it in `errors`
+(`R4 pin 1 names more than one placed pin: …`), and the rest of the batch still
+lands, as for a pin that does not resolve. Their other `errors` lines now read
+`R99 pin 1: component R99 is not present` instead of
+`Component 'R99' not found`.
+
+`add_power_symbol`'s `reason` for a missing pin now names the units searched:
+`R1 has no pin 9 on placed unit 1`.
+
+### `add_zone` and `add_copper_pour` refuse a vertex missing `x` or `y` (patch release)
+
+A `points` item without `x` or `y` used to be left out of the outline, and a
+zone of the remaining vertices was written and reported as added. Such a call
+is now refused as `invalid_argument` naming the item and coordinate, such as
+`points[3].y`, and nothing is written
+([#611](https://github.com/Copperpour/Copperpour/issues/611)), as
+`batch_add_junction` refuses a position missing either. A call whose vertices
+all carry both coordinates behaves as before.
+
 ## v0.16.1
 
 ### `copperpour init` registers `bin/copperpour` in the all-platforms package (patch release)

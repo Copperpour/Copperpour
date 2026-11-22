@@ -13,6 +13,12 @@ use std::path::Path;
 
 const UM_PER_MM: f64 = 1_000.0;
 
+/// Why the Specctra round trip refuses a project's custom rules, on export and
+/// on import. Freerouting routes only to what the DSN carries, whichever
+/// exporter wrote it.
+pub(crate) const CUSTOM_RULES_NOT_CARRIED: &str = "custom DRC rules are not carried to the \
+     router, so Copperpour cannot vouch for routes against them";
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct SesImportPlan {
     pub board_path: String,
@@ -259,12 +265,14 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
             manifest.resolution
         );
     }
+    if manifest.supported_profile.custom_rules {
+        bail!("{CUSTOM_RULES_NOT_CARRIED}: the manifest records custom rules");
+    }
     if copperpour_sexp::layers::CopperStack::new(manifest.supported_profile.copper_layers).is_err()
         || !matches!(
             manifest.supported_profile.component_side.as_str(),
             "front" | "back" | "both"
         )
-        || manifest.supported_profile.custom_rules
         || manifest.supported_profile.outline.is_empty()
         || manifest.supported_profile.pad_shapes.is_empty()
     {

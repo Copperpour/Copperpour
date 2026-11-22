@@ -1275,7 +1275,7 @@ pub enum IpcFootprintFieldBatchOutcome {
 }
 
 /// Readback-derived result of editing one text item in place, or one placed
-/// footprint's value and assembly flags ([`IpcFootprintEdit`]).
+/// footprint's value, assembly flags and lock ([`IpcFootprintEdit`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IpcTextEditOutcome<T> {
     /// The item already held every requested value; nothing was sent.
@@ -1303,6 +1303,8 @@ pub struct IpcFootprintEdit {
     pub dnp: Option<bool>,
     pub exclude_from_bom: Option<bool>,
     pub exclude_from_pos_files: Option<bool>,
+    /// The footprint's own lock.
+    pub locked: Option<bool>,
 }
 
 impl IpcFootprintEdit {
@@ -1312,11 +1314,12 @@ impl IpcFootprintEdit {
             && self.dnp.is_none()
             && self.exclude_from_bom.is_none()
             && self.exclude_from_pos_files.is_none()
+            && self.locked.is_none()
     }
 }
 
-/// A placed footprint's value and assembly flags, as KiCad reports them on
-/// the instance, which is where KiCad reads them (`FOOTPRINT::Deserialize`).
+/// A placed footprint's value, assembly flags and lock, as KiCad reports them
+/// on the instance, which is where KiCad reads them (`FOOTPRINT::Deserialize`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IpcFootprintState {
     pub reference: String,
@@ -1326,6 +1329,7 @@ pub struct IpcFootprintState {
     pub dnp: bool,
     pub exclude_from_bom: bool,
     pub exclude_from_pos_files: bool,
+    pub locked: bool,
     /// Whether the footprint belongs to a schematic symbol, whose DNP and
     /// BOM exclusion `update_pcb_from_schematic` carries to the board.
     pub linked_to_schematic: bool,

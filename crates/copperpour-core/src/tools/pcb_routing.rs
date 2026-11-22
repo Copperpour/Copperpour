@@ -5730,6 +5730,7 @@ mod apply_specctra_ses_candidate_drc_tests {
         checked: Option<std::path::PathBuf>,
         rules: Option<String>,
         writes: Vec<String>,
+        candidate_written: bool,
     }
 
     #[derive(Clone, Copy)]
@@ -5775,6 +5776,18 @@ mod apply_specctra_ses_candidate_drc_tests {
         drc_report_json: &str,
         failure: ItemFailure,
     ) -> Applied {
+        apply_with_manifest_edit(rules, extra, drc_report_json, failure, |_| {}).await
+    }
+
+    /// Serves `apply_specctra_ses` as [`apply_in_project`] does, with `edit`
+    /// applied to the exported reverse manifest first.
+    async fn apply_with_manifest_edit(
+        rules: &str,
+        extra: serde_json::Value,
+        drc_report_json: &str,
+        failure: ItemFailure,
+        edit: fn(&mut serde_json::Value),
+    ) -> Applied {
         let project = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         let seen = tempfile::tempdir().unwrap();
@@ -5786,7 +5799,9 @@ mod apply_specctra_ses_candidate_drc_tests {
         let export = crate::specctra::export_dsn(&board, SAVED, &routing_rules()).unwrap();
         let manifest = elsewhere.path().join("board.dsn.copperpour.json");
         let ses = elsewhere.path().join("board.ses");
-        std::fs::write(&manifest, export.manifest).unwrap();
+        let mut manifest_json: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        edit(&mut manifest_json);
+        std::fs::write(&manifest, manifest_json.to_string()).unwrap();
         std::fs::write(&ses, SES).unwrap();
         let candidate = elsewhere.path().join("board.freerouted.kicad_pcb");
         let report_file = seen.path().join("drc-report.json");
@@ -5984,6 +5999,7 @@ mod apply_specctra_ses_candidate_drc_tests {
             checked,
             rules: rules_seen,
             writes,
+            candidate_written: candidate.exists(),
         }
     }
 
@@ -6048,6 +6064,38 @@ mod apply_specctra_ses_candidate_drc_tests {
                 json!(["created-1", "created-3"])
             );
         }
+    }
+
+    /// #75: a manifest that records custom rules is refused before any
+    /// route transaction, candidate or DRC, with the reason that the rules
+    /// never reached the router.
+    #[tokio::test]
+    async fn a_manifest_recording_custom_rules_is_refused_before_apply() {
+        let applied = apply_with_manifest_edit(
+            RULES,
+            json!({}),
+            r#"{"violations":[],"unconnected_items":[],"schematic_parity":[]}"#,
+            ItemFailure::None,
+            |manifest| manifest["supported_profile"]["custom_rules"] = true.into(),
+        )
+        .await;
+        let body = &applied.body;
+        assert!(applied.result.is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "handler_error");
+        for text in [&body["message"], &body["error"]["reason"]] {
+            let text = text.as_str().unwrap();
+            assert!(
+                text.contains(
+                    "custom DRC rules are not carried to the router, so Copperpour cannot \
+                     vouch for routes against them: the manifest records custom rules"
+                ),
+                "{body}"
+            );
+            assert!(!text.contains("routing profile"), "{body}");
+        }
+        assert!(applied.writes.is_empty(), "{:?}", applied.writes);
+        assert!(!applied.candidate_written);
+        assert!(applied.checked.is_none(), "kicad-cli never ran");
     }
 
     #[tokio::test]

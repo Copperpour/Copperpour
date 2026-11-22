@@ -455,18 +455,27 @@ impl ToolContext {
 
     /// [`Self::ipc_endpoint`] and where it came from, for reporting the
     /// endpoint the calls use (`get_installation_info`). It costs what an IPC
-    /// call's own lookup costs, and shares the same ping backoff (250 ms to
-    /// 2 s) for a candidate set none of whose sockets answered (#32).
+    /// call's own lookup costs, and shares its ping backoff for a candidate
+    /// set that needs probing (#32).
     pub fn ipc_endpoint_with_origin(&self) -> (IpcEndpoint, IpcEndpointOrigin) {
-        let resolve = |candidates: &dyn Fn() -> Vec<String>,
-                       detect: &dyn Fn() -> copperpour_ipc::IpcDetection| {
-            endpoint_and_origin_for(self.rediscovers_ipc(), &self.config.ipc_address, || {
-                let mut backoff = self
-                    .ipc_probe_backoff
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                backoff.resolve(std::time::Instant::now(), &candidates(), detect)
-            })
+        self.resolve_ipc_endpoint().decided
+    }
+
+    fn resolve_ipc_endpoint(&self) -> IpcResolution {
+        let resolve = |list: &dyn Fn() -> Vec<String>| {
+            let mut candidates = Vec::new();
+            let decided =
+                endpoint_and_origin_for(self.rediscovers_ipc(), &self.config.ipc_address, || {
+                    let mut backoff = self
+                        .ipc_probe_backoff
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    candidates = list();
+                    backoff.resolve(std::time::Instant::now, &candidates, || {
+                        copperpour_ipc::socket::detect_candidate_endpoints(&candidates)
+                    })
+                });
+            with_selection(&self.selected_ipc_endpoint, decided, || candidates)
         };
         #[cfg(all(test, unix))]
         if let Some(dir) = self
@@ -475,23 +484,9 @@ impl ToolContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
         {
-            return with_selection(
-                &self.selected_ipc_endpoint,
-                resolve(
-                    &|| copperpour_ipc::socket::candidate_endpoints_in(&dir),
-                    &|| copperpour_ipc::socket::detect_ipc_endpoint_in(&dir),
-                ),
-                || copperpour_ipc::socket::candidate_endpoints_in(&dir),
-            );
+            return resolve(&|| copperpour_ipc::socket::candidate_endpoints_in(&dir));
         }
-        with_selection(
-            &self.selected_ipc_endpoint,
-            resolve(
-                &copperpour_ipc::candidate_endpoints,
-                &copperpour_ipc::detect_ipc_endpoint,
-            ),
-            copperpour_ipc::candidate_endpoints,
-        )
+        resolve(&copperpour_ipc::candidate_endpoints)
     }
 
     /// Clear any active ping backoff, e.g. after launching KiCad
@@ -521,6 +516,16 @@ impl ToolContext {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(address);
             }
             self.reset_ipc_probe_backoff();
+        }
+    }
+
+    fn forget_ipc_selection(&self, address: &str) {
+        let mut selected = self
+            .selected_ipc_endpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if selected.as_deref() == Some(address) {
+            *selected = None;
         }
     }
 
@@ -775,26 +780,21 @@ pub(crate) fn compile_input_validator(
 
 // ─── IPC helpers ──────────────────────────────────────────────────────────────
 
-/// Initial and maximum delay before re-pinging a candidate set none of whose
-/// sockets answered (#32).
+/// Initial and maximum delay before re-pinging several candidates (#32).
 const INITIAL_IPC_REPROBE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 const MAX_IPC_REPROBE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Bounded exponential backoff for the pings of IPC rediscovery on
 /// [`ToolContext`].
 ///
-/// Only an `Ambiguous` outcome pings: no candidate, or a single one, is
-/// decided from the socket directory alone, so those always run and a socket
-/// that appears is seen on the next call. An `Ambiguous` outcome is reused for
-/// the same candidate set until its window ends; a changed set probes at once.
-/// Serialized by a mutex on [`ToolContext`], so concurrent callers share one
-/// probe.
+/// Only sets of several candidates require Ping. Reuse their routing result
+/// for 250 ms, increasing the delay up to 2 s on repeated ambiguity. A changed
+/// set probes at once. This does not cache open-document evidence.
 #[derive(Debug, Default)]
 struct IpcProbeBackoff {
     consecutive_misses: u32,
-    /// The candidate set last found ambiguous, its outcome, and when it may be
-    /// pinged again.
-    last_ambiguous: Option<(
+    /// The candidate set, its last routing outcome and its next probe time.
+    last_probe: Option<(
         Vec<String>,
         copperpour_ipc::IpcDetection,
         std::time::Instant,
@@ -804,13 +804,13 @@ struct IpcProbeBackoff {
 impl IpcProbeBackoff {
     fn resolve(
         &mut self,
-        now: std::time::Instant,
+        now: impl Fn() -> std::time::Instant,
         candidates: &[String],
         detect: impl FnOnce() -> copperpour_ipc::IpcDetection,
     ) -> copperpour_ipc::IpcDetection {
-        let same_set = match &self.last_ambiguous {
+        let same_set = match &self.last_probe {
             Some((set, outcome, until)) if set.as_slice() == candidates => {
-                if now < *until {
+                if now() < *until {
                     return outcome.clone();
                 }
                 true
@@ -825,22 +825,27 @@ impl IpcProbeBackoff {
             self.consecutive_misses = 0;
         }
         let outcome = detect();
-        if matches!(outcome, copperpour_ipc::IpcDetection::Ambiguous(_)) {
+        let delay = if matches!(outcome, copperpour_ipc::IpcDetection::Ambiguous(_)) {
             let shift = self.consecutive_misses.min(4);
             let delay = INITIAL_IPC_REPROBE_BACKOFF
                 .saturating_mul(1u32 << shift)
                 .min(MAX_IPC_REPROBE_BACKOFF);
             self.consecutive_misses = self.consecutive_misses.saturating_add(1);
-            self.last_ambiguous = Some((candidates.to_vec(), outcome.clone(), now + delay));
+            delay
+        } else if matches!(outcome, copperpour_ipc::IpcDetection::Found(_)) {
+            self.consecutive_misses = 0;
+            INITIAL_IPC_REPROBE_BACKOFF
         } else {
             self.reset();
-        }
+            return outcome;
+        };
+        self.last_probe = Some((candidates.to_vec(), outcome.clone(), now() + delay));
         outcome
     }
 
     fn reset(&mut self) {
         self.consecutive_misses = 0;
-        self.last_ambiguous = None;
+        self.last_probe = None;
     }
 }
 
@@ -901,6 +906,12 @@ pub enum IpcEndpointOrigin {
     Selected,
 }
 
+struct IpcResolution {
+    decided: (IpcEndpoint, IpcEndpointOrigin),
+    alternatives: Vec<String>,
+    selected: Option<String>,
+}
+
 /// Detection's `decided` endpoint, with the one `open_board` selected
 /// deciding between several that qualify when it is among them. Detection
 /// that settles on one socket is kept for this call, as it would be without a
@@ -911,26 +922,44 @@ fn with_selection(
     selected: &std::sync::Mutex<Option<String>>,
     decided: (IpcEndpoint, IpcEndpointOrigin),
     candidates: impl FnOnce() -> Vec<String>,
-) -> (IpcEndpoint, IpcEndpointOrigin) {
+) -> IpcResolution {
     let mut selected = selected
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(address) = selected.clone() else {
-        return decided;
-    };
     let listed = match &decided {
-        (IpcEndpoint::Ambiguous(candidates), _) => {
-            if candidates.contains(&address) {
-                return (IpcEndpoint::Address(address), IpcEndpointOrigin::Selected);
-            }
-            false
-        }
-        _ => candidates().contains(&address),
+        (IpcEndpoint::Ambiguous(candidates), _) => candidates.clone(),
+        (IpcEndpoint::Address(_), IpcEndpointOrigin::DetectedNow) => candidates(),
+        _ if selected.is_some() => candidates(),
+        _ => Vec::new(),
     };
-    if !listed {
+    if selected
+        .as_ref()
+        .is_some_and(|address| !listed.contains(address))
+    {
         *selected = None;
     }
-    decided
+    let decided = match (&decided.0, selected.as_ref()) {
+        (IpcEndpoint::Ambiguous(_), Some(address)) => (
+            IpcEndpoint::Address(address.clone()),
+            IpcEndpointOrigin::Selected,
+        ),
+        _ => decided,
+    };
+    let alternatives = match &decided {
+        (
+            IpcEndpoint::Address(chosen),
+            IpcEndpointOrigin::Selected | IpcEndpointOrigin::DetectedNow,
+        ) => listed
+            .into_iter()
+            .filter(|address| address != chosen)
+            .collect(),
+        _ => Vec::new(),
+    };
+    IpcResolution {
+        selected: selected.clone(),
+        decided,
+        alternatives,
+    }
 }
 
 /// [`ToolContext::ipc_endpoint`]'s decision and where it came from, with
@@ -1238,45 +1267,50 @@ struct BoundCandidate {
 enum AmbiguousBoardResolution {
     Unique(Box<BoundCandidate>),
     MultipleHolders(Vec<String>),
+    NoHolder(Option<anyhow::Error>),
+    Duplicate(anyhow::Error),
     Unresolved,
 }
 
 enum CandidateBoardProbe {
     Holds(Box<BoundCandidate>),
-    DoesNotHold,
+    DoesNotHold(anyhow::Error),
+    Duplicate(anyhow::Error),
     Undecided,
 }
 
 /// When endpoint discovery left several candidates (`Ambiguous`), probe each in
 /// parallel for `requested`: if exactly one holds it and every other candidate
 /// explicitly proves it does not (wrong board, no open boards, `AS_UNHANDLED`,
-/// or unreachable), bind that holder. Two holders refuse as `AmbiguousDocument`;
-/// any undecided candidate (`AS_NOT_READY`, `AS_UNIMPLEMENTED`, timeout, parse
-/// error) keeps the ambiguous refusal rather than guessing.
+/// or no listener), bind that holder. Two holders refuse as `AmbiguousDocument`;
+/// any undecided candidate keeps the ambiguous refusal rather than guessing.
 async fn resolve_ambiguous_board_endpoint(
     candidates: &[String],
     requested: &std::path::Path,
+    preferred: Option<&str>,
+    memory: &board_session::BoardSessionMemory,
 ) -> anyhow::Result<AmbiguousBoardResolution> {
     let mut probes = tokio::task::JoinSet::new();
     for (index, address) in candidates.iter().cloned().enumerate() {
         let board = requested.to_path_buf();
+        let memory = memory.clone();
         probes.spawn_blocking(move || {
             let client = copperpour_ipc::client::KiCadIpcClient::new(address.clone());
             let outcome = match client.find_open_board(&board) {
-                Ok(document) => CandidateBoardProbe::Holds(Box::new(BoundCandidate {
-                    address,
-                    client,
-                    document,
-                })),
-                Err(error)
-                    if BoardEditorAbsence::from_error(&error)
-                        == Some(BoardEditorAbsence::NoPcbEditor)
-                        || error
-                            .downcast_ref::<copperpour_ipc::BoardTargetError>()
-                            .is_some_and(copperpour_ipc::BoardTargetError::proves_not_open)
-                        || copperpour_ipc::is_transport_unreachable(&error) =>
-                {
-                    CandidateBoardProbe::DoesNotHold
+                Ok(document) => {
+                    memory.observe_live(&board);
+                    CandidateBoardProbe::Holds(Box::new(BoundCandidate {
+                        address,
+                        client,
+                        document,
+                    }))
+                }
+                Err(error) if is_duplicate_board(&error) => {
+                    memory.observe_live(&board);
+                    CandidateBoardProbe::Duplicate(error)
+                }
+                Err(error) if candidate_does_not_hold_board(&error) => {
+                    CandidateBoardProbe::DoesNotHold(error)
                 }
                 Err(_) => CandidateBoardProbe::Undecided,
             };
@@ -1295,10 +1329,22 @@ async fn resolve_ambiguous_board_endpoint(
 
     let mut holders = Vec::new();
     let mut undecided = false;
-    for slot in ordered {
+    let mut evidence = None;
+    for (address, slot) in candidates.iter().zip(ordered) {
         match slot {
             Some(CandidateBoardProbe::Holds(bound)) => holders.push(bound),
-            Some(CandidateBoardProbe::DoesNotHold) => {}
+            Some(CandidateBoardProbe::DoesNotHold(error)) => {
+                let is_preferred = preferred == Some(address.as_str());
+                let rank = (board_absence_rank(&error), is_preferred);
+                if (rank.0 != 0 || is_preferred)
+                    && evidence.as_ref().is_none_or(|(best, _)| rank > *best)
+                {
+                    evidence = Some((rank, error));
+                }
+            }
+            Some(CandidateBoardProbe::Duplicate(error)) => {
+                return Ok(AmbiguousBoardResolution::Duplicate(error));
+            }
             Some(CandidateBoardProbe::Undecided) | None => undecided = true,
         }
     }
@@ -1308,9 +1354,77 @@ async fn resolve_ambiguous_board_endpoint(
         Ok(AmbiguousBoardResolution::MultipleHolders(addresses))
     } else if !undecided && holders.len() == 1 {
         Ok(AmbiguousBoardResolution::Unique(holders.pop().unwrap()))
-    } else {
+    } else if undecided {
         Ok(AmbiguousBoardResolution::Unresolved)
+    } else {
+        Ok(AmbiguousBoardResolution::NoHolder(
+            evidence.map(|(_, error)| error),
+        ))
     }
+}
+
+/// A PCB document answer is stronger than a manager's reply or a dead route.
+fn board_absence_rank(error: &anyhow::Error) -> u8 {
+    if error.is::<copperpour_ipc::BoardTargetError>() {
+        2
+    } else if BoardEditorAbsence::from_error(error) == Some(BoardEditorAbsence::NoPcbEditor) {
+        1
+    } else {
+        0
+    }
+}
+
+fn is_duplicate_board(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<copperpour_ipc::BoardTargetError>(),
+        Some(copperpour_ipc::BoardTargetError::AmbiguousDocument { .. })
+    )
+}
+
+fn candidate_does_not_hold_board(error: &anyhow::Error) -> bool {
+    BoardEditorAbsence::from_error(error) == Some(BoardEditorAbsence::NoPcbEditor)
+        || error
+            .downcast_ref::<copperpour_ipc::BoardTargetError>()
+            .is_some_and(copperpour_ipc::BoardTargetError::proves_not_open)
+        || copperpour_ipc::unreachable_reason(error)
+            == Some(copperpour_ipc::UnreachableReason::NoListener)
+}
+
+fn unresolved_board_candidates(
+    requested: &std::path::Path,
+    candidates: &[String],
+    detail: Option<&anyhow::Error>,
+) -> copperpour_ipc::IpcFailure {
+    if let Some((detail, reason)) =
+        detail.and_then(|error| copperpour_ipc::unreachable_reason(error).map(|r| (error, r)))
+    {
+        let message = format!("{detail:#}");
+        return copperpour_ipc::IpcFailure::Target {
+            error: copperpour_ipc::BoardTargetError::UnresolvedTransport {
+                reason,
+                message: message.clone(),
+            },
+            message,
+        };
+    }
+    let endpoints = candidates
+        .iter()
+        .map(|address| copperpour_ipc::redact_endpoint(address))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut reasons = vec![format!(
+        "Could not determine which KiCad editor holds this board. Check these endpoints: \
+         {endpoints}."
+    )];
+    if let Some(error) = detail {
+        reasons.push(format!("{error:#}"));
+    }
+    let error = copperpour_ipc::BoardTargetError::UnresolvedDocumentIdentities {
+        requested: copperpour_sexp::paths::display_path(requested),
+        reasons,
+    };
+    let message = error.to_string();
+    copperpour_ipc::IpcFailure::Target { error, message }
 }
 
 /// As [`with_board_ipc_classified`], handing `f` the document KiCad resolved
@@ -1336,11 +1450,42 @@ where
         + 'static,
 {
     let requested = board_path.to_path_buf();
-    let observation = requested.clone();
     let memory = ctx.board_session.clone();
-    match ctx.ipc_endpoint() {
+    use std::ops::ControlFlow::{Break, Continue};
+
+    let IpcResolution {
+        decided: (mut endpoint, origin),
+        mut alternatives,
+        selected,
+    } = ctx.resolve_ipc_endpoint();
+    let mut preferred = None;
+    // Ping is only discovery evidence. Give an explicit editor selection the
+    // first exact-board check even if the cached Ping preferred a sibling.
+    if origin != IpcEndpointOrigin::Startup {
+        if let Some(address) = &selected {
+            if let Some(index) = alternatives
+                .iter()
+                .position(|candidate| candidate == address)
+            {
+                alternatives[index] = endpoint.address().to_owned();
+                endpoint = IpcEndpoint::Address(address.clone());
+            }
+        }
+    }
+    // A discovered route is not exact-board evidence for its siblings.
+    if origin == IpcEndpointOrigin::DetectedNow && selected.is_none() && !alternatives.is_empty() {
+        let chosen = endpoint.address().to_owned();
+        preferred = Some(chosen.clone());
+        alternatives.insert(0, chosen);
+        endpoint = IpcEndpoint::Ambiguous(std::mem::take(&mut alternatives));
+    }
+    let (candidates, f, primary_failure) = match endpoint {
+        IpcEndpoint::Ambiguous(candidates) => (candidates, f, None),
         endpoint @ IpcEndpoint::Address(_) => {
-            with_ipc_classified(endpoint, move |client| {
+            let chosen = endpoint.address().to_owned();
+            let requested = requested.clone();
+            let memory = memory.clone();
+            match with_ipc_classified(endpoint, move |client| {
                 let document = match client.find_open_board(&requested) {
                     Ok(document) => document,
                     // Classified by the typed status in the chain, never by message
@@ -1348,53 +1493,152 @@ where
                     // rendered message, so by the time the caller sees one the status
                     // is gone — and the two unsupported statuses part company here,
                     // because only one of them is evidence about KiCad's editors.
-                    Err(error) => match BoardEditorAbsence::from_error(&error) {
-                        Some(absence) => {
-                            return Ok(BoardBinding::Unserved {
+                    Err(error) => {
+                        if is_duplicate_board(&error) {
+                            memory.observe_live(&requested);
+                            return Err(error);
+                        }
+                        // Discovery chose where to ask first, not which other
+                        // editors can be ruled out for this board.
+                        if !alternatives.is_empty() {
+                            return Ok(Continue((alternatives, error, f)));
+                        }
+                        if let Some(absence) = BoardEditorAbsence::from_error(&error) {
+                            return Ok(Break(BoardBinding::Unserved {
                                 absence,
                                 message: format!("{error:#}"),
-                            })
+                            }));
                         }
-                        None => return Err(error),
-                    },
+                        return Err(error);
+                    }
                 };
-                memory.observe_live(&observation);
-                f(client, document).map(BoardBinding::Bound)
+                memory.observe_live(&requested);
+                f(client, document).map(|value| Break(BoardBinding::Bound(value)))
+            })
+            .await?
+            {
+                Ok(Continue((mut candidates, error, f))) => {
+                    if !candidate_does_not_hold_board(&error) {
+                        candidates.insert(0, chosen);
+                        return Ok(Err(unresolved_board_candidates(
+                            board_path,
+                            &candidates,
+                            Some(&error),
+                        )));
+                    }
+                    if copperpour_ipc::unreachable_reason(&error)
+                        == Some(copperpour_ipc::UnreachableReason::NoListener)
+                    {
+                        // Don't select the dead listener again in the backoff window.
+                        ctx.forget_ipc_selection(&chosen);
+                    }
+                    (candidates, f, Some((chosen, error)))
+                }
+                Ok(Break(binding)) => return Ok(Ok(binding)),
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+    };
+    match resolve_ambiguous_board_endpoint(&candidates, &requested, preferred.as_deref(), &memory)
+        .await?
+    {
+        AmbiguousBoardResolution::Unique(bound) => tokio::task::spawn_blocking(move || {
+            f(&bound.client, bound.document)
+                .map(BoardBinding::Bound)
+                .map_err(|error| {
+                    warn_if_ipc_unreachable(&bound.address, &error);
+                    copperpour_ipc::IpcFailure::from_error(error)
+                })
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Thread error: {e}")),
+        AmbiguousBoardResolution::MultipleHolders(holders) => {
+            let error = copperpour_ipc::BoardTargetError::AmbiguousDocument {
+                requested: copperpour_sexp::paths::display_path(&requested),
+                candidates: holders
+                    .iter()
+                    .map(|addr| copperpour_ipc::redact_endpoint(addr))
+                    .collect(),
+            };
+            let message = error.to_string();
+            Ok(Err(copperpour_ipc::IpcFailure::Target { error, message }))
+        }
+        AmbiguousBoardResolution::Unresolved => {
+            let mut candidates = candidates;
+            if let Some((chosen, _)) = primary_failure {
+                candidates.insert(0, chosen);
+            }
+            Ok(Err(unresolved_board_candidates(
+                &requested,
+                &candidates,
+                None,
+            )))
+        }
+        AmbiguousBoardResolution::Duplicate(error) => {
+            Ok(Err(copperpour_ipc::IpcFailure::from_error(error)))
+        }
+        // Discovery never picked a route. Preserve the existing ambiguity
+        // result rather than letting one candidate's absence speak for all.
+        AmbiguousBoardResolution::NoHolder(_)
+            if primary_failure.is_none() && preferred.is_none() =>
+        {
+            with_ipc_classified(IpcEndpoint::Ambiguous(candidates), move |client| {
+                let _ = client.find_open_board(&requested)?;
+                unreachable!("ambiguous endpoint client fails before sending")
             })
             .await
         }
-        IpcEndpoint::Ambiguous(candidates) => {
-            match resolve_ambiguous_board_endpoint(&candidates, &requested).await? {
-                AmbiguousBoardResolution::Unique(bound) => tokio::task::spawn_blocking(move || {
-                    memory.observe_live(&observation);
-                    f(&bound.client, bound.document)
-                        .map(BoardBinding::Bound)
-                        .map_err(|error| {
-                            warn_if_ipc_unreachable(&bound.address, &error);
-                            copperpour_ipc::IpcFailure::from_error(error)
-                        })
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("Thread error: {e}")),
-                AmbiguousBoardResolution::MultipleHolders(holders) => {
-                    let error = copperpour_ipc::BoardTargetError::AmbiguousDocument {
-                        requested: copperpour_sexp::paths::display_path(&requested),
-                        candidates: holders
-                            .iter()
-                            .map(|addr| copperpour_ipc::redact_endpoint(addr))
-                            .collect(),
+        AmbiguousBoardResolution::NoHolder(sibling_failure) => {
+            let primary_error = primary_failure.as_ref().map(|(_, error)| error);
+            let primary_died = primary_error.is_some_and(copperpour_ipc::is_transport_unreachable);
+            let use_sibling = sibling_failure.as_ref().is_some_and(|sibling| {
+                primary_error
+                    .is_none_or(|primary| board_absence_rank(sibling) > board_absence_rank(primary))
+            });
+            let evidence = if use_sibling {
+                sibling_failure.as_ref()
+            } else {
+                primary_error
+            };
+            if let Some(error) = evidence {
+                let rank = board_absence_rank(error);
+                // A replacement answer must not release a write veto that
+                // the lost editor's transport failure would have kept.
+                if rank != 0
+                    && (!matches!(
+                        live_board::editor_lock(&requested),
+                        live_board::EditorLock::Absent
+                    ) || (rank == 1
+                        && !memory.permits_file_fallback_without_release(&requested)))
+                {
+                    let fallback = if primary_died { primary_failure } else { None };
+                    if let Some((chosen, error)) = fallback {
+                        warn_if_ipc_unreachable(&chosen, &error);
+                        return Ok(Err(copperpour_ipc::IpcFailure::from_error(error)));
+                    }
+                    // Leave the existing transport-loss gates to report the veto.
+                } else if let Some(absence) = BoardEditorAbsence::from_error(error) {
+                    return Ok(Ok(BoardBinding::Unserved {
+                        absence,
+                        message: format!("{error:#}"),
+                    }));
+                } else {
+                    let failure = if use_sibling {
+                        sibling_failure.map(|error| (preferred.unwrap_or_default(), error))
+                    } else {
+                        primary_failure
                     };
-                    let message = error.to_string();
-                    Ok(Err(copperpour_ipc::IpcFailure::Target { error, message }))
-                }
-                AmbiguousBoardResolution::Unresolved => {
-                    with_ipc_classified(IpcEndpoint::Ambiguous(candidates), move |client| {
-                        let _ = client.find_open_board(&requested)?;
-                        unreachable!("ambiguous endpoint client fails before sending")
-                    })
-                    .await
+                    if let Some((chosen, error)) = failure {
+                        warn_if_ipc_unreachable(&chosen, &error);
+                        return Ok(Err(copperpour_ipc::IpcFailure::from_error(error)));
+                    }
                 }
             }
+            with_ipc_classified(IpcEndpoint::Ambiguous(candidates), move |client| {
+                let _ = client.find_open_board(&requested)?;
+                unreachable!("ambiguous endpoint client fails before sending")
+            })
+            .await
         }
     }
 }
@@ -1495,6 +1739,16 @@ pub(crate) fn ipc_target_error_result(error: &copperpour_ipc::BoardTargetError) 
                 recovery,
             )
         }
+        BoardTargetError::UnresolvedTransport {
+            message: reason, ..
+        } => CallToolResult::error_kind_with_recovery(
+            crate::mcp::error::ToolErrorKind::EditorUnavailable {
+                editor: "pcb".to_string(),
+                reason: reason.clone(),
+            },
+            message,
+            recovery,
+        ),
         BoardTargetError::StaleDocument {
             requested,
             previously_bound,
@@ -1555,6 +1809,13 @@ mod ipc_target_error_tests {
                     reasons: vec!["unidentified document".to_string()],
                 },
                 "ambiguous_open_board",
+            ),
+            (
+                copperpour_ipc::BoardTargetError::UnresolvedTransport {
+                    reason: copperpour_ipc::UnreachableReason::AccessDenied,
+                    message: "Permission denied".into(),
+                },
+                "editor_unavailable",
             ),
         ];
 
@@ -3210,6 +3471,15 @@ pub fn lib_symbol_not_found_error(
     lib_id: &str,
     src: &dyn copperpour_schematic_editor::library::SymbolLibrarySource,
 ) -> CallToolResult {
+    CallToolResult::error(lib_symbol_not_found_message(lib_id, src))
+}
+
+/// The text of [`lib_symbol_not_found_error`], for a caller that reports it
+/// per item rather than failing the whole call.
+pub(crate) fn lib_symbol_not_found_message(
+    lib_id: &str,
+    src: &dyn copperpour_schematic_editor::library::SymbolLibrarySource,
+) -> String {
     let library = lib_id.split(':').next().unwrap_or(lib_id);
     let mut msg = if !copperpour_schematic_editor::library::library_exists(library, src) {
         // Naming only KICAD10_SYMBOL_DIR misleads when the library *is*
@@ -3234,14 +3504,16 @@ pub fn lib_symbol_not_found_error(
             suggestions.join(", ")
         ));
     }
-    CallToolResult::error(msg)
+    msg
 }
 
 /// Insert a symbol definition into the schematic's lib_symbols section.
 /// Creates the lib_symbols section if it doesn't exist. Skips if already present.
 ///
-/// Returns `false` when `lib_id` cannot be resolved — callers must surface
-/// that as an error rather than writing a definition-less instance (#34).
+/// Returns `false`, leaving `content` unchanged, when `lib_id` cannot be
+/// resolved or the definition could not be placed in `lib_symbols` — callers
+/// must surface that as an error rather than writing a definition-less
+/// instance (#34).
 #[must_use]
 pub fn ensure_lib_symbol_in_schematic(
     content: &mut String,
@@ -3265,23 +3537,56 @@ pub fn ensure_lib_symbol_in_schematic(
             None => return false,
         };
 
-    // Ensure lib_symbols section exists
-    if !content.contains("(lib_symbols") {
-        if let Some(insert_after) = content.find(")\n") {
-            content.insert_str(insert_after + 2, "\n\t(lib_symbols\n\t)\n");
-        }
+    // Edit a copy, so a definition that does not land leaves `content` as it
+    // was for the caller to save or discard.
+    let mut staged = content.clone();
+    // String-aware: a title or property may contain the text "(lib_symbols".
+    let section = |text: &str| {
+        copperpour_sexp::writer::find_block_starts(text, "lib_symbols")
+            .into_iter()
+            .next()
+    };
+    if section(&staged).is_none() {
+        // KiCad writes lib_symbols right after the sheet's header items.
+        let header = [
+            "version",
+            "generator",
+            "generator_version",
+            "uuid",
+            "paper",
+            "title_block",
+        ];
+        let Some(after) = copperpour_sexp::writer::find_direct_child_blocks(&staged, "kicad_sch")
+            .into_iter()
+            .take_while(|&(start, end)| {
+                copperpour_sexp::parse_sexp(&staged[start..end])
+                    .ok()
+                    .and_then(|node| node.head().map(|head| header.contains(&head)))
+                    .unwrap_or(false)
+            })
+            .last()
+            .map(|(_, end)| end)
+        else {
+            return false;
+        };
+        staged.insert_str(after, "\n\t(lib_symbols\n\t)");
     }
-
-    // Find the closing paren of lib_symbols and insert before it
-    if let Some(ls_start) = content.find("(lib_symbols") {
-        if let Some((_, block_end)) =
-            copperpour_sexp::writer::find_balanced_block(content, ls_start)
-        {
-            let ls_end = block_end - 1;
-            content.insert_str(ls_end, &format!("\n{}\n\t", indent_lib_symbol(&sym_def)));
-        }
+    if let Some((_, block_end)) = section(&staged)
+        .and_then(|start| copperpour_sexp::writer::find_balanced_block(&staged, start))
+    {
+        staged.insert_str(
+            block_end - 1,
+            &format!("\n{}\n\t", indent_lib_symbol(&sym_def)),
+        );
     }
-    true
+    // Report what the content now holds, not that an insert was attempted.
+    let embedded = copperpour_sexp::writer::find_direct_child_blocks(&staged, "lib_symbols")
+        .iter()
+        .any(|&(start, end)| lib_symbol_name(&staged[start..end]).as_deref() == Some(lib_id));
+    if embedded {
+        *content = staged;
+    }
+    embedded
 }
 
 /// A resolved library definition indented to sit inside `lib_symbols`. Shared
@@ -5347,27 +5652,33 @@ mod ipc_rediscovery_tests {
         );
         let unlisted = || -> Vec<String> { panic!("an ambiguous detection lists every candidate") };
         let selected = std::sync::Mutex::new(Some(editor.clone()));
-        assert_eq!(with_selection(&selected, ambiguous(), unlisted), chosen);
+        assert_eq!(
+            with_selection(&selected, ambiguous(), unlisted).decided,
+            chosen
+        );
         // Detection settled on one socket: its answer, the selection kept
         // while the editor is a candidate.
         assert_eq!(
-            with_selection(&selected, found(&editor), both),
+            with_selection(&selected, found(&editor), both).decided,
             found(&editor)
         );
         assert_eq!(
-            with_selection(&selected, found(&other), both),
+            with_selection(&selected, found(&other), both).decided,
             found(&other)
         );
-        assert_eq!(with_selection(&selected, ambiguous(), unlisted), chosen);
+        assert_eq!(
+            with_selection(&selected, ambiguous(), unlisted).decided,
+            chosen
+        );
         // The editor gone: forgotten for good.
         let only_other = || vec![other.clone()];
         assert_eq!(
-            with_selection(&selected, found(&other), only_other),
+            with_selection(&selected, found(&other), only_other).decided,
             found(&other)
         );
         assert_eq!(*selected.lock().unwrap(), None);
         assert_eq!(
-            with_selection(&selected, ambiguous(), unlisted),
+            with_selection(&selected, ambiguous(), unlisted).decided,
             ambiguous()
         );
 
@@ -5378,7 +5689,7 @@ mod ipc_rediscovery_tests {
             IpcEndpointOrigin::Startup,
         );
         assert_eq!(
-            with_selection(&selected, startup.clone(), Vec::new),
+            with_selection(&selected, startup.clone(), Vec::new).decided,
             startup
         );
         assert_eq!(*selected.lock().unwrap(), None);
@@ -5389,7 +5700,10 @@ mod ipc_rediscovery_tests {
             IpcEndpoint::Ambiguous(vec![other.clone(), STARTUP.to_string()]),
             IpcEndpointOrigin::DetectedNow,
         );
-        assert_eq!(with_selection(&selected, others.clone(), unlisted), others);
+        assert_eq!(
+            with_selection(&selected, others.clone(), unlisted).decided,
+            others
+        );
         assert_eq!(*selected.lock().unwrap(), None);
     }
 
@@ -5430,25 +5744,33 @@ mod ipc_rediscovery_tests {
         let probes = std::cell::Cell::new(0usize);
         let t0 = std::time::Instant::now();
         for _ in 0..3 {
-            let out = backoff.resolve(t0, &[], || {
-                probes.set(probes.get() + 1);
-                IpcDetection::NotFound
-            });
+            let out = backoff.resolve(
+                || t0,
+                &[],
+                || {
+                    probes.set(probes.get() + 1);
+                    IpcDetection::NotFound
+                },
+            );
             assert_eq!(out, IpcDetection::NotFound);
         }
         assert_eq!(probes.get(), 3);
         let sock = vec!["ipc:///k/api.sock".to_string()];
-        let found = backoff.resolve(t0, &sock, || {
-            probes.set(probes.get() + 1);
-            IpcDetection::Found(sock[0].clone())
-        });
+        let found = backoff.resolve(
+            || t0,
+            &sock,
+            || {
+                probes.set(probes.get() + 1);
+                IpcDetection::Found(sock[0].clone())
+            },
+        );
         assert_eq!(found, IpcDetection::Found(sock[0].clone()));
         assert_eq!(probes.get(), 4);
     }
 
     /// A candidate set none of whose sockets answered is re-pinged with
-    /// exponential backoff (250 ms → 500 ms → 1 s → 2 s cap); a changed set,
-    /// a `Found` outcome or `reset()` probes at once (#32).
+    /// exponential backoff (250 ms → 500 ms → 1 s → 2 s cap); a changed set
+    /// or `reset()` probes at once (#32).
     #[test]
     fn ambiguous_reprobe_backs_off_per_candidate_set() {
         use std::time::Duration;
@@ -5457,10 +5779,14 @@ mod ipc_rediscovery_tests {
         let t0 = std::time::Instant::now();
         let set = two_dead();
         let mut probe = |at: std::time::Instant, set: &[String]| {
-            backoff.resolve(at, set, || {
-                probes.set(probes.get() + 1);
-                IpcDetection::Ambiguous(set.to_vec())
-            })
+            backoff.resolve(
+                || at,
+                set,
+                || {
+                    probes.set(probes.get() + 1);
+                    IpcDetection::Ambiguous(set.to_vec())
+                },
+            )
         };
 
         let mut at = t0;
@@ -5492,26 +5818,34 @@ mod ipc_rediscovery_tests {
         // `reset()` clears an active window.
         backoff.reset();
         let before = probes.get();
-        backoff.resolve(at + Duration::from_millis(251), &grown, || {
-            probes.set(probes.get() + 1);
-            IpcDetection::Ambiguous(grown.clone())
-        });
+        backoff.resolve(
+            || at + Duration::from_millis(251),
+            &grown,
+            || {
+                probes.set(probes.get() + 1);
+                IpcDetection::Ambiguous(grown.clone())
+            },
+        );
         assert_eq!(probes.get(), before + 1);
 
-        // A `Found` outcome clears it too: the next miss after it starts
-        // again at 250 ms instead of escalating from the earlier miss.
+        // A `Found` outcome is reused briefly but clears the miss count.
         let a = grown[0].clone();
         let found_at = at + Duration::from_secs(10);
-        backoff.resolve(found_at, &grown, || IpcDetection::Found(a.clone()));
+        backoff.resolve(|| found_at, &grown, || IpcDetection::Found(a.clone()));
         let miss = || {
             probes.set(probes.get() + 1);
             IpcDetection::Ambiguous(grown.clone())
         };
         let before = probes.get();
-        backoff.resolve(found_at, &grown, miss);
-        assert_eq!(probes.get(), before + 1);
-        backoff.resolve(found_at + Duration::from_millis(250), &grown, miss);
-        assert_eq!(probes.get(), before + 2, "the window after Found is 250 ms");
+        assert_eq!(
+            backoff.resolve(|| found_at, &grown, miss),
+            IpcDetection::Found(a)
+        );
+        assert_eq!(probes.get(), before);
+        backoff.resolve(|| found_at + Duration::from_millis(250), &grown, miss);
+        assert_eq!(probes.get(), before + 1, "the Found window is 250 ms");
+        backoff.resolve(|| found_at + Duration::from_millis(500), &grown, miss);
+        assert_eq!(probes.get(), before + 2, "the next miss window is 250 ms");
     }
 
     /// `open_board` choosing an endpoint clears an active ping backoff, so
@@ -5522,21 +5856,37 @@ mod ipc_rediscovery_tests {
         ctx.enable_ipc_rediscovery();
         let set = two_dead();
         let t0 = std::time::Instant::now();
-        ctx.ipc_probe_backoff
-            .lock()
-            .unwrap()
-            .resolve(t0, &set, || IpcDetection::Ambiguous(set.clone()));
-        assert!(ctx
-            .ipc_probe_backoff
-            .lock()
-            .unwrap()
-            .last_ambiguous
-            .is_some());
+        ctx.ipc_probe_backoff.lock().unwrap().resolve(
+            || t0,
+            &set,
+            || IpcDetection::Ambiguous(set.clone()),
+        );
+        assert!(ctx.ipc_probe_backoff.lock().unwrap().last_probe.is_some());
 
         ctx.select_ipc_endpoint(set[0].clone());
         let backoff = ctx.ipc_probe_backoff.lock().unwrap();
-        assert!(backoff.last_ambiguous.is_none());
+        assert!(backoff.last_probe.is_none());
         assert_eq!(backoff.consecutive_misses, 0);
+    }
+
+    #[test]
+    fn slow_discovery_starts_backoff_after_the_probe_finishes() {
+        let mut backoff = IpcProbeBackoff::default();
+        let candidates = two_dead();
+        let clock = std::cell::Cell::new(std::time::Instant::now());
+        let found = IpcDetection::Found(candidates[0].clone());
+        backoff.resolve(
+            || clock.get(),
+            &candidates,
+            || {
+                clock.set(clock.get() + MAX_IPC_REPROBE_BACKOFF);
+                found.clone()
+            },
+        );
+        assert_eq!(
+            backoff.resolve(|| clock.get(), &candidates, || panic!("probe repeated")),
+            found
+        );
     }
 
     /// Concurrent callers facing the same dead candidate set share the backoff
@@ -5560,10 +5910,14 @@ mod ipc_rediscovery_tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     let mut guard = backoff.lock().unwrap();
-                    guard.resolve(now, &two_dead(), || {
-                        probes.fetch_add(1, Ordering::SeqCst);
-                        IpcDetection::Ambiguous(two_dead())
-                    })
+                    guard.resolve(
+                        || now,
+                        &two_dead(),
+                        || {
+                            probes.fetch_add(1, Ordering::SeqCst);
+                            IpcDetection::Ambiguous(two_dead())
+                        },
+                    )
                 })
             })
             .collect();
@@ -5695,7 +6049,10 @@ mod multi_endpoint_discovery_tests {
         let result = &parsed["result"];
         let is_error = result["isError"].as_bool().unwrap_or(false);
         let text = result["content"][0]["text"].as_str().unwrap();
-        let body: Value = serde_json::from_str(text).unwrap();
+        let body = serde_json::from_str(text).unwrap_or_else(|error| {
+            assert!(is_error, "expected JSON payload: {error}: {text}");
+            json!({ "message": text })
+        });
         (is_error, body)
     }
 
@@ -5811,7 +6168,8 @@ mod multi_endpoint_discovery_tests {
             "inproc://copperpour-unreachable-sibling-test".to_string(),
         ];
 
-        match resolve_ambiguous_board_endpoint(&candidates, &board_a)
+        let memory = board_session::BoardSessionMemory::default();
+        match resolve_ambiguous_board_endpoint(&candidates, &board_a, None, &memory)
             .await
             .unwrap()
         {
@@ -5821,7 +6179,7 @@ mod multi_endpoint_discovery_tests {
             _ => panic!("expected unique holder for board_a"),
         }
 
-        match resolve_ambiguous_board_endpoint(&candidates, &board_b)
+        match resolve_ambiguous_board_endpoint(&candidates, &board_b, None, &memory)
             .await
             .unwrap()
         {
@@ -5832,9 +6190,35 @@ mod multi_endpoint_discovery_tests {
         }
 
         assert!(matches!(
-            resolve_ambiguous_board_endpoint(&candidates, &board_c)
+            resolve_ambiguous_board_endpoint(&candidates, &board_c, None, &memory)
                 .await
                 .unwrap(),
+            AmbiguousBoardResolution::NoHolder(Some(error))
+                if error.is::<copperpour_ipc::BoardTargetError>()
+        ));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_board_resolution_refuses_holder_beside_transport_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let pcb = MockIpcServer::spawn("holder", pcb_editor_response(board_document(&board)));
+        let invalid_endpoint = "tcp://127.0.0.1:65536";
+        assert_eq!(
+            copperpour_ipc::KiCadIpcClient::new(invalid_endpoint)
+                .ping_outcome()
+                .failure_kind(),
+            Some("transport_error")
+        );
+        assert!(matches!(
+            resolve_ambiguous_board_endpoint(
+                &[pcb.address().to_string(), invalid_endpoint.to_string()],
+                &board,
+                None,
+                &board_session::BoardSessionMemory::default(),
+            )
+            .await
+            .unwrap(),
             AmbiguousBoardResolution::Unresolved
         ));
     }
@@ -5848,7 +6232,8 @@ mod multi_endpoint_discovery_tests {
         let pcb_2 = MockIpcServer::spawn("dup-pcb-2", pcb_editor_response(board_document(&board)));
         let dup_candidates = vec![pcb_1.address().to_string(), pcb_2.address().to_string()];
 
-        match resolve_ambiguous_board_endpoint(&dup_candidates, &board)
+        let memory = board_session::BoardSessionMemory::default();
+        match resolve_ambiguous_board_endpoint(&dup_candidates, &board, None, &memory)
             .await
             .unwrap()
         {
@@ -5862,7 +6247,7 @@ mod multi_endpoint_discovery_tests {
         let undecided_candidates =
             vec![pcb_1.address().to_string(), not_ready.address().to_string()];
         assert!(matches!(
-            resolve_ambiguous_board_endpoint(&undecided_candidates, &board)
+            resolve_ambiguous_board_endpoint(&undecided_candidates, &board, None, &memory)
                 .await
                 .unwrap(),
             AmbiguousBoardResolution::Unresolved
@@ -5948,6 +6333,678 @@ mod multi_endpoint_discovery_tests {
         .await;
         assert!(is_error, "duplicate holders must refuse: {dup}");
         assert_eq!(dup["error"]["kind"], "ambiguous_target", "{dup}");
+    }
+
+    #[cfg(unix)]
+    async fn with_cached_selected_editor(
+        dir: &std::path::Path,
+        other: impl Fn(kiapi::common::ApiRequest) -> kiapi::common::ApiResponse + Send + 'static,
+    ) -> (McpHandler, MockIpcServer) {
+        let kicad_dir = dir.join("kicad");
+        std::fs::create_dir(&kicad_dir).unwrap();
+        let selected_path = kicad_dir.join("api.sock");
+        let selected_addr = format!("ipc://{}", selected_path.display());
+        let other_addr = format!(
+            "ipc://{}/api-{}.sock",
+            kicad_dir.display(),
+            std::process::id()
+        );
+        let board = dir.join("selected.kicad_pcb");
+        std::fs::write(&board, "").unwrap();
+        let selected = MockIpcServer::spawn_at(
+            selected_addr.clone(),
+            pcb_editor_response(board_document(&board)),
+        );
+        let other = MockIpcServer::spawn_at(other_addr.clone(), other);
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        handler.enable_ipc_rediscovery();
+        handler.set_ipc_kicad_dir_for_test(kicad_dir.clone());
+
+        let ctx = handler.ipc_context_for_test();
+        // Record the same positive observation and selection as `open_board`.
+        ctx.board_session.observe_live(&board);
+        ctx.select_ipc_endpoint(selected_addr.clone());
+        assert_eq!(
+            ctx.ipc_endpoint_with_origin(),
+            (
+                IpcEndpoint::Address(selected_addr.clone()),
+                IpcEndpointOrigin::Selected
+            )
+        );
+        let (is_error, stackup) =
+            call_served(&handler, 1, "get_board_stackup", json!({ "board": board })).await;
+        assert!(
+            !is_error,
+            "a healthy selection still serves its exact board: {stackup}"
+        );
+        let candidates = vec![selected_addr.clone(), other_addr];
+        {
+            let mut backoff = ctx.ipc_probe_backoff.lock().unwrap();
+            let (cached, outcome, until) = backoff.last_probe.as_mut().unwrap();
+            assert_eq!(cached, &candidates);
+            assert_eq!(
+                *outcome,
+                copperpour_ipc::IpcDetection::Ambiguous(candidates.clone())
+            );
+            // Keep the actual cached detection in force regardless of runner delays.
+            *until = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        }
+        drop(selected);
+        let _ = std::fs::remove_file(&selected_path);
+        drop(std::os::unix::net::UnixListener::bind(&selected_path).unwrap());
+        assert_eq!(
+            copperpour_ipc::socket::candidate_endpoints_in(&kicad_dir),
+            candidates
+        );
+        assert_eq!(
+            copperpour_ipc::KiCadIpcClient::new(selected_addr)
+                .ping_outcome()
+                .failure_kind(),
+            Some("no_listener")
+        );
+        (handler, other)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_selection_refuses_saved_board_write_when_other_editor_is_unresolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("requested.kicad_pcb");
+        let before = include_bytes!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        std::fs::write(&board, before).unwrap();
+        let (handler, _other) = with_cached_selected_editor(dir.path(), |request| {
+            let command = request.message.unwrap();
+            if command.type_url.ends_with("Ping") {
+                reply(kiapi::common::ApiStatusCode::AsOk, "", None)
+            } else {
+                assert!(command.type_url.ends_with("GetOpenDocuments"));
+                reply(
+                    kiapi::common::ApiStatusCode::AsNotReady,
+                    "editor is busy",
+                    None,
+                )
+            }
+        })
+        .await;
+
+        let (is_error, result) = call_served(
+            &handler,
+            2,
+            "set_board_size",
+            json!({ "board": board, "width": 50.0, "height": 40.0 }),
+        )
+        .await;
+        assert!(
+            std::fs::read(&board).unwrap().as_slice() == before,
+            "an unresolved editor must prevent a saved-board write: {result}"
+        );
+        assert!(is_error, "{result}");
+        assert_eq!(result["error"]["kind"], "ambiguous_open_board", "{result}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_selection_refuses_file_only_write_and_keeps_discovery_backoff() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("requested.kicad_pcb");
+        std::fs::write(&board, "").unwrap();
+        let project = board.with_extension("kicad_pro");
+        let before = br#"{"board":{"design_settings":{"rules":{"min_clearance":0.125}}}}"#;
+        std::fs::write(&project, before).unwrap();
+        let pings = Arc::new(AtomicUsize::new(0));
+        let ipc_pings = pings.clone();
+        let (handler, _other) = with_cached_selected_editor(dir.path(), move |request| {
+            let command = request.message.unwrap();
+            if command.type_url.ends_with("Ping") {
+                ipc_pings.fetch_add(1, Ordering::Relaxed);
+                reply(kiapi::common::ApiStatusCode::AsOk, "", None)
+            } else {
+                assert!(command.type_url.ends_with("GetOpenDocuments"));
+                reply(
+                    kiapi::common::ApiStatusCode::AsNotReady,
+                    "editor is busy",
+                    None,
+                )
+            }
+        })
+        .await;
+        let pings_before = pings.load(Ordering::Relaxed);
+        for id in 2..4 {
+            let (is_error, result) = call_served(
+                &handler,
+                id,
+                "set_design_rules",
+                json!({ "board": board, "min_clearance": 0.25 }),
+            )
+            .await;
+            assert_eq!(
+                std::fs::read(&project).unwrap().as_slice(),
+                before,
+                "{result}"
+            );
+            assert!(is_error, "{result}");
+            assert_eq!(result["error"]["kind"], "ambiguous_open_board", "{result}");
+        }
+        assert_eq!(pings.load(Ordering::Relaxed), pings_before);
+        let ctx = handler.ipc_context_for_test();
+        assert_eq!(
+            *ctx.selected_ipc_endpoint.lock().unwrap(),
+            None,
+            "a missing listener must not be selected again inside the backoff window"
+        );
+        // Expire the cache without sleeping. The only Ping responder will now
+        // be Found, but its board query still cannot establish absence.
+        ctx.ipc_probe_backoff
+            .lock()
+            .unwrap()
+            .last_probe
+            .as_mut()
+            .unwrap()
+            .2 = std::time::Instant::now();
+        let (is_error, result) = call_served(
+            &handler,
+            4,
+            "set_design_rules",
+            json!({ "board": board, "min_clearance": 0.25 }),
+        )
+        .await;
+        assert_eq!(
+            std::fs::read(&project).unwrap().as_slice(),
+            before,
+            "{result}"
+        );
+        assert!(is_error, "{result}");
+        assert_eq!(result["error"]["kind"], "ambiguous_open_board", "{result}");
+        assert!(pings.load(Ordering::Relaxed) > pings_before);
+        let pings_after = pings.load(Ordering::Relaxed);
+        {
+            let mut backoff = ctx.ipc_probe_backoff.lock().unwrap();
+            let (_, outcome, until) = backoff.last_probe.as_mut().unwrap();
+            assert!(matches!(outcome, copperpour_ipc::IpcDetection::Found(_)));
+            *until = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        }
+        let (is_error, result) = call_served(
+            &handler,
+            5,
+            "set_design_rules",
+            json!({ "board": board, "min_clearance": 0.25 }),
+        )
+        .await;
+        assert_eq!(
+            std::fs::read(&project).unwrap().as_slice(),
+            before,
+            "{result}"
+        );
+        assert!(is_error, "{result}");
+        assert_eq!(result["error"]["kind"], "ambiguous_open_board", "{result}");
+        assert_eq!(pings.load(Ordering::Relaxed), pings_after);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sole_ping_responder_does_not_hide_an_unresolved_board_candidate() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("requested.kicad_pcb");
+        std::fs::write(&board, "").unwrap();
+        let requested = board.clone();
+        let (handler, known) =
+            with_cached_selected_editor(dir.path(), pcb_editor_response(board_document(&board)))
+                .await;
+        let socket = dir.path().join("kicad/api.sock");
+        std::fs::remove_file(&socket).unwrap();
+        let _unknown = MockIpcServer::spawn_at(format!("ipc://{}", socket.display()), |_| {
+            reply(
+                kiapi::common::ApiStatusCode::AsNotReady,
+                "editor is busy",
+                None,
+            )
+        });
+        let ctx = handler.ipc_context_for_test();
+        // Test the unselected route here; selection priority has its own test.
+        ctx.forget_ipc_selection(&format!("ipc://{}", socket.display()));
+        // The cached route came from a probe before the sibling answered.
+        let address = known.address().to_owned();
+        {
+            let mut backoff = ctx.ipc_probe_backoff.lock().unwrap();
+            let (_, outcome, until) = backoff.last_probe.as_mut().unwrap();
+            *outcome = copperpour_ipc::IpcDetection::Found(address.clone());
+            *until = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        }
+        let (endpoint, origin) = ctx.ipc_endpoint_with_origin();
+        assert_eq!(origin, IpcEndpointOrigin::DetectedNow);
+        assert_eq!(endpoint.address(), address);
+        let ran = Arc::new(AtomicBool::new(false));
+        let operation = ran.clone();
+        let result = with_bound_board_ipc_classified(ctx, &requested, move |_, _| {
+            operation.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(
+            !ran.load(Ordering::Relaxed),
+            "a board operation ran with an unresolved sibling"
+        );
+        assert!(matches!(
+            result,
+            Err(copperpour_ipc::IpcFailure::Target {
+                error: copperpour_ipc::BoardTargetError::UnresolvedDocumentIdentities { .. },
+                ..
+            })
+        ));
+        assert!(
+            !ctx.board_session.authorize_file_fallback(&board),
+            "an exact observation must survive an unresolved sibling"
+        );
+        ctx.select_ipc_endpoint(address);
+        let (is_error, result) =
+            call_served(&handler, 2, "get_board_stackup", json!({ "board": board })).await;
+        assert!(
+            !is_error,
+            "the selected editor still holds this board: {result}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovered_manager_and_stale_sibling_preserve_write_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("requested.kicad_pcb");
+        let before = include_bytes!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        std::fs::write(&board, before).unwrap();
+        let _manager = MockIpcServer::spawn_at(
+            format!("ipc://{}/api.sock", dir.path().display()),
+            manager_response,
+        );
+        let stale = dir.path().join(format!("api-{}.sock", std::process::id()));
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        handler.enable_ipc_rediscovery();
+        handler.set_ipc_kicad_dir_for_test(dir.path().to_owned());
+        let lock = copperpour_sexp::writer::kicad_editor_lock_path(&board).unwrap();
+        std::fs::write(&lock, "editor lock").unwrap();
+        handler
+            .ipc_context_for_test()
+            .board_session
+            .observe_live(&board);
+        std::fs::remove_file(lock).unwrap();
+        let (is_error, result) =
+            call_served(&handler, 1, "get_board_stackup", json!({ "board": board })).await;
+        assert!(is_error, "{result}");
+        assert_eq!(result["recovery"]["cause"], "no_pcb_editor_at_endpoint");
+        assert!(
+            handler
+                .ipc_context_for_test()
+                .board_session
+                .was_observed_live(&board),
+            "an IPC-only read must not release board-session evidence"
+        );
+        let (is_error, result) = call_served(
+            &handler,
+            2,
+            "set_board_size",
+            json!({ "board": board, "width": 50.0, "height": 40.0 }),
+        )
+        .await;
+        assert!(
+            std::fs::read(&board).unwrap().as_slice() == before,
+            "{result}"
+        );
+        assert!(is_error, "{result}");
+        assert!(
+            result["message"].as_str().unwrap().contains("PCB editor"),
+            "{result}"
+        );
+
+        let stale = format!("ipc://{}", stale.display());
+        let candidates = copperpour_ipc::socket::candidate_endpoints_in(dir.path());
+        handler
+            .ipc_context_for_test()
+            .ipc_probe_backoff
+            .lock()
+            .unwrap()
+            .last_probe = Some((
+            candidates,
+            copperpour_ipc::IpcDetection::Found(stale),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        ));
+        let (is_error, result) = call_served(
+            &handler,
+            3,
+            "set_board_size",
+            json!({ "board": board, "width": 50.0, "height": 40.0 }),
+        )
+        .await;
+        assert!(
+            std::fs::read(&board).unwrap().as_slice() == before,
+            "{result}"
+        );
+        assert!(is_error, "{result}");
+        assert!(
+            result["message"].as_str().unwrap().contains("PCB editor"),
+            "{result}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manager_does_not_release_a_previously_live_board_when_selection_dies() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("requested.kicad_pcb");
+        std::fs::write(&board, "").unwrap();
+        let project = board.with_extension("kicad_pro");
+        let before = br#"{"board":{"design_settings":{"rules":{"min_clearance":0.125}}}}"#;
+        std::fs::write(&project, before).unwrap();
+        let other = dir.path().join("other.kicad_pcb");
+        let (handler, sibling) =
+            with_cached_selected_editor(dir.path(), pcb_editor_response(board_document(&other)))
+                .await;
+        let address = sibling.address().to_owned();
+        drop(sibling);
+        let _manager = MockIpcServer::spawn_at(address, manager_response);
+        handler
+            .ipc_context_for_test()
+            .board_session
+            .observe_live(&board);
+        let (is_error, result) = call_served(
+            &handler,
+            2,
+            "set_design_rules",
+            json!({ "board": board, "min_clearance": 0.25 }),
+        )
+        .await;
+        assert_eq!(
+            std::fs::read(&project).unwrap().as_slice(),
+            before,
+            "{result}"
+        );
+        assert!(is_error, "{result}");
+        assert_eq!(result["error"]["kind"], "unsafe_file_fallback", "{result}");
+        assert_eq!(
+            result["error"]["reason"], "board_previously_observed_live",
+            "{result}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manager_does_not_release_a_locked_board_when_selection_dies() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("requested.kicad_pcb");
+        std::fs::write(&board, "").unwrap();
+        let project = board.with_extension("kicad_pro");
+        let before = br#"{"board":{"design_settings":{"rules":{"min_clearance":0.125}}}}"#;
+        std::fs::write(&project, before).unwrap();
+        let lock = copperpour_sexp::writer::kicad_editor_lock_path(&board).unwrap();
+        std::fs::write(&lock, "editor lock").unwrap();
+        let other = dir.path().join("other.kicad_pcb");
+        let (handler, sibling) =
+            with_cached_selected_editor(dir.path(), pcb_editor_response(board_document(&other)))
+                .await;
+        let address = sibling.address().to_owned();
+        drop(sibling);
+        let _manager = MockIpcServer::spawn_at(address, manager_response);
+        let (is_error, result) = call_served(
+            &handler,
+            2,
+            "set_design_rules",
+            json!({ "board": board, "min_clearance": 0.25 }),
+        )
+        .await;
+        assert!(is_error, "{result}");
+        assert_eq!(result["error"]["kind"], "unsafe_file_fallback", "{result}");
+        assert_eq!(result["error"]["reason"], "kicad_lock_present", "{result}");
+        assert_eq!(std::fs::read(&project).unwrap().as_slice(), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selected_permission_denial_keeps_recovery_without_allowing_file_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("requested.kicad_pcb");
+        std::fs::write(&board, "").unwrap();
+        let project = board.with_extension("kicad_pro");
+        let before = br#"{"board":{"design_settings":{"rules":{"min_clearance":0.125}}}}"#;
+        std::fs::write(&project, before).unwrap();
+        let other = dir.path().join("other.kicad_pcb");
+        let (handler, _sibling) =
+            with_cached_selected_editor(dir.path(), pcb_editor_response(board_document(&other)))
+                .await;
+        let path = dir.path().join("kicad/api.sock");
+        std::fs::remove_file(&path).unwrap();
+        let address = format!("ipc://{}", path.display());
+        let selected = MockIpcServer::spawn_at(address.clone(), manager_response);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let ping = copperpour_ipc::KiCadIpcClient::new(address).ping_outcome();
+        if ping.is_responsive() {
+            eprintln!("skipped: this account can connect despite the socket mode bits");
+            return;
+        }
+        assert_eq!(ping.failure_kind(), Some("access_denied"), "{ping:?}");
+
+        let (is_error, read) =
+            call_served(&handler, 2, "get_board_stackup", json!({ "board": board })).await;
+        assert!(is_error, "{read}");
+        assert_eq!(read["error"]["kind"], "editor_unavailable", "{read}");
+        assert_eq!(read["recovery"]["cause"], "access_denied", "{read}");
+        let (is_error, write) = call_served(
+            &handler,
+            3,
+            "set_design_rules",
+            json!({ "board": board, "min_clearance": 0.25 }),
+        )
+        .await;
+        assert!(is_error, "{write}");
+        assert_eq!(write["recovery"]["cause"], "access_denied", "{write}");
+        assert_eq!(std::fs::read(&project).unwrap().as_slice(), before);
+        drop(selected);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selected_handshake_failure_cannot_authorize_file_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("requested.kicad_pcb");
+        std::fs::write(&board, "").unwrap();
+        let project = board.with_extension("kicad_pro");
+        let before = br#"{"board":{"design_settings":{"rules":{"min_clearance":0.125}}}}"#;
+        std::fs::write(&project, before).unwrap();
+        let other = dir.path().join("other.kicad_pcb");
+        let (handler, _sibling) =
+            with_cached_selected_editor(dir.path(), pcb_editor_response(board_document(&other)))
+                .await;
+        let path = dir.path().join("kicad/api.sock");
+        std::fs::remove_file(&path).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let peer = std::thread::spawn(move || drop(listener.accept().unwrap()));
+        let (is_error, result) = call_served(
+            &handler,
+            2,
+            "set_design_rules",
+            json!({ "board": board, "min_clearance": 0.25 }),
+        )
+        .await;
+        peer.join().unwrap();
+        assert!(is_error, "{result}");
+        assert_eq!(result["error"]["kind"], "editor_unavailable", "{result}");
+        assert_eq!(result["recovery"]["cause"], "handshake_failed", "{result}");
+        assert_eq!(std::fs::read(&project).unwrap().as_slice(), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cached_ping_does_not_override_a_selected_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("selected.kicad_pcb");
+        let (handler, sibling) = with_cached_selected_editor(dir.path(), |request| {
+            if request.message.unwrap().type_url.ends_with("Ping") {
+                reply(kiapi::common::ApiStatusCode::AsOk, "", None)
+            } else {
+                reply(kiapi::common::ApiStatusCode::AsNotReady, "busy", None)
+            }
+        })
+        .await;
+        let path = dir.path().join("kicad/api.sock");
+        std::fs::remove_file(&path).unwrap();
+        let _selected = MockIpcServer::spawn_at(
+            format!("ipc://{}", path.display()),
+            pcb_editor_response(board_document(&board)),
+        );
+        let ctx = handler.ipc_context_for_test();
+        ctx.ipc_probe_backoff
+            .lock()
+            .unwrap()
+            .last_probe
+            .as_mut()
+            .unwrap()
+            .1 = copperpour_ipc::IpcDetection::Found(sibling.address().to_owned());
+        let (is_error, result) =
+            call_served(&handler, 2, "get_board_stackup", json!({ "board": board })).await;
+        assert!(!is_error, "{result}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selection_preserves_wrong_document_beside_project_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other.kicad_pcb");
+        let board = dir.path().join("requested.kicad_pcb");
+        std::fs::write(&board, "").unwrap();
+        let editor = MockIpcServer::spawn_at(
+            format!("ipc://{}/api.sock", dir.path().display()),
+            pcb_editor_response(board_document(&other)),
+        );
+        let _manager = MockIpcServer::spawn_at(
+            format!(
+                "ipc://{}/api-{}.sock",
+                dir.path().display(),
+                std::process::id()
+            ),
+            manager_response,
+        );
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        handler.enable_ipc_rediscovery();
+        handler.set_ipc_kicad_dir_for_test(dir.path().to_owned());
+        handler
+            .ipc_context_for_test()
+            .select_ipc_endpoint(editor.address().to_owned());
+        let (is_error, result) =
+            call_served(&handler, 1, "get_board_stackup", json!({ "board": board })).await;
+        assert!(is_error, "{result}");
+        assert_eq!(result["error"]["kind"], "wrong_document", "{result}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_sibling_document_evidence_outranks_a_stale_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("requested.kicad_pcb");
+        let other = dir.path().join("other.kicad_pcb");
+        std::fs::write(&board, "").unwrap();
+        let (handler, _editor) =
+            with_cached_selected_editor(dir.path(), pcb_editor_response(board_document(&other)))
+                .await;
+
+        let (is_error, cached) =
+            call_served(&handler, 2, "get_board_stackup", json!({ "board": board })).await;
+        assert!(is_error, "{cached}");
+        assert_eq!(cached["error"]["kind"], "wrong_document", "{cached}");
+
+        handler.ipc_context_for_test().reset_ipc_probe_backoff();
+        let (is_error, fresh) =
+            call_served(&handler, 3, "get_board_stackup", json!({ "board": board })).await;
+        assert!(is_error, "{fresh}");
+        assert_eq!(fresh["error"], cached["error"], "{fresh}");
+
+        let project = board.with_extension("kicad_pro");
+        let before = br#"{"board":{"design_settings":{"rules":{"min_clearance":0.125}}}}"#;
+        std::fs::write(&project, before).unwrap();
+        let ctx = handler.ipc_context_for_test();
+        ctx.select_ipc_endpoint(format!("ipc://{}/kicad/api.sock", dir.path().display()));
+        ctx.board_session.observe_live(&board);
+        let (is_error, write) = call_served(
+            &handler,
+            4,
+            "set_design_rules",
+            json!({ "board": board, "min_clearance": 0.25 }),
+        )
+        .await;
+        assert!(is_error, "{write}");
+        assert_eq!(write["error"]["reason"], "board_previously_observed_live");
+        assert_eq!(std::fs::read(&project).unwrap().as_slice(), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_dead_endpoint_is_not_replaced_by_a_discovered_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("requested.kicad_pcb");
+        std::fs::write(&board, "").unwrap();
+        let configured = dir.path().join("configured.sock");
+        drop(std::os::unix::net::UnixListener::bind(&configured).unwrap());
+        let editor = format!("ipc://{}", dir.path().join("api.sock").display());
+        let _editor = MockIpcServer::spawn_at(editor, pcb_editor_response(board_document(&board)));
+        let handler = McpHandler::new(ServerConfig {
+            ipc_address: format!("ipc://{}", configured.display()),
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        handler.set_ipc_kicad_dir_for_test(dir.path().to_owned());
+        let (is_error, result) =
+            call_served(&handler, 1, "get_board_stackup", json!({ "board": board })).await;
+        assert!(is_error, "{result}");
+        assert_eq!(result["error"]["kind"], "editor_unavailable", "{result}");
+        assert_eq!(result["recovery"]["cause"], "no_listener", "{result}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_selection_binds_the_exact_board_on_the_remaining_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("requested.kicad_pcb");
+        std::fs::write(&board, "").unwrap();
+        let document = board_document(&board);
+        let respond = pcb_editor_response(document.clone());
+        let (handler, _other) = with_cached_selected_editor(dir.path(), move |request| {
+            let command = request.message.as_ref().unwrap();
+            if command.type_url.ends_with("GetBoardStackup") {
+                let command = <kiapi::board::commands::GetBoardStackup as prost::Message>::decode(
+                    command.value.as_slice(),
+                )
+                .unwrap();
+                assert_eq!(command.board.as_ref(), Some(&document));
+            }
+            respond(request)
+        })
+        .await;
+        let (is_error, result) =
+            call_served(&handler, 2, "get_board_stackup", json!({ "board": board })).await;
+        assert!(
+            !is_error,
+            "the other editor holds the requested board: {result}"
+        );
     }
 
     /// Issue #32 end to end through served `check_kicad_ui`:

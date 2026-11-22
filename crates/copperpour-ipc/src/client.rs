@@ -1005,6 +1005,11 @@ pub enum BoardTargetError {
         requested: String,
         reasons: Vec<String>,
     },
+    /// The selected endpoint's transport failed without ruling out a live editor.
+    UnresolvedTransport {
+        reason: UnreachableReason,
+        message: String,
+    },
     StaleDocument {
         requested: String,
         previously_bound: String,
@@ -1090,6 +1095,7 @@ impl std::fmt::Display for BoardTargetError {
                 "KiCad's open documents cannot be compared safely with requested board '{requested}' ({})",
                 reasons.join("; ")
             ),
+            Self::UnresolvedTransport { message, .. } => formatter.write_str(message),
             Self::StaleDocument {
                 requested,
                 previously_bound,

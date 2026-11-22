@@ -168,7 +168,9 @@ representable SMD and all-copper through-hole pads, routing rules, locked-routin
 inventory and zone representation. They retain main’s multilayer, both-side and
 copper-plane support. Rule areas, custom `.kicad_dru` files, nonuniform per-layer
 pad geometry and other unsupported manifest features remain refused. A native
-exporter cannot bypass those checks.
+exporter cannot bypass those checks. Custom rules are refused because neither
+exporter carries them to the router, so Copperpour cannot vouch for routes
+against them.
 
 | `native_bridge_mode` | Export order after shared checks |
 |---|---|

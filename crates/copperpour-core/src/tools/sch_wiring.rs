@@ -162,16 +162,19 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "rotate_schematic_label",
-            "Rotate a net label to a new angle and update its justify direction accordingly.",
+            "Rotate one net label, by uuid or by net and position, to a new angle and update \
+             its justify direction accordingly.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
-                    "net": { "type": "string" },
-                    "x": { "type": "number" }, "y": { "type": "number" },
+                    "uuid": { "type": "string", "description": "One label's uuid, as list_schematic_labels reports it. Given alone" },
+                    "net": { "type": "string", "description": "The label's name, with x and y" },
+                    "x": { "type": "number", "description": "With net and y: the label's position in mm, as delete_schematic_net_label takes it" },
+                    "y": { "type": "number", "description": "With net and x: the label's position in mm" },
                     "rotation": { "type": "number" }
                 },
-                "required": ["schematic", "net", "x", "y", "rotation"]
+                "required": ["schematic", "rotation"]
             }),
             |args, ctx| async move { handle_rotate_label(args, ctx).await }
         ),
@@ -191,8 +194,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_rotate_labels",
-            "Rotate multiple labels by net name in a single file read/write cycle. \
-             A label not found at its x and y, or named twice, refuses the batch, and \
+            "Rotate multiple labels, each by uuid or by net and position, in a single file \
+             read/write cycle. A label not found, or named twice, refuses the batch, and \
              nothing is written.",
             json!({
                 "type": "object",
@@ -203,11 +206,13 @@ pub fn tools() -> Vec<ToolDef> {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "net": { "type": "string" },
-                                "x": { "type": "number" }, "y": { "type": "number" },
+                                "uuid": { "type": "string", "description": "One label's uuid, as list_schematic_labels reports it. Given alone" },
+                                "net": { "type": "string", "description": "The label's name, with x and y" },
+                                "x": { "type": "number", "description": "With net and y: the label's position in mm, as delete_schematic_net_label takes it" },
+                                "y": { "type": "number", "description": "With net and x: the label's position in mm" },
                                 "rotation": { "type": "number" }
                             },
-                            "required": ["net", "x", "y", "rotation"]
+                            "required": ["rotation"]
                         }
                     }
                 },
@@ -2354,6 +2359,8 @@ struct LabelBlock {
     net: String,
     x: f64,
     y: f64,
+    /// The label's own `(uuid …)`.
+    uuid: Option<String>,
 }
 
 /// KiCAD's three label tags. `label` is the plain net label — the type
@@ -2392,6 +2399,7 @@ fn find_label_blocks(content: &str) -> Vec<LabelBlock> {
                 net: net.to_string(),
                 x,
                 y,
+                uuid: node.find_str("uuid").map(str::to_string),
             });
         }
     }
@@ -2409,15 +2417,7 @@ async fn handle_rotate_label(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let net = match require_str(args, "net") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let x = match require_f64(args, "x") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let y = match require_f64(args, "y") {
+    let target = match LabelRef::parse(args, "") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -2428,7 +2428,7 @@ async fn handle_rotate_label(
 
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
-    let turn = match turn_label(&content, &net, x, y, rotation)? {
+    let turn = match turn_label(&content, &target, rotation)? {
         Ok(turn) => turn,
         Err(refusal) => return Ok(CallToolResult::error(refusal)),
     };
@@ -2446,37 +2446,91 @@ struct LabelTurn {
     reply: serde_json::Value,
 }
 
-/// The edits that turn the `net` label at (`x`, `y`) in `content` to
-/// `rotation`, or why there is no such label.
+/// How a rotate names its label: by `uuid` alone, or by `net` with `x` and
+/// `y`, as `rename_schematic_net_label` names one label.
+enum LabelRef<'a> {
+    Uuid(&'a str),
+    At { net: &'a str, x: f64, y: f64 },
+}
+
+impl<'a> LabelRef<'a> {
+    /// The label `args` names, or the refusal naming its field, worded as
+    /// `rename_schematic_net_label` words it. `item` prefixes the field: empty
+    /// for `rotate_schematic_label`, `labels[1].` for a batch item.
+    fn parse(args: &'a serde_json::Value, item: &str) -> Result<Self, CallToolResult> {
+        let refuse =
+            |key: &str, reason: &str| crate::tools::invalid_arg(&format!("{item}{key}"), reason);
+        let given = |key: &str| !args[key].is_null();
+        if let Some(uuid) = opt_str(args, "uuid") {
+            if ["net", "x", "y"].iter().any(|key| given(key)) {
+                return Err(refuse(
+                    "uuid",
+                    "is given alone; net with x and y chooses the label instead",
+                ));
+            }
+            return Ok(Self::Uuid(uuid));
+        }
+        let net = require_str(args, "net")
+            .map_err(|_| refuse("net", "give uuid, or net with x and y"))?;
+        if !given("x") && !given("y") {
+            return Err(refuse("net", "goes with x and y"));
+        }
+        let number = |key: &str| {
+            args[key]
+                .as_f64()
+                .ok_or_else(|| refuse(key, "missing or not a number"))
+        };
+        Ok(Self::At {
+            net,
+            x: number("x")?,
+            y: number("y")?,
+        })
+    }
+}
+
+/// The edits that turn the label `target` names in `content` to `rotation`,
+/// or why there is no such label.
 fn turn_label(
     content: &str,
-    net: &str,
-    x: f64,
-    y: f64,
+    target: &LabelRef,
     rotation: f64,
 ) -> anyhow::Result<Result<LabelTurn, String>> {
     let labels = find_label_blocks(content);
-    let named: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
-    let Some(label) = named
-        .iter()
-        .find(|l| same_point(l.x, x) && same_point(l.y, y))
-    else {
-        let positions: Vec<String> = named
-            .iter()
-            .map(|l| format!("{} at ({}, {})", l.kind, l.x, l.y))
-            .collect();
-        return Ok(Err(if positions.is_empty() {
-            format!("No label named '{}' in this schematic", net)
-        } else {
-            format!(
-                "No label '{}' at ({}, {}). Found: {}",
-                net,
-                x,
-                y,
-                positions.join("; ")
-            )
-        }));
+    let (label, x, y) = match *target {
+        LabelRef::Uuid(uuid) => {
+            let Some(label) = labels.iter().find(|l| l.uuid.as_deref() == Some(uuid)) else {
+                return Ok(Err(format!(
+                    "No label with uuid '{uuid}' in this schematic"
+                )));
+            };
+            (label, label.x, label.y)
+        }
+        LabelRef::At { net, x, y } => {
+            let named: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
+            let Some(label) = named
+                .iter()
+                .find(|l| same_point(l.x, x) && same_point(l.y, y))
+            else {
+                let positions: Vec<String> = named
+                    .iter()
+                    .map(|l| format!("{} at ({}, {})", l.kind, l.x, l.y))
+                    .collect();
+                return Ok(Err(if positions.is_empty() {
+                    format!("No label named '{}' in this schematic", net)
+                } else {
+                    format!(
+                        "No label '{}' at ({}, {}). Found: {}",
+                        net,
+                        x,
+                        y,
+                        positions.join("; ")
+                    )
+                }));
+            };
+            (*label, x, y)
+        }
     };
+    let net = label.net.as_str();
 
     let (block_start, block_end) = find_balanced_block(content, label.start)
         .ok_or_else(|| anyhow::anyhow!("Cannot parse label block"))?;
@@ -2514,11 +2568,11 @@ fn turn_label(
     };
 
     let effects = child(block, label.kind, "effects");
-    let justify = effects.and_then(|(e_start, e_end)| {
+    let old_justify = effects.and_then(|(e_start, e_end)| {
         child(&block[e_start..e_end], "effects", "justify")
             .map(|(j_start, j_end)| (e_start + j_start, e_start + j_end))
     });
-    if let Some((j_start, j_end)) = justify {
+    if let Some((j_start, j_end)) = old_justify {
         // Replace the existing justify in place.
         edits.push(SexpEdit::replace(
             block_start + j_start,
@@ -2684,21 +2738,19 @@ async fn handle_batch_rotate_labels(
     // A label missing `rotation` used to be counted as rotated and left as it
     // was (#724). Check every label before touching the file, as
     // batch_add_junction does, so a malformed batch changes nothing.
+    let mut targets = Vec::with_capacity(labels.len());
     for (i, label) in labels.iter().enumerate() {
-        if label["net"].as_str().is_none() {
+        let target = match LabelRef::parse(label, &format!("labels[{i}].")) {
+            Ok(target) => target,
+            Err(e) => return Ok(e),
+        };
+        let Some(rotation) = label["rotation"].as_f64() else {
             return Ok(crate::tools::invalid_arg(
-                &format!("labels[{i}].net"),
-                "missing or not a string",
+                &format!("labels[{i}].rotation"),
+                "missing or not a number",
             ));
-        }
-        for key in ["x", "y", "rotation"] {
-            if label[key].as_f64().is_none() {
-                return Ok(crate::tools::invalid_arg(
-                    &format!("labels[{i}].{key}"),
-                    "missing or not a number",
-                ));
-            }
-        }
+        };
+        targets.push((target, rotation));
     }
     if labels.is_empty() {
         return Ok(CallToolResult::json(&json!({ "rotated": 0 })));
@@ -2709,14 +2761,8 @@ async fn handle_batch_rotate_labels(
     let expected = content.clone();
     let mut edits = Vec::new();
     let mut turned: Vec<usize> = Vec::new();
-    for (i, label) in labels.iter().enumerate() {
-        let turn = match turn_label(
-            &content,
-            label["net"].as_str().unwrap_or_default(),
-            label["x"].as_f64().unwrap_or(0.0),
-            label["y"].as_f64().unwrap_or(0.0),
-            label["rotation"].as_f64().unwrap_or(0.0),
-        )? {
+    for (i, (target, rotation)) in targets.iter().enumerate() {
+        let turn = match turn_label(&content, target, *rotation)? {
             Ok(turn) => turn,
             Err(refusal) => {
                 return Ok(CallToolResult::error(format!(
@@ -5501,6 +5547,10 @@ mod label_tests {
         );
         let result = rotate(&path, "EN", 10.0, 20.0, 180.0).await;
         assert!(!result.is_error);
+        let reply: serde_json::Value =
+            serde_json::from_str(crate::tools::project_file_writer_tests::text_of(&result))
+                .unwrap();
+        assert_eq!(reply["justify"], json!("right"), "{reply}");
 
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("(at 10 20 180)"), "anchor must rotate");
@@ -5525,6 +5575,34 @@ mod label_tests {
             "the file's own font must be preserved"
         );
         assert_eq!(body.matches("(justify").count(), 1, "no duplicate justify");
+    }
+
+    /// The reply's `justify` is the direction written, not where the label's
+    /// old justify sat in the file. Both labels of the KiCad-saved sheet
+    /// carry a justify for the edit to replace.
+    #[tokio::test]
+    async fn rotate_reports_the_justify_it_writes() {
+        for (net, kind, y, rotation, justify, written) in [
+            ("(at 1 2)", "label", 97.79, 180.0, "right", "right bottom"),
+            ("PWR", "global_label", 105.41, 90.0, "left", "left"),
+        ] {
+            let (_d, path) = label_move_sheet();
+            let result = rotate(&path, net, 114.3, y, rotation).await;
+            let text = crate::tools::project_file_writer_tests::text_of(&result);
+            assert!(!result.is_error, "{text}");
+            let sheet = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(justify_of(&sheet, net), written);
+            let body: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                body,
+                json!({
+                    "rotated_label": net,
+                    "type": kind,
+                    "rotation": rotation,
+                    "justify": justify
+                })
+            );
+        }
     }
 
     #[tokio::test]
@@ -5683,27 +5761,29 @@ mod label_tests {
         }
     }
 
-    /// A label missing a field used to be counted and left as it was. It is
-    /// refused by name at the schema gate before anything is written.
+    /// A label missing `rotation` used to be counted and left as it was. It
+    /// is refused by name at the schema gate before anything is written.
     #[tokio::test]
     async fn batch_rotate_labels_refuses_a_label_missing_a_field() {
         let handler = handler().await;
-        for (key, field) in [("rotation", "labels[1].rotation"), ("net", "labels[1].net")] {
-            let (_d, path) = label_move_sheet();
-            let mut labels = both_labels_turned();
-            labels[1].as_object_mut().unwrap().remove(key);
-            let result = batch_rotate(&handler, &path, labels).await;
-            assert!(result.is_error, "{}", text_of(&result));
-            let body: serde_json::Value = serde_json::from_str(text_of(&result)).unwrap();
-            assert_eq!(body["error"]["kind"], json!("invalid_argument"), "{body}");
-            assert_eq!(body["error"]["field"], json!(field), "{body}");
-            assert_eq!(
-                body["error"]["reason"],
-                json!(format!("\"{key}\" is a required property")),
-                "{body}"
-            );
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), LABEL_MOVE);
-        }
+        let (_d, path) = label_move_sheet();
+        let mut labels = both_labels_turned();
+        labels[1].as_object_mut().unwrap().remove("rotation");
+        let result = batch_rotate(&handler, &path, labels).await;
+        assert!(result.is_error, "{}", text_of(&result));
+        let body: serde_json::Value = serde_json::from_str(text_of(&result)).unwrap();
+        assert_eq!(body["error"]["kind"], json!("invalid_argument"), "{body}");
+        assert_eq!(
+            body["error"]["field"],
+            json!("labels[1].rotation"),
+            "{body}"
+        );
+        assert_eq!(
+            body["error"]["reason"],
+            json!("\"rotation\" is a required property"),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), LABEL_MOVE);
     }
 
     /// The handler refuses the same labels when the schema gate is not in
@@ -5736,6 +5816,237 @@ mod label_tests {
             assert_eq!(body["error"]["field"], json!(field), "{body}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), LABEL_MOVE);
         }
+    }
+
+    // ─── rotation by uuid ──────────────────────────────────────────────────
+
+    /// The uuids of the KiCad-saved sheet's two labels, and of the wire the
+    /// first sits on.
+    const AT_LABEL: &str = "3031ddf4-4f23-44fc-bceb-58bba2ec8575";
+    const PWR_LABEL: &str = "c6653f40-dca2-48f0-85fa-e9e371c6a1b0";
+    const AT_WIRE: &str = "1f044f87-1a20-43d1-a365-bf361a33fb02";
+
+    async fn rotate_label(
+        handler: &crate::mcp::handler::McpHandler,
+        path: &std::path::Path,
+        mut args: serde_json::Value,
+    ) -> CallToolResult {
+        args["schematic"] = json!(path.display().to_string());
+        served_call(handler, "rotate_schematic_label", args).await
+    }
+
+    /// A label named by its uuid turns as it does named by net and position:
+    /// the same reply, and the same sheet byte for byte.
+    #[tokio::test]
+    async fn rotate_schematic_label_takes_a_uuid() {
+        let handler = handler().await;
+        for (uuid, net, y) in [(AT_LABEL, "(at 1 2)", 97.79), (PWR_LABEL, "PWR", 105.41)] {
+            let (_d, by_uuid) = label_move_sheet();
+            let (_e, by_position) = label_move_sheet();
+            let one =
+                rotate_label(&handler, &by_uuid, json!({ "uuid": uuid, "rotation": 180 })).await;
+            assert!(!one.is_error, "{}", text_of(&one));
+            let args = json!({ "net": net, "x": 114.3, "y": y, "rotation": 180 });
+            let other = rotate_label(&handler, &by_position, args).await;
+            assert!(!other.is_error, "{}", text_of(&other));
+            assert_eq!(text_of(&one), text_of(&other));
+            let turned = std::fs::read_to_string(&by_uuid).unwrap();
+            assert_eq!(turned, std::fs::read_to_string(&by_position).unwrap());
+            assert_ne!(turned, LABEL_MOVE);
+        }
+    }
+
+    /// A uuid that is no label's, here the wire's under the first label, is
+    /// refused by either tool, the batch naming its item, first or last.
+    /// Nothing is written.
+    #[tokio::test]
+    async fn rotate_tools_refuse_a_uuid_not_on_the_sheet() {
+        let handler = handler().await;
+        let (_d, path) = label_move_sheet();
+        let result =
+            rotate_label(&handler, &path, json!({ "uuid": AT_WIRE, "rotation": 180 })).await;
+        assert!(result.is_error, "{}", text_of(&result));
+        assert_eq!(
+            text_of(&result),
+            format!("No label with uuid '{AT_WIRE}' in this schematic")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), LABEL_MOVE);
+        for missing in [1, 0] {
+            let (_d, path) = label_move_sheet();
+            let mut labels = both_labels_turned();
+            labels[missing] = json!({ "uuid": AT_WIRE, "rotation": 180 });
+            let result = batch_rotate(&handler, &path, labels).await;
+            assert!(result.is_error, "{}", text_of(&result));
+            assert_eq!(
+                text_of(&result),
+                format!(
+                    "labels[{missing}]: No label with uuid '{AT_WIRE}' in this schematic. \
+                     No label was rotated."
+                )
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), LABEL_MOVE);
+        }
+    }
+
+    /// `uuid` is given alone, and `net` goes with `x` and `y`, worded as
+    /// rename_schematic_net_label words them. A batch item's refusal names it.
+    /// Nothing is written.
+    #[tokio::test]
+    async fn rotate_tools_take_uuid_alone_or_net_with_x_and_y() {
+        let handler = handler().await;
+        let alone = "is given alone; net with x and y chooses the label instead";
+        for (label, field, reason) in [
+            (
+                json!({ "uuid": AT_LABEL, "net": "(at 1 2)" }),
+                "uuid",
+                alone,
+            ),
+            (json!({ "uuid": AT_LABEL, "x": 114.3 }), "uuid", alone),
+            (json!({ "uuid": AT_LABEL, "y": 97.79 }), "uuid", alone),
+            (json!({}), "net", "give uuid, or net with x and y"),
+            (json!({ "net": "(at 1 2)" }), "net", "goes with x and y"),
+            (
+                json!({ "net": "(at 1 2)", "x": 114.3 }),
+                "y",
+                "missing or not a number",
+            ),
+        ] {
+            let mut label = label;
+            label["rotation"] = json!(180);
+            let (_d, path) = label_move_sheet();
+            let single = rotate_label(&handler, &path, label.clone()).await;
+            let (_e, batch_path) = label_move_sheet();
+            let labels = json!([both_labels_turned()[1].clone(), label]);
+            let batch = batch_rotate(&handler, &batch_path, labels).await;
+            for (result, field) in [
+                (single, field.to_string()),
+                (batch, format!("labels[1].{field}")),
+            ] {
+                assert!(result.is_error, "{}", text_of(&result));
+                let body: serde_json::Value = serde_json::from_str(text_of(&result)).unwrap();
+                assert_eq!(body["error"]["kind"], json!("invalid_argument"), "{body}");
+                assert_eq!(body["error"]["field"], json!(field), "{body}");
+                assert_eq!(body["error"]["reason"], json!(reason), "{body}");
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), LABEL_MOVE);
+            assert_eq!(std::fs::read_to_string(&batch_path).unwrap(), LABEL_MOVE);
+        }
+    }
+
+    /// The single tool's handler refuses a field of the wrong type when the
+    /// schema gate is not in front of it, before anything is written.
+    #[tokio::test]
+    async fn rotate_schematic_label_handler_checks_the_label_first() {
+        for (key, value, field) in [
+            ("x", json!("114.3"), "x"),
+            ("y", json!("97.79"), "y"),
+            ("net", json!(7), "net"),
+            ("rotation", json!("180"), "rotation"),
+        ] {
+            let (_d, path) = label_move_sheet();
+            let mut args = json!({
+                "schematic": path.display().to_string(),
+                "net": "(at 1 2)", "x": 114.3, "y": 97.79, "rotation": 180
+            });
+            args[key] = value;
+            let result = handle_rotate_label(&args, &test_ctx()).await.unwrap();
+            assert!(result.is_error, "{}", text_of(&result));
+            let body: serde_json::Value = serde_json::from_str(text_of(&result)).unwrap();
+            assert_eq!(body["error"]["kind"], json!("invalid_argument"), "{body}");
+            assert_eq!(body["error"]["field"], json!(field), "{body}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), LABEL_MOVE);
+        }
+    }
+
+    /// A batch takes a label by uuid beside one by net and position, and the
+    /// sheet is the one net and position alone make.
+    #[tokio::test]
+    async fn batch_rotate_labels_takes_a_uuid() {
+        let handler = handler().await;
+        let (_d, path) = label_move_sheet();
+        let mut labels = both_labels_turned();
+        labels[0] = json!({ "uuid": AT_LABEL, "rotation": 180 });
+        let result = batch_rotate(&handler, &path, labels).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let body: serde_json::Value = serde_json::from_str(text_of(&result)).unwrap();
+        assert_eq!(body, json!({ "rotated": 2 }));
+        let (_e, by_position) = label_move_sheet();
+        let result = batch_rotate(&handler, &by_position, both_labels_turned()).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            std::fs::read_to_string(&by_position).unwrap()
+        );
+    }
+
+    /// One label named twice, by uuid both times or by uuid once and by net
+    /// and position once, is refused as a label named twice by position is.
+    #[tokio::test]
+    async fn batch_rotate_labels_refuses_a_uuid_naming_a_label_twice() {
+        let handler = handler().await;
+        let by_uuid = json!({ "uuid": AT_LABEL, "rotation": 90 });
+        let by_position = json!({ "net": "(at 1 2)", "x": 114.3, "y": 97.79, "rotation": 90 });
+        for (first, second) in [
+            (&by_uuid, &by_uuid),
+            (&by_uuid, &by_position),
+            (&by_position, &by_uuid),
+        ] {
+            let (_d, path) = label_move_sheet();
+            let labels = json!([first, both_labels_turned()[1].clone(), second]);
+            let result = batch_rotate(&handler, &path, labels).await;
+            assert!(result.is_error, "{}", text_of(&result));
+            let body: serde_json::Value = serde_json::from_str(text_of(&result)).unwrap();
+            assert_eq!(body["error"]["kind"], json!("invalid_argument"), "{body}");
+            assert_eq!(body["error"]["field"], json!("labels[2]"), "{body}");
+            assert_eq!(
+                body["error"]["reason"],
+                json!("names the same label as labels[0]"),
+                "{body}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), LABEL_MOVE);
+        }
+    }
+
+    /// The KiCad-saved sheet with a plain label `PWR` on the global label
+    /// `PWR`'s anchor, and the plain label's uuid.
+    const COINCIDENT: &str =
+        include_str!("../../tests/fixtures/coincident_labels_kicad10.kicad_sch");
+    const PLAIN_PWR: &str = "0d4d3a43-7e99-4613-b6d3-aa71f4b45928";
+
+    fn coincident_sheet() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, path) = sch_with("");
+        std::fs::write(&path, COINCIDENT).unwrap();
+        (dir, path)
+    }
+
+    /// Two labels of one name on one anchor, which net and position cannot
+    /// tell apart: each turns alone by its uuid, the other left as it was, and
+    /// one batch turns both.
+    #[tokio::test]
+    async fn a_uuid_turns_one_of_two_labels_on_one_anchor() {
+        let handler = handler().await;
+        for (uuid, turned, kept) in [
+            (PWR_LABEL, "global_label", "label"),
+            (PLAIN_PWR, "label", "global_label"),
+        ] {
+            let (_d, path) = coincident_sheet();
+            let args = json!({ "uuid": uuid, "rotation": 180 });
+            let result = rotate_label(&handler, &path, args).await;
+            assert!(!result.is_error, "{}", text_of(&result));
+            assert_eq!(rotation_of(&path, turned, "PWR"), 180.0);
+            assert_eq!(rotation_of(&path, kept, "PWR"), 0.0);
+        }
+        let (_d, path) = coincident_sheet();
+        let labels = json!([
+            { "uuid": PWR_LABEL, "rotation": 180 },
+            { "uuid": PLAIN_PWR, "rotation": 90 }
+        ]);
+        let result = batch_rotate(&handler, &path, labels).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let body: serde_json::Value = serde_json::from_str(text_of(&result)).unwrap();
+        assert_eq!(body, json!({ "rotated": 2 }));
+        assert_eq!(rotation_of(&path, "global_label", "PWR"), 180.0);
+        assert_eq!(rotation_of(&path, "label", "PWR"), 90.0);
     }
 
     // ─── move by offset ────────────────────────────────────────────────────

@@ -137,8 +137,18 @@ pub fn detect_ipc_endpoint_in(kicad_dir: &Path) -> IpcDetection {
 }
 
 fn detect_ipc_endpoint_from_defaults(defaults: Vec<PathBuf>) -> IpcDetection {
-    choose_endpoint(
-        &adoptable_candidates_from_defaults(defaults),
+    let candidates = adoptable_candidates_from_defaults(defaults)
+        .iter()
+        .map(|path| format_address(path))
+        .collect::<Vec<_>>();
+    detect_candidate_endpoints(&candidates)
+}
+
+/// Probe a single snapshot from `candidate_endpoints` or `candidate_endpoints_in`.
+#[doc(hidden)]
+pub fn detect_candidate_endpoints(candidates: &[String]) -> IpcDetection {
+    choose_candidate_endpoint(
+        candidates,
         |address| {
             crate::KiCadIpcClient::new(address)
                 .ping_outcome()
@@ -191,19 +201,28 @@ fn adoptable_candidates_from_defaults(defaults: Vec<PathBuf>) -> Vec<PathBuf> {
 /// supplied, so a test can state which candidates answer. The Ping runs only
 /// when there is a choice, and `probe_pcb` runs only when several candidates
 /// answer the Ping.
+#[cfg(all(test, unix))]
 fn choose_endpoint(
     candidates: &[PathBuf],
     responds: impl Fn(&str) -> bool,
     probe_pcb: impl Fn(&str) -> PcbEndpointProbe,
 ) -> IpcDetection {
     let addresses: Vec<String> = candidates.iter().map(|path| format_address(path)).collect();
-    match addresses.as_slice() {
+    choose_candidate_endpoint(&addresses, responds, probe_pcb)
+}
+
+fn choose_candidate_endpoint(
+    addresses: &[String],
+    responds: impl Fn(&str) -> bool,
+    probe_pcb: impl Fn(&str) -> PcbEndpointProbe,
+) -> IpcDetection {
+    match addresses {
         [] => IpcDetection::NotFound,
         [only] => IpcDetection::Found(only.clone()),
         _ => {
             let answering: Vec<&String> = addresses.iter().filter(|a| responds(a)).collect();
             match answering.as_slice() {
-                [] => IpcDetection::Ambiguous(addresses),
+                [] => IpcDetection::Ambiguous(addresses.to_vec()),
                 [one] => IpcDetection::Found((*one).clone()),
                 several => {
                     let mut pcb_servers = Vec::new();
@@ -221,7 +240,7 @@ fn choose_endpoint(
                     if !undecided && pcb_servers.len() == 1 {
                         IpcDetection::Found(pcb_servers[0].clone())
                     } else {
-                        IpcDetection::Ambiguous(addresses)
+                        IpcDetection::Ambiguous(addresses.to_vec())
                     }
                 }
             }
@@ -913,6 +932,25 @@ mod tests {
 
             let detected = detect_ipc_endpoint_in(&kicad_dir);
             assert_eq!(detected, IpcDetection::Found(format_address(&pcb_path)));
+        }
+
+        #[test]
+        fn probing_keeps_the_candidate_snapshot_when_paths_disappear() {
+            let dir = tempfile::tempdir().unwrap();
+            let first = dir.path().join("api.sock");
+            let second = dir.path().join(format!("api-{}.sock", std::process::id()));
+            let listener_a = std::os::unix::net::UnixListener::bind(&first).unwrap();
+            let listener_b = std::os::unix::net::UnixListener::bind(&second).unwrap();
+            let snapshot = candidate_endpoints_in(dir.path());
+            assert_eq!(snapshot.len(), 2);
+            drop((listener_a, listener_b));
+            std::fs::remove_file(first).unwrap();
+            std::fs::remove_file(second).unwrap();
+            assert!(candidate_endpoints_in(dir.path()).is_empty());
+            assert_eq!(
+                detect_candidate_endpoints(&snapshot),
+                IpcDetection::Ambiguous(snapshot)
+            );
         }
 
         #[test]

@@ -1,8 +1,10 @@
 # Solder mask and paste margin footprints
 
-Five versions of the same footprint, each written by KiCad, used to check that
-`edit_footprint_pad` and `set_footprint_metadata` write a pad's and a
-footprint's own solder mask and paste margins exactly as KiCad does.
+Nine versions of the same footprint, each written by KiCad. The first five
+check that `edit_footprint_pad` and `set_footprint_metadata` write a pad's and
+a footprint's own solder mask and paste margins exactly as KiCad does. The last
+four are library changes `update_footprints_from_library` refreshes from
+([#723](https://github.com/Copperpour/Copperpour/issues/723)).
 
 The footprint is
 `Package_SON.pretty/Winbond_USON-8-1EP_3x2mm_P0.5mm_EP0.2x1.6mm` from the
@@ -11,10 +13,13 @@ own; its exposed pad is pad `9`.
 
 ## Provenance
 
-All five files were written by KiCad 10.0.8's own footprint writer on Windows
-11, through its Python bindings (`pcbnew.PCB_IO_KICAD_SEXPR`):
+The first five files were written by KiCad 10.0.8's own footprint writer on
+Windows 11, through its Python bindings (`pcbnew.PCB_IO_KICAD_SEXPR`):
 `FootprintLoad(library, name, True)`, one change through the setters named
-below, then `FootprintSave`. Nothing was edited by hand.
+below, then `FootprintSave`. The last four were written the same way by KiCad
+10.0.8 on Linux x86_64, each from the first-five file named below, keeping
+the stock footprint name; they end their lines with LF where the first five
+have CRLF. Nothing was edited by hand.
 
 | Fixture | Change made in KiCad | SHA-256 (first 16) |
 |---|---|---|
@@ -23,6 +28,10 @@ below, then `FootprintSave`. Nothing was edited by hand.
 | `solder_margins_ep_zero_kicad10.kicad_mod` | pad `9`: the same three set to 0 | `fb68a75f9728822c` |
 | `solder_margins_footprint_kicad10.kicad_mod` | footprint: `SetLocalSolderMaskMargin(0.05 mm)`, `SetLocalSolderPasteMargin(-0.03 mm)`, `SetLocalSolderPasteMarginRatio(-0.1)` | `ac0b381216859776` |
 | `solder_margins_footprint_zero_kicad10.kicad_mod` | footprint: the same three set to 0 | `62fd1d34cf3e7c38` |
+| `solder_margins_ep_changed_kicad10.kicad_mod` | from `ep`: pad `9`: `SetLocalSolderMaskMargin(0.03 mm)` | `54ea1e4e96fe80be` |
+| `solder_margins_footprint_changed_kicad10.kicad_mod` | from `footprint`: footprint: `SetLocalSolderMaskMargin(-0.02 mm)` | `f653a8570a431682` |
+| `solder_margins_clearance_kicad10.kicad_mod` | from `none`: footprint: `SetLocalClearance(0.2 mm)` | `c53f7d38f4a53a58` |
+| `solder_margins_zone_connect_kicad10.kicad_mod` | from `none`: footprint: `SetLocalZoneConnection(ZONE_CONNECTION_FULL)` | `f5ec6ce989cfa4d0` |
 
 ## What they show
 
