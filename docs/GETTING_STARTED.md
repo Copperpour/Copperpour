@@ -35,6 +35,9 @@ Parts come from KiCad's own symbol and footprint libraries, the same ones you us
 in KiCad (`search_symbols`, `search_footprints`). Reference templates (USB-C sink,
 LDO, buck, STM32, I2C, LED) come with verified component values.
 
+For a before-and-after schematic, see the
+[schematic readability worked example](SCHEMATIC_READABILITY_WORKED_EXAMPLE.md).
+
 ### 4. Optional: source parts from JLCPCB
 
 If you plan to have JLCPCB assemble the board, Copperpour can match parts against
