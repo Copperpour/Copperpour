@@ -203,6 +203,17 @@ class SettingsDialogFocusTests(unittest.TestCase):
             found = self.plugin.find_pcb_editor_window()
             self.assertIs(found, pcb_editor)
 
+    def test_the_action_plugin_class_keeps_its_name(self):
+        # KiCad stores the toolbar button setting under `<file>/<class name>`,
+        # so renaming the class resets it for every install (#250).
+        base = self.pcbnew.ActionPlugin
+        names = [
+            value.__name__
+            for value in vars(self.plugin).values()
+            if isinstance(value, type) and issubclass(value, base) and value is not base
+        ]
+        self.assertEqual(names, ["CopperpourPlugin"])
+
     def test_save_preserves_settings_without_controls(self):
         saved_settings = {
             "eager_toolsets": True,

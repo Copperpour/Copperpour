@@ -265,19 +265,21 @@ transition. [#277](https://github.com/Copperpour/Copperpour/issues/277) · [#24]
 
 #### Standalone HTTP
 
-If you used the KiCad plugin to start an HTTP server, reuse its `settings.json`
-with `--config` to retain the saved paths and HTTP address. For the launch below,
-set `"transport": "http"` in that file or a copy. With `"both"`, the server shuts
-down when the redirected stdin reaches EOF. For a new setup, a TOML file with
-`transport = "http"` also works.
+If you used the KiCad plugin to start an HTTP server, copy its `settings.json`
+to retain the saved paths and HTTP address, set `"transport": "http"` in the copy,
+and pass the copy with `--config`. Keep `"transport": "stdio"` in the plugin's own
+file if any client launches the installed binary over stdio: the binary reads that
+file when started without `--config`, and with `"http"` it never answers on stdio.
+With `"both"`, the server shuts down when the redirected stdin reaches EOF. For a
+new setup, a TOML file with `transport = "http"` also works.
 
 When launching from a terminal, redirect stdin so the binary enters server mode.
 
 ```sh
-/path/to/copperpour --config /path/to/settings.json </dev/null
+/path/to/copperpour --config /path/to/http-settings.json </dev/null
 ```
 
-In Windows Command Prompt, use `copperpour.exe --config C:\path\to\settings.json < NUL`.
+In Windows Command Prompt, use `copperpour.exe --config C:\path\to\http-settings.json < NUL`.
 If running from a OneDrive-managed plugin folder fails with an access error, copy
 the binary and configuration to a local folder and launch from there.
 
