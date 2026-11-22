@@ -182,6 +182,8 @@ async fn main() -> Result<()> {
         Err(error) => tracing::warn!("guidance drift detection unavailable: {error:#}"),
     }
 
+    ipc_source.start_prerequisite_checks(&config.ipc_address, &handler);
+
     match config.transport {
         TransportMode::Stdio => {
             handler.enable_stdio_reload();

@@ -538,12 +538,33 @@ the phantom pads are gone and the expected drawing shapes returned. Save the
 board and run DRC afterward. Ctrl-Z reverses the complete repair if its visual
 result is not what you expect.
 
-## "kicad-cli not found"
+## KiCad prerequisite health
 
-Common install paths are auto-detected (including the Windows registry and macOS
-app bundle). Call `get_installation_info`: its `kicad` block reports the resolved
-CLI path and probe status. `not_found` with a null `cli_path` means discovery
-found no CLI.
+Copperpour checks the KiCad CLI and IPC once in the background when its MCP
+server starts. The new checks run concurrently with budgets of five seconds
+for the CLI version and two seconds for IPC. The server logs a summary to
+stderr. Initialization and unrelated tools can continue while the checks run.
+
+Call `get_installation_info` and read `prerequisite_health`. The report includes
+the time of the observation, the executable or redacted endpoint source, and
+next steps for each capability. After fixing setup, call the tool with
+`{"refresh_prerequisite_health": true}` or restart the MCP server. A refresh uses
+the running server's configuration. Restart after changing its configuration
+file or launch environment.
+
+- **CLI.** A version from KiCad 10 or later establishes that the executable
+  launched and reported a supported version. For `not_found`, check
+  `kicad_cli` or the MCP process's PATH. For `unexecutable` or `timed_out`, run
+  the configured CLI with `--version` as the account running Copperpour.
+- **IPC.** `communication_confirmed` records whether the probe received a
+  recognizable response. The endpoint can respond before the PCB Editor is
+  ready or when no PCB document is open. If the endpoint is unreachable,
+  verify the intended KiCad instance, its **Enable KiCad API** setting, and
+  its endpoint. An unreachable or unknown result leaves the cause unresolved.
+  With several automatically detected candidates, health reports ambiguity
+  until there is evidence for one endpoint or you configure it explicitly.
+  A ready result applies to the sampled endpoint. Tools still verify their
+  own board targets.
 
 For an unusual install location, follow [Manual configuration](CONFIGURATION.md).
 If a setting appears to be ignored, inspect the tool's `configuration` block:

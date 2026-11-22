@@ -208,6 +208,21 @@ impl McpHandler {
         })
     }
 
+    /// Schedule one read-only prerequisite assessment without delaying the
+    /// transport or MCP initialization. Both standalone and embedded servers
+    /// call this after applying their effective configuration.
+    pub fn start_prerequisite_checks(
+        &self,
+        endpoint_source: &'static str,
+        endpoint: crate::tools::IpcEndpoint,
+    ) {
+        crate::runtime_info::prerequisites::PrerequisiteHealth::start(
+            self.ctx.clone(),
+            endpoint_source,
+            endpoint,
+        );
+    }
+
     /// Accessor for the `CallObserver` — used by meta-tools `get_recent_calls`
     /// and `server_stats` that live on `ToolContext`.
     pub fn observer(&self) -> &CallObserver {

@@ -812,8 +812,14 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
     let parameters: BTreeSet<String> = registry::ALL_TOOLSETS
         .iter()
         .flat_map(|ts| registry::tools_for(ts.name).unwrap_or_default())
-        .filter_map(|d| {
-            d.input_schema
+        .map(|tool| tool.input_schema)
+        .chain(
+            copperpour_core::router::meta_tools::meta_tool_descriptions()
+                .into_iter()
+                .map(|tool| tool.input_schema),
+        )
+        .filter_map(|schema| {
+            schema
                 .get("properties")
                 .and_then(|p| p.as_object())
                 .map(|o| o.keys().cloned().collect::<Vec<_>>())
@@ -900,6 +906,7 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "compensating_deletion",
         "browser_launch_error",
         "absolute_path",
+        "prerequisite_health",
         "binary_on_disk",
         "newer_than_running",
         "working_directory",

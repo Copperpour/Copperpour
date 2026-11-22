@@ -71,6 +71,7 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
         }
         if let Ok(handler) = &handler {
             config.apply_to_handler(handler);
+            ipc_source.start_prerequisite_checks(&config.ipc_address, handler);
         }
         match handler {
             Ok(handler) => match config.transport {

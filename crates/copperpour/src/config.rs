@@ -88,7 +88,7 @@ pub enum TransportMode {
 }
 
 /// Where the effective `ipc_address` came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcAddressSource {
     /// Set explicitly in a config file.
     Config,
@@ -96,6 +96,8 @@ pub enum IpcAddressSource {
     Environment,
     /// Probed from the platform's default KiCad socket path.
     Detected,
+    /// Several candidates qualify. Live tools will resolve them on demand.
+    Ambiguous(Vec<String>),
     /// Nothing found — IPC tools will report the socket as unconfigured, and
     /// the ones with a file path will quietly use it.
     Unresolved,
@@ -105,55 +107,46 @@ impl IpcAddressSource {
     /// Whether the address may be looked for again while the server runs:
     /// only one that was detected or not found. A configured or environment
     /// address is the user's choice and is never replaced (#32).
-    pub fn rediscovers(self) -> bool {
-        matches!(
-            self,
-            IpcAddressSource::Detected | IpcAddressSource::Unresolved
-        )
+    pub fn rediscovers(&self) -> bool {
+        matches!(self, Self::Detected | Self::Ambiguous(_) | Self::Unresolved)
     }
 
     /// Report the resolution once tracing is initialized.
-    pub fn log(self, address: &str) {
+    pub fn log(&self, address: &str) {
         if let Some(message) = self.resolved_log_message(address) {
             info!("{message}");
-            return;
         }
-
-        if let copperpour_ipc::IpcDetection::Ambiguous(candidates) =
-            copperpour_ipc::detect_ipc_endpoint()
-        {
-            warn!(
-                "More than one KiCad IPC socket qualifies and not exactly one answered, \
-                 so none was picked: {}. Set ipc_address to the one KiCad lists under \
-                 Preferences > Plugins. Copperpour looks again on every IPC call.",
-                candidates
-                    .iter()
-                    .map(|c| copperpour_ipc::redact_endpoint(c))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            return;
-        }
-        warn!(
-            "No KiCad IPC socket found (no KICAD_API_SOCKET, none detected at {}). \
-             Live-KiCad tools will fail and file-backed ones will edit the \
-             project on disk instead. Enable Preferences > Plugins > \
-             'Enable KiCad API' (KiCad > Preferences on macOS), or set ipc_address in your config.",
-            copperpour_ipc::candidate_socket_paths()
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
     }
 
-    fn resolved_log_message(self, address: &str) -> Option<String> {
-        let source = match self {
-            IpcAddressSource::Config => "config",
-            IpcAddressSource::Environment => "KICAD_API_SOCKET",
-            IpcAddressSource::Detected => "auto-detection",
-            IpcAddressSource::Unresolved => return None,
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::Environment => "KICAD_API_SOCKET",
+            Self::Detected => "auto-detection",
+            Self::Ambiguous(_) => "ambiguous",
+            Self::Unresolved => "unresolved",
+        }
+    }
+
+    pub fn start_prerequisite_checks(
+        self,
+        address: &str,
+        handler: &copperpour_core::mcp::handler::McpHandler,
+    ) {
+        use copperpour_core::tools::IpcEndpoint;
+        let source = self.as_str();
+        let endpoint = match self {
+            Self::Ambiguous(candidates) => IpcEndpoint::Ambiguous(candidates),
+            _ => IpcEndpoint::Address(address.to_owned()),
         };
+        handler.start_prerequisite_checks(source, endpoint);
+    }
+
+    fn resolved_log_message(&self, address: &str) -> Option<String> {
+        if address.is_empty() {
+            return None;
+        }
+        let source = self.as_str();
         Some(format!(
             "KiCad IPC address from {source}: {}",
             copperpour_ipc::redact_endpoint(address)
@@ -277,12 +270,16 @@ impl Config {
     /// tracing is up; a session that will silently fall back to file editing
     /// says so at startup rather than at the first confusing tool result.
     pub fn resolve_ipc_address(&mut self) -> IpcAddressSource {
-        self.resolve_ipc_address_with(copperpour_ipc::detect_ipc_address)
+        self.resolve_ipc_address_with(|| {
+            copperpour_ipc::socket::unprobed_candidate_endpoint(
+                &copperpour_ipc::candidate_endpoints(),
+            )
+        })
     }
 
     fn resolve_ipc_address_with(
         &mut self,
-        detect_ipc_address: impl FnOnce() -> Option<String>,
+        detect_ipc_endpoint: impl FnOnce() -> copperpour_ipc::IpcDetection,
     ) -> IpcAddressSource {
         let trimmed = self.ipc_address.trim().to_string();
         if !trimmed.is_empty() {
@@ -297,12 +294,15 @@ impl Config {
                 return IpcAddressSource::Environment;
             }
         }
-        match detect_ipc_address() {
-            Some(address) => {
+        match detect_ipc_endpoint() {
+            copperpour_ipc::IpcDetection::Found(address) => {
                 self.ipc_address = address;
                 IpcAddressSource::Detected
             }
-            None => IpcAddressSource::Unresolved,
+            copperpour_ipc::IpcDetection::Ambiguous(candidates) => {
+                IpcAddressSource::Ambiguous(candidates)
+            }
+            copperpour_ipc::IpcDetection::NotFound => IpcAddressSource::Unresolved,
         }
     }
 
@@ -589,7 +589,9 @@ mod tests {
         std::env::set_var("KICAD_API_SOCKET", " \t ");
 
         let mut c = Config::default();
-        let source = c.resolve_ipc_address_with(|| Some("ipc:///tmp/kicad/api.sock".to_string()));
+        let source = c.resolve_ipc_address_with(|| {
+            copperpour_ipc::IpcDetection::Found("ipc:///tmp/kicad/api.sock".to_string())
+        });
 
         assert_eq!(source, IpcAddressSource::Detected);
         assert_eq!(c.ipc_address, "ipc:///tmp/kicad/api.sock");
@@ -641,7 +643,9 @@ mod tests {
 
         let f = write_temp("json", r#"{"ipc_socket_path": "   "}"#);
         let mut c = Config::load_from(f.path()).unwrap();
-        let source = c.resolve_ipc_address_with(|| Some("ipc:///tmp/kicad/api.sock".to_string()));
+        let source = c.resolve_ipc_address_with(|| {
+            copperpour_ipc::IpcDetection::Found("ipc:///tmp/kicad/api.sock".to_string())
+        });
         assert_eq!(source, IpcAddressSource::Detected);
         assert_eq!(c.ipc_address, "ipc:///tmp/kicad/api.sock");
     }
@@ -655,7 +659,9 @@ mod tests {
         std::env::remove_var("KICAD_API_SOCKET");
 
         let mut c = Config::default();
-        let source = c.resolve_ipc_address_with(|| Some("ipc:///tmp/kicad/api.sock".to_string()));
+        let source = c.resolve_ipc_address_with(|| {
+            copperpour_ipc::IpcDetection::Found("ipc:///tmp/kicad/api.sock".to_string())
+        });
         assert_eq!(source, IpcAddressSource::Detected);
         assert_eq!(c.ipc_address, "ipc:///tmp/kicad/api.sock");
     }
@@ -666,7 +672,9 @@ mod tests {
         std::env::set_var("KICAD_API_SOCKET", "ipc://env-wins.sock");
 
         let mut c = Config::default();
-        let source = c.resolve_ipc_address_with(|| Some("ipc:///tmp/kicad/api.sock".to_string()));
+        let source = c.resolve_ipc_address_with(|| {
+            copperpour_ipc::IpcDetection::Found("ipc:///tmp/kicad/api.sock".to_string())
+        });
         assert_eq!(source, IpcAddressSource::Environment);
         assert_eq!(c.ipc_address, "ipc://env-wins.sock");
 
@@ -693,7 +701,7 @@ mod tests {
         std::env::remove_var("KICAD_API_SOCKET");
 
         let mut c = Config::default();
-        let source = c.resolve_ipc_address_with(|| None);
+        let source = c.resolve_ipc_address_with(|| copperpour_ipc::IpcDetection::NotFound);
         assert_eq!(source, IpcAddressSource::Unresolved);
         assert_eq!(c.ipc_address, "");
     }

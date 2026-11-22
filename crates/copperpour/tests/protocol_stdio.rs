@@ -238,6 +238,152 @@ fn handshake_baseline_and_full_registry_loads() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn prerequisite_health_is_cached_until_explicit_refresh() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cli = tmp.path().join("kicad-cli");
+    write_executable_script(&cli, "#!/bin/sh\nprintf '10.0.5\\n'\n");
+    let missing_ipc = format!("ipc://{}", tmp.path().join("missing.sock").display());
+    std::fs::write(
+        tmp.path().join("konnect.toml"),
+        format!(
+            "kicad_cli = {}\nipc_address = {}\n",
+            json!(cli),
+            json!(missing_ipc)
+        ),
+    )
+    .unwrap();
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let installation_info = |p: &mut McpProcess, args| {
+        McpProcess::tool_body(&p.call_tool("get_installation_info", args))
+    };
+
+    let first = installation_info(&mut p, json!({}));
+    let startup = &first["prerequisite_health"];
+    assert_eq!(startup["source"], "startup", "{first:#}");
+    assert!(startup["checked_at_unix_ms"].is_number());
+    assert_eq!(startup["kicad_cli"]["status"], "ready");
+    assert_eq!(startup["kicad_cli"]["version"], "10.0.5");
+    assert_eq!(startup["ipc"]["status"], "unreachable");
+    assert_eq!(startup["ipc"]["source"], "config");
+    assert_eq!(startup["ipc"]["endpoint"], missing_ipc);
+
+    std::fs::remove_file(&cli).unwrap();
+    assert_eq!(
+        installation_info(&mut p, json!({}))["prerequisite_health"],
+        *startup
+    );
+    let refreshed = installation_info(&mut p, json!({"refresh_prerequisite_health": true}));
+    assert_eq!(refreshed["prerequisite_health"]["source"], "refresh");
+    assert_eq!(
+        refreshed["prerequisite_health"]["kicad_cli"]["reason"],
+        "not_found"
+    );
+    assert_eq!(refreshed["kicad"]["probe_status"], "launch_failed");
+    assert_eq!(
+        installation_info(&mut p, json!({}))["prerequisite_health"],
+        refreshed["prerequisite_health"]
+    );
+}
+
+#[test]
+fn prerequisite_health_respects_disabled_cli_and_requires_a_boolean_refresh() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("konnect.toml"),
+        "kicad_cli = '  '\nipc_address = 'ipc://prerequisite-health-disabled.sock'\n",
+    )
+    .unwrap();
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let info = McpProcess::tool_body(&p.call_tool("get_installation_info", json!({})));
+    assert_eq!(
+        info["prerequisite_health"]["kicad_cli"]["reason"],
+        "disabled"
+    );
+    assert!(info["prerequisite_health"]["kicad_cli"]["executable_path"].is_null());
+    assert!(info["prerequisite_health"]["kicad_cli"]["version"].is_null());
+
+    let result = p.call_tool(
+        "get_installation_info",
+        json!({"refresh_prerequisite_health": "true"}),
+    );
+    assert_eq!(result["isError"], true);
+    let error = McpProcess::tool_body(&result);
+    assert_eq!(error["error"]["kind"], "invalid_argument");
+    assert_eq!(error["error"]["field"], "refresh_prerequisite_health");
+}
+
+#[cfg(unix)]
+#[test]
+fn prerequisite_health_cli_timeout_leaves_initialization_and_other_tools_available() {
+    use std::time::{Duration, Instant};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cli = tmp.path().join("kicad-cli");
+    write_executable_script(&cli, "#!/bin/sh\nexec sleep 30\n");
+    std::fs::write(
+        tmp.path().join("konnect.toml"),
+        format!(
+            "kicad_cli = {}\nipc_address = {}\n",
+            json!(cli),
+            json!(format!(
+                "ipc://{}",
+                tmp.path().join("missing.sock").display()
+            )),
+        ),
+    )
+    .unwrap();
+
+    let start = Instant::now();
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let tools = McpProcess::tool_body(&p.call_tool("list_toolboxes", json!({})));
+    assert!(tools["toolsets"].is_array(), "{tools}");
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "initialization or toolbox discovery waited for the CLI timeout"
+    );
+
+    let info = McpProcess::tool_body(&p.call_tool("get_installation_info", json!({})));
+    assert_eq!(
+        info["prerequisite_health"]["kicad_cli"]["reason"], "timed_out",
+        "{info:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn prerequisite_health_distinguishes_old_and_unexecutable_cli() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cli = tmp.path().join("kicad-cli");
+    write_executable_script(&cli, "#!/bin/sh\nprintf '9.0.8\\n'\n");
+    std::fs::write(
+        tmp.path().join("konnect.toml"),
+        format!(
+            "kicad_cli = {}\nipc_address = 'ipc://missing.sock'\n",
+            json!(cli)
+        ),
+    )
+    .unwrap();
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let startup = McpProcess::tool_body(&p.call_tool("get_installation_info", json!({})));
+    let cli_health = &startup["prerequisite_health"]["kicad_cli"];
+    assert_eq!(cli_health["reason"], "unsupported_version");
+    assert_eq!(cli_health["version"], "9.0.8");
+
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let refreshed = McpProcess::tool_body(&p.call_tool(
+        "get_installation_info",
+        json!({"refresh_prerequisite_health": true}),
+    ));
+    assert_eq!(
+        refreshed["prerequisite_health"]["kicad_cli"]["reason"],
+        "unexecutable"
+    );
+}
+
 // #527: diagnostics must probe the configured executable, even when it cannot
 // launch, instead of substituting a different installed KiCad.
 #[test]
@@ -384,6 +530,56 @@ fn installation_info_reports_the_serving_process_without_leaking_endpoint_secret
     assert!(!body["restart_guidance"].as_array().unwrap().is_empty());
 }
 
+// These real Unix listeners never speak NNG. Eager automatic discovery
+// would wait on them before replying, even for an unrelated MCP request.
+#[cfg(target_os = "linux")]
+#[test]
+fn prerequisite_health_leaves_multiple_unverified_sockets_for_live_operations() {
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_dir = tmp.path().join("kicad");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    std::fs::write(tmp.path().join("konnect.toml"), "kicad_cli = ''\n").unwrap();
+    let primary = socket_dir.join("api.sock");
+    let alternate = socket_dir.join(format!("api-{}.sock", std::process::id()));
+    let _primary = UnixListener::bind(&primary).unwrap();
+    let _alternate = UnixListener::bind(&alternate).unwrap();
+
+    let start = Instant::now();
+    let mut p = McpProcess::spawn_with_env_without(
+        Some(tmp.path()),
+        true,
+        &[("TMPDIR", tmp.path().to_str().unwrap())],
+        &["KICAD_API_SOCKET"],
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "IPC discovery delayed initialization"
+    );
+
+    let start = Instant::now();
+    for args in [json!({}), json!({"refresh_prerequisite_health": true})] {
+        let info = McpProcess::tool_body(&p.call_tool("get_installation_info", args));
+        assert_eq!(info["ipc"]["source"], "ambiguous");
+        let ipc = &info["prerequisite_health"]["ipc"];
+        assert_eq!(ipc["reason"], "ambiguous_endpoint", "{info:#}");
+        assert_eq!(ipc["communication_confirmed"], false);
+        assert_eq!(
+            ipc["candidates"],
+            json!([
+                format!("ipc://{}", primary.display()),
+                format!("ipc://{}", alternate.display()),
+            ])
+        );
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "diagnostics probed unverified candidates"
+    );
+}
+
 /// #565 over real stdio: with nothing to dial at startup, the server looks
 /// for KiCad's socket on every call, and `get_installation_info` reports the
 /// socket it finds after startup, from the decision the IPC calls make.
@@ -415,6 +611,15 @@ fn installation_info_reports_a_socket_found_after_startup() {
         "{before:#}"
     );
 
+    assert_eq!(
+        before["prerequisite_health"]["ipc"]["reason"],
+        "not_configured"
+    );
+    assert_eq!(
+        before["prerequisite_health"]["ipc"]["communication_confirmed"],
+        false
+    );
+
     // KiCad starts after the server, and its socket appears.
     let socket = temp_dir.join("kicad").join("api.sock");
     let _kicad = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -430,6 +635,16 @@ fn installation_info_reports_a_socket_found_after_startup() {
         }),
         "{after:#}"
     );
+
+    assert_eq!(after["prerequisite_health"], before["prerequisite_health"]);
+    let refreshed = McpProcess::tool_body(&p.call_tool(
+        "get_installation_info",
+        json!({"refresh_prerequisite_health": true}),
+    ));
+    let health = &refreshed["prerequisite_health"]["ipc"];
+    assert_eq!(health["endpoint"], after["ipc"]["endpoint"]);
+    assert_eq!(health["status"], "unreachable");
+    assert_eq!(health["communication_confirmed"], false);
 }
 
 #[test]
