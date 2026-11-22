@@ -9,7 +9,7 @@
     "move_schematic_objects_between_sheets",
     "run_design_review"
   ],
-  "legacy_entry_ceiling": 3,
+  "legacy_entry_ceiling": 2,
   "legacy_entries": [
     {
       "id": "drc-source-and-policy",
@@ -24,18 +24,6 @@
         "https://github.com/Copperpour/Copperpour/issues/58"
       ],
       "removal_criteria": "One owned DRC execution/result contract identifies source state and reports unavailable or partial evidence without ambiguity."
-    },
-    {
-      "id": "explicit-config-startup",
-      "paths": [
-        "crates/copperpour/src/config.rs",
-        "crates/copperpour/src/ffi.rs"
-      ],
-      "rationale": "The plugin startup path can substitute defaults after an explicitly requested configuration fails, obscuring the refusal from the caller.",
-      "tracking_issues": [
-        "https://github.com/mixelpixx/Konnect/issues/545"
-      ],
-      "removal_criteria": "Explicit-config failure is a structured startup refusal, no substituted defaults are started, and regression coverage exercises the plugin entry point."
     },
     {
       "id": "live-file-board-readers",

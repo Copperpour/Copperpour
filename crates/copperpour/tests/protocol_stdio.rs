@@ -1093,6 +1093,39 @@ fn a_malformed_explicit_config_stops_startup_instead_of_falling_back() {
     );
 }
 
+#[test]
+fn cli_explicit_config_flag_errors_refuse_startup_instead_of_falling_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Place a valid search-path file in cwd to prove none of these fall back to discovery.
+    std::fs::write(tmp.path().join("copperpour.toml"), "log_level = \"info\"\n").unwrap();
+    let valid = tmp.path().join("valid.toml");
+    std::fs::write(&valid, "log_level = \"info\"\n").unwrap();
+    let valid_str = valid.to_str().unwrap();
+
+    for (args, expected_reason) in [
+        (vec!["--config"], "--config requires"),
+        (vec!["--config", ""], "must not be empty"),
+        (
+            vec!["--config", valid_str, "--config", valid_str],
+            "only be specified once",
+        ),
+    ] {
+        let (ok, stderr) = run_expecting_startup_failure(tmp.path(), &args);
+        assert!(
+            !ok,
+            "invalid --config invocation {args:?} must refuse startup, stderr={stderr}"
+        );
+        assert!(
+            stderr.contains(expected_reason),
+            "expected '{expected_reason}' in stderr for {args:?}, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("configuration:"),
+            "refused --config invocation {args:?} must not report a loaded configuration: {stderr}"
+        );
+    }
+}
+
 /// A server started from an SSH session has no display; `launch_kicad_ui`
 /// says so, and `display` aims KiCad at one (#225). `/bin/sh` stands in for
 /// KiCad and runs the `project` argument as its script.

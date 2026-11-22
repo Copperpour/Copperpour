@@ -6,11 +6,11 @@ mod run_registry;
 mod transaction_cli;
 mod transport;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use config::{Config, TransportMode};
-use copperpour_core::config_resolution::ConfigSource;
 use copperpour_core::mcp::handler::McpHandler;
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -113,12 +113,9 @@ async fn main() -> Result<()> {
     // deliberately non-mutating: guidance installation requires `copperpour init`.
     let _client = install::client_from_server_args(&args[1..])?;
 
-    // --config <path>: load config from specified file
-    let config_path = args
-        .iter()
-        .position(|a| a == "--config")
-        .and_then(|pos| args.get(pos + 1))
-        .map(std::path::PathBuf::from);
+    // --config <path>: load config from specified file. Refuse missing or
+    // repeated flags instead of silently falling back to discovery/defaults.
+    let config_path = parse_config_path(&args[1..])?;
 
     let (config, ipc_source, config_resolution) = Config::load_resolved(config_path.as_deref())?;
 
@@ -133,35 +130,7 @@ async fn main() -> Result<()> {
 
     info!("Copperpour v{} starting", env!("CARGO_PKG_VERSION"));
     ipc_source.log(&config.ipc_address);
-
-    // Name the configuration that actually started this process. A user whose
-    // settings appear to be ignored otherwise has nothing to go on before the
-    // first tool call, and `get_installation_info` may not be reachable at all
-    // if the transport is the thing misconfigured (#419). One record, not one
-    // per shadowed file: first-match is the intended policy, so a warning per
-    // skipped file would be noise.
-    match (
-        config_resolution.source(),
-        config_resolution.selected_path(),
-    ) {
-        // An explicit --config bypasses discovery, so a count of "later
-        // candidates" would claim a search ran that never did.
-        (ConfigSource::ExplicitPath, Some(path)) => info!(
-            "configuration: explicit_path from {} (search list not consulted)",
-            path.display(),
-        ),
-        (_, Some(path)) => info!(
-            skipped_existing_paths = ?config_resolution.skipped_existing_paths(),
-            "configuration: {} from {} ({} later candidate(s) exist and were not merged)",
-            config_resolution.source().as_str(),
-            path.display(),
-            config_resolution.skipped_existing_paths().len(),
-        ),
-        (_, None) => info!(
-            "configuration: {} (no configuration file was loaded)",
-            config_resolution.source().as_str(),
-        ),
-    }
+    config::log_config_resolution(&config_resolution);
 
     // Record this server, and reap the records of servers that are gone
     // (#103). This is the only spot that sees all three spawn paths — the
@@ -221,6 +190,29 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_config_path(args: &[String]) -> Result<Option<PathBuf>> {
+    let mut selected = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--config" {
+            if selected.is_some() {
+                bail!("--config may only be specified once");
+            }
+            let Some(value) = args.get(index + 1) else {
+                bail!("--config requires a file path");
+            };
+            selected = Some(PathBuf::from(value));
+            index += 2;
+        } else if arg == "--client" {
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(selected)
 }
 
 /// Replace the standalone process through the platform-specific validated
@@ -425,5 +417,21 @@ mod cli_dispatch_tests {
             Cli::Server
         );
         assert_eq!(classify(&cli(&["--client", "codex"])), Cli::Server);
+    }
+
+    #[test]
+    fn parse_config_path_accepts_single_value_and_refuses_missing_or_duplicate() {
+        let args = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_config_path(&args(&[])).unwrap(), None);
+        assert_eq!(
+            parse_config_path(&args(&["--config", "a.toml"])).unwrap(),
+            Some(PathBuf::from("a.toml"))
+        );
+        assert_eq!(
+            parse_config_path(&args(&["--client", "codex", "--config", "a.toml"])).unwrap(),
+            Some(PathBuf::from("a.toml"))
+        );
+        assert!(parse_config_path(&args(&["--config"])).is_err());
+        assert!(parse_config_path(&args(&["--config", "a.toml", "--config", "b.toml"])).is_err());
     }
 }

@@ -104,6 +104,9 @@ fn client_from_args_allowing(args: &[String], also: &[&str]) -> Result<InstallCl
             selected = Some(value.parse()?);
             index += 2;
         } else if also.contains(&arg) {
+            if args.get(index + 1).is_none() {
+                bail!("{arg} requires a value");
+            }
             index += 2;
         } else {
             bail!("unrecognised argument '{arg}'; run 'copperpour --help' for usage");
@@ -2456,6 +2459,7 @@ mod tests {
             client_from_server_args(&["--config".to_string(), "C:/k.json".to_string()]).unwrap(),
             InstallClient::Claude
         );
+        assert!(client_from_server_args(&["--config".to_string()]).is_err());
         assert!(client_from_server_args(&["--nope".to_string()]).is_err());
     }
 
