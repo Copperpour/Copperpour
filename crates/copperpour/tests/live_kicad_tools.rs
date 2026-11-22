@@ -676,15 +676,7 @@ fn footprint_library_update_apply_then_dry_run_is_noop() {
         "KiCad save changed the rebuilt fab text: {saved_converged}"
     );
     mcp.tool("load_toolset", json!({"name": "verification"}));
-    let drc = mcp.tool(
-        "run_drc",
-        json!({
-            "board": board,
-            "severity": "info",
-            "tests": ["lib_footprint_mismatch"],
-            "limit": 100
-        }),
-    );
+    let drc = mcp.tool("run_drc", footprint_mismatch_drc_arguments(&board));
     let drc: Value = serde_json::from_str(drc["content"][0]["text"].as_str().unwrap()).unwrap();
     assert!(
         drc["violations"]
@@ -1419,4 +1411,77 @@ fn footprint_field_layer_and_visibility_round_trip_through_live_kicad() {
             "{reference}'s saved Value is not hidden"
         );
     }
+}
+
+fn footprint_mismatch_drc_arguments(board: &std::path::Path) -> Value {
+    json!({
+        "board": board,
+        "severity": "info",
+        "rules": ["lib_footprint_mismatch"],
+        "limit": 100
+    })
+}
+
+/// Precondition guard for `footprint_library_update_apply_then_dry_run_is_noop`,
+/// deliberately **not** `#[ignore]`d so CI catches schema drift (#758).
+#[tokio::test]
+async fn footprint_mismatch_drc_arguments_pass_served_schema_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = dir.path().join("missing.kicad_pcb");
+    let args = footprint_mismatch_drc_arguments(&board);
+
+    let config = copperpour_core::tools::ServerConfig {
+        kicad_cli: dir
+            .path()
+            .join("missing-kicad-cli")
+            .to_string_lossy()
+            .into_owned(),
+        ..Default::default()
+    };
+    let handler = copperpour_core::mcp::handler::McpHandler::new(config)
+        .await
+        .unwrap();
+    let load = handler
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "load_toolset", "arguments": {"name": "verification"}}
+        }))
+        .await
+        .expect("load_toolset receives a response");
+    assert_ne!(
+        load.result.as_ref().unwrap()["isError"],
+        json!(true),
+        "{load:?}"
+    );
+
+    let response = handler
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "run_drc", "arguments": args.clone()}
+        }))
+        .await
+        .expect("run_drc receives a response");
+    let result = response.result.expect("run_drc returns a tool result");
+    let body: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        body["error"]["kind"],
+        json!("handler_error"),
+        "expected run_drc to pass schema and argument validation and reach kicad-cli spawn: {body}"
+    );
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Failed to spawn kicad-cli"),
+        "expected run_drc to reach kicad-cli spawn after validating arguments: {body}"
+    );
+    assert_eq!(
+        args["rules"],
+        json!(["lib_footprint_mismatch"]),
+        "live refresh test must filter DRC to lib_footprint_mismatch"
+    );
 }
