@@ -42,8 +42,8 @@ This operation is not `update_pcb_from_schematic`. Schematic sync updates
 schematic-owned fields while preserving artwork. Library refresh replaces supported
 library-owned pads, graphics, attributes, metadata, and 3D models while preserving
 the placed footprint's reference, value, position, rotation, board side, locked
-state, KIID, symbol metadata, instance overrides, and pad nets by logical pad
-number.
+state, KIID, symbol metadata, instance overrides (unless
+`reset_clearance_overrides` is set), and pad nets by logical pad number.
 
 Always dry-run first:
 
@@ -56,6 +56,7 @@ update_footprints_from_library(
   reset_text_positions?,
   reset_text_content?,
   reset_fabrication_attributes?,
+  reset_clearance_overrides?,
   dry_run,
   expected_plan_revision?
 )
@@ -76,6 +77,10 @@ update_footprints_from_library(
   position-file exclusions. `reset_text_content` and
   `reset_fabrication_attributes` take the library's instead. DNP and "not in
   schematic" are always kept.
+- Pads take the library's solder mask and paste margins. The footprint keeps
+  its own clearance, zone connection, margins and solder mask bridge setting;
+  `reset_clearance_overrides` takes the library's, as KiCad's dialog does by
+  default.
 - A stale plan, unresolved library, removed connected pad, or unsupported
   library content returns a non-mutating conflict for the whole selection.
 

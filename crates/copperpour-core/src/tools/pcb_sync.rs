@@ -11777,6 +11777,70 @@ mod tests {
         }
     }
 
+    /// A replacement by a footprint with solder margins takes them, as KiCad's
+    /// Update PCB does (`ExchangeFootprint` with its defaults): each pad gets
+    /// the library's, and the footprint's own clearance, zone connection,
+    /// margins and bridge setting become the library's, whatever the board
+    /// had. The next dry run has nothing to do.
+    #[tokio::test]
+    async fn a_replacement_takes_the_new_footprints_solder_margins() {
+        use crate::tools::library_footprint::test_margins::{
+            expected_margins, placed_margins, SOLDER_MARGIN_FOOTPRINTS,
+        };
+        use copperpour_ipc::gen::kiapi::board::types::{
+            FootprintInstance, SolderMaskOverrides, ZoneConnectionStyle,
+        };
+
+        for (name, source, own, pad_9) in SOLDER_MARGIN_FOOTPRINTS {
+            let mut before =
+                FootprintInstance::decode(schematic_backed_resistor().value.as_slice()).unwrap();
+            let overrides = before.overrides.get_or_insert_with(Default::default);
+            overrides.copper_clearance = Some(copperpour_ipc::builders::distance(0.2));
+            overrides.solder_mask = Some(SolderMaskOverrides {
+                solder_mask_margin: Some(copperpour_ipc::builders::distance(0.07)),
+                ..Default::default()
+            });
+            overrides.zone_connection = ZoneConnectionStyle::ZcsFull as i32;
+            before.attributes.as_mut().unwrap().allow_soldermask_bridges = true;
+            let served = ServedSync::holding(HeldBoard {
+                footprints: vec![copperpour_ipc::builders::pack_any(
+                    &before,
+                    "kiapi.board.types.FootprintInstance",
+                )],
+                zones: Vec::new(),
+                nets: vec!["VCC", "GND"],
+            })
+            .await;
+            margins_library(&served, &[(name, source)]);
+            let netlist = r1_on(&format!("Margins:{name}"));
+
+            let plan = served.dry_run(&netlist).await;
+            assert_eq!(
+                plan["changes"][0]["replace_footprint"]["to"],
+                format!("Margins:{name}"),
+                "{name}: {plan:#}"
+            );
+            let applied = served.apply(&netlist).await;
+            assert_eq!(applied["status"], "applied", "{name}: {applied:#}");
+            let held =
+                FootprintInstance::decode(served.held.lock().unwrap()[0].value.as_slice()).unwrap();
+            assert_eq!(
+                placed_margins(&held),
+                expected_margins(own, pad_9),
+                "{name}"
+            );
+            let overrides = held.overrides.unwrap();
+            assert_eq!(overrides.copper_clearance, None, "{name}");
+            assert_eq!(
+                overrides.zone_connection,
+                ZoneConnectionStyle::ZcsInherited as i32,
+                "{name}"
+            );
+            assert!(!held.attributes.unwrap().allow_soldermask_bridges, "{name}");
+            assert_eq!(served.dry_run(&netlist).await["status"], "noop", "{name}");
+        }
+    }
+
     /// Issue #82: a KiCad-resaved hierarchy with root-page symbols, two
     /// instances of a reused sheet, reused nested sheets, and an unassigned
     /// footprint synchronizes existing footprints whose stored PCB paths carry

@@ -1,0 +1,9 @@
+### `update_footprints_from_library` carries solder margins and takes `reset_clearance_overrides` (minor release)
+
+[#723](https://github.com/Copperpour/Copperpour/issues/723):
+
+- **Now carried:** a library footprint's own `solder_mask_margin`, `solder_paste_margin` and `solder_paste_margin_ratio` (or the older `solder_paste_ratio`), and each pad's own, by `update_footprints_from_library`, which refused such a footprint by name ("pad clause 'solder_mask_margin' is not supported by typed library refresh"), and by `update_pcb_from_schematic` when it replaces a footprint.
+- **Pads:** a refreshed pad takes its library pad's margins, as KiCad replaces every pad, so a pad whose margins differ plans `pads`.
+- **New argument:** `reset_clearance_overrides`, a boolean, `false` by default like the other reset flags, is KiCad's "Update/reset clearance overrides", which KiCad's dialog checks by default. Set, it gives each footprint the library's own clearance, zone connection, solder mask and paste margins and solder mask bridge setting; the refresh refuses a library footprint with its own clearance or zone connection, so those two become none and inherited. A footprint whose clearance, zone connection or margins change plans the new `changed_domains` value `clearance_overrides`. Left unset, it is left out of the plan revision.
+- **Changed by default:** a refresh keeps the placed footprint's solder mask bridge setting unless `reset_clearance_overrides` is set, as KiCad does with the option unchecked. Before, it took the library's and planned `attributes`.
+- **What to do:** to refresh as KiCad's dialog does by default, pass `reset_clearance_overrides: true`. It takes the library's bridge setting, as a refresh did before, and also its clearance, zone connection and margins, which a refresh kept before; no argument takes the one without the other.
