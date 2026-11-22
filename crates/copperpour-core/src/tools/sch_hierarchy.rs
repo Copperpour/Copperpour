@@ -2556,7 +2556,7 @@ fn compare_page_numbers(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// Case-sensitive natural order: ASCII digit runs met in both strings compare
 /// by value, everything else by code point, and a prefix sorts first.
-fn natural_compare(a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn natural_compare(a: &str, b: &str) -> std::cmp::Ordering {
     let digits = |s: &str| s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (mut a, mut b) = (a, b);
     loop {

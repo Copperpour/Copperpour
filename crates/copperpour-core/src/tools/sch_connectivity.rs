@@ -265,6 +265,7 @@ pub(super) type ScopedNetName = (String, u8);
 /// `root_names` cannot go stale behind a later union. Callers get the two
 /// questions they actually ask — [`root_at`](Self::root_at) for a net's
 /// identity, [`name_of_root`](Self::name_of_root) for what it is called.
+#[derive(Clone)]
 pub(crate) struct NetGraph {
     point_key: fn(f64, f64) -> NetRoot,
     /// Every name at a point, not just the winning one. A rail label written
@@ -291,6 +292,12 @@ impl NetGraph {
             root_names: HashMap::new(),
             root_aliases: HashMap::new(),
         }
+    }
+
+    pub(super) fn into_named_nets(mut self) -> Self {
+        self.merge_named_nets();
+        self.name_nets();
+        self
     }
 
     fn ensure(&mut self, k: (i64, i64)) {
@@ -326,6 +333,11 @@ impl NetGraph {
 
     fn add_label(&mut self, x: f64, y: f64, net: &str, kind: LabelKind) {
         self.add_driver(x, y, net, kind, false);
+    }
+
+    /// Name a power pin without attaching it to a wire that only crosses it.
+    pub(super) fn add_power_pin_driver(&mut self, x: f64, y: f64, net: &str, local: bool) {
+        self.add_driver(x, y, net, LabelKind::PowerSymbol, local);
     }
 
     fn add_driver(&mut self, x: f64, y: f64, net: &str, kind: LabelKind, power_local: bool) {
@@ -529,10 +541,7 @@ fn seed_net_graph(
     sheet_pins: &[(f64, f64)],
     on_wire: &WireIndex,
 ) -> NetGraph {
-    let mut graph = seed_drawn_graph(wires, labels, junctions, sheet_pins, on_wire);
-    graph.merge_named_nets();
-    graph.name_nets();
-    graph
+    seed_drawn_graph(wires, labels, junctions, sheet_pins, on_wire).into_named_nets()
 }
 
 fn seed_drawn_graph(
@@ -655,18 +664,16 @@ pub(super) fn snapshot_net_graph(tree: &SexpNode, wires: &[Wire]) -> NetGraph {
                 if pin.hidden && pin.electrical_type == "power_in" {
                     let (x, y) = pin_endpoint(&pin, transform);
                     let name = super::sch_label_rename::stored_name(&pin.name);
-                    graph.add_driver(x, y, &name, LabelKind::PowerSymbol, false);
+                    graph.add_power_pin_driver(x, y, &name, false);
                 }
             }
         }
     }
     for label in extract_power_symbol_labels(tree) {
         let local = label.uuid.is_some_and(|uuid| local_power.contains(&uuid));
-        graph.add_driver(label.x, label.y, &label.net, label.kind, local);
+        graph.add_power_pin_driver(label.x, label.y, &label.net, local);
     }
-    graph.merge_named_nets();
-    graph.name_nets();
-    graph
+    graph.into_named_nets()
 }
 
 /// Use the run check's saved-coordinate equality, without changing the
@@ -724,15 +731,16 @@ impl Default for UnitNotation {
 impl UnitNotation {
     /// The notation of the project that owns `schematic`.
     pub(crate) fn for_schematic(schematic: &std::path::Path) -> Self {
+        Self::project_notation(schematic).unwrap_or_default()
+    }
+
+    pub(crate) fn project_notation(schematic: &std::path::Path) -> Option<Self> {
         let default = UnitNotation::default();
-        let Some(project) = crate::tools::resolve_schematic_ownership(schematic)
+        let project = crate::tools::resolve_schematic_ownership(schematic)
             .ok()
             .flatten()
             .and_then(|ownership| std::fs::read_to_string(ownership.project_file).ok())
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        else {
-            return default;
-        };
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())?;
         let setting = |key: &str, range: std::ops::RangeInclusive<u32>, fallback: u32| {
             project["schematic"][key]
                 .as_u64()
@@ -740,14 +748,14 @@ impl UnitNotation {
                 .filter(|value| range.contains(value))
                 .unwrap_or(fallback)
         };
-        UnitNotation {
+        Some(UnitNotation {
             separator: setting("subpart_id_separator", 0..=126, default.separator),
             first_id: setting(
                 "subpart_first_id",
                 u32::from('1')..=u32::from('z'),
                 default.first_id,
             ),
-        }
+        })
     }
 
     /// `SCH_SYMBOL::SubReference`: the library's display name for the unit
@@ -874,11 +882,26 @@ pub(crate) struct PinNetNames {
 
 impl PinNetNames {
     pub(crate) fn build(tree: &SexpNode, graph: &mut NetGraph, notation: UnitNotation) -> Self {
+        use copperpour_sexp::schematic::extract_lib_pins_for_unit_and_body_style;
+        Self::build_with_pins(tree, graph, notation, false, |_, node, lib, unit| {
+            extract_lib_pins_for_unit_and_body_style(lib, unit, super::symbol_body_style(node))
+                .into_iter()
+                .map(|pin| (pin, None))
+                .collect()
+        })
+    }
+
+    /// `pins_for_symbol` receives the index in the sheet's top-level symbol
+    /// list, before skipping any unresolved symbols.
+    pub(crate) fn build_with_pins(
+        tree: &SexpNode,
+        graph: &mut NetGraph,
+        notation: UnitNotation,
+        include_single_pin_names: bool,
+        pins_for_symbol: impl Fn(usize, &SexpNode, &SexpNode, u32) -> Vec<(LibPin, Option<String>)>,
+    ) -> Self {
         use super::symbol_pins::{stacked, Stacked, TILDE_IS_TEXT};
-        use copperpour_sexp::schematic::{
-            extract_lib_pins_for_unit_and_body_style, find_lib_symbol, parse_subsymbol_unit,
-            symbol_instance,
-        };
+        use copperpour_sexp::schematic::{find_lib_symbol, parse_subsymbol_unit, symbol_instance};
         // KiCad reads a pin named `~` in an older file as unnamed.
         let tilde_is_empty = tree
             .find_str("version")
@@ -889,7 +912,7 @@ impl PinNetNames {
             .map(|node| node.find_all("symbol"))
             .unwrap_or_default();
         let mut drivers: HashMap<NetRoot, Vec<PinDriver>> = HashMap::new();
-        for node in tree.find_all("symbol") {
+        for (i, node) in tree.find_all("symbol").into_iter().enumerate() {
             let Some(instance) = symbol_instance(node) else {
                 continue;
             };
@@ -924,23 +947,20 @@ impl PinNetNames {
                 instance.reference.clone()
             };
             let unannotated = instance.reference.is_empty() || instance.reference.ends_with('?');
-            // `(convert N)` is the parser's legacy token for it, and
-            // `BODY_STYLE::BASE`, 1, its default.
-            let body_style = super::symbol_body_style(node);
-            let pins: Vec<LibPin> =
-                extract_lib_pins_for_unit_and_body_style(lib, instance.unit, body_style)
-                    .into_iter()
-                    .map(|mut pin| {
-                        for text in [&mut pin.name, &mut pin.number] {
-                            if tilde_is_empty && *text == "~" {
-                                text.clear();
-                            }
+            let pins: Vec<_> = pins_for_symbol(i, node, lib, instance.unit)
+                .into_iter()
+                .map(|(mut pin, alternate)| {
+                    for text in [&mut pin.name, &mut pin.number] {
+                        if tilde_is_empty && *text == "~" {
+                            text.clear();
                         }
-                        pin
-                    })
-                    .collect();
+                    }
+                    let shown_name = alternate.unwrap_or_else(|| pin.name.clone());
+                    (pin, shown_name)
+                })
+                .collect();
             let t = instance.pin_transform();
-            for pin in &pins {
+            for (pin, shown_name) in &pins {
                 // `SCH_PIN::ConnectionPropagatesTo`: a `no_connect` pin
                 // connects to nothing.
                 if pin.electrical_type == "no_connect" {
@@ -956,9 +976,11 @@ impl PinNetNames {
                 } else {
                     PIN_PRIORITY
                 };
+                // KiCad names the net from the library name but detects
+                // duplicates using the actual names shown on the sheet.
                 let sharing = |no_connect: bool| {
-                    pins.iter().any(|other| {
-                        other.name == pin.name
+                    pins.iter().any(|(other, other_shown_name)| {
+                        other_shown_name == shown_name
                             && other.number != pin.number
                             && (other.electrical_type == "no_connect") == no_connect
                     })
@@ -999,11 +1021,13 @@ impl PinNetNames {
             })
             .filter_map(|(root, drivers)| {
                 let highest = drivers.iter().map(|driver| driver.priority).max()?;
-                // A net one pin drives weakly is KiCad's `unconnected-(…)`.
-                if highest < GLOBAL_POWER_PIN_PRIORITY && drivers.len() == 1 {
+                // KiCad also uses `unconnected-(…)` for a weak single-pin
+                // net with a wire stub. Legacy callers omit these names.
+                let weak_single_pin = highest < GLOBAL_POWER_PIN_PRIORITY && drivers.len() == 1;
+                if weak_single_pin && !include_single_pin_names {
                     return None;
                 }
-                let no_connect = no_connect_roots.contains(&root);
+                let no_connect = weak_single_pin || no_connect_roots.contains(&root);
                 // A name up to its hash, which every one follows with `-Pad`,
                 // sorts as the whole name does against any name that does not
                 // begin with it, and before one that does: that net, which
