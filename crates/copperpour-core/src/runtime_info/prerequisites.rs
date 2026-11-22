@@ -533,5 +533,36 @@ mod tests {
         }
         assert_eq!(std::fs::read(&board).unwrap(), contents.as_slice());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        let absent = format!("ipc://{}", dir.path().join("absent.sock").display());
+        let absent_handler = McpHandler::new(ServerConfig {
+            kicad_cli: dir
+                .path()
+                .join("missing-cli")
+                .to_string_lossy()
+                .into_owned(),
+            ipc_address: absent.clone(),
+            project_dir: Some(dir.path().to_path_buf()),
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        let started = std::time::Instant::now();
+        absent_handler.start_prerequisite_checks("config", IpcEndpoint::Address(absent.clone()));
+        let absent_health = health(&absent_handler, json!({})).await;
+        assert_eq!(
+            absent_health["ipc"]["status"], "unreachable",
+            "{absent_health}"
+        );
+        assert_eq!(
+            absent_health["ipc"]["reason"], "no_listener",
+            "{absent_health}"
+        );
+        assert_eq!(absent_health["ipc"]["endpoint"], absent);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "absent socket probe waited for deadline: {:?}",
+            started.elapsed()
+        );
     }
 }

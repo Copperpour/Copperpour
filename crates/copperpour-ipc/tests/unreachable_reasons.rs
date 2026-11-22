@@ -19,13 +19,29 @@ fn reason_of(outcome: &PingOutcome) -> Option<UnreachableReason> {
 fn an_address_nothing_listens_on_reports_no_listener() {
     let dir = tempfile::tempdir().unwrap();
     let address = format!("ipc://{}", dir.path().join("absent.sock").display());
+    let client = KiCadIpcClient::new(&address);
 
-    let outcome = KiCadIpcClient::new(&address).ping_outcome();
-
+    let outcome = client.ping_outcome();
     assert_eq!(
         reason_of(&outcome),
         Some(UnreachableReason::NoListener),
         "{outcome:?}"
+    );
+
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(2);
+    let error = client
+        .get_kicad_version_before(Some(deadline))
+        .expect_err("absent socket must refuse dial");
+    let elapsed = started.elapsed();
+    assert_eq!(
+        copperpour_ipc::unreachable_reason(&error),
+        Some(UnreachableReason::NoListener),
+        "{error:#}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "refused dial waited for deadline: {elapsed:?}"
     );
 }
 
@@ -187,12 +203,28 @@ mod unix {
         let _listener = UnixListener::bind(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let outcome = KiCadIpcClient::new(format!("ipc://{}", path.display())).ping_outcome();
+        let client = KiCadIpcClient::new(format!("ipc://{}", path.display()));
+        let outcome = client.ping_outcome();
 
         assert_eq!(
             reason_of(&outcome),
             Some(UnreachableReason::AccessDenied),
             "{outcome:?}"
+        );
+
+        let started = std::time::Instant::now();
+        let error = client
+            .get_kicad_version_before(Some(started + std::time::Duration::from_secs(2)))
+            .expect_err("unopenable socket must refuse dial");
+        assert_eq!(
+            copperpour_ipc::unreachable_reason(&error),
+            Some(UnreachableReason::AccessDenied),
+            "{error:#}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "access-denied dial waited for deadline: {:?}",
+            started.elapsed()
         );
     }
 
@@ -202,17 +234,66 @@ mod unix {
         let path = dir.path().join("closes.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let accepting = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("the dial reaches the listener");
-            drop(stream);
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().expect("the dial reaches the listener");
+                drop(stream);
+            }
         });
 
-        let outcome = KiCadIpcClient::new(format!("ipc://{}", path.display())).ping_outcome();
-
-        accepting.join().unwrap();
+        let client = KiCadIpcClient::new(format!("ipc://{}", path.display()));
+        let outcome = client.ping_outcome();
         assert_eq!(
             reason_of(&outcome),
             Some(UnreachableReason::HandshakeFailed),
             "{outcome:?}"
+        );
+
+        let started = std::time::Instant::now();
+        let error = client
+            .get_kicad_version_before(Some(started + std::time::Duration::from_secs(2)))
+            .expect_err("closing listener must fail handshake");
+        assert_eq!(
+            copperpour_ipc::unreachable_reason(&error),
+            Some(UnreachableReason::HandshakeFailed),
+            "{error:#}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "closed-listener dial waited for deadline: {:?}",
+            started.elapsed()
+        );
+
+        accepting.join().unwrap();
+    }
+
+    #[test]
+    fn a_silent_listener_is_bounded_by_the_deadline_and_reports_a_failed_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silent.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let accepting = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("the dial reaches the listener");
+            let _ = released.recv_timeout(std::time::Duration::from_secs(15));
+        });
+
+        let client = KiCadIpcClient::new(format!("ipc://{}", path.display()));
+        let started = std::time::Instant::now();
+        let error = client
+            .get_kicad_version_before(Some(started + std::time::Duration::from_millis(200)))
+            .expect_err("silent listener must time out at deadline");
+        let elapsed = started.elapsed();
+        drop(release);
+        accepting.join().unwrap();
+
+        assert_eq!(
+            copperpour_ipc::unreachable_reason(&error),
+            Some(UnreachableReason::HandshakeFailed),
+            "{error:#}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "silent listener waited for NNG's 10s negotiation limit instead of deadline: {elapsed:?}"
         );
     }
 }
