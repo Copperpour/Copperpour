@@ -265,7 +265,8 @@ fn prerequisite_health_is_cached_until_explicit_refresh() {
     assert!(startup["checked_at_unix_ms"].is_number());
     assert_eq!(startup["kicad_cli"]["status"], "ready");
     assert_eq!(startup["kicad_cli"]["version"], "10.0.5");
-    assert_eq!(startup["ipc"]["status"], "unreachable");
+    assert_eq!(startup["ipc"]["status"], "unreachable", "{first:#}");
+    assert_eq!(startup["ipc"]["reason"], "no_listener", "{first:#}");
     assert_eq!(startup["ipc"]["source"], "config");
     assert_eq!(startup["ipc"]["endpoint"], missing_ipc);
 
