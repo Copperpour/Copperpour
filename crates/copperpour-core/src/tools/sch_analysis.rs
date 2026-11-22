@@ -9,6 +9,7 @@ use crate::tools::reference_hint::component_not_found;
 use crate::tools::sch_connectivity::{
     label_roots, net_graph_for, pt_key, ConnectivityIndex, PinNetNames, UnitNotation,
 };
+use crate::tools::sch_layout_score::handle_compare_schematic_layout;
 use crate::tools::{
     get_path, invalid_arg, is_power_symbol_reference, opt_f64, opt_positive_f64,
     placed_pins_by_reference, require_f64, require_str, resolved_placed_pins_by_reference,
@@ -155,6 +156,24 @@ pub fn tools() -> Vec<ToolDef> {
                 },
                 "required": ["schematic"] }),
             |args, ctx| async move { handle_find_orphan_items(args, ctx).await }
+        ),
+        tool!(
+            "compare_schematic_layout",
+            "Score a saved schematic sheet, optionally comparing it with a saved baseline. \
+             Check pin connectivity and symbol identity before ranking layout changes. \
+             No writes, editor access, or ERC.",
+            json!({ "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to the saved .kicad_sch sheet" },
+                    "baseline": { "type": ["string", "null"], "description": "Path to an earlier saved copy of the same sheet" },
+                    "removed_power_symbol_uuids": {
+                        "type": ["array", "null"],
+                        "items": { "type": "string" },
+                        "description": "UUIDs of power symbols intentionally removed from the baseline"
+                    }
+                },
+                "required": ["schematic"] }),
+            |args, ctx| async move { handle_compare_schematic_layout(args, ctx).await }
         ),
         tool!(
             "find_shorted_nets",
@@ -623,12 +642,14 @@ async fn handle_trace_from_point(
     })))
 }
 
+pub(super) const ORPHAN_TOLERANCE: f64 = 0.05;
+
 async fn handle_find_orphan_items(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let tolerance = opt_f64(args, "tolerance").unwrap_or(0.05);
+    let tolerance = opt_f64(args, "tolerance").unwrap_or(ORPHAN_TOLERANCE);
     if !tolerance.is_finite() || tolerance <= 0.0 {
         return Ok(CallToolResult::error(
             "Invalid argument 'tolerance': must be finite and positive",
@@ -643,7 +664,15 @@ async fn handle_find_orphan_items(
     // them changes no coincidence answer below.
     let labels = extract_all_net_labels(&tree);
     let index = ConnectivityIndex::build(&tree, &wires, &buses, &labels, tolerance);
+    let all = orphan_findings(&index);
+    Ok(CallToolResult::json(&json!({
+        "orphan_count": all.len(),
+        "orphans": all,
+        "tolerance": tolerance
+    })))
+}
 
+pub(super) fn orphan_findings(index: &ConnectivityIndex<'_>) -> Vec<serde_json::Value> {
     let mut all: Vec<serde_json::Value> = Vec::new();
 
     // A wire end is dangling only when nothing terminates it. Ending on a
@@ -698,11 +727,7 @@ async fn handle_find_orphan_items(
         }
     }
 
-    Ok(CallToolResult::json(&json!({
-        "orphan_count": all.len(),
-        "orphans": all,
-        "tolerance": tolerance
-    })))
+    all
 }
 
 async fn handle_find_shorted_nets(
@@ -1149,12 +1174,14 @@ async fn handle_get_connected_items(
     })))
 }
 
+pub(super) const OVERLAP_TOLERANCE: f64 = 0.5;
+
 async fn handle_check_overlaps(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let tol = opt_f64(args, "tolerance").unwrap_or(0.5);
+    let tol = opt_f64(args, "tolerance").unwrap_or(OVERLAP_TOLERANCE);
     if !tol.is_finite() || tol < 0.0 {
         return Ok(CallToolResult::error_kind(
             crate::mcp::error::ToolErrorKind::InvalidArgument {
@@ -1165,7 +1192,22 @@ async fn handle_check_overlaps(
         ));
     }
     let (_, tree) = read_schematic(&sch_path)?;
-    let instances = extract_symbol_instances(&tree);
+    let wires = extract_wires(&tree);
+    let (all, bounds_resolved, bounds_unresolved) = overlap_findings(&tree, &wires, tol);
+    Ok(CallToolResult::json(&json!({
+        "overlap_count": all.len(),
+        "overlaps": all,
+        "bounds_resolved": bounds_resolved,
+        "bounds_unresolved": bounds_unresolved
+    })))
+}
+
+pub(super) fn overlap_findings(
+    tree: &copperpour_sexp::SexpNode,
+    wires: &[Wire],
+    tol: f64,
+) -> (Vec<serde_json::Value>, usize, Vec<String>) {
+    let instances = extract_symbol_instances(tree);
     let lib_symbols = tree
         .find("lib_symbols")
         .map(|node| node.find_all("symbol"))
@@ -1237,7 +1279,7 @@ async fn handle_check_overlaps(
 
     // The structural extractor already combines local, global, and
     // hierarchical labels.
-    let all_labels = extract_labels(&tree);
+    let all_labels = extract_labels(tree);
     let mut label_overlaps: Vec<serde_json::Value> = Vec::new();
     for (i, a) in all_labels.iter().enumerate() {
         for b in &all_labels[i + 1..] {
@@ -1253,7 +1295,7 @@ async fn handle_check_overlaps(
     // own fields may sit on its own body: stock Device:R puts its Value inside
     // it. Two labels of different nets at one anchor are already a
     // label_overlap.
-    let texts = text_extents(&tree);
+    let texts = text_extents(tree);
     let mut text_overlaps: Vec<serde_json::Value> = Vec::new();
     let mut push_text = |a: serde_json::Value, a_box: SymbolBounds, b: serde_json::Value, b_box| {
         let (overlap_x, overlap_y) = a_box.overlap_depth(b_box);
@@ -1323,7 +1365,7 @@ async fn handle_check_overlaps(
     // drawing that reaches past the tip may clip it.
     let mut wire_overlaps: Vec<serde_json::Value> = Vec::new();
     let mut wire_label_overlaps: Vec<serde_json::Value> = Vec::new();
-    for wire in extract_wires(&tree) {
+    for wire in wires {
         let (from, to) = ((wire.x1, wire.y1), (wire.x2, wire.y2));
         for (instance, placed) in &placements {
             let Some((_, geometry)) = placed else {
@@ -1335,7 +1377,7 @@ async fn handle_check_overlaps(
             if body.segment_enters(from, to) && !geometry.wire_leaves_pin(from, to) {
                 wire_overlaps.push(json!({
                     "type": "wire_overlap",
-                    "a": wire_json(&wire),
+                    "a": wire_json(wire),
                     "b": {
                         "kind": "symbol_body",
                         "reference": instance.reference,
@@ -1350,7 +1392,7 @@ async fn handle_check_overlaps(
             if from != to && text.wire_crossing_bounds().segment_enters(from, to) {
                 wire_label_overlaps.push(json!({
                     "type": "wire_label_overlap",
-                    "a": wire_json(&wire),
+                    "a": wire_json(wire),
                     "b": text_json(text),
                     "bounds_b": bounds_json(text.reported_run())
                 }));
@@ -1366,14 +1408,10 @@ async fn handle_check_overlaps(
     let bounds_unresolved = placements
         .iter()
         .filter(|(_, placed)| placed.is_none())
-        .map(|(instance, _)| instance.reference.as_str())
+        .map(|(instance, _)| instance.reference.clone())
         .collect::<Vec<_>>();
-    Ok(CallToolResult::json(&json!({
-        "overlap_count": all.len(),
-        "overlaps": all,
-        "bounds_resolved": placements.len() - bounds_unresolved.len(),
-        "bounds_unresolved": bounds_unresolved
-    })))
+    let bounds_resolved = placements.len() - bounds_unresolved.len();
+    (all, bounds_resolved, bounds_unresolved)
 }
 
 /// Whether `text` is one of `instance`'s own fields: the same placed symbol by

@@ -1,0 +1,465 @@
+//! Compare two snapshots of one saved sheet, independent of the editor.
+
+use super::sch_analysis::{orphan_findings, overlap_findings, ORPHAN_TOLERANCE, OVERLAP_TOLERANCE};
+use super::sch_block_move::snapshot_net_changes;
+use super::sch_connectivity::{drawn_net_graph_for, ConnectivityIndex, COINCIDENT_TOLERANCE};
+use super::sch_pin_contacts::default_contact_counts;
+use super::{get_path, invalid_arg, opt_str_list, resolved_placed_pins_by_reference, ToolContext};
+use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
+use copperpour_sexp::geometry::points_coincident;
+use copperpour_sexp::schematic::{
+    extract_all_net_labels, extract_buses, extract_labels, extract_wires, find_lib_symbol,
+    symbol_instance, LabelKind, Wire,
+};
+use copperpour_sexp::{parse_sexp, SexpNode};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::Path;
+
+#[cfg(test)]
+#[path = "sch_layout_score_tests.rs"]
+mod tests;
+
+const TIERS: [&[&str]; 4] = [
+    &[
+        "component_overlap",
+        "label_overlap",
+        "wire_overlap",
+        "dangling_wire_end",
+        "floating_label",
+        "unconnected_pin",
+    ],
+    &[
+        "text_overlap_text",
+        "text_overlap_body",
+        "pin_contact",
+        "short_pin_wire",
+    ],
+    &[
+        "diagonal_wires",
+        "collinear_overlaps",
+        "wire_bends",
+        "split_runs",
+        "redundant_power_symbols",
+    ],
+    &["wire_length_mm"],
+];
+
+const LENGTH: &str = "wire_length_mm";
+
+// Store length in micrometres so comparison and the displayed delta agree.
+type Terms = BTreeMap<&'static str, Option<i64>>;
+
+fn terms() -> impl Iterator<Item = &'static str> {
+    TIERS.into_iter().flatten().copied()
+}
+
+fn term_json(key: &str, number: Option<i64>) -> Value {
+    match number {
+        Some(n) if key == LENGTH => json!(n as f64 / 1000.0),
+        _ => json!(number),
+    }
+}
+
+struct Score {
+    terms: Terms,
+    bounds_unresolved: Vec<String>,
+    wire_segments: usize,
+    power_symbols: Option<usize>,
+}
+
+impl Score {
+    fn json(&self) -> Value {
+        let mut result = json!({
+            "bounds_unresolved": self.bounds_unresolved,
+            "wire_segments": self.wire_segments,
+            "power_symbols": self.power_symbols,
+        });
+        for (&key, &number) in &self.terms {
+            result[key] = term_json(key, number);
+        }
+        result
+    }
+}
+
+fn increment(score: &mut Terms, key: &str) {
+    if let Some(Some(count)) = score.get_mut(key) {
+        *count += 1;
+    }
+}
+
+fn measure(tree: &SexpNode) -> Score {
+    let wires = extract_wires(tree);
+    let buses = extract_buses(tree);
+    let labels = extract_all_net_labels(tree);
+    let index = ConnectivityIndex::build(tree, &wires, &buses, &labels, ORPHAN_TOLERANCE);
+    let pins = resolved_placed_pins_by_reference(tree);
+    let (overlaps, _, bounds_unresolved) = overlap_findings(tree, &wires, OVERLAP_TOLERANCE);
+
+    let mut score: Terms = terms().map(|key| (key, Some(0))).collect();
+    let contact_counts = default_contact_counts(tree, &wires);
+    score.insert(
+        "pin_contact",
+        contact_counts.map(|(contacts, _)| contacts as i64),
+    );
+    score.insert(
+        "short_pin_wire",
+        contact_counts.map(|(_, short)| short as i64),
+    );
+    if !bounds_unresolved.is_empty() {
+        for key in ["component_overlap", "wire_overlap", "text_overlap_body"] {
+            score.insert(key, None);
+        }
+    }
+    if pins.is_none() {
+        for key in [
+            "dangling_wire_end",
+            "floating_label",
+            "unconnected_pin",
+            "wire_bends",
+            "split_runs",
+            "redundant_power_symbols",
+        ] {
+            score.insert(key, None);
+        }
+    }
+    for finding in overlaps.iter().chain(&orphan_findings(&index)) {
+        if let Some(kind) = finding["type"].as_str() {
+            let key = match kind {
+                "text_overlap" if finding["b"]["kind"] == "symbol_body" => "text_overlap_body",
+                "text_overlap" => "text_overlap_text",
+                other => other,
+            };
+            increment(&mut score, key);
+        }
+    }
+
+    let length: f64 = wires
+        .iter()
+        .map(|wire| (wire.x2 - wire.x1).hypot(wire.y2 - wire.y1))
+        .sum();
+    score.insert(LENGTH, Some((length * 1000.0).round() as i64));
+    for (i, a) in wires.iter().enumerate() {
+        if (a.x2 - a.x1).abs() > 1e-6 && (a.y2 - a.y1).abs() > 1e-6 {
+            increment(&mut score, "diagonal_wires");
+        }
+        for b in &wires[i + 1..] {
+            if collinear_overlap(a, b) {
+                increment(&mut score, "collinear_overlaps");
+            }
+        }
+    }
+    if pins.is_some() {
+        let junction_index =
+            ConnectivityIndex::build(tree, &wires, &buses, &labels, COINCIDENT_TOLERANCE);
+        count_wire_joints(&mut score, &wires, &junction_index);
+        score.insert(
+            "redundant_power_symbols",
+            Some(redundant_power_symbols(
+                tree,
+                &wires,
+                &labels,
+                &junction_index,
+            )),
+        );
+    }
+
+    let lib_symbols = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    let power_symbols = pins.map(|instances| {
+        instances
+            .iter()
+            .filter(|(inst, _)| {
+                find_lib_symbol(&lib_symbols, inst).is_some_and(|lib| lib.find("power").is_some())
+            })
+            .count()
+    });
+    Score {
+        terms: score,
+        bounds_unresolved,
+        wire_segments: wires.len(),
+        power_symbols,
+    }
+}
+
+fn ends(wire: &Wire) -> [((f64, f64), (f64, f64)); 2] {
+    let (a, b) = ((wire.x1, wire.y1), (wire.x2, wire.y2));
+    [(a, b), (b, a)]
+}
+
+fn collinear_overlap(a: &Wire, b: &Wire) -> bool {
+    let a_len = (a.x2 - a.x1).hypot(a.y2 - a.y1);
+    let b_len = (b.x2 - b.x1).hypot(b.y2 - b.y1);
+    // Both axes must agree: a result must not depend on record order.
+    a_len > 1e-4 && b_len > 1e-4 && projects_over(a, b, a_len) && projects_over(b, a, b_len)
+}
+
+fn projects_over(a: &Wire, b: &Wire, length: f64) -> bool {
+    let (dx, dy) = (a.x2 - a.x1, a.y2 - a.y1);
+    let tol = 1e-4;
+    let (ux, uy) = (dx / length, dy / length);
+    let project = |x: f64, y: f64| {
+        let (x, y) = (x - a.x1, y - a.y1);
+        ((x * uy - y * ux).abs() <= tol).then_some(x * ux + y * uy)
+    };
+    let (Some(t1), Some(t2)) = (project(b.x1, b.y1), project(b.x2, b.y2)) else {
+        return false;
+    };
+    t1.max(t2).min(length) - t1.min(t2).max(0.0) > tol
+}
+
+fn count_wire_joints(score: &mut Terms, wires: &[Wire], index: &ConnectivityIndex<'_>) {
+    for (i, wire) in wires.iter().enumerate() {
+        for ((x, y), (ax, ay)) in ends(wire) {
+            if index.wire_ends_at(x, y) != 2
+                || index.has_pin(x, y)
+                || index.has_sheet_pin(x, y)
+                || index.has_label(x, y)
+                || index.has_junction(x, y)
+                || index.has_no_connect(x, y)
+                || index.on_bus(x, y)
+                || index.has_bus_entry_wire_end(x, y)
+                || index.on_wire_interior(x, y)
+            {
+                continue;
+            }
+            let other = wires[i + 1..]
+                .iter()
+                .flat_map(ends)
+                .find(|&((bx, by), _)| points_coincident(x, y, bx, by, COINCIDENT_TOLERANCE));
+            if let Some(((x2, y2), (bx, by))) = other {
+                let (dx, dy) = (ax - x, ay - y);
+                let (ex, ey) = (bx - x2, by - y2);
+                let scale = dx.hypot(dy) * ex.hypot(ey);
+                if scale == 0.0 {
+                    continue;
+                }
+                if (dx * ey - ex * dy).abs() <= 1e-6 * scale {
+                    // Collinear returns on the same side are stacked, not a split run.
+                    if dx * ex + dy * ey < 0.0 {
+                        increment(score, "split_runs");
+                    }
+                } else {
+                    increment(score, "wire_bends");
+                }
+            }
+        }
+    }
+}
+
+fn redundant_power_symbols(
+    tree: &SexpNode,
+    wires: &[Wire],
+    labels: &[copperpour_sexp::schematic::Label],
+    index: &ConnectivityIndex<'_>,
+) -> i64 {
+    let drawn_labels = extract_labels(tree);
+    let mut drawn = drawn_net_graph_for(tree, wires, &drawn_labels);
+    let mut seen = HashSet::new();
+    let mut duplicates = 0;
+    let mut counted = HashSet::new();
+    for label in labels
+        .iter()
+        .filter(|label| label.kind == LabelKind::PowerSymbol)
+    {
+        if (index.has_wire_end(label.x, label.y)
+            || (index.on_wire(label.x, label.y) && index.has_junction(label.x, label.y)))
+            && counted.insert((
+                label.uuid.as_deref(),
+                drawn.root_at(label.x, label.y),
+                &label.net,
+            ))
+            && !seen.insert((drawn.root_at(label.x, label.y), &label.net))
+        {
+            duplicates += 1;
+        }
+    }
+    duplicates
+}
+
+fn identities(tree: &SexpNode) -> Option<BTreeMap<&str, &SexpNode>> {
+    let mut result = BTreeMap::new();
+    for symbol in tree.find_all("symbol") {
+        let uuid = symbol.find_str("uuid")?;
+        symbol.find_str("lib_id")?;
+        if result.insert(uuid, symbol).is_some() {
+            return None;
+        }
+    }
+    Some(result)
+}
+
+fn gate(before: &SexpNode, after: &SexpNode, requested: &[String]) -> Vec<String> {
+    let (Some(was), Some(now)) = (identities(before), identities(after)) else {
+        return vec!["a placed symbol has missing or duplicate identity".to_owned()];
+    };
+    let lib_symbols = before
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    let mut approved = BTreeSet::new();
+    let mut reasons = Vec::new();
+    for uuid in requested
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+    {
+        let is_power = was
+            .get(uuid)
+            .and_then(|node| symbol_instance(node))
+            .and_then(|inst| find_lib_symbol(&lib_symbols, &inst))
+            .is_some_and(|lib| lib.find("power").is_some());
+        if is_power && !now.contains_key(uuid) {
+            approved.insert(uuid);
+        } else {
+            reasons.push(format!("{uuid} is not a removed power symbol"));
+        }
+    }
+    for (&uuid, &symbol) in &was {
+        match now.get(uuid) {
+            Some(kept) => {
+                if kept.find("lib_id") != symbol.find("lib_id")
+                    || kept.find("instances") != symbol.find("instances")
+                {
+                    reasons.push(format!("symbol {uuid} changed its lib_id or instances"));
+                }
+                let on_board = |node: &SexpNode| node.find_str("on_board") != Some("no");
+                if on_board(kept) != on_board(symbol) {
+                    reasons.push(format!("symbol {uuid} changed its PCB membership"));
+                }
+            }
+            None if !approved.contains(uuid) => reasons.push(format!("symbol {uuid} was removed")),
+            _ => {}
+        }
+    }
+    for uuid in now.keys().filter(|uuid| !was.contains_key(*uuid)) {
+        reasons.push(format!("symbol {uuid} was added"));
+    }
+    reasons.extend(snapshot_net_changes(before, after, &approved));
+    reasons
+}
+
+fn verdict(delta: &Terms, reasons: &[String]) -> &'static str {
+    if !reasons.is_empty() {
+        return "blocked";
+    }
+    let changes = |tier: &'static [&'static str]| tier.iter().filter_map(|key| delta[key]);
+    if TIERS[..2]
+        .iter()
+        .any(|tier| changes(tier).any(|change| change > 0))
+    {
+        return "not_improved";
+    }
+    if TIERS
+        .iter()
+        .all(|tier| changes(tier).all(|change| change == 0))
+    {
+        return "unchanged";
+    }
+    if TIERS
+        .iter()
+        .map(|tier| changes(tier).sum::<i64>())
+        .find(|sum| *sum != 0)
+        .is_some_and(|sum| sum < 0)
+    {
+        "improved"
+    } else {
+        "not_improved"
+    }
+}
+
+fn read_sheet(path: &Path) -> Result<SexpNode, CallToolResult> {
+    // The writers replace atomically; a single open reads one saved version
+    // without creating the cooperative lockfile used by read_schematic.
+    let malformed = |reason: String| {
+        let message = format!("Cannot read schematic {}: {reason}", path.display());
+        CallToolResult::error_kind(
+            ToolErrorKind::MalformedFile {
+                path: path.display().to_string(),
+                reason,
+            },
+            message,
+        )
+    };
+    let bytes = std::fs::read(path).map_err(|err| {
+        CallToolResult::error_kind(
+            ToolErrorKind::file_not_found(path),
+            format!("Cannot read schematic {}: {err}", path.display()),
+        )
+    })?;
+    let source = std::str::from_utf8(&bytes).map_err(|err| malformed(err.to_string()))?;
+    let tree = parse_sexp(source).map_err(|err| malformed(err.to_string()))?;
+    if tree.head() != Some("kicad_sch") || tree.find_str("version").is_none() {
+        return Err(malformed("expected a KiCad schematic sheet".to_owned()));
+    }
+    Ok(tree)
+}
+
+pub(super) async fn handle_compare_schematic_layout(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let path = get_path(args, "schematic")?;
+    let baseline = if args["baseline"].is_null() {
+        None
+    } else {
+        Some(get_path(args, "baseline")?)
+    };
+    let removed = match opt_str_list(args, "removed_power_symbol_uuids") {
+        Ok(list) => list.unwrap_or_default(),
+        Err(error) => return Ok(error),
+    };
+    if baseline.is_none() && !removed.is_empty() {
+        return Ok(invalid_arg(
+            "removed_power_symbol_uuids",
+            "requires a baseline",
+        ));
+    }
+    let sheet = match read_sheet(&path) {
+        Ok(sheet) => sheet,
+        Err(error) => return Ok(error),
+    };
+    let score = measure(&sheet);
+    let (baseline_score, delta, verdict, reasons, not_compared) = if let Some(path) = baseline {
+        let baseline = match read_sheet(&path) {
+            Ok(sheet) => sheet,
+            Err(error) => return Ok(error),
+        };
+        let baseline_score = measure(&baseline);
+        let delta: Terms = terms()
+            .map(|key| {
+                let change = score.terms[key].zip(baseline_score.terms[key]);
+                (key, change.map(|(now, was)| now - was))
+            })
+            .collect();
+        let not_compared = terms()
+            .filter(|key| delta[key].is_none())
+            .collect::<Vec<_>>();
+        let reasons = gate(&baseline, &sheet, &removed);
+        let verdict = verdict(&delta, &reasons);
+        let delta: Value = delta
+            .iter()
+            .map(|(&key, &change)| (key.to_owned(), term_json(key, change)))
+            .collect();
+        (
+            baseline_score.json(),
+            delta,
+            Some(verdict),
+            reasons,
+            not_compared,
+        )
+    } else {
+        let not_compared = terms().filter(|key| score.terms[key].is_none()).collect();
+        (Value::Null, Value::Null, None, Vec::new(), not_compared)
+    };
+    Ok(CallToolResult::json(&json!({
+        "score": score.json(),
+        "baseline_score": baseline_score,
+        "delta": delta,
+        "verdict": verdict,
+        "reasons": reasons,
+        "not_compared": not_compared,
+    })))
+}
