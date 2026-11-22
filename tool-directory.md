@@ -133,9 +133,9 @@ and Windows servers do not.
 | `split_wire_at_point` | Split a wire at a given point, creating two segments and a junction. |
 | `add_schematic_net_label` | Add a net label (`net_label`, `global_label`, or `hierarchical_label`). |
 | `delete_schematic_net_label` | Delete a net label by net name and position. |
-| `rotate_schematic_label` | Rotate a net label to a new angle and update its justify direction. |
+| `rotate_schematic_label` | Rotate a net label, by uuid or position, to a new angle and update its justify direction. |
 | `move_labels_by_offset` | Move all labels matching a net name by a given X/Y offset. |
-| `batch_rotate_labels` | Rotate multiple labels by net name in a single file read/write cycle. |
+| `batch_rotate_labels` | Rotate multiple labels, each by uuid or position, in a single file read/write cycle. |
 | `add_power_symbol` | Add a power symbol (VCC, GND, etc.). Name the pin it ties to with `reference` + `pin_number`, or give `x` + `y`. A named pin places the symbol on the pin's endpoint and, unless `rotation` is given, turns it to face away from the body. Coordinates snap to the 1.27mm grid like the other placers. Reports the placed coordinates. Auto-numbers the internal reference in the library symbol's prefix (`#PWR`, or `#FLG` for `PWR_FLAG`; each prefix its own series) to the lowest number free in the whole hierarchy, one per instance of a sheet placed more than once; a sheet no project owns is numbered against itself alone, and a sheet file that cannot be read is named in `other_sheets_unreadable`, its numbers unseen. Preserves every saved hierarchy instance and reports committed-file readback; refuses stale instance metadata before writing. |
 | `add_no_connect` | Add a no-connect flag (X marker) to an unconnected pin endpoint. |
 | `delete_no_connect` | Remove a no-connect flag at a given position. |
