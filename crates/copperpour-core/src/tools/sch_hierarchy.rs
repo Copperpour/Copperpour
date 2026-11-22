@@ -817,11 +817,14 @@ fn validate_pin_type(pin_type: &str) -> Result<(), CallToolResult> {
     if ALLOWED_PIN_TYPES.contains(&pin_type) {
         Ok(())
     } else {
-        Err(CallToolResult::error(format!(
-            "Invalid pin_type '{}' — must be one of: {}",
-            pin_type,
-            ALLOWED_PIN_TYPES.join(", ")
-        )))
+        Err(argument_refusal(
+            "pin_type",
+            format!(
+                "Invalid pin_type '{}' — must be one of: {}",
+                pin_type,
+                ALLOWED_PIN_TYPES.join(", ")
+            ),
+        ))
     }
 }
 
@@ -1079,7 +1082,7 @@ fn sheet_pin_edge_is_full(
     } else {
         format!("is already filled through slot {filled_through}")
     };
-    CallToolResult::error(format!(
+    let message = format!(
         "The '{side}' edge of sheet '{sheet_name}' holds {capacity} sheet pins at \
          {SHEET_PIN_SPACING_MM} mm apart and {filled}, \
          so '{first_that_did_not_fit}' \
@@ -1087,7 +1090,17 @@ fn sheet_pin_edge_is_full(
          the box, piling the overflow on the corner instead of leaving it where it was written, \
          so the import is refused entire and nothing was written.{gaps} Enlarge the sheet with \
          edit_sheet, or import onto more than one side."
-    ))
+    );
+    CallToolResult::error_kind(
+        ToolErrorKind::PlanBlocked {
+            operation: "import_sheet_pins".to_string(),
+            reasons: vec![format!(
+                "the '{side}' edge of sheet '{sheet_name}' has no slot for \
+                 '{first_that_did_not_fit}'"
+            )],
+        },
+        message,
+    )
 }
 
 fn parent_dir(sch_path: &Path) -> PathBuf {
@@ -1163,8 +1176,26 @@ fn record_sheet_pages(
     }
 }
 
-/// A hierarchy the page walk cannot finish (a cycle, or a sheet it cannot
-/// read) is a `conflict` on that file: nothing was written.
+/// An `invalid_argument` refusal on `field` whose message is the reason, so
+/// the text callers already read is unchanged.
+fn argument_refusal(field: &str, message: impl Into<String>) -> CallToolResult {
+    let message = message.into();
+    CallToolResult::error_kind(
+        ToolErrorKind::InvalidArgument {
+            field: field.to_string(),
+            reason: message.clone(),
+        },
+        message,
+    )
+}
+
+/// The schematic holds no sheet named `name`.
+fn sheet_not_found(field: &str, name: &str) -> CallToolResult {
+    argument_refusal(field, format!("Sheet '{name}' not found"))
+}
+
+/// A hierarchy the page walk or relink walk cannot finish (a cycle, or a sheet
+/// it cannot read) is a `conflict` on that file: nothing was written.
 fn page_allocation_conflict(path: &Path, message: String) -> CallToolResult {
     CallToolResult::error_kind(
         ToolErrorKind::Conflict {
@@ -1293,7 +1324,10 @@ fn next_free_page(
         )?;
     }
     (2u32..).find(|page| !used.contains(page)).ok_or_else(|| {
-        CallToolResult::error("No free page numbers remain in this schematic hierarchy")
+        page_allocation_conflict(
+            parent_path,
+            "No free page numbers remain in this schematic hierarchy".to_string(),
+        )
     })
 }
 
@@ -2573,17 +2607,20 @@ async fn handle_add_hierarchical_sheet(
     let child_path = dir.join(&sheet_file);
 
     if !is_valid_relative_sheet_file(&sheet_file) {
-        return Ok(CallToolResult::error(
+        return Ok(argument_refusal(
+            "sheet_file",
             "sheet_file must be a relative .kicad_sch path without parent traversal",
         ));
     }
     if !child_path.parent().is_some_and(Path::is_dir) {
-        return Ok(CallToolResult::error(
+        return Ok(argument_refusal(
+            "sheet_file",
             "The child sheet directory does not exist",
         ));
     }
     if super::same_schematic_document(&child_path, &parent_path) {
-        return Ok(CallToolResult::error(
+        return Ok(argument_refusal(
+            "sheet_file",
             "A hierarchical sheet cannot reference its parent file",
         ));
     }
@@ -2592,16 +2629,19 @@ async fn handle_add_hierarchical_sheet(
     let parent = cse::Schematic::load(&parent_path)?;
 
     if parent.sheets.by_name(&sheet_name).is_some() {
-        return Ok(CallToolResult::error(format!(
-            "Sheet named '{}' already exists in this schematic — use edit_sheet to modify it \
-             or pick a different name",
-            sheet_name
-        )));
+        return Ok(argument_refusal(
+            "sheet_name",
+            format!(
+                "Sheet named '{sheet_name}' already exists in this schematic — use edit_sheet \
+                 to modify it or pick a different name"
+            ),
+        ));
     }
 
     let child_existed = child_path.is_file();
     if child_path.exists() && !child_existed {
-        return Ok(CallToolResult::error(
+        return Ok(argument_refusal(
+            "sheet_file",
             "The child schematic path exists but is not a regular file",
         ));
     }
@@ -2672,21 +2712,27 @@ async fn handle_add_hierarchical_sheet(
             left_out,
         } = files_below(&child_path);
         if let Some((file, why)) = left_out.first() {
-            return Ok(CallToolResult::error(format!(
-                "'{}' {why}, so the files below '{sheet_file}' cannot be relinked; nothing \
-                 was written.",
-                file.display()
-            )));
+            return Ok(page_allocation_conflict(
+                file,
+                format!(
+                    "'{}' {why}, so the files below '{sheet_file}' cannot be relinked; nothing \
+                     was written.",
+                    file.display()
+                ),
+            ));
         }
         if below
             .iter()
             .any(|(file, _)| super::same_schematic_document(file, &parent_path))
         {
-            return Ok(CallToolResult::error(format!(
-                "'{sheet_file}' places '{}' through its sheets, so the new sheet would place \
-                 its own parent; nothing was written.",
-                parent_path.display()
-            )));
+            return Ok(argument_refusal(
+                "sheet_file",
+                format!(
+                    "'{sheet_file}' places '{}' through its sheets, so the new sheet would place \
+                     its own parent; nothing was written.",
+                    parent_path.display()
+                ),
+            ));
         }
         for (file, suffixes) in below {
             let added: Vec<String> = suffixes
@@ -2805,20 +2851,27 @@ fn plan_repointed_sheet_relinks(
         left_out,
     } = files_below(&new_child_path);
     if let Some((file, why)) = left_out.first() {
-        return Ok(Err(CallToolResult::error(format!(
-            "'{}' {why}, so the files below '{new_file}' cannot be relinked; nothing was written.",
-            file.display()
-        ))));
+        return Ok(Err(page_allocation_conflict(
+            file,
+            format!(
+                "'{}' {why}, so the files below '{new_file}' cannot be relinked; nothing was \
+                 written.",
+                file.display()
+            ),
+        )));
     }
     if new_below
         .iter()
         .any(|(file, _)| super::same_schematic_document(file, sch_path))
     {
-        return Ok(Err(CallToolResult::error(format!(
-            "'{new_file}' places '{}' through its sheets, so the edited sheet would place its \
-             own parent; nothing was written.",
-            sch_path.display()
-        ))));
+        return Ok(Err(argument_refusal(
+            "new_file",
+            format!(
+                "'{new_file}' places '{}' through its sheets, so the edited sheet would place its \
+                 own parent; nothing was written.",
+                sch_path.display()
+            ),
+        )));
     }
 
     let (parent_base, parent_uuid) = ensure_source_root_uuid(before)?;
@@ -2950,12 +3003,7 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     let mut sch = cse::Schematic::load(&sch_path)?;
     let sheet = match sch.sheets.by_name_mut(&sheet_name) {
         Some(s) => s,
-        None => {
-            return Ok(CallToolResult::error(format!(
-                "Sheet '{}' not found",
-                sheet_name
-            )))
-        }
+        None => return Ok(sheet_not_found("sheet_name", &sheet_name)),
     };
     let sheet_uuid = sheet.uuid.clone();
     let old_file = sheet.file().to_string();
@@ -3005,15 +3053,20 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
             Some(true) => changed.push(label),
             Some(false) => {}
             None => {
-                return Ok(CallToolResult::error(format!(
-                    "Sheet '{sheet_name}' has no {field} field"
-                )))
+                return Ok(CallToolResult::error_kind(
+                    ToolErrorKind::MalformedFile {
+                        path: sch_path.display().to_string(),
+                        reason: format!("sheet '{sheet_name}' has no {field} property"),
+                    },
+                    format!("Sheet '{sheet_name}' has no {field} field"),
+                ))
             }
         }
     }
 
     if requested.is_empty() {
-        return Ok(CallToolResult::error(
+        return Ok(argument_refusal(
+            "fields",
             "No fields to change — provide at least one of: new_name, new_file, hide_name, \
              hide_file, x+y, width+height",
         ));
@@ -3118,10 +3171,7 @@ async fn handle_move_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
                 &json!({ "moved": sheet_name, "x": x, "y": y, "changed": changed }),
             ))
         }
-        None => Ok(CallToolResult::error(format!(
-            "Sheet '{}' not found",
-            sheet_name
-        ))),
+        None => Ok(sheet_not_found("sheet_name", &sheet_name)),
     }
 }
 
@@ -3183,10 +3233,7 @@ async fn handle_delete_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result
                          numbers may now have a gap — call renumber_sheet_pages if needed."
             })))
         }
-        None => Ok(CallToolResult::error(format!(
-            "Sheet '{}' not found",
-            sheet_name
-        ))),
+        None => Ok(sheet_not_found("sheet_name", &sheet_name)),
     }
 }
 
@@ -3211,10 +3258,10 @@ async fn handle_duplicate_sheet(
     let parent = cse::Schematic::load(&sch_path)?;
 
     if parent.sheets.by_name(&new_name).is_some() {
-        return Ok(CallToolResult::error(format!(
-            "Sheet named '{}' already exists",
-            new_name
-        )));
+        return Ok(argument_refusal(
+            "new_sheet_name",
+            format!("Sheet named '{new_name}' already exists"),
+        ));
     }
 
     let (src_x, src_y, src_w, src_h, src_file) = match parent.sheets.by_name(&source_name) {
@@ -3222,12 +3269,7 @@ async fn handle_duplicate_sheet(
             let (x, y) = s.position();
             (x, y, s.width, s.height, s.file().to_string())
         }
-        None => {
-            return Ok(CallToolResult::error(format!(
-                "Sheet '{}' not found",
-                source_name
-            )))
-        }
+        None => return Ok(sheet_not_found("source_sheet_name", &source_name)),
     };
 
     let dir = parent_dir(&sch_path);
@@ -3235,23 +3277,28 @@ async fn handle_duplicate_sheet(
     let new_child = dir.join(&new_file);
 
     if !is_valid_relative_sheet_file(&new_file) || !new_child.parent().is_some_and(Path::is_dir) {
-        return Ok(CallToolResult::error(
+        return Ok(argument_refusal(
+            "new_file",
             "new_file must be a relative .kicad_sch path in an existing project directory",
         ));
     }
 
     if new_child.exists() {
-        return Ok(CallToolResult::error(format!(
-            "'{}' already exists — pick a different file name, or use add_hierarchical_sheet \
-             to link the existing file instead of duplicating",
-            new_file
-        )));
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::Conflict {
+                paths: vec![new_child.display().to_string()],
+            },
+            format!(
+                "'{new_file}' already exists — pick a different file name, or use \
+                 add_hierarchical_sheet to link the existing file instead of duplicating"
+            ),
+        ));
     }
     if !source_child.exists() {
-        return Ok(CallToolResult::error(format!(
-            "Source sheet's file '{}' was not found on disk — cannot duplicate",
-            src_file
-        )));
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::file_not_found(&source_child),
+            format!("Source sheet's file '{src_file}' was not found on disk — cannot duplicate"),
+        ));
     }
 
     const DUPLICATE_OFFSET_MM: f64 = 20.0;
@@ -3354,10 +3401,10 @@ async fn handle_get_sheet_hierarchy(
 ) -> anyhow::Result<CallToolResult> {
     let root_path = get_path(args, "schematic")?;
     if !root_path.exists() {
-        return Ok(CallToolResult::error(format!(
-            "Schematic '{}' not found",
-            root_path.display()
-        )));
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::file_not_found(&root_path),
+            format!("Schematic '{}' not found", root_path.display()),
+        ));
     }
     let project_name = opt_str(args, "project_name")
         .map(str::to_string)
@@ -3436,10 +3483,10 @@ async fn handle_renumber_sheet_pages(
 ) -> anyhow::Result<CallToolResult> {
     let root_path = get_path(args, "schematic")?;
     if !root_path.exists() {
-        return Ok(CallToolResult::error(format!(
-            "Schematic '{}' not found",
-            root_path.display()
-        )));
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::file_not_found(&root_path),
+            format!("Schematic '{}' not found", root_path.display()),
+        ));
     }
 
     // Page paths are hierarchical instance paths rooted at the root sheet's
@@ -3629,19 +3676,17 @@ async fn handle_import_sheet_pins(
             let (x, y) = s.position();
             (dir.join(s.file()), x, y, s.width, s.height)
         }
-        None => {
-            return Ok(CallToolResult::error(format!(
-                "Sheet '{}' not found",
-                sheet_name
-            )))
-        }
+        None => return Ok(sheet_not_found("sheet_name", &sheet_name)),
     };
 
     if !child_path.exists() {
-        return Ok(CallToolResult::error(format!(
-            "Child file '{}' not found on disk — cannot read its hierarchical labels",
-            child_path.display()
-        )));
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::file_not_found(&child_path),
+            format!(
+                "Child file '{}' not found on disk — cannot read its hierarchical labels",
+                child_path.display()
+            ),
+        ));
     }
     let child = cse::Schematic::load(&child_path)?;
     let label_names: Vec<(String, String)> = child
@@ -3900,21 +3945,16 @@ async fn handle_add_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resul
     let mut sch = cse::Schematic::load(&sch_path)?;
     let sheet = match sch.sheets.by_name_mut(&sheet_name) {
         Some(s) => s,
-        None => {
-            return Ok(CallToolResult::error(format!(
-                "Sheet '{}' not found",
-                sheet_name
-            )))
-        }
+        None => return Ok(sheet_not_found("sheet_name", &sheet_name)),
     };
     let sheet_uuid = sheet.uuid.clone();
     let sheet_box = SheetBox::of(sheet);
 
     if sheet.pin_by_name(&pin_name).is_some() {
-        return Ok(CallToolResult::error(format!(
-            "Sheet '{}' already has a pin named '{}'",
-            sheet_name, pin_name
-        )));
+        return Ok(argument_refusal(
+            "pin_name",
+            format!("Sheet '{sheet_name}' already has a pin named '{pin_name}'"),
+        ));
     }
 
     if requested_side.is_some() {
@@ -3970,22 +4010,17 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
     let mut sch = cse::Schematic::load(&sch_path)?;
     let sheet = match sch.sheets.by_name_mut(&sheet_name) {
         Some(s) => s,
-        None => {
-            return Ok(CallToolResult::error(format!(
-                "Sheet '{}' not found",
-                sheet_name
-            )))
-        }
+        None => return Ok(sheet_not_found("sheet_name", &sheet_name)),
     };
     let sheet_uuid = sheet.uuid.clone();
     let sheet_box = SheetBox::of(sheet);
     let pin = match sheet.pin_by_name_mut(&pin_name) {
         Some(p) => p,
         None => {
-            return Ok(CallToolResult::error(format!(
-                "Pin '{}' not found on sheet '{}'",
-                pin_name, sheet_name
-            )))
+            return Ok(argument_refusal(
+                "pin_name",
+                format!("Pin '{pin_name}' not found on sheet '{sheet_name}'"),
+            ))
         }
     };
 
@@ -4039,7 +4074,8 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
     let saved_name = pin.name.clone();
 
     if requested.is_empty() {
-        return Ok(CallToolResult::error(
+        return Ok(argument_refusal(
+            "fields",
             "No fields to change — provide at least one of: new_name, pin_type, side, x+y",
         ));
     }
@@ -4093,20 +4129,15 @@ async fn handle_delete_sheet_pin(
     let mut sch = cse::Schematic::load(&sch_path)?;
     let sheet = match sch.sheets.by_name_mut(&sheet_name) {
         Some(s) => s,
-        None => {
-            return Ok(CallToolResult::error(format!(
-                "Sheet '{}' not found",
-                sheet_name
-            )))
-        }
+        None => return Ok(sheet_not_found("sheet_name", &sheet_name)),
     };
     let sheet_uuid = sheet.uuid.clone();
 
     if !sheet.remove_pin(&pin_name) {
-        return Ok(CallToolResult::error(format!(
-            "Pin '{}' not found on sheet '{}'",
-            pin_name, sheet_name
-        )));
+        return Ok(argument_refusal(
+            "pin_name",
+            format!("Pin '{pin_name}' not found on sheet '{sheet_name}'"),
+        ));
     }
     if let Some(error) =
         commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "delete_sheet_pin")?
@@ -4127,10 +4158,10 @@ async fn handle_validate_sheet_pins(
     let root_path = get_path(args, "schematic")?;
 
     if !root_path.exists() {
-        return Ok(CallToolResult::error(format!(
-            "Schematic '{}' not found",
-            root_path.display()
-        )));
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::file_not_found(&root_path),
+            format!("Schematic '{}' not found", root_path.display()),
+        ));
     }
 
     let mut issues = Vec::new();
@@ -4689,11 +4720,10 @@ mod tests {
         let result = edit_fields(&root, "CH3", json!({ "hide_file": true })).await;
 
         assert!(result.is_error);
-        let text = match &result.content[0] {
-            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
-            _ => panic!("expected text content"),
-        };
-        assert_eq!(text, "Sheet 'CH3' has no Sheetfile field");
+        let body = result_json(&result);
+        assert_eq!(body["error"]["kind"], "malformed_file", "{body}");
+        assert_eq!(body["error"]["path"], root.display().to_string(), "{body}");
+        assert_eq!(body["message"], "Sheet 'CH3' has no Sheetfile field");
         assert_eq!(std::fs::read_to_string(&root).unwrap(), cut);
     }
 
@@ -6694,6 +6724,14 @@ mod tests {
         .await
         .unwrap();
         assert!(result.is_error, "the edge is filled through its last slot");
+        let body = result_json(&result);
+        assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+        assert_eq!(body["error"]["operation"], "import_sheet_pins", "{body}");
+        assert_eq!(
+            body["error"]["reasons"],
+            json!(["the 'left' edge of sheet 'A' has no slot for 'VIN'"]),
+            "{body}"
+        );
 
         let message = format!("{:?}", result.content);
         assert!(
@@ -7964,6 +8002,12 @@ mod instance_path_lifecycle_tests {
         let (failed, body) = place_bank(&root, "middle").await;
         assert!(failed, "{body}");
         assert!(body.to_string().contains("junk.kicad_sch"), "{body}");
+        assert_eq!(body["error"]["kind"], "conflict", "{body}");
+        let paths = body["error"]["paths"].as_array().unwrap();
+        assert!(
+            paths.len() == 1 && paths[0].as_str().unwrap().ends_with("junk.kicad_sch"),
+            "{body}"
+        );
         assert_eq!(text_of(&root), root_before, "nothing was written");
         assert_eq!(text_of(&bank), bank_text);
         assert_eq!(text_of(&cell), cell_before);
@@ -8003,6 +8047,8 @@ mod instance_path_lifecycle_tests {
         .await;
         assert!(failed, "{body}");
         assert!(body.to_string().contains("its own parent"), "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "sheet_file", "{body}");
         assert_eq!(text_of(&root), root_before);
         assert_eq!(text_of(&mid), mid_before);
     }
@@ -8043,6 +8089,7 @@ mod instance_path_lifecycle_tests {
         .await;
         assert!(failed, "{body}");
         assert!(body.to_string().contains("deeper"), "{body}");
+        assert_eq!(body["error"]["kind"], "conflict", "{body}");
         assert_eq!(text_of(&root), root_before);
     }
 
@@ -9690,6 +9737,278 @@ mod create_schematic_ownership_tests {
             def.description.contains("add_hierarchical_sheet"),
             "description must name add_hierarchical_sheet: {}",
             def.description
+        );
+    }
+}
+
+/// The hierarchy tools' refusals carry a typed `error.kind` (#741), with the
+/// message callers already read kept as it was.
+#[cfg(test)]
+mod error_kind_tests {
+    use super::instance_path_lifecycle_tests::{project, served};
+    use serde_json::{json, Value};
+    use std::path::Path;
+
+    /// Every file in the fixture project, by name, so a refusal can be shown
+    /// to have written nothing anywhere in it.
+    fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    enum Detail {
+        Field(&'static str),
+        /// The path the error names ends with this file name.
+        Path(&'static str),
+        /// `conflict`'s only path ends with this file name.
+        Paths(&'static str),
+    }
+
+    #[tokio::test]
+    async fn hierarchy_refusals_are_typed_through_served_dispatch() {
+        let (tmp, root) = project();
+        let dir = tmp.path();
+        let missing = dir.join("absent.kicad_sch");
+        // One pin on Mid, so edit_sheet_pin reaches its no-fields check.
+        let (failed, body) = served(
+            "add_sheet_pin",
+            json!({"schematic": root, "sheet_name": "Mid", "pin_name": "IN",
+                   "pin_type": "input", "x": 10.0, "y": 10.0}),
+        )
+        .await;
+        assert!(!failed, "{body}");
+        let before = snapshot(dir);
+
+        let cases: Vec<(&str, Value, &str, Detail, &str)> = vec![
+            (
+                "edit_sheet",
+                json!({"schematic": root, "sheet_name": "Nope", "new_name": "X"}),
+                "invalid_argument",
+                Detail::Field("sheet_name"),
+                "Sheet 'Nope' not found",
+            ),
+            (
+                "move_sheet",
+                json!({"schematic": root, "sheet_name": "Nope", "x": 1.0, "y": 1.0}),
+                "invalid_argument",
+                Detail::Field("sheet_name"),
+                "Sheet 'Nope' not found",
+            ),
+            (
+                "delete_sheet",
+                json!({"schematic": root, "sheet_name": "Nope"}),
+                "invalid_argument",
+                Detail::Field("sheet_name"),
+                "Sheet 'Nope' not found",
+            ),
+            (
+                "duplicate_sheet",
+                json!({"schematic": root, "source_sheet_name": "Nope",
+                       "new_sheet_name": "Copy", "new_file": "copy.kicad_sch"}),
+                "invalid_argument",
+                Detail::Field("source_sheet_name"),
+                "Sheet 'Nope' not found",
+            ),
+            (
+                "duplicate_sheet",
+                json!({"schematic": root, "source_sheet_name": "Mid",
+                       "new_sheet_name": "Child", "new_file": "copy.kicad_sch"}),
+                "invalid_argument",
+                Detail::Field("new_sheet_name"),
+                "Sheet named 'Child' already exists",
+            ),
+            (
+                "duplicate_sheet",
+                json!({"schematic": root, "source_sheet_name": "Mid",
+                       "new_sheet_name": "Copy", "new_file": "shared.kicad_sch"}),
+                "conflict",
+                Detail::Paths("shared.kicad_sch"),
+                "'shared.kicad_sch' already exists",
+            ),
+            (
+                "add_hierarchical_sheet",
+                json!({"schematic": root, "sheet_file": "../up.kicad_sch",
+                       "sheet_name": "Up"}),
+                "invalid_argument",
+                Detail::Field("sheet_file"),
+                "sheet_file must be a relative .kicad_sch path without parent traversal",
+            ),
+            (
+                "add_hierarchical_sheet",
+                json!({"schematic": root, "sheet_file": "new.kicad_sch",
+                       "sheet_name": "Mid"}),
+                "invalid_argument",
+                Detail::Field("sheet_name"),
+                "Sheet named 'Mid' already exists in this schematic",
+            ),
+            (
+                "edit_sheet",
+                json!({"schematic": root, "sheet_name": "Mid"}),
+                "invalid_argument",
+                Detail::Field("fields"),
+                "No fields to change",
+            ),
+            (
+                "add_hierarchical_sheet",
+                json!({"schematic": root, "sheet_file": "demo.kicad_sch",
+                       "sheet_name": "Self"}),
+                "invalid_argument",
+                Detail::Field("sheet_file"),
+                "A hierarchical sheet cannot reference its parent file",
+            ),
+            (
+                "add_hierarchical_sheet",
+                json!({"schematic": root, "sheet_file": "missing_dir/child.kicad_sch",
+                       "sheet_name": "Sub"}),
+                "invalid_argument",
+                Detail::Field("sheet_file"),
+                "The child sheet directory does not exist",
+            ),
+            (
+                "duplicate_sheet",
+                json!({"schematic": root, "source_sheet_name": "Mid",
+                       "new_sheet_name": "Copy", "new_file": "../escape.kicad_sch"}),
+                "invalid_argument",
+                Detail::Field("new_file"),
+                "new_file must be a relative .kicad_sch path in an existing project directory",
+            ),
+            (
+                "delete_sheet_pin",
+                json!({"schematic": root, "sheet_name": "Mid", "pin_name": "NOPE"}),
+                "invalid_argument",
+                Detail::Field("pin_name"),
+                "Pin 'NOPE' not found on sheet 'Mid'",
+            ),
+            (
+                "import_sheet_pins",
+                json!({"schematic": root, "sheet_name": "Nope"}),
+                "invalid_argument",
+                Detail::Field("sheet_name"),
+                "Sheet 'Nope' not found",
+            ),
+            (
+                "add_sheet_pin",
+                json!({"schematic": root, "sheet_name": "Nope", "pin_name": "IN2",
+                       "pin_type": "input", "x": 10.0, "y": 10.0}),
+                "invalid_argument",
+                Detail::Field("sheet_name"),
+                "Sheet 'Nope' not found",
+            ),
+            (
+                "edit_sheet_pin",
+                json!({"schematic": root, "sheet_name": "Nope", "pin_name": "IN",
+                       "new_name": "X"}),
+                "invalid_argument",
+                Detail::Field("sheet_name"),
+                "Sheet 'Nope' not found",
+            ),
+            (
+                "add_sheet_pin",
+                json!({"schematic": root, "sheet_name": "Mid", "pin_name": "IN",
+                       "pin_type": "input", "x": 10.0, "y": 10.0}),
+                "invalid_argument",
+                Detail::Field("pin_name"),
+                "Sheet 'Mid' already has a pin named 'IN'",
+            ),
+            (
+                "edit_sheet_pin",
+                json!({"schematic": root, "sheet_name": "Mid", "pin_name": "NOPE",
+                       "new_name": "X"}),
+                "invalid_argument",
+                Detail::Field("pin_name"),
+                "Pin 'NOPE' not found on sheet 'Mid'",
+            ),
+            (
+                "edit_sheet_pin",
+                json!({"schematic": root, "sheet_name": "Mid", "pin_name": "IN"}),
+                "invalid_argument",
+                Detail::Field("fields"),
+                "No fields to change",
+            ),
+            (
+                "delete_sheet_pin",
+                json!({"schematic": root, "sheet_name": "Nope", "pin_name": "IN"}),
+                "invalid_argument",
+                Detail::Field("sheet_name"),
+                "Sheet 'Nope' not found",
+            ),
+            (
+                "get_sheet_hierarchy",
+                json!({"schematic": missing}),
+                "file_not_found",
+                Detail::Path("absent.kicad_sch"),
+                "not found",
+            ),
+            (
+                "renumber_sheet_pages",
+                json!({"schematic": missing}),
+                "file_not_found",
+                Detail::Path("absent.kicad_sch"),
+                "not found",
+            ),
+            (
+                "validate_sheet_pins",
+                json!({"schematic": missing}),
+                "file_not_found",
+                Detail::Path("absent.kicad_sch"),
+                "not found",
+            ),
+        ];
+
+        for (tool, arguments, kind, detail, message) in cases {
+            let (failed, body) = served(tool, arguments.clone()).await;
+            let case = format!("{tool} {arguments}: {body}");
+            assert!(failed, "{case}");
+            assert_eq!(body["error"]["kind"], kind, "{case}");
+            let shown = body["message"].as_str().unwrap_or_default();
+            assert!(shown.contains(message), "{case}");
+            match detail {
+                Detail::Field(field) => {
+                    assert_eq!(body["error"]["field"], field, "{case}");
+                    assert_eq!(body["error"]["reason"], shown, "{case}");
+                }
+                Detail::Path(name) => {
+                    let path = body["error"]["path"].as_str().unwrap_or_default();
+                    assert!(path.ends_with(name), "{case}");
+                }
+                Detail::Paths(name) => {
+                    let paths = body["error"]["paths"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    assert_eq!(paths.len(), 1, "{case}");
+                    assert!(paths[0].as_str().unwrap().ends_with(name), "{case}");
+                }
+            }
+            assert!(snapshot(dir) == before, "{case} must write nothing");
+        }
+
+        // Direct handler check for validate_pin_type (bypassing served enum schema validation)
+        let res = super::validate_pin_type("sideways").unwrap_err();
+        assert!(res.is_error);
+        let text = match &res.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text,
+            _ => panic!("expected text"),
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "pin_type", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Invalid pin_type 'sideways'"),
+            "{body}"
         );
     }
 }
