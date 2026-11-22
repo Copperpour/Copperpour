@@ -41,13 +41,10 @@ def _ensure_stubs():
     wx.RESIZE_BORDER = 2
     wx.ID_ANY = -1
     wx.ID_OK = 5100
-    wx.ID_YES = 5103
-    wx.ID_NO = 5104
     wx.ID_CLOSE = 5105
     wx.ID_SAVE = 5106
     wx.OK = 4
     wx.ICON_INFORMATION = 800
-    wx.ICON_ERROR = 400
     wx.ALIGN_CENTER_VERTICAL = 1
     wx.ALIGN_RIGHT = 2
     wx.EXPAND = 4
@@ -118,12 +115,6 @@ def _ensure_stubs():
         def GetSelection(self):
             return self._sel
 
-        def SetLabel(self, lbl):
-            self._val = lbl
-
-        def SetForegroundColour(self, col):
-            pass
-
         def Enable(self, en):
             pass
 
@@ -145,7 +136,6 @@ def _ensure_stubs():
     wx.Button = lambda *a, **k: _DummyCtrl()
     wx.Choice = lambda *a, **k: _DummyCtrl()
     wx.CheckBox = lambda *a, **k: _DummyCtrl()
-    wx.Colour = lambda *a, **k: None
     wx.Size = lambda *a, **k: None
     wx.MessageBox = mock.MagicMock()
     wx.GetTopLevelWindows = lambda: []
@@ -213,7 +203,7 @@ class SettingsDialogFocusTests(unittest.TestCase):
             found = self.plugin.find_pcb_editor_window()
             self.assertIs(found, pcb_editor)
 
-    def test_dialog_actions_preserve_settings_without_controls(self):
+    def test_save_preserves_settings_without_controls(self):
         saved_settings = {
             "eager_toolsets": True,
             "future_setting": {"enabled": False, "items": ["example"]},
@@ -221,34 +211,23 @@ class SettingsDialogFocusTests(unittest.TestCase):
             "log_level": "info",
         }
 
-        for action, handler, server_running in (
-            ("Save", "_on_save", False),
-            ("Start Server", "_on_start_stop", False),
-            ("Stop Server", "_on_start_stop", True),
-        ):
-            with self.subTest(action=action), tempfile.TemporaryDirectory() as plugin_dir:
-                settings_path = Path(plugin_dir) / "settings.json"
-                settings_path.write_text(json.dumps(saved_settings), encoding="utf-8")
-                dlg = self.dialog_mod.CopperpourSettingsDialog(
-                    parent=None,
-                    plugin_dir=plugin_dir,
-                    binary_path="/fake/copperpour",
-                    server_running=server_running,
-                )
-                dlg.log_level_ctrl.SetSelection(3)  # debug
+        with tempfile.TemporaryDirectory() as plugin_dir:
+            settings_path = Path(plugin_dir) / "settings.json"
+            settings_path.write_text(json.dumps(saved_settings), encoding="utf-8")
+            dlg = self.dialog_mod.CopperpourSettingsDialog(parent=None, plugin_dir=plugin_dir)
+            dlg.log_level_ctrl.SetSelection(3)  # debug
 
-                getattr(dlg, handler)(None)
+            dlg._on_save(None)
 
-                persisted = json.loads(settings_path.read_text(encoding="utf-8"))
-                self.assertIs(persisted.get("eager_toolsets"), True)
-                self.assertEqual(persisted.get("future_setting"), saved_settings["future_setting"])
-                self.assertEqual(persisted["log_level"], "debug")
+            persisted = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertIs(persisted.get("eager_toolsets"), True)
+            self.assertEqual(persisted.get("future_setting"), saved_settings["future_setting"])
+            self.assertEqual(persisted["log_level"], "debug")
 
     def test_on_save_passes_parent_self_to_messagebox(self):
         dlg = self.dialog_mod.CopperpourSettingsDialog(
             parent=None,
             plugin_dir=str(PLUGIN_DIR),
-            binary_path="/fake/konnect",
         )
         self.wx.MessageBox.reset_mock()
         with mock.patch("settings_dialog.save_settings"):
@@ -258,56 +237,41 @@ class SettingsDialogFocusTests(unittest.TestCase):
         _args, kwargs = self.wx.MessageBox.call_args
         self.assertIs(kwargs.get("parent"), dlg, "wx.MessageBox must be parented to the dialog")
 
-    def test_on_start_stop_with_callbacks_does_not_call_endmodal(self):
-        start_called = [False]
-        stop_called = [False]
+    def test_plugin_applies_saved_bridge_setting_after_dialog_closes(self):
+        bridge = mock.Mock()
+        bridge.available.return_value = True
+        with tempfile.TemporaryDirectory() as plugin_dir, \
+                mock.patch.object(self.plugin, "PLUGIN_DIR", plugin_dir), \
+                mock.patch.object(self.plugin, "SETTINGS_PATH", os.path.join(plugin_dir, "settings.json")), \
+                mock.patch.object(self.plugin, "_native_bridge", bridge), \
+                mock.patch.object(self.plugin, "CopperpourSettingsDialog") as dialog:
+            settings_path = Path(plugin_dir) / "settings.json"
+            for enabled in (True, False):
+                with self.subTest(enabled=enabled):
+                    bridge.reset_mock()
+                    bridge.running.return_value = not enabled
 
-        def on_start():
-            start_called[0] = True
-            return True
+                    def save_and_close():
+                        settings_path.write_text(
+                            json.dumps({"native_specctra_bridge": enabled}), encoding="utf-8"
+                        )
+                        return self.wx.ID_CLOSE
 
-        def on_stop():
-            stop_called[0] = True
+                    dialog.return_value.ShowModal.side_effect = save_and_close
+                    self.plugin.CopperpourPlugin().Run()
 
-        dlg = self.dialog_mod.CopperpourSettingsDialog(
-            parent=None,
-            plugin_dir=str(PLUGIN_DIR),
-            binary_path="/fake/konnect",
-            server_running=False,
-            on_start_server=on_start,
-            on_stop_server=on_stop,
-        )
-
-        with mock.patch("settings_dialog.save_settings"):
-            # Click Start Server
-            dlg._on_start_stop(None)
-            self.assertTrue(start_called[0])
-            self.assertTrue(dlg._server_running)
-            self.assertIsNone(dlg._end_modal_code, "EndModal must not be called when callback is present")
-
-            # Click Stop Server
-            dlg._on_start_stop(None)
-            self.assertTrue(stop_called[0])
-            self.assertFalse(dlg._server_running)
-            self.assertIsNone(dlg._end_modal_code, "EndModal must not be called when callback is present")
-
-    def test_on_start_stop_fallback_without_callbacks_calls_endmodal(self):
-        dlg = self.dialog_mod.CopperpourSettingsDialog(
-            parent=None,
-            plugin_dir=str(PLUGIN_DIR),
-            binary_path="/fake/konnect",
-            server_running=False,
-            on_start_server=None,
-            on_stop_server=None,
-        )
-
-        with mock.patch("settings_dialog.save_settings"):
-            dlg._on_start_stop(None)
-            self.assertEqual(dlg._end_modal_code, self.wx.ID_YES)
-
-            dlg._server_running = True
-            dlg._on_start_stop(None)
-            self.assertEqual(dlg._end_modal_code, self.wx.ID_NO)
+                    dialog.assert_called_with(
+                        parent=None,
+                        plugin_dir=plugin_dir,
+                        native_bridge_available=True,
+                        native_bridge_running=not enabled,
+                    )
+                    self.assertEqual(
+                        bridge.method_calls,
+                        [mock.call.available(), mock.call.running(),
+                         mock.call.start() if enabled else mock.call.stop()],
+                    )
+                    dialog.return_value.Destroy.assert_called()
 
 
 if __name__ == "__main__":
