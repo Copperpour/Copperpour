@@ -645,9 +645,9 @@ impl Sheet {
     }
 }
 
-fn xy(node: Option<&SexpNode>) -> Option<Value> {
+fn xy(node: Option<&SexpNode>) -> Option<(f64, f64)> {
     let node = node?;
-    Some(json!({ "x": node.get_f64(1)?, "y": node.get_f64(2)? }))
+    Some((node.get_f64(1)?, node.get_f64(2)?))
 }
 
 /// `(color R G B A)` as `[r, g, b, a]`, or `None` when absent.
@@ -668,48 +668,100 @@ fn color_json(node: Option<&SexpNode>) -> Option<Value> {
     Some(json!([channel(r)?, channel(g)?, channel(b)?, a?]))
 }
 
-/// A listed shape in `add_schematic_shapes`'s vocabulary, or the part it lacks.
-fn shape_json(node: &SexpNode, uuid: Option<&str>) -> Result<Value, &'static str> {
-    let mut shape = match node.head() {
-        Some(head @ ("polyline" | "bezier")) => {
-            let points: Vec<Value> = node
-                .find("pts")
-                .ok_or("pts")?
-                .find_all("xy")
-                .into_iter()
-                .map(|xy| Some(json!({ "x": xy.get_f64(1)?, "y": xy.get_f64(2)? })))
-                .collect::<Option<_>>()
-                .ok_or("readable points")?;
-            match points.as_slice() {
-                _ if head == "bezier" => {
-                    if points.len() != 4 {
-                        return Err("four points");
-                    }
-                    json!({ "type": "bezier", "points": points })
+type Point = (f64, f64);
+
+enum SavedGeometry {
+    Polyline(Vec<Point>),
+    Bezier([Point; 4]),
+    Rectangle(Point, Point),
+    Circle(Point, f64),
+    Arc(Point, Point, Point),
+}
+
+impl SavedGeometry {
+    fn read(node: &SexpNode) -> Result<Self, &'static str> {
+        let point = |tag| xy(node.find(tag)).ok_or(tag);
+        Ok(match node.head() {
+            Some(head @ ("polyline" | "bezier")) => {
+                let points: Vec<Point> = node
+                    .find("pts")
+                    .ok_or("pts")?
+                    .find_all("xy")
+                    .into_iter()
+                    .map(|node| xy(Some(node)))
+                    .collect::<Option<_>>()
+                    .ok_or("readable points")?;
+                if head == "bezier" {
+                    Self::Bezier(points.try_into().map_err(|_| "four points")?)
+                } else if points.len() >= 2 {
+                    Self::Polyline(points)
+                } else {
+                    return Err("two points");
                 }
-                [] | [_] => return Err("two points"),
-                [start, end] => json!({ "type": "line", "start": start, "end": end }),
-                _ => json!({ "type": "poly", "points": points }),
+            }
+            Some("rectangle") => Self::Rectangle(point("start")?, point("end")?),
+            Some("circle") => {
+                Self::Circle(point("center")?, node.find_f64("radius").ok_or("radius")?)
+            }
+            Some("arc") => Self::Arc(point("start")?, point("mid")?, point("end")?),
+            _ => return Err("shape type"),
+        })
+    }
+
+    fn json(self) -> Value {
+        let point = |(x, y): Point| json!({ "x": x, "y": y });
+        match self {
+            Self::Polyline(points) => match points.as_slice() {
+                [start, end] => json!({"type": "line", "start": point(*start), "end": point(*end)}),
+                _ => {
+                    json!({"type": "poly", "points": points.into_iter().map(point).collect::<Vec<_>>()})
+                }
+            },
+            Self::Bezier(points) => json!({"type": "bezier", "points": points.map(point)}),
+            Self::Rectangle(start, end) => {
+                json!({"type": "rect", "start": point(start), "end": point(end)})
+            }
+            Self::Circle(center, radius) => {
+                json!({"type": "circle", "center": point(center), "radius_mm": radius})
+            }
+            Self::Arc(start, mid, end) => {
+                json!({"type": "arc", "start": point(start), "mid": point(mid), "end": point(end)})
             }
         }
-        Some("rectangle") => json!({
-            "type": "rect",
-            "start": xy(node.find("start")).ok_or("start")?,
-            "end": xy(node.find("end")).ok_or("end")?
-        }),
-        Some("circle") => json!({
-            "type": "circle",
-            "center": xy(node.find("center")).ok_or("center")?,
-            "radius_mm": node.find_f64("radius").ok_or("radius")?
-        }),
-        Some("arc") => json!({
-            "type": "arc",
-            "start": xy(node.find("start")).ok_or("start")?,
-            "mid": xy(node.find("mid")).ok_or("mid")?,
-            "end": xy(node.find("end")).ok_or("end")?
-        }),
-        _ => return Err("shape type"),
+    }
+}
+
+pub(super) fn saved_shape_bounds(
+    node: &SexpNode,
+) -> Option<copperpour_sexp::schematic::SymbolBounds> {
+    use copperpour_sexp::schematic::{arc_bounds, SymbolBounds};
+    let finite = |(x, y): Point| x.is_finite() && y.is_finite();
+    let points = |vertices: &[Point]| {
+        let (&first, rest) = vertices.split_first()?;
+        vertices.iter().copied().all(finite).then(|| {
+            let mut bounds = SymbolBounds::spanning(first, first);
+            for &(x, y) in rest {
+                bounds.include(x, y);
+            }
+            bounds
+        })
     };
+    match SavedGeometry::read(node).ok()? {
+        SavedGeometry::Polyline(vertices) => points(&vertices),
+        // The curve stays within the control points' envelope.
+        SavedGeometry::Bezier(vertices) => points(&vertices),
+        SavedGeometry::Rectangle(a, b) => points(&[a, b]),
+        SavedGeometry::Circle((x, y), radius) if radius >= 0.0 => {
+            points(&[(x - radius, y - radius), (x + radius, y + radius)])
+        }
+        SavedGeometry::Arc(a, m, b) if [a, m, b].into_iter().all(finite) => arc_bounds(a, m, b),
+        _ => None,
+    }
+}
+
+/// A listed shape in `add_schematic_shapes`'s vocabulary, or the part it lacks.
+fn shape_json(node: &SexpNode, uuid: Option<&str>) -> Result<Value, &'static str> {
+    let mut shape = SavedGeometry::read(node)?.json();
     let stroke = node.find("stroke");
     shape["uuid"] = json!(uuid);
     shape["stroke_width_mm"] = json!(stroke.and_then(|s| s.find_f64("width")).unwrap_or(0.0));

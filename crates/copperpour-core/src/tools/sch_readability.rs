@@ -4,7 +4,7 @@ mod connector_pin_signals;
 
 use super::{
     sch_analysis::handle_check_overlaps, sch_layout_score::handle_compare_schematic_layout,
-    sch_pin_contacts, sch_wire_runs, ToolDef,
+    sch_page_fit, sch_pin_contacts, sch_wire_runs, ToolDef,
 };
 use crate::tool;
 use serde_json::json;
@@ -13,6 +13,7 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         connector_pin_signals::tool(),
         overlap_tool_def(),
+        sch_page_fit::tool_def(),
         sch_wire_runs::tool_def(),
         compare_tool_def(),
         sch_pin_contacts::definition(),
@@ -162,5 +163,10 @@ mod tests {
             .iter()
             .all(|tool| tool.name != "plan_schematic_cleanup"));
         assert_readability_route("plan_schematic_cleanup").await;
+    }
+
+    #[tokio::test]
+    async fn page_fit_belongs_to_readability() {
+        assert_readability_route("check_schematic_page_fit").await;
     }
 }

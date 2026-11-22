@@ -535,7 +535,7 @@ fn unescape(text: &str) -> String {
 }
 
 /// A `(bold yes)`-style flag, or the bare atom older files write.
-fn flag(node: &SexpNode, name: &str) -> bool {
+pub(crate) fn flag(node: &SexpNode, name: &str) -> bool {
     node.children().unwrap_or(&[]).iter().any(|c| match c {
         SexpNode::Atom(a) => a == name,
         SexpNode::List(_) => {
@@ -548,6 +548,83 @@ fn flag(node: &SexpNode, name: &str) -> bool {
 /// Whether an angle is an odd number of quarter turns.
 fn is_vertical(degrees: f64) -> bool {
     ((degrees / 90.0).round() as i64).rem_euclid(2) == 1
+}
+
+fn checked_text(text: &str, node: &SexpNode) -> Result<(), &'static str> {
+    if text.contains("${") || text.contains("@{") {
+        return Err("unresolved_text_variable");
+    }
+    if text.contains('\n') {
+        return Err("unsupported_multiline_text");
+    }
+    if !text
+        .chars()
+        .all(|c| matches!(c, ' '..='~' | '°' | '±' | 'µ' | 'μ' | 'Ω' | 'Ω'))
+    {
+        return Err("unsupported_glyph");
+    }
+    let effects = node.find("effects");
+    if effects.and_then(|e| e.find("font")).is_some_and(|f| {
+        f.find("face").is_some() || flag(f, "italic") || f.find("line_spacing").is_some()
+    }) || effects
+        .and_then(|e| e.find("justify"))
+        .is_some_and(|j| flag(j, "mirror"))
+    {
+        return Err("unsupported_text_style");
+    }
+    Ok(())
+}
+
+/// Check the limits of the stroke-font reader before using its estimate for
+/// a verdict. The overlap tool can still use its existing approximate boxes.
+pub fn check_text_extent(node: &SexpNode, extent: &TextExtent) -> Result<(), &'static str> {
+    checked_text(&extent.text, node)
+}
+
+/// Plot a non-symbol field at its saved position. The offset is used for
+/// global labels, whose fields follow the same offset as their main text.
+pub fn saved_field_bounds(
+    node: &SexpNode,
+    offset: (f64, f64),
+    sheet_file: bool,
+) -> Result<Option<SymbolBounds>, &'static str> {
+    if matches!(node.get(1), Some(SexpNode::Atom(a)) if a == "private")
+        || flag(node, "hide")
+        || node.find("effects").is_some_and(|e| flag(e, "hide"))
+    {
+        return Ok(None);
+    }
+    let name = node
+        .get(1)
+        .and_then(SexpNode::as_str)
+        .ok_or("invalid_field")?;
+    let value = node
+        .get(2)
+        .and_then(SexpNode::as_str)
+        .ok_or("invalid_field")?;
+    let text = if flag(node, "show_name") {
+        format!("{name}: {}", unescape(value))
+    } else if sheet_file {
+        format!("File: {}", unescape(value))
+    } else {
+        unescape(value)
+    };
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    checked_text(&text, node)?;
+    let (x, y, a) = parse_at(node).ok_or("invalid_field_position")?;
+    if ![x, y, a].into_iter().all(f64::is_finite) {
+        return Err("invalid_field_position");
+    }
+    let style = TextStyle::of(node);
+    let bounds = style.drawn(&Drawn::of(&text), style.vertical);
+    Ok(Some(moved(
+        turned(bounds, if is_vertical(a) { 90.0 } else { 0.0 }),
+        x + offset.0,
+        y + offset.1,
+        0.0,
+    )))
 }
 
 /// How KiCad draws a symbol field on the sheet (`"horizontal"` or
@@ -750,53 +827,63 @@ pub fn text_extents(tree: &SexpNode) -> Vec<TextExtent> {
             continue;
         };
         let lib_symbol = find_lib_symbol(&lib_symbols, &instance);
-        let units = lib_symbol.map_or(1, unit_count);
-        let is_power_symbol = lib_symbol.is_some_and(|symbol| symbol.find("power").is_some());
-        let t = instance.pin_transform();
-        for property in node.find_all("property") {
-            // eeschema draws a private field only in the symbol editor
-            // (`SCH_PAINTER::draw`), and writes it `(property private …)`.
-            if property
-                .get(1)
-                .is_some_and(|n| matches!(n, SexpNode::Atom(a) if a == "private"))
-            {
-                continue;
-            }
-            let (Some(name), Some(value)) = (
-                property.get(1).and_then(|n| n.as_str()),
-                property.get(2).and_then(|v| v.as_str()),
-            ) else {
-                continue;
-            };
-            let hidden =
-                flag(property, "hide") || property.find("effects").is_some_and(|e| flag(e, "hide"));
-            let shows_name = flag(property, "show_name");
-            let Some((x, y, angle)) = parse_at(property) else {
-                continue;
-            };
-            if hidden || (value.is_empty() && !shows_name) {
-                continue;
-            }
-            let mut text = unescape(value);
-            if name == "Reference" && units > 1 {
-                text.push_str(&unit_letters(instance.unit));
-            }
-            if shows_name {
-                text = format!("{name}: {text}");
-            }
-            let style = TextStyle::of(property);
-            let run = field_run(&style, &text, (x, y, angle), &t);
-            let owner = TextOwner::Field {
-                reference: instance.reference.clone(),
-                unit: instance.unit,
-                symbol_uuid: instance.uuid.clone(),
-                field: name.to_string(),
-                is_power_symbol,
-            };
-            extents.push(TextExtent::new(owner, text, run, run, run));
-        }
+        extents.extend(
+            node.find_all("property")
+                .into_iter()
+                .filter_map(|p| symbol_field_extent(p, &instance, lib_symbol).ok().flatten()),
+        );
     }
     extents
+}
+
+/// The same field extent used by [`text_extents`], distinguishing invisible
+/// fields from visible fields whose saved geometry is missing.
+pub fn symbol_field_extent(
+    property: &SexpNode,
+    instance: &crate::schematic::SymbolInstance,
+    lib_symbol: Option<&SexpNode>,
+) -> Result<Option<TextExtent>, &'static str> {
+    // eeschema draws private properties only in the symbol editor.
+    if matches!(property.get(1), Some(SexpNode::Atom(a)) if a == "private")
+        || flag(property, "hide")
+        || property.find("effects").is_some_and(|e| flag(e, "hide"))
+    {
+        return Ok(None);
+    }
+    let name = property
+        .get(1)
+        .and_then(SexpNode::as_str)
+        .ok_or("invalid_field")?;
+    let value = property
+        .get(2)
+        .and_then(SexpNode::as_str)
+        .ok_or("invalid_field")?;
+    let shows_name = flag(property, "show_name");
+    if value.is_empty() && !shows_name {
+        return Ok(None);
+    }
+    let at = parse_at(property).ok_or("invalid_field_position")?;
+    let mut text = unescape(value);
+    if name == "Reference" && lib_symbol.is_some_and(|s| unit_count(s) > 1) {
+        text.push_str(&unit_letters(instance.unit));
+    }
+    if shows_name {
+        text = format!("{name}: {text}");
+    }
+    let run = field_run(
+        &TextStyle::of(property),
+        &text,
+        at,
+        &instance.pin_transform(),
+    );
+    let owner = TextOwner::Field {
+        reference: instance.reference.clone(),
+        unit: instance.unit,
+        symbol_uuid: instance.uuid.clone(),
+        field: name.to_string(),
+        is_power_symbol: lib_symbol.is_some_and(|symbol| symbol.find("power").is_some()),
+    };
+    Ok(Some(TextExtent::new(owner, text, run, run, run)))
 }
 
 /// A field's run as `SCH_FIELD::Plot` draws it: centred on the centre of the
@@ -848,7 +935,18 @@ fn field_run(
     moved(upright, x + cx, y + cy, 0.0)
 }
 
-fn label_extent(node: &SexpNode, kind: LabelKind) -> Option<TextExtent> {
+pub fn label_extent(node: &SexpNode, kind: LabelKind) -> Option<TextExtent> {
+    label_placement(node, kind).map(|placement| placement.extent)
+}
+
+/// Bounds of the parts that plot separately, and the offset applied to fields.
+pub struct LabelPlacement {
+    pub extent: TextExtent,
+    pub field_offset: (f64, f64),
+    pub outline: Option<SymbolBounds>,
+}
+
+pub fn label_placement(node: &SexpNode, kind: LabelKind) -> Option<LabelPlacement> {
     let net = node.get(1)?.as_str()?.to_string();
     let (x, y, angle) = parse_at(node)?;
     let text = unescape(&net);
@@ -873,7 +971,7 @@ fn label_extent(node: &SexpNode, kind: LabelKind) -> Option<TextExtent> {
             0.0,
         )
     };
-    let (run, bounds, compared) = match kind {
+    let (run, bounds, compared, offset, outline) = match kind {
         LabelKind::GlobalLabel => {
             // `SCH_GLOBALLABEL::GetSchematicTextOffset`.
             let margin = LABEL_SIZE_RATIO * h;
@@ -910,7 +1008,7 @@ fn label_extent(node: &SexpNode, kind: LabelKind) -> Option<TextExtent> {
             };
             let line = moved(turned(outline, quarter), x, y, 0.0);
             let stroked = moved(line, 0.0, 0.0, style.stroke / 2.0);
-            (run_at(dx, dy), stroked, line)
+            (run_at(dx, dy), stroked, line, (dx, dy), Some(stroked))
         }
         LabelKind::HierarchicalLabel => {
             // `SCH_HIERLABEL::GetSchematicTextOffset`, and the flag's corners
@@ -926,7 +1024,13 @@ fn label_extent(node: &SexpNode, kind: LabelKind) -> Option<TextExtent> {
             let run = run_at(dx, dy);
             let line = moved(SymbolBounds::spanning(corner, opposite), x, y, 0.0);
             let stroked = moved(line, 0.0, 0.0, style.stroke / 2.0);
-            (run, joined(run, stroked), joined(run, line))
+            (
+                run,
+                joined(run, stroked),
+                joined(run, line),
+                (dx, dy),
+                Some(stroked),
+            )
         }
         _ => {
             // `SCH_LABEL_BASE::GetSchematicTextOffset`: off the wire by the
@@ -934,7 +1038,7 @@ fn label_extent(node: &SexpNode, kind: LabelKind) -> Option<TextExtent> {
             let dist = TEXT_OFFSET_RATIO * h + style.pen;
             let (dx, dy) = if vertical { (-dist, 0.0) } else { (0.0, -dist) };
             let run = run_at(dx, dy);
-            (run, run, run)
+            (run, run, run, (dx, dy), None)
         }
     };
     let owner = TextOwner::Label {
@@ -944,7 +1048,213 @@ fn label_extent(node: &SexpNode, kind: LabelKind) -> Option<TextExtent> {
         at: (x, y),
         is_vertical: vertical,
     };
-    Some(TextExtent::new(owner, text, run, bounds, compared))
+    Some(LabelPlacement {
+        extent: TextExtent::new(owner, text, run, bounds, compared),
+        field_offset: offset,
+        outline,
+    })
+}
+
+/// Bounds of visible single-line pin names and numbers. Stacked pin numbers
+/// and unsupported text styles are left to the caller's coverage report.
+pub fn pin_text_bounds<'a, F: Fn(&str) -> bool + 'a>(
+    lib: &'a SexpNode,
+    instance: &crate::schematic::SymbolInstance,
+    body_style: u32,
+    default_pen: f64,
+    text_offset_ratio: f64,
+    use_pin: F,
+    default_overbar: bool,
+) -> impl Iterator<Item = Result<SymbolBounds, &'static str>> + use<'a, F> {
+    use crate::schematic::{lib_pin_nodes_for_body_style, parse_lib_pin};
+    let show_name = lib.find("pin_names").is_none_or(|e| !flag(e, "hide"));
+    let show_number = lib.find("pin_numbers").is_none_or(|e| !flag(e, "hide"));
+    let inside = lib
+        .find("pin_names")
+        .and_then(|n| n.find_f64("offset"))
+        .unwrap_or(0.0);
+    let transform = instance.pin_transform();
+    let rotation = instance.rotation;
+    lib_pin_nodes_for_body_style(lib, instance.unit, body_style)
+        .into_iter()
+        .flat_map(move |node| {
+            let Some(pin) = parse_lib_pin(node) else {
+                return [Err("invalid_pin_geometry"), Ok(None)];
+            };
+            if pin.hidden || !use_pin(&pin.number) {
+                return [Ok(None), Ok(None)];
+            }
+            let text_size = |tag, visible| {
+                let text = node.find(tag)?;
+                let size = text
+                    .find("effects")?
+                    .find("font")?
+                    .find("size")?
+                    .get_f64(1)?;
+                let value = unescape(text.get(1)?.as_str()?);
+                (visible && size > 0.0 && value != "~" && !value.trim().is_empty())
+                    .then_some((text, value, size))
+            };
+            let name = text_size("name", show_name);
+            let number = text_size("number", show_number);
+            let angle = pin.rotation.to_radians();
+            let tip = transform_pin(pin.local_x, pin.local_y, transform);
+            let root = transform_pin(
+                pin.local_x + pin.length * angle.cos(),
+                pin.local_y + pin.length * angle.sin(),
+                transform,
+            );
+            let dx = root.0 - tip.0;
+            let dy = root.1 - tip.1;
+            let vertical = if pin.length == 0.0 {
+                is_vertical(pin.rotation + rotation)
+            } else {
+                dy.abs() > dx.abs()
+            };
+            let midpoint = ((tip.0 + root.0) / 2.0, (tip.1 + root.1) / 2.0);
+            // SCH_PIN::PlotPinTexts: painter clearance plus its 4 mil margin.
+            let offset = ((24.0 * text_offset_ratio).round() + 4.0) * 0.0254 + default_pen;
+            let both_outside = inside == 0.0 && name.is_some() && number.is_some();
+            let bounds = |info: Option<(&SexpNode, String, f64)>, is_name: bool| {
+                let Some((node, text, size)) = info else {
+                    return Ok(None);
+                };
+                if !is_name && text.starts_with('[') && text.ends_with(']') {
+                    return Err("unsupported_stacked_pin_number");
+                }
+                checked_text(&text, node)?;
+                if !default_overbar && text.contains("~{") {
+                    return Err("project_overbar_offset_not_measured");
+                }
+                let (at, horizontal, vertical_justify) = if is_name && inside != 0.0 {
+                    if vertical {
+                        let sign = if dy < 0.0 { -1.0 } else { 1.0 };
+                        (
+                            (root.0, root.1 + sign * inside),
+                            if sign < 0.0 {
+                                Justify::Start
+                            } else {
+                                Justify::End
+                            },
+                            Justify::Center,
+                        )
+                    } else {
+                        let sign = if dx < 0.0 { -1.0 } else { 1.0 };
+                        (
+                            (root.0 + sign * inside, root.1),
+                            if sign > 0.0 {
+                                Justify::Start
+                            } else {
+                                Justify::End
+                            },
+                            Justify::Center,
+                        )
+                    }
+                } else {
+                    let below = !is_name && both_outside;
+                    let shift = if below { offset } else { -offset };
+                    let at = if vertical {
+                        (midpoint.0 + shift, midpoint.1)
+                    } else {
+                        (midpoint.0, midpoint.1 + shift)
+                    };
+                    (
+                        at,
+                        Justify::Center,
+                        if below { Justify::Start } else { Justify::End },
+                    )
+                };
+                let style = TextStyle {
+                    width: size,
+                    height: size,
+                    stroke: default_pen.min(size / 4.0),
+                    pen: size / 8.0,
+                    horizontal,
+                    vertical: vertical_justify,
+                };
+                Ok(Some(moved(
+                    turned(
+                        style.drawn(&Drawn::of(&text), vertical_justify),
+                        if vertical { 90.0 } else { 0.0 },
+                    ),
+                    at.0,
+                    at.1,
+                    0.0,
+                )))
+            };
+            [bounds(name, true), bounds(number, false)]
+        })
+        .filter_map(Result::transpose)
+}
+
+/// Ink not clipped by the text box. A single unbroken word is not wrapped,
+/// even when its ink reaches past a box edge.
+pub fn unwrapped_text_box_bounds(
+    node: &SexpNode,
+    b: SymbolBounds,
+) -> Result<Option<SymbolBounds>, &'static str> {
+    let text = unescape(
+        node.get(1)
+            .and_then(SexpNode::as_str)
+            .ok_or("missing_text")?,
+    );
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    checked_text(&text, node)?;
+    let angle = parse_at(node).map_or(0.0, |(_, _, angle)| angle);
+    let style = TextStyle::of(node);
+    let (left, top, right, bottom) = if let Some(margins) = node.find("margins") {
+        let margin = |i| {
+            margins
+                .get_f64(i)
+                .filter(|m| m.is_finite())
+                .ok_or("invalid_item_geometry")
+        };
+        (margin(1)?, margin(2)?, margin(3)?, margin(4)?)
+    } else {
+        // SCH_TEXTBOX::GetLegacyTextMargin rounds each term to schematic IU.
+        let round = |v: f64| (v * SCHEMATIC_IU_PER_MM).round() / SCHEMATIC_IU_PER_MM;
+        let width = node
+            .find("stroke")
+            .and_then(|s| s.find_f64("width"))
+            .unwrap_or(DEFAULT_LINE_WIDTH_MM);
+        let margin = round(width / 2.0) + round(style.width * 0.75);
+        (margin, margin, margin, margin)
+    };
+    let drawn = Drawn::of(&text);
+    let run_width = if angle == 90.0 {
+        b.max_y - b.min_y - top - bottom
+    } else {
+        b.max_x - b.min_x - left - right
+    };
+    if text.trim().chars().any(char::is_whitespace) && style.box_width(&drawn) > run_width {
+        return Err("wrapped_text_box");
+    }
+    let along_x = |j| match j {
+        Justify::Start => b.min_x + left,
+        Justify::Center => (b.min_x + b.max_x) / 2.0,
+        Justify::End => b.max_x - right,
+    };
+    let along_y = |j| match j {
+        Justify::Start => b.min_y + top,
+        Justify::Center => (b.min_y + b.max_y) / 2.0,
+        Justify::End => b.max_y - bottom,
+    };
+    let (x, y) = match angle {
+        0.0 => (along_x(style.horizontal), along_y(style.vertical)),
+        90.0 => (
+            along_x(style.vertical),
+            along_y(match style.horizontal {
+                Justify::Start => Justify::End,
+                Justify::End => Justify::Start,
+                Justify::Center => Justify::Center,
+            }),
+        ),
+        _ => return Err("unsupported_rotation"),
+    };
+    let ink = style.drawn(&drawn, style.vertical);
+    Ok(Some(moved(turned(ink, angle), x, y, 0.0)))
 }
 
 /// The box holding both.
@@ -955,7 +1265,7 @@ fn joined(mut a: SymbolBounds, b: SymbolBounds) -> SymbolBounds {
 }
 
 /// How many units a library symbol has: its highest `NAME_U_S` unit number.
-fn unit_count(symbol: &SexpNode) -> u32 {
+pub fn unit_count(symbol: &SexpNode) -> u32 {
     let name = symbol.get(1).and_then(|n| n.as_str()).unwrap_or("");
     let base = name.rsplit(':').next().unwrap_or(name);
     symbol
