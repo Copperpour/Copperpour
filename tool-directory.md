@@ -177,11 +177,11 @@ and Windows servers do not.
 | `trace_from_point` | Trace connectivity from any (X,Y) point — returns the wires, labels, component pins and junction dots at that point, and the net it belongs to. Hierarchical sheet pins and no-connect flags are not reported, so an empty pins_here does not prove a wire dangles. |
 | `find_orphan_items` | Find dangling wire ends, floating labels, and unconnected pin endpoints. Pins, sheet pins, junctions, and no-connect flags all count as connections. |
 | `find_pin_contacts` | Report visible pins touching on distinct symbols and branch-free pin-to-pin runs shorter than `min_wire_mm` (default 2.54 mm). Read-only drawing check on one saved sheet. |
-| `compare_schematic_layout` | Score a saved schematic sheet or compare its readability with a saved baseline after checking pin connectivity and symbol identity. Does not write or run KiCad. |
+| `compare_schematic_layout` | Score a saved schematic sheet, including wires crossing visible Reference or Value text on ordinary symbols. Compare with a saved baseline after checking pin connectivity and symbol identity. Does not write or run KiCad. |
 | `find_shorted_nets` | Detect accidentally merged nets — distinct net names that KiCad nets together, through a wire path they share or through a name that joins their segments. |
 | `find_single_pin_nets` | Find nets that reach at most one pin — often a missing counterpart, an orphan label, or a stub left by a deleted component. Component pins and hierarchical sheet pins count; a power symbol's own pin names the rail rather than consuming it and does not. Reports the pin and label counts, and every label kind that named the net. Read per sheet: a net a global, hierarchical or power label can carry off this one is flagged cross_sheet_unverified. |
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
-| `check_schematic_overlaps` | Find collisions using transformed symbol drawings, pins, and label and field text (excluding free text). Report wires drawn through a symbol body, label text, or visible power symbol Value text, and name symbols checked using the origin fallback. |
+| `check_schematic_overlaps` | Find collisions using transformed symbol drawings, pins, and label and field text (excluding free text). Report wires drawn through a symbol body, label text, visible power symbol Value text, or visible Reference or Value text on ordinary symbols. Name symbols checked using the origin fallback. |
 
 ### `sch_batch` · 19 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call; add, list, edit and delete free text items; add and list graphic shapes.

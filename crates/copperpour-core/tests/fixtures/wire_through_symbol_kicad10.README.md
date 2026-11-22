@@ -2,8 +2,9 @@
 
 `wire_through_symbol_kicad10.kicad_sch` has wires that run through a placed
 symbol's drawn body, and wires that only meet or pass one, so
-`check_schematic_overlaps`' `wire_overlap` entries can be checked: exactly the
-four wires through a body are reported, and no control is.
+`check_schematic_overlaps` can be checked: exactly four wires get `wire_overlap`
+findings. A wire that misses the body can still get `wire_field_overlap` if it
+crosses the symbol's text, as it does at R4's Reference.
 
 ## Provenance
 
