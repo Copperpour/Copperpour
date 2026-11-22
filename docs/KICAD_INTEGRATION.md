@@ -257,12 +257,39 @@ your settings file or download a database at startup.
 
 ## Plugin, Viewer, And Packaging
 
-`plugin` contains the legacy KiCad 10 Python ActionPlugin for settings/server
-control and the optional native Specctra bridge. `plugin.json` declares the
-separate executable IPC integration that is the forward path. Its action stays
-registered but hides its toolbar button: it has no icon, and its stdio server
-exits at once ([#277](https://github.com/Copperpour/Copperpour/issues/277)).
-Fixing both is part of [#24](https://github.com/Copperpour/Copperpour/issues/24). The browser viewer launched by
+The KiCad 10 Python ActionPlugin opens the settings dialog and manages the optional
+native Specctra bridge. MCP clients registered with a Copperpour launch command
+start and manage their own stdio server. The separate executable IPC integration
+declared in `plugin.json` keeps its toolbar button hidden pending the KiCad 11
+transition. [#277](https://github.com/Copperpour/Copperpour/issues/277) · [#24](https://github.com/Copperpour/Copperpour/issues/24)
+
+#### Standalone HTTP
+
+If you used the KiCad plugin to start an HTTP server, copy its `settings.json`
+to retain the saved paths and HTTP address, set `"transport": "http"` in the copy,
+and pass the copy with `--config`. Keep `"transport": "stdio"` in the plugin's own
+file if any client launches the installed binary over stdio: the binary reads that
+file when started without `--config`, and with `"http"` it never answers on stdio.
+With `"both"`, the server shuts down when the redirected stdin reaches EOF. For a
+new setup, a TOML file with `transport = "http"` also works.
+
+When launching from a terminal, redirect stdin so the binary enters server mode.
+
+```sh
+/path/to/copperpour --config /path/to/http-settings.json </dev/null
+```
+
+In Windows Command Prompt, use `copperpour.exe --config C:\path\to\http-settings.json < NUL`.
+If running from a OneDrive-managed plugin folder fails with an access error, copy
+the binary and configuration to a local folder and launch from there.
+
+With the default `http_address`, register `http://127.0.0.1:3000/mcp` in the MCP
+client. A launcher or service can also run the binary with non-terminal stdin.
+Keep the server running while clients use it.
+
+#### Browser viewer
+
+The browser viewer launched by
 `open_schematic_viewer` is embedded in the MCP server. It watches saved schematic
 files and renders private snapshots through `kicad-cli`; its context-owned
 loopback service needs no GUI runtime in the server. The tool returns a credential

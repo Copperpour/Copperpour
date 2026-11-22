@@ -2,8 +2,7 @@
 Copperpour -- Action Plugin launcher.
 
 This thin Python plugin registers a menu item in KiCAD's Tools menu.
-Clicking it opens a settings dialog where users can configure paths
-and start/stop the compiled Rust MCP server binary.
+Clicking it opens a dialog for Copperpour settings and the native Specctra bridge.
 
 Installation (KiCAD PCM):
   The plugin appears in KiCAD's Plugin and Content Manager.
@@ -13,10 +12,7 @@ Installation (KiCAD PCM):
 
 import atexit
 import os
-import shutil
-import subprocess
 import sys
-import threading
 
 import pcbnew  # Available inside KiCAD
 
@@ -26,26 +22,11 @@ if _plugin_dir not in sys.path:
     sys.path.insert(0, _plugin_dir)
 
 from settings_dialog import CopperpourSettingsDialog, load_settings
-from native_bridge import NativeSpecctraBridge, cache_root
+from native_bridge import NativeSpecctraBridge
 import wx
 
 PLUGIN_DIR = _plugin_dir
-BINARY_NAME = "copperpour.exe" if sys.platform == "win32" else "copperpour"
-BINARY_PATH = os.path.join(PLUGIN_DIR, "bin", BINARY_NAME)
 SETTINGS_PATH = os.path.join(PLUGIN_DIR, "settings.json")
-
-_server_process = None
-_server_thread = None
-
-# Windows GUI parents (pcbnew) attach a new console to their subprocesses.
-# That console makes stdin look like a TTY, which triggers copperpour's
-# double-click install wizard instead of MCP server mode. CREATE_NO_WINDOW
-# suppresses the console; stdin=PIPE stays intact.
-_POPEN_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-
-# None without an absolute directory: no PID file, no staging (#190).
-_CACHE_DIR = cache_root()
-_PID_FILE = None if _CACHE_DIR is None else os.path.join(_CACHE_DIR, "server.pid")
 _native_bridge = NativeSpecctraBridge(pcbnew, wx)
 
 
@@ -61,210 +42,7 @@ def _sync_native_bridge():
         _native_bridge.stop()
 
 
-def _stop_native_bridge():
-    _native_bridge.stop()
-
-
-def _stage(source_path):
-    """Copy file to LOCALAPPDATA cache, return cached path.
-
-    Without a cache directory the file is used where it is (#190).
-
-    OneDrive-redirected Documents (common in enterprise Windows) tag both
-    the plugin's copperpour.exe AND settings.json with IO_REPARSE_TAG_CLOUD,
-    which trips ERROR_ACCESS_DENIED on execute and on serde config read.
-    Staging to %LOCALAPPDATA% (never OneDrive-synced) sidesteps it.
-    """
-    if sys.platform != "win32" or _CACHE_DIR is None:
-        return source_path
-    os.makedirs(_CACHE_DIR, exist_ok=True)
-    dst = os.path.join(_CACHE_DIR, os.path.basename(source_path))
-    shutil.copy2(source_path, dst)
-    return dst
-
-
-def _write_pid_file(pid):
-    """Record the PID of the server this session just spawned."""
-    if _PID_FILE is None:
-        return
-    os.makedirs(_CACHE_DIR, exist_ok=True)
-    with open(_PID_FILE, "w") as f:
-        f.write(str(pid))
-
-
-def _clear_pid_file(pid):
-    """Remove the PID file only while it still records ``pid``.
-
-    Every KiCAD session writes the same file. Removing it unconditionally
-    lets the session whose server exits last delete a record written by a
-    session whose server is still running: the survivor becomes untracked,
-    so no later start_server preflight can ever reap it (#103).
-    """
-    if _PID_FILE is None:
-        return
-    try:
-        with open(_PID_FILE) as f:
-            recorded = int(f.read().strip())
-    except (OSError, ValueError):
-        return
-    if recorded != pid:
-        return
-    try:
-        os.remove(_PID_FILE)
-    except OSError:
-        pass
-
-
-def _terminate_owned_server():
-    """Kill the server this session spawned, on KiCAD exit.
-
-    _run_server sits on a daemon thread, so interpreter shutdown drops the
-    thread without touching the child. The server then outlives KiCAD,
-    holding the HTTP port and serving from a possibly pre-update binary --
-    an http-transport server never reads stdin, so parent death is invisible
-    to it and nothing else ends it.
-
-    Best-effort by nature: a hard kill of KiCAD runs no atexit handler, which
-    is why the preflight reap stays.
-    """
-    process = _owned_server()
-    if process is None:
-        return
-    try:
-        process.terminate()
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-    except OSError:
-        return
-    _clear_pid_file(process.pid)
-
-
-def _owned_server():
-    """The server this session spawned, while it is still running."""
-    process = _server_process
-    return process if process is not None and process.poll() is None else None
-
-
-atexit.register(_terminate_owned_server)
-atexit.register(_stop_native_bridge)
-
-
-def _kill_tracked():
-    """Terminate the PID recorded in the PID file (best-effort), clear the file.
-
-    os.kill(pid, 0) is unsafe on Windows -- it invokes TerminateProcess for any
-    signal value, so it would actually kill the process instead of probing.
-    Use taskkill/kill by PID; if the PID is stale, the kill is a harmless no-op.
-    """
-    if _PID_FILE is None:
-        return
-    try:
-        with open(_PID_FILE) as f:
-            pid = int(f.read().strip())
-    except (OSError, ValueError):
-        return
-    try:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/F", "/PID", str(pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=_POPEN_FLAGS,
-            )
-        else:
-            os.kill(pid, 9)
-    except OSError:
-        pass
-    try:
-        os.remove(_PID_FILE)
-    except OSError:
-        pass
-
-
-def _run_server():
-    """Run the MCP server subprocess. Exit means exit -- no retry loop.
-
-    A retry loop respawns copperpour after Stop Server kills it (wait() returns
-    normally on external kill, so nothing distinguishes "crashed" from
-    "stopped"). If copperpour crashes on startup, the user clicks Start again.
-    """
-    global _server_process
-    pid = None
-    try:
-        args = [_stage(BINARY_PATH)]
-        if os.path.exists(SETTINGS_PATH):
-            args += ["--config", _stage(SETTINGS_PATH)]
-        # pcbnew has no valid stderr; inheriting gives copperpour a broken
-        # handle and tracing_subscriber errors on init. DEVNULL is a
-        # valid sink.
-        _server_process = subprocess.Popen(
-            args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            creationflags=_POPEN_FLAGS,
-        )
-        pid = _server_process.pid
-        _write_pid_file(pid)
-        _server_process.wait()
-    except Exception as e:
-        print(f"[Copperpour] Server error: {e}", file=sys.stderr)
-    finally:
-        _server_process = None
-        if pid is not None:
-            _clear_pid_file(pid)
-
-
-def start_server(parent=None):
-    """Start the MCP server in a background thread."""
-    global _server_thread
-
-    if not os.path.exists(BINARY_PATH):
-        wx.MessageBox(
-            f"Copperpour binary not found at:\n{BINARY_PATH}\n\n"
-            "Please reinstall the plugin.",
-            "Copperpour",
-            wx.OK | wx.ICON_ERROR,
-            parent=parent,
-        )
-        return False
-
-    # Orphan from a previous KiCAD session may still be holding the port.
-    _kill_tracked()
-
-    if _server_thread and _server_thread.is_alive():
-        return True
-
-    _server_thread = threading.Thread(target=_run_server, daemon=True)
-    _server_thread.start()
-    return True
-
-
-def stop_server():
-    """Stop the MCP server subprocess."""
-    if _PID_FILE is not None:
-        _kill_tracked()
-        return
-    # No PID file: only the server this session spawned can be reached.
-    process = _owned_server()
-    if process is not None:
-        try:
-            process.kill()
-        except OSError:
-            pass
-
-
-def is_server_running():
-    """Report whether we've launched a server we haven't stopped.
-
-    PID file existence as a proxy -- survives module re-imports. If the
-    server crashed on its own, the next start_server preflight cleans up.
-    Without a PID file, only this module's own process handle is known.
-    """
-    if _PID_FILE is None:
-        return _owned_server() is not None
-    return os.path.exists(_PID_FILE)
+atexit.register(_native_bridge.stop)
 
 
 def find_pcb_editor_window():
@@ -341,35 +119,24 @@ class CopperpourPlugin(pcbnew.ActionPlugin):
         self.name = "Copperpour"
         self.category = "AI Tools"
         self.description = (
-            "Configure and control Copperpour -- enables AI assistants "
+            "Configure Copperpour -- enables AI assistants "
             "like Claude to design PCBs and schematics via the Model Context Protocol."
         )
         self.show_toolbar_button = True
         self.icon_file_name = os.path.join(PLUGIN_DIR, "resources", "icon.png")
 
     def Run(self):
-        """Open the settings dialog. Server start/stop is handled via dialog buttons."""
+        """Open the settings dialog and apply the saved bridge setting on close."""
         parent = find_pcb_editor_window()
 
         dlg = CopperpourSettingsDialog(
             parent=parent,
             plugin_dir=PLUGIN_DIR,
-            binary_path=BINARY_PATH,
-            server_running=is_server_running(),
             native_bridge_available=_native_bridge.available(),
             native_bridge_running=_native_bridge.running(),
-            on_start_server=lambda: start_server(parent=dlg),
-            on_stop_server=stop_server,
         )
 
-        result = dlg.ShowModal()
-
-        if result == wx.ID_YES:
-            # Fallback if dialog delegated via EndModal
-            start_server(parent=parent)
-        elif result == wx.ID_NO:
-            stop_server()
-
+        dlg.ShowModal()
         dlg.Destroy()
         _sync_native_bridge()
 

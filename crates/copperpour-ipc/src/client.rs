@@ -1673,13 +1673,13 @@ impl KiCadIpcClient {
         if self.recovery.is_some() || deadline.is_some() {
             socket.set_opt::<nng::options::protocol::reqrep::ResendTime>(None)?;
         }
-        socket
-            .set_opt::<nng::options::SendTimeout>(Some(before_deadline(
+        let send_bound = || {
+            before_deadline(
                 recovery_remaining
                     .unwrap_or(COMMAND_SEND_TIMEOUT)
                     .min(COMMAND_SEND_TIMEOUT),
-            )))
-            .context("Failed to set NNG send timeout")?;
+            )
+        };
         socket
             .set_opt::<nng::options::RecvTimeout>(Some(recv_timeout))
             .context("Failed to set NNG receive timeout")?;
@@ -1696,14 +1696,7 @@ impl KiCadIpcClient {
         };
 
         let diagnostic_dial_url = crate::redact_endpoint(&dial_url);
-        // A synchronous NNG dial can wait ten seconds for negotiation.
-        // For a deadline-bound read, let send wait for the pipe instead.
-        let dial = if recovery_remaining.is_some() || deadline.is_some() {
-            socket.dial_async(&dial_url)
-        } else {
-            socket.dial(&dial_url)
-        };
-        dial.map_err(|error| {
+        let dial_error = |error: nng::Error| {
             let reason = UnreachableReason::from_dial_error(error);
             unreachable_error(
                 reason,
@@ -1713,9 +1706,33 @@ impl KiCadIpcClient {
                     reason.explanation()
                 ),
             )
-        })?;
+        };
+        if recovery_remaining.is_some() || deadline.is_some() {
+            // A synchronous NNG dial can wait ten seconds for negotiation on a
+            // silent listener (#531). Bound the dial and handshake by the
+            // caller's deadline while still returning a refused dial at once.
+            let dial_timeout = send_bound();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let dial_socket = socket.clone();
+            let url = dial_url.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(dial_socket.dial(&url));
+            });
+            match rx.recv_timeout(dial_timeout) {
+                Ok(result) => result.map_err(dial_error)?,
+                Err(_) => {
+                    socket.close();
+                    return Err(dial_error(nng::Error::TimedOut));
+                }
+            }
+        } else {
+            socket.dial(&dial_url).map_err(dial_error)?;
+        }
 
         // Send request
+        socket
+            .set_opt::<nng::options::SendTimeout>(Some(send_bound()))
+            .context("Failed to set NNG send timeout")?;
         let msg = nng::Message::from(request_bytes.as_slice());
         socket.send(msg).map_err(|(_, error)| {
             unreachable_error(

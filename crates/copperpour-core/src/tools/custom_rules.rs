@@ -1186,6 +1186,111 @@ fn closing(tokens: &[Token], open: usize) -> Option<usize> {
     None
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RuleDependency {
+    NetNames,
+    FootprintSheets { dynamic_component_classes: bool },
+}
+
+/// Check conditions and assertions for one dependency. This does not simulate DRC.
+pub(super) fn check_rule_independence(
+    text: &str,
+    dependency: RuleDependency,
+) -> Result<(), String> {
+    // KiCad expands raw lines before recognizing comments. A substitution
+    // can add a newline followed by a live rule.
+    if text.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with('#') && line.contains("${")
+    }) {
+        return Err("a text variable in a comment may expand into a rule".into());
+    }
+    let tokens = lex(text).map_err(|(offset, fault)| {
+        format!("custom rule at line {}: {fault}", line_of(text, offset))
+    })?;
+    // KiCad expands text variables before parsing the rules, so a token
+    // containing one is not proof of the structure KiCad will evaluate.
+    if tokens.iter().any(|t| {
+        let text = t.tok.text();
+        let mut rest = text;
+        while let Some((_, suffix)) = rest.split_once("${") {
+            let Some((selector, tail)) = suffix.split_once('}') else {
+                return true;
+            };
+            if !selector
+                .strip_prefix("Class:")
+                .is_some_and(|name| !name.is_empty() && !name.contains(['$', '{', '\'', '"']))
+            {
+                return true;
+            }
+            if matches!(
+                dependency,
+                RuleDependency::FootprintSheets {
+                    dynamic_component_classes: true
+                }
+            ) {
+                return true;
+            }
+            rest = tail;
+        }
+        false
+    }) {
+        return Err("a text variable may change how the rule is evaluated".into());
+    }
+    let mut start = 0;
+    while start < tokens.len() {
+        if tokens[start].tok != Tok::Open {
+            return Err("invalid custom rule block".into());
+        }
+        let end = closing(&tokens, start).ok_or("unbalanced custom rules")?;
+        if end <= start + 1 {
+            return Err("invalid custom rule block".into());
+        }
+        let head = &tokens[start + 1].tok;
+        if head.is_keyword("rule") {
+            if !tokens.get(start + 2).is_some_and(|t| t.tok.is_symbol()) || end < start + 3 {
+                return Err("custom rule has no name".into());
+            }
+            let mut clause = start + 3;
+            while clause < end {
+                if tokens[clause].tok != Tok::Open {
+                    return Err("invalid custom rule clause".into());
+                }
+                let close = closing(&tokens, clause)
+                    .filter(|&i| i < end)
+                    .ok_or("unbalanced custom rule clause")?;
+                if close <= clause + 1 {
+                    return Err("invalid custom rule clause".into());
+                }
+                let kind = &tokens[clause + 1].tok;
+                if kind.is_keyword("condition") {
+                    if close != clause + 3 || !tokens[clause + 2].tok.is_symbol() {
+                        return Err("invalid custom rule condition".into());
+                    }
+                    check_rule_expression(tokens[clause + 2].tok.text(), dependency)?;
+                } else if kind.is_keyword("constraint")
+                    && tokens[clause + 2].tok.is_keyword("assertion")
+                {
+                    if close != clause + 4 || !tokens[clause + 3].tok.is_symbol() {
+                        return Err("invalid custom rule assertion".into());
+                    }
+                    check_rule_expression(tokens[clause + 3].tok.text(), dependency)?;
+                } else if !["constraint", "layer", "severity"]
+                    .iter()
+                    .any(|name| kind.is_keyword(name))
+                {
+                    return Err(format!("unknown custom rule clause '{}'", kind.text()));
+                }
+                clause = close + 1;
+            }
+        } else if !head.is_keyword("version") {
+            return Err(format!("unknown custom rule block '{}'", head.text()));
+        }
+        start = end + 1;
+    }
+    Ok(())
+}
+
 struct RuleParser<'a> {
     tokens: &'a [Token],
     at: usize,
@@ -1719,6 +1824,7 @@ struct Codegen<'a> {
     bare_number: bool,
     first_unit: Option<usize>,
     properties: &'a mut BTreeSet<String>,
+    dependency: Option<RuleDependency>,
 }
 
 impl Codegen<'_> {
@@ -1755,6 +1861,21 @@ impl Codegen<'_> {
                 };
                 match &**field {
                     Node::Ident(property) => {
+                        if let Some(dependency) = self.dependency {
+                            let independent: &[&str] = match dependency {
+                                RuleDependency::NetNames => &["NetClass", "ComponentClass", "Type"],
+                                RuleDependency::FootprintSheets {
+                                    dynamic_component_classes: true,
+                                } => &["NetClass", "NetName", "Type"],
+                                RuleDependency::FootprintSheets { .. } => ITEM_FIELDS,
+                            };
+                            if !independent
+                                .iter()
+                                .any(|name| property.eq_ignore_ascii_case(name))
+                            {
+                                return Err(format!("cannot classify rule property {property}"));
+                            }
+                        }
                         let item_field = ITEM_FIELDS
                             .iter()
                             .any(|field| field.eq_ignore_ascii_case(property));
@@ -1776,6 +1897,26 @@ impl Codegen<'_> {
                         }
                     }
                     Node::Call(function, arguments) => {
+                        let dependent: &[&str] = match self.dependency {
+                            Some(RuleDependency::NetNames) => &["inDiffPair", "isCoupledDiffPair"],
+                            Some(RuleDependency::FootprintSheets {
+                                dynamic_component_classes: true,
+                            }) => &[
+                                "memberOfSheet",
+                                "memberOfSheetOrChildren",
+                                "hasComponentClass",
+                            ],
+                            Some(RuleDependency::FootprintSheets { .. }) => {
+                                &["memberOfSheet", "memberOfSheetOrChildren"]
+                            }
+                            None => &[],
+                        };
+                        if dependent
+                            .iter()
+                            .any(|name| function.eq_ignore_ascii_case(name))
+                        {
+                            return Err(format!("rule calls {function}()"));
+                        }
                         if !is_item(item) {
                             return Err(format!(
                                 "'{item}' is not an item; KiCad's are A, B, AB, L and null"
@@ -1806,12 +1947,26 @@ impl Codegen<'_> {
     }
 }
 
+fn check_rule_expression(text: &str, dependency: RuleDependency) -> Result<(), String> {
+    check_expression_with_policy(text, Resolver::Pcb, &mut BTreeSet::new(), Some(dependency))
+        .map(|_| ())
+}
+
 /// Check one condition, assertion or value as KiCad's compiler reads it, and
 /// say what it measures.
 fn check_expression(
     text: &str,
     resolver: Resolver,
     properties: &mut BTreeSet<String>,
+) -> Result<Quantity, String> {
+    check_expression_with_policy(text, resolver, properties, None)
+}
+
+fn check_expression_with_policy(
+    text: &str,
+    resolver: Resolver,
+    properties: &mut BTreeSet<String>,
+    dependency: Option<RuleDependency>,
 ) -> Result<Quantity, String> {
     let lexemes = lex_expression(text, resolver)?;
     if lexemes.first() == Some(&Lexeme::End) {
@@ -1827,6 +1982,7 @@ fn check_expression(
         bare_number: false,
         first_unit: None,
         properties,
+        dependency,
     };
     codegen.visit(&tree)?;
     // KiCad flags a lone number without units, which it would read in nm.
@@ -1844,6 +2000,40 @@ fn check_expression(
 mod tests {
     use super::*;
     use crate::mcp::handler::McpHandler;
+
+    #[test]
+    fn rename_guard_reads_rule_conditions_not_comments_or_literals() {
+        let check_net_name_independent_conditions =
+            |text: &str| check_rule_independence(text, RuleDependency::NetNames);
+        let assertion =
+            |expr| format!("(version 1)\n(rule \"r\" (constraint assertion \"{expr}\"))");
+        assert!(check_net_name_independent_conditions(&assertion("A.NetName == '/SIG'")).is_err());
+        assert!(check_net_name_independent_conditions(&assertion("A.Type == 'Track'")).is_ok());
+        assert!(check_net_name_independent_conditions("(version 1)\n# ${EXTRA_RULE}\n").is_err());
+        let rule = |condition: &str| {
+            format!("(version 1)\n# (condition \"A.NetName\")\n(rule \"r\" (condition \"{condition}\"))")
+        };
+        assert!(check_net_name_independent_conditions("(version 1)").is_ok());
+        assert!(
+            check_net_name_independent_conditions(&rule("A.Type == 'NetName inDiffPair'")).is_ok()
+        );
+        for condition in [
+            "A.nEtNaMe == '/Source/SIG'",
+            "A.(NetName) == '/Source/SIG'",
+            "A.inDiffPair('Data')",
+            "A.isCoupledDiffPair()",
+            "A.futureNetFunction('Data')",
+            "A.Type == '${TEXT}'",
+        ] {
+            let result = check_net_name_independent_conditions(&rule(condition));
+            assert!(result.is_err(), "{condition}: {result:?}");
+        }
+        assert!(check_net_name_independent_conditions(&rule("A.fromTo('J1-1', 'J2-1')")).is_ok());
+        assert!(check_net_name_independent_conditions(&rule(
+            "A.intersectsCourtyard('${Class:Power}')"
+        ))
+        .is_ok());
+    }
     use crate::tools::{write_hook, ServerConfig};
 
     /// Rules of our own in the forms KiCad 10's parser reads: comment lines,

@@ -387,6 +387,40 @@ impl NetclassPattern {
     }
 }
 
+/// For mutation preflight, a wildcard-only approximation is not evidence.
+pub(in crate::tools) fn check_netclass_rename_pattern(
+    pattern: &str,
+    mapping: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    if mapping
+        .iter()
+        .all(|(old, new)| wildcard_matches(pattern, old) && wildcard_matches(pattern, new))
+    {
+        return Ok(());
+    }
+    // KiCad adds an end anchor only when the pattern does not end in '$'.
+    // An escaped final '$' can therefore match a prefix there. Use only
+    // simple regex atoms here rather than assuming wxRegEx and Rust agree.
+    let supported = pattern
+        .bytes()
+        .all(|c| c.is_ascii_alphanumeric() || b" /_-:~#=%@.,+*?^$".contains(&c))
+        && mapping
+            .iter()
+            .all(|(old, new)| !old.contains(['\r', '\n']) && !new.contains(['\r', '\n']));
+    let matcher = NetclassPattern::new(pattern);
+    anyhow::ensure!(
+        matcher.expression.is_some() && supported,
+        "Cannot prove a net rename preserves unsupported netclass pattern {pattern:?}"
+    );
+    for (old, new) in mapping {
+        anyhow::ensure!(
+            matcher.names(old) == matcher.names(new),
+            "Renaming {old:?} to {new:?} changes the match of netclass pattern {pattern:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The project's netclasses other than `Default`, each with its patterns.
 /// Empty when there is no readable `.kicad_pro` or it assigns no nets.
 fn project_netclass_patterns(board: &std::path::Path) -> Vec<(String, Vec<String>)> {

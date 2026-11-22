@@ -7,6 +7,9 @@ five framed, titled blocks. The pair is the shared before/after example for the 
 readability work: layout cleanup and checks start from `before`, and authoring aims at
 `after`.
 
+See the [worked example][walkthrough] for a walkthrough of the redraw and which
+decisions belong to the designer.
+
 The circuit follows the public video "How To Prettify Your Schematic with Kicad 7.0"
 (https://www.youtube.com/watch?v=iqIRjMkHVjY): an ATtiny85 with a battery cell and slide
 switch, an LDR divider, an electret microphone with a bias resistor, and an LED with its
@@ -39,8 +42,8 @@ MK1 `Device:Microphone_Condenser`, D1 `Device:LED`, and `power:+3V3` and `power:
 
 In the video, the first draft and the finished sheet put the LDR and the microphone on
 different pins (LDR on PB4 and the microphone on PB2 in the draft, PB2 and PB3 when
-finished). Here both sheets use the finished sheet's pins, so the two sheets differ only
-in layout and net names.
+finished). Here both sheets use the finished sheet's pins. The redraw changes layout,
+net names and displayed part information without reassigning any pins.
 
 ## Provenance
 
@@ -62,8 +65,8 @@ installed. Nothing was typed into the files by hand.
 4. `add_power_symbol` for `+3V3` at (127, 76.2) and `GND` at (127, 129.54).
 5. `set_schematic_title_block` (title and comment 1).
 
-`after/` started as a byte copy of the finished `before/` project, so every symbol keeps
-its UUID. Then:
+`after/` started as a byte copy of the finished `before/` project, so the nine non-power
+symbols keep their UUIDs. The two original power symbols were replaced. Then:
 
 1. `annotate_schematic`: BT1, SW1, U1, R1 (10k), R2 (LDR), R3 (mic bias), MK1, D1, R4 (LED
    resistor), in ascending X on `before`'s layout.
@@ -79,8 +82,8 @@ its UUID. Then:
    `LDR` at (152.4, 83.82) and `MIC` at (200.66, 83.82), turned 180°.
 7. `batch_add_no_connect` on U1 pins 5, 3 and 1 and SW1 pin 1.
 8. `batch_edit_schematic_components` for values (`3.3 V cell`, `Slide switch`, `10k`,
-   `LDR 5 mm`, `5.6k`, `Electret mic`, `Yellow LED`, `470`) and for Reference and Value
-   text turned horizontal beside each part.
+   `LDR 5 mm`, `Electret mic`, `Yellow LED`, `470`; R3 already had `5.6k`) and for
+   Reference and Value text turned horizontal beside each part.
 9. `add_schematic_shapes` with five dashed rectangles from y = 59.69 to 118.11 (Battery x
    25.4 to 60.96, Microcontroller 66.04 to 134.62, Light sensing 142.24 to 180.34, Sound
    sensing 187.96 to 228.6, LED 236.22 to 276.86), and `add_schematic_text` for each
@@ -99,7 +102,7 @@ found no change to any position, UUID, reference, library ID or property value; 
 added pin UUIDs and default tokens. The `.kicad_pro` files are the ones `create_project`
 wrote.
 
-## What changed electrically: net names only
+## Connectivity: only net names changed
 
 kicad-cli 10.0.8 netlists of an annotated copy of `before` and of `after`, compared by
 symbol UUID and pin number: the same 9 symbols and the same 11 nets, each holding the same
@@ -151,10 +154,30 @@ where four wires meet (at U?'s VCC and GND), or the generic values (`R`, `LED`,
 
 ## What a layout comparison of the pair should find
 
+For a layout-only cleanup of `before`, preserve every pin group and net name and add
+no labels. For an authoring flow given the block plan, use `after` as the target:
+preserve the pin groups and allow exactly the three designer-chosen renames above.
+
 - Annotate a copy of `before`. Each designator then names the same symbol UUID in both
-  sheets, every pin (25) is on a net holding the same pins in both, exactly the three nets
+  sheets, all 25 pins keep the same membership, exactly the three nets
   above change name, and the four unused pins are on no net in either.
 - Control: deleting the `MIC` label on the microphone's side of `after` splits that net,
   and the comparison must report it.
 - `before` has the four unflagged pins and nine unannotated parts; `after` has none. An
   `annotate_schematic` dry run leaves `before` unchanged.
+
+The `schematic_worked_example_tests` module exercises these comparisons through
+Copperpour's `tools/call` dispatcher without needing a KiCad installation.
+
+To check the drawings as well, export fresh plots from this directory with KiCad 10:
+
+```sh
+kicad-cli sch export svg --output ./before/ ./before/worked_example.kicad_sch
+kicad-cli sch export svg --output ./after/ ./after/worked_example.kicad_sch
+```
+
+In `before/worked_example.svg`, look for the `+3V3` rail crossing the LED's Value
+and its resistor's Reference. In `after/worked_example.svg`, check that Battery,
+Microcontroller, Light sensing, Sound sensing and LED each have a frame and title.
+
+[walkthrough]: ../../../../../docs/SCHEMATIC_READABILITY_WORKED_EXAMPLE.md

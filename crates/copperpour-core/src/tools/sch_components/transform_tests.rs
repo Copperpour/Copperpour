@@ -1,9 +1,6 @@
 mod move_connected_tests {
     use super::super::*;
 
-    /// #315: this tool silently delegated to the plain move since the first
-    /// release — symbol moved, wires stayed, success reported. Until the
-    /// wire-carrying move exists it must refuse, naming the alternative.
     #[tokio::test]
     async fn move_connected_refuses_instead_of_faking_success() {
         let result = handle_move_connected(

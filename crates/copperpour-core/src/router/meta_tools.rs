@@ -4,6 +4,7 @@
 //!   get_guidance(path?)       — embedded skills and references, no local file reads
 //!
 //! Discovery / routing:
+//!   find_tools(query, limit?) — search loaded and unloaded tools by name or capability
 //!   list_toolboxes()          — show every toolset with descriptions and load state
 //!   load_toolset(name)        — activate a toolset, expose its tools in tools/list
 //!   unload_toolset(name)      — deactivate a toolset, remove its tools from tools/list
@@ -222,6 +223,7 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
                 "required": []
             }),
         },
+        super::find_tools::description(),
         McpToolDescription {
             name: "load_toolset".to_string(),
             description:
@@ -421,6 +423,7 @@ pub async fn handle_meta_tool_with_reload(
     match name {
         "get_guidance" => Some(crate::guidance::get_guidance(args)),
         "list_toolboxes" => Some(handle_list_toolboxes(ctx).await),
+        "find_tools" => Some(super::find_tools::handle_find_tools(args, ctx).await),
         "load_toolset" => Some(handle_load_toolset(args, ctx).await),
         "unload_toolset" => Some(handle_unload_toolset(args, ctx).await),
         "get_active_toolsets" => Some(handle_get_active_toolsets(ctx).await),
