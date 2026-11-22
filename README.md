@@ -1,10 +1,21 @@
 <a name="top"></a>
 
-<div align="center">
+<p align="center">
+  <img src="docs/assets/copperpour-banner.svg" alt="Copperpour - AI-assisted PCB design for KiCad 10" width="100%">
+</p>
 
-<h1><img src="packaging/resources/icon.png" alt="" height="48" align="absmiddle"> Copperpour</h1>
+<h1 align="center">Copperpour</h1>
 
-</div>
+<p align="center">
+  AI-assisted PCB design in KiCad 10, from schematics to manufacturing files.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Copperpour/Copperpour/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Copperpour/Copperpour/ci.yml?branch=main&amp;style=flat-square&amp;label=CI" alt="CI status on main"></a>
+  <a href="https://github.com/Copperpour/Copperpour/releases/latest"><img src="https://img.shields.io/github/v/release/Copperpour/Copperpour?style=flat-square&amp;label=release&amp;color=B87333" alt="Latest release"></a>
+  <a href="#requirements"><img src="https://img.shields.io/badge/KiCad-10-314CB0?style=flat-square" alt="Requires KiCad 10"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--only-B87333?style=flat-square" alt="License: AGPL-3.0-only"></a>
+</p>
 
 **AI-assisted PCB design for KiCad 10.** Copperpour is a native KiCad plugin — a single
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs

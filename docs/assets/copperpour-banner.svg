@@ -1,0 +1,219 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="ttl dsc">
+<title id="ttl">Copperpour - AI-assisted PCB design</title>
+<desc id="dsc">The Cu tile and Copperpour wordmark beside a copper-poured circuit board seen at a low angle: a chip, pads, traces, vias and a pin header etched into the copper.</desc>
+<defs>
+  <!-- Card frame: rounded corners so it sits as a deliberate card on light pages -->
+  <clipPath id="frame"><rect width="1280" height="360" rx="20"/></clipPath>
+
+  <!-- Backdrop -->
+  <radialGradient id="bg" cx="0" cy="0" r="1.25">
+    <stop offset="0" stop-color="#1B2836"/>
+    <stop offset=".55" stop-color="#121B26"/>
+    <stop offset="1" stop-color="#0B1119"/>
+  </radialGradient>
+  <radialGradient id="halo" cx="1010" cy="190" r="360" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#B06C28" stop-opacity=".18"/>
+    <stop offset="1" stop-color="#B06C28" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="vig" cx=".45" cy=".45" r=".8">
+    <stop offset=".6" stop-color="#05080D" stop-opacity="0"/>
+    <stop offset="1" stop-color="#05080D" stop-opacity=".45"/>
+  </radialGradient>
+  <linearGradient id="word" x1="0" y1="0" x2=".08" y2="1">
+    <stop offset="0" stop-color="#F9D2A8"/>
+    <stop offset=".55" stop-color="#E0A264"/>
+    <stop offset="1" stop-color="#B87333"/>
+  </linearGradient>
+  <filter id="blur" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="14"/></filter>
+  <filter id="blur-s" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="5"/></filter>
+
+  <!-- Board-space paints (units are board units, before projection) -->
+  <linearGradient id="cu" x1="0" y1="430" x2="1000" y2="0" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#EFAE66"/>
+    <stop offset=".3" stop-color="#D08B45"/>
+    <stop offset=".65" stop-color="#B26D30"/>
+    <stop offset="1" stop-color="#8A4E1D"/>
+  </linearGradient>
+  <radialGradient id="spec" cx="300" cy="190" r="380" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#FFEBCF" stop-opacity=".28"/>
+    <stop offset=".6" stop-color="#FFEBCF" stop-opacity=".06"/>
+    <stop offset="1" stop-color="#FFEBCF" stop-opacity="0"/>
+  </radialGradient>
+  <linearGradient id="gold" x1="0" y1="430" x2="1000" y2="0" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#FBE2B0"/>
+    <stop offset="1" stop-color="#D7A564"/>
+  </linearGradient>
+  <linearGradient id="chip" x1="-70" y1="40" x2="40" y2="-70" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#353C45"/>
+    <stop offset="1" stop-color="#1C2229"/>
+  </linearGradient>
+
+  <!-- Trace centrelines: drawn twice, wide and dark for the clearance, then copper -->
+  <g id="traces" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M150 150H290L312.5 172.5H416"/>
+    <path d="M150 230H320L347.5 202.5H416"/>
+    <path d="M150 270H330L367.5 232.5H416"/>
+    <path d="M150 350H310L397.5 262.5H416"/>
+    <path d="M467.5 314V330L430 367.5"/>
+    <path d="M497.5 314V380"/>
+    <path d="M542.5 314V340L572.5 370"/>
+    <path d="M572.5 314V325L620 372.5"/>
+    <path d="M482.5 106V76"/>
+    <path d="M512.5 106V90L540 62.5"/>
+    <path d="M542.5 106V100L590 52.5"/>
+    <path d="M624 157.5H660L700 117.5H1000"/>
+    <path d="M624 187.5H680L720 147.5H1000"/>
+    <path d="M624 217.5H700L740 177.5H1000"/>
+    <path d="M624 247.5H720L760 207.5H1000"/>
+  </g>
+
+  <!-- QFP: one row of 8 pads, rotated onto four sides (local units, placed at 520,210 and scaled 1.25) -->
+  <g id="qfp-row">
+    <rect x="-45" y="61" width="6" height="22"/>
+    <rect x="-33" y="61" width="6" height="22"/>
+    <rect x="-21" y="61" width="6" height="22"/>
+    <rect x="-9" y="61" width="6" height="22"/>
+    <rect x="3" y="61" width="6" height="22"/>
+    <rect x="15" y="61" width="6" height="22"/>
+    <rect x="27" y="61" width="6" height="22"/>
+    <rect x="39" y="61" width="6" height="22"/>
+  </g>
+  <g id="qfp-leads">
+    <rect x="-44" y="55" width="4" height="16"/>
+    <rect x="-32" y="55" width="4" height="16"/>
+    <rect x="-20" y="55" width="4" height="16"/>
+    <rect x="-8" y="55" width="4" height="16"/>
+    <rect x="4" y="55" width="4" height="16"/>
+    <rect x="16" y="55" width="4" height="16"/>
+    <rect x="28" y="55" width="4" height="16"/>
+    <rect x="40" y="55" width="4" height="16"/>
+  </g>
+  <g id="qfp-pads"><use href="#qfp-row"/><use href="#qfp-row" transform="rotate(90)"/><use href="#qfp-row" transform="rotate(180)"/><use href="#qfp-row" transform="rotate(270)"/></g>
+
+  <!-- Through-hole pads and vias -->
+  <g id="tht"><circle r="22" fill="#101924"/><circle r="13" fill="url(#gold)"/><circle r="6" fill="#0A0F15"/></g>
+  <g id="tht-sq"><circle r="22" fill="#101924"/><rect x="-13" y="-13" width="26" height="26" rx="2" fill="url(#gold)"/><circle r="6" fill="#0A0F15"/></g>
+  <!-- thermal relief: dashed clearance ring leaves four copper spokes -->
+  <g id="thermal"><circle r="18" fill="none" stroke="#101924" stroke-width="10" stroke-dasharray="20.27 8" stroke-dashoffset="-4"/><circle r="13" fill="url(#gold)"/><circle r="6" fill="#0A0F15"/></g>
+  <g id="via"><circle r="13" fill="#101924"/><circle r="7.5" fill="#E7AA66"/><circle r="3.5" fill="#0A0F15"/></g>
+  <g id="stitch"><circle r="10" fill="#E2A462" stroke="#6E3C12" stroke-opacity=".6" stroke-width="1.5"/><circle r="4.5" fill="#0A0F15"/></g>
+
+  <!-- 0603 capacitor: pads, then a body raised 3 px (board offset -5,-5) -->
+  <g id="cap">
+    <rect x="-20" y="-11" width="40" height="22" rx="3" fill="#101924"/>
+    <rect x="-15" y="-7" width="10" height="14" fill="url(#gold)"/><rect x="5" y="-7" width="10" height="14" fill="url(#gold)"/>
+    <path d="M-14-10H4L9-5V5H-9L-14 0Z" fill="#5E4632"/>
+    <rect x="-14" y="-10" width="18" height="10" fill="#B89878"/>
+    <rect x="-14" y="-10" width="4" height="10" fill="#D9D3C9"/><rect x="0" y="-10" width="4" height="10" fill="#D9D3C9"/>
+  </g>
+</defs>
+
+<g clip-path="url(#frame)">
+<!-- Backdrop: blue slate (matches GitHub's dark theme), copper glow behind the board, vignette -->
+<rect width="1280" height="360" fill="url(#bg)"/>
+<rect width="1280" height="360" fill="url(#halo)"/>
+<rect width="1280" height="360" fill="url(#vig)"/>
+
+<!-- Board. One projection maps flat board units (u 0-1000, v 0-430) to the screen.
+     Up by h px on screen = (-h/0.6, -h/0.6) in board units. -->
+<g transform="matrix(.7 .3 -.7 .3 830 -40)">
+  <!-- soft drop shadow -->
+  <rect x="40" y="60" width="1000" height="430" rx="6" fill="#000" opacity=".6" filter="url(#blur)"/>
+
+  <!-- edge stack: underside, then the front face (12 px thick), copper lip, FR4 core -->
+  <rect x="20" y="20" width="1000" height="430" rx="6" fill="#0D141C"/>
+  <path d="M6 430H1000L1020 450H26Z" fill="#3B3020"/>
+  <path d="M6 430H1000L1008 438H14Z" fill="#59492E"/>
+  <path d="M6 430H1000L1002 432H8Z" fill="#E9B072"/>
+  <path d="M24 448H1018L1020 450H26Z" fill="#7D5128"/>
+
+  <!-- top: FR4 border, then the pour inset 10 units -->
+  <rect width="1000" height="430" rx="6" fill="#1A2430"/>
+  <rect x="10" y="10" width="980" height="410" rx="4" fill="url(#cu)"/>
+
+  <!-- clearances cut into the pour -->
+  <use href="#traces" stroke="#101924" stroke-width="19"/>
+  <g transform="translate(520 210) scale(1.25)">
+    <rect x="-64" y="-64" width="128" height="128" fill="#101924"/>
+    <use href="#qfp-pads" fill="#101924" stroke="#101924" stroke-width="12"/>
+  </g>
+  <circle cx="60" cy="370" r="30" fill="#101924"/>
+  <circle cx="820" cy="390" r="16" fill="#101924"/>
+
+  <!-- copper traces -->
+  <use href="#traces" stroke="url(#cu)" stroke-width="7"/>
+
+  <!-- one broad sheen across the copper -->
+  <rect x="10" y="10" width="980" height="410" rx="4" fill="url(#spec)"/>
+
+  <!-- pin header J1: pins 2 and 5 are ground, tied to the pour by thermal reliefs -->
+  <use href="#tht-sq" x="150" y="150"/>
+  <use href="#thermal" x="150" y="190"/>
+  <use href="#tht" x="150" y="230"/>
+  <use href="#tht" x="150" y="270"/>
+  <use href="#thermal" x="150" y="310"/>
+  <use href="#tht" x="150" y="350"/>
+
+  <!-- signal vias at trace ends, ground stitching vias in the pour -->
+  <use href="#via" x="430" y="367.5"/><use href="#via" x="497.5" y="380"/><use href="#via" x="572.5" y="370"/><use href="#via" x="620" y="372.5"/>
+  <use href="#via" x="482.5" y="76"/><use href="#via" x="540" y="62.5"/><use href="#via" x="590" y="52.5"/>
+  <use href="#stitch" x="250" y="60"/>
+  <use href="#stitch" x="300" y="400"/>
+  <use href="#stitch" x="820" y="320"/>
+  <use href="#stitch" x="380" y="110"/>
+  <use href="#stitch" x="700" y="390"/>
+
+  <!-- mounting hole and fiducial -->
+  <circle cx="60" cy="370" r="21" fill="url(#gold)"/><circle cx="60" cy="370" r="13" fill="#0A0F15"/>
+  <circle cx="820" cy="390" r="7" fill="url(#gold)"/>
+
+  <!-- silkscreen -->
+  <g fill="none" stroke="#F4EBDD" stroke-opacity=".7" stroke-width="2.5" stroke-linejoin="round">
+    <path d="M121 126H179V374H121Z"/>
+    <path d="M121 170H179"/>
+  </g>
+
+  <!-- QFP: gold pads, silver leads, halo, then the body raised 9 px (local -15,-15) -->
+  <g transform="translate(520 210) scale(1.25)">
+    <use href="#qfp-pads" fill="url(#gold)"/>
+    <g fill="#CFC8BD">
+      <use href="#qfp-leads"/>
+      <use href="#qfp-leads" transform="rotate(90)"/>
+      <use href="#qfp-leads" transform="rotate(180)"/>
+      <use href="#qfp-leads" transform="rotate(270)"/>
+    </g>
+    <rect x="-58" y="-58" width="122" height="122" fill="#000" opacity=".5" filter="url(#blur-s)"/>
+    <path d="M-70-70H40L55-55V55H-55L-70 40Z" fill="#11161C"/>
+    <path d="M-55 55H55L40 40H-70Z" fill="#272E37"/>
+    <path d="M55-55V55L40 40V-70Z" fill="#151A21"/>
+    <rect x="-70" y="-70" width="110" height="110" fill="url(#chip)"/>
+    <rect x="-64" y="-64" width="98" height="98" fill="none" stroke="#FFF2E0" stroke-opacity=".08" stroke-width="2"/>
+    <path d="M-70 40H40V-70" fill="none" stroke="#7C8794" stroke-opacity=".7" stroke-width="1.6"/>
+    <circle cx="-56" cy="-56" r="5" fill="#0F1318" stroke="#5C6672" stroke-width="1"/>
+    <rect x="-40" y="-26" width="54" height="5" rx="2" fill="#FFF2E0" opacity=".1"/>
+    <rect x="-40" y="-12" width="38" height="5" rx="2" fill="#FFF2E0" opacity=".1"/>
+  </g>
+
+  <!-- decoupling capacitors -->
+  <use href="#cap" x="665" y="310"/>
+  <use href="#cap" x="655" y="92"/>
+</g>
+
+</g>
+
+<!-- Hairline edge, so the card reads on GitHub's dark page too -->
+<rect x=".5" y=".5" width="1279" height="359" rx="19.5" fill="none" stroke="#FFFFFF" stroke-opacity=".08"/>
+
+<!-- Text. Left edges align on x=64: x values offset each first glyph's side bearing
+     (Liberation Sans: bold C 3.4 px at 82, regular N 2.5 px at 30), plus optical overhang
+     for the round C (1.5 px) and the slanted A (3 px).
+     Vertical rhythm: tile 40-132, then gaps of 24 / 18 / 14 px between ink. -->
+<g font-family="Liberation Sans, Arial, Helvetica, sans-serif">
+  <rect x="64" y="40" width="92" height="92" rx="20" fill="#B87333"/>
+  <rect x="71" y="47" width="78" height="78" rx="14" fill="none" stroke="#E8A86E" stroke-width="3"/>
+  <text x="110" y="102" font-size="46" font-weight="700" fill="#FFFFFF" text-anchor="middle">Cu</text>
+  <text x="59" y="212" font-size="82" font-weight="700" letter-spacing="-2" fill="url(#word)">Copperpour</text>
+  <text x="61" y="270" font-size="34" fill="#E6EDF3">AI-assisted PCB design</text>
+  <text x="61.5" y="311" font-size="30" fill="#AAB7C5">Native KiCad plugin. Powered by MCP.</text>
+</g>
+</svg>
