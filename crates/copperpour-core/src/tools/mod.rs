@@ -109,6 +109,8 @@ pub mod schematic_builder;
 mod schematic_placement_tests;
 #[cfg(test)]
 mod schematic_title_block_tests;
+#[cfg(test)]
+mod schematic_worked_example_tests;
 mod solder_margins;
 #[cfg(test)]
 mod stub_obstacle_tests;
