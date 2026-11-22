@@ -1584,31 +1584,36 @@ fn update_pcb_sheet_metadata(
         };
         ensure!(seen.insert(path.to_owned()), "Duplicate PCB path {path}");
         let mut fields = [
-            ("sheetname", &sheet.name, false),
-            ("sheetfile", &sheet.file, false),
+            ("sheetname", "Sheetname", &sheet.name, false),
+            ("sheetfile", "Sheetfile", &sheet.file, false),
         ];
         for (from, to) in find_direct_child_blocks(block, tag) {
             let node = parse_sexp(&block[from..to])?;
-            if let Some((field, value, found)) = fields
-                .iter_mut()
-                .find(|(field, _, _)| node.head() == Some(*field))
+            let legacy = node.head() == Some("property");
+            if let Some((field, property, value, found)) =
+                fields.iter_mut().find(|(field, property, _, _)| {
+                    node.head() == Some(*field)
+                        || (legacy && node.get(1).and_then(SexpNode::as_str) == Some(*property))
+                })
             {
+                let index = if legacy { 2 } else { 1 };
                 ensure!(
-                    !*found && node.children().is_some_and(|c| c.len() == 2),
+                    !*found && node.children().is_some_and(|c| c.len() == index + 1),
                     "Malformed or duplicate PCB {field} at {path}"
                 );
                 *found = true;
-                if node.get(1).and_then(SexpNode::as_str) != Some(value.as_str()) {
-                    edits.push(SexpEdit::replace(
-                        start + from,
-                        start + to,
-                        format!("({field} {})", quote(value)),
-                    ));
+                if node.get(index).and_then(SexpNode::as_str) != Some(value.as_str()) {
+                    let replacement = if legacy {
+                        format!("(property {} {})", quote(property), quote(value))
+                    } else {
+                        format!("({field} {})", quote(value))
+                    };
+                    edits.push(SexpEdit::replace(start + from, start + to, replacement));
                 }
             }
         }
         let mut missing = String::new();
-        for (field, value, found) in fields {
+        for (field, _, value, found) in fields {
             if !found {
                 ensure!(
                     footprint.find(field).is_none(),
@@ -1637,6 +1642,7 @@ fn move_pcb_net_names(
     let tree = parse_sexp(source)?;
     let mut expected = 0;
     let mut renamed = BTreeMap::new();
+    let mut board_names = BTreeSet::new();
     let mut pending = vec![(&tree, None)];
     while let Some((node, parent)) = pending.pop() {
         let name = match node.head() {
@@ -1645,6 +1651,9 @@ fn move_pcb_net_names(
             _ => None,
         };
         if let Some(name) = name {
+            if !name.is_empty() {
+                board_names.insert(name);
+            }
             ensure!(
                 !mapping.values().any(|new| new == name),
                 "PCB already contains destination net '{name}'"
@@ -1691,6 +1700,7 @@ fn move_pcb_net_names(
     if renamed.is_empty() {
         return Ok((source.to_owned(), renamed));
     }
+    check_pcb_diff_pair_membership(&board_names, &renamed)?;
     // In the numeric format the code is the copper identity. Refuse
     // conflicting declarations or an affected name paired with another code.
     let mut codes = BTreeMap::new();
@@ -1768,6 +1778,51 @@ fn move_pcb_net_names(
         "Cannot locate every PCB net-name occurrence"
     );
     Ok((apply_edits(source.to_owned(), edits), renamed))
+}
+
+/// KiCad 10.0.8 DRC_ENGINE::MatchDpSuffix skips digits and underscores
+/// after the polarity marker. Keep the peer identity and polarity, not
+/// the spelling of its name.
+fn pcb_diff_pair_peer(name: &str) -> Option<(bool, String)> {
+    let tail = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '_');
+    let marker = tail.chars().next_back()?;
+    let (positive, opposite) = match marker {
+        '+' => (true, '-'),
+        '-' => (false, '+'),
+        'P' => (true, 'N'),
+        'N' => (false, 'P'),
+        _ => return None,
+    };
+    let prefix = &tail[..tail.len() - 1];
+    Some((
+        positive,
+        format!("{prefix}{opposite}{}", &name[tail.len()..]),
+    ))
+}
+
+fn check_pcb_diff_pair_membership(
+    before: &BTreeSet<&str>,
+    renamed: &BTreeMap<String, String>,
+) -> Result<()> {
+    let new_name = |old: &str| {
+        renamed
+            .get(old)
+            .map_or_else(|| old.to_owned(), Clone::clone)
+    };
+    let after = before
+        .iter()
+        .map(|old| new_name(old))
+        .collect::<BTreeSet<_>>();
+    for old in renamed.keys() {
+        let new = &renamed[old];
+        let expected = pcb_diff_pair_peer(old)
+            .filter(|(_, peer)| before.contains(peer.as_str()))
+            .map(|(positive, peer)| (positive, new_name(&peer)));
+        let observed = pcb_diff_pair_peer(new).filter(|(_, peer)| after.contains(peer));
+        ensure!(expected == observed,
+            "Renaming PCB net {old:?} to {new:?} would change differential-pair membership or polarity");
+    }
+    Ok(())
 }
 
 fn optional_project_inputs(root: &Path) -> impl Iterator<Item = PathBuf> + '_ {
@@ -3735,6 +3790,48 @@ mod tests {
         assert!(
             verify_pcb_pad_membership(&board(&foreign, "1"), &evidence, &renamed, &instances)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn transfer_preserves_pcb_differential_pair_membership() {
+        let board = |a, b| format!("(kicad_pcb (segment (net \"{a}\")) (segment (net \"{b}\")))");
+        let paired = board("/Source/USB_P_12", "/Source/USB_N_12");
+        let both = BTreeMap::from([
+            ("/Source/USB_P_12".into(), "/Dest/USB_P_12".into()),
+            ("/Source/USB_N_12".into(), "/Dest/USB_N_12".into()),
+        ]);
+        assert!(move_pcb_net_names(&paired, &both).is_ok());
+        let split = BTreeMap::from([("/Source/USB_P_12".into(), "/Dest/USB_P_12".into())]);
+        assert!(move_pcb_net_names(&paired, &split)
+            .unwrap_err()
+            .to_string()
+            .contains("differential-pair membership"));
+        let unpaired = board("/Source/USB_P_12", "/Dest/USB_N_12");
+        assert!(move_pcb_net_names(&unpaired, &split)
+            .unwrap_err()
+            .to_string()
+            .contains("differential-pair membership"));
+        let polarity = BTreeMap::from([
+            ("/Source/USB_P_12".into(), "/Dest/USB_N_12".into()),
+            ("/Source/USB_N_12".into(), "/Dest/USB_P_12".into()),
+        ]);
+        assert!(move_pcb_net_names(&paired, &polarity).is_err());
+    }
+
+    #[test]
+    fn transfer_updates_legacy_pcb_sheet_properties_in_place() {
+        let board = r#"(kicad_pcb (footprint "R" (path "/test") (property "Sheetname" "/Old/") (property "Sheetfile" "old.kicad_sch")))"#;
+        let sheet = PcbSheetMetadata {
+            name: "/New/".into(),
+            file: "new.kicad_sch".into(),
+        };
+        let updated = update_pcb_sheet_metadata(board, &BTreeSet::from(["/test"]), &sheet).unwrap();
+        assert_eq!(
+            updated,
+            board
+                .replace("/Old/", "/New/")
+                .replace("old.kicad_sch", "new.kicad_sch")
         );
     }
 

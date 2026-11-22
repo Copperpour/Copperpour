@@ -5,6 +5,11 @@ names and filenames, and renamed nets on the project's same-named `.kicad_pcb`.
 The board and sheets change in one transaction. Footprint UUIDs, placement, and routing
 stay the same.
 
+A PCB net rename must keep differential-pair membership and polarity. It must also
+keep the project's explicit net assignments and match the same netclass patterns.
+Without a PCB, the existing restriction on netclass patterns other than `*` still
+applies to schematic net renames.
+
 Run a new dry run before applying. Review `affected_files`, `pcb_path_mapping`, and
 `pcb_net_name_mapping`. If a board exists but `kicad-cli` is unavailable, the net mapping
 is `null`. Make `kicad-cli` available and plan again; you cannot apply an unchecked plan.

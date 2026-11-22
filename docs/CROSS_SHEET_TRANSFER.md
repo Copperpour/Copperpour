@@ -78,8 +78,7 @@ Without `kicad-cli`, a dry run still returns the plan, with
 `verification.status: "not_run"` and `connectivity_impacts: null`, and apply refuses.
 If a PCB exists, `pcb_net_name_mapping` is also `null`, and `affected_files` may omit a
 board that only needs net-name updates. Once `kicad-cli` is available, run a new dry run
-and apply with its revision. A check that
-fails or returns output Copperpour can't read refuses the move.
+and apply with its revision. A failed check or unreadable result prevents the move.
 
 ## What the tool refuses
 
@@ -117,7 +116,9 @@ Review `pcb_path_mapping` and `pcb_net_name_mapping` in the dry run. A root-rela
 footprint path can map to itself when only its saved sheet name and filename change.
 The tool does not place missing footprints, match by reference alone, or write project
 settings. It refuses ambiguous footprint paths, destination net collisions, changes in
-which netclass patterns match, and renames that would change explicit net assignments.
+which netclass patterns match, changes to differential-pair membership or polarity,
+and renames that would change explicit net assignments. Without a PCB, a schematic
+net rename still requires the project to have no netclass pattern other than `*`.
 Before renaming a PCB net, it checks that the saved pads on that net belong to the
 verified schematic pin group. If the check fails, reconcile the board with the
 schematic and plan again.
