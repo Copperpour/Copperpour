@@ -93,10 +93,10 @@ resvg = "=0.48.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Pure-Rust git for the vcs toolset (copperpour-vcs). No libgit2, no C.
-# Default features for now — the T2.1 spike trims to the plumbing actually
-# used once the API surface is settled (default-features=false breaks
-# gix-hash's backend selection).
-gix = { version = "0.90", features = ["status", "worktree-mutation"] }
+# Keep only the minimal plumbing copperpour-vcs uses today (`sha1` selects
+# gix-hash's SHA-1 backend so gix compiles with default-features = false);
+# add features like `status` or `worktree-mutation` back only when used.
+gix = { version = "0.90", default-features = false, features = ["sha1"] }
 
 # Internal crates
 copperpour-sexp = { path = "crates/copperpour-sexp" }
