@@ -2,8 +2,8 @@
 
 `wire_over_power_text_kicad10.kicad_sch` holds one `power:+3V3` symbol, one hierarchical
 label and the wires that cross or miss their text. It has no other symbols and no design
-data. It backs the proposed check that reports a wire drawn through a label's text,
-including the Value text of a power symbol, which is the net name the reader sees.
+data. It tests `wire_label_overlap` findings for hierarchical labels and power symbols,
+whose Value text shows the net name.
 
 ## Provenance
 
@@ -27,7 +27,7 @@ kicad-cli sch export svg --exclude-drawing-sheet -o . wire_over_power_text_kicad
 
 | Wire | KiCad plot | Expected |
 | --- | --- | --- |
-| Horizontal at y = 46.99, x = 45.72–55.88 | Crosses every glyph of the `+3V3` Value text | A wire-over-text finding (proposed; not reported today) |
+| Horizontal at y = 46.99, x = 45.72–55.88 | Crosses every glyph of the `+3V3` Value text | `wire_label_overlap` |
 | Vertical at x = 80.01, y = 48.26–53.34 | Crosses the `G` of `SIG_H` at y ≈ 50.1–51.4 | `wire_label_overlap` |
 | Vertical at x = 50.8, y = 50.8–55.88, from the power pin | Leaves the pin away from the symbol and its text | No finding |
 | Horizontal at y = 44.45, x = 45.72–55.88 | Passes 2.1 mm above the `+3V3` text | No finding |

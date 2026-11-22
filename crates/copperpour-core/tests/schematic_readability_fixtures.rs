@@ -142,6 +142,11 @@ const SCHEMATICS: &[(&str, &str, &str)] = &[
         "eeschema",
     ),
     (
+        "wire_label_variants_kicad10.kicad_sch",
+        "wire_label_variants_kicad10.README.md",
+        "eeschema",
+    ),
+    (
         "wire_over_label_kicad10.kicad_sch",
         "wire_over_label_kicad10.README.md",
         "eeschema",

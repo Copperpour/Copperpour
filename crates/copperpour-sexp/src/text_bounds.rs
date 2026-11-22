@@ -129,6 +129,8 @@ pub enum TextOwner {
         uuid: Option<String>,
         /// The label's anchor, its `(at …)`.
         at: (f64, f64),
+        /// Whether the lettering runs vertically on the sheet.
+        is_vertical: bool,
     },
     Field {
         reference: String,
@@ -136,6 +138,8 @@ pub enum TextOwner {
         /// The placed symbol's `uuid`, which tells two unannotated `R?` apart.
         symbol_uuid: Option<String>,
         field: String,
+        /// The embedded symbol definition declares `(power)`.
+        is_power_symbol: bool,
     },
 }
 
@@ -157,6 +161,32 @@ pub struct TextExtent {
 }
 
 impl TextExtent {
+    /// The text-only bounds at KiCad's reported coordinate precision.
+    pub fn reported_run(&self) -> SymbolBounds {
+        rounded(self.run)
+    }
+
+    /// Wire crossings use the run alone. A local label sits beside its wire:
+    /// its descenders' box can spill across the baseline, but a wire along
+    /// that line or meeting it from the far side is not a crossing.
+    pub fn wire_crossing_bounds(&self) -> SymbolBounds {
+        let mut bounds = self.run;
+        if let TextOwner::Label {
+            kind: LabelKind::NetLabel,
+            at: (x, y),
+            is_vertical,
+            ..
+        } = self.owner
+        {
+            if is_vertical {
+                bounds.max_x = bounds.max_x.min(x);
+            } else {
+                bounds.max_y = bounds.max_y.min(y);
+            }
+        }
+        bounds
+    }
+
     fn new(
         owner: TextOwner,
         text: String,
@@ -601,7 +631,9 @@ pub fn text_extents(tree: &SexpNode) -> Vec<TextExtent> {
         let Some(instance) = symbol_instance(node) else {
             continue;
         };
-        let units = find_lib_symbol(&lib_symbols, &instance).map_or(1, unit_count);
+        let lib_symbol = find_lib_symbol(&lib_symbols, &instance);
+        let units = lib_symbol.map_or(1, unit_count);
+        let is_power_symbol = lib_symbol.is_some_and(|symbol| symbol.find("power").is_some());
         let t = instance.pin_transform();
         for property in node.find_all("property") {
             // eeschema draws a private field only in the symbol editor
@@ -641,6 +673,7 @@ pub fn text_extents(tree: &SexpNode) -> Vec<TextExtent> {
                 unit: instance.unit,
                 symbol_uuid: instance.uuid.clone(),
                 field: name.to_string(),
+                is_power_symbol,
             };
             extents.push(TextExtent::new(owner, text, run, run, run));
         }
@@ -791,6 +824,7 @@ fn label_extent(node: &SexpNode, kind: LabelKind) -> Option<TextExtent> {
         net,
         uuid: node.find_str("uuid").map(String::from),
         at: (x, y),
+        is_vertical: vertical,
     };
     Some(TextExtent::new(owner, text, run, bounds, compared))
 }
