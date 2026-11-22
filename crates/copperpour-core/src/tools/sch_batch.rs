@@ -20,6 +20,7 @@ use copperpour_sexp::{
         extract_wires, find_lib_symbol, format_net_label, parse_at, read_schematic,
         symbol_bounds_for_instance, SymbolBounds,
     },
+    text_bounds::free_note_bounds,
     writer::{apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit},
 };
 use serde_json::{json, Value};
@@ -426,16 +427,17 @@ pub fn tools() -> Vec<ToolDef> {
         super::sch_shapes::list_tool(),
         tool!(
             "get_schematic_layout",
-            "Return a compact spatial summary of the schematic: component positions, \
-             transformed drawing/pin bounds (excluding free text), and optionally wire segments \
-             and label locations. Reports any component whose embedded library geometry could \
-             not be resolved.",
+            "Return a compact spatial summary of the saved schematic: component positions, \
+             transformed drawing/pin bounds, and optionally wire segments, label locations, \
+             and free-text note bounds. The bounding_box covers symbols only. Reports \
+             geometry it could not resolve.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "include_wires": { "type": "boolean", "description": "Include wire data", "default": true },
-                    "include_labels": { "type": "boolean", "description": "Include label data", "default": true }
+                    "include_labels": { "type": "boolean", "description": "Include label data", "default": true },
+                    "include_notes": { "type": "boolean", "description": "Include bounds of supported stroke-font notes and identify unmeasured notes and text boxes. Does not change bounding_box.", "default": false }
                 },
                 "required": ["schematic"]
             }),
@@ -2220,6 +2222,11 @@ async fn handle_get_layout(
     let sch_path = get_path(args, "schematic")?;
     let include_wires = args["include_wires"].as_bool().unwrap_or(true);
     let include_labels = args["include_labels"].as_bool().unwrap_or(true);
+    let include_notes = match args.get("include_notes") {
+        None | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        Some(_) => return Ok(invalid_arg("include_notes", "must be a boolean")),
+    };
 
     let (_, tree) = read_schematic(&sch_path)?;
     let instances = extract_symbol_instances(&tree);
@@ -2319,6 +2326,31 @@ async fn handle_get_layout(
             .collect();
         result["label_count"] = json!(label_data.len());
         result["labels"] = json!(label_data);
+    }
+
+    if include_notes {
+        let notes: Vec<_> = tree
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .filter(|note| matches!(note.head(), Some("text" | "text_box")))
+            .map(|note| {
+                let (bounds, status, reason) = match free_note_bounds(note) {
+                    Ok(Some(bounds)) => (Some(bounds_json(bounds)), "measured", None),
+                    Ok(None) => (None, "no_ink", None),
+                    Err(reason) => (None, "unmeasured", Some(reason)),
+                };
+                json!({
+                    "uuid": note.find_str("uuid"),
+                    "kind": note.head(),
+                    "bounds": bounds,
+                    "status": status,
+                    "reason": reason
+                })
+            })
+            .collect();
+        result["note_count"] = json!(notes.len());
+        result["notes"] = json!(notes);
     }
 
     Ok(CallToolResult::json(&result))
@@ -6189,3 +6221,6 @@ mod batch_field_placement_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod note_bounds_tests;

@@ -35,8 +35,9 @@
 //! (`~{}`, `_{}`, `^{}`) left out. The text offset and label size ratios and
 //! the default line width are eeschema's defaults, not a project's own
 //! schematic setup; italic, outline fonts, unit names other than letters and
-//! text variables are taken as written. Free text, sheet fields, sheet pins,
-//! labels' own fields and private fields are not measured.
+//! text variables are taken as written for labels and fields. Sheet fields,
+//! sheet pins, labels' own fields and private fields are not measured.
+//! [`free_note_bounds`] covers plain sheet notes separately.
 
 use crate::geometry::{round6, transform_pin, PinTransform};
 use crate::parser::SexpNode;
@@ -119,6 +120,13 @@ const LABEL_SIZE_RATIO: f64 = 0.375;
 /// `DEFAULT_LINE_WIDTH_MILS`, 6 mils, the pen text without a thickness of its
 /// own is drawn with (`SCH_FIELD::Plot`, `GetEffectiveTextPenWidth`).
 const DEFAULT_LINE_WIDTH_MM: f64 = 0.1524;
+
+/// `JOB_EXPORT_SCH_PLOT`'s default minimum pen: a hairline at 300 dpi.
+const DEFAULT_PLOT_MIN_PEN_MM: f64 = 0.0847;
+
+const SCHEMATIC_IU_PER_MM: f64 = 10_000.0;
+// KiCad's parseInternalUnits uses 7071/10000, not the exact 1/sqrt(2).
+const MAX_SCHEMATIC_COORD_MM: f64 = i32::MAX as f64 * (7071.0 / 10_000.0) / SCHEMATIC_IU_PER_MM;
 
 /// Whose text an extent holds.
 #[derive(Debug, Clone, PartialEq)]
@@ -230,6 +238,10 @@ struct TextStyle {
 
 impl TextStyle {
     fn of(node: &SexpNode) -> Self {
+        Self::with_explicit_thickness(node, |t| *t > 0.0)
+    }
+
+    fn with_explicit_thickness(node: &SexpNode, is_explicit: impl FnOnce(&f64) -> bool) -> Self {
         let effects = node.find("effects");
         let font = effects.and_then(|e| e.find("font"));
         let size = font.and_then(|f| f.find("size"));
@@ -238,7 +250,7 @@ impl TextStyle {
         let bold = font.is_some_and(|f| flag(f, "bold"));
         let thickness = font
             .and_then(|f| f.find_f64("thickness"))
-            .filter(|t| *t > 0.0);
+            .filter(is_explicit);
         // `ClampTextPenSize`: no more than a quarter of the smaller size.
         let clamp = |pen: f64| pen.min(width.min(height) * 0.25);
         let (pen, stroke) = match thickness {
@@ -608,6 +620,112 @@ enum Spin {
     Bottom,
 }
 
+/// The ink bounds in mm of a top-level KiCad stroke-font note. `Ok(None)`
+/// means the note draws no ink; `Err` means this model cannot measure it.
+pub fn free_note_bounds(node: &SexpNode) -> Result<Option<SymbolBounds>, &'static str> {
+    if node.head() != Some("text") {
+        return Err("unsupported_note_type");
+    }
+    let text = match node.get(1) {
+        Some(SexpNode::Str(text)) => text,
+        _ => return Err("missing_text"),
+    };
+    let text = unescape(text);
+    if text.trim_matches([' ', '\n']).is_empty() {
+        return Ok(None);
+    }
+    let at = node.find("at").ok_or("invalid_position")?;
+    let coord = |index| {
+        at.get_f64(index)
+            .filter(|v| v.is_finite())
+            .ok_or("invalid_position")
+    };
+    let (x, y, angle) = (coord(1)?, coord(2)?, coord(3)?);
+    if x.abs().max(y.abs()) > MAX_SCHEMATIC_COORD_MM {
+        return Err("invalid_position");
+    }
+    if !matches!(angle, 0.0 | 90.0) {
+        return Err("unsupported_rotation");
+    }
+    let effects = node.find("effects");
+    let font = effects.and_then(|e| e.find("font"));
+    if font.is_some_and(|f| {
+        f.find("face").is_some() || f.find("line_spacing").is_some() || flag(f, "italic")
+    }) || effects
+        .and_then(|e| e.find("justify"))
+        .is_some_and(|j| flag(j, "mirror"))
+    {
+        return Err("unsupported_text_style");
+    }
+    let size = font
+        .and_then(|f| f.find("size"))
+        .ok_or("invalid_font_size")?;
+    // EDA_TEXT::SetTextSize clamps sizes outside this range on load.
+    if !(1..=2).all(|axis| {
+        size.get_f64(axis)
+            .is_some_and(|v| (0.001..=250.0).contains(&v))
+    }) {
+        return Err("invalid_font_size");
+    }
+    if let Some(thickness) = font.and_then(|f| f.find("thickness")) {
+        if !thickness
+            .get_f64(1)
+            .is_some_and(|v| (0.0..=MAX_SCHEMATIC_COORD_MM).contains(&v))
+        {
+            return Err("invalid_text_geometry");
+        }
+    }
+    if text.contains("${") || text.contains("@{") {
+        return Err("unresolved_text_variable");
+    }
+    if ["~{", "^{", "_{"]
+        .iter()
+        .any(|markup| text.contains(markup))
+    {
+        return Err("unsupported_markup");
+    }
+    if !text
+        .chars()
+        .all(|c| matches!(c, ' '..='~' | '\n' | '°' | '±' | 'µ' | 'μ' | 'Ω' | 'Ω'))
+    {
+        return Err("unsupported_glyph");
+    }
+    // GetEffectiveTextPenWidth treats a saved pen of at most 1 internal unit as automatic.
+    let mut style =
+        TextStyle::with_explicit_thickness(node, |t| (t * SCHEMATIC_IU_PER_MM).round() > 1.0);
+    style.stroke = style.stroke.max(DEFAULT_PLOT_MIN_PEN_MM);
+    // GetLinePositions uses the stroke font's 1.68 pitch times its legacy
+    // factor, rounded to schematic internal units (0.0001 mm). SCH_TEXT
+    // then subtracts 2500 internal units along the sheet's Y axis at plot time.
+    let interline = (style.height * 1.68 * 0.9583 * SCHEMATIC_IU_PER_MM).round();
+    // wxStringSplit keeps interior empty lines but omits the final empty token.
+    let lines = text.split_terminator('\n');
+    let last_line = (lines.clone().count() - 1) as f64;
+    let shift = match style.vertical {
+        Justify::Start => 0.0,
+        Justify::Center => (last_line * interline / 2.0).trunc(),
+        Justify::End => last_line * interline,
+    };
+    let bounds = lines
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if line.trim_matches(' ').is_empty() {
+                return None;
+            }
+            let drawn = Drawn::of(line);
+            let local = moved(
+                style.drawn(&drawn, style.vertical),
+                0.0,
+                (index as f64 * interline - shift) / SCHEMATIC_IU_PER_MM,
+                0.0,
+            );
+            Some(moved(turned(local, angle), x, y - 0.25, 0.0))
+        })
+        .reduce(joined)
+        .map(rounded);
+    Ok(bounds)
+}
+
 /// Every label's and every visible field's extent on the sheet: the labels
 /// first, then each placed symbol's fields in file order.
 pub fn text_extents(tree: &SexpNode) -> Vec<TextExtent> {
@@ -873,6 +991,99 @@ fn unit_letters(unit: u32) -> String {
 mod tests {
     use super::*;
     use crate::parser::parse_sexp;
+
+    #[test]
+    fn note_style_and_broken_geometry_are_disclosed() {
+        for (source, expected) in [
+            (
+                r#"(text "A" (at 0 0 0) (effects (font (face "Custom") (size 1.27 1.27))))"#,
+                "unsupported_text_style",
+            ),
+            (
+                r#"(text "A" (at 0 0 0) (effects (font (size 1.27 1.27) (line_spacing 1.2))))"#,
+                "unsupported_text_style",
+            ),
+            (
+                r#"(text "A" (at 0 0 0) (effects (font (size 1.27 1.27)) (justify mirror)))"#,
+                "unsupported_text_style",
+            ),
+            (
+                r#"(text (at 0 0 0) (effects (font (size 1.27 1.27))))"#,
+                "missing_text",
+            ),
+            (
+                r#"(text "A" (at 0 0) (effects (font (size 1.27 1.27))))"#,
+                "invalid_position",
+            ),
+            (
+                r#"(text "A" (at NaN 0 0) (effects (font (size 1.27 1.27))))"#,
+                "invalid_position",
+            ),
+            (
+                r#"(text "A" (at 1000000000 0 0) (effects (font (size 1.27 1.27))))"#,
+                "invalid_position",
+            ),
+            (
+                r#"(text "A" (at 0 0 0) (effects (font (bold yes))))"#,
+                "invalid_font_size",
+            ),
+            (
+                r#"(text "A" (at 0 0 0) (effects (font (size 1.27 0))))"#,
+                "invalid_font_size",
+            ),
+            (
+                r#"(text "A" (at 0 0 0) (effects (font (size 1.27 1.27) (thickness NaN))))"#,
+                "invalid_text_geometry",
+            ),
+            (
+                r#"(text "A" (at 0 0 0) (effects (font (size 1.27 500))))"#,
+                "invalid_font_size",
+            ),
+        ] {
+            assert_eq!(
+                free_note_bounds(&parse_sexp(source).unwrap()).unwrap_err(),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_notes_and_each_markup_form_are_distinguished() {
+        for text in ["", " ", "{space}\n{space}"] {
+            let text = text.replace('\n', "\\n");
+            let source = format!(r#"(text "{text}" (at 0 0 0) (effects (font (size 1.27 1.27))))"#);
+            assert!(free_note_bounds(&parse_sexp(&source).unwrap())
+                .unwrap()
+                .is_none());
+        }
+        for text in ["V_{OUT}", "~{RST}", "x^{2}"] {
+            let source = format!(r#"(text "{text}" (at 0 0 0) (effects (font (size 1.27 1.27))))"#);
+            assert_eq!(
+                free_note_bounds(&parse_sexp(&source).unwrap()).unwrap_err(),
+                "unsupported_markup",
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn note_bounds_use_font_width_and_height_in_file_order() {
+        let measure = |height, width| {
+            let source =
+                format!(r#"(text "A\nA" (at 0 0 0) (effects (font (size {height} {width}))))"#);
+            free_note_bounds(&parse_sexp(&source).unwrap())
+                .unwrap()
+                .unwrap()
+        };
+        let square = measure(1.27, 1.27);
+        let wide = measure(1.27, 2.54);
+        assert_eq!(wide.height(), square.height());
+        assert!(wide.width() > square.width());
+        let tall = measure(2.54, 1.27);
+        assert_eq!(tall.width(), square.width());
+        assert!(tall.height() > square.height());
+    }
 
     #[test]
     fn markup_braces_are_not_drawn() {
