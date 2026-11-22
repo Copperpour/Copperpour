@@ -1252,6 +1252,13 @@ pub(super) fn check_net_name_independent_conditions(text: &str) -> Result<(), St
                         return Err("invalid custom rule condition".into());
                     }
                     check_net_name_independent_expression(tokens[clause + 2].tok.text())?;
+                } else if kind.is_keyword("constraint")
+                    && tokens[clause + 2].tok.is_keyword("assertion")
+                {
+                    if close != clause + 4 || !tokens[clause + 3].tok.is_symbol() {
+                        return Err("invalid custom rule assertion".into());
+                    }
+                    check_net_name_independent_expression(tokens[clause + 3].tok.text())?;
                 } else if !["constraint", "layer", "severity"]
                     .iter()
                     .any(|name| kind.is_keyword(name))
@@ -1958,6 +1965,10 @@ mod tests {
 
     #[test]
     fn rename_guard_reads_rule_conditions_not_comments_or_literals() {
+        let assertion =
+            |expr| format!("(version 1)\n(rule \"r\" (constraint assertion \"{expr}\"))");
+        assert!(check_net_name_independent_conditions(&assertion("A.NetName == '/SIG'")).is_err());
+        assert!(check_net_name_independent_conditions(&assertion("A.Type == 'Track'")).is_ok());
         assert!(check_net_name_independent_conditions("(version 1)\n# ${EXTRA_RULE}\n").is_err());
         let rule = |condition: &str| {
             format!("(version 1)\n# (condition \"A.NetName\")\n(rule \"r\" (condition \"{condition}\"))")

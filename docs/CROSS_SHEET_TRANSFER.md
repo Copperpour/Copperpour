@@ -127,10 +127,10 @@ schematic and plan again.
 The plan and transaction require the same-named `.kicad_dru` to stay unchanged, or to
 stay absent if it does not exist. If present, the rules file must be a regular file,
 not a symlink or directory. The tool never rewrites custom rules. If a PCB net
-would change names, the tool refuses the move when a rule condition uses `NetName`,
-`inDiffPair`, or another expression it cannot prove is independent of net names. The
-refusal names the rules file and the old and new net names. The condition check runs
-only when a PCB net would change names.
+would change names, the tool refuses the move when a rule condition or assertion uses
+`NetName`, `inDiffPair`, or another expression it cannot prove is independent of net
+names. The refusal names the rules file and the old and new net names. The expression
+check runs only when a PCB net would change names.
 
 Run PCB DRC after the move. Schematic verification does not check how a footprint's
 new sheet membership affects custom rules.

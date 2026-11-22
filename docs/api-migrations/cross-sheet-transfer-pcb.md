@@ -17,6 +17,6 @@ is `null`. Make `kicad-cli` available and plan again; you cannot apply an unchec
 The tool never rewrites the same-named `.kicad_dru`. It requires the file to stay
 unchanged, or to stay absent if it does not exist. Use a regular file for custom rules;
 the tool refuses symlinks and directories. A move that would rename a PCB net
-is refused if a rule condition depends on net names, such as `NetName` or `inDiffPair`,
-or if the tool cannot rule out that dependency. The refusal names the file and the old
-and new net names. Moves that do not rename PCB nets skip the condition check.
+is refused if a rule condition or assertion uses `NetName`, `inDiffPair`, or another
+expression the tool cannot prove is independent of net names. The refusal names the
+file and the old and new net names. Moves without PCB net renames skip this check.

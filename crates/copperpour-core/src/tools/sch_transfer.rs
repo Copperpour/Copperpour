@@ -5088,12 +5088,21 @@ fi
                 "offset_y_mm":request.offset_y_mm
             }
         }});
-        for (dry_run, with_rules, expected) in [
-            (true, false, "updating saved project net assignments"),
-            (false, false, "updating saved project net assignments"),
-            (false, true, "custom rules"),
+        for (dry_run, rules, expected) in [
+            (true, None, "updating saved project net assignments"),
+            (false, None, "updating saved project net assignments"),
+            (
+                false,
+                Some("(condition \"A.(NetName) == '/SIG'\")"),
+                "custom rules",
+            ),
+            (
+                false,
+                Some("(constraint assertion \"A.NetName == '/SIG'\")"),
+                "custom rules",
+            ),
         ] {
-            if with_rules {
+            if let Some(rules) = rules {
                 std::fs::write(request.schematic.with_extension("kicad_pro"), "{}").unwrap();
                 std::fs::write(
                     request.schematic.with_extension("kicad_pcb"),
@@ -5102,7 +5111,7 @@ fi
                 .unwrap();
                 std::fs::write(
                     request.schematic.with_extension("kicad_dru"),
-                    "(version 1)\n(rule \"example\" (condition \"A.(NetName) == '/SIG'\"))\n",
+                    format!("(version 1)\n(rule \"example\" {rules})\n"),
                 )
                 .unwrap();
             }
@@ -5127,6 +5136,9 @@ fi
                 "{result}"
             );
             assert_eq!(before, snapshot(dir.path()));
+            assert!(copperpour_sexp::inspect_file_transactions(dir.path())
+                .unwrap()
+                .is_empty());
         }
     }
 
