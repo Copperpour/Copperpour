@@ -372,13 +372,11 @@ pub(super) async fn handle_move_connected(
     _args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    // Since the first release this silently delegated to the plain move and
-    // reported success — the symbol moved, every wire stayed put, and the
-    // caller was told the connections were preserved (#315). A tool must not
-    // claim work it does not do: refuse until the wire-carrying move exists
-    // (it needs #120's connectivity model to know which wires to stretch).
+    // The old implementation moved only the symbol but reported that it
+    // preserved connections. Refuse until the tool can move the wires too.
     Ok(CallToolResult::error(
-        "move_connected is not implemented: it used to move the symbol and leave          every wire behind while reporting the connections preserved. Use          move_schematic_component (moves the symbol only), then re-route or use          connect_pins for the affected nets. Wire-carrying moves are tracked in          issue #315 and depend on the connectivity work in #120.",
+        "move_connected is not implemented. Use move_schematic_component (moves the symbol \
+         only), then re-route or use connect_pins for the affected nets.",
     ))
 }
 
