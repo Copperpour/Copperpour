@@ -5892,6 +5892,214 @@ mod call_tool_tests {
         handler.ctx.router.active_tools().await.len()
     }
 
+    async fn find_tools_request(handler: &McpHandler, method: &str, params: Value) -> Value {
+        handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+    }
+
+    async fn find_tools_listed_names(handler: &McpHandler) -> Vec<String> {
+        let result = find_tools_request(handler, "tools/list", json!({})).await;
+        let mut names: Vec<_> = result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    async fn find_tools_call(handler: &McpHandler, arguments: Value) -> (bool, Value) {
+        let result = find_tools_request(
+            handler,
+            "tools/call",
+            json!({ "name": "find_tools", "arguments": arguments }),
+        )
+        .await;
+        let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        (result["isError"] == true, body)
+    }
+
+    #[tokio::test]
+    async fn find_tools_discovers_unloaded_tools_without_changing_the_listing() {
+        let handler = lazy_handler().await;
+        let before = find_tools_listed_names(&handler).await;
+        assert!(before.iter().any(|name| name == "find_tools"));
+        assert!(!before
+            .iter()
+            .any(|name| name == "update_pcb_from_schematic"));
+
+        let (is_error, exact) =
+            find_tools_call(&handler, json!({"query": "  UPDATE_PCB_FROM_SCHEMATIC  "})).await;
+        assert!(!is_error, "{exact}");
+        let defs = crate::router::registry::tools_for("sch_export").unwrap();
+        let def = defs
+            .iter()
+            .find(|def| def.name == "update_pcb_from_schematic")
+            .unwrap();
+        assert_eq!(
+            exact["matches"][0],
+            json!({
+                "tool": "update_pcb_from_schematic",
+                "toolset": "sch_export",
+                "description": def.description,
+                "loaded": false
+            })
+        );
+
+        let (is_error, capability) = find_tools_call(
+            &handler,
+            json!({"query": "sync a schematic's netlist onto PCB footprints without opening KiCad's GUI"}),
+        )
+        .await;
+        assert!(!is_error, "{capability}");
+        assert!(
+            capability["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .take(5)
+                .any(|entry| entry["tool"] == def.name),
+            "{capability}"
+        );
+
+        assert_eq!(find_tools_listed_names(&handler).await, before);
+        let (is_error, starter) = find_tools_call(&handler, json!({"query": "open_project"})).await;
+        assert!(!is_error, "{starter}");
+        assert_eq!(starter["matches"][0]["toolset"], "project");
+        assert_eq!(starter["matches"][0]["loaded"], true);
+    }
+
+    #[tokio::test]
+    async fn find_tools_ties_follow_toolset_order_then_tool_name() {
+        let handler = lazy_handler().await;
+        let (is_error, body) = find_tools_call(&handler, json!({"query": "project"})).await;
+        assert!(!is_error, "{body}");
+        let names: Vec<_> = body["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["tool"].as_str().unwrap())
+            .filter(|name| {
+                [
+                    "create_project",
+                    "get_project_info",
+                    "load_project_config",
+                    "open_project",
+                ]
+                .contains(name)
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "create_project",
+                "get_project_info",
+                "open_project",
+                "load_project_config"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn find_tools_validates_queries_and_limits() {
+        let handler = lazy_handler().await;
+        for (args, field) in [
+            (json!({}), "query"),
+            (json!({"query": false}), "query"),
+            (json!({"query": ""}), "query"),
+            (json!({"query": "  \t\n"}), "query"),
+            (json!({"query": "pcb", "limit": 0}), "limit"),
+            (json!({"query": "pcb", "limit": 51}), "limit"),
+            (json!({"query": "pcb", "limit": 1.5}), "limit"),
+        ] {
+            let (is_error, body) = find_tools_call(&handler, args).await;
+            assert!(is_error, "{body}");
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], field, "{body}");
+        }
+
+        let (is_error, body) = find_tools_call(&handler, json!({"query": "π".repeat(201)})).await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "query", "{body}");
+        assert!(
+            body["error"]["reason"].as_str().unwrap().contains("200"),
+            "{body}"
+        );
+
+        let (is_error, body) = find_tools_call(&handler, json!({"query": "π".repeat(200)})).await;
+        assert!(!is_error, "{body}");
+        assert_eq!(body, json!({"matches": [], "truncated": false}));
+
+        let (is_error, default) = find_tools_call(&handler, json!({"query": "board"})).await;
+        assert!(!is_error, "{default}");
+        assert_eq!(default["matches"].as_array().unwrap().len(), 20);
+        assert_eq!(default["truncated"], true);
+
+        let (is_error, maximum) =
+            find_tools_call(&handler, json!({"query": "board", "limit": 50})).await;
+        assert!(!is_error, "{maximum}");
+        assert_eq!(maximum["matches"].as_array().unwrap().len(), 50);
+        assert_eq!(maximum["truncated"], true);
+        assert_eq!(
+            &maximum["matches"].as_array().unwrap()[..20],
+            default["matches"].as_array().unwrap()
+        );
+
+        let (is_error, limited) =
+            find_tools_call(&handler, json!({"query": "board", "limit": 1.0})).await;
+        assert!(!is_error, "{limited}");
+        assert_eq!(
+            limited,
+            json!({"matches": [default["matches"][0]], "truncated": true})
+        );
+    }
+
+    #[tokio::test]
+    async fn find_tools_enforces_bounds_in_the_direct_meta_handler() {
+        let handler = lazy_handler().await;
+        for (args, field) in [
+            (json!({"query": "π".repeat(201)}), "query"),
+            (json!({"query": "board", "limit": 0}), "limit"),
+            (json!({"query": "board", "limit": 51}), "limit"),
+        ] {
+            let result = meta_tools::handle_meta_tool("find_tools", &args, &handler.ctx)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_str(text(&result)).unwrap();
+            assert!(result.is_error, "{body}");
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], field, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn find_tools_is_read_only_through_call_tool() {
+        let handler = lazy_handler().await;
+        let args = json!({"query": "get_template", "limit": 1});
+        let direct = find_tools_request(
+            &handler,
+            "tools/call",
+            json!({"name": "find_tools", "arguments": args}),
+        )
+        .await;
+        let via = find_tools_request(
+            &handler,
+            "tools/call",
+            json!({"name": "call_tool", "arguments": {"name": "find_tools", "arguments": args}}),
+        )
+        .await;
+        assert_ne!(direct["isError"], true, "{direct}");
+        assert_eq!(direct["content"], via["content"], "{via}");
+    }
+
     /// A tool of an unloaded toolset runs through call_tool, gives what a
     /// direct call would, and leaves the tool list as it was.
     #[tokio::test]
