@@ -145,8 +145,8 @@ and Windows servers do not.
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect; a point that already has one is reported as `already_present` and not rewritten. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle, skipping points that already have one; `added` counts the dots written. |
 | `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body, or across it when that stub would join another net (`plan_blocked` when every direction would). `stub_length: 0` puts the label on the pin with no wire. |
-| `connect_pins` | Connect two pins by reference and pin number. Prefers the elbow that crosses fewer symbol bodies, then fewer label and field text runs. Reports the drawn path; refuses (`plan_blocked`) if no candidate avoids joining another net. |
-| `add_schematic_connection` | Connect two points by coordinates, using the same routing as `connect_pins`. Reports the drawn path; refuses (`plan_blocked`) if no candidate avoids joining another net. |
+| `connect_pins` | Connect two pins by reference and pin number. Prefers the elbow that crosses fewer symbol bodies, then fewer label and field text runs. Reports the drawn path, or `already_connected` with `x` and `y` for pins that connect by contact on the saved sheet. Refuses (`plan_blocked`) a zero-length route, a wire end that would miss its pin, or a route that would join another net. |
+| `add_schematic_connection` | Connect two points by coordinates. Uses the same elbow choice as `connect_pins`. Reports the drawn path; refuses a zero-length route or a route that would join another net. |
 
 ### `sch_bus` · 4 tools
 **Purpose:** Buses, bus entries, and fanning a group of pins out onto a bus.
@@ -206,7 +206,7 @@ and Windows servers do not.
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in one write with committed-file readback. Copies each library Value and Footprint unless that entry explicitly overrides it, preserves every saved hierarchy instance, and preflights stale metadata before any placement. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. An entry under a numbered reference already held is refused, and the others are placed. |
-| `batch_connect_pins` | Connect multiple pin pairs by reference and pin number in a single file read/write cycle. Routes as `connect_pins` does. A pair with no safe route is skipped and listed in `errors`. |
+| `batch_connect_pins` | Connect multiple pin pairs by reference and pin number in a single file read/write cycle. Routes as `connect_pins` does. Reports touching, connectable pairs in `already_connected`, new routes in `connected_count`, and refused pairs in `errors`. |
 
 ### `sch_export` · 11 tools
 **Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC and set its checks' severities, and synchronize a live PCB.

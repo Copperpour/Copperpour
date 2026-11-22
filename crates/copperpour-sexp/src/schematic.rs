@@ -1322,7 +1322,12 @@ pub fn resolve_lib_pins_for_unit_and_body_style(
         .collect()
 }
 
-fn lib_pin_nodes_for_body_style(sym_node: &SexpNode, unit: u32, body_style: u32) -> Vec<&SexpNode> {
+/// Library pin nodes for the given unit and body style, including common pins.
+pub fn lib_pin_nodes_for_body_style(
+    sym_node: &SexpNode,
+    unit: u32,
+    body_style: u32,
+) -> Vec<&SexpNode> {
     fn collect_nodes<'a>(node: &'a SexpNode, out: &mut Vec<&'a SexpNode>) {
         out.extend(node.find_all("pin"));
         for sub in node.find_all("symbol") {
@@ -1390,12 +1395,6 @@ fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
         .and_then(|n| n.as_str())
         .unwrap_or("")
         .to_string();
-    let hidden = node.find_str("hide") == Some("yes")
-        || node
-            .children()
-            .unwrap_or_default()
-            .iter()
-            .any(|child| child.as_str() == Some("hide"));
     Some(LibPin {
         number,
         name,
@@ -1404,8 +1403,18 @@ fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
         local_y: y,
         rotation,
         length,
-        hidden,
+        hidden: lib_pin_is_hidden(node),
     })
+}
+
+/// Whether a library pin is hidden, including the old bare `hide` spelling.
+pub fn lib_pin_is_hidden(node: &SexpNode) -> bool {
+    node.find_str("hide") == Some("yes")
+        || node
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .any(|child| child.as_str() == Some("hide"))
 }
 
 /// Compute the schematic-space pin endpoint (where wires connect) for a lib pin
