@@ -389,21 +389,46 @@ fn run_isolated_native_profile(test_name: &str, group: &str) {
                 }
             }
             "shared" => {
+                // The same board exports in every mode without the rules
+                // file, so only the custom-rules check refuses it.
+                const NOT_CARRIED: &str = "custom DRC rules are not carried to the router, \
+                     so Copperpour cannot vouch for routes against them";
                 for mode in ["disable", "prefer", "require"] {
                     let (error, body, count, dsn, manifest) = scenario(
                         &root,
+                        &format!("plain-{mode}"),
+                        RECT,
+                        Some(RECT_DSN),
+                        mode,
+                        false,
+                        false,
+                    )
+                    .await;
+                    assert!(!error && dsn && manifest, "{body}");
+                    let (method, exports) = if mode == "disable" {
+                        ("kicad_ipc_snapshot", 0)
+                    } else {
+                        ("kicad10_native_actionplugin", 1)
+                    };
+                    assert_eq!(body["method"], method, "{body}");
+                    assert_eq!(count, exports);
+                    let (error, body, count, dsn, manifest) = scenario(
+                        &root,
                         &format!("custom-{mode}"),
-                        CIRCLE,
-                        Some(CIRCLE_DSN),
+                        RECT,
+                        Some(RECT_DSN),
                         mode,
                         true,
                         false,
                     )
                     .await;
-                    assert!(
-                        error && body.to_string().contains("revision-bound SES import"),
-                        "{body}"
-                    );
+                    assert!(error, "{body}");
+                    assert_eq!(body["error"]["kind"], "handler_error", "{body}");
+                    for text in [&body["message"], &body["error"]["reason"]] {
+                        let text = text.as_str().unwrap();
+                        assert!(text.contains(NOT_CARRIED), "{body}");
+                        assert!(!text.contains("routing profile"), "{body}");
+                    }
                     assert_eq!(count, 0);
                     assert!(!dsn && !manifest);
                 }
