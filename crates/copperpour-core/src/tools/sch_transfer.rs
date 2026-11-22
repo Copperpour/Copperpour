@@ -1647,7 +1647,7 @@ fn move_pcb_net_names(
     while let Some((node, parent)) = pending.pop() {
         let name = match node.head() {
             Some("net") => net_name(node),
-            Some("net_name" | "add_net") => node.get(1).and_then(SexpNode::as_str),
+            Some("net_name" | "add_net" | "last_netname") => node.get(1).and_then(SexpNode::as_str),
             _ => None,
         };
         if let Some(name) = name {
@@ -3747,6 +3747,14 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Unsupported PCB net-name occurrence"));
+        let tuning = before.replace(
+            "(gr_text",
+            "(generated (last_netname \"/source/LIMIT\")) (gr_text",
+        );
+        assert!(move_pcb_net_names(&tuning, &mapping)
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported PCB net-name occurrence"));
         let inconsistent = legacy.replace("(zone (net 7)", "(zone (net 9)");
         assert!(move_pcb_net_names(&inconsistent, &mapping)
             .unwrap_err()
@@ -4196,6 +4204,8 @@ mod tests {
         RulesWithoutPcb,
         PcbPathsOnly,
         StaleSelection,
+        WrongPcbPad,
+        SplitDiffPair,
     }
 
     #[cfg(unix)]
@@ -4205,13 +4215,25 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn transfer_refuses_wrong_pads_and_split_pairs_without_writing() {
+        assert_served_transfer(Served::WrongPcbPad).await;
+        assert_served_transfer(Served::SplitDiffPair).await;
+    }
+
+    #[cfg(unix)]
     async fn assert_served_transfer(mode: Served) {
         let (dir, request) = fixture();
         let control = tempfile::tempdir().unwrap();
         let board = request.schematic.with_extension("kicad_pcb");
         if matches!(
             mode,
-            Served::Pcb | Served::PcbInterrupt | Served::PcbPathsOnly | Served::StaleSelection
+            Served::Pcb
+                | Served::PcbInterrupt
+                | Served::PcbPathsOnly
+                | Served::StaleSelection
+                | Served::WrongPcbPad
+                | Served::SplitDiffPair
         ) {
             let saved =
                 include_str!("../../tests/fixtures/repeat_layout_routing_kicad10.kicad_pcb");
@@ -4239,7 +4261,13 @@ mod tests {
                     edits.push(SexpEdit::replace(start, end, changed));
                 }
             }
-            std::fs::write(&board, apply_edits(saved.to_owned(), edits)).unwrap();
+            let mut saved = apply_edits(saved.to_owned(), edits);
+            if mode == Served::SplitDiffPair {
+                saved = saved.replace("/Channel 1/MID", "/Channel 1/USB_P");
+                let close = saved.rfind(')').unwrap();
+                saved.insert_str(close, "\n(segment (net \"/Channel 1/USB_N\"))\n");
+            }
+            std::fs::write(&board, saved).unwrap();
             if mode == Served::Pcb {
                 std::fs::write(
                     board.with_extension("kicad_dru"),
@@ -4265,15 +4293,20 @@ mod tests {
         let netlist = format!(
             r#"<export><design><sheet tstamps="/"><title_block><source>component_fields_kicad10.kicad_sch</source></title_block></sheet>
                 <sheet name="/Logic regulator/" tstamps="/{SHEET_UUID}/"><title_block><source>logic.kicad_sch</source></title_block></sheet></design>
-                <components><comp ref="R1"><tstamps>{RESISTOR}</tstamps><sheetpath names="/Logic regulator/" tstamps="/{SHEET_UUID}/"/><property name="Sheetfile" value="logic.kicad_sch"/></comp></components><nets><net name="$net" class="Default"><node ref="R1" pin="1"/></net></nets></export>"#
+                <components><comp ref="R1"><tstamps>{RESISTOR}</tstamps><sheetpath names="/Logic regulator/" tstamps="/{SHEET_UUID}/"/><property name="Sheetfile" value="logic.kicad_sch"/></comp></components><nets><net name="$net" class="Default"><node ref="R1" pin="$pin"/></net></nets></export>"#
         );
-        let old_net = if mode == Served::PcbPathsOnly {
-            "/not-on-the-board"
+        let old_net = match mode {
+            Served::PcbPathsOnly => "/not-on-the-board",
+            Served::SplitDiffPair => "/Channel 1/USB_P",
+            _ => "/Channel 1/MID",
+        };
+        let pin = if mode == Served::WrongPcbPad {
+            "2"
         } else {
-            "/Channel 1/MID"
+            "1"
         };
         let command = format!(
-            "#!/bin/sh\ntrigger=\"$(dirname \"$0\")/late-input\"\nif [ -f \"$trigger\" ]; then printf 'late input' > \"$(cat \"$trigger\")\" || exit 1; fi\nif [ \"$2\" = erc ]; then\ncat > \"$4\" <<'ERC'\n{report}\nERC\nelse\nnet='{old_net}'\nsheet=/\nif grep -q '{RESISTOR}' \"$(dirname \"$8\")/logic.kicad_sch\"; then net='/Logic regulator/MID'; sheet='/{SHEET_UUID}/'; fi\nif [ \"$7\" = kicadsexpr ]; then\ncat > \"$5\" <<PCB\n(export (components (comp (ref \"R1\") (sheetpath (tstamps \"$sheet\")) (tstamps \"{RESISTOR}\"))) (nets (net (name \"$net\") (node (ref \"R1\") (pin \"1\")))))\nPCB\nelse\ncat > \"$5\" <<NETLIST\n{netlist}\nNETLIST\nfi\nfi\n"
+            "#!/bin/sh\ntrigger=\"$(dirname \"$0\")/late-input\"\nif [ -f \"$trigger\" ]; then printf 'late input' > \"$(cat \"$trigger\")\" || exit 1; fi\nif [ \"$2\" = erc ]; then\ncat > \"$4\" <<'ERC'\n{report}\nERC\nelse\nnet='{old_net}'\npin='{pin}'\nsheet=/\nif grep -q '{RESISTOR}' \"$(dirname \"$8\")/logic.kicad_sch\"; then net='/Logic regulator/MID'; sheet='/{SHEET_UUID}/'; fi\nif [ \"$7\" = kicadsexpr ]; then\ncat > \"$5\" <<PCB\n(export (components (comp (ref \"R1\") (sheetpath (tstamps \"$sheet\")) (tstamps \"{RESISTOR}\"))) (nets (net (name \"$net\") (node (ref \"R1\") (pin \"$pin\")))))\nPCB\nelse\ncat > \"$5\" <<NETLIST\n{netlist}\nNETLIST\nfi\nfi\n"
         );
         let script =
             cli::test_support::write_script(control.path(), "fake-transfer-cli", &command, "");
@@ -4312,6 +4345,20 @@ mod tests {
             .unwrap();
         let planned: Value =
             serde_json::from_str(planned["content"][0]["text"].as_str().unwrap()).unwrap();
+        if matches!(mode, Served::WrongPcbPad | Served::SplitDiffPair) {
+            let reason = if mode == Served::WrongPcbPad {
+                "does not match the verified schematic pin"
+            } else {
+                "would change differential-pair membership"
+            };
+            assert_eq!(planned["error"]["kind"], "plan_blocked", "{planned}");
+            assert!(planned.to_string().contains(reason), "{planned}");
+            assert_eq!(snapshot(dir.path()), before);
+            assert!(copperpour_sexp::inspect_file_transactions(dir.path())
+                .unwrap()
+                .is_empty());
+            return;
+        }
         let revision = planned["plan_revision"].as_str().unwrap().to_owned();
         if mode == Served::StaleSelection {
             assert!(!planned["pcb_path_mapping"].as_object().unwrap().is_empty());

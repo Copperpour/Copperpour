@@ -77,8 +77,9 @@ placement, so the move is refused.
 Without `kicad-cli`, a dry run still returns the plan, with
 `verification.status: "not_run"` and `connectivity_impacts: null`, and apply refuses.
 If a PCB exists, `pcb_net_name_mapping` is also `null`, and `affected_files` may omit a
-board that only needs net-name updates. Once `kicad-cli` is available, run a new dry run
-and apply with its revision. A failed check or unreadable result prevents the move.
+board that only needs net-name or sheet metadata updates. Once `kicad-cli` is available,
+run a new dry run and apply with its revision. A failed check or unreadable result
+prevents the move.
 
 ## What the tool refuses
 
@@ -124,7 +125,8 @@ verified schematic pin group. If the check fails, reconcile the board with the
 schematic and plan again.
 
 The plan and transaction require the same-named `.kicad_dru` to stay unchanged, or to
-stay absent if it does not exist. The tool never rewrites custom rules. If a PCB net
+stay absent if it does not exist. If present, the rules file must be a regular file,
+not a symlink or directory. The tool never rewrites custom rules. If a PCB net
 would change names, the tool refuses the move when a rule condition uses `NetName`,
 `inDiffPair`, or another expression it cannot prove is independent of net names. The
 refusal names the rules file and the old and new net names. The condition check runs
