@@ -56,7 +56,7 @@ does not establish that a missing server-side check ran.
 When a call fails, returns partial/uncertain results, or tools/KiCad behave unexpectedly:
 
 1. **Classify before acting** — inspect the complete response (`error.kind` or status, target, source, and mutation outcome). Consume structured recovery fields when present (the `recovery` block on IPC failures, `retry_safe`, `board_state`, `drop_confirmed`, `browser_launch_error`, `absolute_path`) without inventing missing fields on older responses.
-2. **Diagnose read-only** — use `get_installation_info`, `get_recent_calls`, `check_kicad_ui`, or target inspection to resolve uncertainty. Avoid repeatedly running full installation assessments (`guidance.checked` is `"earlier"` when cached; refresh is explicit via `copperpour status` / `copperpour init`).
+2. **Diagnose read-only** — inspect `prerequisite_health` from `get_installation_info` for cached KiCad CLI and IPC findings. After repairing setup, request `refresh_prerequisite_health: true` or restart the MCP server for a fresh observation. Use `get_recent_calls`, `check_kicad_ui`, or exact target inspection for operation-specific failures.
 3. **Take safe, already-authorized steps** — e.g. `load_toolset` when discovery is supported, pass absolute paths, or share the returned `url` when `open_schematic_viewer` reports `browser_launch_error`.
 4. **Retry only when safe** — fix the cause first and retry only when outcome semantics allow it; never loop, replay applied batch items, or auto-replay `ipc_batch_recovered`.
 5. **Escalate with exact context** — state what happened, what changed or remains uncertain, and the exact next command, config change, or reference; ask only for what cannot be resolved from evidence.

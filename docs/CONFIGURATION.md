@@ -11,10 +11,11 @@ or when automatic discovery cannot identify your API socket.
 
 ## Check discovery first
 
-Ask your AI client to call `get_installation_info`. Its `kicad` block reports the
-CLI path, version and `probe_status`; `not_found` with a null `cli_path` means no
-CLI was found. Its `configuration` block identifies the configuration file used
-by the running server and any files it shadowed.
+Ask your AI client to call `get_installation_info`. Its
+`prerequisite_health` block reports the observed CLI path, version, and IPC
+readiness. Its `configuration` block identifies the configuration file used
+by the running server and any files it shadowed. After changing that file,
+restart the server to load it.
 
 ## Set executable paths
 

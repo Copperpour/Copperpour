@@ -158,6 +158,16 @@ pub fn detect_candidate_endpoints(candidates: &[String]) -> IpcDetection {
     )
 }
 
+/// Classify a candidate snapshot without talking to any candidate. Several
+/// qualifying sockets need operation-specific evidence before one can be used.
+pub fn unprobed_candidate_endpoint(candidates: &[String]) -> IpcDetection {
+    match candidates {
+        [] => IpcDetection::NotFound,
+        [address] => IpcDetection::Found(address.clone()),
+        _ => IpcDetection::Ambiguous(candidates.to_vec()),
+    }
+}
+
 /// Every endpoint [`detect_ipc_endpoint`] chooses among, as addresses, before
 /// any is dialled: a caller that can tell them apart by what they hold, rather
 /// than by whether they answer, looks at each.

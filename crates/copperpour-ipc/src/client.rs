@@ -532,6 +532,24 @@ fn unpack_typed<M: Message + Default>(
     unpack_any(&response)
 }
 
+/// A read-only health probe received an absent or incompatible typed payload.
+#[derive(Debug, thiserror::Error)]
+#[error("KiCad returned incompatible health probe evidence")]
+pub struct HealthProbePayloadError;
+
+fn unpack_health_response<M: Message + Default>(
+    reply: Option<prost_types::Any>,
+    command: &str,
+    expected: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<M> {
+    if deadline.is_some() {
+        unpack_typed(reply, command, expected).context(HealthProbePayloadError)
+    } else {
+        unpack_required(reply, command)
+    }
+}
+
 /// What one per-item result of `CreateItems` says: KiCad's status code, and
 /// whether the item counts as created.
 ///
@@ -1570,6 +1588,16 @@ impl KiCadIpcClient {
         type_name: &str,
         recv_timeout: std::time::Duration,
     ) -> Result<Option<prost_types::Any>> {
+        self.send_command_with_deadline(command, type_name, recv_timeout, None)
+    }
+
+    fn send_command_with_deadline(
+        &self,
+        command: &impl Message,
+        type_name: &str,
+        recv_timeout: std::time::Duration,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Option<prost_types::Any>> {
         if self.socket_path.is_empty() {
             // Several sockets qualifying is the one unconfigured state the
             // user can settle in one step, so name them (#374).
@@ -1621,6 +1649,14 @@ impl KiCadIpcClient {
         // its own answer back by then rather than this command's default.
         use nng::options::Options;
         let recovery_remaining = self.recovery_remaining()?;
+        let before_deadline = |timeout| {
+            deadline.map_or(timeout, |end| {
+                std::cmp::min(
+                    timeout,
+                    end.saturating_duration_since(std::time::Instant::now()),
+                )
+            })
+        };
         let recv_timeout = if let Some(window) = &self.recovery {
             let window = window
                 .lock()
@@ -1634,15 +1670,15 @@ impl KiCadIpcClient {
         // Do not let the request timer retransmit a mutation while waiting
         // for its original reply. Peer-disconnect resends are an NNG protocol
         // limitation, so uncertainty still never authorizes automatic retry.
-        if self.recovery.is_some() {
+        if self.recovery.is_some() || deadline.is_some() {
             socket.set_opt::<nng::options::protocol::reqrep::ResendTime>(None)?;
         }
         socket
-            .set_opt::<nng::options::SendTimeout>(Some(
+            .set_opt::<nng::options::SendTimeout>(Some(before_deadline(
                 recovery_remaining
                     .unwrap_or(COMMAND_SEND_TIMEOUT)
                     .min(COMMAND_SEND_TIMEOUT),
-            ))
+            )))
             .context("Failed to set NNG send timeout")?;
         socket
             .set_opt::<nng::options::RecvTimeout>(Some(recv_timeout))
@@ -1660,7 +1696,9 @@ impl KiCadIpcClient {
         };
 
         let diagnostic_dial_url = crate::redact_endpoint(&dial_url);
-        let dial = if recovery_remaining.is_some() {
+        // A synchronous NNG dial can wait ten seconds for negotiation.
+        // For a deadline-bound read, let send wait for the pipe instead.
+        let dial = if recovery_remaining.is_some() || deadline.is_some() {
             socket.dial_async(&dial_url)
         } else {
             socket.dial(&dial_url)
@@ -1702,7 +1740,7 @@ impl KiCadIpcClient {
             } else {
                 recv_timeout
             };
-            socket.set_opt::<nng::options::RecvTimeout>(Some(timeout))?;
+            socket.set_opt::<nng::options::RecvTimeout>(Some(before_deadline(timeout)))?;
             Ok(())
         })();
         receive_config.map_err(|error| {
@@ -1769,7 +1807,11 @@ impl KiCadIpcClient {
             } else {
                 status.error_message.clone()
             };
-            debug!("[BETA] IPC ← error: {} ({})", msg, code.as_str_name());
+            if deadline.is_some() {
+                debug!("[BETA] IPC health probe ← {}", code.as_str_name());
+            } else {
+                debug!("[BETA] IPC ← error: {} ({})", msg, code.as_str_name());
+            }
             return Err(anyhow::Error::new(ApiStatusError {
                 code: code as i32,
                 code_name: code.as_str_name().to_string(),
@@ -1951,14 +1993,31 @@ impl KiCadIpcClient {
 
     /// Observe the running KiCad version through the typed IPC command.
     pub fn get_kicad_version(&self) -> Result<IpcKiCadVersion> {
+        self.get_kicad_version_before(None)
+    }
+
+    /// Observe a typed version reply within the caller's read-only probe budget.
+    pub fn get_kicad_version_before(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<IpcKiCadVersion> {
         let command = kiapi::common::commands::GetVersion {};
-        let response = unpack_required::<kiapi::common::commands::GetVersionResponse>(
-            self.send_command(&command, "kiapi.common.commands.GetVersion")?,
+        let response = unpack_health_response::<kiapi::common::commands::GetVersionResponse>(
+            self.send_command_with_deadline(
+                &command,
+                "kiapi.common.commands.GetVersion",
+                COMMAND_RECV_TIMEOUT,
+                deadline,
+            )?,
             "GetVersion",
+            "kiapi.common.commands.GetVersionResponse",
+            deadline,
         )?;
-        let version = response
-            .version
-            .context("GetVersion response did not contain a KiCad version")?;
+        let version = match response.version {
+            Some(version) => version,
+            None if deadline.is_some() => return Err(HealthProbePayloadError.into()),
+            None => anyhow::bail!("GetVersion response did not contain a KiCad version"),
+        };
         Ok(IpcKiCadVersion {
             major: version.major,
             minor: version.minor,
@@ -1972,6 +2031,15 @@ impl KiCadIpcClient {
         &self,
         editor: IpcEditorKind,
     ) -> Result<Vec<kiapi::common::types::DocumentSpecifier>> {
+        self.get_open_documents_before(editor, None)
+    }
+
+    /// Observe available documents within the caller's read-only probe budget.
+    pub fn get_open_documents_before(
+        &self,
+        editor: IpcEditorKind,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<kiapi::common::types::DocumentSpecifier>> {
         let document_type = match editor {
             IpcEditorKind::Schematic => kiapi::common::types::DocumentType::DoctypeSchematic,
             IpcEditorKind::Pcb => kiapi::common::types::DocumentType::DoctypePcb,
@@ -1979,10 +2047,23 @@ impl KiCadIpcClient {
         let command = kiapi::common::commands::GetOpenDocuments {
             r#type: document_type as i32,
         };
-        let response = unpack_required::<kiapi::common::commands::GetOpenDocumentsResponse>(
-            self.send_command(&command, "kiapi.common.commands.GetOpenDocuments")?,
+        let response = unpack_health_response::<kiapi::common::commands::GetOpenDocumentsResponse>(
+            self.send_command_with_deadline(
+                &command,
+                "kiapi.common.commands.GetOpenDocuments",
+                COMMAND_RECV_TIMEOUT,
+                deadline,
+            )?,
             "GetOpenDocuments",
+            "kiapi.common.commands.GetOpenDocumentsResponse",
+            deadline,
         )?;
+        if deadline.is_some() {
+            for document in &response.documents {
+                editor_document_from_specifier(editor, document.clone())
+                    .context(HealthProbePayloadError)?;
+            }
+        }
         Ok(response.documents)
     }
 

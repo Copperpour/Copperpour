@@ -343,14 +343,21 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
             description:
                 "Report read-only provenance for the Copperpour process serving this call: build \
                  version and commit when available, executable path, conservatively detected \
-                 install source, on-disk binary version, KiCad CLI version, the redacted IPC \
-                 endpoint the tools dial now and where it came from, proven newer-binary \
+                 install source, on-disk binary version, cached KiCad CLI and IPC prerequisite health, the redacted IPC \
+                 endpoint provenance, proven newer-binary \
                  state, platform-specific restart guidance, and \
-                 whether installed skills, agents, and hooks match this build's bundle."
+                 whether installed skills, agents, and hooks match this build's bundle. \
+                 Set refresh_prerequisite_health to explicitly update the cached health evidence."
                     .to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "refresh_prerequisite_health": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Rerun read-only KiCad prerequisite probes and update the cached report."
+                    }
+                },
                 "required": []
             }),
         },
@@ -419,7 +426,7 @@ pub async fn handle_meta_tool_with_reload(
         "get_active_toolsets" => Some(handle_get_active_toolsets(ctx).await),
         "get_recent_calls" => Some(handle_get_recent_calls(args, ctx).await),
         "server_stats" => Some(handle_server_stats(ctx).await),
-        "get_installation_info" => Some(handle_get_installation_info(ctx).await),
+        "get_installation_info" => Some(handle_get_installation_info(args, ctx).await),
         #[cfg(unix)]
         "reload_server" if reload.is_enabled() => Some(handle_reload_server(args, reload).await),
         _ => None,
@@ -748,14 +755,12 @@ async fn handle_server_stats(ctx: &std::sync::Arc<ToolContext>) -> CallToolResul
     CallToolResult::json(&snap)
 }
 
-async fn handle_get_installation_info(ctx: &std::sync::Arc<ToolContext>) -> CallToolResult {
-    let info = crate::runtime_info::collect(
-        &ctx.config,
-        &ctx.config_resolution,
-        ctx.guidance.get().map(|probe| probe.as_ref()),
-        ctx.ipc_endpoint_with_origin(),
-    )
-    .await;
+async fn handle_get_installation_info(args: &Value, ctx: &ToolContext) -> CallToolResult {
+    let refresh = match crate::tools::opt_bool_flag(args, "refresh_prerequisite_health") {
+        Ok(value) => value.unwrap_or(false),
+        Err(error) => return error,
+    };
+    let info = crate::runtime_info::collect(ctx, refresh).await;
     CallToolResult::json(&info)
 }
 

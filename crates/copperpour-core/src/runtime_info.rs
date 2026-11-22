@@ -1,8 +1,10 @@
 //! Read-only runtime and installation provenance for the serving process.
 
+pub(crate) mod prerequisites;
+
 use crate::config_resolution::{ConfigResolution, SEARCH_POLICY};
 use crate::guidance::GuidanceProbe;
-use crate::tools::{IpcEndpoint, IpcEndpointOrigin, ServerConfig};
+use crate::tools::{IpcEndpoint, IpcEndpointOrigin, ToolContext};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -12,12 +14,12 @@ use tokio::process::Command;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const PCM_IDENTIFIER: &str = "com.github.copperpour.copperpour";
 
-pub(crate) async fn collect(
-    config: &ServerConfig,
-    resolution: &ConfigResolution,
-    guidance: Option<&dyn GuidanceProbe>,
-    ipc: (IpcEndpoint, IpcEndpointOrigin),
-) -> Value {
+pub(crate) async fn collect(ctx: &ToolContext, refresh_prerequisite_health: bool) -> Value {
+    let ipc = ctx.diagnostic_ipc_endpoint();
+    let assessment = ctx
+        .prerequisite_health
+        .read(ctx, refresh_prerequisite_health.then(|| ipc.clone()))
+        .await;
     let running_version = env!("CARGO_PKG_VERSION");
     let executable_path = installed_executable_path().ok();
     let installation = executable_path
@@ -34,18 +36,6 @@ pub(crate) async fn collect(
         .as_deref()
         .and_then(|version| stable_version_cmp(version, running_version))
         .map(|ordering| ordering == Ordering::Greater);
-
-    // Keep empty-value installation discovery, but probe nonempty overrides
-    // exactly as CLI execution resolves them, including missing explicit paths.
-    let kicad_cli_path = if config.kicad_cli.trim().is_empty() {
-        crate::kicad_install::find_cli("")
-    } else {
-        Some(crate::tools::cli::resolve_cli_executable(&config.kicad_cli))
-    };
-    let kicad_probe = match kicad_cli_path.as_deref() {
-        Some(path) => probe_command_version(path, VersionCommand::KiCad).await,
-        None => VersionProbe::not_found(),
-    };
 
     json!({
         "build": {
@@ -71,24 +61,18 @@ pub(crate) async fn collect(
                 "newer_than_running": newer_than_running,
             },
         },
-        "kicad": {
-            "cli_path": kicad_cli_path.as_deref().map(display_path),
-            "probe_status": kicad_probe.status,
-            "version": kicad_probe.version,
-        },
-        "ipc": ipc_block(&config.ipc_address, &ipc.0, ipc.1),
-        "configuration": configuration_block(resolution),
-        "guidance": guidance_block(guidance),
+        "kicad": assessment.legacy_cli,
+        "ipc": ipc_block(&ctx.config.ipc_address, &ipc.0, ipc.1),
+        "prerequisite_health": assessment.health,
+        "configuration": configuration_block(&ctx.config_resolution),
+        "guidance": guidance_block(ctx.guidance.get().map(|probe| probe.as_ref())),
         "restart_guidance": restart_guidance(installation.name, newer_than_running),
     })
 }
 
-/// The IPC endpoint the tools dial now, redacted, and where it came from:
-/// [`crate::tools::ToolContext::ipc_endpoint_with_origin`], the decision every
-/// IPC call makes. With rediscovery on, a KiCad started or restarted after
-/// the server is found per call; reporting only the startup address showed
-/// `null` while the tools were talking to it.
-///
+/// Redacted endpoint provenance from the diagnostic view. A candidate
+/// inventory can report a single endpoint without communicating with it,
+/// while a plural set requires evidence already available from live tools.
 /// `configured` keeps its meaning: an address was resolved at startup.
 /// `source` is `resolved_server_config` for that address,
 /// `detected_at_call_time` for a socket found now, `selected_by_open_board`
@@ -219,6 +203,7 @@ enum VersionCommand {
 struct VersionProbe {
     status: &'static str,
     version: Option<String>,
+    not_found: bool,
 }
 
 impl VersionProbe {
@@ -226,6 +211,7 @@ impl VersionProbe {
         Self {
             status: "executable_path_unavailable",
             version: None,
+            not_found: false,
         }
     }
 
@@ -233,6 +219,7 @@ impl VersionProbe {
         Self {
             status: "not_found",
             version: None,
+            not_found: true,
         }
     }
 }
@@ -242,16 +229,18 @@ async fn probe_command_version(path: &Path, command_kind: VersionCommand) -> Ver
     command.arg("--version").kill_on_drop(true);
     let output = match tokio::time::timeout(COMMAND_TIMEOUT, command.output()).await {
         Ok(Ok(output)) => output,
-        Ok(Err(_)) => {
+        Ok(Err(error)) => {
             return VersionProbe {
                 status: "launch_failed",
                 version: None,
+                not_found: error.kind() == std::io::ErrorKind::NotFound && !path.is_file(),
             };
         }
         Err(_) => {
             return VersionProbe {
                 status: "timed_out",
                 version: None,
+                not_found: false,
             };
         }
     };
@@ -260,6 +249,7 @@ async fn probe_command_version(path: &Path, command_kind: VersionCommand) -> Ver
         return VersionProbe {
             status: "nonzero_exit",
             version: None,
+            not_found: false,
         };
     }
 
@@ -282,6 +272,7 @@ async fn probe_command_version(path: &Path, command_kind: VersionCommand) -> Ver
             "unrecognized_output"
         },
         version,
+        not_found: false,
     }
 }
 

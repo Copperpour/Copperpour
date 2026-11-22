@@ -343,6 +343,7 @@ pub struct ToolContext {
     /// Reads installed guidance for drift. Set once by the standalone binary,
     /// which owns the bundle; absent in embedded and test contexts (#728).
     pub(crate) guidance: std::sync::OnceLock<std::sync::Arc<dyn crate::guidance::GuidanceProbe>>,
+    pub(crate) prerequisite_health: crate::runtime_info::prerequisites::PrerequisiteHealth,
     /// Look for KiCad's socket again on every IPC call instead of keeping the
     /// startup address (#32). Set only by the server entry points, and only
     /// when the address was detected or not found: a configured or
@@ -379,6 +380,7 @@ impl ToolContext {
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
+            prerequisite_health: Default::default(),
             ipc_rediscovery: std::sync::atomic::AtomicBool::new(false),
             ipc_probe_backoff: std::sync::Mutex::new(IpcProbeBackoff::default()),
             selected_ipc_endpoint: std::sync::Mutex::new(None),
@@ -405,6 +407,7 @@ impl ToolContext {
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
+            prerequisite_health: Default::default(),
             ipc_rediscovery: std::sync::atomic::AtomicBool::new(false),
             ipc_probe_backoff: std::sync::Mutex::new(IpcProbeBackoff::default()),
             selected_ipc_endpoint: std::sync::Mutex::new(None),
@@ -456,30 +459,58 @@ impl ToolContext {
         self.ipc_endpoint_with_origin().0
     }
 
-    /// [`Self::ipc_endpoint`] and where it came from, for reporting the
-    /// endpoint the calls use (`get_installation_info`). It costs what an IPC
-    /// call's own lookup costs, and shares its ping backoff for a candidate
-    /// set that needs probing (#32).
+    /// [`Self::ipc_endpoint`] and where it came from, using the same live
+    /// lookup and ping backoff as IPC operations.
     pub fn ipc_endpoint_with_origin(&self) -> (IpcEndpoint, IpcEndpointOrigin) {
         self.resolve_ipc_endpoint().decided
     }
 
-    fn resolve_ipc_endpoint(&self) -> IpcResolution {
-        let resolve = |list: &dyn Fn() -> Vec<String>| {
-            let mut candidates = Vec::new();
-            let decided =
-                endpoint_and_origin_for(self.rediscovers_ipc(), &self.config.ipc_address, || {
-                    let mut backoff = self
-                        .ipc_probe_backoff
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    candidates = list();
-                    backoff.resolve(std::time::Instant::now, &candidates, || {
-                        copperpour_ipc::socket::detect_candidate_endpoints(&candidates)
+    /// Observe the current candidates without initiating a routing probe.
+    /// Ordinary diagnostics can report recent routing evidence for the same
+    /// set or a still-present selection made by open_board.
+    pub(crate) fn diagnostic_ipc_endpoint(&self) -> (IpcEndpoint, IpcEndpointOrigin) {
+        let mut candidates = Vec::new();
+        let decided =
+            endpoint_and_origin_for(self.rediscovers_ipc(), &self.config.ipc_address, || {
+                candidates = self.ipc_candidates();
+                self.ipc_probe_backoff
+                    // A live operation may hold this lock during native I/O.
+                    .try_lock()
+                    .ok()
+                    .and_then(|state| state.recent_outcome(&candidates))
+                    .unwrap_or_else(|| {
+                        copperpour_ipc::socket::unprobed_candidate_endpoint(&candidates)
                     })
-                });
-            with_selection(&self.selected_ipc_endpoint, decided, || candidates)
-        };
+            });
+        let mut selected = self
+            .selected_ipc_endpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        with_selection(&mut selected, decided, || candidates).decided
+    }
+
+    fn resolve_ipc_endpoint(&self) -> IpcResolution {
+        let mut candidates = Vec::new();
+        let decided =
+            endpoint_and_origin_for(self.rediscovers_ipc(), &self.config.ipc_address, || {
+                let mut backoff = self
+                    .ipc_probe_backoff
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                candidates = self.ipc_candidates();
+                backoff.resolve(std::time::Instant::now, &candidates, || {
+                    copperpour_ipc::socket::detect_candidate_endpoints(&candidates)
+                })
+            });
+        let mut selected = self
+            .selected_ipc_endpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        with_selection(&mut selected, decided, || candidates)
+    }
+
+    fn ipc_candidates(&self) -> Vec<String> {
         #[cfg(all(test, unix))]
         if let Some(dir) = self
             .ipc_kicad_dir_override
@@ -487,9 +518,9 @@ impl ToolContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
         {
-            return resolve(&|| copperpour_ipc::socket::candidate_endpoints_in(&dir));
+            return copperpour_ipc::socket::candidate_endpoints_in(&dir);
         }
-        resolve(&copperpour_ipc::candidate_endpoints)
+        copperpour_ipc::candidate_endpoints()
     }
 
     /// Clear any active ping backoff, e.g. after launching KiCad
@@ -846,6 +877,11 @@ impl IpcProbeBackoff {
         outcome
     }
 
+    fn recent_outcome(&self, candidates: &[String]) -> Option<copperpour_ipc::IpcDetection> {
+        let (previous, outcome, until) = self.last_probe.as_ref()?;
+        (previous == candidates && std::time::Instant::now() < *until).then(|| outcome.clone())
+    }
+
     fn reset(&mut self) {
         self.consecutive_misses = 0;
         self.last_probe = None;
@@ -922,13 +958,10 @@ struct IpcResolution {
 /// socket, as an exited editor's `api-<pid>.sock` stops being one; a busy
 /// editor that missed one Ping keeps it.
 fn with_selection(
-    selected: &std::sync::Mutex<Option<String>>,
+    selected: &mut Option<String>,
     decided: (IpcEndpoint, IpcEndpointOrigin),
     candidates: impl FnOnce() -> Vec<String>,
 ) -> IpcResolution {
-    let mut selected = selected
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let listed = match &decided {
         (IpcEndpoint::Ambiguous(candidates), _) => candidates.clone(),
         (IpcEndpoint::Address(_), IpcEndpointOrigin::DetectedNow) => candidates(),
@@ -5689,60 +5722,60 @@ mod ipc_rediscovery_tests {
             IpcEndpointOrigin::Selected,
         );
         let unlisted = || -> Vec<String> { panic!("an ambiguous detection lists every candidate") };
-        let selected = std::sync::Mutex::new(Some(editor.clone()));
+        let mut selected = Some(editor.clone());
         assert_eq!(
-            with_selection(&selected, ambiguous(), unlisted).decided,
+            with_selection(&mut selected, ambiguous(), unlisted).decided,
             chosen
         );
         // Detection settled on one socket: its answer, the selection kept
         // while the editor is a candidate.
         assert_eq!(
-            with_selection(&selected, found(&editor), both).decided,
+            with_selection(&mut selected, found(&editor), both).decided,
             found(&editor)
         );
         assert_eq!(
-            with_selection(&selected, found(&other), both).decided,
+            with_selection(&mut selected, found(&other), both).decided,
             found(&other)
         );
         assert_eq!(
-            with_selection(&selected, ambiguous(), unlisted).decided,
+            with_selection(&mut selected, ambiguous(), unlisted).decided,
             chosen
         );
         // The editor gone: forgotten for good.
         let only_other = || vec![other.clone()];
         assert_eq!(
-            with_selection(&selected, found(&other), only_other).decided,
+            with_selection(&mut selected, found(&other), only_other).decided,
             found(&other)
         );
-        assert_eq!(*selected.lock().unwrap(), None);
+        assert_eq!(selected, None);
         assert_eq!(
-            with_selection(&selected, ambiguous(), unlisted).decided,
+            with_selection(&mut selected, ambiguous(), unlisted).decided,
             ambiguous()
         );
 
         // Nothing detected, so the startup address: forgotten too.
-        let selected = std::sync::Mutex::new(Some(editor.clone()));
+        let mut selected = Some(editor.clone());
         let startup = (
             IpcEndpoint::Address(STARTUP.to_string()),
             IpcEndpointOrigin::Startup,
         );
         assert_eq!(
-            with_selection(&selected, startup.clone(), Vec::new).decided,
+            with_selection(&mut selected, startup.clone(), Vec::new).decided,
             startup
         );
-        assert_eq!(*selected.lock().unwrap(), None);
+        assert_eq!(selected, None);
 
         // An ambiguous detection without it: forgotten.
-        let selected = std::sync::Mutex::new(Some(editor.clone()));
+        let mut selected = Some(editor.clone());
         let others = (
             IpcEndpoint::Ambiguous(vec![other.clone(), STARTUP.to_string()]),
             IpcEndpointOrigin::DetectedNow,
         );
         assert_eq!(
-            with_selection(&selected, others.clone(), unlisted).decided,
+            with_selection(&mut selected, others.clone(), unlisted).decided,
             others
         );
-        assert_eq!(*selected.lock().unwrap(), None);
+        assert_eq!(selected, None);
     }
 
     /// A configured address stays the one the calls use.

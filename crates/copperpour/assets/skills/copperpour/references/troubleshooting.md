@@ -19,10 +19,10 @@ uncertain outcome, or behaves unexpectedly in the client or KiCad.
    or guarantees.
 2. **Gather read-only diagnostics.** Use `get_installation_info`,
    `get_recent_calls`, `check_kicad_ui`, and target-specific inspection when
-   they resolve uncertainty. Avoid repeatedly running full installation
-   assessments: `get_installation_info`'s `guidance` block reports cached state
-   when `checked` is `"earlier"`, and refresh is explicit via `copperpour status`
-   or `copperpour init`.
+   they resolve uncertainty. In `get_installation_info`, read
+   `prerequisite_health` for the cached startup or latest refresh result. After
+   repairing setup, pass `{"refresh_prerequisite_health": true}` or restart the
+   MCP server. For installed guidance drift, use `copperpour status`.
 3. **Perform an already-authorized, safe recovery step** when its prerequisites
    are established: for example, call `load_toolset` when the client supports
    dynamic discovery, pass an absolute filesystem path, or give the user the
@@ -72,8 +72,9 @@ uncertain outcome, or behaves unexpectedly in the client or KiCad.
 ### Setup, Binary, CLI, and Guidance Drift
 
 - **Missing `kicad-cli` ("kicad-cli not found"):** Call `get_installation_info`
-  and inspect the `kicad` block. Ask the user to install KiCad or configure
-  `kicad_cli` in Copperpour's config; do not fall back to manual file edits.
+  and inspect `prerequisite_health.kicad_cli` for the executable and observed
+  reason. Follow its guidance for a missing, unexecutable, timed-out, or
+  unsupported CLI. Restart after configuration or launch environment changes.
 - **Stale serving binary:** If `installation.binary_on_disk.newer_than_running`
   is `true` (or expected newer behavior is missing), tell the user to restart
   the MCP client (and KiCad if KiCad owns the server), then verify with
@@ -89,6 +90,11 @@ uncertain outcome, or behaves unexpectedly in the client or KiCad.
 
 ### IPC, Endpoints, and KiCad UI State
 
+- **Prerequisite health:** Check `prerequisite_health.ipc` and its timestamp.
+  A configured endpoint can be unreachable. Follow the reported guidance
+  when evidence is unavailable, and preserve uncertainty about the cause.
+  A responding endpoint can still lack a ready PCB Editor or open PCB
+  document. Verify the exact board before calling live tools.
 - **Wrong board or "KiCAD must be running with the board loaded":** Ask the
   user to open the exact `.kicad_pcb` in PCB Editor with KiCad IPC enabled.
   Do not substitute another open board or edit the saved file.
