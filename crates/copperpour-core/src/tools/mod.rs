@@ -6005,7 +6005,7 @@ mod ipc_rediscovery_tests {
 }
 
 #[cfg(test)]
-mod multi_endpoint_discovery_tests {
+pub(super) mod multi_endpoint_discovery_tests {
     use super::*;
     #[cfg(unix)]
     use crate::mcp::handler::McpHandler;
@@ -6411,6 +6411,46 @@ mod multi_endpoint_discovery_tests {
         dir: &std::path::Path,
         other: impl Fn(kiapi::common::ApiRequest) -> kiapi::common::ApiResponse + Send + 'static,
     ) -> (McpHandler, MockIpcServer) {
+        with_cached_selected_editor_and_cli(dir, other, String::new()).await
+    }
+
+    #[cfg(unix)]
+    pub(in crate::tools) async fn transfer_with_stale_selection(
+        dir: &std::path::Path,
+        board: &std::path::Path,
+        sibling_holds_board: bool,
+        cli: String,
+    ) -> (McpHandler, MockIpcServer) {
+        let known = pcb_editor_response(board_document(board));
+        with_cached_selected_editor_and_cli(
+            dir,
+            move |request| {
+                if sibling_holds_board
+                    || request
+                        .message
+                        .as_ref()
+                        .is_some_and(|m| m.type_url.ends_with("Ping"))
+                {
+                    known(request)
+                } else {
+                    reply(
+                        kiapi::common::ApiStatusCode::AsNotReady,
+                        "editor is busy",
+                        None,
+                    )
+                }
+            },
+            cli,
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn with_cached_selected_editor_and_cli(
+        dir: &std::path::Path,
+        other: impl Fn(kiapi::common::ApiRequest) -> kiapi::common::ApiResponse + Send + 'static,
+        kicad_cli: String,
+    ) -> (McpHandler, MockIpcServer) {
         let kicad_dir = dir.join("kicad");
         std::fs::create_dir(&kicad_dir).unwrap();
         let selected_path = kicad_dir.join("api.sock");
@@ -6429,6 +6469,7 @@ mod multi_endpoint_discovery_tests {
         let other = MockIpcServer::spawn_at(other_addr.clone(), other);
         let handler = McpHandler::new(ServerConfig {
             eager_toolsets: true,
+            kicad_cli,
             ..ServerConfig::default()
         })
         .await

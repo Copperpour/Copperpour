@@ -4098,6 +4098,13 @@ mod tests {
         PcbInterrupt,
         RulesWithoutPcb,
         PcbPathsOnly,
+        StaleSelection,
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transfer_refuses_when_a_stale_selection_hides_another_editor() {
+        assert_served_transfer(Served::StaleSelection).await;
     }
 
     #[cfg(unix)]
@@ -4107,7 +4114,7 @@ mod tests {
         let board = request.schematic.with_extension("kicad_pcb");
         if matches!(
             mode,
-            Served::Pcb | Served::PcbInterrupt | Served::PcbPathsOnly
+            Served::Pcb | Served::PcbInterrupt | Served::PcbPathsOnly | Served::StaleSelection
         ) {
             let saved =
                 include_str!("../../tests/fixtures/repeat_layout_routing_kicad10.kicad_pcb");
@@ -4209,6 +4216,38 @@ mod tests {
         let planned: Value =
             serde_json::from_str(planned["content"][0]["text"].as_str().unwrap()).unwrap();
         let revision = planned["plan_revision"].as_str().unwrap().to_owned();
+        if mode == Served::StaleSelection {
+            assert!(!planned["pcb_path_mapping"].as_object().unwrap().is_empty());
+            assert_eq!(snapshot(dir.path()), before);
+            for holds_board in [false, true] {
+                for dry_run in [true, false] {
+                    // Use fresh discovery state: a dry-run refusal must not
+                    // prime the route or observation used by the apply case.
+                    let sockets = tempfile::tempdir().unwrap();
+                    let (handler, _sibling) = super::super::multi_endpoint_discovery_tests::transfer_with_stale_selection(
+                        sockets.path(), &board, holds_board, script.to_str().unwrap().into()
+                    ).await;
+                    let response = handler
+                        .handle_message(call(dry_run, (!dry_run).then_some(revision.as_str())))
+                        .await
+                        .unwrap()
+                        .result
+                        .unwrap();
+                    assert_eq!(snapshot(dir.path()), before, "{response}");
+                    assert!(copperpour_sexp::inspect_file_transactions(dir.path())
+                        .unwrap()
+                        .is_empty());
+                    assert_eq!(kind(&response), "plan_blocked", "{response}");
+                    assert!(
+                        response
+                            .to_string()
+                            .contains("Cannot prove that the project PCB is closed"),
+                        "{response}"
+                    );
+                }
+            }
+            return;
+        }
         if matches!(mode, Served::RulesWithoutPcb | Served::PcbPathsOnly) {
             assert_eq!(planned["pcb_net_name_mapping"], json!({}));
             assert_eq!(planned["connectivity_impacts"][0]["old_name"], old_net);
