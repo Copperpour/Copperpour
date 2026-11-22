@@ -25,10 +25,10 @@ mod teardrops;
 mod text_edit;
 pub use footprint_pads::FootprintEditTargetError;
 pub use teardrops::{
-    legacy_teardrops_in_board_text, supports_teardrop_settings, teardrop_targets_from_items,
-    IpcTeardropApplied, IpcTeardropApplyOutcome, IpcTeardropEdit, IpcTeardropRefusal,
-    IpcTeardropSettings, IpcTeardropTarget, IpcTeardropTargetKind, IpcTeardropZone,
-    TeardropReadError, TEARDROP_SETTINGS_MIN_KICAD_VERSION,
+    diff_nodes, legacy_teardrops_in_board_text, supports_teardrop_settings,
+    teardrop_targets_from_items, IpcTeardropApplied, IpcTeardropApplyOutcome, IpcTeardropEdit,
+    IpcTeardropRefusal, IpcTeardropSettings, IpcTeardropTarget, IpcTeardropTargetKind,
+    IpcTeardropZone, TeardropReadError, TEARDROP_SETTINGS_MIN_KICAD_VERSION,
 };
 pub use text_edit::TextTargetError;
 

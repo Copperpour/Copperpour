@@ -50,6 +50,7 @@ use anyhow::Context;
 use copperpour_ipc::builders::{any_is, mm_to_nm, nm_to_mm, pack_any};
 use copperpour_ipc::client::KiCadIpcClient;
 use copperpour_ipc::gen::kiapi;
+use copperpour_ipc::transform::rotate_point;
 use copperpour_ipc::types::IpcFootprintPlacement;
 use copperpour_ipc::PreflightCause;
 use copperpour_sexp::board::exact_coordinate_pair;
@@ -931,46 +932,6 @@ fn mismatch(reasons: Vec<String>) -> CallToolResult {
             reasons,
         },
         message,
-    )
-}
-
-/// KiCad's `RotatePoint` on a point in nanometres, about the origin
-/// (`libs/kimath/src/trigo.cpp`): the angle normalised to [0, 360), the four
-/// right angles exact, and otherwise each coordinate rounded half away from
-/// zero, with `EDA_ANGLE`'s `M_SQRT1_2` sine and cosine at the odd multiples
-/// of 45°.
-pub(super) fn rotate_point(x: i64, y: i64, degrees: f64) -> (i64, i64) {
-    let mut angle = degrees.rem_euclid(360.0);
-    if angle >= 360.0 {
-        angle -= 360.0;
-    }
-    if angle == 0.0 {
-        return (x, y);
-    }
-    if angle == 90.0 {
-        return (y, -x);
-    }
-    if angle == 180.0 {
-        return (-x, -y);
-    }
-    if angle == 270.0 {
-        return (-y, x);
-    }
-    let half = std::f64::consts::FRAC_1_SQRT_2;
-    let (sin, cos) = match angle {
-        45.0 => (half, half),
-        135.0 => (half, -half),
-        225.0 => (-half, -half),
-        315.0 => (-half, half),
-        _ => {
-            let radians = angle * (std::f64::consts::PI / 180.0);
-            (radians.sin(), radians.cos())
-        }
-    };
-    let (x, y) = (x as f64, y as f64);
-    (
-        (y * sin + x * cos).round() as i64,
-        (y * cos - x * sin).round() as i64,
     )
 }
 

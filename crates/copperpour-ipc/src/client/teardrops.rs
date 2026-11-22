@@ -891,7 +891,7 @@ fn changes_besides_teardrops(
 
 /// The innermost differing nodes between two trees, as paths. Bounded: the
 /// first few are enough to say what changed.
-fn diff_nodes(
+pub fn diff_nodes(
     path: &str,
     before: &copperpour_sexp::SexpNode,
     after: &copperpour_sexp::SexpNode,

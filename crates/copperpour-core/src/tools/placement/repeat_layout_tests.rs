@@ -1238,7 +1238,8 @@ async fn a_group_member_a_closed_board_cannot_measure_is_refused_by_name() {
 /// `SHAPE_LINE_CHAIN::Rotate` and `Move` carry it.
 #[test]
 fn the_area_is_the_outline_kicad_draws() {
-    use super::repeat_layout::{area_outline, carried, rotate_point, Rect};
+    use super::repeat_layout::{area_outline, carried, Rect};
+    use copperpour_ipc::transform::rotate_point;
     let boxes = kicad_boxes();
     let outline = |items: &[&str]| {
         let rects: Vec<Rect> = items.iter().map(|item| boxes[*item]).collect();
@@ -1490,7 +1491,7 @@ async fn a_board_naming_track_nets_by_number_is_refused_unless_routing_is_left()
 /// the README's `rotate_45`, through `PCB_TRACK::Rotate`.
 #[test]
 fn a_45_degree_turn_rounds_as_kicad_rounds_it() {
-    use super::repeat_layout::rotate_point;
+    use copperpour_ipc::transform::rotate_point;
     assert_eq!(
         rotate_point(150_000_000, 111_386_035, 45.0),
         (184_827_838, -27_304_197)

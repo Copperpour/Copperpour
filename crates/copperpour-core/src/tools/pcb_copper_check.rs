@@ -10,6 +10,10 @@
 //! and arc of another net on the same layer. Only overlap counts (distance
 //! zero or less): it is not a clearance check, and zones and the pads of other
 //! footprints, including others in the same batch, are not tested.
+//!
+//! `transform_pcb_items` moves vias, tracks and arcs with the footprints
+//! (#652), so [`check_live_with_copper`] also tests the pads of the footprints
+//! that stay against that copper where it is planned to go.
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::{CallToolResult, ToolContent};
@@ -182,6 +186,37 @@ fn net_label(net: &str) -> &str {
     }
 }
 
+/// Vias, tracks and arcs that move with the footprints, as KiCad will hold
+/// them once moved.
+#[derive(Default)]
+pub(crate) struct MovedCopper {
+    pub(crate) vias: Vec<kiapi::board::types::Via>,
+    pub(crate) tracks: Vec<kiapi::board::types::Track>,
+    pub(crate) arcs: Vec<kiapi::board::types::Arc>,
+}
+
+impl MovedCopper {
+    fn is_empty(&self) -> bool {
+        self.vias.is_empty() && self.tracks.is_empty() && self.arcs.is_empty()
+    }
+
+    fn ids(&self) -> impl Iterator<Item = String> + '_ {
+        let vias = self.vias.iter().map(|via| kiid(&via.id));
+        let tracks = self.tracks.iter().map(|track| kiid(&track.id));
+        vias.chain(tracks)
+            .chain(self.arcs.iter().map(|arc| kiid(&arc.id)))
+    }
+}
+
+/// What the check tested of the copper that moves: its counts, and how many
+/// pads of the footprints that stay it was tested against.
+struct MovedCoverage {
+    via_count: usize,
+    track_count: usize,
+    arc_count: usize,
+    staying_pad_count: usize,
+}
+
 /// What the check found, and what it read to find it.
 pub(crate) struct PlacementCheck {
     poses: Vec<PlannedPose>,
@@ -191,6 +226,7 @@ pub(crate) struct PlacementCheck {
     via_count: usize,
     track_count: usize,
     arc_count: usize,
+    moved: Option<MovedCoverage>,
 }
 
 impl PlacementCheck {
@@ -200,7 +236,7 @@ impl PlacementCheck {
 
     /// The `copper_check` object of a response, built from the check alone.
     pub(crate) fn report(&self) -> Value {
-        json!({
+        let mut report = json!({
             "status": if self.has_conflicts() { "conflicts" } else { "clear" },
             "conflict_count": self.conflicts.len(),
             "conflicts": self.conflicts,
@@ -211,7 +247,15 @@ impl PlacementCheck {
                 "track_count": self.track_count,
                 "arc_count": self.arc_count,
             },
-        })
+        });
+        if let Some(moved) = &self.moved {
+            let coverage = &mut report["coverage"];
+            coverage["moved_via_count"] = json!(moved.via_count);
+            coverage["moved_track_count"] = json!(moved.track_count);
+            coverage["moved_arc_count"] = json!(moved.arc_count);
+            coverage["staying_pad_count"] = json!(moved.staying_pad_count);
+        }
+        report
     }
 
     fn placements(&self) -> Vec<Value> {
@@ -227,14 +271,18 @@ impl PlacementCheck {
             .collect()
     }
 
+    /// Each conflict in words, as a refusal's reasons name it.
+    pub(crate) fn conflict_reasons(&self) -> Vec<String> {
+        self.conflicts
+            .iter()
+            .map(CopperConflict::describe)
+            .collect()
+    }
+
     /// The refusal for conflicts the caller did not allow. Nothing was sent
     /// to KiCad but reads, which is what makes `plan_blocked` honest.
     pub(crate) fn blocked_result(&self, operation: &str) -> CallToolResult {
-        let reasons: Vec<String> = self
-            .conflicts
-            .iter()
-            .map(CopperConflict::describe)
-            .collect();
+        let reasons = self.conflict_reasons();
         let shown = reasons
             .iter()
             .take(3)
@@ -375,6 +423,21 @@ pub(crate) fn check_live(
     requests: &[PoseRequest],
     ignored: &HashSet<String>,
 ) -> anyhow::Result<PlacementCheck> {
+    check_live_with_copper(client, document, requests, ignored, None)
+}
+
+/// As [`check_live`], with `moved` the vias, tracks and arcs that move with
+/// the footprints, at their planned place. The moved pads are tested against
+/// the copper that stays, `moved` left out with `ignored`; and the pads of
+/// every footprint that stays, where they stand, against `moved`. So no pad
+/// ends up on another net's copper, whichever of the two moved. Reads only.
+pub(crate) fn check_live_with_copper(
+    client: &KiCadIpcClient,
+    document: DocumentSpecifier,
+    requests: &[PoseRequest],
+    ignored: &HashSet<String>,
+    moved: Option<&MovedCopper>,
+) -> anyhow::Result<PlacementCheck> {
     use kiapi::common::types::KiCadObjectType as Kot;
 
     let mut footprints = Vec::new();
@@ -387,7 +450,7 @@ pub(crate) fn check_live(
         }
     }
     let poses = plan_poses(&footprints, requests)?;
-    test_copper(client, document, poses, ignored).map_err(|error| {
+    test_copper(client, document, poses, &footprints, ignored, moved).map_err(|error| {
         // Copperpour's refusal, over the failure it rests on (#240).
         let refusal = PreflightRefusal::check_incomplete(
             "the copper check could not complete, so nothing was moved",
@@ -421,12 +484,15 @@ pub(crate) fn refusal_kind(
 }
 
 /// Test the planned pads against the board's vias, tracks and arcs, less
-/// those in `ignored`.
+/// those in `ignored` and in `moved`; and the pads of the footprints that
+/// stay against `moved`.
 fn test_copper(
     client: &KiCadIpcClient,
     document: DocumentSpecifier,
     poses: Vec<PlannedPose>,
+    footprints: &[kiapi::board::types::FootprintInstance],
     ignored: &HashSet<String>,
+    moved: Option<&MovedCopper>,
 ) -> anyhow::Result<PlacementCheck> {
     use kiapi::common::types::KiCadObjectType as Kot;
 
@@ -438,8 +504,16 @@ fn test_copper(
         via_count: 0,
         track_count: 0,
         arc_count: 0,
+        moved: moved.map(|moved| MovedCoverage {
+            via_count: moved.vias.len(),
+            track_count: moved.tracks.len(),
+            arc_count: moved.arcs.len(),
+            staying_pad_count: 0,
+        }),
     };
-    if check.poses.iter().all(|pose| pose.pads.is_empty()) {
+    let empty = MovedCopper::default();
+    let moved = moved.unwrap_or(&empty);
+    if check.poses.iter().all(|pose| pose.pads.is_empty()) && moved.is_empty() {
         return Ok(check);
     }
 
@@ -467,56 +541,45 @@ fn test_copper(
         client.get_items_in(document.clone(), Kot::KotPcbArc)?,
         "kiapi.board.types.Arc",
     )?;
-    vias.retain(|via| !ignored.contains(&kiid(&via.id)));
-    tracks.retain(|track| !ignored.contains(&kiid(&track.id)));
-    arcs.retain(|arc| !ignored.contains(&kiid(&arc.id)));
+    let moving: HashSet<String> = moved.ids().collect();
+    let stays = |id: &Option<kiapi::common::types::Kiid>| {
+        let id = kiid(id);
+        !ignored.contains(&id) && !moving.contains(&id)
+    };
+    vias.retain(|via| stays(&via.id));
+    tracks.retain(|track| stays(&track.id));
+    arcs.retain(|arc| stays(&arc.id));
     check.via_count = vias.len();
     check.track_count = tracks.len();
     check.arc_count = arcs.len();
+    let staying = staying_poses(client, &document, footprints, &check.poses, moved, &copper)?;
 
     // `GetPadShapeAsPolygon` answers for layers a pad has no copper on, so
     // presence decides which layers hold copper. A pair KiCad leaves out or
     // calls unknown is tested as present: a needless test, never a missed one.
     let via_ids: Vec<String> = vias.iter().map(|via| kiid(&via.id)).collect();
+    let moved_via_ids: Vec<String> = moved.vias.iter().map(|via| kiid(&via.id)).collect();
     let mut ids: Vec<String> = check
         .poses
         .iter()
+        .chain(&staying)
         .flat_map(|pose| pose.pads.iter().map(|pad| pad.kiid.clone()))
         .collect();
-    ids.extend(via_ids.iter().cloned());
+    ids.extend(via_ids.iter().chain(&moved_via_ids).cloned());
     let presence = client.check_padstack_presence_in(document.clone(), &ids, &copper)?;
     let present = |id: &str, layer: BoardLayer| {
         presence.get(&(id.to_string(), layer as i32))
             != Some(&kiapi::board::commands::PadstackPresence::PspNotPresent)
     };
-
-    let mut found = Vec::new();
-    let mut tested_pads = std::collections::HashSet::new();
-    for (layer_index, &layer) in copper.iter().enumerate() {
-        let on_layer: Vec<(usize, usize)> = check
-            .poses
-            .iter()
-            .enumerate()
-            .flat_map(|(pose_index, pose)| {
-                pose.pads
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, pad)| present(&pad.kiid, layer))
-                    .map(move |(pad_index, _)| (pose_index, pad_index))
-            })
-            .collect();
-        if on_layer.is_empty() {
-            continue;
-        }
-        let layer_name = layer_label(layer);
-        let pad_ids: Vec<String> = on_layer
-            .iter()
-            .map(|&(pose, pad)| check.poses[pose].pads[pad].kiid.clone())
-            .collect();
-        let outlines = client.get_pad_shapes_as_polygons_in(document.clone(), &pad_ids, layer)?;
-
+    // The copper on `layer` of the given vias, tracks and arcs.
+    let obstacles_on = |layer: BoardLayer,
+                        vias: &[kiapi::board::types::Via],
+                        via_ids: &[String],
+                        tracks: &[kiapi::board::types::Track],
+                        arcs: &[kiapi::board::types::Arc]|
+     -> anyhow::Result<Vec<Obstacle>> {
         let mut obstacles = Vec::new();
-        for (via, id) in vias.iter().zip(&via_ids) {
+        for (via, id) in vias.iter().zip(via_ids) {
             if present(id, layer) {
                 obstacles.push(via_obstacle(via, layer)?);
             }
@@ -527,9 +590,48 @@ fn test_copper(
         for arc in arcs.iter().filter(|arc| arc.layer == layer as i32) {
             obstacles.push(arc_obstacle(arc)?);
         }
+        Ok(obstacles)
+    };
 
-        for (&(pose_index, pad_index), mut outline) in on_layer.iter().zip(outlines) {
-            let pose = &check.poses[pose_index];
+    let mut found = Vec::new();
+    let mut tested_pads = [HashSet::new(), HashSet::new()];
+    // Side 0: the moved pads, tested against the copper that stays; side 1:
+    // the pads that stay, tested against the copper that moves.
+    let sides = [&check.poses, &staying];
+    for (layer_index, &layer) in copper.iter().enumerate() {
+        let mut on_layer = Vec::new();
+        for (side, poses) in sides.iter().enumerate() {
+            for (pose_index, pose) in poses.iter().enumerate() {
+                for (pad_index, pad) in pose.pads.iter().enumerate() {
+                    if present(&pad.kiid, layer) {
+                        on_layer.push((side, pose_index, pad_index));
+                    }
+                }
+            }
+        }
+        if on_layer.is_empty() {
+            continue;
+        }
+        let layer_name = layer_label(layer);
+        let pad_ids: Vec<String> = on_layer
+            .iter()
+            .map(|&(side, pose, pad)| sides[side][pose].pads[pad].kiid.clone())
+            .collect();
+        let outlines = client.get_pad_shapes_as_polygons_in(document.clone(), &pad_ids, layer)?;
+        let obstacles = [
+            obstacles_on(layer, &vias, &via_ids, &tracks, &arcs)?,
+            obstacles_on(
+                layer,
+                &moved.vias,
+                &moved_via_ids,
+                &moved.tracks,
+                &moved.arcs,
+            )?,
+        ];
+
+        for (&(side, pose_index, pad_index), mut outline) in on_layer.iter().zip(outlines) {
+            let obstacles = &obstacles[side];
+            let pose = &sides[side][pose_index];
             let pad = &pose.pads[pad_index];
             for xform in &pose.xforms {
                 transform_polygon(&mut outline, xform);
@@ -540,13 +642,13 @@ fn test_copper(
                     pose.reference, pad.number
                 )
             })?;
-            tested_pads.insert(pad.kiid.clone());
+            tested_pads[side].insert(pad.kiid.clone());
             for (obstacle_index, obstacle) in obstacles.iter().enumerate() {
                 if same_net(&pad.net, &obstacle.net) || !region.touches_any(&obstacle.capsules) {
                     continue;
                 }
                 found.push((
-                    (pose_index, pad_index, layer_index, obstacle_index),
+                    (side, pose_index, pad_index, layer_index, obstacle_index),
                     CopperConflict {
                         reference: pose.reference.clone(),
                         pad: pad.number.clone(),
@@ -563,8 +665,97 @@ fn test_copper(
     }
     found.sort_by_key(|(order, _)| *order);
     check.conflicts = found.into_iter().map(|(_, conflict)| conflict).collect();
-    check.pad_count = tested_pads.len();
+    check.pad_count = tested_pads[0].len();
+    if let Some(coverage) = check.moved.as_mut() {
+        coverage.staying_pad_count = tested_pads[1].len();
+    }
     Ok(check)
+}
+
+/// The footprints that stay, where they stand, whose pads could touch
+/// `moved`: KiCad's box of each footprint (`GetBoundingBox`, without its
+/// text) grown by the touch tolerance must meet the box of a moved item's
+/// copper. That narrowing never drops a pad that could touch: a footprint's
+/// box holds every pad's box (`pcbnew/footprint.cpp:1802-1803` at 10.0.6), a
+/// pad's box its shape on every layer (`pcbnew/pad.cpp:1108-1140`), and the
+/// outline the test reads is drawn inside that shape (`ERROR_INSIDE`,
+/// `pcbnew/api/api_handler_pcb.cpp:1302-1303`); the moved copper's box is
+/// taken from the capsules the test itself uses, at their widest layer.
+fn staying_poses(
+    client: &KiCadIpcClient,
+    document: &DocumentSpecifier,
+    footprints: &[kiapi::board::types::FootprintInstance],
+    poses: &[PlannedPose],
+    moved: &MovedCopper,
+    copper: &[BoardLayer],
+) -> anyhow::Result<Vec<PlannedPose>> {
+    if moved.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut reach = Vec::new();
+    for via in &moved.vias {
+        for &layer in copper {
+            reach.push(via_obstacle(via, layer)?);
+        }
+    }
+    for track in &moved.tracks {
+        reach.push(track_obstacle(track)?);
+    }
+    for arc in &moved.arcs {
+        reach.push(arc_obstacle(arc)?);
+    }
+    let reach: Vec<(Point, Point)> = reach
+        .iter()
+        .flat_map(|obstacle| &obstacle.capsules)
+        .map(|capsule| {
+            let grow = capsule.radius_nm + TOUCH_TOLERANCE_NM;
+            (
+                (
+                    capsule.a.0.min(capsule.b.0) - grow,
+                    capsule.a.1.min(capsule.b.1) - grow,
+                ),
+                (
+                    capsule.a.0.max(capsule.b.0) + grow,
+                    capsule.a.1.max(capsule.b.1) + grow,
+                ),
+            )
+        })
+        .collect();
+    let moving: HashSet<&str> = poses.iter().map(|pose| pose.reference.as_str()).collect();
+    let staying: Vec<_> = footprints
+        .iter()
+        .filter(|footprint| !moving.contains(footprint_reference(footprint)))
+        .collect();
+    let ids: Vec<String> = staying
+        .iter()
+        .map(|footprint| kiid(&footprint.id))
+        .collect();
+    let boxes = client.get_item_boxes_in(document.clone(), &ids)?;
+    let mut near = Vec::new();
+    for (footprint, id) in staying.into_iter().zip(&ids) {
+        let bounds = boxes
+            .get(id)
+            .with_context(|| format!("KiCad gave no box for footprint {id}"))?;
+        let (at, size) = (
+            point(bounds.position.unwrap_or_default()),
+            point(bounds.size.unwrap_or_default()),
+        );
+        let meets = |(low, high): &(Point, Point)| {
+            low.0 <= at.0 + size.0 && at.0 <= high.0 && low.1 <= at.1 + size.1 && at.1 <= high.1
+        };
+        if reach.iter().any(meets) {
+            let reference = footprint_reference(footprint).to_string();
+            let held = Pose::held_by(footprint);
+            near.push(PlannedPose {
+                pads: pads_of(footprint, &reference)?,
+                reference,
+                current: held,
+                target: held,
+                xforms: Vec::new(),
+            });
+        }
+    }
+    Ok(near)
 }
 
 /// Resolve each request against the footprint it names, as the placement
@@ -635,7 +826,7 @@ fn plan_poses(
     .into())
 }
 
-fn footprint_reference(footprint: &kiapi::board::types::FootprintInstance) -> &str {
+pub(super) fn footprint_reference(footprint: &kiapi::board::types::FootprintInstance) -> &str {
     footprint
         .reference_field
         .as_ref()
@@ -1388,6 +1579,7 @@ mod geometry_tests {
             via_count: 0,
             track_count: 1,
             arc_count: 0,
+            moved: None,
         };
         let warning = |response: Value| {
             let result = check.applied_result(response);

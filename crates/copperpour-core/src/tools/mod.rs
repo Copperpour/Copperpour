@@ -66,6 +66,7 @@ mod pcb_copper_apply;
 pub(crate) mod pcb_copper_check;
 pub mod pcb_export;
 pub(crate) mod pcb_footprint_update;
+mod pcb_item_transform;
 pub mod pcb_routing;
 pub(crate) mod pcb_sync;
 mod pcb_teardrops;
