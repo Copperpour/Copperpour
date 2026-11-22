@@ -861,7 +861,8 @@ pub struct IpcBoardBounds {
 /// complete when it is not (#688).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpcUnavailableItemClass {
-    /// The class, by the name a response reports it under (`tables`).
+    /// The class, by the name a response reports it under (`generators`, or
+    /// `tables` on KiCad releases before 10.0.7).
     pub class: String,
     pub reason: UnavailableReason,
 }
@@ -869,7 +870,8 @@ pub struct IpcUnavailableItemClass {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnavailableReason {
     /// KiCad declined to list the class. KiCad 10.0.5 answers `GetItems` for
-    /// tables and generators with `AS_BAD_REQUEST`.
+    /// tables and generators with `AS_BAD_REQUEST`; KiCad 10.0.7+ lists tables
+    /// and still declines generators.
     Refused { status: String, message: String },
     /// KiCad listed items of a class the bundled protocol has no message for,
     /// so their KIIDs cannot be read to measure them.

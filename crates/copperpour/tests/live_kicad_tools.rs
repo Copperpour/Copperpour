@@ -756,6 +756,14 @@ fn real_kicad_open_documents_resolve_to_comparable_paths() {
     );
 }
 
+/// First KiCad release whose IPC API carries `kiapi.board.types.Table` and
+/// lists `KOT_PCB_TABLE` in `GetItems` (`board_types.proto`: `Since: 10.0.7`).
+const TABLES_MIN_KICAD_VERSION: (u32, u32, u32) = (10, 0, 7);
+
+fn kicad_lists_tables(version: &copperpour_ipc::IpcKiCadVersion) -> bool {
+    (version.major, version.minor, version.patch) >= TABLES_MIN_KICAD_VERSION
+}
+
 /// `get_board_extents` against a real KiCad (#688): the live answer comes from
 /// KiCad, not silently from the file, and on an unedited board it agrees with
 /// the saved file measured the way KiCad measures it.
@@ -803,18 +811,40 @@ fn board_extents_live_and_saved_agree_on_an_unedited_board() {
         "KiCad measured nothing: {live}"
     );
     assert_eq!(saved["skipped_item_count"], 0, "{saved}");
-    // KiCad 10 will not list tables or generators. The live answer names both
-    // with KiCad's own refusal instead of reading as complete (#688).
+    // KiCad 10 refuses to list generators. Releases before 10.0.7 also refuse
+    // tables; 10.0.7+ lists tables as `kiapi.board.types.Table`, so they are
+    // measured rather than named as unavailable (#688, #757).
+    let version = ipc
+        .get_kicad_version()
+        .expect("KiCad should report its version");
     let unavailable = live["unavailable_item_classes"]
         .as_array()
         .expect("the live answer names what KiCad would not list");
-    for class in ["tables", "generators"] {
+    let assert_refused = |class: &str| {
         let named = unavailable
             .iter()
             .find(|entry| entry["class"] == class)
             .unwrap_or_else(|| panic!("{class} is not named: {live}"));
         assert_eq!(named["reason"], "refused", "{live}");
         assert_eq!(named["kiapi_status"], "AS_BAD_REQUEST", "{live}");
+    };
+    assert_refused("generators");
+    if kicad_lists_tables(&version) {
+        assert!(
+            unavailable.iter().all(|entry| entry["class"] != "tables"),
+            "KiCad {} lists tables, so they should not be named as unavailable: {live}",
+            version.full_version
+        );
+        if let Some(saved_tables) = saved["unmeasured_item_counts"]["tables"].as_u64() {
+            assert_eq!(
+                live["measured_item_counts"]["tables"],
+                json!(saved_tables),
+                "KiCad {} should measure every table on the board: {live}",
+                version.full_version
+            );
+        }
+    } else {
+        assert_refused("tables");
     }
     assert_eq!(saved["unavailable_item_classes"], json!([]), "{saved}");
 
@@ -833,6 +863,178 @@ fn board_extents_live_and_saved_agree_on_an_unedited_board() {
             );
         }
     }
+}
+
+/// On KiCad 10.0.7+, a board containing a table gets that table measured in
+/// live `get_board_extents` (`measured_item_counts.tables` and the returned
+/// box), and `tables` is not listed in `unavailable_item_classes` (#757).
+#[test]
+#[ignore = "requires a running KiCad 10.0.7+ GUI with a disposable board open and its API socket"]
+fn board_extents_measures_a_table_on_live_kicad() {
+    let board = std::path::PathBuf::from(
+        test_env("LIVE_KICAD_BOARD")
+            .expect("COPPERPOUR_LIVE_KICAD_BOARD must name the disposable open board"),
+    );
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let ipc = KiCadIpcClient::new(&socket);
+    let document = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match ipc.find_open_board(&board) {
+                Ok(doc) => break doc,
+                Err(error)
+                    if error.to_string().contains("AS_NOT_READY")
+                        && std::time::Instant::now() < deadline => {}
+                Err(error) => panic!("KiCad did not open the disposable board: {error:#}"),
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    };
+    let version = ipc
+        .get_kicad_version()
+        .expect("KiCad should report its version");
+    if !kicad_lists_tables(&version) {
+        println!(
+            "skipping table measurement check on KiCad {} (< 10.0.7)",
+            version.full_version
+        );
+        return;
+    }
+
+    let mut mcp = McpProcess::spawn(&socket);
+    mcp.tool("load_toolset", json!({"name": "pcb_board"}));
+    let mut live_extents = || -> Value {
+        let result = mcp.tool(
+            "get_board_extents",
+            json!({"board": board, "board_source": "live"}),
+        );
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap())
+            .expect("get_board_extents did not return JSON")
+    };
+
+    let before = live_extents();
+    let base_x_max = before["x_max"].as_f64().unwrap_or(100.0);
+    let base_y_max = before["y_max"].as_f64().unwrap_or(100.0);
+    let before_tables = before["measured_item_counts"]["tables"]
+        .as_u64()
+        .unwrap_or(0);
+
+    // Place a 20x10 mm 1x1 table clearly past the board's current bottom-right.
+    let table_x0 = base_x_max + 40.0;
+    let table_y0 = base_y_max + 40.0;
+    let table_x1 = table_x0 + 20.0;
+    let table_y1 = table_y0 + 10.0;
+    let table = kiapi::board::types::Table {
+        column_count: 1,
+        column_widths: vec![20_000_000],
+        row_heights: vec![10_000_000],
+        layer: kiapi::board::types::BoardLayer::BlFSilkS as i32,
+        cells: vec![kiapi::board::types::TableCell {
+            text_box: Some(kiapi::board::types::BoardTextBox {
+                textbox: Some(kiapi::common::types::TextBox {
+                    top_left: Some(copperpour_ipc::builders::vec2(table_x0, table_y0)),
+                    bottom_right: Some(copperpour_ipc::builders::vec2(table_x1, table_y1)),
+                    text: "T1".to_string(),
+                    ..Default::default()
+                }),
+                layer: kiapi::board::types::BoardLayer::BlFSilkS as i32,
+                ..Default::default()
+            }),
+            column_span: 1,
+            row_span: 1,
+        }],
+        ..Default::default()
+    };
+    let created = ipc
+        .create_items_in_returning(
+            document.clone(),
+            vec![copperpour_ipc::builders::pack_any(
+                &table,
+                "kiapi.board.types.Table",
+            )],
+        )
+        .expect("KiCad 10.0.7+ should create a Table via IPC");
+    let created_item = created
+        .first()
+        .expect("KiCad should echo the created Table item");
+    assert!(
+        copperpour_ipc::builders::any_is(created_item, "kiapi.board.types.Table"),
+        "expected kiapi.board.types.Table, got {}",
+        created_item.type_url
+    );
+    let created_id = kiapi::board::types::Table::decode(created_item.value.as_slice())
+        .expect("created item should decode as Table")
+        .id
+        .expect("created table has a KIID")
+        .value;
+
+    // Clean up the test table on drop even if `live_extents()` panics.
+    struct TableCleanup<'a> {
+        ipc: &'a KiCadIpcClient,
+        document: kiapi::common::types::DocumentSpecifier,
+        id: Option<String>,
+    }
+    impl TableCleanup<'_> {
+        fn delete_now(&mut self) {
+            if let Some(id) = self.id.take() {
+                self.ipc
+                    .delete_items_in(self.document.clone(), vec![id])
+                    .expect("failed to delete test table");
+            }
+        }
+    }
+    impl Drop for TableCleanup<'_> {
+        fn drop(&mut self) {
+            if let Some(id) = self.id.take() {
+                let _ = self.ipc.delete_items_in(self.document.clone(), vec![id]);
+            }
+        }
+    }
+    let mut cleanup = TableCleanup {
+        ipc: &ipc,
+        document,
+        id: Some(created_id),
+    };
+
+    let after = live_extents();
+    cleanup.delete_now();
+    println!("before: {before}\nafter:  {after}");
+
+    assert_eq!(
+        after["item_count"],
+        json!(before["item_count"].as_u64().unwrap() + 1),
+        "item_count did not include the new table: {after}"
+    );
+    assert_eq!(
+        after["measured_item_counts"]["tables"],
+        json!(before_tables + 1),
+        "table was not counted as measured: {after}"
+    );
+    let unavailable = after["unavailable_item_classes"]
+        .as_array()
+        .expect("unavailable_item_classes array");
+    assert!(
+        unavailable.iter().all(|entry| entry["class"] != "tables"),
+        "tables must not be named as unavailable on KiCad {}: {after}",
+        version.full_version
+    );
+    assert!(
+        unavailable
+            .iter()
+            .any(|entry| entry["class"] == "generators"),
+        "generators should still be named as unavailable: {after}"
+    );
+    let after_x_max = after["x_max"].as_f64().unwrap();
+    let after_y_max = after["y_max"].as_f64().unwrap();
+    // KiCad inflates the table box by half its border stroke (~0.05 mm default).
+    assert!(
+        after_x_max >= table_x1 - 1e-3 && after_x_max <= table_x1 + 0.5,
+        "x_max ({after_x_max}) did not match table right edge {table_x1}: {after}"
+    );
+    assert!(
+        after_y_max >= table_y1 - 1e-3 && after_y_max <= table_y1 + 0.5,
+        "y_max ({after_y_max}) did not match table bottom edge {table_y1}: {after}"
+    );
 }
 
 fn tool_body(result: &Value) -> Value {

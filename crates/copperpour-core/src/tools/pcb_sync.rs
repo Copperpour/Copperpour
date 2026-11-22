@@ -360,10 +360,11 @@ struct SyncPlan {
 /// What added footprints were staged beside (#688).
 ///
 /// Additions go to the right of the board's measured extent. KiCad 10.0.5
-/// will not list tables or generators, so a live board is never measured
-/// whole: the evidence says which classes were left out, and tells a board
-/// with no items apart from one whose items could not be measured. Neither
-/// refuses the sync; staging is a starting position the caller can move.
+/// will not list tables or generators (KiCad 10.0.7+ lists tables and still
+/// declines generators), so a live board is never measured whole: the evidence
+/// says which classes were left out, and tells a board with no items apart from
+/// one whose items could not be measured. Neither refuses the sync; staging is
+/// a starting position the caller can move.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StagingEvidence {
     /// KiCad measured at least one item.
@@ -7889,6 +7890,9 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// A held board table in `ServedSync`: its KIID and bounding box `(x, y, width, height)` in mm.
+    type HeldTable = (&'static str, (f64, f64, f64, f64));
+
     /// What the mock's board holds before the sync touches it.
     #[derive(Clone, Default)]
     struct HeldBoard {
@@ -7932,7 +7936,14 @@ mod tests {
         /// As [`Self::new`], with KiCad also holding one board graphic whose
         /// box is `outline`, `(x, y, width, height)` in mm.
         async fn holding_outline(outline: Option<(f64, f64, f64, f64)>) -> Self {
-            Self::build(outline, Vec::new(), Readback::AsSent, HeldBoard::default()).await
+            Self::build(
+                outline,
+                Vec::new(),
+                Vec::new(),
+                Readback::AsSent,
+                HeldBoard::default(),
+            )
+            .await
         }
 
         /// As [`Self::holding_outline`], with KiCad refusing to list each class
@@ -7941,21 +7952,29 @@ mod tests {
             outline: Option<(f64, f64, f64, f64)>,
             refused: Vec<copperpour_ipc::gen::kiapi::common::types::KiCadObjectType>,
         ) -> Self {
-            Self::build(outline, refused, Readback::AsSent, HeldBoard::default()).await
+            Self::build(
+                outline,
+                Vec::new(),
+                refused,
+                Readback::AsSent,
+                HeldBoard::default(),
+            )
+            .await
         }
 
         /// As [`Self::new`], with the board read back as `readback` says.
         async fn reading_back(readback: Readback) -> Self {
-            Self::build(None, Vec::new(), readback, HeldBoard::default()).await
+            Self::build(None, Vec::new(), Vec::new(), readback, HeldBoard::default()).await
         }
 
         /// As [`Self::new`], with KiCad already holding `held`.
         async fn holding(held: HeldBoard) -> Self {
-            Self::build(None, Vec::new(), Readback::AsSent, held).await
+            Self::build(None, Vec::new(), Vec::new(), Readback::AsSent, held).await
         }
 
         async fn build(
             outline: Option<(f64, f64, f64, f64)>,
+            held_tables: Vec<HeldTable>,
             refused: Vec<copperpour_ipc::gen::kiapi::common::types::KiCadObjectType>,
             readback: Readback,
             held: HeldBoard,
@@ -8049,6 +8068,7 @@ mod tests {
                         let footprints =
                             kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32;
                         let zones = kiapi::common::types::KiCadObjectType::KotPcbZone as i32;
+                        let tables = kiapi::common::types::KiCadObjectType::KotPcbTable as i32;
                         let items = match outline {
                             Some(_) if request.types.contains(&shapes) => {
                                 vec![crate::tools::pcb_board::board_mock::listed_item(
@@ -8079,6 +8099,15 @@ mod tests {
                                     _ => held_zones.clone(),
                                 }
                             }
+                            _ if request.types.contains(&tables) => held_tables
+                                .iter()
+                                .map(|(kiid, _)| {
+                                    crate::tools::pcb_board::board_mock::listed_item(
+                                        kiapi::common::types::KiCadObjectType::KotPcbTable,
+                                        kiid,
+                                    )
+                                })
+                                .collect(),
                             _ => Vec::new(),
                         };
                         return Some(copperpour_ipc::builders::pack_any(
@@ -8125,6 +8154,11 @@ mod tests {
                             |kiid| {
                                 if kiid == "outline" {
                                     return outline.expect("an outline to measure");
+                                }
+                                if let Some((_, bounds)) =
+                                    held_tables.iter().find(|(id, _)| *id == kiid)
+                                {
+                                    return *bounds;
                                 }
                                 assert!(
                                     held_kiids.iter().any(|held| held == kiid),
@@ -9073,6 +9107,40 @@ mod tests {
         // Still staged beside the measured outline.
         let x = plan["changes"][0]["position"]["x"].as_f64().unwrap();
         assert!(x > 155.0 && x < 165.0, "staged at x = {x}: {plan:#}");
+    }
+
+    /// On KiCad 10.0.7+, tables are listed and measured, so additions are
+    /// staged to the right of a table extending past the board outline and
+    /// `staging.unavailable_item_classes` names only generators.
+    #[tokio::test]
+    async fn staging_measures_tables_when_kicad_lists_them() {
+        use copperpour_ipc::gen::kiapi::common::types::KiCadObjectType as Kind;
+
+        let served = ServedSync::build(
+            Some((100.0, 80.0, 50.0, 40.0)),
+            vec![("board-table", (200.0, 80.0, 30.0, 20.0))],
+            vec![Kind::KotPcbGenerator],
+            Readback::AsSent,
+            HeldBoard::default(),
+        )
+        .await;
+
+        let plan = served
+            .dry_run(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(
+            plan["staging"],
+            serde_json::json!({
+                "basis": "partial_geometry",
+                "unavailable_item_classes": [refused_class("generators")],
+            }),
+            "{plan:#}"
+        );
+        // Staged past the table's right edge (230 mm), not the outline's (150 mm).
+        let x = plan["changes"][0]["position"]["x"].as_f64().unwrap();
+        assert!(x > 235.0 && x < 245.0, "staged at x = {x}: {plan:#}");
     }
 
     /// A board where KiCad measured nothing but would not list some classes is

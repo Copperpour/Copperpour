@@ -1454,8 +1454,8 @@ pub fn tools() -> Vec<ToolDef> {
              so unsaved edits count; 'board_source' selects that. An answer from the \
              saved file names, in 'unmeasured_item_counts', what it could not measure. \
              A live answer names, in 'unavailable_item_classes', each item class KiCad \
-             would not list, with KiCad's answer: KiCad 10 lists neither tables nor \
-             generators.",
+             would not list, with KiCad's answer: KiCad 10 refuses generators, and \
+             releases before 10.0.7 also refuse tables.",
             json!({
                 "type": "object",
                 "properties": {
@@ -4078,6 +4078,18 @@ pub(crate) mod board_mock {
                         ..Default::default()
                     },
                     "kiapi.board.types.Track",
+                )
+            }
+            kiapi::common::types::KiCadObjectType::KotPcbTable => {
+                copperpour_ipc::builders::pack_any(
+                    &board::Table {
+                        id,
+                        column_count: 1,
+                        column_widths: vec![20_000_000],
+                        locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+                        ..Default::default()
+                    },
+                    "kiapi.board.types.Table",
                 )
             }
             other => panic!("the double lists no {other:?}"),

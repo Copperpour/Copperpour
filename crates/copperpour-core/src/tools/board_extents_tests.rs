@@ -67,6 +67,8 @@ enum ClassAnswer {
     Fail,
     /// `count` items of a type the bundled protocol has no message for.
     ListUnknown(usize),
+    /// A `Table` item with corrupt protobuf bytes, to pin the decode failure path.
+    ListMalformedTable,
 }
 
 /// The classes KiCad 10.0.5 refuses to list that a bounds read asks for.
@@ -139,10 +141,14 @@ fn spawn_kicad(
             }
             Some(ClassAnswer::ListUnknown(count)) => (0..count)
                 .map(|i| prost_types::Any {
-                    type_url: "type.googleapis.com/kiapi.board.types.Table".to_string(),
-                    value: format!("table {i}").into_bytes(),
+                    type_url: "type.googleapis.com/kiapi.board.types.Generator".to_string(),
+                    value: format!("generator {i}").into_bytes(),
                 })
                 .collect(),
+            Some(ClassAnswer::ListMalformedTable) => vec![prost_types::Any {
+                type_url: "type.googleapis.com/kiapi.board.types.Table".to_string(),
+                value: b"not valid table protobuf".to_vec(),
+            }],
             None => items
                 .iter()
                 .filter(|(kind, _, _)| asked.types.contains(&(*kind as i32)))
@@ -355,25 +361,84 @@ async fn a_measured_class_kicad_refuses_is_named_not_dropped() {
     assert_eq!(body["sources"], json!({ "bounds": "ipc" }));
 }
 
-/// A KiCad that does list tables lists a type the bundled protocol cannot read,
-/// so their KIIDs cannot be measured. They are counted rather than dropped.
+/// KiCad 10.0.7+ lists tables as `kiapi.board.types.Table`. When a board holds
+/// a table, its KIID is measured with the other classes, expanding the live
+/// extent, and only generators remain in `unavailable_item_classes`.
 #[tokio::test]
-async fn tables_a_kicad_lists_are_counted_when_they_cannot_be_measured() {
-    let answers = vec![
-        (Kind::KotPcbTable, ClassAnswer::ListUnknown(2)),
-        (Kind::KotPcbGenerator, ClassAnswer::Refuse),
-    ];
+async fn tables_a_kicad_lists_are_measured_in_the_live_extent() {
+    let mut items = LIVE_ITEMS.to_vec();
+    items.push((Kind::KotPcbTable, "live-table", (250.0, 200.0, 20.0, 10.0)));
+    let answers = vec![(Kind::KotPcbGenerator, ClassAnswer::Refuse)];
+    let scene = Scene::build(move |board| Some(spawn_kicad(board, items, answers))).await;
+    let body = scene.body(Some("live")).await;
+    assert_close(extent(&body), (190.0, 140.0, 270.0, 210.0));
+    assert_eq!(body["item_count"], json!(4));
+    assert_eq!(
+        body["measured_item_counts"],
+        json!({ "footprints": 1, "shapes": 1, "tables": 1, "tracks": 1 })
+    );
+    assert_eq!(
+        body["unavailable_item_classes"],
+        json!([refused("generators")])
+    );
+}
+
+/// On KiCad 10.0.7+ holding a board with no tables, listing tables succeeds
+/// with zero items, so `tables` is absent from both `measured_item_counts` and
+/// `unavailable_item_classes`.
+#[tokio::test]
+async fn a_kicad_that_lists_zero_tables_names_only_generators() {
+    let answers = vec![(Kind::KotPcbGenerator, ClassAnswer::Refuse)];
+    let scene =
+        Scene::build(move |board| Some(spawn_kicad(board, LIVE_ITEMS.to_vec(), answers))).await;
+    let body = scene.body(Some("live")).await;
+    assert_close(extent(&body), (190.0, 140.0, 230.0, 170.0));
+    assert_eq!(body["item_count"], json!(3));
+    assert_eq!(
+        body["measured_item_counts"],
+        json!({ "footprints": 1, "shapes": 1, "tracks": 1 })
+    );
+    assert_eq!(
+        body["unavailable_item_classes"],
+        json!([refused("generators")])
+    );
+}
+
+/// A KiCad that does list generators lists a type the bundled protocol cannot
+/// read, so their KIIDs cannot be measured. They are counted rather than dropped.
+#[tokio::test]
+async fn generators_a_kicad_lists_are_counted_when_they_cannot_be_measured() {
+    let answers = vec![(Kind::KotPcbGenerator, ClassAnswer::ListUnknown(2))];
     let scene =
         Scene::build(move |board| Some(spawn_kicad(board, LIVE_ITEMS.to_vec(), answers))).await;
     let body = scene.body(None).await;
     assert_eq!(
         body["unavailable_item_classes"],
-        json!([
-            { "class": "tables", "reason": "undecodable", "listed_count": 2 },
-            refused("generators")
-        ])
+        json!([{ "class": "generators", "reason": "undecodable", "listed_count": 2 }])
     );
     assert_eq!(body["item_count"], json!(3));
+}
+
+/// Because `Table` is now a decoded class rather than an unreadable one, a
+/// corrupt `Table` payload fails the live read instead of being dropped or
+/// downgraded to `undecodable`.
+#[tokio::test]
+async fn a_malformed_table_fails_the_live_read_instead_of_being_dropped() {
+    let answers = vec![
+        (Kind::KotPcbTable, ClassAnswer::ListMalformedTable),
+        (Kind::KotPcbGenerator, ClassAnswer::Refuse),
+    ];
+    let scene =
+        Scene::build(move |board| Some(spawn_kicad(board, LIVE_ITEMS.to_vec(), answers))).await;
+    let result = scene.call(Some("live")).await;
+    assert!(result.is_error, "{}", body_text(&result));
+    let text = body_text(&result);
+    assert!(text.contains("kiapi.board.types.Table"), "{text}");
+    assert_eq!(
+        crate::mcp::error::extract_error_kind(&result).as_deref(),
+        Some("editor_unavailable"),
+        "{text}"
+    );
 }
 
 /// Any failure other than KiCad declining a class still fails the read by
