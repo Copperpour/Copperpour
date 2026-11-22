@@ -60,6 +60,17 @@ impl BoardSessionMemory {
         self.authorize_file_fallback_with(board, || editor_lock(board))
     }
 
+    /// Check the same close evidence without releasing a live observation.
+    pub(crate) fn permits_file_fallback_without_release(&self, board: &Path) -> bool {
+        let observed = self
+            .observed_live
+            .lock()
+            .expect("board-session memory poisoned");
+        file_fallback_permitted(observed.get(&board_key(board)).copied(), || {
+            editor_lock(board)
+        })
+    }
+
     fn authorize_file_fallback_with(
         &self,
         board: &Path,
@@ -70,16 +81,24 @@ impl BoardSessionMemory {
             .observed_live
             .lock()
             .expect("board-session memory poisoned");
-        let Some(lock_was_present) = observed.get(&key).copied() else {
-            return true;
-        };
         // Inspect under the memory lock so this evidence cannot clear a newer
         // live observation recorded concurrently.
-        if lock_was_present && matches!(inspect(), EditorLock::Absent) {
+        if file_fallback_permitted(observed.get(&key).copied(), inspect) {
             observed.remove(&key);
             return true;
         }
         false
+    }
+}
+
+fn file_fallback_permitted(
+    lock_was_present: Option<bool>,
+    inspect: impl FnOnce() -> EditorLock,
+) -> bool {
+    match lock_was_present {
+        None => true,
+        Some(true) => matches!(inspect(), EditorLock::Absent),
+        Some(false) => false,
     }
 }
 

@@ -303,6 +303,9 @@ pub(crate) fn for_unavailable_endpoint(endpoint: &IpcEndpoint, message: &str) ->
 /// Recovery guidance for a [`BoardTargetError`] refusal.
 pub(crate) fn for_board_target_error(error: &BoardTargetError) -> RecoveryGuidance {
     match error {
+        BoardTargetError::UnresolvedTransport { reason, message } => {
+            for_unreachable(*reason, None, &[], message)
+        }
         BoardTargetError::NoOpenDocuments { requested } => RecoveryGuidance {
             cause: "no_open_documents".to_string(),
             observed: "KiCad IPC is reachable, but KiCad reported no open PCB documents.".to_string(),
