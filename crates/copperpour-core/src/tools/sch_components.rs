@@ -312,7 +312,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_connected",
-            "REFUSED until implemented: moving a symbol while stretching its connected              wires is not built yet. Calling this returns an error naming              move_schematic_component as the working alternative — it moves the symbol              only, leaving wires where they are.",
+            "Not implemented: always refuses. Use move_schematic_component to move the symbol \
+             without moving its wires, then re-route or use connect_pins for the affected nets.",
             // No parameters: the handler refuses unconditionally, and the
             // schema-parameter guard (rightly) refuses a schema that advertises
             // arguments nothing reads. The old parameters are documented in
