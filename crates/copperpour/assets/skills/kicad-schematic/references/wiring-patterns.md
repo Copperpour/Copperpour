@@ -80,8 +80,9 @@
 For two-leg routes, `connect_pins`, `add_schematic_connection`, and `batch_connect_pins`
 prefer fewer symbol body crossings, then fewer label and field text crossings.
 Horizontal-first breaks ties. An elbow that would join another net is never used.
-The text score uses the text runs measured by `check_schematic_overlaps`,
-without label outlines. It does not measure free-text notes or sheet-pin names.
+The text score uses the text runs measured by `check_schematic_overlaps` in
+`sch_readability`, without label outlines. It does not measure free-text notes or
+sheet-pin names.
 
 ## Net Label Types
 

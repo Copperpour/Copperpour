@@ -101,9 +101,11 @@ mod sch_instance_repair;
 mod sch_label_rename;
 mod sch_layout_score;
 mod sch_pin_contacts;
+pub mod sch_readability;
 mod sch_shapes;
 mod sch_texts;
 mod sch_transfer;
+pub(crate) mod sch_wire_runs;
 pub mod sch_wiring;
 pub mod schematic_builder;
 #[cfg(test)]
@@ -2745,6 +2747,13 @@ pub(crate) fn symbol_body_style(node: &copperpour_sexp::SexpNode) -> u32 {
 
 /// Resolve the pins actually drawn by the selected unit and body style.
 fn drawn_symbol_pins(tree: &copperpour_sexp::SexpNode) -> Option<PlacedPinsByReference> {
+    drawn_symbol_pin_inventory(tree).into_iter().collect()
+}
+
+/// An entry for each placed symbol, including unresolved ones.
+fn drawn_symbol_pin_inventory(
+    tree: &copperpour_sexp::SexpNode,
+) -> Vec<Option<(copperpour_sexp::schematic::SymbolInstance, UnitPins)>> {
     use copperpour_sexp::schematic::{
         find_lib_symbol, resolve_lib_pins_for_unit_and_body_style, symbol_instance,
     };

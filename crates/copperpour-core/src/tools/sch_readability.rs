@@ -1,0 +1,149 @@
+//! Read-only checks of one saved schematic sheet's drawing and layout.
+
+use super::{
+    sch_analysis::handle_check_overlaps, sch_layout_score::handle_compare_schematic_layout,
+    sch_pin_contacts, sch_wire_runs, ToolDef,
+};
+use crate::tool;
+use serde_json::json;
+
+pub fn tools() -> Vec<ToolDef> {
+    vec![
+        overlap_tool_def(),
+        sch_wire_runs::tool_def(),
+        compare_tool_def(),
+        sch_pin_contacts::definition(),
+    ]
+}
+
+fn overlap_tool_def() -> ToolDef {
+    tool!(
+        "check_schematic_overlaps",
+        "Find overlapping symbols from their transformed drawings and pins (excluding free \
+             text): shared body area, a pin running into another symbol's body, or pins \
+             meeting anywhere but tip to tip. Pin-tip contact and touching edges are not \
+             reported. Also finds \
+             conflicting labels at the same location, colliding label and field text \
+             (`text_overlap`), wires drawn through a symbol's body (`wire_overlap`), \
+             wires crossing label text or visible power symbol Value text (`wire_label_overlap`), \
+             and wires crossing visible Reference or Value text on ordinary symbols \
+             (`wire_field_overlap`). \
+             Reports any symbol whose embedded \
+             geometry could not be resolved and used the origin fallback instead.",
+        json!({ "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "tolerance": {
+                        "type": "number",
+                        "description": "Coordinate tolerance in mm for label collisions and the origin fallback when library geometry is unavailable",
+                        "default": 0.5
+                    }
+                },
+                "required": ["schematic"] }),
+        |args, ctx| async move { handle_check_overlaps(args, ctx).await }
+    )
+}
+
+pub(super) fn compare_tool_def() -> ToolDef {
+    tool!(
+        "compare_schematic_layout",
+        "Score a saved schematic sheet, optionally comparing it with a saved baseline. \
+         Counts wires crossing visible Reference or Value text on ordinary symbols. \
+         Check pin connectivity and symbol identity before ranking layout changes. \
+         No writes, editor access, or ERC.",
+        json!({ "type": "object",
+            "properties": {
+                "schematic": { "type": "string", "description": "Path to the saved .kicad_sch sheet" },
+                "baseline": { "type": ["string", "null"], "description": "Path to an earlier saved copy of the same sheet" },
+                "removed_power_symbol_uuids": {
+                    "type": ["array", "null"],
+                    "items": { "type": "string" },
+                    "description": "UUIDs of power symbols intentionally removed from the baseline"
+                }
+            },
+            "required": ["schematic"] }),
+        |args, ctx| async move { handle_compare_schematic_layout(args, ctx).await }
+    )
+}
+
+#[cfg(test)]
+#[path = "sch_overlap_tests.rs"]
+mod overlap_tests;
+
+#[cfg(test)]
+async fn request(
+    handler: &crate::mcp::handler::McpHandler,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    handler
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+        }))
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{mcp::handler::McpHandler, tools::ServerConfig};
+
+    async fn assert_readability_route(name: &str) {
+        let handler = McpHandler::new(ServerConfig::default()).await.unwrap();
+        request(
+            &handler,
+            "tools/call",
+            json!({
+                "name": "load_toolset", "arguments": {"name": "sch_analysis"}
+            }),
+        )
+        .await;
+        let call = json!({"name": name, "arguments": {}});
+        let result = request(&handler, "tools/call", call.clone()).await;
+        assert_eq!(result["isError"], true);
+        let body: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["error"]["kind"], "toolset_not_loaded", "{body}");
+        assert_eq!(body["error"]["toolset"], "sch_readability", "{body}");
+        request(
+            &handler,
+            "tools/call",
+            json!({
+                "name": "load_toolset", "arguments": {"name": "sch_readability"}
+            }),
+        )
+        .await;
+        let loaded = request(&handler, "tools/list", json!({})).await;
+        assert!(loaded["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == name));
+    }
+
+    #[tokio::test]
+    async fn overlap_recovery_names_the_new_toolset() {
+        assert!(crate::tools::sch_analysis::tools()
+            .iter()
+            .all(|tool| tool.name != "check_schematic_overlaps"));
+        assert_readability_route("check_schematic_overlaps").await;
+    }
+
+    #[tokio::test]
+    async fn comparison_belongs_to_readability() {
+        assert_readability_route("compare_schematic_layout").await;
+    }
+
+    #[tokio::test]
+    async fn pin_contacts_belong_to_readability() {
+        assert_readability_route("find_pin_contacts").await;
+    }
+
+    #[tokio::test]
+    async fn wire_runs_belong_to_readability() {
+        assert_readability_route("check_schematic_wire_runs").await;
+    }
+}

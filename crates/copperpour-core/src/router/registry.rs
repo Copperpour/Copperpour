@@ -47,7 +47,12 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_analysis",
-        description: "Net connectivity, pin queries, trace paths, overlap/orphan detection",
+        description: "Net connectivity, pin queries, trace paths, and orphan detection",
+        category: "schematic",
+    },
+    ToolsetMeta {
+        name: "sch_readability",
+        description: "Check saved schematic sheets for overlaps, touching pins, and long or indirect wire runs, and compare layout scores",
         category: "schematic",
     },
     ToolsetMeta {
@@ -206,6 +211,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "sch_wiring" => Some(sch_wiring::tools()),
         "sch_bus" => Some(sch_bus::tools()),
         "sch_analysis" => Some(sch_analysis::tools()),
+        "sch_readability" => Some(sch_readability::tools()),
         "sch_batch" => Some(sch_batch::tools()),
         "sch_export" => Some(sch_export::tools()),
         "sch_hierarchy" => Some(sch_hierarchy::tools()),

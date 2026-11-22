@@ -1,6 +1,6 @@
 ### Add `compare_schematic_layout` (minor release)
 
-Load `sch_analysis` to score a saved `schematic` sheet. Pass `baseline` to compare
+Load `sch_readability` to score a saved `schematic` sheet. Pass `baseline` to compare
 two saved copies of the same sheet. The tool reads neither unsaved editor changes
 nor other sheets. It writes nothing and does not run KiCad.
 

@@ -110,7 +110,7 @@ impl PointIndex {
 /// Wires bucketed by the coordinate they hold constant: a horizontal wire can
 /// only be met in its own row, a vertical one in its own column. Mirrors
 /// `point_on_segment`, which answers `false` for anything diagonal.
-struct WireIndex<'a> {
+pub(super) struct WireIndex<'a> {
     tol: f64,
     rows: HashMap<i64, Vec<&'a Wire>>,
     columns: HashMap<i64, Vec<&'a Wire>>,
@@ -121,7 +121,7 @@ impl<'a> WireIndex<'a> {
         self.tol
     }
 
-    fn build(wires: &'a [Wire], tol: f64) -> Self {
+    pub(super) fn build(wires: &'a [Wire], tol: f64) -> Self {
         let mut index = WireIndex {
             tol,
             rows: HashMap::new(),
@@ -150,9 +150,16 @@ impl<'a> WireIndex<'a> {
         let cell_x = bucket(x, self.tol);
         let cell_y = bucket(y, self.tol);
         (-1..=1).flat_map(move |delta| {
-            let column = self.columns.get(&(cell_x + delta)).into_iter().flatten();
-            let row = self.rows.get(&(cell_y + delta)).into_iter().flatten();
-            column.chain(row)
+            let column = cell_x
+                .checked_add(delta)
+                .and_then(|cell| self.columns.get(&cell));
+            let row = cell_y
+                .checked_add(delta)
+                .and_then(|cell| self.rows.get(&cell));
+            column
+                .into_iter()
+                .flatten()
+                .chain(row.into_iter().flatten())
         })
     }
 
@@ -160,6 +167,22 @@ impl<'a> WireIndex<'a> {
     fn hits(&self, x: f64, y: f64) -> impl Iterator<Item = &&'a Wire> {
         self.candidates(x, y).filter(move |wire| {
             point_on_segment(x, y, wire.x1, wire.y1, wire.x2, wire.y2, self.tol)
+        })
+    }
+
+    pub(super) fn interior_hits(
+        &self,
+        x: f64,
+        y: f64,
+        point_key: fn(f64, f64) -> NetRoot,
+    ) -> impl Iterator<Item = &'a Wire> + '_ {
+        let p = point_key(x, y);
+        self.hits(x, y).copied().filter(move |w| {
+            let a = point_key(w.x1, w.y1);
+            let b = point_key(w.x2, w.y2);
+            a.min(b) < p
+                && p < a.max(b)
+                && ((a.0 == b.0 && a.0 == p.0) || (a.1 == b.1 && a.1 == p.1))
         })
     }
 
@@ -243,6 +266,7 @@ pub(super) type ScopedNetName = (String, u8);
 /// questions they actually ask — [`root_at`](Self::root_at) for a net's
 /// identity, [`name_of_root`](Self::name_of_root) for what it is called.
 pub(crate) struct NetGraph {
+    point_key: fn(f64, f64) -> NetRoot,
     /// Every name at a point, not just the winning one. A rail label written
     /// over the power symbol that names it puts two names on one coordinate,
     /// and dropping the loser would keep it out of
@@ -259,8 +283,9 @@ pub(crate) struct NetGraph {
 }
 
 impl NetGraph {
-    fn new() -> Self {
+    fn new(point_key: fn(f64, f64) -> NetRoot) -> Self {
         NetGraph {
+            point_key,
             point_nets: HashMap::new(),
             parent: HashMap::new(),
             root_names: HashMap::new(),
@@ -292,8 +317,8 @@ impl NetGraph {
     }
 
     fn add_wire(&mut self, w: &Wire) {
-        let a = pt_key(w.x1, w.y1);
-        let b = pt_key(w.x2, w.y2);
+        let a = (self.point_key)(w.x1, w.y1);
+        let b = (self.point_key)(w.x2, w.y2);
         self.ensure(a);
         self.ensure(b);
         self.union(a, b);
@@ -304,7 +329,7 @@ impl NetGraph {
     }
 
     fn add_driver(&mut self, x: f64, y: f64, net: &str, kind: LabelKind, power_local: bool) {
-        let k = pt_key(x, y);
+        let k = (self.point_key)(x, y);
         self.ensure(k);
         let held = self.point_nets.entry(k).or_default();
         // Kept whole, and ranked only when a name has to be *chosen*: every
@@ -331,7 +356,7 @@ impl NetGraph {
     /// compare net *names*: a net carrying two names has one root and would
     /// fail a name comparison against itself.
     pub(crate) fn root_at(&mut self, x: f64, y: f64) -> NetRoot {
-        self.find(pt_key(x, y))
+        self.find((self.point_key)(x, y))
     }
 
     /// What the net at `root` is called, or `None` when no label names it.
@@ -517,25 +542,42 @@ fn seed_drawn_graph(
     sheet_pins: &[(f64, f64)],
     on_wire: &WireIndex,
 ) -> NetGraph {
-    let mut graph = NetGraph::new();
+    seed_drawn_graph_with(
+        wires,
+        labels,
+        junctions,
+        sheet_pins,
+        pt_key,
+        |graph, x, y, _| {
+            for w in on_wire.hits(x, y) {
+                graph.union(pt_key(x, y), pt_key(w.x1, w.y1));
+            }
+        },
+    )
+}
+
+fn seed_drawn_graph_with(
+    wires: &[Wire],
+    labels: &[Label],
+    junctions: &[(f64, f64)],
+    sheet_pins: &[(f64, f64)],
+    point_key: fn(f64, f64) -> NetRoot,
+    attach: impl Fn(&mut NetGraph, f64, f64, Option<LabelKind>),
+) -> NetGraph {
+    let mut graph = NetGraph::new(point_key);
     for wire in wires {
         graph.add_wire(wire);
     }
-    let attach = |graph: &mut NetGraph, x: f64, y: f64| {
-        for wire in on_wire.hits(x, y) {
-            graph.union(pt_key(x, y), pt_key(wire.x1, wire.y1));
-        }
-    };
     for label in labels {
         graph.add_label(label.x, label.y, &label.net, label.kind);
-        attach(&mut graph, label.x, label.y);
+        attach(&mut graph, label.x, label.y, Some(label.kind));
     }
     for &(x, y) in junctions {
-        graph.ensure(pt_key(x, y));
-        attach(&mut graph, x, y);
+        graph.ensure(point_key(x, y));
+        attach(&mut graph, x, y, None);
     }
     for &(x, y) in sheet_pins {
-        graph.ensure(pt_key(x, y));
+        graph.ensure(point_key(x, y));
     }
     graph
 }
@@ -622,6 +664,36 @@ pub(super) fn snapshot_net_graph(tree: &SexpNode, wires: &[Wire]) -> NetGraph {
         let local = label.uuid.is_some_and(|uuid| local_power.contains(&uuid));
         graph.add_driver(label.x, label.y, &label.net, label.kind, local);
     }
+    graph.merge_named_nets();
+    graph.name_nets();
+    graph
+}
+
+/// Use the run check's saved-coordinate equality, without changing the
+/// tolerance of the older connectivity tools.
+pub(super) fn wire_run_net_graph(
+    tree: &SexpNode,
+    wires: &[Wire],
+    labels: &[Label],
+    point_key: fn(f64, f64) -> NetRoot,
+) -> NetGraph {
+    let index = WireIndex::build(wires, COINCIDENT_TOLERANCE);
+    let mut graph = seed_drawn_graph_with(
+        wires,
+        labels,
+        &extract_junctions(tree),
+        &extract_sheet_pins(tree),
+        point_key,
+        |graph, x, y, kind| {
+            // A power symbol names its pin; only a junction or drawn label joins
+            // that coordinate to a wire that passes through it.
+            if kind != Some(LabelKind::PowerSymbol) {
+                for w in index.interior_hits(x, y, point_key) {
+                    graph.union(point_key(x, y), point_key(w.x1, w.y1));
+                }
+            }
+        },
+    );
     graph.merge_named_nets();
     graph.name_nets();
     graph
@@ -970,6 +1042,11 @@ impl PinNetNames {
         if pin.electrical_type == "no_connect" {
             return None;
         }
+        self.pin_name_of_root(root)
+    }
+
+    /// The pin-derived name only. Callers prefer the graph's explicit name.
+    pub(crate) fn pin_name_of_root(&self, root: NetRoot) -> Option<String> {
         self.names.get(&root).cloned()
     }
 }

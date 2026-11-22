@@ -1,6 +1,6 @@
 ### Add `find_pin_contacts` (minor release)
 
-Load `sch_analysis` and call `find_pin_contacts` with `schematic` to examine one saved
+Load `sch_readability` and call `find_pin_contacts` with `schematic` to examine one saved
 sheet without KiCad. `contacts` lists coincident visible pins of distinct placed symbols
 and the wires, junctions and labels at each contact. These wires are geometric
 witnesses, not a statement that the net graph joins them to the pins.
