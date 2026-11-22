@@ -3209,6 +3209,15 @@ pub fn lib_symbol_not_found_error(
     lib_id: &str,
     src: &dyn copperpour_schematic_editor::library::SymbolLibrarySource,
 ) -> CallToolResult {
+    CallToolResult::error(lib_symbol_not_found_message(lib_id, src))
+}
+
+/// The text of [`lib_symbol_not_found_error`], for a caller that reports it
+/// per item rather than failing the whole call.
+pub(crate) fn lib_symbol_not_found_message(
+    lib_id: &str,
+    src: &dyn copperpour_schematic_editor::library::SymbolLibrarySource,
+) -> String {
     let library = lib_id.split(':').next().unwrap_or(lib_id);
     let mut msg = if !copperpour_schematic_editor::library::library_exists(library, src) {
         // Naming only KICAD10_SYMBOL_DIR misleads when the library *is*
@@ -3233,14 +3242,16 @@ pub fn lib_symbol_not_found_error(
             suggestions.join(", ")
         ));
     }
-    CallToolResult::error(msg)
+    msg
 }
 
 /// Insert a symbol definition into the schematic's lib_symbols section.
 /// Creates the lib_symbols section if it doesn't exist. Skips if already present.
 ///
-/// Returns `false` when `lib_id` cannot be resolved — callers must surface
-/// that as an error rather than writing a definition-less instance (#34).
+/// Returns `false`, leaving `content` unchanged, when `lib_id` cannot be
+/// resolved or the definition could not be placed in `lib_symbols` — callers
+/// must surface that as an error rather than writing a definition-less
+/// instance (#34).
 #[must_use]
 pub fn ensure_lib_symbol_in_schematic(
     content: &mut String,
@@ -3264,23 +3275,56 @@ pub fn ensure_lib_symbol_in_schematic(
             None => return false,
         };
 
-    // Ensure lib_symbols section exists
-    if !content.contains("(lib_symbols") {
-        if let Some(insert_after) = content.find(")\n") {
-            content.insert_str(insert_after + 2, "\n\t(lib_symbols\n\t)\n");
-        }
+    // Edit a copy, so a definition that does not land leaves `content` as it
+    // was for the caller to save or discard.
+    let mut staged = content.clone();
+    // String-aware: a title or property may contain the text "(lib_symbols".
+    let section = |text: &str| {
+        copperpour_sexp::writer::find_block_starts(text, "lib_symbols")
+            .into_iter()
+            .next()
+    };
+    if section(&staged).is_none() {
+        // KiCad writes lib_symbols right after the sheet's header items.
+        let header = [
+            "version",
+            "generator",
+            "generator_version",
+            "uuid",
+            "paper",
+            "title_block",
+        ];
+        let Some(after) = copperpour_sexp::writer::find_direct_child_blocks(&staged, "kicad_sch")
+            .into_iter()
+            .take_while(|&(start, end)| {
+                copperpour_sexp::parse_sexp(&staged[start..end])
+                    .ok()
+                    .and_then(|node| node.head().map(|head| header.contains(&head)))
+                    .unwrap_or(false)
+            })
+            .last()
+            .map(|(_, end)| end)
+        else {
+            return false;
+        };
+        staged.insert_str(after, "\n\t(lib_symbols\n\t)");
     }
-
-    // Find the closing paren of lib_symbols and insert before it
-    if let Some(ls_start) = content.find("(lib_symbols") {
-        if let Some((_, block_end)) =
-            copperpour_sexp::writer::find_balanced_block(content, ls_start)
-        {
-            let ls_end = block_end - 1;
-            content.insert_str(ls_end, &format!("\n{}\n\t", indent_lib_symbol(&sym_def)));
-        }
+    if let Some((_, block_end)) = section(&staged)
+        .and_then(|start| copperpour_sexp::writer::find_balanced_block(&staged, start))
+    {
+        staged.insert_str(
+            block_end - 1,
+            &format!("\n{}\n\t", indent_lib_symbol(&sym_def)),
+        );
     }
-    true
+    // Report what the content now holds, not that an insert was attempted.
+    let embedded = copperpour_sexp::writer::find_direct_child_blocks(&staged, "lib_symbols")
+        .iter()
+        .any(|&(start, end)| lib_symbol_name(&staged[start..end]).as_deref() == Some(lib_id));
+    if embedded {
+        *content = staged;
+    }
+    embedded
 }
 
 /// A resolved library definition indented to sit inside `lib_symbols`. Shared
