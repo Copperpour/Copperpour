@@ -74,8 +74,14 @@
 | Pin to a named net (signal bus) | `connect_to_net` | Adds stub + label, clean |
 | Pin to power rail | `add_power_symbol` | Creates net automatically |
 | Multiple pins to same net | `batch_connect_to_net` | Single atomic write |
-| Two points already known by coordinates | `add_schematic_connection` | Auto H+V routing |
+| Two points already known by coordinates | `add_schematic_connection` | Straight wire or clearer safe elbow |
 | Simple horizontal/vertical wire | `add_wire` | Manual, use sparingly |
+
+For two-leg routes, `connect_pins`, `add_schematic_connection`, and `batch_connect_pins`
+prefer fewer symbol body crossings, then fewer label and field text crossings.
+Horizontal-first breaks ties. An elbow that would join another net is never used.
+The text score uses the text runs measured by `check_schematic_overlaps`,
+without label outlines. It does not measure free-text notes or sheet-pin names.
 
 ## Net Label Types
 

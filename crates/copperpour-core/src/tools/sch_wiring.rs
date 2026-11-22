@@ -18,9 +18,11 @@ use copperpour_sexp::{
     geometry::{round6, snap_point},
     parser::parse_sexp,
     schematic::{
-        extract_symbol_instances, extract_wires, find_t_junctions, format_junction, format_wire,
-        parse_at, pin_endpoint, read_schematic, wire_end_needs_junction, Wire,
+        extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
+        format_junction, format_wire, parse_at, pin_endpoint, read_schematic,
+        symbol_geometry_for_instance, wire_end_needs_junction, Wire,
     },
+    text_bounds::text_extents,
     writer::{
         apply_edits, direct_children_with_tag, find_balanced_block, find_block_starts,
         find_block_with_leading_whitespace, find_direct_child_blocks, find_enclosing_block,
@@ -403,8 +405,8 @@ pub fn tools() -> Vec<ToolDef> {
             "connect_pins",
             "Connect two component pins by reference and pin number. \
              Looks up pin coordinates automatically and routes a wire between them, \
-             horizontal leg first, or vertical first when that would join another net's \
-             pin, label or sheet pin. Refuses with plan_blocked when both would. Reports \
+             preferring an elbow that crosses fewer symbol bodies, then fewer label and field \
+             text runs. Refuses with plan_blocked if no candidate avoids joining another net. Reports \
              the drawn path, corner included.",
             json!({
                 "type": "object",
@@ -421,10 +423,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_schematic_connection",
-            "Connect two schematic points directly with a wire (auto-routes H+V segments, \
-             or V+H when H+V would join another net's pin, label or sheet pin; refuses with \
-             plan_blocked when both would). Use connect_pins if you have component \
-             references instead of coordinates.",
+            "Connect two schematic points with a straight wire or a two-leg elbow. Routes as \
+             connect_pins does and reports the drawn path. Refuses with plan_blocked if no \
+             candidate avoids joining another net. Use connect_pins if you have references \
+             instead of coordinates.",
             json!({
                 "type": "object",
                 "properties": {
@@ -674,13 +676,12 @@ pub(crate) struct Routed {
     pub(crate) path: Vec<(f64, f64)>,
 }
 
-/// Route a wire between two points: a single straight wire when axis-aligned,
-/// otherwise an H-then-V L-bend, or V-then-H when the first would join another
-/// net. Each leg goes through T-junction detection, which dots every pin and
-/// wire end the leg meets, so a route is kept only if it joins nothing beyond
-/// the two endpoints' own nets (#887).
+/// Route a straight wire when aligned, otherwise try the two elbows in order
+/// of readability. Each candidate still goes through T-junction detection and
+/// can join only the two endpoints' own nets (#887).
 ///
-/// The inner `Err` holds one reason per bend tried, or why none could be checked.
+/// The inner `Err` holds one reason per bend in horizontal-first, vertical-first
+/// order, or why none could be checked.
 pub(crate) fn route_between(
     content: &str,
     x1: f64,
@@ -695,12 +696,24 @@ pub(crate) fn route_between(
             crate::tools::UNRESOLVED_PIN_GEOMETRY
         )]));
     };
-    let bends: &[(&str, &[(f64, f64)])] = if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
-        &[("straight", &[(x1, y1), (x2, y2)])]
+    let from = (x1, y1);
+    let to = (x2, y2);
+    let straight = [from, to];
+    let horizontal = [from, (x2, y1), to];
+    let vertical = [from, (x1, y2), to];
+    let aligned = (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01;
+    let prefer_vertical = !aligned && vertical_elbow_is_clearer(&before, horizontal, vertical);
+    let bends: &[(&str, &[(f64, f64)])] = if aligned {
+        &[("straight", &straight)]
+    } else if prefer_vertical {
+        &[
+            ("vertical-first", &vertical),
+            ("horizontal-first", &horizontal),
+        ]
     } else {
         &[
-            ("horizontal-first", &[(x1, y1), (x2, y1), (x2, y2)]),
-            ("vertical-first", &[(x1, y1), (x1, y2), (x2, y2)]),
+            ("horizontal-first", &horizontal),
+            ("vertical-first", &vertical),
         ]
     };
     let mut refused = Vec::new();
@@ -718,7 +731,55 @@ pub(crate) fn route_between(
             }
         }
     }
+    if prefer_vertical {
+        refused.reverse();
+    }
     Ok(Err(refused))
+}
+
+fn vertical_elbow_is_clearer(
+    tree: &copperpour_sexp::SexpNode,
+    horizontal: [(f64, f64); 3],
+    vertical: [(f64, f64); 3],
+) -> bool {
+    let libraries = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    let symbols: Vec<_> = extract_symbol_instances(tree)
+        .iter()
+        .filter_map(|instance| {
+            let library = find_lib_symbol(&libraries, instance)?;
+            symbol_geometry_for_instance(library, instance)
+        })
+        .collect();
+    let texts = text_extents(tree);
+    let score = |points: [(f64, f64); 3]| {
+        // Score the coordinates format_wire will write, using the same body
+        // interior and outward pin-tip rule as check_schematic_overlaps.
+        let points = points.map(|(x, y)| (round6(x), round6(y)));
+        let bodies = symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.body.is_some_and(|body| {
+                    points.windows(2).any(|leg| {
+                        body.segment_enters(leg[0], leg[1])
+                            && !symbol.wire_leaves_pin(leg[0], leg[1])
+                    })
+                })
+            })
+            .count();
+        let text_runs = texts
+            .iter()
+            .filter(|text| {
+                points
+                    .windows(2)
+                    .any(|leg| text.run.segment_enters(leg[0], leg[1]))
+            })
+            .count();
+        (bodies, text_runs)
+    };
+    score(vertical) < score(horizontal)
 }
 
 /// The refusal for a route that [`route_between`] could not draw.

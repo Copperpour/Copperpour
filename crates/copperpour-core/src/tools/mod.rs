@@ -85,6 +85,8 @@ mod revision_conflict_tests;
 #[cfg(test)]
 mod route_differential_pair_tests;
 #[cfg(test)]
+mod route_elbow_tests;
+#[cfg(test)]
 mod route_obstacle_tests;
 pub mod sch_analysis;
 pub(crate) mod sch_annotate;

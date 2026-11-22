@@ -173,7 +173,8 @@ pattern.
 
 ### connect_pins
 
-Use for direct pin-to-pin connections. The tool auto-routes with L-bends.
+Use for direct pin-to-pin connections. The tool chooses a straight wire or the
+clearer of two safe elbows. Read `path` rather than assuming horizontal-first.
 
 ```
 connect_pins(schematic, ref1, pin1, ref2, pin2)
@@ -181,7 +182,6 @@ connect_pins(schematic, ref1, pin1, ref2, pin2)
 
 - Specify pins by pin number (from get_schematic_pin_locations)
 - Works best when pins are nearby and facing each other
-- Automatically creates wire segments with proper bends
 
 ### connect_to_net
 
