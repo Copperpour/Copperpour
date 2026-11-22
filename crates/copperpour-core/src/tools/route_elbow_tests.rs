@@ -72,6 +72,30 @@ impl Sheet {
             .collect();
         assert_eq!(wires, legs);
     }
+
+    async fn with_destination_label() -> Self {
+        let sheet = Self::new().await;
+        let (is_error, body) = sheet
+            .call(
+                "add_schematic_net_label",
+                json!({ "net": "VCC(3V3)", "x": 127, "y": 63.5, "rotation": 180 }),
+            )
+            .await;
+        assert!(!is_error, "{body}");
+        sheet
+    }
+
+    async fn assert_no_wire_label_overlap(&self) {
+        let (is_error, body) = self.call("check_schematic_overlaps", json!({})).await;
+        assert!(!is_error, "{body}");
+        let findings = body["overlaps"].as_array().unwrap();
+        assert!(
+            findings
+                .iter()
+                .all(|item| item["type"] != "wire_label_overlap"),
+            "{body}"
+        );
+    }
 }
 
 fn pair(ref1: &str, ref2: &str) -> Value {
@@ -101,11 +125,67 @@ async fn connect_pins_routes_around_r3_without_a_wire_overlap() {
 }
 
 #[tokio::test]
-async fn connect_pins_routes_around_label_text_without_touching_its_anchor() {
-    Sheet::new()
-        .await
+async fn connect_pins_routes_around_label_text_without_a_wire_label_overlap() {
+    let sheet = Sheet::new().await;
+    sheet
         .connects("connect_pins", pair("R4", "R5"), &TEXT_PATH)
         .await;
+    sheet.assert_no_wire_label_overlap().await;
+}
+
+#[tokio::test]
+async fn connect_pins_can_route_along_the_destination_label_baseline() {
+    let sheet = Sheet::with_destination_label().await;
+    let (is_error, route) = sheet.call("connect_pins", pair("R4", "R5")).await;
+    assert!(!is_error, "{route}");
+    sheet.assert_no_wire_label_overlap().await;
+    assert_eq!(route["path"], json!(TEXT_PATH), "{route}");
+    sheet.assert_wires(&[&TEXT_PATH]);
+}
+
+#[tokio::test]
+async fn add_schematic_connection_can_route_along_the_destination_label_baseline() {
+    let from = [117.5, 62.5];
+    let to = TEXT_PATH[2];
+    Sheet::with_destination_label()
+        .await
+        .connects(
+            "add_schematic_connection",
+            points(from, to),
+            &[from, [from[0], to[1]], to],
+        )
+        .await;
+
+    // The other elbow crosses the same label, not a second obstacle.
+    let sheet = Sheet::with_destination_label().await;
+    let corner = [to[0], from[1]];
+    for (start, end) in [(from, corner), (corner, to)] {
+        let (is_error, body) = sheet.call("add_wire", points(start, end)).await;
+        assert!(!is_error, "{body}");
+    }
+    let (is_error, body) = sheet.call("check_schematic_overlaps", json!({})).await;
+    assert!(!is_error, "{body}");
+    let findings = body["overlaps"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|item| item["type"] == "wire_label_overlap" && item["b"]["net"] == "VCC(3V3)"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn batch_connect_pins_can_route_along_the_destination_label_baseline() {
+    let sheet = Sheet::with_destination_label().await;
+    let (is_error, body) = sheet
+        .call(
+            "batch_connect_pins",
+            json!({ "connections": [pair("R4", "R5")] }),
+        )
+        .await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["connected_count"], 1, "{body}");
+    sheet.assert_wires(&[&TEXT_PATH]);
 }
 
 #[tokio::test]
