@@ -8053,6 +8053,98 @@ mod instance_path_lifecycle_tests {
         assert_eq!(text_of(&mid), mid_before);
     }
 
+    #[tokio::test]
+    async fn a_repoint_onto_the_parents_ancestor_is_typed_and_writes_nothing() {
+        let (_tmp, root, bank, _cell) = nested_project();
+        let (root_before, bank_before) = (text_of(&root), text_of(&bank));
+
+        let (failed, body) = served(
+            "edit_sheet",
+            json!({"schematic": bank, "sheet_name": "east",
+                   "new_file": "nested_pages.kicad_sch"}),
+        )
+        .await;
+        assert!(failed, "{body}");
+        assert!(body.to_string().contains("its own parent"), "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "new_file", "{body}");
+        assert_eq!(text_of(&root), root_before);
+        assert_eq!(text_of(&bank), bank_before);
+    }
+
+    #[tokio::test]
+    async fn a_repoint_onto_an_unreadable_hierarchy_is_typed_and_writes_nothing() {
+        let (tmp, root, bank, _cell) = nested_project();
+        let spare = tmp.path().join("spare.kicad_sch");
+        std::fs::copy(&bank, &spare).unwrap();
+        break_east(tmp.path(), &spare);
+        let root_before = text_of(&root);
+
+        let (failed, body) = served(
+            "edit_sheet",
+            json!({"schematic": root, "sheet_name": "south", "new_file": "spare.kicad_sch"}),
+        )
+        .await;
+        assert!(failed, "{body}");
+        assert_eq!(body["error"]["kind"], "conflict", "{body}");
+        let paths = body["error"]["paths"].as_array().unwrap();
+        assert!(
+            paths.len() == 1 && paths[0].as_str().unwrap().ends_with("junk.kicad_sch"),
+            "{body}"
+        );
+        assert_eq!(text_of(&root), root_before);
+    }
+
+    #[tokio::test]
+    async fn a_directory_as_the_child_sheet_is_an_invalid_argument() {
+        let (tmp, root) = project();
+        std::fs::create_dir(tmp.path().join("folder.kicad_sch")).unwrap();
+        let root_before = text_of(&root);
+
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({"schematic": root, "sheet_file": "folder.kicad_sch", "sheet_name": "Folder"}),
+        )
+        .await;
+        assert!(failed, "{body}");
+        assert!(body.to_string().contains("not a regular file"), "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "sheet_file", "{body}");
+        assert_eq!(text_of(&root), root_before);
+    }
+
+    #[tokio::test]
+    async fn a_missing_child_file_is_file_not_found() {
+        let (tmp, root) = project();
+        std::fs::remove_file(tmp.path().join("mid.kicad_sch")).unwrap();
+        let root_before = text_of(&root);
+
+        for (tool, arguments) in [
+            (
+                "duplicate_sheet",
+                json!({"schematic": root, "source_sheet_name": "Mid",
+                       "new_sheet_name": "Copy", "new_file": "copy.kicad_sch"}),
+            ),
+            (
+                "import_sheet_pins",
+                json!({"schematic": root, "sheet_name": "Mid"}),
+            ),
+        ] {
+            let (failed, body) = served(tool, arguments).await;
+            assert!(failed, "{tool}: {body}");
+            assert_eq!(body["error"]["kind"], "file_not_found", "{tool}: {body}");
+            assert!(
+                body["error"]["path"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("mid.kicad_sch"),
+                "{tool}: {body}"
+            );
+            assert_eq!(text_of(&root), root_before, "{tool}");
+        }
+        assert!(!tmp.path().join("copy.kicad_sch").exists());
+    }
+
     /// No tool builds a chain this deep, since `add_hierarchical_sheet`
     /// refuses a parent past the limit; the files are the blank template with
     /// the sheet block the tool writes, from `format_hierarchical_sheet`.
