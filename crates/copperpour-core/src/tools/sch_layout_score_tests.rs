@@ -6,6 +6,9 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[path = "sch_layout_score_guard_tests.rs"]
+mod guards;
+
 const CROWDED: &str = "region_cleanup_kicad10/crowded/crowded.kicad_sch";
 const SPARSE: &str = "region_cleanup_kicad10/sparse/sparse.kicad_sch";
 const DIRECT_LANES: &str = "direct_lanes_kicad10/direct_lanes.kicad_sch";
@@ -731,40 +734,6 @@ async fn listing_the_last_supply_does_not_allow_losing_a_net_name() {
 }
 
 #[tokio::test]
-async fn symbol_identity_changes_are_blocked_independently_of_connectivity() {
-    let handler = handler().await;
-    let before = Sheet::input(SPARSE);
-    let source = String::from_utf8(before.bytes()).unwrap();
-    let uuid = symbol_uuid(&before, "R1");
-    let new_uuid = "915d8b53-de33-4f21-ad28-ef7af5dce6f4";
-    for (old, new, reason) in [
-        (
-            uuid.as_str(),
-            new_uuid,
-            format!("symbol {uuid} was removed"),
-        ),
-        (
-            "(instances\n",
-            "(instances (project \"extra\")\n",
-            "changed its lib_id or instances".into(),
-        ),
-        (
-            "(lib_id \"Device:R\")",
-            "(lib_id \"Other:R\") (lib_name \"Device:R\")",
-            "changed its lib_id or instances".into(),
-        ),
-    ] {
-        let after = before.fork();
-        let changed = source.replacen(old, new, 1);
-        assert_ne!(changed, source);
-        fs::write(&after.path, changed).unwrap();
-        let result = compare(&handler, &before, &after, &[]).await;
-        assert_verdict(&result, "blocked");
-        assert!(reasons(&result).contains(&reason), "{result}");
-    }
-}
-
-#[tokio::test]
 async fn changed_embedded_pin_numbers_block_a_same_identity_comparison() {
     let handler = handler().await;
     let before = Sheet::input(SPARSE);
@@ -930,7 +899,11 @@ async fn listing_an_ordinary_symbol_does_not_allow_removing_it() {
     ok(&handler, &after, "batch_delete", json!({"uuids": [uuid]})).await;
     let result = compare(&handler, &before, &after, std::slice::from_ref(&uuid)).await;
     assert_verdict(&result, "blocked");
-    assert!(reasons(&result).contains(&format!("{uuid} is not a removed power symbol")));
+    assert_eq!(
+        result["reasons"].as_array().unwrap().first(),
+        Some(&json!(format!("{uuid} is not a removed power symbol"))),
+        "{result}"
+    );
 }
 
 #[tokio::test]
@@ -1111,62 +1084,6 @@ fn collinear_overlap_is_invariant_under_wire_and_endpoint_order() {
         for short in [wire(other), wire([x2, y2, x1, y1])] {
             assert_eq!(collinear_overlap(&long, &short), expected);
             assert_eq!(collinear_overlap(&short, &long), expected);
-        }
-    }
-}
-
-#[tokio::test]
-async fn invalid_inputs_do_not_touch_either_sheet() {
-    let handler = handler().await;
-    let sheet = Sheet::input(SPARSE);
-    let snapshot = sheet.files();
-    for args in [
-        json!({"baseline": 123}),
-        json!({"removed_power_symbol_uuids": ["anything"]}),
-    ] {
-        let (error, result) = call(&handler, &sheet, TOOL, args).await;
-        assert!(error, "{result}");
-        assert_eq!(result["error"]["kind"], "invalid_argument", "{result}");
-    }
-    assert_eq!(sheet.files(), snapshot);
-}
-
-#[tokio::test]
-async fn a_missing_sheet_names_the_failed_path() {
-    let handler = handler().await;
-    let sheet = Sheet::input(SPARSE);
-    let missing = sheet.path.with_file_name("missing.kicad_sch");
-    let before = sheet.files();
-    for args in [
-        json!({"schematic": sheet.path, "baseline": missing}),
-        json!({"schematic": missing, "baseline": sheet.path}),
-    ] {
-        let (error, result) = rpc(&handler, TOOL, args).await;
-        assert!(error, "{result}");
-        assert_eq!(result["error"]["kind"], "file_not_found", "{result}");
-        assert_eq!(result["error"]["path"], json!(missing), "{result}");
-        assert_eq!(sheet.files(), before);
-    }
-}
-
-#[tokio::test]
-async fn malformed_sheets_name_the_failed_path() {
-    let handler = handler().await;
-    let sheet = Sheet::input(SPARSE);
-    let malformed = sheet.fork();
-    for bytes in [b"(kicad_pcb)".as_slice(), b"(kicad_sch", b"\xff"] {
-        fs::write(&malformed.path, bytes).unwrap();
-        let before = [sheet.files(), malformed.files()];
-        for args in [
-            json!({"schematic": malformed.path, "baseline": sheet.path}),
-            json!({"schematic": sheet.path, "baseline": malformed.path}),
-        ] {
-            let (error, result) = rpc(&handler, TOOL, args).await;
-            assert!(error, "{result}");
-            assert_eq!(result["error"]["kind"], "malformed_file", "{result}");
-            assert_eq!(result["error"]["path"], json!(malformed.path), "{result}");
-            assert!(!result["error"]["reason"].as_str().unwrap().is_empty());
-            assert_eq!([sheet.files(), malformed.files()], before);
         }
     }
 }
