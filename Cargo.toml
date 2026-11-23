@@ -51,7 +51,7 @@ topola_specctra = "0.1.0"
 # NNG for KiCAD 10 IPC (nanomsg-next-gen, replaces ZeroMQ)
 nng = "1"
 prost = "0.13"
-prost-types = "0.13"
+prost-types = "0.14"
 
 # Config
 toml = "1.1"
