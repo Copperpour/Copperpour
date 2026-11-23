@@ -24,10 +24,13 @@ The comparison does not check the ERC effect of removing a power symbol.
 Otherwise `improved` means the first tier with a different sum went down and
 no individual term in the first two tiers went up. The tiers, in order, are
 connectivity-related findings, text and pin visibility, wire and power-symbol
-clutter, then wire length in mm. `unchanged` means every compared term tied;
-other comparisons are `not_improved`. The wire clutter terms count simple bends,
-straight splits, diagonals, stacked wire pairs, and excess supply symbols for
-the same rail on one drawn node, not across separate islands joined by name.
+clutter, then wire length in mm. `wire_field_overlap` counts the same crossings as
+`check_schematic_overlaps` in the text and pin visibility tier. Moving a field clear
+of a wire can improve the score without changing connectivity. `unchanged` means
+every compared term tied; other comparisons are `not_improved`. The wire clutter
+terms count simple bends, straight splits, diagonals, stacked wire pairs, and excess
+supply symbols for the same rail on one drawn node, not across separate islands
+joined by name.
 `PWR_FLAG` does not count toward that redundancy term.
 
 Compare alternative results of one authoring call, not the input with the new

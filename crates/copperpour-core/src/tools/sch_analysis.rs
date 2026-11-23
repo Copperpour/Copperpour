@@ -160,6 +160,7 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "compare_schematic_layout",
             "Score a saved schematic sheet, optionally comparing it with a saved baseline. \
+             Counts wires crossing visible Reference or Value text on ordinary symbols. \
              Check pin connectivity and symbol identity before ranking layout changes. \
              No writes, editor access, or ERC.",
             json!({ "type": "object",
@@ -223,8 +224,10 @@ pub fn tools() -> Vec<ToolDef> {
              meeting anywhere but tip to tip. Pin-tip contact and touching edges are not \
              reported. Also finds \
              conflicting labels at the same location, colliding label and field text \
-             (`text_overlap`), wires drawn through a symbol's body (`wire_overlap`), and \
-             wires crossing label text or visible power symbol Value text (`wire_label_overlap`). \
+             (`text_overlap`), wires drawn through a symbol's body (`wire_overlap`), \
+             wires crossing label text or visible power symbol Value text (`wire_label_overlap`), \
+             and wires crossing visible Reference or Value text on ordinary symbols \
+             (`wire_field_overlap`). \
              Reports any symbol whose embedded \
              geometry could not be resolved and used the origin fallback instead.",
             json!({ "type": "object",
@@ -1346,15 +1349,22 @@ pub(super) fn overlap_findings(
         }
     }
 
-    let label_texts = texts
+    let wire_texts = texts
         .iter()
-        .filter(|text| match &text.owner {
-            TextOwner::Label { .. } => true,
-            TextOwner::Field {
-                field,
-                is_power_symbol,
-                ..
-            } => *is_power_symbol && field == "Value",
+        .filter_map(|text| {
+            let kind = match &text.owner {
+                TextOwner::Label { .. } => "wire_label_overlap",
+                TextOwner::Field {
+                    field,
+                    is_power_symbol,
+                    ..
+                } => match (field.as_str(), is_power_symbol) {
+                    ("Value", true) => "wire_label_overlap",
+                    ("Reference" | "Value", false) => "wire_field_overlap",
+                    _ => return None,
+                },
+            };
+            Some((text, kind))
         })
         .collect::<Vec<_>>();
 
@@ -1364,7 +1374,7 @@ pub(super) fn overlap_findings(
     // and so is one that leaves the symbol's own pin tip outward, though a
     // drawing that reaches past the tip may clip it.
     let mut wire_overlaps: Vec<serde_json::Value> = Vec::new();
-    let mut wire_label_overlaps: Vec<serde_json::Value> = Vec::new();
+    let mut wire_text_overlaps: Vec<serde_json::Value> = Vec::new();
     for wire in wires {
         let (from, to) = ((wire.x1, wire.y1), (wire.x2, wire.y2));
         for (instance, placed) in &placements {
@@ -1388,10 +1398,10 @@ pub(super) fn overlap_findings(
                 }));
             }
         }
-        for text in &label_texts {
+        for (text, kind) in &wire_texts {
             if from != to && text.wire_crossing_bounds().segment_enters(from, to) {
-                wire_label_overlaps.push(json!({
-                    "type": "wire_label_overlap",
+                wire_text_overlaps.push(json!({
+                    "type": kind,
                     "a": wire_json(wire),
                     "b": text_json(text),
                     "bounds_b": bounds_json(text.reported_run())
@@ -1404,7 +1414,7 @@ pub(super) fn overlap_findings(
     all.extend(label_overlaps);
     all.extend(text_overlaps);
     all.extend(wire_overlaps);
-    all.extend(wire_label_overlaps);
+    all.extend(wire_text_overlaps);
     let bounds_unresolved = placements
         .iter()
         .filter(|(_, placed)| placed.is_none())
@@ -2354,15 +2364,14 @@ mod wire_label_overlap_tests {
     #[tokio::test]
     async fn only_visible_power_value_text_counts_as_label_text() {
         let body = served_overlaps(VARIANTS).await;
-        let fields = body["overlaps"]
-            .as_array()
-            .unwrap()
+        let findings = body["overlaps"].as_array().unwrap();
+        let label_fields = findings
             .iter()
-            .filter(|o| o["b"]["kind"] != "label")
+            .filter(|o| o["b"]["kind"] == "field" && o["type"] == "wire_label_overlap")
             .collect::<Vec<_>>();
-        assert_eq!(fields.len(), 1, "{body}");
+        assert_eq!(label_fields.len(), 1, "{body}");
         assert_crossing(
-            fields[0],
+            label_fields[0],
             "26ff5974-14a7-474a-8459-76984cb68503",
             [99.06, 96.52, 110.49, 96.52],
             json!({
@@ -2371,8 +2380,31 @@ mod wire_label_overlap_tests {
             }),
             [103.17, 95.83, 107.71, 97.10],
         );
+
+        let resistor_fields = findings
+            .iter()
+            .filter(|o| o["type"] == "wire_field_overlap")
+            .collect::<Vec<_>>();
+        assert_eq!(resistor_fields.len(), 2, "{body}");
+        for (wire, field) in [
+            ("92409db3-f11f-4c1f-9db7-37239e7bc06d", "Reference"),
+            ("9678b691-6f2d-47e6-bf4c-bd29e527c04e", "Value"),
+        ] {
+            assert!(
+                resistor_fields.iter().any(|o| {
+                    o["b"]["reference"] == "R1"
+                        && o["a"]["uuid"] == wire
+                        && o["b"]["field"] == field
+                }),
+                "{body}"
+            );
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "sch_wire_field_overlap_tests.rs"]
+mod wire_field_overlap_tests;
 
 #[cfg(test)]
 mod wire_overlap_tests {
@@ -2401,13 +2433,13 @@ mod wire_overlap_tests {
 
     /// The wire through the crystal, the wire across `R1`, the wire from
     /// `X1`'s pin tip into its body and the wire from the `GND` symbol's tip into
-    /// its own drawing are reported, each with its symbol, and nothing else is:
+    /// its own drawing are the only `wire_overlap` findings:
     /// not the wires on `R2`'s pin tips, along `Y2`'s top edge, ending on `Y3`'s
     /// edge, beside `R4`, leaving `X1`'s pin tip outward past which its drawing
     /// reaches, or leaving the pin tips of the stock `D1` LED, whose emission
     /// arrows reach past its left tip, outward or square to the pin.
     #[tokio::test]
-    async fn only_the_wires_through_a_body_are_reported() {
+    async fn only_the_wires_through_a_body_report_wire_overlap() {
         let body = check().await;
         let mut found = body["overlaps"]
             .as_array()
@@ -2434,7 +2466,32 @@ mod wire_overlap_tests {
         ]
         .map(|(uuid, reference)| (uuid.to_string(), reference.to_string()));
         assert_eq!(found, expected, "{body}");
-        assert_eq!(body["overlap_count"], 4, "{body}");
+
+        let mut fields = body["overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["type"] == "wire_field_overlap")
+            .map(|o| {
+                (
+                    o["a"]["uuid"].as_str().unwrap(),
+                    o["b"]["reference"].as_str().unwrap(),
+                    o["b"]["field"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                ("7f228b0f-7e2f-4061-a35f-d496b115f231", "R1", "Reference"),
+                ("7f228b0f-7e2f-4061-a35f-d496b115f231", "R1", "Value"),
+                ("c2c87694-21b8-4679-9498-fb356e6e4738", "R4", "Reference"),
+                ("e389c34b-85fd-453a-a53c-bcb6f48b1c1c", "X1", "Reference"),
+            ],
+            "{body}"
+        );
+        assert_eq!(body["overlap_count"], found.len() + fields.len(), "{body}");
 
         let through = body["overlaps"]
             .as_array()

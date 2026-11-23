@@ -26,5 +26,5 @@ total. `kicad-cli sch erc --severity-all` reports nothing. ERC counts leave out
 `lib_symbol_issues` and `footprint_link_issues`, which depend on the machine's KiCad
 library tables.
 
-`check_schematic_overlaps` on `main` returns zero findings on this sheet, because it does
-not compare wires with field text.
+`check_schematic_overlaps` reports three `wire_field_overlap` findings for C1: two for
+the middle lane and one for the bottom lane.

@@ -147,10 +147,11 @@ unannotated designators.
 | `find_single_pin_nets` | 0 | 0 |
 | `check_bom_health` | 8 findings: no footprint on 7 parts, no MPN on U1; `missing_value` 0 | the same 8 |
 
-None of these tools reports what makes `before` hard to read: the `+3V3` rail through D?'s
-value text and R?'s reference text, the five places where wires cross, the two junctions
-where four wires meet (at U?'s VCC and GND), or the generic values (`R`, `LED`,
-`Battery_Cell`), which `check_bom_health` does not count as missing.
+Since that snapshot, `check_schematic_overlaps` reports two `wire_field_overlap` findings
+for the `+3V3` rail on `before`: D?'s Value and R?'s Reference. The snapshot's table
+did not capture the five places where wires cross, the two junctions where four wires
+meet (at U?'s VCC and GND), or the generic values (`R`, `LED`, `Battery_Cell`), which
+`check_bom_health` does not count as missing.
 
 ## What a layout comparison of the pair should find
 
