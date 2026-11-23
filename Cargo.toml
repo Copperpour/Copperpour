@@ -60,7 +60,7 @@ toml = "1.1"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 
 # SQLite (JLCPCB database)
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # Error handling
