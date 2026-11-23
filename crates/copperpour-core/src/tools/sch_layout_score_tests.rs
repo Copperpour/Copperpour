@@ -3,6 +3,7 @@ use crate::tools::ServerConfig;
 use copperpour_sexp::schematic::{extract_wires, read_schematic};
 use copperpour_sexp::SexpNode;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,28 @@ const CROWDED: &str = "region_cleanup_kicad10/crowded/crowded.kicad_sch";
 const SPARSE: &str = "region_cleanup_kicad10/sparse/sparse.kicad_sch";
 const DIRECT_LANES: &str = "direct_lanes_kicad10/direct_lanes.kicad_sch";
 const TOOL: &str = "compare_schematic_layout";
+
+#[tokio::test]
+async fn only_preview_comparison_excludes_mandatory_lead_length() {
+    let handler = handler().await;
+    let sheet = Sheet::input("block_placement_kicad10/opamp_stage/opamp_stage.kicad_sch");
+    let tree = sheet.tree();
+    let stub = extract_wires(&tree)
+        .into_iter()
+        .find(|w| ((w.x1 - w.x2).hypot(w.y1 - w.y2) - 2.54).abs() < 1e-6)
+        .expect("fixture has a 2.54 mm wire");
+    let omitted = BTreeSet::from([stub.uuid.unwrap()]);
+    let all = BTreeSet::new();
+    let baseline = compare(&handler, &sheet, &sheet, &[]).await;
+    let shared = super::compare_layout(&tree, Some(&tree), &[], [&all; 2]).json();
+    assert_eq!(shared, baseline);
+    let preview = super::compare_layout(&tree, Some(&tree), &[], [&all, &omitted]).json();
+    let mut expected = baseline;
+    expected["score"]["wire_length_mm"] = json!(495.30);
+    expected["delta"]["wire_length_mm"] = json!(-2.54);
+    expected["verdict"] = json!("improved");
+    assert_eq!(preview, expected);
+}
 
 struct Sheet {
     dir: tempfile::TempDir,

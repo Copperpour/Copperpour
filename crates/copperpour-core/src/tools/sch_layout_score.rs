@@ -90,6 +90,10 @@ fn increment(score: &mut Terms, key: &str) {
 }
 
 pub(super) fn measure(tree: &SexpNode) -> Score {
+    measure_with_stub_exclusions(tree, &BTreeSet::new())
+}
+
+fn measure_with_stub_exclusions(tree: &SexpNode, required_stubs: &BTreeSet<String>) -> Score {
     let wires = extract_wires(tree);
     let buses = extract_buses(tree);
     let labels = extract_all_net_labels(tree);
@@ -137,6 +141,12 @@ pub(super) fn measure(tree: &SexpNode) -> Score {
 
     let length: f64 = wires
         .iter()
+        .filter(|wire| {
+            !wire
+                .uuid
+                .as_ref()
+                .is_some_and(|uuid| required_stubs.contains(uuid))
+        })
         .map(|wire| (wire.x2 - wire.x1).hypot(wire.y2 - wire.y1))
         .sum();
     score.insert(LENGTH, Some((length * 1000.0).round() as i64));
@@ -401,6 +411,64 @@ impl Score {
     }
 }
 
+pub(super) struct LayoutComparison {
+    score: Score,
+    baseline_score: Option<Score>,
+    delta: Terms,
+    pub(super) verdict: Option<&'static str>,
+    pub(super) reasons: Vec<String>,
+}
+
+impl LayoutComparison {
+    pub(super) fn json(&self) -> Value {
+        let not_compared = terms()
+            .filter(|key| self.delta[key].is_none())
+            .collect::<Vec<_>>();
+        let delta = self.baseline_score.as_ref().map(|_| {
+            self.delta
+                .iter()
+                .map(|(&key, &change)| (key.to_owned(), term_json(key, change)))
+                .collect::<Value>()
+        });
+        json!({
+            "score": self.score.json(),
+            "baseline_score": self.baseline_score.as_ref().map(Score::json),
+            "delta": delta,
+            "verdict": self.verdict,
+            "reasons": self.reasons,
+            "not_compared": not_compared,
+        })
+    }
+}
+
+/// Compare complete in-memory snapshots. Callers may exclude verified mandatory lead
+/// lengths from ranking, but those wires still participate in all other checks.
+pub(super) fn compare_layout(
+    sheet: &SexpNode,
+    baseline: Option<&SexpNode>,
+    removed: &[String],
+    required_stubs: [&BTreeSet<String>; 2],
+) -> LayoutComparison {
+    let [baseline_stubs, sheet_stubs] = required_stubs;
+    let score = measure_with_stub_exclusions(sheet, sheet_stubs);
+    let baseline_score = baseline.map(|tree| measure_with_stub_exclusions(tree, baseline_stubs));
+    // A single-sheet score reports which terms could be measured.
+    let delta = baseline_score
+        .as_ref()
+        .map_or_else(|| score.terms.clone(), |before| score.delta_from(before));
+    let reasons = baseline.map_or_else(Vec::new, |before| {
+        gate(before, sheet, removed, NetComparison::Layout)
+    });
+    let verdict = baseline.map(|_| verdict(&delta, &reasons));
+    LayoutComparison {
+        score,
+        baseline_score,
+        delta,
+        verdict,
+        reasons,
+    }
+}
+
 pub(super) fn read_saved_sheet(path: &Path) -> Result<(String, SexpNode), CallToolResult> {
     // The writers replace atomically; a single open reads one saved version
     // without creating the cooperative lockfile used by read_schematic.
@@ -452,40 +520,16 @@ pub(super) async fn handle_compare_schematic_layout(
         Ok((_, sheet)) => sheet,
         Err(error) => return Ok(error),
     };
-    let score = measure(&sheet);
-    let (baseline_score, delta, verdict, reasons, not_compared) = if let Some(path) = baseline {
-        let baseline = match read_saved_sheet(&path) {
-            Ok((_, sheet)) => sheet,
-            Err(error) => return Ok(error),
-        };
-        let baseline_score = measure(&baseline);
-        let delta = score.delta_from(&baseline_score);
-        let not_compared = terms()
-            .filter(|key| delta[key].is_none())
-            .collect::<Vec<_>>();
-        let reasons = gate(&baseline, &sheet, &removed, NetComparison::Layout);
-        let verdict = verdict(&delta, &reasons);
-        let delta: Value = delta
-            .iter()
-            .map(|(&key, &change)| (key.to_owned(), term_json(key, change)))
-            .collect();
-        (
-            baseline_score.json(),
-            delta,
-            Some(verdict),
-            reasons,
-            not_compared,
-        )
-    } else {
-        let not_compared = terms().filter(|key| score.terms[key].is_none()).collect();
-        (Value::Null, Value::Null, None, Vec::new(), not_compared)
+    let baseline = match baseline.as_deref().map(read_saved_sheet).transpose() {
+        Ok(tree) => tree,
+        Err(error) => return Ok(error),
     };
-    Ok(CallToolResult::json(&json!({
-        "score": score.json(),
-        "baseline_score": baseline_score,
-        "delta": delta,
-        "verdict": verdict,
-        "reasons": reasons,
-        "not_compared": not_compared,
-    })))
+    let no_stubs = BTreeSet::new();
+    let comparison = compare_layout(
+        &sheet,
+        baseline.as_ref().map(|(_, tree)| tree),
+        &removed,
+        [&no_stubs; 2],
+    );
+    Ok(CallToolResult::json(&comparison.json()))
 }
