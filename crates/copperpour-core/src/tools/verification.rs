@@ -9,8 +9,7 @@ use crate::tool;
 use crate::tools::pcb_board::block_tag;
 use crate::tools::pcb_components::escape_sexp_string;
 use crate::tools::{
-    get_path, invalid_arg, opt_str, require_f64, require_str, with_board_ipc_classified,
-    ToolContext, ToolDef,
+    get_path, invalid_arg, opt_str, require_f64, require_str, ToolContext, ToolDef,
 };
 use copperpour_sexp::board::exact_coordinate_pair;
 use copperpour_sexp::geometry::round6;
@@ -292,7 +291,8 @@ pub fn tools() -> Vec<ToolDef> {
              malformed courtyard geometry and does not substitute pads or anchors. Neither \
              mode measures pad, trace or copper clearance; use `run_drc` for electrical \
              clearance and `get_component_pads` for pad geometry. Reads the live KiCad board \
-             when open, otherwise the saved file, and reports the source.",
+             when open, otherwise the saved file ('board_source' selects auto, live, or \
+             saved), and reports the source.",
             json!({
                 "type": "object",
                 "properties": {
@@ -304,7 +304,8 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["anchor", "courtyard"],
                         "default": "anchor",
                         "description": "anchor: placement-origin distance; courtyard: authored courtyard bbox edge distance"
-                    }
+                    },
+                    "board_source": super::board_source::board_source_schema()
                 },
                 "required": ["board", "ref1", "ref2"]
             }),
@@ -2168,6 +2169,10 @@ async fn handle_check_clearance(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
+    let source_selector = match super::board_source::BoardSource::from_args(args) {
+        Ok(source) => source,
+        Err(refusal) => return Ok(refusal),
+    };
     let ref1 = match require_str(args, "ref1") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -2186,45 +2191,26 @@ async fn handle_check_clearance(
     // Prefer the exact unsaved board KiCad owns. Falling back only when the
     // requested board is not open gives both modes the same live/file
     // semantics and prevents a plausible answer from stale placement data.
-    let live = with_board_ipc_classified(ctx, &board, move |client, document| {
-        client.save_document_to_string_in(document)
-    })
-    .await?;
-    let (content, source) = match live {
-        Ok(content) => (content, "ipc"),
-        Err(copperpour_ipc::IpcFailure::Unreachable { .. }) => {
-            (std::fs::read_to_string(&board)?, "saved_file")
-        }
-        Err(copperpour_ipc::IpcFailure::Target { error, .. }) if error.proves_not_open() => {
-            (std::fs::read_to_string(&board)?, "saved_file")
-        }
-        Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
-            return Ok(crate::tools::ipc_target_error_result(&error));
-        }
-        // Reading the board raises no refusal of Copperpour's own (#240).
-        Err(
-            copperpour_ipc::IpcFailure::Rejected { message, .. }
-            | copperpour_ipc::IpcFailure::Preflight(copperpour_ipc::PreflightRefusal {
-                reason: message,
-                ..
-            }),
-        ) => {
-            return Ok(CallToolResult::error(message));
-        }
-        Err(copperpour_ipc::IpcFailure::Recovered(message)) => {
-            return Ok(crate::tools::ipc_recovered_result(&message));
-        }
-        Err(copperpour_ipc::IpcFailure::Uncertain(message)) => {
-            return Ok(crate::tools::ipc_uncertain_result(&message));
-        }
-        Err(failure @ copperpour_ipc::IpcFailure::ItemRejected { .. }) => {
-            return Ok(crate::tools::ipc_failure_result(failure));
-        }
+    let super::placement::ObservedBoardSnapshot {
+        content,
+        legacy_source: source,
+        domain_source,
+        evidence,
+    } = match super::placement::live_or_saved_board(
+        ctx,
+        &board,
+        source_selector,
+        "clearance measurement",
+    )
+    .await?
+    {
+        Ok(read) => read,
+        Err(result) => return Ok(result),
     };
     let tree = copperpour_sexp::parser::parse_sexp(&content)?;
 
     if mode == "courtyard" {
-        return courtyard_clearance_result(&tree, &ref1, &ref2, source);
+        return courtyard_clearance_result(&tree, &ref1, &ref2, source, domain_source, evidence);
     }
 
     let pos1 = find_footprint_position(&tree, &ref1)?;
@@ -2241,7 +2227,7 @@ async fn handle_check_clearance(
     // courtyard gap (#410). Stage 1 names what the number is; `distance_mm`
     // stays as a deprecated alias so no consumer breaks before stage 2 adds
     // real geometry.
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "ref1": ref1,
         "ref2": ref2,
         "mode": "anchor",
@@ -2256,7 +2242,9 @@ async fn handle_check_clearance(
         "deprecated_fields": ["distance_mm"],
         "note": "anchor-to-anchor distance only; not pad, trace or courtyard clearance — \
                  footprint size and shape are not considered. Use run_drc for clearance."
-    })))
+    });
+    super::board_source::provenance(&mut body, json!({ "clearance": domain_source }), evidence);
+    Ok(CallToolResult::json(&body))
 }
 
 /// Compatibility measurement retained by the default `anchor` mode. The
@@ -2344,21 +2332,39 @@ fn courtyard_clearance_result(
     ref1: &str,
     ref2: &str,
     source: &str,
+    domain_source: &str,
+    evidence: serde_json::Value,
 ) -> anyhow::Result<CallToolResult> {
     let first = authored_courtyard(tree, ref1)?;
     let second = authored_courtyard(tree, ref2)?;
     if let Err(reason_code) = first {
-        return Ok(courtyard_unavailable(ref1, ref2, source, ref1, reason_code));
+        return Ok(courtyard_unavailable(
+            ref1,
+            ref2,
+            source,
+            domain_source,
+            evidence,
+            ref1,
+            reason_code,
+        ));
     }
     if let Err(reason_code) = second {
-        return Ok(courtyard_unavailable(ref1, ref2, source, ref2, reason_code));
+        return Ok(courtyard_unavailable(
+            ref1,
+            ref2,
+            source,
+            domain_source,
+            evidence,
+            ref2,
+            reason_code,
+        ));
     }
     let first = first.expect("checked above");
     let second = second.expect("checked above");
     let side1 = side_name(first.layer_side);
     let side2 = side_name(second.layer_side);
     if first.layer_side != second.layer_side {
-        return Ok(CallToolResult::json(&json!({
+        let mut body = json!({
             "ref1": ref1,
             "ref2": ref2,
             "mode": "courtyard",
@@ -2372,13 +2378,15 @@ fn courtyard_clearance_result(
             "side2": side2,
             "reason_code": "opposite_board_sides",
             "note": "Opposite-side courtyard spacing is not a same-side placement collision. Use run_drc for through-board and copper clearance."
-        })));
+        });
+        super::board_source::provenance(&mut body, json!({ "clearance": domain_source }), evidence);
+        return Ok(CallToolResult::json(&body));
     }
 
     let a = first.bbox;
     let b = second.bbox;
     let (clearance, overlaps) = courtyard_bbox_spacing(a, b);
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "ref1": ref1,
         "ref2": ref2,
         "mode": "courtyard",
@@ -2401,17 +2409,21 @@ fn courtyard_clearance_result(
             "rotation_deg": second.rotation_deg
         },
         "note": "Axis-aligned board-space hull distance between authored courtyards; zero with overlaps=true means the hulls overlap. This is not copper clearance; use run_drc for electrical clearance."
-    })))
+    });
+    super::board_source::provenance(&mut body, json!({ "clearance": domain_source }), evidence);
+    Ok(CallToolResult::json(&body))
 }
 
 fn courtyard_unavailable(
     ref1: &str,
     ref2: &str,
     source: &str,
+    domain_source: &str,
+    evidence: serde_json::Value,
     unavailable_reference: &str,
     reason_code: &str,
 ) -> CallToolResult {
-    CallToolResult::json(&json!({
+    let mut body = json!({
         "ref1": ref1,
         "ref2": ref2,
         "mode": "courtyard",
@@ -2424,7 +2436,9 @@ fn courtyard_unavailable(
         "unavailable_reference": unavailable_reference,
         "reason_code": reason_code,
         "note": "An authored, fully readable courtyard is required for each footprint; pads and anchors are not substituted."
-    }))
+    });
+    super::board_source::provenance(&mut body, json!({ "clearance": domain_source }), evidence);
+    CallToolResult::json(&body)
 }
 
 /// Look up the board-space (x, y) position of a footprint by its reference designator.
