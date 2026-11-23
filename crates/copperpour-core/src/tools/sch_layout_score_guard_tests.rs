@@ -2,12 +2,12 @@ use super::super::handle_compare_schematic_layout;
 use super::{assert_verdict, handler, ok, rpc, symbol_uuid, McpHandler, Sheet, SPARSE, TOOL};
 use crate::mcp::protocol::ToolContent;
 use crate::router::ToolRouter;
-use crate::tools::{ServerConfig, ToolContext};
+use crate::tools::{MissingArgument, ServerConfig, ToolContext};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, PartialEq)]
 struct SavedFile {
@@ -38,13 +38,30 @@ fn saved_input(sheet: &Sheet) -> Vec<SavedFile> {
         .collect()
 }
 
+fn prepare_read_only_inputs(inputs: &[&Sheet]) -> Vec<Vec<SavedFile>> {
+    // Make an in-place, same-byte rewrite detectable even if the filesystem
+    // records modification times at coarse resolution.
+    let old = SystemTime::UNIX_EPOCH + Duration::from_secs(946_684_800);
+    for sheet in inputs {
+        for entry in fs::read_dir(sheet.dir.path()).unwrap() {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(entry.unwrap().path())
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+    }
+    inputs.iter().map(|sheet| saved_input(sheet)).collect()
+}
+
 async fn read_only_call(
     handler: &McpHandler,
     tool: &str,
     args: Value,
     inputs: &[&Sheet],
 ) -> (bool, Value) {
-    let before: Vec<_> = inputs.iter().map(|sheet| saved_input(sheet)).collect();
+    let before = prepare_read_only_inputs(inputs);
     let result = rpc(handler, tool, args).await;
     let after: Vec<_> = inputs.iter().map(|sheet| saved_input(sheet)).collect();
     assert_eq!(after, before, "{tool} changed a saved input or sidecar");
@@ -83,6 +100,11 @@ async fn a_power_symbol_still_present_cannot_be_approved_for_removal() {
     let before = Sheet::input("power_orientation_kicad10/power_orientation.kicad_sch");
     let after = before.fork();
     let uuid = symbol_uuid(&before, "#PWR03");
+    assert!(
+        copperpour_sexp::schematic::extract_power_symbol_labels(&before.tree())
+            .iter()
+            .any(|label| label.uuid.as_deref() == Some(uuid.as_str()))
+    );
     assert_blocked(
         &before,
         &after,
@@ -269,12 +291,18 @@ async fn a_schematic_header_without_a_version_is_refused() {
 
 #[tokio::test]
 async fn an_incomplete_s_expression_names_the_failed_path() {
-    assert_malformed(b"(kicad_sch", None).await;
+    let text = "(kicad_sch (version 20260306)";
+    let reason = copperpour_sexp::parse_sexp(text).unwrap_err().to_string();
+    assert_malformed(text.as_bytes(), Some(&reason)).await;
 }
 
 #[tokio::test]
 async fn a_non_utf8_sheet_names_the_failed_path() {
-    assert_malformed(b"\xff", None).await;
+    let mut bytes = b"(kicad_sch (version 20260306) (generator \"fixture\"))".to_vec();
+    let index = bytes.iter().position(|&byte| byte == b'f').unwrap();
+    bytes[index] = 0xff;
+    let reason = std::str::from_utf8(&bytes).unwrap_err().to_string();
+    assert_malformed(&bytes, Some(&reason)).await;
 }
 
 #[tokio::test]
@@ -309,37 +337,35 @@ async fn assert_invalid_argument(
 #[tokio::test]
 async fn a_non_string_baseline_is_refused() {
     let sheet = Sheet::input(SPARSE);
-    assert_invalid_argument(
-        json!({"schematic": sheet.path, "baseline": 123}),
-        &[&sheet],
-        "baseline",
-        None,
-    )
-    .await;
+    let args = json!({"schematic": sheet.path, "baseline": 123});
+    assert_invalid_argument(args.clone(), &[&sheet], "baseline", None).await;
+    assert_handler_refuses_path(&args, &[&sheet], "baseline").await;
 }
 
 #[tokio::test]
 async fn a_missing_schematic_argument_is_refused() {
     let baseline = Sheet::input(SPARSE);
-    assert_invalid_argument(
-        json!({"baseline": baseline.path}),
-        &[&baseline],
-        "schematic",
-        Some("missing"),
-    )
-    .await;
+    let args = json!({"baseline": baseline.path});
+    assert_invalid_argument(args.clone(), &[&baseline], "schematic", Some("missing")).await;
+    assert_handler_refuses_path(&args, &[&baseline], "schematic").await;
 }
 
 #[tokio::test]
 async fn a_non_string_schematic_argument_is_refused() {
     let baseline = Sheet::input(SPARSE);
-    assert_invalid_argument(
-        json!({"schematic": 123, "baseline": baseline.path}),
-        &[&baseline],
-        "schematic",
-        None,
-    )
-    .await;
+    let args = json!({"schematic": 123, "baseline": baseline.path});
+    assert_invalid_argument(args.clone(), &[&baseline], "schematic", None).await;
+    assert_handler_refuses_path(&args, &[&baseline], "schematic").await;
+}
+
+async fn assert_handler_refuses_path(args: &Value, inputs: &[&Sheet], field: &str) {
+    let before = prepare_read_only_inputs(inputs);
+    let ctx = ToolContext::new(ServerConfig::default(), Arc::new(ToolRouter::new()));
+    let result = handle_compare_schematic_layout(args, &ctx).await;
+    let after: Vec<_> = inputs.iter().map(|sheet| saved_input(sheet)).collect();
+    assert_eq!(after, before);
+    let err = result.expect_err("the handler should refuse the path argument");
+    assert_eq!(MissingArgument::field_in(&err), Some(field), "{err}");
 }
 
 #[tokio::test]
@@ -359,10 +385,27 @@ async fn a_non_list_removal_approval_argument_is_refused() {
     .await;
 }
 
+#[tokio::test]
+async fn a_served_approval_entry_error_names_its_index() {
+    let before = Sheet::input(SPARSE);
+    let after = before.fork();
+    assert_invalid_argument(
+        json!({
+            "baseline": before.path,
+            "schematic": after.path,
+            "removed_power_symbol_uuids": [123],
+        }),
+        &[&before, &after],
+        "removed_power_symbol_uuids[0]",
+        None,
+    )
+    .await;
+}
+
 async fn assert_handler_refuses_approvals(approvals: Value, reason: &str) {
     let baseline = Sheet::input(SPARSE);
     let sheet = baseline.fork();
-    let before = [saved_input(&baseline), saved_input(&sheet)];
+    let before = prepare_read_only_inputs(&[&baseline, &sheet]);
     let ctx = ToolContext::new(ServerConfig::default(), Arc::new(ToolRouter::new()));
     let response = handle_compare_schematic_layout(
         &json!({
@@ -374,7 +417,7 @@ async fn assert_handler_refuses_approvals(approvals: Value, reason: &str) {
     )
     .await
     .unwrap();
-    assert_eq!([saved_input(&baseline), saved_input(&sheet)], before);
+    assert_eq!(vec![saved_input(&baseline), saved_input(&sheet)], before);
     assert!(response.is_error);
     let [ToolContent::Text { text }] = response.content.as_slice() else {
         panic!("expected a single structured error: {response:?}");
