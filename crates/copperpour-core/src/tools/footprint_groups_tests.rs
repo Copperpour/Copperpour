@@ -68,6 +68,37 @@ fn groups_are_counted() {
     );
 }
 
+/// Two footprints with one reference, as before annotation: the first owns a
+/// group, the second none. Their counts add up, so the reference is refused;
+/// keeping only the last footprint's count would let the edit through, and the
+/// tool might edit the footprint that owns the group (#826's review).
+#[test]
+fn a_reference_two_footprints_carry_owns_what_both_own() {
+    let r1 = "(property \"Reference\" \"R1\"";
+    let u1 = "(property \"Reference\" \"U1\"";
+    assert!(BOARD.find(r1) < BOARD.find(u1), "R1 must come first");
+    // U1 without its own group, renamed to R1, after the original R1.
+    let two_r1 = BOARD.replacen(U1_GROUP, "", 1).replacen(u1, r1, 1);
+    assert_eq!(two_r1.matches(r1).count(), 2);
+    assert!(owned_group_reasons_in(&two_r1, "move", Some(&["R1"])).is_empty());
+    // The first R1 owns a group.
+    let first_owns = two_r1.replacen(
+        r1,
+        &format!(
+            "(group \"\" (uuid \"00000000-0000-0000-0000-000000000826\") (members))\n\t\t{r1}"
+        ),
+        1,
+    );
+    assert_eq!(
+        reasons(&owned_group_reasons_in(&first_owns, "move", Some(&["R1"]))),
+        [(
+            Some("R1"),
+            "R1 owns 1 group, which KiCad drops when its API updates a footprint; move R1 in \
+             KiCad's PCB editor instead"
+        )]
+    );
+}
+
 #[test]
 fn an_unreadable_board_refuses_rather_than_passes() {
     let found = owned_group_reasons_in("(kicad_pcb", "move", Some(&["R1", "U1"]));

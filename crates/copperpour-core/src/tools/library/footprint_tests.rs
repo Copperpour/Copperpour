@@ -592,6 +592,13 @@ fn pad_layers_are_written_in_kicads_order_and_wildcards() {
             r#"(layers "F.Mask" "B.Cu")"#,
         ),
         (vec!["F.Paste"], r#"(layers "F.Paste")"#),
+        // KiCad 10.0.8 wrote these two (#825's review): both pastes fold to
+        // `*.Paste` after `*.Cu`, and B.Mask (layer 3) precedes F.Paste (13).
+        (
+            vec!["F.Paste", "B.Paste", "B.Cu", "F.Cu"],
+            r#"(layers "*.Cu" "*.Paste")"#,
+        ),
+        (vec!["F.Paste", "B.Mask"], r#"(layers "B.Mask" "F.Paste")"#),
     ] {
         assert_eq!(kicad_pad_layers(&names), written, "{names:?}");
     }
