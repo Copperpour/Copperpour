@@ -170,4 +170,12 @@ mod tests {
     async fn page_fit_belongs_to_readability() {
         assert_readability_route("check_schematic_page_fit").await;
     }
+
+    #[tokio::test]
+    async fn block_placement_belongs_only_to_readability() {
+        assert!(crate::tools::sch_analysis::tools()
+            .iter()
+            .all(|tool| tool.name != "preview_block_placement"));
+        assert_readability_route("preview_block_placement").await;
+    }
 }
