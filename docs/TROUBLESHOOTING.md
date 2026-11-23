@@ -680,14 +680,86 @@ back to project-local sidecars, and so is a relative default (a relative
 `HOME`, say): edits then refuse until `HOME`, `XDG_DATA_HOME` or
 `COPPERPOUR_STATE_DIR` is an absolute path.
 
+## Which clients see a loaded toolset
+
+Copperpour decides which toolsets are loaded; each MCP client keeps its own copy
+of `tools/list`. The server behaves the same for every client:
+
+- The first `tools/list` holds the meta-tools and the starter kit (`project`,
+  `config`). It holds every toolset when `eager_toolsets` is `true`, or when the
+  client's `clientInfo.name` starts with `claude-ai` or `local-agent-mode-`, the
+  two Claude Desktop connections seen not to offer tools loaded later
+  (`CLIENTS_THAT_CACHE_TOOL_LIST` in
+  `crates/copperpour-core/src/mcp/handler.rs`).
+- `initialize` declares `tools.listChanged`. `load_toolset` and `unload_toolset`
+  send `notifications/tools/list_changed` over stdio and over the HTTP SSE
+  stream, and the next `tools/list` has the change. The server cannot see
+  whether the client uses the new list, so a `load_toolset` reply that adds
+  tools carries a `hint` with the recovery. `get_active_toolsets` reports the
+  server's state, not the client's.
+- A direct `tools/call` runs the tool it names and no other. A tool whose
+  toolset is not loaded is refused with `toolset_not_loaded`, which names the
+  toolset. A name no toolset has is refused with `unknown_tool`. Neither loads
+  anything, unless `auto_load_toolsets` is `true`: then the owning toolset loads
+  and the named tool runs.
+- `find_tools` searches every registered tool, loaded or not, and returns its
+  name, toolset, description and load state, but no schema. It was added after
+  v0.17.0. `call_tool` runs a tool by name whether or not it is loaded or
+  listed, with that tool's own argument checks, and by default only read-only
+  tools (see [`call_tool`](TOOL_SYSTEM.md#call_tool)). Neither changes
+  `tools/list`, and both are in every first listing, so neither needs a refresh.
+
+A loaded toolset becomes callable in the same session when the client fetches
+`tools/list` again after the notification and offers the new tools. A client
+that ignores the new list never offers them, and restarting it, or a reconnect
+that respawns a stdio server, starts a new server from the starter kit. Such a
+client needs a complete first listing (`eager_toolsets`, or the automatic load
+above), which takes effect at the next start, or `call_tool`, which needs no
+refresh. For which process to restart, see
+["Which Copperpour binary is this client using?"](#which-copperpour-binary-is-this-client-using).
+
+What has been observed, by client and setting. "Not observed" means nobody has
+reported it yet.
+
+| Client | Default (`load_toolset`) | `eager_toolsets = true` | Recommended |
+| --- | --- | --- | --- |
+| Claude Code (CLI) | Same session: Claude Code 2.1.327, Linux, v0.16.1 ([#50](https://github.com/Copperpour/Copperpour/issues/50#issuecomment-7003867638)). Never on two other setups, cause not found: Konnect 0.11.1 on Windows, Claude Code version not recorded ([#50](https://github.com/Copperpour/Copperpour/issues/50)), and 2.1.325 on Linux with v0.15.0, CLI or Code tab not stated ([#50](https://github.com/Copperpour/Copperpour/issues/50#issuecomment-6993958716)). | Callable after a restart: 2.1.325, Linux, v0.15.0 ([#50](https://github.com/Copperpour/Copperpour/issues/50#issuecomment-6993958716)). | Default. If new tools are rejected as "No such tool available", set `eager_toolsets` and restart the CLI. |
+| Claude Code in Claude Desktop (Code tab) | Not observed separately; see the 2.1.325 report above. | Not observed separately. | As for the CLI. |
+| Claude Desktop (Chat), `claude-ai` | Every tool from the first listing: the server loads every toolset at `initialize` (server log, v0.15.0, Linux, [#448](https://github.com/Copperpour/Copperpour/pull/448)). Before that, never: the app fetched the new list and still refused its tools (Konnect v0.11.0, Kubuntu 24.04, app version not recorded, [Konnect#233](https://github.com/mixelpixx/Konnect/issues/233#issuecomment-5469073195)); also on Windows 11 ([Konnect#169](https://github.com/mixelpixx/Konnect/issues/169)). | Callable across many sessions: Konnect v0.11.0, Kubuntu 24.04 ([Konnect#233](https://github.com/mixelpixx/Konnect/issues/233#issuecomment-5469073195)). | Nothing to set. |
+| Claude Desktop cloud agent connection, `local-agent-mode-<key>` | Every tool from the first listing since v0.17.0; loaded tools were then called in cloud sessions ([#448](https://github.com/Copperpour/Copperpour/pull/448)). Before that, never: v0.15.0, Linux, app version not recorded. | Not observed separately. | Nothing to set. |
+| GitHub Copilot in VS Code | Never: Copilot keeps its first `tools/list`, and reloading the window did not help (versions not recorded, [Konnect#325](https://github.com/mixelpixx/Konnect/issues/325#issuecomment-5407317596)). | Partly: Copilot offers an unstable subset under a 128-tool cap across all MCP servers, and refuses the rest as "currently disabled by the user" ([Konnect#325](https://github.com/mixelpixx/Konnect/issues/325#issuecomment-5407317596)). | None verified; see [VS Code Copilot](#vs-code-copilot-says-a-tool-is-currently-disabled-by-the-user). |
+| Zed | Same session: Zed 1.29.3, stdio ([#53](https://github.com/Copperpour/Copperpour/issues/53#issuecomment-7068905279)). Never on Zed 1.14.2, which also ran other tools in place of the missing ones (Konnect 0.10.1 and 0.11.1, [#53](https://github.com/Copperpour/Copperpour/issues/53)). | Callable over stdio, Zed version not stated ([#53](https://github.com/Copperpour/Copperpour/issues/53#issuecomment-6875990140)). | Default (observed on 1.29.3). `eager_toolsets` on a build that rejects new tools. |
+| Muse (Meta) | Never: Muse reads `tools/list` once per session (Konnect v0.11.0, Windows, Muse version not recorded, [#131](https://github.com/Copperpour/Copperpour/issues/131)). | Callable from the next session, no tool cap seen ([#131](https://github.com/Copperpour/Copperpour/issues/131)). | `eager_toolsets`; see [Muse](#muse-meta-never-sees-tools-loaded-after-startup). |
+| Reasonix | Never: Reasonix 1.19.7, Konnect v0.2.2 ([Konnect#134](https://github.com/mixelpixx/Konnect/issues/134)). | Not observed. | `eager_toolsets` (not verified). |
+| Codex, Gemini CLI, Cursor, Antigravity | Not observed. | Not observed. | Default; `eager_toolsets` if new tools stay unknown. |
+
+Still to observe, so none of it is claimed above:
+
+- `call_tool` and `find_tools` in a client application.
+  [#450](https://github.com/Copperpour/Copperpour/pull/450) drove `call_tool`
+  from a script over stdio.
+- Claude Code in the Code tab after `load_toolset`, and the cause of the two
+  Claude Code failures in [#50](https://github.com/Copperpour/Copperpour/issues/50).
+- Any client over HTTP. The server's SSE delivery is tested, not a client's
+  response to it.
+- A reconnect that keeps the server process, in any client.
+- Claude Desktop's two connections on macOS and Windows with a current release.
+- Reasonix with `eager_toolsets`, and Codex, Gemini CLI, Cursor and Antigravity
+  at all.
+
+To add a result, open an issue with the client and its version, the Copperpour
+version, the transport, and the `MCP client: …` line the server logs to stderr
+at startup.
+
 ## Tools don't appear after `load_toolset`
 
 After a successful `load_toolset` call the server sends a
 `notifications/tools/list_changed` notification, and MCP clients are expected to
 re-fetch `tools/list` in response. If newly loaded tools never show up:
 
-1. Check your client honors `notifications/tools/list_changed` (most current MCP
-   clients do; some cache the initial tool list forever).
+1. Check whether your client honors `notifications/tools/list_changed`; some
+   keep their first tool list. What each client has been seen to do is in
+   ["Which clients see a loaded toolset"](#which-clients-see-a-loaded-toolset).
 2. Disable any competing tool-search or tool-filter layer sitting between the
    model and the server. A Chrome-extension "tool search" that shadowed the real
    tool list caused exactly this in
@@ -705,12 +777,11 @@ above helps: the tools are loaded server-side, but the client has no schema to
 invoke them with. `load_toolset` reports the names it loaded and *not* their
 schemas, so a model can see a tool named in the reply and still be unable to
 call it. That is the symptom in
-[#134](https://github.com/mixelpixx/Konnect/issues/134) and
-[#169](https://github.com/mixelpixx/Konnect/issues/169) — reported against
-Claude Desktop, and in [#50](https://github.com/Copperpour/Copperpour/issues/50)
-against some Claude Code setups, although Claude Code 2.1.327 over stdio has been
-seen to refresh. The server cannot tell whether a client refreshed, so every
-`load_toolset` reply that adds tools carries a `hint` pointing here.
+[Konnect#134](https://github.com/mixelpixx/Konnect/issues/134) (Reasonix) and
+[Konnect#169](https://github.com/mixelpixx/Konnect/issues/169) (Claude Desktop);
+the [client table](#which-clients-see-a-loaded-toolset) lists the others. The
+server cannot tell whether a client refreshed, so every `load_toolset` reply
+that adds tools carries a `hint` pointing here.
 
 For clients that cache the initial list but do not also cap the number of
 callable tools, the fix is to make the *first* listing complete:
@@ -728,6 +799,13 @@ It is off by default because it costs what the router exists to save: roughly
 Note that `auto_load_toolsets` does **not** solve this. It loads a toolset when
 a tool from it is *called*, which helps only a client that already knows the
 tool name — so it does nothing for a client whose tool list is stale.
+
+Without a restart, `call_tool` can reach a tool the client never listed, since
+`call_tool` itself is in every first listing; `find_tools` finds the tool's
+name. By default `call_tool` runs only read-only tools; see
+[`call_tool`](TOOL_SYSTEM.md#call_tool) for `call_tool_allow_writes` and what
+allowing it means for client approvals. Neither has been observed in a client
+application yet.
 
 ## VS Code Copilot says a tool is "currently disabled by the user"
 
@@ -759,7 +837,12 @@ Current options are:
    need below the client's budget.
 2. Use an MCP client that honors `tools/list_changed` or can expose Copperpour's
    full catalog.
-3. Use the community two-tool proxy pattern demonstrated in
+3. Keep `eager_toolsets` off and call tools through `call_tool`, using
+   `find_tools` to look up names. This is the proxy's pattern built into the
+   server, but it has not been observed in Copilot. `find_tools` returns no
+   schema, and `call_tool` runs only read-only tools unless the operator sets
+   `call_tool_allow_writes = true`.
+4. Use the community two-tool proxy pattern demonstrated in
    [the #325 follow-up](https://github.com/mixelpixx/Konnect/issues/325#issuecomment-5407317596):
    expose only `copperpour_help` and `copperpour_call` to Copilot, let
    `copperpour_help()` list names or return one tool's description and schema,
@@ -768,8 +851,8 @@ Current options are:
 
 The proxy is a community workaround attached to the issue, not code shipped or
 reviewed by Copperpour; inspect it and configure its executable path before use.
-A native compact tool-surface mode and MCP tool-directory resource are tracked
-in [#60](https://github.com/Copperpour/Copperpour/issues/60), but are not available yet.
+See ["Which clients see a loaded toolset"](#which-clients-see-a-loaded-toolset)
+for what has and has not been observed in Copilot.
 
 ## Muse (Meta) never sees tools loaded after startup
 
