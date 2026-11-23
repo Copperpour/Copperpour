@@ -130,8 +130,14 @@ async fn model_production_orchestration_attaches_step_and_wrl_and_reuses_identic
             }
             let observed = std::fs::read_to_string(&fp).unwrap();
             assert!(observed.contains(result["kicad_path"].as_str().unwrap()));
-            assert!(observed.contains("(offset (xyz 11 22 5))"));
-            assert!(observed.contains("(rotate (xyz 0 0 180))"));
+            // The model block is in KiCad's nested layout (#715); read it flat.
+            let flat = observed
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .replace(" )", ")");
+            assert!(flat.contains("(offset (xyz 11 22 5))"), "{observed}");
+            assert!(flat.contains("(rotate (xyz 0 0 180))"), "{observed}");
             assert!(observed.contains("(pad \"1\""));
         }
         assert_eq!(
