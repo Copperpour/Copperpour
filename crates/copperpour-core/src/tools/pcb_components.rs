@@ -2533,16 +2533,18 @@ pub fn tools() -> Vec<ToolDef> {
             "Return live board-space pad positions, effective rotations, physical geometry, drills, \
              copper-layer shapes, layers and net assignments for a footprint. \
              Reads the board open in KiCad when it is reachable and falls back to the file only \
-             when no live KiCad holds this board — IPC unreachable, or that board not open — \
-             'source' says which, so unsaved placements are visible without a save. \
+             when no live KiCad holds this board — IPC unreachable, or that board not open \
+             ('board_source' selects auto, live, or saved) — \
+             'source', 'sources' and 'source_evidence' say which, so unsaved placements are visible without a save. \
              A pad's 'net' is its net name, \"\" if the pad carries no net \
              (unconnected), or — reading the file — null if the net node is present \
              but unreadable; treat null as an error, not as an unconnected pad.",
             json!({
                 "type": "object",
                 "properties": {
-                    "board":     { "type": "string" },
-                    "reference": { "type": "string" }
+                    "board":        { "type": "string" },
+                    "reference":    { "type": "string" },
+                    "board_source": crate::tools::board_source::board_source_schema()
                 },
                 "required": ["board", "reference"]
             }),
@@ -2552,13 +2554,15 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "get_pad_position",
             "Return the live board-space position, effective rotation, physical geometry, drill, \
-             layers and net of a specific pad number on a footprint.",
+             layers and net of a specific pad number on a footprint ('board_source' selects auto, \
+             live, or saved).",
             json!({
                 "type": "object",
                 "properties": {
-                    "board":       { "type": "string" },
-                    "reference":   { "type": "string" },
-                    "pad_number":  { "type": "string" }
+                    "board":        { "type": "string" },
+                    "reference":    { "type": "string" },
+                    "pad_number":   { "type": "string" },
+                    "board_source": crate::tools::board_source::board_source_schema()
                 },
                 "required": ["board", "reference", "pad_number"]
             }),
@@ -4305,6 +4309,10 @@ async fn handle_get_component_pads(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
+    let source_selector = match crate::tools::board_source::BoardSource::from_args(args) {
+        Ok(source) => source,
+        Err(refusal) => return Ok(refusal),
+    };
     let reference = match require_str(args, "reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -4315,23 +4323,34 @@ async fn handle_get_component_pads(
     // answer about a stale board while the writers in this toolset act on the
     // live one. The file stays the fallback for an offline session.
     let ipc_reference = reference.clone();
-    let live = with_board_ipc_classified(ctx, &board_path, move |c, document| {
-        c.get_footprint_pads_in(document, &ipc_reference)
-    })
+    let observation = crate::tools::board_source::read_board(
+        ctx,
+        &board_path,
+        source_selector,
+        "component pads",
+        move |c, document| c.get_footprint_pads_in(document, &ipc_reference),
+    )
     .await?;
-    match live {
+    let saved_why = match observation {
+        crate::tools::board_source::BoardRead::Refused(refusal) => return Ok(refusal),
         // KiCad has the part and reports pads for it.
-        Ok(Some(pads)) if !pads.is_empty() => {
+        crate::tools::board_source::BoardRead::Live(Some(pads)) if !pads.is_empty() => {
             let items: Vec<serde_json::Value> = pads
                 .iter()
                 .map(|pad| serde_json::to_value(pad).expect("IpcPad is serializable"))
                 .collect();
-            return Ok(CallToolResult::json(&json!({
+            let mut body = json!({
                 "reference": reference,
                 "pad_count": items.len(),
                 "pads": items,
                 "source": "ipc"
-            })));
+            });
+            crate::tools::board_source::provenance(
+                &mut body,
+                json!({ "pads": crate::tools::board_source::FROM_IPC }),
+                crate::tools::board_source::live_evidence(),
+            );
+            return Ok(CallToolResult::json(&body));
         }
         // KiCad has the part and reports no pads. A pad-less footprint is
         // legal — a logo, a mounting graphic — so this is not wrong by
@@ -4344,7 +4363,7 @@ async fn handle_get_component_pads(
         // "no pads" is refused until the next save. Preferring that to
         // silently reporting an unread response as an empty pad list is the
         // whole point — and the message says which key to press.
-        Ok(Some(_)) => {
+        crate::tools::board_source::BoardRead::Live(Some(_)) => {
             if saved_pad_count(&board_path, &reference).is_some_and(|count| count > 0) {
                 return Ok(CallToolResult::error(format!(
                     "KiCad reports no pads for footprint '{reference}' while the saved file \
@@ -4352,48 +4371,29 @@ async fn handle_get_component_pads(
                      retry, and report this if it persists."
                 )));
             }
-            return Ok(CallToolResult::json(&json!({
+            let mut body = json!({
                 "reference": reference,
                 "pad_count": 0,
                 "pads": [],
                 "source": "ipc"
-            })));
+            });
+            crate::tools::board_source::provenance(
+                &mut body,
+                json!({ "pads": crate::tools::board_source::FROM_IPC }),
+                crate::tools::board_source::live_evidence(),
+            );
+            return Ok(CallToolResult::json(&body));
         }
         // KiCad holds this board and does not have the part: the file may
         // still carry a footprint the user has deleted, so answering from it
         // would be answering about a board that no longer exists.
-        Ok(None) => {
+        crate::tools::board_source::BoardRead::Live(None) => {
             return Ok(CallToolResult::error(format!(
                 "Footprint '{reference}' not found on the board open in KiCad"
             )))
         }
-        // Unreachable, or reachable and holding some other board: either way
-        // no live KiCad can be answering about this one, so read the file.
-        Err(copperpour_ipc::IpcFailure::Unreachable { .. }) => {}
-        Err(copperpour_ipc::IpcFailure::Target { error, .. }) if error.proves_not_open() => {}
-        Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
-            return Ok(crate::tools::ipc_target_error_result(&error));
-        }
-        // Reading the pads raises no refusal of Copperpour's own (#240).
-        Err(
-            copperpour_ipc::IpcFailure::Rejected { message, .. }
-            | copperpour_ipc::IpcFailure::Preflight(copperpour_ipc::PreflightRefusal {
-                reason: message,
-                ..
-            }),
-        ) => {
-            return Ok(CallToolResult::error(message));
-        }
-        Err(copperpour_ipc::IpcFailure::Recovered(message)) => {
-            return Ok(crate::tools::ipc_recovered_result(&message));
-        }
-        Err(copperpour_ipc::IpcFailure::Uncertain(message)) => {
-            return Ok(crate::tools::ipc_uncertain_result(&message));
-        }
-        Err(failure @ copperpour_ipc::IpcFailure::ItemRejected { .. }) => {
-            return Ok(crate::tools::ipc_failure_result(failure));
-        }
-    }
+        crate::tools::board_source::BoardRead::Saved(why) => why,
+    };
 
     let content = std::fs::read_to_string(&board_path)?;
     let tree = copperpour_sexp::parser::parse_sexp(&content)?;
@@ -4480,12 +4480,18 @@ async fn handle_get_component_pads(
         pads.push(value);
     }
 
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "reference": reference,
         "pad_count": pads.len(),
         "pads": pads,
         "source": "file"
-    })))
+    });
+    crate::tools::board_source::provenance(
+        &mut body,
+        json!({ "pads": crate::tools::board_source::FROM_SAVED_BOARD }),
+        saved_why.evidence(),
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_get_pad_position(
@@ -4508,13 +4514,20 @@ async fn handle_get_pad_position(
                     .iter()
                     .find(|p| p["number"].as_str() == Some(&pad_number))
                 {
-                    // Carry the pad list's source, so a caller measuring one
-                    // pad can still tell whether it measured the live board.
+                    // Carry the pad list's source and provenance, so a caller
+                    // measuring one pad can still tell whether it measured the
+                    // live board and why any saved fallback occurred.
                     let mut pad = pad.clone();
-                    if let (Some(object), Some(source)) =
-                        (pad.as_object_mut(), parsed.get("source"))
-                    {
-                        object.insert("source".to_string(), source.clone());
+                    if let Some(object) = pad.as_object_mut() {
+                        if let Some(source) = parsed.get("source") {
+                            object.insert("source".to_string(), source.clone());
+                        }
+                        if let Some(pad_source) = parsed.pointer("/sources/pads") {
+                            object.insert("sources".to_string(), json!({ "pad": pad_source }));
+                        }
+                        if let Some(evidence) = parsed.get("source_evidence") {
+                            object.insert("source_evidence".to_string(), evidence.clone());
+                        }
                     }
                     return Ok(CallToolResult::json(&pad));
                 }

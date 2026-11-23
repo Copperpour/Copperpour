@@ -87,6 +87,8 @@ pub(crate) const FROM_SAVED_BOARD: &str = "saved_board";
 pub(crate) const FROM_PROJECT_FILE: &str = "project_file";
 /// A domain computed from other reported domains rather than observed.
 pub(crate) const FROM_DERIVED: &str = "derived";
+/// A domain supplied directly by a tool argument rather than read from disk or IPC.
+pub(crate) const FROM_ARGUMENT: &str = "argument";
 /// A domain no reachable source could answer.
 pub(crate) const FROM_UNAVAILABLE: &str = "unavailable";
 
@@ -410,6 +412,9 @@ fn lost_live_board(board_path: &Path, situation: &str) -> CallToolResult {
 /// 6. `SavedSnapshot` contains only read-only tools, while `ClosedBoardOnly`
 ///    and `ApplyModeDependent` contain only non-read-only tools, preventing a
 ///    mutating tool from being misclassified into a read-only snapshot class.
+/// 7. Every read-only tool with a selector-eligible [`BoardAccess`]
+///    (`LivePreferredWithFallback` or `MixedSource`) advertises the canonical
+///    `board_source` selector.
 #[cfg(test)]
 pub(crate) fn validate_board_access_inventory(tools: &[crate::tools::ToolDef]) -> Vec<String> {
     use crate::router::call_tool_policy;
@@ -474,6 +479,15 @@ pub(crate) fn validate_board_access_inventory(tools: &[crate::tools::ToolDef]) -
             violations.push(format!(
                 "{}: declares BoardAccess::SavedSnapshot but is not in call_tool_policy::READ_ONLY_TOOLS",
                 tool.name
+            ));
+        }
+        if tool.board_access.supports_board_source_selector()
+            && is_read_only
+            && !tool.advertises_board_source()
+        {
+            violations.push(format!(
+                "{}: read-only BoardAccess::{:?} tool does not advertise 'board_source'",
+                tool.name, tool.board_access
             ));
         }
         if matches!(
@@ -688,6 +702,28 @@ mod tests {
         let violations = validate_board_access_inventory(&[mutator_as_saved]);
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(violations[0].contains("SavedSnapshot"), "{violations:?}");
+
+        // Read-only selector-eligible tools (LivePreferredWithFallback and MixedSource)
+        // missing board_source.
+        for (name, access) in [
+            ("get_board_extents", BoardAccess::LivePreferredWithFallback),
+            ("get_placement_overview", BoardAccess::MixedSource),
+        ] {
+            let missing_selector = dummy_tool(
+                name,
+                json!({
+                    "type": "object",
+                    "properties": { "board": { "type": "string" } }
+                }),
+                access,
+            );
+            let violations = validate_board_access_inventory(&[missing_selector]);
+            assert_eq!(violations.len(), 1, "{name}: {violations:?}");
+            assert!(
+                violations[0].contains("does not advertise 'board_source'"),
+                "{name}: {violations:?}"
+            );
+        }
 
         // Read-only tool classified as ClosedBoardOnly or ApplyModeDependent.
         for access in [

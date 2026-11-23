@@ -15,9 +15,10 @@
 //! ratsnest draws for an unrouted net. Routed copper is not considered: this
 //! describes the placement, not the routing.
 
-use super::live_or_saved_board;
+use super::{live_or_saved_board, ObservedBoardSnapshot};
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::board_source::{self, BoardSource};
 use crate::tools::pcb_routing::wildcard_matches;
 use crate::tools::{get_path, ToolContext, ToolDef};
 use copperpour_sexp::board::{
@@ -53,7 +54,8 @@ pub(super) fn tool() -> ToolDef {
          Airwires are each net's minimum spanning tree over its pads; routing is ignored. \
          Ground nets and nets with more than max_net_pads pads are left out of the airwires \
          and listed. Reads the board live from KiCad when it is open there, else the saved \
-         file. image: true also returns a picture of outline, courtyards, pads and airwires.",
+         file ('board_source' selects auto, live, or saved). image: true also returns a \
+         picture of outline, courtyards, pads and airwires.",
         json!({
             "type": "object",
             "properties": {
@@ -70,7 +72,8 @@ pub(super) fn tool() -> ToolDef {
                 "max_net_pads": { "type": "integer", "minimum": 2, "description": "Nets with more pads are left out of the airwires. Default 40." },
                 "top": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Entries per ranked list. Default 10." },
                 "image": { "type": "boolean", "description": "Also return the placement as an image block. Default false." },
-                "width_px": { "type": "integer", "minimum": 200, "maximum": 4096, "description": "Image width in pixels. Default 1600." }
+                "width_px": { "type": "integer", "minimum": 200, "maximum": 4096, "description": "Image width in pixels. Default 1600." },
+                "board_source": board_source::board_source_schema()
             },
             "required": ["board"]
         }),
@@ -92,7 +95,16 @@ async fn handle_placement_overview(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let (content, source) = match live_or_saved_board(ctx, &board).await? {
+    let source_selector = match BoardSource::from_args(args) {
+        Ok(source) => source,
+        Err(refusal) => return Ok(refusal),
+    };
+    let ObservedBoardSnapshot {
+        content,
+        legacy_source: source,
+        domain_source,
+        evidence,
+    } = match live_or_saved_board(ctx, &board, source_selector, "placement overview").await? {
         Ok(read) => read,
         Err(result) => return Ok(result),
     };
@@ -119,26 +131,39 @@ async fn handle_placement_overview(
     };
 
     // ── Net groups ──────────────────────────────────────────────────────────
-    let (group_patterns, groups_source) = match args["net_groups"].as_object() {
-        Some(map) => (
-            map.iter()
-                .map(|(name, patterns)| {
-                    let patterns = patterns
-                        .as_array()
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(|v| v.as_str().map(str::to_string))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    (name.clone(), patterns)
-                })
-                .collect::<Vec<(String, Vec<String>)>>(),
-            "argument",
-        ),
-        None => (project_netclass_patterns(&board), "netclasses"),
-    };
+    let (group_patterns, groups_source, net_groups_domain_source) =
+        match args["net_groups"].as_object() {
+            Some(map) => (
+                map.iter()
+                    .map(|(name, patterns)| {
+                        let patterns = patterns
+                            .as_array()
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (name.clone(), patterns)
+                    })
+                    .collect::<Vec<(String, Vec<String>)>>(),
+                "argument",
+                board_source::FROM_ARGUMENT,
+            ),
+            None => {
+                let (patterns, pro_readable) = project_netclass_patterns(&board);
+                (
+                    patterns,
+                    "netclasses",
+                    if pro_readable {
+                        board_source::FROM_PROJECT_FILE
+                    } else {
+                        board_source::FROM_UNAVAILABLE
+                    },
+                )
+            }
+        };
     let nets = index.nets();
     // A netclass pattern is matched as KiCad matches it, against the whole
     // net name; only a group the caller names also matches the short name.
@@ -313,6 +338,15 @@ async fn handle_placement_overview(
         report["airwires"]["crossings_note"] =
             json!(format!("not counted above {MAX_CROSSING_EDGES} airwires"));
     }
+    board_source::provenance(
+        &mut report,
+        json!({
+            "placement": domain_source,
+            "net_groups": net_groups_domain_source,
+            "groups": board_source::FROM_DERIVED,
+        }),
+        evidence,
+    );
 
     let mut result = CallToolResult::json(&report);
     if args["image"].as_bool().unwrap_or(false) {
@@ -422,14 +456,14 @@ pub(in crate::tools) fn check_netclass_rename_pattern(
     Ok(())
 }
 
-/// The project's netclasses other than `Default`, each with its patterns.
-/// Empty when there is no readable `.kicad_pro` or it assigns no nets.
-fn project_netclass_patterns(board: &std::path::Path) -> Vec<(String, Vec<String>)> {
+/// The project's netclasses other than `Default`, each with its patterns,
+/// plus whether a readable `.kicad_pro` backed them.
+fn project_netclass_patterns(board: &std::path::Path) -> (Vec<(String, Vec<String>)>, bool) {
     let Ok(text) = std::fs::read_to_string(board.with_extension("kicad_pro")) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let mut by_class: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for entry in settings["net_settings"]["netclass_patterns"]
@@ -448,7 +482,7 @@ fn project_netclass_patterns(board: &std::path::Path) -> Vec<(String, Vec<String
                 .push(pattern.to_string());
         }
     }
-    by_class.into_iter().collect()
+    (by_class.into_iter().collect(), true)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -42,6 +42,53 @@ const LIVE_LAYERS: [&str; 3] = ["F.Cu", "B.Cu", "Edge.Cuts"];
 const LIVE_TOP_DISPLAY_NAME: &str = "LiveRenamedTop";
 const LIVE_NETS: [&str; 2] = ["LIVE_ONLY_P", "LIVE_ONLY_Q"];
 
+/// Saved vs. live geometry on `board_source_divergence_kicad10.kicad_pcb`:
+/// the saved file has R1 at (100, 50) (pad 1 at 99.5, 50 on `SAVED_ONLY_A`),
+/// R2 at (110, 50) (anchor distance 10.0 mm, 2 footprints), while the live
+/// KiCad double reports R1 at (85, 45) (pad 1 at 84.5, 45 on `LIVE_ONLY_P`),
+/// R2 at (109, 45) (anchor distance 24.0 mm), and an extra live footprint R3
+/// at (120, 55) (3 footprints total).
+const SAVED_R1_PAD1_X: f64 = 99.5;
+const LIVE_R1_PAD1_X: f64 = 84.5;
+const SAVED_ANCHOR_CLEARANCE_MM: f64 = 10.0;
+const LIVE_ANCHOR_CLEARANCE_MM: f64 = 24.0;
+const SAVED_FOOTPRINT_COUNT: u64 = 2;
+const LIVE_FOOTPRINT_COUNT: u64 = 3;
+
+const LIVE_DOCUMENT_SNAPSHOT: &str = "(kicad_pcb\n\
+\t(version 20260206)\n\
+\t(generator \"pcbnew\")\n\
+\t(generator_version \"10.0\")\n\
+\t(layers\n\
+\t\t(0 \"F.Cu\" signal)\n\
+\t\t(2 \"B.Cu\" signal)\n\
+\t\t(25 \"Edge.Cuts\" user)\n\
+\t\t(31 \"F.CrtYd\" user \"F.Courtyard\")\n\
+\t)\n\
+\t(gr_rect (start 80 30) (end 130 70) (stroke (width 0.05) (type default)) (fill none) (layer \"Edge.Cuts\"))\n\
+\t(footprint \"Resistor_SMD:R_0402\" (layer \"F.Cu\") (at 85 45)\n\
+\t\t(property \"Reference\" \"R1\" (at 0 -1.5 0) (layer \"F.SilkS\"))\n\
+\t\t(property \"Value\" \"10k\" (at 0 1.5 0) (layer \"F.Fab\"))\n\
+\t\t(fp_rect (start -1 -0.6) (end 1 0.6) (stroke (width 0.05) (type default)) (fill none) (layer \"F.CrtYd\"))\n\
+\t\t(pad \"1\" smd rect (at -0.5 0) (size 0.6 0.5) (layers \"F.Cu\" \"F.Mask\" \"F.Paste\") (net \"LIVE_ONLY_P\"))\n\
+\t\t(pad \"2\" smd rect (at 0.5 0) (size 0.6 0.5) (layers \"F.Cu\" \"F.Mask\" \"F.Paste\") (net \"LIVE_ONLY_Q\"))\n\
+\t)\n\
+\t(footprint \"Resistor_SMD:R_0402\" (layer \"F.Cu\") (at 109 45)\n\
+\t\t(property \"Reference\" \"R2\" (at 0 -1.5 0) (layer \"F.SilkS\"))\n\
+\t\t(property \"Value\" \"4.7k\" (at 0 1.5 0) (layer \"F.Fab\"))\n\
+\t\t(fp_rect (start -1 -0.6) (end 1 0.6) (stroke (width 0.05) (type default)) (fill none) (layer \"F.CrtYd\"))\n\
+\t\t(pad \"1\" smd rect (at -0.5 0) (size 0.6 0.5) (layers \"F.Cu\" \"F.Mask\" \"F.Paste\") (net \"LIVE_ONLY_P\"))\n\
+\t\t(pad \"2\" smd rect (at 0.5 0) (size 0.6 0.5) (layers \"F.Cu\" \"F.Mask\" \"F.Paste\") (net \"LIVE_ONLY_Q\"))\n\
+\t)\n\
+\t(footprint \"Resistor_SMD:R_0402\" (layer \"F.Cu\") (at 120 55)\n\
+\t\t(property \"Reference\" \"R3\" (at 0 -1.5 0) (layer \"F.SilkS\"))\n\
+\t\t(property \"Value\" \"1k\" (at 0 1.5 0) (layer \"F.Fab\"))\n\
+\t\t(fp_rect (start -1 -0.6) (end 1 0.6) (stroke (width 0.05) (type default)) (fill none) (layer \"F.CrtYd\"))\n\
+\t\t(pad \"1\" smd rect (at -0.5 0) (size 0.6 0.5) (layers \"F.Cu\" \"F.Mask\" \"F.Paste\") (net \"LIVE_ONLY_Q\"))\n\
+\t\t(pad \"2\" smd rect (at 0.5 0) (size 0.6 0.5) (layers \"F.Cu\" \"F.Mask\" \"F.Paste\") (net \"LIVE_ONLY_P\"))\n\
+\t)\n\
+)\n";
+
 /// The layers the double enables, as KiCad's own `BoardLayer` enum rather
 /// than hand-copied numbers — `board_types.proto` is vendored from KiCad and
 /// resynced on upgrades, and a constant that silently stopped meaning `F.Cu`
@@ -412,7 +459,123 @@ fn live_answer(command: &prost_types::Any) -> Option<prost_types::Any> {
             "kiapi.board.commands.NetsResponse",
         ));
     }
+    if command.type_url.ends_with("SaveDocumentToString") {
+        let asked = kiapi::common::commands::SaveDocumentToString::decode(&command.value[..])
+            .expect("SaveDocumentToString request");
+        assert!(
+            asked.document.is_some(),
+            "SaveDocumentToString must name the bound document"
+        );
+        return Some(copperpour_ipc::builders::pack_any(
+            &kiapi::common::commands::SavedDocumentResponse {
+                document: asked.document,
+                contents: LIVE_DOCUMENT_SNAPSHOT.to_string(),
+            },
+            "kiapi.common.commands.SavedDocumentResponse",
+        ));
+    }
+    if command.type_url.ends_with("GetItems") {
+        let asked = kiapi::common::commands::GetItems::decode(&command.value[..])
+            .expect("GetItems request");
+        assert!(
+            asked
+                .header
+                .as_ref()
+                .and_then(|h| h.document.as_ref())
+                .is_some(),
+            "GetItems must name the bound document"
+        );
+        let items = if asked
+            .types
+            .contains(&(kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32))
+        {
+            vec![live_r1_footprint()]
+        } else {
+            Vec::new()
+        };
+        return Some(copperpour_ipc::builders::pack_any(
+            &kiapi::common::commands::GetItemsResponse {
+                header: asked.header,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                items,
+            },
+            "kiapi.common.commands.GetItemsResponse",
+        ));
+    }
     None
+}
+
+fn live_r1_footprint() -> prost_types::Any {
+    let pad = |number: &str, x: f64, y: f64, net: &str, uuid: &str| {
+        copperpour_ipc::builders::pack_any(
+            &kiapi::board::types::Pad {
+                id: Some(kiapi::common::types::Kiid {
+                    value: uuid.to_string(),
+                }),
+                number: number.to_string(),
+                r#type: kiapi::board::types::PadType::PtSmd as i32,
+                position: Some(copperpour_ipc::builders::vec2(x, y)),
+                net: Some(kiapi::board::types::Net {
+                    code: None,
+                    name: net.to_string(),
+                }),
+                pad_stack: Some(kiapi::board::types::PadStack {
+                    layers: vec![
+                        BoardLayer::BlFCu as i32,
+                        BoardLayer::BlFMask as i32,
+                        BoardLayer::BlFPaste as i32,
+                    ],
+                    copper_layers: vec![kiapi::board::types::PadStackLayer {
+                        layer: BoardLayer::BlFCu as i32,
+                        shape: kiapi::board::types::PadStackShape::PssRectangle as i32,
+                        size: Some(copperpour_ipc::builders::vec2(0.6, 0.5)),
+                        ..Default::default()
+                    }],
+                    angle: Some(kiapi::common::types::Angle { value_degrees: 0.0 }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "kiapi.board.types.Pad",
+        )
+    };
+    copperpour_ipc::builders::pack_any(
+        &kiapi::board::types::FootprintInstance {
+            position: Some(copperpour_ipc::builders::vec2(85.0, 45.0)),
+            reference_field: Some(kiapi::board::types::Field {
+                name: "Reference".to_string(),
+                text: Some(kiapi::board::types::BoardText {
+                    text: Some(kiapi::common::types::Text {
+                        text: "R1".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            definition: Some(kiapi::board::types::Footprint {
+                items: vec![
+                    pad(
+                        "1",
+                        LIVE_R1_PAD1_X,
+                        45.0,
+                        LIVE_NETS[0],
+                        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+                    ),
+                    pad(
+                        "2",
+                        85.5,
+                        45.0,
+                        LIVE_NETS[1],
+                        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+                    ),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        "kiapi.board.types.FootprintInstance",
+    )
 }
 
 fn layer_names(body: &Value) -> Vec<String> {
@@ -1021,14 +1184,23 @@ async fn netclasses_refuse_after_a_failed_live_query() {
 async fn an_unknown_board_source_is_refused_by_name() {
     let scene = Scene::offline().await;
 
-    for tool in ["get_layer_list", "get_netclasses"] {
+    for (tool, extra) in [
+        ("get_layer_list", json!({})),
+        ("get_netclasses", json!({})),
+        ("score_placement", json!({})),
+        ("get_placement_overview", json!({})),
+        ("check_clearance", json!({ "ref1": "R1", "ref2": "R2" })),
+        ("get_component_pads", json!({ "reference": "R1" })),
+        (
+            "get_pad_position",
+            json!({ "reference": "R1", "pad_number": "1" }),
+        ),
+    ] {
         for value in [json!("ipc"), json!("file"), json!(true)] {
-            let result = scene
-                .call_with(
-                    tool,
-                    json!({ "board": scene.board.to_string_lossy(), "board_source": value }),
-                )
-                .await;
+            let mut args = extra.clone();
+            args["board"] = json!(scene.board.to_string_lossy());
+            args["board_source"] = value.clone();
+            let result = scene.call_with(tool, args).await;
             assert!(result.is_error, "{tool} accepted {value}");
             assert_eq!(
                 kind_of(&result).as_deref(),
@@ -1042,6 +1214,548 @@ async fn an_unknown_board_source_is_refused_by_name() {
             );
         }
     }
+}
+
+/// Stage 4 readers (`score_placement`, `get_placement_overview`,
+/// `check_clearance`, `get_component_pads`, `get_pad_position`) share the
+/// exact-board `board_source` contract: live board wins under `auto`,
+/// `saved` inspects the file even when KiCad holds the board open,
+/// wrong-board refuses `live` (`wrong_document`) and explains `auto`
+/// (`board_not_open_in_kicad`), post-identification failure refuses without
+/// substituting saved state, and a board observed live then lost refuses
+/// `auto` (`unsafe_file_fallback`) while disclosing `saved`.
+#[tokio::test]
+async fn stage4_readers_prefer_live_under_auto_and_inspect_file_under_saved() {
+    let scene = Scene::live().await;
+
+    let call_reader = |tool: &'static str, extra: Value, mode: Option<&'static str>| {
+        let scene = &scene;
+        async move {
+            let mut args = extra;
+            args["board"] = json!(scene.board.to_string_lossy());
+            if let Some(m) = mode {
+                args["board_source"] = json!(m);
+            }
+            let result = scene.call_with(tool, args).await;
+            assert!(
+                !result.is_error,
+                "{tool} ({mode:?}): {:?}",
+                body_of(&result)
+            );
+            body_of(&result)
+        }
+    };
+
+    // 1. score_placement
+    let score_live = call_reader("score_placement", json!({}), None).await;
+    assert_eq!(score_live["source"], json!("ipc"), "{score_live}");
+    assert_eq!(
+        score_live["sources"],
+        json!({ "placement": "ipc" }),
+        "{score_live}"
+    );
+    assert_eq!(
+        score_live["source_evidence"]["board_state"],
+        json!("ipc"),
+        "{score_live}"
+    );
+    assert_eq!(
+        score_live["source_evidence"]["excludes_unsaved_editor_state"],
+        json!(false),
+        "{score_live}"
+    );
+    assert_eq!(
+        score_live["footprints_scored"],
+        json!(LIVE_FOOTPRINT_COUNT),
+        "{score_live}"
+    );
+
+    let score_saved = call_reader("score_placement", json!({}), Some("saved")).await;
+    assert_eq!(score_saved["source"], json!("saved_file"), "{score_saved}");
+    assert_eq!(
+        score_saved["sources"],
+        json!({ "placement": "saved_board" }),
+        "{score_saved}"
+    );
+    assert_eq!(
+        score_saved["source_evidence"]["excludes_unsaved_editor_state"],
+        json!(true),
+        "{score_saved}"
+    );
+    assert_eq!(
+        score_saved["footprints_scored"],
+        json!(SAVED_FOOTPRINT_COUNT),
+        "{score_saved}"
+    );
+
+    // 2. get_placement_overview (mixed source: placement + net_groups + groups)
+    let overview_live = call_reader("get_placement_overview", json!({}), None).await;
+    assert_eq!(overview_live["source"], json!("ipc"), "{overview_live}");
+    assert_eq!(
+        overview_live["sources"],
+        json!({
+            "placement": "ipc",
+            "net_groups": "project_file",
+            "groups": "derived",
+        }),
+        "{overview_live}"
+    );
+    assert_eq!(
+        overview_live["source_evidence"]["board_state"],
+        json!("ipc"),
+        "{overview_live}"
+    );
+    assert_eq!(
+        overview_live["footprints"],
+        json!(LIVE_FOOTPRINT_COUNT),
+        "{overview_live}"
+    );
+    assert_eq!(
+        overview_live["groups"][0]["nets"],
+        json!([LIVE_NETS[0]]),
+        "{overview_live}"
+    );
+
+    let overview_saved = call_reader("get_placement_overview", json!({}), Some("saved")).await;
+    assert_eq!(
+        overview_saved["source"],
+        json!("saved_file"),
+        "{overview_saved}"
+    );
+    assert_eq!(
+        overview_saved["sources"],
+        json!({
+            "placement": "saved_board",
+            "net_groups": "project_file",
+            "groups": "derived",
+        }),
+        "{overview_saved}"
+    );
+    assert_eq!(
+        overview_saved["footprints"],
+        json!(SAVED_FOOTPRINT_COUNT),
+        "{overview_saved}"
+    );
+    assert_eq!(
+        overview_saved["groups"][0]["nets"],
+        json!([SAVED_NETS[0]]),
+        "{overview_saved}"
+    );
+
+    let overview_arg = call_reader(
+        "get_placement_overview",
+        json!({ "net_groups": { "Custom": [LIVE_NETS[1]] } }),
+        Some("live"),
+    )
+    .await;
+    assert_eq!(
+        overview_arg["sources"]["net_groups"],
+        json!("argument"),
+        "{overview_arg}"
+    );
+
+    // 3. check_clearance (anchor and courtyard modes)
+    let clearance_live = call_reader(
+        "check_clearance",
+        json!({ "ref1": "R1", "ref2": "R2" }),
+        None,
+    )
+    .await;
+    assert_eq!(clearance_live["source"], json!("ipc"), "{clearance_live}");
+    assert_eq!(
+        clearance_live["sources"],
+        json!({ "clearance": "ipc" }),
+        "{clearance_live}"
+    );
+    assert_eq!(
+        clearance_live["source_evidence"]["board_state"],
+        json!("ipc"),
+        "{clearance_live}"
+    );
+    assert_eq!(
+        clearance_live["source_evidence"]["excludes_unsaved_editor_state"],
+        json!(false),
+        "{clearance_live}"
+    );
+    assert_eq!(
+        clearance_live["anchor_distance_mm"],
+        json!(LIVE_ANCHOR_CLEARANCE_MM),
+        "{clearance_live}"
+    );
+
+    let clearance_saved = call_reader(
+        "check_clearance",
+        json!({ "ref1": "R1", "ref2": "R2" }),
+        Some("saved"),
+    )
+    .await;
+    assert_eq!(
+        clearance_saved["source"],
+        json!("saved_file"),
+        "{clearance_saved}"
+    );
+    assert_eq!(
+        clearance_saved["sources"],
+        json!({ "clearance": "saved_board" }),
+        "{clearance_saved}"
+    );
+    assert_eq!(
+        clearance_saved["anchor_distance_mm"],
+        json!(SAVED_ANCHOR_CLEARANCE_MM),
+        "{clearance_saved}"
+    );
+
+    let courtyard_live = call_reader(
+        "check_clearance",
+        json!({ "ref1": "R1", "ref2": "R2", "mode": "courtyard" }),
+        None,
+    )
+    .await;
+    assert_eq!(courtyard_live["source"], json!("ipc"), "{courtyard_live}");
+    assert_eq!(
+        courtyard_live["sources"],
+        json!({ "clearance": "ipc" }),
+        "{courtyard_live}"
+    );
+    assert_eq!(
+        courtyard_live["source_evidence"]["board_state"],
+        json!("ipc"),
+        "{courtyard_live}"
+    );
+    assert_eq!(courtyard_live["available"], json!(true), "{courtyard_live}");
+    // Live R1 is at x=85 (hull [84, 86]) and R2 is at x=109 (hull [108, 110]) -> 22.0 mm gap.
+    assert_eq!(
+        courtyard_live["courtyard_clearance_mm"],
+        json!(22.0),
+        "{courtyard_live}"
+    );
+
+    let courtyard_saved = call_reader(
+        "check_clearance",
+        json!({ "ref1": "R1", "ref2": "R2", "mode": "courtyard" }),
+        Some("saved"),
+    )
+    .await;
+    assert_eq!(
+        courtyard_saved["source"],
+        json!("saved_file"),
+        "{courtyard_saved}"
+    );
+    assert_eq!(
+        courtyard_saved["sources"],
+        json!({ "clearance": "saved_board" }),
+        "{courtyard_saved}"
+    );
+    assert_eq!(
+        courtyard_saved["source_evidence"]["excludes_unsaved_editor_state"],
+        json!(true),
+        "{courtyard_saved}"
+    );
+    assert_eq!(
+        courtyard_saved["available"],
+        json!(false),
+        "{courtyard_saved}"
+    );
+    assert_eq!(
+        courtyard_saved["reason_code"],
+        json!("authored_courtyard_missing"),
+        "{courtyard_saved}"
+    );
+
+    // 4. get_component_pads
+    let pads_live = call_reader("get_component_pads", json!({ "reference": "R1" }), None).await;
+    assert_eq!(pads_live["source"], json!("ipc"), "{pads_live}");
+    assert_eq!(
+        pads_live["sources"],
+        json!({ "pads": "ipc" }),
+        "{pads_live}"
+    );
+    assert_eq!(
+        pads_live["source_evidence"]["board_state"],
+        json!("ipc"),
+        "{pads_live}"
+    );
+    assert_eq!(
+        pads_live["source_evidence"]["excludes_unsaved_editor_state"],
+        json!(false),
+        "{pads_live}"
+    );
+    assert_eq!(
+        pads_live["pads"][0]["x"],
+        json!(LIVE_R1_PAD1_X),
+        "{pads_live}"
+    );
+    assert_eq!(
+        pads_live["pads"][0]["net"],
+        json!(LIVE_NETS[0]),
+        "{pads_live}"
+    );
+
+    let pads_saved = call_reader(
+        "get_component_pads",
+        json!({ "reference": "R1" }),
+        Some("saved"),
+    )
+    .await;
+    assert_eq!(pads_saved["source"], json!("file"), "{pads_saved}");
+    assert_eq!(
+        pads_saved["sources"],
+        json!({ "pads": "saved_board" }),
+        "{pads_saved}"
+    );
+    assert_eq!(
+        pads_saved["pads"][0]["x"],
+        json!(SAVED_R1_PAD1_X),
+        "{pads_saved}"
+    );
+    assert_eq!(
+        pads_saved["pads"][0]["net"],
+        json!(SAVED_NETS[0]),
+        "{pads_saved}"
+    );
+
+    // 5. get_pad_position
+    let pad_live = call_reader(
+        "get_pad_position",
+        json!({ "reference": "R1", "pad_number": "1" }),
+        None,
+    )
+    .await;
+    assert_eq!(pad_live["source"], json!("ipc"), "{pad_live}");
+    assert_eq!(pad_live["sources"], json!({ "pad": "ipc" }), "{pad_live}");
+    assert_eq!(
+        pad_live["source_evidence"]["board_state"],
+        json!("ipc"),
+        "{pad_live}"
+    );
+    assert_eq!(
+        pad_live["source_evidence"]["excludes_unsaved_editor_state"],
+        json!(false),
+        "{pad_live}"
+    );
+    assert_eq!(pad_live["x"], json!(LIVE_R1_PAD1_X), "{pad_live}");
+    assert_eq!(pad_live["net"], json!(LIVE_NETS[0]), "{pad_live}");
+
+    let pad_saved = call_reader(
+        "get_pad_position",
+        json!({ "reference": "R1", "pad_number": "1" }),
+        Some("saved"),
+    )
+    .await;
+    assert_eq!(pad_saved["source"], json!("file"), "{pad_saved}");
+    assert_eq!(
+        pad_saved["sources"],
+        json!({ "pad": "saved_board" }),
+        "{pad_saved}"
+    );
+    assert_eq!(pad_saved["x"], json!(SAVED_R1_PAD1_X), "{pad_saved}");
+    assert_eq!(pad_saved["net"], json!(SAVED_NETS[0]), "{pad_saved}");
+}
+
+#[tokio::test]
+async fn stage4_readers_enforce_refusal_and_staleness_across_all_five_tools() {
+    let readers = [
+        ("score_placement", json!({})),
+        ("get_placement_overview", json!({})),
+        ("check_clearance", json!({ "ref1": "R1", "ref2": "R2" })),
+        ("get_component_pads", json!({ "reference": "R1" })),
+        (
+            "get_pad_position",
+            json!({ "reference": "R1", "pad_number": "1" }),
+        ),
+    ];
+
+    // Post-identification failure refuses under auto and live without falling back.
+    let rejecting = Scene::rejecting().await;
+    for (tool, extra) in &readers {
+        for mode in [None, Some("auto"), Some("live")] {
+            let mut args = extra.clone();
+            args["board"] = json!(rejecting.board.to_string_lossy());
+            if let Some(m) = mode {
+                args["board_source"] = json!(m);
+            }
+            let refused = rejecting.call_with(tool, args).await;
+            assert!(
+                refused.is_error,
+                "{tool} ({mode:?}) must refuse after live identification failure: {}",
+                body_of(&refused)
+            );
+            assert_eq!(
+                kind_of(&refused).as_deref(),
+                Some("editor_unavailable"),
+                "{tool} ({mode:?}): {}",
+                body_of(&refused)
+            );
+            let text = body_of(&refused).to_string();
+            assert!(
+                !text.contains(SAVED_NETS[0]),
+                "{tool} ({mode:?}) leaked saved board state: {text}"
+            );
+        }
+    }
+
+    // Wrong board open in KiCad refuses `live` as `wrong_document` and falls back under `auto`.
+    let other_board = Scene::holding_another_board().await;
+    for (tool, extra) in &readers {
+        let mut live_args = extra.clone();
+        live_args["board"] = json!(other_board.board.to_string_lossy());
+        live_args["board_source"] = json!("live");
+        let refused = other_board.call_with(tool, live_args).await;
+        assert!(refused.is_error, "{tool} live on wrong board must refuse");
+        assert_eq!(
+            kind_of(&refused).as_deref(),
+            Some("wrong_document"),
+            "{tool}"
+        );
+
+        let mut auto_args = extra.clone();
+        auto_args["board"] = json!(other_board.board.to_string_lossy());
+        let ok = other_board.call_with(tool, auto_args).await;
+        assert!(!ok.is_error, "{tool} auto: {:?}", body_of(&ok));
+        let body = body_of(&ok);
+        assert_eq!(
+            body["source_evidence"]["reason"],
+            json!("board_not_open_in_kicad"),
+            "{tool}: {body}"
+        );
+    }
+
+    // Previously observed live then lost: refuses `auto` with `unsafe_file_fallback`,
+    // allows `saved` with `explicitly_requested_after_live_observation`.
+    let mut lost = Scene::live().await;
+    let _ = lost.body("score_placement", None).await;
+    lost.lose_kicad();
+
+    for (tool, extra) in &readers {
+        let mut auto_args = extra.clone();
+        auto_args["board"] = json!(lost.board.to_string_lossy());
+        let refused = lost.call_with(tool, auto_args).await;
+        assert!(refused.is_error, "{tool} must refuse stale fallback");
+        assert_eq!(
+            kind_of(&refused).as_deref(),
+            Some("unsafe_file_fallback"),
+            "{tool}"
+        );
+
+        let mut saved_args = extra.clone();
+        saved_args["board"] = json!(lost.board.to_string_lossy());
+        saved_args["board_source"] = json!("saved");
+        let ok = lost.call_with(tool, saved_args).await;
+        assert!(!ok.is_error, "{tool} saved: {:?}", body_of(&ok));
+        let body = body_of(&ok);
+        assert_eq!(
+            body["source_evidence"]["reason"],
+            json!("explicitly_requested_after_live_observation"),
+            "{tool}: {body}"
+        );
+        assert_eq!(
+            body["source_evidence"]["excludes_unsaved_editor_state"],
+            json!(true),
+            "{tool}: {body}"
+        );
+    }
+}
+
+/// With two boards open in KiCad simultaneously, both the snapshot reader
+/// (`score_placement` via `SaveDocumentToString`) and the item reader
+/// (`get_component_pads` via `GetItems`) bind and address the exact requested
+/// document rather than KiCad's default/first open board.
+#[tokio::test]
+async fn stage4_readers_with_two_open_boards_address_the_requested_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first_open.kicad_pcb");
+    std::fs::write(&first, "").unwrap();
+    let requested = fixture_board(dir.path());
+    write_project(&requested);
+
+    let first_doc = board_document(&first.to_string_lossy());
+    let requested_doc = board_document(&requested.to_string_lossy());
+    let server = crate::tools::pcb_board::board_mock::spawn_kicad_reporting_documents(
+        vec![first_doc.clone(), requested_doc.clone()],
+        move |command| {
+            if command.type_url.ends_with("SaveDocumentToString") {
+                let asked =
+                    kiapi::common::commands::SaveDocumentToString::decode(&command.value[..])
+                        .expect("SaveDocumentToString request");
+                assert_eq!(
+                    asked.document,
+                    Some(requested_doc.clone()),
+                    "must request the second (requested) board document, not the first"
+                );
+                return Some(copperpour_ipc::builders::pack_any(
+                    &kiapi::common::commands::SavedDocumentResponse {
+                        document: asked.document,
+                        contents: LIVE_DOCUMENT_SNAPSHOT.to_string(),
+                    },
+                    "kiapi.common.commands.SavedDocumentResponse",
+                ));
+            }
+            if command.type_url.ends_with("GetItems") {
+                let asked = kiapi::common::commands::GetItems::decode(&command.value[..])
+                    .expect("GetItems request");
+                assert_eq!(
+                    asked.header.as_ref().and_then(|h| h.document.clone()),
+                    Some(requested_doc.clone()),
+                    "GetItems must address the requested board document, not the first"
+                );
+                return Some(copperpour_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: asked.header,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: vec![live_r1_footprint()],
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            None
+        },
+    );
+    let handler = handler_talking_to(server.address()).await;
+    let scene = Scene {
+        _dir: dir,
+        board: requested,
+        kicad: Some(server),
+        handler,
+    };
+
+    let score = scene.body("score_placement", None).await;
+    assert_eq!(score["source"], json!("ipc"), "{score}");
+    assert_eq!(
+        score["footprints_scored"],
+        json!(LIVE_FOOTPRINT_COUNT),
+        "{score}"
+    );
+
+    let pads_res = scene
+        .call_with(
+            "get_component_pads",
+            json!({ "board": scene.board.to_string_lossy(), "reference": "R1" }),
+        )
+        .await;
+    assert!(!pads_res.is_error, "{:?}", body_of(&pads_res));
+    let pads = body_of(&pads_res);
+    assert_eq!(pads["source"], json!("ipc"), "{pads}");
+    assert_eq!(pads["pads"][0]["x"], json!(LIVE_R1_PAD1_X), "{pads}");
+}
+
+/// Without a readable `.kicad_pro`, `get_placement_overview` discloses
+/// `sources.net_groups: "unavailable"` rather than claiming project-file data.
+#[tokio::test]
+async fn placement_overview_without_project_file_reports_net_groups_unavailable() {
+    let scene = Scene::offline().await;
+    std::fs::remove_file(scene.board.with_extension("kicad_pro")).unwrap();
+
+    let body = scene.body("get_placement_overview", Some("saved")).await;
+    assert_eq!(
+        body["sources"],
+        json!({
+            "placement": "saved_board",
+            "net_groups": "unavailable",
+            "groups": "derived",
+        }),
+        "{body}"
+    );
+    assert_eq!(body["groups"], json!([]), "{body}");
 }
 
 /// Omitting the selector keeps every existing caller working, and means

@@ -59,7 +59,8 @@ mod repeat_layout_tests;
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, opt_positive_f64, with_board_ipc_classified, ToolContext, ToolDef};
+use crate::tools::board_source::{self, BoardRead, BoardSource};
+use crate::tools::{get_path, opt_positive_f64, ToolContext, ToolDef};
 #[cfg(test)]
 use copperpour_sexp::board::board_outline_bbox;
 use copperpour_sexp::board::{
@@ -96,7 +97,9 @@ pub fn tools() -> Vec<ToolDef> {
          is measured from the nearest courtyard edge to the outline boundary, alongside \
          'center_edge_distance_mm'. A board with no Edge.Cuts of its own takes its outline \
          from footprints' Edge.Cuts as KiCad does ('outline_source': 'footprint'), and a \
-         footprint with no electrical pads that is that outline is not scored as a part.",
+         footprint with no electrical pads that is that outline is not scored as a part. \
+         Reads the exact board open in KiCad when reachable and falls back to the saved file \
+         only when it can say why ('board_source' selects auto, live, or saved).",
             json!({
                 "type": "object",
                 "properties": {
@@ -105,7 +108,8 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "array",
                         "items": { "type": "string", "minLength": 1 },
                         "description": "Footprint references intentionally mounted at the board edge whose courtyard overhangs the outline (for example a flush USB-C receptacle whose courtyard extends past Edge.Cuts). Parts with a drill hole on or crossing the outline (such as castellated half-holes) are recognized automatically without needing to be listed here; copper pads alone on the edge are not."
-                    }
+                    },
+                    "board_source": board_source::board_source_schema()
                 },
                 "required": ["board"]
             }),
@@ -262,55 +266,46 @@ fn read_saved_board(board: &std::path::Path) -> anyhow::Result<Result<String, Ca
     }
 }
 
-/// The board as KiCad holds it when it is open there, else the saved file:
-/// `(content, source)` with source `"ipc"` or `"saved_file"`. A saved-file
-/// read of an open board would describe a stale snapshot against moves KiCad
-/// already applied (#595), so the live copy wins whenever it can be had.
+pub(crate) struct ObservedBoardSnapshot {
+    pub content: String,
+    pub legacy_source: &'static str,
+    pub domain_source: &'static str,
+    pub evidence: serde_json::Value,
+}
+
+/// The board as KiCad holds it when it is open there, else the saved file,
+/// resolved through [`board_source::read_board`] so exact-board targeting,
+/// post-identification refusal, session-memory staleness checks, and
+/// provenance evidence share one seam (#58, #595).
 pub(crate) async fn live_or_saved_board(
     ctx: &ToolContext,
     board: &std::path::Path,
-) -> anyhow::Result<Result<(String, &'static str), CallToolResult>> {
-    let board = board.to_path_buf();
-    let live = with_board_ipc_classified(ctx, &board, move |client, document| {
-        client.save_document_to_string_in(document)
-    })
-    .await?;
-    let (content, source) = match live {
-        Ok(content) => (content, "ipc"),
-        Err(copperpour_ipc::IpcFailure::Unreachable { .. }) => match read_saved_board(&board)? {
-            Ok(content) => (content, "saved_file"),
-            Err(result) => return Ok(Err(result)),
+    source: BoardSource,
+    what: &str,
+) -> anyhow::Result<Result<ObservedBoardSnapshot, CallToolResult>> {
+    let observation =
+        board_source::read_board(ctx, board, source, what, move |client, document| {
+            client.save_document_to_string_in(document)
+        })
+        .await?;
+    match observation {
+        BoardRead::Live(content) => Ok(Ok(ObservedBoardSnapshot {
+            content,
+            legacy_source: "ipc",
+            domain_source: board_source::FROM_IPC,
+            evidence: board_source::live_evidence(),
+        })),
+        BoardRead::Saved(why) => match read_saved_board(board)? {
+            Ok(content) => Ok(Ok(ObservedBoardSnapshot {
+                content,
+                legacy_source: "saved_file",
+                domain_source: board_source::FROM_SAVED_BOARD,
+                evidence: why.evidence(),
+            })),
+            Err(result) => Ok(Err(result)),
         },
-        Err(copperpour_ipc::IpcFailure::Target { error, .. }) if error.proves_not_open() => {
-            match read_saved_board(&board)? {
-                Ok(content) => (content, "saved_file"),
-                Err(result) => return Ok(Err(result)),
-            }
-        }
-        Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
-            return Ok(Err(crate::tools::ipc_target_error_result(&error)));
-        }
-        // Reading the board raises no refusal of Copperpour's own (#240).
-        Err(
-            copperpour_ipc::IpcFailure::Rejected { message, .. }
-            | copperpour_ipc::IpcFailure::Preflight(copperpour_ipc::PreflightRefusal {
-                reason: message,
-                ..
-            }),
-        ) => {
-            return Ok(Err(CallToolResult::error(message)));
-        }
-        Err(copperpour_ipc::IpcFailure::Recovered(message)) => {
-            return Ok(Err(crate::tools::ipc_recovered_result(&message)));
-        }
-        Err(copperpour_ipc::IpcFailure::Uncertain(message)) => {
-            return Ok(Err(crate::tools::ipc_uncertain_result(&message)));
-        }
-        Err(failure @ copperpour_ipc::IpcFailure::ItemRejected { .. }) => {
-            return Ok(Err(crate::tools::ipc_failure_result(failure)));
-        }
-    };
-    Ok(Ok((content, source)))
+        BoardRead::Refused(refusal) => Ok(Err(refusal)),
+    }
 }
 
 async fn handle_score_placement(
@@ -318,6 +313,10 @@ async fn handle_score_placement(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
+    let source_selector = match BoardSource::from_args(args) {
+        Ok(source) => source,
+        Err(refusal) => return Ok(refusal),
+    };
     let explicit_edge_mounted = match parse_edge_mounted_arg(args) {
         Ok(refs) => refs,
         Err(refusal) => return Ok(refusal),
@@ -329,7 +328,12 @@ async fn handle_score_placement(
     // disk yet — the failure mode #595 was filed against. The saved file
     // remains the disclosed fallback for a closed or unreachable board;
     // scoring policy itself is unchanged either way.
-    let (content, source) = match live_or_saved_board(ctx, &board).await? {
+    let ObservedBoardSnapshot {
+        content,
+        legacy_source: source,
+        domain_source,
+        evidence,
+    } = match live_or_saved_board(ctx, &board, source_selector, "placement score").await? {
         Ok(read) => read,
         Err(result) => return Ok(result),
     };
@@ -691,7 +695,7 @@ async fn handle_score_placement(
     }
     warnings.extend(edge_mounted_warnings);
 
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "verdict": verdict,
         "score": score,
         "outline_missing": matches!(outline_shape, OutlineShape::Missing),
@@ -781,7 +785,9 @@ async fn handle_score_placement(
         "footprints_scored": parts.len(),
         "footprints_skipped": scan.skipped,
         "source": source,
-    })))
+    });
+    board_source::provenance(&mut body, json!({ "placement": domain_source }), evidence);
+    Ok(CallToolResult::json(&body))
 }
 
 // ─── Shared plumbing for the placers ─────────────────────────────────────────
@@ -793,10 +799,17 @@ async fn score_of_content(ctx: &ToolContext, content: &str) -> anyhow::Result<se
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("plan.kicad_pcb");
     std::fs::write(&path, content)?;
-    let result = handle_score_placement(&json!({ "board": path.to_string_lossy() }), ctx).await?;
+    let result = handle_score_placement(
+        &json!({ "board": path.to_string_lossy(), "board_source": "saved" }),
+        ctx,
+    )
+    .await?;
     let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
         anyhow::bail!("score returned non-text content");
     };
+    if result.is_error {
+        anyhow::bail!("score_placement failed on planned content: {text}");
+    }
     Ok(serde_json::from_str(text)?)
 }
 
