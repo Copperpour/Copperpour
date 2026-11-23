@@ -1,6 +1,7 @@
 //! `edit_symbol_pin`: change one pin's electrical type, graphic style, name,
 //! number, position, angle, length or visibility in an existing `.kicad_sym`
-//! symbol, leaving everything else as written.
+//! symbol, leaving everything else as written; and `delete_symbol_pin`, which
+//! removes one pin chosen the same way (#716).
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -13,7 +14,10 @@ use crate::tools::sch_annotate::opt_string;
 use crate::tools::symbol_fields::{header, symbol_block, unusable, write_checked};
 use crate::tools::{invalid_arg, ToolContext, ToolDef};
 use copperpour_schematic_editor::types::fmt_f64;
-use copperpour_sexp::writer::{apply_edits, find_direct_child_blocks, read_consistent, SexpEdit};
+use copperpour_sexp::writer::{
+    apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, read_consistent,
+    SexpEdit,
+};
 use copperpour_sexp::SexpError;
 use serde_json::json;
 use std::path::Path;
@@ -146,6 +150,8 @@ struct Pin {
     length: String,
     /// The spans of the parts, in [`PARTS`] order.
     spans: [Option<(usize, usize)>; 8],
+    /// The span of the whole `(pin …)` block.
+    block: (usize, usize),
     /// Whether KiCad reads the pin as hidden: a bare `hide`, or the last
     /// `(hide yes|no)` (`parseSymbolPin`).
     hidden: bool,
@@ -347,6 +353,21 @@ fn measure_arg(
     }
 }
 
+/// `pin_x` and `pin_y`, the pin's current connection point in KiCad's units,
+/// given together or not at all.
+fn pin_at_arg(args: &serde_json::Value) -> Result<Option<(i64, i64)>, CallToolResult> {
+    let together = "give pin_x and pin_y together: the pin's current connection point";
+    match (
+        measure_arg(args, "pin_x", f64::NEG_INFINITY)?,
+        measure_arg(args, "pin_y", f64::NEG_INFINITY)?,
+    ) {
+        (Some(x), Some(y)) => Ok(Some((x, y))),
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(invalid_arg("pin_y", together)),
+        (None, Some(_)) => Err(invalid_arg("pin_x", together)),
+    }
+}
+
 fn parse_request(args: &serde_json::Value) -> Result<Request<'_>, CallToolResult> {
     let angle = super::opt_u32(args, "angle")?;
     if angle.is_some_and(|angle| !PIN_ANGLES.contains(&angle)) {
@@ -355,16 +376,7 @@ fn parse_request(args: &serde_json::Value) -> Result<Request<'_>, CallToolResult
             "must be 0, 90, 180 or 270, the directions KiCad reads",
         ));
     }
-    let together = "give pin_x and pin_y together: the pin's current connection point";
-    let pin_at = match (
-        measure_arg(args, "pin_x", f64::NEG_INFINITY)?,
-        measure_arg(args, "pin_y", f64::NEG_INFINITY)?,
-    ) {
-        (Some(x), Some(y)) => Some((x, y)),
-        (None, None) => None,
-        (Some(_), None) => return Err(invalid_arg("pin_y", together)),
-        (None, Some(_)) => return Err(invalid_arg("pin_x", together)),
-    };
+    let pin_at = pin_at_arg(args)?;
     let request = Request {
         symbol: super::require_str(args, "symbol_name")?,
         number: super::require_str(args, "pin_number")?.replace(' ', "_"),
@@ -637,6 +649,7 @@ fn read_pin(
         angle: text(6),
         length: text(7),
         spans,
+        block: (start, end),
         hidden,
         hide_spans,
         hide_at,
@@ -681,6 +694,7 @@ fn choose_pin<'p>(
     path: &Path,
     pins: &'p [Pin],
     request: &Request,
+    tool: &str,
 ) -> Result<&'p Pin, CallToolResult> {
     let (symbol, number) = (request.symbol, request.number.as_str());
     let numbered: Vec<&Pin> = pins.iter().filter(|pin| pin.number == number).collect();
@@ -776,7 +790,7 @@ fn choose_pin<'p>(
             path,
             &format!(
                 "symbol '{symbol}' has {} pins numbered '{number}' named '{}' at one point in \
-                 {}, which edit_symbol_pin cannot tell apart",
+                 {}, which {tool} cannot tell apart",
                 chosen.len(),
                 first.name,
                 first.place()
@@ -842,7 +856,7 @@ fn prepare_edit(
         }
     }
     let pins = symbol_pins(source, start, end).map_err(|reason| unusable(path, &reason))?;
-    let pin = choose_pin(path, &pins, request)?.clone();
+    let pin = choose_pin(path, &pins, request, "edit_symbol_pin")?.clone();
 
     if let Some(new) = request
         .new_number
@@ -986,6 +1000,179 @@ fn readback_mismatch(
         {
             return Some(format!(
                 "pin '{}' of {} does not read as asked",
+                was.number,
+                was.place()
+            ));
+        }
+    }
+    None
+}
+
+pub(crate) fn delete_tool() -> ToolDef {
+    tool!(
+        "delete_symbol_pin",
+        "Remove one pin of an existing library symbol, chosen as edit_symbol_pin chooses one: \
+         by pin_number, with unit or body_style when the number is in more than one unit or \
+         body style, and pin_name or pin_x and pin_y when pins share a number in one unit and \
+         body style. An ambiguous choice is refused before writing; a derived symbol is \
+         refused, since its pins are its root's. Everything else, and the rest of the library, \
+         is left as written. Reports the removed pin.",
+        json!({
+            "type": "object",
+            "properties": {
+                "library_path": { "type": "string", "description": "Path to an existing .kicad_sym library file" },
+                "symbol_name": { "type": "string", "description": "Name of the symbol to change" },
+                "pin_number": { "type": "string", "description": "Number of the pin to remove, as written in the symbol (for example '1' or 'A3')" },
+                "unit": { "type": "integer", "minimum": 0, "description": "Unit holding the pin; 0 for a pin common to all units" },
+                "body_style": { "type": "integer", "minimum": 0, "description": "Body style holding the pin: 1 for the first, 2 and up for alternates such as De Morgan, 0 for a pin common to all" },
+                "pin_name": { "type": "string", "description": "Current name of the pin, to choose between pins that share pin_number in one unit and body style" },
+                "pin_x": { "type": "number", "description": "Current X of the pin's connection point in mm, with pin_y, to choose between pins that share pin_number and name" },
+                "pin_y": { "type": "number", "description": "Current Y of the pin's connection point in mm, with pin_x" }
+            },
+            "required": ["library_path", "symbol_name", "pin_number"],
+            "additionalProperties": false
+        }),
+        |args, ctx| async move { handle_delete_symbol_pin(args, ctx).await }
+    )
+}
+
+/// A request that only chooses a pin: `edit_symbol_pin`'s selectors, nothing
+/// to set.
+fn parse_selection(args: &serde_json::Value) -> Result<Request<'_>, CallToolResult> {
+    Ok(Request {
+        symbol: super::require_str(args, "symbol_name")?,
+        number: super::require_str(args, "pin_number")?.replace(' ', "_"),
+        unit: super::opt_u32(args, "unit")?,
+        body_style: super::opt_u32(args, "body_style")?,
+        pin_name: opt_string(args, "pin_name")?.map(|name| name.replace(' ', "_")),
+        pin_at: pin_at_arg(args)?,
+        pin_type: None,
+        style: None,
+        name: None,
+        new_number: None,
+        x: None,
+        y: None,
+        angle: None,
+        length: None,
+        hidden: None,
+    })
+}
+
+async fn handle_delete_symbol_pin(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let path = super::get_path(args, "library_path")?;
+    if path.extension().and_then(|extension| extension.to_str()) != Some("kicad_sym") {
+        return Ok(unusable(&path, "it does not end in .kicad_sym"));
+    }
+    let request = match parse_selection(args) {
+        Ok(request) => request,
+        Err(error) => return Ok(error),
+    };
+    let source = match read_consistent(&path) {
+        Ok(source) => source,
+        Err(SexpError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::file_not_found(&path),
+                format!("Symbol library not found: {}", path.display()),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let (removed, replacement) = match prepare_delete(&path, &source, &request) {
+        Ok(delete) => delete,
+        Err(error) => return Ok(error),
+    };
+    let check = |text: &str| delete_readback_mismatch(text, &source, request.symbol, &removed);
+    if let Some(refusal) = write_checked(&path, &source, replacement, "delete_symbol_pin", check)? {
+        return Ok(refusal);
+    }
+
+    // Measures and the angle as numbers, as KiCad reads them.
+    let measure = |text: &str| units_of(text).map(|units| units as f64 / UNITS_PER_MM);
+    Ok(CallToolResult::json(&json!({
+        "success": true,
+        "library_path": path.display().to_string(),
+        "symbol": request.symbol,
+        "removed": {
+            "number": removed.number,
+            "name": removed.name,
+            "type": removed.pin_type,
+            "style": removed.style,
+            "unit": removed.unit,
+            "body_style": removed.body_style,
+            "x": measure(&removed.x),
+            "y": measure(&removed.y),
+            "angle": leading_integer(&removed.angle),
+            "length": measure(&removed.length),
+            "hidden": removed.hidden
+        }
+    })))
+}
+
+/// The chosen pin, and the library without it: its block goes with the
+/// whitespace that leads it, so its line goes and nothing else moves.
+fn prepare_delete(
+    path: &Path,
+    source: &str,
+    request: &Request,
+) -> Result<(Pin, String), CallToolResult> {
+    let root = source.len() - source.trim_start().len();
+    if header(source, root).map(|(head, _)| head) != Some("kicad_symbol_lib") {
+        return Err(unusable(path, "it is not a (kicad_symbol_lib ...) file"));
+    }
+    let (start, end) = symbol_block(source, request.symbol)?;
+    if let Some(parent) = extends(source, start, end) {
+        return Err(invalid_arg(
+            "symbol_name",
+            &format!(
+                "symbol '{}' extends '{parent}', whose pins it uses; remove the pin from \
+                 '{parent}'",
+                request.symbol
+            ),
+        ));
+    }
+    let pins = symbol_pins(source, start, end).map_err(|reason| unusable(path, &reason))?;
+    let pin = choose_pin(path, &pins, request, "delete_symbol_pin")?.clone();
+    let (from, to) = find_block_with_leading_whitespace(source, pin.block.0)
+        .ok_or_else(|| unusable(path, "it holds a pin whose block does not close"))?;
+    Ok((
+        pin,
+        apply_edits(source.to_string(), vec![SexpEdit::delete(from, to)]),
+    ))
+}
+
+/// Why `written` is not `before` without `removed`, or `None` when it is:
+/// every other pin of the symbol is still there, in order, as it was.
+fn delete_readback_mismatch(
+    written: &str,
+    before: &str,
+    symbol: &str,
+    removed: &Pin,
+) -> Option<String> {
+    let pins_of = |text: &str| {
+        let (start, end) = symbol_block(text, symbol).ok()?;
+        symbol_pins(text, start, end).ok()
+    };
+    let Some(after) = pins_of(written) else {
+        return Some(format!("symbol '{symbol}' no longer has readable pins"));
+    };
+    let Some(original) = pins_of(before) else {
+        return Some(format!("symbol '{symbol}' had no readable pins"));
+    };
+    let kept: Vec<&Pin> = original.iter().filter(|pin| *pin != removed).collect();
+    if kept.len() + 1 != original.len() || after.len() != kept.len() {
+        return Some("not exactly one pin was removed".to_string());
+    }
+    for (was, now) in kept.iter().zip(&after) {
+        if now.unit != was.unit
+            || now.body_style != was.body_style
+            || now.parts() != was.parts()
+            || now.hidden != was.hidden
+        {
+            return Some(format!(
+                "pin '{}' in {} changed, which delete_symbol_pin does not do",
                 was.number,
                 was.place()
             ));
@@ -2215,5 +2402,175 @@ mod tests {
             on.get("warnings").is_none(),
             "on-grid move must not warn: {on}"
         );
+    }
+
+    // kicad-cli 10.0.8 saved each from symbols drawn for these tests (no stock
+    // symbol); provenance in tests/fixtures/delete_symbol_pin_kicad10.README.md.
+    const DELETE_SOURCE: &str =
+        include_str!("../../tests/fixtures/delete_symbol_pin_source_kicad10.kicad_sym");
+    const DUPLICATE_REMOVED: &str =
+        include_str!("../../tests/fixtures/delete_symbol_pin_duplicate_removed_kicad10.kicad_sym");
+    const DE_MORGAN_REMOVED: &str =
+        include_str!("../../tests/fixtures/delete_symbol_pin_de_morgan_removed_kicad10.kicad_sym");
+
+    async fn delete_pin(arguments: serde_json::Value) -> (CallToolResult, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pins.kicad_sym");
+        std::fs::write(&path, DELETE_SOURCE).unwrap();
+        let mut arguments = arguments;
+        arguments["library_path"] = json!(path);
+        let ctx = ToolContext::new(
+            ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_delete_symbol_pin(&arguments, &ctx).await.unwrap();
+        (result, std::fs::read_to_string(&path).unwrap())
+    }
+
+    fn body_of(result: &CallToolResult) -> serde_json::Value {
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// The library without the chosen pin is byte for byte what KiCad saves
+    /// for that library: removing the duplicate pin 2 of DUP, chosen by its
+    /// connection point, and pin 1 of GATE's body style 2.
+    #[tokio::test]
+    async fn delete_symbol_pin_writes_what_kicad_saves() {
+        let (result, written) = delete_pin(json!({
+            "symbol_name": "DUP", "pin_number": "2", "pin_x": 6.35, "pin_y": 2.54
+        }))
+        .await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(written, DUPLICATE_REMOVED);
+        assert_eq!(
+            body_of(&result)["removed"],
+            json!({
+                "number": "2", "name": "NC", "type": "passive", "style": "line",
+                "unit": 1, "body_style": 1, "x": 6.35, "y": 2.54, "angle": 180,
+                "length": 2.54, "hidden": false
+            })
+        );
+
+        let (result, written) = delete_pin(json!({
+            "symbol_name": "GATE", "pin_number": "1", "body_style": 2
+        }))
+        .await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(written, DE_MORGAN_REMOVED);
+        assert_eq!(body_of(&result)["removed"]["style"], "inverted");
+    }
+
+    /// The pin is chosen as edit_symbol_pin chooses one; a choice that names
+    /// more than one pin is refused before writing.
+    #[tokio::test]
+    async fn an_ambiguous_choice_is_refused_without_writing() {
+        for (arguments, kind, field) in [
+            (
+                json!({ "symbol_name": "DUP", "pin_number": "2" }),
+                "ambiguous_target",
+                None,
+            ),
+            (
+                json!({ "symbol_name": "DUP", "pin_number": "2", "pin_name": "NC" }),
+                "ambiguous_target",
+                None,
+            ),
+            (
+                json!({ "symbol_name": "GATE", "pin_number": "1" }),
+                "ambiguous_target",
+                None,
+            ),
+            (
+                json!({ "symbol_name": "DUP", "pin_number": "9" }),
+                "invalid_argument",
+                Some("pin_number"),
+            ),
+            (
+                json!({ "symbol_name": "DUP", "pin_number": "2", "pin_x": 1, "pin_y": 1 }),
+                "invalid_argument",
+                Some("pin_x"),
+            ),
+            (
+                json!({ "symbol_name": "DUP", "pin_number": "2", "pin_x": 6.35 }),
+                "invalid_argument",
+                Some("pin_y"),
+            ),
+        ] {
+            let (result, written) = delete_pin(arguments.clone()).await;
+            assert!(result.is_error, "{arguments}");
+            let body = body_of(&result);
+            assert_eq!(body["error"]["kind"], kind, "{arguments}: {body}");
+            if let Some(field) = field {
+                assert_eq!(body["error"]["field"], field, "{arguments}: {body}");
+            }
+            assert_eq!(written, DELETE_SOURCE, "{arguments}");
+        }
+    }
+
+    /// A derived symbol's pins are its root's: refused, naming the root.
+    #[tokio::test]
+    async fn a_derived_symbol_is_refused() {
+        let (result, written) =
+            delete_pin(json!({ "symbol_name": "GATE_ALT", "pin_number": "1", "body_style": 1 }))
+                .await;
+        assert!(result.is_error);
+        let body = body_of(&result);
+        assert_eq!(body["error"]["field"], "symbol_name", "{body}");
+        assert!(
+            body["message"].as_str().unwrap().contains("'GATE'"),
+            "{body}"
+        );
+        assert_eq!(written, DELETE_SOURCE);
+    }
+
+    /// The check before writing refuses a plan that removes anything but the
+    /// one pin.
+    #[test]
+    fn the_readback_check_wants_exactly_that_pin_gone() {
+        let (start, end) = symbol_block(DELETE_SOURCE, "DUP").unwrap();
+        let pins = symbol_pins(DELETE_SOURCE, start, end).unwrap();
+        let removed = &pins[2];
+        assert_eq!(
+            delete_readback_mismatch(DUPLICATE_REMOVED, DELETE_SOURCE, "DUP", removed),
+            None
+        );
+        assert!(delete_readback_mismatch(DELETE_SOURCE, DELETE_SOURCE, "DUP", removed).is_some());
+        let other = &pins[1];
+        assert!(delete_readback_mismatch(DUPLICATE_REMOVED, DELETE_SOURCE, "DUP", other).is_some());
+        // One pin too many removed: the last one, which nothing else would notice.
+        let (start, end) = symbol_block(DUPLICATE_REMOVED, "DUP").unwrap();
+        let last = symbol_pins(DUPLICATE_REMOVED, start, end)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let (from, to) =
+            find_block_with_leading_whitespace(DUPLICATE_REMOVED, last.block.0).unwrap();
+        let two_gone = format!("{}{}", &DUPLICATE_REMOVED[..from], &DUPLICATE_REMOVED[to..]);
+        assert!(delete_readback_mismatch(&two_gone, DELETE_SOURCE, "DUP", removed).is_some());
+    }
+
+    #[test]
+    fn delete_symbol_pin_takes_edit_symbol_pins_selectors_only() {
+        let schema = delete_tool().input_schema;
+        let properties: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(
+            properties,
+            [
+                "body_style",
+                "library_path",
+                "pin_name",
+                "pin_number",
+                "pin_x",
+                "pin_y",
+                "symbol_name",
+                "unit"
+            ]
+        );
+        assert_eq!(schema["additionalProperties"], false);
     }
 }
