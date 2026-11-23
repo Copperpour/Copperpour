@@ -9,6 +9,9 @@ mod search_and_info;
 mod symbol_ops;
 
 #[cfg(test)]
+#[path = "create_footprint_kicad10_tests.rs"]
+mod create_footprint_kicad10_tests;
+#[cfg(test)]
 #[path = "library_custom_pad_tests.rs"]
 mod custom_pad_tests;
 #[cfg(test)]
@@ -47,10 +50,16 @@ use crate::router::ToolRouter;
 #[cfg(test)]
 use crate::tools::{ServerConfig, ToolContext};
 #[cfg(test)]
+use copperpour_sexp::geometry::round6;
+#[cfg(test)]
 use copperpour_sexp::parser::{parse_sexp, SexpNode};
 #[cfg(test)]
 use copperpour_sexp::writer::{
     apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks, SexpEdit,
+};
+#[cfg(test)]
+use footprint_ops::{
+    build_footprint_graphics, silk_pieces, FootprintOutlines, SILK_PAD_CLEARANCE, SILK_WIDTH,
 };
 #[cfg(test)]
 use footprint_ops::{
@@ -268,8 +277,8 @@ pub fn tools() -> Vec<ToolDef> {
                             "required": ["number", "type", "shape", "x", "y", "width", "height"]
                         }
                     },
-                    "body_width": { "type": "number", "description": "Physical component body width in mm (optional; used for silk/fab outlines). Falls back to the pad envelope if omitted." },
-                    "body_height": { "type": "number", "description": "Physical component body height in mm (optional)." },
+                    "body_width": { "type": "number", "description": "The component body's size along X in mm (optional, with body_height). With a body, the F.Fab outline is the body, the courtyard goes around the pads and the body, and the silk runs 0.11 mm outside the body, broken near pads. Without one, the outlines follow the pad envelope." },
+                    "body_height": { "type": "number", "description": "The component body's size along Y in mm (optional, with body_width), as seen from above; not the 3D height." },
                     "package_type": { "type": "string", "description": "'smd' (0.25mm courtyard), 'through_hole' (0.5mm), 'small' (0.15mm, <0603), or 'bga' (1.0mm). Sets courtyard clearance when courtyard_clearance is not given." },
                     "courtyard_clearance": { "type": "number", "description": "Explicit courtyard clearance in mm (overrides package_type / auto-detection)." },
                     "model": {

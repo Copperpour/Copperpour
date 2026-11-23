@@ -8,6 +8,7 @@ pub mod layers;
 pub mod net;
 pub mod parser;
 pub mod paths;
+pub mod prettify;
 pub mod schematic;
 pub mod text_bounds;
 pub mod title_block;
@@ -21,6 +22,7 @@ pub use command::{
 pub use error::{SexpError, TransactionConflictKind};
 pub use geometry::{transform_direction, transform_pin, PinTransform};
 pub use parser::{parse_sexp, SexpNode};
+pub use prettify::prettify;
 pub use transaction::{
     abandon_file_transaction, commit_file_transaction, inspect_file_transactions,
     recover_file_transaction, recover_file_transactions, try_commit_file_transaction,

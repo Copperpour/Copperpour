@@ -3,6 +3,7 @@
 use super::footprint_drill_sexp;
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
+use crate::tools::footprint_kicad10;
 use crate::tools::solder_margins;
 use crate::tools::{get_path, require_array, require_str, ToolContext};
 use copperpour_sexp::parser::{parse_sexp, SexpNode};
@@ -20,6 +21,24 @@ pub(super) struct PadGeom {
     pub(super) y: f64,
     pub(super) w: f64,
     pub(super) h: f64,
+    /// Rotation in degrees, as the pad's `(at x y rotation)`.
+    pub(super) rotation: f64,
+}
+
+impl PadGeom {
+    /// The pad's axis-aligned extent `(min_x, min_y, max_x, max_y)`, its
+    /// rotation included.
+    pub(super) fn extent(&self) -> (f64, f64, f64, f64) {
+        let (sin, cos) = self.rotation.to_radians().sin_cos();
+        let half_x = (self.w / 2.0 * cos).abs() + (self.h / 2.0 * sin).abs();
+        let half_y = (self.w / 2.0 * sin).abs() + (self.h / 2.0 * cos).abs();
+        (
+            self.x - half_x,
+            self.y - half_y,
+            self.x + half_x,
+            self.y + half_y,
+        )
+    }
 }
 
 /// Axis-aligned bounding box `(min_x, min_y, max_x, max_y)` over pad extents.
@@ -29,10 +48,11 @@ pub(super) fn pads_bbox(pads: &[PadGeom]) -> (f64, f64, f64, f64) {
     let mut max_x = f64::NEG_INFINITY;
     let mut max_y = f64::NEG_INFINITY;
     for p in pads {
-        min_x = min_x.min(p.x - p.w / 2.0);
-        min_y = min_y.min(p.y - p.h / 2.0);
-        max_x = max_x.max(p.x + p.w / 2.0);
-        max_y = max_y.max(p.y + p.h / 2.0);
+        let (x0, y0, x1, y1) = p.extent();
+        min_x = min_x.min(x0);
+        min_y = min_y.min(y0);
+        max_x = max_x.max(x1);
+        max_y = max_y.max(y1);
     }
     (min_x, min_y, max_x, max_y)
 }
@@ -138,8 +158,9 @@ pub(super) fn chamfered_rect_points(
     pts
 }
 
-/// Emit the `(model ...)` block when a `model` object with a non-empty `path`
-/// is present. Path is passed through verbatim (absolute or KiCAD env-var).
+/// The `(model ...)` block, as KiCad's footprint writer prints it, when a
+/// `model` object with a non-empty `path` is present. The path is passed
+/// through verbatim (absolute or a KiCad env-var path).
 pub(super) fn build_model_sexp(args: &serde_json::Value) -> String {
     let model = match args.get("model") {
         Some(m) if m.is_object() => m,
@@ -149,20 +170,18 @@ pub(super) fn build_model_sexp(args: &serde_json::Value) -> String {
         Some(p) if !p.is_empty() => p,
         _ => return String::new(),
     };
-    let xyz = |key: &str, default: f64| -> (f64, f64, f64) {
+    let xyz = |key: &str, default: f64| -> String {
         let o = &model[key];
-        (
-            o["x"].as_f64().unwrap_or(default),
-            o["y"].as_f64().unwrap_or(default),
-            o["z"].as_f64().unwrap_or(default),
-        )
+        ["x", "y", "z"]
+            .map(|axis| footprint_kicad10::g10(o[axis].as_f64().unwrap_or(default)))
+            .join(" ")
     };
-    let (ox, oy, oz) = xyz("offset", 0.0);
-    let (sx, sy, sz) = xyz("scale", 1.0);
-    let (rx, ry, rz) = xyz("rotate", 0.0);
     format!(
-        "\n  (model \"{}\"\n    (offset (xyz {} {} {}))\n    (scale (xyz {} {} {}))\n    (rotate (xyz {} {} {}))\n  )",
-        path, ox, oy, oz, sx, sy, sz, rx, ry, rz
+        "(model {} (offset (xyz {})) (scale (xyz {})) (rotate (xyz {})))",
+        crate::tools::footprint_metadata::quote_string(path),
+        xyz("offset", 0.0),
+        xyz("scale", 1.0),
+        xyz("rotate", 0.0)
     )
 }
 
@@ -243,9 +262,68 @@ fn written_pad_layers(pad: &SexpNode) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Build the courtyard, silkscreen, fab outline, reference/value text, and the
-/// pin-1 marker (silk dot + fab chamfer) for a footprint from its pad geometry.
-fn build_footprint_graphics(args: &serde_json::Value, name: &str, pads: &[PadGeom]) -> String {
+/// The silk line width KiCad's library conventions use, in mm.
+pub(super) const SILK_WIDTH: f64 = 0.12;
+/// How far the silk outline runs outside a given body, centre line to body
+/// edge, in mm (KiCad library conventions, as asked on #704 and #711).
+const SILK_BODY_OFFSET: f64 = 0.11;
+/// The smallest gap between a silk line's edge and a pad's copper, in mm.
+pub(super) const SILK_PAD_CLEARANCE: f64 = 0.2;
+
+/// What `create_footprint` draws around its pads: the graphics, and where the
+/// Reference and Value go.
+pub(super) struct FootprintOutlines {
+    pub(super) graphics: Vec<footprint_kicad10::Graphic>,
+    pub(super) reference_at: (f64, f64),
+    pub(super) value_at: (f64, f64),
+}
+
+/// The pieces of the line from `from` to `to` along one axis, at `across` on
+/// the other, that keep `SILK_PAD_CLEARANCE` from every pad's copper; pieces
+/// shorter than a line's width are dropped.
+pub(super) fn silk_pieces(
+    pads: &[PadGeom],
+    horizontal: bool,
+    across: f64,
+    from: f64,
+    to: f64,
+) -> Vec<(f64, f64)> {
+    let keep_out = SILK_PAD_CLEARANCE + SILK_WIDTH / 2.0;
+    let mut pieces = vec![(from, to)];
+    for pad in pads {
+        let (x0, y0, x1, y1) = pad.extent();
+        let (along, side) = if horizontal {
+            ((x0, x1), (y0, y1))
+        } else {
+            ((y0, y1), (x0, x1))
+        };
+        if across <= side.0 - keep_out || across >= side.1 + keep_out {
+            continue;
+        }
+        let (cut_from, cut_to) = (along.0 - keep_out, along.1 + keep_out);
+        pieces = pieces
+            .into_iter()
+            .flat_map(|(start, end)| {
+                [(start, end.min(cut_from)), (start.max(cut_to), end)]
+                    .into_iter()
+                    .filter(|(a, b)| b > a)
+            })
+            .collect();
+    }
+    pieces.retain(|(start, end)| end - start >= SILK_WIDTH);
+    pieces
+}
+
+/// Build the courtyard, silkscreen, fab outline and pin-1 marker (silk dot +
+/// fab chamfer) for a footprint from its pads and, when given, its body (#711):
+/// with a body, the courtyard goes around the pads and the body, and the silk
+/// runs `SILK_BODY_OFFSET` outside the body, broken where it would come closer
+/// than `SILK_PAD_CLEARANCE` to a pad. Without one, both follow the pad envelope.
+pub(super) fn build_footprint_graphics(
+    args: &serde_json::Value,
+    pads: &[PadGeom],
+) -> FootprintOutlines {
+    use footprint_kicad10::{Graphic, Shape};
     let (pmin_x, pmin_y, pmax_x, pmax_y) = pads_bbox(pads);
 
     let body = match (args["body_width"].as_f64(), args["body_height"].as_f64()) {
@@ -258,105 +336,145 @@ fn build_footprint_graphics(args: &serde_json::Value, name: &str, pads: &[PadGeo
         pads,
         body,
     );
+    // The body is centred on the pads.
+    let (cx, cy) = ((pmin_x + pmax_x) / 2.0, (pmin_y + pmax_y) / 2.0);
+    let body_box =
+        body.map(|(bw, bh)| (cx - bw / 2.0, cy - bh / 2.0, cx + bw / 2.0, cy + bh / 2.0));
 
-    // Courtyard: pad envelope + clearance.
+    // Courtyard: around the pads and the body, plus the clearance.
+    let (umin_x, umin_y, umax_x, umax_y) = match body_box {
+        Some((bx0, by0, bx1, by1)) => (
+            pmin_x.min(bx0),
+            pmin_y.min(by0),
+            pmax_x.max(bx1),
+            pmax_y.max(by1),
+        ),
+        None => (pmin_x, pmin_y, pmax_x, pmax_y),
+    };
     let (cmin_x, cmin_y, cmax_x, cmax_y) = (
-        pmin_x - clearance,
-        pmin_y - clearance,
-        pmax_x + clearance,
-        pmax_y + clearance,
+        umin_x - clearance,
+        umin_y - clearance,
+        umax_x + clearance,
+        umax_y + clearance,
     );
 
-    // Silk: just outside the pad envelope so it clears pads (avoids the
-    // silk-over-pad DRC violation) regardless of the body outline.
-    let silk_margin = 0.15;
-    let (smin_x, smin_y, smax_x, smax_y) = (
-        pmin_x - silk_margin,
-        pmin_y - silk_margin,
-        pmax_x + silk_margin,
-        pmax_y + silk_margin,
-    );
+    let line = |shape, layer, width| Graphic {
+        shape,
+        layer,
+        width,
+        filled: false,
+    };
+    let mut graphics = vec![line(
+        Shape::Rect {
+            start: (cmin_x, cmin_y),
+            end: (cmax_x, cmax_y),
+        },
+        "F.CrtYd",
+        0.05,
+    )];
+
+    // Silk: outside the body, broken near pads; without a body, just outside
+    // the pad envelope so it clears them.
+    let (smin_x, smin_y, smax_x, smax_y) = match body_box {
+        Some((bx0, by0, bx1, by1)) => {
+            let outline = (
+                bx0 - SILK_BODY_OFFSET,
+                by0 - SILK_BODY_OFFSET,
+                bx1 + SILK_BODY_OFFSET,
+                by1 + SILK_BODY_OFFSET,
+            );
+            let (x0, y0, x1, y1) = outline;
+            for (horizontal, across, from, to) in [
+                (true, y0, x0, x1),
+                (true, y1, x0, x1),
+                (false, x0, y0, y1),
+                (false, x1, y0, y1),
+            ] {
+                for (start, end) in silk_pieces(pads, horizontal, across, from, to) {
+                    let (start, end) = if horizontal {
+                        ((start, across), (end, across))
+                    } else {
+                        ((across, start), (across, end))
+                    };
+                    graphics.push(line(Shape::Line { start, end }, "F.SilkS", SILK_WIDTH));
+                }
+            }
+            outline
+        }
+        None => {
+            let silk_margin = 0.15;
+            let outline = (
+                pmin_x - silk_margin,
+                pmin_y - silk_margin,
+                pmax_x + silk_margin,
+                pmax_y + silk_margin,
+            );
+            graphics.push(line(
+                Shape::Rect {
+                    start: (outline.0, outline.1),
+                    end: (outline.2, outline.3),
+                },
+                "F.SilkS",
+                SILK_WIDTH,
+            ));
+            outline
+        }
+    };
 
     // Fab: the component body when given, else the pad envelope. May overlap
     // pads — fab is a documentation layer, not subject to silk-over-pad rules.
-    let (fmin_x, fmin_y, fmax_x, fmax_y) = match body {
-        Some((bw, bh)) => {
-            let cx = (pmin_x + pmax_x) / 2.0;
-            let cy = (pmin_y + pmax_y) / 2.0;
-            (cx - bw / 2.0, cy - bh / 2.0, cx + bw / 2.0, cy + bh / 2.0)
-        }
-        None => (pmin_x, pmin_y, pmax_x, pmax_y),
-    };
-
-    let mut s = String::new();
-
-    // Courtyard rectangle (F.CrtYd) — required for DRC.
-    s.push_str(&format!(
-        "\n  (fp_rect (start {:.4} {:.4}) (end {:.4} {:.4}) (stroke (width 0.05) (type solid)) (fill none) (layer \"F.CrtYd\"))",
-        cmin_x, cmin_y, cmax_x, cmax_y
-    ));
-    // Silkscreen outline (F.SilkS).
-    s.push_str(&format!(
-        "\n  (fp_rect (start {:.4} {:.4}) (end {:.4} {:.4}) (stroke (width 0.12) (type solid)) (fill none) (layer \"F.SilkS\"))",
-        smin_x, smin_y, smax_x, smax_y
-    ));
+    let (fmin_x, fmin_y, fmax_x, fmax_y) = body_box.unwrap_or((pmin_x, pmin_y, pmax_x, pmax_y));
 
     if let Some(i1) = pin1_index(pads) {
         let p1 = &pads[i1];
 
         // Fab outline with the pin-1 corner chamfered.
         let chamfer = (0.25 * (fmax_x - fmin_x).min(fmax_y - fmin_y)).clamp(0.3, 1.0);
-        let pts = chamfered_rect_points(fmin_x, fmin_y, fmax_x, fmax_y, p1.x, p1.y, chamfer);
-        let pts_str: String = pts
-            .iter()
-            .map(|(x, y)| format!("(xy {:.4} {:.4}) ", x, y))
-            .collect();
-        s.push_str(&format!(
-            "\n  (fp_poly (pts {}) (stroke (width 0.1) (type solid)) (fill none) (layer \"F.Fab\"))",
-            pts_str.trim()
-        ));
+        let points = chamfered_rect_points(fmin_x, fmin_y, fmax_x, fmax_y, p1.x, p1.y, chamfer);
+        graphics.push(line(Shape::Poly { points }, "F.Fab", 0.1));
 
         // Silk pin-1 dot just outside the silk outline, aligned with pin 1's
         // pad — NOT at the footprint corner, where a dot is ambiguous between
         // pin 1 and the last pin that shares the same corner. It sits directly
         // beside pin 1 so the mark is unmistakable.
-        let bcx = (pmin_x + pmax_x) / 2.0;
-        let bcy = (pmin_y + pmax_y) / 2.0;
-        let (dx, dy) = if (p1.x - bcx).abs() >= (p1.y - bcy).abs() {
+        let (dx, dy) = if (p1.x - cx).abs() >= (p1.y - cy).abs() {
             // Pin 1 is on a left/right edge: dot outside that edge, at pin 1's y.
-            let sign = if p1.x < bcx { -1.0 } else { 1.0 };
+            let sign = if p1.x < cx { -1.0 } else { 1.0 };
             let edge = if sign < 0.0 { smin_x } else { smax_x };
             (edge + sign * 0.4, p1.y)
         } else {
             // Pin 1 is on a top/bottom edge: dot outside that edge, at pin 1's x.
-            let sign = if p1.y < bcy { -1.0 } else { 1.0 };
+            let sign = if p1.y < cy { -1.0 } else { 1.0 };
             let edge = if sign < 0.0 { smin_y } else { smax_y };
             (p1.x, edge + sign * 0.4)
         };
-        s.push_str(&format!(
-            "\n  (fp_circle (center {:.4} {:.4}) (end {:.4} {:.4}) (stroke (width 0.1) (type solid)) (fill solid) (layer \"F.SilkS\"))",
-            dx, dy, dx + 0.15, dy
-        ));
+        graphics.push(Graphic {
+            shape: Shape::Circle {
+                center: (dx, dy),
+                end: (dx + 0.15, dy),
+            },
+            layer: "F.SilkS",
+            width: 0.1,
+            filled: true,
+        });
     } else {
         // No pads to mark pin 1 against — plain fab rectangle.
-        s.push_str(&format!(
-            "\n  (fp_rect (start {:.4} {:.4}) (end {:.4} {:.4}) (stroke (width 0.1) (type solid)) (fill none) (layer \"F.Fab\"))",
-            fmin_x, fmin_y, fmax_x, fmax_y
+        graphics.push(line(
+            Shape::Rect {
+                start: (fmin_x, fmin_y),
+                end: (fmax_x, fmax_y),
+            },
+            "F.Fab",
+            0.1,
         ));
     }
 
-    // Reference (F.SilkS, above) and value (F.Fab, below).
-    let cx = (pmin_x + pmax_x) / 2.0;
-    s.push_str(&format!(
-        "\n  (fp_text reference \"REF**\" (at {:.4} {:.4} 0) (layer \"F.SilkS\") (effects (font (size 1 1) (thickness 0.15))))",
-        cx, cmin_y - 1.0
-    ));
-    s.push_str(&format!(
-        "\n  (fp_text value \"{}\" (at {:.4} {:.4} 0) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))",
-        name, cx, cmax_y + 1.0
-    ));
-
-    s
+    // Reference above the courtyard (F.SilkS), value below it (F.Fab).
+    FootprintOutlines {
+        graphics,
+        reference_at: (cx, cmin_y - 1.0),
+        value_at: (cx, cmax_y + 1.0),
+    }
 }
 
 pub(crate) async fn handle_create_footprint(
@@ -413,8 +531,14 @@ pub(crate) async fn handle_create_footprint(
     } else {
         None
     };
-    let mut pad_geoms: Vec<PadGeom> = Vec::new();
-    let mut pad_sexp = String::new();
+    // Each pad as KiCad's writer prints it, before its UUID, with what
+    // `FOOTPRINT::cmp_pads` sorts by.
+    struct WrittenPad {
+        geometry: PadGeom,
+        shape_order: u8,
+        sexp: String,
+    }
+    let mut pads: Vec<WrittenPad> = Vec::new();
     let mut warnings = Vec::new();
     for pad in &pads_val {
         // Safe after validate_footprint_pad_items: every schema-required field
@@ -434,27 +558,30 @@ pub(crate) async fn handle_create_footprint(
         } else {
             vec!["*.Cu", "*.Mask"]
         };
-        let layers = format!(
-            "(layers {})",
-            layer_names
-                .iter()
-                .map(|layer| format!("\"{layer}\""))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
+        let layers = kicad_pad_layers(&layer_names);
 
-        let rotation = pad["rotation"].as_f64().unwrap_or(0.0);
+        // KiCad keeps a pad's orientation in [0, 360) (`EDA_ANGLE::Normalize`).
+        let rotation = pad["rotation"].as_f64().unwrap_or(0.0).rem_euclid(360.0);
         let at = if rotation == 0.0 {
-            format!("(at {x} {y})")
+            format!(
+                "(at {} {})",
+                footprint_kicad10::mm(x),
+                footprint_kicad10::mm(y)
+            )
         } else {
-            format!("(at {x} {y} {rotation})")
+            format!(
+                "(at {} {} {})",
+                footprint_kicad10::mm(x),
+                footprint_kicad10::mm(y),
+                footprint_kicad10::g10(rotation)
+            )
         };
 
         let roundrect_ratio = if let Some(ratio) = pad["roundrect_rratio"].as_f64() {
             if !(0.0..=0.5).contains(&ratio) {
                 anyhow::bail!("roundrect_rratio must be between 0 and 0.5");
             }
-            format!("(roundrect_rratio {ratio})")
+            format!("(roundrect_rratio {})", footprint_kicad10::g10(ratio))
         } else {
             String::new()
         };
@@ -464,13 +591,12 @@ pub(crate) async fn handle_create_footprint(
         } else {
             String::new()
         };
-        // On the pad's one line, after everything else, where KiCad writes them.
         let custom_shape = match pad.get("custom_shape").filter(|value| !value.is_null()) {
             Some(value) => {
                 let custom = crate::tools::pad_primitives::CustomPadShape::from_json(value)
                     .expect("validated custom shape");
                 format!(
-                    " {} {}",
+                    "{} {}",
                     crate::tools::pad_primitives::inline(&custom.options_sexp(0)),
                     crate::tools::pad_primitives::inline(&custom.primitives_sexp(0))
                 )
@@ -478,7 +604,6 @@ pub(crate) async fn handle_create_footprint(
             None => String::new(),
         };
 
-        // KiCad writes the property just before the layers.
         let fabrication_property = pad["fabrication_property"]
             .as_str()
             .map(|name| PadFabricationProperty::parse(name).expect("validated"));
@@ -491,38 +616,56 @@ pub(crate) async fn handle_create_footprint(
         }
         let property = fabrication_property
             .and_then(PadFabricationProperty::token)
-            .map_or_else(String::new, |token| format!("(property {token}) "));
+            .map_or_else(String::new, |token| format!("(property {token})"));
+        // KiCad writes it for a plated hole (`PCB_IO_KICAD_SEXPR::format( const PAD* )`).
+        let unused_layers = if pad_type == "thru_hole" {
+            "(remove_unused_layers no)"
+        } else {
+            ""
+        };
 
-        pad_sexp.push_str(&format!(
-            "\n  (pad \"{}\" {} {} {} (size {} {}) {}{} {} {}{})",
-            number,
+        // The children in the order KiCad's pad writer prints them.
+        let sexp = format!(
+            "(pad {} {} {} {} (size {} {}) {} {} {} {} {} {}",
+            crate::tools::footprint_metadata::quote_string(&number),
             pad_type,
             shape,
             at,
-            w,
-            h,
+            footprint_kicad10::mm(w),
+            footprint_kicad10::mm(h),
+            drill_sexp,
             property,
             layers,
-            drill_sexp,
+            unused_layers,
             roundrect_ratio,
             custom_shape
-        ));
-        pad_geoms.push(PadGeom {
-            number,
-            pad_type,
-            x,
-            y,
-            w,
-            h,
+        );
+        // KiCad's `PAD_SHAPE` order (`pcbnew/padstack.h`).
+        let shape_order = match shape {
+            "circle" => 0,
+            "rect" => 1,
+            "oval" => 2,
+            "roundrect" => 4,
+            _ => 6,
+        };
+        pads.push(WrittenPad {
+            geometry: PadGeom {
+                number,
+                pad_type,
+                x,
+                y,
+                w,
+                h,
+                rotation,
+            },
+            shape_order,
+            sexp,
         });
     }
+    let pad_geoms: Vec<PadGeom> = pads.iter().map(|pad| pad.geometry.clone()).collect();
 
-    // Courtyard, silk, fab, text, and pin-1 marker, derived from pad geometry.
-    let graphics = if pad_geoms.is_empty() {
-        String::new()
-    } else {
-        build_footprint_graphics(args, name, &pad_geoms)
-    };
+    // Courtyard, silk, fab and pin-1 marker, derived from the pads and body.
+    let outlines = (!pad_geoms.is_empty()).then(|| build_footprint_graphics(args, &pad_geoms));
     let model_sexp = build_model_sexp(args);
 
     let attr = if pad_geoms.iter().any(|p| p.pad_type == "smd") {
@@ -531,10 +674,69 @@ pub(crate) async fn handle_create_footprint(
         "through_hole"
     };
 
-    let content = format!(
-        "(footprint \"{}\"\n  (version 20240108)\n  (generator \"copperpour\")\n  (layer \"F.Cu\")\n  (descr \"{}\")\n  (attr {}){}{}{}\n)",
-        name, description, attr, pad_sexp, graphics, model_sexp
+    // The footprint in the order KiCad's writer prints it
+    // (`PCB_IO_KICAD_SEXPR::format( const FOOTPRINT* )`), graphics and pads
+    // sorted as `FOOTPRINT::cmp_drawings` and `cmp_pads` sort them, then laid
+    // out by its `Prettify` pass (#711).
+    let quote = crate::tools::footprint_metadata::quote_string;
+    let mut text = format!(
+        "(footprint {} (version {}) (generator \"copperpour\") (generator_version \"10.0\") \
+         (layer \"F.Cu\")",
+        quote(name),
+        footprint_kicad10::FOOTPRINT_VERSION
     );
+    if !description.is_empty() {
+        text.push_str(&format!(" (descr {})", quote(description)));
+    }
+    let (reference_at, value_at) = outlines
+        .as_ref()
+        .map_or(((0.0, 0.0), (0.0, 0.0)), |o| (o.reference_at, o.value_at));
+    let text_font = "(size 1 1) (thickness 0.15)";
+    let hidden_font = "(size 1.27 1.27)";
+    for field in [
+        footprint_kicad10::field_sexp(
+            "Reference",
+            "REF**",
+            reference_at,
+            "F.SilkS",
+            false,
+            text_font,
+        ),
+        footprint_kicad10::field_sexp("Value", name, value_at, "F.Fab", false, text_font),
+        footprint_kicad10::field_sexp("Datasheet", "", (0.0, 0.0), "F.Fab", true, hidden_font),
+        footprint_kicad10::field_sexp("Description", "", (0.0, 0.0), "F.Fab", true, hidden_font),
+    ] {
+        text.push(' ');
+        text.push_str(&field);
+    }
+    text.push_str(&format!(
+        " (attr {attr}) (duplicate_pad_numbers_are_jumpers no)"
+    ));
+    let mut graphics = outlines.map(|o| o.graphics).unwrap_or_default();
+    graphics.sort_by(|a, b| a.kicad_order(b));
+    for graphic in &graphics {
+        text.push(' ');
+        text.push_str(&graphic.sexp(&footprint_kicad10::new_uuid()));
+    }
+    let nm = footprint_kicad10::nanometres;
+    pads.sort_by(|a, b| {
+        let (pa, pb) = (&a.geometry, &b.geometry);
+        footprint_kicad10::str_num_cmp(&pa.number, &pb.number)
+            .then((nm(pa.x), nm(pa.y)).cmp(&(nm(pb.x), nm(pb.y))))
+            .then((nm(pa.w), nm(pa.h)).cmp(&(nm(pb.w), nm(pb.h))))
+            .then(a.shape_order.cmp(&b.shape_order))
+    });
+    for pad in &pads {
+        text.push_str(&format!(
+            " {} (uuid \"{}\"))",
+            pad.sexp,
+            footprint_kicad10::new_uuid()
+        ));
+    }
+    text.push_str(" (embedded_fonts no) ");
+    text.push_str(&model_sexp);
+    text.push(')');
+    let content = copperpour_sexp::prettify(&text);
 
     // Ensure parent directory exists
     if let Some(parent) = output.parent() {

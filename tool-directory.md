@@ -422,7 +422,7 @@ Live `move_component`, `rotate_component`, `set_component_placements`, `align_co
 
 | Tool | Description |
 |------|-------------|
-| `create_footprint` | Create a new footprint (`.kicad_mod`) file from a pad layout description. |
+| `create_footprint` | Create a new footprint (`.kicad_mod`) file from a pad layout description, in the KiCad 10 format KiCad writes, with courtyard, silk and fab outlines around the pads and the body. |
 | `edit_footprint_pad` | Atomically edit or renumber matching pads, including valid circle/rect/oval/roundrect/custom shape transitions, a roundrect pad's corner ratio, a custom pad's anchor and primitives (`custom_shape`, replacing the whole list), independent dimensions, the pad's layers (written as KiCad writes them), the pad's zone connection override, its fabrication property (castellated, heatsink, testpoint, …), and its own solder mask and paste margins, each reported with its previous and current value. |
 | `set_footprint_graphics` | Atomically append, replace, or delete `line`, `arc`, `rect`, `circle` and `poly` primitives on one footprint layer; `rect`, `circle` and `poly` require `fill`. Replacement/deletion preserves unrelated source and rejects graphics referenced by a group. |
 | `set_footprint_metadata` | Atomically replace a footprint description, tags, supported attributes, Value text, or its own solder mask and paste margins while preserving unrelated source. Empty tags or attributes remove their block. Reports each changed field's previous and current value, and warns when attributes drop the footprint type or an attribute it does not accept. |
