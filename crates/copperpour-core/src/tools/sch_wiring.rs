@@ -4095,6 +4095,8 @@ async fn handle_add_power_symbol(
     let uncertain = |reason: String| {
         crate::tools::mutation_outcome_uncertain(&sch_path, "add_power_symbol", reason)
     };
+    #[cfg(test)]
+    power_orientation_tests::run_before_power_readback(&sch_path);
     let committed_source = match read_consistent(&sch_path) {
         Ok(source) => source,
         Err(error) => {
@@ -4813,6 +4815,8 @@ pub(crate) async fn handle_batch_add_power_symbol(
             reason,
         ))
     };
+    #[cfg(test)]
+    power_orientation_tests::run_before_power_readback(&sch_path);
     let committed_source = match read_consistent(&sch_path) {
         Ok(source) => source,
         Err(error) => return uncertain(format!("saved schematic could not be read: {error}")),

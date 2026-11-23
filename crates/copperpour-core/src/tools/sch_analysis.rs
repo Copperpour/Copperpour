@@ -1649,10 +1649,64 @@ pub fn added_clearance_findings(
 #[cfg(test)]
 mod clearance_tests {
     use super::*;
-    use copperpour_sexp::parse_sexp;
+    use copperpour_sexp::{parse_sexp, SexpNode};
 
     const SOURCE: &str =
         include_str!("../../tests/fixtures/power_orientation_kicad10/power_orientation.kicad_sch");
+    const BODY_CROSSINGS: &str =
+        include_str!("../../tests/fixtures/wire_through_symbol_kicad10.kicad_sch");
+    const R1_CROSSING_WIRE: &str = "7f228b0f-7e2f-4061-a35f-d496b115f231";
+    const Y1_CROSSING_WIRE: &str = "c3143ef8-21cb-4f0b-a9c8-fe7b58052256";
+
+    fn wire_crossing_snapshots() -> (SexpNode, SexpNode) {
+        let after = parse_sexp(BODY_CROSSINGS).unwrap();
+        let mut before = after.clone();
+        let SexpNode::List(items) = &mut before else {
+            panic!("expected a schematic list");
+        };
+        let count = items.len();
+        items.retain(|node| {
+            node.head() != Some("wire")
+                || !matches!(
+                    node.find_str("uuid"),
+                    Some(R1_CROSSING_WIRE | Y1_CROSSING_WIRE)
+                )
+        });
+        assert_eq!(items.len(), count - 2);
+        (before, after)
+    }
+
+    #[test]
+    fn wire_body_crossings_report_only_named_changes() {
+        let (before, after) = wire_crossing_snapshots();
+        // Either crossing is new. Only the one whose wire was named belongs
+        // in the report; the other cannot be subtracted as a pre-existing finding.
+        for (wire, reference) in [(R1_CROSSING_WIRE, "R1"), (Y1_CROSSING_WIRE, "Y1")] {
+            let report = added_clearance_findings(&before, &after, &[wire]);
+            let crossings: Vec<_> = report
+                .findings
+                .iter()
+                .filter(|finding| finding["type"] == "wire_overlap")
+                .collect();
+            assert_eq!(crossings.len(), 1, "{:?}", report.findings);
+            assert_eq!(crossings[0]["a"]["uuid"], wire);
+            assert_eq!(crossings[0]["b"]["reference"], reference);
+        }
+    }
+
+    #[test]
+    fn an_empty_change_set_reports_no_clearance_findings() {
+        let (before, after) = wire_crossing_snapshots();
+        assert!(
+            added_clearance_findings(&before, &after, &[R1_CROSSING_WIRE])
+                .findings
+                .iter()
+                .any(|finding| finding["type"] == "wire_overlap")
+        );
+        let report = added_clearance_findings(&before, &after, &[]);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(report.bounds_unresolved.is_empty());
+    }
 
     #[test]
     fn moving_a_symbol_onto_another_pin_reports_the_contact() {

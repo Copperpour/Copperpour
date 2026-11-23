@@ -1,8 +1,59 @@
 use super::batch_power_tests::{handler, pins, serve};
 use super::*;
 use crate::mcp::handler::McpHandler;
+use copperpour_sexp::SexpNode;
 use serde_json::Value;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+
+type BeforePowerReadback = Box<dyn FnOnce(&Path)>;
+
+thread_local! {
+    static LATE_SAVE: RefCell<Option<(PathBuf, BeforePowerReadback)>> = const { RefCell::new(None) };
+}
+
+fn save_before_power_readback(path: &Path, edit: impl FnOnce(&Path) + 'static) {
+    LATE_SAVE.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some((path.to_owned(), Box::new(edit)));
+    });
+}
+
+/// Simulate an editor save after the writer's atomic byte readback, but before
+/// the tool checks that the saved sheet still contains its requested edits.
+pub(super) fn run_before_power_readback(path: &Path) {
+    let edit = LATE_SAVE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|(target, _)| target == path) {
+            slot.take().map(|(_, edit)| edit)
+        } else {
+            None
+        }
+    });
+    if let Some(edit) = edit {
+        edit(path);
+    }
+}
+
+fn remove_one_new_saved_item(
+    path: &Path,
+    tag: &str,
+    before: &SexpNode,
+    is_target: impl Fn(&SexpNode) -> bool,
+) {
+    let saved = read_consistent(path).unwrap();
+    let existing = before.find_all(tag);
+    let mut spans = direct_children_with_tag(&saved, "kicad_sch", tag)
+        .into_iter()
+        .filter(|&(start, end)| {
+            let node = parse_sexp(&saved[start..end]).unwrap();
+            is_target(&node) && !existing.contains(&&node)
+        });
+    let (start, end) = spans.next().expect("the writer saved the new item");
+    assert!(spans.next().is_none(), "the edit must remove exactly one item");
+    let edited = apply_edits(saved.clone(), vec![SexpEdit::delete(start, end)]);
+    write_atomic_if_unchanged(path, &saved, &edited).unwrap();
+}
 
 fn fixture() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -341,28 +392,34 @@ async fn an_unjoined_batch_pin_uses_its_explicit_rotation() {
 #[tokio::test]
 async fn a_joined_row_ignores_pin_rotation_overrides() {
     let handler = handler().await;
-    let (_dir, path) = fixture();
-    let reply = serve(
-        &handler,
-        "batch_add_power_symbol",
-        &path,
-        json!({
-            "power_net": "GND", "pins": [
-                {"reference": "J5", "pin_number": "1", "rotation": 0},
-                {"reference": "J5", "pin_number": "2", "rotation": 180}
-            ],
-        }),
-    )
-    .await;
-    assert_eq!(reply["is_error"], false, "{reply}");
-    assert_eq!(reply["groups"][0]["joined"], true, "{reply}");
-    assert_eq!(reply["groups"][0]["symbol"]["rotation"], 90.0, "{reply}");
-    assert_eq!(
-        reply["groups"][0]["ignored_rotations"],
-        json!(pins(&["J5.1", "J5.2"])),
-        "{reply}"
-    );
-    assert_eq!(reply["wires_added_count"], 3, "{reply}");
+    for overridden in [&["J5.1", "J5.2"][..], &["J5.2"][..], &[][..]] {
+        let (_dir, path) = fixture();
+        let mut requested = pins(&["J5.1", "J5.2"]);
+        if overridden.contains(&"J5.1") {
+            requested[0]["rotation"] = json!(0);
+        }
+        if overridden.contains(&"J5.2") {
+            requested[1]["rotation"] = json!(180);
+        }
+        let reply = serve(
+            &handler,
+            "batch_add_power_symbol",
+            &path,
+            json!({"power_net": "GND", "pins": requested}),
+        )
+        .await;
+        assert_eq!(reply["is_error"], false, "{reply}");
+        assert_eq!(reply["placed_count"], 1, "{reply}");
+        let group = &reply["groups"][0];
+        assert_eq!(group["joined"], true, "{reply}");
+        assert_eq!(group["symbol"]["rotation"], 90.0, "{reply}");
+        if overridden.is_empty() {
+            assert!(group.get("ignored_rotations").is_none(), "{reply}");
+        } else {
+            assert_eq!(group["ignored_rotations"], pins(overridden), "{reply}");
+        }
+        assert_eq!(reply["wires_added_count"], 3, "{reply}");
+    }
 }
 
 #[tokio::test]
@@ -431,7 +488,6 @@ async fn single_stub_lengths_reject_invalid_values_without_writing() {
     let (_dir, path) = fixture();
     let before = std::fs::read(&path).unwrap();
     for args in [
-        json!({"reference": "J4", "pin_number": "1", "stub_length": -1.27}),
         json!({"reference": "J4", "pin_number": "1", "stub_length": 1.0}),
         json!({"x": 220.98, "y": 180.34, "stub_length": 2.54}),
     ] {
@@ -456,12 +512,97 @@ async fn single_stub_lengths_reject_invalid_values_without_writing() {
     assert_eq!(reply["y"], 180.34, "{reply}");
 }
 
+async fn assert_power_length_refused(tool: &str, mut args: Value, reason: &str) {
+    let handler = handler().await;
+    let ctx = ToolContext::new(
+        crate::tools::ServerConfig::default(),
+        std::sync::Arc::new(crate::router::ToolRouter::new()),
+    );
+    let (_dir, path) = fixture();
+    let before = std::fs::read(&path).unwrap();
+    args["power_net"] = json!("GND");
+    let served = serve(&handler, tool, &path, args.clone()).await;
+    assert_eq!(served["is_error"], true, "{served}");
+    assert_eq!(served["error"]["kind"], "invalid_argument", "{served}");
+    assert_eq!(served["error"]["field"], "stub_length", "{served}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    // Dispatch already rejects these values. Call the handler without the
+    // schema as well so this test reaches the handler's own range check.
+    args["schematic"] = json!(path);
+    let result = match tool {
+        "add_power_symbol" => handle_add_power_symbol(&args, &ctx).await.unwrap(),
+        "batch_add_power_symbol" => handle_batch_add_power_symbol(&args, &ctx).await.unwrap(),
+        _ => unreachable!("not a power-symbol tool"),
+    };
+    let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+        panic!("expected a structured invalid_argument reply");
+    };
+    let reply: Value = serde_json::from_str(text).unwrap();
+    assert!(result.is_error, "{tool}: {reply}");
+    assert_eq!(reply["error"]["kind"], "invalid_argument", "{tool}: {reply}");
+    assert_eq!(reply["error"]["field"], "stub_length", "{tool}: {reply}");
+    assert_eq!(reply["error"]["reason"], reason, "{tool}: {reply}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn a_negative_grid_aligned_power_stub_is_refused_without_writing() {
+    assert_power_length_refused(
+        "add_power_symbol",
+        json!({"reference": "J4", "pin_number": "1", "stub_length": -2.54}),
+        "must be a finite, nonnegative length in mm",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_zero_length_batch_power_stub_is_refused_without_writing() {
+    assert_power_length_refused(
+        "batch_add_power_symbol",
+        json!({"pins": pins(&["J5.1", "J5.2"]), "stub_length": 0}),
+        "must be a finite length greater than zero",
+    )
+    .await;
+}
+
 fn fixture_with_missing_symbol() -> (tempfile::TempDir, PathBuf) {
     let (dir, path) = fixture();
     let mut sch = cse::Schematic::load(&path).unwrap();
     sch.symbols.by_reference_mut("J3").unwrap().lib_id = "missing:Connector".into();
     sch.overwrite().unwrap();
     (dir, path)
+}
+
+#[tokio::test]
+async fn an_unresolved_symbol_with_an_empty_reference_is_named_in_the_refusal() {
+    let handler = handler().await;
+    let (_dir, path) = fixture_with_missing_symbol();
+    let source = std::fs::read_to_string(&path).unwrap();
+    let before = source.replacen(
+        "(property \"Reference\" \"J3\"",
+        "(property \"Reference\" \"\"",
+        1,
+    );
+    assert_ne!(source, before);
+    std::fs::write(&path, &before).unwrap();
+    let reply = serve(
+        &handler,
+        "add_power_symbol",
+        &path,
+        json!({"power_net": "+3V3", "reference": "J4", "pin_number": "1"}),
+    )
+    .await;
+    assert_eq!(reply["is_error"], true, "{reply}");
+    assert_eq!(reply["error"]["kind"], "plan_blocked", "{reply}");
+    assert!(
+        reply["error"]["reasons"][0]
+            .as_str()
+            .unwrap()
+            .contains("unresolved pin geometry for <unknown symbol>"),
+        "{reply}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before.as_bytes());
 }
 
 #[tokio::test]
@@ -1173,12 +1314,10 @@ async fn an_unused_pin_marked_no_connect_reserves_no_stub_corridor() {
     );
 }
 
-#[tokio::test]
-async fn a_stub_adds_a_junction_at_an_existing_wire_exit() {
-    let handler = handler().await;
-    let (_dir, path) = fixture();
+async fn fixture_with_wire_exit(handler: &McpHandler) -> (tempfile::TempDir, PathBuf) {
+    let (dir, path) = fixture();
     let wire = serve(
-        &handler,
+        handler,
         "add_wire",
         &path,
         json!({
@@ -1187,10 +1326,88 @@ async fn a_stub_adds_a_junction_at_an_existing_wire_exit() {
     )
     .await;
     assert_eq!(wire["is_error"], false, "{wire}");
+    (dir, path)
+}
+
+#[tokio::test]
+async fn a_stub_adds_a_junction_at_an_existing_wire_exit() {
+    let handler = handler().await;
+    let (_dir, path) = fixture_with_wire_exit(&handler).await;
     let reply = place(&handler, &path, "+3V3", "J4.1").await;
     check_placement(&path, &reply, (71.12, 124.46), 0.0, (68.58, 124.46));
     let tree = read_schematic(&path).unwrap().1;
     assert!(copperpour_sexp::schematic::extract_junctions(&tree).contains(&(68.58, 124.46)));
+}
+
+#[tokio::test]
+async fn a_missing_saved_power_stub_junction_reports_an_uncertain_mutation() {
+    let handler = handler().await;
+    let (_dir, path) = fixture_with_wire_exit(&handler).await;
+    let (_, before) = read_schematic(&path).unwrap();
+    let counts = (before.find_all("symbol").len(), before.find_all("wire").len());
+    save_before_power_readback(&path, move |path| {
+        remove_one_new_saved_item(path, "junction", &before, |dot| {
+            parse_at(dot).is_some_and(|(x, y, _)| (x, y) == (68.58, 124.46))
+        });
+    });
+    let tool = "add_power_symbol";
+    let reply = serve(
+        &handler,
+        tool,
+        &path,
+        json!({"power_net": "+3V3", "reference": "J4", "pin_number": "1"}),
+    )
+    .await;
+    let (_, after) = read_schematic(&path).unwrap();
+    assert_eq!(after.find_all("symbol").len(), counts.0 + 1);
+    assert_eq!(after.find_all("wire").len(), counts.1 + 1);
+    assert!(!copperpour_sexp::schematic::extract_junctions(&after).contains(&(68.58, 124.46)));
+    assert_eq!(reply["is_error"], true, "{reply}");
+    assert_eq!(reply["error"]["kind"], "mutation_outcome_uncertain", "{reply}");
+    assert_eq!(reply["error"]["operation"], tool, "{reply}");
+    assert_eq!(reply["error"]["path"], path.display().to_string(), "{reply}");
+    assert_eq!(
+        reply["error"]["reason"],
+        "a new junction was not found in the saved file",
+        "{reply}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_saved_power_bar_wire_reports_an_uncertain_mutation() {
+    let handler = handler().await;
+    let (_dir, path) = fixture();
+    let (_, before) = read_schematic(&path).unwrap();
+    let counts = (before.find_all("symbol").len(), before.find_all("wire").len());
+    save_before_power_readback(&path, move |path| {
+        // Remove the vertical bar only. Both horizontal stubs, the symbol
+        // and the planned junction must survive the simulated save.
+        remove_one_new_saved_item(path, "wire", &before, |wire| {
+            let xy = wire.find("pts").unwrap().find_all("xy");
+            xy[0].get_f64(1).unwrap() == xy[1].get_f64(1).unwrap()
+        });
+    });
+    let tool = "batch_add_power_symbol";
+    let reply = serve(
+        &handler,
+        tool,
+        &path,
+        json!({"power_net": "GND", "pins": pins(&["J5.1", "J5.2"])}),
+    )
+    .await;
+    let (_, after) = read_schematic(&path).unwrap();
+    assert_eq!(after.find_all("symbol").len(), counts.0 + 1);
+    assert_eq!(after.find_all("wire").len(), counts.1 + 2);
+    assert!(copperpour_sexp::schematic::extract_junctions(&after).contains(&(71.12, 137.16)));
+    assert_eq!(reply["is_error"], true, "{reply}");
+    assert_eq!(reply["error"]["kind"], "mutation_outcome_uncertain", "{reply}");
+    assert_eq!(reply["error"]["operation"], tool, "{reply}");
+    assert_eq!(reply["error"]["path"], path.display().to_string(), "{reply}");
+    let reason = reply["error"]["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with("wire ") && reason.ends_with(" is not in the saved file"),
+        "{reply}"
+    );
 }
 
 #[tokio::test]
