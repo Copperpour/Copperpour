@@ -257,6 +257,11 @@ keeping its value and layout, `remove_fields=["LCSC"]` deletes one, `value`
 sets the Value field, `datasheet` the Datasheet field, and `reference_prefix` the
 Reference field.
 
+`field_order=["Manufacturer", "Manufacturer Number"]` puts those custom fields
+first, in that order; the others keep their order after them. Each field moves
+whole. Mandatory fields stay first and `ki_*` fields last, so they cannot be
+named; a field set or renamed in the same call can be.
+
 ### Symbol Layout Guidelines
 
 - Pin 1 indicator (dot or bar) on the symbol body
