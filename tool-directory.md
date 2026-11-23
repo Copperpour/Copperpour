@@ -200,6 +200,7 @@ and Windows servers do not.
 | `compare_schematic_layout` | Score a saved schematic sheet, including wires crossing visible Reference or Value text on ordinary symbols. Compare with a saved baseline after checking pin connectivity and symbol identity. Does not write or run KiCad. |
 | `find_pin_contacts` | Report visible pins touching on distinct symbols and branch-free pin-to-pin runs shorter than `min_wire_mm` (default 2.54 mm). Read-only drawing check on one saved sheet. |
 | `plan_schematic_cleanup` | Preview net-preserving reroutes and permitted symbol moves on one saved schematic. Returns a revision, ordered steps and skip reasons without writing. |
+| `preview_block_placement` | Preview placement and wiring for explicitly selected supporting parts around a fixed IC on one saved sheet. Does not write or run KiCad. |
 
 ### `sch_batch` · 19 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call; add, list, edit and delete free text items; add and list graphic shapes.

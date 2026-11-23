@@ -18,6 +18,7 @@ pub fn tools() -> Vec<ToolDef> {
         compare_tool_def(),
         sch_pin_contacts::definition(),
         super::sch_cleanup::definition(),
+        super::sch_block_placement::definition(),
     ]
 }
 

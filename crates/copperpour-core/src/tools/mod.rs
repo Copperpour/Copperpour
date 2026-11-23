@@ -95,6 +95,7 @@ pub mod sch_analysis;
 pub(crate) mod sch_annotate;
 pub mod sch_batch;
 mod sch_block_move;
+mod sch_block_placement;
 pub mod sch_bus;
 mod sch_cleanup;
 pub mod sch_components;
