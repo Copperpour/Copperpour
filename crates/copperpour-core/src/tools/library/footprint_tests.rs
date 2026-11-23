@@ -411,6 +411,205 @@ async fn edit_margins(source: &str, arguments: serde_json::Value) -> (serde_json
     (body, std::fs::read_to_string(&path).unwrap())
 }
 
+// KiCad 10.0.8 wrote each of these from the stock Winbond USON-8, one
+// PAD::SetLayerSet each; provenance in tests/fixtures/pad_layers_kicad10.README.md.
+const LAYERS_SOURCE: &str =
+    include_str!("../../../tests/fixtures/pad_layers_source_kicad10.kicad_mod");
+const LAYERS_NO_PASTE: &str =
+    include_str!("../../../tests/fixtures/pad_layers_no_paste_kicad10.kicad_mod");
+const LAYERS_BACK: &str = include_str!("../../../tests/fixtures/pad_layers_back_kicad10.kicad_mod");
+const LAYERS_EP_PASTE: &str =
+    include_str!("../../../tests/fixtures/pad_layers_ep_paste_kicad10.kicad_mod");
+const LAYERS_BOTH_SIDES: &str =
+    include_str!("../../../tests/fixtures/pad_layers_both_sides_kicad10.kicad_mod");
+
+#[tokio::test]
+async fn edit_footprint_pad_writes_layers_as_kicad_does() {
+    let cases = [
+        (
+            "paste removed",
+            LAYERS_SOURCE,
+            "1",
+            json!(["F.Mask", "F.Cu"]),
+            LAYERS_NO_PASTE,
+        ),
+        (
+            "paste given back",
+            LAYERS_NO_PASTE,
+            "1",
+            json!(["F.Paste", "F.Cu", "F.Mask"]),
+            LAYERS_SOURCE,
+        ),
+        (
+            "moved to the back",
+            LAYERS_SOURCE,
+            "1",
+            json!(["B.Paste", "B.Mask", "B.Cu"]),
+            LAYERS_BACK,
+        ),
+        (
+            "paste on the exposed pad",
+            LAYERS_SOURCE,
+            "9",
+            json!(["F.Cu", "F.Paste", "F.Mask"]),
+            LAYERS_EP_PASTE,
+        ),
+        (
+            "both sides as wildcards",
+            LAYERS_SOURCE,
+            "9",
+            json!(["B.Mask", "F.Cu", "B.Cu", "F.Mask"]),
+            LAYERS_BOTH_SIDES,
+        ),
+        (
+            "wildcards given",
+            LAYERS_SOURCE,
+            "9",
+            json!(["*.Mask", "*.Cu"]),
+            LAYERS_BOTH_SIDES,
+        ),
+        (
+            "unchanged",
+            LAYERS_SOURCE,
+            "1",
+            json!(["F.Cu", "F.Mask", "F.Paste"]),
+            LAYERS_SOURCE,
+        ),
+    ];
+    for (case, source, pad, layers, kicad) in cases {
+        let (body, written) =
+            edit_margins(source, json!({ "pad_number": pad, "layers": layers })).await;
+        assert_eq!(body["updated_count"], 1, "{case}: {body}");
+        assert_eq!(
+            solder_margins::without_uuids(&written),
+            solder_margins::without_uuids(kicad),
+            "{case}: the pad must match KiCad's and nothing else may change"
+        );
+    }
+
+    let (body, written) = edit_margins(
+        LAYERS_SOURCE,
+        json!({ "pad_number": "1", "layers": ["F.Cu", "F.Mask"] }),
+    )
+    .await;
+    assert_eq!(
+        body["layers"],
+        json!({ "previous": ["F.Cu", "F.Mask", "F.Paste"], "current": ["F.Cu", "F.Mask"] })
+    );
+    let pad_uuid = |text: &str| {
+        let pad = &text[text.find("(pad \"1\"").unwrap()..];
+        pad[pad.find("(uuid").unwrap()..][..44].to_string()
+    };
+    assert_eq!(
+        pad_uuid(&written),
+        pad_uuid(LAYERS_SOURCE),
+        "the pad keeps its UUID"
+    );
+}
+
+#[tokio::test]
+async fn edit_footprint_pad_layers_with_match_all_report_each_distinct_change() {
+    let source = "(footprint \"P\"\n  (version 20260206)\n  (layer \"F.Cu\")\n  \
+        (pad \"1\" smd rect (at -1 0) (size 1 1) (layers \"F.Cu\" \"F.Mask\") (uuid \"a\"))\n  \
+        (pad \"1\" smd rect (at 1 0) (size 1 1) (layers \"F.Cu\" \"F.Mask\" \"F.Paste\") (uuid \"b\"))\n  \
+        (pad \"2\" smd rect (at 3 0) (size 1 1) (layers \"F.Cu\" \"F.Mask\") (uuid \"c\"))\n)\n";
+    let (body, written) = edit_margins(
+        source,
+        json!({ "pad_number": "1", "match_all": true, "layers": ["F.Cu", "F.Paste", "F.Mask"] }),
+    )
+    .await;
+    assert_eq!(body["updated_count"], 2, "{body}");
+    assert_eq!(
+        body["layers"],
+        json!([
+            { "previous": ["F.Cu", "F.Mask"], "current": ["F.Cu", "F.Mask", "F.Paste"] },
+            { "previous": ["F.Cu", "F.Mask", "F.Paste"], "current": ["F.Cu", "F.Mask", "F.Paste"] }
+        ])
+    );
+    assert_eq!(
+        written,
+        source.replacen(
+            "(layers \"F.Cu\" \"F.Mask\") (uuid \"a\")",
+            "(layers \"F.Cu\" \"F.Mask\" \"F.Paste\") (uuid \"a\")",
+            1
+        ),
+        "both pads 1 are on the new layers, pad 2 is untouched"
+    );
+}
+
+#[tokio::test]
+async fn edit_footprint_pad_refuses_bad_layers_without_writing() {
+    for (layers, reason) in [
+        (
+            json!("F.Cu"),
+            "must be an array of layer names when supplied",
+        ),
+        (json!(null), "must be an array of layer names when supplied"),
+        (json!([]), "pad layers must not be empty"),
+        (json!(["F.Cu", 3]), "pad layers must contain strings"),
+        (json!(["F.Cu", "In1.Cu"]), "invalid pad layer: In1.Cu"),
+        (json!(["F.SilkS"]), "invalid pad layer: F.SilkS"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("P.kicad_mod");
+        std::fs::write(&path, LAYERS_SOURCE).unwrap();
+        let result = handle_edit_footprint_pad(
+            &json!({ "footprint_path": path, "pad_number": "1", "layers": layers }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{layers}");
+        let body: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(body["error"]["field"], "layers", "{body}");
+        assert!(
+            body["error"]["reason"].as_str().unwrap().contains(reason),
+            "{layers}: {body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), LAYERS_SOURCE);
+    }
+}
+
+#[test]
+fn pad_layers_are_written_in_kicads_order_and_wildcards() {
+    for (names, written) in [
+        (
+            vec!["F.Paste", "F.Mask", "F.Cu"],
+            r#"(layers "F.Cu" "F.Mask" "F.Paste")"#,
+        ),
+        (vec!["B.Mask", "B.Cu"], r#"(layers "B.Cu" "B.Mask")"#),
+        (vec!["F.Cu", "B.Cu"], r#"(layers "*.Cu")"#),
+        (
+            vec!["*.Cu", "F.Cu", "F.Mask"],
+            r#"(layers "*.Cu" "F.Mask")"#,
+        ),
+        (
+            vec!["B.Paste", "F.Paste", "B.Mask", "F.Mask", "F.Cu"],
+            r#"(layers "*.Paste" "*.Mask" "F.Cu")"#,
+        ),
+        (
+            vec!["F.Mask", "B.Cu", "F.Mask"],
+            r#"(layers "F.Mask" "B.Cu")"#,
+        ),
+        (vec!["F.Paste"], r#"(layers "F.Paste")"#),
+    ] {
+        assert_eq!(kicad_pad_layers(&names), written, "{names:?}");
+    }
+}
+
+#[test]
+fn edit_footprint_pad_schema_offers_the_create_footprint_layer_names() {
+    let tools = tools();
+    let edit = tools
+        .iter()
+        .find(|tool| tool.name == "edit_footprint_pad")
+        .unwrap();
+    assert_eq!(
+        edit.input_schema["properties"]["layers"]["items"]["enum"],
+        json!(PAD_LAYER_NAMES)
+    );
+}
+
 #[tokio::test]
 async fn edit_footprint_pad_writes_solder_margins_as_kicad_does() {
     let set = json!({

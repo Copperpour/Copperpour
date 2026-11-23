@@ -18,8 +18,8 @@ mod lib_table_tests;
 #[cfg(test)]
 mod symbol_tests;
 
-use footprint_ops::handle_edit_footprint_pad;
 pub(crate) use footprint_ops::{handle_create_footprint, skip_sexp_token, PadFabricationProperty};
+use footprint_ops::{handle_edit_footprint_pad, PAD_LAYER_NAMES};
 pub(crate) use lib_tables::{
     expand_lib_uri, footprint_lib_nickname_for_dir, handle_register_footprint_library,
     handle_register_symbol_library, is_lib_id, resolve_footprint_path, KiCadSymbolSource,
@@ -52,7 +52,7 @@ use copperpour_sexp::writer::{
 #[cfg(test)]
 use footprint_ops::{
     build_model_sexp, chamfered_rect_points, courtyard_clearance, edit_footprint_pad_block,
-    escape_library_string, format_ratio, pads_bbox, pin1_index, report_observed,
+    escape_library_string, format_ratio, kicad_pad_layers, pads_bbox, pin1_index, report_observed,
     set_pad_fabrication_property, set_pad_zone_connect, PadGeom, PadZoneConnect,
 };
 #[cfg(test)]
@@ -291,7 +291,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_footprint_pad",
-            "Edit the size, shape, corner ratio, custom shape, position, drill, zone connection, fabrication property, or solder mask and paste margins of a pad in an existing .kicad_mod footprint file. Each margin and the corner ratio are reported with their previous and current value; a custom shape is reported as read back from the pad as written.",
+            "Edit the size, shape, corner ratio, custom shape, position, drill, layers, zone connection, fabrication property, or solder mask and paste margins of a pad in an existing .kicad_mod footprint file. Each margin, the corner ratio and the layers are reported with their previous and current value; a custom shape is reported as read back from the pad as written.",
             json!({
                 "type": "object",
                 "properties": {
@@ -316,6 +316,12 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "custom_shape": super::pad_primitives::custom_shape_schema(),
                     "drill": footprint_drill_schema(),
+                    "layers": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": PAD_LAYER_NAMES },
+                        "minItems": 1,
+                        "description": "Replacement pad layers (optional), the names create_footprint accepts, for example [\"F.Cu\", \"F.Mask\", \"F.Paste\"] for an SMD pad with its stencil opening. Written as KiCad writes them: *.Cu for front and back copper, *.Mask for both masks, then the rest in KiCad's layer order."
+                    },
                     "zone_connect": {
                         "type": "string",
                         "enum": ["inherited", "solid", "thermal", "none"],
