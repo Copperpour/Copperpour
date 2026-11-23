@@ -10213,6 +10213,49 @@ mod tests {
         );
     }
 
+    /// Update PCB's replacement reads the new footprint with the refresh's
+    /// reader, which takes custom pads now (#679): a part moved onto the
+    /// stock VQFN is prepared, and one moved onto a VQFN whose custom pads
+    /// have `(clearance convexhull)` is refused by name.
+    #[test]
+    fn a_replacement_with_custom_pads_is_prepared_and_convexhull_refused() {
+        let (_temp, board_path) = project_with_stock_footprints();
+        let kicad = copperpour_ipc::IpcKiCadVersion {
+            major: 10,
+            minor: 0,
+            patch: 8,
+            full_version: "10.0.8".to_string(),
+        };
+        let replace_onto = |footprint_id: &str| {
+            let mut component = resistor("R1", "/sheet/existing");
+            component.footprint_id = footprint_id.to_string();
+            let design = ExportedDesign {
+                root_sheet_uuid: None,
+                components: vec![component],
+                skipped: Vec::new(),
+                unassigned: Vec::new(),
+            };
+            let board = board_with(vec![board_resistor("R1", Some("/sheet/existing"))]);
+            let plan = plan_sync("netlist", &design, &board);
+            assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+            prepare_replacements(&board_path, &plan, &board, &kicad)
+        };
+
+        let (prepared, refused) = replace_onto(PLACEABLE_VQFN);
+        assert!(refused.is_empty(), "{refused:?}");
+        assert!(prepared.contains_key(PLACEABLE_VQFN));
+
+        let (_, refused) = replace_onto(GENERIC_VQFN);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].code, "unsupported_library_footprint");
+        assert!(
+            refused[0].message.contains("custom pad '1'")
+                && refused[0].message.contains("convexhull"),
+            "{}",
+            refused[0].message
+        );
+    }
+
     /// A footprint an earlier sync placed is linked to its symbol but has no
     /// sheet name, sheet file or filters. Its sheet alone differs from the
     /// schematic's, and that is an update, as in KiCad's Update PCB: the

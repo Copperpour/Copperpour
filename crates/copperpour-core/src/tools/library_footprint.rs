@@ -1116,17 +1116,13 @@ pub(crate) fn unsupported_features(root: &SexpNode) -> Result<Vec<String>> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     check_supported_children(root, &mut |placed, _refresh| {
-        if placed != CARRIED_BY_PLACEMENT && seen.insert(placed.to_string()) {
+        if seen.insert(placed.to_string()) {
             out.push(placed.to_string());
         }
         Ok(())
     })?;
     Ok(out)
 }
-
-/// The placement note for something live placement carries but the typed
-/// library refresh does not compare yet, so only the refresh refuses it.
-const CARRIED_BY_PLACEMENT: &str = "";
 
 fn check_supported_children(
     root: &SexpNode,
@@ -1509,15 +1505,11 @@ fn check_pad(
         .get(3)
         .and_then(SexpNode::as_str)
         .context("footprint pad is missing its shape")?;
+    // Placement, Update PCB and the refresh build and compare custom pads
+    // through the shared model (#679); what it cannot carry is refused where
+    // the pads are read (`extract_pad_definitions`).
     let custom = shape == "custom";
-    if custom {
-        // Placement and Update PCB's additions build custom pads (#679); the
-        // refresh does not compare them yet, so it still refuses them.
-        on_unsupported(
-            CARRIED_BY_PLACEMENT,
-            "pad shape 'custom' is not supported by typed library refresh",
-        )?;
-    } else if !matches!(shape, "circle" | "rect" | "oval" | "roundrect") {
+    if !custom && !matches!(shape, "circle" | "rect" | "oval" | "roundrect") {
         on_unsupported(
             &format!("pad shape '{shape}' is not carried by typed placement"),
             &format!("pad shape '{shape}' is not supported by typed library refresh"),
@@ -1707,20 +1699,16 @@ mod tests {
         copperpour_sexp::parse_sexp(source).unwrap()
     }
 
-    /// Custom pads are carried by live placement (#679), so a footprint with
-    /// them lists none of its shape, options or primitives as not carried;
-    /// the typed refresh does not compare them yet and still refuses them.
+    /// Custom pads are carried by live placement and the typed refresh
+    /// (#679): a footprint with them lists none of its shape, options or
+    /// primitives as not carried, and the refresh accepts it.
     #[test]
-    fn custom_pads_are_carried_by_placement_and_refused_by_the_refresh() {
+    fn custom_pads_are_carried_by_placement_and_the_refresh() {
         let vqfn = root(include_str!(
             "../../tests/fixtures/pad_primitives_vqfn20_kicad10.kicad_mod"
         ));
         assert_eq!(unsupported_features(&vqfn).unwrap(), Vec::<String>::new());
-        let refusal = validate_supported_children(&vqfn).unwrap_err().to_string();
-        assert_eq!(
-            refusal,
-            "pad shape 'custom' is not supported by typed library refresh"
-        );
+        validate_supported_children(&vqfn).unwrap();
     }
 
     /// Solder margins are carried by live placement and the typed refresh, so

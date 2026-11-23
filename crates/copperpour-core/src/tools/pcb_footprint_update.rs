@@ -2190,6 +2190,14 @@ fn normalized_items(
                         if layer.shape() != PadStackShape::PssCustom {
                             layer.custom_anchor_shape = PadStackShape::PssUnknown as i32;
                         }
+                        // A custom pad's primitives come back with the id,
+                        // parent and empty net KiCad assigns; a built one has
+                        // none until KiCad adds them (`custom_pads_ipc.README.md`).
+                        for shape in &mut layer.custom_shapes {
+                            shape.id = None;
+                            shape.parent = None;
+                            shape.net = None;
+                        }
                     }
                     // KiCad holds a zone connection and a spoke angle for
                     // every pad, and reads missing settings as an inherited
@@ -6363,6 +6371,154 @@ mod tests {
 
     /// KiCad's report of `reference`, the update `source` builds for it, and
     /// the domains the plan reports.
+    /// KiCad 10.0.8's own placement of stock footprints with custom pads
+    /// (`custom_pads_ipc.README.md`), and KiCad's resave of each library
+    /// footprint. Two captures are left out because the refresh does not take
+    /// their footprints for other reasons: the microSD connector's rule areas
+    /// and the fiducial's pad mask margin. The SFH2201 is the rect-anchored one.
+    const CUSTOM_PAD_CAPTURES: [(&[u8], &str); 5] = [
+        (
+            include_bytes!("../../tests/fixtures/custom_pads_vqfn20_0_ipc.bin"),
+            include_str!("../../tests/fixtures/pad_primitives_vqfn20_kicad10.kicad_mod"),
+        ),
+        (
+            include_bytes!("../../tests/fixtures/custom_pads_vqfn20_90_ipc.bin"),
+            include_str!("../../tests/fixtures/pad_primitives_vqfn20_kicad10.kicad_mod"),
+        ),
+        (
+            include_bytes!("../../tests/fixtures/custom_pads_wuerth_ipc.bin"),
+            include_str!("../../tests/fixtures/pad_primitives_wuerth_kicad10.kicad_mod"),
+        ),
+        (
+            include_bytes!("../../tests/fixtures/custom_pads_sfh2201_0_ipc.bin"),
+            include_str!("../../tests/fixtures/custom_pads_sfh2201_kicad10.kicad_mod"),
+        ),
+        (
+            include_bytes!("../../tests/fixtures/custom_pads_sfh2201_270_ipc.bin"),
+            include_str!("../../tests/fixtures/custom_pads_sfh2201_kicad10.kicad_mod"),
+        ),
+    ];
+
+    /// A refresh of KiCad's placed footprint `capture` from `source`.
+    fn custom_pads_refresh(
+        capture: &[u8],
+        source: &str,
+    ) -> Result<(
+        kiapi::board::types::FootprintInstance,
+        kiapi::board::types::FootprintInstance,
+        BTreeSet<ChangedDomain>,
+    )> {
+        let current = kiapi::board::types::FootprintInstance::decode(capture).unwrap();
+        let id = current.definition.as_ref().unwrap().id.as_ref().unwrap();
+        let library_id = format!("{}:{}", id.library_nickname, id.entry_name);
+        let library = parse_library_footprint(&library_id, source)?;
+        let prepared = build_updated_instance(
+            &current,
+            &library,
+            two_layers(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            Resets::default(),
+        )?;
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        Ok((current, updated, prepared.changed_domains))
+    }
+
+    /// Each custom pad's copper layer, without what KiCad assigns itself and
+    /// without the rounding and chamfer ratios, which mean nothing for a
+    /// custom pad (KiCad reports its defaults there).
+    fn custom_layers(
+        footprint: &kiapi::board::types::FootprintInstance,
+    ) -> Vec<(String, kiapi::board::types::PadStackLayer)> {
+        footprint
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
+            .map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap())
+            .filter_map(|pad| {
+                let mut layer = pad.pad_stack?.copper_layers.first()?.clone();
+                (layer.shape == kiapi::board::types::PadStackShape::PssCustom as i32).then(|| {
+                    layer.corner_rounding_ratio = 0.0;
+                    layer.chamfer_ratio = 0.0;
+                    layer.chamfered_corners = None;
+                    for shape in &mut layer.custom_shapes {
+                        shape.id = None;
+                        shape.parent = None;
+                        shape.net = None;
+                    }
+                    (pad.number, layer)
+                })
+            })
+            .collect()
+    }
+
+    /// A footprint KiCad placed from its library, with custom pads, plans no
+    /// change: at 0° and 90°, with circle and rect anchors and every primitive
+    /// type (#679). The update carries KiCad's own custom pads, not just ones
+    /// equal after normalizing.
+    #[test]
+    fn kicad_placed_custom_pads_match_their_library() {
+        for (capture, source) in CUSTOM_PAD_CAPTURES {
+            let (current, updated, changed) = custom_pads_refresh(capture, source).unwrap();
+            let reference = field_text(&current.reference_field);
+            assert!(changed.is_empty(), "{reference:?}: {changed:?}");
+            assert!(!custom_layers(&current).is_empty(), "{reference:?}");
+            assert_eq!(
+                custom_layers(&updated),
+                custom_layers(&current),
+                "{reference:?}"
+            );
+        }
+    }
+
+    /// A library pad whose primitives or anchor changed plans `pads`, and the
+    /// update carries the library's new shape.
+    #[test]
+    fn a_changed_custom_pad_plans_pads() {
+        let (capture, source) = CUSTOM_PAD_CAPTURES[0];
+        let moved = source.replacen("(xy -0.375 -0.075)", "(xy -0.4 -0.075)", 1);
+        let (_, updated, changed) = custom_pads_refresh(capture, &moved).unwrap();
+        assert_eq!(changed, BTreeSet::from([ChangedDomain::Pads]));
+        let (number, layer) = &custom_layers(&updated)[0];
+        assert_eq!(number, "1");
+        let shape = layer.custom_shapes[0].shape.as_ref().unwrap();
+        let Some(kiapi::common::types::graphic_shape::Geometry::Polygon(polygons)) =
+            shape.geometry.as_ref()
+        else {
+            panic!("pad 1's primitive is a polygon");
+        };
+        let first = &polygons.polygons[0].outline.as_ref().unwrap().nodes[0];
+        assert_eq!(
+            first.geometry,
+            Some(kiapi::common::types::poly_line_node::Geometry::Point(
+                copperpour_ipc::builders::vec2(-0.4, -0.075)
+            ))
+        );
+
+        let anchor = source.replacen("(anchor circle)", "(anchor rect)", 1);
+        let (_, _, changed) = custom_pads_refresh(capture, &anchor).unwrap();
+        assert_eq!(changed, BTreeSet::from([ChangedDomain::Pads]));
+    }
+
+    /// A library custom pad with `(clearance convexhull)` is refused with the
+    /// pad named, as placement refuses it.
+    #[test]
+    fn the_refresh_refuses_a_convexhull_custom_pad_by_name() {
+        let (capture, source) = CUSTOM_PAD_CAPTURES[0];
+        let convexhull = source.replace("(clearance outline)", "(clearance convexhull)");
+        let error = custom_pads_refresh(capture, &convexhull)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("custom pad '1'") && error.contains("convexhull"),
+            "{error}"
+        );
+    }
+
     fn issue_283_refresh(
         reference: &str,
         source: &str,
