@@ -9,13 +9,13 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::sch_connectivity::COINCIDENT_TOLERANCE as TOLERANCE;
 use crate::tools::{
-    get_path, opt_f64, opt_str, require_array, require_f64, require_str, PlacedPins, ToolContext,
-    ToolDef,
+    get_path, opt_f64, opt_str, require_array, require_f64, require_str, NamedPin, PlacedPins,
+    ToolContext, ToolDef,
 };
 use copperpour_schematic_editor as cse;
 use copperpour_schematic_editor::types::fmt_f64;
 use copperpour_sexp::{
-    geometry::{round6, snap_point},
+    geometry::{round6, snap_point, transform_pin},
     parser::parse_sexp,
     schematic::{
         extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
@@ -406,8 +406,11 @@ pub fn tools() -> Vec<ToolDef> {
             "Connect two component pins by reference and pin number. \
              Looks up pin coordinates automatically and routes a wire between them, \
              preferring an elbow that crosses fewer symbol bodies, then fewer label and field \
-             text runs. Refuses with plan_blocked if no candidate avoids joining another net. Reports \
-             the drawn path, corner included.",
+             text runs. Refuses with plan_blocked if no candidate avoids joining another net \
+             or if a wire would miss a pin or have zero length in KiCad. \
+             Reports already_connected with x and y without writing if visible, \
+             connectable pins already touch on the saved schematic. \
+             Reports the drawn path, corner included.",
             json!({
                 "type": "object",
                 "properties": {
@@ -425,8 +428,8 @@ pub fn tools() -> Vec<ToolDef> {
             "add_schematic_connection",
             "Connect two schematic points with a straight wire or a two-leg elbow. Routes as \
              connect_pins does and reports the drawn path. Refuses with plan_blocked if no \
-             candidate avoids joining another net. Use connect_pins if you have references \
-             instead of coordinates.",
+             candidate avoids joining another net or if the route would contain a zero-length \
+             segment. Use connect_pins if you have references instead of coordinates.",
             json!({
                 "type": "object",
                 "properties": {
@@ -669,11 +672,186 @@ pub(crate) fn insert_wire_with_junctions(
     c
 }
 
-/// A route [`route_between`] drew: the new content, and the points the wire
-/// runs through, corner included.
+/// The proposed schematic and the points the wire runs through, corner included.
 pub(crate) struct Routed {
     pub(crate) content: String,
-    pub(crate) path: Vec<(f64, f64)>,
+    path: Vec<(f64, f64)>,
+}
+
+pub(crate) enum ConnectionRefusal {
+    ZeroLengthSegment,
+    UnprovenContact,
+    PinNotPlaced,
+    MissedPin,
+    Unsafe(Vec<String>),
+}
+
+impl ConnectionRefusal {
+    pub(crate) fn reasons(self) -> Vec<String> {
+        match self {
+            Self::ZeroLengthSegment => vec!["KiCad would read a zero-length wire segment".into()],
+            Self::UnprovenContact => vec![
+                "the pin tips coincide, but contact cannot be confirmed for a hidden, \
+                 electrically unconnected or unresolved pin"
+                    .into(),
+            ],
+            Self::PinNotPlaced => {
+                vec!["the requested pin position is not verified in its placed body style".into()]
+            }
+            Self::MissedPin => {
+                vec!["KiCad would read a wire end away from its requested pin".into()]
+            }
+            Self::Unsafe(reasons) => reasons,
+        }
+    }
+
+    fn result(self, operation: &str) -> CallToolResult {
+        let reasons = match self {
+            Self::Unsafe(reasons) => return route_blocked(operation, reasons),
+            other => other.reasons(),
+        };
+        let message = format!("{operation} did not draw a wire: {}", reasons.join("; "));
+        CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::PlanBlocked {
+                operation: operation.into(),
+                reasons,
+            },
+            message,
+        )
+    }
+}
+
+fn kicad_schematic_mm(mm: f64) -> f64 {
+    // KiCad's schematic parser clamps to its displayable range, then rounds
+    // to integer 100 nm units (SCH_IO_KICAD_SEXPR_PARSER::parseInternalUnits).
+    const IU_PER_MM: f64 = 10_000.0;
+    const LIMIT: f64 = i32::MAX as f64 * 7071.0 / 10_000.0;
+    (mm * IU_PER_MM).clamp(-LIMIT, LIMIT).round() / IU_PER_MM
+}
+
+fn saved_pin_tip(pin: &NamedPin) -> (f64, f64) {
+    // KiCad reads the origin and library pin offset separately, and truncates
+    // the instance angle before choosing the orthogonal transform.
+    transform_pin(
+        kicad_schematic_mm(pin.pin.local_x),
+        kicad_schematic_mm(pin.pin.local_y),
+        copperpour_sexp::geometry::PinTransform {
+            comp_x: kicad_schematic_mm(pin.t.comp_x),
+            comp_y: kicad_schematic_mm(pin.t.comp_y),
+            rotation_deg: pin.t.rotation_deg.trunc(),
+            ..pin.t
+        },
+    )
+}
+
+fn saved_wire_point((x, y): (f64, f64)) -> (f64, f64) {
+    (kicad_schematic_mm(round6(x)), kicad_schematic_mm(round6(y)))
+}
+
+fn placed_pin_definition<'a>(
+    tree: &'a copperpour_sexp::SexpNode,
+    named: &NamedPin,
+) -> Option<(
+    &'a copperpour_sexp::SexpNode,
+    Vec<&'a copperpour_sexp::SexpNode>,
+)> {
+    use copperpour_sexp::schematic::{lib_pin_nodes_for_body_style, symbol_instance};
+    let uuid = named.instance_uuid.as_deref()?;
+    let mut instances = tree
+        .find_all("symbol")
+        .into_iter()
+        .filter(|node| node.find_str("uuid") == Some(uuid));
+    let placed = instances.next()?;
+    if instances.next().is_some() {
+        return None;
+    }
+    let inst = symbol_instance(placed)?;
+    let libs = tree.find("lib_symbols")?.find_all("symbol");
+    let lib = find_lib_symbol(&libs, &inst)?;
+    let pins: Vec<_> =
+        lib_pin_nodes_for_body_style(lib, inst.unit, super::symbol_body_style(placed))
+            .into_iter()
+            .filter(|pin| pin.find_str("number") == Some(named.pin.number.as_str()))
+            .collect();
+    let verified = !pins.is_empty()
+        && pins.iter().all(|pin| {
+            parse_at(pin).is_some_and(|(x, y, _)| (x, y) == (named.pin.local_x, named.pin.local_y))
+        });
+    verified.then_some((placed, pins))
+}
+
+fn can_confirm_pin_contact(
+    placed: &copperpour_sexp::SexpNode,
+    pins: &[&copperpour_sexp::SexpNode],
+    number: &str,
+) -> bool {
+    use copperpour_sexp::schematic::lib_pin_is_hidden;
+    let mut placed_pins = placed
+        .find_all("pin")
+        .into_iter()
+        .filter(|pin| pin.get(1).and_then(|n| n.as_str()) == Some(number));
+    let alternate = placed_pins
+        .next()
+        .and_then(|pin| pin.find_str("alternate"))
+        .filter(|name| !name.is_empty());
+    if placed_pins.next().is_some() {
+        return false;
+    }
+    let eligible = |pin: &copperpour_sexp::SexpNode| {
+        if lib_pin_is_hidden(pin) {
+            return Some(false);
+        }
+        let kind = match alternate {
+            None => pin.get(1)?.as_str()?,
+            Some(name) => pin
+                .find_all("alternate")
+                .into_iter()
+                .find(|alt| alt.get(1).and_then(|n| n.as_str()) == Some(name))?
+                .get(2)?
+                .as_str()?,
+        };
+        Some(!matches!(kind, "no_connect" | "unconnected"))
+    };
+    // A repeated pin number in one body must not let one eligible copy hide
+    // an ineligible one. Resolve the visible/electrical status of each.
+    pins.iter().all(|pin| eligible(pin) == Some(true))
+}
+
+pub(crate) enum PinRoute {
+    Drawn(Routed),
+    AlreadyConnected { x: f64, y: f64 },
+}
+
+pub(crate) fn route_between_pins(
+    content: &str,
+    tree: &copperpour_sexp::SexpNode,
+    from: &NamedPin,
+    to: &NamedPin,
+) -> anyhow::Result<Result<PinRoute, ConnectionRefusal>> {
+    let (Some((from_instance, from_pins)), Some((to_instance, to_pins))) = (
+        placed_pin_definition(tree, from),
+        placed_pin_definition(tree, to),
+    ) else {
+        return Ok(Err(ConnectionRefusal::PinNotPlaced));
+    };
+    let (from_tip, to_tip) = (saved_pin_tip(from), saved_pin_tip(to));
+    if from_tip == to_tip {
+        if !can_confirm_pin_contact(from_instance, &from_pins, &from.pin.number)
+            || !can_confirm_pin_contact(to_instance, &to_pins, &to.pin.number)
+        {
+            return Ok(Err(ConnectionRefusal::UnprovenContact));
+        }
+        let (x, y) = from_tip;
+        return Ok(Ok(PinRoute::AlreadyConnected { x, y }));
+    }
+    // Keep the planner and its unrelated-net guard on the same geometry.
+    // Do not move a wire end to reach a pin the current planner models differently.
+    let (from_raw, to_raw) = (from.endpoint(), to.endpoint());
+    if saved_wire_point(from_raw) != from_tip || saved_wire_point(to_raw) != to_tip {
+        return Ok(Err(ConnectionRefusal::MissedPin));
+    }
+    let ((x1, y1), (x2, y2)) = (from_raw, to_raw);
+    Ok(route_between(content, x1, y1, x2, y2)?.map(PinRoute::Drawn))
 }
 
 /// Route a straight wire when aligned, otherwise try the two elbows in order
@@ -681,27 +859,34 @@ pub(crate) struct Routed {
 /// can join only the two endpoints' own nets (#887).
 ///
 /// The inner `Err` holds one reason per bend in horizontal-first, vertical-first
-/// order, or why none could be checked.
-pub(crate) fn route_between(
+/// order, or why no candidate could be drawn or checked.
+fn route_between(
     content: &str,
     x1: f64,
     y1: f64,
     x2: f64,
     y2: f64,
-) -> anyhow::Result<Result<Routed, Vec<String>>> {
+) -> anyhow::Result<Result<Routed, ConnectionRefusal>> {
     let before = parse_sexp(content)?;
+    let (start, end) = (saved_wire_point((x1, y1)), saved_wire_point((x2, y2)));
+    let same_x = start.0 == end.0;
+    let same_y = start.1 == end.1;
+    let aligned = (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01;
+    // Either elbow has a zero-length leg when just one axis collapses.
+    if (same_x && same_y) || (!aligned && (same_x || same_y)) {
+        return Ok(Err(ConnectionRefusal::ZeroLengthSegment));
+    }
     let Some(guard) = RouteGuard::new(&before, (x1, y1), &[(x2, y2)]) else {
-        return Ok(Err(vec![format!(
+        return Ok(Err(ConnectionRefusal::Unsafe(vec![format!(
             "cannot check what the route would join: {}",
             crate::tools::UNRESOLVED_PIN_GEOMETRY
-        )]));
+        )])));
     };
     let from = (x1, y1);
     let to = (x2, y2);
     let straight = [from, to];
     let horizontal = [from, (x2, y1), to];
     let vertical = [from, (x1, y2), to];
-    let aligned = (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01;
     let prefer_vertical = !aligned && vertical_elbow_is_clearer(&before, horizontal, vertical);
     let bends: &[(&str, &[(f64, f64)])] = if aligned {
         &[("straight", &straight)]
@@ -727,14 +912,14 @@ pub(crate) fn route_between(
                 return Ok(Ok(Routed {
                     content: routed,
                     path: points.to_vec(),
-                }))
+                }));
             }
         }
     }
     if prefer_vertical {
         refused.reverse();
     }
-    Ok(Err(refused))
+    Ok(Err(ConnectionRefusal::Unsafe(refused)))
 }
 
 fn vertical_elbow_is_clearer(
@@ -4431,23 +4616,29 @@ async fn handle_connect_pins(
     let pins = PlacedPins::new(&tree);
     // No coordinate form here: an ambiguous pin is wired by its endpoint.
     const RECOVERY: &str = "Call add_schematic_connection with the endpoint of the one you mean.";
-    let (x1, y1) = match pins.resolve(&ref1, &pin1) {
-        Ok(pin) => pin.endpoint(),
+    let from = match pins.resolve(&ref1, &pin1) {
+        Ok(pin) => pin,
         Err(refusal) => return Ok(refusal.result("connect", RECOVERY)),
     };
-    let (x2, y2) = match pins.resolve(&ref2, &pin2) {
-        Ok(pin) => pin.endpoint(),
+    let to = match pins.resolve(&ref2, &pin2) {
+        Ok(pin) => pin,
         Err(refusal) => return Ok(refusal.result("connect", RECOVERY)),
     };
-
     // Route wire(s) between the two pin endpoints
-    let routed = match route_between(&content, x1, y1, x2, y2)? {
-        Ok(routed) => routed,
-        Err(reasons) => return Ok(route_blocked("connect_pins", reasons)),
+    let routed = match route_between_pins(&content, &tree, &from, &to)? {
+        Ok(PinRoute::Drawn(routed)) => routed,
+        Ok(PinRoute::AlreadyConnected { x, y }) => {
+            return Ok(CallToolResult::json(&json!({
+                "already_connected": true, "x": x, "y": y,
+            })));
+        }
+        Err(refusal) => return Ok(refusal.result("connect_pins")),
     };
 
     write_atomic_if_unchanged(&sch_path, &content, &routed.content)?;
 
+    let (x1, y1) = routed.path[0];
+    let (x2, y2) = *routed.path.last().expect("a drawn route has an endpoint");
     Ok(CallToolResult::json(&json!({
         "connected": {
             "from": { "ref": ref1, "pin": pin1, "x": x1, "y": y1 },
@@ -4482,7 +4673,7 @@ async fn handle_add_schematic_connection(
     let content = read_consistent(&sch_path)?;
     let routed = match route_between(&content, x1, y1, x2, y2)? {
         Ok(routed) => routed,
-        Err(reasons) => return Ok(route_blocked("add_schematic_connection", reasons)),
+        Err(refusal) => return Ok(refusal.result("add_schematic_connection")),
     };
 
     write_atomic_if_unchanged(&sch_path, &content, &routed.content)?;
@@ -8252,6 +8443,342 @@ mod power_on_pin_tests {
             "{result}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
+    }
+}
+
+#[cfg(test)]
+mod coincident_route_tests {
+    use super::batch_power_tests::serve;
+    use super::{extract_wires, json, parse_sexp};
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+    use std::path::PathBuf;
+
+    const SHEET: &str =
+        include_str!("../../tests/fixtures/pin_contact_kicad10/pin_contact.kicad_sch");
+
+    async fn setup(source: &str) -> (McpHandler, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pin_contact.kicad_sch");
+        std::fs::write(&path, source).unwrap();
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        (handler, dir, path)
+    }
+
+    fn assert_blocked(result: &serde_json::Value, operation: &str, reason: &str) {
+        assert_eq!(result["is_error"], true, "{result}");
+        assert_eq!(result["error"]["kind"], "plan_blocked", "{result}");
+        assert_eq!(result["error"]["operation"], operation, "{result}");
+        assert_eq!(result["error"]["reasons"], json!([reason]), "{result}");
+    }
+
+    #[tokio::test]
+    async fn connect_pins_reports_coincident_tips_without_writing() {
+        // KiCad rounds the resistor origin and its local pin coordinate separately.
+        // These both move by less than one half-unit, but their sum would move the
+        // written wire by a full unit if only route_between checked its length.
+        let source = SHEET
+            .replacen("(at 59.69 50.8 90)", "(at 59.689951 50.8 90)", 1)
+            .replacen("(at 0 3.81 270)", "(at 0 3.810049 270)", 1);
+        let (handler, _dir, path) = setup(&source).await;
+        let result = serve(
+            &handler,
+            "connect_pins",
+            &path,
+            json!({"ref1": "J1", "pin1": "1", "ref2": "R1", "pin2": "1"}),
+        )
+        .await;
+        assert!(
+            std::fs::read(&path).unwrap() == source.as_bytes(),
+            "sheet changed"
+        );
+        assert_eq!(
+            result,
+            json!({"is_error": false, "already_connected": true, "x": 55.88, "y": 50.8})
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_pins_reports_tips_that_touch_after_kicad_truncates_the_angle() {
+        let source = SHEET.replacen("(at 59.69 50.8 90)", "(at 59.69 50.8 90.5)", 1);
+        let (handler, _dir, path) = setup(&source).await;
+        let result = serve(
+            &handler,
+            "connect_pins",
+            &path,
+            json!({"ref1": "J1", "pin1": "1", "ref2": "R1", "pin2": "1"}),
+        )
+        .await;
+        assert!(
+            std::fs::read(&path).unwrap() == source.as_bytes(),
+            "sheet changed"
+        );
+        assert_eq!(
+            result,
+            json!({"is_error": false, "already_connected": true, "x": 55.88, "y": 50.8})
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_pins_refuses_a_nonzero_wire_that_would_miss_a_pin() {
+        let source = SHEET
+            .replacen("(at 59.69 50.8 90)", "(at 59.690151 50.8 90)", 1)
+            .replacen("(at 0 3.81 270)", "(at 0 3.810049 270)", 1);
+        // KiCad puts R1.1 at 55.8802; the raw wire would end at 55.8801.
+        let (handler, _dir, path) = setup(&source).await;
+        let result = serve(
+            &handler,
+            "connect_pins",
+            &path,
+            json!({"ref1": "J1", "pin1": "1", "ref2": "R1", "pin2": "1"}),
+        )
+        .await;
+        assert!(
+            std::fs::read(&path).unwrap() == source.as_bytes(),
+            "sheet changed"
+        );
+        assert_blocked(
+            &result,
+            "connect_pins",
+            "KiCad would read a wire end away from its requested pin",
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_pins_refuses_a_pin_from_an_inactive_body_style() {
+        let source = SHEET.replacen(
+            "(symbol \"R_1_1\"",
+            "(symbol \"R_1_2\"\n\
+             (pin passive line (at 0 -3.81 90) (length 1.27)\n\
+             (name \"\" (effects (font (size 1.27 1.27))))\n\
+             (number \"99\" (effects (font (size 1.27 1.27))))))\n\
+             (symbol \"R_1_1\"",
+            1,
+        );
+        assert_ne!(source, SHEET);
+        let (handler, _dir, path) = setup(&source).await;
+        let result = serve(
+            &handler,
+            "connect_pins",
+            &path,
+            json!({"ref1": "R20", "pin1": "99", "ref2": "R21", "pin2": "2"}),
+        )
+        .await;
+        assert!(
+            std::fs::read(&path).unwrap() == source.as_bytes(),
+            "sheet changed"
+        );
+        assert_blocked(
+            &result,
+            "connect_pins",
+            "the requested pin position is not verified in its placed body style",
+        );
+    }
+
+    #[tokio::test]
+    async fn contact_does_not_claim_hidden_or_electrically_unconnected_pins() {
+        let pin = "(pin passive line\n\t\t\t\t\t(at 0 3.81 270)";
+        let alternate = SHEET.replacen(
+            pin,
+            &format!("{pin}\n\t\t\t\t\t(alternate \"NC\" no_connect line)"),
+            1,
+        );
+        let (start, end) = crate::tools::find_all_symbol_instance_blocks(&alternate, "R1")[0];
+        let mut selected = alternate.clone();
+        let symbol =
+            alternate[start..end].replacen("(pin \"1\"", "(pin \"1\"\n\t\t\t(alternate \"NC\")", 1);
+        selected.replace_range(start..end, &symbol);
+        for source in [
+            SHEET.replacen(pin, &format!("{pin}\n\t\t\t\t\t(hide yes)"), 1),
+            SHEET.replacen(pin, "(pin unconnected line\n\t\t\t\t\t(at 0 3.81 270)", 1),
+            selected,
+        ] {
+            assert_ne!(source, SHEET);
+            let (handler, _dir, path) = setup(&source).await;
+            let pair = json!({"ref1": "J1", "pin1": "1", "ref2": "R1", "pin2": "1"});
+            let single = serve(&handler, "connect_pins", &path, pair.clone()).await;
+            assert!(
+                std::fs::read(&path).unwrap() == source.as_bytes(),
+                "sheet changed"
+            );
+            assert_blocked(
+                &single,
+                "connect_pins",
+                "the pin tips coincide, but contact cannot be confirmed for a hidden, \
+                 electrically unconnected or unresolved pin",
+            );
+            let batch = serve(
+                &handler,
+                "batch_connect_pins",
+                &path,
+                json!({"connections": [pair]}),
+            )
+            .await;
+            assert!(
+                std::fs::read(&path).unwrap() == source.as_bytes(),
+                "sheet changed"
+            );
+            assert_eq!(batch["is_error"], true, "{batch}");
+            assert_eq!(batch["connected_count"], 0, "{batch}");
+            assert_eq!(batch["already_connected"], json!([]), "{batch}");
+            assert!(batch["errors"][0]
+                .as_str()
+                .unwrap()
+                .contains("contact cannot be confirmed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinate_route_refuses_endpoints_that_kicad_reads_as_one_point() {
+        let (handler, _dir, path) = setup(SHEET).await;
+        let result = serve(
+            &handler,
+            "add_schematic_connection",
+            &path,
+            json!({"x1": 40.0, "y1": 25.0, "x2": 40.000049, "y2": 25.000049}),
+        )
+        .await;
+        assert!(
+            std::fs::read(&path).unwrap() == SHEET.as_bytes(),
+            "sheet changed"
+        );
+        assert_blocked(
+            &result,
+            "add_schematic_connection",
+            "KiCad would read a zero-length wire segment",
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinate_route_refuses_a_bend_with_a_collapsed_leg() {
+        let (handler, _dir, path) = setup(SHEET).await;
+        let result = serve(
+            &handler,
+            "add_schematic_connection",
+            &path,
+            json!({"x1": 160000.0, "y1": 25.0, "x2": 160001.0, "y2": 26.0}),
+        )
+        .await;
+        assert!(
+            std::fs::read(&path).unwrap() == SHEET.as_bytes(),
+            "sheet changed"
+        );
+        assert_blocked(
+            &result,
+            "add_schematic_connection",
+            "KiCad would read a zero-length wire segment",
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinate_route_draws_a_short_nonzero_wire() {
+        let (handler, _dir, path) = setup(SHEET).await;
+        let result = serve(
+            &handler,
+            "add_schematic_connection",
+            &path,
+            json!({"x1": 40.0, "y1": 25.0, "x2": 40.000051, "y2": 25.0}),
+        )
+        .await;
+        assert_eq!(result["is_error"], false, "{result}");
+        assert_eq!(result["path"], json!([[40.0, 25.0], [40.000051, 25.0]]));
+        assert_added_wire(&path, (40.0, 25.0), (40.000051, 25.0));
+    }
+
+    fn assert_added_wire(path: &std::path::Path, from: (f64, f64), to: (f64, f64)) {
+        let before = extract_wires(&parse_sexp(SHEET).unwrap());
+        let after = std::fs::read_to_string(path).unwrap();
+        let wires = extract_wires(&parse_sexp(&after).unwrap());
+        assert_eq!(wires.len(), before.len() + 1);
+        let added = wires
+            .iter()
+            .find(|wire| !before.iter().any(|old| old.uuid == wire.uuid))
+            .unwrap();
+        assert_eq!(((added.x1, added.y1), (added.x2, added.y2)), (from, to));
+    }
+
+    #[tokio::test]
+    async fn batch_connect_pins_reports_coincident_pairs_without_writing() {
+        let (handler, _dir, path) = setup(SHEET).await;
+        let result = serve(
+            &handler,
+            "batch_connect_pins",
+            &path,
+            json!({"connections": [
+                {"ref1": "J1", "pin1": "1", "ref2": "R1", "pin2": "1"}
+            ]}),
+        )
+        .await;
+        assert!(
+            std::fs::read(&path).unwrap() == SHEET.as_bytes(),
+            "sheet changed"
+        );
+        assert_eq!(
+            result,
+            json!({
+                "is_error": false,
+                "connected_count": 0,
+                "already_connected": [{"pair": "J1.1 -> R1.1", "x": 55.88, "y": 50.8}],
+                "errors": []
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_connect_pins_keeps_contact_success_when_another_pair_fails() {
+        let (handler, _dir, path) = setup(SHEET).await;
+        let result = serve(
+            &handler,
+            "batch_connect_pins",
+            &path,
+            json!({"connections": [
+                {"ref1": "J1", "pin1": "1", "ref2": "R1", "pin2": "1"},
+                {"ref1": "J1", "pin1": "1", "ref2": "R1", "pin2": "99"}
+            ]}),
+        )
+        .await;
+        assert!(
+            std::fs::read(&path).unwrap() == SHEET.as_bytes(),
+            "sheet changed"
+        );
+        assert_eq!(result["is_error"], false, "{result}");
+        assert_eq!(result["connected_count"], 0, "{result}");
+        assert_eq!(
+            result["already_connected"],
+            json!([{"pair": "J1.1 -> R1.1", "x": 55.88, "y": 50.8}]),
+            "{result}"
+        );
+        assert_eq!(result["errors"].as_array().unwrap().len(), 1, "{result}");
+        assert!(result["errors"][0].as_str().unwrap().contains("pin 99"));
+    }
+
+    #[tokio::test]
+    async fn batch_connect_pins_still_draws_valid_routes_next_to_coincident_pairs() {
+        let (handler, _dir, path) = setup(SHEET).await;
+        let result = serve(
+            &handler,
+            "batch_connect_pins",
+            &path,
+            json!({"connections": [
+                {"ref1": "J1", "pin1": "1", "ref2": "R1", "pin2": "1"},
+                {"ref1": "R20", "pin1": "2", "ref2": "R21", "pin2": "2"}
+            ]}),
+        )
+        .await;
+        assert_eq!(result["is_error"], false, "{result}");
+        assert_eq!(result["connected_count"], 1, "{result}");
+        assert_eq!(
+            result["already_connected"],
+            json!([{"pair": "J1.1 -> R1.1", "x": 55.88, "y": 50.8}]),
+            "{result}"
+        );
+        assert_eq!(result["errors"], json!([]), "{result}");
+        assert_added_wire(&path, (63.5, 143.51), (81.28, 143.51));
     }
 }
 

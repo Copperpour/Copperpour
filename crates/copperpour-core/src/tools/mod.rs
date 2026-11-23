@@ -2776,6 +2776,7 @@ fn drawn_symbol_pins(tree: &copperpour_sexp::SexpNode) -> Option<PlacedPinsByRef
 pub(crate) struct NamedPin {
     pub pin: copperpour_sexp::schematic::LibPin,
     pub t: copperpour_sexp::geometry::PinTransform,
+    pub instance_uuid: Option<String>,
 }
 
 impl NamedPin {
@@ -2890,6 +2891,7 @@ impl PlacedPins {
                 let named = NamedPin {
                     pin: pin.clone(),
                     t: *t,
+                    instance_uuid: inst.uuid.clone(),
                 };
                 let (x, y) = named.endpoint();
                 // Stacked pins sharing a number within one placed unit are one

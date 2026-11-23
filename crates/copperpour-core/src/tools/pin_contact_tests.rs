@@ -246,21 +246,20 @@ async fn reports_contacts_created_by_placement_and_move() {
 }
 
 #[tokio::test]
-async fn reports_a_zero_length_wire_written_between_touching_pins() {
-    let sheet = Sheet::new(SCH).await;
-    sheet
-        .ok(
-            "connect_pins",
-            json!({"ref1": "J1", "pin1": "1", "ref2": "R1", "pin2": "1"}),
-        )
-        .await;
-    let report = sheet.report().await;
+async fn reports_a_saved_zero_length_wire_between_touching_pins() {
+    let at = (55.88, 50.8);
+    let source = with_items(SCH, &wire(at, at, 1));
+    let report = Sheet::new(&source).await.report().await;
     let short = report["short_wires"]
         .as_array()
         .unwrap()
         .iter()
         .find(|finding| finding["length_mm"] == 0.0)
         .unwrap_or_else(|| panic!("{report}"));
+    assert_eq!(
+        short["wire_uuids"],
+        json!(["00000000-0000-4000-8000-000000000001"])
+    );
     assert_eq!(pins(&short["start"]["pins"]), ["J1.1", "R1.1"]);
     assert_eq!(short["start"], short["end"]);
 }
@@ -525,32 +524,16 @@ async fn a_nearby_visible_pin_does_not_break_a_wire_joint() {
 }
 
 #[tokio::test]
-async fn coincident_pins_report_an_existing_zero_length_wire_and_annotations() {
-    let at = (55.88, 50.8);
+async fn coincident_pins_report_annotations_at_the_contact() {
     let source = with_items(
         SCH,
-        &format!(
-            "{} (junction (at 55.88 50.8) (diameter 0) (color 0 0 0 0)) \
+        "(junction (at 55.88 50.8) (diameter 0) (color 0 0 0 0)) \
          (global_label \"AT_CONTACT\" (at 55.88 50.8 0))",
-            wire(at, at, 1)
-        ),
     );
     let report = Sheet::new(&source).await.report().await;
     let contact = contact(&report, &["J1.1", "R1.1"]);
     assert_eq!(contact["junctions"], json!([{"x": 55.88, "y": 50.8}]));
     assert_eq!(contact["labels"][0]["net"], "AT_CONTACT");
-    let zero = report["short_wires"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|w| w["length_mm"] == 0.0)
-        .expect("zero-length run");
-    assert_eq!(
-        zero["wire_uuids"],
-        json!(["00000000-0000-4000-8000-000000000001"])
-    );
-    assert_eq!(pins(&zero["start"]["pins"]), ["J1.1", "R1.1"]);
-    assert_eq!(zero["start"], zero["end"]);
 }
 
 #[tokio::test]
