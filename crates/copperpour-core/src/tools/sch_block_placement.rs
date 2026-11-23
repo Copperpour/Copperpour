@@ -268,6 +268,8 @@ fn preview(tree: &SexpNode, request: &Request<'_>) -> Preview {
         if candidate == *tree {
             return (suggestions, "unchanged", vec![], score, Value::Null);
         }
+        // The candidate already passed the preservation gate. Separately,
+        // the preview must not call a wire-adding grouping a cleanup.
         let adds_wire = score["delta"]["wire_length_mm"]
             .as_f64()
             .is_some_and(|delta| delta > 0.0);

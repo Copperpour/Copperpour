@@ -688,7 +688,7 @@ pub(super) fn redraw_point_key(x: f64, y: f64) -> NetRoot {
 pub(super) fn kicad_schematic_mm(mm: f64) -> f64 {
     // SCH_IO_KICAD_SEXPR_PARSER::parseInternalUnits clamps the coordinate
     // to the drawable range before rounding to 100 nm units.
-    const LIMIT: f64 = i32::MAX as f64 * 0.7071;
+    const LIMIT: f64 = i32::MAX as f64 * 7071.0 / 10_000.0;
     (mm * DRAWN_UNITS_PER_MM).clamp(-LIMIT, LIMIT).round() / DRAWN_UNITS_PER_MM
 }
 
