@@ -98,6 +98,9 @@ pub(super) struct SymbolFields {
     /// Datasheet).
     pub(super) renames: Vec<(String, String)>,
     pub(super) removals: Vec<String>,
+    /// Custom fields to put first, in this order (#717); only
+    /// `set_symbol_properties` takes it.
+    pub(super) field_order: Option<Vec<String>>,
 }
 
 impl SymbolFields {
@@ -255,7 +258,59 @@ fn parse_symbol_edits(
     });
     fields.renames = parse_rename_fields(args, fields)?;
     fields.removals = parse_remove_fields(args, fields)?;
+    fields.field_order = parse_field_order(args, fields)?;
     Ok(())
+}
+
+/// `field_order`: custom field names, each once, none mandatory, `ki_*` or
+/// removed in the same call. Whether the symbol has them is checked on the
+/// library, after the call's other changes.
+fn parse_field_order(
+    args: &serde_json::Value,
+    fields: &SymbolFields,
+) -> Result<Option<Vec<String>>, CallToolResult> {
+    let entries = match args.get("field_order") {
+        None => return Ok(None),
+        Some(serde_json::Value::Array(entries)) if !entries.is_empty() => entries,
+        Some(_) => {
+            return Err(invalid_arg(
+                "field_order",
+                "expected a non-empty array of custom field names",
+            ))
+        }
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries {
+        let Some(name) = entry.as_str().filter(|name| !name.is_empty()) else {
+            return Err(invalid_arg(
+                "field_order",
+                "every entry must be a non-empty field name",
+            ));
+        };
+        let refusal = if is_mandatory(name) {
+            Some(format!(
+                "'{name}' is one of KiCad's mandatory symbol fields ({MANDATORY_LIST}), which \
+                 KiCad always writes first"
+            ))
+        } else if is_ki_name(name) {
+            Some(format!(
+                "'{name}' {KI_RESERVED}, which KiCad writes after the custom fields"
+            ))
+        } else if names.iter().any(|seen| seen == name) {
+            Some(format!("'{name}' is named twice"))
+        } else if fields.removals.iter().any(|removed| removed == name) {
+            Some(format!(
+                "'{name}' is also named in remove_fields; a call cannot both remove and order a field"
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            return Err(invalid_arg("field_order", &reason));
+        }
+        names.push(name.to_owned());
+    }
+    Ok(Some(names))
 }
 
 fn parse_rename_fields(
@@ -426,9 +481,10 @@ pub(super) fn tool() -> ToolDef {
     tool!(
         "set_symbol_properties",
         "Set the Reference prefix, Value, Footprint, Datasheet, Description, keywords, footprint filters or custom fields \
-         (MPN, LCSC, ...) of an existing library symbol, and rename or remove its custom \
-         fields. Only the supplied fields change; an existing or renamed field keeps its position \
-         and visibility. Reports each changed field's previous and current value.",
+         (MPN, LCSC, ...) of an existing library symbol, rename or remove its custom fields, and \
+         reorder them (field_order). Only the supplied fields change; an existing or renamed \
+         field keeps its position and visibility. Reports each changed field's previous and \
+         current value, and the previous and current custom field order.",
         with_field_schema(json!({
             "type": "object",
             "properties": {
@@ -441,6 +497,12 @@ pub(super) fn tool() -> ToolDef {
                     "type": "object",
                     "description": "Custom fields to rename, as current name: new name. A renamed field keeps its value, position, visibility and text effects. Names match whole and case-sensitively, as KiCad's custom field names do; a new name the symbol already carries is refused.",
                     "additionalProperties": { "type": "string" }
+                },
+                "field_order": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "Custom field names to put first among the custom fields, in this order; the others keep their order after them. Each field moves whole, with its value, position, visibility and text effects. KiCad's mandatory fields stay first and ki_* fields last, so they cannot be named; a name the symbol does not carry after this call's other changes is refused before writing.",
+                    "items": { "type": "string" }
                 },
                 "remove_fields": {
                     "type": "array",
@@ -478,7 +540,7 @@ async fn handle_set_symbol_properties(
         return Ok(invalid_arg(
             "symbol_properties",
             "supply at least one of reference_prefix, value, footprint, datasheet, description, \
-             keywords, fp_filters, fields, rename_fields or remove_fields",
+             keywords, fp_filters, fields, rename_fields, remove_fields or field_order",
         ));
     }
     let source = match read_consistent(&path) {
@@ -494,6 +556,7 @@ async fn handle_set_symbol_properties(
     let PreparedEdit {
         replacement,
         changes,
+        field_order,
     } = match prepare_edit(&path, &source, symbol, &fields) {
         Ok(edit) => edit,
         Err(error) => return Ok(error),
@@ -513,6 +576,9 @@ async fn handle_set_symbol_properties(
         "symbol": symbol,
         "changes": changes
     });
+    if let Some((previous, current)) = field_order {
+        body["field_order"] = json!({ "previous": previous, "current": current });
+    }
     if !fields.removals.is_empty() {
         // Only a removal puts a remove_fields name into `changes`, since each
         // name has one part in a call.
@@ -595,6 +661,8 @@ struct PreparedEdit {
     /// `{property: {"previous": …, "current": …}}` for each changed property;
     /// an absent property reads as null.
     changes: serde_json::Map<String, serde_json::Value>,
+    /// The custom fields' order before and after, when `field_order` was given.
+    field_order: Option<(Vec<String>, Vec<String>)>,
 }
 
 pub(super) struct Property {
@@ -797,10 +865,107 @@ fn prepare_edit(
             .into_iter()
             .map(|(offset, text)| SexpEdit::insert(offset, text)),
     );
+    let mut replacement = apply_edits(source.to_string(), edits);
+    // The order is set last, on the fields as this call leaves them, so it may
+    // name a field added or renamed in the same call.
+    let field_order = match &fields.field_order {
+        Some(order) => {
+            let (reordered, previous, current) = reorder_fields(path, &replacement, symbol, order)?;
+            replacement = reordered;
+            Some((previous, current))
+        }
+        None => None,
+    };
     Ok(PreparedEdit {
-        replacement: apply_edits(source.to_string(), edits),
+        replacement,
         changes,
+        field_order,
     })
+}
+
+/// Whether KiCad writes `name` among a symbol's custom fields: not mandatory,
+/// not `ki_*` (keywords, filters, the KiCad 6/7 description).
+fn is_custom(name: &str) -> bool {
+    !is_mandatory(name) && !is_ki_name(name)
+}
+
+/// The custom fields' names in `text`'s symbol, in file order.
+fn custom_order(properties: &[Property]) -> Vec<String> {
+    properties
+        .iter()
+        .filter(|property| is_custom(&property.name))
+        .map(|property| property.name.clone())
+        .collect()
+}
+
+/// `text` with `symbol`'s custom fields in `order` first and the others after
+/// them in their order, and the order before and after (#717). KiCad keeps a
+/// symbol's fields in the order it reads them (each field takes the next
+/// ordinal, `SCH_FIELD::SCH_FIELD`, `eeschema/sch_field.cpp`) and writes them in
+/// that order (`LIB_SYMBOL::GetFields`, `eeschema/lib_symbol.cpp`;
+/// `SCH_IO_KICAD_SEXPR_LIB_CACHE::SaveSymbol`), as its Symbol Properties dialog
+/// moves them. Each custom field's place takes the whole block of the field
+/// that goes there, so blocks move unchanged and nothing else does.
+fn reorder_fields(
+    path: &Path,
+    text: &str,
+    symbol: &str,
+    order: &[String],
+) -> Result<(String, Vec<String>, Vec<String>), CallToolResult> {
+    let (start, end) = symbol_block(text, symbol)?;
+    let properties =
+        symbol_properties(text, start, end).map_err(|reason| unusable(path, &reason))?;
+    let custom: Vec<&Property> = properties
+        .iter()
+        .filter(|property| is_custom(&property.name))
+        .collect();
+    let previous = custom_order(&properties);
+    if let Some(missing) = order.iter().find(|name| !previous.contains(name)) {
+        return Err(invalid_arg(
+            "field_order",
+            &format!(
+                "symbol '{symbol}' has no custom field '{missing}'; its custom fields are {}",
+                if previous.is_empty() {
+                    "none".to_string()
+                } else {
+                    previous
+                        .iter()
+                        .map(|name| format!("'{name}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ),
+        ));
+    }
+    let mut moved: Vec<&Property> = order
+        .iter()
+        .filter_map(|name| {
+            custom
+                .iter()
+                .copied()
+                .find(|property| property.name == *name)
+        })
+        .collect();
+    moved.extend(
+        custom
+            .iter()
+            .copied()
+            .filter(|property| !order.contains(&property.name)),
+    );
+    let current: Vec<String> = moved.iter().map(|property| property.name.clone()).collect();
+    let edits = custom
+        .iter()
+        .zip(&moved)
+        .filter(|(slot, field)| slot.name != field.name)
+        .map(|(slot, field)| {
+            SexpEdit::replace(
+                slot.block.0,
+                slot.block.1,
+                text[field.block.0..field.block.1].to_string(),
+            )
+        })
+        .collect();
+    Ok((apply_edits(text.to_string(), edits), previous, current))
 }
 
 /// The top-level `(symbol "NAME" …)` block of the library.
@@ -962,7 +1127,13 @@ fn readback_mismatch(
                     .then(|| format!("field '{new}' is not '{old}' renamed"))
             })
     };
-    requested.or_else(removed).or_else(renamed)
+    let ordered = || {
+        let order = fields.field_order.as_ref()?;
+        let found = custom_order(&properties);
+        (!found.starts_with(order))
+            .then(|| format!("the custom fields read {found:?}, not starting with {order:?}"))
+    };
+    requested.or_else(removed).or_else(renamed).or_else(ordered)
 }
 
 #[cfg(test)]
@@ -2225,7 +2396,7 @@ pub(super) mod tests {
             (
                 json!({"rename_fields": {}, "remove_fields": []}),
                 "symbol_properties",
-                "supply at least one of reference_prefix, value, footprint, datasheet, description, keywords, fp_filters, fields, rename_fields or remove_fields",
+                "supply at least one of reference_prefix, value, footprint, datasheet, description, keywords, fp_filters, fields, rename_fields, remove_fields or field_order",
             ),
         ] {
             let (_dir, path) = library_with(FIXTURE);
@@ -2393,5 +2564,193 @@ pub(super) mod tests {
         );
         let reason = readback_mismatch(&unhidden, FIXTURE, "FIELDS_FULL", &fields).unwrap();
         assert!(reason.contains("is not 'LCSC' renamed"), "{reason}");
+    }
+
+    // kicad-cli 10.0.8 saved each from one symbol drawn for these tests, its
+    // custom fields in three orders; provenance in
+    // tests/fixtures/symbol_field_order_kicad10.README.md.
+    const ORDER_SOURCE: &str =
+        include_str!("../../tests/fixtures/symbol_field_order_source_kicad10.kicad_sym");
+    const MANUFACTURER_FIRST: &str = include_str!(
+        "../../tests/fixtures/symbol_field_order_manufacturer_first_kicad10.kicad_sym"
+    );
+    const TECHNOLOGY_FIRST: &str =
+        include_str!("../../tests/fixtures/symbol_field_order_technology_first_kicad10.kicad_sym");
+
+    async fn order_call(arguments: serde_json::Value) -> (CallToolResult, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cap.kicad_sym");
+        std::fs::write(&path, ORDER_SOURCE).unwrap();
+        let mut arguments = arguments;
+        arguments["library_path"] = json!(path);
+        arguments["symbol_name"] = json!("CAP");
+        let context = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_set_symbol_properties(&arguments, &context)
+            .await
+            .unwrap();
+        (result, std::fs::read_to_string(&path).unwrap())
+    }
+
+    fn order_body(result: &CallToolResult) -> serde_json::Value {
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// The reordered library is byte for byte what KiCad saves with its custom
+    /// fields in that order.
+    #[tokio::test]
+    async fn field_order_writes_what_kicad_saves() {
+        for (order, kicad, current) in [
+            (
+                json!(["Manufacturer", "Manufacturer Number"]),
+                MANUFACTURER_FIRST,
+                json!([
+                    "Manufacturer",
+                    "Manufacturer Number",
+                    "Tolerance",
+                    "Technology"
+                ]),
+            ),
+            (
+                json!(["Technology", "Tolerance"]),
+                TECHNOLOGY_FIRST,
+                json!([
+                    "Technology",
+                    "Tolerance",
+                    "Manufacturer Number",
+                    "Manufacturer"
+                ]),
+            ),
+        ] {
+            let (result, written) = order_call(json!({ "field_order": order })).await;
+            assert!(!result.is_error, "{:?}", result.content);
+            assert_eq!(written, kicad, "{order}");
+            assert_eq!(
+                order_body(&result)["field_order"],
+                json!({
+                    "previous": ["Manufacturer Number", "Tolerance", "Manufacturer", "Technology"],
+                    "current": current
+                })
+            );
+        }
+    }
+
+    /// An order the fields already have writes nothing.
+    #[tokio::test]
+    async fn an_order_already_in_place_writes_nothing() {
+        let (result, written) =
+            order_call(json!({ "field_order": ["Manufacturer Number", "Tolerance"] })).await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(written, ORDER_SOURCE);
+        let body = order_body(&result);
+        assert_eq!(
+            body["field_order"]["previous"],
+            body["field_order"]["current"]
+        );
+    }
+
+    /// The order applies to the fields as the call leaves them: a field added
+    /// or renamed in the same call can be named.
+    #[tokio::test]
+    async fn field_order_names_fields_set_or_renamed_in_the_same_call() {
+        let (result, written) = order_call(json!({
+            "fields": { "LCSC": "C14663" },
+            "rename_fields": { "Technology": "Dielectric" },
+            "field_order": ["LCSC", "Dielectric"]
+        }))
+        .await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(
+            order_body(&result)["field_order"]["current"],
+            json!([
+                "LCSC",
+                "Dielectric",
+                "Manufacturer Number",
+                "Tolerance",
+                "Manufacturer"
+            ])
+        );
+        let (start, end) = symbol_block(&written, "CAP").unwrap();
+        let properties = symbol_properties(&written, start, end).unwrap();
+        assert_eq!(
+            properties
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Reference",
+                "Value",
+                "Footprint",
+                "Datasheet",
+                "Description",
+                "LCSC",
+                "Dielectric",
+                "Manufacturer Number",
+                "Tolerance",
+                "Manufacturer",
+                "ki_keywords"
+            ],
+            "mandatory fields first and ki_keywords last, as KiCad keeps them"
+        );
+    }
+
+    #[tokio::test]
+    async fn field_order_is_refused_before_writing() {
+        for (order, extra, reason) in [
+            (json!(["Value"]), json!({}), "mandatory"),
+            (json!(["ki_keywords"]), json!({}), "ki_* name"),
+            (json!(["Tolerance", "Tolerance"]), json!({}), "named twice"),
+            (json!(["LCSC"]), json!({}), "has no custom field 'LCSC'"),
+            (
+                json!(["Technology"]),
+                json!({ "remove_fields": ["Technology"] }),
+                "remove_fields",
+            ),
+            (
+                json!(["Technology"]),
+                json!({ "rename_fields": { "Technology": "Dielectric" } }),
+                "has no custom field 'Technology'",
+            ),
+            (json!([]), json!({}), "non-empty array"),
+            (json!("Tolerance"), json!({}), "non-empty array"),
+            (json!([""]), json!({}), "non-empty field name"),
+        ] {
+            let mut arguments = extra.clone();
+            arguments["field_order"] = order.clone();
+            let (result, written) = order_call(arguments).await;
+            assert!(result.is_error, "{order} {extra}");
+            let body = order_body(&result);
+            assert_eq!(
+                body["error"]["field"], "field_order",
+                "{order} {extra}: {body}"
+            );
+            assert!(
+                body["error"]["reason"].as_str().unwrap().contains(reason),
+                "{order} {extra}: {body}"
+            );
+            assert_eq!(written, ORDER_SOURCE, "{order} {extra}");
+        }
+    }
+
+    /// The check before writing wants the named fields first, in order.
+    #[test]
+    fn the_check_wants_the_named_fields_first() {
+        let fields = SymbolFields {
+            field_order: Some(vec!["Manufacturer".into(), "Manufacturer Number".into()]),
+            ..SymbolFields::default()
+        };
+        assert_eq!(
+            readback_mismatch(MANUFACTURER_FIRST, ORDER_SOURCE, "CAP", &fields),
+            None
+        );
+        let reason = readback_mismatch(ORDER_SOURCE, ORDER_SOURCE, "CAP", &fields).unwrap();
+        assert!(reason.contains("not starting with"), "{reason}");
     }
 }

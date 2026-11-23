@@ -38,7 +38,8 @@ use super::sch_components::{
     ComponentDeleteTargetError, ComponentMutationIntent,
 };
 use super::sch_wiring::{
-    add_stub_label, add_stub_wire, clear_stub_direction, route_between, route_blocked,
+    add_stub_label, add_stub_wire, clear_stub_direction, route_between_pins, route_blocked,
+    PinRoute,
 };
 use super::PlacedPins;
 
@@ -229,7 +230,9 @@ pub fn tools() -> Vec<ToolDef> {
             "batch_connect_pins",
             "Connect multiple component pin pairs by reference and pin number, in a single \
              file read/write cycle. Routes as connect_pins does; a pair whose route would \
-             join another net is skipped and listed in errors.",
+             join another net, miss a pin or draw a zero-length segment is skipped and listed \
+             in errors. Pins already connected by contact on the saved sheet are listed in \
+             already_connected, not counted as drawn routes.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1019,7 +1022,7 @@ async fn handle_batch_connect_pins(
     // Resolve every endpoint from the initial tree before any wire is
     // inserted -- symbols/lib_symbols never change as wires are added, so
     // this is safe to do up front instead of re-resolving per connection.
-    let mut resolved: Vec<(String, f64, f64, f64, f64)> = Vec::new();
+    let mut resolved = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for conn in &connections {
         let (Some(ref1), Some(pin1), Some(ref2), Some(pin2)) = (
@@ -1035,10 +1038,7 @@ async fn handle_batch_connect_pins(
             placed_pins.resolve(ref1, pin1),
             placed_pins.resolve(ref2, pin2),
         ) {
-            (Ok(a), Ok(b)) => {
-                let ((x1, y1), (x2, y2)) = (a.endpoint(), b.endpoint());
-                resolved.push((format!("{ref1}.{pin1} -> {ref2}.{pin2}"), x1, y1, x2, y2))
-            }
+            (Ok(a), Ok(b)) => resolved.push((format!("{ref1}.{pin1} -> {ref2}.{pin2}"), a, b)),
             (Err(e), _) | (_, Err(e)) => errors.push(e.describe()),
         }
     }
@@ -1049,13 +1049,17 @@ async fn handle_batch_connect_pins(
     // still land, as an unresolved pin's do.
     let mut new_content = content;
     let mut connected = 0;
-    for (pair, x1, y1, x2, y2) in &resolved {
-        match route_between(&new_content, *x1, *y1, *x2, *y2)? {
-            Ok(routed) => {
+    let mut already_connected = Vec::new();
+    for (pair, from, to) in &resolved {
+        match route_between_pins(&new_content, &tree, from, to)? {
+            Ok(PinRoute::Drawn(routed)) => {
                 new_content = routed.content;
                 connected += 1;
             }
-            Err(reasons) => errors.push(format!("{pair}: {}", reasons.join("; "))),
+            Ok(PinRoute::AlreadyConnected { x, y }) => {
+                already_connected.push(json!({"pair": pair, "x": x, "y": y}));
+            }
+            Err(refusal) => errors.push(format!("{pair}: {}", refusal.reasons().join("; "))),
         }
     }
 
@@ -1065,9 +1069,10 @@ async fn handle_batch_connect_pins(
 
     let mut result = CallToolResult::json(&json!({
         "connected_count": connected,
+        "already_connected": already_connected,
         "errors": errors
     }));
-    result.is_error = connected == 0 && !errors.is_empty();
+    result.is_error = connected == 0 && already_connected.is_empty() && !errors.is_empty();
     Ok(result)
 }
 

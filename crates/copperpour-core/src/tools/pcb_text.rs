@@ -963,11 +963,23 @@ async fn handle_edit_footprint_field(
     let mirror_auto = edit.mirror_to_match_layer;
     let live_reference = reference.clone();
     let outcome = match on_live_board(ctx, &board, move |client, document| {
-        client.edit_footprint_field_in(document, &live_reference, slot, &edit)
+        if let Some(refused) = super::pcb_footprint_update::refuse_owned_groups(
+            client,
+            &document,
+            "edit_footprint_field",
+            "edit the fields of",
+            Some(&[live_reference.as_str()]),
+        )? {
+            return Ok(Err(refused));
+        }
+        client
+            .edit_footprint_field_in(document, &live_reference, slot, &edit)
+            .map(Ok)
     })
     .await?
     {
-        Ok(Ok(outcome)) => outcome,
+        Ok(Ok(Ok(outcome))) => outcome,
+        Ok(Ok(Err(refused))) => return Ok(refused),
         Ok(Err(error)) => return Ok(live_error_result(error, "edit_footprint_field")),
         Err(result) => return Ok(result),
     };

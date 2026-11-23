@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 const CROWDED: &str = "region_cleanup_kicad10/crowded/crowded.kicad_sch";
 const SPARSE: &str = "region_cleanup_kicad10/sparse/sparse.kicad_sch";
+const DIRECT_LANES: &str = "direct_lanes_kicad10/direct_lanes.kicad_sch";
 const TOOL: &str = "compare_schematic_layout";
 
 struct Sheet {
@@ -139,7 +140,7 @@ async fn single_saved_score_and_gateway_report_the_same_read_only_result() {
     let expected = json!({
         "component_overlap": 0, "label_overlap": 0, "wire_overlap": 0,
         "dangling_wire_end": 0, "floating_label": 0, "unconnected_pin": 0,
-        "text_overlap_text": 2, "text_overlap_body": 1, "pin_contact": 7,
+        "text_overlap_text": 2, "text_overlap_body": 1, "wire_field_overlap": 0, "pin_contact": 7,
         "short_pin_wire": 0, "diagonal_wires": 0, "collinear_overlaps": 0,
         "wire_bends": 5, "split_runs": 0, "redundant_power_symbols": 0,
         "wire_length_mm": 130.81, "wire_segments": 9, "power_symbols": 10,
@@ -147,6 +148,59 @@ async fn single_saved_score_and_gateway_report_the_same_read_only_result() {
     });
     assert_eq!(result["score"], expected);
     assert_eq!(result["not_compared"], json!([]));
+}
+
+async fn direct_lanes_with_clear_fields(handler: &McpHandler, crossed: &Sheet) -> Sheet {
+    let clear = crossed.fork();
+    ok(
+        handler,
+        &clear,
+        "edit_schematic_component",
+        json!({
+            "reference": "C1",
+            "field_placements": {
+                "Reference": {"x": 71.12, "y": 69.85, "rotation": 90},
+                "Value": {"x": 71.12, "y": 72.39, "rotation": 90}
+            }
+        }),
+    )
+    .await;
+    clear
+}
+
+#[tokio::test]
+async fn clearing_wire_field_crossings_improves_the_layout_score() {
+    let handler = handler().await;
+    let crossed = Sheet::input(DIRECT_LANES);
+    let clear = direct_lanes_with_clear_fields(&handler, &crossed).await;
+    let result = compare(&handler, &crossed, &clear, &[]).await;
+    assert_verdict(&result, "improved");
+    assert_eq!(
+        result["baseline_score"]["wire_field_overlap"], 3,
+        "{result}"
+    );
+    assert_eq!(result["score"]["wire_field_overlap"], 0, "{result}");
+    assert_eq!(result["delta"]["wire_field_overlap"], -3, "{result}");
+    for (term, delta) in result["delta"].as_object().unwrap() {
+        if term != "wire_field_overlap" {
+            assert_eq!(delta.as_f64(), Some(0.0), "{term}: {result}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn introducing_wire_field_crossings_makes_the_layout_not_improved() {
+    let handler = handler().await;
+    let crossed = Sheet::input(DIRECT_LANES);
+    let clear = direct_lanes_with_clear_fields(&handler, &crossed).await;
+    let result = compare(&handler, &clear, &crossed, &[]).await;
+    assert_verdict(&result, "not_improved");
+    assert_eq!(
+        result["baseline_score"]["wire_field_overlap"], 0,
+        "{result}"
+    );
+    assert_eq!(result["score"]["wire_field_overlap"], 3, "{result}");
+    assert_eq!(result["delta"]["wire_field_overlap"], 3, "{result}");
 }
 
 #[tokio::test]

@@ -36,9 +36,9 @@ anchor, carried through the placement, and no symbol is marked `fields_autoplace
 | | R7, R13, R14 `Device:R` | R13's fields for a caller-positioned control |
 | | `+3V3`, `GND` | power symbols, not connected |
 
-Neither crossing wire enters a symbol body, so `wire_overlap` stays clear, and
-`check_schematic_overlaps` on `main` returns zero findings on the sheet. KiCad 10.0.8
-plots both wires through the lettering.
+Neither crossing wire enters a symbol body, so `wire_overlap` stays clear.
+`check_schematic_overlaps` reports two `wire_field_overlap` findings, one for each
+wire that KiCad 10.0.8 plots through the lettering.
 
 ## Expected results (KiCad 10.0.8)
 

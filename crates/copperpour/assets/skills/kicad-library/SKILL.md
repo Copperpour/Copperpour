@@ -258,6 +258,11 @@ keeping its value and layout, `remove_fields=["LCSC"]` deletes one, `value`
 sets the Value field, `datasheet` the Datasheet field, and `reference_prefix` the
 Reference field.
 
+`field_order=["Manufacturer", "Manufacturer Number"]` puts those custom fields
+first, in that order; the others keep their order after them. Each field moves
+whole. Mandatory fields stay first and `ki_*` fields last, so they cannot be
+named; a field set or renamed in the same call can be.
+
 ### Remove a Symbol Pin
 
 `delete_symbol_pin` (toolset `library_maintenance`) removes one pin of a library symbol, such as the second of
@@ -396,9 +401,9 @@ set_footprint_graphics(
 
 ### Existing Footprint Metadata
 
-Use `set_footprint_metadata` to replace a footprint description, search tags, or
-KiCad footprint attributes without changing pads, graphics, properties, groups, or
-3D models.
+Use `set_footprint_metadata` to replace a footprint description, search tags,
+KiCad footprint attributes, or its Value text without changing pads, graphics,
+properties, groups, or 3D models.
 
 ```text
 set_footprint_metadata(
@@ -417,8 +422,16 @@ set_footprint_metadata(
   in the response.
 - `exclude_from_pos_files` omits the footprint from pick-and-place output without
   implicitly adding `exclude_from_bom`.
+- `value` replaces only the Value field's text, for example after the footprint
+  was renamed outside `rename_footprint` and kept its old Value. Its position,
+  layer and effects stay; a footprint without a Value is refused.
 - Use `edit_footprint_pad` with `new_number` and optional `match_all=true` to
   renumber one or every matching direct-child pad atomically.
+- Use `edit_footprint_pad` with `layers` to change a pad's layers in place, for
+  example `["F.Cu", "F.Mask", "F.Paste"]` to give an SMD pad back its stencil
+  opening. It takes the names `create_footprint` takes and writes them as KiCad
+  does (`*.Cu` / `*.Mask` for both sides); the pad keeps its UUID, and
+  `match_all=true` changes every pad with that number.
 - Use `edit_footprint_pad` with `zone_connect` (`solid`, `thermal`, `none`) to
   override how zones connect to one pad, or `inherited` to remove the override.
 - Use `edit_footprint_pad` with `solder_mask_margin` and `solder_paste_margin`

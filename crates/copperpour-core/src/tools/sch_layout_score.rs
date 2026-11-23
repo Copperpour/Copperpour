@@ -32,6 +32,7 @@ const TIERS: [&[&str]; 4] = [
     &[
         "text_overlap_text",
         "text_overlap_body",
+        "wire_field_overlap",
         "pin_contact",
         "short_pin_wire",
     ],
