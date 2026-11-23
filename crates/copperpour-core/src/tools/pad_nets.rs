@@ -63,11 +63,23 @@ async fn handle_set_pad_net(
     let (reference_ipc, pad_ipc, net_ipc) =
         (reference.clone(), pad_number.clone(), net_name.clone());
     let outcome = match with_bound_board_ipc_classified(ctx, &board, move |client, document| {
-        client.set_pad_net_in(document, &reference_ipc, &pad_ipc, &net_ipc)
+        if let Some(refused) = super::pcb_footprint_update::refuse_owned_groups(
+            client,
+            &document,
+            "set_pad_net",
+            "change the pad nets of",
+            Some(&[reference_ipc.as_str()]),
+        )? {
+            return Ok(Err(refused));
+        }
+        client
+            .set_pad_net_in(document, &reference_ipc, &pad_ipc, &net_ipc)
+            .map(Ok)
     })
     .await?
     {
-        Ok(BoardBinding::Bound(outcome)) => outcome,
+        Ok(BoardBinding::Bound(Ok(outcome))) => outcome,
+        Ok(BoardBinding::Bound(Err(refused))) => return Ok(refused),
         Ok(BoardBinding::Unserved { absence, message }) => {
             return Ok(crate::tools::ipc_unserved_result(absence, &message))
         }

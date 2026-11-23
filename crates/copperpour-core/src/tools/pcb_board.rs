@@ -3993,8 +3993,37 @@ pub(crate) mod board_mock {
                     );
                 }
             }
-            reply(kiapi::common::ApiStatusCode::AsOk, "", respond(&command))
+            reply(
+                kiapi::common::ApiStatusCode::AsOk,
+                "",
+                respond(&command).or_else(|| empty_saved_board(&command)),
+            )
         })
+    }
+
+    /// The board text [`empty_saved_board`] answers with.
+    pub const EMPTY_SAVED_BOARD: &str =
+        "(kicad_pcb\n\t(version 20260206)\n\t(generator \"pcbnew\")\n)\n";
+
+    /// KiCad's answer to a `SaveDocumentToString` the test left unanswered: a
+    /// board with nothing on it. A tool that reads the board text before it
+    /// edits a footprint (the groups a footprint owns, #701) then finds
+    /// nothing to refuse; a test about that read answers it itself.
+    pub fn empty_saved_board(command: &prost_types::Any) -> Option<prost_types::Any> {
+        use prost::Message;
+        if !command.type_url.ends_with("SaveDocumentToString") {
+            return None;
+        }
+        let request =
+            kiapi::common::commands::SaveDocumentToString::decode(command.value.as_slice())
+                .expect("SaveDocumentToString request");
+        Some(copperpour_ipc::builders::pack_any(
+            &kiapi::common::commands::SavedDocumentResponse {
+                document: request.document,
+                contents: EMPTY_SAVED_BOARD.to_string(),
+            },
+            "kiapi.common.commands.SavedDocumentResponse",
+        ))
     }
 
     /// As [`spawn_kicad_holding_board`], for the two answers that are not
@@ -4129,7 +4158,7 @@ pub(crate) mod board_mock {
                     "kiapi.common.commands.GetOpenDocumentsResponse",
                 ))
             } else {
-                respond(&command)
+                respond(&command).or_else(|| empty_saved_board(&command))
             };
             kiapi::common::ApiResponse {
                 status: Some(kiapi::common::ApiResponseStatus {

@@ -377,20 +377,34 @@ pub(crate) enum Checked<T> {
     Blocked(PlacementCheck),
     /// A dry run: nothing was moved.
     DryRun(PlacementCheck),
+    /// A footprint to move owns groups, which the move would drop (#701):
+    /// `tool`'s `plan_blocked` refusal naming each one. Nothing was moved,
+    /// and the copper check did not run.
+    Refused(CallToolResult),
 }
 
-/// Check `requests` against the live board, then run `apply` only when the
-/// check passed, or found conflicts the caller allowed, and this is not a dry
-/// run. A check that cannot complete is an error, so nothing is applied on
-/// evidence that was never gathered.
+/// Refuse `requests` when a footprint they move owns groups, then check them
+/// against the live board, then run `apply` only when the check passed, or
+/// found conflicts the caller allowed, and this is not a dry run. A check that
+/// cannot complete is an error, so nothing is applied on evidence that was
+/// never gathered. `tool` names the refusal.
 pub(crate) fn check_then_apply<T>(
     client: &KiCadIpcClient,
     document: DocumentSpecifier,
+    tool: &str,
     requests: &[PoseRequest],
     options: CheckOptions,
     apply: impl FnOnce(&KiCadIpcClient) -> anyhow::Result<T>,
 ) -> anyhow::Result<Checked<T>> {
-    check_then_apply_ignoring(client, document, requests, &HashSet::new(), options, apply)
+    check_then_apply_ignoring(
+        client,
+        document,
+        tool,
+        requests,
+        &HashSet::new(),
+        options,
+        apply,
+    )
 }
 
 /// As [`check_then_apply`], leaving out of the test the vias, tracks and arcs
@@ -398,11 +412,30 @@ pub(crate) fn check_then_apply<T>(
 pub(crate) fn check_then_apply_ignoring<T>(
     client: &KiCadIpcClient,
     document: DocumentSpecifier,
+    tool: &str,
     requests: &[PoseRequest],
     ignored: &HashSet<String>,
     options: CheckOptions,
     apply: impl FnOnce(&KiCadIpcClient) -> anyhow::Result<T>,
 ) -> anyhow::Result<Checked<T>> {
+    let references: Vec<&str> = requests.iter().map(PoseRequest::reference).collect();
+    let action = if requests
+        .iter()
+        .all(|request| matches!(request, PoseRequest::Rotate { .. }))
+    {
+        "rotate"
+    } else {
+        "move"
+    };
+    if let Some(refused) = crate::tools::pcb_footprint_update::refuse_owned_groups(
+        client,
+        &document,
+        tool,
+        action,
+        Some(&references),
+    )? {
+        return Ok(Checked::Refused(refused));
+    }
     let check = check_live(client, document, requests, ignored)?;
     if options.dry_run {
         return Ok(Checked::DryRun(check));
@@ -2129,6 +2162,7 @@ mod served_tests {
                     matches!(
                         command.as_str(),
                         "GetItems"
+                            | "SaveDocumentToString"
                             | "GetBoardEnabledLayers"
                             | "CheckPadstackPresenceOnLayers"
                             | "GetPadShapeAsPolygon"
@@ -2539,7 +2573,10 @@ mod served_tests {
         assert_eq!(result["isError"], true, "{result:#}");
         let text = result["content"][0]["text"].as_str().unwrap();
         let body: Value = serde_json::from_str(text).unwrap_or_else(|_| json!(text));
-        assert_eq!(*sent.lock().unwrap(), ["GetItems", "GetBoardEnabledLayers"]);
+        assert_eq!(
+            *sent.lock().unwrap(),
+            ["SaveDocumentToString", "GetItems", "GetBoardEnabledLayers"]
+        );
         assert_eq!(std::fs::read_to_string(&board).unwrap(), ISSUE_96.board);
         assert_eq!(body["error"]["kind"], "plan_blocked", "{body:#}");
         assert_eq!(body["error"]["operation"], "move_component");
@@ -3343,6 +3380,7 @@ mod served_tests {
                         "kiapi.common.commands.GetItemsResponse",
                     ))
                     .filter(|_| name == "GetItems")
+                    .or_else(|| crate::tools::pcb_board::board_mock::empty_saved_board(&command))
                 }),
             };
             log.lock().unwrap().push(name);

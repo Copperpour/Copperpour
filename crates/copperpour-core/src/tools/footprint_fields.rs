@@ -83,11 +83,23 @@ async fn handle_set_footprint_field(
 
     let (reference_ipc, name_ipc, value_ipc) = (reference.clone(), name.clone(), value.clone());
     let outcome = match with_bound_board_ipc_classified(ctx, &board, move |client, document| {
-        client.set_footprint_field_in(document, &reference_ipc, &name_ipc, &value_ipc, visible)
+        if let Some(refused) = super::pcb_footprint_update::refuse_owned_groups(
+            client,
+            &document,
+            "set_footprint_field",
+            "edit the fields of",
+            Some(&[reference_ipc.as_str()]),
+        )? {
+            return Ok(Err(refused));
+        }
+        client
+            .set_footprint_field_in(document, &reference_ipc, &name_ipc, &value_ipc, visible)
+            .map(Ok)
     })
     .await?
     {
-        Ok(BoardBinding::Bound(outcome)) => outcome,
+        Ok(BoardBinding::Bound(Ok(outcome))) => outcome,
+        Ok(BoardBinding::Bound(Err(refused))) => return Ok(refused),
         Ok(BoardBinding::Unserved { absence, message }) => {
             return Ok(crate::tools::ipc_unserved_result(absence, &message))
         }

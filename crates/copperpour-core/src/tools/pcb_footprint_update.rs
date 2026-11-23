@@ -596,6 +596,144 @@ fn owned_group_conflicts(board_text: &str, changes: &[PlannedUpdate]) -> Vec<Upd
         .collect()
 }
 
+/// A footprint a live edit would strip of its own groups, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnedGroupReason {
+    /// The footprint's reference; `None` when the board text could not tell
+    /// which footprints own groups.
+    pub(crate) reference: Option<String>,
+    pub(crate) reason: String,
+}
+
+/// Each footprint among `references` that owns a group, read from KiCad's own
+/// serialization of the live board (#701).
+///
+/// Every tool that changes a placed footprint on a live board sends the whole
+/// footprint back with `UpdateItems`, and KiCad 10.0.8 rebuilds it from that
+/// message: `FOOTPRINT::Deserialize` clears its groups and
+/// `FOOTPRINT::Serialize` never writes them, so the edit drops every group the
+/// footprint owns. No item read lists them, so this reads the board once.
+///
+/// `references` are the footprints the tool edits, `None` for every footprint
+/// on the board. A reference no footprint carries is left to the tool, which
+/// reports it as missing. `action` is what the user can do in KiCad's PCB
+/// editor instead, such as `move`: "… move R1 in KiCad's PCB editor instead".
+pub(crate) fn owned_group_reasons(
+    client: &copperpour_ipc::KiCadIpcClient,
+    document: &kiapi::common::types::DocumentSpecifier,
+    action: &str,
+    references: Option<&[&str]>,
+) -> Result<Vec<OwnedGroupReason>> {
+    if references.is_some_and(<[&str]>::is_empty) {
+        return Ok(Vec::new());
+    }
+    let board_text = client.save_document_to_string_in(document.clone())?;
+    Ok(owned_group_reasons_in(&board_text, action, references))
+}
+
+/// [`owned_group_reasons`] as the refusal of a tool that edits footprints in
+/// one step: `plan_blocked` for `tool`, naming every footprint that owns a
+/// group, before anything is written. `None` when no target owns one.
+pub(crate) fn refuse_owned_groups(
+    client: &copperpour_ipc::KiCadIpcClient,
+    document: &kiapi::common::types::DocumentSpecifier,
+    tool: &str,
+    action: &str,
+    references: Option<&[&str]>,
+) -> Result<Option<CallToolResult>> {
+    let found = owned_group_reasons(client, document, action, references)?;
+    Ok(owned_groups_refusal(tool, found))
+}
+
+fn owned_groups_refusal(tool: &str, found: Vec<OwnedGroupReason>) -> Option<CallToolResult> {
+    if found.is_empty() {
+        return None;
+    }
+    let reasons: Vec<String> = found.into_iter().map(|found| found.reason).collect();
+    Some(CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::PlanBlocked {
+            operation: tool.to_string(),
+            reasons: reasons.clone(),
+        },
+        format!(
+            "{tool} refused: {}. Nothing was written.",
+            reasons.join("; ")
+        ),
+    ))
+}
+
+/// The reasons of [`owned_group_reasons`] in `board_text`, once per
+/// reference, in the order asked, or in reference order for every footprint.
+/// A reference several footprints carry owns what they all own.
+fn owned_group_reasons_in(
+    board_text: &str,
+    action: &str,
+    references: Option<&[&str]>,
+) -> Vec<OwnedGroupReason> {
+    let owned = match owned_groups_by_reference(board_text) {
+        Ok(owned) => owned,
+        Err(error) => {
+            let targets = references.map_or("the footprints".to_string(), |references| {
+                references.join(", ")
+            });
+            return vec![OwnedGroupReason {
+                reference: None,
+                reason: format!(
+                    "could not determine whether {targets} own groups, which KiCad drops when \
+                     its API updates a footprint: {error}"
+                ),
+            }];
+        }
+    };
+    let every: Vec<&str>;
+    let references = match references {
+        Some(references) => references,
+        None => {
+            every = owned.keys().map(String::as_str).collect();
+            &every
+        }
+    };
+    let mut seen = BTreeSet::new();
+    references
+        .iter()
+        .filter(|reference| seen.insert(**reference))
+        .filter_map(|reference| {
+            let count = owned.get(*reference).copied().filter(|count| *count > 0)?;
+            let groups = if count == 1 {
+                "1 group".to_string()
+            } else {
+                format!("{count} groups")
+            };
+            Some(OwnedGroupReason {
+                reference: Some(reference.to_string()),
+                reason: format!(
+                    "{reference} owns {groups}, which KiCad drops when its API updates a \
+                     footprint; {action} {reference} in KiCad's PCB editor instead"
+                ),
+            })
+        })
+        .collect()
+}
+
+/// The groups each reference's footprints own in `board_text`.
+fn owned_groups_by_reference(board_text: &str) -> Result<BTreeMap<String, usize>> {
+    let board = copperpour_sexp::parse_sexp(board_text)?;
+    let counts = copperpour_sexp::board::footprint_owned_group_counts(&board)?;
+    let mut owned = BTreeMap::new();
+    for footprint in copperpour_sexp::board::footprints(&board) {
+        let Some(reference) = copperpour_sexp::board::footprint_reference(footprint) else {
+            continue;
+        };
+        let count = footprint
+            .find_str("uuid")
+            .and_then(|id| counts.get(id))
+            .copied()
+            .unwrap_or_default();
+        *owned.entry(reference).or_default() += count;
+    }
+    Ok(owned)
+}
+
 fn snapshot_routed_nets(
     client: &copperpour_ipc::KiCadIpcClient,
     document: kiapi::common::types::DocumentSpecifier,
@@ -7961,3 +8099,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "footprint_groups_tests.rs"]
+mod footprint_groups_tests;

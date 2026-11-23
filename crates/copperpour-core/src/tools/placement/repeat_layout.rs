@@ -1703,6 +1703,7 @@ async fn handle_repeat_layout(args: &Value, ctx: &ToolContext) -> anyhow::Result
             pcb_copper_check::check_then_apply_ignoring(
                 client,
                 document.clone(),
+                OPERATION,
                 &requests,
                 &ignored,
                 options,
@@ -1745,6 +1746,7 @@ async fn handle_repeat_layout(args: &Value, ctx: &ToolContext) -> anyhow::Result
         BoardWrite::Ipc(Live::Planned(Checked::Blocked(check), _)) => {
             Ok(check.blocked_result(OPERATION))
         }
+        BoardWrite::Ipc(Live::Planned(Checked::Refused(refused), _)) => Ok(refused),
         BoardWrite::Ipc(Live::Planned(Checked::DryRun(check), report)) => {
             let mut body = check.dry_run_body();
             if let Some(report) = report {

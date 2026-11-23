@@ -75,6 +75,8 @@ enum LiveResult {
     Snapshot(Result<IpcFootprint3DModelSnapshot, Error>),
     Conflict(IpcFootprint3DModelSnapshot),
     Edited(Result<IpcFootprint3DModelEditOutcome, Error>),
+    /// The footprint owns groups, which the edit would drop (#701).
+    Refused(CallToolResult),
 }
 
 async fn handle_set_placed_footprint_models(
@@ -113,14 +115,30 @@ async fn handle_set_placed_footprint_models(
     let live_reference = reference.clone();
     let revision_board = board.clone();
     let live = with_bound_board_ipc_classified(ctx, &board, move |client, document| {
-        let snapshot = client.footprint_3d_model_snapshot_in(document.clone(), &live_reference);
         let Some(edit) = edit else {
-            return Ok(LiveResult::Snapshot(snapshot));
+            return Ok(LiveResult::Snapshot(client.footprint_3d_model_snapshot_in(
+                document.clone(),
+                &live_reference,
+            )));
         };
-        let snapshot = match snapshot {
-            Ok(snapshot) => snapshot,
-            Err(error) => return Ok(LiveResult::Snapshot(Err(error))),
-        };
+        // A footprint that owns groups is never edited here (#701), whatever
+        // its models revision, so this comes before the snapshot.
+        match super::pcb_footprint_update::refuse_owned_groups(
+            client,
+            &document,
+            "set_placed_footprint_models",
+            "change the 3D models of",
+            Some(&[live_reference.as_str()]),
+        ) {
+            Ok(Some(refused)) => return Ok(LiveResult::Refused(refused)),
+            Ok(None) => {}
+            Err(error) => return Ok(LiveResult::Edited(Err(error))),
+        }
+        let snapshot =
+            match client.footprint_3d_model_snapshot_in(document.clone(), &live_reference) {
+                Ok(snapshot) => snapshot,
+                Err(error) => return Ok(LiveResult::Snapshot(Err(error))),
+            };
         if expected_revision.as_deref()
             != Some(models_revision(&revision_board, &snapshot).as_str())
         {
@@ -156,6 +174,7 @@ async fn handle_set_placed_footprint_models(
     };
 
     match live {
+        LiveResult::Refused(refused) => Ok(refused),
         LiveResult::Snapshot(Ok(snapshot)) => {
             Ok(snapshot_result("inspected", false, &board, &snapshot))
         }

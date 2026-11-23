@@ -892,7 +892,7 @@ fn footprint_side(fp: &SexpNode) -> Option<Side> {
 
 /// The reference designator: `(property "Reference" "R1" …)` in current
 /// formats, `(fp_text reference "R1" …)` in legacy ones.
-fn footprint_reference(fp: &SexpNode) -> Option<String> {
+pub fn footprint_reference(fp: &SexpNode) -> Option<String> {
     for prop in fp.find_all("property") {
         if prop.get(1).and_then(|n| n.as_str()) == Some("Reference") {
             return prop.get(2).and_then(|n| n.as_str()).map(str::to_string);

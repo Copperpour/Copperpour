@@ -557,6 +557,12 @@ struct Kicad {
 
 impl Kicad {
     async fn holding(fixture: &str) -> Self {
+        Self::holding_saving(fixture, None).await
+    }
+
+    /// As [`Self::holding`], answering `SaveDocumentToString` with `saved`
+    /// when given, as the board KiCad would write.
+    async fn holding_saving(fixture: &str, saved: Option<String>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join(fixture);
         std::fs::copy(Path::new(FIXTURE_DIR).join(fixture), &board).unwrap();
@@ -571,7 +577,17 @@ impl Kicad {
             move |command, _| {
                 let name = any_type_name(command).rsplit('.').next().unwrap();
                 log.lock().unwrap().push(name.to_string());
-                None
+                let saved = saved.as_ref().filter(|_| name == "SaveDocumentToString")?;
+                let request =
+                    kiapi::common::commands::SaveDocumentToString::decode(command.value.as_slice())
+                        .unwrap();
+                Some(pack_any(
+                    &kiapi::common::commands::SavedDocumentResponse {
+                        document: request.document,
+                        contents: saved.clone(),
+                    },
+                    "kiapi.common.commands.SavedDocumentResponse",
+                ))
             }
         });
         let handler = handler_talking_to(server.address()).await;
@@ -655,6 +671,47 @@ async fn a_live_board_takes_the_layout_in_one_commit() {
     );
 }
 
+/// #701: a target footprint that owns a group refuses the whole layout,
+/// at the dry run too, since KiCad 10.0.8 drops a footprint's groups on every
+/// update over its API.
+#[tokio::test]
+async fn a_target_that_owns_a_group_refuses_the_whole_layout() {
+    let content = std::fs::read_to_string(Path::new(FIXTURE_DIR).join(BOARD)).unwrap();
+    let r7 = "(property \"Reference\" \"R7\"";
+    assert_eq!(content.matches(r7).count(), 1);
+    let grouped = content.replacen(
+        r7,
+        &format!(
+            "(group \"\" (uuid \"00000000-0000-0000-0000-000000000701\") (members))\n\t\t{r7}"
+        ),
+        1,
+    );
+    let kicad = Kicad::holding_saving(BOARD, Some(grouped)).await;
+    let before = kicad.held();
+    for dry_run in [false, true] {
+        let (is_error, body) = call_with(
+            &kicad.handler,
+            &kicad.board,
+            json!({ "anchor_reference": "R1", "dry_run": dry_run }),
+        )
+        .await;
+        assert!(is_error, "{body:#}");
+        assert_eq!(body["error"]["kind"], "plan_blocked", "{body:#}");
+        assert_eq!(body["error"]["operation"], "repeat_layout", "{body:#}");
+        assert_eq!(
+            body["error"]["reasons"],
+            json!([
+                "R7 owns 1 group, which KiCad drops when its API updates a footprint; \
+                    move R7 in KiCad's PCB editor instead"
+            ]),
+            "{body:#}"
+        );
+    }
+    assert_eq!(kicad.held(), before);
+    assert_eq!(kicad.store.lock().unwrap().updates, 0);
+    assert!(!kicad.sent().iter().any(|name| name == "BeginCommit"));
+}
+
 #[tokio::test]
 async fn a_live_dry_run_only_reads() {
     let kicad = Kicad::holding(BOARD).await;
@@ -674,7 +731,7 @@ async fn a_live_dry_run_only_reads() {
         assert!(
             matches!(
                 name.as_str(),
-                "GetOpenDocuments" | "GetItems" | "GetVersion"
+                "GetOpenDocuments" | "GetItems" | "GetVersion" | "SaveDocumentToString"
             ),
             "{name} reached KiCad"
         );
@@ -2111,6 +2168,7 @@ async fn a_live_routing_dry_run_only_reads() {
                 "GetOpenDocuments"
                     | "GetItems"
                     | "GetVersion"
+                    | "SaveDocumentToString"
                     | "GetBoundingBox"
                     | "GetBoardEnabledLayers"
                     | "CheckPadstackPresenceOnLayers"
