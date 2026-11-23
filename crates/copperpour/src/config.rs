@@ -151,6 +151,10 @@ pub struct Config {
     /// would fail every call before kicad-cli could answer.
     #[serde(default = "default_kicad_cli_timeout_seconds")]
     pub kicad_cli_timeout_seconds: u64,
+
+    /// Sentry issue reporting and local crash/error capture settings (#824).
+    #[serde(default)]
+    pub issue_reporting: copperpour_core::issue_reporting::IssueReportingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -160,6 +164,17 @@ pub enum TransportMode {
     Stdio,
     Http,
     Both,
+}
+
+#[cfg(feature = "issue-reporting")]
+impl TransportMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Http => "http",
+            Self::Both => "both",
+        }
+    }
 }
 
 /// Where the effective `ipc_address` came from.
@@ -258,6 +273,19 @@ impl Config {
                 "call_tool_allow_writes is on: a client that has allowed call_tool runs \
                  mutating tools without their individual approval prompts"
             );
+        }
+        #[cfg(feature = "issue-reporting")]
+        {
+            let reporter =
+                std::sync::Arc::new(copperpour_core::issue_reporting::IssueReporter::new(
+                    self.issue_reporting.clone(),
+                    handler.selected_config_path().map(Path::to_path_buf),
+                    self.transport.as_str().to_string(),
+                    self.project_dir.clone(),
+                ));
+            handler.set_issue_reporter(reporter.clone());
+            copperpour_core::issue_reporting::register_global_reporter(reporter);
+            copperpour_core::issue_reporting::install_panic_hook();
         }
     }
 }
@@ -444,6 +472,7 @@ impl Default for Config {
             eager_toolsets: false,
             call_tool_allow_writes: false,
             kicad_cli_timeout_seconds: default_kicad_cli_timeout_seconds(),
+            issue_reporting: copperpour_core::issue_reporting::IssueReportingConfig::default(),
         }
     }
 }

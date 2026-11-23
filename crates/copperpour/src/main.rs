@@ -191,6 +191,9 @@ async fn main() -> Result<()> {
         }
     }
 
+    #[cfg(feature = "issue-reporting")]
+    copperpour_core::issue_reporting::flush_global_reporter(std::time::Duration::from_secs(2));
+
     Ok(())
 }
 

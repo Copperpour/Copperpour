@@ -93,6 +93,47 @@ fn attach_guidance_notice(result: &mut CallToolResult, notice: String) {
     result.content.push(ToolContent::Text { text: notice });
 }
 
+#[cfg(feature = "issue-reporting")]
+fn attach_pending_reports_notice(result: &mut CallToolResult, notice: Value) {
+    for content in &mut result.content {
+        if let ToolContent::Text { text } = content {
+            if let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(text) {
+                map.entry("pending_reports").or_insert(notice);
+                *text = Value::Object(map).to_string();
+                return;
+            }
+        }
+    }
+    result.content.push(ToolContent::Text {
+        text: format!("pending_reports: {notice}"),
+    });
+}
+
+#[cfg(feature = "issue-reporting")]
+fn extract_result_message(result: &CallToolResult) -> String {
+    for content in &result.content {
+        if let ToolContent::Text { text } = content {
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(text) {
+                if let Some(msg) = map.get("message").and_then(Value::as_str) {
+                    return msg.to_string();
+                }
+                if let Some(err) = map.get("error").and_then(Value::as_object) {
+                    if let Some(reason) = err.get("reason").and_then(Value::as_str) {
+                        return reason.to_string();
+                    }
+                    if let Some(msg) = err.get("message").and_then(Value::as_str) {
+                        return msg.to_string();
+                    }
+                }
+                // Never dump an arbitrary JSON tool result into a report.
+                return "tool returned an error".to_string();
+            }
+            return text.clone();
+        }
+    }
+    String::new()
+}
+
 /// An `invalid_argument` refusal for `field`.
 fn invalid_argument(field: &str, reason: &str) -> (CallToolResult, CallStatus, Option<String>) {
     (
@@ -243,6 +284,22 @@ impl McpHandler {
     /// a second call is ignored.
     pub fn set_guidance_probe(&self, probe: Arc<dyn crate::guidance::GuidanceProbe>) {
         let _ = self.ctx.guidance.set(probe);
+    }
+
+    /// Replace the issue reporter on this handler (used by server startup to
+    /// apply config + transport, and by tests to inject a mock transport/store).
+    #[cfg(feature = "issue-reporting")]
+    pub fn set_issue_reporter(&self, reporter: Arc<crate::issue_reporting::IssueReporter>) {
+        self.ctx.set_issue_reporter(reporter);
+    }
+
+    #[cfg(feature = "issue-reporting")]
+    pub fn issue_reporter(&self) -> Arc<crate::issue_reporting::IssueReporter> {
+        self.ctx.issue_reporter()
+    }
+
+    pub fn selected_config_path(&self) -> Option<&std::path::Path> {
+        self.ctx.config_resolution.selected_path()
     }
 
     /// Let `call_tool` run every tool except the ones it never runs, not only
@@ -410,12 +467,27 @@ impl McpHandler {
             // ── Lifecycle ──────────────────────────────────────────────────
             "initialize" => {
                 self.adapt_to_client(req.params.as_ref()).await;
-                let notice = self
+                let mut notices = Vec::new();
+                if let Some(guidance) = self
                     .ctx
                     .guidance
                     .get()
-                    .and_then(|probe| probe.peek_notice());
-                let result = McpServerState::build_initialize_result(notice);
+                    .and_then(|probe| probe.peek_notice())
+                {
+                    if !guidance.is_empty() {
+                        notices.push(guidance);
+                    }
+                }
+                #[cfg(feature = "issue-reporting")]
+                if let Some(pending) = self.ctx.issue_reporter().initialize_pending_notice() {
+                    notices.push(pending);
+                }
+                let combined = if notices.is_empty() {
+                    None
+                } else {
+                    Some(notices.join("\n\n"))
+                };
+                let result = McpServerState::build_initialize_result(combined);
                 Ok(Some(serde_json::to_value(result)?))
             }
             "notifications/initialized" => Ok(None),
@@ -493,6 +565,36 @@ impl McpHandler {
         );
 
         let (mut result, status, error_kind) = self.dispatch_tool(&params.name, &args).await;
+        #[cfg(feature = "issue-reporting")]
+        if let Some(kind) = error_kind.as_deref() {
+            if matches!(kind, "handler_error" | "mutation_outcome_uncertain")
+                && !matches!(
+                    recorded_name.as_str(),
+                    "report_issue" | "discard_pending_reports"
+                )
+            {
+                let (kicad_version, kicad_cli_version) =
+                    self.ctx.prerequisite_health.cached_kicad_versions();
+                let recent_calls = self
+                    .observer
+                    .recent(20)
+                    .await
+                    .iter()
+                    .map(crate::issue_reporting::SanitizedCallRecord::from)
+                    .collect();
+                let message = extract_result_message(&result);
+                if let Some(pending_notice) = self.ctx.issue_reporter().capture_tool_error(
+                    &recorded_name,
+                    kind,
+                    &message,
+                    kicad_version,
+                    kicad_cli_version,
+                    recent_calls,
+                ) {
+                    attach_pending_reports_notice(&mut result, pending_notice);
+                }
+            }
+        }
         if recorded_name != "get_guidance" {
             let notice = self
                 .session_guidance_notice

@@ -37,10 +37,11 @@ sha2.workspace = true
 
 [features]
 # Forwards copperpour-core's integrations; see its Cargo.toml (#210).
-default = ["jlcpcb", "freerouting", "native-bridge"]
+default = ["jlcpcb", "freerouting", "native-bridge", "issue-reporting"]
 jlcpcb = ["copperpour-core/jlcpcb"]
 freerouting = ["copperpour-core/freerouting"]
 native-bridge = ["copperpour-core/native-bridge"]
+issue-reporting = ["copperpour-core/issue-reporting"]
 
 [build-dependencies]
 

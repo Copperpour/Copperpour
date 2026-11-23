@@ -194,7 +194,13 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         kicad_plugin_init_inner(config_path)
     }))
-    .unwrap_or_else(|_| record_and_log_refusal(StartupRefusal::panic_refusal()))
+    .unwrap_or_else(|panic| {
+        #[cfg(feature = "issue-reporting")]
+        copperpour_core::issue_reporting::capture_caught_panic("kicad_plugin_init", panic.as_ref());
+        #[cfg(not(feature = "issue-reporting"))]
+        let _ = panic;
+        record_and_log_refusal(StartupRefusal::panic_refusal())
+    })
 }
 
 unsafe fn kicad_plugin_init_inner(config_path: *const c_char) -> c_int {
@@ -223,6 +229,20 @@ unsafe fn kicad_plugin_init_inner(config_path: *const c_char) -> c_int {
                 return record_and_log_refusal(StartupRefusal::from_config_error(&error));
             }
         };
+
+    #[cfg(feature = "issue-reporting")]
+    {
+        let reporter = std::sync::Arc::new(copperpour_core::issue_reporting::IssueReporter::new(
+            config.issue_reporting.clone(),
+            config_resolution
+                .selected_path()
+                .map(std::path::Path::to_path_buf),
+            config.transport.as_str().to_string(),
+            config.project_dir.clone(),
+        ));
+        copperpour_core::issue_reporting::register_global_reporter(reporter);
+        copperpour_core::issue_reporting::install_panic_hook();
+    }
 
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,

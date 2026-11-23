@@ -92,6 +92,39 @@ impl PrerequisiteHealth {
         }
         latest.as_ref().expect("assessment initialized").clone()
     }
+
+    /// Return any already-cached `(kicad_version, kicad_cli_version)` without
+    /// spawning subprocesses or waiting on startup probes.
+    #[cfg(feature = "issue-reporting")]
+    pub(crate) fn cached_kicad_versions(&self) -> (Option<String>, Option<String>) {
+        let assessment = self
+            .latest
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .or_else(|| {
+                self.startup
+                    .get()
+                    .and_then(|startup| startup.report.borrow().clone())
+            });
+        let Some(assessment) = assessment else {
+            return (None, None);
+        };
+        let kicad_cli_version = assessment
+            .health
+            .get("kicad_cli")
+            .and_then(|v| v.get("version"))
+            .and_then(Value::as_str)
+            .or_else(|| assessment.legacy_cli.get("version").and_then(Value::as_str))
+            .map(ToOwned::to_owned);
+        let kicad_version = assessment
+            .health
+            .get("ipc")
+            .and_then(|v| v.get("kicad_version"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        (kicad_version, kicad_cli_version)
+    }
 }
 
 impl Assessment {

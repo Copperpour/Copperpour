@@ -55,6 +55,13 @@ and Windows servers do not.
 |------|---------|
 | `get_installation_info` | Report the serving build version and commit, executable path, verified install source, on-disk binary version, cached KiCad CLI and IPC prerequisite health with an explicit refresh option, redacted IPC endpoint provenance, proven stale-process evidence, platform-specific restart guidance, and whether installed skills, agents, and hooks match this build's bundle. |
 
+### Issue reporting
+
+| Tool | Purpose |
+|------|---------|
+| `report_issue` | Send a structured Copperpour bug report or feature request to Sentry (or send locally captured pending reports by ID) and return the Sentry event ID(s). Scrubs paths, usernames, hostnames, and IPs; never includes design files or tool arguments/results. Requires the `issue-reporting` feature (on by default; omitted from `--no-default-features` offline builds). |
+| `discard_pending_reports` | Discard locally stored pending crash/error reports without sending them, optionally setting `issue_reporting.capture = false` (`never_ask: true`). Requires the `issue-reporting` feature. |
+
 ### Unix stdio maintenance
 
 | Tool | Purpose |

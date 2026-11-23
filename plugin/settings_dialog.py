@@ -17,6 +17,12 @@ import wx
 
 # ─── Default settings ────────────────────────────────────────────────────────
 
+DEFAULT_ISSUE_REPORTING = {
+    "enabled": True,
+    "capture": True,
+    "automatic": False,
+}
+
 DEFAULT_SETTINGS = {
     "kicad_cli": "",
     "ipc_socket_path": "",
@@ -24,6 +30,7 @@ DEFAULT_SETTINGS = {
     "log_level": "info",
     "transport": "stdio",
     "native_specctra_bridge": False,
+    "issue_reporting": dict(DEFAULT_ISSUE_REPORTING),
 }
 
 LOG_LEVELS = ["error", "warn", "info", "debug", "trace"]
@@ -36,11 +43,18 @@ TRANSPORTS = ["stdio", "http", "both"]
 def load_settings(settings_path):
     """Load settings from JSON, falling back to defaults."""
     settings = dict(DEFAULT_SETTINGS)
+    settings["issue_reporting"] = dict(DEFAULT_ISSUE_REPORTING)
     if os.path.exists(settings_path):
         try:
             with open(settings_path, "r") as f:
                 saved = json.load(f)
-            settings.update(saved)
+            if isinstance(saved, dict):
+                saved_reporting = saved.get("issue_reporting")
+                settings.update(saved)
+                merged_reporting = dict(DEFAULT_ISSUE_REPORTING)
+                if isinstance(saved_reporting, dict):
+                    merged_reporting.update(saved_reporting)
+                settings["issue_reporting"] = merged_reporting
         except (json.JSONDecodeError, IOError):
             pass
     return settings
@@ -240,6 +254,39 @@ class CopperpourSettingsDialog(wx.Dialog):
         adv_box.Add(self.native_bridge_status, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         main_sizer.Add(adv_box, 0, wx.EXPAND | wx.ALL, 8)
 
+        # ── Issue Reporting section ──────────────────────────────────
+        report_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Issue Reporting (Sentry)")
+        self.issue_reporting_enabled_ctrl = wx.CheckBox(
+            panel,
+            label="Enable issue reporting to Sentry",
+        )
+        self.issue_reporting_enabled_ctrl.Bind(
+            wx.EVT_CHECKBOX, self._on_issue_reporting_toggled
+        )
+        report_box.Add(
+            self.issue_reporting_enabled_ctrl, 0, wx.LEFT | wx.RIGHT | wx.TOP | wx.BOTTOM, 5
+        )
+
+        self.issue_reporting_capture_ctrl = wx.CheckBox(
+            panel,
+            label="Capture crashes and errors locally (ask before sending)",
+        )
+        self.issue_reporting_capture_ctrl.Bind(
+            wx.EVT_CHECKBOX, self._on_issue_reporting_toggled
+        )
+        report_box.Add(
+            self.issue_reporting_capture_ctrl, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5
+        )
+
+        self.issue_reporting_automatic_ctrl = wx.CheckBox(
+            panel,
+            label="Send captured crash and error reports automatically",
+        )
+        report_box.Add(
+            self.issue_reporting_automatic_ctrl, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5
+        )
+        main_sizer.Add(report_box, 0, wx.EXPAND | wx.ALL, 8)
+
         # ── Bottom buttons ───────────────────────────────────────────
         btn_sizer = wx.StdDialogButtonSizer()
         self.save_btn = wx.Button(panel, wx.ID_SAVE, "Save")
@@ -290,9 +337,33 @@ class CopperpourSettingsDialog(wx.Dialog):
             and bool(self.settings.get("native_specctra_bridge", False))
         )
 
+        reporting = self.settings.get("issue_reporting", {})
+        if not isinstance(reporting, dict):
+            reporting = {}
+        enabled = bool(reporting.get("enabled", True))
+        self.issue_reporting_enabled_ctrl.SetValue(enabled)
+        self.issue_reporting_capture_ctrl.SetValue(bool(reporting.get("capture", True)))
+        self.issue_reporting_automatic_ctrl.SetValue(bool(reporting.get("automatic", False)))
+        self._sync_issue_reporting_controls()
+
+    def _sync_issue_reporting_controls(self):
+        enabled = bool(self.issue_reporting_enabled_ctrl.GetValue())
+        capture = bool(self.issue_reporting_capture_ctrl.GetValue())
+        self.issue_reporting_capture_ctrl.Enable(enabled)
+        self.issue_reporting_automatic_ctrl.Enable(enabled and capture)
+
+    def _on_issue_reporting_toggled(self, event):
+        self._sync_issue_reporting_controls()
+
     def _collect_settings(self):
         """Update dialog fields while preserving other settings."""
         settings = dict(self.settings)
+        reporting = dict(settings.get("issue_reporting") or {})
+        reporting.update({
+            "enabled": bool(self.issue_reporting_enabled_ctrl.GetValue()),
+            "capture": bool(self.issue_reporting_capture_ctrl.GetValue()),
+            "automatic": bool(self.issue_reporting_automatic_ctrl.GetValue()),
+        })
         settings.update({
             "kicad_cli": self.kicad_cli_ctrl.GetValue().strip(),
             "ipc_socket_path": self.ipc_ctrl.GetValue().strip(),
@@ -300,6 +371,7 @@ class CopperpourSettingsDialog(wx.Dialog):
             "log_level": LOG_LEVELS[self.log_level_ctrl.GetSelection()],
             "transport": TRANSPORTS[self.transport_ctrl.GetSelection()],
             "native_specctra_bridge": self.native_bridge_ctrl.GetValue(),
+            "issue_reporting": reporting,
         })
         return settings
 

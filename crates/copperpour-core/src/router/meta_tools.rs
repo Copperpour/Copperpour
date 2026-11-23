@@ -367,6 +367,101 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
 
     #[allow(unused_mut)]
     let mut descriptions = descriptions;
+    #[cfg(feature = "issue-reporting")]
+    {
+        descriptions.push(McpToolDescription {
+            name: "report_issue".to_string(),
+            description: "Send a structured Copperpour bug report or feature request to Sentry, or send locally captured pending reports by ID. Always show the user the exact report text or pending payload and get their approval before sending. Server context (Copperpour version, features, OS/arch, KiCad versions, transport, and recent sanitized call summaries without arguments or results) is attached automatically. Paths, usernames, hostnames, and IPs are scrubbed. Returns the Sentry event ID(s)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": [
+                            "wrong_result",
+                            "bad_refusal",
+                            "crash",
+                            "missing_tool",
+                            "missing_argument",
+                            "docs_or_guidance",
+                            "other"
+                        ],
+                        "description": "Issue category (required when not sending pending_ids). missing_tool and missing_argument are tagged as feature_request."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Short summary of the bug or missing capability (required when not sending pending_ids)."
+                    },
+                    "tool": {
+                        "type": "string",
+                        "description": "Tool name involved, if any (required for missing_argument; omit for missing_tool)."
+                    },
+                    "argument": {
+                        "type": "string",
+                        "description": "Missing option/argument name (required for missing_argument)."
+                    },
+                    "capability": {
+                        "type": "string",
+                        "description": "Capability that was needed (required for missing_tool)."
+                    },
+                    "expected": {
+                        "type": "string",
+                        "description": "What was expected."
+                    },
+                    "actual": {
+                        "type": "string",
+                        "description": "What actually happened."
+                    },
+                    "error_kind": {
+                        "type": "string",
+                        "description": "Structured error.kind if the call failed."
+                    },
+                    "workaround": {
+                        "type": "string",
+                        "description": "Workaround used, if any."
+                    },
+                    "pending_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "IDs of locally stored pending reports to send and clear."
+                    },
+                    "always_send": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, persist issue_reporting.automatic = true before sending so future crash/error reports send automatically without asking."
+                    }
+                },
+                "required": []
+            }),
+        });
+        descriptions.push(McpToolDescription {
+            name: "discard_pending_reports".to_string(),
+            description: "Discard locally stored pending crash/error reports without sending them to Sentry. Set never_ask=true to persist issue_reporting.capture = false so future crashes and errors are no longer stored."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pending_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "IDs of pending reports to delete."
+                    },
+                    "all": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Discard all currently pending reports."
+                    },
+                    "never_ask": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, persist issue_reporting.capture = false and stop storing crash/error reports."
+                    }
+                },
+                "required": []
+            }),
+        });
+    }
     #[cfg(unix)]
     {
         if reload_enabled {
@@ -430,6 +525,10 @@ pub async fn handle_meta_tool_with_reload(
         "get_recent_calls" => Some(handle_get_recent_calls(args, ctx).await),
         "server_stats" => Some(handle_server_stats(ctx).await),
         "get_installation_info" => Some(handle_get_installation_info(args, ctx).await),
+        #[cfg(feature = "issue-reporting")]
+        "report_issue" => Some(handle_report_issue(args, ctx).await),
+        #[cfg(feature = "issue-reporting")]
+        "discard_pending_reports" => Some(handle_discard_pending_reports(args, ctx).await),
         #[cfg(unix)]
         "reload_server" if reload.is_enabled() => Some(handle_reload_server(args, reload).await),
         _ => None,
@@ -789,6 +888,357 @@ async fn handle_get_active_toolsets(ctx: &std::sync::Arc<ToolContext>) -> CallTo
         "total_active_tools": result.iter()
             .filter_map(|t| t["tool_count"].as_u64())
             .sum::<u64>()
+    }))
+}
+
+#[cfg(feature = "issue-reporting")]
+async fn handle_report_issue(args: &Value, ctx: &std::sync::Arc<ToolContext>) -> CallToolResult {
+    use crate::issue_reporting::{
+        compiled_features, report_type_for_category, IssueReportPayload, SanitizedCallRecord,
+    };
+
+    let reporter = ctx.issue_reporter();
+    let cfg = reporter.effective_config();
+    if !cfg.enabled {
+        return CallToolResult::error_kind(
+            ToolErrorKind::InvalidConfiguration {
+                path: reporter
+                    .config_file_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                reason: "issue_reporting_disabled".to_string(),
+            },
+            "Issue reporting is disabled (issue_reporting.enabled = false or COPPERPOUR_ISSUE_REPORTING=0). Nothing was sent.",
+        );
+    }
+
+    let always_send = args
+        .get("always_send")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut seen_ids = std::collections::HashSet::new();
+    let pending_ids: Vec<String> = args
+        .get("pending_ids")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .filter(|id| seen_ids.insert((*id).to_string()))
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Branch 1: send pending locally-captured reports by ID.
+    if !pending_ids.is_empty() {
+        let Some(store) = reporter.store() else {
+            return CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: "pending report store unavailable".to_string(),
+                },
+                "Pending report store is unavailable in this environment.",
+            );
+        };
+        let pending = store.list();
+        let mut matched = Vec::new();
+        let mut not_found = Vec::new();
+        for id in &pending_ids {
+            if let Some(report) = pending.iter().find(|r| &r.id == id) {
+                matched.push(report.clone());
+            } else {
+                not_found.push(id.clone());
+            }
+        }
+        if matched.is_empty() {
+            return CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "pending_ids".to_string(),
+                    reason: "none of the requested pending report IDs exist".to_string(),
+                },
+                format!(
+                    "None of the requested pending_ids exist: {}",
+                    not_found.join(", ")
+                ),
+            );
+        }
+
+        let mut config_updated = false;
+        if always_send {
+            if let Err(err) = reporter.enable_always_send() {
+                return CallToolResult::error_kind(
+                    ToolErrorKind::MutationOutcomeUncertain {
+                        operation: "enable_always_send".to_string(),
+                        path: reporter
+                            .resolved_config_path()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                        reason: err.to_string(),
+                    },
+                    format!("Failed to persist issue_reporting.automatic = true: {err}"),
+                );
+            }
+            config_updated = true;
+        }
+
+        let mut sent = Vec::new();
+        let mut sent_ids = Vec::new();
+        for report in &matched {
+            match reporter.send_payload(&report.payload, Some(&report.signature)) {
+                Ok(event_id) => {
+                    sent.push(json!({
+                        "pending_id": report.id,
+                        "event_id": event_id,
+                        "category": report.payload.category,
+                        "report_type": report.payload.report_type,
+                    }));
+                    sent_ids.push(report.id.clone());
+                }
+                Err(err) => {
+                    return CallToolResult::error_kind(
+                        ToolErrorKind::HandlerError {
+                            reason: err.to_string(),
+                        },
+                        format!("Failed to send pending report '{}': {err}", report.id),
+                    );
+                }
+            }
+        }
+
+        if let Err(err) = store.remove(&sent_ids, false) {
+            return CallToolResult::error_kind(
+                ToolErrorKind::MutationOutcomeUncertain {
+                    operation: "clear_pending_reports".to_string(),
+                    path: store.dir().display().to_string(),
+                    reason: err.to_string(),
+                },
+                format!("Sent report(s) to Sentry, but clearing pending files failed: {err}"),
+            );
+        }
+
+        return CallToolResult::json(&json!({
+            "sent": sent,
+            "not_found_ids": not_found,
+            "always_send_enabled": config_updated,
+            "remaining_pending": store.list().len(),
+        }));
+    }
+
+    // Branch 2: file a new report from the agent.
+    let Some(category) = args
+        .get("category")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "category".to_string(),
+                reason: "required when pending_ids is not provided".to_string(),
+            },
+            "Argument 'category' is required when pending_ids is not provided.",
+        );
+    };
+
+    let Some(summary) = args
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "summary".to_string(),
+                reason: "required and must be non-empty".to_string(),
+            },
+            "Argument 'summary' is required and must be non-empty.",
+        );
+    };
+
+    let opt_str = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let tool = opt_str("tool");
+    let argument = opt_str("argument");
+    let capability = opt_str("capability");
+
+    if category == "missing_tool" && capability.is_none() {
+        return CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "capability".to_string(),
+                reason: "required when category is 'missing_tool'".to_string(),
+            },
+            "Argument 'capability' is required when category is 'missing_tool'.",
+        );
+    }
+    if category == "missing_argument" {
+        if tool.is_none() {
+            return CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "tool".to_string(),
+                    reason: "required when category is 'missing_argument'".to_string(),
+                },
+                "Argument 'tool' is required when category is 'missing_argument'.",
+            );
+        }
+        if argument.is_none() {
+            return CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "argument".to_string(),
+                    reason: "required when category is 'missing_argument'".to_string(),
+                },
+                "Argument 'argument' is required when category is 'missing_argument'.",
+            );
+        }
+    }
+
+    let mut config_updated = false;
+    if always_send {
+        if let Err(err) = reporter.enable_always_send() {
+            return CallToolResult::error_kind(
+                ToolErrorKind::MutationOutcomeUncertain {
+                    operation: "enable_always_send".to_string(),
+                    path: reporter
+                        .resolved_config_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    reason: err.to_string(),
+                },
+                format!("Failed to persist issue_reporting.automatic = true: {err}"),
+            );
+        }
+        config_updated = true;
+    }
+
+    let (kicad_version, kicad_cli_version) = ctx.prerequisite_health.cached_kicad_versions();
+    let recent_calls: Vec<SanitizedCallRecord> = ctx
+        .observer
+        .recent(20)
+        .await
+        .iter()
+        .map(SanitizedCallRecord::from)
+        .collect();
+
+    let report_type = report_type_for_category(category);
+    let mut payload = IssueReportPayload {
+        category: category.to_string(),
+        report_type: report_type.to_string(),
+        summary: summary.to_string(),
+        tool,
+        argument,
+        capability,
+        expected: opt_str("expected"),
+        actual: opt_str("actual"),
+        error_kind: opt_str("error_kind"),
+        workaround: opt_str("workaround"),
+        source: "agent".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        features: compiled_features(),
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        kicad_version,
+        kicad_cli_version,
+        transport: reporter.transport_name().to_string(),
+        recent_calls,
+        occurrences: 1,
+    };
+    payload.scrub(&reporter.scrub_context());
+
+    match reporter.send_payload(&payload, None) {
+        Ok(event_id) => CallToolResult::json(&json!({
+            "sent": true,
+            "event_id": event_id,
+            "category": payload.category,
+            "report_type": payload.report_type,
+            "always_send_enabled": config_updated,
+        })),
+        Err(err) => CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: err.to_string(),
+            },
+            format!("Failed to send issue report: {err}"),
+        ),
+    }
+}
+
+#[cfg(feature = "issue-reporting")]
+async fn handle_discard_pending_reports(
+    args: &Value,
+    ctx: &std::sync::Arc<ToolContext>,
+) -> CallToolResult {
+    let reporter = ctx.issue_reporter();
+    let never_ask = args
+        .get("never_ask")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+    let mut seen_ids = std::collections::HashSet::new();
+    let pending_ids: Vec<String> = args
+        .get("pending_ids")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .filter(|id| seen_ids.insert((*id).to_string()))
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !never_ask && !all && pending_ids.is_empty() {
+        return CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "pending_ids".to_string(),
+                reason: "provide pending_ids, all=true, or never_ask=true".to_string(),
+            },
+            "Specify pending_ids, all=true, or never_ask=true.",
+        );
+    }
+
+    let mut config_updated = false;
+    if never_ask {
+        if let Err(err) = reporter.enable_never_ask() {
+            return CallToolResult::error_kind(
+                ToolErrorKind::MutationOutcomeUncertain {
+                    operation: "enable_never_ask".to_string(),
+                    path: reporter
+                        .resolved_config_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    reason: err.to_string(),
+                },
+                format!("Failed to persist issue_reporting.capture = false: {err}"),
+            );
+        }
+        config_updated = true;
+    }
+
+    let clear_all = all || (never_ask && pending_ids.is_empty());
+    let (discarded_ids, not_found_ids, remaining_count) = match reporter.store() {
+        Some(store) => match store.remove(&pending_ids, clear_all) {
+            Ok((removed, not_found)) => (removed, not_found, store.list().len()),
+            Err(err) => {
+                return CallToolResult::error_kind(
+                    ToolErrorKind::MutationOutcomeUncertain {
+                        operation: "discard_pending_reports".to_string(),
+                        path: store.dir().display().to_string(),
+                        reason: err.to_string(),
+                    },
+                    format!("Failed to discard pending reports: {err}"),
+                );
+            }
+        },
+        None => (Vec::new(), pending_ids, 0),
+    };
+
+    CallToolResult::json(&json!({
+        "discarded_ids": discarded_ids,
+        "not_found_ids": not_found_ids,
+        "remaining_count": remaining_count,
+        "never_ask_enabled": config_updated,
     }))
 }
 

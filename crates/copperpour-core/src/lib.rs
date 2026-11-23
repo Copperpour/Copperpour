@@ -7,6 +7,7 @@ pub(crate) mod fab;
 pub mod gates;
 pub mod guidance;
 pub(crate) mod hex;
+pub mod issue_reporting;
 #[cfg(feature = "freerouting")]
 pub(crate) mod java_runtime;
 pub mod kicad_install;

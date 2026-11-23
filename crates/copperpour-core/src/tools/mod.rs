@@ -435,30 +435,20 @@ pub struct ToolContext {
     /// rediscovery, so served tests never touch the host's `/tmp/kicad`.
     #[cfg(all(test, unix))]
     ipc_kicad_dir_override: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// Sentry issue reporter & local pending-report store (#824).
+    #[cfg(feature = "issue-reporting")]
+    issue_reporter: std::sync::RwLock<Arc<crate::issue_reporting::IssueReporter>>,
 }
 
 impl ToolContext {
     /// Construct a context with an in-memory-only observer (no JSONL). Used by
     /// tests and by callers that don't need persistent call logs.
     pub fn new(config: ServerConfig, router: Arc<ToolRouter>) -> Self {
-        install_schematic_editor_owners();
-        ToolContext {
-            config: config.normalized(),
+        Self::new_with_observer(
+            config,
             router,
-            observer: crate::observability::CallObserver::new(None),
-            jlcpcb_cache: QueryCache::default(),
-            viewers: viewer::ViewerRegistry::default(),
-            board_session: board_session::BoardSessionMemory::default(),
-            config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
-            guidance: std::sync::OnceLock::new(),
-            prerequisite_health: Default::default(),
-            ipc_rediscovery: std::sync::atomic::AtomicBool::new(false),
-            ipc_probe_backoff: std::sync::Mutex::new(IpcProbeBackoff::default()),
-            selected_ipc_endpoint: std::sync::Mutex::new(None),
-            opening_board: tokio::sync::Mutex::new(()),
-            #[cfg(all(test, unix))]
-            ipc_kicad_dir_override: std::sync::Mutex::new(None),
-        }
+            crate::observability::CallObserver::new(None),
+        )
     }
 
     /// Construct a context with a specific observer — wired in by `McpHandler`
@@ -469,8 +459,16 @@ impl ToolContext {
         observer: crate::observability::CallObserver,
     ) -> Self {
         install_schematic_editor_owners();
+        let config = config.normalized();
+        #[cfg(feature = "issue-reporting")]
+        let issue_reporter =
+            std::sync::RwLock::new(Arc::new(crate::issue_reporting::IssueReporter::in_memory(
+                crate::issue_reporting::IssueReportingConfig::default(),
+                "unknown".to_string(),
+                config.project_dir.clone(),
+            )));
         ToolContext {
-            config: config.normalized(),
+            config,
             router,
             observer,
             jlcpcb_cache: QueryCache::default(),
@@ -485,7 +483,25 @@ impl ToolContext {
             opening_board: tokio::sync::Mutex::new(()),
             #[cfg(all(test, unix))]
             ipc_kicad_dir_override: std::sync::Mutex::new(None),
+            #[cfg(feature = "issue-reporting")]
+            issue_reporter,
         }
+    }
+
+    #[cfg(feature = "issue-reporting")]
+    pub fn issue_reporter(&self) -> Arc<crate::issue_reporting::IssueReporter> {
+        self.issue_reporter
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[cfg(feature = "issue-reporting")]
+    pub fn set_issue_reporter(&self, reporter: Arc<crate::issue_reporting::IssueReporter>) {
+        *self
+            .issue_reporter
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = reporter;
     }
 
     #[cfg(all(test, unix))]

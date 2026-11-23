@@ -30,6 +30,42 @@ pub trait GuidanceProbe: Send + Sync {
 }
 
 /// Small, always-present rules; full workflows are fetched on demand.
+#[cfg(feature = "issue-reporting")]
+pub const SESSION_RULES: &str = "Copperpour operating rules for KiCad work:\n\
+Route every design modification through Copperpour MCP tools. Never hand-edit \
+.kicad_sch, .kicad_pcb, .kicad_pro, .kicad_sym, .kicad_mod, fp-lib-table or \
+sym-lib-table with text/file tools. Discover tools with list_toolboxes and \
+load_toolset; if the required MCP capability is unavailable, stop and report it \
+instead of editing source files. Prefer tool exports for analysis. PCB IPC \
+operations need the exact board open in KiCad with IPC enabled; saved-file \
+schematic operations do not require the GUI.\n\
+Before mutations, dependent checks, retries or completion claims, read \
+copperpour/references/reliability-contract.md through get_guidance. Bind the \
+requested document and distinguish live-editor evidence from saved files. Await \
+state-changing prerequisites, inspect errors and per-item outcomes, and verify \
+results by readback. A successful call alone is not proof that a change applied \
+or a check ran. After a partial or uncertain mutation, inspect what happened \
+before retrying; do not repeat already-applied work or replace missing evidence \
+with zero findings.\n\
+Use get_guidance with no arguments to list this build's skills and references, \
+then read an exact listed path (start with copperpour/SKILL.md). The same content \
+is available as copperpour://guidance/ resources. Server guidance needs no init \
+or local skill installation; init remains opt-in for native skills and hooks. \
+When initialize instructions or a tool result includes a guidance_notice, you \
+must surface that notice in your reply to the user and ask them to run the \
+reported init command.\n\
+When you hit a Copperpour bug (wrong result, unexplained refusal, crash) or a \
+missing tool/argument, offer to file it via report_issue, showing the user the \
+exact text first and never sending without their approval. When initialize \
+instructions or a tool result includes a pending_reports notice, show the user \
+each report's summary and exact payload and ask them to choose: send \
+(report_issue), discard (discard_pending_reports), always send \
+(report_issue with always_send: true), or never ask \
+(discard_pending_reports with never_ask: true). Never send pending reports \
+without the user's answer.";
+
+/// Small, always-present rules; full workflows are fetched on demand.
+#[cfg(not(feature = "issue-reporting"))]
 pub const SESSION_RULES: &str = "Copperpour operating rules for KiCad work:\n\
 Route every design modification through Copperpour MCP tools. Never hand-edit \
 .kicad_sch, .kicad_pcb, .kicad_pro, .kicad_sym, .kicad_mod, fp-lib-table or \

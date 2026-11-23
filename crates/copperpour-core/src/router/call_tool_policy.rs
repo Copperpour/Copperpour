@@ -386,6 +386,11 @@ pub const READ_ONLY_META_TOOLS: &[&str] = &[
 /// does.
 pub const SESSION_META_TOOLS: &[&str] = &["load_toolset", "unload_toolset"];
 
+/// Meta-tools that send issue reports off the machine or mutate local pending
+/// reports / user config. Neither read-only nor forbidden: `call_tool` reaches
+/// them only with `call_tool_allow_writes` (#824).
+pub const ISSUE_REPORTING_META_TOOLS: &[&str] = &["discard_pending_reports", "report_issue"];
+
 /// Tools `call_tool` never runs, whatever the configuration: itself, since a
 /// nested call would only hide its target one level deeper, and
 /// `reload_server`, which replaces the serving process and asks for its own
@@ -481,6 +486,7 @@ mod tests {
         let lists = [
             set(READ_ONLY_META_TOOLS),
             set(SESSION_META_TOOLS),
+            set(ISSUE_REPORTING_META_TOOLS),
             set(NEVER_THROUGH_CALL_TOOL),
         ];
         let listed: Vec<_> = lists.iter().flatten().copied().collect();
@@ -489,10 +495,16 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name)
             .collect();
-        // `reload_server` is described on Unix only; it is listed everywhere.
+        // `reload_server` is described on Unix only; `report_issue` and
+        // `discard_pending_reports` require the `issue-reporting` feature.
         let mut expected: BTreeSet<String> = listed.iter().map(|name| name.to_string()).collect();
         if !cfg!(unix) {
             expected.remove("reload_server");
+        }
+        if !cfg!(feature = "issue-reporting") {
+            for name in ISSUE_REPORTING_META_TOOLS {
+                expected.remove(*name);
+            }
         }
         assert_eq!(meta, expected);
         let registered = registered();

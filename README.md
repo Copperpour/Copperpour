@@ -72,6 +72,7 @@ directly:
 - **Watch it happen** — a live schematic viewer auto-refreshes as the AI edits
 
 The full tool catalog is documented in [tool-directory.md](tool-directory.md).
+Copperpour can also send scrubbed bug and feature reports to Sentry with your approval (automatic sending is off by default); see [Issue reporting and privacy](docs/CONFIGURATION.md#issue-reporting-and-privacy).
 
 ## How it works
 

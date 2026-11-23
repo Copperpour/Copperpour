@@ -68,3 +68,37 @@ For other server settings, see the
 [configuration reference](KICAD_INTEGRATION.md#configuration). Whether your
 MCP client needs `eager_toolsets` is in
 [Which clients see a loaded toolset](TROUBLESHOOTING.md#which-clients-see-a-loaded-toolset).
+
+## Issue reporting and privacy
+
+Copperpour can send structured bug reports and feature requests to the `copperpour` Sentry project (via the `report_issue` meta-tool) so agents can report bugs or missing capabilities without a GitHub account. Automatic sending is **off by default**: panics, `handler_error`, and `mutation_outcome_uncertain` results are scrubbed and stored locally (`0600` on Unix) in the Copperpour state directory, and the agent asks you before anything is sent.
+
+### What is sent
+
+- Issue category, bug vs. feature-request tag, and the agent's summary/details (which you approve before sending).
+- Server context: Copperpour version (`copperpour@<version>`) and build features, OS/arch, KiCad and `kicad-cli` versions, and MCP transport.
+- Recent sanitized call records: tool name, toolset, status, `error_kind`, and duration.
+- For a captured panic or error: the tool, `error_kind`, the panic location in Copperpour's source, and a fingerprint of the message. The message itself is never stored or sent, because it can name references, nets or files.
+
+### What is never sent
+
+- Design files, file contents, net/reference/value/label names, or tool arguments/results.
+- Absolute filesystem paths (home directories become `~`, project roots become `<project>`, and non-Copperpour path components are dropped).
+- Usernames, hostnames, or IP addresses (`send_default_pii = false`, `server_name` unset).
+
+### Configuration and opt-out
+
+Configure `[issue_reporting]` in your active `config.toml` (or via **Tools → External Plugins → Copperpour** in KiCad):
+
+```toml
+[issue_reporting]
+enabled = true      # master switch (default: true)
+capture = true      # store scrubbed crash/error reports locally and ask (default: true)
+automatic = false   # send captured crash/error reports without asking (default: false)
+```
+
+Environment overrides:
+
+- `COPPERPOUR_ISSUE_REPORTING=0` disables issue reporting completely (no local capture, `report_issue` refuses and sends nothing).
+- `DO_NOT_TRACK=1` forces `automatic = false`.
+- Offline builds (`cargo build --no-default-features`) omit the `issue-reporting` feature, Sentry, and all outbound HTTP client code.
