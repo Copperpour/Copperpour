@@ -1322,7 +1322,7 @@ fn resolve_symbol_pins_inherits_from_base() {
     let pins = resolve_symbol_pins(&root, derived);
     let numbers: Vec<&str> = pins
         .iter()
-        .map(|p| p.find_str("number").unwrap_or(""))
+        .map(|p| p.node.find_str("number").unwrap_or(""))
         .collect();
     assert_eq!(
         pins.len(),
@@ -1493,7 +1493,7 @@ fn resolve_symbol_pins_follows_multilevel_chain() {
     let pins = resolve_symbol_pins(&root, a);
     let numbers: Vec<&str> = pins
         .iter()
-        .map(|p| p.find_str("number").unwrap_or(""))
+        .map(|p| p.node.find_str("number").unwrap_or(""))
         .collect();
     assert_eq!(numbers, vec!["1"], "A→B→C should resolve to C's pin");
 }
@@ -1524,11 +1524,11 @@ fn resolve_symbol_pins_handles_cycle() {
     let pins = resolve_symbol_pins(&root, a);
     let numbers: Vec<&str> = pins
         .iter()
-        .map(|p| p.find_str("number").unwrap_or(""))
+        .map(|p| p.node.find_str("number").unwrap_or(""))
         .collect();
-    // Terminates (no hang); collects A's pin "1" then B's pin "2".
-    assert!(numbers.contains(&"1"), "{numbers:?}");
-    assert!(numbers.contains(&"2"), "{numbers:?}");
+    // Terminates (no hang). KiCad's GetSafeRootSymbol stops at the last
+    // symbol before the cycle, B, and shows its pins only (#712).
+    assert_eq!(numbers, vec!["2"]);
 }
 
 #[test]
@@ -1551,14 +1551,14 @@ fn resolve_symbol_pins_missing_base_falls_back() {
     let pins = resolve_symbol_pins(&root, orphan);
     let numbers: Vec<&str> = pins
         .iter()
-        .map(|p| p.find_str("number").unwrap_or(""))
+        .map(|p| p.node.find_str("number").unwrap_or(""))
         .collect();
     // Missing base: walk stops, returns Orphan's own pin (no panic).
     assert_eq!(numbers, vec!["7"]);
 }
 
 #[test]
-fn resolve_symbol_pins_derived_shadows_base() {
+fn resolve_symbol_pins_takes_a_derived_symbols_pins_from_its_root() {
     let src = "\
 (kicad_symbol_lib
   (symbol \"Base\"
@@ -1580,10 +1580,11 @@ fn resolve_symbol_pins_derived_shadows_base() {
         .find(|s| s.get(1).and_then(|n| n.as_str()) == Some("Derived"))
         .unwrap();
     let pins = resolve_symbol_pins(&root, derived);
-    // Derived's own pin "1" shadows base's pin "1": one pin, derived's name.
+    // KiCad shows a derived symbol's root's pins, never its own
+    // (`LIB_SYMBOL::GetGraphicalPins`, #712): base's pin "1".
     assert_eq!(pins.len(), 1, "{pins:?}");
-    assert_eq!(pins[0].find_str("name"), Some("DERIVED_G"));
-    assert_eq!(pins[0].find_str("number"), Some("1"));
+    assert_eq!(pins[0].name(), "BASE_G");
+    assert_eq!(pins[0].number(), "1");
 }
 
 #[tokio::test]

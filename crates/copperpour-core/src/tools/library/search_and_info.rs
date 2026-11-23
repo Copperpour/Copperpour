@@ -7,6 +7,7 @@ use super::lib_tables::{
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tools::{get_path, require_str, ToolContext};
+use copperpour_schematic_editor::types::fmt_f64;
 use copperpour_sexp::parser::{parse_sexp, SexpNode};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -71,51 +72,254 @@ fn descendants_with_head<'a>(node: &'a SexpNode, head: &str) -> Vec<&'a SexpNode
     out
 }
 
-/// Resolve the effective pins of a symbol, following `(extends "BASE")` so
-/// derived symbols inherit pins from their base. Walks from the most-derived
-/// symbol (`sym_node`) up through each base found among `root`'s top-level
-/// symbols, collecting pin nodes with most-derived precedence (a pin number
-/// declared on a derived symbol shadows the same number on a base). A visited
-/// set guards against cyclic `extends`; a missing base stops the walk
-/// gracefully and returns whatever pins were collected.
-pub(super) fn resolve_symbol_pins<'a>(
-    root: &'a SexpNode,
-    sym_node: &'a SexpNode,
-) -> Vec<&'a SexpNode> {
-    // Build the chain [sym_node, base, base-of-base, ...] (most-derived first).
-    let mut chain: Vec<&SexpNode> = Vec::new();
-    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+/// A library symbol's pin, with the unit and body style its unit sub-symbol
+/// (`NAME_<unit>_<body style>`) gives it; `None` for a unit whose name KiCad
+/// would not read.
+#[derive(Debug)]
+pub(super) struct SymbolPin<'a> {
+    pub(super) node: &'a SexpNode,
+    pub(super) unit: Option<u32>,
+    pub(super) body_style: Option<u32>,
+}
+
+impl SymbolPin<'_> {
+    pub(super) fn number(&self) -> &str {
+        self.node
+            .find("number")
+            .and_then(|n| n.get(1))
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+    }
+
+    pub(super) fn name(&self) -> &str {
+        self.node
+            .find("name")
+            .and_then(|n| n.get(1))
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+    }
+
+    pub(super) fn position(&self) -> (f64, f64) {
+        self.node
+            .find("at")
+            .and_then(|a| Some((a.get_f64(1)?, a.get_f64(2)?)))
+            .unwrap_or((0.0, 0.0))
+    }
+}
+
+/// The symbol whose pins `sym_node` shows. KiCad takes a derived symbol's
+/// pins from the root of its `extends` chain (`LIB_SYMBOL::GetGraphicalPins`,
+/// `eeschema/lib_symbol.cpp`, 10.0.8), found as `GetSafeRootSymbol` finds it:
+/// the last symbol reached before a missing base or a cycle (#712).
+fn pin_owner<'a>(root: &'a SexpNode, sym_node: &'a SexpNode) -> &'a SexpNode {
+    let mut visited = std::collections::HashSet::new();
     let mut current = sym_node;
     while let Some(name) = current.get(1).and_then(|n| n.as_str()) {
-        if !visited.insert(name) {
-            break; // cycle guard: name already seen
-        }
-        chain.push(current);
+        visited.insert(name);
         let Some(base_name) = current.find_str("extends") else {
-            break; // terminal base (no extends)
+            break;
         };
         let Some(base) = root
             .find_all("symbol")
             .into_iter()
             .find(|s| s.get(1).and_then(|n| n.as_str()) == Some(base_name))
         else {
-            break; // missing base — stop gracefully
+            break;
         };
+        if visited.contains(base_name) {
+            break;
+        }
         current = base;
     }
+    current
+}
 
-    // Collect pins most-derived first, dedup by number.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut pins: Vec<&SexpNode> = Vec::new();
-    for sym in &chain {
-        for pin in descendants_with_head(sym, "pin") {
-            let number = pin.find_str("number").unwrap_or("").to_owned();
-            if seen.insert(number) {
-                pins.push(pin);
+/// Every pin `sym_node` shows, in file order (#712): those of its pin owner's
+/// `NAME_<unit>_<body style>` units, and any written directly under it, which
+/// KiCad reads as unit 1, body style 1 (as `edit_symbol_pin` reads them). No
+/// pin is dropped: pins that share a number are each listed.
+pub(super) fn resolve_symbol_pins<'a>(
+    root: &'a SexpNode,
+    sym_node: &'a SexpNode,
+) -> Vec<SymbolPin<'a>> {
+    let owner = pin_owner(root, sym_node);
+    let mut pins = Vec::new();
+    for child in owner.children().unwrap_or(&[]) {
+        match child.head() {
+            Some("pin") => pins.push(SymbolPin {
+                node: child,
+                unit: Some(1),
+                body_style: Some(1),
+            }),
+            Some("symbol") => {
+                let place = child.get(1).and_then(|n| n.as_str()).and_then(|name| {
+                    let mut parts = name.rsplitn(3, '_');
+                    let body_style = parts.next()?.parse().ok()?;
+                    let unit = parts.next()?.parse().ok()?;
+                    parts.next()?;
+                    Some((unit, body_style))
+                });
+                for pin in descendants_with_head(child, "pin") {
+                    pins.push(SymbolPin {
+                        node: pin,
+                        unit: place.map(|p| p.0),
+                        body_style: place.map(|p| p.1),
+                    });
+                }
             }
+            _ => {}
         }
     }
     pins
+}
+
+/// How many pins a pin number stands for, counted as KiCad counts it without
+/// expanding (`CountStackedPinNotation`, `common/string_utils.cpp`, 10.0.8):
+/// one per number of a stacked `[1,3,5-7]`, a run's length for a run, and 1
+/// for anything else, invalid notation included. A run is never expanded, so
+/// `[1-1000000000]` costs no more than `[1-3]`; KiCad sums into an `int`, this
+/// into a `u64` (#712).
+pub(super) fn stacked_pin_count(number: &str) -> u64 {
+    crate::tools::symbol_pins::stacked(number)
+        .iter()
+        .map(|part| match part {
+            crate::tools::symbol_pins::Stacked::One(_) => 1,
+            // `stacked` keeps only runs with first <= last.
+            crate::tools::symbol_pins::Stacked::Run(_, first, last) => {
+                (i128::from(*last) - i128::from(*first) + 1) as u64
+            }
+        })
+        .fold(0, u64::saturating_add)
+}
+
+/// The pin count KiCad gives a symbol (`LIB_SYMBOL::GetPinCount`): its pins in
+/// every unit and in body style 1, a pin of body style 0 included, a stacked
+/// number counting once per pin it stands for (#712).
+fn kicad_pin_count(pins: &[SymbolPin]) -> u64 {
+    pins.iter()
+        .filter(|pin| matches!(pin.body_style, None | Some(0) | Some(1)))
+        .map(|pin| stacked_pin_count(pin.number()))
+        .fold(0, u64::saturating_add)
+}
+
+/// One element of a pin's number for the duplicate check, with what KiCad's
+/// checker sorts it by after the number: body style, unit, and the pin.
+type CheckedPin = (u32, u32, usize);
+
+/// What KiCad's symbol checker reports as duplicate pins (`CheckDuplicatePins`,
+/// `eeschema/symbol_checker.cpp`, 10.0.8): every pin's numbers, stacked ones
+/// expanded, sorted by number, body style and unit; each neighbouring pair of
+/// two pins with one number is reported unless both body styles are set and
+/// differ. Units, positions and jumper settings make no difference (#712).
+///
+/// Runs are compared as intervals, never expanded: each prefix's numbers are
+/// split where a run starts or ends, so the same pins hold every number of a
+/// segment and KiCad's neighbouring pairs are the same throughout it; a pair
+/// is reported once per segment, with the segment as a range. A number that
+/// is not prefix-and-digits as KiCad writes it (no digits, a leading zero) can
+/// only equal itself and is compared as text.
+pub(super) fn duplicate_pin_warnings(pins: &[SymbolPin]) -> Vec<String> {
+    use crate::tools::symbol_pins::{alphanumeric, stacked, Stacked};
+
+    let mut runs: std::collections::BTreeMap<String, Vec<(i64, i64, CheckedPin)>> =
+        std::collections::BTreeMap::new();
+    let mut texts: std::collections::BTreeMap<String, Vec<CheckedPin>> =
+        std::collections::BTreeMap::new();
+    for (index, pin) in pins.iter().enumerate() {
+        let (Some(unit), Some(body_style)) = (pin.unit, pin.body_style) else {
+            continue;
+        };
+        let checked = (body_style, unit, index);
+        for part in stacked(pin.number()) {
+            match part {
+                Stacked::Run(prefix, first, last) => {
+                    runs.entry(prefix).or_default().push((first, last, checked));
+                }
+                Stacked::One(number) => match alphanumeric(&number) {
+                    (prefix, Some(value)) if format!("{prefix}{value}") == number => {
+                        runs.entry(prefix.to_string())
+                            .or_default()
+                            .push((value, value, checked));
+                    }
+                    _ => texts.entry(number).or_default().push(checked),
+                },
+            }
+        }
+    }
+
+    let describe = |shown: &str, index: usize| {
+        let pin = &pins[index];
+        let shown = if pin.number() == shown {
+            shown.to_string()
+        } else {
+            format!("{shown} ({})", pin.number())
+        };
+        let (x, y) = pin.position();
+        format!(
+            "pin {shown} '{}' at ({}, {}) in unit {}, body style {}",
+            pin.name(),
+            fmt_f64(x),
+            fmt_f64(y),
+            pin.unit.unwrap_or_default(),
+            pin.body_style.unwrap_or_default()
+        )
+    };
+    // (sort key, warning): sorted by the first number's text at the end, as
+    // the expanded check sorted its numbers.
+    let mut warnings: Vec<(String, String)> = Vec::new();
+    let mut report = |key: String, shown: String, mut holders: Vec<CheckedPin>| {
+        holders.sort_unstable();
+        let what = if shown.contains('-') {
+            "numbers"
+        } else {
+            "number"
+        };
+        for pair in holders.windows(2) {
+            let ((style_a, _, a), (style_b, _, b)) = (pair[0], pair[1]);
+            if a != b && !(style_a != 0 && style_b != 0 && style_a != style_b) {
+                warnings.push((
+                    key.clone(),
+                    format!(
+                        "duplicate pin {what} {shown}: {} and {}; KiCad's symbol checker reports them",
+                        describe(&shown, a),
+                        describe(&shown, b)
+                    ),
+                ));
+            }
+        }
+    };
+    for (number, holders) in texts {
+        if holders.len() > 1 {
+            report(number.clone(), number, holders);
+        }
+    }
+    for (prefix, entries) in &runs {
+        let mut edges: Vec<i128> = entries
+            .iter()
+            .flat_map(|(first, last, _)| [i128::from(*first), i128::from(*last) + 1])
+            .collect();
+        edges.sort_unstable();
+        edges.dedup();
+        for edge in edges.windows(2) {
+            let (low, high) = (edge[0], edge[1] - 1);
+            let holders: Vec<CheckedPin> = entries
+                .iter()
+                .filter(|(first, last, _)| i128::from(*first) <= low && high <= i128::from(*last))
+                .map(|(_, _, checked)| *checked)
+                .collect();
+            if holders.len() < 2 {
+                continue;
+            }
+            let shown = if low == high {
+                format!("{prefix}{low}")
+            } else {
+                format!("{prefix}{low}-{prefix}{high}")
+            };
+            report(format!("{prefix}{low}"), shown, holders);
+        }
+    }
+    warnings.sort_by(|a, b| a.0.cmp(&b.0));
+    warnings.into_iter().map(|(_, warning)| warning).collect()
 }
 
 /// Search one library body for top-level symbols whose name contains `query`
@@ -782,26 +986,25 @@ pub(super) async fn handle_get_symbol_info(
         }
     };
 
-    // Pins live inside nested unit sub-symbols, so recurse to collect them all.
-    // Derived symbols (`(extends …)`) inherit pins from their base; the helper
-    // walks the extends chain so derived symbols report their inherited pins.
-    let pins: Vec<serde_json::Value> = resolve_symbol_pins(&root, sym_node)
-        .into_iter()
+    // Every pin, each with its unit and body style; a derived symbol shows its
+    // root's pins, as KiCad does (#712).
+    let symbol_pins = resolve_symbol_pins(&root, sym_node);
+    let pins: Vec<serde_json::Value> = symbol_pins
+        .iter()
         .map(|pin| {
-            let pin_type = pin.get(1).and_then(|n| n.as_str()).unwrap_or("");
-            let (px, py) = pin
-                .find("at")
-                .and_then(|a| Some((a.get_f64(1)?, a.get_f64(2)?)))
-                .unwrap_or((0.0, 0.0));
+            let (px, py) = pin.position();
             json!({
-                "number": pin.find("number").and_then(|n| n.get(1)).and_then(|n| n.as_str()).unwrap_or(""),
-                "name": pin.find("name").and_then(|n| n.get(1)).and_then(|n| n.as_str()).unwrap_or(""),
-                "type": pin_type,
+                "number": pin.number(),
+                "name": pin.name(),
+                "type": pin.node.get(1).and_then(|n| n.as_str()).unwrap_or(""),
+                "unit": pin.unit,
+                "body_style": pin.body_style,
                 "x": px,
                 "y": py
             })
         })
         .collect();
+    let warnings = duplicate_pin_warnings(&symbol_pins);
 
     // Properties are direct children of the top-level symbol.
     let mut properties = serde_json::Map::new();
@@ -816,9 +1019,12 @@ pub(super) async fn handle_get_symbol_info(
 
     let mut answer = identity;
     answer["name"] = json!(sym_name);
-    answer["pin_count"] = json!(pins.len());
+    answer["pin_count"] = json!(kicad_pin_count(&symbol_pins));
     answer["pins"] = json!(pins);
     answer["properties"] = json!(properties);
+    if !warnings.is_empty() {
+        answer["warnings"] = json!(warnings);
+    }
     Ok(CallToolResult::text(
         serde_json::to_string(&answer).unwrap(),
     ))

@@ -16,6 +16,9 @@ mod footprint_tests;
 #[cfg(test)]
 mod lib_table_tests;
 #[cfg(test)]
+#[path = "symbol_info_pins_tests.rs"]
+mod symbol_info_pins_tests;
+#[cfg(test)]
 mod symbol_tests;
 
 pub(crate) use footprint_ops::{handle_create_footprint, skip_sexp_token, PadFabricationProperty};
@@ -66,8 +69,9 @@ use lib_tables::{
 };
 #[cfg(test)]
 use search_and_info::{
-    collect_3d_models_in_dir, is_3d_model_file, resolve_symbol_pins, search_footprint_entries,
-    search_lib_symbols, search_response, search_symbol_entries, top_level_symbol_names,
+    collect_3d_models_in_dir, duplicate_pin_warnings, is_3d_model_file, resolve_symbol_pins,
+    search_footprint_entries, search_lib_symbols, search_response, search_symbol_entries,
+    stacked_pin_count, top_level_symbol_names, SymbolPin,
 };
 #[cfg(test)]
 use std::path::{Path, PathBuf};
@@ -591,8 +595,11 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "get_symbol_info",
             "Return detailed information about a schematic symbol: pins, properties, description. \
-             Name it by lib_id through the symbol library tables, or by library_path and \
-             symbol_name in a .kicad_sym file, registered or not.",
+             Every pin is listed with its unit and body_style, as edit_symbol_pin chooses pins; a \
+             derived symbol shows its root's pins. pin_count is KiCad's (every unit, body style \
+             1, a stacked number once per pin), and warnings name the duplicate pins KiCad's \
+             symbol checker reports. Name it by lib_id through the symbol library tables, or by \
+             library_path and symbol_name in a .kicad_sym file, registered or not.",
             json!({
                 "type": "object",
                 "properties": {
