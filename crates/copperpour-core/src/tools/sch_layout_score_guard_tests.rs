@@ -1,28 +1,41 @@
+use super::super::handle_compare_schematic_layout;
 use super::{assert_verdict, handler, ok, rpc, symbol_uuid, McpHandler, Sheet, SPARSE, TOOL};
+use crate::mcp::protocol::ToolContent;
+use crate::router::ToolRouter;
+use crate::tools::{ServerConfig, ToolContext};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 #[derive(Debug, PartialEq)]
-struct SavedInput {
-    files: Vec<(PathBuf, Vec<u8>)>,
+struct SavedFile {
+    name: PathBuf,
+    bytes: Vec<u8>,
     modified: SystemTime,
     #[cfg(unix)]
     inode: (u64, u64),
 }
 
-fn saved_input(sheet: &Sheet) -> SavedInput {
-    let metadata = fs::metadata(&sheet.path).unwrap();
-    SavedInput {
-        files: sheet.files(),
-        modified: metadata.modified().unwrap(),
-        #[cfg(unix)]
-        inode: {
-            use std::os::unix::fs::MetadataExt;
-            (metadata.dev(), metadata.ino())
-        },
-    }
+fn saved_input(sheet: &Sheet) -> Vec<SavedFile> {
+    sheet
+        .files()
+        .into_iter()
+        .map(|(name, bytes)| {
+            let metadata = fs::metadata(sheet.dir.path().join(&name)).unwrap();
+            SavedFile {
+                name,
+                bytes,
+                modified: metadata.modified().unwrap(),
+                #[cfg(unix)]
+                inode: {
+                    use std::os::unix::fs::MetadataExt;
+                    (metadata.dev(), metadata.ino())
+                },
+            }
+        })
+        .collect()
 }
 
 async fn read_only_call(
@@ -127,13 +140,9 @@ async fn replacing_a_symbol_uuid_reports_both_changed_identities() {
 }
 
 async fn assert_invalid_identity(before: &Sheet, after: &Sheet) {
-    assert_blocked(
-        before,
-        after,
-        &[],
-        &["a placed symbol has missing or duplicate identity".into()],
-    )
-    .await;
+    let reasons = ["a placed symbol has missing or duplicate identity".into()];
+    assert_blocked(before, after, &[], &reasons).await;
+    assert_blocked(after, before, &[], &reasons).await;
 }
 
 #[tokio::test]
@@ -348,6 +357,48 @@ async fn a_non_list_removal_approval_argument_is_refused() {
         None,
     )
     .await;
+}
+
+async fn assert_handler_refuses_approvals(approvals: Value, reason: &str) {
+    let baseline = Sheet::input(SPARSE);
+    let sheet = baseline.fork();
+    let before = [saved_input(&baseline), saved_input(&sheet)];
+    let ctx = ToolContext::new(ServerConfig::default(), Arc::new(ToolRouter::new()));
+    let response = handle_compare_schematic_layout(
+        &json!({
+            "baseline": baseline.path,
+            "schematic": sheet.path,
+            "removed_power_symbol_uuids": approvals,
+        }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!([saved_input(&baseline), saved_input(&sheet)], before);
+    assert!(response.is_error);
+    let [ToolContent::Text { text }] = response.content.as_slice() else {
+        panic!("expected a single structured error: {response:?}");
+    };
+    let result: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        result["error"],
+        json!({
+            "kind": "invalid_argument",
+            "field": "removed_power_symbol_uuids",
+            "reason": reason,
+        }),
+        "{result}"
+    );
+}
+
+#[tokio::test]
+async fn the_handler_refuses_an_approval_argument_that_is_not_a_list() {
+    assert_handler_refuses_approvals(json!("not an array"), "expected an array of strings").await;
+}
+
+#[tokio::test]
+async fn the_handler_refuses_an_approval_list_with_a_non_string_entry() {
+    assert_handler_refuses_approvals(json!([123]), "every entry must be a string").await;
 }
 
 #[tokio::test]
