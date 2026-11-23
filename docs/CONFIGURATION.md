@@ -65,4 +65,6 @@ precedence over `KICAD_API_SOCKET` and discovery. See
 for discovery and reconnection behavior.
 
 For other server settings, see the
-[configuration reference](KICAD_INTEGRATION.md#configuration).
+[configuration reference](KICAD_INTEGRATION.md#configuration). Whether your
+MCP client needs `eager_toolsets` is in
+[Which clients see a loaded toolset](TROUBLESHOOTING.md#which-clients-see-a-loaded-toolset).

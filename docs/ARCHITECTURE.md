@@ -120,7 +120,10 @@ crates/copperpour/src/main.rs
 `router/registry.rs` unless `eager_toolsets` requests a complete initial list.
 The latter exists for clients that do not refresh after
 `notifications/tools/list_changed`; the configuration contract is documented
-beside the fields in `crates/copperpour/src/config.rs`.
+beside the fields in `crates/copperpour/src/config.rs`. At `initialize`, a
+client named in `CLIENTS_THAT_CACHE_TOOL_LIST` gets every toolset loaded too.
+Which clients refresh is recorded in
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#which-clients-see-a-loaded-toolset).
 
 ## Server guidance
 

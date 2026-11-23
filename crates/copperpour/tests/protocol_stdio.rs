@@ -699,6 +699,67 @@ fn structured_errors_guide_recovery() {
     assert_eq!(body["error"]["field"], "name");
 }
 
+/// A direct call runs the tool it names or nothing (#60, #53). A known tool
+/// whose toolset is not loaded, and an unknown name one letter off a listed
+/// tool, are refused under the name sent: no toolset loads, no other tool
+/// runs and `tools/list` stays the same. The arguments are ones the real tools
+/// accept; the controls at the end show that each call made by its right name
+/// writes.
+#[test]
+fn a_refused_call_runs_no_other_tool() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sheet = tmp.path().join("unrouted.kicad_sch");
+    let sheet_args = json!({"path": sheet.to_string_lossy()});
+    let project = tmp.path().join("unrouted_project");
+    let project_args = json!({"name": "unrouted_project", "path": project.to_string_lossy()});
+    let mut p = McpProcess::spawn();
+    let before = listed_tools(&mut p);
+    assert!(before.iter().any(|name| name == "create_project"));
+    assert!(!before.iter().any(|name| name == "create_schematic"));
+
+    // Known tool, toolset not loaded.
+    let lines = p.call_tool_then_fence("create_schematic", sheet_args.clone());
+    let r = fenced_result(&lines);
+    assert_eq!(r["isError"], json!(true), "{r}");
+    let body = McpProcess::tool_body(&r);
+    assert_eq!(body["error"]["kind"], "toolset_not_loaded", "{body}");
+    assert_eq!(body["error"]["tool"], "create_schematic", "{body}");
+    assert_eq!(body["error"]["toolset"], "sch_hierarchy", "{body}");
+    assert_eq!(list_changed_count(&lines), 0, "{lines:#?}");
+    assert!(!sheet.exists(), "a refused call wrote {sheet:?}");
+
+    // Unknown name beside the listed create_project: no nearest match runs.
+    let lines = p.call_tool_then_fence("create_projects", project_args.clone());
+    let r = fenced_result(&lines);
+    assert_eq!(r["isError"], json!(true), "{r}");
+    let body = McpProcess::tool_body(&r);
+    assert_eq!(body["error"]["kind"], "unknown_tool", "{body}");
+    assert_eq!(body["error"]["tool"], "create_projects", "{body}");
+    assert_eq!(list_changed_count(&lines), 0, "{lines:#?}");
+    assert!(!project.exists(), "a refused call wrote {project:?}");
+
+    assert_eq!(listed_tools(&mut p), before, "tools/list changed");
+    // Each refusal is logged under the name sent, newest first.
+    let recent = McpProcess::tool_body(&p.call_tool("get_recent_calls", json!({"limit": 2})));
+    let calls = &recent["calls"];
+    assert_eq!(calls[0]["tool"], "create_projects", "{recent}");
+    assert_eq!(calls[0]["status"], "not_found", "{recent}");
+    assert_eq!(calls[0]["error_kind"], "unknown_tool", "{recent}");
+    assert_eq!(calls[1]["tool"], "create_schematic", "{recent}");
+    assert_eq!(calls[1]["status"], "not_found", "{recent}");
+    assert_eq!(calls[1]["error_kind"], "toolset_not_loaded", "{recent}");
+
+    // Controls: the same arguments under the right names write.
+    let created = p.call_tool("create_project", project_args);
+    assert_ne!(created["isError"], json!(true), "{created}");
+    assert!(project.join("unrouted_project.kicad_pro").exists());
+    let loaded = p.call_tool("load_toolset", json!({"name": "sch_hierarchy"}));
+    assert_ne!(loaded["isError"], json!(true), "{loaded}");
+    let direct = p.call_tool("create_schematic", sheet_args);
+    assert_ne!(direct["isError"], json!(true), "{direct}");
+    assert!(sheet.exists());
+}
+
 #[test]
 fn unknown_method_is_json_rpc_error_not_crash() {
     let mut p = McpProcess::spawn();

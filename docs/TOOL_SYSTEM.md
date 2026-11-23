@@ -37,7 +37,9 @@ accepts either one name or an array; a successful change causes
 5. Otherwise return `unknown_tool`.
 
 This distinction lets a client recover from an unloaded tool without confusing
-it with a misspelled or removed public API.
+it with a misspelled or removed public API. Neither refusal runs another tool.
+Which clients see tools loaded after their first `tools/list` is recorded in
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#which-clients-see-a-loaded-toolset).
 
 ### `call_tool`
 
