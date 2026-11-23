@@ -81,6 +81,11 @@ impl McpProcess {
             if isolate_home {
                 command.env("HOME", dir);
                 command.env("APPDATA", dir);
+                let state_overridden = env.iter().any(|(k, _)| *k == "COPPERPOUR_STATE_DIR")
+                    || removed_env.contains(&"COPPERPOUR_STATE_DIR");
+                if !state_overridden {
+                    command.env("COPPERPOUR_STATE_DIR", dir.join(".copperpour-state"));
+                }
             }
         }
         let mut child = command

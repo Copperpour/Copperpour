@@ -136,16 +136,16 @@ jobs:
       - name: No HTTP client, catalog or archive crate in the dependency tree
         run: |
           found=$(cargo tree -p copperpour --locked --no-default-features -e normal --prefix none --format '{p}' \
-            | grep -E '^(reqwest|rusqlite|libsqlite3-sys|zip|rustls|hyper-rustls|hyper-tls|native-tls|openssl) ' | sort -u || true)
+            | grep -E '^(sentry|reqwest|rusqlite|libsqlite3-sys|zip|rustls|hyper-rustls|hyper-tls|native-tls|openssl) ' | sort -u || true)
           if [ -n "$found" ]; then echo "$found"; exit 1; fi
       - name: No vendor hosts in the binaries
         run: |
-          found=$(grep -a -o -i -h -E '[a-z0-9.-]*(lcsc|jlcpcb|easyeda|lceda)\.(com|cn)' \
+          found=$(grep -a -o -i -h -E '[a-z0-9.-]*(lcsc|jlcpcb|easyeda|lceda)\.(com|cn)|[a-z0-9.-]*sentry\.io' \
             target/debug/copperpour target/debug/libcopperpour_plugin.so | sort -u || true)
           if [ -n "$found" ]; then echo "$found"; exit 1; fi
       - name: Each integration builds on its own
         run: |
-          for feature in jlcpcb freerouting native-bridge; do
+          for feature in jlcpcb freerouting native-bridge issue-reporting; do
             cargo check -p copperpour --locked --no-default-features --features "$feature"
           done
 

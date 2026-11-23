@@ -66,6 +66,19 @@ Never delete locks/endpoints, relax permissions, overwrite config files, termina
 
 For scenario-specific playbooks (CLI/binary/guidance drift, IPC/endpoints/`AS_NOT_READY`, viewer URLs, missing client tools, invalid config, locks, divergent journals, `unsafe_file_fallback`, `ipc_outcome_unknown`, `mutation_outcome_uncertain`) and worked examples, read [the troubleshooting reference](references/troubleshooting.md) (`copperpour/references/troubleshooting.md` via `get_guidance`).
 
+## Reporting Copperpour Issues
+
+When you encounter a Copperpour bug (`wrong_result`, `bad_refusal`, `crash`, `docs_or_guidance`) or a missing capability (`missing_tool`, `missing_argument`), offer to report it via `report_issue` (no GitHub account needed). Always show the user the exact free-text summary/details first and **never send without the user's approval**.
+
+When `initialize` instructions or a tool result includes a `pending_reports` notice (locally captured panics, `handler_error`, or `mutation_outcome_uncertain` results), show the user each report's summary and exact payload and ask them to choose one of all four options:
+
+1. **Send**: `report_issue(pending_ids: [...])` — sends the reports and returns their Sentry event IDs.
+2. **Discard**: `discard_pending_reports(pending_ids: [...])` — deletes them without sending.
+3. **Always send**: `report_issue(pending_ids: [...], always_send: true)` — sets `issue_reporting.automatic = true` and sends these; future crash/error reports send automatically without storing.
+4. **Never ask**: `discard_pending_reports(pending_ids: [...], never_ask: true)` — sets `issue_reporting.capture = false` and stops storing crash/error reports.
+
+Never send pending reports without the user's answer. If the user does not choose, leave them pending for the next session without asking again in the same session.
+
 ## Decision Tree
 
 | User Request | Channel | Tool / Action |

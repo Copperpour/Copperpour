@@ -52,9 +52,11 @@ def _ensure_stubs():
     wx.LEFT = 16
     wx.RIGHT = 32
     wx.BOTTOM = 64
+    wx.TOP = 128
     wx.VERTICAL = 1
     wx.HORIZONTAL = 2
     wx.EVT_BUTTON = object()
+    wx.EVT_CHECKBOX = object()
 
     class _Window:
         def __init__(self, title=""):
@@ -102,6 +104,7 @@ def _ensure_stubs():
         def __init__(self, *a, **k):
             self._val = ""
             self._sel = 0
+            self._enabled = True
 
         def SetValue(self, val):
             self._val = val
@@ -116,7 +119,10 @@ def _ensure_stubs():
             return self._sel
 
         def Enable(self, en):
-            pass
+            self._enabled = bool(en)
+
+        def IsEnabled(self):
+            return self._enabled
 
         def Bind(self, *a, **k):
             pass
@@ -247,6 +253,39 @@ class SettingsDialogFocusTests(unittest.TestCase):
         self.wx.MessageBox.assert_called_once()
         _args, kwargs = self.wx.MessageBox.call_args
         self.assertIs(kwargs.get("parent"), dlg, "wx.MessageBox must be parented to the dialog")
+
+    def test_issue_reporting_defaults_roundtrip_and_toggle(self):
+        with tempfile.TemporaryDirectory() as plugin_dir:
+            settings_path = Path(plugin_dir) / "settings.json"
+            dlg = self.dialog_mod.CopperpourSettingsDialog(parent=None, plugin_dir=plugin_dir)
+            self.assertTrue(dlg.issue_reporting_enabled_ctrl.GetValue())
+            self.assertTrue(dlg.issue_reporting_capture_ctrl.GetValue())
+            self.assertFalse(dlg.issue_reporting_automatic_ctrl.GetValue())
+            self.assertTrue(dlg.issue_reporting_capture_ctrl.IsEnabled())
+            self.assertTrue(dlg.issue_reporting_automatic_ctrl.IsEnabled())
+
+            dlg.issue_reporting_enabled_ctrl.SetValue(False)
+            dlg._on_issue_reporting_toggled(None)
+            self.assertFalse(dlg.issue_reporting_capture_ctrl.IsEnabled())
+            self.assertFalse(dlg.issue_reporting_automatic_ctrl.IsEnabled())
+
+            dlg.issue_reporting_enabled_ctrl.SetValue(True)
+            dlg._on_issue_reporting_toggled(None)
+            dlg.issue_reporting_capture_ctrl.SetValue(False)
+            dlg._on_issue_reporting_toggled(None)
+            self.assertFalse(dlg.issue_reporting_automatic_ctrl.IsEnabled())
+
+            dlg.issue_reporting_capture_ctrl.SetValue(True)
+            dlg._on_issue_reporting_toggled(None)
+            self.assertTrue(dlg.issue_reporting_automatic_ctrl.IsEnabled())
+            dlg.issue_reporting_automatic_ctrl.SetValue(True)
+            dlg._on_save(None)
+
+            persisted = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["issue_reporting"],
+                {"enabled": True, "capture": True, "automatic": True},
+            )
 
     def test_plugin_applies_saved_bridge_setting_after_dialog_closes(self):
         bridge = mock.Mock()
