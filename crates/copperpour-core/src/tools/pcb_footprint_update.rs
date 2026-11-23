@@ -1,6 +1,6 @@
 use super::library::PadFabricationProperty;
 use super::library_footprint::{
-    apply_pad_margins, apply_reference_points, carries_kicad_10_0_7_fields,
+    apply_pad_margins, apply_reference_points, carries_kicad_10_0_7_fields, carries_net_ties,
     default_thermal_spoke_angle, fab_property, needs_kicad_10_0_7_summary, pad_margins, pad_zones,
     points, validate_supported_children, LibraryPoint, PadZoneSettings, SolderMargins,
 };
@@ -43,6 +43,9 @@ struct LibraryFootprint {
     margins: SolderMargins,
     graphics: Vec<copperpour_ipc::IpcGraphicDefinition>,
     points: Vec<LibraryPoint>,
+    /// The footprint's net-tie pad groups, which a refresh takes, as KiCad's
+    /// `ExchangeFootprint` keeps the new footprint's (#85).
+    net_ties: Vec<kiapi::board::types::NetTieDefinition>,
     models: Vec<kiapi::board::types::Footprint3DModel>,
 }
 
@@ -65,6 +68,8 @@ enum ChangedDomain {
     Models,
     TextEffects,
     ClearanceOverrides,
+    /// The footprint's net-tie pad groups: which pads it may short (#85).
+    NetTies,
 }
 
 #[derive(Debug)]
@@ -289,6 +294,9 @@ struct PlannedUpdate {
     preserved: PreservedState,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     text_effects: Vec<FieldEffectsChange>,
+    /// Not reported; the apply holds the board to them when it changes them.
+    #[serde(skip)]
+    net_ties: Vec<kiapi::board::types::NetTieDefinition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -483,13 +491,43 @@ pub(crate) async fn handle_update_footprints_from_library(
                 // KiCad may drop a text attribute it does not take over IPC,
                 // so the reset is proven against the board, not the request.
                 let missing = match client
-                    .get_items_in(readback_document, ObjectType::KotPcbFootprint)
+                    .get_items_in(readback_document.clone(), ObjectType::KotPcbFootprint)
                 {
                     Ok(footprints) => text_effects_not_held(&footprints, &plan.changes),
                     Err(error) => vec![format!("the board could not be read back: {error:#}")],
                 };
                 if !missing.is_empty() {
                     return Ok(text_effects_uncertain(&ipc_board_path, &missing));
+                }
+            }
+            if plan
+                .changes
+                .iter()
+                .any(|change| change.changed_domains.contains(&ChangedDomain::NetTies))
+            {
+                // Which pads a footprint may short is proven against the
+                // board too: a KiCad that dropped the groups would otherwise
+                // report a refresh that changed nothing (#85).
+                let reason = match client
+                    .get_items_in(readback_document, ObjectType::KotPcbFootprint)
+                {
+                    Ok(footprints) => {
+                        let missing = net_ties_not_held(&footprints, &plan.changes);
+                        (!missing.is_empty()).then(|| {
+                            format!(
+                                "the board read after the commit does not hold the library's \
+                                 net-tie pad groups on {}",
+                                missing.join(", ")
+                            )
+                        })
+                    }
+                    Err(error) => Some(format!(
+                        "the board could not be read back to check its net-tie pad groups: \
+                         {error:#}"
+                    )),
+                };
+                if let Some(reason) = reason {
+                    return Ok(uncertain_after_commit(&ipc_board_path, reason));
                 }
             }
             plan.coverage.selected.applied = plan.coverage.selected.planned;
@@ -821,10 +859,18 @@ fn plan_response(plan: &UpdatePlan, applied: bool) -> CallToolResult {
 }
 
 fn text_effects_uncertain(board: &Path, missing: &[String]) -> CallToolResult {
-    let reason = format!(
-        "the board read after the commit does not hold the reset text effects of {}",
-        missing.join(", ")
-    );
+    uncertain_after_commit(
+        board,
+        format!(
+            "the board read after the commit does not hold the reset text effects of {}",
+            missing.join(", ")
+        ),
+    )
+}
+
+/// The update KiCad committed, though `reason` keeps the board from proving
+/// it applied.
+fn uncertain_after_commit(board: &Path, reason: String) -> CallToolResult {
     CallToolResult::error_kind(
         crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain {
             operation: "update_footprints_from_library".to_string(),
@@ -1141,6 +1187,20 @@ fn plan_updates(
             });
             continue;
         }
+        // KiCad 10.0.0 would keep each group as one pad named by all of
+        // them, and its readback would not show it (`carries_net_ties`).
+        if !library.net_ties.is_empty() && !carries_net_ties(kicad) {
+            diagnostics.push(UpdateDiagnostic {
+                code: "unsupported_library_footprint".to_string(),
+                message: format!(
+                    "footprint '{}' has net-tie pad groups, which KiCad's API carries only from \
+                     KiCad 10.0.1; this KiCad is {}",
+                    candidate.library_id, kicad.full_version
+                ),
+                reference: Some(candidate.reference),
+            });
+            continue;
+        }
         let prepared = match build_updated_instance(
             &candidate.instance,
             &library,
@@ -1180,6 +1240,7 @@ fn plan_updates(
                 changed_domains: prepared.changed_domains,
                 preserved: prepared.preserved,
                 text_effects: prepared.text_effects,
+                net_ties: library.net_ties.clone(),
             });
             prepared_items.push(prepared.item);
         }
@@ -1235,6 +1296,7 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     let pad_margins = pad_margins(&root, &pad_nodes)?;
     let margins = SolderMargins::of_footprint(&root)?;
     let points = points(&root)?;
+    let net_ties = super::library_footprint::net_ties(&root)?;
     // Custom properties travel as typed Field items below. Treating visible
     // properties as generic graphics as well would duplicate their text.
     let graphics = super::pcb_components::extract_graphic_definitions_without_properties(source)?;
@@ -1265,6 +1327,7 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         margins,
         graphics,
         points,
+        net_ties,
         models,
     })
 }
@@ -1290,6 +1353,13 @@ impl ReplacementFootprint {
     /// the refresh refuses it on an older KiCad.
     pub(crate) fn needs_kicad_10_0_7(&self) -> Option<&'static str> {
         self.0.needs_kicad_10_0_7()
+    }
+
+    /// Whether the footprint has net-tie pad groups, which KiCad's API
+    /// carries only from 10.0.1, as the refresh refuses them on an older
+    /// KiCad.
+    pub(crate) fn has_net_ties(&self) -> bool {
+        !self.0.net_ties.is_empty()
     }
 }
 
@@ -1495,6 +1565,9 @@ fn build_updated_instance(
         .definition
         .context("typed footprint builder returned no definition")?;
     definition.attributes = library.definition.attributes.clone();
+    // The library's groups, as KiCad's `ExchangeFootprint` keeps the new
+    // footprint's and copies none from the old one.
+    definition.net_ties = library.net_ties.clone();
     definition.reference_field = current_definition.reference_field.clone();
     definition.value_field = current_definition.value_field.clone();
     definition.datasheet_field = current_definition.datasheet_field.clone();
@@ -1773,6 +1846,29 @@ fn text_effects_not_held(
         }
     }
     missing
+}
+
+/// The references of the footprints whose net-tie pad groups the update
+/// changes and the board read after the commit does not hold as sent, the
+/// footprints found by KIID, which the update keeps.
+fn net_ties_not_held(footprints: &[prost_types::Any], changes: &[PlannedUpdate]) -> Vec<String> {
+    let read: BTreeMap<String, kiapi::board::types::FootprintInstance> = footprints
+        .iter()
+        .filter_map(|item| {
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).ok()
+        })
+        .filter_map(|instance| Some((instance.id.as_ref()?.value.clone(), instance)))
+        .collect();
+    changes
+        .iter()
+        .filter(|change| change.changed_domains.contains(&ChangedDomain::NetTies))
+        .filter(|change| {
+            read.get(&change.kiid)
+                .and_then(|instance| instance.definition.as_ref())
+                .is_none_or(|definition| definition.net_ties != change.net_ties)
+        })
+        .map(|change| change.reference.clone())
+        .collect()
 }
 
 /// Equal at KiCad's nm resolution, with angles compared modulo 360° (modulo
@@ -2119,6 +2215,12 @@ fn changed_domains(
         != normalized_overrides(updated.overrides.as_ref())
     {
         changed.insert(ChangedDomain::ClearanceOverrides);
+    }
+    // Compared in order, groups and pad numbers alike: KiCad's library
+    // check compares each group's text in turn
+    // (`drc_test_provider_library_parity.cpp`).
+    if current_definition.net_ties != updated_definition.net_ties {
+        changed.insert(ChangedDomain::NetTies);
     }
     Ok(changed)
 }
@@ -5904,6 +6006,7 @@ mod tests {
             changed_domains: prepared.changed_domains.clone(),
             preserved: prepared.preserved.clone(),
             text_effects: prepared.text_effects.clone(),
+            net_ties: Vec::new(),
         };
         let unchanged = builders::pack_any(&applied, "kiapi.board.types.FootprintInstance");
         assert_eq!(
@@ -8253,6 +8356,322 @@ mod tests {
                 ..rotated_180
             }
         ));
+    }
+
+    // ─── #85: net-tie pad groups ────────────────────────────────────────────
+
+    /// KiCad 10.0.8's stock three-pad net tie (`net_tie_kicad10.README.md`).
+    const NET_TIE_3_THT: &str =
+        include_str!("../../tests/fixtures/net_tie_3_tht_pad0.3mm_kicad10.kicad_mod");
+    const NET_TIE_3_THT_ID: &str = "NetTie:NetTie-3_THT_Pad0.3mm";
+    /// `NET_TIE_3_THT`'s group, as KiCad writes it.
+    const NET_TIE_3_CLAUSE: &str = "(net_tie_pad_groups \"1, 2, 3\")";
+
+    /// `NET_TIE_3_THT` with `clause` for its group.
+    fn net_tie_3_with(clause: &str) -> String {
+        assert!(
+            NET_TIE_3_THT.contains(NET_TIE_3_CLAUSE),
+            "the edit must land"
+        );
+        NET_TIE_3_THT.replace(NET_TIE_3_CLAUSE, clause)
+    }
+
+    /// Each net-tie group `instance` holds, as pad numbers.
+    fn tie_groups(instance: &kiapi::board::types::FootprintInstance) -> Vec<Vec<String>> {
+        instance
+            .definition
+            .as_ref()
+            .unwrap()
+            .net_ties
+            .iter()
+            .map(|group| group.pad_number.clone())
+            .collect()
+    }
+
+    /// `current_instance` on `layer` as NT1, linked to the stock net tie but
+    /// with none of its content or groups yet.
+    fn net_tie_current(
+        layer: kiapi::board::types::BoardLayer,
+    ) -> kiapi::board::types::FootprintInstance {
+        let mut current = current_instance(layer);
+        current.reference_field = Some(field("Reference", "NT1", 101.0, 48.0, true));
+        let definition = current.definition.as_mut().unwrap();
+        definition.reference_field = current.reference_field.clone();
+        definition.id = Some(kiapi::common::types::LibraryIdentifier {
+            library_nickname: "NetTie".to_string(),
+            entry_name: "NetTie-3_THT_Pad0.3mm".to_string(),
+        });
+        current
+    }
+
+    /// `current` refreshed from `source` as the stock net tie: the update and
+    /// the domains the plan reports.
+    fn net_tie_refresh(
+        current: &kiapi::board::types::FootprintInstance,
+        source: &str,
+    ) -> (
+        kiapi::board::types::FootprintInstance,
+        BTreeSet<ChangedDomain>,
+    ) {
+        let library = parse_library_footprint(NET_TIE_3_THT_ID, source).unwrap();
+        let prepared = build_updated_instance(
+            current,
+            &library,
+            two_layers(),
+            &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
+            &BTreeSet::new(),
+            Resets::default(),
+        )
+        .unwrap();
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        (updated, prepared.changed_domains)
+    }
+
+    /// NT1 on `layer` once a refresh from the stock net tie is applied.
+    fn placed_net_tie(
+        layer: kiapi::board::types::BoardLayer,
+    ) -> kiapi::board::types::FootprintInstance {
+        net_tie_refresh(&net_tie_current(layer), NET_TIE_3_THT).0
+    }
+
+    /// The refresh reads the library's group and gives it to the placed
+    /// footprint on either side; a footprint without it plans `net_ties`.
+    #[test]
+    fn a_refresh_takes_the_librarys_net_ties_on_either_side() {
+        use kiapi::board::types::BoardLayer;
+        let library = parse_library_footprint(NET_TIE_3_THT_ID, NET_TIE_3_THT).unwrap();
+        assert_eq!(library.net_ties.len(), 1);
+        assert_eq!(library.net_ties[0].pad_number, ["1", "2", "3"]);
+        for layer in [BoardLayer::BlFCu, BoardLayer::BlBCu] {
+            let current = net_tie_current(layer);
+            assert!(tie_groups(&current).is_empty());
+            let (updated, changed) = net_tie_refresh(&current, NET_TIE_3_THT);
+            assert!(
+                changed.contains(&ChangedDomain::NetTies),
+                "{layer:?}: {changed:?}"
+            );
+            assert_eq!(tie_groups(&updated), [vec!["1", "2", "3"]], "{layer:?}");
+        }
+    }
+
+    /// A refresh straight after one from the same library changes nothing, on
+    /// either side: the groups compare as they were sent.
+    #[test]
+    fn a_net_tie_refreshed_from_an_unchanged_library_plans_no_change() {
+        use kiapi::board::types::BoardLayer;
+        for layer in [BoardLayer::BlFCu, BoardLayer::BlBCu] {
+            let placed = placed_net_tie(layer);
+            let (_, changed) = net_tie_refresh(&placed, NET_TIE_3_THT);
+            assert!(changed.is_empty(), "{layer:?}: {changed:?}");
+        }
+    }
+
+    /// A library whose group loses a pad, is reordered, is split or is gone
+    /// plans `net_ties` alone, and the update carries the library's groups.
+    /// Order counts: KiCad's library check compares each group's text.
+    #[test]
+    fn a_changed_net_tie_group_plans_net_ties_alone() {
+        let placed = placed_net_tie(kiapi::board::types::BoardLayer::BlFCu);
+        for (clause, expected) in [
+            ("(net_tie_pad_groups \"1, 2\")", vec![vec!["1", "2"]]),
+            (
+                "(net_tie_pad_groups \"3, 2, 1\")",
+                vec![vec!["3", "2", "1"]],
+            ),
+            (
+                "(net_tie_pad_groups \"1, 2\" \"3\")",
+                vec![vec!["1", "2"], vec!["3"]],
+            ),
+            ("", vec![]),
+        ] {
+            let (updated, changed) = net_tie_refresh(&placed, &net_tie_3_with(clause));
+            assert_eq!(
+                changed,
+                BTreeSet::from([ChangedDomain::NetTies]),
+                "{clause}"
+            );
+            assert_eq!(tie_groups(&updated), expected, "{clause}");
+        }
+    }
+
+    /// KiCad 10.0.8's report of the stock Antenova antenna it placed
+    /// (`issue_300_ipc.README.md`) holds the group a refresh from its library
+    /// sends, so the groups plan no change. Its keepout zone, which the
+    /// refresh still refuses, is left out of the library here.
+    #[test]
+    fn kicad_reports_a_placed_net_tie_as_the_refresh_builds_it() {
+        let source =
+            include_str!("../../tests/fixtures/issue_300_antenova_sr4g013_kicad10.kicad_mod");
+        let start = source.find("\t(zone\n").unwrap();
+        let end = start + source[start..].find("\n\t)\n").unwrap() + "\n\t)\n".len();
+        let without_zone = format!("{}{}", &source[..start], &source[end..]);
+        assert!(!without_zone.contains("\t(zone\n"));
+        let (current, updated, changed) =
+            issue_300_refresh_of(issue_300_capture("U8"), &without_zone);
+        assert_eq!(tie_groups(&current), [vec!["1", "2"]]);
+        assert_eq!(tie_groups(&updated), tie_groups(&current));
+        assert!(!changed.contains(&ChangedDomain::NetTies), "{changed:?}");
+    }
+
+    /// KiCad 10.0.0 would keep each group as one pad, so the plan refuses a
+    /// library footprint with net ties there before preparing anything, and
+    /// lets it through from 10.0.1. A footprint without them is not held to
+    /// it.
+    #[test]
+    fn kicad_10_0_0_refuses_a_net_tie_refresh() {
+        let plan = plan_on(&kicad(10, 0, 0), NET_TIE_3_THT_ID, NET_TIE_3_THT);
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.prepared_items.is_empty());
+        assert_eq!(plan.diagnostics.len(), 1, "{:?}", plan.diagnostics);
+        let diagnostic = &plan.diagnostics[0];
+        assert_eq!(diagnostic.code, "unsupported_library_footprint");
+        assert_eq!(diagnostic.reference.as_deref(), Some("U1"));
+        assert_eq!(
+            diagnostic.message,
+            "footprint 'NetTie:NetTie-3_THT_Pad0.3mm' has net-tie pad groups, which KiCad's \
+             API carries only from KiCad 10.0.1; this KiCad is 10.0.0"
+        );
+        for version in [kicad(10, 0, 1), kicad(10, 0, 6), kicad(10, 0, 8)] {
+            let plan = plan_on(&version, NET_TIE_3_THT_ID, NET_TIE_3_THT);
+            assert!(
+                plan.diagnostics.is_empty(),
+                "{}: {:?}",
+                version.full_version,
+                plan.diagnostics
+            );
+            assert_eq!(plan.status, PlanStatus::Ready, "{}", version.full_version);
+            assert!(plan.changes[0]
+                .changed_domains
+                .contains(&ChangedDomain::NetTies));
+        }
+        let plan = plan_on(&kicad(10, 0, 0), "Test:Socket", KICAD_LIBRARY_FOOTPRINT);
+        assert!(
+            plan.diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("10.0.1")),
+            "{:?}",
+            plan.diagnostics
+        );
+    }
+
+    /// A group the refresh could not send as the library writes it refuses
+    /// the footprint before anything is prepared, naming why; Update PCB's
+    /// replacement reads it the same way.
+    #[test]
+    fn a_malformed_net_tie_group_refuses_the_refresh() {
+        let plan = plan_on(
+            &kicad_10_0_8(),
+            NET_TIE_3_THT_ID,
+            &net_tie_3_with("(net_tie_pad_groups \"1, 4\")"),
+        );
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.prepared_items.is_empty());
+        assert_eq!(plan.diagnostics.len(), 1, "{:?}", plan.diagnostics);
+        assert_eq!(plan.diagnostics[0].code, "unsupported_library_footprint");
+        assert!(
+            plan.diagnostics[0].message.contains("names pad '4'"),
+            "{}",
+            plan.diagnostics[0].message
+        );
+        assert!(ReplacementFootprint::parse(
+            NET_TIE_3_THT_ID,
+            &net_tie_3_with("(net_tie_pad_groups \"1,2\")")
+        )
+        .is_err());
+    }
+
+    /// A board holding NT1 placed from the stock net tie, beside a library
+    /// holding `library` as that footprint, served by a KiCad of `version`
+    /// that keeps what it is sent when `keeps_updates`.
+    fn net_tie_mock(
+        library: &str,
+        version: (u32, u32, u32),
+        keeps_updates: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf, PlannerMock) {
+        let (temp, board) = library_project("NetTie", "NetTie-3_THT_Pad0.3mm", library);
+        let placed = builders::pack_any(
+            &placed_net_tie(kiapi::board::types::BoardLayer::BlFCu),
+            "kiapi.board.types.FootprintInstance",
+        );
+        let mock = spawn_planner_mock_on(&board, vec![placed], false, keeps_updates, version);
+        (temp, board, mock)
+    }
+
+    #[tokio::test]
+    async fn served_dry_run_of_a_placed_net_tie_is_noop_and_kicad_10_0_0_refuses_it() {
+        for (version, status) in [
+            ((10, 0, 8), "noop"),
+            ((10, 0, 1), "noop"),
+            ((10, 0, 0), "conflict"),
+        ] {
+            let (_temp, board, mock) = net_tie_mock(NET_TIE_3_THT, version, true);
+            let handler = served(mock.kicad.address()).await;
+            let body =
+                result_json(&served_call(&handler, serde_json::json!({ "board": board })).await);
+            assert_eq!(body["status"], status, "{version:?}: {body}");
+            if status == "noop" {
+                assert_eq!(body["coverage"]["unchanged"]["planned"], 1, "{body}");
+            } else {
+                let message = body["diagnostics"][0]["message"].as_str().unwrap();
+                assert!(
+                    message.contains("carries only from KiCad 10.0.1; this KiCad is 10.0.0"),
+                    "{message}"
+                );
+            }
+            let capture = mock.capture.lock().unwrap();
+            assert_eq!(capture.begin_count, 0);
+            assert!(capture.update_batches.is_empty());
+        }
+    }
+
+    /// A changed group plans `net_ties`, and its apply reads the board back:
+    /// a KiCad that keeps the groups reports applied, and one that drops them
+    /// leaves the outcome uncertain rather than reporting a refresh it did
+    /// not make.
+    #[tokio::test]
+    async fn a_served_net_tie_change_is_applied_and_read_back() {
+        let changed = net_tie_3_with("(net_tie_pad_groups \"1, 2\")");
+        for keeps_updates in [true, false] {
+            let (_temp, board, mock) = net_tie_mock(&changed, (10, 0, 8), keeps_updates);
+            let handler = served(mock.kicad.address()).await;
+            let plan =
+                result_json(&served_call(&handler, serde_json::json!({ "board": board })).await);
+            assert_eq!(plan["status"], "ready", "{plan}");
+            assert_eq!(
+                plan["changes"][0]["changed_domains"],
+                serde_json::json!(["net_ties"]),
+                "{plan}"
+            );
+            let applied = served_call(
+                &handler,
+                serde_json::json!({
+                    "board": board,
+                    "dry_run": false,
+                    "expected_plan_revision": plan["plan_revision"],
+                }),
+            )
+            .await;
+            let body = result_json(&applied);
+            if keeps_updates {
+                assert!(!applied.is_error, "{body}");
+                assert_eq!(body["status"], "applied", "{body}");
+            } else {
+                assert!(applied.is_error, "{body}");
+                assert_eq!(
+                    body["error"]["kind"], "mutation_outcome_uncertain",
+                    "{body}"
+                );
+                assert!(
+                    body["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("does not hold the library's net-tie pad groups on NT1"),
+                    "{body}"
+                );
+            }
+            assert_eq!(mock.capture.lock().unwrap().update_batches, vec![1]);
+        }
     }
 }
 

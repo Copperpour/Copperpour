@@ -3185,15 +3185,15 @@ async fn handle_add_mounting_hole(
     let reference_ipc = spec.reference.clone();
     let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board_path, "mounting hole", move |c| {
-        let (carry_10_0_7, kicad_before_10_0_7) = prepared_ipc.resolve_kicad_10_0_7(c)?;
-        let item = prepared_ipc.ipc_item(&lib_id_ipc, &reference_ipc, x, y, carry_10_0_7)?;
+        let (carried, older_kicad) = prepared_ipc.resolve_kicad_carried(c)?;
+        let item = prepared_ipc.ipc_item(&lib_id_ipc, &reference_ipc, x, y, carried)?;
         let fp = c.place_footprint_item(&requested_board, &reference_ipc, item)?;
-        Ok((fp, kicad_before_10_0_7))
+        Ok((fp, older_kicad))
     })
     .await?;
 
     match attempt {
-        BoardWrite::Ipc((fp, kicad_before_10_0_7)) => {
+        BoardWrite::Ipc((fp, older_kicad)) => {
             let mut response = json!({
                 "reference": fp.reference, "x": fp.position.x, "y": fp.position.y,
                 "drill_diameter": spec.drill_diameter_mm, "footprint": fp.footprint,
@@ -3201,7 +3201,7 @@ async fn handle_add_mounting_hole(
                 "geometry_note": geometry_note,
                 "source": "ipc"
             });
-            let not_carried = prepared.not_carried(kicad_before_10_0_7.as_ref());
+            let not_carried = prepared.not_carried(older_kicad.as_ref());
             if !not_carried.is_empty() {
                 response["not_carried"] = json!(not_carried);
             }

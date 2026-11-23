@@ -103,6 +103,37 @@ pub(crate) fn carries_kicad_10_0_7_fields(version: &copperpour_ipc::IpcKiCadVers
     (version.major, version.minor, version.patch) >= (10, 0, 7)
 }
 
+/// Whether `version`'s API keeps a footprint's net-tie pad groups. Every
+/// KiCad 10 release sends a group as its pad numbers, split at commas and
+/// whitespace (`FOOTPRINT::Serialize`), and joins them again when it takes a
+/// footprint (`FOOTPRINT::Deserialize`): 10.0.1 and later with ", ", as its
+/// own files write a group, but 10.0.0 with a space. KiCad reads a group as
+/// the pad numbers between its commas (`MapPadNumbersToNetTieGroups`), so
+/// 10.0.0 would hold "1 2" as one pad named "1 2" and tie nothing, while its
+/// readback still showed pads 1 and 2.
+pub(crate) fn carries_net_ties(version: &copperpour_ipc::IpcKiCadVersion) -> bool {
+    (version.major, version.minor, version.patch) >= (10, 0, 1)
+}
+
+/// What a placement sends of the library data that not every KiCad 10
+/// release takes over its API.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CarriedByKiCad {
+    /// Pad fabrication properties and reference points (KiCad 10.0.7+).
+    pub(crate) fields_10_0_7: bool,
+    /// Net-tie pad groups (KiCad 10.0.1+, [`carries_net_ties`]).
+    pub(crate) net_ties: bool,
+}
+
+impl CarriedByKiCad {
+    /// Both, as KiCad 10.0.7 and later take them.
+    #[cfg(test)]
+    pub(crate) const ALL: Self = Self {
+        fields_10_0_7: true,
+        net_ties: true,
+    };
+}
+
 /// The fabrication property KiCad reports for a pad, or `None` for
 /// `PFP_NONE` and for `PFP_UNKNOWN`, which KiCad before 10.0.7 sends for
 /// every pad.
@@ -680,6 +711,146 @@ pub(crate) fn build_reference_point(
     })
 }
 
+/// A library footprint's net-tie pad groups as KiCad's parser reads them, in
+/// the library's order, each with its pad numbers in its own order: every
+/// string of `(net_tie_pad_groups "1, 2" …)`, a repeated clause adding its
+/// groups after the first's, and, in a file of format 20220815 or older
+/// whose keywords start with "net tie", one more group of every pad
+/// (`LEGACY_NET_TIES`, `parseFOOTPRINT_unchecked`).
+///
+/// Placement and the refresh send each group as its pad numbers
+/// (`NetTieDefinition`), and KiCad 10.0.1 and later store them joined with
+/// ", " ([`carries_net_ties`]). A group that would not come back as the
+/// library writes it, or that KiCad could not tie as written, is refused
+/// before anything is sent:
+/// - a clause holding anything but quoted strings, or nothing;
+/// - a group that names no pad, or has an empty pad number between commas,
+///   which KiCad's API leaves out;
+/// - a backslash, which KiCad reads as an escape and its API does not;
+/// - a pad number with whitespace in it, at which KiCad's API splits it;
+/// - a group not written as its pad numbers joined with ", ", such as "1,2":
+///   KiCad would store "1, 2", and its library check compares the text
+///   (`drc_test_provider_library_parity.cpp`);
+/// - a pad number the footprint has no pad for;
+/// - a pad number named twice, in one group or in two.
+pub(crate) fn net_ties(root: &SexpNode) -> Result<Vec<kiapi::board::types::NetTieDefinition>> {
+    let pads = root
+        .find_all("pad")
+        .into_iter()
+        .map(|pad| pad.get(1).and_then(SexpNode::as_str).unwrap_or_default())
+        .collect::<Vec<_>>();
+    let mut groups = Vec::new();
+    for clause in root.find_all("net_tie_pad_groups") {
+        let values = clause.children().unwrap_or_default();
+        if values.len() < 2 {
+            bail!("net_tie_pad_groups names no pad group");
+        }
+        for value in &values[1..] {
+            match value {
+                SexpNode::Str(group) => groups.push(group.clone()),
+                SexpNode::Atom(atom) => bail!(
+                    "net_tie_pad_groups holds the unquoted '{atom}'; KiCad writes each pad \
+                     group as a quoted string"
+                ),
+                SexpNode::List(_) => bail!(
+                    "net_tie_pad_groups holds a list; KiCad writes each pad group as a \
+                     quoted string"
+                ),
+            }
+        }
+    }
+    if super::solder_margins::file_version(root) <= super::library_upgrade::LEGACY_NET_TIES
+        && root
+            .find_str("tags")
+            .is_some_and(|tags| tags.starts_with("net tie"))
+    {
+        let every_pad = pads.join(", ");
+        if !every_pad.is_empty() {
+            groups.push(every_pad);
+        }
+    }
+
+    let known = pads.iter().copied().collect::<BTreeSet<&str>>();
+    let mut named = BTreeMap::<String, usize>::new();
+    let mut net_ties = Vec::with_capacity(groups.len());
+    for (index, group) in groups.iter().enumerate() {
+        if group.contains('\\') {
+            bail!(
+                "net-tie pad group \"{group}\" holds a backslash, which KiCad reads as an \
+                 escape and its API does not"
+            );
+        }
+        let numbers = group.split(',').map(str::trim).collect::<Vec<&str>>();
+        if numbers.iter().all(|number| number.is_empty()) {
+            bail!("net-tie pad group \"{group}\" names no pad");
+        }
+        if numbers.iter().any(|number| number.is_empty()) {
+            bail!(
+                "net-tie pad group \"{group}\" has an empty pad number, which KiCad's API \
+                 leaves out"
+            );
+        }
+        if let Some(number) = numbers
+            .iter()
+            .find(|number| number.contains(char::is_whitespace))
+        {
+            bail!(
+                "pad number '{number}' in net-tie pad group \"{group}\" holds whitespace, at \
+                 which KiCad's API splits it"
+            );
+        }
+        let written = numbers.join(", ");
+        if written != *group {
+            bail!(
+                "net-tie pad group \"{group}\" is not written as KiCad writes one: KiCad would \
+                 keep it as \"{written}\", which its library check reports as differing"
+            );
+        }
+        for number in &numbers {
+            if !known.contains(number) {
+                bail!(
+                    "net-tie pad group \"{group}\" names pad '{number}', which the footprint \
+                     does not have"
+                );
+            }
+            if let Some(first) = named.insert(number.to_string(), index) {
+                if first == index {
+                    bail!("net-tie pad group \"{group}\" names pad '{number}' twice");
+                }
+                bail!(
+                    "pad '{number}' is in two net-tie pad groups, \"{}\" and \"{group}\"",
+                    groups[first]
+                );
+            }
+        }
+        net_ties.push(kiapi::board::types::NetTieDefinition {
+            pad_number: numbers.iter().map(|number| number.to_string()).collect(),
+        });
+    }
+    Ok(net_ties)
+}
+
+/// The `not_carried` entry for net-tie pad groups a KiCad before 10.0.1
+/// cannot keep ([`carries_net_ties`]), or `None` when there are none or
+/// `kicad` keeps them.
+pub(crate) fn net_ties_not_carried_reason(
+    net_ties: &[kiapi::board::types::NetTieDefinition],
+    kicad: &copperpour_ipc::IpcKiCadVersion,
+) -> Option<String> {
+    if net_ties.is_empty() || carries_net_ties(kicad) {
+        return None;
+    }
+    let groups = net_ties
+        .iter()
+        .map(|group| format!("\"{}\"", group.pad_number.join(", ")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "net-tie pad groups ({groups}) require KiCad 10.0.1 or newer (connected KiCad is {})",
+        kicad.full_version
+    ))
+}
+
 /// A library pad's zone connection and thermal relief clauses, as KiCad's
 /// `parsePAD` reads them. Each is `None` when the pad doesn't set it.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -1136,6 +1307,9 @@ fn check_supported_children(
             "version" | "generator" | "generator_version" | "layer" | "descr" | "tags" | "attr"
             | "property" | "fp_text" | "fp_line" | "fp_rect" | "fp_circle" | "fp_arc"
             | "fp_poly" | "pad" | "model" | "point" => {}
+            // Placement and the refresh carry the groups; `net_ties` reads
+            // them and refuses what they cannot carry (#85).
+            "net_tie_pad_groups" => {}
             // KiCad 10 writes these two flags into every footprint it saves
             // (all 15,428 official library files carry them, every one at its
             // default). At the default the typed rebuild loses nothing;
@@ -2112,5 +2286,197 @@ mod tests {
         assert!(!models(&with("(hide yes)")).unwrap()[0].visible);
         assert!(!models(&with("hide")).unwrap()[0].visible);
         assert!(models(&with("(hide maybe)")).is_err());
+    }
+
+    // ─── #85: net-tie pad groups ────────────────────────────────────────────
+
+    /// KiCad 10.0.8's stock net ties (`net_tie_kicad10.README.md`).
+    const NET_TIE_2_SMD: &str =
+        include_str!("../../tests/fixtures/net_tie_2_smd_pad0.5mm_kicad10.kicad_mod");
+    const NET_TIE_3_THT: &str =
+        include_str!("../../tests/fixtures/net_tie_3_tht_pad0.3mm_kicad10.kicad_mod");
+    const NET_TIE_4_SMD: &str =
+        include_str!("../../tests/fixtures/net_tie_4_smd_pad0.5mm_kicad10.kicad_mod");
+    /// `NET_TIE_3_THT`'s group, as KiCad writes it.
+    const NET_TIE_3_CLAUSE: &str = "(net_tie_pad_groups \"1, 2, 3\")";
+
+    /// Each group's pad numbers.
+    fn groups(net_ties: &[kiapi::board::types::NetTieDefinition]) -> Vec<Vec<&str>> {
+        net_ties
+            .iter()
+            .map(|group| group.pad_number.iter().map(String::as_str).collect())
+            .collect()
+    }
+
+    /// `NET_TIE_3_THT` with `clause` for its group.
+    fn net_tie_3_with(clause: &str) -> String {
+        assert!(
+            NET_TIE_3_THT.contains(NET_TIE_3_CLAUSE),
+            "the edit must land"
+        );
+        NET_TIE_3_THT.replace(NET_TIE_3_CLAUSE, clause)
+    }
+
+    /// Each stock net tie reads as its one group of every pad, in pad order,
+    /// and neither placement nor the refresh lists or refuses the clause.
+    #[test]
+    fn stock_net_ties_read_as_their_one_pad_group() {
+        for (source, expected) in [
+            (NET_TIE_2_SMD, vec!["1", "2"]),
+            (NET_TIE_3_THT, vec!["1", "2", "3"]),
+            (NET_TIE_4_SMD, vec!["1", "2", "3", "4"]),
+        ] {
+            let footprint = root(source);
+            assert_eq!(
+                groups(&net_ties(&footprint).unwrap()),
+                std::slice::from_ref(&expected),
+                "{expected:?}"
+            );
+            assert_eq!(
+                unsupported_features(&footprint).unwrap(),
+                Vec::<String>::new(),
+                "{expected:?}"
+            );
+            validate_supported_children(&footprint).unwrap();
+        }
+        assert!(net_ties(&root(C_0603)).unwrap().is_empty());
+    }
+
+    /// KiCad 10.0.8's report of the stock Antenova antenna it placed, whose
+    /// library writes `(net_tie_pad_groups "1, 2")` (`issue_300_ipc.README.md`),
+    /// holds the groups the reader sends.
+    #[test]
+    fn kicad_reports_a_placed_net_tie_as_the_reader_reads_it() {
+        use prost::Message as _;
+        let library = net_ties(&root(include_str!(
+            "../../tests/fixtures/issue_300_antenova_sr4g013_kicad10.kicad_mod"
+        )))
+        .unwrap();
+        assert_eq!(groups(&library), [vec!["1", "2"]]);
+        let reported = kiapi::board::types::FootprintInstance::decode(
+            include_bytes!("../../tests/fixtures/issue_300_u8.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        assert_eq!(reported.definition.unwrap().net_ties, library);
+    }
+
+    /// KiCad gives a footprint of format 20220815 or older whose keywords
+    /// start with "net tie" one group of every pad, and KiCad 10.0.8's own
+    /// upgrade of the hand-written KiCad 6 net tie writes that group
+    /// (`library_upgrade/README.md`). From format 20220818 only the clause
+    /// makes a net tie.
+    #[test]
+    fn an_older_net_tie_takes_its_group_from_the_keywords() {
+        let legacy = net_ties(&root(include_str!(
+            "../../tests/fixtures/library_upgrade/kicad5.pretty/NetTie_Legacy.kicad_mod"
+        )))
+        .unwrap();
+        assert_eq!(groups(&legacy), [vec!["1", "2"]]);
+        let upgraded = net_ties(&root(include_str!(
+            "../../tests/fixtures/library_upgrade/kicad10.pretty/NetTie_Legacy.kicad_mod"
+        )))
+        .unwrap();
+        assert_eq!(legacy, upgraded);
+
+        let untied = NET_TIE_2_SMD.replace("\t(net_tie_pad_groups \"1, 2\")\n", "");
+        assert_ne!(untied, NET_TIE_2_SMD, "the edit must land");
+        assert!(untied.contains("(tags \"net tie\")"));
+        assert!(net_ties(&root(&untied)).unwrap().is_empty());
+    }
+
+    /// Inline because KiCad writes none of them: a group KiCad's API would
+    /// not give back as the library writes it, or that KiCad could not tie,
+    /// refuses the footprint, saying why.
+    #[test]
+    fn a_net_tie_group_that_would_not_come_back_is_refused() {
+        for (clause, expected) in [
+            ("(net_tie_pad_groups 1)", "holds the unquoted '1'"),
+            ("(net_tie_pad_groups (group \"1, 2\"))", "holds a list"),
+            ("(net_tie_pad_groups)", "names no pad group"),
+            ("(net_tie_pad_groups \"\")", "group \"\" names no pad"),
+            ("(net_tie_pad_groups \" , \")", "names no pad"),
+            ("(net_tie_pad_groups \"1, , 2\")", "has an empty pad number"),
+            ("(net_tie_pad_groups \"1, 2,\")", "has an empty pad number"),
+            (r#"(net_tie_pad_groups "1\\, 2")"#, "holds a backslash"),
+            (
+                "(net_tie_pad_groups \"1 2\")",
+                "pad number '1 2' in net-tie pad group \"1 2\" holds whitespace",
+            ),
+            ("(net_tie_pad_groups \"1\t2\")", "holds whitespace"),
+            (
+                "(net_tie_pad_groups \"1,2\")",
+                "KiCad would keep it as \"1, 2\"",
+            ),
+            (
+                "(net_tie_pad_groups \"1 , 2\")",
+                "KiCad would keep it as \"1, 2\"",
+            ),
+            (
+                "(net_tie_pad_groups \"1, 4\")",
+                "names pad '4', which the footprint does not have",
+            ),
+            ("(net_tie_pad_groups \"1, 2, 1\")", "names pad '1' twice"),
+            (
+                "(net_tie_pad_groups \"1, 2\" \"2, 3\")",
+                "pad '2' is in two net-tie pad groups, \"1, 2\" and \"2, 3\"",
+            ),
+            (
+                "(net_tie_pad_groups \"1, 2\") (net_tie_pad_groups \"3, 1\")",
+                "pad '1' is in two net-tie pad groups",
+            ),
+        ] {
+            let refusal = net_ties(&root(&net_tie_3_with(clause)))
+                .unwrap_err()
+                .to_string();
+            assert!(refusal.contains(expected), "{clause}: {refusal}");
+        }
+    }
+
+    /// Inline because KiCad writes every group in one clause: a second clause
+    /// adds its groups after the first's, as KiCad's parser reads it, and
+    /// each group keeps its own pad order.
+    #[test]
+    fn groups_keep_their_order_in_one_clause_or_two() {
+        for clause in [
+            "(net_tie_pad_groups \"3, 1\" \"2\")",
+            "(net_tie_pad_groups \"3, 1\") (net_tie_pad_groups \"2\")",
+        ] {
+            assert_eq!(
+                groups(&net_ties(&root(&net_tie_3_with(clause))).unwrap()),
+                [vec!["3", "1"], vec!["2"]],
+                "{clause}"
+            );
+        }
+    }
+
+    /// KiCad 10.0.0 joins a group's pad numbers with a space, so only 10.0.1
+    /// and later carry net ties, and placement names what it leaves out.
+    #[test]
+    fn net_ties_are_carried_from_kicad_10_0_1() {
+        let kicad = |major, minor, patch| copperpour_ipc::IpcKiCadVersion {
+            major,
+            minor,
+            patch,
+            full_version: format!("{major}.{minor}.{patch}"),
+        };
+        assert!(!carries_net_ties(&kicad(10, 0, 0)));
+        for version in [
+            kicad(10, 0, 1),
+            kicad(10, 0, 6),
+            kicad(10, 0, 8),
+            kicad(10, 99, 0),
+        ] {
+            assert!(carries_net_ties(&version), "{}", version.full_version);
+        }
+        let ties = net_ties(&root(NET_TIE_3_THT)).unwrap();
+        assert_eq!(net_ties_not_carried_reason(&ties, &kicad(10, 0, 1)), None);
+        assert_eq!(net_ties_not_carried_reason(&[], &kicad(10, 0, 0)), None);
+        assert_eq!(
+            net_ties_not_carried_reason(&ties, &kicad(10, 0, 0)).as_deref(),
+            Some(
+                "net-tie pad groups (\"1, 2, 3\") require KiCad 10.0.1 or newer (connected \
+                 KiCad is 10.0.0)"
+            )
+        );
     }
 }

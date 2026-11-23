@@ -41,10 +41,10 @@ MCP equivalent of KiCad **Tools → Update Footprints from Library**.
 
 This operation is not `update_pcb_from_schematic`. Schematic sync updates
 schematic-owned fields while preserving artwork. Library refresh replaces supported
-library-owned pads, graphics, attributes, metadata, and 3D models while preserving
-the placed footprint's reference, value, position, rotation, board side, locked
-state, KIID, symbol metadata, instance overrides (unless
-`reset_clearance_overrides` is set), and pad nets by logical pad number.
+library-owned pads, net-tie pad groups, graphics, attributes, metadata, and 3D
+models while preserving the placed footprint's reference, value, position,
+rotation, board side, locked state, KIID, symbol metadata, instance overrides
+(unless `reset_clearance_overrides` is set), and pad nets by logical pad number.
 
 Always dry-run first:
 
@@ -82,6 +82,10 @@ update_footprints_from_library(
   its own clearance, zone connection, margins and solder mask bridge setting;
   `reset_clearance_overrides` takes the library's, as KiCad's dialog does by
   default.
+- A net tie takes the library's net-tie pad groups, as KiCad's update does; a
+  changed group plans `net_ties`. KiCad 10.0.0's API cannot keep them, so there
+  a net-tie footprint is refused, and placement leaves the groups out and lists
+  them in `not_carried`.
 - A stale plan, unresolved library, removed connected pad, or unsupported
   library content returns a non-mutating conflict for the whole selection.
 

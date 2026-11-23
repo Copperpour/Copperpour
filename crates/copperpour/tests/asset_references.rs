@@ -975,6 +975,10 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // tools (#596).
         "skipped_footprints",
         "skipped_footprint",
+        // The library refresh's changed_domains value and placement's
+        // response field the net-tie guidance names, not callable tools (#85).
+        "net_ties",
+        "not_carried",
     ];
 
     let mut phantom = Vec::new();
