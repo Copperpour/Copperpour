@@ -385,9 +385,9 @@ set_footprint_graphics(
 
 ### Existing Footprint Metadata
 
-Use `set_footprint_metadata` to replace a footprint description, search tags, or
-KiCad footprint attributes without changing pads, graphics, properties, groups, or
-3D models.
+Use `set_footprint_metadata` to replace a footprint description, search tags,
+KiCad footprint attributes, or its Value text without changing pads, graphics,
+properties, groups, or 3D models.
 
 ```text
 set_footprint_metadata(
@@ -406,6 +406,9 @@ set_footprint_metadata(
   in the response.
 - `exclude_from_pos_files` omits the footprint from pick-and-place output without
   implicitly adding `exclude_from_bom`.
+- `value` replaces only the Value field's text, for example after the footprint
+  was renamed outside `rename_footprint` and kept its old Value. Its position,
+  layer and effects stay; a footprint without a Value is refused.
 - Use `edit_footprint_pad` with `new_number` and optional `match_all=true` to
   renumber one or every matching direct-child pad atomically.
 - Use `edit_footprint_pad` with `layers` to change a pad's layers in place, for
