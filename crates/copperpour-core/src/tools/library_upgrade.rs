@@ -741,7 +741,7 @@ struct FootprintContent {
 /// The footprint version up to which KiCad kept net ties in the keywords: a
 /// footprint whose keywords start with "net tie" gets one pad group of all its
 /// pads (`LEGACY_NET_TIES`, `parseFOOTPRINT_unchecked`).
-const LEGACY_NET_TIES: u32 = 20220815;
+pub(super) const LEGACY_NET_TIES: u32 = 20220815;
 
 const FOOTPRINT_GRAPHICS: [&str; 8] = [
     "fp_line",

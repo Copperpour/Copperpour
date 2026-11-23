@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::library::PadFabricationProperty;
-use super::library_footprint::{carries_kicad_10_0_7_fields, reported_fab_property};
+use super::library_footprint::{
+    carries_kicad_10_0_7_fields, carries_net_ties, reported_fab_property, CarriedByKiCad,
+};
 use crate::hex::encode_hex;
 use crate::mcp::protocol::{CallToolResult, ToolContent};
 use crate::tools::{
@@ -444,6 +446,9 @@ struct PreparedFootprint {
     margins: super::library_footprint::SolderMargins,
     /// Reference points declared in the library footprint.
     points: Vec<super::library_footprint::LibraryPoint>,
+    /// The library's net-tie pad groups, which KiCad's API keeps from 10.0.1
+    /// (#85).
+    net_ties: Vec<copperpour_ipc::gen::kiapi::board::types::NetTieDefinition>,
     /// Library footprint clauses or children that typed placement leaves out.
     unsupported: Vec<String>,
     width: f64,
@@ -643,14 +648,19 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 .extend(library_fields_not_carried(&plan, &prepared));
             plan.diagnostics
                 .extend(unsupported_features_not_carried(&plan, &prepared));
-            // Asked only when a part has a pad property or reference point,
-            // so every other sync sends what it sent before #149.
-            let carry_pad_properties = if prepared.values().any(|part| {
+            // Asked only when a part has a pad property, a reference point or
+            // a net tie, so every other sync sends what it sent before #149.
+            let needs_10_0_7 = prepared.values().any(|part| {
                 super::library_footprint::needs_kicad_10_0_7(&part.pad_properties, &part.points)
-            }) {
+            });
+            let has_net_ties = prepared.values().any(|part| !part.net_ties.is_empty());
+            let carried = if needs_10_0_7 || has_net_ties {
                 let kicad = client.get_kicad_version()?;
-                let carried = carries_kicad_10_0_7_fields(&kicad);
-                if !carried {
+                let carried = CarriedByKiCad {
+                    fields_10_0_7: needs_10_0_7 && carries_kicad_10_0_7_fields(&kicad),
+                    net_ties: carries_net_ties(&kicad),
+                };
+                if needs_10_0_7 && !carried.fields_10_0_7 {
                     plan.diagnostics
                         .extend(kicad_10_0_7_not_carried(&plan, &prepared, &kicad));
                     // The apply sends something else then, so a plan made
@@ -660,9 +670,18 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                     hasher.update(b"pad_properties_not_carried");
                     plan.plan_revision = encode_hex(&hasher.finalize());
                 }
+                if has_net_ties && !carried.net_ties {
+                    plan.diagnostics
+                        .extend(net_ties_not_carried(&plan, &prepared, &kicad));
+                    // Likewise on either side of 10.0.1.
+                    let mut hasher = Sha256::new();
+                    hasher.update(plan.plan_revision.as_bytes());
+                    hasher.update(b"net_ties_not_carried");
+                    plan.plan_revision = encode_hex(&hasher.finalize());
+                }
                 carried
             } else {
-                false
+                CarriedByKiCad::default()
             };
 
             if dry_run || plan.status == PlanStatus::Conflict {
@@ -695,7 +714,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 &replacements,
                 copper_layers,
                 &snapshot,
-                carry_pad_properties,
+                carried,
             )?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
@@ -2946,6 +2965,7 @@ fn prepare_footprint_source(
     let margins =
         super::library_footprint::SolderMargins::of_footprint(&root).map_err(unsupported)?;
     let points = super::library_footprint::points(&root).map_err(unsupported)?;
+    let net_ties = super::library_footprint::net_ties(&root).map_err(unsupported)?;
     let unsupported_features =
         super::library_footprint::unsupported_features(&root).map_err(unsupported)?;
     let description_and_keywords = super::library_footprint::description_and_keywords(&root);
@@ -2975,6 +2995,7 @@ fn prepare_footprint_source(
         pad_margins,
         margins,
         points,
+        net_ties,
         unsupported: unsupported_features,
         width,
         height,
@@ -3310,6 +3331,36 @@ fn kicad_10_0_7_not_carried(
         .collect()
 }
 
+/// Footprints the plan adds with net-tie pad groups a KiCad before 10.0.1
+/// cannot keep over its API ([`carries_net_ties`], #85). They are placed
+/// without them, as pad fabrication properties are before 10.0.7, rather
+/// than with groups KiCad would read as one pad each.
+fn net_ties_not_carried(
+    plan: &SyncPlan,
+    prepared: &BTreeMap<String, PreparedFootprint>,
+    kicad: &copperpour_ipc::IpcKiCadVersion,
+) -> Vec<SyncDiagnostic> {
+    additions_by_footprint(plan)
+        .into_iter()
+        .filter_map(|(footprint_id, references)| {
+            let part = prepared.get(footprint_id)?;
+            let reason =
+                super::library_footprint::net_ties_not_carried_reason(&part.net_ties, kicad)?;
+            Some(footprint_conflict(
+                "not_carried",
+                format!(
+                    "{footprint_id} ({}): {reason}; {} will be placed without them. KiCad's \
+                     Tools > Update Footprints from Library restores them.",
+                    listed(&references),
+                    listed(&references)
+                ),
+                footprint_id,
+                references,
+            ))
+        })
+        .collect()
+}
+
 /// Pad fabrication properties for a message, one entry per pad number and
 /// property, bounded as [`listed`] bounds references.
 fn listed_pad_properties<'a>(
@@ -3581,6 +3632,17 @@ fn read_replacement(
             "unsupported_library_footprint",
             format!(
                 "it has {what}, which KiCad's API carries only from KiCad 10.0.7; this KiCad is {}",
+                kicad.full_version
+            ),
+        ));
+    }
+    // KiCad 10.0.0 would keep each group as one pad, as the refresh refuses it.
+    if footprint.has_net_ties() && !carries_net_ties(kicad) {
+        return Err((
+            "unsupported_library_footprint",
+            format!(
+                "it has net-tie pad groups, which KiCad's API carries only from KiCad 10.0.1; \
+                 this KiCad is {}",
                 kicad.full_version
             ),
         ));
@@ -3998,13 +4060,13 @@ fn restage_additions(
 /// One footprint the plan adds, as `CreateItems` receives it: built from the
 /// library's pads, drawings and fields, given the rest of the library's data,
 /// then the schematic's reference, value, symbol path, DNP and pad nets.
-/// `carry_pad_properties` says the KiCad it goes to takes pad fabrication
-/// properties (10.0.7+).
+/// `carried` says what the KiCad it goes to takes of pad fabrication
+/// properties and reference points (10.0.7+) and net-tie pad groups (10.0.1+).
 fn build_added_footprint(
     change: &PlannedChange,
     part: &PreparedFootprint,
     net_codes: &BTreeMap<String, i32>,
-    carry_pad_properties: bool,
+    carried: CarriedByKiCad,
 ) -> Result<prost_types::Any> {
     let PlannedChange::Add {
         reference,
@@ -4047,9 +4109,9 @@ fn build_added_footprint(
         &part.pad_properties,
         &part.pad_zones,
         &part.pad_margins,
-        carry_pad_properties,
+        carried.fields_10_0_7,
     )?;
-    if carry_pad_properties {
+    if carried.fields_10_0_7 {
         super::library_footprint::apply_reference_points(
             definition,
             &part.points,
@@ -4057,6 +4119,9 @@ fn build_added_footprint(
             0.0,
             None,
         )?;
+    }
+    if carried.net_ties {
+        definition.net_ties = part.net_ties.clone();
     }
     apply_library_data(&mut footprint, part)?;
     apply_symbol_fields(&mut footprint, fields)?;
@@ -4083,7 +4148,7 @@ fn build_mutation_items(
     replacements: &BTreeMap<String, super::pcb_footprint_update::ReplacementFootprint>,
     copper_layers: u32,
     snapshot: &LiveSnapshot,
-    carry_pad_properties: bool,
+    carried: CarriedByKiCad,
 ) -> Result<(Vec<prost_types::Any>, Vec<prost_types::Any>)> {
     let mut creates = Vec::new();
     let mut updates = Vec::new();
@@ -4097,7 +4162,7 @@ fn build_mutation_items(
                     change,
                     part,
                     &snapshot.net_codes,
-                    carry_pad_properties,
+                    carried,
                 )?);
             }
             PlannedChange::Update {
@@ -10778,8 +10843,13 @@ mod tests {
             sheet: SymbolSheet::default(),
         };
         let built_dnp = |part: &PreparedFootprint, dnp: bool| {
-            let item =
-                build_added_footprint(&addition(dnp), part, &BTreeMap::new(), false).unwrap();
+            let item = build_added_footprint(
+                &addition(dnp),
+                part,
+                &BTreeMap::new(),
+                CarriedByKiCad::default(),
+            )
+            .unwrap();
             let footprint =
                 kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
             let attributes = footprint.attributes.unwrap();
@@ -11757,6 +11827,179 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("reference point"));
+    }
+
+    // ─── #85: net-tie pad groups ────────────────────────────────────────────
+
+    /// KiCad 10.0.8's stock three-pad net tie (`net_tie_kicad10.README.md`).
+    const NET_TIE_3_THT_SOURCE: &str =
+        include_str!("../../tests/fixtures/net_tie_3_tht_pad0.3mm_kicad10.kicad_mod");
+    const NET_TIE_3_THT: &str = "NetTie:NetTie-3_THT_Pad0.3mm";
+
+    fn kicad_10_0(patch: u32) -> copperpour_ipc::IpcKiCadVersion {
+        copperpour_ipc::IpcKiCadVersion {
+            major: 10,
+            minor: 0,
+            patch,
+            full_version: format!("10.0.{patch}"),
+        }
+    }
+
+    /// An added net tie is read with its group, and built with it when the
+    /// KiCad takes it and without it when not.
+    #[test]
+    fn an_added_net_tie_carries_its_group_when_kicad_takes_it() {
+        use copperpour_ipc::gen::kiapi;
+
+        let part = prepare_footprint_source(NET_TIE_3_THT_SOURCE).unwrap();
+        assert!(part.unsupported.is_empty(), "{:?}", part.unsupported);
+        let groups = |carried: CarriedByKiCad| {
+            let item = build_added_footprint(
+                &planned_add("NT1", NET_TIE_3_THT, &[]),
+                &part,
+                &BTreeMap::new(),
+                carried,
+            )
+            .unwrap();
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                .unwrap()
+                .definition
+                .unwrap()
+                .net_ties
+                .into_iter()
+                .map(|group| group.pad_number)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(groups(CarriedByKiCad::ALL), [vec!["1", "2", "3"]]);
+        assert!(groups(CarriedByKiCad::default()).is_empty());
+
+        // A group the API would not give back refuses the part, as the
+        // refresh refuses it.
+        let malformed = NET_TIE_3_THT_SOURCE.replace(
+            "(net_tie_pad_groups \"1, 2, 3\")",
+            "(net_tie_pad_groups \"1, 4\")",
+        );
+        assert_ne!(malformed, NET_TIE_3_THT_SOURCE, "the edit must land");
+        let Err((code, reason)) = prepare_footprint_source(&malformed) else {
+            panic!("a group naming a missing pad is refused");
+        };
+        assert_eq!(code, "unsupported_library_footprint");
+        assert!(reason.contains("names pad '4'"), "{reason}");
+    }
+
+    /// Update PCB names the net ties a KiCad before 10.0.1 cannot keep, with
+    /// every part that uses them, and none from 10.0.1.
+    #[test]
+    fn net_ties_an_older_kicad_cannot_keep_are_named() {
+        let prepared = BTreeMap::from([(
+            NET_TIE_3_THT.to_string(),
+            prepare_footprint_source(NET_TIE_3_THT_SOURCE).unwrap(),
+        )]);
+        let plan = plan_adding(vec![
+            planned_add("NT1", NET_TIE_3_THT, &[]),
+            planned_add("NT2", NET_TIE_3_THT, &[]),
+        ]);
+        assert!(net_ties_not_carried(&plan, &prepared, &kicad_10_0(1)).is_empty());
+        let diagnostics = net_ties_not_carried(&plan, &prepared, &kicad_10_0(0));
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "not_carried");
+        assert_eq!(diagnostics[0].references, ["NT1", "NT2"]);
+        assert!(
+            diagnostics[0].message.contains(
+                "net-tie pad groups (\"1, 2, 3\") require KiCad 10.0.1 or newer (connected \
+                 KiCad is 10.0.0)"
+            ),
+            "{}",
+            diagnostics[0].message
+        );
+    }
+
+    /// Update PCB's replacement onto a net tie is refused on KiCad 10.0.0, as
+    /// the refresh refuses it, and read from 10.0.1.
+    #[test]
+    fn a_replacement_onto_a_net_tie_needs_kicad_10_0_1() {
+        let (temp, board_path) = project_with_stock_footprints();
+        std::fs::write(
+            temp.path()
+                .join("Custom_Stock.pretty/NetTie-3_THT_Pad0.3mm.kicad_mod"),
+            NET_TIE_3_THT_SOURCE,
+        )
+        .unwrap();
+        let footprint_id = "Custom_Stock:NetTie-3_THT_Pad0.3mm";
+        let (code, reason) =
+            read_replacement(footprint_id, &board_path, &kicad_10_0(0)).unwrap_err();
+        assert_eq!(code, "unsupported_library_footprint");
+        assert_eq!(
+            reason,
+            "it has net-tie pad groups, which KiCad's API carries only from KiCad 10.0.1; this \
+             KiCad is 10.0.0"
+        );
+        let footprint = read_replacement(footprint_id, &board_path, &kicad_10_0(1)).unwrap();
+        assert!(footprint.has_net_ties());
+    }
+
+    /// Write the stock net tie to a `NetTie.pretty` library in `served`'s
+    /// project, with its `fp-lib-table` row.
+    fn net_tie_library(served: &ServedSync) {
+        let project_dir = served.board.parent().unwrap();
+        let pretty = project_dir.join("NetTie.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::fs::write(
+            pretty.join("NetTie-3_THT_Pad0.3mm.kicad_mod"),
+            NET_TIE_3_THT_SOURCE,
+        )
+        .unwrap();
+        let fp_table = project_dir.join("fp-lib-table");
+        let existing_table = std::fs::read_to_string(&fp_table)
+            .unwrap_or_else(|_| "(fp_lib_table\n  (version 7)\n)\n".to_string());
+        let updated_table = existing_table.replacen(
+            "\n)",
+            "\n  (lib (name \"NetTie\")(type \"KiCad\")(uri \"${KIPRJMOD}/NetTie.pretty\")(options \"\")(descr \"\"))\n)",
+            1,
+        );
+        std::fs::write(&fp_table, updated_table).unwrap();
+    }
+
+    /// Update PCB adds a net tie with its library group on KiCad 10.0.8. On
+    /// 10.0.0 it adds it without, asking KiCad's version once per call, and
+    /// says so in a `not_carried` diagnostic.
+    #[tokio::test]
+    async fn an_added_net_tie_carries_its_group_or_reports_it_not_carried() {
+        let netlist = exported_netlist(&[("NT1", NET_TIE_3_THT, &["1", "2", "3"])]);
+
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        net_tie_library(&served);
+        let applied = served.apply(&netlist).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+        let sent = served.sent_footprints();
+        let net_ties = &sent[0].definition.as_ref().unwrap().net_ties;
+        assert_eq!(net_ties.len(), 1, "{net_ties:?}");
+        assert_eq!(net_ties[0].pad_number, ["1", "2", "3"]);
+        assert_eq!(served.sent("GetVersion"), 2);
+
+        let older = ServedSync::reading_back(Readback::AsSent).await;
+        older.report_kicad_version(10, 0, 0);
+        net_tie_library(&older);
+        let applied = older.apply(&netlist).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        let diagnostics = applied["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1, "{applied:#}");
+        assert_eq!(diagnostics[0]["code"], "not_carried");
+        assert_eq!(diagnostics[0]["footprint_id"], NET_TIE_3_THT);
+        assert!(
+            diagnostics[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("require KiCad 10.0.1 or newer (connected KiCad is 10.0.0)"),
+            "{applied:#}"
+        );
+        assert!(older.sent_footprints()[0]
+            .definition
+            .as_ref()
+            .unwrap()
+            .net_ties
+            .is_empty());
     }
 
     /// Write each `(name, text)` footprint to a `Margins.pretty` library in

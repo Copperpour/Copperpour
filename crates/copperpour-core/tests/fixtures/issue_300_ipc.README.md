@@ -65,7 +65,10 @@ Refresh reads U1 to U5 whole:
 
 The tests read U6 to U8 only pad by pad, for the values U1 to U5 don't have.
 Refresh still refuses all three for other clauses: U6 and U7 for a custom
-pad, U8 for `net_tie_pad_groups`.
+pad, U8 for its keepout `zone`. U8's `(net_tie_pad_groups "1, 2")` is
+reported as one `NetTieDefinition` with pad numbers `1` and `2`, which the
+net-tie tests read ([#85](https://github.com/Copperpour/Copperpour/issues/85),
+`net_tie_kicad10.README.md`).
 
 - **U6: `(zone_connect 0)` on 16 rectangles.** Reported `ZCS_NONE`, 90°.
 - **U7: `(zone_connect 1)` on 11 round thermal vias.** Reported `ZCS_THERMAL`,

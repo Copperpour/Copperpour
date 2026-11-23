@@ -960,6 +960,9 @@ struct LibraryFootprintData {
     pad_margins: Vec<super::library_footprint::SolderMargins>,
     margins: super::library_footprint::SolderMargins,
     points: Vec<super::library_footprint::LibraryPoint>,
+    /// The library's net-tie pad groups, which KiCad's API keeps from
+    /// 10.0.1 (#85).
+    net_ties: Vec<copperpour_ipc::gen::kiapi::board::types::NetTieDefinition>,
     unsupported: Vec<String>,
 }
 
@@ -1020,6 +1023,7 @@ impl PreparedFootprintPlacement {
             pad_margins: super::library_footprint::pad_margins(&root, &pad_nodes)?,
             margins: super::library_footprint::SolderMargins::of_footprint(&root)?,
             points: super::library_footprint::points(&root)?,
+            net_ties: super::library_footprint::net_ties(&root)?,
             unsupported: super::library_footprint::unsupported_features(&root)?,
         };
         let board_sexp = if let Some(dir) = project_dir {
@@ -1104,27 +1108,48 @@ impl PreparedFootprintPlacement {
         })
     }
 
-    /// Check connected KiCad's version only when this footprint carries
-    /// 10.0.7+ fields. Returns `(carry_10_0_7_fields, kicad_if_older)`.
-    pub(crate) fn resolve_kicad_10_0_7(
+    /// Whether this footprint has net-tie pad groups, which KiCad's API keeps
+    /// only from 10.0.1.
+    fn has_net_ties(&self) -> bool {
+        self.library
+            .as_ref()
+            .is_some_and(|lib| !lib.net_ties.is_empty())
+    }
+
+    /// Ask the connected KiCad's version only when this footprint has what
+    /// not every KiCad 10 release carries: pad fabrication properties or
+    /// reference points (10.0.7+), or net-tie pad groups (10.0.1+). Returns
+    /// what to send, and the KiCad when it is too old for some of what the
+    /// footprint has.
+    pub(crate) fn resolve_kicad_carried(
         &self,
         client: &KiCadIpcClient,
-    ) -> anyhow::Result<(bool, Option<copperpour_ipc::IpcKiCadVersion>)> {
-        if !self.needs_kicad_10_0_7() {
-            return Ok((false, None));
+    ) -> anyhow::Result<(
+        super::library_footprint::CarriedByKiCad,
+        Option<copperpour_ipc::IpcKiCadVersion>,
+    )> {
+        let (needs_10_0_7, has_net_ties) = (self.needs_kicad_10_0_7(), self.has_net_ties());
+        if !needs_10_0_7 && !has_net_ties {
+            return Ok((Default::default(), None));
         }
         let kicad = client.get_kicad_version()?;
-        if super::library_footprint::carries_kicad_10_0_7_fields(&kicad) {
-            Ok((true, None))
-        } else {
-            Ok((false, Some(kicad)))
-        }
+        // Only a footprint that has them sends the 10.0.7 fields, as before.
+        let carried = super::library_footprint::CarriedByKiCad {
+            fields_10_0_7: needs_10_0_7
+                && super::library_footprint::carries_kicad_10_0_7_fields(&kicad),
+            net_ties: super::library_footprint::carries_net_ties(&kicad),
+        };
+        let left_out =
+            (needs_10_0_7 && !carried.fields_10_0_7) || (has_net_ties && !carried.net_ties);
+        Ok((carried, left_out.then_some(kicad)))
     }
 
     /// Features of the library footprint that the typed IPC path left out.
+    /// `older_kicad` is the connected KiCad when it is too old for some of
+    /// them ([`Self::resolve_kicad_carried`]).
     pub(crate) fn not_carried(
         &self,
-        kicad_before_10_0_7: Option<&copperpour_ipc::IpcKiCadVersion>,
+        older_kicad: Option<&copperpour_ipc::IpcKiCadVersion>,
     ) -> Vec<String> {
         let Some(library) = &self.library else {
             return Vec::new();
@@ -1136,11 +1161,15 @@ impl PreparedFootprintPlacement {
                  Description and custom properties left out): {reason}"
             ));
         }
-        if let Some(kicad) = kicad_before_10_0_7 {
+        if let Some(kicad) = older_kicad {
             items.extend(super::library_footprint::not_carried_10_0_7_reasons(
                 &library.pad_properties,
                 &self.pads,
                 &library.points,
+                kicad,
+            ));
+            items.extend(super::library_footprint::net_ties_not_carried_reason(
+                &library.net_ties,
                 kicad,
             ));
         }
@@ -1150,16 +1179,16 @@ impl PreparedFootprintPlacement {
     /// The F.Cu `FootprintInstance` the IPC path creates, with the library's
     /// 3D models, attributes, description and keywords, pad zone settings,
     /// pad and footprint solder mask and paste margins, fields (Reference,
-    /// Value, Datasheet, Description and custom properties), and (when
-    /// `carry_10_0_7_fields` is true) pad fabrication properties and
-    /// reference points on it.
+    /// Value, Datasheet, Description and custom properties), and, as
+    /// `carried` says, pad fabrication properties and reference points and
+    /// net-tie pad groups on it.
     pub(crate) fn ipc_item(
         &self,
         lib_id: &str,
         reference: &str,
         x: f64,
         y: f64,
-        carry_10_0_7_fields: bool,
+        carried: super::library_footprint::CarriedByKiCad,
     ) -> anyhow::Result<prost_types::Any> {
         let item = KiCadIpcClient::build_footprint_item(
             lib_id,
@@ -1197,9 +1226,9 @@ impl PreparedFootprintPlacement {
             &library.pad_properties,
             &library.pad_zones,
             &library.pad_margins,
-            carry_10_0_7_fields,
+            carried.fields_10_0_7,
         )?;
-        if carry_10_0_7_fields {
+        if carried.fields_10_0_7 {
             super::library_footprint::apply_reference_points(
                 definition,
                 &library.points,
@@ -1207,6 +1236,9 @@ impl PreparedFootprintPlacement {
                 self.front_rotation,
                 None,
             )?;
+        }
+        if carried.net_ties {
+            definition.net_ties = library.net_ties.clone();
         }
         if let Ok(properties) = &library.properties {
             apply_library_properties(&mut footprint, properties, reference, &self.value)?;
@@ -2821,8 +2853,8 @@ async fn handle_place_component(
     let requested_board = board.clone();
     let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board, "placement", move |c| {
-        let (carry_10_0_7, kicad_before_10_0_7) = prepared_ipc.resolve_kicad_10_0_7(c)?;
-        let item = prepared_ipc.ipc_item(&footprint_ipc, &reference_ipc, x, y, carry_10_0_7)?;
+        let (carried, older_kicad) = prepared_ipc.resolve_kicad_carried(c)?;
+        let item = prepared_ipc.ipc_item(&footprint_ipc, &reference_ipc, x, y, carried)?;
         let placed = c.place_footprint_item(&requested_board, &reference_ipc, item)?;
         let placed = if on_back {
             match flip_new_footprint_to_back(c, &reference_ipc)? {
@@ -2834,12 +2866,12 @@ async fn handle_place_component(
         };
         let document = c.find_open_board(&requested_board)?;
         let models = c.footprint_3d_model_snapshot_in(document, &reference_ipc)?;
-        Ok(Ok((placed, models.models, kicad_before_10_0_7)))
+        Ok(Ok((placed, models.models, older_kicad)))
     })
     .await?;
 
     match attempt {
-        BoardWrite::Ipc(Ok((fp, models, kicad_before_10_0_7))) => {
+        BoardWrite::Ipc(Ok((fp, models, older_kicad))) => {
             let mut response = json!({
                 "placed": fp.reference,
                 "footprint": fp.footprint,
@@ -2856,7 +2888,7 @@ async fn handle_place_component(
             if let Some(warning) = prepared.library_fields_not_carried(&footprint, &reference) {
                 response["warning"] = json!(warning);
             }
-            let not_carried = prepared.not_carried(kicad_before_10_0_7.as_ref());
+            let not_carried = prepared.not_carried(older_kicad.as_ref());
             if !not_carried.is_empty() {
                 response["not_carried"] = json!(not_carried);
             }
@@ -4713,20 +4745,20 @@ async fn handle_place_array(
             );
         }
 
-        let (carry_10_0_7, kicad_before_10_0_7) = match planned.first() {
-            Some((_, first, _, _)) => first.resolve_kicad_10_0_7(c)?,
-            None => (false, None),
+        let (carried, older_kicad) = match planned.first() {
+            Some((_, first, _, _)) => first.resolve_kicad_carried(c)?,
+            None => (Default::default(), None),
         };
         let not_carried = planned
             .first()
-            .map(|(_, first, _, _)| first.not_carried(kicad_before_10_0_7.as_ref()))
+            .map(|(_, first, _, _)| first.not_carried(older_kicad.as_ref()))
             .unwrap_or_default();
 
         let items = planned
             .iter()
             .map(|(reference, prepared, x, y)| {
                 prepared
-                    .ipc_item(&footprint_id, reference, *x, *y, carry_10_0_7)
+                    .ipc_item(&footprint_id, reference, *x, *y, carried)
                     .with_context(|| format!("failed to prepare {reference}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -4909,10 +4941,10 @@ async fn handle_duplicate_component(
     let fp_id = src.footprint.clone();
     let dup_board = board.clone();
     let (fp, not_carried) = ipc!(ctx, args, |c| {
-        let (carry_10_0_7, kicad_before_10_0_7) = prepared.resolve_kicad_10_0_7(c)?;
-        let item = prepared.ipc_item(&fp_id, &ipc_reference, x, y, carry_10_0_7)?;
+        let (carried, older_kicad) = prepared.resolve_kicad_carried(c)?;
+        let item = prepared.ipc_item(&fp_id, &ipc_reference, x, y, carried)?;
         let fp = c.place_footprint_item(&dup_board, &ipc_reference, item)?;
-        let not_carried = prepared.not_carried(kicad_before_10_0_7.as_ref());
+        let not_carried = prepared.not_carried(older_kicad.as_ref());
         Ok((fp, not_carried))
     });
     let mut response = json!({
@@ -8305,7 +8337,13 @@ mod tests {
         )
         .unwrap();
         let item = prepared
-            .ipc_item("Capacitor_SMD:C_0603_1608Metric", "C1", 10.0, 20.0, true)
+            .ipc_item(
+                "Capacitor_SMD:C_0603_1608Metric",
+                "C1",
+                10.0,
+                20.0,
+                crate::tools::library_footprint::CarriedByKiCad::ALL,
+            )
             .unwrap();
         let footprint = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
         assert_eq!(
@@ -8353,7 +8391,13 @@ mod tests {
         // KiCad's top-bottom flip negates the orientation about the anchor,
         // so the F.Cu copy is built at -30 to land at 30 on B.Cu.
         let item = prepared
-            .ipc_item("Capacitor_SMD:C_0603_1608Metric", "C1", 10.0, 20.0, true)
+            .ipc_item(
+                "Capacitor_SMD:C_0603_1608Metric",
+                "C1",
+                10.0,
+                20.0,
+                crate::tools::library_footprint::CarriedByKiCad::ALL,
+            )
             .unwrap();
         let footprint = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
         assert_eq!(footprint.layer, board::BoardLayer::BlFCu as i32);
@@ -8418,7 +8462,13 @@ mod tests {
             )
             .unwrap();
             let item = prepared
-                .ipc_item("Capacitor_SMD:C_0603_1608Metric", &reference, x, y, true)
+                .ipc_item(
+                    "Capacitor_SMD:C_0603_1608Metric",
+                    &reference,
+                    x,
+                    y,
+                    crate::tools::library_footprint::CarriedByKiCad::ALL,
+                )
                 .unwrap();
             let built = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
             assert_eq!(
@@ -8492,7 +8542,13 @@ mod tests {
             )
             .unwrap();
             let item = prepared
-                .ipc_item("Capacitor_SMD:C_0603_1608Metric", "C1", x, y, true)
+                .ipc_item(
+                    "Capacitor_SMD:C_0603_1608Metric",
+                    "C1",
+                    x,
+                    y,
+                    crate::tools::library_footprint::CarriedByKiCad::ALL,
+                )
                 .unwrap();
             let built = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
             assert_eq!(
@@ -8546,7 +8602,15 @@ mod tests {
             Some(tmp.path()),
         )
         .unwrap();
-        let item = prepared.ipc_item(&lib_id, "U1", 10.0, 20.0, true).unwrap();
+        let item = prepared
+            .ipc_item(
+                &lib_id,
+                "U1",
+                10.0,
+                20.0,
+                crate::tools::library_footprint::CarriedByKiCad::ALL,
+            )
+            .unwrap();
         let built = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
         let shown = |field: &Option<board::Field>| {
             field
@@ -8673,7 +8737,15 @@ mod tests {
                 Some(tmp.path()),
             )
             .unwrap();
-            let item = prepared.ipc_item(&lib_id, &reference, x, y, true).unwrap();
+            let item = prepared
+                .ipc_item(
+                    &lib_id,
+                    &reference,
+                    x,
+                    y,
+                    crate::tools::library_footprint::CarriedByKiCad::ALL,
+                )
+                .unwrap();
             let built = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
             let (kicad_pads, built_pads) = (pads(&kicad), pads(&built));
             assert_eq!(kicad_pads.len(), built_pads.len(), "{reference}");
@@ -8814,7 +8886,15 @@ mod tests {
                 Some(tmp.path()),
             )
             .unwrap();
-            let item = prepared.ipc_item(&lib_id, &reference, x, y, true).unwrap();
+            let item = prepared
+                .ipc_item(
+                    &lib_id,
+                    &reference,
+                    x,
+                    y,
+                    crate::tools::library_footprint::CarriedByKiCad::ALL,
+                )
+                .unwrap();
             let built = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
             let kicad = summary(&kicad);
             assert_eq!(summary(&built), kicad, "{reference}");
@@ -11121,6 +11201,238 @@ mod nanometre_rounding_tests {
         );
         let store = store.lock().unwrap();
         assert_eq!((store.updates, store.creates, store.deletes), (0, 0, 0));
+    }
+
+    // ─── #85: net-tie pad groups ────────────────────────────────────────────
+
+    /// KiCad 10.0.8's stock net ties (`net_tie_kicad10.README.md`): each one's
+    /// library name, text and one group.
+    const NET_TIE_FOOTPRINTS: [(&str, &str, &[&str]); 3] = [
+        (
+            "NetTie-2_SMD_Pad0.5mm",
+            include_str!("../../tests/fixtures/net_tie_2_smd_pad0.5mm_kicad10.kicad_mod"),
+            &["1", "2"],
+        ),
+        (
+            "NetTie-3_THT_Pad0.3mm",
+            include_str!("../../tests/fixtures/net_tie_3_tht_pad0.3mm_kicad10.kicad_mod"),
+            &["1", "2", "3"],
+        ),
+        (
+            "NetTie-4_SMD_Pad0.5mm",
+            include_str!("../../tests/fixtures/net_tie_4_smd_pad0.5mm_kicad10.kicad_mod"),
+            &["1", "2", "3", "4"],
+        ),
+    ];
+
+    /// Each net-tie group `footprint` holds, as pad numbers.
+    fn tie_groups(footprint: &FootprintInstance) -> Vec<Vec<String>> {
+        footprint
+            .definition
+            .as_ref()
+            .unwrap()
+            .net_ties
+            .iter()
+            .map(|group| group.pad_number.clone())
+            .collect()
+    }
+
+    /// `place_component` gives each stock net tie its library group on KiCad
+    /// 10.0.1 and later, and lists nothing as not carried.
+    #[tokio::test]
+    async fn place_component_carries_net_tie_pad_groups() {
+        for version in [(10, 0, 1), (10, 0, 8)] {
+            for (entry, source, group) in NET_TIE_FOOTPRINTS {
+                let dir = tempfile::tempdir().unwrap();
+                let (board, lib_id) = issue_318_fixture(dir.path(), "NetTie", entry, source);
+                let store = Arc::new(Mutex::new(ItemStore::default()));
+                let (is_error, text) = served_with_version(
+                    &board,
+                    store.clone(),
+                    version,
+                    "place_component",
+                    json!({
+                        "board": board.to_string_lossy(),
+                        "footprint": lib_id,
+                        "reference": "NT1",
+                        "x": 10.0,
+                        "y": 10.0,
+                    }),
+                )
+                .await;
+                assert!(!is_error, "{entry} on {version:?}: {text}");
+                let out: Value = serde_json::from_str(&text).unwrap();
+                assert!(
+                    out.get("not_carried").is_none(),
+                    "{entry} on {version:?}: {out}"
+                );
+                assert_eq!(
+                    tie_groups(&held_footprint(&store)),
+                    [group.to_vec()],
+                    "{entry} on {version:?}"
+                );
+            }
+        }
+    }
+
+    /// Oracle test (#85): placing the stock Antenova antenna on KiCad 10.0.8
+    /// sends the net-tie group KiCad reported for it in `issue_300_u8.ipc.bin`.
+    /// Its keepout zone is still left out, and listed; its group is not.
+    #[tokio::test]
+    async fn place_component_carries_the_net_tie_kicad_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let (board, lib_id) = issue_318_fixture(
+            dir.path(),
+            "RF_Antenna",
+            "Antenova_SR4G013_GPS",
+            include_str!("../../tests/fixtures/issue_300_antenova_sr4g013_kicad10.kicad_mod"),
+        );
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let (is_error, text) = served_with_version(
+            &board,
+            store.clone(),
+            (10, 0, 8),
+            "place_component",
+            json!({
+                "board": board.to_string_lossy(),
+                "footprint": lib_id,
+                "reference": "U8",
+                "x": 170.0,
+                "y": 115.0,
+            }),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        let out: Value = serde_json::from_str(&text).unwrap();
+        assert!(out["not_carried"].to_string().contains("zone"), "{out}");
+        assert!(!out["not_carried"].to_string().contains("net_tie"), "{out}");
+        let oracle = FootprintInstance::decode(
+            include_bytes!("../../tests/fixtures/issue_300_u8.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            held_footprint(&store).definition.unwrap().net_ties,
+            oracle.definition.unwrap().net_ties
+        );
+    }
+
+    /// On KiCad 10.0.0, which would keep each group as one pad,
+    /// `place_component` places a net tie without its group and names the
+    /// group in `not_carried`, as it does pad properties before 10.0.7.
+    #[tokio::test]
+    async fn place_component_on_kicad_10_0_0_reports_net_ties_not_carried() {
+        let (entry, source, _) = NET_TIE_FOOTPRINTS[1];
+        let dir = tempfile::tempdir().unwrap();
+        let (board, lib_id) = issue_318_fixture(dir.path(), "NetTie", entry, source);
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let (is_error, text) = served_with_version(
+            &board,
+            store.clone(),
+            (10, 0, 0),
+            "place_component",
+            json!({
+                "board": board.to_string_lossy(),
+                "footprint": lib_id,
+                "reference": "NT1",
+                "x": 10.0,
+                "y": 10.0,
+            }),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        let out: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            out["not_carried"],
+            json!([
+                "net-tie pad groups (\"1, 2, 3\") require KiCad 10.0.1 or newer (connected KiCad \
+                 is 10.0.0)"
+            ]),
+            "{out}"
+        );
+        assert!(tie_groups(&held_footprint(&store)).is_empty());
+    }
+
+    /// `place_component_array` and `duplicate_component` build their
+    /// footprints as `place_component` does, net ties included.
+    #[tokio::test]
+    async fn array_and_duplicate_carry_net_tie_pad_groups() {
+        let (entry, source, group) = NET_TIE_FOOTPRINTS[1];
+        let dir = tempfile::tempdir().unwrap();
+        let (board, lib_id) = issue_318_fixture(dir.path(), "NetTie", entry, source);
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        for (tool, arguments) in [
+            (
+                "place_component_array",
+                json!({
+                    "board": board.to_string_lossy(),
+                    "footprint": lib_id,
+                    "start_x": 10.0,
+                    "start_y": 10.0,
+                    "count_x": 2,
+                    "count_y": 1,
+                    "spacing_x": 5.0,
+                    "ref_prefix": "NT",
+                    "ref_start": 1,
+                }),
+            ),
+            (
+                "duplicate_component",
+                json!({
+                    "board": board.to_string_lossy(),
+                    "reference": "NT1",
+                    "new_reference": "NT9",
+                    "x": 30.0,
+                    "y": 10.0,
+                }),
+            ),
+        ] {
+            let (is_error, text) =
+                served_with_version(&board, store.clone(), (10, 0, 8), tool, arguments).await;
+            assert!(!is_error, "{tool}: {text}");
+            let out: Value = serde_json::from_str(&text).unwrap();
+            assert!(out.get("not_carried").is_none(), "{tool}: {out}");
+        }
+        let items = store.lock().unwrap().items.clone();
+        assert_eq!(items.len(), 3);
+        for item in &items {
+            let footprint = FootprintInstance::decode(item.value.as_slice()).unwrap();
+            assert_eq!(tie_groups(&footprint), [group.to_vec()]);
+        }
+    }
+
+    /// A net-tie group placement could not send as the library writes it
+    /// refuses the part before anything reaches KiCad, naming why.
+    #[tokio::test]
+    async fn place_component_refuses_a_malformed_net_tie_group() {
+        let (entry, source, _) = NET_TIE_FOOTPRINTS[1];
+        let malformed = source.replace(
+            "(net_tie_pad_groups \"1, 2, 3\")",
+            "(net_tie_pad_groups \"1, 4\")",
+        );
+        assert_ne!(malformed, source, "the edit must land");
+        let dir = tempfile::tempdir().unwrap();
+        let (board, lib_id) = issue_318_fixture(dir.path(), "NetTie", entry, &malformed);
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let (is_error, text) = served_with_version(
+            &board,
+            store.clone(),
+            (10, 0, 8),
+            "place_component",
+            json!({
+                "board": board.to_string_lossy(),
+                "footprint": lib_id,
+                "reference": "NT1",
+                "x": 10.0,
+                "y": 10.0,
+            }),
+        )
+        .await;
+        assert!(is_error, "{text}");
+        assert!(
+            text.contains("names pad '4', which the footprint does not have"),
+            "{text}"
+        );
+        assert!(store.lock().unwrap().items.is_empty());
     }
 }
 
