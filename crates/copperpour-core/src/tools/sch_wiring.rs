@@ -772,9 +772,10 @@ fn vertical_elbow_is_clearer(
         let text_runs = texts
             .iter()
             .filter(|text| {
+                let bounds = text.wire_crossing_bounds();
                 points
                     .windows(2)
-                    .any(|leg| text.run.segment_enters(leg[0], leg[1]))
+                    .any(|leg| bounds.segment_enters(leg[0], leg[1]))
             })
             .count();
         (bodies, text_runs)
