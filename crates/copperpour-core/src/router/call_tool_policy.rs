@@ -70,9 +70,9 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "list_schematic_components",
     // sch_readability
     "check_connector_pin_signals",
+    "check_placement",
     "check_schematic_overlaps",
     "check_schematic_page_fit",
-    "check_schematic_placement",
     "check_schematic_wire_runs",
     "compare_schematic_layout",
     "find_pin_contacts",

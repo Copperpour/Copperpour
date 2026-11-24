@@ -1,6 +1,6 @@
-### Add `check_schematic_placement` (minor release)
+### Add `check_placement` (minor release)
 
-Load `sch_readability` and call `check_schematic_placement` with `schematic` to check one
+Load `sch_readability` and call `check_placement` with `schematic` to check one
 saved sheet's placement. `overlaps`, `overlap_count`, `bounds_resolved` and
 `bounds_unresolved` are the same as `check_schematic_overlaps` returns for that sheet at
 its default tolerance. `off_grid_pins` lists each placed symbol pin tip whose X or Y is

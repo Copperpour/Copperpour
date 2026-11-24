@@ -1,7 +1,7 @@
-//! `check_schematic_placement`: a static placement check of one saved sheet.
+//! `check_placement`: a static placement check of one saved schematic sheet.
 //!
 //! Overlaps come from [`overlap_findings`], the same code behind
-//! `check_schematic_overlaps`, so the two tools cannot disagree. Pin positions
+//! `check_schematic_overlaps`, at its default tolerance. Pin positions
 //! come from [`drawn_symbol_pins`], the selected unit and body style KiCad draws.
 
 use super::sch_analysis::{overlap_findings, OVERLAP_TOLERANCE};
@@ -16,7 +16,7 @@ use std::path::Path;
 
 pub(super) fn definition() -> ToolDef {
     tool!(
-        "check_schematic_placement",
+        "check_placement",
         "Check one saved schematic sheet's placement: the overlaps check_schematic_overlaps \
          reports, from the same code, and placed symbol pin tips off KiCad's nominal 1.27 mm \
          grid. Refuses a sheet whose symbol pins cannot all be resolved rather than \
@@ -28,11 +28,11 @@ pub(super) fn definition() -> ToolDef {
             },
             "required": ["schematic"]
         }),
-        |args, _ctx| async move { handle_check_schematic_placement(args) }
+        |args, _ctx| async move { handle_check_placement(args) }
     )
 }
 
-fn handle_check_schematic_placement(args: &Value) -> anyhow::Result<CallToolResult> {
+fn handle_check_placement(args: &Value) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "schematic")?;
     Ok(match check_placement(&path) {
         Ok(report) => CallToolResult::json(&report),
@@ -75,6 +75,7 @@ fn check_placement(path: &Path) -> Result<Value, CallToolResult> {
         drawn_symbol_pins(&tree).ok_or_else(|| malformed(path, UNRESOLVED_PIN_GEOMETRY))?;
     let mut pins: Vec<PinPosition<'_>> = Vec::new();
     for (symbol, unit_pins) in &placed {
+        let start = pins.len();
         for (pin, transform) in unit_pins {
             let at = pin_endpoint(pin, *transform);
             if pin.number.is_empty() || !at.0.is_finite() || !at.1.is_finite() {
@@ -82,9 +83,9 @@ fn check_placement(path: &Path) -> Result<Value, CallToolResult> {
             }
             // Stacked pins sharing a number and position are one connection
             // point, as KiCad reports them once.
-            let stacked = pins.iter().any(|seen| {
-                std::ptr::eq(seen.symbol, symbol) && seen.number == pin.number && seen.at == at
-            });
+            let stacked = pins[start..]
+                .iter()
+                .any(|seen| seen.number == pin.number && seen.at == at);
             if !stacked {
                 pins.push(PinPosition {
                     symbol,

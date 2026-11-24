@@ -4,12 +4,14 @@ use crate::tools::ServerConfig;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-const TOOL: &str = "check_schematic_placement";
+const TOOL: &str = "check_placement";
 /// KiCad 10.0.8-resaved; every pin on the 1.27 mm grid (README beside it).
 const CROWDED: &str =
     include_str!("../../tests/fixtures/region_cleanup_kicad10/crowded/crowded.kicad_sch");
 /// KiCad's own hv_converter demo; C4 pin 2 sits at (149.352, 84.328).
 const OFF_GRID_DEMO: &str = include_str!("../../tests/fixtures/power_on_off_grid_pin.kicad_sch");
+const PIN_CONTACT: &str = include_str!("../../tests/fixtures/symbol_pin_contact_kicad10.kicad_sch");
+const PIN_UNITS: &str = include_str!("../../tests/fixtures/power_on_pin_kicad10.kicad_sch");
 /// U1's placement line in `CROWDED`, unique because of the lib_id before it.
 const U1_AT: &str = "(lib_id \"Regulator_Linear:AMS1117-3.3\")\n\t\t(at 127 76.2 0)";
 
@@ -91,6 +93,16 @@ async fn an_on_grid_sheet_reports_no_off_grid_pins() {
     assert!(report["pin_count"].as_u64().unwrap() > 0, "{report}");
 }
 
+#[tokio::test]
+async fn counts_only_placed_units_and_body_styles() {
+    let sheet = Sheet::new("power_on_pin_kicad10.kicad_sch", PIN_UNITS).await;
+    let report = sheet.ok(TOOL).await;
+    // Five resistors, three amplifier pins, two amplifier power pins,
+    // three NAND pins in the selected body style and two power symbols.
+    assert_eq!(report["pin_count"], 20, "{report}");
+    assert_eq!(report["off_grid_pin_count"], 0, "{report}");
+}
+
 /// Half a grid step moves only U1's three pins off the grid. Their expected
 /// positions are KiCad's (fixture README) plus the shift, not this tool's math.
 #[tokio::test]
@@ -123,7 +135,7 @@ async fn a_half_grid_shift_reports_exactly_the_moved_symbols_pins() {
 /// One KiCad internal unit (0.0001 mm) of drift is off the grid; a whole
 /// grid step is not.
 #[tokio::test]
-async fn the_grid_boundary_is_one_internal_unit() {
+async fn one_internal_unit_of_drift_is_off_grid() {
     let drift = Sheet::new("crowded.kicad_sch", &shifted_u1("127.0001")).await;
     assert_eq!(drift.ok(TOOL).await["off_grid_pin_count"], 3);
     let step = Sheet::new("crowded.kicad_sch", &shifted_u1("128.27")).await;
@@ -135,19 +147,14 @@ async fn kicads_own_off_grid_pin_is_reported() {
     let sheet = Sheet::new("hv_converter.kicad_sch", OFF_GRID_DEMO).await;
     let report = sheet.ok(TOOL).await;
     let pins = report["off_grid_pins"].as_array().unwrap();
-    assert!(
-        pins.iter().any(|p| p["reference"] == "C4"
-            && p["pin_number"] == "2"
-            && p["x"] == 149.352
-            && p["y"] == 84.328),
-        "{report}"
-    );
-    for pin in pins {
-        let (x, y) = (pin["x"].as_f64().unwrap(), pin["y"].as_f64().unwrap());
+    // C4 is rotated. D2 uses the sheet-local lib_name, not its base lib_id.
+    for (reference, x, y) in [("C4", 149.352, 84.328), ("D2", 131.572, 96.52)] {
         assert!(
-            !copperpour_sexp::geometry::is_on_schematic_pin_grid(x)
-                || !copperpour_sexp::geometry::is_on_schematic_pin_grid(y),
-            "{pin}"
+            pins.iter().any(|p| p["reference"] == reference
+                && p["pin_number"] == "2"
+                && p["x"] == x
+                && p["y"] == y),
+            "{reference}.2 missing: {report}"
         );
     }
 }
@@ -178,6 +185,21 @@ async fn overlaps_match_check_schematic_overlaps() {
 }
 
 #[tokio::test]
+async fn a_collision_is_reported_but_a_pin_tip_contact_is_not() {
+    let sheet = Sheet::new("symbol_pin_contact_kicad10.kicad_sch", PIN_CONTACT).await;
+    let report = sheet.ok(TOOL).await;
+    let overlaps = report["overlaps"].as_array().unwrap();
+    let collides = |a: &str, b: &str| {
+        overlaps.iter().any(|row| {
+            row["type"] == "component_overlap"
+                && ((row["a"] == a && row["b"] == b) || (row["a"] == b && row["b"] == a))
+        })
+    };
+    assert!(collides("R12", "R13"), "{report}");
+    assert!(!collides("R10", "#PWR01"), "{report}");
+}
+
+#[tokio::test]
 async fn unresolved_pin_geometry_is_refused_not_reported_clean() {
     let source = CROWDED.replace(
         "(lib_id \"Regulator_Linear:AMS1117-3.3\")\n\t\t(at",
@@ -197,9 +219,31 @@ async fn unresolved_pin_geometry_is_refused_not_reported_clean() {
 #[tokio::test]
 async fn missing_and_non_schematic_files_are_named_errors() {
     let sheet = Sheet::new("crowded.kicad_sch", "(kicad_pcb (version 20260306))").await;
-    assert_eq!(sheet.error().await["error"]["kind"], "malformed_file");
+    let body = sheet.error().await;
+    assert_eq!(body["error"]["kind"], "malformed_file");
+    assert_eq!(body["error"]["path"], json!(sheet.path));
     std::fs::remove_file(&sheet.path).unwrap();
     assert_eq!(sheet.error().await["error"]["kind"], "file_not_found");
+}
+
+#[tokio::test]
+async fn unreadable_overlap_inputs_are_not_treated_as_clean() {
+    for (item, reason) in [
+        (
+            "(wire (pts (xy 1 2)))",
+            "one or more wires have unreadable endpoints",
+        ),
+        (
+            "(label \"SIG\" (at 1))",
+            "one or more labels have unreadable anchors",
+        ),
+    ] {
+        let source = format!("(kicad_sch (version 20260306) (lib_symbols) {item})");
+        let sheet = Sheet::new("malformed.kicad_sch", &source).await;
+        let body = sheet.error().await;
+        assert_eq!(body["error"]["kind"], "malformed_file", "{body}");
+        assert_eq!(body["error"]["reason"], reason, "{body}");
+    }
 }
 
 #[tokio::test]

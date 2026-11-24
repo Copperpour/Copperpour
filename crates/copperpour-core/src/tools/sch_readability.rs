@@ -182,6 +182,6 @@ mod tests {
 
     #[tokio::test]
     async fn placement_check_belongs_to_readability() {
-        assert_readability_route("check_schematic_placement").await;
+        assert_readability_route("check_placement").await;
     }
 }
