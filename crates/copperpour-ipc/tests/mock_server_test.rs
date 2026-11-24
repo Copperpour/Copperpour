@@ -1224,10 +1224,12 @@ fn delete_items_surfaces_per_item_failure() {
     assert!(error.contains("missing-id"), "{error}");
 }
 
-/// KiCad 10 builds per-item deletion results and never attaches them, so a
-/// successful delete comes back with an empty `deleted_items`. Treating that
-/// as failure is what made delete_component report "0 deletion results" for
-/// deletions that had actually happened (#116).
+/// KiCad before 10.0.7 builds per-item deletion results and never attaches
+/// them, so a successful delete comes back with an empty `deleted_items`.
+/// Treating that as failure is what made delete_component report "0 deletion
+/// results" for deletions that had actually happened (#116). KiCad 10.0.7 and
+/// later return one result per item (KiCad 77e2d53da2), which the strict
+/// branch checks; the empty list stays accepted for the older releases.
 #[test]
 fn an_empty_deletion_result_list_is_not_a_failure() {
     let mock = spawn_mock(|request| {
