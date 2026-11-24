@@ -353,7 +353,7 @@ Copperpour can autoroute a board with [Freerouting](https://freerouting.org):
 the board, routes it, and imports the result.
 
 Fixed straight tracks and through vias are preserved. Netted copper zones export
-as planes, and [supported rule areas](docs/api-migrations/specctra-rule-areas.md)
+as planes, and [supported rule areas](docs/API_MIGRATIONS.md#the-specctra-round-trip-keeps-rule-areas-as-keep-outs-minor-release)
 export as keep-outs with whole-micrometre vertices. Routed arcs, unlocked routing
 and unsupported zone/rule-area forms are refused before export.
 
@@ -387,8 +387,8 @@ or normal discovery, and a browser; no Tauri runtime is needed.
 The browser viewer is embedded in the MCP server and PCM package. No separate
 viewer executable or GTK/WebKit/WebView build is needed. The standalone
 `schematic-viewer` command has been retired; use `open_schematic_viewer` instead.
-See the [retirement migration](docs/api-migrations/retire-standalone-viewer.md) and
-[browser response contract](docs/api-migrations/browser-viewer-mcp.md).
+See the [retirement migration](docs/API_MIGRATIONS.md#standalone-tauri-schematic-viewer-retired-minor-release) and
+[browser response contract](docs/API_MIGRATIONS.md#open_schematic_viewer-uses-the-browser-service-standalone-tauri-viewer-deprecated-minor-release).
 
 ## Requirements
 

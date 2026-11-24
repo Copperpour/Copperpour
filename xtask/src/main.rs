@@ -16,6 +16,7 @@
 
 mod api_migrations;
 mod fixtures;
+mod markdown_links;
 
 use copperpour_core::router::{meta_tools, registry};
 use std::path::{Path, PathBuf};

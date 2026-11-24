@@ -5,7 +5,7 @@ The crate contains the GUI-independent viewer engine and browser service.
 an instance per canonical root until the MCP server context ends (stdio disconnect
 or HTTP server shutdown). Set `open_browser: false`
 to obtain the private URL without launching a browser. The standalone Tauri
-command has been [retired](../../docs/api-migrations/retire-standalone-viewer.md).
+command has been [retired](../../docs/API_MIGRATIONS.md#standalone-tauri-schematic-viewer-retired-minor-release).
 
 For local browser testing:
 

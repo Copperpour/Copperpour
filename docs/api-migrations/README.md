@@ -19,3 +19,6 @@ Only the first line may be a `#`, `##` or `###` heading; use `####` inside.
 `cargo test -p xtask` checks every file here. At release,
 `cargo xtask collect-api-migrations vMAJOR.MINOR.PATCH` moves them, in file-name
 order, under `## vMAJOR.MINOR.PATCH` in `../API_MIGRATIONS.md` and deletes them.
+It rewrites relative links inside the notes for their new place. While another
+file links to a note, it refuses before changing anything: repoint that link at
+the note's `../API_MIGRATIONS.md#<section>` first.
