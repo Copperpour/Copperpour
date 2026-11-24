@@ -115,7 +115,9 @@ Follow this sequence for a clean PCB workflow:
    the part another footprint or fix the pad; when the schematic connects
    a pad the footprint does not have, fix the symbol or the footprint choice. A
    footprint whose symbol left the schematic stays on the board and is listed under
-   `footprints_without_symbols`. To delete those, as KiCad's **Delete footprints with
+   `footprints_without_symbols` (`reason: "symbol_removed"`), and so does the footprint
+   of a symbol marked Exclude from board (`reason: "excluded_from_board"`). To delete
+   those, as KiCad's **Delete footprints with
    no symbols** does, ask the user first, then run the dry run and the apply with
    `delete_footprints_without_symbols: true`: each one is a `delete` change in the
    plan, a board-only footprint (a logo, a mounting hole) is never deleted, and a
