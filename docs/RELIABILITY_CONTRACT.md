@@ -1,9 +1,8 @@
 # Tool reliability contract
 
-Use this contract when implementing or reviewing a tool, and when interpreting
-tool results during a design workflow. It defines contribution requirements and
-caller behavior; it does not claim every existing handler already satisfies them.
-Repository governance remains authoritative for merge gates and evidence.
+Apply this contract to tool calls and to new or changed tool behavior.
+See the migration inventory for tracked exceptions and repository governance
+for merge requirements.
 
 ## For callers: establish what happened
 
@@ -72,24 +71,10 @@ Do not claim all-or-nothing behavior when the backend cannot provide it.
 
 ## Bounded migration inventory
 
-The shared `outcome` envelope is implemented for
-`add_rule_area`, `add_schematic_component`, `annotate_schematic`,
-`batch_place_components`, `delete_zone`, `move_schematic_objects_between_sheets`, and
-`run_design_review`.
-That pilot is intentionally bounded. The following adjacent paths retain their
-existing response contracts until their focused issues are resolved. The
-machine-checked source of this baseline is
-[`reliability-legacy-inventory.json`](reliability-legacy-inventory.json); the
-table below is its human-readable explanation.
-
-| Area | Current gap | Tracking | Removal condition |
-|---|---|---|---|
-| DRC entry points | `tools::drc` shares explicit save/refill ordering and source evidence. Default calls still read saved files; general source authority and the outcome-envelope migration remain incomplete. | [#58](https://github.com/Copperpour/Copperpour/issues/58) | One owned DRC execution/result contract identifies source state and unavailable or partial evidence, including the remaining migration. |
-| Live/file board readers | `get_layer_list` and `get_netclasses` read the saved file while sibling writers can operate on the live board. | [#542](https://github.com/mixelpixx/Konnect/issues/542) | Readers disclose and consistently select the live or saved source, with stale-file coverage. |
-
-New migrations should reuse the shared outcome type, but each remains a focused
-change with its own compatibility and failure evidence. This inventory is not a
-claim that those paths already meet the contract.
+The [machine-checked inventory](reliability-legacy-inventory.json) lists tools
+using the shared `outcome` envelope and remaining exceptions with their scope
+and removal criteria. Reuse the shared outcome type for focused migrations with
+their own compatibility and failure evidence.
 
 ## Proportionate evidence
 
@@ -112,23 +97,12 @@ use the existing validation-debt process.
 
 ## Adoption and enforcement
 
-These are review requirements for new and changed behavior. Existing defects
-remain visible in issues; fixing one tool does not require migrating every other
-handler first. Keep fixes focused and expose one review-ready step per overlapping
-dependency chain under the existing branch workflow.
-
 The dispatch compiles, caches, and enforces every advertised tool schema before
 the handler runs. Handlers still own domain rules and checked direct-call paths.
-The CI gate checks that the outcome pilot remains served through the catalogue,
-that its envelope survives the JSON-RPC `tools/call` path, and that every legacy
-entry names existing paths, rationale, tracking issues, and removal criteria.
-The baseline ceiling is code-reviewed and must ratchet down when an entry is
-removed; adding tolerated debt requires an explicit guard change and must never
-be generated automatically.
-
-Contributors may use any AI or none. Share the behavioral contract while retaining
-independent toolchain instructions and reviews. This contract specifies outcomes,
-not model selection.
+CI checks that adopted tools serve the envelope through JSON-RPC `tools/call`
+and that each legacy entry names existing paths, rationale, tracking issues, and
+removal criteria. Lower the ceiling when removing a legacy entry. Adding an
+entry requires an explicit, reviewed guard change.
 
 ## Maintainer references
 
@@ -136,7 +110,5 @@ not model selection.
 - [Contributing](../CONTRIBUTING.md)
 - [Branch workflow](BRANCH_AND_PULL_REQUEST_WORKFLOW.md)
 
-The canonical source is `docs/RELIABILITY_CONTRACT.md`. The installer embeds these
-same bytes as the copperpour skill's `references/reliability-contract.md`, so
-installed guidance can read it offline. Repository links above refer to current
-maintainer policy, which may be newer than an installed release.
+The installer embeds this contract as `references/reliability-contract.md`
+for offline use. Repository links refer to current maintainer policy.

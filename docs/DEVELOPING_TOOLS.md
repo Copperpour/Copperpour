@@ -10,7 +10,7 @@ the safest implementation usually follows an existing neighboring tool.
 |---|---|---|
 | Saved schematic mutation | `copperpour-schematic-editor` or `copperpour-sexp` | Revision-aware atomic write; transaction journal for multi-file changes |
 | Live board mutation | `copperpour-ipc` | `KiCadIpcClient::ensure_board_is_active` before sending the mutation |
-| Board mutation with a safe closed-file implementation | IPC first, file fallback | `attempt_ipc_write` in `tools/pcb_board.rs`; fallback only when IPC is unreachable |
+| Board mutation with a safe closed-file implementation | IPC first, file fallback | `attempt_ipc_write` in `tools/pcb_board.rs`; fallback only when IPC is unreachable or the board is proven safely closed |
 | Board file mutation with no IPC implementation | `copperpour-sexp` or focused parser/edit code | `refuse_if_board_open_in_kicad` before touching the file |
 | KiCad-supported check or export | `kicad-cli` through `tools/cli.rs` | Validate exit status, output existence, and parsed result coverage |
 
@@ -25,17 +25,21 @@ transport because KiCad may already hold or have changed the target document.
 2. Implement the handler near related handlers and reuse their target checks and
    response conventions.
 3. Use valid Draft 2020-12 JSON Schema, list every required field, declare
-   bounds, and set `additionalProperties: false` only when the object is
-   intentionally closed. The catalogue compiles and caches this schema; MCP
-   dispatch enforces exactly what is advertised.
+   bounds, and declare every accepted property, including in nested records.
+   `ToolDef::new` closes fixed records. Caller-keyed maps must set
+   `additionalProperties: true` or a value schema. Keep fixed records within
+   map values closed and untyped caller data unrestricted. Register a new map
+   in `fixed_records_are_closed_and_only_reviewed_maps_are_extensible` and add
+   a compatibility test. These rules also apply to meta-tools.
 4. Read required values with `require_*` or `get_path`, and malformed-present
    options with a checked optional helper. Dispatch validation does not replace
    direct-handler validation. Never turn a malformed present value into an
    omitted value or silent default.
 5. Validate the target and all preconditions before the first mutation.
 6. Use `CallToolResult::json`, `text`, `image`, or `error_kind` as appropriate.
-7. Update `router/registry.rs`, `tool-directory.md`, and the guarded documentation
-   named by `CONTRIBUTING.md`.
+7. Register new toolsets in `router/registry.rs` and add a toolset to
+   `STARTER_KIT` if it belongs in the default set. Classify new tools in
+   `router/call_tool_policy.rs` and update `tool-directory.md`.
 
 For an IPC write that accepts a layer name, use `try_layer_from_name` so an
 unknown layer is refused before it becomes an invalid KiCad message.
@@ -54,10 +58,6 @@ Treat success, counts, and verdicts as claims that require evidence.
   schematic parity because each category can independently make a board fail.
 - After a risky IPC transformation, compare a bounded post-state with what was
   sent. `tools/pcb_sync.rs` is the reference for a commit plus read-back check.
-
-These rules address failures where the transport and KiCad both returned
-success but the resulting board was wrong, and where a verdict appeared clean
-only because one result category was ignored.
 
 ## Errors And Compatibility
 
@@ -88,14 +88,15 @@ real fixture only after the failing shape remains represented.
 
 For a mutating tool, cover the refusal path before the success path: wrong open
 board, reachable IPC rejection, stale file revision, unsupported geometry, or
-missing evidence. For IPC behavior that mocks cannot prove, add an ignored live
-test and record the live validation command in the PR.
+missing evidence. For a schema change, test typo refusals and unchanged state
+through served dispatch. For IPC behavior that mocks cannot prove, add an
+ignored live test and record the live validation command in the PR.
 
 ## Adding A Vendor Integration
 
 Code that reaches a vendor's service, or a program outside Copperpour, goes
 behind a Cargo feature of its own in `crates/copperpour-core/Cargo.toml`. It is
-on by default and forwarded by `crates/copperpour/Cargo.toml` (#210). Mark its
+on by default and forwarded by `crates/copperpour/Cargo.toml`. Mark its
 dependencies `optional` and enable them from the feature. Gate its module and
 its `tool!` entries with `#[cfg(feature = "...")]`, and gate tests that call its
 tools. Without it, its tools aren't registered. Code that runs in every build

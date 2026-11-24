@@ -1,11 +1,5 @@
 # Developer Overview
 
-This is the map layer for developers who need to understand Copperpour before
-changing it. Detailed implementation notes and the authoritative current tool
-statistics remain in [`DEV.md`](../DEV.md); public naming and contribution rules
-remain in [`CONTRIBUTING.md`](../CONTRIBUTING.md) and
-[`NAMING_CONVENTIONS.md`](NAMING_CONVENTIONS.md).
-
 Copperpour is a Rust MCP server with KiCad integration and packaging support. An
 MCP client talks to the `copperpour` binary, which exposes a small starter surface,
 loads domain toolsets on demand, and routes each call to a file, IPC, or
@@ -64,7 +58,7 @@ decision and its safety gates are described in
 The MCP browser viewer registry lives on `ToolContext` and reuses services by canonical
 root schematic. `open_schematic_viewer` returns a private URL plus separate OS-opener
 status; `open_browser: false` supports headless use. See the
-[browser migration](api-migrations/browser-viewer-mcp.md).
+[viewer README](../crates/copperpour-viewer/README.md).
 
 Server guidance lives in `copperpour-core::guidance`: short `initialize` rules and
 one shared embedded catalog for resources, `get_guidance`, and the native skill
