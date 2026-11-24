@@ -1902,3 +1902,526 @@ async fn a_live_only_write_with_no_board_editor_offers_only_the_pcb_editor() {
     );
     assert_eq!(std::fs::read(&scene.board).unwrap(), before);
 }
+
+// ─── Stage 4b: saved-snapshot boundary disclosure (#58) ──────────────────────
+
+/// A symbol-free, KiCad-saved sheet for the `run_design_review` contract
+/// tests, copied beside the board under its stem.
+fn write_minimal_schematic(dir: &Path) -> PathBuf {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/schematic_page_fit_custom_sheet_kicad10.kicad_sch");
+    let sch = dir.join("board_source_divergence_kicad10.kicad_sch");
+    std::fs::copy(&source, &sch).expect("the fixture is committed beside the tests");
+    sch
+}
+
+#[cfg(unix)]
+fn write_fake_clean_drc_cli(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("fake-kicad-cli.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         out=\"\"\n\
+         while [ \"$#\" -gt 0 ]; do\n\
+           if [ \"$1\" = \"--output\" ]; then out=\"$2\"; shift 2; else shift; fi\n\
+         done\n\
+         printf '{\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]}\\n' > \"$out\"\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    script
+}
+
+/// Every Stage 4b saved-snapshot tool reports per-domain `sources` and
+/// `source_evidence` disclosing that unsaved KiCad editor changes are excluded,
+/// both offline and when a sibling editor lock file is present on disk.
+#[tokio::test]
+async fn stage4b_saved_snapshot_tools_disclose_boundary_offline_and_with_lock() {
+    let scene = Scene::offline().await;
+    let board = scene.board.to_string_lossy().to_string();
+    let sch = write_minimal_schematic(scene._dir.path());
+    let sch_str = sch.to_string_lossy().to_string();
+
+    // Baseline: offline, no lock, no .kicad_dru.
+    let audit = body_of(
+        &scene
+            .call_with("audit_manufacturing", json!({ "board": board }))
+            .await,
+    );
+    assert_eq!(
+        audit["sources"],
+        json!({ "board": "saved_board" }),
+        "{audit}"
+    );
+    assert_eq!(audit["source_evidence"]["board_state"], "saved_board");
+    assert_eq!(
+        audit["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+    assert_eq!(audit["source_evidence"]["reason"], "saved_snapshot_only");
+
+    let models = body_of(
+        &scene
+            .call_with("check_3d_models", json!({ "board": board }))
+            .await,
+    );
+    assert_eq!(
+        models["sources"],
+        json!({ "footprints": "saved_board" }),
+        "{models}"
+    );
+    assert_eq!(models["source_evidence"]["board_state"], "saved_board");
+    assert_eq!(
+        models["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+    assert_eq!(models["source_evidence"]["reason"], "saved_snapshot_only");
+
+    let cost_default = body_of(
+        &scene
+            .call_with("estimate_cost", json!({ "board": board }))
+            .await,
+    );
+    assert_eq!(
+        cost_default["sources"],
+        json!({
+            "board": "saved_board",
+            "copper_layers": "saved_board",
+            "cost_estimate": "derived",
+        }),
+        "{cost_default}"
+    );
+    assert_eq!(
+        cost_default["source_evidence"]["board_state"],
+        "saved_board"
+    );
+    assert_eq!(
+        cost_default["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+    assert_eq!(
+        cost_default["source_evidence"]["reason"],
+        "saved_snapshot_only"
+    );
+
+    let cost_override = body_of(
+        &scene
+            .call_with("estimate_cost", json!({ "board": board, "layers": 6 }))
+            .await,
+    );
+    assert_eq!(
+        cost_override["sources"]["copper_layers"],
+        json!("argument"),
+        "{cost_override}"
+    );
+
+    let rules = body_of(
+        &scene
+            .call_with("get_design_rules", json!({ "board": board }))
+            .await,
+    );
+    assert_eq!(
+        rules["sources"],
+        json!({ "rules": "project_file" }),
+        "{rules}"
+    );
+    assert_eq!(rules["source_evidence"]["board_state"], "project_file");
+    assert_eq!(
+        rules["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+    assert_eq!(rules["source_evidence"]["reason"], "saved_snapshot_only");
+
+    let sizes = body_of(
+        &scene
+            .call_with("get_predefined_sizes", json!({ "board": board }))
+            .await,
+    );
+    assert_eq!(
+        sizes["sources"],
+        json!({
+            "track_widths": "project_file",
+            "via_dimensions": "project_file",
+        }),
+        "{sizes}"
+    );
+    assert_eq!(sizes["source_evidence"]["board_state"], "project_file");
+    assert_eq!(
+        sizes["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+    assert_eq!(sizes["source_evidence"]["reason"], "saved_snapshot_only");
+
+    // list_custom_rules without a .kicad_dru file reports rules as unavailable.
+    let custom_missing = body_of(
+        &scene
+            .call_with("list_custom_rules", json!({ "board": board }))
+            .await,
+    );
+    assert_eq!(custom_missing["exists"], false, "{custom_missing}");
+    assert_eq!(
+        custom_missing["sources"],
+        json!({
+            "rules": "unavailable",
+            "user_layers": "saved_board",
+        }),
+        "{custom_missing}"
+    );
+    assert_eq!(
+        custom_missing["source_evidence"]["board_state"],
+        "saved_board"
+    );
+    assert_eq!(
+        custom_missing["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+    assert_eq!(
+        custom_missing["source_evidence"]["reason"],
+        "saved_snapshot_only"
+    );
+
+    // With a .kicad_dru file present, rules provenance is custom_rules_file.
+    std::fs::write(
+        scene.board.with_extension("kicad_dru"),
+        "(version 1)\n(rule \"HV\" (constraint clearance (min 0.5mm)))\n",
+    )
+    .unwrap();
+    let custom_present = body_of(
+        &scene
+            .call_with("list_custom_rules", json!({ "board": board }))
+            .await,
+    );
+    assert_eq!(custom_present["exists"], true, "{custom_present}");
+    assert_eq!(
+        custom_present["sources"],
+        json!({
+            "rules": "custom_rules_file",
+            "user_layers": "saved_board",
+        }),
+        "{custom_present}"
+    );
+
+    // validate_for_manufacturing with no kicad-cli: DRC is unavailable, output file also carries provenance.
+    let report_path = scene._dir.path().join("mfg-validation.json");
+    let validation = body_of(
+        &scene
+            .call_with(
+                "validate_for_manufacturing",
+                json!({ "board": board, "output": report_path.to_string_lossy() }),
+            )
+            .await,
+    );
+    assert_eq!(
+        validation["sources"],
+        json!({
+            "board": "saved_board",
+            "drc": "unavailable",
+        }),
+        "{validation}"
+    );
+    assert_eq!(validation["source_evidence"]["board_state"], "saved_board");
+    assert_eq!(
+        validation["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+    assert_eq!(
+        validation["source_evidence"]["reason"],
+        "saved_snapshot_only"
+    );
+    let written: Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(written["sources"], validation["sources"]);
+    assert_eq!(written["source_evidence"], validation["source_evidence"]);
+
+    // run_design_review without a board reports schematic-only provenance and keeps outcome.
+    let review_sch = body_of(
+        &scene
+            .call_with("run_design_review", json!({ "schematic": sch_str }))
+            .await,
+    );
+    assert_eq!(
+        review_sch["sources"],
+        json!({ "schematic": "saved_schematic" }),
+        "{review_sch}"
+    );
+    assert_eq!(review_sch["source_evidence"]["board_state"], Value::Null);
+    assert_eq!(
+        review_sch["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+    assert_eq!(review_sch["source_evidence"]["reason"], "no_board_supplied");
+    assert!(review_sch.get("outcome").is_some(), "{review_sch}");
+
+    // run_design_review with a board (and no kicad-cli) discloses saved board + unavailable DRC.
+    let review_both = body_of(
+        &scene
+            .call_with(
+                "run_design_review",
+                json!({ "schematic": sch_str, "board": board }),
+            )
+            .await,
+    );
+    assert_eq!(
+        review_both["sources"],
+        json!({
+            "schematic": "saved_schematic",
+            "board": "saved_board",
+            "drc": "unavailable",
+        }),
+        "{review_both}"
+    );
+    assert_eq!(review_both["source_evidence"]["board_state"], "saved_board");
+    assert_eq!(
+        review_both["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+    assert_eq!(
+        review_both["source_evidence"]["reason"],
+        "saved_snapshot_only"
+    );
+
+    // Now place a sibling editor lock beside the board: all 8 tools still succeed
+    // and disclose `saved_snapshot_only_with_editor_lock`.
+    let lock_path = copperpour_sexp::writer::kicad_editor_lock_path(&scene.board).unwrap();
+    std::fs::write(&lock_path, "locked").unwrap();
+    for (tool, args) in [
+        ("audit_manufacturing", json!({ "board": board })),
+        ("check_3d_models", json!({ "board": board })),
+        ("estimate_cost", json!({ "board": board })),
+        ("get_design_rules", json!({ "board": board })),
+        ("get_predefined_sizes", json!({ "board": board })),
+        ("list_custom_rules", json!({ "board": board })),
+        ("validate_for_manufacturing", json!({ "board": board })),
+        (
+            "run_design_review",
+            json!({ "schematic": sch_str, "board": board }),
+        ),
+    ] {
+        let result = scene.call_with(tool, args).await;
+        assert!(
+            !result.is_error,
+            "{tool} should not refuse on editor lock: {}",
+            text_of(&result)
+        );
+        let body = body_of(&result);
+        assert_eq!(
+            body["source_evidence"]["reason"],
+            json!("saved_snapshot_only_with_editor_lock"),
+            "{tool}: {body}"
+        );
+        assert_eq!(
+            body["source_evidence"]["excludes_unsaved_editor_state"],
+            json!(true),
+            "{tool}: {body}"
+        );
+    }
+}
+
+/// After the server has observed a board live in KiCad, every Stage 4b saved-snapshot
+/// tool discloses `saved_snapshot_only_after_live_observation` without consulting IPC
+/// or refusing the read-only snapshot.
+#[tokio::test]
+async fn stage4b_saved_snapshot_tools_disclose_after_live_observation() {
+    let scene = Scene::live().await;
+    let board = scene.board.to_string_lossy().to_string();
+    let sch = write_minimal_schematic(scene._dir.path());
+    let sch_str = sch.to_string_lossy().to_string();
+
+    // First observe the board live via an interactive reader on the same handler.
+    let live = scene.body("get_layer_list", Some("live")).await;
+    assert_eq!(live["source_evidence"]["board_state"], "ipc", "{live}");
+
+    for (tool, args) in [
+        ("audit_manufacturing", json!({ "board": board })),
+        ("check_3d_models", json!({ "board": board })),
+        ("estimate_cost", json!({ "board": board })),
+        ("get_design_rules", json!({ "board": board })),
+        ("get_predefined_sizes", json!({ "board": board })),
+        ("list_custom_rules", json!({ "board": board })),
+        ("validate_for_manufacturing", json!({ "board": board })),
+        (
+            "run_design_review",
+            json!({ "schematic": sch_str, "board": board }),
+        ),
+    ] {
+        let result = scene.call_with(tool, args).await;
+        assert!(!result.is_error, "{tool}: {}", text_of(&result));
+        let body = body_of(&result);
+        assert_eq!(
+            body["source_evidence"]["reason"],
+            json!("saved_snapshot_only_after_live_observation"),
+            "{tool}: {body}"
+        );
+        assert_eq!(
+            body["source_evidence"]["excludes_unsaved_editor_state"],
+            json!(true),
+            "{tool}: {body}"
+        );
+    }
+}
+
+/// When `kicad-cli` completes DRC, both `validate_for_manufacturing` and
+/// `run_design_review` report `sources.drc == "kicad_cli"` alongside
+/// `sources.board == "saved_board"`.
+#[cfg(unix)]
+#[tokio::test]
+async fn stage4b_cli_drc_analysis_tools_report_kicad_cli_source_when_drc_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = fixture_board(dir.path());
+    write_project(&board);
+    let sch = write_minimal_schematic(dir.path());
+    let fake_cli = write_fake_clean_drc_cli(dir.path());
+
+    let handler = McpHandler::new(ServerConfig {
+        kicad_cli: fake_cli.to_string_lossy().into_owned(),
+        kicad_binary: String::new(),
+        ipc_address: String::new(),
+        project_dir: None,
+        jlcpcb_db_path: None,
+        auto_load_toolsets: true,
+        eager_toolsets: true,
+    })
+    .await
+    .expect("handler builds");
+    let scene = Scene {
+        _dir: dir,
+        board,
+        kicad: None,
+        handler,
+    };
+    let board_str = scene.board.to_string_lossy().to_string();
+    let sch_str = sch.to_string_lossy().to_string();
+
+    let validation = body_of(
+        &scene
+            .call_with("validate_for_manufacturing", json!({ "board": board_str }))
+            .await,
+    );
+    assert_eq!(
+        validation["sources"],
+        json!({
+            "board": "saved_board",
+            "drc": "kicad_cli",
+        }),
+        "{validation}"
+    );
+    assert_eq!(
+        validation["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+
+    let review = body_of(
+        &scene
+            .call_with(
+                "run_design_review",
+                json!({ "schematic": sch_str, "board": board_str }),
+            )
+            .await,
+    );
+    assert_eq!(
+        review["sources"],
+        json!({
+            "schematic": "saved_schematic",
+            "board": "saved_board",
+            "drc": "kicad_cli",
+        }),
+        "{review}"
+    );
+    assert_eq!(
+        review["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+}
+
+/// `get_design_rules` and `get_predefined_sizes` also disclose a sibling
+/// `.kicad_pro` lock when no board lock is present.
+#[tokio::test]
+async fn stage4b_project_file_readers_disclose_project_lock() {
+    let scene = Scene::offline().await;
+    let board = scene.board.to_string_lossy().to_string();
+    let pro_lock =
+        copperpour_sexp::writer::kicad_project_lock_path(&scene.board.with_extension("kicad_pro"))
+            .unwrap();
+    std::fs::write(&pro_lock, "locked").unwrap();
+
+    for tool in ["get_design_rules", "get_predefined_sizes"] {
+        let body = body_of(&scene.call_with(tool, json!({ "board": board })).await);
+        assert_eq!(
+            body["source_evidence"]["board_state"],
+            json!("project_file"),
+            "{tool}: {body}"
+        );
+        assert_eq!(
+            body["source_evidence"]["reason"],
+            json!("saved_snapshot_only_with_editor_lock"),
+            "{tool}: {body}"
+        );
+    }
+}
+
+/// When `run_design_review` is given a missing/unreadable board path (and DRC
+/// cannot run), both `sources.board` and `source_evidence.board_state` report
+/// `"unavailable"` rather than claiming a saved board was read.
+#[tokio::test]
+async fn stage4b_design_review_with_unreadable_board_reports_unavailable_state() {
+    let scene = Scene::offline().await;
+    let sch = write_minimal_schematic(scene._dir.path());
+    let missing_board = scene._dir.path().join("does_not_exist.kicad_pcb");
+
+    let review = body_of(
+        &scene
+            .call_with(
+                "run_design_review",
+                json!({
+                    "schematic": sch.to_string_lossy(),
+                    "board": missing_board.to_string_lossy(),
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        review["sources"],
+        json!({
+            "schematic": "saved_schematic",
+            "board": "unavailable",
+            "drc": "unavailable",
+        }),
+        "{review}"
+    );
+    assert_eq!(review["source_evidence"]["board_state"], "unavailable");
+    assert_eq!(
+        review["source_evidence"]["excludes_unsaved_editor_state"],
+        true
+    );
+}
+
+/// When a saved board declares no `(layers ...)` table (`board_copper_layers == 0`)
+/// and the caller omits `layers`, `estimate_cost` reports `sources.copper_layers`
+/// as `"unavailable"` rather than `"saved_board"`.
+#[tokio::test]
+async fn stage4b_estimate_cost_without_layers_table_reports_copper_layers_unavailable() {
+    let scene = Scene::offline().await;
+    let no_layers_board = scene._dir.path().join("no_layers.kicad_pcb");
+    std::fs::write(&no_layers_board, "(kicad_pcb (version 20260206))\n").unwrap();
+
+    let cost = body_of(
+        &scene
+            .call_with(
+                "estimate_cost",
+                json!({ "board": no_layers_board.to_string_lossy() }),
+            )
+            .await,
+    );
+    assert_eq!(
+        cost["sources"],
+        json!({
+            "board": "saved_board",
+            "copper_layers": "unavailable",
+            "cost_estimate": "derived",
+        }),
+        "{cost}"
+    );
+}

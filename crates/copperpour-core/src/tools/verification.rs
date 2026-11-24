@@ -97,7 +97,9 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "get_design_rules",
-            "Return the current design rule constraints defined in the sibling KiCAD project file.",
+            "Return the current design rule constraints defined in the sibling KiCAD project file. \
+             Reads the saved .kicad_pro file on disk (unsaved editor changes are excluded) and \
+             reports provenance.",
             json!({
                 "type": "object",
                 "properties": {
@@ -150,7 +152,9 @@ pub fn tools() -> Vec<ToolDef> {
             "get_predefined_sizes",
             "Return the PCB editor Pre-defined Sizes list from the sibling .kicad_pro: \
              track_widths (mm) and via_dimensions (diameter/drill mm), including the \
-             0 / 0,0 netclass sentinel KiCad keeps at the front of each list.",
+             0 / 0,0 netclass sentinel KiCad keeps at the front of each list. Reads the \
+             saved .kicad_pro file on disk (unsaved editor changes are excluded) and reports \
+             provenance.",
             json!({
                 "type": "object",
                 "properties": {
@@ -755,21 +759,24 @@ fn design_rules_json(project: &Value) -> Value {
 
 async fn handle_get_design_rules(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let project_path = sibling_project_path(&board);
     let content = tokio::fs::read_to_string(&project_path).await?;
     let project: serde_json::Value = serde_json::from_str(&content)?;
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "board": board.to_str().unwrap_or(""),
-            "project": project_path.to_str().unwrap_or(""),
-            "rules": design_rules_json(&project)
-        }))
-        .unwrap(),
-    ))
+    let mut body = json!({
+        "board": board.to_str().unwrap_or(""),
+        "project": project_path.to_str().unwrap_or(""),
+        "rules": design_rules_json(&project)
+    });
+    super::board_source::provenance(
+        &mut body,
+        json!({ "rules": super::board_source::FROM_PROJECT_FILE }),
+        super::board_source::saved_project_evidence(ctx, &board),
+    );
+    Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
 // ─── Pre-defined sizes (Board Setup → Design Rules → Pre-defined Sizes) ───────
@@ -1007,7 +1014,7 @@ async fn handle_set_predefined_sizes(
 
 async fn handle_get_predefined_sizes(
     args: &Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let (project_path, _, project) = match load_sibling_project(&board)? {
@@ -1015,11 +1022,20 @@ async fn handle_get_predefined_sizes(
         Err(refusal) => return Ok(refusal),
     };
     let (track_widths, via_dimensions) = current_predefined_sizes(&project);
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "project": project_path,
         "track_widths": track_widths,
         "via_dimensions": via_dimensions
-    })))
+    });
+    super::board_source::provenance(
+        &mut body,
+        json!({
+            "track_widths": super::board_source::FROM_PROJECT_FILE,
+            "via_dimensions": super::board_source::FROM_PROJECT_FILE,
+        }),
+        super::board_source::saved_project_evidence(ctx, &board),
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 // ─── KiCAD UI management ──────────────────────────────────────────────────────

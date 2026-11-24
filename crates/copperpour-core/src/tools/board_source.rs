@@ -83,8 +83,14 @@ pub(crate) fn board_source_schema() -> Value {
 pub(crate) const FROM_IPC: &str = "ipc";
 /// A domain answered from the `.kicad_pcb` file as last saved.
 pub(crate) const FROM_SAVED_BOARD: &str = "saved_board";
+/// A domain answered from `.kicad_sch` schematic files as last saved.
+pub(crate) const FROM_SAVED_SCHEMATIC: &str = "saved_schematic";
 /// A domain answered from the `.kicad_pro` project file.
 pub(crate) const FROM_PROJECT_FILE: &str = "project_file";
+/// A domain answered from the sibling `.kicad_dru` custom rules file.
+pub(crate) const FROM_CUSTOM_RULES_FILE: &str = "custom_rules_file";
+/// A domain produced by running `kicad-cli` against the saved board file.
+pub(crate) const FROM_KICAD_CLI: &str = "kicad_cli";
 /// A domain computed from other reported domains rather than observed.
 pub(crate) const FROM_DERIVED: &str = "derived";
 /// A domain supplied directly by a tool argument rather than read from disk or IPC.
@@ -132,6 +138,103 @@ pub(crate) fn live_evidence() -> Value {
         "excludes_unsaved_editor_state": false,
         "reason": Value::Null,
         "detail": "KiCad answered for the exact requested board over its IPC API.",
+    })
+}
+
+/// Observed provenance for a saved-snapshot tool that reads `.kicad_pcb`
+/// (and/or runs `kicad-cli` against it) without consulting KiCad IPC.
+pub(crate) fn saved_snapshot_evidence(ctx: &ToolContext, board_path: &Path) -> Value {
+    saved_file_evidence(
+        ctx,
+        board_path,
+        FROM_SAVED_BOARD,
+        live_board::editor_lock(board_path),
+    )
+}
+
+/// Observed provenance for a saved-snapshot tool that reads only the sibling
+/// `.kicad_pro` project file without consulting KiCad IPC.
+pub(crate) fn saved_project_evidence(ctx: &ToolContext, board_path: &Path) -> Value {
+    let lock = match live_board::editor_lock(board_path) {
+        live_board::EditorLock::Absent => {
+            live_board::project_lock(&board_path.with_extension("kicad_pro"))
+        }
+        other => other,
+    };
+    saved_file_evidence(ctx, board_path, FROM_PROJECT_FILE, lock)
+}
+
+/// Observed provenance when a board path was supplied to a saved-snapshot
+/// workflow, but neither the board file nor CLI DRC could be read.
+pub(crate) fn saved_board_unavailable_evidence(ctx: &ToolContext, board_path: &Path) -> Value {
+    saved_file_evidence(
+        ctx,
+        board_path,
+        FROM_UNAVAILABLE,
+        live_board::editor_lock(board_path),
+    )
+}
+
+/// Observed provenance for a mixed review run when no board path was supplied.
+pub(crate) fn schematic_only_evidence() -> Value {
+    json!({
+        "board_state": Value::Null,
+        "excludes_unsaved_editor_state": true,
+        "reason": "no_board_supplied",
+        "detail": "No board path was supplied; only the saved schematic files on disk were \
+                   inspected and any unsaved editor changes are excluded.",
+    })
+}
+
+/// Build saved-snapshot provenance without touching KiCad IPC. Reports whether
+/// this server session previously saw the board live or whether an exact-board
+/// sibling lock file is present on disk.
+fn saved_file_evidence(
+    ctx: &ToolContext,
+    board_path: &Path,
+    board_state: &'static str,
+    lock: live_board::EditorLock,
+) -> Value {
+    let (reason, detail) = if ctx.board_session.was_observed_live(board_path) {
+        (
+            "saved_snapshot_only_after_live_observation",
+            "This tool inspects the saved files on disk without consulting KiCad IPC. Copperpour \
+             observed this board live in KiCad during this server session, so unsaved editor \
+             changes are excluded."
+                .to_string(),
+        )
+    } else {
+        match lock {
+            live_board::EditorLock::Absent => (
+                "saved_snapshot_only",
+                "This tool inspects the saved files on disk without consulting KiCad IPC; any \
+                 unsaved editor changes are excluded."
+                    .to_string(),
+            ),
+            live_board::EditorLock::Present(path) => (
+                "saved_snapshot_only_with_editor_lock",
+                format!(
+                    "This tool inspects the saved files on disk without consulting KiCad IPC, and \
+                     the sibling lock '{}' is present; any unsaved editor changes are excluded.",
+                    display_path(&path)
+                ),
+            ),
+            live_board::EditorLock::Unreadable(path, error) => (
+                "saved_snapshot_only_with_uninspectable_lock",
+                format!(
+                    "This tool inspects the saved files on disk without consulting KiCad IPC, and \
+                     the sibling lock '{}' could not be inspected ({error}); any unsaved editor \
+                     changes are excluded.",
+                    display_path(&path)
+                ),
+            ),
+        }
+    };
+    json!({
+        "board_state": board_state,
+        "excludes_unsaved_editor_state": true,
+        "reason": reason,
+        "detail": detail,
     })
 }
 
@@ -985,5 +1088,37 @@ mod tests {
         assert_eq!(saved["board_state"], json!(FROM_SAVED_BOARD));
         assert_eq!(saved["excludes_unsaved_editor_state"], json!(true));
         assert_eq!(saved["reason"], json!("kicad_ipc_unreachable"));
+    }
+
+    #[test]
+    fn saved_file_evidence_discloses_uninspectable_lock() {
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let board = Path::new("/tmp/board.kicad_pcb");
+        let lock_path = std::path::PathBuf::from("/tmp/~board.kicad_pcb.lck");
+        let evidence = saved_file_evidence(
+            &ctx,
+            board,
+            FROM_SAVED_BOARD,
+            live_board::EditorLock::Unreadable(
+                lock_path,
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+            ),
+        );
+        assert_eq!(evidence["board_state"], json!(FROM_SAVED_BOARD));
+        assert_eq!(evidence["excludes_unsaved_editor_state"], json!(true));
+        assert_eq!(
+            evidence["reason"],
+            json!("saved_snapshot_only_with_uninspectable_lock")
+        );
+        assert!(
+            evidence["detail"]
+                .as_str()
+                .unwrap()
+                .contains("permission denied"),
+            "{evidence}"
+        );
     }
 }
